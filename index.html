@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>terminal manager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+
+    <!-- ============================================================ -->
+    <!-- TITLEBAR                                                     -->
+    <!-- ============================================================ -->
+    <header class="titlebar">
+      <div class="titlebar-left">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 4l4 4l-4 4"></path>
+              <path d="M9 12h5"></path>
+            </svg>
+          </span>
+          <span class="brand-name">terminal.mgr</span>
+          <span class="brand-version">v0.1.0</span>
+        </div>
+        <div class="titlebar-breadcrumb">
+          <span class="crumb">main</span>
+          <span class="crumb-sep">/</span>
+          <span class="crumb active">dashboard</span>
+        </div>
+      </div>
+      <div class="titlebar-right">
+        <button class="pill-btn" title="Command palette (Ctrl+K)">
+          <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="2" y="2" width="12" height="12" rx="1"></rect><path d="M5 6l2 2l-2 2M8 10h3"></path></svg>
+          <span>search</span>
+          <kbd>⌘K</kbd>
+        </button>
+        <div class="titlebar-divider"></div>
+        <button class="icon-btn tight" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="10" rx="1"></rect><line x1="6" y1="3" x2="6" y2="13"></line></svg>
+        </button>
+        <button class="icon-btn tight" title="Fullscreen" aria-label="Fullscreen">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3 6V3h3M13 6V3h-3M3 10v3h3M13 10v3h-3"></path></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- ============================================================ -->
+    <!-- MAIN LAYOUT                                                  -->
+    <!-- ============================================================ -->
+    <div class="layout">
+
+      <!-- ================ SIDEBAR ================ -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-head">
+          <span class="sidebar-title">workspaces</span>
+          <div class="sidebar-head-actions">
+            <button class="icon-btn tight" title="New workspace (⌘N)" aria-label="New workspace">
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3v10M3 8h10"></path></svg>
+            </button>
+            <button class="icon-btn tight" title="Collapse all" aria-label="Collapse all">
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 7l4-3l4 3M4 9l4 3l4-3"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="sidebar-scroll">
+          <!-- ====== Workspace: main ====== -->
+          <div class="workspace active" data-ws="main">
+            <div class="workspace-head" tabindex="0">
+              <span class="chevron" aria-hidden="true">▾</span>
+              <span class="workspace-num">1</span>
+              <span class="workspace-name">main</span>
+              <span class="workspace-meta">
+                <span class="branch-tag">main</span>
+              </span>
+            </div>
+            <div class="workspace-body">
+              <button class="subtab active" data-tab="terminals">
+                <span class="tree-glyph">├</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="12" height="10" rx="1"></rect><path d="M5 7l2 1.5L5 10M8 10h3"></path></svg>
+                </span>
+                <span class="subtab-label">terminals</span>
+                <span class="subtab-count">4</span>
+              </button>
+              <button class="subtab" data-tab="agents">
+                <span class="tree-glyph">├</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="6" r="2.5"></circle><path d="M3 13c.8-2.5 2.8-4 5-4s4.2 1.5 5 4" stroke-linecap="round"></path></svg>
+                </span>
+                <span class="subtab-label">agents</span>
+                <span class="subtab-count pulse">2</span>
+              </button>
+              <button class="subtab" data-tab="worktrees">
+                <span class="tree-glyph">├</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="4" cy="4" r="1.5"></circle><circle cx="4" cy="12" r="1.5"></circle><circle cx="12" cy="8" r="1.5"></circle><path d="M4 5.5v5M5.5 4H9a2 2 0 012 2v.5M5.5 12H9a2 2 0 002-2v-.5"></path></svg>
+                </span>
+                <span class="subtab-label">worktrees</span>
+                <span class="subtab-count">3</span>
+              </button>
+              <button class="subtab" data-tab="sessions">
+                <span class="tree-glyph">├</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 5h12v8H2zM2 5l6-3l6 3" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+                </span>
+                <span class="subtab-label">sessions</span>
+                <span class="subtab-count">1</span>
+              </button>
+              <button class="subtab" data-tab="env">
+                <span class="tree-glyph">└</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 4h10M3 8h10M3 12h10"></path><circle cx="5" cy="4" r=".5" fill="currentColor"></circle><circle cx="11" cy="8" r=".5" fill="currentColor"></circle><circle cx="7" cy="12" r=".5" fill="currentColor"></circle></svg>
+                </span>
+                <span class="subtab-label">environment</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- ====== Workspace: api ====== -->
+          <div class="workspace" data-ws="api">
+            <div class="workspace-head" tabindex="0">
+              <span class="chevron" aria-hidden="true">▾</span>
+              <span class="workspace-num">2</span>
+              <span class="workspace-name">api</span>
+              <span class="workspace-meta">
+                <span class="branch-tag">fix/pdf-export</span>
+              </span>
+            </div>
+            <div class="workspace-body">
+              <button class="subtab" data-tab="terminals">
+                <span class="tree-glyph">├</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="12" height="10" rx="1"></rect><path d="M5 7l2 1.5L5 10M8 10h3"></path></svg>
+                </span>
+                <span class="subtab-label">terminals</span>
+                <span class="subtab-count">2</span>
+              </button>
+              <button class="subtab" data-tab="agents">
+                <span class="tree-glyph">├</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="6" r="2.5"></circle><path d="M3 13c.8-2.5 2.8-4 5-4s4.2 1.5 5 4" stroke-linecap="round"></path></svg>
+                </span>
+                <span class="subtab-label">agents</span>
+                <span class="subtab-count">1</span>
+              </button>
+              <button class="subtab" data-tab="worktrees">
+                <span class="tree-glyph">└</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="4" cy="4" r="1.5"></circle><circle cx="4" cy="12" r="1.5"></circle><circle cx="12" cy="8" r="1.5"></circle><path d="M4 5.5v5M5.5 4H9a2 2 0 012 2v.5M5.5 12H9a2 2 0 002-2v-.5"></path></svg>
+                </span>
+                <span class="subtab-label">worktrees</span>
+                <span class="subtab-count">2</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- ====== Workspace: infra ====== -->
+          <div class="workspace collapsed" data-ws="infra">
+            <div class="workspace-head" tabindex="0">
+              <span class="chevron" aria-hidden="true">▾</span>
+              <span class="workspace-num">3</span>
+              <span class="workspace-name">infra</span>
+              <span class="workspace-meta">
+                <span class="branch-tag">staging</span>
+              </span>
+            </div>
+            <div class="workspace-body">
+              <button class="subtab" data-tab="terminals">
+                <span class="tree-glyph">├</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="12" height="10" rx="1"></rect><path d="M5 7l2 1.5L5 10M8 10h3"></path></svg>
+                </span>
+                <span class="subtab-label">terminals</span>
+                <span class="subtab-count">1</span>
+              </button>
+              <button class="subtab" data-tab="sessions">
+                <span class="tree-glyph">└</span>
+                <span class="subtab-icon">
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 5h12v8H2zM2 5l6-3l6 3" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+                </span>
+                <span class="subtab-label">sessions</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- ====== Workspace: scratch ====== -->
+          <div class="workspace collapsed" data-ws="scratch">
+            <div class="workspace-head" tabindex="0">
+              <span class="chevron" aria-hidden="true">▾</span>
+              <span class="workspace-num">4</span>
+              <span class="workspace-name">scratch</span>
+              <span class="workspace-meta">
+                <span class="branch-tag muted">no branch</span>
+              </span>
+            </div>
+            <div class="workspace-body">
+              <button class="subtab" data-tab="terminals">
+                <span class="tree-glyph">└</span>
+                <span class="subtab-label">terminals</span>
+                <span class="subtab-count">0</span>
+              </button>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- ====== Activity footer ====== -->
+        <div class="sidebar-footer">
+          <div class="footer-title">activity</div>
+          <div class="activity-item running">
+            <div class="activity-row">
+              <span class="activity-name">claude</span>
+              <span class="activity-state">running</span>
+            </div>
+            <div class="activity-desc">refactor split pane logic</div>
+          </div>
+          <div class="activity-item stopped">
+            <div class="activity-row">
+              <span class="activity-name">amp</span>
+              <span class="activity-state">stopped</span>
+            </div>
+            <div class="activity-desc">verify readme docs</div>
+          </div>
+          <div class="activity-item waiting">
+            <div class="activity-row">
+              <span class="activity-name">codex</span>
+              <span class="activity-state">waiting</span>
+            </div>
+            <div class="activity-desc">needs review</div>
+          </div>
+        </div>
+
+        <!-- ====== Keyboard hints strip ====== -->
+        <div class="sidebar-hints">
+          <span class="hint"><kbd>↑↓</kbd>cycle</span>
+          <span class="hint"><kbd>⏎</kbd>open</span>
+          <span class="hint"><kbd>x</kbd>kill</span>
+          <span class="hint"><kbd>t</kbd>theme</span>
+        </div>
+      </aside>
+
+      <!-- ================ CONTENT ================ -->
+      <main class="content">
+
+        <!-- ====== Terminal tab bar ====== -->
+        <div class="tabbar">
+          <div class="tabs" id="tabs">
+            <button class="tab active" data-tab-id="t1">
+              <span class="tab-status running"></span>
+              <span class="tab-name">dashboard</span>
+              <span class="tab-subtitle">go run</span>
+              <span class="tab-close" aria-label="Close tab">×</span>
+            </button>
+            <button class="tab" data-tab-id="t2">
+              <span class="tab-status running"></span>
+              <span class="tab-name">api.server</span>
+              <span class="tab-subtitle">bun dev</span>
+              <span class="tab-close" aria-label="Close tab">×</span>
+            </button>
+            <button class="tab" data-tab-id="t3">
+              <span class="tab-status idle"></span>
+              <span class="tab-name">scratch</span>
+              <span class="tab-subtitle">bash</span>
+              <span class="tab-close" aria-label="Close tab">×</span>
+            </button>
+            <button class="tab-add" title="New terminal (⌘T)" aria-label="New terminal">
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"></path></svg>
+            </button>
+          </div>
+
+          <div class="tabbar-actions">
+            <button class="icon-btn" id="btn-split-h" title="Split right (⌘D)" aria-label="Split right">
+              <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="10" rx="1"></rect><line x1="8" y1="3" x2="8" y2="13"></line></svg>
+            </button>
+            <button class="icon-btn" id="btn-split-v" title="Split down (⌘⇧D)" aria-label="Split down">
+              <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="10" rx="1"></rect><line x1="2" y1="8" x2="14" y2="8"></line></svg>
+            </button>
+            <button class="icon-btn" id="btn-grid" title="2x2 grid" aria-label="2x2 grid">
+              <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="10" rx="1"></rect><line x1="8" y1="3" x2="8" y2="13"></line><line x1="2" y1="8" x2="14" y2="8"></line></svg>
+            </button>
+            <button class="icon-btn" id="btn-balance" title="Balance panes" aria-label="Balance panes">
+              <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 8h8M6 5l-2 3l2 3M10 5l2 3l-2 3"></path></svg>
+            </button>
+            <div class="tabbar-divider"></div>
+            <button class="icon-btn" id="btn-settings" title="Settings (⌘,)" aria-label="Settings">
+              <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="8" cy="8" r="2"></circle>
+                <path d="M8 1.5v1.5M8 13v1.5M14.5 8H13M3 8H1.5M12.6 3.4l-1 1M4.4 11.6l-1 1M12.6 12.6l-1-1M4.4 4.4l-1-1"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- ====== Terminal grid ====== -->
+        <div class="terminal-grid" id="terminal-grid"></div>
+
+        <!-- ====== Status bar ====== -->
+        <footer class="statusbar">
+          <div class="statusbar-left">
+            <span class="status-item accent" id="status-mode">
+              <span class="status-glyph">◆</span>
+              <span>main</span>
+            </span>
+            <span class="status-item">
+              <span class="status-dot running"></span>
+              <span>4 active</span>
+            </span>
+            <span class="status-item" id="status-cpu">cpu <span class="tnum">12.4</span>%</span>
+            <span class="status-item" id="status-mem">mem <span class="tnum">1.42</span>G</span>
+            <span class="status-item" id="status-net">↓ <span class="tnum">0.8</span>k/s</span>
+          </div>
+          <div class="statusbar-right">
+            <span class="status-item">utf-8</span>
+            <span class="status-item">bash · 5.2</span>
+            <span class="status-item"><span class="tnum">80</span>×<span class="tnum">24</span></span>
+            <span class="status-item" id="status-clock"><span class="tnum">14:32</span></span>
+          </div>
+        </footer>
+      </main>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SETTINGS MODAL                                               -->
+    <!-- ============================================================ -->
+    <div class="modal-overlay" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title-row">
+            <span class="modal-mark">◆</span>
+            <h2 class="modal-title" id="settings-title">settings</h2>
+          </div>
+          <button class="icon-btn" id="settings-close" aria-label="Close settings">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"></path></svg>
+          </button>
+        </div>
+
+        <div class="modal-nav">
+          <button class="modal-nav-item active">general</button>
+          <button class="modal-nav-item">appearance</button>
+          <button class="modal-nav-item">shell</button>
+          <button class="modal-nav-item">keybinds</button>
+          <button class="modal-nav-item">agents</button>
+        </div>
+
+        <div class="modal-body">
+          <section class="modal-section">
+            <h3 class="modal-section-title">general</h3>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Default shell</span>
+                <span class="setting-desc">Command run when opening a new terminal</span>
+              </div>
+              <select class="input select">
+                <option>bash</option>
+                <option>zsh</option>
+                <option>fish</option>
+                <option>pwsh</option>
+              </select>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Working directory</span>
+                <span class="setting-desc">Starting directory for new terminals</span>
+              </div>
+              <input class="input" type="text" value="~/projects/main" />
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Restore on startup</span>
+                <span class="setting-desc">Reopen last active session and panes</span>
+              </div>
+              <button class="toggle on" aria-pressed="true"></button>
+            </div>
+          </section>
+
+          <section class="modal-section">
+            <h3 class="modal-section-title">appearance</h3>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Theme</span>
+                <span class="setting-desc">Visual palette</span>
+              </div>
+              <div class="theme-chips">
+                <button class="theme-chip amber active" title="Amber"></button>
+                <button class="theme-chip green" title="Green"></button>
+                <button class="theme-chip cyan" title="Cyan"></button>
+                <button class="theme-chip mono" title="Mono"></button>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Font size</span>
+                <span class="setting-desc">Terminal output size</span>
+              </div>
+              <div class="stepper">
+                <button class="stepper-btn">−</button>
+                <span class="stepper-val tnum">13</span>
+                <button class="stepper-btn">+</button>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Glow effect</span>
+                <span class="setting-desc">Subtle CRT-style text shadow</span>
+              </div>
+              <button class="toggle on" aria-pressed="true"></button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Background texture</span>
+                <span class="setting-desc">Warm ambient gradient</span>
+              </div>
+              <button class="toggle on" aria-pressed="true"></button>
+            </div>
+          </section>
+
+          <section class="modal-section">
+            <h3 class="modal-section-title">shell</h3>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Shell integration</span>
+                <span class="setting-desc">Inject prompt markers for smart scrollback</span>
+              </div>
+              <button class="toggle on" aria-pressed="true"></button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">History size</span>
+                <span class="setting-desc">Lines retained per pane</span>
+              </div>
+              <input class="input" type="text" value="50000" />
+            </div>
+          </section>
+        </div>
+
+        <div class="modal-footer">
+          <span class="modal-hint"><kbd>esc</kbd> close</span>
+          <div class="modal-footer-actions">
+            <button class="btn ghost" id="settings-cancel">cancel</button>
+            <button class="btn primary">save changes</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
