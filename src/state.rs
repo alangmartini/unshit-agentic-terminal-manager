@@ -297,14 +297,12 @@ pub fn seed_state() -> AppState {
         },
     ];
 
-    let tabs = vec![
-        TerminalTab {
-            id: "t1".to_string(),
-            name: "shell".to_string(),
-            subtitle: "bash".to_string(),
-            status: TabStatus::Running,
-        },
-    ];
+    let tabs = vec![TerminalTab {
+        id: "t1".to_string(),
+        name: "shell".to_string(),
+        subtitle: "bash".to_string(),
+        status: TabStatus::Running,
+    }];
 
     let default_pane = Pane {
         id: PaneId(1),
@@ -567,8 +565,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if state.tabs.is_empty() {
                 return false;
             }
-            state.active_tab =
-                if state.active_tab == 0 { state.tabs.len() - 1 } else { state.active_tab - 1 };
+            state.active_tab = if state.active_tab == 0 {
+                state.tabs.len() - 1
+            } else {
+                state.active_tab - 1
+            };
             true
         }
         "pane.split_right" => {
@@ -627,4 +628,50 @@ pub fn find_active_pane(state: &UiSnapshot) -> &Pane {
 
 pub fn is_on(state: &UiSnapshot, key: &str) -> bool {
     state.toggles.get(key).copied().unwrap_or(false)
+}
+
+/// Resize all active terminals and their PTYs to the given column/row count.
+///
+/// Called by the `on_cell_metrics` callback after the renderer publishes the
+/// first valid cell dimensions, and also usable as a general "resize all"
+/// helper.
+pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
+    let ids: Vec<u32> = state.terminals.keys().copied().collect();
+    for id in ids {
+        state.pty_manager.resize(id, cols, rows);
+        if let Some(terminal) = state.terminals.get_mut(&id) {
+            terminal.resize(rows as usize, cols as usize);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_all_terminals_updates_every_terminal() {
+        let mut state = seed_state();
+        // Insert a couple of terminals (no real PTY needed for this test).
+        state.terminals.insert(1, Terminal::new(24, 80));
+        state.terminals.insert(2, Terminal::new(24, 80));
+
+        // Resize all to 120x40.
+        resize_all_terminals(&mut state, 120, 40);
+
+        for (_, term) in &state.terminals {
+            let grid = term.grid();
+            assert_eq!(grid.cols(), 120, "terminal cols should be 120 after resize");
+            assert_eq!(grid.rows(), 40, "terminal rows should be 40 after resize");
+        }
+    }
+
+    #[test]
+    fn resize_all_terminals_handles_empty_state() {
+        let mut state = seed_state();
+        state.terminals.clear();
+        // Should not panic with no terminals.
+        resize_all_terminals(&mut state, 100, 30);
+        assert!(state.terminals.is_empty());
+    }
 }
