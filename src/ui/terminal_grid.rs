@@ -136,6 +136,10 @@ fn build_pane_body(
             .with_grid(grid.clone())
             .with_persistent_buffer(true);
 
+        // A tab_index is required so the element is focusable; without it the
+        // framework ignores click-to-focus and keyboard events never arrive.
+        grid_el = grid_el.with_tab_index(0);
+
         if is_active {
             grid_el = grid_el.captures_keyboard(true);
 
@@ -188,4 +192,92 @@ fn build_pane_body(
     }
 
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use unshit::core::cell_grid::CellGrid;
+
+    /// Build a minimal shared state for testing. Does not spawn any real PTY.
+    fn test_shared() -> SharedState {
+        Arc::new(Mutex::new(crate::state::seed_state()))
+    }
+
+    fn find_terminal_content(def: &ElementDef) -> Option<&ElementDef> {
+        if def.classes.iter().any(|c| c == "terminal-content") {
+            return Some(def);
+        }
+        for child in &def.children {
+            if let Some(found) = find_terminal_content(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Regression test: terminal-content must have tab_index so the framework
+    /// treats it as focusable. Without this, click-to-focus never fires and
+    /// keyboard events are silently dropped.
+    #[test]
+    fn terminal_content_has_tab_index_for_focus() {
+        let shared = test_shared();
+        let pane_id = PaneId(1);
+        let grid = CellGrid::new(24, 80);
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id.0, grid);
+
+        let body = build_pane_body(pane_id, true, &shared, &grids);
+        let content = find_terminal_content(&body)
+            .expect("terminal-content element should exist when grid is present");
+        assert_eq!(
+            content.tab_index,
+            Some(0),
+            "terminal-content must have tab_index=0 to be focusable"
+        );
+    }
+
+    /// The active pane's terminal-content must have captures_keyboard enabled
+    /// so keystrokes are forwarded to the PTY instead of handled as shortcuts.
+    #[test]
+    fn active_pane_captures_keyboard() {
+        let shared = test_shared();
+        let pane_id = PaneId(1);
+        let grid = CellGrid::new(24, 80);
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id.0, grid);
+
+        let body = build_pane_body(pane_id, true, &shared, &grids);
+        let content = find_terminal_content(&body)
+            .expect("terminal-content element should exist");
+        assert!(
+            content.captures_keyboard,
+            "active pane terminal-content must capture keyboard"
+        );
+    }
+
+    /// An inactive pane should still be focusable (tab_index set) but must
+    /// NOT capture the keyboard so that shortcuts keep working.
+    #[test]
+    fn inactive_pane_does_not_capture_keyboard() {
+        let shared = test_shared();
+        let pane_id = PaneId(1);
+        let grid = CellGrid::new(24, 80);
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id.0, grid);
+
+        let body = build_pane_body(pane_id, false, &shared, &grids);
+        let content = find_terminal_content(&body)
+            .expect("terminal-content element should exist");
+        assert_eq!(
+            content.tab_index,
+            Some(0),
+            "inactive pane terminal-content should still be focusable"
+        );
+        assert!(
+            !content.captures_keyboard,
+            "inactive pane must not capture keyboard"
+        );
+    }
 }
