@@ -11,13 +11,20 @@ pub fn svg_icon(node: SvgNode) -> ElementDef {
 }
 
 fn group(attrs: SvgAttrs, children: Vec<SvgNode>) -> SvgNode {
-    SvgNode { primitive: SvgPrimitive::Group, attrs, children }
+    SvgNode {
+        primitive: SvgPrimitive::Group,
+        attrs,
+        children,
+    }
 }
 
 fn path_d(d: &str) -> SvgNode {
     let commands = parse_svg_path(d).expect("icon path data must parse");
     SvgNode {
-        primitive: SvgPrimitive::Path { d: d.to_string(), commands },
+        primitive: SvgPrimitive::Path {
+            d: d.to_string(),
+            commands,
+        },
         attrs: SvgAttrs::default(),
         children: Vec::new(),
     }
@@ -33,7 +40,14 @@ fn circle(cx: f32, cy: f32, r: f32) -> SvgNode {
 
 fn rect(x: f32, y: f32, width: f32, height: f32, rx: f32) -> SvgNode {
     SvgNode {
-        primitive: SvgPrimitive::Rect { x, y, width, height, rx, ry: rx },
+        primitive: SvgPrimitive::Rect {
+            x,
+            y,
+            width,
+            height,
+            rx,
+            ry: rx,
+        },
         attrs: SvgAttrs::default(),
         children: Vec::new(),
     }
@@ -69,7 +83,10 @@ pub fn icon_brand_chevron() -> SvgNode {
 pub fn icon_search() -> SvgNode {
     group(
         root_attrs(1.5, StrokeLineCap::Round, StrokeLineJoin::Miter),
-        vec![rect(2.0, 2.0, 12.0, 12.0, 1.0), path_d("M5 6l2 2l-2 2M8 10h3")],
+        vec![
+            rect(2.0, 2.0, 12.0, 12.0, 1.0),
+            path_d("M5 6l2 2l-2 2M8 10h3"),
+        ],
     )
 }
 
@@ -104,7 +121,10 @@ pub fn icon_chevrons() -> SvgNode {
 pub fn icon_terminal() -> SvgNode {
     group(
         root_attrs(1.5, StrokeLineCap::Round, StrokeLineJoin::Round),
-        vec![rect(2.0, 3.0, 12.0, 10.0, 1.0), path_d("M5 7l2 1.5L5 10M8 10h3")],
+        vec![
+            rect(2.0, 3.0, 12.0, 10.0, 1.0),
+            path_d("M5 7l2 1.5L5 10M8 10h3"),
+        ],
     )
 }
 

@@ -297,14 +297,12 @@ pub fn seed_state() -> AppState {
         },
     ];
 
-    let tabs = vec![
-        TerminalTab {
-            id: "t1".to_string(),
-            name: "shell".to_string(),
-            subtitle: "bash".to_string(),
-            status: TabStatus::Running,
-        },
-    ];
+    let tabs = vec![TerminalTab {
+        id: "t1".to_string(),
+        name: "shell".to_string(),
+        subtitle: "bash".to_string(),
+        status: TabStatus::Running,
+    }];
 
     let default_pane = Pane {
         id: PaneId(1),
@@ -567,8 +565,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if state.tabs.is_empty() {
                 return false;
             }
-            state.active_tab =
-                if state.active_tab == 0 { state.tabs.len() - 1 } else { state.active_tab - 1 };
+            state.active_tab = if state.active_tab == 0 {
+                state.tabs.len() - 1
+            } else {
+                state.active_tab - 1
+            };
             true
         }
         "pane.split_right" => {
@@ -636,14 +637,12 @@ mod tests {
     /// Build a minimal AppState for testing tab/dispatch logic.
     /// Avoids PTY spawning by providing empty panes and terminals directly.
     fn test_state() -> AppState {
-        let tabs = vec![
-            TerminalTab {
-                id: "t1".to_string(),
-                name: "shell".to_string(),
-                subtitle: "bash".to_string(),
-                status: TabStatus::Running,
-            },
-        ];
+        let tabs = vec![TerminalTab {
+            id: "t1".to_string(),
+            name: "shell".to_string(),
+            subtitle: "bash".to_string(),
+            status: TabStatus::Running,
+        }];
         let pane = Pane {
             id: PaneId(1),
             title: "shell".to_string(),
@@ -715,7 +714,7 @@ mod tests {
         let mut state = test_state();
         mutate_add_tab(&mut state); // t2
         mutate_add_tab(&mut state); // t3
-        // tabs: [t1, t2, t3], active = 2
+                                    // tabs: [t1, t2, t3], active = 2
 
         // Close middle tab while active is after it
         state.active_tab = 2;
@@ -1037,8 +1036,7 @@ mod tests {
 
     #[test]
     fn mutate_with_applies_closure() {
-        let shared: SharedState =
-            std::sync::Arc::new(std::sync::Mutex::new(test_state()));
+        let shared: SharedState = std::sync::Arc::new(std::sync::Mutex::new(test_state()));
         let result = mutate_with(&shared, |st| {
             st.font_size_pt = 25;
             st.font_size_pt

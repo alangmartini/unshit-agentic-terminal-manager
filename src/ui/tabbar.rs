@@ -66,15 +66,13 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                 .with_child(svg_icon(icon_settings())),
         );
 
-    ElementDef::new(Tag::Div).with_class("tabbar").with_child(tabs).with_child(actions)
+    ElementDef::new(Tag::Div)
+        .with_class("tabbar")
+        .with_child(tabs)
+        .with_child(actions)
 }
 
-fn build_tab(
-    index: usize,
-    tab: &TerminalTab,
-    is_active: bool,
-    shared: &SharedState,
-) -> ElementDef {
+fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedState) -> ElementDef {
     let status_class = match tab.status {
         TabStatus::Running => "running",
         TabStatus::Idle => "idle",
@@ -96,18 +94,27 @@ fn build_tab(
 
     let close_state = shared.clone();
     btn.with_child(
-        ElementDef::new(Tag::Span).with_class("tab-status").with_class(status_class.to_string()),
-    )
-    .with_child(ElementDef::new(Tag::Span).with_class("tab-name").with_text(tab.name.clone()))
-    .with_child(
-        ElementDef::new(Tag::Span).with_class("tab-subtitle").with_text(tab.subtitle.clone()),
+        ElementDef::new(Tag::Span)
+            .with_class("tab-status")
+            .with_class(status_class.to_string()),
     )
     .with_child(
-        ElementDef::new(Tag::Span).with_class("tab-close").with_text("\u{00D7}").on_click(
-            move || {
+        ElementDef::new(Tag::Span)
+            .with_class("tab-name")
+            .with_text(tab.name.clone()),
+    )
+    .with_child(
+        ElementDef::new(Tag::Span)
+            .with_class("tab-subtitle")
+            .with_text(tab.subtitle.clone()),
+    )
+    .with_child(
+        ElementDef::new(Tag::Span)
+            .with_class("tab-close")
+            .with_text("\u{00D7}")
+            .on_click(move || {
                 mutate_with(&close_state, |st| mutate_close_tab(st, index));
-            },
-        ),
+            }),
     )
 }
 

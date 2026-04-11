@@ -2,8 +2,8 @@ use unshit::core::element::*;
 use unshit::core::event::{Event, EventType};
 
 use crate::state::{
-    mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane,
-    PaneId, SharedState, UiSnapshot,
+    mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane, PaneId,
+    SharedState, UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -22,15 +22,15 @@ pub fn build_terminal_grid(
             let is_active = pane.id == state.active_pane;
             // Add resizer between panes (except before the first one).
             if col_idx > 0 {
-                row_el = row_el.with_child(
-                    ElementDef::new(Tag::Div).with_class("pane-resizer"),
-                );
+                row_el = row_el.with_child(ElementDef::new(Tag::Div).with_class("pane-resizer"));
             }
             row_el = row_el.with_child(build_pane(pane, is_active, shared, grids));
         }
         if row_idx > 0 {
             grid_el = grid_el.with_child(
-                ElementDef::new(Tag::Div).with_class("pane-resizer").with_class("vertical"),
+                ElementDef::new(Tag::Div)
+                    .with_class("pane-resizer")
+                    .with_class("vertical"),
             );
         }
         grid_el = grid_el.with_child(row_el);
@@ -58,7 +58,9 @@ fn build_pane(
     });
 
     let body = build_pane_body(pane.id, is_active, shared, grids);
-    container.with_child(build_pane_header(pane, shared)).with_child(body)
+    container
+        .with_child(build_pane_header(pane, shared))
+        .with_child(body)
 }
 
 fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
@@ -84,7 +86,11 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
                         .with_text(format!("\u{00B7} {}", pane.subtitle)),
                 ),
         )
-        .with_child(ElementDef::new(Tag::Div).with_class("pane-meta").with_text(meta))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("pane-meta")
+                .with_text(meta),
+        )
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("pane-header-right")
@@ -325,9 +331,13 @@ mod tests {
         let el = build_pane_header(&pane, &shared);
         // left, meta, right
         assert_eq!(el.children.len(), 3);
-        assert!(el.children[0].classes.contains(&"pane-header-left".to_string()));
+        assert!(el.children[0]
+            .classes
+            .contains(&"pane-header-left".to_string()));
         assert!(el.children[1].classes.contains(&"pane-meta".to_string()));
-        assert!(el.children[2].classes.contains(&"pane-header-right".to_string()));
+        assert!(el.children[2]
+            .classes
+            .contains(&"pane-header-right".to_string()));
     }
 
     #[test]
@@ -405,8 +415,12 @@ mod tests {
         assert!(fallback.classes.contains(&"term-line".to_string()));
         // Should have prompt and cursor children
         assert_eq!(fallback.children.len(), 2);
-        assert!(fallback.children[0].classes.contains(&"term-prompt".to_string()));
-        assert!(fallback.children[1].classes.contains(&"term-cursor".to_string()));
+        assert!(fallback.children[0]
+            .classes
+            .contains(&"term-prompt".to_string()));
+        assert!(fallback.children[1]
+            .classes
+            .contains(&"term-cursor".to_string()));
     }
 
     #[test]
@@ -520,9 +534,13 @@ mod tests {
         let left = &el.children[0];
         assert!(left.classes.contains(&"pane-header-left".to_string()));
         assert_eq!(left.children.len(), 3);
-        assert!(left.children[0].classes.contains(&"pane-status-dot".to_string()));
+        assert!(left.children[0]
+            .classes
+            .contains(&"pane-status-dot".to_string()));
         assert!(left.children[1].classes.contains(&"pane-title".to_string()));
-        assert!(left.children[2].classes.contains(&"pane-subtitle".to_string()));
+        assert!(left.children[2]
+            .classes
+            .contains(&"pane-subtitle".to_string()));
     }
 
     #[test]

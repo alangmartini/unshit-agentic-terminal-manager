@@ -55,9 +55,9 @@ impl PtyManager {
             pixel_height: 0,
         };
 
-        let pty_pair = pty_system.openpty(size).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+        let pty_pair = pty_system
+            .openpty(size)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         let shell = default_shell();
 
@@ -66,17 +66,20 @@ impl PtyManager {
             cmd.cwd(home);
         }
 
-        let child = pty_pair.slave.spawn_command(cmd).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+        let child = pty_pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        let reader = pty_pair.master.try_clone_reader().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+        let reader = pty_pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        let writer = pty_pair.master.take_writer().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+        let writer = pty_pair
+            .master
+            .take_writer()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         self.pairs.insert(
             pane_id,

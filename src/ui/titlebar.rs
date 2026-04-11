@@ -35,10 +35,14 @@ pub fn build_titlebar(shared: &SharedState) -> ElementDef {
                     ElementDef::new(Tag::Div)
                         .with_class("titlebar-breadcrumb")
                         .with_child(
-                            ElementDef::new(Tag::Span).with_class("crumb").with_text("main"),
+                            ElementDef::new(Tag::Span)
+                                .with_class("crumb")
+                                .with_text("main"),
                         )
                         .with_child(
-                            ElementDef::new(Tag::Span).with_class("crumb-sep").with_text("/"),
+                            ElementDef::new(Tag::Span)
+                                .with_class("crumb-sep")
+                                .with_text("/"),
                         )
                         .with_child(
                             ElementDef::new(Tag::Span)
@@ -60,7 +64,9 @@ pub fn build_titlebar(shared: &SharedState) -> ElementDef {
                         .with_child(svg_icon(icon_search()))
                         .with_child(ElementDef::new(Tag::Span).with_text("search"))
                         .with_child(
-                            ElementDef::new(Tag::Span).with_class("kbd").with_text("\u{2318}K"),
+                            ElementDef::new(Tag::Span)
+                                .with_class("kbd")
+                                .with_text("\u{2318}K"),
                         ),
                 )
                 .with_child(ElementDef::new(Tag::Div).with_class("titlebar-divider"))
@@ -134,7 +140,9 @@ mod tests {
         // brand + breadcrumb
         assert_eq!(left.children.len(), 2);
         assert!(left.children[0].classes.contains(&"brand".to_string()));
-        assert!(left.children[1].classes.contains(&"titlebar-breadcrumb".to_string()));
+        assert!(left.children[1]
+            .classes
+            .contains(&"titlebar-breadcrumb".to_string()));
     }
 
     #[test]
@@ -180,9 +188,15 @@ mod tests {
         let el = build_titlebar(&shared);
         let brand = &el.children[0].children[0];
         assert_eq!(brand.children.len(), 3);
-        assert!(brand.children[0].classes.contains(&"brand-mark".to_string()));
-        assert!(brand.children[1].classes.contains(&"brand-name".to_string()));
-        assert!(brand.children[2].classes.contains(&"brand-version".to_string()));
+        assert!(brand.children[0]
+            .classes
+            .contains(&"brand-mark".to_string()));
+        assert!(brand.children[1]
+            .classes
+            .contains(&"brand-name".to_string()));
+        assert!(brand.children[2]
+            .classes
+            .contains(&"brand-version".to_string()));
     }
 
     #[test]
@@ -191,10 +205,18 @@ mod tests {
         let el = build_titlebar(&shared);
         let breadcrumb = &el.children[0].children[1];
         assert_eq!(breadcrumb.children.len(), 3);
-        assert!(breadcrumb.children[0].classes.contains(&"crumb".to_string()));
-        assert!(breadcrumb.children[1].classes.contains(&"crumb-sep".to_string()));
-        assert!(breadcrumb.children[2].classes.contains(&"crumb".to_string()));
-        assert!(breadcrumb.children[2].classes.contains(&"active".to_string()));
+        assert!(breadcrumb.children[0]
+            .classes
+            .contains(&"crumb".to_string()));
+        assert!(breadcrumb.children[1]
+            .classes
+            .contains(&"crumb-sep".to_string()));
+        assert!(breadcrumb.children[2]
+            .classes
+            .contains(&"crumb".to_string()));
+        assert!(breadcrumb.children[2]
+            .classes
+            .contains(&"active".to_string()));
     }
 
     #[test]
