@@ -297,14 +297,12 @@ pub fn seed_state() -> AppState {
         },
     ];
 
-    let tabs = vec![
-        TerminalTab {
-            id: "t1".to_string(),
-            name: "shell".to_string(),
-            subtitle: "bash".to_string(),
-            status: TabStatus::Running,
-        },
-    ];
+    let tabs = vec![TerminalTab {
+        id: "t1".to_string(),
+        name: "shell".to_string(),
+        subtitle: "bash".to_string(),
+        status: TabStatus::Running,
+    }];
 
     let default_pane = Pane {
         id: PaneId(1),
@@ -567,8 +565,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if state.tabs.is_empty() {
                 return false;
             }
-            state.active_tab =
-                if state.active_tab == 0 { state.tabs.len() - 1 } else { state.active_tab - 1 };
+            state.active_tab = if state.active_tab == 0 {
+                state.tabs.len() - 1
+            } else {
+                state.active_tab - 1
+            };
             true
         }
         "pane.split_right" => {
