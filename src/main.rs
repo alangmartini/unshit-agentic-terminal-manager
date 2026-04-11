@@ -93,25 +93,10 @@ fn main() {
 
     let shared: SharedState = Arc::new(std::sync::Mutex::new(seed_state()));
 
-    // Spawn initial PTY for the default pane.
-    {
-        let mut guard = shared.lock().unwrap();
-        let pane_id = guard.active_pane.0;
-        let (cols, rows) = (80u16, 24u16);
-        let terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
-        guard.terminals.insert(pane_id, terminal);
-        match guard.pty_manager.spawn(pane_id, cols, rows) {
-            Ok(reader) => {
-                crate::bridge::register_reader(pane_id, reader);
-            }
-            Err(e) => {
-                log::error!("failed to spawn initial PTY: {}", e);
-                if let Some(t) = guard.terminals.get_mut(&pane_id) {
-                    t.process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
-                }
-            }
-        }
-    }
+    // PTY spawn is deferred: the blink subscription will create terminals
+    // for all panes once the renderer publishes real cell metrics. This
+    // avoids the 80x24 hardcode that causes text misalignment on the first
+    // frame. See issue #5.
 
     let tree_shared = shared.clone();
     let command_shared = shared.clone();
@@ -140,11 +125,21 @@ fn main() {
         move || {
             let guard = tree_shared.lock().expect("state mutex poisoned");
             let snap = guard.ui_snapshot();
+            let active_id = guard.active_pane.0;
+            let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
             // Clone grids for rendering. This gives us an immutable snapshot.
+            // Enforce cursor visibility: only the active pane shows a cursor,
+            // and only when the OS window has focus.
             let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = guard
                 .terminals
                 .iter()
-                .map(|(&id, t)| (id, t.grid().clone()))
+                .map(|(&id, t)| {
+                    let mut grid = t.grid().clone();
+                    if id != active_id || !win_focused {
+                        grid.set_cursor_visible(false);
+                    }
+                    (id, grid)
+                })
                 .collect();
             drop(guard);
             build_tree(&snap, &tree_shared, &grids)

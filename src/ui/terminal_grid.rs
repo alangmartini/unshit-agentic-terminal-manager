@@ -164,13 +164,25 @@ fn build_pane_body(
             let resize_shared = shared.clone();
             let resize_pane_id = pane_id;
             grid_el = grid_el.on_resize(move |w, h| {
-                // Estimate character dimensions: ~8px wide, ~16px tall for monospace.
-                let cols = (w / 8.0).max(1.0) as u16;
-                let rows = (h / 16.0).max(1.0) as u16;
+                use unshit::core::cell_grid::CellGrid;
+
                 mutate_with(&resize_shared, |st| {
-                    st.pty_manager.resize(resize_pane_id.0, cols, rows);
-                    if let Some(terminal) = st.terminals.get_mut(&resize_pane_id.0) {
-                        terminal.resize(rows as usize, cols as usize);
+                    st.last_grid_width = w;
+                    st.last_grid_height = h;
+
+                    // Only resize if the renderer has published real metrics.
+                    // On the first frame, metrics are 0 because on_resize fires
+                    // before the render pass. The PTY keeps its initial 80x24
+                    // until the blink subscription corrects it with real metrics.
+                    let cell_w = CellGrid::global_cell_w();
+                    let cell_h = CellGrid::global_cell_h();
+                    if cell_w > 0.0 && cell_h > 0.0 {
+                        let cols = (w / cell_w).max(1.0) as u16;
+                        let rows = (h / cell_h).max(1.0) as u16;
+                        st.pty_manager.resize(resize_pane_id.0, cols, rows);
+                        if let Some(terminal) = st.terminals.get_mut(&resize_pane_id.0) {
+                            terminal.resize(rows as usize, cols as usize);
+                        }
                     }
                 });
             });

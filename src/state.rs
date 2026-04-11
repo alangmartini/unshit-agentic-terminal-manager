@@ -118,6 +118,11 @@ pub struct AppState {
     pub next_id: u32,
     pub pty_manager: crate::pty::PtyManager,
     pub terminals: std::collections::HashMap<u32, Terminal>,
+    /// Last known physical pixel dimensions of the terminal grid element.
+    /// Updated by the on_resize handler; used by the blink subscription
+    /// to compute correct PTY dimensions once cell metrics are available.
+    pub last_grid_width: f32,
+    pub last_grid_height: f32,
 }
 
 impl AppState {
@@ -342,6 +347,8 @@ pub fn seed_state() -> AppState {
         next_id: 2,
         pty_manager: crate::pty::PtyManager::new(),
         terminals: std::collections::HashMap::new(),
+        last_grid_width: 0.0,
+        last_grid_height: 0.0,
     }
 }
 
@@ -409,20 +416,24 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
     state.next_id += 1;
     let pane_id = PaneId(id_num);
 
-    // Spawn a PTY and terminal for the new pane.
-    let (cols, rows) = (80u16, 24u16);
+    // Use real cell metrics when available; fall back to 80x24.
+    let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w();
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let (cols, rows) = compute_pty_dimensions(
+        state.last_grid_width,
+        state.last_grid_height,
+        cell_w,
+        cell_h,
+    );
+
     let mut terminal = Terminal::new(rows as usize, cols as usize);
     match state.pty_manager.spawn(id_num, cols, rows) {
         Ok(reader) => {
-            // Reader will be wired to a subscription by the bridge.
-            // Store it temporarily so the bridge can pick it up.
             state.terminals.insert(id_num, terminal);
-            // Store the reader in a pending slot.
             crate::bridge::register_reader(id_num, reader);
         }
         Err(e) => {
             log::error!("failed to spawn PTY for pane {}: {}", id_num, e);
-            // Still create the terminal so the pane renders.
             terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
             state.terminals.insert(id_num, terminal);
         }
@@ -450,7 +461,16 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
     state.next_id += 1;
     let pane_id = PaneId(id_num);
 
-    let (cols, rows) = (80u16, 24u16);
+    // Use real cell metrics when available; fall back to 80x24.
+    let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w();
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let (cols, rows) = compute_pty_dimensions(
+        state.last_grid_width,
+        state.last_grid_height,
+        cell_w,
+        cell_h,
+    );
+
     let mut terminal = Terminal::new(rows as usize, cols as usize);
     match state.pty_manager.spawn(id_num, cols, rows) {
         Ok(reader) => {
@@ -493,7 +513,16 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         state.next_id += 1;
         let pane_id = PaneId(id_num);
 
-        let (cols, rows) = (80u16, 24u16);
+        // Use real cell metrics when available; fall back to 80x24.
+        let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w();
+        let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+        let (cols, rows) = compute_pty_dimensions(
+            state.last_grid_width,
+            state.last_grid_height,
+            cell_w,
+            cell_h,
+        );
+
         let mut terminal = Terminal::new(rows as usize, cols as usize);
         match state.pty_manager.spawn(id_num, cols, rows) {
             Ok(reader) => {
@@ -627,4 +656,151 @@ pub fn find_active_pane(state: &UiSnapshot) -> &Pane {
 
 pub fn is_on(state: &UiSnapshot, key: &str) -> bool {
     state.toggles.get(key).copied().unwrap_or(false)
+}
+
+/// CSS base font-size in px. Must match `--t-md` in assets/styles.css.
+pub const CSS_BASE_FONT_SIZE: f32 = 12.0;
+
+/// CSS line-height for `.terminal-content`. Must match `line-height: 1.2` in
+/// assets/styles.css.
+pub const CSS_LINE_HEIGHT: f32 = 1.2;
+
+/// Pre-publish cell metrics to the global atomics so that `on_resize` handlers
+/// can compute correct PTY dimensions on the very first frame, before the
+/// renderer has had a chance to measure and publish them.
+///
+/// Returns `(cell_w, cell_h)` that were published.
+pub fn pre_publish_cell_metrics(scale_factor: f32, cell_width_ratio: f32) -> (f32, f32) {
+    let font_size = CSS_BASE_FONT_SIZE * scale_factor;
+    let cell_w = font_size * cell_width_ratio;
+    let cell_h = font_size * CSS_LINE_HEIGHT;
+    unshit::core::cell_grid::CellGrid::publish_cell_metrics(cell_w, cell_h);
+    (cell_w, cell_h)
+}
+
+/// Compute PTY column and row dimensions from real cell metrics.
+///
+/// Returns `(cols, rows)` based on the grid pixel dimensions and
+/// the measured cell size. Falls back to `(80, 24)` when metrics
+/// are not yet available (cell size is zero or grid size is zero).
+pub fn compute_pty_dimensions(
+    grid_width: f32,
+    grid_height: f32,
+    cell_w: f32,
+    cell_h: f32,
+) -> (u16, u16) {
+    if cell_w > 0.0 && cell_h > 0.0 && grid_width > 0.0 {
+        let cols = (grid_width / cell_w).max(1.0) as u16;
+        let rows = (grid_height / cell_h).max(1.0) as u16;
+        (cols, rows)
+    } else {
+        (80u16, 24u16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_state_has_empty_terminals() {
+        let state = seed_state();
+        assert!(
+            state.terminals.is_empty(),
+            "seed_state must not pre-populate terminals; PTY spawn is deferred"
+        );
+    }
+
+    #[test]
+    fn seed_state_has_default_pane() {
+        let state = seed_state();
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 1);
+        assert_eq!(state.panes[0][0].id, PaneId(1));
+    }
+
+    #[test]
+    fn compute_pty_dimensions_with_valid_metrics() {
+        let (cols, rows) = compute_pty_dimensions(800.0, 600.0, 8.0, 16.0);
+        assert_eq!(cols, 100);
+        assert_eq!(rows, 37);
+    }
+
+    #[test]
+    fn compute_pty_dimensions_fallback_when_no_metrics() {
+        let (cols, rows) = compute_pty_dimensions(800.0, 600.0, 0.0, 0.0);
+        assert_eq!(cols, 80);
+        assert_eq!(rows, 24);
+    }
+
+    #[test]
+    fn compute_pty_dimensions_fallback_when_no_grid() {
+        let (cols, rows) = compute_pty_dimensions(0.0, 0.0, 8.0, 16.0);
+        assert_eq!(cols, 80);
+        assert_eq!(rows, 24);
+    }
+
+    #[test]
+    fn compute_pty_dimensions_fallback_partial_zero() {
+        let (cols, rows) = compute_pty_dimensions(800.0, 600.0, 8.0, 0.0);
+        assert_eq!(cols, 80);
+        assert_eq!(rows, 24);
+    }
+
+    #[test]
+    fn compute_pty_dimensions_minimum_one() {
+        let (cols, rows) = compute_pty_dimensions(1.0, 1.0, 8.0, 16.0);
+        assert_eq!(cols, 1);
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn measure_cell_width_ratio_returns_reasonable_value() {
+        let ratio = measure_cell_width_ratio_at(12.0);
+        assert!(ratio > 0.0, "ratio must be positive, got {}", ratio);
+        assert!(ratio < 1.0, "ratio must be less than 1.0, got {}", ratio);
+    }
+
+    #[test]
+    fn pre_publish_sets_nonzero_global_metrics() {
+        use unshit::core::cell_grid::CellGrid;
+        CellGrid::publish_cell_metrics(0.0, 0.0);
+        assert_eq!(CellGrid::global_cell_w(), 0.0);
+        let (cell_w, cell_h) = pre_publish_cell_metrics(1.0, 0.6);
+        assert!(cell_w > 0.0, "cell_w must be positive, got {}", cell_w);
+        assert!(cell_h > 0.0, "cell_h must be positive, got {}", cell_h);
+        assert_eq!(CellGrid::global_cell_w(), cell_w);
+        assert_eq!(CellGrid::global_cell_h(), cell_h);
+    }
+
+    #[test]
+    fn pre_publish_matches_renderer_formula() {
+        let scale = 1.0_f32;
+        let ratio = measure_cell_width_ratio_at(CSS_BASE_FONT_SIZE * scale);
+        let (cell_w, cell_h) = pre_publish_cell_metrics(scale, ratio);
+        let expected_cell_h = CSS_BASE_FONT_SIZE * scale * CSS_LINE_HEIGHT;
+        assert!(cell_w > 4.0 && cell_w < 20.0,
+            "cell_w should be plausible monospace width, got {}", cell_w);
+        assert!((cell_h - expected_cell_h).abs() < 0.001,
+            "cell_h should be {}, got {}", expected_cell_h, cell_h);
+    }
+
+    #[test]
+    fn pre_publish_scales_with_dpi() {
+        let ratio = 0.6_f32;
+        let (w1, h1) = pre_publish_cell_metrics(1.0, ratio);
+        let (w2, h2) = pre_publish_cell_metrics(2.0, ratio);
+        assert!((w2 - w1 * 2.0).abs() < 0.001_f32,
+            "cell_w at 2x should be double: {} vs {}", w2, w1 * 2.0);
+        assert!((h2 - h1 * 2.0).abs() < 0.001_f32,
+            "cell_h at 2x should be double: {} vs {}", h2, h1 * 2.0);
+    }
+
+    #[test]
+    fn seed_state_defaults_are_consistent_for_pre_publish() {
+        let state = seed_state();
+        assert_eq!(state.scale_factor, 1.0);
+        assert_eq!(state.cell_width_ratio, 0.6);
+        assert!(state.cell_width_ratio > 0.0 && state.cell_width_ratio < 1.0);
+    }
 }
