@@ -297,14 +297,12 @@ pub fn seed_state() -> AppState {
         },
     ];
 
-    let tabs = vec![
-        TerminalTab {
-            id: "t1".to_string(),
-            name: "shell".to_string(),
-            subtitle: "bash".to_string(),
-            status: TabStatus::Running,
-        },
-    ];
+    let tabs = vec![TerminalTab {
+        id: "t1".to_string(),
+        name: "shell".to_string(),
+        subtitle: "bash".to_string(),
+        status: TabStatus::Running,
+    }];
 
     let default_pane = Pane {
         id: PaneId(1),
@@ -567,8 +565,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if state.tabs.is_empty() {
                 return false;
             }
-            state.active_tab =
-                if state.active_tab == 0 { state.tabs.len() - 1 } else { state.active_tab - 1 };
+            state.active_tab = if state.active_tab == 0 {
+                state.tabs.len() - 1
+            } else {
+                state.active_tab - 1
+            };
             true
         }
         "pane.split_right" => {
@@ -627,4 +628,106 @@ pub fn find_active_pane(state: &UiSnapshot) -> &Pane {
 
 pub fn is_on(state: &UiSnapshot, key: &str) -> bool {
     state.toggles.get(key).copied().unwrap_or(false)
+}
+
+/// Measure the actual monospace cell_width / font_size ratio using cosmic-text
+/// at a specific (DPI-scaled) font size. Because glyph hinting can produce
+/// different advance widths at different pixel sizes, the measurement must be
+/// taken at the same size the renderer will use.
+///
+/// `line_height` is the absolute pixel line height (typically `font_size * 1.2`
+/// from CSS). Accepting it as a parameter keeps the caller as the single source
+/// of truth for the line_height multiplier, rather than hardcoding 1.2 here.
+pub fn measure_cell_width_ratio_at(font_size: f32, line_height: f32) -> f32 {
+    use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+
+    let mut fs = FontSystem::new();
+    let metrics = Metrics::new(font_size, line_height);
+    let mut buffer = Buffer::new(&mut fs, metrics);
+    buffer.set_size(&mut fs, Some(font_size * 10.0), None);
+    buffer.set_text(
+        &mut fs,
+        "M",
+        Attrs::new().family(Family::Monospace),
+        Shaping::Advanced,
+    );
+    buffer.shape_until_scroll(&mut fs, false);
+
+    if let Some(glyph) = buffer
+        .layout_runs()
+        .flat_map(|run| run.glyphs.iter())
+        .next()
+    {
+        let ratio = glyph.w / font_size;
+        log::info!(
+            "measured monospace cell_width ratio: {:.4} (glyph.w={:.2} at font_size={:.1})",
+            ratio,
+            glyph.w,
+            font_size
+        );
+        return ratio;
+    }
+    log::warn!("failed to measure monospace cell_width, falling back to 0.6");
+    0.6
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // measure_cell_width_ratio_at: line_height parameter (issue #5, approach 4)
+    // -----------------------------------------------------------------------
+
+    /// The function must accept an explicit line_height parameter so the
+    /// hardcoded 1.2 multiplier is not buried inside the measurement logic.
+    /// This test verifies the function exists with the new signature.
+    #[test]
+    fn measure_cell_width_ratio_at_accepts_line_height() {
+        let font_size = 12.0_f32;
+        let line_height = font_size * 1.2;
+        let ratio = measure_cell_width_ratio_at(font_size, line_height);
+        assert!(ratio > 0.0, "ratio must be positive, got {}", ratio);
+        assert!(ratio < 1.0, "ratio must be less than 1.0, got {}", ratio);
+    }
+
+    /// Different line_height values should not affect the width ratio because
+    /// cosmic-text Metrics line_height only affects vertical layout, not the
+    /// glyph advance width. This confirms the research finding.
+    #[test]
+    fn line_height_does_not_affect_width_ratio() {
+        let font_size = 14.0_f32;
+        let ratio_normal = measure_cell_width_ratio_at(font_size, font_size * 1.2);
+        let ratio_tall = measure_cell_width_ratio_at(font_size, font_size * 2.0);
+        let ratio_tight = measure_cell_width_ratio_at(font_size, font_size * 1.0);
+
+        // All ratios should be identical since line_height does not alter advance width.
+        let epsilon = 0.001;
+        assert!(
+            (ratio_normal - ratio_tall).abs() < epsilon,
+            "expected same ratio for different line_heights: normal={}, tall={}",
+            ratio_normal,
+            ratio_tall
+        );
+        assert!(
+            (ratio_normal - ratio_tight).abs() < epsilon,
+            "expected same ratio for different line_heights: normal={}, tight={}",
+            ratio_normal,
+            ratio_tight
+        );
+    }
+
+    /// The function must produce a reasonable ratio at typical font sizes.
+    #[test]
+    fn measure_cell_width_ratio_reasonable_range() {
+        for &size in &[10.0_f32, 12.0, 14.0, 16.0, 24.0] {
+            let ratio = measure_cell_width_ratio_at(size, size * 1.2);
+            assert!(
+                ratio > 0.3 && ratio < 0.9,
+                "at font_size={}, ratio {} is outside expected 0.3..0.9 range",
+                size,
+                ratio
+            );
+        }
+    }
 }
