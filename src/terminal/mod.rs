@@ -5,7 +5,7 @@
 //! cursor movement, scrolling, text attributes (bold, italic, underline, etc.),
 //! 256-color and true-color SGR, erase operations, and window title (OSC).
 
-use unshit::core::cell_grid::{CellGrid, Cell, CellAttrs, color_256, ANSI_16};
+use unshit::core::cell_grid::{color_256, Cell, CellAttrs, CellGrid, ANSI_16};
 use unshit::core::style::types::Color;
 use vte::{Params, Perform};
 
@@ -31,10 +31,20 @@ pub struct Terminal {
 }
 
 /// Default foreground: warm amber.
-const DEFAULT_FG: Color = Color { r: 212, g: 163, b: 72, a: 255 };
+const DEFAULT_FG: Color = Color {
+    r: 212,
+    g: 163,
+    b: 72,
+    a: 255,
+};
 
 /// Default background: fully transparent black.
-const DEFAULT_BG: Color = Color { r: 0, g: 0, b: 0, a: 0 };
+const DEFAULT_BG: Color = Color {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 0,
+};
 
 impl Terminal {
     /// Create a new terminal emulator with the given dimensions.
@@ -315,9 +325,19 @@ impl<'a> Perform for Performer<'a> {
                 match mode {
                     // 0: erase from cursor to end of display
                     0 => {
-                        t.clear_region(t.cursor_row, t.cursor_col, t.cursor_row, t.cols.saturating_sub(1));
+                        t.clear_region(
+                            t.cursor_row,
+                            t.cursor_col,
+                            t.cursor_row,
+                            t.cols.saturating_sub(1),
+                        );
                         if t.cursor_row + 1 < t.rows {
-                            t.clear_region(t.cursor_row + 1, 0, t.rows - 1, t.cols.saturating_sub(1));
+                            t.clear_region(
+                                t.cursor_row + 1,
+                                0,
+                                t.rows - 1,
+                                t.cols.saturating_sub(1),
+                            );
                         }
                     }
                     // 1: erase from start of display to cursor
@@ -341,7 +361,12 @@ impl<'a> Perform for Performer<'a> {
                 match mode {
                     // 0: erase from cursor to end of line
                     0 => {
-                        t.clear_region(t.cursor_row, t.cursor_col, t.cursor_row, t.cols.saturating_sub(1));
+                        t.clear_region(
+                            t.cursor_row,
+                            t.cursor_col,
+                            t.cursor_row,
+                            t.cols.saturating_sub(1),
+                        );
                     }
                     // 1: erase from start of line to cursor
                     1 => {
@@ -451,7 +476,6 @@ impl<'a> Perform for Performer<'a> {
             }
 
             // -- SGR: Select Graphic Rendition ---------------------------------
-
             'm' => {
                 handle_sgr(t, &pv);
             }
