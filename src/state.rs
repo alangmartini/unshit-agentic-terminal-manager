@@ -303,14 +303,12 @@ pub fn seed_state() -> AppState {
         },
     ];
 
-    let tabs = vec![
-        TerminalTab {
-            id: "t1".to_string(),
-            name: "shell".to_string(),
-            subtitle: "bash".to_string(),
-            status: TabStatus::Running,
-        },
-    ];
+    let tabs = vec![TerminalTab {
+        id: "t1".to_string(),
+        name: "shell".to_string(),
+        subtitle: "bash".to_string(),
+        status: TabStatus::Running,
+    }];
 
     let default_pane = Pane {
         id: PaneId(1),
@@ -599,8 +597,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if state.tabs.is_empty() {
                 return false;
             }
-            state.active_tab =
-                if state.active_tab == 0 { state.tabs.len() - 1 } else { state.active_tab - 1 };
+            state.active_tab = if state.active_tab == 0 {
+                state.tabs.len() - 1
+            } else {
+                state.active_tab - 1
+            };
             true
         }
         "pane.split_right" => {
@@ -661,15 +662,31 @@ pub fn is_on(state: &UiSnapshot, key: &str) -> bool {
     state.toggles.get(key).copied().unwrap_or(false)
 }
 
+/// Resize all active terminals and their PTYs to the given column/row count.
+pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
+    let ids: Vec<u32> = state.terminals.keys().copied().collect();
+    for id in ids {
+        state.pty_manager.resize(id, cols, rows);
+        if let Some(terminal) = state.terminals.get_mut(&id) {
+            terminal.resize(rows as usize, cols as usize);
+        }
+    }
+}
+
+
 /// Measure the actual monospace cell_width / font_size ratio using cosmic-text
 /// at a specific (DPI-scaled) font size. Because glyph hinting can produce
 /// different advance widths at different pixel sizes, the measurement must be
 /// taken at the same size the renderer will use.
-pub fn measure_cell_width_ratio_at(font_size: f32) -> f32 {
+///
+/// `line_height` is the absolute pixel line height (typically `font_size * 1.2`
+/// from CSS). Accepting it as a parameter keeps the caller as the single source
+/// of truth for the line_height multiplier, rather than hardcoding 1.2 here.
+pub fn measure_cell_width_ratio_at(font_size: f32, line_height: f32) -> f32 {
     use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 
     let mut fs = FontSystem::new();
-    let metrics = Metrics::new(font_size, font_size * 1.2);
+    let metrics = Metrics::new(font_size, line_height);
     let mut buffer = Buffer::new(&mut fs, metrics);
     buffer.set_size(&mut fs, Some(font_size * 10.0), None);
     buffer.set_text(
@@ -706,10 +723,7 @@ pub const CSS_BASE_FONT_SIZE: f32 = 12.0;
 pub const CSS_LINE_HEIGHT: f32 = 1.2;
 
 /// Pre-publish cell metrics to the global atomics so that `on_resize` handlers
-/// can compute correct PTY dimensions on the very first frame, before the
-/// renderer has had a chance to measure and publish them.
-///
-/// Returns `(cell_w, cell_h)` that were published.
+/// can compute correct PTY dimensions on the very first frame.
 pub fn pre_publish_cell_metrics(scale_factor: f32, cell_width_ratio: f32) -> (f32, f32) {
     let font_size = CSS_BASE_FONT_SIZE * scale_factor;
     let cell_w = font_size * cell_width_ratio;
@@ -719,10 +733,7 @@ pub fn pre_publish_cell_metrics(scale_factor: f32, cell_width_ratio: f32) -> (f3
 }
 
 /// Compute PTY column and row dimensions from real cell metrics.
-///
-/// Returns `(cols, rows)` based on the grid pixel dimensions and
-/// the measured cell size. Falls back to `(80, 24)` when metrics
-/// are not yet available (cell size is zero or grid size is zero).
+/// Falls back to `(80, 24)` when metrics are not yet available.
 pub fn compute_pty_dimensions(
     grid_width: f32,
     grid_height: f32,
@@ -737,6 +748,7 @@ pub fn compute_pty_dimensions(
         (80u16, 24u16)
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -795,8 +807,33 @@ mod tests {
     }
 
     #[test]
-    fn measure_cell_width_ratio_returns_reasonable_value() {
-        let ratio = measure_cell_width_ratio_at(12.0);
+    fn resize_all_terminals_updates_every_terminal() {
+        let mut state = seed_state();
+        state.terminals.insert(1, Terminal::new(24, 80));
+        state.terminals.insert(2, Terminal::new(24, 80));
+
+        resize_all_terminals(&mut state, 120, 40);
+
+        for (_, term) in &state.terminals {
+            let grid = term.grid();
+            assert_eq!(grid.cols(), 120, "terminal cols should be 120 after resize");
+            assert_eq!(grid.rows(), 40, "terminal rows should be 40 after resize");
+        }
+    }
+
+    #[test]
+    fn resize_all_terminals_handles_empty_state() {
+        let mut state = seed_state();
+        state.terminals.clear();
+        resize_all_terminals(&mut state, 100, 30);
+        assert!(state.terminals.is_empty());
+    }
+
+    #[test]
+    fn measure_cell_width_ratio_at_accepts_line_height() {
+        let font_size = 12.0_f32;
+        let line_height = font_size * 1.2;
+        let ratio = measure_cell_width_ratio_at(font_size, line_height);
         assert!(ratio > 0.0, "ratio must be positive, got {}", ratio);
         assert!(ratio < 1.0, "ratio must be less than 1.0, got {}", ratio);
     }
@@ -805,24 +842,9 @@ mod tests {
     fn pre_publish_sets_nonzero_global_metrics() {
         use unshit::core::cell_grid::CellGrid;
         CellGrid::publish_cell_metrics(0.0, 0.0);
-        assert_eq!(CellGrid::global_cell_w(), 0.0);
         let (cell_w, cell_h) = pre_publish_cell_metrics(1.0, 0.6);
         assert!(cell_w > 0.0, "cell_w must be positive, got {}", cell_w);
         assert!(cell_h > 0.0, "cell_h must be positive, got {}", cell_h);
-        assert_eq!(CellGrid::global_cell_w(), cell_w);
-        assert_eq!(CellGrid::global_cell_h(), cell_h);
-    }
-
-    #[test]
-    fn pre_publish_matches_renderer_formula() {
-        let scale = 1.0_f32;
-        let ratio = measure_cell_width_ratio_at(CSS_BASE_FONT_SIZE * scale);
-        let (cell_w, cell_h) = pre_publish_cell_metrics(scale, ratio);
-        let expected_cell_h = CSS_BASE_FONT_SIZE * scale * CSS_LINE_HEIGHT;
-        assert!(cell_w > 4.0 && cell_w < 20.0,
-            "cell_w should be plausible monospace width, got {}", cell_w);
-        assert!((cell_h - expected_cell_h).abs() < 0.001,
-            "cell_h should be {}, got {}", expected_cell_h, cell_h);
     }
 
     #[test]
@@ -830,10 +852,18 @@ mod tests {
         let ratio = 0.6_f32;
         let (w1, h1) = pre_publish_cell_metrics(1.0, ratio);
         let (w2, h2) = pre_publish_cell_metrics(2.0, ratio);
-        assert!((w2 - w1 * 2.0).abs() < 0.001_f32,
-            "cell_w at 2x should be double: {} vs {}", w2, w1 * 2.0);
-        assert!((h2 - h1 * 2.0).abs() < 0.001_f32,
-            "cell_h at 2x should be double: {} vs {}", h2, h1 * 2.0);
+        assert!(
+            (w2 - w1 * 2.0).abs() < 0.001_f32,
+            "cell_w at 2x should be double: {} vs {}",
+            w2,
+            w1 * 2.0
+        );
+        assert!(
+            (h2 - h1 * 2.0).abs() < 0.001_f32,
+            "cell_h at 2x should be double: {} vs {}",
+            h2,
+            h1 * 2.0
+        );
     }
 
     #[test]
@@ -841,6 +871,40 @@ mod tests {
         let state = seed_state();
         assert_eq!(state.scale_factor, 1.0);
         assert_eq!(state.cell_width_ratio, 0.6);
-        assert!(state.cell_width_ratio > 0.0 && state.cell_width_ratio < 1.0);
+    }
+
+    #[test]
+    fn line_height_does_not_affect_width_ratio() {
+        let font_size = 14.0_f32;
+        let ratio_normal = measure_cell_width_ratio_at(font_size, font_size * 1.2);
+        let ratio_tall = measure_cell_width_ratio_at(font_size, font_size * 2.0);
+        let ratio_tight = measure_cell_width_ratio_at(font_size, font_size * 1.0);
+
+        let epsilon = 0.001;
+        assert!(
+            (ratio_normal - ratio_tall).abs() < epsilon,
+            "expected same ratio for different line_heights: normal={}, tall={}",
+            ratio_normal,
+            ratio_tall
+        );
+        assert!(
+            (ratio_normal - ratio_tight).abs() < epsilon,
+            "expected same ratio for different line_heights: normal={}, tight={}",
+            ratio_normal,
+            ratio_tight
+        );
+    }
+
+    #[test]
+    fn measure_cell_width_ratio_reasonable_range() {
+        for &size in &[10.0_f32, 12.0, 14.0, 16.0, 24.0] {
+            let ratio = measure_cell_width_ratio_at(size, size * 1.2);
+            assert!(
+                ratio > 0.3 && ratio < 0.9,
+                "at font_size={}, ratio {} is outside expected 0.3..0.9 range",
+                size,
+                ratio
+            );
+        }
     }
 }

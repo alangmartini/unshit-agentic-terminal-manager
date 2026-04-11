@@ -11,8 +11,11 @@ pub fn build_statusbar(state: &UiSnapshot) -> ElementDef {
 }
 
 fn build_statusbar_left(state: &UiSnapshot) -> ElementDef {
-    let running_count: usize =
-        state.tabs.iter().filter(|t| t.status == TabStatus::Running).count();
+    let running_count: usize = state
+        .tabs
+        .iter()
+        .filter(|t| t.status == TabStatus::Running)
+        .count();
 
     ElementDef::new(Tag::Div)
         .with_class("statusbar-left")
@@ -22,7 +25,9 @@ fn build_statusbar_left(state: &UiSnapshot) -> ElementDef {
                 .with_class("accent")
                 .with_id("status-mode")
                 .with_child(
-                    ElementDef::new(Tag::Span).with_class("status-glyph").with_text("\u{25C6}"),
+                    ElementDef::new(Tag::Span)
+                        .with_class("status-glyph")
+                        .with_text("\u{25C6}"),
                 )
                 .with_child(ElementDef::new(Tag::Span).with_text("main")),
         )
@@ -30,7 +35,9 @@ fn build_statusbar_left(state: &UiSnapshot) -> ElementDef {
             ElementDef::new(Tag::Span)
                 .with_class("status-item")
                 .with_child(
-                    ElementDef::new(Tag::Span).with_class("status-dot").with_class("running"),
+                    ElementDef::new(Tag::Span)
+                        .with_class("status-dot")
+                        .with_class("running"),
                 )
                 .with_child(
                     ElementDef::new(Tag::Span).with_text(format!("{} active", running_count)),
@@ -77,16 +84,30 @@ fn build_statusbar_left(state: &UiSnapshot) -> ElementDef {
 fn build_statusbar_right(state: &UiSnapshot) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("statusbar-right")
-        .with_child(ElementDef::new(Tag::Span).with_class("status-item").with_text("utf-8"))
         .with_child(
-            ElementDef::new(Tag::Span).with_class("status-item").with_text("bash \u{00B7} 5.2"),
+            ElementDef::new(Tag::Span)
+                .with_class("status-item")
+                .with_text("utf-8"),
         )
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("status-item")
-                .with_child(ElementDef::new(Tag::Span).with_class("tnum").with_text("80"))
+                .with_text("bash \u{00B7} 5.2"),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("status-item")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("tnum")
+                        .with_text("80"),
+                )
                 .with_child(ElementDef::new(Tag::Span).with_text("\u{00D7}"))
-                .with_child(ElementDef::new(Tag::Span).with_class("tnum").with_text("24")),
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("tnum")
+                        .with_text("24"),
+                ),
         )
         .with_child(
             ElementDef::new(Tag::Span)

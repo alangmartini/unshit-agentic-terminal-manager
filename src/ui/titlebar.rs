@@ -35,10 +35,14 @@ pub fn build_titlebar(shared: &SharedState) -> ElementDef {
                     ElementDef::new(Tag::Div)
                         .with_class("titlebar-breadcrumb")
                         .with_child(
-                            ElementDef::new(Tag::Span).with_class("crumb").with_text("main"),
+                            ElementDef::new(Tag::Span)
+                                .with_class("crumb")
+                                .with_text("main"),
                         )
                         .with_child(
-                            ElementDef::new(Tag::Span).with_class("crumb-sep").with_text("/"),
+                            ElementDef::new(Tag::Span)
+                                .with_class("crumb-sep")
+                                .with_text("/"),
                         )
                         .with_child(
                             ElementDef::new(Tag::Span)
@@ -60,7 +64,9 @@ pub fn build_titlebar(shared: &SharedState) -> ElementDef {
                         .with_child(svg_icon(icon_search()))
                         .with_child(ElementDef::new(Tag::Span).with_text("search"))
                         .with_child(
-                            ElementDef::new(Tag::Span).with_class("kbd").with_text("\u{2318}K"),
+                            ElementDef::new(Tag::Span)
+                                .with_class("kbd")
+                                .with_text("\u{2318}K"),
                         ),
                 )
                 .with_child(ElementDef::new(Tag::Div).with_class("titlebar-divider"))

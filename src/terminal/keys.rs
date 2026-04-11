@@ -5,7 +5,7 @@
 //! combinations (Ctrl, Alt, Shift), arrow keys, function keys, and common
 //! special keys (Home, End, Page Up/Down, Delete, etc.).
 
-use unshit::core::event::{Key, KeyboardEvent, KeyEventKind, Modifiers};
+use unshit::core::event::{Key, KeyEventKind, KeyboardEvent, Modifiers};
 
 /// Encode a `KeyboardEvent` into the byte sequence expected by a terminal.
 ///
@@ -21,7 +21,6 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
 
     match event.key {
         // -- Characters --------------------------------------------------------
-
         Key::Char(c) => {
             if has_ctrl {
                 // Ctrl+a..z produce bytes 0x01..0x1A.
@@ -56,7 +55,6 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
         }
 
         // -- Simple special keys -----------------------------------------------
-
         Key::Enter => Some(vec![0x0D]),
         Key::Tab => Some(vec![0x09]),
         Key::Backspace => Some(vec![0x7F]),
@@ -71,14 +69,12 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
         }
 
         // -- Arrow keys --------------------------------------------------------
-
         Key::ArrowUp => Some(encode_modified_key(b'A', has_shift, has_alt, has_ctrl)),
         Key::ArrowDown => Some(encode_modified_key(b'B', has_shift, has_alt, has_ctrl)),
         Key::ArrowRight => Some(encode_modified_key(b'C', has_shift, has_alt, has_ctrl)),
         Key::ArrowLeft => Some(encode_modified_key(b'D', has_shift, has_alt, has_ctrl)),
 
         // -- Navigation keys ---------------------------------------------------
-
         Key::Home => Some(encode_modified_key(b'H', has_shift, has_alt, has_ctrl)),
         Key::End => Some(encode_modified_key(b'F', has_shift, has_alt, has_ctrl)),
         Key::PageUp => Some(encode_modified_tilde(b"5", has_shift, has_alt, has_ctrl)),
@@ -86,7 +82,6 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
         Key::Delete => Some(encode_modified_tilde(b"3", has_shift, has_alt, has_ctrl)),
 
         // -- Function keys (F1 through F12) ------------------------------------
-
         Key::F(n) => encode_fkey(n, has_shift, has_alt, has_ctrl),
 
         Key::Unknown => None,
@@ -195,8 +190,18 @@ fn encode_fkey(n: u8, shift: bool, alt: bool, ctrl: bool) -> Option<Vec<u8>> {
 /// sequence).
 fn xterm_modifier(shift: bool, alt: bool, ctrl: bool) -> u8 {
     let mut m: u8 = 1;
-    if shift { m += 1; }
-    if alt { m += 2; }
-    if ctrl { m += 4; }
-    if m == 1 { 0 } else { m }
+    if shift {
+        m += 1;
+    }
+    if alt {
+        m += 2;
+    }
+    if ctrl {
+        m += 4;
+    }
+    if m == 1 {
+        0
+    } else {
+        m
+    }
 }

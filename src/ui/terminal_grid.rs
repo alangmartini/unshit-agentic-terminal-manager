@@ -2,8 +2,8 @@ use unshit::core::element::*;
 use unshit::core::event::{Event, EventType};
 
 use crate::state::{
-    mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane,
-    PaneId, SharedState, UiSnapshot,
+    mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane, PaneId,
+    SharedState, UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -22,15 +22,15 @@ pub fn build_terminal_grid(
             let is_active = pane.id == state.active_pane;
             // Add resizer between panes (except before the first one).
             if col_idx > 0 {
-                row_el = row_el.with_child(
-                    ElementDef::new(Tag::Div).with_class("pane-resizer"),
-                );
+                row_el = row_el.with_child(ElementDef::new(Tag::Div).with_class("pane-resizer"));
             }
             row_el = row_el.with_child(build_pane(pane, is_active, shared, grids));
         }
         if row_idx > 0 {
             grid_el = grid_el.with_child(
-                ElementDef::new(Tag::Div).with_class("pane-resizer").with_class("vertical"),
+                ElementDef::new(Tag::Div)
+                    .with_class("pane-resizer")
+                    .with_class("vertical"),
             );
         }
         grid_el = grid_el.with_child(row_el);
@@ -58,7 +58,9 @@ fn build_pane(
     });
 
     let body = build_pane_body(pane.id, is_active, shared, grids);
-    container.with_child(build_pane_header(pane, shared)).with_child(body)
+    container
+        .with_child(build_pane_header(pane, shared))
+        .with_child(body)
 }
 
 fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
@@ -84,7 +86,11 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
                         .with_text(format!("\u{00B7} {}", pane.subtitle)),
                 ),
         )
-        .with_child(ElementDef::new(Tag::Div).with_class("pane-meta").with_text(meta))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("pane-meta")
+                .with_text(meta),
+        )
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("pane-header-right")
@@ -170,10 +176,10 @@ fn build_pane_body(
                     st.last_grid_width = w;
                     st.last_grid_height = h;
 
-                    // Only resize if the renderer has published real metrics.
-                    // On the first frame, metrics are 0 because on_resize fires
-                    // before the render pass. The PTY keeps its initial 80x24
-                    // until the blink subscription corrects it with real metrics.
+                    // Use the renderer's published cell metrics when available.
+                    // On the first frame, metrics may be 0 because on_resize
+                    // fires before the render pass. The on_cell_metrics callback
+                    // and blink subscription handle the initial correction.
                     let cell_w = CellGrid::global_cell_w();
                     let cell_h = CellGrid::global_cell_h();
                     if cell_w > 0.0 && cell_h > 0.0 {
@@ -261,8 +267,7 @@ mod tests {
         grids.insert(pane_id.0, grid);
 
         let body = build_pane_body(pane_id, true, &shared, &grids);
-        let content = find_terminal_content(&body)
-            .expect("terminal-content element should exist");
+        let content = find_terminal_content(&body).expect("terminal-content element should exist");
         assert!(
             content.captures_keyboard,
             "active pane terminal-content must capture keyboard"
@@ -280,8 +285,7 @@ mod tests {
         grids.insert(pane_id.0, grid);
 
         let body = build_pane_body(pane_id, false, &shared, &grids);
-        let content = find_terminal_content(&body)
-            .expect("terminal-content element should exist");
+        let content = find_terminal_content(&body).expect("terminal-content element should exist");
         assert_eq!(
             content.tab_index,
             Some(0),
@@ -290,6 +294,24 @@ mod tests {
         assert!(
             !content.captures_keyboard,
             "inactive pane must not capture keyboard"
+        );
+    }
+
+    /// Active pane must register an on_resize handler so the PTY dimensions
+    /// stay in sync with the visible grid area.
+    #[test]
+    fn active_pane_registers_resize_handler() {
+        let shared = test_shared();
+        let pane_id = PaneId(1);
+        let grid = CellGrid::new(24, 80);
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id.0, grid);
+
+        let body = build_pane_body(pane_id, true, &shared, &grids);
+        let content = find_terminal_content(&body).expect("terminal-content element should exist");
+        assert!(
+            content.on_resize.is_some(),
+            "active pane terminal-content must have a resize handler"
         );
     }
 }

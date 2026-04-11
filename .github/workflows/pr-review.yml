@@ -1,0 +1,107 @@
+name: PR Quality Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  # Standard Rust checks (fast, cheap, always run)
+  rust-checks:
+    name: Rust Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy lints
+        run: cargo clippy -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all
+
+  # Code coverage with cargo-llvm-cov
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+
+      - name: Generate coverage summary
+        run: cargo llvm-cov --all-features --no-run
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: lcov.info
+
+  # Claude Code review + simplify (disabled: requires ANTHROPIC_API_KEY secret)
+  # claude-review:
+  #   name: Claude Code Review & Simplify
+  #   runs-on: ubuntu-latest
+  #   if: >
+  #     github.event_name == 'pull_request' ||
+  #     (github.event_name == 'issue_comment' &&
+  #      github.event.issue.pull_request &&
+  #      contains(github.event.comment.body, '@claude'))
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0
+  #
+  #     - uses: anthropics/claude-code-action@v1
+  #       with:
+  #         anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+  #         model: claude-sonnet-4-6
+  #         prompt: |
+  #           You are reviewing a PR for the terminal-manager project (Rust + web frontend).
+  #
+  #           Do the following in order:
+  #
+  #           1. **Simplify**: Review all changed code for reuse opportunities, code quality,
+  #              and efficiency. Suggest concrete simplifications. Flag any unnecessary
+  #              complexity, dead code, or duplicated logic.
+  #
+  #           2. **Test coverage**: Check that every new feature has unit + integration tests,
+  #              and every bug fix has a regression test. If tests are missing, list exactly
+  #              what tests should be added.
+  #
+  #           3. **Code review**: Check for:
+  #              - Logic errors and broken edge cases
+  #              - Security issues (command injection, unsafe blocks without justification)
+  #              - Violations of the CLAUDE.md guidelines
+  #              - Rust idioms (proper error handling, no unwrap in non-test code)
+  #              - Performance concerns
+  #
+  #           4. **Summary**: Give a clear verdict: APPROVE, REQUEST_CHANGES, or COMMENT.
+  #              Be specific about what needs to change.
+  #
+  #           Post your findings as a structured PR review comment.
+  #         claude_args: "--max-turns 10"
