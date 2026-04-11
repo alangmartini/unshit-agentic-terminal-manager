@@ -9,7 +9,9 @@ use std::sync::Arc;
 use unshit::app::{App, AppConfig, FontSource};
 use unshit::core::element::*;
 
-use crate::state::{dispatch, mutate_with, seed_state, SharedState, UiSnapshot};
+use crate::state::{
+    dispatch, mutate_with, resize_all_terminals, seed_state, SharedState, UiSnapshot,
+};
 use crate::ui::settings::build_settings_modal;
 use crate::ui::sidebar::build_sidebar;
 use crate::ui::statusbar::build_statusbar;
@@ -118,6 +120,7 @@ fn main() {
 
     let tree_shared = shared.clone();
     let command_shared = shared.clone();
+    let metrics_shared = shared.clone();
     let sub_shared = shared.clone();
 
     let mut app = App::new(
@@ -137,6 +140,27 @@ fn main() {
             on_command: Some(Arc::new(move |command: &str| -> bool {
                 let mut guard = command_shared.lock().expect("state mutex poisoned");
                 dispatch(&mut guard, command)
+            })),
+            on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
+                // The renderer has just published valid cell metrics. Use the
+                // pending resize (cols, rows) it computed, or fall back to a
+                // calculation from the cell dimensions and a default viewport.
+                use unshit::core::cell_grid::CellGrid;
+                let (cols, rows) = CellGrid::take_pending_resize().unwrap_or_else(|| {
+                    // Fallback: estimate from a reasonable default viewport.
+                    let cols = (1280.0 / cell_w).max(1.0) as u16;
+                    let rows = (800.0 / cell_h).max(1.0) as u16;
+                    (cols, rows)
+                });
+                log::info!(
+                    "on_cell_metrics: cell={}x{} -> resize all PTYs to {}x{}",
+                    cell_w,
+                    cell_h,
+                    cols,
+                    rows
+                );
+                let mut guard = metrics_shared.lock().expect("state mutex poisoned");
+                resize_all_terminals(&mut guard, cols, rows);
             })),
             ..Default::default()
         },

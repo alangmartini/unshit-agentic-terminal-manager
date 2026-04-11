@@ -170,9 +170,19 @@ fn build_pane_body(
             let resize_shared = shared.clone();
             let resize_pane_id = pane_id;
             grid_el = grid_el.on_resize(move |w, h| {
-                // Estimate character dimensions: ~8px wide, ~16px tall for monospace.
-                let cols = (w / 8.0).max(1.0) as u16;
-                let rows = (h / 16.0).max(1.0) as u16;
+                use unshit::core::cell_grid::CellGrid;
+                // Use the renderer's published cell metrics when available;
+                // fall back to a rough estimate for the very first layout
+                // pass (before on_cell_metrics fires).
+                let cell_w = CellGrid::global_cell_w();
+                let cell_h = CellGrid::global_cell_h();
+                let (cw, ch) = if cell_w > 0.0 && cell_h > 0.0 {
+                    (cell_w, cell_h)
+                } else {
+                    (8.0, 16.0)
+                };
+                let cols = (w / cw).max(1.0) as u16;
+                let rows = (h / ch).max(1.0) as u16;
                 mutate_with(&resize_shared, |st| {
                     st.pty_manager.resize(resize_pane_id.0, cols, rows);
                     if let Some(terminal) = st.terminals.get_mut(&resize_pane_id.0) {
@@ -282,6 +292,24 @@ mod tests {
         assert!(
             !content.captures_keyboard,
             "inactive pane must not capture keyboard"
+        );
+    }
+
+    /// Active pane must register an on_resize handler so the PTY dimensions
+    /// stay in sync with the visible grid area.
+    #[test]
+    fn active_pane_registers_resize_handler() {
+        let shared = test_shared();
+        let pane_id = PaneId(1);
+        let grid = CellGrid::new(24, 80);
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id.0, grid);
+
+        let body = build_pane_body(pane_id, true, &shared, &grids);
+        let content = find_terminal_content(&body).expect("terminal-content element should exist");
+        assert!(
+            content.on_resize.is_some(),
+            "active pane terminal-content must have a resize handler"
         );
     }
 }

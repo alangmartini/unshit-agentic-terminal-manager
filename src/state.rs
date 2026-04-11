@@ -630,6 +630,21 @@ pub fn is_on(state: &UiSnapshot, key: &str) -> bool {
     state.toggles.get(key).copied().unwrap_or(false)
 }
 
+/// Resize all active terminals and their PTYs to the given column/row count.
+///
+/// Called by the `on_cell_metrics` callback after the renderer publishes the
+/// first valid cell dimensions, and also usable as a general "resize all"
+/// helper.
+pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
+    let ids: Vec<u32> = state.terminals.keys().copied().collect();
+    for id in ids {
+        state.pty_manager.resize(id, cols, rows);
+        if let Some(terminal) = state.terminals.get_mut(&id) {
+            terminal.resize(rows as usize, cols as usize);
+        }
+    }
+}
+
 /// Measure the actual monospace cell_width / font_size ratio using cosmic-text
 /// at a specific (DPI-scaled) font size. Because glyph hinting can produce
 /// different advance widths at different pixel sizes, the measurement must be
@@ -675,13 +690,29 @@ pub fn measure_cell_width_ratio_at(font_size: f32, line_height: f32) -> f32 {
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // measure_cell_width_ratio_at: line_height parameter (issue #5, approach 4)
-    // -----------------------------------------------------------------------
+    #[test]
+    fn resize_all_terminals_updates_every_terminal() {
+        let mut state = seed_state();
+        state.terminals.insert(1, Terminal::new(24, 80));
+        state.terminals.insert(2, Terminal::new(24, 80));
 
-    /// The function must accept an explicit line_height parameter so the
-    /// hardcoded 1.2 multiplier is not buried inside the measurement logic.
-    /// This test verifies the function exists with the new signature.
+        resize_all_terminals(&mut state, 120, 40);
+
+        for (_, term) in &state.terminals {
+            let grid = term.grid();
+            assert_eq!(grid.cols(), 120, "terminal cols should be 120 after resize");
+            assert_eq!(grid.rows(), 40, "terminal rows should be 40 after resize");
+        }
+    }
+
+    #[test]
+    fn resize_all_terminals_handles_empty_state() {
+        let mut state = seed_state();
+        state.terminals.clear();
+        resize_all_terminals(&mut state, 100, 30);
+        assert!(state.terminals.is_empty());
+    }
+
     #[test]
     fn measure_cell_width_ratio_at_accepts_line_height() {
         let font_size = 12.0_f32;
@@ -691,9 +722,6 @@ mod tests {
         assert!(ratio < 1.0, "ratio must be less than 1.0, got {}", ratio);
     }
 
-    /// Different line_height values should not affect the width ratio because
-    /// cosmic-text Metrics line_height only affects vertical layout, not the
-    /// glyph advance width. This confirms the research finding.
     #[test]
     fn line_height_does_not_affect_width_ratio() {
         let font_size = 14.0_f32;
@@ -701,7 +729,6 @@ mod tests {
         let ratio_tall = measure_cell_width_ratio_at(font_size, font_size * 2.0);
         let ratio_tight = measure_cell_width_ratio_at(font_size, font_size * 1.0);
 
-        // All ratios should be identical since line_height does not alter advance width.
         let epsilon = 0.001;
         assert!(
             (ratio_normal - ratio_tall).abs() < epsilon,
@@ -717,7 +744,6 @@ mod tests {
         );
     }
 
-    /// The function must produce a reasonable ratio at typical font sizes.
     #[test]
     fn measure_cell_width_ratio_reasonable_range() {
         for &size in &[10.0_f32, 12.0, 14.0, 16.0, 24.0] {
