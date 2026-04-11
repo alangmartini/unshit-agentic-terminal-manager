@@ -645,6 +645,47 @@ pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
     }
 }
 
+/// Measure the actual monospace cell_width / font_size ratio using cosmic-text
+/// at a specific (DPI-scaled) font size. Because glyph hinting can produce
+/// different advance widths at different pixel sizes, the measurement must be
+/// taken at the same size the renderer will use.
+///
+/// `line_height` is the absolute pixel line height (typically `font_size * 1.2`
+/// from CSS). Accepting it as a parameter keeps the caller as the single source
+/// of truth for the line_height multiplier, rather than hardcoding 1.2 here.
+pub fn measure_cell_width_ratio_at(font_size: f32, line_height: f32) -> f32 {
+    use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+
+    let mut fs = FontSystem::new();
+    let metrics = Metrics::new(font_size, line_height);
+    let mut buffer = Buffer::new(&mut fs, metrics);
+    buffer.set_size(&mut fs, Some(font_size * 10.0), None);
+    buffer.set_text(
+        &mut fs,
+        "M",
+        Attrs::new().family(Family::Monospace),
+        Shaping::Advanced,
+    );
+    buffer.shape_until_scroll(&mut fs, false);
+
+    if let Some(glyph) = buffer
+        .layout_runs()
+        .flat_map(|run| run.glyphs.iter())
+        .next()
+    {
+        let ratio = glyph.w / font_size;
+        log::info!(
+            "measured monospace cell_width ratio: {:.4} (glyph.w={:.2} at font_size={:.1})",
+            ratio,
+            glyph.w,
+            font_size
+        );
+        return ratio;
+    }
+    log::warn!("failed to measure monospace cell_width, falling back to 0.6");
+    0.6
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,11 +693,9 @@ mod tests {
     #[test]
     fn resize_all_terminals_updates_every_terminal() {
         let mut state = seed_state();
-        // Insert a couple of terminals (no real PTY needed for this test).
         state.terminals.insert(1, Terminal::new(24, 80));
         state.terminals.insert(2, Terminal::new(24, 80));
 
-        // Resize all to 120x40.
         resize_all_terminals(&mut state, 120, 40);
 
         for (_, term) in &state.terminals {
@@ -670,8 +709,51 @@ mod tests {
     fn resize_all_terminals_handles_empty_state() {
         let mut state = seed_state();
         state.terminals.clear();
-        // Should not panic with no terminals.
         resize_all_terminals(&mut state, 100, 30);
         assert!(state.terminals.is_empty());
+    }
+
+    #[test]
+    fn measure_cell_width_ratio_at_accepts_line_height() {
+        let font_size = 12.0_f32;
+        let line_height = font_size * 1.2;
+        let ratio = measure_cell_width_ratio_at(font_size, line_height);
+        assert!(ratio > 0.0, "ratio must be positive, got {}", ratio);
+        assert!(ratio < 1.0, "ratio must be less than 1.0, got {}", ratio);
+    }
+
+    #[test]
+    fn line_height_does_not_affect_width_ratio() {
+        let font_size = 14.0_f32;
+        let ratio_normal = measure_cell_width_ratio_at(font_size, font_size * 1.2);
+        let ratio_tall = measure_cell_width_ratio_at(font_size, font_size * 2.0);
+        let ratio_tight = measure_cell_width_ratio_at(font_size, font_size * 1.0);
+
+        let epsilon = 0.001;
+        assert!(
+            (ratio_normal - ratio_tall).abs() < epsilon,
+            "expected same ratio for different line_heights: normal={}, tall={}",
+            ratio_normal,
+            ratio_tall
+        );
+        assert!(
+            (ratio_normal - ratio_tight).abs() < epsilon,
+            "expected same ratio for different line_heights: normal={}, tight={}",
+            ratio_normal,
+            ratio_tight
+        );
+    }
+
+    #[test]
+    fn measure_cell_width_ratio_reasonable_range() {
+        for &size in &[10.0_f32, 12.0, 14.0, 16.0, 24.0] {
+            let ratio = measure_cell_width_ratio_at(size, size * 1.2);
+            assert!(
+                ratio > 0.3 && ratio < 0.9,
+                "at font_size={}, ratio {} is outside expected 0.3..0.9 range",
+                size,
+                ratio
+            );
+        }
     }
 }
