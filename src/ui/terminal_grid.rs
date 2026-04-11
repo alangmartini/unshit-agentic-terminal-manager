@@ -167,6 +167,8 @@ fn build_pane_body(
             );
 
             // Register resize handler to update PTY dimensions.
+            // Prefer the renderer-computed pending resize (exact), fall
+            // back to global cell metrics, then to hardcoded estimates.
             let resize_shared = shared.clone();
             let resize_pane_id = pane_id;
             grid_el = grid_el.on_resize(move |w, h| {
@@ -312,6 +314,30 @@ mod tests {
         assert!(
             content.on_resize.is_some(),
             "active pane terminal-content must have a resize handler"
+        );
+    }
+
+    /// The resize handler should prefer renderer-computed pending resize
+    /// when available (issue #5 fix). When CellGrid::publish_pending_resize
+    /// was called before the on_resize handler fires, take_pending_resize
+    /// should return the exact dimensions.
+    #[test]
+    fn pending_resize_round_trips_through_cell_grid() {
+        // Publish a pending resize to simulate the renderer computing
+        // grid dimensions atomically.
+        CellGrid::publish_pending_resize(100, 30);
+        let result = CellGrid::take_pending_resize();
+        assert_eq!(
+            result,
+            Some((100, 30)),
+            "take_pending_resize should return the exact cols/rows published by the renderer"
+        );
+
+        // After take, should be cleared.
+        let second = CellGrid::take_pending_resize();
+        assert!(
+            second.is_none(),
+            "pending resize should be consumed after take"
         );
     }
 }
