@@ -9,8 +9,10 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         scroll = scroll.with_child(build_workspace(w_idx, workspace, shared));
     }
 
-    let mut sidebar =
-        ElementDef::new(Tag::Div).with_class("sidebar").with_class("role-aside").with_id("sidebar");
+    let mut sidebar = ElementDef::new(Tag::Div)
+        .with_class("sidebar")
+        .with_class("role-aside")
+        .with_id("sidebar");
     if state.sidebar_collapsed {
         sidebar = sidebar.with_class("collapsed");
     }
@@ -24,7 +26,11 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
 fn build_sidebar_head() -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("sidebar-head")
-        .with_child(ElementDef::new(Tag::Span).with_class("sidebar-title").with_text("workspaces"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("sidebar-title")
+                .with_text("workspaces"),
+        )
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("sidebar-head-actions")
@@ -60,7 +66,11 @@ fn build_workspace(
                 }
             });
         })
-        .with_child(ElementDef::new(Tag::Span).with_class("chevron").with_text("\u{25BE}"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("chevron")
+                .with_text("\u{25BE}"),
+        )
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("workspace-num")
@@ -72,15 +82,17 @@ fn build_workspace(
                 .with_text(workspace.name.clone()),
         )
         .with_child(
-            ElementDef::new(Tag::Span).with_class("workspace-meta").with_child({
-                let mut branch_tag = ElementDef::new(Tag::Span)
-                    .with_class("branch-tag")
-                    .with_text(workspace.branch.clone());
-                if workspace.branch_muted {
-                    branch_tag = branch_tag.with_class("muted");
-                }
-                branch_tag
-            }),
+            ElementDef::new(Tag::Span)
+                .with_class("workspace-meta")
+                .with_child({
+                    let mut branch_tag = ElementDef::new(Tag::Span)
+                        .with_class("branch-tag")
+                        .with_text(workspace.branch.clone());
+                    if workspace.branch_muted {
+                        branch_tag = branch_tag.with_class("muted");
+                    }
+                    branch_tag
+                }),
         );
 
     let mut body = ElementDef::new(Tag::Div).with_class("workspace-body");
@@ -123,7 +135,9 @@ fn build_subtab(
     });
 
     btn = btn.with_child(
-        ElementDef::new(Tag::Span).with_class("tree-glyph").with_text(subtab.tree_glyph),
+        ElementDef::new(Tag::Span)
+            .with_class("tree-glyph")
+            .with_text(subtab.tree_glyph),
     );
 
     if let Some(icon) = subtab.icon {
@@ -135,12 +149,15 @@ fn build_subtab(
     }
 
     btn = btn.with_child(
-        ElementDef::new(Tag::Span).with_class("subtab-label").with_text(subtab.label.clone()),
+        ElementDef::new(Tag::Span)
+            .with_class("subtab-label")
+            .with_text(subtab.label.clone()),
     );
 
     if let Some(count) = subtab.count {
-        let mut count_el =
-            ElementDef::new(Tag::Span).with_class("subtab-count").with_text(count.to_string());
+        let mut count_el = ElementDef::new(Tag::Span)
+            .with_class("subtab-count")
+            .with_text(count.to_string());
         if subtab.pulse {
             count_el = count_el.with_class("pulse");
         }
@@ -153,9 +170,23 @@ fn build_subtab(
 fn build_sidebar_footer() -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("sidebar-footer")
-        .with_child(ElementDef::new(Tag::Div).with_class("footer-title").with_text("activity"))
-        .with_child(activity_item("running", "claude", "running", "refactor split pane logic"))
-        .with_child(activity_item("stopped", "amp", "stopped", "verify readme docs"))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("footer-title")
+                .with_text("activity"),
+        )
+        .with_child(activity_item(
+            "running",
+            "claude",
+            "running",
+            "refactor split pane logic",
+        ))
+        .with_child(activity_item(
+            "stopped",
+            "amp",
+            "stopped",
+            "verify readme docs",
+        ))
         .with_child(activity_item("waiting", "codex", "waiting", "needs review"))
 }
 
@@ -178,7 +209,9 @@ fn activity_item(state_class: &str, name: &str, state: &str, desc: &str) -> Elem
                 ),
         )
         .with_child(
-            ElementDef::new(Tag::Div).with_class("activity-desc").with_text(desc.to_string()),
+            ElementDef::new(Tag::Div)
+                .with_class("activity-desc")
+                .with_text(desc.to_string()),
         )
 }
 
@@ -194,6 +227,10 @@ fn build_sidebar_hints() -> ElementDef {
 fn hint_item(key: &str, label: &str) -> ElementDef {
     ElementDef::new(Tag::Span)
         .with_class("hint")
-        .with_child(ElementDef::new(Tag::Span).with_class("kbd").with_text(key.to_string()))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("kbd")
+                .with_text(key.to_string()),
+        )
         .with_child(ElementDef::new(Tag::Span).with_text(label.to_string()))
 }
