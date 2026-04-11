@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-unshit = { path = "../unshit-rust-framework/crates/unshit", features = ["async", "clipboard"] }
+unshit = { version = "0.1.0", features = ["async", "clipboard"] }
 portable-pty = "0.8"
 vte = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "io-util"] }
