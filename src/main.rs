@@ -9,9 +9,7 @@ use std::sync::Arc;
 use unshit::app::{App, AppConfig, FontSource};
 use unshit::core::element::*;
 
-use crate::state::{
-    dispatch, mutate_with, seed_state, SharedState, UiSnapshot,
-};
+use crate::state::{dispatch, mutate_with, seed_state, SharedState, UiSnapshot};
 use crate::ui::settings::build_settings_modal;
 use crate::ui::sidebar::build_sidebar;
 use crate::ui::statusbar::build_statusbar;
@@ -21,9 +19,14 @@ use crate::ui::titlebar::build_titlebar;
 
 const STYLES: &str = include_str!("../assets/styles.css");
 
-fn build_tree(snap: &UiSnapshot, shared: &SharedState, grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>) -> ElementTree {
-    let mut modal_overlay =
-        ElementDef::new(Tag::Div).with_class("modal-overlay").with_id("settings-modal");
+fn build_tree(
+    snap: &UiSnapshot,
+    shared: &SharedState,
+    grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
+) -> ElementTree {
+    let mut modal_overlay = ElementDef::new(Tag::Div)
+        .with_class("modal-overlay")
+        .with_id("settings-modal");
     if snap.settings_open {
         modal_overlay = modal_overlay.with_class("open");
     }
@@ -152,9 +155,7 @@ fn main() {
     );
 
     // Set up PTY output subscriptions.
-    app.set_subscriptions(move || {
-        bridge::build_subscriptions(&sub_shared)
-    });
+    app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
 
     app.run();
 }

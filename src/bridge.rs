@@ -8,8 +8,7 @@ use unshit::app::{EventSink, ExternalEvent, Subscription};
 
 use crate::state::SharedState;
 
-static PENDING_READERS: Mutex<Option<HashMap<u32, Box<dyn Read + Send>>>> =
-    Mutex::new(None);
+static PENDING_READERS: Mutex<Option<HashMap<u32, Box<dyn Read + Send>>>> = Mutex::new(None);
 
 pub fn register_reader(pane_id: u32, reader: Box<dyn Read + Send>) {
     let mut guard = PENDING_READERS.lock().unwrap();
@@ -33,8 +32,7 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
     let reader = take_reader(pane_id)?;
 
     // Wrap reader in Arc<Mutex<>> so the factory closure is Sync.
-    let reader_cell: Arc<Mutex<Option<Box<dyn Read + Send>>>> =
-        Arc::new(Mutex::new(Some(reader)));
+    let reader_cell: Arc<Mutex<Option<Box<dyn Read + Send>>>> = Arc::new(Mutex::new(Some(reader)));
 
     Some(Subscription::new(
         format!("pty-{}", pane_id),
