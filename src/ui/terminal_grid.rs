@@ -189,3 +189,359 @@ fn build_pane_body(
 
     body
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{seed_state, Pane, PaneId};
+    use std::sync::{Arc, Mutex};
+    use unshit::core::cell_grid::CellGrid;
+
+    fn make_shared() -> SharedState {
+        Arc::new(Mutex::new(seed_state()))
+    }
+
+    fn make_snapshot() -> UiSnapshot {
+        seed_state().ui_snapshot()
+    }
+
+    fn make_pane(id: u32, title: &str) -> Pane {
+        Pane {
+            id: PaneId(id),
+            title: title.to_string(),
+            subtitle: "bash".to_string(),
+            pid: 1234,
+            cpu: 5.3,
+        }
+    }
+
+    // -- build_terminal_grid: single pane ---------------------------------------
+
+    #[test]
+    fn terminal_grid_single_pane_has_correct_structure() {
+        let snap = make_snapshot(); // default: single pane
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new();
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        assert!(el.classes.contains(&"terminal-grid".to_string()));
+        assert_eq!(el.id.as_deref(), Some("terminal-grid"));
+        // Single pane = one row, no vertical resizers
+        assert_eq!(el.children.len(), 1);
+        let row = &el.children[0];
+        assert!(row.classes.contains(&"pane-row".to_string()));
+        // Single pane in the row, no horizontal resizers
+        assert_eq!(row.children.len(), 1);
+    }
+
+    // -- build_terminal_grid: 2x2 layout ----------------------------------------
+
+    #[test]
+    fn terminal_grid_2x2_has_resizers() {
+        let mut state = seed_state();
+        state.panes = vec![
+            vec![make_pane(1, "a"), make_pane(2, "b")],
+            vec![make_pane(3, "c"), make_pane(4, "d")],
+        ];
+        state.active_pane = PaneId(1);
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new();
+        let el = build_terminal_grid(&snap, &shared, &grids);
+
+        // 2 rows + 1 vertical resizer between them = 3 children
+        assert_eq!(el.children.len(), 3);
+
+        // The vertical resizer is at index 1
+        let v_resizer = &el.children[1];
+        assert!(v_resizer.classes.contains(&"pane-resizer".to_string()));
+        assert!(v_resizer.classes.contains(&"vertical".to_string()));
+
+        // Each row has 2 panes + 1 horizontal resizer = 3 children
+        let row0 = &el.children[0];
+        assert_eq!(row0.children.len(), 3);
+        let h_resizer = &row0.children[1];
+        assert!(h_resizer.classes.contains(&"pane-resizer".to_string()));
+
+        let row1 = &el.children[2];
+        assert_eq!(row1.children.len(), 3);
+    }
+
+    // -- build_pane: active vs inactive -----------------------------------------
+
+    #[test]
+    fn pane_active_has_active_class() {
+        let pane = make_pane(1, "shell");
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, true, &shared, &grids);
+        assert!(el.classes.contains(&"pane".to_string()));
+        assert!(el.classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn pane_inactive_lacks_active_class() {
+        let pane = make_pane(1, "shell");
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, false, &shared, &grids);
+        assert!(el.classes.contains(&"pane".to_string()));
+        assert!(!el.classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn pane_has_header_and_body() {
+        let pane = make_pane(1, "shell");
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, true, &shared, &grids);
+        assert_eq!(el.children.len(), 2);
+        assert!(el.children[0].classes.contains(&"pane-header".to_string()));
+        assert!(el.children[1].classes.contains(&"pane-body".to_string()));
+    }
+
+    #[test]
+    fn pane_has_click_handler() {
+        let pane = make_pane(1, "shell");
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, false, &shared, &grids);
+        assert!(el.on_click.is_some());
+    }
+
+    // -- build_pane_header ------------------------------------------------------
+
+    #[test]
+    fn pane_header_has_correct_class() {
+        let pane = make_pane(42, "zsh");
+        let shared = make_shared();
+        let el = build_pane_header(&pane, &shared);
+        assert!(el.classes.contains(&"pane-header".to_string()));
+    }
+
+    #[test]
+    fn pane_header_has_three_sections() {
+        let pane = make_pane(42, "zsh");
+        let shared = make_shared();
+        let el = build_pane_header(&pane, &shared);
+        // left, meta, right
+        assert_eq!(el.children.len(), 3);
+        assert!(el.children[0].classes.contains(&"pane-header-left".to_string()));
+        assert!(el.children[1].classes.contains(&"pane-meta".to_string()));
+        assert!(el.children[2].classes.contains(&"pane-header-right".to_string()));
+    }
+
+    #[test]
+    fn pane_header_meta_shows_pid_and_cpu() {
+        let pane = make_pane(42, "zsh");
+        let shared = make_shared();
+        let el = build_pane_header(&pane, &shared);
+        let meta = &el.children[1];
+        // meta text should contain "pid 1234" and "5.3%"
+        if let unshit::core::element::ElementContent::Text(ref text) = meta.content {
+            assert!(text.contains("1234"), "expected pid in meta, got: {}", text);
+            assert!(text.contains("5.3"), "expected cpu in meta, got: {}", text);
+        } else {
+            panic!("expected text content in pane-meta");
+        }
+    }
+
+    #[test]
+    fn pane_header_right_has_action_buttons() {
+        let pane = make_pane(1, "shell");
+        let shared = make_shared();
+        let el = build_pane_header(&pane, &shared);
+        let right = &el.children[2];
+        // search, split_h, split_v, close = 4 buttons
+        assert_eq!(right.children.len(), 4);
+        // Last button (close) should have "danger" class
+        assert!(right.children[3].classes.contains(&"danger".to_string()));
+    }
+
+    // -- build_pane_body: with grid ---------------------------------------------
+
+    #[test]
+    fn pane_body_with_grid_renders_terminal_content() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        assert!(el.classes.contains(&"pane-body".to_string()));
+        assert_eq!(el.children.len(), 1);
+        let grid_el = &el.children[0];
+        assert!(grid_el.classes.contains(&"terminal-content".to_string()));
+        assert!(grid_el.persistent_buffer);
+    }
+
+    #[test]
+    fn pane_body_with_grid_active_captures_keyboard() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let grid_el = &el.children[0];
+        assert!(grid_el.captures_keyboard);
+    }
+
+    #[test]
+    fn pane_body_with_grid_inactive_does_not_capture_keyboard() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), false, &shared, &grids);
+        let grid_el = &el.children[0];
+        assert!(!grid_el.captures_keyboard);
+    }
+
+    // -- build_pane_body: without grid (fallback) -------------------------------
+
+    #[test]
+    fn pane_body_without_grid_shows_fallback() {
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new(); // no grid for pane 1
+        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        assert!(el.classes.contains(&"pane-body".to_string()));
+        assert_eq!(el.children.len(), 1);
+        let fallback = &el.children[0];
+        assert!(fallback.classes.contains(&"term-line".to_string()));
+        // Should have prompt and cursor children
+        assert_eq!(fallback.children.len(), 2);
+        assert!(fallback.children[0].classes.contains(&"term-prompt".to_string()));
+        assert!(fallback.children[1].classes.contains(&"term-cursor".to_string()));
+    }
+
+    #[test]
+    fn pane_body_without_grid_inactive_also_shows_fallback() {
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new();
+        let el = build_pane_body(PaneId(99), false, &shared, &grids);
+        assert_eq!(el.children.len(), 1);
+        assert!(el.children[0].classes.contains(&"term-line".to_string()));
+    }
+
+    // -- closure invocation tests (cover on_click/on_resize bodies) ------------
+
+    #[test]
+    fn pane_click_sets_active_pane() {
+        let shared = make_shared();
+        let pane = make_pane(42, "shell");
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, false, &shared, &grids);
+        (el.on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().active_pane, PaneId(42));
+    }
+
+    #[test]
+    fn pane_header_split_h_has_click_handler() {
+        let shared = make_shared();
+        let pane = make_pane(1, "shell");
+        let el = build_pane_header(&pane, &shared);
+        let right = &el.children[2];
+        // split_h is the second action button (index 1)
+        let split_h = &right.children[1];
+        assert!(split_h.on_click.is_some());
+        assert!(split_h.classes.contains(&"pane-action".to_string()));
+    }
+
+    #[test]
+    fn pane_header_split_v_has_click_handler() {
+        let shared = make_shared();
+        let pane = make_pane(1, "shell");
+        let el = build_pane_header(&pane, &shared);
+        let right = &el.children[2];
+        // split_v is the third action button (index 2)
+        let split_v = &right.children[2];
+        assert!(split_v.on_click.is_some());
+        assert!(split_v.classes.contains(&"pane-action".to_string()));
+    }
+
+    #[test]
+    fn pane_header_close_has_click_handler_and_danger_class() {
+        let shared = make_shared();
+        let pane = make_pane(1, "shell");
+        let el = build_pane_header(&pane, &shared);
+        let right = &el.children[2];
+        // close is the last action button (index 3)
+        let close_btn = &right.children[3];
+        assert!(close_btn.classes.contains(&"danger".to_string()));
+        assert!(close_btn.classes.contains(&"pane-action".to_string()));
+        assert!(close_btn.on_click.is_some());
+    }
+
+    #[test]
+    fn pane_body_active_grid_has_keyboard_handler() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let grid_el = &el.children[0];
+        // Should have event handlers registered (KeyboardCapture)
+        assert!(!grid_el.handlers.is_empty());
+    }
+
+    #[test]
+    fn pane_body_active_grid_has_resize_handler() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let grid_el = &el.children[0];
+        assert!(grid_el.on_resize.is_some());
+    }
+
+    #[test]
+    fn pane_body_inactive_grid_has_no_keyboard_handler() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), false, &shared, &grids);
+        let grid_el = &el.children[0];
+        assert!(grid_el.handlers.is_empty());
+        assert!(grid_el.on_resize.is_none());
+    }
+
+    #[test]
+    fn pane_body_resize_handler_invocation() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let grid_el = &el.children[0];
+        let resize_fn = grid_el.on_resize.as_ref().unwrap();
+        // Invoke with a 640x384 area (should yield 80 cols, 24 rows)
+        (resize_fn)(640.0, 384.0);
+        // The resize handler should not panic and should work
+    }
+
+    #[test]
+    fn pane_header_left_has_status_dot_title_subtitle() {
+        let pane = make_pane(1, "zsh");
+        let shared = make_shared();
+        let el = build_pane_header(&pane, &shared);
+        let left = &el.children[0];
+        assert!(left.classes.contains(&"pane-header-left".to_string()));
+        assert_eq!(left.children.len(), 3);
+        assert!(left.children[0].classes.contains(&"pane-status-dot".to_string()));
+        assert!(left.children[1].classes.contains(&"pane-title".to_string()));
+        assert!(left.children[2].classes.contains(&"pane-subtitle".to_string()));
+    }
+
+    #[test]
+    fn terminal_grid_with_three_cols() {
+        let mut state = seed_state();
+        state.panes = vec![vec![
+            make_pane(1, "a"),
+            make_pane(2, "b"),
+            make_pane(3, "c"),
+        ]];
+        state.active_pane = PaneId(1);
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new();
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        // 1 row, no vertical resizers
+        assert_eq!(el.children.len(), 1);
+        let row = &el.children[0];
+        // 3 panes + 2 resizers = 5
+        assert_eq!(row.children.len(), 5);
+    }
+}

@@ -1047,4 +1047,241 @@ mod tests {
         let guard = shared.lock().unwrap();
         assert_eq!(guard.font_size_pt, 25);
     }
+
+    // -- mutate_split_right ---------------------------------------------------
+
+    #[test]
+    fn split_right_increases_pane_count_and_changes_active() {
+        let mut state = seed_state();
+        let original_active = state.active_pane;
+        let original_col_count = state.panes[0].len();
+
+        mutate_split_right(&mut state, original_active);
+
+        assert_eq!(state.panes[0].len(), original_col_count + 1);
+        assert_ne!(state.active_pane, original_active);
+        // The new pane should be in the terminals map
+        assert!(state.terminals.contains_key(&state.active_pane.0));
+    }
+
+    #[test]
+    fn split_right_at_max_cols_is_noop() {
+        let mut state = seed_state();
+        // Manually fill the first row to MAX_COLS to avoid spawning many PTYs
+        while state.panes[0].len() < MAX_COLS {
+            let id = state.next_id;
+            state.next_id += 1;
+            state.panes[0].push(Pane {
+                id: PaneId(id),
+                title: "shell".to_string(),
+                subtitle: "bash".to_string(),
+                pid: 0,
+                cpu: 0.0,
+            });
+            state.active_pane = PaneId(id);
+        }
+        assert_eq!(state.panes[0].len(), MAX_COLS);
+
+        let pane_count_before = state.panes[0].len();
+        let active_before = state.active_pane;
+        let ap = state.active_pane;
+        mutate_split_right(&mut state, ap);
+
+        assert_eq!(state.panes[0].len(), pane_count_before);
+        assert_eq!(state.active_pane, active_before);
+    }
+
+    #[test]
+    fn split_right_nonexistent_pane_is_noop() {
+        let mut state = seed_state();
+        let active_before = state.active_pane;
+        let pane_count = state.panes[0].len();
+
+        mutate_split_right(&mut state, PaneId(9999));
+
+        assert_eq!(state.panes[0].len(), pane_count);
+        assert_eq!(state.active_pane, active_before);
+    }
+
+    // -- mutate_split_down ----------------------------------------------------
+
+    #[test]
+    fn split_down_increases_row_count() {
+        let mut state = seed_state();
+        let original_row_count = state.panes.len();
+        let original_active = state.active_pane;
+
+        mutate_split_down(&mut state, original_active);
+
+        assert_eq!(state.panes.len(), original_row_count + 1);
+        assert_ne!(state.active_pane, original_active);
+        assert!(state.terminals.contains_key(&state.active_pane.0));
+    }
+
+    #[test]
+    fn split_down_at_max_rows_is_noop() {
+        let mut state = seed_state();
+        // Manually fill to MAX_ROWS to avoid spawning many PTYs
+        while state.panes.len() < MAX_ROWS {
+            let id = state.next_id;
+            state.next_id += 1;
+            state.panes.push(vec![Pane {
+                id: PaneId(id),
+                title: "shell".to_string(),
+                subtitle: "bash".to_string(),
+                pid: 0,
+                cpu: 0.0,
+            }]);
+            state.active_pane = PaneId(id);
+        }
+        assert_eq!(state.panes.len(), MAX_ROWS);
+
+        let row_count_before = state.panes.len();
+        let active_before = state.active_pane;
+        let ap = state.active_pane;
+        mutate_split_down(&mut state, ap);
+
+        assert_eq!(state.panes.len(), row_count_before);
+        assert_eq!(state.active_pane, active_before);
+    }
+
+    #[test]
+    fn split_down_nonexistent_pane_is_noop() {
+        let mut state = seed_state();
+        let row_count = state.panes.len();
+        let active_before = state.active_pane;
+
+        mutate_split_down(&mut state, PaneId(9999));
+
+        assert_eq!(state.panes.len(), row_count);
+        assert_eq!(state.active_pane, active_before);
+    }
+
+    // -- mutate_close_pane ----------------------------------------------------
+
+    #[test]
+    fn close_pane_from_multi_pane_row() {
+        let mut state = seed_state();
+        // Split right so we have 2 panes in row 0
+        let first_pane = state.active_pane;
+        mutate_split_right(&mut state, first_pane);
+        let second_pane = state.active_pane;
+        assert_eq!(state.panes[0].len(), 2);
+
+        // Close the second pane, active should fall back
+        mutate_close_pane(&mut state, second_pane);
+        assert_eq!(state.panes[0].len(), 1);
+        assert_eq!(state.active_pane, first_pane);
+        // Terminal entry should be removed
+        assert!(!state.terminals.contains_key(&second_pane.0));
+    }
+
+    #[test]
+    fn close_last_pane_auto_creates_new_one() {
+        let mut state = seed_state();
+        let original_pane = state.active_pane;
+
+        mutate_close_pane(&mut state, original_pane);
+
+        // Should still have exactly one pane
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 1);
+        // The new pane should have a different id
+        assert_ne!(state.active_pane, original_pane);
+        // Old terminal removed
+        assert!(!state.terminals.contains_key(&original_pane.0));
+        // New terminal created
+        assert!(state.terminals.contains_key(&state.active_pane.0));
+    }
+
+    #[test]
+    fn close_nonexistent_pane_is_noop() {
+        let mut state = seed_state();
+        let active_before = state.active_pane;
+        let pane_count = state.panes[0].len();
+
+        mutate_close_pane(&mut state, PaneId(9999));
+
+        assert_eq!(state.panes[0].len(), pane_count);
+        assert_eq!(state.active_pane, active_before);
+    }
+
+    #[test]
+    fn close_non_active_pane_keeps_active_unchanged() {
+        let mut state = seed_state();
+        let first_pane = state.active_pane;
+        mutate_split_right(&mut state, first_pane);
+        let second_pane = state.active_pane;
+
+        // Switch active back to first pane
+        state.active_pane = first_pane;
+
+        // Close the non-active second pane
+        mutate_close_pane(&mut state, second_pane);
+        assert_eq!(state.panes[0].len(), 1);
+        assert_eq!(state.active_pane, first_pane);
+    }
+
+    #[test]
+    fn close_pane_removes_empty_row() {
+        let mut state = seed_state();
+        // Add a second row via split down
+        let ap = state.active_pane;
+        mutate_split_down(&mut state, ap);
+        assert_eq!(state.panes.len(), 2);
+        let second_row_pane = state.active_pane;
+
+        // Close the pane in the second row (the only pane there)
+        mutate_close_pane(&mut state, second_row_pane);
+        assert_eq!(state.panes.len(), 1);
+    }
+
+    // -- dispatch pane commands -----------------------------------------------
+
+    #[test]
+    fn dispatch_pane_split_right() {
+        let mut state = seed_state();
+        let original_col_count = state.panes[0].len();
+
+        assert!(dispatch(&mut state, "pane.split_right"));
+        assert_eq!(state.panes[0].len(), original_col_count + 1);
+    }
+
+    #[test]
+    fn dispatch_pane_split_down() {
+        let mut state = seed_state();
+        let original_row_count = state.panes.len();
+
+        assert!(dispatch(&mut state, "pane.split_down"));
+        assert_eq!(state.panes.len(), original_row_count + 1);
+    }
+
+    #[test]
+    fn dispatch_pane_close() {
+        let mut state = seed_state();
+        // Split first so closing does not trigger the "last pane" path
+        dispatch(&mut state, "pane.split_right");
+        let pane_count = state.panes[0].len();
+
+        assert!(dispatch(&mut state, "pane.close"));
+        assert_eq!(state.panes[0].len(), pane_count - 1);
+    }
+
+    // -- dispatch tab.next / tab.prev with empty tabs -------------------------
+
+    #[test]
+    fn dispatch_tab_next_empty_tabs_returns_false() {
+        let mut state = test_state();
+        state.tabs.clear();
+
+        assert!(!dispatch(&mut state, "tab.next"));
+    }
+
+    #[test]
+    fn dispatch_tab_prev_empty_tabs_returns_false() {
+        let mut state = test_state();
+        state.tabs.clear();
+
+        assert!(!dispatch(&mut state, "tab.prev"));
+    }
 }

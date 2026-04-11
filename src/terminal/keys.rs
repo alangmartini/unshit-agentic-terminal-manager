@@ -520,4 +520,108 @@ mod tests {
     fn modifier_all() {
         assert_eq!(xterm_modifier(true, true, true), 8);
     }
+
+    // -- Modified F5-F12 keys (with Shift, Alt, or Ctrl) ----------------------
+
+    #[test]
+    fn shift_f5() {
+        let result = encode_key(&key_event(Key::F(5), Modifiers::SHIFT));
+        // F5 code=15, Shift modifier=2: \x1b[15;2~
+        assert_eq!(result, Some(b"\x1b[15;2~".to_vec()));
+    }
+
+    #[test]
+    fn alt_f8() {
+        let result = encode_key(&key_event(Key::F(8), Modifiers::ALT));
+        // F8 code=19, Alt modifier=3: \x1b[19;3~
+        assert_eq!(result, Some(b"\x1b[19;3~".to_vec()));
+    }
+
+    #[test]
+    fn ctrl_f12() {
+        let result = encode_key(&key_event(Key::F(12), Modifiers::CTRL));
+        // F12 code=24, Ctrl modifier=5: \x1b[24;5~
+        assert_eq!(result, Some(b"\x1b[24;5~".to_vec()));
+    }
+
+    #[test]
+    fn shift_ctrl_f6() {
+        let result = encode_key(&key_event(Key::F(6), Modifiers::SHIFT | Modifiers::CTRL));
+        // F6 code=17, Shift+Ctrl modifier=6: \x1b[17;6~
+        assert_eq!(result, Some(b"\x1b[17;6~".to_vec()));
+    }
+
+    #[test]
+    fn f7_unmodified() {
+        let result = encode_key(&key_event(Key::F(7), Modifiers::empty()));
+        // F7 code=18: \x1b[18~
+        assert_eq!(result, Some(b"\x1b[18~".to_vec()));
+    }
+
+    #[test]
+    fn f9_unmodified() {
+        let result = encode_key(&key_event(Key::F(9), Modifiers::empty()));
+        // F9 code=20: \x1b[20~
+        assert_eq!(result, Some(b"\x1b[20~".to_vec()));
+    }
+
+    #[test]
+    fn f10_unmodified() {
+        let result = encode_key(&key_event(Key::F(10), Modifiers::empty()));
+        // F10 code=21: \x1b[21~
+        assert_eq!(result, Some(b"\x1b[21~".to_vec()));
+    }
+
+    #[test]
+    fn f11_unmodified() {
+        let result = encode_key(&key_event(Key::F(11), Modifiers::empty()));
+        // F11 code=23: \x1b[23~
+        assert_eq!(result, Some(b"\x1b[23~".to_vec()));
+    }
+
+    // -- Modified tilde sequences (PageUp, PageDown, Delete) ------------------
+
+    #[test]
+    fn shift_page_up() {
+        let result = encode_key(&key_event(Key::PageUp, Modifiers::SHIFT));
+        // PageUp num=5, Shift modifier=2: \x1b[5;2~
+        assert_eq!(result, Some(b"\x1b[5;2~".to_vec()));
+    }
+
+    #[test]
+    fn alt_delete() {
+        let result = encode_key(&key_event(Key::Delete, Modifiers::ALT));
+        // Delete num=3, Alt modifier=3: \x1b[3;3~
+        assert_eq!(result, Some(b"\x1b[3;3~".to_vec()));
+    }
+
+    #[test]
+    fn shift_page_down() {
+        let result = encode_key(&key_event(Key::PageDown, Modifiers::SHIFT));
+        // PageDown num=6, Shift modifier=2: \x1b[6;2~
+        assert_eq!(result, Some(b"\x1b[6;2~".to_vec()));
+    }
+
+    // -- Modified Home/End keys -----------------------------------------------
+
+    #[test]
+    fn shift_home() {
+        let result = encode_key(&key_event(Key::Home, Modifiers::SHIFT));
+        // Home letter=H, Shift modifier=2: \x1b[1;2H
+        assert_eq!(result, Some(b"\x1b[1;2H".to_vec()));
+    }
+
+    #[test]
+    fn ctrl_end() {
+        let result = encode_key(&key_event(Key::End, Modifiers::CTRL));
+        // End letter=F, Ctrl modifier=5: \x1b[1;5F
+        assert_eq!(result, Some(b"\x1b[1;5F".to_vec()));
+    }
+
+    // -- F(0) out-of-range returns None ---------------------------------------
+
+    #[test]
+    fn f0_returns_none() {
+        assert!(encode_key(&key_event(Key::F(0), Modifiers::empty())).is_none());
+    }
 }

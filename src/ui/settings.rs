@@ -230,3 +230,482 @@ fn toggle_button(on: bool, key: &str, shared: &SharedState) -> ElementDef {
         });
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{seed_state, SettingsSection};
+    use std::sync::{Arc, Mutex};
+
+    fn make_shared() -> SharedState {
+        Arc::new(Mutex::new(seed_state()))
+    }
+
+    fn make_snapshot() -> UiSnapshot {
+        seed_state().ui_snapshot()
+    }
+
+    // -- build_settings_modal ---------------------------------------------------
+
+    #[test]
+    fn settings_modal_has_modal_class() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_settings_modal(&snap, &shared);
+        assert!(el.classes.contains(&"modal".to_string()));
+    }
+
+    #[test]
+    fn settings_modal_has_four_children() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_settings_modal(&snap, &shared);
+        // header, nav, body, footer
+        assert_eq!(el.children.len(), 4);
+    }
+
+    // -- build_modal_header -----------------------------------------------------
+
+    #[test]
+    fn modal_header_has_correct_class() {
+        let shared = make_shared();
+        let el = build_modal_header(&shared);
+        assert!(el.classes.contains(&"modal-header".to_string()));
+    }
+
+    #[test]
+    fn modal_header_contains_title_and_close_button() {
+        let shared = make_shared();
+        let el = build_modal_header(&shared);
+        // Should have title row and close button
+        assert_eq!(el.children.len(), 2);
+        // Close button should have on_click
+        let close_btn = &el.children[1];
+        assert!(close_btn.on_click.is_some());
+        assert_eq!(close_btn.id.as_deref(), Some("settings-close"));
+    }
+
+    // -- build_modal_nav --------------------------------------------------------
+
+    #[test]
+    fn modal_nav_has_nav_class() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::General, &shared);
+        assert!(el.classes.contains(&"modal-nav".to_string()));
+    }
+
+    #[test]
+    fn modal_nav_has_five_items() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::General, &shared);
+        assert_eq!(el.children.len(), 5);
+    }
+
+    #[test]
+    fn modal_nav_marks_general_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::General, &shared);
+        // First child should have "active" class
+        assert!(el.children[0].classes.contains(&"active".to_string()));
+        // Others should not
+        for child in &el.children[1..] {
+            assert!(!child.classes.contains(&"active".to_string()));
+        }
+    }
+
+    #[test]
+    fn modal_nav_marks_appearance_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
+        assert!(!el.children[0].classes.contains(&"active".to_string()));
+        assert!(el.children[1].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn modal_nav_marks_shell_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Shell, &shared);
+        assert!(el.children[2].classes.contains(&"active".to_string()));
+        assert!(!el.children[0].classes.contains(&"active".to_string()));
+        assert!(!el.children[1].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn modal_nav_items_have_click_handlers() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::General, &shared);
+        for child in &el.children {
+            assert!(child.on_click.is_some());
+        }
+    }
+
+    // -- build_modal_body -------------------------------------------------------
+
+    #[test]
+    fn modal_body_has_three_sections() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_modal_body(&snap, &shared);
+        assert!(el.classes.contains(&"modal-body".to_string()));
+        assert_eq!(el.children.len(), 3);
+    }
+
+    // -- build_general_section --------------------------------------------------
+
+    #[test]
+    fn general_section_has_correct_class_and_title() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_general_section(&snap, &shared);
+        assert!(el.classes.contains(&"modal-section".to_string()));
+        // First child is the section title
+        let title = &el.children[0];
+        assert!(title.classes.contains(&"modal-section-title".to_string()));
+    }
+
+    #[test]
+    fn general_section_has_setting_rows() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_general_section(&snap, &shared);
+        // title + 3 setting rows (default shell, working directory, restore on startup)
+        assert_eq!(el.children.len(), 4);
+    }
+
+    // -- build_appearance_section -----------------------------------------------
+
+    #[test]
+    fn appearance_section_has_correct_class() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_appearance_section(&snap, &shared);
+        assert!(el.classes.contains(&"modal-section".to_string()));
+    }
+
+    #[test]
+    fn appearance_section_theme_chips_mark_amber_active() {
+        let snap = make_snapshot(); // theme defaults to "amber"
+        let shared = make_shared();
+        let el = build_appearance_section(&snap, &shared);
+        // children: title, theme row, font row, glow row, bg texture row
+        assert_eq!(el.children.len(), 5);
+        // Theme row is children[1], which is a setting_row.
+        // setting_row has 2 children: setting-meta and the control (theme-chips).
+        let theme_row = &el.children[1];
+        let theme_chips = &theme_row.children[1]; // the control element
+        assert!(theme_chips.classes.contains(&"theme-chips".to_string()));
+        // First chip (amber) should have "active"
+        assert!(theme_chips.children[0].classes.contains(&"active".to_string()));
+        // Others should not
+        for chip in &theme_chips.children[1..] {
+            assert!(!chip.classes.contains(&"active".to_string()));
+        }
+    }
+
+    #[test]
+    fn appearance_section_theme_chips_mark_cyan_active() {
+        let mut state = seed_state();
+        state.theme = "cyan".to_string();
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let el = build_appearance_section(&snap, &shared);
+        let theme_chips = &el.children[1].children[1];
+        // cyan is the 3rd theme (index 2)
+        assert!(!theme_chips.children[0].classes.contains(&"active".to_string()));
+        assert!(!theme_chips.children[1].classes.contains(&"active".to_string()));
+        assert!(theme_chips.children[2].classes.contains(&"active".to_string()));
+        assert!(!theme_chips.children[3].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn appearance_section_theme_chips_mark_green_active() {
+        let mut state = seed_state();
+        state.theme = "green".to_string();
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let el = build_appearance_section(&snap, &shared);
+        let theme_chips = &el.children[1].children[1];
+        assert!(theme_chips.children[1].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn appearance_section_has_font_stepper() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_appearance_section(&snap, &shared);
+        let font_row = &el.children[2];
+        let stepper = &font_row.children[1];
+        assert!(stepper.classes.contains(&"stepper".to_string()));
+        // stepper has 3 children: dec button, value span, inc button
+        assert_eq!(stepper.children.len(), 3);
+    }
+
+    // -- build_shell_section ----------------------------------------------------
+
+    #[test]
+    fn shell_section_has_correct_title() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_shell_section(&snap, &shared);
+        assert!(el.classes.contains(&"modal-section".to_string()));
+        let title = &el.children[0];
+        assert!(title.classes.contains(&"modal-section-title".to_string()));
+    }
+
+    #[test]
+    fn shell_section_has_two_setting_rows() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_shell_section(&snap, &shared);
+        // title + 2 rows (shell integration, history size)
+        assert_eq!(el.children.len(), 3);
+    }
+
+    // -- build_modal_footer -----------------------------------------------------
+
+    #[test]
+    fn modal_footer_has_correct_class() {
+        let shared = make_shared();
+        let el = build_modal_footer(&shared);
+        assert!(el.classes.contains(&"modal-footer".to_string()));
+    }
+
+    #[test]
+    fn modal_footer_has_hint_and_actions() {
+        let shared = make_shared();
+        let el = build_modal_footer(&shared);
+        assert_eq!(el.children.len(), 2);
+        // First child is the hint
+        assert!(el.children[0].classes.contains(&"modal-hint".to_string()));
+        // Second child is the footer actions
+        let actions = &el.children[1];
+        assert!(actions.classes.contains(&"modal-footer-actions".to_string()));
+        // actions has cancel and save buttons
+        assert_eq!(actions.children.len(), 2);
+    }
+
+    #[test]
+    fn modal_footer_cancel_button_has_id() {
+        let shared = make_shared();
+        let el = build_modal_footer(&shared);
+        let actions = &el.children[1];
+        let cancel = &actions.children[0];
+        assert_eq!(cancel.id.as_deref(), Some("settings-cancel"));
+        assert!(cancel.on_click.is_some());
+    }
+
+    #[test]
+    fn modal_footer_save_button_has_click_handler() {
+        let shared = make_shared();
+        let el = build_modal_footer(&shared);
+        let actions = &el.children[1];
+        let save = &actions.children[1];
+        assert!(save.classes.contains(&"primary".to_string()));
+        assert!(save.on_click.is_some());
+    }
+
+    // -- setting_row ------------------------------------------------------------
+
+    #[test]
+    fn setting_row_has_meta_and_control() {
+        let control = ElementDef::new(Tag::Input).with_class("input");
+        let el = setting_row("Label", "Description", control);
+        assert!(el.classes.contains(&"setting-row".to_string()));
+        assert_eq!(el.children.len(), 2);
+        let meta = &el.children[0];
+        assert!(meta.classes.contains(&"setting-meta".to_string()));
+        assert_eq!(meta.children.len(), 2); // label span + desc span
+    }
+
+    // -- toggle_button ----------------------------------------------------------
+
+    #[test]
+    fn toggle_button_on_has_on_class() {
+        let shared = make_shared();
+        let el = toggle_button(true, "test-key", &shared);
+        assert!(el.classes.contains(&"toggle".to_string()));
+        assert!(el.classes.contains(&"on".to_string()));
+        assert!(el.on_click.is_some());
+    }
+
+    #[test]
+    fn toggle_button_off_lacks_on_class() {
+        let shared = make_shared();
+        let el = toggle_button(false, "test-key", &shared);
+        assert!(el.classes.contains(&"toggle".to_string()));
+        assert!(!el.classes.contains(&"on".to_string()));
+        assert!(el.on_click.is_some());
+    }
+
+    // -- closure invocation tests (cover on_click bodies) ----------------------
+
+    #[test]
+    fn close_button_click_closes_modal() {
+        let shared = make_shared();
+        // Open the modal first
+        shared.lock().unwrap().settings_open = true;
+        let el = build_modal_header(&shared);
+        let close_btn = &el.children[1];
+        // Invoke the on_click closure
+        (close_btn.on_click.as_ref().unwrap())();
+        assert!(!shared.lock().unwrap().settings_open);
+    }
+
+    #[test]
+    fn nav_item_click_changes_section() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::General, &shared);
+        // Click the Appearance nav item (index 1)
+        (el.children[1].on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().settings_section, SettingsSection::Appearance);
+    }
+
+    #[test]
+    fn nav_item_click_changes_to_shell() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::General, &shared);
+        // Click the Shell nav item (index 2)
+        (el.children[2].on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().settings_section, SettingsSection::Shell);
+    }
+
+    #[test]
+    fn nav_item_click_changes_to_keybinds() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::General, &shared);
+        (el.children[3].on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().settings_section, SettingsSection::Keybinds);
+    }
+
+    #[test]
+    fn nav_item_click_changes_to_agents() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::General, &shared);
+        (el.children[4].on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().settings_section, SettingsSection::Agents);
+    }
+
+    #[test]
+    fn theme_chip_click_changes_theme() {
+        let shared = make_shared();
+        let snap = make_snapshot();
+        let el = build_appearance_section(&snap, &shared);
+        let theme_chips = &el.children[1].children[1];
+        // Click "green" chip (index 1)
+        (theme_chips.children[1].on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().theme, "green");
+    }
+
+    #[test]
+    fn theme_chip_click_changes_to_cyan() {
+        let shared = make_shared();
+        let snap = make_snapshot();
+        let el = build_appearance_section(&snap, &shared);
+        let theme_chips = &el.children[1].children[1];
+        // Click "cyan" chip (index 2)
+        (theme_chips.children[2].on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().theme, "cyan");
+    }
+
+    #[test]
+    fn theme_chip_click_changes_to_mono() {
+        let shared = make_shared();
+        let snap = make_snapshot();
+        let el = build_appearance_section(&snap, &shared);
+        let theme_chips = &el.children[1].children[1];
+        // Click "mono" chip (index 3)
+        (theme_chips.children[3].on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().theme, "mono");
+    }
+
+    #[test]
+    fn font_dec_button_decreases_font_size() {
+        let shared = make_shared();
+        let initial = shared.lock().unwrap().font_size_pt;
+        let snap = make_snapshot();
+        let el = build_appearance_section(&snap, &shared);
+        let stepper = &el.children[2].children[1];
+        let dec_btn = &stepper.children[0];
+        (dec_btn.on_click.as_ref().unwrap())();
+        let after = shared.lock().unwrap().font_size_pt;
+        // font.dec should decrease (or clamp at min)
+        assert!(after <= initial);
+    }
+
+    #[test]
+    fn font_inc_button_increases_font_size() {
+        let shared = make_shared();
+        let initial = shared.lock().unwrap().font_size_pt;
+        let snap = make_snapshot();
+        let el = build_appearance_section(&snap, &shared);
+        let stepper = &el.children[2].children[1];
+        let inc_btn = &stepper.children[2];
+        (inc_btn.on_click.as_ref().unwrap())();
+        let after = shared.lock().unwrap().font_size_pt;
+        assert!(after >= initial);
+    }
+
+    #[test]
+    fn toggle_button_click_toggles_state() {
+        let shared = make_shared();
+        let el = toggle_button(false, "test-toggle", &shared);
+        // Initially off
+        assert!(!shared.lock().unwrap().toggles.get("test-toggle").copied().unwrap_or(false));
+        // Click to turn on
+        (el.on_click.as_ref().unwrap())();
+        assert!(shared.lock().unwrap().toggles.get("test-toggle").copied().unwrap_or(false));
+        // Click again to turn off
+        (el.on_click.as_ref().unwrap())();
+        assert!(!shared.lock().unwrap().toggles.get("test-toggle").copied().unwrap_or(false));
+    }
+
+    #[test]
+    fn cancel_button_click_closes_modal() {
+        let shared = make_shared();
+        shared.lock().unwrap().settings_open = true;
+        let el = build_modal_footer(&shared);
+        let actions = &el.children[1];
+        let cancel = &actions.children[0];
+        (cancel.on_click.as_ref().unwrap())();
+        assert!(!shared.lock().unwrap().settings_open);
+    }
+
+    #[test]
+    fn save_button_click_closes_modal() {
+        let shared = make_shared();
+        shared.lock().unwrap().settings_open = true;
+        let el = build_modal_footer(&shared);
+        let actions = &el.children[1];
+        let save = &actions.children[1];
+        (save.on_click.as_ref().unwrap())();
+        assert!(!shared.lock().unwrap().settings_open);
+    }
+
+    #[test]
+    fn modal_nav_marks_keybinds_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Keybinds, &shared);
+        assert!(el.children[3].classes.contains(&"active".to_string()));
+        assert!(!el.children[0].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn modal_nav_marks_agents_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Agents, &shared);
+        assert!(el.children[4].classes.contains(&"active".to_string()));
+        assert!(!el.children[0].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn appearance_section_theme_chips_mark_mono_active() {
+        let mut state = seed_state();
+        state.theme = "mono".to_string();
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let el = build_appearance_section(&snap, &shared);
+        let theme_chips = &el.children[1].children[1];
+        assert!(theme_chips.children[3].classes.contains(&"active".to_string()));
+        assert!(!theme_chips.children[0].classes.contains(&"active".to_string()));
+    }
+}

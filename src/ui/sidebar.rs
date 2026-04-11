@@ -197,3 +197,384 @@ fn hint_item(key: &str, label: &str) -> ElementDef {
         .with_child(ElementDef::new(Tag::Span).with_class("kbd").with_text(key.to_string()))
         .with_child(ElementDef::new(Tag::Span).with_text(label.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{seed_state, SharedState, Subtab, SubtabIcon, Workspace};
+    use std::sync::{Arc, Mutex};
+
+    fn has_class(el: &ElementDef, class: &str) -> bool {
+        el.classes.iter().any(|c| c == class)
+    }
+
+    fn text_of(el: &ElementDef) -> Option<&str> {
+        match &el.content {
+            ElementContent::Text(t) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
+    fn find_by_class<'a>(el: &'a ElementDef, class: &str) -> Option<&'a ElementDef> {
+        if has_class(el, class) {
+            return Some(el);
+        }
+        for child in &el.children {
+            if let Some(found) = find_by_class(child, class) {
+                return found.into();
+            }
+        }
+        None
+    }
+
+    fn make_shared() -> SharedState {
+        Arc::new(Mutex::new(seed_state()))
+    }
+
+    fn make_workspace(num: u32, collapsed: bool, branch_muted: bool) -> Workspace {
+        Workspace {
+            num,
+            name: format!("ws-{}", num),
+            branch: "main".to_string(),
+            branch_muted,
+            collapsed,
+            subtabs: vec![
+                Subtab {
+                    label: "terminals".to_string(),
+                    count: Some(3),
+                    pulse: false,
+                    active: true,
+                    icon: Some(SubtabIcon::Terminal),
+                    tree_glyph: "\u{251C}",
+                },
+                Subtab {
+                    label: "agents".to_string(),
+                    count: None,
+                    pulse: false,
+                    active: false,
+                    icon: None,
+                    tree_glyph: "\u{2514}",
+                },
+            ],
+        }
+    }
+
+    // -- build_sidebar --
+
+    #[test]
+    fn build_sidebar_not_collapsed() {
+        let shared = make_shared();
+        let state = shared.lock().unwrap().ui_snapshot();
+        let el = build_sidebar(&state, &shared);
+
+        assert_eq!(el.tag, Tag::Div);
+        assert!(has_class(&el, "sidebar"));
+        assert!(!has_class(&el, "collapsed"));
+        assert_eq!(el.id.as_deref(), Some("sidebar"));
+        // Should have 4 children: head, scroll, footer, hints
+        assert_eq!(el.children.len(), 4);
+    }
+
+    #[test]
+    fn build_sidebar_collapsed() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.sidebar_collapsed = true;
+        }
+        let state = shared.lock().unwrap().ui_snapshot();
+        let el = build_sidebar(&state, &shared);
+
+        assert!(has_class(&el, "sidebar"));
+        assert!(has_class(&el, "collapsed"));
+    }
+
+    #[test]
+    fn build_sidebar_scroll_contains_workspaces() {
+        let shared = make_shared();
+        let state = shared.lock().unwrap().ui_snapshot();
+        let el = build_sidebar(&state, &shared);
+        // children[1] is the scroll container
+        let scroll = &el.children[1];
+        assert!(has_class(scroll, "sidebar-scroll"));
+        assert_eq!(scroll.children.len(), state.workspaces.len());
+    }
+
+    // -- build_sidebar_head --
+
+    #[test]
+    fn sidebar_head_has_title_and_actions() {
+        let head = build_sidebar_head();
+        assert!(has_class(&head, "sidebar-head"));
+        // First child should be the title span
+        let title = &head.children[0];
+        assert!(has_class(title, "sidebar-title"));
+        assert_eq!(text_of(title), Some("workspaces"));
+        // Second child is actions div with two buttons
+        let actions = &head.children[1];
+        assert!(has_class(actions, "sidebar-head-actions"));
+        assert_eq!(actions.children.len(), 2);
+        for btn in &actions.children {
+            assert_eq!(btn.tag, Tag::Button);
+            assert!(has_class(btn, "icon-btn"));
+        }
+    }
+
+    // -- build_workspace --
+
+    #[test]
+    fn workspace_not_collapsed_has_no_collapsed_class() {
+        let shared = make_shared();
+        let ws = make_workspace(2, false, false);
+        let el = build_workspace(0, &ws, &shared);
+        assert!(has_class(&el, "workspace"));
+        assert!(!has_class(&el, "collapsed"));
+    }
+
+    #[test]
+    fn workspace_collapsed_has_collapsed_class() {
+        let shared = make_shared();
+        let ws = make_workspace(2, true, false);
+        let el = build_workspace(0, &ws, &shared);
+        assert!(has_class(&el, "workspace"));
+        assert!(has_class(&el, "collapsed"));
+    }
+
+    #[test]
+    fn workspace_num_1_is_active() {
+        let shared = make_shared();
+        let ws = make_workspace(1, false, false);
+        let el = build_workspace(0, &ws, &shared);
+        assert!(has_class(&el, "active"));
+    }
+
+    #[test]
+    fn workspace_num_2_is_not_active() {
+        let shared = make_shared();
+        let ws = make_workspace(2, false, false);
+        let el = build_workspace(0, &ws, &shared);
+        assert!(!has_class(&el, "active"));
+    }
+
+    #[test]
+    fn workspace_branch_muted() {
+        let shared = make_shared();
+        let ws = make_workspace(2, false, true);
+        let el = build_workspace(0, &ws, &shared);
+        let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
+        assert!(has_class(branch_tag, "muted"));
+    }
+
+    #[test]
+    fn workspace_branch_not_muted() {
+        let shared = make_shared();
+        let ws = make_workspace(2, false, false);
+        let el = build_workspace(0, &ws, &shared);
+        let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
+        assert!(!has_class(branch_tag, "muted"));
+    }
+
+    #[test]
+    fn workspace_head_shows_name_and_num() {
+        let shared = make_shared();
+        let ws = make_workspace(3, false, false);
+        let el = build_workspace(0, &ws, &shared);
+        let head = find_by_class(&el, "workspace-head").unwrap();
+        let num_el = find_by_class(head, "workspace-num").unwrap();
+        assert_eq!(text_of(num_el), Some("3"));
+        let name_el = find_by_class(head, "workspace-name").unwrap();
+        assert_eq!(text_of(name_el), Some("ws-3"));
+    }
+
+    #[test]
+    fn workspace_body_has_subtabs() {
+        let shared = make_shared();
+        let ws = make_workspace(2, false, false);
+        let el = build_workspace(0, &ws, &shared);
+        let body = find_by_class(&el, "workspace-body").unwrap();
+        assert_eq!(body.children.len(), 2);
+    }
+
+    // -- build_subtab --
+
+    #[test]
+    fn subtab_active() {
+        let shared = make_shared();
+        let sub = Subtab {
+            label: "test".to_string(),
+            count: None,
+            pulse: false,
+            active: true,
+            icon: None,
+            tree_glyph: "\u{251C}",
+        };
+        let el = build_subtab(0, 0, &sub, &shared);
+        assert_eq!(el.tag, Tag::Button);
+        assert!(has_class(&el, "subtab"));
+        assert!(has_class(&el, "active"));
+    }
+
+    #[test]
+    fn subtab_inactive() {
+        let shared = make_shared();
+        let sub = Subtab {
+            label: "test".to_string(),
+            count: None,
+            pulse: false,
+            active: false,
+            icon: None,
+            tree_glyph: "\u{251C}",
+        };
+        let el = build_subtab(0, 0, &sub, &shared);
+        assert!(has_class(&el, "subtab"));
+        assert!(!has_class(&el, "active"));
+    }
+
+    #[test]
+    fn subtab_with_icon() {
+        let shared = make_shared();
+        let sub = Subtab {
+            label: "terminals".to_string(),
+            count: None,
+            pulse: false,
+            active: false,
+            icon: Some(SubtabIcon::Terminal),
+            tree_glyph: "\u{251C}",
+        };
+        let el = build_subtab(0, 0, &sub, &shared);
+        assert!(find_by_class(&el, "subtab-icon").is_some());
+    }
+
+    #[test]
+    fn subtab_without_icon() {
+        let shared = make_shared();
+        let sub = Subtab {
+            label: "plain".to_string(),
+            count: None,
+            pulse: false,
+            active: false,
+            icon: None,
+            tree_glyph: "\u{251C}",
+        };
+        let el = build_subtab(0, 0, &sub, &shared);
+        assert!(find_by_class(&el, "subtab-icon").is_none());
+    }
+
+    #[test]
+    fn subtab_with_count() {
+        let shared = make_shared();
+        let sub = Subtab {
+            label: "stuff".to_string(),
+            count: Some(42),
+            pulse: false,
+            active: false,
+            icon: None,
+            tree_glyph: "\u{251C}",
+        };
+        let el = build_subtab(0, 0, &sub, &shared);
+        let count_el = find_by_class(&el, "subtab-count").expect("subtab-count not found");
+        assert_eq!(text_of(count_el), Some("42"));
+        assert!(!has_class(count_el, "pulse"));
+    }
+
+    #[test]
+    fn subtab_without_count() {
+        let shared = make_shared();
+        let sub = Subtab {
+            label: "stuff".to_string(),
+            count: None,
+            pulse: false,
+            active: false,
+            icon: None,
+            tree_glyph: "\u{251C}",
+        };
+        let el = build_subtab(0, 0, &sub, &shared);
+        assert!(find_by_class(&el, "subtab-count").is_none());
+    }
+
+    #[test]
+    fn subtab_with_pulse() {
+        let shared = make_shared();
+        let sub = Subtab {
+            label: "agents".to_string(),
+            count: Some(5),
+            pulse: true,
+            active: false,
+            icon: None,
+            tree_glyph: "\u{251C}",
+        };
+        let el = build_subtab(0, 0, &sub, &shared);
+        let count_el = find_by_class(&el, "subtab-count").unwrap();
+        assert!(has_class(count_el, "pulse"));
+    }
+
+    #[test]
+    fn subtab_has_tree_glyph_and_label() {
+        let shared = make_shared();
+        let sub = Subtab {
+            label: "sessions".to_string(),
+            count: None,
+            pulse: false,
+            active: false,
+            icon: None,
+            tree_glyph: "\u{2514}",
+        };
+        let el = build_subtab(0, 0, &sub, &shared);
+        let glyph = find_by_class(&el, "tree-glyph").unwrap();
+        assert_eq!(text_of(glyph), Some("\u{2514}"));
+        let label = find_by_class(&el, "subtab-label").unwrap();
+        assert_eq!(text_of(label), Some("sessions"));
+    }
+
+    // -- build_sidebar_footer --
+
+    #[test]
+    fn sidebar_footer_has_activity_items() {
+        let footer = build_sidebar_footer();
+        assert!(has_class(&footer, "sidebar-footer"));
+        // 1 title + 3 activity items
+        assert_eq!(footer.children.len(), 4);
+        let title = &footer.children[0];
+        assert!(has_class(title, "footer-title"));
+        assert_eq!(text_of(title), Some("activity"));
+    }
+
+    // -- activity_item --
+
+    #[test]
+    fn activity_item_structure() {
+        let item = activity_item("running", "claude", "running", "refactor logic");
+        assert!(has_class(&item, "activity-item"));
+        assert!(has_class(&item, "running"));
+        let row = find_by_class(&item, "activity-row").unwrap();
+        let name_el = find_by_class(row, "activity-name").unwrap();
+        assert_eq!(text_of(name_el), Some("claude"));
+        let state_el = find_by_class(row, "activity-state").unwrap();
+        assert_eq!(text_of(state_el), Some("running"));
+        let desc_el = find_by_class(&item, "activity-desc").unwrap();
+        assert_eq!(text_of(desc_el), Some("refactor logic"));
+    }
+
+    // -- build_sidebar_hints --
+
+    #[test]
+    fn sidebar_hints_has_four_hints() {
+        let hints = build_sidebar_hints();
+        assert!(has_class(&hints, "sidebar-hints"));
+        assert_eq!(hints.children.len(), 4);
+    }
+
+    // -- hint_item --
+
+    #[test]
+    fn hint_item_structure() {
+        let item = hint_item("x", "kill");
+        assert!(has_class(&item, "hint"));
+        assert_eq!(item.children.len(), 2);
+        let kbd = &item.children[0];
+        assert!(has_class(kbd, "kbd"));
+        assert_eq!(text_of(kbd), Some("x"));
+        let label = &item.children[1];
+        assert_eq!(text_of(label), Some("kill"));
+    }
+}

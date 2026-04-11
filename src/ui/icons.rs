@@ -210,3 +210,257 @@ pub fn subtab_icon_for(kind: SubtabIcon) -> SvgNode {
         SubtabIcon::EnvList => icon_env_list(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Helper functions -----------------------------------------------------
+
+    #[test]
+    fn path_d_parses_valid_path() {
+        let node = path_d("M2 4l4 4l-4 4");
+        assert!(matches!(node.primitive, SvgPrimitive::Path { .. }));
+        assert!(node.children.is_empty());
+    }
+
+    #[test]
+    fn circle_creates_circle_primitive() {
+        let node = circle(8.0, 6.0, 2.5);
+        assert!(matches!(
+            node.primitive,
+            SvgPrimitive::Circle { cx, cy, r }
+            if (cx - 8.0).abs() < f32::EPSILON
+            && (cy - 6.0).abs() < f32::EPSILON
+            && (r - 2.5).abs() < f32::EPSILON
+        ));
+    }
+
+    #[test]
+    fn rect_creates_rect_primitive() {
+        let node = rect(2.0, 3.0, 12.0, 10.0, 1.0);
+        assert!(matches!(
+            node.primitive,
+            SvgPrimitive::Rect { x, y, width, height, rx, ry }
+            if (x - 2.0).abs() < f32::EPSILON
+            && (y - 3.0).abs() < f32::EPSILON
+            && (width - 12.0).abs() < f32::EPSILON
+            && (height - 10.0).abs() < f32::EPSILON
+            && (rx - 1.0).abs() < f32::EPSILON
+            && (ry - 1.0).abs() < f32::EPSILON
+        ));
+    }
+
+    #[test]
+    fn line_creates_line_primitive() {
+        let node = line(6.0, 3.0, 6.0, 13.0);
+        assert!(matches!(
+            node.primitive,
+            SvgPrimitive::Line { x1, y1, x2, y2 }
+            if (x1 - 6.0).abs() < f32::EPSILON
+            && (y1 - 3.0).abs() < f32::EPSILON
+            && (x2 - 6.0).abs() < f32::EPSILON
+            && (y2 - 13.0).abs() < f32::EPSILON
+        ));
+    }
+
+    #[test]
+    fn group_wraps_children() {
+        let children = vec![path_d("M0 0l1 1"), circle(1.0, 1.0, 1.0)];
+        let node = group(SvgAttrs::default(), children);
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2);
+    }
+
+    #[test]
+    fn root_attrs_sets_viewbox_and_stroke() {
+        let attrs = root_attrs(1.6, StrokeLineCap::Round, StrokeLineJoin::Round);
+        assert!(attrs.view_box.is_some());
+        assert!(matches!(attrs.fill, Some(SvgPaint::None)));
+        assert!(matches!(attrs.stroke, Some(SvgPaint::Current)));
+        assert_eq!(attrs.stroke_width, Some(1.6));
+        assert_eq!(attrs.stroke_linecap, Some(StrokeLineCap::Round));
+        assert_eq!(attrs.stroke_linejoin, Some(StrokeLineJoin::Round));
+    }
+
+    #[test]
+    fn svg_icon_wraps_in_element_def() {
+        let node = icon_brand_chevron();
+        // Should produce an ElementDef without panicking
+        let _elem = svg_icon(node);
+    }
+
+    // -- Icon builder functions (smoke tests) ---------------------------------
+
+    #[test]
+    fn icon_brand_chevron_builds() {
+        let node = icon_brand_chevron();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2);
+    }
+
+    #[test]
+    fn icon_search_builds() {
+        let node = icon_search();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2); // rect + path
+    }
+
+    #[test]
+    fn icon_sidebar_toggle_builds() {
+        let node = icon_sidebar_toggle();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2); // rect + line
+    }
+
+    #[test]
+    fn icon_fullscreen_corners_builds() {
+        let node = icon_fullscreen_corners();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn icon_plus_builds() {
+        let node = icon_plus();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn icon_chevrons_builds() {
+        let node = icon_chevrons();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn icon_terminal_builds() {
+        let node = icon_terminal();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2); // rect + path
+    }
+
+    #[test]
+    fn icon_user_builds() {
+        let node = icon_user();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2); // circle + body_arc path
+    }
+
+    #[test]
+    fn icon_user_body_arc_has_round_linecap() {
+        let node = icon_user();
+        // The second child (body_arc) should have stroke_linecap set to Round
+        let body_arc = &node.children[1];
+        assert_eq!(body_arc.attrs.stroke_linecap, Some(StrokeLineCap::Round));
+    }
+
+    #[test]
+    fn icon_git_branch_builds() {
+        let node = icon_git_branch();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 4); // 3 circles + path
+    }
+
+    #[test]
+    fn icon_folder_builds() {
+        let node = icon_folder();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn icon_env_list_builds() {
+        let node = icon_env_list();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 4); // path + 3 dots
+    }
+
+    #[test]
+    fn icon_env_list_dots_have_fill() {
+        let node = icon_env_list();
+        // Children 1, 2, 3 are the dots with fill = Current
+        for i in 1..=3 {
+            assert!(
+                matches!(node.children[i].attrs.fill, Some(SvgPaint::Current)),
+                "dot at index {} should have fill=Current",
+                i,
+            );
+        }
+    }
+
+    #[test]
+    fn icon_split_h_builds() {
+        let node = icon_split_h();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2);
+    }
+
+    #[test]
+    fn icon_split_v_builds() {
+        let node = icon_split_v();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2);
+    }
+
+    #[test]
+    fn icon_grid_builds() {
+        let node = icon_grid();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 3); // rect + 2 lines
+    }
+
+    #[test]
+    fn icon_balance_builds() {
+        let node = icon_balance();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn icon_settings_builds() {
+        let node = icon_settings();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2); // circle + path
+    }
+
+    #[test]
+    fn icon_close_builds() {
+        let node = icon_close();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    // -- subtab_icon_for covers all variants ----------------------------------
+
+    #[test]
+    fn subtab_icon_for_terminal() {
+        let node = subtab_icon_for(SubtabIcon::Terminal);
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+    }
+
+    #[test]
+    fn subtab_icon_for_user() {
+        let node = subtab_icon_for(SubtabIcon::User);
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+    }
+
+    #[test]
+    fn subtab_icon_for_git_branch() {
+        let node = subtab_icon_for(SubtabIcon::GitBranch);
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+    }
+
+    #[test]
+    fn subtab_icon_for_folder() {
+        let node = subtab_icon_for(SubtabIcon::Folder);
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+    }
+
+    #[test]
+    fn subtab_icon_for_env_list() {
+        let node = subtab_icon_for(SubtabIcon::EnvList);
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+    }
+}

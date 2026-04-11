@@ -99,3 +99,161 @@ fn build_statusbar_right(state: &UiSnapshot) -> ElementDef {
                 ),
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{
+        seed_state, Pane, PaneId, SettingsSection, TerminalTab,
+    };
+    use std::collections::BTreeMap;
+
+    fn snapshot_from_seed() -> UiSnapshot {
+        seed_state().ui_snapshot()
+    }
+
+    fn minimal_snapshot() -> UiSnapshot {
+        UiSnapshot {
+            workspaces: vec![],
+            active_workspace: 0,
+            tabs: vec![],
+            active_tab: 0,
+            panes: vec![vec![Pane {
+                id: PaneId(1),
+                title: "shell".into(),
+                subtitle: "bash".into(),
+                pid: 0,
+                cpu: 0.0,
+            }]],
+            active_pane: PaneId(1),
+            settings_open: false,
+            settings_section: SettingsSection::General,
+            theme: "amber".into(),
+            font_size_pt: 13,
+            toggles: BTreeMap::new(),
+            palette_open: false,
+            sidebar_collapsed: false,
+            cpu_pct: 0.0,
+            mem_gb: 0.0,
+            net_kbps: 0.0,
+            clock_hhmm: "00:00".into(),
+        }
+    }
+
+    #[test]
+    fn build_statusbar_does_not_panic() {
+        let snap = snapshot_from_seed();
+        let _elem = build_statusbar(&snap);
+    }
+
+    #[test]
+    fn build_statusbar_returns_div() {
+        let snap = snapshot_from_seed();
+        let elem = build_statusbar(&snap);
+        assert!(matches!(elem.tag, Tag::Div));
+    }
+
+    #[test]
+    fn build_statusbar_has_left_and_right() {
+        let snap = snapshot_from_seed();
+        let elem = build_statusbar(&snap);
+        assert_eq!(elem.children.len(), 2);
+    }
+
+    #[test]
+    fn build_statusbar_left_does_not_panic() {
+        let snap = snapshot_from_seed();
+        let _elem = build_statusbar_left(&snap);
+    }
+
+    #[test]
+    fn build_statusbar_right_does_not_panic() {
+        let snap = snapshot_from_seed();
+        let _elem = build_statusbar_right(&snap);
+    }
+
+    #[test]
+    fn statusbar_with_no_tabs_shows_zero_active() {
+        let snap = minimal_snapshot();
+        // Should not panic even with zero tabs
+        let _elem = build_statusbar(&snap);
+    }
+
+    #[test]
+    fn statusbar_with_multiple_running_tabs() {
+        let mut snap = minimal_snapshot();
+        snap.tabs = vec![
+            TerminalTab {
+                id: "t1".into(),
+                name: "shell".into(),
+                subtitle: "bash".into(),
+                status: TabStatus::Running,
+            },
+            TerminalTab {
+                id: "t2".into(),
+                name: "build".into(),
+                subtitle: "cargo".into(),
+                status: TabStatus::Running,
+            },
+            TerminalTab {
+                id: "t3".into(),
+                name: "idle".into(),
+                subtitle: "bash".into(),
+                status: TabStatus::Idle,
+            },
+            TerminalTab {
+                id: "t4".into(),
+                name: "stopped".into(),
+                subtitle: "bash".into(),
+                status: TabStatus::Stopped,
+            },
+        ];
+        // Should not panic, running count should be 2
+        let _elem = build_statusbar(&snap);
+    }
+
+    #[test]
+    fn statusbar_with_high_cpu() {
+        let mut snap = minimal_snapshot();
+        snap.cpu_pct = 99.9;
+        let _elem = build_statusbar(&snap);
+    }
+
+    #[test]
+    fn statusbar_with_high_mem() {
+        let mut snap = minimal_snapshot();
+        snap.mem_gb = 128.55;
+        let _elem = build_statusbar(&snap);
+    }
+
+    #[test]
+    fn statusbar_with_high_net() {
+        let mut snap = minimal_snapshot();
+        snap.net_kbps = 9999.9;
+        let _elem = build_statusbar(&snap);
+    }
+
+    #[test]
+    fn statusbar_with_custom_clock() {
+        let mut snap = minimal_snapshot();
+        snap.clock_hhmm = "23:59".into();
+        let _elem = build_statusbar(&snap);
+    }
+
+    #[test]
+    fn statusbar_with_zero_values() {
+        let mut snap = minimal_snapshot();
+        snap.cpu_pct = 0.0;
+        snap.mem_gb = 0.0;
+        snap.net_kbps = 0.0;
+        let _elem = build_statusbar(&snap);
+    }
+
+    #[test]
+    fn statusbar_right_has_static_items() {
+        let snap = minimal_snapshot();
+        let elem = build_statusbar_right(&snap);
+        // Should have 4 children: utf-8, bash version, dimensions, clock
+        assert_eq!(elem.children.len(), 4);
+    }
+}

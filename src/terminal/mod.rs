@@ -1098,4 +1098,161 @@ mod tests {
         let cell = t.grid.get_cell(0, 0).unwrap();
         assert!(!cell.attrs.contains(CellAttrs::BOLD));
     }
+
+    // -- SGR attribute setting: DIM, INVERSE, STRIKETHROUGH -------------------
+
+    #[test]
+    fn sgr_dim() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[2mD");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(cell.attrs.contains(CellAttrs::DIM));
+    }
+
+    #[test]
+    fn sgr_inverse() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[7mI");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(cell.attrs.contains(CellAttrs::INVERSE));
+    }
+
+    #[test]
+    fn sgr_strikethrough() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[9mS");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(cell.attrs.contains(CellAttrs::STRIKETHROUGH));
+    }
+
+    // -- SGR attribute unsetting: codes 22-29 ---------------------------------
+
+    #[test]
+    fn sgr_unbold_undim() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[1;2m"); // bold + dim on
+        assert!(t.attrs.contains(CellAttrs::BOLD));
+        assert!(t.attrs.contains(CellAttrs::DIM));
+        t.process_bytes(b"\x1b[22m"); // unbold/undim
+        t.process_bytes(b"X");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(!cell.attrs.contains(CellAttrs::BOLD));
+        assert!(!cell.attrs.contains(CellAttrs::DIM));
+    }
+
+    #[test]
+    fn sgr_unitalic() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[3m"); // italic on
+        t.process_bytes(b"\x1b[23m"); // italic off
+        t.process_bytes(b"X");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(!cell.attrs.contains(CellAttrs::ITALIC));
+    }
+
+    #[test]
+    fn sgr_ununderline() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[4m"); // underline on
+        t.process_bytes(b"\x1b[24m"); // underline off
+        t.process_bytes(b"X");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(!cell.attrs.contains(CellAttrs::UNDERLINE));
+    }
+
+    #[test]
+    fn sgr_uninverse() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[7m"); // inverse on
+        t.process_bytes(b"\x1b[27m"); // inverse off
+        t.process_bytes(b"X");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(!cell.attrs.contains(CellAttrs::INVERSE));
+    }
+
+    #[test]
+    fn sgr_unstrikethrough() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[9m"); // strikethrough on
+        t.process_bytes(b"\x1b[29m"); // strikethrough off
+        t.process_bytes(b"X");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(!cell.attrs.contains(CellAttrs::STRIKETHROUGH));
+    }
+
+    // -- SGR background extended colors ---------------------------------------
+
+    #[test]
+    fn sgr_bg_256_color() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[48;5;82mX"); // 256-color bg
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell.bg, color_256(82));
+    }
+
+    #[test]
+    fn sgr_bg_truecolor() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[48;2;50;100;150mX"); // RGB bg
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell.bg, Color::rgb(50, 100, 150));
+    }
+
+    #[test]
+    fn sgr_bg_bright_colors() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[103mX"); // bright yellow bg (100 + 3)
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell.bg, ANSI_16[11]); // bright yellow = 8 + 3
+    }
+
+    // -- CSI 'f' (HVP) works like 'H' ----------------------------------------
+
+    #[test]
+    fn cursor_hvp_f() {
+        let mut t = Terminal::new(10, 20);
+        t.process_bytes(b"\x1b[4;12f"); // HVP: row 4, col 12
+        assert_eq!(t.cursor_position(), (3, 11)); // 1-based to 0-based
+    }
+
+    // -- Scroll edge cases ----------------------------------------------------
+
+    #[test]
+    fn scroll_down_on_zero_size_terminal() {
+        let mut t = Terminal::new(0, 0);
+        t.scroll_down(); // should not panic
+    }
+
+    // -- Erase display mode 1 (erase from start to cursor) --------------------
+
+    #[test]
+    fn erase_display_to_cursor() {
+        let mut t = Terminal::new(4, 20);
+        t.process_bytes(b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc\r\ndddddddddd");
+        // Cursor after writing is at row 3, col 10.
+        t.process_bytes(b"\x1b[2;5H"); // row 2, col 5 (0-indexed: 1, 4)
+        t.process_bytes(b"\x1b[1J"); // erase from start of display to cursor
+        // Row 0 should be fully erased
+        assert_eq!(row_text(&t, 0), "");
+        // Row 1: cols 0..4 erased, col 5 onward preserved
+        let cell_erased = t.grid.get_cell(1, 0).unwrap();
+        assert_eq!(cell_erased.ch, ' ');
+        let cell_kept = t.grid.get_cell(1, 5).unwrap();
+        assert_eq!(cell_kept.ch, 'b');
+        // Row 2 and 3 should be untouched
+        assert_eq!(row_text(&t, 2), "cccccccccc");
+        assert_eq!(row_text(&t, 3), "dddddddddd");
+    }
+
+    // -- Erase display mode 3 (same as 2, entire display) ---------------------
+
+    #[test]
+    fn erase_display_mode_3() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc");
+        t.process_bytes(b"\x1b[3J"); // erase entire display (with scrollback)
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "");
+        assert_eq!(row_text(&t, 2), "");
+    }
 }
