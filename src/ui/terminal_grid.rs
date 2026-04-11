@@ -2,8 +2,8 @@ use unshit::core::element::*;
 use unshit::core::event::{Event, EventType};
 
 use crate::state::{
-    mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane,
-    PaneId, SharedState, UiSnapshot,
+    mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane, PaneId,
+    SharedState, UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -22,15 +22,15 @@ pub fn build_terminal_grid(
             let is_active = pane.id == state.active_pane;
             // Add resizer between panes (except before the first one).
             if col_idx > 0 {
-                row_el = row_el.with_child(
-                    ElementDef::new(Tag::Div).with_class("pane-resizer"),
-                );
+                row_el = row_el.with_child(ElementDef::new(Tag::Div).with_class("pane-resizer"));
             }
             row_el = row_el.with_child(build_pane(pane, is_active, shared, grids));
         }
         if row_idx > 0 {
             grid_el = grid_el.with_child(
-                ElementDef::new(Tag::Div).with_class("pane-resizer").with_class("vertical"),
+                ElementDef::new(Tag::Div)
+                    .with_class("pane-resizer")
+                    .with_class("vertical"),
             );
         }
         grid_el = grid_el.with_child(row_el);
@@ -58,7 +58,9 @@ fn build_pane(
     });
 
     let body = build_pane_body(pane.id, is_active, shared, grids);
-    container.with_child(build_pane_header(pane, shared)).with_child(body)
+    container
+        .with_child(build_pane_header(pane, shared))
+        .with_child(body)
 }
 
 fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
@@ -84,7 +86,11 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
                         .with_text(format!("\u{00B7} {}", pane.subtitle)),
                 ),
         )
-        .with_child(ElementDef::new(Tag::Div).with_class("pane-meta").with_text(meta))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("pane-meta")
+                .with_text(meta),
+        )
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("pane-header-right")
@@ -161,12 +167,28 @@ fn build_pane_body(
             );
 
             // Register resize handler to update PTY dimensions.
+            // Prefer the renderer-computed pending resize (exact), fall
+            // back to global cell metrics, then to hardcoded estimates.
             let resize_shared = shared.clone();
             let resize_pane_id = pane_id;
             grid_el = grid_el.on_resize(move |w, h| {
-                // Estimate character dimensions: ~8px wide, ~16px tall for monospace.
-                let cols = (w / 8.0).max(1.0) as u16;
-                let rows = (h / 16.0).max(1.0) as u16;
+                // First, check if the renderer already published an exact
+                // pending resize (eliminates the stale-metrics timing gap).
+                let (cols, rows) = if let Some((c, r)) =
+                    unshit::core::cell_grid::CellGrid::take_pending_resize()
+                {
+                    (c, r)
+                } else {
+                    // Fall back to global cell metrics when available.
+                    let cell_w: f32 = unshit::core::cell_grid::CellGrid::global_cell_w();
+                    let cell_h: f32 = unshit::core::cell_grid::CellGrid::global_cell_h();
+                    let cw: f32 = if cell_w > 0.0 { cell_w } else { 8.0 };
+                    let ch: f32 = if cell_h > 0.0 { cell_h } else { 16.0 };
+                    let c = (w / cw).max(1.0) as u16;
+                    let r = (h / ch).max(1.0) as u16;
+                    (c, r)
+                };
+
                 mutate_with(&resize_shared, |st| {
                     st.pty_manager.resize(resize_pane_id.0, cols, rows);
                     if let Some(terminal) = st.terminals.get_mut(&resize_pane_id.0) {
@@ -249,8 +271,7 @@ mod tests {
         grids.insert(pane_id.0, grid);
 
         let body = build_pane_body(pane_id, true, &shared, &grids);
-        let content = find_terminal_content(&body)
-            .expect("terminal-content element should exist");
+        let content = find_terminal_content(&body).expect("terminal-content element should exist");
         assert!(
             content.captures_keyboard,
             "active pane terminal-content must capture keyboard"
@@ -268,8 +289,7 @@ mod tests {
         grids.insert(pane_id.0, grid);
 
         let body = build_pane_body(pane_id, false, &shared, &grids);
-        let content = find_terminal_content(&body)
-            .expect("terminal-content element should exist");
+        let content = find_terminal_content(&body).expect("terminal-content element should exist");
         assert_eq!(
             content.tab_index,
             Some(0),
@@ -278,6 +298,48 @@ mod tests {
         assert!(
             !content.captures_keyboard,
             "inactive pane must not capture keyboard"
+        );
+    }
+
+    /// The active pane must register an on_resize handler so the PTY
+    /// gets notified when the element dimensions change.
+    #[test]
+    fn active_pane_has_resize_handler() {
+        let shared = test_shared();
+        let pane_id = PaneId(1);
+        let grid = CellGrid::new(24, 80);
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id.0, grid);
+
+        let body = build_pane_body(pane_id, true, &shared, &grids);
+        let content = find_terminal_content(&body).expect("terminal-content element should exist");
+        assert!(
+            content.on_resize.is_some(),
+            "active pane terminal-content must have on_resize handler"
+        );
+    }
+
+    /// The resize handler should prefer renderer-computed pending resize
+    /// when available (issue #5 fix). When CellGrid::publish_pending_resize
+    /// was called before the on_resize handler fires, take_pending_resize
+    /// should return the exact dimensions.
+    #[test]
+    fn pending_resize_round_trips_through_cell_grid() {
+        // Publish a pending resize to simulate the renderer computing
+        // grid dimensions atomically.
+        CellGrid::publish_pending_resize(100, 30);
+        let result = CellGrid::take_pending_resize();
+        assert_eq!(
+            result,
+            Some((100, 30)),
+            "take_pending_resize should return the exact cols/rows published by the renderer"
+        );
+
+        // After take, should be cleared.
+        let second = CellGrid::take_pending_resize();
+        assert!(
+            second.is_none(),
+            "pending resize should be consumed after take"
         );
     }
 }
