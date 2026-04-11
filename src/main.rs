@@ -93,13 +93,19 @@ fn main() {
 
     let shared: SharedState = Arc::new(std::sync::Mutex::new(seed_state()));
 
-    // PTY spawn is deferred: the blink subscription will create terminals
-    // for all panes once the renderer publishes real cell metrics. This
-    // avoids the 80x24 hardcode that causes text misalignment on the first
-    // frame. See issue #5.
+    // Pre-publish cell metrics with defaults (scale=1.0, ratio=0.6) so that
+    // on_resize has non-zero values even before the renderer runs. The
+    // on_scale_factor callback will re-publish with the real DPI and a
+    // font-measured ratio once the window reports its scale factor. Issue #5.
+    {
+        let guard = shared.lock().unwrap();
+        crate::state::pre_publish_cell_metrics(guard.scale_factor, guard.cell_width_ratio);
+    }
 
     let tree_shared = shared.clone();
     let command_shared = shared.clone();
+    let scale_shared = shared.clone();
+    let close_shared = shared.clone();
     let sub_shared = shared.clone();
 
     let mut app = App::new(
@@ -119,6 +125,20 @@ fn main() {
             on_command: Some(Arc::new(move |command: &str| -> bool {
                 let mut guard = command_shared.lock().expect("state mutex poisoned");
                 dispatch(&mut guard, command)
+            })),
+            on_scale_factor: Some(Arc::new(move |scale: f32| {
+                let mut guard = scale_shared.lock().expect("state mutex poisoned");
+                guard.scale_factor = scale;
+                guard.cell_width_ratio =
+                    crate::state::measure_cell_width_ratio_at(12.0 * scale);
+                crate::state::pre_publish_cell_metrics(
+                    guard.scale_factor,
+                    guard.cell_width_ratio,
+                );
+            })),
+            on_close: Some(Arc::new(move || {
+                let mut guard = close_shared.lock().expect("state mutex poisoned");
+                guard.pty_manager.destroy_all();
             })),
             ..Default::default()
         },

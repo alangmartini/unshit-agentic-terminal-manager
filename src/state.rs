@@ -118,9 +118,10 @@ pub struct AppState {
     pub next_id: u32,
     pub pty_manager: crate::pty::PtyManager,
     pub terminals: std::collections::HashMap<u32, Terminal>,
+    pub scale_factor: f32,
+    /// Ratio of monospace cell_width to font_size, measured from the actual font.
+    pub cell_width_ratio: f32,
     /// Last known physical pixel dimensions of the terminal grid element.
-    /// Updated by the on_resize handler; used by the blink subscription
-    /// to compute correct PTY dimensions once cell metrics are available.
     pub last_grid_width: f32,
     pub last_grid_height: f32,
 }
@@ -347,6 +348,8 @@ pub fn seed_state() -> AppState {
         next_id: 2,
         pty_manager: crate::pty::PtyManager::new(),
         terminals: std::collections::HashMap::new(),
+        scale_factor: 1.0,
+        cell_width_ratio: 0.6,
         last_grid_width: 0.0,
         last_grid_height: 0.0,
     }
@@ -656,6 +659,43 @@ pub fn find_active_pane(state: &UiSnapshot) -> &Pane {
 
 pub fn is_on(state: &UiSnapshot, key: &str) -> bool {
     state.toggles.get(key).copied().unwrap_or(false)
+}
+
+/// Measure the actual monospace cell_width / font_size ratio using cosmic-text
+/// at a specific (DPI-scaled) font size. Because glyph hinting can produce
+/// different advance widths at different pixel sizes, the measurement must be
+/// taken at the same size the renderer will use.
+pub fn measure_cell_width_ratio_at(font_size: f32) -> f32 {
+    use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+
+    let mut fs = FontSystem::new();
+    let metrics = Metrics::new(font_size, font_size * 1.2);
+    let mut buffer = Buffer::new(&mut fs, metrics);
+    buffer.set_size(&mut fs, Some(font_size * 10.0), None);
+    buffer.set_text(
+        &mut fs,
+        "M",
+        Attrs::new().family(Family::Monospace),
+        Shaping::Advanced,
+    );
+    buffer.shape_until_scroll(&mut fs, false);
+
+    if let Some(glyph) = buffer
+        .layout_runs()
+        .flat_map(|run| run.glyphs.iter())
+        .next()
+    {
+        let ratio = glyph.w / font_size;
+        log::info!(
+            "measured monospace cell_width ratio: {:.4} (glyph.w={:.2} at font_size={:.1})",
+            ratio,
+            glyph.w,
+            font_size
+        );
+        return ratio;
+    }
+    log::warn!("failed to measure monospace cell_width, falling back to 0.6");
+    0.6
 }
 
 /// CSS base font-size in px. Must match `--t-md` in assets/styles.css.
