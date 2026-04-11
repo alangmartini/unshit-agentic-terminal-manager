@@ -639,3 +639,463 @@ fn reset_attrs(t: &mut Terminal) {
     t.bg = DEFAULT_BG;
     t.attrs = CellAttrs::empty();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: extract the text content of a terminal row as a trimmed string.
+    fn row_text(term: &Terminal, row: usize) -> String {
+        let mut s = String::new();
+        for col in 0..term.cols {
+            if let Some(cell) = term.grid.get_cell(row, col) {
+                s.push(cell.ch);
+            }
+        }
+        s.trim_end_matches(|c: char| c == ' ' || c == '\0').to_string()
+    }
+
+    // -- Construction ---------------------------------------------------------
+
+    #[test]
+    fn new_terminal_dimensions() {
+        let t = Terminal::new(24, 80);
+        assert_eq!(t.rows, 24);
+        assert_eq!(t.cols, 80);
+        assert_eq!(t.cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn default_terminal_is_24x80() {
+        let t = Terminal::default();
+        assert_eq!(t.rows, 24);
+        assert_eq!(t.cols, 80);
+    }
+
+    // -- Basic text output ----------------------------------------------------
+
+    #[test]
+    fn print_hello() {
+        let mut t = Terminal::new(5, 20);
+        t.process_bytes(b"Hello");
+        assert_eq!(row_text(&t, 0), "Hello");
+        assert_eq!(t.cursor_position(), (0, 5));
+    }
+
+    #[test]
+    fn print_with_newline() {
+        let mut t = Terminal::new(5, 20);
+        t.process_bytes(b"line1\r\nline2");
+        assert_eq!(row_text(&t, 0), "line1");
+        assert_eq!(row_text(&t, 1), "line2");
+    }
+
+    #[test]
+    fn line_wrap() {
+        let mut t = Terminal::new(3, 5);
+        t.process_bytes(b"abcdefgh");
+        assert_eq!(row_text(&t, 0), "abcde");
+        assert_eq!(row_text(&t, 1), "fgh");
+        assert_eq!(t.cursor_position(), (1, 3));
+    }
+
+    #[test]
+    fn scroll_on_overflow() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"line1\r\nline2\r\nline3\r\nline4");
+        // line1 should have scrolled off
+        assert_eq!(row_text(&t, 0), "line2");
+        assert_eq!(row_text(&t, 1), "line3");
+        assert_eq!(row_text(&t, 2), "line4");
+    }
+
+    // -- Control characters ---------------------------------------------------
+
+    #[test]
+    fn carriage_return() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"hello\rworld");
+        assert_eq!(row_text(&t, 0), "world");
+    }
+
+    #[test]
+    fn backspace() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"abc\x08X");
+        assert_eq!(row_text(&t, 0), "abX");
+    }
+
+    #[test]
+    fn tab_stops() {
+        let mut t = Terminal::new(3, 40);
+        t.process_bytes(b"a\tb");
+        // Tab should move to column 8
+        assert_eq!(t.cursor_position(), (0, 9)); // 'b' is at col 8, cursor at 9
+        let cell = t.grid.get_cell(0, 8).unwrap();
+        assert_eq!(cell.ch, 'b');
+    }
+
+    // -- Cursor movement (CSI) ------------------------------------------------
+
+    #[test]
+    fn cursor_up() {
+        let mut t = Terminal::new(10, 10);
+        t.process_bytes(b"\x1b[5;5H"); // move to row 5, col 5
+        assert_eq!(t.cursor_position(), (4, 4));
+        t.process_bytes(b"\x1b[2A"); // up 2
+        assert_eq!(t.cursor_position(), (2, 4));
+    }
+
+    #[test]
+    fn cursor_down() {
+        let mut t = Terminal::new(10, 10);
+        t.process_bytes(b"\x1b[1;1H"); // top left
+        t.process_bytes(b"\x1b[3B"); // down 3
+        assert_eq!(t.cursor_position(), (3, 0));
+    }
+
+    #[test]
+    fn cursor_forward() {
+        let mut t = Terminal::new(10, 10);
+        t.process_bytes(b"\x1b[5C"); // forward 5
+        assert_eq!(t.cursor_position(), (0, 5));
+    }
+
+    #[test]
+    fn cursor_back() {
+        let mut t = Terminal::new(10, 10);
+        t.process_bytes(b"\x1b[1;8H"); // col 8
+        t.process_bytes(b"\x1b[3D"); // back 3
+        assert_eq!(t.cursor_position(), (0, 4));
+    }
+
+    #[test]
+    fn cursor_position_absolute() {
+        let mut t = Terminal::new(10, 20);
+        t.process_bytes(b"\x1b[3;10H");
+        assert_eq!(t.cursor_position(), (2, 9)); // 1-based to 0-based
+    }
+
+    #[test]
+    fn cursor_clamps_to_bounds() {
+        let mut t = Terminal::new(5, 10);
+        t.process_bytes(b"\x1b[100;100H");
+        assert_eq!(t.cursor_position(), (4, 9)); // clamped
+    }
+
+    #[test]
+    fn cursor_cha() {
+        let mut t = Terminal::new(5, 20);
+        t.process_bytes(b"hello");
+        t.process_bytes(b"\x1b[3G"); // CHA: move to column 3
+        assert_eq!(t.cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn cursor_vpa() {
+        let mut t = Terminal::new(10, 10);
+        t.process_bytes(b"\x1b[5d"); // VPA: move to row 5
+        assert_eq!(t.cursor_position(), (4, 0));
+    }
+
+    // -- Erase operations -----------------------------------------------------
+
+    #[test]
+    fn erase_to_end_of_line() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"0123456789");
+        t.process_bytes(b"\x1b[1;4H"); // move to col 4
+        t.process_bytes(b"\x1b[0K"); // erase to end of line
+        assert_eq!(row_text(&t, 0), "012");
+    }
+
+    #[test]
+    fn erase_to_start_of_line() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"0123456789");
+        t.process_bytes(b"\x1b[1;4H"); // move to col 4 (0-indexed: 3)
+        t.process_bytes(b"\x1b[1K"); // erase from start to cursor
+        // Cols 0..3 should be blank, 4..9 preserved
+        let cell0 = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell0.ch, ' ');
+        let cell4 = t.grid.get_cell(0, 4).unwrap();
+        assert_eq!(cell4.ch, '4');
+    }
+
+    #[test]
+    fn erase_entire_line() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"0123456789");
+        t.process_bytes(b"\x1b[1;5H");
+        t.process_bytes(b"\x1b[2K"); // erase entire line
+        assert_eq!(row_text(&t, 0), "");
+    }
+
+    #[test]
+    fn erase_display_from_cursor() {
+        let mut t = Terminal::new(3, 15);
+        t.process_bytes(b"aaa\r\nbbb\r\nccc");
+        // Cursor is now at row 2, col 3.
+        // Move to row 2, col 2 (1-based: row 2, col 2).
+        t.process_bytes(b"\x1b[2;2H"); // row 2, col 2 (0-indexed: row 1, col 1)
+        t.process_bytes(b"\x1b[0J"); // erase from cursor to end
+        assert_eq!(row_text(&t, 0), "aaa");
+        // Row 1: col 0 = 'b', col 1 onward erased
+        let cell = t.grid.get_cell(1, 0).unwrap();
+        assert_eq!(cell.ch, 'b');
+        let cell = t.grid.get_cell(1, 1).unwrap();
+        assert_eq!(cell.ch, ' ');
+        assert_eq!(row_text(&t, 2), "");
+    }
+
+    #[test]
+    fn erase_entire_display() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc");
+        t.process_bytes(b"\x1b[2J"); // erase entire display
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "");
+        assert_eq!(row_text(&t, 2), "");
+    }
+
+    // -- Resize ---------------------------------------------------------------
+
+    #[test]
+    fn resize_clamps_cursor() {
+        let mut t = Terminal::new(10, 20);
+        t.process_bytes(b"\x1b[8;15H"); // row 8, col 15
+        assert_eq!(t.cursor_position(), (7, 14));
+
+        t.resize(5, 10);
+        assert_eq!(t.rows, 5);
+        assert_eq!(t.cols, 10);
+        assert_eq!(t.cursor_position(), (4, 9)); // clamped
+    }
+
+    // -- SGR (text attributes) ------------------------------------------------
+
+    #[test]
+    fn sgr_bold() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[1mBold\x1b[0m");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(cell.attrs.contains(CellAttrs::BOLD));
+        assert_eq!(cell.ch, 'B');
+    }
+
+    #[test]
+    fn sgr_italic_underline() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[3;4mtext\x1b[0m");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(cell.attrs.contains(CellAttrs::ITALIC));
+        assert!(cell.attrs.contains(CellAttrs::UNDERLINE));
+    }
+
+    #[test]
+    fn sgr_reset() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[1;3mX\x1b[0mY");
+        let x = t.grid.get_cell(0, 0).unwrap();
+        assert!(x.attrs.contains(CellAttrs::BOLD));
+        let y = t.grid.get_cell(0, 1).unwrap();
+        assert!(!y.attrs.contains(CellAttrs::BOLD));
+        assert!(!y.attrs.contains(CellAttrs::ITALIC));
+    }
+
+    #[test]
+    fn sgr_foreground_standard() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[31mR"); // red foreground
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell.fg, ANSI_16[1]); // index 1 = red
+    }
+
+    #[test]
+    fn sgr_background_standard() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[42mG"); // green background
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell.bg, ANSI_16[2]); // index 2 = green
+    }
+
+    #[test]
+    fn sgr_256_color() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[38;5;196mR"); // 256-color fg
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell.fg, color_256(196));
+    }
+
+    #[test]
+    fn sgr_truecolor() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[38;2;100;150;200mX"); // RGB fg
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell.fg, Color::rgb(100, 150, 200));
+    }
+
+    #[test]
+    fn sgr_default_fg_bg() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[31;42m"); // set colors
+        t.process_bytes(b"\x1b[39;49m"); // reset to default
+        t.process_bytes(b"X");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell.fg, DEFAULT_FG);
+        assert_eq!(cell.bg, DEFAULT_BG);
+    }
+
+    #[test]
+    fn sgr_bright_colors() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[91mX"); // bright red fg
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell.fg, ANSI_16[9]); // bright red = 8+1
+
+        t.process_bytes(b"\x1b[102mY"); // bright green bg
+        let cell = t.grid.get_cell(0, 1).unwrap();
+        assert_eq!(cell.bg, ANSI_16[10]); // bright green = 8+2
+    }
+
+    // -- ESC sequences --------------------------------------------------------
+
+    #[test]
+    fn save_restore_cursor() {
+        let mut t = Terminal::new(10, 20);
+        t.process_bytes(b"\x1b[3;5H"); // move to (2,4)
+        t.process_bytes(b"\x1b7"); // save cursor
+        t.process_bytes(b"\x1b[1;1H"); // move to (0,0)
+        assert_eq!(t.cursor_position(), (0, 0));
+        t.process_bytes(b"\x1b8"); // restore cursor
+        assert_eq!(t.cursor_position(), (2, 4));
+    }
+
+    #[test]
+    fn reverse_index_at_top_scrolls_down() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"line1\r\nline2\r\nline3");
+        t.process_bytes(b"\x1b[1;1H"); // go to top
+        t.process_bytes(b"\x1bM"); // reverse index
+        // line1 should move to row 1, row 0 should be blank
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "line1");
+    }
+
+    #[test]
+    fn reverse_index_not_at_top_just_moves_up() {
+        let mut t = Terminal::new(5, 10);
+        t.process_bytes(b"\x1b[3;1H"); // row 3
+        t.process_bytes(b"\x1bM"); // reverse index
+        assert_eq!(t.cursor_position(), (1, 0)); // moved up one
+    }
+
+    // -- OSC (window title) ---------------------------------------------------
+
+    #[test]
+    fn osc_sets_title() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b]0;My Terminal\x07");
+        assert_eq!(t.title(), "My Terminal");
+    }
+
+    #[test]
+    fn osc2_sets_title() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b]2;Another Title\x07");
+        assert_eq!(t.title(), "Another Title");
+    }
+
+    // -- Insert/Delete characters ---------------------------------------------
+
+    #[test]
+    fn insert_characters() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"abcde");
+        t.process_bytes(b"\x1b[1;3H"); // col 3 (0-indexed: 2)
+        t.process_bytes(b"\x1b[2@"); // insert 2 blanks
+        let cell_a = t.grid.get_cell(0, 0).unwrap();
+        assert_eq!(cell_a.ch, 'a');
+        let cell_b = t.grid.get_cell(0, 1).unwrap();
+        assert_eq!(cell_b.ch, 'b');
+        let cell_blank = t.grid.get_cell(0, 2).unwrap();
+        assert_eq!(cell_blank.ch, ' ');
+        let cell_c = t.grid.get_cell(0, 4).unwrap();
+        assert_eq!(cell_c.ch, 'c');
+    }
+
+    #[test]
+    fn delete_characters() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"abcde");
+        t.process_bytes(b"\x1b[1;2H"); // col 2 (0-indexed: 1)
+        t.process_bytes(b"\x1b[2P"); // delete 2 chars
+        assert_eq!(row_text(&t, 0), "ade");
+    }
+
+    // -- Scroll operations ----------------------------------------------------
+
+    #[test]
+    fn scroll_up_csi() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"line1\r\nline2\r\nline3");
+        t.process_bytes(b"\x1b[1S"); // scroll up 1
+        assert_eq!(row_text(&t, 0), "line2");
+        assert_eq!(row_text(&t, 1), "line3");
+        assert_eq!(row_text(&t, 2), "");
+    }
+
+    #[test]
+    fn scroll_down_csi() {
+        let mut t = Terminal::new(3, 10);
+        t.process_bytes(b"line1\r\nline2\r\nline3");
+        t.process_bytes(b"\x1b[1T"); // scroll down 1
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "line1");
+        assert_eq!(row_text(&t, 2), "line2");
+    }
+
+    // -- Insert/Delete lines --------------------------------------------------
+
+    #[test]
+    fn insert_lines() {
+        let mut t = Terminal::new(4, 10);
+        t.process_bytes(b"aaaa\r\nbbbb\r\ncccc\r\ndddd");
+        t.process_bytes(b"\x1b[2;1H"); // row 2
+        t.process_bytes(b"\x1b[1L"); // insert 1 line
+        assert_eq!(row_text(&t, 0), "aaaa");
+        assert_eq!(row_text(&t, 1), ""); // inserted blank
+        assert_eq!(row_text(&t, 2), "bbbb");
+        assert_eq!(row_text(&t, 3), "cccc");
+    }
+
+    #[test]
+    fn delete_lines() {
+        let mut t = Terminal::new(4, 10);
+        t.process_bytes(b"aaaa\r\nbbbb\r\ncccc\r\ndddd");
+        t.process_bytes(b"\x1b[2;1H"); // row 2
+        t.process_bytes(b"\x1b[1M"); // delete 1 line
+        assert_eq!(row_text(&t, 0), "aaaa");
+        assert_eq!(row_text(&t, 1), "cccc");
+        assert_eq!(row_text(&t, 2), "dddd");
+        assert_eq!(row_text(&t, 3), ""); // blank bottom
+    }
+
+    // -- Edge cases -----------------------------------------------------------
+
+    #[test]
+    fn zero_size_terminal_does_not_panic() {
+        let mut t = Terminal::new(0, 0);
+        t.process_bytes(b"hello"); // should not panic
+    }
+
+    #[test]
+    fn empty_sgr_resets() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[1m"); // bold on
+        t.process_bytes(b"\x1b[m"); // SGR with no params = reset
+        t.process_bytes(b"X");
+        let cell = t.grid.get_cell(0, 0).unwrap();
+        assert!(!cell.attrs.contains(CellAttrs::BOLD));
+    }
+}

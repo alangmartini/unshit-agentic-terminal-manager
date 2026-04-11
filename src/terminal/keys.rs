@@ -200,3 +200,324 @@ fn xterm_modifier(shift: bool, alt: bool, ctrl: bool) -> u8 {
     if ctrl { m += 4; }
     if m == 1 { 0 } else { m }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a simple key-press event for testing.
+    fn key_event(key: Key, modifiers: Modifiers) -> KeyboardEvent {
+        KeyboardEvent {
+            key,
+            kind: KeyEventKind::Pressed,
+            modifiers,
+            text: None,
+        }
+    }
+
+    fn key_event_with_text(key: Key, modifiers: Modifiers, text: &str) -> KeyboardEvent {
+        KeyboardEvent {
+            key,
+            kind: KeyEventKind::Pressed,
+            modifiers,
+            text: Some(text.to_string()),
+        }
+    }
+
+    fn key_up(key: Key) -> KeyboardEvent {
+        KeyboardEvent {
+            key,
+            kind: KeyEventKind::Released,
+            modifiers: Modifiers::empty(),
+            text: None,
+        }
+    }
+
+    // -- Key-up events are ignored --------------------------------------------
+
+    #[test]
+    fn key_up_returns_none() {
+        assert!(encode_key(&key_up(Key::Char('a'))).is_none());
+        assert!(encode_key(&key_up(Key::Enter)).is_none());
+    }
+
+    // -- Plain characters -----------------------------------------------------
+
+    #[test]
+    fn plain_char() {
+        let result = encode_key(&key_event(Key::Char('a'), Modifiers::empty()));
+        assert_eq!(result, Some(vec![b'a']));
+    }
+
+    #[test]
+    fn char_with_text_field() {
+        let result = encode_key(&key_event_with_text(
+            Key::Char('a'),
+            Modifiers::empty(),
+            "hello",
+        ));
+        assert_eq!(result, Some(b"hello".to_vec()));
+    }
+
+    // -- Ctrl+char produces control codes -------------------------------------
+
+    #[test]
+    fn ctrl_a() {
+        let result = encode_key(&key_event(Key::Char('a'), Modifiers::CTRL));
+        assert_eq!(result, Some(vec![0x01]));
+    }
+
+    #[test]
+    fn ctrl_c() {
+        let result = encode_key(&key_event(Key::Char('c'), Modifiers::CTRL));
+        assert_eq!(result, Some(vec![0x03]));
+    }
+
+    #[test]
+    fn ctrl_z() {
+        let result = encode_key(&key_event(Key::Char('z'), Modifiers::CTRL));
+        assert_eq!(result, Some(vec![0x1A]));
+    }
+
+    // -- Alt+char prepends ESC ------------------------------------------------
+
+    #[test]
+    fn alt_a() {
+        let result = encode_key(&key_event(Key::Char('a'), Modifiers::ALT));
+        assert_eq!(result, Some(vec![0x1b, b'a']));
+    }
+
+    #[test]
+    fn alt_shift_a() {
+        let result = encode_key(&key_event(
+            Key::Char('a'),
+            Modifiers::ALT | Modifiers::SHIFT,
+        ));
+        assert_eq!(result, Some(vec![0x1b, b'A']));
+    }
+
+    // -- Simple special keys --------------------------------------------------
+
+    #[test]
+    fn enter() {
+        assert_eq!(
+            encode_key(&key_event(Key::Enter, Modifiers::empty())),
+            Some(vec![0x0D])
+        );
+    }
+
+    #[test]
+    fn tab() {
+        assert_eq!(
+            encode_key(&key_event(Key::Tab, Modifiers::empty())),
+            Some(vec![0x09])
+        );
+    }
+
+    #[test]
+    fn backspace() {
+        assert_eq!(
+            encode_key(&key_event(Key::Backspace, Modifiers::empty())),
+            Some(vec![0x7F])
+        );
+    }
+
+    #[test]
+    fn escape() {
+        assert_eq!(
+            encode_key(&key_event(Key::Escape, Modifiers::empty())),
+            Some(vec![0x1B])
+        );
+    }
+
+    #[test]
+    fn space() {
+        assert_eq!(
+            encode_key(&key_event(Key::Space, Modifiers::empty())),
+            Some(vec![0x20])
+        );
+    }
+
+    #[test]
+    fn ctrl_space() {
+        assert_eq!(
+            encode_key(&key_event(Key::Space, Modifiers::CTRL)),
+            Some(vec![0x00])
+        );
+    }
+
+    // -- Arrow keys -----------------------------------------------------------
+
+    #[test]
+    fn arrow_up() {
+        assert_eq!(
+            encode_key(&key_event(Key::ArrowUp, Modifiers::empty())),
+            Some(vec![0x1b, b'[', b'A'])
+        );
+    }
+
+    #[test]
+    fn arrow_down() {
+        assert_eq!(
+            encode_key(&key_event(Key::ArrowDown, Modifiers::empty())),
+            Some(vec![0x1b, b'[', b'B'])
+        );
+    }
+
+    #[test]
+    fn ctrl_arrow_right() {
+        let result = encode_key(&key_event(Key::ArrowRight, Modifiers::CTRL));
+        // Ctrl modifier = 5, so \x1b[1;5C
+        assert_eq!(result, Some(b"\x1b[1;5C".to_vec()));
+    }
+
+    #[test]
+    fn shift_arrow_left() {
+        let result = encode_key(&key_event(Key::ArrowLeft, Modifiers::SHIFT));
+        // Shift modifier = 2, so \x1b[1;2D
+        assert_eq!(result, Some(b"\x1b[1;2D".to_vec()));
+    }
+
+    // -- Navigation keys ------------------------------------------------------
+
+    #[test]
+    fn home() {
+        assert_eq!(
+            encode_key(&key_event(Key::Home, Modifiers::empty())),
+            Some(vec![0x1b, b'[', b'H'])
+        );
+    }
+
+    #[test]
+    fn end() {
+        assert_eq!(
+            encode_key(&key_event(Key::End, Modifiers::empty())),
+            Some(vec![0x1b, b'[', b'F'])
+        );
+    }
+
+    #[test]
+    fn page_up() {
+        assert_eq!(
+            encode_key(&key_event(Key::PageUp, Modifiers::empty())),
+            Some(b"\x1b[5~".to_vec())
+        );
+    }
+
+    #[test]
+    fn page_down() {
+        assert_eq!(
+            encode_key(&key_event(Key::PageDown, Modifiers::empty())),
+            Some(b"\x1b[6~".to_vec())
+        );
+    }
+
+    #[test]
+    fn delete() {
+        assert_eq!(
+            encode_key(&key_event(Key::Delete, Modifiers::empty())),
+            Some(b"\x1b[3~".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_delete() {
+        let result = encode_key(&key_event(Key::Delete, Modifiers::CTRL));
+        assert_eq!(result, Some(b"\x1b[3;5~".to_vec()));
+    }
+
+    // -- Function keys --------------------------------------------------------
+
+    #[test]
+    fn f1() {
+        assert_eq!(
+            encode_key(&key_event(Key::F(1), Modifiers::empty())),
+            Some(vec![0x1b, b'O', b'P'])
+        );
+    }
+
+    #[test]
+    fn f4() {
+        assert_eq!(
+            encode_key(&key_event(Key::F(4), Modifiers::empty())),
+            Some(vec![0x1b, b'O', b'S'])
+        );
+    }
+
+    #[test]
+    fn f5() {
+        assert_eq!(
+            encode_key(&key_event(Key::F(5), Modifiers::empty())),
+            Some(b"\x1b[15~".to_vec())
+        );
+    }
+
+    #[test]
+    fn f12() {
+        assert_eq!(
+            encode_key(&key_event(Key::F(12), Modifiers::empty())),
+            Some(b"\x1b[24~".to_vec())
+        );
+    }
+
+    #[test]
+    fn f13_returns_none() {
+        assert!(encode_key(&key_event(Key::F(13), Modifiers::empty())).is_none());
+    }
+
+    #[test]
+    fn ctrl_f1() {
+        let result = encode_key(&key_event(Key::F(1), Modifiers::CTRL));
+        // Modified F1: \x1b[1;5P
+        assert_eq!(result, Some(b"\x1b[1;5P".to_vec()));
+    }
+
+    // -- Unknown key ----------------------------------------------------------
+
+    #[test]
+    fn unknown_key_returns_none() {
+        assert!(encode_key(&key_event(Key::Unknown, Modifiers::empty())).is_none());
+    }
+
+    // -- xterm_modifier -------------------------------------------------------
+
+    #[test]
+    fn modifier_none() {
+        assert_eq!(xterm_modifier(false, false, false), 0);
+    }
+
+    #[test]
+    fn modifier_shift() {
+        assert_eq!(xterm_modifier(true, false, false), 2);
+    }
+
+    #[test]
+    fn modifier_alt() {
+        assert_eq!(xterm_modifier(false, true, false), 3);
+    }
+
+    #[test]
+    fn modifier_ctrl() {
+        assert_eq!(xterm_modifier(false, false, true), 5);
+    }
+
+    #[test]
+    fn modifier_shift_alt() {
+        assert_eq!(xterm_modifier(true, true, false), 4);
+    }
+
+    #[test]
+    fn modifier_shift_ctrl() {
+        assert_eq!(xterm_modifier(true, false, true), 6);
+    }
+
+    #[test]
+    fn modifier_alt_ctrl() {
+        assert_eq!(xterm_modifier(false, true, true), 7);
+    }
+
+    #[test]
+    fn modifier_all() {
+        assert_eq!(xterm_modifier(true, true, true), 8);
+    }
+}

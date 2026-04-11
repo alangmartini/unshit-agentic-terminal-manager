@@ -628,3 +628,423 @@ pub fn find_active_pane(state: &UiSnapshot) -> &Pane {
 pub fn is_on(state: &UiSnapshot, key: &str) -> bool {
     state.toggles.get(key).copied().unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal AppState for testing tab/dispatch logic.
+    /// Avoids PTY spawning by providing empty panes and terminals directly.
+    fn test_state() -> AppState {
+        let tabs = vec![
+            TerminalTab {
+                id: "t1".to_string(),
+                name: "shell".to_string(),
+                subtitle: "bash".to_string(),
+                status: TabStatus::Running,
+            },
+        ];
+        let pane = Pane {
+            id: PaneId(1),
+            title: "shell".to_string(),
+            subtitle: "bash".to_string(),
+            pid: 0,
+            cpu: 0.0,
+        };
+        AppState {
+            workspaces: vec![],
+            active_workspace: 0,
+            tabs,
+            active_tab: 0,
+            panes: vec![vec![pane]],
+            active_pane: PaneId(1),
+            settings_open: false,
+            settings_section: SettingsSection::General,
+            theme: "amber".to_string(),
+            font_size_pt: 13,
+            toggles: BTreeMap::new(),
+            palette_open: false,
+            sidebar_collapsed: false,
+            cpu_pct: 0.0,
+            mem_gb: 0.0,
+            net_kbps: 0.0,
+            clock_hhmm: "12:00".to_string(),
+            next_id: 2,
+            pty_manager: crate::pty::PtyManager::new(),
+            terminals: std::collections::HashMap::new(),
+        }
+    }
+
+    // -- SettingsSection ------------------------------------------------------
+
+    #[test]
+    fn settings_section_labels() {
+        assert_eq!(SettingsSection::General.label(), "general");
+        assert_eq!(SettingsSection::Appearance.label(), "appearance");
+        assert_eq!(SettingsSection::Shell.label(), "shell");
+        assert_eq!(SettingsSection::Keybinds.label(), "keybinds");
+        assert_eq!(SettingsSection::Agents.label(), "agents");
+    }
+
+    #[test]
+    fn settings_section_all_returns_five() {
+        let all = SettingsSection::all();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0], SettingsSection::General);
+        assert_eq!(all[4], SettingsSection::Agents);
+    }
+
+    // -- Tab mutations --------------------------------------------------------
+
+    #[test]
+    fn add_tab_increments_id_and_activates() {
+        let mut state = test_state();
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.next_id, 2);
+
+        mutate_add_tab(&mut state);
+
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.tabs[1].id, "t2");
+        assert_eq!(state.active_tab, 1);
+        assert_eq!(state.next_id, 3);
+    }
+
+    #[test]
+    fn close_tab_removes_and_adjusts_active() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state); // t2
+        mutate_add_tab(&mut state); // t3
+        // tabs: [t1, t2, t3], active = 2
+
+        // Close middle tab while active is after it
+        state.active_tab = 2;
+        mutate_close_tab(&mut state, 1);
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.active_tab, 1); // shifted left
+    }
+
+    #[test]
+    fn close_active_tab_clamps() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        // tabs: [t1, t2], active = 1
+
+        mutate_close_tab(&mut state, 1); // close active (last)
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.active_tab, 0);
+    }
+
+    #[test]
+    fn close_last_tab_creates_new_one() {
+        let mut state = test_state();
+        // only one tab
+        mutate_close_tab(&mut state, 0);
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.tabs[0].id, "t2"); // new tab was created
+    }
+
+    #[test]
+    fn close_tab_out_of_bounds_is_noop() {
+        let mut state = test_state();
+        let len_before = state.tabs.len();
+        mutate_close_tab(&mut state, 999);
+        assert_eq!(state.tabs.len(), len_before);
+    }
+
+    #[test]
+    fn close_tab_before_active_decrements_active() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state); // t2
+        mutate_add_tab(&mut state); // t3
+        state.active_tab = 2;
+
+        mutate_close_tab(&mut state, 0);
+        assert_eq!(state.active_tab, 1);
+    }
+
+    // -- find_pane_coord ------------------------------------------------------
+
+    #[test]
+    fn find_pane_coord_finds_existing() {
+        let state = test_state();
+        assert_eq!(find_pane_coord(&state, PaneId(1)), Some((0, 0)));
+    }
+
+    #[test]
+    fn find_pane_coord_returns_none_for_missing() {
+        let state = test_state();
+        assert_eq!(find_pane_coord(&state, PaneId(999)), None);
+    }
+
+    #[test]
+    fn find_pane_coord_multi_row() {
+        let mut state = test_state();
+        let pane2 = Pane {
+            id: PaneId(5),
+            title: "test".to_string(),
+            subtitle: "".to_string(),
+            pid: 0,
+            cpu: 0.0,
+        };
+        state.panes.push(vec![pane2]);
+        assert_eq!(find_pane_coord(&state, PaneId(5)), Some((1, 0)));
+    }
+
+    // -- Font size ------------------------------------------------------------
+
+    #[test]
+    fn font_size_increments() {
+        let mut state = test_state();
+        state.font_size_pt = 13;
+        mutate_font_size_delta(&mut state, 1);
+        assert_eq!(state.font_size_pt, 14);
+    }
+
+    #[test]
+    fn font_size_clamps_at_max() {
+        let mut state = test_state();
+        state.font_size_pt = MAX_FONT_SIZE;
+        mutate_font_size_delta(&mut state, 1);
+        assert_eq!(state.font_size_pt, MAX_FONT_SIZE);
+    }
+
+    #[test]
+    fn font_size_clamps_at_min() {
+        let mut state = test_state();
+        state.font_size_pt = MIN_FONT_SIZE;
+        mutate_font_size_delta(&mut state, -1);
+        assert_eq!(state.font_size_pt, MIN_FONT_SIZE);
+    }
+
+    #[test]
+    fn font_size_large_delta_clamps() {
+        let mut state = test_state();
+        state.font_size_pt = 13;
+        mutate_font_size_delta(&mut state, 100);
+        assert_eq!(state.font_size_pt, MAX_FONT_SIZE);
+    }
+
+    // -- dispatch -------------------------------------------------------------
+
+    #[test]
+    fn dispatch_modal_open_close() {
+        let mut state = test_state();
+        assert!(!state.settings_open);
+
+        assert!(dispatch(&mut state, "modal.open"));
+        assert!(state.settings_open);
+
+        // Opening again returns false (already open)
+        assert!(!dispatch(&mut state, "modal.open"));
+
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!state.settings_open);
+
+        // Closing again returns false (already closed)
+        assert!(!dispatch(&mut state, "modal.close"));
+    }
+
+    #[test]
+    fn dispatch_tab_new() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "tab.new"));
+        assert_eq!(state.tabs.len(), 2);
+    }
+
+    #[test]
+    fn dispatch_tab_close_active() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        state.active_tab = 1;
+        assert!(dispatch(&mut state, "tab.close.active"));
+        assert_eq!(state.tabs.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_tab_next_wraps() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        mutate_add_tab(&mut state);
+        state.active_tab = 0;
+
+        assert!(dispatch(&mut state, "tab.next"));
+        assert_eq!(state.active_tab, 1);
+
+        assert!(dispatch(&mut state, "tab.next"));
+        assert_eq!(state.active_tab, 2);
+
+        // Wraps to 0
+        assert!(dispatch(&mut state, "tab.next"));
+        assert_eq!(state.active_tab, 0);
+    }
+
+    #[test]
+    fn dispatch_tab_prev_wraps() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        mutate_add_tab(&mut state);
+        state.active_tab = 0;
+
+        // Wraps to last
+        assert!(dispatch(&mut state, "tab.prev"));
+        assert_eq!(state.active_tab, 2);
+
+        assert!(dispatch(&mut state, "tab.prev"));
+        assert_eq!(state.active_tab, 1);
+    }
+
+    #[test]
+    fn dispatch_tab_switch() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        mutate_add_tab(&mut state);
+        state.active_tab = 0;
+
+        assert!(dispatch(&mut state, "tab.switch:2"));
+        assert_eq!(state.active_tab, 2);
+
+        // Switching to current tab returns false
+        assert!(!dispatch(&mut state, "tab.switch:2"));
+
+        // Out-of-bounds returns false
+        assert!(!dispatch(&mut state, "tab.switch:99"));
+
+        // Invalid number returns false
+        assert!(!dispatch(&mut state, "tab.switch:abc"));
+    }
+
+    #[test]
+    fn dispatch_sidebar_toggle() {
+        let mut state = test_state();
+        assert!(!state.sidebar_collapsed);
+
+        assert!(dispatch(&mut state, "sidebar.toggle"));
+        assert!(state.sidebar_collapsed);
+
+        assert!(dispatch(&mut state, "sidebar.toggle"));
+        assert!(!state.sidebar_collapsed);
+    }
+
+    #[test]
+    fn dispatch_font_inc_dec() {
+        let mut state = test_state();
+        state.font_size_pt = 13;
+
+        assert!(dispatch(&mut state, "font.inc"));
+        assert_eq!(state.font_size_pt, 14);
+
+        assert!(dispatch(&mut state, "font.dec"));
+        assert_eq!(state.font_size_pt, 13);
+    }
+
+    #[test]
+    fn dispatch_font_inc_at_max_returns_false() {
+        let mut state = test_state();
+        state.font_size_pt = MAX_FONT_SIZE;
+        assert!(!dispatch(&mut state, "font.inc"));
+    }
+
+    #[test]
+    fn dispatch_font_dec_at_min_returns_false() {
+        let mut state = test_state();
+        state.font_size_pt = MIN_FONT_SIZE;
+        assert!(!dispatch(&mut state, "font.dec"));
+    }
+
+    #[test]
+    fn dispatch_palette_toggle() {
+        let mut state = test_state();
+        assert!(!state.palette_open);
+
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(state.palette_open);
+
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(!state.palette_open);
+    }
+
+    #[test]
+    fn dispatch_unknown_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "nonexistent.command"));
+    }
+
+    // -- find_active_pane / is_on ---------------------------------------------
+
+    #[test]
+    fn find_active_pane_returns_matching() {
+        let state = test_state();
+        let snap = state.ui_snapshot();
+        let pane = find_active_pane(&snap);
+        assert_eq!(pane.id, PaneId(1));
+    }
+
+    #[test]
+    fn find_active_pane_falls_back_to_first() {
+        let mut state = test_state();
+        state.active_pane = PaneId(999); // non-existent
+        let snap = state.ui_snapshot();
+        let pane = find_active_pane(&snap);
+        assert_eq!(pane.id, PaneId(1)); // falls back
+    }
+
+    #[test]
+    fn is_on_returns_value_or_false() {
+        let mut state = test_state();
+        state.toggles.insert("glow".to_string(), true);
+        state.toggles.insert("dim".to_string(), false);
+        let snap = state.ui_snapshot();
+
+        assert!(is_on(&snap, "glow"));
+        assert!(!is_on(&snap, "dim"));
+        assert!(!is_on(&snap, "nonexistent"));
+    }
+
+    // -- ui_snapshot ----------------------------------------------------------
+
+    #[test]
+    fn ui_snapshot_copies_fields() {
+        let mut state = test_state();
+        state.font_size_pt = 20;
+        state.theme = "dracula".to_string();
+        state.sidebar_collapsed = true;
+
+        let snap = state.ui_snapshot();
+        assert_eq!(snap.font_size_pt, 20);
+        assert_eq!(snap.theme, "dracula");
+        assert!(snap.sidebar_collapsed);
+    }
+
+    // -- seed_state -----------------------------------------------------------
+
+    #[test]
+    fn seed_state_has_reasonable_defaults() {
+        let state = seed_state();
+        assert_eq!(state.workspaces.len(), 4);
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.active_workspace, 0);
+        assert_eq!(state.font_size_pt, 13);
+        assert!(!state.settings_open);
+        assert!(!state.sidebar_collapsed);
+        assert!(!state.palette_open);
+    }
+
+    // -- mutate_with ----------------------------------------------------------
+
+    #[test]
+    fn mutate_with_applies_closure() {
+        let shared: SharedState =
+            std::sync::Arc::new(std::sync::Mutex::new(test_state()));
+        let result = mutate_with(&shared, |st| {
+            st.font_size_pt = 25;
+            st.font_size_pt
+        });
+        assert_eq!(result, 25);
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.font_size_pt, 25);
+    }
+}
