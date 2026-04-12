@@ -24,7 +24,7 @@ cargo llvm-cov --html # coverage report in target/llvm-cov/html/
 - `src/state.rs` - Application state, PTY dimension helpers, cell metrics
 - `src/ui/` - UI components (split panes, settings, keyboard nav)
 - `assets/styles.css` - All CSS styling
-- Framework dependency: `../unshit-rust-framework/` (relative to repo root, NOT deeper)
+- `crates/unshit-framework/` - The unshit framework (git subtree from `unshit-rust-framework` repo)
 
 ## Framework Pitfalls (unshit-rust-framework)
 
@@ -38,21 +38,29 @@ Critical things to know about the unshit framework:
 
 4. **PTY must be spawned eagerly.** Do NOT defer PTY spawning until cell metrics are available. This creates a deadlock: no terminal -> no CellGrid rendered -> no metrics published -> PTY never spawns. Always spawn at 80x24, then correct dimensions once metrics arrive.
 
-5. **Cargo.toml path dependency.** The unshit path MUST be `../unshit-rust-framework/crates/unshit`. Agents working in worktrees will see a different relative path. Always verify Cargo.toml after agent work.
-
 ## Agent/Worktree Guidelines
 
-When spawning agents in isolated worktrees:
+The unshit framework lives inside this repo as a git subtree at `crates/unshit-framework/`. Agents in worktrees can freely modify both app code and framework code without path issues.
 
-1. **Always verify `Cargo.toml` path dependencies after agent work.** Worktrees change the relative path to sibling repos. The correct path is `../unshit-rust-framework/crates/unshit` from the repo root.
+1. **Run `cargo run` after merging agent work.** Tests passing does NOT mean the app works correctly. Visual regressions (layout, CSS) are not caught by unit tests. Always launch the app and verify visually.
 
-2. **Run `cargo run` after merging agent work.** Tests passing does NOT mean the app works correctly. Visual regressions (layout, CSS) are not caught by unit tests. Always launch the app and verify visually.
+2. **Merge agents one at a time, not all at once.** Parallel agent branches that touch overlapping files create cascading merge conflicts. Merge and verify each one sequentially.
 
-3. **Merge agents one at a time, not all at once.** Parallel agent branches that touch overlapping files create cascading merge conflicts. Merge and verify each one sequentially.
+3. **Check for missing callbacks after conflict resolution.** `AppConfig` fields like `on_close`, `on_scale_factor`, `on_cell_metrics` can be silently dropped during conflict resolution. Verify all callbacks are present after merging.
 
-4. **Check for missing callbacks after conflict resolution.** `AppConfig` fields like `on_close`, `on_scale_factor`, `on_cell_metrics` can be silently dropped during conflict resolution. Verify all callbacks are present after merging.
+4. **Do not remove eager PTY spawn.** The initial PTY spawn in `main.rs` is load-bearing. Without it, the terminal never renders.
 
-5. **Do not remove eager PTY spawn.** The initial PTY spawn in `main.rs` is load-bearing. Without it, the terminal never renders.
+## Syncing with upstream unshit
+
+The framework was imported via `git subtree` from `unshit-rust-framework`. The remote `unshit-upstream` is configured.
+
+```bash
+# Pull latest changes from the standalone unshit repo
+git subtree pull --prefix=crates/unshit-framework unshit-upstream master --squash
+
+# Push framework changes back to the standalone repo
+git subtree push --prefix=crates/unshit-framework unshit-upstream <branch-name>
+```
 
 ## Testing Requirements
 
