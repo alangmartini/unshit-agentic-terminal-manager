@@ -925,4 +925,46 @@ mod tests {
             );
         }
     }
+
+    // Regression: issue #17. The initial PTY dimensions must be estimated
+    // from the window size, not hardcoded to 80x24. Using 80 cols caused
+    // the PowerShell greeting to wrap before on_cell_metrics corrected it.
+    #[test]
+    fn initial_pty_estimate_not_hardcoded_80x24() {
+        let ratio = measure_cell_width_ratio_at(12.0, 12.0 * CSS_LINE_HEIGHT);
+        let cell_w = CSS_BASE_FONT_SIZE * ratio;
+        let cell_h = CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT;
+        // Same formula as main.rs: window(1280x800) minus chrome(284x109)
+        let cols = ((1280.0_f32 - 284.0) / cell_w).max(1.0) as u16;
+        let rows = ((800.0_f32 - 109.0) / cell_h).max(1.0) as u16;
+        assert!(
+            cols > 80,
+            "estimated cols ({}) must exceed the old hardcoded 80",
+            cols
+        );
+        assert!(
+            rows > 24,
+            "estimated rows ({}) must exceed the old hardcoded 24",
+            rows
+        );
+    }
+
+    #[test]
+    fn initial_pty_estimate_reasonable_range() {
+        let ratio = measure_cell_width_ratio_at(12.0, 12.0 * CSS_LINE_HEIGHT);
+        let cell_w = CSS_BASE_FONT_SIZE * ratio;
+        let cell_h = CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT;
+        let cols = ((1280.0_f32 - 284.0) / cell_w).max(1.0) as u16;
+        let rows = ((800.0_f32 - 109.0) / cell_h).max(1.0) as u16;
+        assert!(
+            (100..200).contains(&cols),
+            "estimated cols ({}) outside reasonable 100..200 range",
+            cols
+        );
+        assert!(
+            (30..60).contains(&rows),
+            "estimated rows ({}) outside reasonable 30..60 range",
+            rows
+        );
+    }
 }
