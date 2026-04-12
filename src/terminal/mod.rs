@@ -663,3 +663,182 @@ fn reset_attrs(t: &mut Terminal) {
     t.bg = DEFAULT_BG;
     t.attrs = CellAttrs::empty();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: "Windows" must occupy consecutive columns with no gaps.
+    ///
+    /// The renderer previously used `Attrs::new()` (SansSerif) for shaping
+    /// individual characters but `Attrs::new().family(Monospace)` to measure
+    /// cell width. Narrow sans-serif glyphs (i, l, r) rendered visually
+    /// narrower than the measured cell_w, producing visible gaps like
+    /// "Wi ndows" or "Mi crosoft". The fix ensures both shaping and
+    /// measurement use the Monospace family.
+    #[test]
+    fn windows_string_occupies_consecutive_columns() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"Windows");
+
+        // Each character should be placed at consecutive columns on row 0.
+        let expected: Vec<(usize, char)> = "Windows".chars().enumerate().collect();
+
+        for (col, expected_ch) in &expected {
+            let cell = term.grid().get_cell(0, *col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, *expected_ch,
+                "column {} should contain '{}' but got '{}'",
+                col, expected_ch, cell.ch,
+            );
+        }
+
+        // Cursor should be right after the last character.
+        let (row, col) = term.cursor_position();
+        assert_eq!(row, 0);
+        assert_eq!(col, 7, "cursor should be at column 7 after 7-char string");
+    }
+
+    /// Regression test: "Microsoft" must occupy consecutive columns.
+    ///
+    /// Same root cause as the "Windows" gap bug. "Microsoft" contains
+    /// multiple narrow glyphs (i, c, r, o) that exposed the font family
+    /// mismatch in the renderer.
+    #[test]
+    fn microsoft_string_occupies_consecutive_columns() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"Microsoft");
+
+        for (col, expected_ch) in "Microsoft".chars().enumerate() {
+            let cell = term.grid().get_cell(0, col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, expected_ch,
+                "column {} should contain '{}' but got '{}'",
+                col, expected_ch, cell.ch,
+            );
+        }
+
+        let (row, col) = term.cursor_position();
+        assert_eq!(row, 0);
+        assert_eq!(col, 9);
+    }
+
+    /// Every printable ASCII character (0x20..=0x7E) must occupy exactly one
+    /// cell and advance the cursor by one column.
+    #[test]
+    fn all_printable_ascii_occupy_one_cell_each() {
+        // 95 printable chars need 96 cols to avoid wrap (cursor sits at col 95).
+        let mut term = Terminal::new(24, 96);
+        let printable: String = (0x20u8..=0x7Eu8).map(|b| b as char).collect();
+        term.process_bytes(printable.as_bytes());
+
+        for (col, expected_ch) in printable.chars().enumerate() {
+            let cell = term.grid().get_cell(0, col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, expected_ch,
+                "column {} should contain {:?} (0x{:02X}) but got {:?}",
+                col, expected_ch, expected_ch as u32, cell.ch,
+            );
+        }
+
+        let (row, col) = term.cursor_position();
+        assert_eq!(row, 0);
+        assert_eq!(col, 95, "cursor should advance by one per printable char");
+    }
+
+    /// Narrow characters (i, l, r, t, f, j) must each advance the cursor by
+    /// exactly one column, same as wide characters (M, W, m, w).
+    #[test]
+    fn narrow_and_wide_chars_advance_cursor_equally() {
+        let narrow_chars = "ilrtfj";
+        let wide_chars = "MWmw";
+
+        for &ch in narrow_chars.as_bytes() {
+            let mut term = Terminal::new(24, 80);
+            term.process_bytes(&[ch]);
+            let (_, col) = term.cursor_position();
+            assert_eq!(
+                col, 1,
+                "narrow char '{}' should advance cursor to col 1, got {}",
+                ch as char, col,
+            );
+        }
+
+        for &ch in wide_chars.as_bytes() {
+            let mut term = Terminal::new(24, 80);
+            term.process_bytes(&[ch]);
+            let (_, col) = term.cursor_position();
+            assert_eq!(
+                col, 1,
+                "wide char '{}' should advance cursor to col 1, got {}",
+                ch as char, col,
+            );
+        }
+    }
+
+    /// Mixed narrow and wide characters in a string must produce a
+    /// contiguous sequence with no gaps.
+    #[test]
+    fn mixed_narrow_wide_string_no_gaps() {
+        let mut term = Terminal::new(24, 80);
+        let input = "File listing";
+        term.process_bytes(input.as_bytes());
+
+        for (col, expected_ch) in input.chars().enumerate() {
+            let cell = term.grid().get_cell(0, col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, expected_ch,
+                "column {} should contain '{}' but got '{}'",
+                col, expected_ch, cell.ch,
+            );
+        }
+
+        let (_, col) = term.cursor_position();
+        assert_eq!(col, input.len());
+    }
+
+    #[test]
+    fn basic_terminal_creation() {
+        let term = Terminal::new(24, 80);
+        assert_eq!(term.rows, 24);
+        assert_eq!(term.cols, 80);
+        assert_eq!(term.cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn cursor_wraps_at_end_of_line() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"ABCDE");
+        // After writing 5 chars in a 5-col terminal, cursor wraps to next row.
+        assert_eq!(term.cursor_position(), (1, 0));
+    }
+
+    #[test]
+    fn linefeed_advances_row() {
+        let mut term = Terminal::new(24, 80);
+        // LF (\n) only advances the row; it does NOT reset the column.
+        // After "A" cursor is at (0,1). LF moves to (1,1). "B" prints at (1,1).
+        term.process_bytes(b"A\nB");
+        assert_eq!(term.cursor_position(), (1, 2));
+        let cell_a = term.grid().get_cell(0, 0).unwrap();
+        assert_eq!(cell_a.ch, 'A');
+        let cell_b = term.grid().get_cell(1, 1).unwrap();
+        assert_eq!(cell_b.ch, 'B');
+    }
+
+    #[test]
+    fn carriage_return_resets_column() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"Hello\r");
+        assert_eq!(term.cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn resize_clamps_cursor() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"\x1b[20;70H"); // move cursor to row 19, col 69
+        assert_eq!(term.cursor_position(), (19, 69));
+        term.resize(10, 40);
+        assert_eq!(term.cursor_position(), (9, 39));
+    }
+}

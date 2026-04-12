@@ -673,7 +673,6 @@ pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
     }
 }
 
-
 /// Measure the actual monospace cell_width / font_size ratio using cosmic-text
 /// at a specific (DPI-scaled) font size. Because glyph hinting can produce
 /// different advance widths at different pixel sizes, the measurement must be
@@ -748,7 +747,6 @@ pub fn compute_pty_dimensions(
         (80u16, 24u16)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
