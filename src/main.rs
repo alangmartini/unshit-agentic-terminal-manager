@@ -98,13 +98,33 @@ fn main() {
 
     let shared: SharedState = Arc::new(std::sync::Mutex::new(seed_state()));
 
-    // PTY spawn deferred to blink subscription (approach 3, issue #5).
-    // No eager spawn here; the blink timer creates PTYs once cell metrics
-    // are available, so they start at the correct dimensions.
+    // Spawn initial PTY for the default pane eagerly at 80x24.
+    // The blink subscription and on_cell_metrics callback will correct
+    // the dimensions once the renderer publishes real cell metrics.
+    {
+        let mut guard = shared.lock().unwrap();
+        let pane_id = guard.active_pane.0;
+        let (cols, rows) = (80u16, 24u16);
+        let terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+        guard.terminals.insert(pane_id, terminal);
+        match guard.pty_manager.spawn(pane_id, cols, rows) {
+            Ok(reader) => {
+                crate::bridge::register_reader(pane_id, reader);
+            }
+            Err(e) => {
+                log::error!("failed to spawn initial PTY: {}", e);
+                if let Some(t) = guard.terminals.get_mut(&pane_id) {
+                    t.process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
+                }
+            }
+        }
+    }
 
     let tree_shared = shared.clone();
     let command_shared = shared.clone();
     let metrics_shared = shared.clone();
+    let scale_shared = shared.clone();
+    let close_shared = shared.clone();
     let sub_shared = shared.clone();
 
     let mut app = App::new(
@@ -127,6 +147,18 @@ fn main() {
             })),
             // Approach 1: on_cell_metrics fires once after the first render
             // publishes valid cell dimensions. Resize all PTYs immediately.
+            on_scale_factor: Some(Arc::new(move |scale: f32| {
+                let mut guard = scale_shared.lock().expect("state mutex poisoned");
+                guard.scale_factor = scale;
+            })),
+            on_close: Some(Arc::new(move || {
+                let mut guard = close_shared.lock().expect("state mutex poisoned");
+                let ids: Vec<u32> = guard.terminals.keys().copied().collect();
+                for id in ids {
+                    guard.pty_manager.destroy(id);
+                }
+                guard.terminals.clear();
+            })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
                 let (cols, rows) = CellGrid::take_pending_resize().unwrap_or_else(|| {
