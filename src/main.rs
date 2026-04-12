@@ -98,6 +98,18 @@ fn main() {
 
     let shared: SharedState = Arc::new(std::sync::Mutex::new(seed_state()));
 
+    // Measure the actual monospace cell width ratio and pre-publish cell
+    // metrics so the very first on_resize handler can compute correct PTY
+    // dimensions instead of falling back to 80x24.
+    {
+        let mut guard = shared.lock().unwrap();
+        let font_size = crate::state::CSS_BASE_FONT_SIZE * guard.scale_factor;
+        let line_height = font_size * crate::state::CSS_LINE_HEIGHT;
+        guard.cell_width_ratio =
+            crate::state::measure_cell_width_ratio_at(font_size, line_height);
+        crate::state::pre_publish_cell_metrics(guard.scale_factor, guard.cell_width_ratio);
+    }
+
     // Spawn initial PTY for the default pane eagerly at 80x24.
     // The blink subscription and on_cell_metrics callback will correct
     // the dimensions once the renderer publishes real cell metrics.
@@ -179,13 +191,12 @@ fn main() {
             let guard = tree_shared.lock().expect("state mutex poisoned");
             let snap = guard.ui_snapshot();
             let active_id = guard.active_pane.0;
-            let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
             let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = guard
                 .terminals
                 .iter()
                 .map(|(&id, t)| {
                     let mut grid = t.grid().clone();
-                    if id != active_id || !win_focused {
+                    if id != active_id {
                         grid.set_cursor_visible(false);
                     }
                     (id, grid)

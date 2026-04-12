@@ -108,13 +108,18 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                     {
                         let mut guard = shared.lock().expect("state mutex poisoned");
 
-                        // Cursor blink: active pane only, and only when
-                        // the window has OS focus.
+                        // Cursor blink: active pane blinks when focused,
+                        // shows steady cursor when window is unfocused.
+                        // Inactive panes never show a cursor.
                         let active_id = guard.active_pane.0;
                         let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
                         for (&id, terminal) in guard.terminals.iter_mut() {
-                            if id == active_id && win_focused {
-                                terminal.grid_mut().set_cursor_visible(visible);
+                            if id == active_id {
+                                if win_focused {
+                                    terminal.grid_mut().set_cursor_visible(visible);
+                                } else {
+                                    terminal.grid_mut().set_cursor_visible(true);
+                                }
                             } else {
                                 terminal.grid_mut().set_cursor_visible(false);
                             }
