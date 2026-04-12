@@ -663,3 +663,361 @@ fn reset_attrs(t: &mut Terminal) {
     t.bg = DEFAULT_BG;
     t.attrs = CellAttrs::empty();
 }
+
+// ---------------------------------------------------------------------------
+// Tests: character preservation and glyph verification
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: extract the char stored in a cell at (row, col).
+    fn cell_char(term: &Terminal, row: usize, col: usize) -> char {
+        term.grid()
+            .get_cell(row, col)
+            .expect("cell should exist")
+            .ch
+    }
+
+    /// Helper: read a run of characters from a row starting at `start_col`.
+    fn read_row_str(term: &Terminal, row: usize, start_col: usize, len: usize) -> String {
+        (start_col..start_col + len)
+            .map(|col| cell_char(term, row, col))
+            .collect()
+    }
+
+    // -- put_char preserves the exact character --
+
+    #[test]
+    fn put_char_preserves_exact_character() {
+        let mut term = Terminal::new(4, 80);
+        let chars = ['i', 'l', '1', '|', ';', '!', 'I', 'O', '0'];
+        for &c in &chars {
+            term.cursor_row = 0;
+            term.cursor_col = 0;
+            term.put_char(c);
+            let stored = cell_char(&term, 0, 0);
+            assert_eq!(
+                stored, c,
+                "put_char({:?}) should store exactly {:?}, got {:?}",
+                c, c, stored
+            );
+        }
+    }
+
+    // -- All printable ASCII characters stored correctly --
+
+    #[test]
+    fn all_ascii_printable_stored_correctly() {
+        let mut term = Terminal::new(2, 96);
+        // Feed all printable ASCII as raw bytes; VTE `print` callback handles
+        // them since they are not control characters.
+        let bytes: Vec<u8> = (0x20u8..=0x7E).collect();
+        term.process_bytes(&bytes);
+
+        for (i, byte) in (0x20u8..=0x7E).enumerate() {
+            let expected = byte as char;
+            let stored = cell_char(&term, 0, i);
+            assert_eq!(
+                stored, expected,
+                "ASCII 0x{:02X} ({:?}) at col {} stored as {:?}",
+                byte, expected, i, stored
+            );
+        }
+    }
+
+    // -- Characters that are visually confusable at small sizes --
+
+    #[test]
+    fn visually_confusable_chars_are_distinct() {
+        // These pairs are known to be confused when a proportional font is used
+        // at small sizes.  The terminal emulator must store the exact character
+        // the PTY sent, regardless of font rendering.
+        let confusable_pairs: &[(char, char)] = &[
+            ('i', ';'),
+            ('l', '!'),
+            ('1', 'l'),
+            ('|', '!'),
+            ('O', '0'),
+            ('I', 'l'),
+        ];
+
+        for &(a, b) in confusable_pairs {
+            let mut term = Terminal::new(1, 80);
+            term.process_bytes(&[a as u8]);
+            let stored = cell_char(&term, 0, 0);
+            assert_eq!(stored, a, "{:?} must not become {:?}", a, b);
+            assert_ne!(stored, b, "{:?} must not become {:?}", a, b);
+        }
+    }
+
+    // -- Word tests: "Corporation" --
+
+    #[test]
+    fn word_corporation_stored_char_by_char() {
+        let word = "Corporation";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(word.as_bytes());
+
+        for (col, expected) in word.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "\"Corporation\"[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+        assert_eq!(read_row_str(&term, 0, 0, word.len()), word);
+    }
+
+    // -- Word tests: "Windows" --
+
+    #[test]
+    fn word_windows_stored_char_by_char() {
+        let word = "Windows";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(word.as_bytes());
+
+        for (col, expected) in word.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "\"Windows\"[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+        assert_eq!(read_row_str(&term, 0, 0, word.len()), word);
+    }
+
+    // -- Word tests: "Microsoft" --
+
+    #[test]
+    fn word_microsoft_stored_char_by_char() {
+        let word = "Microsoft";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(word.as_bytes());
+
+        for (col, expected) in word.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "\"Microsoft\"[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+        assert_eq!(read_row_str(&term, 0, 0, word.len()), word);
+    }
+
+    // -- Multi-byte UTF-8 characters --
+
+    #[test]
+    fn multibyte_utf8_characters_stored_correctly() {
+        let test_chars: &[char] = &[
+            '\u{00E9}',  // e-acute (2 bytes)
+            '\u{00F1}',  // n-tilde (2 bytes)
+            '\u{00FC}',  // u-diaeresis (2 bytes)
+            '\u{4E16}',  // CJK "world" (3 bytes)
+            '\u{1F600}', // grinning face emoji (4 bytes)
+        ];
+
+        for &ch in test_chars {
+            let mut term = Terminal::new(1, 80);
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            term.process_bytes(encoded.as_bytes());
+            let stored = cell_char(&term, 0, 0);
+            assert_eq!(
+                stored, ch,
+                "UTF-8 char U+{:04X} ({:?}) should be stored exactly, got {:?}",
+                ch as u32, ch, stored
+            );
+        }
+    }
+
+    // -- Real PowerShell greeting output --
+
+    #[test]
+    fn powershell_greeting_characters_preserved() {
+        // Simulated PowerShell 7.x greeting. The VTE parser handles the plain
+        // printable text portions; escape sequences set colors/cursor but do
+        // not affect character storage.
+        //
+        // This specifically tests that 'i' in "Microsoft" and "Corporation"
+        // is not garbled into ';'.
+        let greeting = concat!(
+            "PowerShell 7.4.1\r\n",
+            "Copyright (c) Microsoft Corporation.\r\n",
+            "\r\n",
+            "https://aka.ms/powershell\r\n",
+            "Type 'help' to get help.\r\n",
+        );
+
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(greeting.as_bytes());
+
+        // Row 0: "PowerShell 7.4.1"
+        assert_eq!(read_row_str(&term, 0, 0, 16), "PowerShell 7.4.1");
+
+        // Row 1: "Copyright (c) Microsoft Corporation."
+        let row1 = read_row_str(&term, 1, 0, 36);
+        assert_eq!(row1, "Copyright (c) Microsoft Corporation.");
+
+        // Specifically verify the 'i' characters in "Microsoft" and
+        // "Corporation" are not stored as ';'.
+        // "Microsoft" starts at col 14.
+        assert_eq!(cell_char(&term, 1, 14), 'M');
+        assert_eq!(cell_char(&term, 1, 15), 'i'); // NOT ';'
+        assert_eq!(cell_char(&term, 1, 16), 'c');
+        assert_eq!(cell_char(&term, 1, 17), 'r');
+        assert_eq!(cell_char(&term, 1, 18), 'o');
+        assert_eq!(cell_char(&term, 1, 19), 's');
+        assert_eq!(cell_char(&term, 1, 20), 'o');
+        assert_eq!(cell_char(&term, 1, 21), 'f');
+        assert_eq!(cell_char(&term, 1, 22), 't');
+
+        // "Corporation" starts at col 24.
+        assert_eq!(cell_char(&term, 1, 24), 'C');
+        assert_eq!(cell_char(&term, 1, 25), 'o');
+        assert_eq!(cell_char(&term, 1, 26), 'r');
+        assert_eq!(cell_char(&term, 1, 27), 'p');
+        assert_eq!(cell_char(&term, 1, 28), 'o');
+        assert_eq!(cell_char(&term, 1, 29), 'r');
+        assert_eq!(cell_char(&term, 1, 30), 'a');
+        assert_eq!(cell_char(&term, 1, 31), 't');
+        assert_eq!(cell_char(&term, 1, 32), 'i'); // NOT ';'
+        assert_eq!(cell_char(&term, 1, 33), 'o');
+        assert_eq!(cell_char(&term, 1, 34), 'n');
+
+        // Row 3: "https://aka.ms/powershell" (25 chars)
+        assert_eq!(read_row_str(&term, 3, 0, 25), "https://aka.ms/powershell");
+
+        // Row 4: "Type 'help' to get help."
+        assert_eq!(read_row_str(&term, 4, 0, 24), "Type 'help' to get help.");
+    }
+
+    // -- PowerShell greeting with ANSI escape sequences --
+
+    #[test]
+    fn powershell_greeting_with_ansi_escapes() {
+        // Real PTY output includes SGR color escapes around the greeting.
+        // The terminal must store the text characters unchanged, ignoring
+        // the escape sequences for character identity purposes.
+        let ansi_greeting = concat!(
+            "\x1b[0m",                  // reset
+            "\x1b[32mPowerShell 7.4.1", // green text
+            "\x1b[0m\r\n",              // reset + newline
+            "\x1b[90mCopyright (c) Microsoft Corporation.\x1b[0m\r\n",
+            "\r\n",
+            "\x1b[36mhttps://aka.ms/powershell\x1b[0m\r\n",
+            "\x1b[90mType 'help' to get help.\x1b[0m\r\n",
+        );
+
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(ansi_greeting.as_bytes());
+
+        assert_eq!(read_row_str(&term, 0, 0, 16), "PowerShell 7.4.1");
+        assert_eq!(
+            read_row_str(&term, 1, 0, 36),
+            "Copyright (c) Microsoft Corporation."
+        );
+        // 'i' in Microsoft at col 15
+        assert_eq!(cell_char(&term, 1, 15), 'i');
+        // 'i' in Corporation at col 32
+        assert_eq!(cell_char(&term, 1, 32), 'i');
+    }
+
+    // -- Cursor advances correctly for consecutive characters --
+
+    #[test]
+    fn cursor_advances_consecutively() {
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(b"abcde");
+        assert_eq!(term.cursor_position(), (0, 5));
+        for (col, expected) in "abcde".chars().enumerate() {
+            assert_eq!(cell_char(&term, 0, col), expected);
+        }
+    }
+
+    // -- Line wrap preserves characters --
+
+    #[test]
+    fn line_wrap_preserves_characters() {
+        // Use a narrow terminal (10 cols) and write 15 characters.
+        let mut term = Terminal::new(4, 10);
+        term.process_bytes(b"abcdefghijklmno");
+
+        // First 10 on row 0.
+        assert_eq!(read_row_str(&term, 0, 0, 10), "abcdefghij");
+        // Next 5 on row 1.
+        assert_eq!(read_row_str(&term, 1, 0, 5), "klmno");
+    }
+
+    // -- Characters after CR overwrite correctly --
+
+    #[test]
+    fn carriage_return_overwrites_preserve_chars() {
+        let mut term = Terminal::new(1, 80);
+        // Write "Hello", CR, then "Hi!!"
+        term.process_bytes(b"Hello\rHi!!");
+        // "Hi!!" overwrites the first 4 chars; 'o' remains at col 4.
+        assert_eq!(cell_char(&term, 0, 0), 'H');
+        assert_eq!(cell_char(&term, 0, 1), 'i');
+        assert_eq!(cell_char(&term, 0, 2), '!');
+        assert_eq!(cell_char(&term, 0, 3), '!');
+        assert_eq!(cell_char(&term, 0, 4), 'o');
+    }
+
+    // -- Tab character does not corrupt adjacent cells --
+
+    #[test]
+    fn tab_does_not_corrupt_adjacent_cells() {
+        let mut term = Terminal::new(1, 80);
+        // "A" then tab then "B". Tab advances to col 8.
+        term.process_bytes(b"A\tB");
+        assert_eq!(cell_char(&term, 0, 0), 'A');
+        assert_eq!(cell_char(&term, 0, 8), 'B');
+    }
+
+    // -- Full sentence with mixed confusable characters --
+
+    #[test]
+    fn sentence_with_confusable_characters() {
+        let sentence = "Bill filled 100 oil pills.";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(sentence.as_bytes());
+
+        for (col, expected) in sentence.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "sentence[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+    }
+
+    // -- process_bytes is idempotent: processing the same bytes again
+    //    on a fresh terminal produces the same grid --
+
+    #[test]
+    fn process_bytes_is_deterministic() {
+        let input = b"Microsoft Corporation 2024\r\nWindows PowerShell";
+        let mut t1 = Terminal::new(24, 80);
+        let mut t2 = Terminal::new(24, 80);
+        t1.process_bytes(input);
+        t2.process_bytes(input);
+
+        for row in 0..2 {
+            for col in 0..46 {
+                let c1 = cell_char(&t1, row, col);
+                let c2 = cell_char(&t2, row, col);
+                assert_eq!(
+                    c1, c2,
+                    "determinism: ({},{}) differs between runs",
+                    row, col
+                );
+            }
+        }
+    }
+}
