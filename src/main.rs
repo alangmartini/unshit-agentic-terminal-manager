@@ -91,8 +91,9 @@ fn user_shortcut_bindings() -> Vec<(String, String)> {
 
 fn main() {
     env_logger::Builder::from_env(
-        env_logger::Env::default()
-            .default_filter_or("info,wgpu_hal=error,wgpu_core=error,naga=error"),
+        env_logger::Env::default().default_filter_or(
+            "info,wgpu_hal=error,wgpu_core=error,naga=error,unshit_app::app=error",
+        ),
     )
     .init();
 
@@ -127,15 +128,16 @@ fn main() {
         // (4) + pane-body horizontal padding(24) = 284.  tabbar(38) +
         // statusbar(24) + pane-header(27) + pane borders/margins(4) +
         // pane-body vertical padding(16) = 109.
-        let cell_w_est =
-            crate::state::CSS_BASE_FONT_SIZE * guard.cell_width_ratio;
-        let cell_h_est =
-            crate::state::CSS_BASE_FONT_SIZE * crate::state::CSS_LINE_HEIGHT;
+        let cell_w_est = crate::state::CSS_BASE_FONT_SIZE * guard.cell_width_ratio;
+        let cell_h_est = crate::state::CSS_BASE_FONT_SIZE * crate::state::CSS_LINE_HEIGHT;
         let init_cols = ((1280.0_f32 - 284.0) / cell_w_est).max(1.0) as u16;
         let init_rows = ((800.0_f32 - 109.0) / cell_h_est).max(1.0) as u16;
         log::info!(
             "initial PTY estimate: {}x{} (cell_w_est={:.2}, cell_h_est={:.2})",
-            init_cols, init_rows, cell_w_est, cell_h_est,
+            init_cols,
+            init_rows,
+            cell_w_est,
+            cell_h_est,
         );
         let pane_id = guard.active_pane.0;
         let terminal = crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
@@ -219,7 +221,7 @@ fn main() {
                 .terminals
                 .iter()
                 .map(|(&id, t)| {
-                    let mut grid = t.grid().clone();
+                    let mut grid = t.display_grid();
                     if id != active_id {
                         grid.set_cursor_visible(false);
                     }
