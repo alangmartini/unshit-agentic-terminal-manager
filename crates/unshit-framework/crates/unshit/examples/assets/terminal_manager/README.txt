@@ -1,0 +1,3 @@
+Source snapshot of terminal-manager styles.
+
+This file (styles.css) was copied byte for byte from the sibling reference project at ../terminal-manager/styles.css (relative to the unshit-rust-framework repo root). It is a snapshot, not a live link, captured for the terminal-manager port scaffold tracked in GitHub issue #131 (part of epic #125). The CSS is embedded into the terminal_manager example via include_str!; when the upstream file changes, this copy must be refreshed manually. Some features (radial gradients, repeating linear gradients, animations, backdrop filter, stacked inset box-shadow) are intentionally present but may parse as warnings until the corresponding framework capabilities land.

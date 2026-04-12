@@ -1,0 +1,41 @@
+[package]
+name = "unshit-bench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+unshit-core = { path = "../unshit-core" }
+taffy = { workspace = true }
+cosmic-text = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "css_parsing"
+harness = false
+
+[[bench]]
+name = "style_cascade"
+harness = false
+
+[[bench]]
+name = "layout"
+harness = false
+
+[[bench]]
+name = "hit_test"
+harness = false
+
+[[bench]]
+name = "tree_building"
+harness = false
+
+[[bench]]
+name = "reconcile"
+harness = false
+
+[lints]
+workspace = true
