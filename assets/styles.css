@@ -174,8 +174,8 @@ body::after {
   z-index: 1;
   width: 100%;
   height: 100%;
-  display: grid;
-  grid-template-rows: var(--titlebar-h) 1fr;
+  display: flex;
+  flex-direction: column;
 }
 
 
@@ -183,6 +183,8 @@ body::after {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  height: var(--titlebar-h);
+  min-height: var(--titlebar-h);
   background: var(--bg-void);
   border-bottom: 1px solid var(--border-hair);
   padding: 0 var(--sp-5);
@@ -316,14 +318,16 @@ body::after {
 
 
 .layout {
-  display: grid;
-  grid-template-columns: var(--sidebar-w) 1fr;
+  display: flex;
+  flex: 1;
   overflow: hidden;
   min-height: 0;
 }
 
 
 .sidebar {
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
   background: var(--bg-subtle);
   border-right: 1px solid var(--border-hair);
   display: flex;
@@ -366,6 +370,7 @@ body::after {
 
 .sidebar-scroll {
   flex: 1;
+  flex-direction: column;
   overflow-y: auto;
   overflow-x: hidden;
   padding: var(--sp-3) 0;
@@ -387,6 +392,7 @@ body::after {
 
 
 .workspace {
+  flex-direction: column;
   padding-bottom: var(--sp-1);
   margin-bottom: var(--sp-2);
 }
@@ -490,6 +496,7 @@ body::after {
 }
 
 .workspace-body {
+  flex-direction: column;
   padding: var(--sp-1) 0 var(--sp-2);
   overflow: hidden;
   max-height: 300px;
@@ -605,6 +612,7 @@ body::after {
 
 
 .sidebar-footer {
+  flex-direction: column;
   border-top: 1px solid var(--border-hair);
   padding: var(--sp-5) var(--sp-6) var(--sp-4);
   max-height: 200px;
@@ -628,6 +636,7 @@ body::after {
 }
 
 .activity-item {
+  flex-direction: column;
   margin-bottom: var(--sp-4);
   padding-left: var(--sp-4);
   border-left: 2px solid var(--border-soft);
@@ -712,8 +721,9 @@ body::after {
 
 
 .content {
-  display: grid;
-  grid-template-rows: var(--tabbar-h) 1fr var(--statusbar-h);
+  display: flex;
+  flex-direction: column;
+  flex: 1;
   min-height: 0;
   min-width: 0;
   overflow: hidden;
@@ -725,6 +735,8 @@ body::after {
   display: flex;
   align-items: stretch;
   justify-content: space-between;
+  height: var(--tabbar-h);
+  min-height: var(--tabbar-h);
   background: var(--bg-subtle);
   border-bottom: 1px solid var(--border-hair);
   padding-right: var(--sp-3);
@@ -895,6 +907,7 @@ body::after {
   position: relative;
   display: flex;
   flex-direction: column;
+  flex: 1;
   min-height: 0;
   min-width: 0;
   overflow: hidden;
@@ -1017,8 +1030,9 @@ body::after {
 .pane-meta {
   color: var(--fg-muted);
   font-size: var(--t-xs);
-  margin-left: auto;
+  padding-left: var(--sp-5);
   padding-right: var(--sp-3);
+  white-space: nowrap;
 }
 
 .pane-header-right {
@@ -1090,6 +1104,7 @@ body::after {
   min-width: 0;
   width: 100%;
   height: 100%;
+  line-height: 1.2;
 }
 
 .term-line {
@@ -1209,6 +1224,8 @@ body.dragging-pane {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  height: var(--statusbar-h);
+  min-height: var(--statusbar-h);
   background: var(--bg-void);
   border-top: 1px solid var(--border-hair);
   padding: 0 var(--sp-5);

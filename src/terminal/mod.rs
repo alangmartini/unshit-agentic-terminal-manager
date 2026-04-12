@@ -79,6 +79,8 @@ impl Terminal {
             parser.advance(&mut performer, byte);
         }
         self.parser = parser;
+        // Sync cursor position to the grid so the renderer can draw it.
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
     /// Immutable reference to the backing cell grid.
@@ -105,6 +107,7 @@ impl Terminal {
         if self.cursor_col >= cols {
             self.cursor_col = cols.saturating_sub(1);
         }
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
     /// The current window title (set via OSC 0 or OSC 2).
@@ -662,4 +665,455 @@ fn reset_attrs(t: &mut Terminal) {
     t.fg = DEFAULT_FG;
     t.bg = DEFAULT_BG;
     t.attrs = CellAttrs::empty();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: character preservation and glyph verification
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: extract the char stored in a cell at (row, col).
+    fn cell_char(term: &Terminal, row: usize, col: usize) -> char {
+        term.grid()
+            .get_cell(row, col)
+            .expect("cell should exist")
+            .ch
+    }
+
+    /// Helper: read a run of characters from a row starting at `start_col`.
+    fn read_row_str(term: &Terminal, row: usize, start_col: usize, len: usize) -> String {
+        (start_col..start_col + len)
+            .map(|col| cell_char(term, row, col))
+            .collect()
+    }
+
+    // -- Basic terminal operations (PR #13) -----------------------------------
+
+    #[test]
+    fn basic_terminal_creation() {
+        let term = Terminal::new(24, 80);
+        assert_eq!(term.rows, 24);
+        assert_eq!(term.cols, 80);
+        assert_eq!(term.cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn cursor_wraps_at_end_of_line() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"ABCDE");
+        // After writing 5 chars in a 5-col terminal, cursor wraps to next row.
+        assert_eq!(term.cursor_position(), (1, 0));
+    }
+
+    #[test]
+    fn linefeed_advances_row() {
+        let mut term = Terminal::new(24, 80);
+        // LF (\n) only advances the row; it does NOT reset the column.
+        // After "A" cursor is at (0,1). LF moves to (1,1). "B" prints at (1,1).
+        term.process_bytes(b"A\nB");
+        assert_eq!(term.cursor_position(), (1, 2));
+        let cell_a = term.grid().get_cell(0, 0).unwrap();
+        assert_eq!(cell_a.ch, 'A');
+        let cell_b = term.grid().get_cell(1, 1).unwrap();
+        assert_eq!(cell_b.ch, 'B');
+    }
+
+    #[test]
+    fn carriage_return_resets_column() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"Hello\r");
+        assert_eq!(term.cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn resize_clamps_cursor() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"\x1b[20;70H"); // move cursor to row 19, col 69
+        assert_eq!(term.cursor_position(), (19, 69));
+        term.resize(10, 40);
+        assert_eq!(term.cursor_position(), (9, 39));
+    }
+
+    // -- Character spacing regression tests (PR #13) --------------------------
+
+    /// Regression test: "Windows" must occupy consecutive columns with no gaps.
+    ///
+    /// The renderer previously used `Attrs::new()` (SansSerif) for shaping
+    /// individual characters but `Attrs::new().family(Monospace)` to measure
+    /// cell width. Narrow sans-serif glyphs (i, l, r) rendered visually
+    /// narrower than the measured cell_w, producing visible gaps like
+    /// "Wi ndows" or "Mi crosoft". The fix ensures both shaping and
+    /// measurement use the Monospace family.
+    #[test]
+    fn windows_string_occupies_consecutive_columns() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"Windows");
+
+        let expected: Vec<(usize, char)> = "Windows".chars().enumerate().collect();
+        for (col, expected_ch) in &expected {
+            let cell = term.grid().get_cell(0, *col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, *expected_ch,
+                "column {} should contain '{}' but got '{}'",
+                col, expected_ch, cell.ch,
+            );
+        }
+
+        let (row, col) = term.cursor_position();
+        assert_eq!(row, 0);
+        assert_eq!(col, 7, "cursor should be at column 7 after 7-char string");
+    }
+
+    /// Regression test: "Microsoft" must occupy consecutive columns.
+    #[test]
+    fn microsoft_string_occupies_consecutive_columns() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"Microsoft");
+
+        for (col, expected_ch) in "Microsoft".chars().enumerate() {
+            let cell = term.grid().get_cell(0, col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, expected_ch,
+                "column {} should contain '{}' but got '{}'",
+                col, expected_ch, cell.ch,
+            );
+        }
+
+        let (row, col) = term.cursor_position();
+        assert_eq!(row, 0);
+        assert_eq!(col, 9);
+    }
+
+    /// Every printable ASCII character (0x20..=0x7E) must occupy exactly one
+    /// cell and advance the cursor by one column.
+    #[test]
+    fn all_printable_ascii_occupy_one_cell_each() {
+        let mut term = Terminal::new(24, 96);
+        let printable: String = (0x20u8..=0x7Eu8).map(|b| b as char).collect();
+        term.process_bytes(printable.as_bytes());
+
+        for (col, expected_ch) in printable.chars().enumerate() {
+            let cell = term.grid().get_cell(0, col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, expected_ch,
+                "column {} should contain {:?} (0x{:02X}) but got {:?}",
+                col, expected_ch, expected_ch as u32, cell.ch,
+            );
+        }
+
+        let (row, col) = term.cursor_position();
+        assert_eq!(row, 0);
+        assert_eq!(col, 95, "cursor should advance by one per printable char");
+    }
+
+    /// Narrow characters (i, l, r, t, f, j) must each advance the cursor by
+    /// exactly one column, same as wide characters (M, W, m, w).
+    #[test]
+    fn narrow_and_wide_chars_advance_cursor_equally() {
+        let narrow_chars = "ilrtfj";
+        let wide_chars = "MWmw";
+
+        for &ch in narrow_chars.as_bytes() {
+            let mut term = Terminal::new(24, 80);
+            term.process_bytes(&[ch]);
+            let (_, col) = term.cursor_position();
+            assert_eq!(
+                col, 1,
+                "narrow char '{}' should advance cursor to col 1, got {}",
+                ch as char, col,
+            );
+        }
+
+        for &ch in wide_chars.as_bytes() {
+            let mut term = Terminal::new(24, 80);
+            term.process_bytes(&[ch]);
+            let (_, col) = term.cursor_position();
+            assert_eq!(
+                col, 1,
+                "wide char '{}' should advance cursor to col 1, got {}",
+                ch as char, col,
+            );
+        }
+    }
+
+    /// Mixed narrow and wide characters in a string must produce a
+    /// contiguous sequence with no gaps.
+    #[test]
+    fn mixed_narrow_wide_string_no_gaps() {
+        let mut term = Terminal::new(24, 80);
+        let input = "File listing";
+        term.process_bytes(input.as_bytes());
+
+        for (col, expected_ch) in input.chars().enumerate() {
+            let cell = term.grid().get_cell(0, col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, expected_ch,
+                "column {} should contain '{}' but got '{}'",
+                col, expected_ch, cell.ch,
+            );
+        }
+
+        let (_, col) = term.cursor_position();
+        assert_eq!(col, input.len());
+    }
+
+    // -- Glyph verification tests (PR #15) ------------------------------------
+
+    #[test]
+    fn put_char_preserves_exact_character() {
+        let mut term = Terminal::new(4, 80);
+        let chars = ['i', 'l', '1', '|', ';', '!', 'I', 'O', '0'];
+        for &c in &chars {
+            term.cursor_row = 0;
+            term.cursor_col = 0;
+            term.put_char(c);
+            let stored = cell_char(&term, 0, 0);
+            assert_eq!(
+                stored, c,
+                "put_char({:?}) should store exactly {:?}, got {:?}",
+                c, c, stored
+            );
+        }
+    }
+
+    #[test]
+    fn all_ascii_printable_stored_correctly() {
+        let mut term = Terminal::new(2, 96);
+        let bytes: Vec<u8> = (0x20u8..=0x7E).collect();
+        term.process_bytes(&bytes);
+
+        for (i, byte) in (0x20u8..=0x7E).enumerate() {
+            let expected = byte as char;
+            let stored = cell_char(&term, 0, i);
+            assert_eq!(
+                stored, expected,
+                "ASCII 0x{:02X} ({:?}) at col {} stored as {:?}",
+                byte, expected, i, stored
+            );
+        }
+    }
+
+    #[test]
+    fn visually_confusable_chars_are_distinct() {
+        let confusable_pairs: &[(char, char)] = &[
+            ('i', ';'),
+            ('l', '!'),
+            ('1', 'l'),
+            ('|', '!'),
+            ('O', '0'),
+            ('I', 'l'),
+        ];
+
+        for &(a, b) in confusable_pairs {
+            let mut term = Terminal::new(1, 80);
+            term.process_bytes(&[a as u8]);
+            let stored = cell_char(&term, 0, 0);
+            assert_eq!(stored, a, "{:?} must not become {:?}", a, b);
+            assert_ne!(stored, b, "{:?} must not become {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn word_corporation_stored_char_by_char() {
+        let word = "Corporation";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(word.as_bytes());
+
+        for (col, expected) in word.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "\"Corporation\"[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+        assert_eq!(read_row_str(&term, 0, 0, word.len()), word);
+    }
+
+    #[test]
+    fn word_windows_stored_char_by_char() {
+        let word = "Windows";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(word.as_bytes());
+
+        for (col, expected) in word.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "\"Windows\"[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+        assert_eq!(read_row_str(&term, 0, 0, word.len()), word);
+    }
+
+    #[test]
+    fn word_microsoft_stored_char_by_char() {
+        let word = "Microsoft";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(word.as_bytes());
+
+        for (col, expected) in word.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "\"Microsoft\"[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+        assert_eq!(read_row_str(&term, 0, 0, word.len()), word);
+    }
+
+    #[test]
+    fn multibyte_utf8_characters_stored_correctly() {
+        let test_chars: &[char] = &[
+            '\u{00E9}',  // e-acute (2 bytes)
+            '\u{00F1}',  // n-tilde (2 bytes)
+            '\u{00FC}',  // u-diaeresis (2 bytes)
+            '\u{4E16}',  // CJK "world" (3 bytes)
+            '\u{1F600}', // grinning face emoji (4 bytes)
+        ];
+
+        for &ch in test_chars {
+            let mut term = Terminal::new(1, 80);
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            term.process_bytes(encoded.as_bytes());
+            let stored = cell_char(&term, 0, 0);
+            assert_eq!(
+                stored, ch,
+                "UTF-8 char U+{:04X} ({:?}) should be stored exactly, got {:?}",
+                ch as u32, ch, stored
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_greeting_characters_preserved() {
+        let greeting = concat!(
+            "PowerShell 7.4.1\r\n",
+            "Copyright (c) Microsoft Corporation.\r\n",
+            "\r\n",
+            "https://aka.ms/powershell\r\n",
+            "Type 'help' to get help.\r\n",
+        );
+
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(greeting.as_bytes());
+
+        assert_eq!(read_row_str(&term, 0, 0, 16), "PowerShell 7.4.1");
+
+        let row1 = read_row_str(&term, 1, 0, 36);
+        assert_eq!(row1, "Copyright (c) Microsoft Corporation.");
+
+        // 'i' in "Microsoft" at col 15 must NOT be ';'
+        assert_eq!(cell_char(&term, 1, 15), 'i');
+        // 'i' in "Corporation" at col 32 must NOT be ';'
+        assert_eq!(cell_char(&term, 1, 32), 'i');
+
+        assert_eq!(read_row_str(&term, 3, 0, 25), "https://aka.ms/powershell");
+        assert_eq!(read_row_str(&term, 4, 0, 24), "Type 'help' to get help.");
+    }
+
+    #[test]
+    fn powershell_greeting_with_ansi_escapes() {
+        let ansi_greeting = concat!(
+            "\x1b[0m",
+            "\x1b[32mPowerShell 7.4.1",
+            "\x1b[0m\r\n",
+            "\x1b[90mCopyright (c) Microsoft Corporation.\x1b[0m\r\n",
+            "\r\n",
+            "\x1b[36mhttps://aka.ms/powershell\x1b[0m\r\n",
+            "\x1b[90mType 'help' to get help.\x1b[0m\r\n",
+        );
+
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(ansi_greeting.as_bytes());
+
+        assert_eq!(read_row_str(&term, 0, 0, 16), "PowerShell 7.4.1");
+        assert_eq!(
+            read_row_str(&term, 1, 0, 36),
+            "Copyright (c) Microsoft Corporation."
+        );
+        assert_eq!(cell_char(&term, 1, 15), 'i');
+        assert_eq!(cell_char(&term, 1, 32), 'i');
+    }
+
+    #[test]
+    fn cursor_advances_consecutively() {
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(b"abcde");
+        assert_eq!(term.cursor_position(), (0, 5));
+        for (col, expected) in "abcde".chars().enumerate() {
+            assert_eq!(cell_char(&term, 0, col), expected);
+        }
+    }
+
+    #[test]
+    fn line_wrap_preserves_characters() {
+        let mut term = Terminal::new(4, 10);
+        term.process_bytes(b"abcdefghijklmno");
+
+        assert_eq!(read_row_str(&term, 0, 0, 10), "abcdefghij");
+        assert_eq!(read_row_str(&term, 1, 0, 5), "klmno");
+    }
+
+    #[test]
+    fn carriage_return_overwrites_preserve_chars() {
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(b"Hello\rHi!!");
+        assert_eq!(cell_char(&term, 0, 0), 'H');
+        assert_eq!(cell_char(&term, 0, 1), 'i');
+        assert_eq!(cell_char(&term, 0, 2), '!');
+        assert_eq!(cell_char(&term, 0, 3), '!');
+        assert_eq!(cell_char(&term, 0, 4), 'o');
+    }
+
+    #[test]
+    fn tab_does_not_corrupt_adjacent_cells() {
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(b"A\tB");
+        assert_eq!(cell_char(&term, 0, 0), 'A');
+        assert_eq!(cell_char(&term, 0, 8), 'B');
+    }
+
+    #[test]
+    fn sentence_with_confusable_characters() {
+        let sentence = "Bill filled 100 oil pills.";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(sentence.as_bytes());
+
+        for (col, expected) in sentence.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "sentence[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+    }
+
+    #[test]
+    fn process_bytes_is_deterministic() {
+        let input = b"Microsoft Corporation 2024\r\nWindows PowerShell";
+        let mut t1 = Terminal::new(24, 80);
+        let mut t2 = Terminal::new(24, 80);
+        t1.process_bytes(input);
+        t2.process_bytes(input);
+
+        for row in 0..2 {
+            for col in 0..46 {
+                let c1 = cell_char(&t1, row, col);
+                let c2 = cell_char(&t2, row, col);
+                assert_eq!(
+                    c1, c2,
+                    "determinism: ({},{}) differs between runs",
+                    row, col
+                );
+            }
+        }
+    }
 }

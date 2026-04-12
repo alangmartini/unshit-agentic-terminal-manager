@@ -98,13 +98,66 @@ fn main() {
 
     let shared: SharedState = Arc::new(std::sync::Mutex::new(seed_state()));
 
-    // PTY spawn deferred to blink subscription (approach 3, issue #5).
-    // No eager spawn here; the blink timer creates PTYs once cell metrics
-    // are available, so they start at the correct dimensions.
+    // Measure the actual monospace cell width ratio for later use (split
+    // pane spawns, etc.). Do NOT pre-publish cell metrics to the global
+    // atomics: the pre-published values differ slightly from what the
+    // renderer measures (different FontSystem instance), causing the
+    // on_resize handler to fire an intermediate resize with wrong column
+    // count. Instead, let the renderer be the single source of truth:
+    // on_resize stores last_grid_width (cell_w is 0 so no resize), then
+    // on_cell_metrics fires with the renderer's exact cell_w and resizes
+    // the PTY once to the correct dimensions.
+    {
+        let mut guard = shared.lock().unwrap();
+        let font_size = crate::state::CSS_BASE_FONT_SIZE * guard.scale_factor;
+        let line_height = font_size * crate::state::CSS_LINE_HEIGHT;
+        guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
+    }
+
+    // Spawn initial PTY eagerly. This is load-bearing: without a terminal
+    // the CellGrid doesn't exist, the renderer can't publish metrics, and
+    // the PTY never gets spawned (deadlock). Estimate dimensions from the
+    // window size minus CSS chrome so the shell greeting is formatted for
+    // roughly the right width. on_cell_metrics corrects to exact values on
+    // the first frame.
+    {
+        let mut guard = shared.lock().unwrap();
+        // CSS chrome in logical pixels (scale cancels: grid and cells both
+        // scale equally).  sidebar(252) + resizer(4) + pane borders/margins
+        // (4) + pane-body horizontal padding(24) = 284.  tabbar(38) +
+        // statusbar(24) + pane-header(27) + pane borders/margins(4) +
+        // pane-body vertical padding(16) = 109.
+        let cell_w_est =
+            crate::state::CSS_BASE_FONT_SIZE * guard.cell_width_ratio;
+        let cell_h_est =
+            crate::state::CSS_BASE_FONT_SIZE * crate::state::CSS_LINE_HEIGHT;
+        let init_cols = ((1280.0_f32 - 284.0) / cell_w_est).max(1.0) as u16;
+        let init_rows = ((800.0_f32 - 109.0) / cell_h_est).max(1.0) as u16;
+        log::info!(
+            "initial PTY estimate: {}x{} (cell_w_est={:.2}, cell_h_est={:.2})",
+            init_cols, init_rows, cell_w_est, cell_h_est,
+        );
+        let pane_id = guard.active_pane.0;
+        let terminal = crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
+        guard.terminals.insert(pane_id, terminal);
+        match guard.pty_manager.spawn(pane_id, init_cols, init_rows) {
+            Ok(reader) => {
+                crate::bridge::register_reader(pane_id, reader);
+            }
+            Err(e) => {
+                log::error!("failed to spawn initial PTY: {}", e);
+                if let Some(t) = guard.terminals.get_mut(&pane_id) {
+                    t.process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
+                }
+            }
+        }
+    }
 
     let tree_shared = shared.clone();
     let command_shared = shared.clone();
     let metrics_shared = shared.clone();
+    let scale_shared = shared.clone();
+    let close_shared = shared.clone();
     let sub_shared = shared.clone();
 
     let mut app = App::new(
@@ -127,18 +180,33 @@ fn main() {
             })),
             // Approach 1: on_cell_metrics fires once after the first render
             // publishes valid cell dimensions. Resize all PTYs immediately.
+            on_scale_factor: Some(Arc::new(move |scale: f32| {
+                let mut guard = scale_shared.lock().expect("state mutex poisoned");
+                guard.scale_factor = scale;
+            })),
+            on_close: Some(Arc::new(move || {
+                let mut guard = close_shared.lock().expect("state mutex poisoned");
+                let ids: Vec<u32> = guard.terminals.keys().copied().collect();
+                for id in ids {
+                    guard.pty_manager.destroy(id);
+                }
+                guard.terminals.clear();
+            })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
+                let mut guard = metrics_shared.lock().expect("state mutex poisoned");
                 let (cols, rows) = CellGrid::take_pending_resize().unwrap_or_else(|| {
-                    let cols = (1280.0 / cell_w).max(1.0) as u16;
-                    let rows = (800.0 / cell_h).max(1.0) as u16;
-                    (cols, rows)
+                    let w = guard.last_grid_width;
+                    let h = guard.last_grid_height;
+                    crate::state::compute_pty_dimensions(w, h, cell_w, cell_h)
                 });
                 log::info!(
                     "on_cell_metrics: cell={}x{} -> resize all PTYs to {}x{}",
-                    cell_w, cell_h, cols, rows
+                    cell_w,
+                    cell_h,
+                    cols,
+                    rows
                 );
-                let mut guard = metrics_shared.lock().expect("state mutex poisoned");
                 resize_all_terminals(&mut guard, cols, rows);
             })),
             ..Default::default()
@@ -147,13 +215,12 @@ fn main() {
             let guard = tree_shared.lock().expect("state mutex poisoned");
             let snap = guard.ui_snapshot();
             let active_id = guard.active_pane.0;
-            let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
             let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = guard
                 .terminals
                 .iter()
                 .map(|(&id, t)| {
                     let mut grid = t.grid().clone();
-                    if id != active_id || !win_focused {
+                    if id != active_id {
                         grid.set_cursor_visible(false);
                     }
                     (id, grid)

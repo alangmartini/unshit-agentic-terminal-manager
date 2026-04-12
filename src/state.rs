@@ -673,7 +673,6 @@ pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
     }
 }
 
-
 /// Measure the actual monospace cell_width / font_size ratio using cosmic-text
 /// at a specific (DPI-scaled) font size. Because glyph hinting can produce
 /// different advance widths at different pixel sizes, the measurement must be
@@ -718,8 +717,10 @@ pub fn measure_cell_width_ratio_at(font_size: f32, line_height: f32) -> f32 {
 /// CSS base font-size in px. Must match `--t-md` in assets/styles.css.
 pub const CSS_BASE_FONT_SIZE: f32 = 12.0;
 
-/// CSS line-height for `.terminal-content`. Must match `line-height: 1.2` in
-/// assets/styles.css.
+/// CSS line-height for `.terminal-content`. Must match
+/// `.terminal-content { line-height: 1.2; }` in assets/styles.css.
+/// If this value drifts from the CSS, the renderer cell_h and the
+/// pre-published cell_h will disagree, causing row-height mismatches.
 pub const CSS_LINE_HEIGHT: f32 = 1.2;
 
 /// Pre-publish cell metrics to the global atomics so that `on_resize` handlers
@@ -748,7 +749,6 @@ pub fn compute_pty_dimensions(
         (80u16, 24u16)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -892,6 +892,24 @@ mod tests {
             "expected same ratio for different line_heights: normal={}, tight={}",
             ratio_normal,
             ratio_tight
+        );
+    }
+
+    #[test]
+    fn pre_publish_cell_h_matches_css_line_height() {
+        // Regression: CSS_LINE_HEIGHT must stay in sync with
+        // `.terminal-content { line-height }` in styles.css.
+        // If the constant drifts, pre_publish produces a cell_h that
+        // disagrees with the renderer, causing visible row-height gaps.
+        let scale = 1.0_f32;
+        let ratio = 0.6_f32;
+        let (_, cell_h) = pre_publish_cell_metrics(scale, ratio);
+        let expected = CSS_BASE_FONT_SIZE * scale * CSS_LINE_HEIGHT;
+        assert!(
+            (cell_h - expected).abs() < f32::EPSILON,
+            "cell_h ({}) must equal font_size * CSS_LINE_HEIGHT ({})",
+            cell_h,
+            expected,
         );
     }
 

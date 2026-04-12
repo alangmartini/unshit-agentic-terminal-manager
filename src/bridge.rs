@@ -108,13 +108,18 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                     {
                         let mut guard = shared.lock().expect("state mutex poisoned");
 
-                        // Cursor blink: active pane only, and only when
-                        // the window has OS focus.
+                        // Cursor blink: active pane blinks when focused,
+                        // shows steady cursor when window is unfocused.
+                        // Inactive panes never show a cursor.
                         let active_id = guard.active_pane.0;
                         let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
                         for (&id, terminal) in guard.terminals.iter_mut() {
-                            if id == active_id && win_focused {
-                                terminal.grid_mut().set_cursor_visible(visible);
+                            if id == active_id {
+                                if win_focused {
+                                    terminal.grid_mut().set_cursor_visible(visible);
+                                } else {
+                                    terminal.grid_mut().set_cursor_visible(true);
+                                }
                             } else {
                                 terminal.grid_mut().set_cursor_visible(false);
                             }
@@ -133,11 +138,17 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                 "blink sync check: cell_w={:.2} cell_h={:.2} grid_w={:.1} grid_h={:.1}",
                                 cell_w, cell_h, w, h
                             );
-                            if cell_w > 0.0 && cell_h > 0.0 && w > 0.0 {
+                            if cell_w > 0.0 && cell_h > 0.0 {
                                 synced = true;
-                                let (cols, rows) = crate::state::compute_pty_dimensions(
-                                    w, h, cell_w, cell_h,
-                                );
+                                // Use stored grid dimensions if available, otherwise
+                                // fall back to 80x24. The on_resize handler may not
+                                // have fired yet because it only registers when a
+                                // terminal grid exists (chicken-and-egg with deferred spawn).
+                                let (cols, rows) = if w > 0.0 {
+                                    crate::state::compute_pty_dimensions(w, h, cell_w, cell_h)
+                                } else {
+                                    (80u16, 24u16)
+                                };
                                 log::info!(
                                     "PTY sync: {}x{} (cell {:.2}x{:.2}, area {:.0}x{:.0})",
                                     cols, rows, cell_w, cell_h, w, h

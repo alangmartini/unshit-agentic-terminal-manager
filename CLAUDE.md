@@ -20,11 +20,39 @@ cargo llvm-cov --html # coverage report in target/llvm-cov/html/
 - `src/` - Rust backend: PTY management, terminal emulation, state, UI bridge
 - `src/pty/` - Pseudo-terminal handling via `portable-pty`
 - `src/terminal/` - Terminal emulation via `vte`
-- `src/bridge.rs` - Frontend-backend bridge
-- `src/state.rs` - Application state
+- `src/bridge.rs` - Frontend-backend bridge (PTY subscriptions, cursor blink, resize polling)
+- `src/state.rs` - Application state, PTY dimension helpers, cell metrics
 - `src/ui/` - UI components (split panes, settings, keyboard nav)
-- Root (`index.html`, `app.js`, `styles.css`) - Web frontend
-- Framework dependency: `../unshit-rust-framework/`
+- `assets/styles.css` - All CSS styling
+- Framework dependency: `../unshit-rust-framework/` (relative to repo root, NOT deeper)
+
+## Framework Pitfalls (unshit-rust-framework)
+
+Critical things to know about the unshit framework:
+
+1. **Default display is flex-row.** Every `<Div>` defaults to `display: flex; flex-direction: row`. Any container that stacks children vertically MUST have `flex-direction: column` in CSS. This includes `.workspace-body`, `.sidebar-scroll`, `.sidebar-footer`, `.activity-item`, etc.
+
+2. **CSS grid may not expand children correctly.** Prefer flexbox (`display: flex` + `flex: 1`) over `display: grid` with `grid-template-*` for layout. Grid support exists but `1fr` expansion has issues.
+
+3. **Cell metrics timing.** The renderer publishes `cell_w`/`cell_h` via `CellGrid::publish_cell_metrics()` during the render pass. The `on_resize` handler fires during the layout pass BEFORE the renderer, so `global_cell_w()` is 0.0 on the first frame. The `on_cell_metrics` callback and blink subscription handle the correction.
+
+4. **PTY must be spawned eagerly.** Do NOT defer PTY spawning until cell metrics are available. This creates a deadlock: no terminal -> no CellGrid rendered -> no metrics published -> PTY never spawns. Always spawn at 80x24, then correct dimensions once metrics arrive.
+
+5. **Cargo.toml path dependency.** The unshit path MUST be `../unshit-rust-framework/crates/unshit`. Agents working in worktrees will see a different relative path. Always verify Cargo.toml after agent work.
+
+## Agent/Worktree Guidelines
+
+When spawning agents in isolated worktrees:
+
+1. **Always verify `Cargo.toml` path dependencies after agent work.** Worktrees change the relative path to sibling repos. The correct path is `../unshit-rust-framework/crates/unshit` from the repo root.
+
+2. **Run `cargo run` after merging agent work.** Tests passing does NOT mean the app works correctly. Visual regressions (layout, CSS) are not caught by unit tests. Always launch the app and verify visually.
+
+3. **Merge agents one at a time, not all at once.** Parallel agent branches that touch overlapping files create cascading merge conflicts. Merge and verify each one sequentially.
+
+4. **Check for missing callbacks after conflict resolution.** `AppConfig` fields like `on_close`, `on_scale_factor`, `on_cell_metrics` can be silently dropped during conflict resolution. Verify all callbacks are present after merging.
+
+5. **Do not remove eager PTY spawn.** The initial PTY spawn in `main.rs` is load-bearing. Without it, the terminal never renders.
 
 ## Testing Requirements
 
