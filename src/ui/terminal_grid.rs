@@ -1,5 +1,5 @@
 use unshit::core::element::*;
-use unshit::core::event::{Event, EventType};
+use unshit::core::event::{Event, EventType, Key, KeyEventKind, Modifiers};
 
 use crate::state::{
     mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane, PaneId,
@@ -166,15 +166,95 @@ fn build_pane_body(
             grid_el = grid_el.captures_keyboard(true);
 
             // Register keyboard capture handler to send input to PTY.
+            // Shift+PageUp/Down are intercepted for scrollback navigation
+            // instead of being forwarded to the shell.
             let kbd_shared = shared.clone();
             let kbd_pane_id = pane_id;
             grid_el = grid_el.on(
                 EventType::KeyboardCapture,
                 move |event: &Event| -> Option<Box<dyn std::any::Any>> {
                     if let Event::Keyboard(kb) = event {
+                        if kb.kind != KeyEventKind::Pressed {
+                            return None;
+                        }
+
+                        let has_shift = kb.modifiers.contains(Modifiers::SHIFT);
+                        let no_ctrl = !kb.modifiers.contains(Modifiers::CTRL);
+                        let no_alt = !kb.modifiers.contains(Modifiers::ALT);
+
+                        // Shift+PageUp: scroll back half a page.
+                        if has_shift && no_ctrl && no_alt && kb.key == Key::PageUp {
+                            mutate_with(&kbd_shared, |st| {
+                                if let Some(terminal) = st.terminals.get_mut(&kbd_pane_id.0) {
+                                    let half = (terminal.grid().rows() / 2).max(1);
+                                    terminal.scroll_view_up(half);
+                                }
+                            });
+                            return None;
+                        }
+
+                        // Shift+PageDown: scroll forward half a page.
+                        if has_shift && no_ctrl && no_alt && kb.key == Key::PageDown {
+                            mutate_with(&kbd_shared, |st| {
+                                if let Some(terminal) = st.terminals.get_mut(&kbd_pane_id.0) {
+                                    let half = (terminal.grid().rows() / 2).max(1);
+                                    terminal.scroll_view_down(half);
+                                }
+                            });
+                            return None;
+                        }
+
+                        // Any other key while scrolled back snaps to live view.
+                        mutate_with(&kbd_shared, |st| {
+                            if let Some(terminal) = st.terminals.get_mut(&kbd_pane_id.0) {
+                                if terminal.scroll_offset() > 0 {
+                                    terminal.reset_scroll();
+                                }
+                            }
+                        });
+
                         if let Some(bytes) = crate::terminal::keys::encode_key(kb) {
                             mutate_with(&kbd_shared, |st| {
                                 let _ = st.pty_manager.write(kbd_pane_id.0, &bytes);
+                            });
+                        }
+                    }
+                    None
+                },
+            );
+
+            // Mouse wheel scrolls the scrollback buffer.
+            // delta_y > 0 = wheel up (toward older history).
+            // delta_y < 0 = wheel down (toward live screen).
+            // The framework converts LineDelta to pixels (line_height ~40px),
+            // so divide by cell_h to get terminal lines. Minimum 1 line per
+            // notch so small deltas still move.
+            let scroll_shared = shared.clone();
+            let scroll_pane_id = pane_id;
+            grid_el = grid_el.on(
+                EventType::Scroll,
+                move |event: &Event| -> Option<Box<dyn std::any::Any>> {
+                    if let Event::Scroll(se) = event {
+                        use unshit::core::cell_grid::CellGrid;
+                        let cell_h = CellGrid::global_cell_h().max(1.0);
+                        let raw_lines = se.delta_y / cell_h;
+                        // Round away from zero so even a small notch scrolls 1 line.
+                        let lines = if raw_lines > 0.0 {
+                            raw_lines.ceil() as i32
+                        } else {
+                            raw_lines.floor() as i32
+                        };
+                        if lines != 0 {
+                            mutate_with(&scroll_shared, |st| {
+                                if let Some(terminal) =
+                                    st.terminals.get_mut(&scroll_pane_id.0)
+                                {
+                                    if lines > 0 {
+                                        terminal.scroll_view_up(lines as usize);
+                                    } else {
+                                        terminal.scroll_view_down((-lines) as usize);
+                                    }
+                                }
                             });
                         }
                     }
