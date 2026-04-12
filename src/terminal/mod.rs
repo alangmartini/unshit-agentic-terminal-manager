@@ -79,6 +79,8 @@ impl Terminal {
             parser.advance(&mut performer, byte);
         }
         self.parser = parser;
+        // Sync cursor position to the grid so the renderer can draw it.
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
     /// Immutable reference to the backing cell grid.
@@ -105,6 +107,7 @@ impl Terminal {
         if self.cursor_col >= cols {
             self.cursor_col = cols.saturating_sub(1);
         }
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
     /// The current window title (set via OSC 0 or OSC 2).
