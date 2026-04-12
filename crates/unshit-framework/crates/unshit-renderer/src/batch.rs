@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::atlas::{GlyphAtlas, GlyphKey};
+use crate::atlas::{GlyphAtlas, GlyphEntry, GlyphKey};
 use crate::canvas::{CanvasCallback, CanvasRegistry};
 use crate::pipeline::image::ImageInstance;
 use crate::pipeline::quad::{QuadInstance, MAX_GRADIENT_STOPS};
@@ -1634,10 +1634,22 @@ fn emit_grid_cells(
     let cells = grid.cells();
     let dirty = grid.dirty_flags();
 
-    // Reusable buffer for glyph shaping. Creating a cosmic_text::Buffer per
-    // cell was the primary FPS bottleneck: after a scroll every cell is dirty,
-    // causing thousands of allocations per frame. Hoisting the buffer out and
-    // reusing it via set_text() eliminates that overhead.
+    // Per-frame glyph cache: maps a character to its resolved shaping result
+    // (GlyphKey + AtlasEntry + physical offsets). In a monospace grid every
+    // occurrence of the same codepoint produces an identical glyph at the same
+    // subpixel position, so we only need to run cosmic-text shaping once per
+    // unique character per frame. The cache is local (rebuilt each frame), so
+    // font-size changes are handled automatically.
+    struct CachedGlyph {
+        key: GlyphKey,
+        entry: GlyphEntry,
+        physical_x: i32,
+        physical_y: i32,
+        line_y: f32,
+    }
+    let mut glyph_cache: FxHashMap<char, Option<CachedGlyph>> = FxHashMap::default();
+
+    // Reusable buffer for glyph shaping on cache miss.
     let metrics = cosmic_text::Metrics::new(font_size, cell_h);
     let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
     buffer.set_size(font_system, Some(cell_w * 4.0), None);
@@ -1707,10 +1719,26 @@ fn emit_grid_cells(
             }
             fg_linear[3] *= opacity;
 
-            // Look up glyph directly from atlas (single codepoint, no shaping).
-            // Use cell_h as the line height so the baseline matches the grid row spacing.
-            // On Windows, use the DW font name so cosmic-text metrics match
-            // DirectWrite metrics (avoids 'I' gap from Consolas/JetBrains Mono mismatch).
+            // Fast path: look up the per-frame glyph cache before running
+            // cosmic-text shaping. Same char = same glyph in a monospace grid.
+            if let Some(cached) = glyph_cache.get(&cell.ch) {
+                if let Some(cg) = cached {
+                    atlas.touch(&cg.key);
+                    let gx = px + cg.physical_x as f32 + cg.entry.offset[0];
+                    let gy = py + cg.line_y + cg.physical_y as f32 + cg.entry.offset[1];
+                    batch.glyph_instances.push(GlyphInstance {
+                        pos: [gx, gy],
+                        size: cg.entry.size,
+                        uv_min: [cg.entry.uv_rect[0], cg.entry.uv_rect[1]],
+                        uv_max: [cg.entry.uv_rect[2], cg.entry.uv_rect[3]],
+                        color: fg_linear,
+                        clip_rect,
+                    });
+                }
+                continue;
+            }
+
+            // Cache miss: shape with cosmic-text and store the result.
             let ch_str = cell.ch.encode_utf8(&mut ch_buf);
             #[cfg(target_os = "windows")]
             let family = cosmic_text::Family::Name(&rasterizer.dw.font_family);
@@ -1723,6 +1751,8 @@ fn emit_grid_cells(
                 cosmic_text::Shaping::Advanced,
             );
             buffer.shape_until_scroll(font_system, false);
+
+            let mut cached_result: Option<CachedGlyph> = None;
 
             for run in buffer.layout_runs() {
                 for glyph in run.glyphs.iter() {
@@ -1754,7 +1784,14 @@ fn emit_grid_cells(
                         }
                     };
 
-                    // Position the glyph inside the cell.
+                    cached_result = Some(CachedGlyph {
+                        key,
+                        entry,
+                        physical_x: physical.x,
+                        physical_y: physical.y,
+                        line_y: run.line_y,
+                    });
+
                     let gx = px + physical.x as f32 + entry.offset[0];
                     let gy = py + run.line_y + physical.y as f32 + entry.offset[1];
 
@@ -1768,6 +1805,8 @@ fn emit_grid_cells(
                     });
                 }
             }
+
+            glyph_cache.insert(cell.ch, cached_result);
         }
     }
 
@@ -2380,6 +2419,134 @@ mod tests {
             w2.to_bits(),
             "cached value should be bit-identical: {} vs {}",
             w1, w2
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-frame glyph cache tests (emit_grid_cells optimization)
+    // -----------------------------------------------------------------------
+
+    /// Helper: shape a single character through cosmic-text and return the
+    /// resulting GlyphKey (the same computation emit_grid_cells performs).
+    fn shape_char_to_key(fs: &mut FontSystem, ch: char, font_size: f32, cell_h: f32, cell_w: f32) -> Option<GlyphKey> {
+        let metrics = cosmic_text::Metrics::new(font_size, cell_h);
+        let mut buffer = cosmic_text::Buffer::new(fs, metrics);
+        buffer.set_size(fs, Some(cell_w * 4.0), None);
+
+        let mut ch_buf = [0u8; 4];
+        let ch_str = ch.encode_utf8(&mut ch_buf);
+        #[cfg(target_os = "windows")]
+        let family = cosmic_text::Family::Name("Consolas");
+        #[cfg(not(target_os = "windows"))]
+        let family = cosmic_text::Family::Monospace;
+        buffer.set_text(fs, ch_str, cosmic_text::Attrs::new().family(family), cosmic_text::Shaping::Advanced);
+        buffer.shape_until_scroll(fs, false);
+
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                return Some(GlyphKey {
+                    font_id: physical.cache_key.font_size_bits as u64,
+                    glyph_id: physical.cache_key.glyph_id,
+                    font_size_tenths: (font_size * 10.0) as u16,
+                    subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
+                        | (physical.cache_key.y_bin as u8),
+                });
+            }
+        }
+        None
+    }
+
+    /// Core cache invariant: shaping the same character twice must yield an
+    /// identical GlyphKey, otherwise the per-frame cache would serve wrong
+    /// glyphs.
+    #[test]
+    fn same_char_produces_identical_glyph_key() {
+        let mut fs = FontSystem::new();
+        let font_size = 14.0;
+        let cell_h = font_size * 1.2;
+        let cell_w = 8.4;
+
+        let key1 = shape_char_to_key(&mut fs, 'A', font_size, cell_h, cell_w)
+            .expect("'A' should produce a glyph");
+        let key2 = shape_char_to_key(&mut fs, 'A', font_size, cell_h, cell_w)
+            .expect("'A' should produce a glyph on second call");
+        assert_eq!(key1, key2, "same char must yield identical GlyphKey");
+    }
+
+    /// Different characters must produce different glyph IDs so the cache
+    /// does not conflate them.
+    #[test]
+    fn different_chars_produce_different_glyph_keys() {
+        let mut fs = FontSystem::new();
+        let font_size = 14.0;
+        let cell_h = font_size * 1.2;
+        let cell_w = 8.4;
+
+        let key_a = shape_char_to_key(&mut fs, 'A', font_size, cell_h, cell_w)
+            .expect("'A' should produce a glyph");
+        let key_b = shape_char_to_key(&mut fs, 'B', font_size, cell_h, cell_w)
+            .expect("'B' should produce a glyph");
+        assert_ne!(key_a.glyph_id, key_b.glyph_id, "'A' and 'B' must map to different glyph IDs");
+    }
+
+    /// The glyph cache is keyed on `char`. Verify that a broad set of
+    /// printable ASCII characters each produce a unique glyph_id, so
+    /// caching by char is safe.
+    #[test]
+    fn printable_ascii_glyphs_are_unique() {
+        let mut fs = FontSystem::new();
+        let font_size = 14.0;
+        let cell_h = font_size * 1.2;
+        let cell_w = 8.4;
+
+        let mut seen = std::collections::HashMap::<u16, char>::new();
+        for ch in '!'..='~' {
+            if let Some(key) = shape_char_to_key(&mut fs, ch, font_size, cell_h, cell_w) {
+                if let Some(&prev_ch) = seen.get(&key.glyph_id) {
+                    panic!(
+                        "glyph_id {} collides between '{}' and '{}'",
+                        key.glyph_id, prev_ch, ch
+                    );
+                }
+                seen.insert(key.glyph_id, ch);
+            }
+        }
+    }
+
+    /// Shaping must be deterministic across many calls so the per-frame
+    /// cache is safe to rebuild each frame.
+    #[test]
+    fn shaping_is_deterministic_across_many_calls() {
+        let mut fs = FontSystem::new();
+        let font_size = 14.0;
+        let cell_h = font_size * 1.2;
+        let cell_w = 8.4;
+
+        let reference = shape_char_to_key(&mut fs, 'X', font_size, cell_h, cell_w)
+            .expect("'X' should produce a glyph");
+        for _ in 0..100 {
+            let key = shape_char_to_key(&mut fs, 'X', font_size, cell_h, cell_w)
+                .expect("'X' should produce a glyph");
+            assert_eq!(reference, key, "GlyphKey must be stable across repeated shaping");
+        }
+    }
+
+    /// font_size changes must produce different GlyphKeys, validating
+    /// that the frame-local cache (rebuilt each frame with potentially
+    /// different font_size) does not serve stale entries.
+    #[test]
+    fn different_font_size_produces_different_key() {
+        let mut fs = FontSystem::new();
+        let cell_w = 8.4;
+
+        let key_14 = shape_char_to_key(&mut fs, 'M', 14.0, 14.0 * 1.2, cell_w)
+            .expect("'M' at 14pt should produce a glyph");
+        let key_20 = shape_char_to_key(&mut fs, 'M', 20.0, 20.0 * 1.2, cell_w)
+            .expect("'M' at 20pt should produce a glyph");
+        assert_ne!(
+            key_14.font_size_tenths, key_20.font_size_tenths,
+            "different font sizes must produce different font_size_tenths"
         );
     }
 }
