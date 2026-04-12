@@ -105,8 +105,7 @@ fn main() {
         let mut guard = shared.lock().unwrap();
         let font_size = crate::state::CSS_BASE_FONT_SIZE * guard.scale_factor;
         let line_height = font_size * crate::state::CSS_LINE_HEIGHT;
-        guard.cell_width_ratio =
-            crate::state::measure_cell_width_ratio_at(font_size, line_height);
+        guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
         crate::state::pre_publish_cell_metrics(guard.scale_factor, guard.cell_width_ratio);
     }
 
@@ -173,10 +172,17 @@ fn main() {
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
+                let mut guard = metrics_shared.lock().expect("state mutex poisoned");
+                // Prefer the renderer's pending resize (exact). If unavailable
+                // (on_cell_metrics fires before publish_pending_resize), use the
+                // real grid dimensions stored by the on_resize layout callback.
+                // Never fall back to the full window size (1280x800) because it
+                // ignores sidebar, tabbar, statusbar, and padding, producing a
+                // column count far larger than the visible terminal area.
                 let (cols, rows) = CellGrid::take_pending_resize().unwrap_or_else(|| {
-                    let cols = (1280.0 / cell_w).max(1.0) as u16;
-                    let rows = (800.0 / cell_h).max(1.0) as u16;
-                    (cols, rows)
+                    let w = guard.last_grid_width;
+                    let h = guard.last_grid_height;
+                    crate::state::compute_pty_dimensions(w, h, cell_w, cell_h)
                 });
                 log::info!(
                     "on_cell_metrics: cell={}x{} -> resize all PTYs to {}x{}",
@@ -185,7 +191,6 @@ fn main() {
                     cols,
                     rows
                 );
-                let mut guard = metrics_shared.lock().expect("state mutex poisoned");
                 resize_all_terminals(&mut guard, cols, rows);
             })),
             ..Default::default()
