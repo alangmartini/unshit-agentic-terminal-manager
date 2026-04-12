@@ -74,12 +74,23 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                 });
 
                 // Drain channel and feed bytes to the terminal emulator.
+                // Batch all buffered chunks into a single rebuild to avoid
+                // triggering one full tree-rebuild per PTY read (the framework
+                // does not coalesce RequestRebuild events).
                 while let Some(data) = rx.recv().await {
+                    let mut batched = 1u32;
                     {
                         let mut guard = shared.lock().expect("state mutex poisoned");
                         if let Some(terminal) = guard.terminals.get_mut(&pane_id) {
                             terminal.process_bytes(&data);
+                            while let Ok(more) = rx.try_recv() {
+                                terminal.process_bytes(&more);
+                                batched += 1;
+                            }
                         }
+                    }
+                    if batched > 1 {
+                        log::debug!("pty-{}: batched {} chunks into 1 rebuild", pane_id, batched);
                     }
                     yield ExternalEvent::RequestRebuild;
                 }
