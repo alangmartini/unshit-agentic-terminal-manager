@@ -1030,8 +1030,9 @@ body::after {
 .pane-meta {
   color: var(--fg-muted);
   font-size: var(--t-xs);
-  margin-left: auto;
+  padding-left: var(--sp-5);
   padding-right: var(--sp-3);
+  white-space: nowrap;
 }
 
 .pane-header-right {
