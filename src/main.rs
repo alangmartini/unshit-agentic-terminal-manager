@@ -114,16 +114,26 @@ fn main() {
         guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
     }
 
-    // Create the Terminal (with CellGrid) at 80x24 so the renderer has a
-    // grid to measure against. Do NOT spawn the PTY yet: on_cell_metrics
-    // will spawn it with the correct DPI-aware dimensions on the first
-    // frame, avoiding the 80-col -> real-cols resize race that causes
-    // the shell greeting to wrap incorrectly.
+    // Spawn initial PTY eagerly at 80x24. This is load-bearing: without
+    // a terminal the CellGrid doesn't exist, the renderer can't publish
+    // metrics, and the PTY never gets spawned (deadlock). The dimensions
+    // will be corrected by on_cell_metrics on the first frame.
     {
         let mut guard = shared.lock().unwrap();
         let pane_id = guard.active_pane.0;
         let terminal = crate::terminal::Terminal::new(24, 80);
         guard.terminals.insert(pane_id, terminal);
+        match guard.pty_manager.spawn(pane_id, 80, 24) {
+            Ok(reader) => {
+                crate::bridge::register_reader(pane_id, reader);
+            }
+            Err(e) => {
+                log::error!("failed to spawn initial PTY: {}", e);
+                if let Some(t) = guard.terminals.get_mut(&pane_id) {
+                    t.process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
+                }
+            }
+        }
     }
 
     let tree_shared = shared.clone();
@@ -168,60 +178,18 @@ fn main() {
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
                 let mut guard = metrics_shared.lock().expect("state mutex poisoned");
-                // Prefer the renderer's pending resize (exact). If unavailable
-                // (on_cell_metrics fires before publish_pending_resize), use the
-                // real grid dimensions stored by the on_resize layout callback.
                 let (cols, rows) = CellGrid::take_pending_resize().unwrap_or_else(|| {
                     let w = guard.last_grid_width;
                     let h = guard.last_grid_height;
                     crate::state::compute_pty_dimensions(w, h, cell_w, cell_h)
                 });
                 log::info!(
-                    "on_cell_metrics: cell={}x{} -> dims {}x{}",
+                    "on_cell_metrics: cell={}x{} -> resize all PTYs to {}x{}",
                     cell_w,
                     cell_h,
                     cols,
                     rows
                 );
-
-                // Spawn PTYs for panes that have a Terminal but no PTY.
-                // The initial pane's Terminal is created in main() without a
-                // PTY so the CellGrid exists for the renderer to measure.
-                // Now that we have correct DPI-aware dimensions, spawn the
-                // shell at the right size from the start.
-                let pane_ids: Vec<u32> = guard
-                    .panes
-                    .iter()
-                    .flat_map(|row| row.iter().map(|p| p.id.0))
-                    .collect();
-                for id in &pane_ids {
-                    if guard.terminals.contains_key(id) && !guard.pty_manager.has(*id) {
-                        // Resize the terminal grid to match the real dimensions.
-                        if let Some(t) = guard.terminals.get_mut(id) {
-                            t.resize(rows as usize, cols as usize);
-                        }
-                        match guard.pty_manager.spawn(*id, cols, rows) {
-                            Ok(reader) => {
-                                crate::bridge::register_reader(*id, reader);
-                                log::info!(
-                                    "deferred PTY spawn for pane {} at {}x{}",
-                                    id,
-                                    cols,
-                                    rows
-                                );
-                            }
-                            Err(e) => {
-                                log::error!("failed to spawn PTY for pane {}: {}", id, e);
-                                if let Some(t) = guard.terminals.get_mut(id) {
-                                    t.process_bytes(
-                                        format!("Failed to spawn shell: {}\r\n", e).as_bytes(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
                 resize_all_terminals(&mut guard, cols, rows);
             })),
             ..Default::default()
