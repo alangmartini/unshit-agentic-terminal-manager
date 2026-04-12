@@ -114,16 +114,33 @@ fn main() {
         guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
     }
 
-    // Spawn initial PTY eagerly at 80x24. This is load-bearing: without
-    // a terminal the CellGrid doesn't exist, the renderer can't publish
-    // metrics, and the PTY never gets spawned (deadlock). The dimensions
-    // will be corrected by on_cell_metrics on the first frame.
+    // Spawn initial PTY eagerly. This is load-bearing: without a terminal
+    // the CellGrid doesn't exist, the renderer can't publish metrics, and
+    // the PTY never gets spawned (deadlock). Estimate dimensions from the
+    // window size minus CSS chrome so the shell greeting is formatted for
+    // roughly the right width. on_cell_metrics corrects to exact values on
+    // the first frame.
     {
         let mut guard = shared.lock().unwrap();
+        // CSS chrome in logical pixels (scale cancels: grid and cells both
+        // scale equally).  sidebar(252) + resizer(4) + pane borders/margins
+        // (4) + pane-body horizontal padding(24) = 284.  tabbar(38) +
+        // statusbar(24) + pane-header(27) + pane borders/margins(4) +
+        // pane-body vertical padding(16) = 109.
+        let cell_w_est =
+            crate::state::CSS_BASE_FONT_SIZE * guard.cell_width_ratio;
+        let cell_h_est =
+            crate::state::CSS_BASE_FONT_SIZE * crate::state::CSS_LINE_HEIGHT;
+        let init_cols = ((1280.0_f32 - 284.0) / cell_w_est).max(1.0) as u16;
+        let init_rows = ((800.0_f32 - 109.0) / cell_h_est).max(1.0) as u16;
+        log::info!(
+            "initial PTY estimate: {}x{} (cell_w_est={:.2}, cell_h_est={:.2})",
+            init_cols, init_rows, cell_w_est, cell_h_est,
+        );
         let pane_id = guard.active_pane.0;
-        let terminal = crate::terminal::Terminal::new(24, 80);
+        let terminal = crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
         guard.terminals.insert(pane_id, terminal);
-        match guard.pty_manager.spawn(pane_id, 80, 24) {
+        match guard.pty_manager.spawn(pane_id, init_cols, init_rows) {
             Ok(reader) => {
                 crate::bridge::register_reader(pane_id, reader);
             }
