@@ -180,7 +180,10 @@ fn main() {
                 });
                 log::info!(
                     "on_cell_metrics: cell={}x{} -> resize all PTYs to {}x{}",
-                    cell_w, cell_h, cols, rows
+                    cell_w,
+                    cell_h,
+                    cols,
+                    rows
                 );
                 let mut guard = metrics_shared.lock().expect("state mutex poisoned");
                 resize_all_terminals(&mut guard, cols, rows);
