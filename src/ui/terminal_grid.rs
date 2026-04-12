@@ -7,6 +7,13 @@ use crate::state::{
 };
 use crate::ui::icons::*;
 
+/// Returns `true` when the pane grid contains exactly one pane (one row with
+/// one column). In that case the tab bar already displays the pane title and
+/// subtitle, so the pane header can omit them to avoid visual duplication.
+fn is_single_pane(panes: &[Vec<Pane>]) -> bool {
+    panes.len() == 1 && panes[0].len() == 1
+}
+
 pub fn build_terminal_grid(
     state: &UiSnapshot,
     shared: &SharedState,
@@ -16,6 +23,8 @@ pub fn build_terminal_grid(
         .with_class("terminal-grid")
         .with_id("terminal-grid");
 
+    let single_pane = is_single_pane(&state.panes);
+
     for (row_idx, row) in state.panes.iter().enumerate() {
         let mut row_el = ElementDef::new(Tag::Div).with_class("pane-row");
         for (col_idx, pane) in row.iter().enumerate() {
@@ -24,7 +33,7 @@ pub fn build_terminal_grid(
             if col_idx > 0 {
                 row_el = row_el.with_child(ElementDef::new(Tag::Div).with_class("pane-resizer"));
             }
-            row_el = row_el.with_child(build_pane(pane, is_active, shared, grids));
+            row_el = row_el.with_child(build_pane(pane, is_active, single_pane, shared, grids));
         }
         if row_idx > 0 {
             grid_el = grid_el.with_child(
@@ -42,6 +51,7 @@ pub fn build_terminal_grid(
 fn build_pane(
     pane: &Pane,
     is_active: bool,
+    single_pane: bool,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
@@ -59,19 +69,22 @@ fn build_pane(
 
     let body = build_pane_body(pane.id, is_active, shared, grids);
     container
-        .with_child(build_pane_header(pane, shared))
+        .with_child(build_pane_header(pane, single_pane, shared))
         .with_child(body)
 }
 
-fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
+fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> ElementDef {
     let meta = format!("pid {} \u{00B7} {:.1}%", pane.pid, pane.cpu);
     let pane_id = pane.id;
     let split_h_state = shared.clone();
     let split_v_state = shared.clone();
     let close_state = shared.clone();
-    ElementDef::new(Tag::Div)
-        .with_class("pane-header")
-        .with_child(
+    let mut header = ElementDef::new(Tag::Div).with_class("pane-header");
+
+    // When there is only a single pane the tab bar already shows the title and
+    // subtitle, so we omit the left section to avoid visual duplication.
+    if !single_pane {
+        header = header.with_child(
             ElementDef::new(Tag::Div)
                 .with_class("pane-header-left")
                 .with_child(ElementDef::new(Tag::Span).with_class("pane-status-dot"))
@@ -85,7 +98,10 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
                         .with_class("pane-subtitle")
                         .with_text(format!("\u{00B7} {}", pane.subtitle)),
                 ),
-        )
+        );
+    }
+
+    header
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("pane-meta")
@@ -339,5 +355,117 @@ mod tests {
             second.is_none(),
             "pending resize should be consumed after take"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for pane-header deduplication tests
+    // -----------------------------------------------------------------------
+
+    /// Recursively search the element tree for a node whose classes contain
+    /// `class_name`. Returns `true` when at least one match is found.
+    fn tree_has_class(def: &ElementDef, class_name: &str) -> bool {
+        if def.classes.iter().any(|c| c == class_name) {
+            return true;
+        }
+        def.children.iter().any(|c| tree_has_class(c, class_name))
+    }
+
+    /// Recursively search the element tree for any node whose text content
+    /// contains `needle`.
+    fn tree_has_text(def: &ElementDef, needle: &str) -> bool {
+        if let unshit::core::element::ElementContent::Text(ref t) = def.content {
+            if t.contains(needle) {
+                return true;
+            }
+        }
+        def.children.iter().any(|c| tree_has_text(c, needle))
+    }
+
+    fn make_pane(id: u32) -> Pane {
+        Pane {
+            id: PaneId(id),
+            title: "shell".to_string(),
+            subtitle: "bash".to_string(),
+            pid: 42,
+            cpu: 1.5,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pane header deduplication: single pane hides title/subtitle
+    // -----------------------------------------------------------------------
+
+    /// When there is only one pane the tab bar already shows "shell  bash", so
+    /// the pane header must NOT duplicate the title and subtitle.
+    #[test]
+    fn single_pane_header_omits_title_and_subtitle() {
+        let shared = test_shared();
+        let pane = make_pane(1);
+        let header = build_pane_header(&pane, true, &shared);
+
+        assert!(
+            !tree_has_class(&header, "pane-header-left"),
+            "single-pane header must not contain .pane-header-left"
+        );
+        assert!(
+            !tree_has_class(&header, "pane-title"),
+            "single-pane header must not contain .pane-title"
+        );
+        assert!(
+            !tree_has_class(&header, "pane-subtitle"),
+            "single-pane header must not contain .pane-subtitle"
+        );
+        // Meta and action buttons must still be present.
+        assert!(
+            tree_has_class(&header, "pane-meta"),
+            "single-pane header must still contain .pane-meta"
+        );
+        assert!(
+            tree_has_class(&header, "pane-header-right"),
+            "single-pane header must still contain .pane-header-right"
+        );
+    }
+
+    /// When there are multiple panes (split layout) every pane header must
+    /// show its title and subtitle so the user can tell them apart.
+    #[test]
+    fn multi_pane_header_shows_title_and_subtitle() {
+        let shared = test_shared();
+        let pane = make_pane(1);
+        let header = build_pane_header(&pane, false, &shared);
+
+        assert!(
+            tree_has_class(&header, "pane-header-left"),
+            "multi-pane header must contain .pane-header-left"
+        );
+        assert!(
+            tree_has_class(&header, "pane-title"),
+            "multi-pane header must contain .pane-title"
+        );
+        assert!(
+            tree_has_text(&header, "shell"),
+            "multi-pane header must display the pane title text"
+        );
+        assert!(
+            tree_has_text(&header, "bash"),
+            "multi-pane header must display the pane subtitle text"
+        );
+    }
+
+    /// The `is_single_pane` helper must return the correct value for various
+    /// pane grid shapes.
+    #[test]
+    fn is_single_pane_detection() {
+        let one = vec![vec![make_pane(1)]];
+        assert!(is_single_pane(&one), "1x1 grid should be single pane");
+
+        let two_cols = vec![vec![make_pane(1), make_pane(2)]];
+        assert!(!is_single_pane(&two_cols), "1x2 grid is not single pane");
+
+        let two_rows = vec![vec![make_pane(1)], vec![make_pane(2)]];
+        assert!(!is_single_pane(&two_rows), "2x1 grid is not single pane");
+
+        let empty: Vec<Vec<Pane>> = vec![];
+        assert!(!is_single_pane(&empty), "empty grid is not single pane");
     }
 }
