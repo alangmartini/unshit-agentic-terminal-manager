@@ -1,0 +1,23 @@
+[package]
+name = "unshit-test"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+unshit-core = { path = "../unshit-core" }
+unshit-app = { path = "../unshit-app" }
+unshit-macros = { path = "../unshit-macros" }
+unshit-renderer = { path = "../unshit-renderer" }
+taffy = { workspace = true }
+cosmic-text = { workspace = true }
+smallvec = { workspace = true }
+winit = { workspace = true }
+pollster = { workspace = true }
+wgpu = { workspace = true }
+image = { workspace = true }
+bytemuck = { workspace = true }
