@@ -98,15 +98,20 @@ fn main() {
 
     let shared: SharedState = Arc::new(std::sync::Mutex::new(seed_state()));
 
-    // Measure the actual monospace cell width ratio and pre-publish cell
-    // metrics so the very first on_resize handler can compute correct PTY
-    // dimensions instead of falling back to 80x24.
+    // Measure the actual monospace cell width ratio for later use (split
+    // pane spawns, etc.). Do NOT pre-publish cell metrics to the global
+    // atomics: the pre-published values differ slightly from what the
+    // renderer measures (different FontSystem instance), causing the
+    // on_resize handler to fire an intermediate resize with wrong column
+    // count. Instead, let the renderer be the single source of truth:
+    // on_resize stores last_grid_width (cell_w is 0 so no resize), then
+    // on_cell_metrics fires with the renderer's exact cell_w and resizes
+    // the PTY once to the correct dimensions.
     {
         let mut guard = shared.lock().unwrap();
         let font_size = crate::state::CSS_BASE_FONT_SIZE * guard.scale_factor;
         let line_height = font_size * crate::state::CSS_LINE_HEIGHT;
         guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
-        crate::state::pre_publish_cell_metrics(guard.scale_factor, guard.cell_width_ratio);
     }
 
     // Spawn initial PTY for the default pane eagerly at 80x24.
