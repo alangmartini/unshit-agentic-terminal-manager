@@ -177,9 +177,13 @@ fn main() {
             cell_h_est,
         );
         let pane_id = guard.active_pane.0;
+        let cwd = crate::state::active_workspace_cwd(&guard);
         let terminal = crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
         guard.terminals.insert(pane_id, terminal);
-        match guard.pty_manager.spawn(pane_id, init_cols, init_rows) {
+        match guard
+            .pty_manager
+            .spawn_in(pane_id, init_cols, init_rows, cwd.as_deref())
+        {
             Ok(reader) => {
                 crate::bridge::register_reader(pane_id, reader);
             }

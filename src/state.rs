@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::terminal::Terminal;
@@ -49,6 +50,7 @@ impl SettingsSection {
 pub struct Workspace {
     pub num: u32,
     pub name: String,
+    pub path: Option<PathBuf>,
     pub collapsed: bool,
     pub terminals_expanded: bool,
     pub terminal_entries: Vec<TerminalEntry>,
@@ -257,6 +259,7 @@ pub fn seed_state() -> AppState {
         Workspace {
             num: 1,
             name: current_folder_name(),
+            path: std::env::current_dir().ok(),
             collapsed: false,
             terminals_expanded: true,
             terminal_entries: vec![
@@ -332,6 +335,7 @@ pub fn seed_state() -> AppState {
         Workspace {
             num: 2,
             name: "api".to_string(),
+            path: None,
             collapsed: false,
             terminals_expanded: false,
             terminal_entries: vec![
@@ -379,6 +383,7 @@ pub fn seed_state() -> AppState {
         Workspace {
             num: 3,
             name: "infra".to_string(),
+            path: None,
             collapsed: true,
             terminals_expanded: false,
             terminal_entries: vec![TerminalEntry {
@@ -410,6 +415,7 @@ pub fn seed_state() -> AppState {
         Workspace {
             num: 4,
             name: "scratch".to_string(),
+            path: None,
             collapsed: true,
             terminals_expanded: false,
             terminal_entries: vec![],
@@ -623,12 +629,22 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
 }
 
 pub fn mutate_add_workspace(state: &mut AppState) {
+    mutate_add_workspace_with_path(state, None);
+}
+
+pub fn mutate_add_workspace_with_path(state: &mut AppState, path: Option<PathBuf>) {
     let num = state.workspaces.len() as u32 + 1;
+    let name = path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("workspace-{}", num));
     state.workspaces.push(Workspace {
         num,
-        name: format!("workspace-{}", num),
+        name,
+        path,
         collapsed: false,
-        terminals_expanded: false,
+        terminals_expanded: true,
         terminal_entries: vec![],
         subtabs: vec![Subtab {
             label: "terminals".to_string(),
@@ -640,6 +656,7 @@ pub fn mutate_add_workspace(state: &mut AppState) {
             tree_glyph: "\u{2514}",
         }],
     });
+    state.active_workspace = state.workspaces.len() - 1;
 }
 
 pub fn find_pane_coord(state: &AppState, target: PaneId) -> Option<(usize, usize)> {
@@ -674,8 +691,12 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
         cell_h,
     );
 
+    let cwd = active_workspace_cwd(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
-    match state.pty_manager.spawn(id_num, cols, rows) {
+    match state
+        .pty_manager
+        .spawn_in(id_num, cols, rows, cwd.as_deref())
+    {
         Ok(reader) => {
             state.terminals.insert(id_num, terminal);
             crate::bridge::register_reader(id_num, reader);
@@ -724,8 +745,12 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
         cell_h,
     );
 
+    let cwd = active_workspace_cwd(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
-    match state.pty_manager.spawn(id_num, cols, rows) {
+    match state
+        .pty_manager
+        .spawn_in(id_num, cols, rows, cwd.as_deref())
+    {
         Ok(reader) => {
             state.terminals.insert(id_num, terminal);
             crate::bridge::register_reader(id_num, reader);
@@ -798,8 +823,12 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
             cell_h,
         );
 
+        let cwd = active_workspace_cwd(state);
         let mut terminal = Terminal::new(rows as usize, cols as usize);
-        match state.pty_manager.spawn(id_num, cols, rows) {
+        match state
+            .pty_manager
+            .spawn_in(id_num, cols, rows, cwd.as_deref())
+        {
             Ok(reader) => {
                 state.terminals.insert(id_num, terminal);
                 crate::bridge::register_reader(id_num, reader);
@@ -953,6 +982,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Return the working directory for the active workspace, falling back to home.
+pub fn active_workspace_cwd(state: &AppState) -> Option<PathBuf> {
+    state
+        .workspaces
+        .get(state.active_workspace)
+        .and_then(|ws| ws.path.clone())
 }
 
 pub fn find_active_pane(state: &UiSnapshot) -> &Pane {
@@ -1367,5 +1404,74 @@ mod tests {
         );
         // Third element should be unchanged.
         assert_eq!(ratios[0], initial[0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Workspace path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn seed_state_first_workspace_has_cwd_path() {
+        let state = seed_state();
+        let ws = &state.workspaces[0];
+        assert!(
+            ws.path.is_some(),
+            "first workspace must store current_dir as its path"
+        );
+    }
+
+    #[test]
+    fn seed_state_demo_workspaces_have_no_path() {
+        let state = seed_state();
+        for ws in &state.workspaces[1..] {
+            assert!(
+                ws.path.is_none(),
+                "demo workspace '{}' should have no path",
+                ws.name
+            );
+        }
+    }
+
+    #[test]
+    fn add_workspace_with_path_uses_folder_name() {
+        let mut state = seed_state();
+        let path = PathBuf::from("/home/user/projects/my-app");
+        mutate_add_workspace_with_path(&mut state, Some(path.clone()));
+        let ws = state.workspaces.last().unwrap();
+        assert_eq!(ws.name, "my-app");
+        assert_eq!(ws.path, Some(path));
+    }
+
+    #[test]
+    fn add_workspace_with_path_sets_active() {
+        let mut state = seed_state();
+        let old_count = state.workspaces.len();
+        mutate_add_workspace_with_path(&mut state, Some(PathBuf::from("/tmp/test")));
+        assert_eq!(state.active_workspace, old_count);
+    }
+
+    #[test]
+    fn add_workspace_without_path_uses_default_name() {
+        let mut state = seed_state();
+        let expected_num = state.workspaces.len() as u32 + 1;
+        mutate_add_workspace(&mut state);
+        let ws = state.workspaces.last().unwrap();
+        assert_eq!(ws.name, format!("workspace-{}", expected_num));
+        assert!(ws.path.is_none());
+    }
+
+    #[test]
+    fn active_workspace_cwd_returns_path_when_set() {
+        let mut state = seed_state();
+        let path = PathBuf::from("/tmp/ws");
+        mutate_add_workspace_with_path(&mut state, Some(path.clone()));
+        assert_eq!(active_workspace_cwd(&state), Some(path));
+    }
+
+    #[test]
+    fn active_workspace_cwd_returns_none_when_no_path() {
+        let mut state = seed_state();
+        state.active_workspace = 1; // demo workspace with no path
+        assert_eq!(active_workspace_cwd(&state), None);
     }
 }

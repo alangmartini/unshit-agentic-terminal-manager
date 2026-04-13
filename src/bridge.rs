@@ -173,6 +173,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                     .iter()
                                     .flat_map(|row| row.iter().map(|p| p.id.0))
                                     .collect();
+                                let cwd = crate::state::active_workspace_cwd(&guard);
                                 for id in &all_pane_ids {
                                     if !guard.terminals.contains_key(id) {
                                         let terminal = crate::terminal::Terminal::new(
@@ -180,7 +181,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                             cols as usize,
                                         );
                                         guard.terminals.insert(*id, terminal);
-                                        match guard.pty_manager.spawn(*id, cols, rows) {
+                                        match guard.pty_manager.spawn_in(*id, cols, rows, cwd.as_deref()) {
                                             Ok(reader) => {
                                                 crate::bridge::register_reader(*id, reader);
                                                 log::info!(
