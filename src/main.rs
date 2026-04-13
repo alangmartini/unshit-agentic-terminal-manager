@@ -8,8 +8,14 @@ use std::sync::Arc;
 
 use unshit::app::{App, AppConfig, FontSource};
 use unshit::core::element::*;
+use unshit::core::event::DragPhase;
+use unshit::core::style::parse::StyleDeclaration;
+use unshit::core::style::types::Dimension;
 
-use crate::state::{dispatch, mutate_with, seed_state, SharedState, UiSnapshot};
+use crate::state::{
+    dispatch, mutate_with, resize_all_terminals, seed_state, SharedState, UiSnapshot,
+    MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
+};
 use crate::ui::settings::build_settings_modal;
 use crate::ui::sidebar::build_sidebar;
 use crate::ui::statusbar::build_statusbar;
@@ -38,6 +44,38 @@ fn build_tree(
     }
     modal_overlay = modal_overlay.with_child(build_settings_modal(snap, shared));
 
+    let sidebar = build_sidebar(snap, shared)
+        .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
+        .with_style(StyleDeclaration::MinWidth(Dimension::Px(
+            snap.sidebar_width,
+        )));
+
+    let drag_shared = shared.clone();
+    let sidebar_resizer = ElementDef::new(Tag::Div)
+        .with_class("sidebar-resizer")
+        .on_drag(move |ev| match ev.phase {
+            DragPhase::Start => {
+                mutate_with(&drag_shared, |st| {
+                    st.sidebar_drag_start = Some(st.sidebar_width);
+                });
+            }
+            DragPhase::Update => {
+                mutate_with(&drag_shared, |st| {
+                    let start = match st.sidebar_drag_start {
+                        Some(w) => w,
+                        None => return,
+                    };
+                    st.sidebar_width =
+                        (start + ev.total_delta_x).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+                });
+            }
+            DragPhase::End => {
+                mutate_with(&drag_shared, |st| {
+                    st.sidebar_drag_start = None;
+                });
+            }
+        });
+
     ElementTree {
         root: ElementDef::new(Tag::Div)
             .with_class("app")
@@ -45,7 +83,8 @@ fn build_tree(
             .with_child(
                 ElementDef::new(Tag::Div)
                     .with_class("layout")
-                    .with_child(build_sidebar(snap, shared))
+                    .with_child(sidebar)
+                    .with_child(sidebar_resizer)
                     .with_child(
                         ElementDef::new(Tag::Div)
                             .with_class("content")
@@ -89,21 +128,62 @@ fn user_shortcut_bindings() -> Vec<(String, String)> {
 
 fn main() {
     env_logger::Builder::from_env(
-        env_logger::Env::default()
-            .default_filter_or("info,wgpu_hal=error,wgpu_core=error,naga=error"),
+        env_logger::Env::default().default_filter_or(
+            "info,wgpu_hal=error,wgpu_core=error,naga=error,unshit_app::app=error",
+        ),
     )
     .init();
 
     let shared: SharedState = Arc::new(std::sync::Mutex::new(seed_state()));
 
-    // Spawn initial PTY for the default pane.
+    // Measure the actual monospace cell width ratio for later use (split
+    // pane spawns, etc.). Do NOT pre-publish cell metrics to the global
+    // atomics: the pre-published values differ slightly from what the
+    // renderer measures (different FontSystem instance), causing the
+    // on_resize handler to fire an intermediate resize with wrong column
+    // count. Instead, let the renderer be the single source of truth:
+    // on_resize stores last_grid_width (cell_w is 0 so no resize), then
+    // on_cell_metrics fires with the renderer's exact cell_w and resizes
+    // the PTY once to the correct dimensions.
     {
         let mut guard = shared.lock().unwrap();
+        let font_size = crate::state::CSS_BASE_FONT_SIZE * guard.scale_factor;
+        let line_height = font_size * crate::state::CSS_LINE_HEIGHT;
+        guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
+    }
+
+    // Spawn initial PTY eagerly. This is load-bearing: without a terminal
+    // the CellGrid doesn't exist, the renderer can't publish metrics, and
+    // the PTY never gets spawned (deadlock). Estimate dimensions from the
+    // window size minus CSS chrome so the shell greeting is formatted for
+    // roughly the right width. on_cell_metrics corrects to exact values on
+    // the first frame.
+    {
+        let mut guard = shared.lock().unwrap();
+        // CSS chrome in logical pixels (scale cancels: grid and cells both
+        // scale equally).  sidebar(252) + resizer(4) + pane borders/margins
+        // (4) + pane-body horizontal padding(24) = 284.  tabbar(38) +
+        // statusbar(24) + pane-header(27) + pane borders/margins(4) +
+        // pane-body vertical padding(16) = 109.
+        let cell_w_est = crate::state::CSS_BASE_FONT_SIZE * guard.cell_width_ratio;
+        let cell_h_est = crate::state::CSS_BASE_FONT_SIZE * crate::state::CSS_LINE_HEIGHT;
+        let init_cols = ((1280.0_f32 - 284.0) / cell_w_est).max(1.0) as u16;
+        let init_rows = ((800.0_f32 - 109.0) / cell_h_est).max(1.0) as u16;
+        log::info!(
+            "initial PTY estimate: {}x{} (cell_w_est={:.2}, cell_h_est={:.2})",
+            init_cols,
+            init_rows,
+            cell_w_est,
+            cell_h_est,
+        );
         let pane_id = guard.active_pane.0;
-        let (cols, rows) = (80u16, 24u16);
-        let terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+        let cwd = crate::state::active_workspace_cwd(&guard);
+        let terminal = crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
         guard.terminals.insert(pane_id, terminal);
-        match guard.pty_manager.spawn(pane_id, cols, rows) {
+        match guard
+            .pty_manager
+            .spawn_in(pane_id, init_cols, init_rows, cwd.as_deref())
+        {
             Ok(reader) => {
                 crate::bridge::register_reader(pane_id, reader);
             }
@@ -118,6 +198,9 @@ fn main() {
 
     let tree_shared = shared.clone();
     let command_shared = shared.clone();
+    let metrics_shared = shared.clone();
+    let scale_shared = shared.clone();
+    let close_shared = shared.clone();
     let sub_shared = shared.clone();
 
     let mut app = App::new(
@@ -138,16 +221,57 @@ fn main() {
                 let mut guard = command_shared.lock().expect("state mutex poisoned");
                 dispatch(&mut guard, command)
             })),
+            // Approach 1: on_cell_metrics fires once after the first render
+            // publishes valid cell dimensions. Resize all PTYs immediately.
+            on_scale_factor: Some(Arc::new(move |scale: f32| {
+                let mut guard = scale_shared.lock().expect("state mutex poisoned");
+                guard.scale_factor = scale;
+            })),
+            on_close: Some(Arc::new(move || {
+                let mut guard = close_shared.lock().expect("state mutex poisoned");
+                guard.pty_manager.destroy_all();
+                guard.terminals.clear();
+                drop(guard);
+                // Force-exit the process. Without this, tokio's Runtime::drop
+                // blocks indefinitely waiting for spawn_blocking reader tasks
+                // (bridge.rs) that are stuck on pipe reads. The readers hold
+                // cloned PTY pipe handles that keep the .exe locked on Windows
+                // (os error 32), preventing cargo from rebuilding.
+                std::process::exit(0);
+            })),
+            on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
+                use unshit::core::cell_grid::CellGrid;
+                let mut guard = metrics_shared.lock().expect("state mutex poisoned");
+                let (cols, rows) = CellGrid::take_pending_resize().unwrap_or_else(|| {
+                    let w = guard.last_grid_width;
+                    let h = guard.last_grid_height;
+                    crate::state::compute_pty_dimensions(w, h, cell_w, cell_h)
+                });
+                log::info!(
+                    "on_cell_metrics: cell={}x{} -> resize all PTYs to {}x{}",
+                    cell_w,
+                    cell_h,
+                    cols,
+                    rows
+                );
+                resize_all_terminals(&mut guard, cols, rows);
+            })),
             ..Default::default()
         },
         move || {
             let guard = tree_shared.lock().expect("state mutex poisoned");
             let snap = guard.ui_snapshot();
-            // Clone grids for rendering. This gives us an immutable snapshot.
+            let active_id = guard.active_pane.0;
             let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = guard
                 .terminals
                 .iter()
-                .map(|(&id, t)| (id, t.grid().clone()))
+                .map(|(&id, t)| {
+                    let mut grid = t.display_grid();
+                    if id != active_id {
+                        grid.set_cursor_visible(false);
+                    }
+                    (id, grid)
+                })
                 .collect();
             drop(guard);
             build_tree(&snap, &tree_shared, &grids)

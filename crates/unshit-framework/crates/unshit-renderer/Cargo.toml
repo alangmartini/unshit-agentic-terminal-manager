@@ -1,0 +1,28 @@
+[package]
+name = "unshit-renderer"
+description = "wgpu-based GPU renderer, text shaping, and canvas API for the unshit UI framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+unshit-core = { version = "0.1.0", path = "../unshit-core" }
+wgpu = { workspace = true }
+winit = { workspace = true }
+cosmic-text = { workspace = true }
+lyon = { workspace = true }
+bytemuck = { workspace = true }
+rustc-hash = { workspace = true }
+log = { workspace = true }
+image = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+dwrote = { workspace = true }
+winapi = { workspace = true }

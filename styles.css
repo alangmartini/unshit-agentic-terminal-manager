@@ -613,6 +613,55 @@ body::after {
   50% { opacity: 0.4; }
 }
 
+/* ========== Disabled subtabs ========== */
+.subtab.disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.subtab.disabled:hover {
+  background: transparent;
+  color: var(--fg-secondary);
+}
+
+/* ========== Terminal entries ========== */
+.subtab-chevron {
+  color: var(--fg-tertiary);
+  font-size: 9px;
+  width: 10px;
+  transition: transform var(--dur-norm) var(--ease-std);
+}
+
+.terminal-entries {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.terminal-entry {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-1) var(--sp-6) var(--sp-1) calc(var(--sp-6) + 20px);
+  color: var(--fg-secondary);
+  font-size: var(--t-sm);
+  transition: background var(--dur-fast), color var(--dur-fast);
+  cursor: default;
+}
+
+.terminal-entry:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+
+.terminal-entry-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ========== Sidebar footer ========== */
 .sidebar-footer {
   border-top: 1px solid var(--border-hair);

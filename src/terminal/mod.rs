@@ -5,17 +5,26 @@
 //! cursor movement, scrolling, text attributes (bold, italic, underline, etc.),
 //! 256-color and true-color SGR, erase operations, and window title (OSC).
 
+use std::collections::VecDeque;
+
 use unshit::core::cell_grid::{color_256, Cell, CellAttrs, CellGrid, ANSI_16};
 use unshit::core::style::types::Color;
 use vte::{Params, Perform};
 
 pub mod keys;
 
+/// Maximum number of scrollback lines retained per terminal.
+const MAX_SCROLLBACK: usize = 10_000;
+
 /// Terminal emulator state.
 ///
 /// Holds a `CellGrid` plus cursor position, saved cursor, current text
 /// attributes, and the VTE parser. Feed PTY output through `process_bytes`
 /// to update the grid.
+///
+/// The `scrollback` buffer stores lines that scroll off the top of the
+/// visible grid. The user can browse history with `scroll_view_up` /
+/// `scroll_view_down`; `display_grid` returns the composed view.
 pub struct Terminal {
     grid: CellGrid,
     cursor_row: usize,
@@ -28,6 +37,10 @@ pub struct Terminal {
     rows: usize,
     cols: usize,
     title: String,
+    /// Lines that scrolled off the top. Index 0 = oldest line.
+    scrollback: VecDeque<Vec<Cell>>,
+    /// How many lines the user has scrolled back (0 = at bottom / live).
+    scroll_offset: usize,
 }
 
 /// Default foreground: warm amber.
@@ -64,6 +77,8 @@ impl Terminal {
             rows,
             cols,
             title: String::new(),
+            scrollback: VecDeque::new(),
+            scroll_offset: 0,
         }
     }
 
@@ -73,12 +88,17 @@ impl Terminal {
     /// helper can borrow `&mut self` without conflicting with the parser's
     /// own `&mut self` requirement.
     pub fn process_bytes(&mut self, bytes: &[u8]) {
+        // New output from the PTY snaps the view back to the live screen.
+        self.scroll_offset = 0;
+
         let mut parser = std::mem::take(&mut self.parser);
         for &byte in bytes {
             let mut performer = Performer { terminal: self };
             parser.advance(&mut performer, byte);
         }
         self.parser = parser;
+        // Sync cursor position to the grid so the renderer can draw it.
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
     /// Immutable reference to the backing cell grid.
@@ -105,6 +125,7 @@ impl Terminal {
         if self.cursor_col >= cols {
             self.cursor_col = cols.saturating_sub(1);
         }
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
     /// The current window title (set via OSC 0 or OSC 2).
@@ -117,10 +138,95 @@ impl Terminal {
         (self.cursor_row, self.cursor_col)
     }
 
+    // -- scrollback API -------------------------------------------------------
+
+    /// Number of lines stored in the scrollback buffer.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// Current scroll offset (0 = at bottom / live view).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    /// Scroll the view backward (toward older history) by `n` lines.
+    pub fn scroll_view_up(&mut self, n: usize) {
+        let max = self.scrollback.len();
+        self.scroll_offset = (self.scroll_offset + n).min(max);
+    }
+
+    /// Scroll the view forward (toward live screen) by `n` lines.
+    pub fn scroll_view_down(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+
+    /// Snap the view back to the live screen.
+    pub fn reset_scroll(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    /// Build a `CellGrid` representing what should be displayed.
+    ///
+    /// When `scroll_offset == 0` this is just a clone of the live grid.
+    /// When scrolled back, the grid is composed from scrollback lines and
+    /// the upper portion of the live screen, with the cursor hidden.
+    pub fn display_grid(&self) -> CellGrid {
+        if self.scroll_offset == 0 {
+            return self.grid.clone();
+        }
+
+        let mut view = CellGrid::new(self.rows, self.cols);
+        let sb_len = self.scrollback.len();
+
+        for display_row in 0..self.rows {
+            // Virtual line index into (scrollback ++ screen).
+            // At offset 0 the view starts at sb_len (the screen top).
+            // At offset N it starts N lines earlier.
+            let virtual_line = sb_len.saturating_sub(self.scroll_offset) + display_row;
+
+            if virtual_line < sb_len {
+                // This row comes from scrollback.
+                let sb_row = &self.scrollback[virtual_line];
+                for col in 0..self.cols {
+                    if let Some(cell) = sb_row.get(col) {
+                        view.set_cell(display_row, col, *cell);
+                    }
+                    // If scrollback row is shorter (resize), Cell::default fills.
+                }
+            } else {
+                // This row comes from the live screen.
+                let screen_row = virtual_line - sb_len;
+                if screen_row < self.rows {
+                    for col in 0..self.cols {
+                        if let Some(cell) = self.grid.get_cell(screen_row, col) {
+                            view.set_cell(display_row, col, *cell);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hide cursor when scrolled back.
+        view.set_cursor_visible(false);
+        view
+    }
+
     // -- helpers --------------------------------------------------------------
 
-    /// Scroll the grid up by one line, clearing the new bottom row.
+    /// Scroll the grid up by one line. The top row is saved to the
+    /// scrollback buffer before it is lost.
     fn scroll_up(&mut self) {
+        // Capture the top row before it scrolls off.
+        let mut row = Vec::with_capacity(self.cols);
+        for col in 0..self.cols {
+            row.push(self.grid.get_cell(0, col).copied().unwrap_or_default());
+        }
+        self.scrollback.push_back(row);
+        if self.scrollback.len() > MAX_SCROLLBACK {
+            self.scrollback.pop_front();
+        }
+
         self.grid.scroll_up(1);
         self.clear_row(self.rows.saturating_sub(1));
     }
@@ -347,10 +453,15 @@ impl<'a> Perform for Performer<'a> {
                         }
                         t.clear_region(t.cursor_row, 0, t.cursor_row, t.cursor_col);
                     }
-                    // 2 or 3: erase entire display (3 also clears scrollback, but
-                    // we have none)
-                    2 | 3 => {
+                    // 2: erase entire display
+                    2 => {
                         t.clear_region(0, 0, t.rows.saturating_sub(1), t.cols.saturating_sub(1));
+                    }
+                    // 3: erase entire display AND scrollback buffer
+                    3 => {
+                        t.clear_region(0, 0, t.rows.saturating_sub(1), t.cols.saturating_sub(1));
+                        t.scrollback.clear();
+                        t.scroll_offset = 0;
                     }
                     _ => {}
                 }
@@ -664,6 +775,10 @@ fn reset_attrs(t: &mut Terminal) {
     t.attrs = CellAttrs::empty();
 }
 
+// ---------------------------------------------------------------------------
+// Tests: character preservation and glyph verification
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +793,21 @@ mod tests {
         }
         s.trim_end_matches(|c: char| c == ' ' || c == '\0')
             .to_string()
+    }
+
+    /// Helper: extract the char stored in a cell at (row, col).
+    fn cell_char(term: &Terminal, row: usize, col: usize) -> char {
+        term.grid()
+            .get_cell(row, col)
+            .expect("cell should exist")
+            .ch
+    }
+
+    /// Helper: read a run of characters from a row starting at `start_col`.
+    fn read_row_str(term: &Terminal, row: usize, start_col: usize, len: usize) -> String {
+        (start_col..start_col + len)
+            .map(|col| cell_char(term, row, col))
+            .collect()
     }
 
     // -- Construction ---------------------------------------------------------
@@ -886,7 +1016,7 @@ mod tests {
     // -- Resize ---------------------------------------------------------------
 
     #[test]
-    fn resize_clamps_cursor() {
+    fn resize_clamps_cursor_from_large_position() {
         let mut t = Terminal::new(10, 20);
         t.process_bytes(b"\x1b[8;15H"); // row 8, col 15
         assert_eq!(t.cursor_position(), (7, 14));
@@ -1279,5 +1409,649 @@ mod tests {
         assert_eq!(row_text(&t, 0), "");
         assert_eq!(row_text(&t, 1), "");
         assert_eq!(row_text(&t, 2), "");
+    }
+
+    // -- Basic terminal operations (PR #13) -----------------------------------
+
+    #[test]
+    fn basic_terminal_creation() {
+        let term = Terminal::new(24, 80);
+        assert_eq!(term.rows, 24);
+        assert_eq!(term.cols, 80);
+        assert_eq!(term.cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn cursor_wraps_at_end_of_line() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"ABCDE");
+        // After writing 5 chars in a 5-col terminal, cursor wraps to next row.
+        assert_eq!(term.cursor_position(), (1, 0));
+    }
+
+    #[test]
+    fn linefeed_advances_row() {
+        let mut term = Terminal::new(24, 80);
+        // LF (\n) only advances the row; it does NOT reset the column.
+        // After "A" cursor is at (0,1). LF moves to (1,1). "B" prints at (1,1).
+        term.process_bytes(b"A\nB");
+        assert_eq!(term.cursor_position(), (1, 2));
+        let cell_a = term.grid().get_cell(0, 0).unwrap();
+        assert_eq!(cell_a.ch, 'A');
+        let cell_b = term.grid().get_cell(1, 1).unwrap();
+        assert_eq!(cell_b.ch, 'B');
+    }
+
+    #[test]
+    fn carriage_return_resets_column() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"Hello\r");
+        assert_eq!(term.cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn resize_clamps_cursor() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"\x1b[20;70H"); // move cursor to row 19, col 69
+        assert_eq!(term.cursor_position(), (19, 69));
+        term.resize(10, 40);
+        assert_eq!(term.cursor_position(), (9, 39));
+    }
+
+    // -- Character spacing regression tests (PR #13) --------------------------
+
+    /// Regression test: "Windows" must occupy consecutive columns with no gaps.
+    ///
+    /// The renderer previously used `Attrs::new()` (SansSerif) for shaping
+    /// individual characters but `Attrs::new().family(Monospace)` to measure
+    /// cell width. Narrow sans-serif glyphs (i, l, r) rendered visually
+    /// narrower than the measured cell_w, producing visible gaps like
+    /// "Wi ndows" or "Mi crosoft". The fix ensures both shaping and
+    /// measurement use the Monospace family.
+    #[test]
+    fn windows_string_occupies_consecutive_columns() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"Windows");
+
+        let expected: Vec<(usize, char)> = "Windows".chars().enumerate().collect();
+        for (col, expected_ch) in &expected {
+            let cell = term.grid().get_cell(0, *col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, *expected_ch,
+                "column {} should contain '{}' but got '{}'",
+                col, expected_ch, cell.ch,
+            );
+        }
+
+        let (row, col) = term.cursor_position();
+        assert_eq!(row, 0);
+        assert_eq!(col, 7, "cursor should be at column 7 after 7-char string");
+    }
+
+    /// Regression test: "Microsoft" must occupy consecutive columns.
+    #[test]
+    fn microsoft_string_occupies_consecutive_columns() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"Microsoft");
+
+        for (col, expected_ch) in "Microsoft".chars().enumerate() {
+            let cell = term.grid().get_cell(0, col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, expected_ch,
+                "column {} should contain '{}' but got '{}'",
+                col, expected_ch, cell.ch,
+            );
+        }
+
+        let (row, col) = term.cursor_position();
+        assert_eq!(row, 0);
+        assert_eq!(col, 9);
+    }
+
+    /// Every printable ASCII character (0x20..=0x7E) must occupy exactly one
+    /// cell and advance the cursor by one column.
+    #[test]
+    fn all_printable_ascii_occupy_one_cell_each() {
+        let mut term = Terminal::new(24, 96);
+        let printable: String = (0x20u8..=0x7Eu8).map(|b| b as char).collect();
+        term.process_bytes(printable.as_bytes());
+
+        for (col, expected_ch) in printable.chars().enumerate() {
+            let cell = term.grid().get_cell(0, col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, expected_ch,
+                "column {} should contain {:?} (0x{:02X}) but got {:?}",
+                col, expected_ch, expected_ch as u32, cell.ch,
+            );
+        }
+
+        let (row, col) = term.cursor_position();
+        assert_eq!(row, 0);
+        assert_eq!(col, 95, "cursor should advance by one per printable char");
+    }
+
+    /// Narrow characters (i, l, r, t, f, j) must each advance the cursor by
+    /// exactly one column, same as wide characters (M, W, m, w).
+    #[test]
+    fn narrow_and_wide_chars_advance_cursor_equally() {
+        let narrow_chars = "ilrtfj";
+        let wide_chars = "MWmw";
+
+        for &ch in narrow_chars.as_bytes() {
+            let mut term = Terminal::new(24, 80);
+            term.process_bytes(&[ch]);
+            let (_, col) = term.cursor_position();
+            assert_eq!(
+                col, 1,
+                "narrow char '{}' should advance cursor to col 1, got {}",
+                ch as char, col,
+            );
+        }
+
+        for &ch in wide_chars.as_bytes() {
+            let mut term = Terminal::new(24, 80);
+            term.process_bytes(&[ch]);
+            let (_, col) = term.cursor_position();
+            assert_eq!(
+                col, 1,
+                "wide char '{}' should advance cursor to col 1, got {}",
+                ch as char, col,
+            );
+        }
+    }
+
+    /// Mixed narrow and wide characters in a string must produce a
+    /// contiguous sequence with no gaps.
+    #[test]
+    fn mixed_narrow_wide_string_no_gaps() {
+        let mut term = Terminal::new(24, 80);
+        let input = "File listing";
+        term.process_bytes(input.as_bytes());
+
+        for (col, expected_ch) in input.chars().enumerate() {
+            let cell = term.grid().get_cell(0, col).expect("cell should exist");
+            assert_eq!(
+                cell.ch, expected_ch,
+                "column {} should contain '{}' but got '{}'",
+                col, expected_ch, cell.ch,
+            );
+        }
+
+        let (_, col) = term.cursor_position();
+        assert_eq!(col, input.len());
+    }
+
+    // -- Glyph verification tests (PR #15) ------------------------------------
+
+    #[test]
+    fn put_char_preserves_exact_character() {
+        let mut term = Terminal::new(4, 80);
+        let chars = ['i', 'l', '1', '|', ';', '!', 'I', 'O', '0'];
+        for &c in &chars {
+            term.cursor_row = 0;
+            term.cursor_col = 0;
+            term.put_char(c);
+            let stored = cell_char(&term, 0, 0);
+            assert_eq!(
+                stored, c,
+                "put_char({:?}) should store exactly {:?}, got {:?}",
+                c, c, stored
+            );
+        }
+    }
+
+    #[test]
+    fn all_ascii_printable_stored_correctly() {
+        let mut term = Terminal::new(2, 96);
+        let bytes: Vec<u8> = (0x20u8..=0x7E).collect();
+        term.process_bytes(&bytes);
+
+        for (i, byte) in (0x20u8..=0x7E).enumerate() {
+            let expected = byte as char;
+            let stored = cell_char(&term, 0, i);
+            assert_eq!(
+                stored, expected,
+                "ASCII 0x{:02X} ({:?}) at col {} stored as {:?}",
+                byte, expected, i, stored
+            );
+        }
+    }
+
+    #[test]
+    fn visually_confusable_chars_are_distinct() {
+        let confusable_pairs: &[(char, char)] = &[
+            ('i', ';'),
+            ('l', '!'),
+            ('1', 'l'),
+            ('|', '!'),
+            ('O', '0'),
+            ('I', 'l'),
+        ];
+
+        for &(a, b) in confusable_pairs {
+            let mut term = Terminal::new(1, 80);
+            term.process_bytes(&[a as u8]);
+            let stored = cell_char(&term, 0, 0);
+            assert_eq!(stored, a, "{:?} must not become {:?}", a, b);
+            assert_ne!(stored, b, "{:?} must not become {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn word_corporation_stored_char_by_char() {
+        let word = "Corporation";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(word.as_bytes());
+
+        for (col, expected) in word.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "\"Corporation\"[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+        assert_eq!(read_row_str(&term, 0, 0, word.len()), word);
+    }
+
+    #[test]
+    fn word_windows_stored_char_by_char() {
+        let word = "Windows";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(word.as_bytes());
+
+        for (col, expected) in word.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "\"Windows\"[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+        assert_eq!(read_row_str(&term, 0, 0, word.len()), word);
+    }
+
+    #[test]
+    fn word_microsoft_stored_char_by_char() {
+        let word = "Microsoft";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(word.as_bytes());
+
+        for (col, expected) in word.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "\"Microsoft\"[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+        assert_eq!(read_row_str(&term, 0, 0, word.len()), word);
+    }
+
+    #[test]
+    fn multibyte_utf8_characters_stored_correctly() {
+        let test_chars: &[char] = &[
+            '\u{00E9}',  // e-acute (2 bytes)
+            '\u{00F1}',  // n-tilde (2 bytes)
+            '\u{00FC}',  // u-diaeresis (2 bytes)
+            '\u{4E16}',  // CJK "world" (3 bytes)
+            '\u{1F600}', // grinning face emoji (4 bytes)
+        ];
+
+        for &ch in test_chars {
+            let mut term = Terminal::new(1, 80);
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            term.process_bytes(encoded.as_bytes());
+            let stored = cell_char(&term, 0, 0);
+            assert_eq!(
+                stored, ch,
+                "UTF-8 char U+{:04X} ({:?}) should be stored exactly, got {:?}",
+                ch as u32, ch, stored
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_greeting_characters_preserved() {
+        let greeting = concat!(
+            "PowerShell 7.4.1\r\n",
+            "Copyright (c) Microsoft Corporation.\r\n",
+            "\r\n",
+            "https://aka.ms/powershell\r\n",
+            "Type 'help' to get help.\r\n",
+        );
+
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(greeting.as_bytes());
+
+        assert_eq!(read_row_str(&term, 0, 0, 16), "PowerShell 7.4.1");
+
+        let row1 = read_row_str(&term, 1, 0, 36);
+        assert_eq!(row1, "Copyright (c) Microsoft Corporation.");
+
+        // 'i' in "Microsoft" at col 15 must NOT be ';'
+        assert_eq!(cell_char(&term, 1, 15), 'i');
+        // 'i' in "Corporation" at col 32 must NOT be ';'
+        assert_eq!(cell_char(&term, 1, 32), 'i');
+
+        assert_eq!(read_row_str(&term, 3, 0, 25), "https://aka.ms/powershell");
+        assert_eq!(read_row_str(&term, 4, 0, 24), "Type 'help' to get help.");
+    }
+
+    #[test]
+    fn powershell_greeting_with_ansi_escapes() {
+        let ansi_greeting = concat!(
+            "\x1b[0m",
+            "\x1b[32mPowerShell 7.4.1",
+            "\x1b[0m\r\n",
+            "\x1b[90mCopyright (c) Microsoft Corporation.\x1b[0m\r\n",
+            "\r\n",
+            "\x1b[36mhttps://aka.ms/powershell\x1b[0m\r\n",
+            "\x1b[90mType 'help' to get help.\x1b[0m\r\n",
+        );
+
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(ansi_greeting.as_bytes());
+
+        assert_eq!(read_row_str(&term, 0, 0, 16), "PowerShell 7.4.1");
+        assert_eq!(
+            read_row_str(&term, 1, 0, 36),
+            "Copyright (c) Microsoft Corporation."
+        );
+        assert_eq!(cell_char(&term, 1, 15), 'i');
+        assert_eq!(cell_char(&term, 1, 32), 'i');
+    }
+
+    // Regression: issue #17. Capital 'I' in "Instale" must be at col 0
+    // with 'n' immediately at col 1. An ANSI parsing bug could consume
+    // 'I' as a CSI action byte, inserting an empty cell.
+    #[test]
+    fn portuguese_greeting_instale_positions() {
+        let input = "\x1b[33mInstale o PowerShell\x1b[0m";
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(input.as_bytes());
+
+        assert_eq!(cell_char(&term, 0, 0), 'I', "col 0 must be 'I'");
+        assert_eq!(cell_char(&term, 0, 1), 'n', "col 1 must be 'n'");
+        assert_eq!(cell_char(&term, 0, 2), 's', "col 2 must be 's'");
+        assert_eq!(read_row_str(&term, 0, 0, 20), "Instale o PowerShell");
+    }
+
+    // Regression: issue #17. Full Portuguese greeting pattern with
+    // preceding lines and CR/LF. 'I' must land at col 0 of row 3.
+    #[test]
+    fn portuguese_greeting_with_preceding_lines() {
+        let greeting = concat!(
+            "\x1b[93mO Windows PowerShell\x1b[0m\r\n",
+            "Copyright (C) Microsoft Corporation. Todos os direitos reservados.\r\n",
+            "\r\n",
+            "\x1b[33mInstale o PowerShell mais recente\x1b[0m\r\n",
+        );
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(greeting.as_bytes());
+
+        assert_eq!(cell_char(&term, 3, 0), 'I', "row 3 col 0 must be 'I'");
+        assert_eq!(cell_char(&term, 3, 1), 'n', "row 3 col 1 must be 'n'");
+        assert_eq!(read_row_str(&term, 3, 0, 8), "Instale ");
+    }
+
+    #[test]
+    fn cursor_advances_consecutively() {
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(b"abcde");
+        assert_eq!(term.cursor_position(), (0, 5));
+        for (col, expected) in "abcde".chars().enumerate() {
+            assert_eq!(cell_char(&term, 0, col), expected);
+        }
+    }
+
+    #[test]
+    fn line_wrap_preserves_characters() {
+        let mut term = Terminal::new(4, 10);
+        term.process_bytes(b"abcdefghijklmno");
+
+        assert_eq!(read_row_str(&term, 0, 0, 10), "abcdefghij");
+        assert_eq!(read_row_str(&term, 1, 0, 5), "klmno");
+    }
+
+    #[test]
+    fn carriage_return_overwrites_preserve_chars() {
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(b"Hello\rHi!!");
+        assert_eq!(cell_char(&term, 0, 0), 'H');
+        assert_eq!(cell_char(&term, 0, 1), 'i');
+        assert_eq!(cell_char(&term, 0, 2), '!');
+        assert_eq!(cell_char(&term, 0, 3), '!');
+        assert_eq!(cell_char(&term, 0, 4), 'o');
+    }
+
+    #[test]
+    fn tab_does_not_corrupt_adjacent_cells() {
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(b"A\tB");
+        assert_eq!(cell_char(&term, 0, 0), 'A');
+        assert_eq!(cell_char(&term, 0, 8), 'B');
+    }
+
+    #[test]
+    fn sentence_with_confusable_characters() {
+        let sentence = "Bill filled 100 oil pills.";
+        let mut term = Terminal::new(1, 80);
+        term.process_bytes(sentence.as_bytes());
+
+        for (col, expected) in sentence.chars().enumerate() {
+            let stored = cell_char(&term, 0, col);
+            assert_eq!(
+                stored, expected,
+                "sentence[{}] should be {:?}, got {:?}",
+                col, expected, stored
+            );
+        }
+    }
+
+    #[test]
+    fn process_bytes_is_deterministic() {
+        let input = b"Microsoft Corporation 2024\r\nWindows PowerShell";
+        let mut t1 = Terminal::new(24, 80);
+        let mut t2 = Terminal::new(24, 80);
+        t1.process_bytes(input);
+        t2.process_bytes(input);
+
+        for row in 0..2 {
+            for col in 0..46 {
+                let c1 = cell_char(&t1, row, col);
+                let c2 = cell_char(&t2, row, col);
+                assert_eq!(
+                    c1, c2,
+                    "determinism: ({},{}) differs between runs",
+                    row, col
+                );
+            }
+        }
+    }
+
+    // -- Scrollback buffer tests -----------------------------------------------
+
+    /// Helper: fill a small terminal until it scrolls, returning the terminal.
+    fn term_with_scrollback() -> Terminal {
+        // 3-row, 5-col terminal. Write 5 lines to force 2 into scrollback.
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"AAAA\r\n");
+        term.process_bytes(b"BBBB\r\n");
+        term.process_bytes(b"CCCC\r\n");
+        term.process_bytes(b"DDDD\r\n");
+        term.process_bytes(b"EEEE");
+        term
+    }
+
+    #[test]
+    fn scroll_up_saves_top_row_to_scrollback() {
+        let term = term_with_scrollback();
+        // 5 lines in a 3-row terminal: first 2 lines scroll off.
+        assert_eq!(term.scrollback_len(), 2, "expected 2 lines in scrollback");
+    }
+
+    #[test]
+    fn scrollback_preserves_cell_content() {
+        let term = term_with_scrollback();
+        // The first line that scrolled off was "AAAA".
+        let first_line = &term.scrollback[0];
+        assert_eq!(first_line[0].ch, 'A', "first scrollback line should be 'A'");
+        // The second line was "BBBB".
+        let second_line = &term.scrollback[1];
+        assert_eq!(
+            second_line[0].ch, 'B',
+            "second scrollback line should be 'B'"
+        );
+    }
+
+    #[test]
+    fn scrollback_max_limit_enforced() {
+        let mut term = Terminal::new(2, 3);
+        // Write MAX_SCROLLBACK + 10 lines to overflow the buffer.
+        for i in 0..MAX_SCROLLBACK + 10 {
+            let ch = (b'A' + (i % 26) as u8) as char;
+            let line = format!("{}\r\n", ch);
+            term.process_bytes(line.as_bytes());
+        }
+        assert!(
+            term.scrollback_len() <= MAX_SCROLLBACK,
+            "scrollback length {} exceeds MAX_SCROLLBACK {}",
+            term.scrollback_len(),
+            MAX_SCROLLBACK,
+        );
+    }
+
+    #[test]
+    fn scroll_offset_starts_at_zero() {
+        let term = term_with_scrollback();
+        assert_eq!(term.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_view_up_increases_offset() {
+        let mut term = term_with_scrollback();
+        term.scroll_view_up(1);
+        assert_eq!(term.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn scroll_view_down_decreases_offset() {
+        let mut term = term_with_scrollback();
+        term.scroll_view_up(2);
+        term.scroll_view_down(1);
+        assert_eq!(term.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn scroll_view_down_clamps_at_zero() {
+        let mut term = term_with_scrollback();
+        term.scroll_view_up(1);
+        term.scroll_view_down(100);
+        assert_eq!(term.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_view_up_clamped_to_scrollback_len() {
+        let mut term = term_with_scrollback();
+        let max = term.scrollback_len();
+        term.scroll_view_up(max + 100);
+        assert_eq!(term.scroll_offset(), max);
+    }
+
+    #[test]
+    fn process_bytes_resets_scroll_offset() {
+        let mut term = term_with_scrollback();
+        term.scroll_view_up(2);
+        assert!(term.scroll_offset() > 0);
+        term.process_bytes(b"X");
+        assert_eq!(
+            term.scroll_offset(),
+            0,
+            "new output should snap scroll to bottom"
+        );
+    }
+
+    #[test]
+    fn reset_scroll_snaps_to_bottom() {
+        let mut term = term_with_scrollback();
+        term.scroll_view_up(2);
+        term.reset_scroll();
+        assert_eq!(term.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn display_grid_at_bottom_matches_live_grid() {
+        let term = term_with_scrollback();
+        let live = term.grid().clone();
+        let display = term.display_grid();
+        for row in 0..term.rows {
+            for col in 0..term.cols {
+                let live_cell = live.get_cell(row, col).unwrap();
+                let disp_cell = display.get_cell(row, col).unwrap();
+                assert_eq!(
+                    live_cell.ch, disp_cell.ch,
+                    "display_grid at bottom should match live grid at ({},{})",
+                    row, col
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn display_grid_scrolled_shows_scrollback_content() {
+        let mut term = term_with_scrollback();
+        // Scroll all the way back (2 lines of scrollback).
+        term.scroll_view_up(2);
+        let display = term.display_grid();
+
+        // Row 0 should show the first scrollback line (AAAA).
+        let ch = display.get_cell(0, 0).unwrap().ch;
+        assert_eq!(ch, 'A', "scrolled-back row 0 should be 'A', got '{}'", ch);
+
+        // Row 1 should show the second scrollback line (BBBB).
+        let ch = display.get_cell(1, 0).unwrap().ch;
+        assert_eq!(ch, 'B', "scrolled-back row 1 should be 'B', got '{}'", ch);
+
+        // Row 2 should show the first screen row (CCCC).
+        let ch = display.get_cell(2, 0).unwrap().ch;
+        assert_eq!(ch, 'C', "scrolled-back row 2 should be 'C', got '{}'", ch);
+    }
+
+    #[test]
+    fn display_grid_hides_cursor_when_scrolled() {
+        let mut term = term_with_scrollback();
+        term.scroll_view_up(1);
+        let display = term.display_grid();
+        assert!(
+            !display.cursor_visible(),
+            "cursor should be hidden when scrolled back"
+        );
+    }
+
+    #[test]
+    fn display_grid_shows_cursor_at_bottom() {
+        let term = term_with_scrollback();
+        let display = term.display_grid();
+        // At scroll_offset 0, display_grid is just a clone so cursor
+        // visibility is whatever the live grid has.
+        assert!(
+            display.cursor_visible(),
+            "cursor should be visible when at bottom"
+        );
+    }
+
+    #[test]
+    fn csi_ed_3_clears_scrollback() {
+        let mut term = term_with_scrollback();
+        assert!(term.scrollback_len() > 0);
+        // CSI 3 J: erase display + clear scrollback.
+        term.process_bytes(b"\x1b[3J");
+        assert_eq!(
+            term.scrollback_len(),
+            0,
+            "CSI 3 J should clear the scrollback buffer"
+        );
     }
 }

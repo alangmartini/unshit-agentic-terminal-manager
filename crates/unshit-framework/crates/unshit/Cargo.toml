@@ -1,0 +1,74 @@
+[package]
+name = "unshit"
+description = "A GPU-accelerated UI framework for Rust. CSS-styled, flexbox-layouted, wgpu-rendered."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+unshit-core = { version = "0.1.0", path = "../unshit-core" }
+unshit-renderer = { version = "0.1.0", path = "../unshit-renderer" }
+unshit-macros = { version = "0.1.0", path = "../unshit-macros" }
+unshit-app = { version = "0.1.0", path = "../unshit-app" }
+
+[features]
+default = ["clipboard"]
+clipboard = ["unshit-app/clipboard"]
+async = ["unshit-app/async"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+env_logger = { workspace = true }
+tokio = { workspace = true }
+async-stream = { workspace = true }
+wgpu = { workspace = true }
+unshit-test = { path = "../unshit-test" }
+
+[[example]]
+name = "hello"
+path = "examples/hello.rs"
+
+[[example]]
+name = "stress_text"
+path = "examples/stress_text.rs"
+
+[[example]]
+name = "async_counter"
+path = "examples/async_counter.rs"
+
+[[example]]
+name = "async_spawn"
+path = "examples/async_spawn.rs"
+required-features = ["async"]
+
+[[example]]
+name = "async_subscriptions"
+path = "examples/async_subscriptions.rs"
+required-features = ["async"]
+
+[[example]]
+name = "canvas"
+path = "examples/canvas.rs"
+
+[[example]]
+name = "terminal_manager_icons"
+path = "examples/terminal_manager_icons.rs"
+
+[[example]]
+name = "keyframes_demo"
+path = "examples/keyframes_demo.rs"
+
+[[example]]
+name = "kitchen_sink"
+path = "examples/kitchen_sink.rs"
+required-features = ["async"]
+
+[[example]]
+name = "terminal_manager"
+path = "examples/terminal_manager.rs"

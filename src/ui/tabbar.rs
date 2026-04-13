@@ -86,9 +86,7 @@ fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedSt
     let activate_state = shared.clone();
     btn = btn.on_click(move || {
         mutate_with(&activate_state, |st| {
-            if st.active_tab != index {
-                st.active_tab = index;
-            }
+            dispatch(st, &format!("tab.switch:{}", index));
         });
     });
 
@@ -121,7 +119,7 @@ fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedSt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{seed_state, SharedState, TabStatus, TerminalTab};
+    use crate::state::{seed_state, Pane, PaneId, SharedState, TabStatus, TerminalTab};
     use std::sync::{Arc, Mutex};
 
     fn has_class(el: &ElementDef, class: &str) -> bool {
@@ -164,11 +162,22 @@ mod tests {
     }
 
     fn make_tab(name: &str, status: TabStatus) -> TerminalTab {
+        let pane = Pane {
+            id: PaneId(1),
+            title: name.to_string(),
+            subtitle: "bash".to_string(),
+            pid: 0,
+            cpu: 0.0,
+        };
         TerminalTab {
             id: format!("t-{}", name),
             name: name.to_string(),
             subtitle: "bash".to_string(),
             status,
+            panes: vec![vec![pane]],
+            active_pane: PaneId(1),
+            row_ratios: vec![1.0],
+            col_ratios: vec![vec![1.0]],
         }
     }
 

@@ -1,6 +1,9 @@
 use unshit::core::element::*;
 
-use crate::state::{mutate_with, SharedState, Subtab, UiSnapshot, Workspace};
+use crate::state::{
+    mutate_add_workspace_with_path, mutate_with, SharedState, Subtab, TerminalEntry, UiSnapshot,
+    Workspace,
+};
 use crate::ui::icons::*;
 
 pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -17,13 +20,14 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         sidebar = sidebar.with_class("collapsed");
     }
     sidebar
-        .with_child(build_sidebar_head())
+        .with_child(build_sidebar_head(shared))
         .with_child(scroll)
         .with_child(build_sidebar_footer())
         .with_child(build_sidebar_hints())
 }
 
-fn build_sidebar_head() -> ElementDef {
+fn build_sidebar_head(shared: &SharedState) -> ElementDef {
+    let add_state = shared.clone();
     ElementDef::new(Tag::Div)
         .with_class("sidebar-head")
         .with_child(
@@ -38,6 +42,16 @@ fn build_sidebar_head() -> ElementDef {
                     ElementDef::new(Tag::Button)
                         .with_class("icon-btn")
                         .with_class("tight")
+                        .on_click(move || {
+                            let picked = rfd::FileDialog::new()
+                                .set_title("Select workspace folder")
+                                .pick_folder();
+                            if let Some(folder) = picked {
+                                mutate_with(&add_state, |st| {
+                                    mutate_add_workspace_with_path(st, Some(folder));
+                                });
+                            }
+                        })
                         .with_child(svg_icon(icon_plus())),
                 )
                 .with_child(
@@ -80,24 +94,28 @@ fn build_workspace(
             ElementDef::new(Tag::Span)
                 .with_class("workspace-name")
                 .with_text(workspace.name.clone()),
-        )
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("workspace-meta")
-                .with_child({
-                    let mut branch_tag = ElementDef::new(Tag::Span)
-                        .with_class("branch-tag")
-                        .with_text(workspace.branch.clone());
-                    if workspace.branch_muted {
-                        branch_tag = branch_tag.with_class("muted");
-                    }
-                    branch_tag
-                }),
         );
 
     let mut body = ElementDef::new(Tag::Div).with_class("workspace-body");
     for (s_idx, subtab) in workspace.subtabs.iter().enumerate() {
-        body = body.with_child(build_subtab(workspace_index, s_idx, subtab, shared));
+        body = body.with_child(build_subtab(
+            workspace_index,
+            s_idx,
+            subtab,
+            workspace,
+            shared,
+        ));
+        if subtab.label == "terminals"
+            && workspace.terminals_expanded
+            && !workspace.terminal_entries.is_empty()
+        {
+            let mut entries = ElementDef::new(Tag::Div).with_class("terminal-entries");
+            let count = workspace.terminal_entries.len();
+            for (t_idx, entry) in workspace.terminal_entries.iter().enumerate() {
+                entries = entries.with_child(build_terminal_entry(entry, t_idx == count - 1));
+            }
+            body = body.with_child(entries);
+        }
     }
 
     let mut container = ElementDef::new(Tag::Div).with_class("workspace");
@@ -114,31 +132,60 @@ fn build_subtab(
     workspace_index: usize,
     subtab_index: usize,
     subtab: &Subtab,
+    workspace: &Workspace,
     shared: &SharedState,
 ) -> ElementDef {
     let mut btn = ElementDef::new(Tag::Button).with_class("subtab");
     if subtab.active {
         btn = btn.with_class("active");
     }
+    if subtab.disabled {
+        btn = btn.with_class("disabled");
+    }
 
-    let s = shared.clone();
-    let (wi, si) = (workspace_index, subtab_index);
-    btn = btn.on_click(move || {
-        mutate_with(&s, |st| {
-            st.active_workspace = wi;
-            if let Some(ws) = st.workspaces.get_mut(wi) {
-                for (i, sub) in ws.subtabs.iter_mut().enumerate() {
-                    sub.active = i == si;
+    if subtab.label == "terminals" {
+        let s = shared.clone();
+        let wi = workspace_index;
+        btn = btn.on_click(move || {
+            mutate_with(&s, |st| {
+                if let Some(ws) = st.workspaces.get_mut(wi) {
+                    ws.terminals_expanded = !ws.terminals_expanded;
                 }
-            }
+            });
         });
-    });
+    } else if !subtab.disabled {
+        let s = shared.clone();
+        let (wi, si) = (workspace_index, subtab_index);
+        btn = btn.on_click(move || {
+            mutate_with(&s, |st| {
+                st.active_workspace = wi;
+                if let Some(ws) = st.workspaces.get_mut(wi) {
+                    for (i, sub) in ws.subtabs.iter_mut().enumerate() {
+                        sub.active = i == si;
+                    }
+                }
+            });
+        });
+    }
 
-    btn = btn.with_child(
-        ElementDef::new(Tag::Span)
-            .with_class("tree-glyph")
-            .with_text(subtab.tree_glyph),
-    );
+    if subtab.label == "terminals" {
+        let chevron = if workspace.terminals_expanded {
+            "\u{25BE}"
+        } else {
+            "\u{25B8}"
+        };
+        btn = btn.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("subtab-chevron")
+                .with_text(chevron),
+        );
+    } else {
+        btn = btn.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("tree-glyph")
+                .with_text(subtab.tree_glyph),
+        );
+    }
 
     if let Some(icon) = subtab.icon {
         btn = btn.with_child(
@@ -165,6 +212,33 @@ fn build_subtab(
     }
 
     btn
+}
+
+fn build_terminal_entry(entry: &TerminalEntry, is_last: bool) -> ElementDef {
+    let glyph = if is_last { "\u{2514}" } else { "\u{251C}" };
+
+    let mut row = ElementDef::new(Tag::Div)
+        .with_class("terminal-entry")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("tree-glyph")
+                .with_text(glyph),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("terminal-entry-name")
+                .with_text(entry.name.clone()),
+        );
+
+    let mut tag = ElementDef::new(Tag::Span)
+        .with_class("branch-tag")
+        .with_text(entry.branch.clone());
+    if entry.branch_muted {
+        tag = tag.with_class("muted");
+    }
+    row = row.with_child(tag);
+
+    row
 }
 
 fn build_sidebar_footer() -> ElementDef {
@@ -238,7 +312,7 @@ fn hint_item(key: &str, label: &str) -> ElementDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{seed_state, SharedState, Subtab, SubtabIcon, Workspace};
+    use crate::state::{seed_state, SharedState, Subtab, SubtabIcon, TerminalEntry, Workspace};
     use std::sync::{Arc, Mutex};
 
     fn has_class(el: &ElementDef, class: &str) -> bool {
@@ -268,19 +342,21 @@ mod tests {
         Arc::new(Mutex::new(seed_state()))
     }
 
-    fn make_workspace(num: u32, collapsed: bool, branch_muted: bool) -> Workspace {
+    fn make_workspace(num: u32, collapsed: bool) -> Workspace {
         Workspace {
             num,
             name: format!("ws-{}", num),
-            branch: "main".to_string(),
-            branch_muted,
+            path: None,
             collapsed,
+            terminals_expanded: false,
+            terminal_entries: vec![],
             subtabs: vec![
                 Subtab {
                     label: "terminals".to_string(),
                     count: Some(3),
                     pulse: false,
                     active: true,
+                    disabled: false,
                     icon: Some(SubtabIcon::Terminal),
                     tree_glyph: "\u{251C}",
                 },
@@ -289,6 +365,7 @@ mod tests {
                     count: None,
                     pulse: false,
                     active: false,
+                    disabled: false,
                     icon: None,
                     tree_glyph: "\u{2514}",
                 },
@@ -341,7 +418,8 @@ mod tests {
 
     #[test]
     fn sidebar_head_has_title_and_actions() {
-        let head = build_sidebar_head();
+        let shared = make_shared();
+        let head = build_sidebar_head(&shared);
         assert!(has_class(&head, "sidebar-head"));
         // First child should be the title span
         let title = &head.children[0];
@@ -362,7 +440,7 @@ mod tests {
     #[test]
     fn workspace_not_collapsed_has_no_collapsed_class() {
         let shared = make_shared();
-        let ws = make_workspace(2, false, false);
+        let ws = make_workspace(2, false);
         let el = build_workspace(0, &ws, &shared);
         assert!(has_class(&el, "workspace"));
         assert!(!has_class(&el, "collapsed"));
@@ -371,7 +449,7 @@ mod tests {
     #[test]
     fn workspace_collapsed_has_collapsed_class() {
         let shared = make_shared();
-        let ws = make_workspace(2, true, false);
+        let ws = make_workspace(2, true);
         let el = build_workspace(0, &ws, &shared);
         assert!(has_class(&el, "workspace"));
         assert!(has_class(&el, "collapsed"));
@@ -380,7 +458,7 @@ mod tests {
     #[test]
     fn workspace_num_1_is_active() {
         let shared = make_shared();
-        let ws = make_workspace(1, false, false);
+        let ws = make_workspace(1, false);
         let el = build_workspace(0, &ws, &shared);
         assert!(has_class(&el, "active"));
     }
@@ -388,25 +466,31 @@ mod tests {
     #[test]
     fn workspace_num_2_is_not_active() {
         let shared = make_shared();
-        let ws = make_workspace(2, false, false);
+        let ws = make_workspace(2, false);
         let el = build_workspace(0, &ws, &shared);
         assert!(!has_class(&el, "active"));
     }
 
     #[test]
-    fn workspace_branch_muted() {
-        let shared = make_shared();
-        let ws = make_workspace(2, false, true);
-        let el = build_workspace(0, &ws, &shared);
+    fn terminal_entry_branch_muted() {
+        let entry = TerminalEntry {
+            name: "zsh".to_string(),
+            branch: "main".to_string(),
+            branch_muted: true,
+        };
+        let el = build_terminal_entry(&entry, false);
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(has_class(branch_tag, "muted"));
     }
 
     #[test]
-    fn workspace_branch_not_muted() {
-        let shared = make_shared();
-        let ws = make_workspace(2, false, false);
-        let el = build_workspace(0, &ws, &shared);
+    fn terminal_entry_branch_not_muted() {
+        let entry = TerminalEntry {
+            name: "zsh".to_string(),
+            branch: "main".to_string(),
+            branch_muted: false,
+        };
+        let el = build_terminal_entry(&entry, false);
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(!has_class(branch_tag, "muted"));
     }
@@ -414,7 +498,7 @@ mod tests {
     #[test]
     fn workspace_head_shows_name_and_num() {
         let shared = make_shared();
-        let ws = make_workspace(3, false, false);
+        let ws = make_workspace(3, false);
         let el = build_workspace(0, &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         let num_el = find_by_class(head, "workspace-num").unwrap();
@@ -426,7 +510,7 @@ mod tests {
     #[test]
     fn workspace_body_has_subtabs() {
         let shared = make_shared();
-        let ws = make_workspace(2, false, false);
+        let ws = make_workspace(2, false);
         let el = build_workspace(0, &ws, &shared);
         let body = find_by_class(&el, "workspace-body").unwrap();
         assert_eq!(body.children.len(), 2);
@@ -437,15 +521,17 @@ mod tests {
     #[test]
     fn subtab_active() {
         let shared = make_shared();
+        let ws = make_workspace(1, false);
         let sub = Subtab {
             label: "test".to_string(),
             count: None,
             pulse: false,
             active: true,
+            disabled: false,
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, &shared);
         assert_eq!(el.tag, Tag::Button);
         assert!(has_class(&el, "subtab"));
         assert!(has_class(&el, "active"));
@@ -454,15 +540,17 @@ mod tests {
     #[test]
     fn subtab_inactive() {
         let shared = make_shared();
+        let ws = make_workspace(1, false);
         let sub = Subtab {
             label: "test".to_string(),
             count: None,
             pulse: false,
             active: false,
+            disabled: false,
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, &shared);
         assert!(has_class(&el, "subtab"));
         assert!(!has_class(&el, "active"));
     }
@@ -470,45 +558,51 @@ mod tests {
     #[test]
     fn subtab_with_icon() {
         let shared = make_shared();
+        let ws = make_workspace(1, false);
         let sub = Subtab {
             label: "terminals".to_string(),
             count: None,
             pulse: false,
             active: false,
+            disabled: false,
             icon: Some(SubtabIcon::Terminal),
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, &shared);
         assert!(find_by_class(&el, "subtab-icon").is_some());
     }
 
     #[test]
     fn subtab_without_icon() {
         let shared = make_shared();
+        let ws = make_workspace(1, false);
         let sub = Subtab {
             label: "plain".to_string(),
             count: None,
             pulse: false,
             active: false,
+            disabled: false,
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, &shared);
         assert!(find_by_class(&el, "subtab-icon").is_none());
     }
 
     #[test]
     fn subtab_with_count() {
         let shared = make_shared();
+        let ws = make_workspace(1, false);
         let sub = Subtab {
             label: "stuff".to_string(),
             count: Some(42),
             pulse: false,
             active: false,
+            disabled: false,
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, &shared);
         let count_el = find_by_class(&el, "subtab-count").expect("subtab-count not found");
         assert_eq!(text_of(count_el), Some("42"));
         assert!(!has_class(count_el, "pulse"));
@@ -517,30 +611,34 @@ mod tests {
     #[test]
     fn subtab_without_count() {
         let shared = make_shared();
+        let ws = make_workspace(1, false);
         let sub = Subtab {
             label: "stuff".to_string(),
             count: None,
             pulse: false,
             active: false,
+            disabled: false,
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, &shared);
         assert!(find_by_class(&el, "subtab-count").is_none());
     }
 
     #[test]
     fn subtab_with_pulse() {
         let shared = make_shared();
+        let ws = make_workspace(1, false);
         let sub = Subtab {
             label: "agents".to_string(),
             count: Some(5),
             pulse: true,
             active: false,
+            disabled: false,
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, &shared);
         let count_el = find_by_class(&el, "subtab-count").unwrap();
         assert!(has_class(count_el, "pulse"));
     }
@@ -548,15 +646,17 @@ mod tests {
     #[test]
     fn subtab_has_tree_glyph_and_label() {
         let shared = make_shared();
+        let ws = make_workspace(1, false);
         let sub = Subtab {
             label: "sessions".to_string(),
             count: None,
             pulse: false,
             active: false,
+            disabled: false,
             icon: None,
             tree_glyph: "\u{2514}",
         };
-        let el = build_subtab(0, 0, &sub, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, &shared);
         let glyph = find_by_class(&el, "tree-glyph").unwrap();
         assert_eq!(text_of(glyph), Some("\u{2514}"));
         let label = find_by_class(&el, "subtab-label").unwrap();
