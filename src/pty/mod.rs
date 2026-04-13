@@ -61,9 +61,7 @@ impl PtyManager {
             pixel_height: 0,
         };
 
-        let pty_pair = pty_system
-            .openpty(size)
-            .map_err(std::io::Error::other)?;
+        let pty_pair = pty_system.openpty(size).map_err(std::io::Error::other)?;
 
         let shell = default_shell();
 
