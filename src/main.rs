@@ -8,9 +8,13 @@ use std::sync::Arc;
 
 use unshit::app::{App, AppConfig, FontSource};
 use unshit::core::element::*;
+use unshit::core::event::DragPhase;
+use unshit::core::style::parse::StyleDeclaration;
+use unshit::core::style::types::Dimension;
 
 use crate::state::{
     dispatch, mutate_with, resize_all_terminals, seed_state, SharedState, UiSnapshot,
+    MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
 };
 use crate::ui::settings::build_settings_modal;
 use crate::ui::sidebar::build_sidebar;
@@ -40,6 +44,38 @@ fn build_tree(
     }
     modal_overlay = modal_overlay.with_child(build_settings_modal(snap, shared));
 
+    let sidebar = build_sidebar(snap, shared)
+        .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
+        .with_style(StyleDeclaration::MinWidth(Dimension::Px(
+            snap.sidebar_width,
+        )));
+
+    let drag_shared = shared.clone();
+    let sidebar_resizer = ElementDef::new(Tag::Div)
+        .with_class("sidebar-resizer")
+        .on_drag(move |ev| match ev.phase {
+            DragPhase::Start => {
+                mutate_with(&drag_shared, |st| {
+                    st.sidebar_drag_start = Some(st.sidebar_width);
+                });
+            }
+            DragPhase::Update => {
+                mutate_with(&drag_shared, |st| {
+                    let start = match st.sidebar_drag_start {
+                        Some(w) => w,
+                        None => return,
+                    };
+                    st.sidebar_width =
+                        (start + ev.total_delta_x).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+                });
+            }
+            DragPhase::End => {
+                mutate_with(&drag_shared, |st| {
+                    st.sidebar_drag_start = None;
+                });
+            }
+        });
+
     ElementTree {
         root: ElementDef::new(Tag::Div)
             .with_class("app")
@@ -47,7 +83,8 @@ fn build_tree(
             .with_child(
                 ElementDef::new(Tag::Div)
                     .with_class("layout")
-                    .with_child(build_sidebar(snap, shared))
+                    .with_child(sidebar)
+                    .with_child(sidebar_resizer)
                     .with_child(
                         ElementDef::new(Tag::Div)
                             .with_class("content")

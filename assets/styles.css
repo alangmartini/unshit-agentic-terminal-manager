@@ -1258,6 +1258,19 @@ body::after {
   bottom: -3px;
 }
 
+.sidebar-resizer {
+  width: 6px;
+  cursor: col-resize;
+  background: var(--border-hair);
+  transition: background var(--dur-fast) var(--ease-std);
+  flex-shrink: 0;
+  z-index: 10;
+}
+
+.sidebar-resizer:hover {
+  background: var(--amber-400);
+}
+
 body.dragging-pane {
   cursor: col-resize;
   user-select: none;
