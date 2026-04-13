@@ -1404,29 +1404,25 @@ impl ApplicationHandler for AppHandler {
                             y: pos.1,
                         });
                     let mut node = state.interaction.hovered;
-                    loop {
-                        if let Some(element) = state.arena.get(node) {
-                            let mut handled = false;
-                            for (et, handler) in &element.handlers {
-                                if *et == unshit_core::event::EventType::Scroll {
-                                    handler(&scroll_evt);
-                                    handled = true;
-                                    state.needs_rebuild = true;
-                                    state.window.request_redraw();
-                                    break;
-                                }
-                            }
-                            if handled {
+                    while let Some(element) = state.arena.get(node) {
+                        let mut handled = false;
+                        for (et, handler) in &element.handlers {
+                            if *et == unshit_core::event::EventType::Scroll {
+                                handler(&scroll_evt);
+                                handled = true;
+                                state.needs_rebuild = true;
+                                state.window.request_redraw();
                                 break;
                             }
-                            let parent = element.parent;
-                            if parent.is_dangling() {
-                                break;
-                            }
-                            node = parent;
-                        } else {
+                        }
+                        if handled {
                             break;
                         }
+                        let parent = element.parent;
+                        if parent.is_dangling() {
+                            break;
+                        }
+                        node = parent;
                     }
                 }
             }
