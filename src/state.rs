@@ -9,6 +9,8 @@ pub const MIN_FONT_SIZE: u32 = 8;
 pub const MAX_FONT_SIZE: u32 = 32;
 /// Minimum flex-grow ratio for any pane (prevents collapsing below ~10%).
 pub const MIN_PANE_RATIO: f32 = 0.1;
+pub const MIN_SIDEBAR_WIDTH: f32 = 150.0;
+pub const MAX_SIDEBAR_WIDTH: f32 = 500.0;
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
@@ -136,6 +138,9 @@ pub struct AppState {
     pub toggles: BTreeMap<String, bool>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
+    pub sidebar_width: f32,
+    /// Sidebar width at the start of a drag, `None` when not dragging.
+    pub sidebar_drag_start: Option<f32>,
     pub cpu_pct: f32,
     pub mem_gb: f32,
     pub net_kbps: f32,
@@ -195,6 +200,7 @@ impl AppState {
             toggles: self.toggles.clone(),
             palette_open: self.palette_open,
             sidebar_collapsed: self.sidebar_collapsed,
+            sidebar_width: self.sidebar_width,
             cpu_pct: self.cpu_pct,
             mem_gb: self.mem_gb,
             net_kbps: self.net_kbps,
@@ -224,6 +230,7 @@ pub struct UiSnapshot {
     pub toggles: BTreeMap<String, bool>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
+    pub sidebar_width: f32,
     pub cpu_pct: f32,
     pub mem_gb: f32,
     pub net_kbps: f32,
@@ -448,6 +455,8 @@ pub fn seed_state() -> AppState {
         toggles,
         palette_open: false,
         sidebar_collapsed: false,
+        sidebar_width: 252.0,
+        sidebar_drag_start: None,
         cpu_pct: 0.0,
         mem_gb: 0.0,
         net_kbps: 0.0,
@@ -733,8 +742,8 @@ pub fn apply_ratio_delta(
     let delta_ratio = (delta_px / container_px) * total_ratio;
 
     let pair_sum = initial[before_idx] + initial[after_idx];
-    let new_before = (initial[before_idx] + delta_ratio)
-        .clamp(MIN_PANE_RATIO, pair_sum - MIN_PANE_RATIO);
+    let new_before =
+        (initial[before_idx] + delta_ratio).clamp(MIN_PANE_RATIO, pair_sum - MIN_PANE_RATIO);
     let new_after = pair_sum - new_before;
 
     ratios[before_idx] = new_before;
