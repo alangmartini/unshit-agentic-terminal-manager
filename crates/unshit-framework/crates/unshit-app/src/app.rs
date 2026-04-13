@@ -1248,23 +1248,64 @@ impl ApplicationHandler for AppHandler {
                                 }
                                 state.window.request_redraw();
                             } else {
-                                // Dispatch KeyboardCapture event directly to focused element
-                                let focused_id = state.interaction.focused;
-                                let kbd_event = Event::Keyboard(KeyboardEvent {
-                                    kind: unshit_core::event::KeyEventKind::Pressed,
-                                    key: combo.key,
-                                    modifiers: combo.modifiers,
-                                    text: event.text.as_ref().map(|t| t.to_string()),
-                                });
-                                if let Some(element) = state.arena.get(focused_id) {
-                                    for (et, handler) in &element.handlers {
-                                        if *et == EventType::KeyboardCapture {
-                                            handler(&kbd_event);
+                                // When a command-level modifier (Ctrl/Alt/Meta) is held,
+                                // check registered shortcuts before forwarding to the
+                                // capture handler. This lets app hotkeys (Ctrl+T, etc.)
+                                // work even when the terminal pane is focused. Plain
+                                // keys and Shift-only combos bypass this check so normal
+                                // typing and Shift+PageUp/Down still reach the terminal.
+                                let has_command_modifier = combo
+                                    .modifiers
+                                    .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META);
+
+                                let shortcut_handled = if has_command_modifier {
+                                    let was_chord_pending =
+                                        state.shortcut_resolver.is_chord_pending();
+                                    let matched = state.shortcut_resolver.process_key(
+                                        combo,
+                                        &state.interaction,
+                                        &state.arena,
+                                    );
+                                    if let Some(command) = matched {
+                                        dispatch_command(
+                                            state,
+                                            &command,
+                                            self.app.config.on_command.as_ref(),
+                                        );
+                                        true
+                                    } else if state.shortcut_resolver.is_chord_pending()
+                                        && !was_chord_pending
+                                    {
+                                        // Entered chord state (e.g. Ctrl+K as chord
+                                        // leader). Consume the key; don't forward.
+                                        state.window.request_redraw();
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
+                                if !shortcut_handled {
+                                    // No shortcut match: forward to the capture handler.
+                                    let focused_id = state.interaction.focused;
+                                    let kbd_event = Event::Keyboard(KeyboardEvent {
+                                        kind: unshit_core::event::KeyEventKind::Pressed,
+                                        key: combo.key,
+                                        modifiers: combo.modifiers,
+                                        text: event.text.as_ref().map(|t| t.to_string()),
+                                    });
+                                    if let Some(element) = state.arena.get(focused_id) {
+                                        for (et, handler) in &element.handlers {
+                                            if *et == EventType::KeyboardCapture {
+                                                handler(&kbd_event);
+                                            }
                                         }
                                     }
+                                    state.needs_rebuild = true;
+                                    state.window.request_redraw();
                                 }
-                                state.needs_rebuild = true;
-                                state.window.request_redraw();
                             }
                         }
                     } else {
