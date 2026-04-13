@@ -1,7 +1,8 @@
 use unshit::core::element::*;
 
 use crate::state::{
-    mutate_add_workspace, mutate_with, SharedState, Subtab, TerminalEntry, UiSnapshot, Workspace,
+    mutate_add_workspace_with_path, mutate_with, SharedState, Subtab, TerminalEntry, UiSnapshot,
+    Workspace,
 };
 use crate::ui::icons::*;
 
@@ -42,9 +43,14 @@ fn build_sidebar_head(shared: &SharedState) -> ElementDef {
                         .with_class("icon-btn")
                         .with_class("tight")
                         .on_click(move || {
-                            mutate_with(&add_state, |st| {
-                                mutate_add_workspace(st);
-                            });
+                            let picked = rfd::FileDialog::new()
+                                .set_title("Select workspace folder")
+                                .pick_folder();
+                            if let Some(folder) = picked {
+                                mutate_with(&add_state, |st| {
+                                    mutate_add_workspace_with_path(st, Some(folder));
+                                });
+                            }
                         })
                         .with_child(svg_icon(icon_plus())),
                 )

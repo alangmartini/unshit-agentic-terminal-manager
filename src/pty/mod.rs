@@ -8,6 +8,7 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::Path;
 
 /// A single PTY session: the child process, a writer for stdin, the master PTY
 /// handle (needed for resize), and the current terminal size.
@@ -45,12 +46,24 @@ impl PtyManager {
     ///
     /// The shell is chosen from the `SHELL` environment variable. If that is
     /// unset, it falls back to `bash` on Unix or `powershell.exe` on Windows.
-    /// The working directory is set to the user's home directory.
+    /// The working directory is set to `cwd` if provided, otherwise the user's
+    /// home directory.
     pub fn spawn(
         &mut self,
         pane_id: u32,
         cols: u16,
         rows: u16,
+    ) -> std::io::Result<Box<dyn Read + Send>> {
+        self.spawn_in(pane_id, cols, rows, None)
+    }
+
+    /// Like [`spawn`](Self::spawn) but with an explicit working directory.
+    pub fn spawn_in(
+        &mut self,
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
     ) -> std::io::Result<Box<dyn Read + Send>> {
         let pty_system = native_pty_system();
 
@@ -68,7 +81,9 @@ impl PtyManager {
         let shell = default_shell();
 
         let mut cmd = CommandBuilder::new(&shell);
-        if let Some(home) = dirs::home_dir() {
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        } else if let Some(home) = dirs::home_dir() {
             cmd.cwd(home);
         }
 
