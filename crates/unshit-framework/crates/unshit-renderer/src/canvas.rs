@@ -22,6 +22,8 @@ pub struct PaintContext<'a> {
     pub queue: &'a wgpu::Queue,
     /// Persistent GPU buffers for this canvas element, if registered.
     pub persistent_buffer: Option<&'a GpuElementBuffers>,
+    /// The MSAA sample count used by the current render pass.
+    pub sample_count: u32,
 }
 
 /// Trait for user-defined GPU rendering into a rectangular region.
@@ -36,6 +38,7 @@ pub trait CustomPainter: Send + Sync + 'static {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         rect: LayoutRect,
+        sample_count: u32,
     );
 
     /// Called during the render pass. A scissor rect confines output to the
@@ -131,6 +134,7 @@ mod tests {
             _queue: &wgpu::Queue,
             _format: wgpu::TextureFormat,
             _rect: LayoutRect,
+            _sample_count: u32,
         ) {
         }
 
@@ -245,6 +249,7 @@ mod tests {
                 _queue: &wgpu::Queue,
                 _format: wgpu::TextureFormat,
                 _rect: LayoutRect,
+                _sample_count: u32,
             ) {
             }
 

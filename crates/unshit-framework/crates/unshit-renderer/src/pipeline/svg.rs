@@ -79,7 +79,7 @@ pub struct SvgPipeline {
 }
 
 impl SvgPipeline {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("svg shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/svg.wgsl").into()),
@@ -153,6 +153,7 @@ impl SvgPipeline {
         let attrs = wgpu::vertex_attr_array![
             0 => Float32x2, // position
             1 => Float32x4, // color
+            2 => Float32,   // coverage (analytical AA)
         ];
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -183,7 +184,11 @@ impl SvgPipeline {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview: None,
             cache: None,
         });

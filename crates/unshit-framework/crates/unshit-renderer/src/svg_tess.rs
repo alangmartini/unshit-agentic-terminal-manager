@@ -16,8 +16,8 @@ use lyon::math::{point, Point};
 use lyon::path::Path;
 use lyon::tessellation::geometry_builder::BuffersBuilder;
 use lyon::tessellation::{
-    FillOptions, FillTessellator, FillVertex, LineCap, LineJoin, StrokeOptions, StrokeTessellator,
-    StrokeVertex, VertexBuffers,
+    FillOptions, FillTessellator, FillVertex, LineCap, LineJoin, Side, StrokeOptions,
+    StrokeTessellator, StrokeVertex, VertexBuffers,
 };
 use unshit_core::style::types::Color;
 use unshit_core::svg::types::{
@@ -25,16 +25,23 @@ use unshit_core::svg::types::{
 };
 
 /// Default flattening tolerance. Smaller values give smoother curves at the
-/// cost of more triangles. 0.2 pixels is the sweet spot for icons at typical
-/// display sizes and matches the lyon `FillOptions::DEFAULT_TOLERANCE`.
-pub const DEFAULT_TOLERANCE: f32 = 0.2;
+/// cost of more triangles. 0.02 gives noticeably smoother arcs on small (16px)
+/// icons without a meaningful vertex count increase at that scale.
+pub const DEFAULT_TOLERANCE: f32 = 0.02;
 
 /// A tessellated SVG vertex, laid out for the GPU shader.
+///
+/// The `coverage` field implements Skia-style analytical anti-aliasing:
+/// interior vertices get 1.0, stroke-edge vertices get a fractional value
+/// based on distance from the geometric boundary. The GPU interpolates
+/// coverage across triangles and the fragment shader uses it as an alpha
+/// multiplier for sub-pixel edge softening.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct SvgVertex {
     pub position: [f32; 2],
     pub color: [f32; 4],
+    pub coverage: f32,
 }
 
 /// Output of one tessellation run. Held behind an `Arc` so the cache can
@@ -142,6 +149,7 @@ fn tessellate_fill(
         &mut BuffersBuilder::new(buffers, move |vertex: FillVertex| SvgVertex {
             position: vertex.position().to_array(),
             color: color_arr,
+            coverage: 0.0, // uniform zero -> fwidth=0 -> shader skips AA
         }),
     );
 }
@@ -177,9 +185,16 @@ fn tessellate_stroke(
     let _ = tessellator.tessellate_path(
         path,
         &options,
-        &mut BuffersBuilder::new(buffers, move |vertex: StrokeVertex| SvgVertex {
-            position: vertex.position().to_array(),
-            color: color_arr,
+        &mut BuffersBuilder::new(buffers, move |vertex: StrokeVertex| {
+            // Signed side indicator: +1 for positive-side edge, -1 for
+            // negative-side edge. The GPU interpolates this linearly across
+            // each triangle, producing a smooth -1..+1 gradient across the
+            // stroke width even though no vertex sits at the center.
+            let coverage = match vertex.side() {
+                Side::Positive => 1.0_f32,
+                Side::Negative => -1.0_f32,
+            };
+            SvgVertex { position: vertex.position().to_array(), color: color_arr, coverage }
         }),
     );
 }
@@ -432,6 +447,7 @@ mod tests {
         for (va, vb) in a.vertices.iter().zip(b.vertices.iter()) {
             assert_eq!(va.position, vb.position);
             assert_eq!(va.color, vb.color);
+            assert_eq!(va.coverage, vb.coverage);
         }
         assert_eq!(a.indices, b.indices);
     }
@@ -460,5 +476,51 @@ mod tests {
         let g = tessellate(&p, &attrs, Color::BLACK, DEFAULT_TOLERANCE);
         let fill_only = tessellate(&p, &solid_fill(Color::BLACK), Color::BLACK, DEFAULT_TOLERANCE);
         assert!(g.vertex_count() > fill_only.vertex_count());
+    }
+
+    #[test]
+    fn fill_vertices_have_zero_coverage() {
+        let p = SvgPrimitive::Circle { cx: 10.0, cy: 10.0, r: 5.0 };
+        let g = tessellate(&p, &solid_fill(Color::BLACK), Color::BLACK, DEFAULT_TOLERANCE);
+        assert!(g.vertex_count() > 0);
+        for v in &g.vertices {
+            assert_eq!(
+                v.coverage, 0.0,
+                "fill vertices must have coverage 0.0 (uniform -> fwidth=0)"
+            );
+        }
+    }
+
+    #[test]
+    fn stroke_vertices_have_signed_coverage() {
+        let p = SvgPrimitive::Circle { cx: 10.0, cy: 10.0, r: 5.0 };
+        let g = tessellate(&p, &solid_stroke(Color::BLACK, 2.0), Color::BLACK, DEFAULT_TOLERANCE);
+        assert!(g.vertex_count() > 0);
+        for v in &g.vertices {
+            assert!(
+                (-1.0..=1.0).contains(&v.coverage),
+                "stroke coverage {} out of [-1, 1] range",
+                v.coverage
+            );
+        }
+        // Should have vertices on both sides of the stroke.
+        let has_neg = g.vertices.iter().any(|v| v.coverage < -0.5);
+        let has_pos = g.vertices.iter().any(|v| v.coverage > 0.5);
+        assert!(has_neg, "stroke should have negative-side vertices");
+        assert!(has_pos, "stroke should have positive-side vertices");
+    }
+
+    #[test]
+    fn zero_width_stroke_coverage_is_safe() {
+        let p = SvgPrimitive::Line { x1: 0.0, y1: 0.0, x2: 10.0, y2: 0.0 };
+        let attrs = solid_stroke(Color::BLACK, 0.0);
+        let g = tessellate(&p, &attrs, Color::BLACK, DEFAULT_TOLERANCE);
+        // Zero width produces no geometry, but if it did, coverage must be in range.
+        for v in &g.vertices {
+            assert!(
+                (-1.0..=1.0).contains(&v.coverage),
+                "degenerate stroke coverage must be in [-1, 1]"
+            );
+        }
     }
 }

@@ -664,3 +664,58 @@ pub fn clear_dirty_flags(arena: &mut NodeArena, node_id: NodeId) {
         clear_dirty_flags(arena, child_id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::element::{Element, ElementDef};
+    use crate::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, ViewBox};
+
+    /// SVG elements with CSS-assigned pixel dimensions (from a `svg`
+    /// tag rule) must receive non-zero layout size. Without the CSS
+    /// rule, auto-dimensioned SVG leaves collapse to 0x0 in taffy.
+    #[test]
+    fn svg_element_with_css_size_gets_nonzero_layout() {
+        let mut arena = NodeArena::new();
+        let mut taffy = TaffyTree::new();
+        let mut font_system = FontSystem::new();
+
+        // Parent container with explicit 26x26 size.
+        let parent_def = ElementDef::new(Tag::Div);
+        let parent_id = arena.alloc(Element::new(Tag::Div));
+        arena.get_mut(parent_id).unwrap().update_from_def(&parent_def);
+        arena.get_mut(parent_id).unwrap().computed_style.width =
+            crate::style::types::Dimension::Px(26.0);
+        arena.get_mut(parent_id).unwrap().computed_style.height =
+            crate::style::types::Dimension::Px(26.0);
+
+        // SVG child with CSS width/height set (simulates `svg { width: 16px; height: 16px; }`).
+        let svg_node = SvgNode {
+            primitive: SvgPrimitive::Group,
+            attrs: SvgAttrs {
+                view_box: Some(ViewBox::new(0.0, 0.0, 16.0, 16.0)),
+                ..Default::default()
+            },
+            children: Vec::new(),
+        };
+        let svg_def = ElementDef::new(Tag::Div).with_svg(svg_node);
+        let svg_id = arena.alloc(Element::new(Tag::Svg));
+        arena.get_mut(svg_id).unwrap().update_from_def(&svg_def);
+        // The CSS cascade applies `svg { width: 16px; height: 16px; }`.
+        arena.get_mut(svg_id).unwrap().computed_style.width =
+            crate::style::types::Dimension::Px(16.0);
+        arena.get_mut(svg_id).unwrap().computed_style.height =
+            crate::style::types::Dimension::Px(16.0);
+        arena.append_child(parent_id, svg_id);
+
+        sync_element_to_taffy(&mut arena, &mut taffy, parent_id, &mut font_system);
+        let root_taffy = arena.get(parent_id).unwrap().taffy_node.unwrap();
+        let mut cache = TextMeasureCache::new();
+        compute_layout(&mut taffy, root_taffy, 800.0, 600.0, &mut font_system, &mut cache);
+        read_layout_results(&mut arena, &taffy, parent_id, 0.0, 0.0);
+
+        let svg_rect = arena.get(svg_id).unwrap().layout_rect;
+        assert_eq!(svg_rect.width, 16.0, "SVG should be 16px wide from CSS");
+        assert_eq!(svg_rect.height, 16.0, "SVG should be 16px tall from CSS");
+    }
+}

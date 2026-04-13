@@ -17,6 +17,9 @@ use wgpu;
 
 static BACKDROP_FALLBACK_LOG: Once = Once::new();
 
+/// MSAA sample count for the main content pipelines. Set to 1 to disable.
+const MSAA_SAMPLE_COUNT: u32 = 4;
+
 /// Cached probe that decides whether the renderer can support
 /// `backdrop-filter`. The check is extremely conservative: the swapchain
 /// format must allow both `TEXTURE_BINDING` (so the blur shader can sample
@@ -86,6 +89,19 @@ pub struct GpuContext {
     /// frame-surviving buffers. Populated by callers that also maintain the
     /// CPU-side `PersistentBufferManager`.
     pub gpu_persistent_buffers: GpuPersistentBuffers,
+
+    /// Multisampled texture for MSAA. Content pipelines render into this
+    /// texture and wgpu resolves to the single-sample surface at pass end.
+    msaa_texture: Option<wgpu::Texture>,
+    msaa_view: Option<wgpu::TextureView>,
+
+    /// Non-MSAA (sample_count=1) pipeline duplicates for the backdrop blur
+    /// path, created lazily. The backdrop path renders to single-sample
+    /// textures so it cannot use the MSAA content pipelines.
+    backdrop_quad_pipeline: Option<QuadPipeline>,
+    backdrop_text_pipeline: Option<TextPipeline>,
+    backdrop_image_pipeline: Option<ImagePipeline>,
+    backdrop_svg_pipeline: Option<SvgPipeline>,
 }
 
 impl GpuContext {
@@ -169,7 +185,7 @@ impl GpuContext {
         };
         surface.configure(&device, &surface_config);
 
-        let quad_pipeline = QuadPipeline::new(&device, surface_format);
+        let quad_pipeline = QuadPipeline::new(&device, surface_format, MSAA_SAMPLE_COUNT);
         #[cfg(target_os = "windows")]
         let glyph_atlas =
             GlyphAtlas::new_with_format(&device, 2048, wgpu::TextureFormat::Rgba8Unorm);
@@ -180,10 +196,23 @@ impl GpuContext {
             surface_format,
             &glyph_atlas.texture_view,
             &glyph_atlas.sampler,
+            MSAA_SAMPLE_COUNT,
         );
-        let image_pipeline = ImagePipeline::new(&device, surface_format);
-        let svg_pipeline = SvgPipeline::new(&device, surface_format);
+        let image_pipeline = ImagePipeline::new(&device, surface_format, MSAA_SAMPLE_COUNT);
+        let svg_pipeline = SvgPipeline::new(&device, surface_format, MSAA_SAMPLE_COUNT);
         let image_cache = ImageCache::new(&device);
+
+        let (msaa_texture, msaa_view) = if MSAA_SAMPLE_COUNT > 1 {
+            let (t, v) = Self::create_msaa_texture(
+                &device,
+                surface_format,
+                size.width.max(1),
+                size.height.max(1),
+            );
+            (Some(t), Some(v))
+        } else {
+            (None, None)
+        };
 
         let backdrop_filter_available = probe_backdrop_filter_support(&adapter, surface_format);
 
@@ -207,6 +236,12 @@ impl GpuContext {
             backdrop_blurred: None,
             backdrop_blur_pipeline: None,
             gpu_persistent_buffers: GpuPersistentBuffers::new(),
+            msaa_texture,
+            msaa_view,
+            backdrop_quad_pipeline: None,
+            backdrop_text_pipeline: None,
+            backdrop_image_pipeline: None,
+            backdrop_svg_pipeline: None,
         }
     }
 
@@ -214,6 +249,49 @@ impl GpuContext {
     /// need more than the default 256 entries.
     pub fn set_svg_cache_capacity(&mut self, capacity: usize) {
         self.svg_cache.set_capacity(capacity);
+    }
+
+    fn create_msaa_texture(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MSAA texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLE_COUNT,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    /// Lazily create non-MSAA pipeline duplicates for the backdrop blur path.
+    /// Called only when a frame uses backdrop-filter and MSAA is active.
+    fn ensure_backdrop_pipelines(&mut self) {
+        if self.backdrop_quad_pipeline.is_some() {
+            return;
+        }
+        let format = self.surface_format();
+        self.backdrop_quad_pipeline = Some(QuadPipeline::new(&self.device, format, 1));
+        self.backdrop_text_pipeline = Some(TextPipeline::new(
+            &self.device,
+            format,
+            &self.glyph_atlas.texture_view,
+            &self.glyph_atlas.sampler,
+            1,
+        ));
+        self.backdrop_image_pipeline = Some(ImagePipeline::new(&self.device, format, 1));
+        self.backdrop_svg_pipeline = Some(SvgPipeline::new(&self.device, format, 1));
     }
 
     /// Creates a headless GPU context for offscreen rendering (no window required).
@@ -332,17 +410,29 @@ impl GpuContext {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let quad_pipeline = QuadPipeline::new(&device, format);
+        let quad_pipeline = QuadPipeline::new(&device, format, MSAA_SAMPLE_COUNT);
         #[cfg(target_os = "windows")]
         let glyph_atlas =
             GlyphAtlas::new_with_format(&device, 2048, wgpu::TextureFormat::Rgba8Unorm);
         #[cfg(not(target_os = "windows"))]
         let glyph_atlas = GlyphAtlas::new(&device);
-        let text_pipeline =
-            TextPipeline::new(&device, format, &glyph_atlas.texture_view, &glyph_atlas.sampler);
-        let image_pipeline = ImagePipeline::new(&device, format);
-        let svg_pipeline = SvgPipeline::new(&device, format);
+        let text_pipeline = TextPipeline::new(
+            &device,
+            format,
+            &glyph_atlas.texture_view,
+            &glyph_atlas.sampler,
+            MSAA_SAMPLE_COUNT,
+        );
+        let image_pipeline = ImagePipeline::new(&device, format, MSAA_SAMPLE_COUNT);
+        let svg_pipeline = SvgPipeline::new(&device, format, MSAA_SAMPLE_COUNT);
         let image_cache = ImageCache::new(&device);
+
+        let (msaa_texture, msaa_view) = if MSAA_SAMPLE_COUNT > 1 {
+            let (t, v) = Self::create_msaa_texture(&device, format, width, height);
+            (Some(t), Some(v))
+        } else {
+            (None, None)
+        };
 
         let backdrop_filter_available = probe_backdrop_filter_support(adapter, format);
 
@@ -366,6 +456,12 @@ impl GpuContext {
             backdrop_blurred: None,
             backdrop_blur_pipeline: None,
             gpu_persistent_buffers: GpuPersistentBuffers::new(),
+            msaa_texture,
+            msaa_view,
+            backdrop_quad_pipeline: None,
+            backdrop_text_pipeline: None,
+            backdrop_image_pipeline: None,
+            backdrop_svg_pipeline: None,
         }
     }
 
@@ -445,6 +541,13 @@ impl GpuContext {
             self.backdrop_source = None;
             self.backdrop_blurred = None;
         }
+
+        if MSAA_SAMPLE_COUNT > 1 {
+            let format = self.surface_format();
+            let (t, v) = Self::create_msaa_texture(&self.device, format, w, h);
+            self.msaa_texture = Some(t);
+            self.msaa_view = Some(v);
+        }
     }
 
     pub fn window_size(&self) -> (f32, f32) {
@@ -510,26 +613,28 @@ impl GpuContext {
             }
         };
 
-        // Prepare canvas painters before the render pass
+        // Backdrop filter gate (checked before prepare so canvas painters
+        // receive the correct sample count).
         let format = self.surface_format();
-        for layer_batch in &self.layered_batch.layers {
-            for cb in &layer_batch.canvas_callbacks {
-                cb.painter.prepare(&self.device, &self.queue, format, cb.rect);
-            }
-        }
-
-        // Backdrop filter gate. We only take the split path when at least
-        // one layer actually carries a boundary marker and the surface
-        // format supports the required usages. When the gate is closed the
-        // existing single pass code path below runs untouched, which keeps
-        // normal pages at zero extra cost.
         let use_backdrop_path =
             self.backdrop_filter_available && self.layered_batch.has_backdrop_boundaries();
+
+        // Prepare canvas painters before the render pass
+        let paint_sample_count =
+            if use_backdrop_path && MSAA_SAMPLE_COUNT > 1 { 1 } else { MSAA_SAMPLE_COUNT };
+        for layer_batch in &self.layered_batch.layers {
+            for cb in &layer_batch.canvas_callbacks {
+                cb.painter.prepare(&self.device, &self.queue, format, cb.rect, paint_sample_count);
+            }
+        }
 
         if use_backdrop_path {
             self.ensure_backdrop_textures(vw as u32, vh as u32);
             if self.backdrop_blur_pipeline.is_none() {
                 self.backdrop_blur_pipeline = Some(BackdropBlurPipeline::new(&self.device, format));
+            }
+            if MSAA_SAMPLE_COUNT > 1 {
+                self.ensure_backdrop_pipelines();
             }
         }
 
@@ -556,11 +661,19 @@ impl GpuContext {
             } else {
                 &surface_view
             };
+            // When MSAA is active, render into the multisampled texture and
+            // let wgpu resolve into the single-sample surface at pass end.
+            let (pass_view, pass_resolve): (&wgpu::TextureView, Option<&wgpu::TextureView>) =
+                if let Some(ref msaa_v) = self.msaa_view {
+                    (msaa_v, Some(render_view))
+                } else {
+                    (render_view, None)
+                };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: render_view,
-                    resolve_target: None,
+                    view: pass_view,
+                    resolve_target: pass_resolve,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.051,
@@ -675,6 +788,7 @@ impl GpuContext {
                                 device: &self.device,
                                 queue: &self.queue,
                                 persistent_buffer: gpu_buf,
+                                sample_count: MSAA_SAMPLE_COUNT,
                             };
                             cb.painter.paint(&ctx, &mut pass);
                         }
@@ -871,6 +985,26 @@ impl GpuContext {
                 };
 
                 {
+                    // When MSAA is active, pick the non-MSAA pipeline
+                    // duplicates for the backdrop path (single-sample
+                    // target). Bind groups and buffers come from the main
+                    // pipelines since the layouts are structurally identical.
+                    let quad_rp = if MSAA_SAMPLE_COUNT > 1 {
+                        &self.backdrop_quad_pipeline.as_ref().unwrap().pipeline
+                    } else {
+                        &self.quad_pipeline.pipeline
+                    };
+                    let text_rp = if MSAA_SAMPLE_COUNT > 1 {
+                        &self.backdrop_text_pipeline.as_ref().unwrap().pipeline
+                    } else {
+                        &self.text_pipeline.pipeline
+                    };
+                    let svg_rp = if MSAA_SAMPLE_COUNT > 1 {
+                        &self.backdrop_svg_pipeline.as_ref().unwrap().pipeline
+                    } else {
+                        &self.svg_pipeline.pipeline
+                    };
+
                     let load = if pass_cleared {
                         wgpu::LoadOp::Load
                     } else {
@@ -890,7 +1024,7 @@ impl GpuContext {
                     });
 
                     if quad_cur < quad_end {
-                        pass.set_pipeline(&self.quad_pipeline.pipeline);
+                        pass.set_pipeline(quad_rp);
                         pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
                         pass.set_vertex_buffer(0, self.quad_pipeline.instance_buffer.slice(..));
                         pass.draw(0..6, quad_cur..quad_end);
@@ -898,7 +1032,7 @@ impl GpuContext {
 
                     // SVG sub range.
                     if svg_cur < svg_end {
-                        pass.set_pipeline(&self.svg_pipeline.pipeline);
+                        pass.set_pipeline(svg_rp);
                         pass.set_bind_group(0, self.svg_pipeline.global_bind_group(), &[]);
                         while let Some(&(entry_layer, draw_idx, geom_key)) = svg_keys.get(svg_next)
                         {
@@ -916,7 +1050,7 @@ impl GpuContext {
                     }
 
                     if glyph_cur < glyph_end {
-                        pass.set_pipeline(&self.text_pipeline.pipeline);
+                        pass.set_pipeline(text_rp);
                         pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
                         pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
                         pass.set_vertex_buffer(0, self.text_pipeline.instance_buffer.slice(..));
@@ -946,7 +1080,15 @@ impl GpuContext {
                                     &instances,
                                 );
                                 let count = instances.len() as u32;
-                                pass.set_pipeline(&self.image_pipeline.pipeline);
+                                // Inline pipeline selection to avoid holding
+                                // a borrow across upload_instances above.
+                                if MSAA_SAMPLE_COUNT > 1 {
+                                    pass.set_pipeline(
+                                        &self.backdrop_image_pipeline.as_ref().unwrap().pipeline,
+                                    );
+                                } else {
+                                    pass.set_pipeline(&self.image_pipeline.pipeline);
+                                }
                                 pass.set_bind_group(
                                     0,
                                     &self.image_pipeline.uniform_bind_group,
@@ -985,6 +1127,7 @@ impl GpuContext {
                                     device: &self.device,
                                     queue: &self.queue,
                                     persistent_buffer: gpu_buf,
+                                    sample_count: 1,
                                 };
                                 cb.painter.paint(&ctx, &mut pass);
                                 reset_scissor = true;
