@@ -246,9 +246,7 @@ fn build_pane_body(
                         };
                         if lines != 0 {
                             mutate_with(&scroll_shared, |st| {
-                                if let Some(terminal) =
-                                    st.terminals.get_mut(&scroll_pane_id.0)
-                                {
+                                if let Some(terminal) = st.terminals.get_mut(&scroll_pane_id.0) {
                                     if lines > 0 {
                                         terminal.scroll_view_up(lines as usize);
                                     } else {

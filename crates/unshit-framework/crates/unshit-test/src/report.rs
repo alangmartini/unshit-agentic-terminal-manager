@@ -55,10 +55,7 @@ pub struct TestReport {
 impl TestReport {
     /// Create a new report that will be written to `output_dir`.
     pub fn new(output_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            entries: Vec::new(),
-            output_dir: output_dir.into(),
-        }
+        Self { entries: Vec::new(), output_dir: output_dir.into() }
     }
 
     /// Add a test entry to the report.
@@ -154,11 +151,7 @@ impl TestReport {
         );
 
         if let Some(msg) = &entry.failure_message {
-            let _ = write!(
-                html,
-                "<div class=\"failure\"><pre>{}</pre></div>\n",
-                escape_html(msg),
-            );
+            let _ = write!(html, "<div class=\"failure\"><pre>{}</pre></div>\n", escape_html(msg),);
         }
 
         if !entry.screenshot_paths.is_empty() {
@@ -311,8 +304,7 @@ fn encode_image_as_data_uri(path: &Path) -> Option<String> {
 
 /// Base64 encode a byte slice using the standard alphabet.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     let chunks = input.chunks(3);
@@ -474,11 +466,7 @@ mod tests {
             trace: Some(vec![
                 TraceStep {
                     frame_number: 0,
-                    action: TraceAction::Click {
-                        selector: ".btn".into(),
-                        x: 10.0,
-                        y: 20.0,
-                    },
+                    action: TraceAction::Click { selector: ".btn".into(), x: 10.0, y: 20.0 },
                     elapsed_ms: 5,
                     screenshot_path: None,
                 },

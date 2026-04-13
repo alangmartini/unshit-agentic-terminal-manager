@@ -11,10 +11,7 @@ pub struct ScreenshotOptions {
 
 impl Default for ScreenshotOptions {
     fn default() -> Self {
-        Self {
-            tolerance: 0.0,
-            masks: Vec::new(),
-        }
+        Self { tolerance: 0.0, masks: Vec::new() }
     }
 }
 
@@ -24,13 +21,7 @@ pub enum MaskRegion {
     /// Completely ignore this rectangle during comparison.
     Ignore { x: u32, y: u32, w: u32, h: u32 },
     /// Apply a custom tolerance to this rectangle instead of the global one.
-    Tolerance {
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-        tolerance: f64,
-    },
+    Tolerance { x: u32, y: u32, w: u32, h: u32, tolerance: f64 },
 }
 
 impl MaskRegion {
@@ -98,10 +89,7 @@ impl TestHarness {
     pub fn assert_screenshot(&mut self, name: &str, tolerance: f64) {
         self.assert_screenshot_with_options(
             name,
-            ScreenshotOptions {
-                tolerance,
-                masks: Vec::new(),
-            },
+            ScreenshotOptions { tolerance, masks: Vec::new() },
         );
     }
 
@@ -303,11 +291,8 @@ fn compare_with_masks(
         }
     }
 
-    let overall_rmse = if compared_pixels > 0 {
-        (sum_sq / (compared_pixels as f64 * 4.0)).sqrt()
-    } else {
-        0.0
-    };
+    let overall_rmse =
+        if compared_pixels > 0 { (sum_sq / (compared_pixels as f64 * 4.0)).sqrt() } else { 0.0 };
 
     for (region_sum, region_count, region_tol) in &region_sums {
         if *region_count == 0 {
@@ -348,11 +333,7 @@ pub fn compute_rmse(a: &image::RgbaImage, b: &image::RgbaImage) -> f64 {
         return f64::MAX;
     }
     let total_pixels = (a.width() * a.height()) as f64;
-    let sum_sq: f64 = a
-        .pixels()
-        .zip(b.pixels())
-        .map(|(pa, pb)| pixel_sq_diff(pa, pb))
-        .sum();
+    let sum_sq: f64 = a.pixels().zip(b.pixels()).map(|(pa, pb)| pixel_sq_diff(pa, pb)).sum();
     (sum_sq / (total_pixels * 4.0)).sqrt()
 }
 
@@ -369,7 +350,8 @@ fn generate_diff_image(
 
     for y in 0..height {
         for x in 0..width {
-            let ignored = masks.iter().any(|m| matches!(m, MaskRegion::Ignore { .. }) && m.contains(x, y));
+            let ignored =
+                masks.iter().any(|m| matches!(m, MaskRegion::Ignore { .. }) && m.contains(x, y));
 
             if ignored {
                 diff.put_pixel(x, y, image::Rgba([0, 0, 180, 255]));
@@ -384,11 +366,7 @@ fn generate_diff_image(
             };
 
             if pa.0 == golden_px.0 {
-                diff.put_pixel(
-                    x,
-                    y,
-                    image::Rgba([pa[0] / 4, pa[1] / 4, pa[2] / 4, 255]),
-                );
+                diff.put_pixel(x, y, image::Rgba([pa[0] / 4, pa[1] / 4, pa[2] / 4, 255]));
             } else {
                 diff.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
             }
@@ -482,12 +460,7 @@ mod tests {
         assert!(!result_no_mask.passed);
 
         // With Ignore mask covering the changed region, should pass.
-        let masks = vec![MaskRegion::Ignore {
-            x: 0,
-            y: 0,
-            w: 2,
-            h: 2,
-        }];
+        let masks = vec![MaskRegion::Ignore { x: 0, y: 0, w: 2, h: 2 }];
         let result_masked = compare_with_masks(&a, &b, 0.0, &masks);
         assert!(result_masked.passed);
         assert_eq!(result_masked.changed_pixels, 0);
@@ -506,13 +479,7 @@ mod tests {
 
         // Global tolerance is 0, so this would fail without a region mask.
         // The Tolerance region gives the changed area a generous threshold.
-        let masks = vec![MaskRegion::Tolerance {
-            x: 0,
-            y: 0,
-            w: 2,
-            h: 2,
-            tolerance: 100.0,
-        }];
+        let masks = vec![MaskRegion::Tolerance { x: 0, y: 0, w: 2, h: 2, tolerance: 100.0 }];
         let result = compare_with_masks(&a, &b, 100.0, &masks);
         assert!(result.passed);
     }
@@ -539,12 +506,7 @@ mod tests {
     fn diff_image_marks_ignored_regions_blue() {
         let a = solid(100, 100, 100, 255);
         let b = solid(100, 100, 100, 255);
-        let masks = vec![MaskRegion::Ignore {
-            x: 0,
-            y: 0,
-            w: 2,
-            h: 2,
-        }];
+        let masks = vec![MaskRegion::Ignore { x: 0, y: 0, w: 2, h: 2 }];
 
         let diff = generate_diff_image(&a, &b, &masks);
         assert_eq!(*diff.get_pixel(0, 0), Rgba([0, 0, 180, 255]));
@@ -577,25 +539,14 @@ mod tests {
 
     #[test]
     fn pixel_tolerance_returns_none_for_ignored() {
-        let masks = vec![MaskRegion::Ignore {
-            x: 5,
-            y: 5,
-            w: 10,
-            h: 10,
-        }];
+        let masks = vec![MaskRegion::Ignore { x: 5, y: 5, w: 10, h: 10 }];
         assert_eq!(pixel_tolerance(7, 7, 1.0, &masks), None);
         assert_eq!(pixel_tolerance(0, 0, 1.0, &masks), Some(1.0));
     }
 
     #[test]
     fn pixel_tolerance_returns_region_tolerance() {
-        let masks = vec![MaskRegion::Tolerance {
-            x: 0,
-            y: 0,
-            w: 5,
-            h: 5,
-            tolerance: 42.0,
-        }];
+        let masks = vec![MaskRegion::Tolerance { x: 0, y: 0, w: 5, h: 5, tolerance: 42.0 }];
         assert_eq!(pixel_tolerance(2, 2, 1.0, &masks), Some(42.0));
         assert_eq!(pixel_tolerance(10, 10, 1.0, &masks), Some(1.0));
     }

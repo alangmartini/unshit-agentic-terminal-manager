@@ -268,10 +268,8 @@ impl CellGrid {
 
     /// Update the global window focus state.
     pub fn set_window_focused(focused: bool) {
-        GLOBAL_WINDOW_FOCUSED.store(
-            if focused { 1 } else { 0 },
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        GLOBAL_WINDOW_FOCUSED
+            .store(if focused { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Read whether the window is focused.

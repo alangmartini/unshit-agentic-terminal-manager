@@ -80,11 +80,9 @@ fn fill_replaces_text_in_input() {
     let mut h = TestHarness::new(
         css,
         || ElementTree {
-            root: ElementDef::new(Tag::Div).with_class("root").with_child(
-                ElementDef::new(Tag::Input)
-                    .with_class("inp")
-                    .with_text("old text"),
-            ),
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_child(ElementDef::new(Tag::Input).with_class("inp").with_text("old text")),
         },
         800.0,
         600.0,
@@ -105,11 +103,9 @@ fn clear_empties_input() {
     let mut h = TestHarness::new(
         css,
         || ElementTree {
-            root: ElementDef::new(Tag::Div).with_class("root").with_child(
-                ElementDef::new(Tag::Input)
-                    .with_class("inp")
-                    .with_text("some text"),
-            ),
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_child(ElementDef::new(Tag::Input).with_class("inp").with_text("some text")),
         },
         800.0,
         600.0,
@@ -132,9 +128,9 @@ fn hover_on_changes_hovered_element() {
     let mut h = TestHarness::new(
         css,
         || ElementTree {
-            root: ElementDef::new(Tag::Div).with_class("root").with_child(
-                ElementDef::new(Tag::Div).with_class("box"),
-            ),
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_child(ElementDef::new(Tag::Div).with_class("box")),
         },
         800.0,
         600.0,
@@ -157,13 +153,11 @@ fn select_option_on_changes_value() {
         css,
         || ElementTree {
             root: ElementDef::new(Tag::Div).with_class("root").with_child(
-                ElementDef::new(Tag::Select)
-                    .with_class("sel")
-                    .with_options(vec![
-                        ("a".into(), "Alpha".into()),
-                        ("b".into(), "Beta".into()),
-                        ("c".into(), "Charlie".into()),
-                    ]),
+                ElementDef::new(Tag::Select).with_class("sel").with_options(vec![
+                    ("a".into(), "Alpha".into()),
+                    ("b".into(), "Beta".into()),
+                    ("c".into(), "Charlie".into()),
+                ]),
             ),
         },
         800.0,
@@ -187,12 +181,10 @@ fn select_option_by_index_on_changes_selection() {
         css,
         || ElementTree {
             root: ElementDef::new(Tag::Div).with_class("root").with_child(
-                ElementDef::new(Tag::Select)
-                    .with_class("sel")
-                    .with_options(vec![
-                        ("x".into(), "X-ray".into()),
-                        ("y".into(), "Yankee".into()),
-                    ]),
+                ElementDef::new(Tag::Select).with_class("sel").with_options(vec![
+                    ("x".into(), "X-ray".into()),
+                    ("y".into(), "Yankee".into()),
+                ]),
             ),
         },
         800.0,
@@ -212,9 +204,7 @@ fn action_on_missing_element_panics() {
 
     let mut h = TestHarness::new(
         css,
-        || ElementTree {
-            root: ElementDef::new(Tag::Div).with_class("root"),
-        },
+        || ElementTree { root: ElementDef::new(Tag::Div).with_class("root") },
         800.0,
         600.0,
     );

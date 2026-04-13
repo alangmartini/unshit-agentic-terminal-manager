@@ -55,15 +55,11 @@ pub fn ui_test_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let env_vars = config.env_vars();
 
-    let env_setup: Vec<TokenStream2> = env_vars
-        .iter()
-        .map(|(name, val)| quote! { std::env::set_var(#name, #val); })
-        .collect();
+    let env_setup: Vec<TokenStream2> =
+        env_vars.iter().map(|(name, val)| quote! { std::env::set_var(#name, #val); }).collect();
 
-    let env_cleanup: Vec<TokenStream2> = env_vars
-        .iter()
-        .map(|(name, _)| quote! { std::env::remove_var(#name); })
-        .collect();
+    let env_cleanup: Vec<TokenStream2> =
+        env_vars.iter().map(|(name, _)| quote! { std::env::remove_var(#name); }).collect();
 
     let expanded = quote! {
         #(#fn_attrs)*

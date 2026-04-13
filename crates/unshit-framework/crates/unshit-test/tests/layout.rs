@@ -466,18 +466,12 @@ fn flex_shorthand_does_not_eat_next_property() {
     let h = TestHarness::new(
         css,
         || ElementTree {
-            root: ElementDef::new(Tag::Div)
-                .with_class("grid")
-                .with_child(
-                    ElementDef::new(Tag::Div)
-                        .with_class("row")
-                        .with_id("row")
-                        .with_child(
-                            ElementDef::new(Tag::Div)
-                                .with_class("pane")
-                                .with_id("pane"),
-                        ),
-                ),
+            root: ElementDef::new(Tag::Div).with_class("grid").with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("row")
+                    .with_id("row")
+                    .with_child(ElementDef::new(Tag::Div).with_class("pane").with_id("pane")),
+            ),
         },
         800.0,
         600.0,

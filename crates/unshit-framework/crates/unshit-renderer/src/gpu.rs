@@ -262,10 +262,8 @@ impl GpuContext {
         width: u32,
         height: u32,
     ) -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends,
-            ..Default::default()
-        });
+        let instance =
+            wgpu::Instance::new(&wgpu::InstanceDescriptor { backends, ..Default::default() });
 
         let power = if force_fallback {
             wgpu::PowerPreference::LowPower
@@ -303,10 +301,7 @@ impl GpuContext {
             .await
             .ok()?;
 
-        eprintln!(
-            "[unshit-test] using adapter: {} (backend: {:?})",
-            info.name, info.backend
-        );
+        eprintln!("[unshit-test] using adapter: {} (backend: {:?})", info.name, info.backend);
         Some(Self::build_headless_context(
             Arc::new(device),
             Arc::new(queue),

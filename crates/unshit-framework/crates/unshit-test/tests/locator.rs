@@ -12,40 +12,22 @@ fn card_tree() -> ElementTree {
             .with_child(
                 ElementDef::new(Tag::Div)
                     .with_class("card")
+                    .with_child(ElementDef::new(Tag::Span).with_class("title").with_text("Free"))
                     .with_child(
-                        ElementDef::new(Tag::Span)
-                            .with_class("title")
-                            .with_text("Free"),
-                    )
-                    .with_child(
-                        ElementDef::new(Tag::Span)
-                            .with_class("body")
-                            .with_text("Basic plan"),
+                        ElementDef::new(Tag::Span).with_class("body").with_text("Basic plan"),
                     ),
             )
             .with_child(
                 ElementDef::new(Tag::Div)
                     .with_class("card")
+                    .with_child(ElementDef::new(Tag::Span).with_class("title").with_text("Premium"))
                     .with_child(
-                        ElementDef::new(Tag::Span)
-                            .with_class("title")
-                            .with_text("Premium"),
-                    )
-                    .with_child(
-                        ElementDef::new(Tag::Span)
-                            .with_class("body")
-                            .with_text("Full access"),
+                        ElementDef::new(Tag::Span).with_class("body").with_text("Full access"),
                     ),
             )
-            .with_child(
-                ElementDef::new(Tag::Div)
-                    .with_class("card")
-                    .with_child(
-                        ElementDef::new(Tag::Span)
-                            .with_class("title")
-                            .with_text("Enterprise"),
-                    ),
-            ),
+            .with_child(ElementDef::new(Tag::Div).with_class("card").with_child(
+                ElementDef::new(Tag::Span).with_class("title").with_text("Enterprise"),
+            )),
     }
 }
 
@@ -53,11 +35,7 @@ fn button_tree() -> ElementTree {
     ElementTree {
         root: ElementDef::new(Tag::Div)
             .with_class("root")
-            .with_child(
-                ElementDef::new(Tag::Div)
-                    .with_class("btn")
-                    .with_text("Submit"),
-            )
+            .with_child(ElementDef::new(Tag::Div).with_class("btn").with_text("Submit"))
             .with_child(
                 ElementDef::new(Tag::Div)
                     .with_class("btn")
@@ -71,10 +49,7 @@ fn input_tree() -> ElementTree {
     ElementTree {
         root: ElementDef::new(Tag::Div)
             .with_class("root")
-            .with_child(
-                ElementDef::new(Tag::Input)
-                    .with_class("name-input"),
-            ),
+            .with_child(ElementDef::new(Tag::Input).with_class("name-input")),
     }
 }
 
@@ -274,17 +249,11 @@ fn locator_re_resolves_after_rebuild() {
 
     // Rebuild with fewer cards
     h.rebuild(|| ElementTree {
-        root: ElementDef::new(Tag::Div)
-            .with_class("root")
-            .with_child(
-                ElementDef::new(Tag::Div)
-                    .with_class("card")
-                    .with_child(
-                        ElementDef::new(Tag::Span)
-                            .with_class("title")
-                            .with_text("Only one"),
-                    ),
-            ),
+        root: ElementDef::new(Tag::Div).with_class("root").with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("card")
+                .with_child(ElementDef::new(Tag::Span).with_class("title").with_text("Only one")),
+        ),
     });
 
     // After rebuild: 1 card

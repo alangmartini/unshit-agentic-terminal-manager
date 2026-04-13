@@ -322,7 +322,10 @@ impl Element {
             layout_rect: LayoutRect::default(),
             scroll_x: 0.0,
             scroll_y: 0.0,
-            dirty: DirtyFlags::STYLE | DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::CHILDREN,
+            dirty: DirtyFlags::STYLE
+                | DirtyFlags::LAYOUT
+                | DirtyFlags::PAINT
+                | DirtyFlags::CHILDREN,
             content: ElementContent::None,
             tab_index: None,
             captures_keyboard: false,

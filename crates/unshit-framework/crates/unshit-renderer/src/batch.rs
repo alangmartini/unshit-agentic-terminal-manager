@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use crate::atlas::{GlyphAtlas, GlyphEntry, GlyphKey};
 use crate::canvas::{CanvasCallback, CanvasRegistry};
+#[cfg(target_os = "windows")]
+use crate::dw_rasterizer::DwRasterizer;
 use crate::pipeline::image::ImageInstance;
 use crate::pipeline::quad::{QuadInstance, MAX_GRADIENT_STOPS};
 use crate::pipeline::text::GlyphInstance;
 use crate::svg_cache::SvgTessCache;
 use crate::svg_tess::SvgGeometry;
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
-#[cfg(target_os = "windows")]
-use crate::dw_rasterizer::DwRasterizer;
 
 /// Glyph rasterization backends.
 ///
@@ -1089,11 +1089,12 @@ fn walk_for_batch(
                 let content_w = rect.width - style.padding.left - style.padding.right;
                 let content_h = rect.height - style.padding.top - style.padding.bottom;
 
-                let text_max_w = if matches!(style.white_space, WhiteSpace::Nowrap | WhiteSpace::Pre) {
-                    None
-                } else {
-                    Some(content_w)
-                };
+                let text_max_w =
+                    if matches!(style.white_space, WhiteSpace::Nowrap | WhiteSpace::Pre) {
+                        None
+                    } else {
+                        Some(content_w)
+                    };
 
                 let (text_w, text_h) = unshit_core::layout::measure_text_cached(
                     text,
@@ -1577,13 +1578,8 @@ fn emit_text_glyphs_cached(
                 atlas.touch(&key);
                 entry
             } else {
-                let raster_result = rasterize_swash_for_atlas(
-                    rasterizer.swash,
-                    font_system,
-                    &physical,
-                    atlas,
-                    key,
-                );
+                let raster_result =
+                    rasterize_swash_for_atlas(rasterizer.swash, font_system, &physical, atlas, key);
                 match raster_result {
                     Some(entry) => entry,
                     None => continue,
@@ -2112,7 +2108,11 @@ fn emit_select_node(
 ///
 /// Cached: only re-measures when font_size or line_height changes.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
-fn measure_monospace_cell_width(font_system: &mut FontSystem, font_size: f32, line_height: f32) -> f32 {
+fn measure_monospace_cell_width(
+    font_system: &mut FontSystem,
+    font_size: f32,
+    line_height: f32,
+) -> f32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CACHED_SIZE: AtomicU32 = AtomicU32::new(0);
     static CACHED_LINE_HEIGHT: AtomicU32 = AtomicU32::new(0);
@@ -2140,11 +2140,7 @@ fn measure_monospace_cell_width(font_system: &mut FontSystem, font_size: f32, li
     );
     buffer.shape_until_scroll(font_system, false);
 
-    if let Some(glyph) = buffer
-        .layout_runs()
-        .flat_map(|run| run.glyphs.iter())
-        .next()
-    {
+    if let Some(glyph) = buffer.layout_runs().flat_map(|run| run.glyphs.iter()).next() {
         CACHED_SIZE.store(size_bits, Ordering::Relaxed);
         CACHED_LINE_HEIGHT.store(lh_bits, Ordering::Relaxed);
         CACHED_WIDTH.store(glyph.w.to_bits(), Ordering::Relaxed);
@@ -2188,8 +2184,7 @@ fn rasterize_swash_for_atlas(
     // grayscale alpha data must be expanded to RGBA. The subpixel shader reads
     // coverage from the RGB channels, so replicate alpha into all four channels.
     #[cfg(target_os = "windows")]
-    let glyph_data: Vec<u8> =
-        alpha_data.iter().flat_map(|&a| [a, a, a, a]).collect();
+    let glyph_data: Vec<u8> = alpha_data.iter().flat_map(|&a| [a, a, a, a]).collect();
     #[cfg(not(target_os = "windows"))]
     let glyph_data = alpha_data;
 
@@ -2396,12 +2391,14 @@ mod tests {
         assert!(
             (w_normal - w_tall).abs() < epsilon,
             "line_height should not affect advance width: normal={}, tall={}",
-            w_normal, w_tall
+            w_normal,
+            w_tall
         );
         assert!(
             (w_normal - w_tight).abs() < epsilon,
             "line_height should not affect advance width: normal={}, tight={}",
-            w_normal, w_tight
+            w_normal,
+            w_tight
         );
     }
 
@@ -2418,7 +2415,8 @@ mod tests {
             w1.to_bits(),
             w2.to_bits(),
             "cached value should be bit-identical: {} vs {}",
-            w1, w2
+            w1,
+            w2
         );
     }
 
@@ -2428,7 +2426,13 @@ mod tests {
 
     /// Helper: shape a single character through cosmic-text and return the
     /// resulting GlyphKey (the same computation emit_grid_cells performs).
-    fn shape_char_to_key(fs: &mut FontSystem, ch: char, font_size: f32, cell_h: f32, cell_w: f32) -> Option<GlyphKey> {
+    fn shape_char_to_key(
+        fs: &mut FontSystem,
+        ch: char,
+        font_size: f32,
+        cell_h: f32,
+        cell_w: f32,
+    ) -> Option<GlyphKey> {
         let metrics = cosmic_text::Metrics::new(font_size, cell_h);
         let mut buffer = cosmic_text::Buffer::new(fs, metrics);
         buffer.set_size(fs, Some(cell_w * 4.0), None);
@@ -2439,7 +2443,12 @@ mod tests {
         let family = cosmic_text::Family::Name("Consolas");
         #[cfg(not(target_os = "windows"))]
         let family = cosmic_text::Family::Monospace;
-        buffer.set_text(fs, ch_str, cosmic_text::Attrs::new().family(family), cosmic_text::Shaping::Advanced);
+        buffer.set_text(
+            fs,
+            ch_str,
+            cosmic_text::Attrs::new().family(family),
+            cosmic_text::Shaping::Advanced,
+        );
         buffer.shape_until_scroll(fs, false);
 
         for run in buffer.layout_runs() {
@@ -2504,10 +2513,7 @@ mod tests {
         for ch in '!'..='~' {
             if let Some(key) = shape_char_to_key(&mut fs, ch, font_size, cell_h, cell_w) {
                 if let Some(&prev_ch) = seen.get(&key.glyph_id) {
-                    panic!(
-                        "glyph_id {} collides between '{}' and '{}'",
-                        key.glyph_id, prev_ch, ch
-                    );
+                    panic!("glyph_id {} collides between '{}' and '{}'", key.glyph_id, prev_ch, ch);
                 }
                 seen.insert(key.glyph_id, ch);
             }

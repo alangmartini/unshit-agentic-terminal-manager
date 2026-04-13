@@ -166,7 +166,9 @@ impl TextPipeline {
                             }
                         }
                         #[cfg(not(target_os = "windows"))]
-                        { wgpu::BlendState::ALPHA_BLENDING }
+                        {
+                            wgpu::BlendState::ALPHA_BLENDING
+                        }
                     }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
