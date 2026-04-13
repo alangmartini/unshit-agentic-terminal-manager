@@ -127,6 +127,19 @@ fn user_shortcut_bindings() -> Vec<(String, String)> {
 }
 
 fn main() {
+    // Guard against ghost handles (#32): ensure the process exits
+    // immediately on Ctrl+C or panic so spawn_blocking reader tasks
+    // (bridge.rs) cannot keep the .exe locked on Windows (os error 32).
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_panic(info);
+        std::process::exit(1);
+    }));
+    ctrlc::set_handler(|| {
+        std::process::exit(0);
+    })
+    .expect("failed to set Ctrl+C handler");
+
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(
             "info,wgpu_hal=error,wgpu_core=error,naga=error,unshit_app::app=error",
@@ -228,10 +241,13 @@ fn main() {
                 guard.scale_factor = scale;
             })),
             on_close: Some(Arc::new(move || {
-                let mut guard = close_shared.lock().expect("state mutex poisoned");
-                guard.pty_manager.destroy_all();
-                guard.terminals.clear();
-                drop(guard);
+                // Use .lock().ok() instead of .expect() so a poisoned mutex
+                // (from a panic on another thread) does not prevent us from
+                // reaching process::exit below.
+                if let Ok(mut guard) = close_shared.lock() {
+                    guard.pty_manager.destroy_all();
+                    guard.terminals.clear();
+                }
                 // Force-exit the process. Without this, tokio's Runtime::drop
                 // blocks indefinitely waiting for spawn_blocking reader tasks
                 // (bridge.rs) that are stuck on pipe reads. The readers hold
