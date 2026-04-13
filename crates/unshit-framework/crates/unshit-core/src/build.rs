@@ -9,6 +9,7 @@ use crate::style::cascade;
 use crate::style::parse::CompiledStylesheet;
 use crate::style::pseudo::{self, PseudoSideTable};
 use crate::style::transition::{self, ActiveTransitions};
+use crate::style::types::Dimension;
 use crate::tree::NodeArena;
 use cosmic_text::FontSystem;
 use std::time::Instant;
@@ -168,9 +169,8 @@ pub fn resolve_all_styles_with_transitions(
     mut active_transitions: Option<&mut ActiveTransitions>,
 ) {
     let new_style = cascade::resolve_style(arena, stylesheet, node_id, hovered, active, focused);
-    let sel_style = cascade::resolve_selection_style(
-        arena, stylesheet, node_id, hovered, active, focused,
-    );
+    let sel_style =
+        cascade::resolve_selection_style(arena, stylesheet, node_id, hovered, active, focused);
     let children = arena.children(node_id);
 
     if let Some(element) = arena.get_mut(node_id) {
@@ -195,6 +195,16 @@ pub fn resolve_all_styles_with_transitions(
 
         element.computed_style = new_style;
         element.selection_style = sel_style;
+
+        // Apply user-driven resize overrides (from CSS resize drag) so they
+        // persist across style recalculations.
+        if let Some(w) = element.resize_override_width {
+            element.computed_style.width = Dimension::Px(w);
+        }
+        if let Some(h) = element.resize_override_height {
+            element.computed_style.height = Dimension::Px(h);
+        }
+
         // Clear style dirty flags now that this node has been processed.
         element.dirty.remove(DirtyFlags::STYLE | DirtyFlags::SUBTREE_STYLE);
     }
@@ -303,6 +313,15 @@ pub fn resolve_dirty_styles_with_transitions(
 
             element.computed_style = new_style;
             element.selection_style = sel_style;
+
+            // Apply user-driven resize overrides (from CSS resize drag).
+            if let Some(w) = element.resize_override_width {
+                element.computed_style.width = Dimension::Px(w);
+            }
+            if let Some(h) = element.resize_override_height {
+                element.computed_style.height = Dimension::Px(h);
+            }
+
             // Clear the node's own STYLE flag now that it has been resolved.
             element.dirty.remove(DirtyFlags::STYLE);
         }

@@ -1,5 +1,5 @@
 use crate::id::NodeId;
-use crate::style::types::{Layer, PointerEvents};
+use crate::style::types::{CssResize, Layer, Overflow, PointerEvents};
 use crate::tree::NodeArena;
 use bitflags::bitflags;
 use std::fmt;
@@ -372,6 +372,19 @@ pub struct InteractionState {
     pub drag_last_pos: (f32, f32),
     /// Mouse button that started the drag.
     pub drag_button: MouseButton,
+    /// CSS resize drag: the element being resized and its initial size.
+    pub resize_drag: Option<ResizeDragInfo>,
+}
+
+/// State for a CSS `resize` drag interaction.
+#[derive(Clone, Copy, Debug)]
+pub struct ResizeDragInfo {
+    pub node_id: NodeId,
+    pub initial_width: f32,
+    pub initial_height: f32,
+    pub origin: (f32, f32),
+    pub allow_horizontal: bool,
+    pub allow_vertical: bool,
 }
 
 impl Default for InteractionState {
@@ -392,6 +405,7 @@ impl Default for InteractionState {
             dragging: false,
             drag_last_pos: (0.0, 0.0),
             drag_button: MouseButton::Left,
+            resize_drag: None,
         }
     }
 }
@@ -475,6 +489,76 @@ pub fn find_click_handler(arena: &NodeArena, start: NodeId) -> Option<NodeId> {
             break;
         }
     }
+    None
+}
+
+const GRIP_ZONE: f32 = 16.0;
+
+/// Walk the element tree looking for a resizable element whose bottom-right
+/// grip zone contains the cursor. Returns `ResizeDragInfo` for the frontmost match.
+pub fn find_resize_grip_at(
+    arena: &NodeArena,
+    root: NodeId,
+    x: f32,
+    y: f32,
+) -> Option<ResizeDragInfo> {
+    find_resize_grip_recursive(arena, root, x, y, 0.0, 0.0)
+}
+
+fn find_resize_grip_recursive(
+    arena: &NodeArena,
+    node_id: NodeId,
+    x: f32,
+    y: f32,
+    scroll_offset_x: f32,
+    scroll_offset_y: f32,
+) -> Option<ResizeDragInfo> {
+    let element = arena.get(node_id)?;
+    let rect = element.layout_rect;
+
+    let render_x = rect.x - scroll_offset_x;
+    let render_y = rect.y - scroll_offset_y;
+
+    if x < render_x || x > render_x + rect.width || y < render_y || y > render_y + rect.height {
+        return None;
+    }
+
+    let child_scroll_x = scroll_offset_x + element.scroll_x;
+    let child_scroll_y = scroll_offset_y + element.scroll_y;
+
+    // Check children first (frontmost wins)
+    let mut child = element.last_child;
+    while !child.is_dangling() {
+        if let Some(info) =
+            find_resize_grip_recursive(arena, child, x, y, child_scroll_x, child_scroll_y)
+        {
+            return Some(info);
+        }
+        child = arena.get(child).map(|e| e.prev_sibling).unwrap_or(NodeId::DANGLING);
+    }
+
+    // Check this element: must have resize != None and overflow != Visible (per CSS spec)
+    let style = &element.computed_style;
+    if style.resize == CssResize::None || style.overflow == Overflow::Visible {
+        return None;
+    }
+
+    // Check if cursor is in the bottom-right grip zone
+    let grip_x = render_x + rect.width - GRIP_ZONE;
+    let grip_y = render_y + rect.height - GRIP_ZONE;
+    if x >= grip_x && y >= grip_y {
+        let allow_horizontal = matches!(style.resize, CssResize::Both | CssResize::Horizontal);
+        let allow_vertical = matches!(style.resize, CssResize::Both | CssResize::Vertical);
+        return Some(ResizeDragInfo {
+            node_id,
+            initial_width: rect.width,
+            initial_height: rect.height,
+            origin: (x, y),
+            allow_horizontal,
+            allow_vertical,
+        });
+    }
+
     None
 }
 
@@ -753,5 +837,165 @@ mod tests {
         let original = ImeEvent::Preedit("日本語".to_string(), Some((0, 9)));
         let cloned = original.clone();
         assert_eq!(original, cloned);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_resize_grip_at tests
+    // -----------------------------------------------------------------------
+
+    use crate::element::{Element, LayoutRect, Tag};
+    use crate::style::types::{CssResize as Resize, Overflow};
+    use crate::tree::NodeArena;
+
+    /// Build a single resizable element at a known position.
+    fn make_resizable_element(
+        arena: &mut NodeArena,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        resize: Resize,
+        overflow: Overflow,
+    ) -> NodeId {
+        let mut elem = Element::new(Tag::Div);
+        elem.layout_rect = LayoutRect { x, y, width: w, height: h };
+        elem.computed_style.resize = resize;
+        elem.computed_style.overflow = overflow;
+        arena.alloc(elem)
+    }
+
+    #[test]
+    fn resize_grip_requires_overflow_not_visible() {
+        let mut arena = NodeArena::new();
+        let root = make_resizable_element(
+            &mut arena,
+            0.0,
+            0.0,
+            200.0,
+            200.0,
+            Resize::Both,
+            Overflow::Visible,
+        );
+        // Cursor in grip zone but overflow is Visible: no hit
+        assert!(find_resize_grip_at(&arena, root, 195.0, 195.0).is_none());
+    }
+
+    #[test]
+    fn resize_grip_requires_resize_not_none() {
+        let mut arena = NodeArena::new();
+        let root = make_resizable_element(
+            &mut arena,
+            0.0,
+            0.0,
+            200.0,
+            200.0,
+            Resize::None,
+            Overflow::Hidden,
+        );
+        // Overflow is hidden but resize is None: no hit
+        assert!(find_resize_grip_at(&arena, root, 195.0, 195.0).is_none());
+    }
+
+    #[test]
+    fn resize_grip_hit_bottom_right() {
+        let mut arena = NodeArena::new();
+        let root = make_resizable_element(
+            &mut arena,
+            0.0,
+            0.0,
+            200.0,
+            200.0,
+            Resize::Both,
+            Overflow::Hidden,
+        );
+        // Cursor in bottom-right 16x16 grip zone
+        let info = find_resize_grip_at(&arena, root, 190.0, 190.0);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.node_id, root);
+        assert!(info.allow_horizontal);
+        assert!(info.allow_vertical);
+        assert_eq!(info.initial_width, 200.0);
+        assert_eq!(info.initial_height, 200.0);
+    }
+
+    #[test]
+    fn resize_grip_miss_outside_zone() {
+        let mut arena = NodeArena::new();
+        let root = make_resizable_element(
+            &mut arena,
+            0.0,
+            0.0,
+            200.0,
+            200.0,
+            Resize::Both,
+            Overflow::Hidden,
+        );
+        // Cursor in the center of the element: not in grip zone
+        assert!(find_resize_grip_at(&arena, root, 100.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn resize_grip_horizontal_only() {
+        let mut arena = NodeArena::new();
+        let root = make_resizable_element(
+            &mut arena,
+            0.0,
+            0.0,
+            200.0,
+            200.0,
+            Resize::Horizontal,
+            Overflow::Scroll,
+        );
+        let info = find_resize_grip_at(&arena, root, 195.0, 195.0).unwrap();
+        assert!(info.allow_horizontal);
+        assert!(!info.allow_vertical);
+    }
+
+    #[test]
+    fn resize_grip_vertical_only() {
+        let mut arena = NodeArena::new();
+        let root = make_resizable_element(
+            &mut arena,
+            0.0,
+            0.0,
+            200.0,
+            200.0,
+            Resize::Vertical,
+            Overflow::Scroll,
+        );
+        let info = find_resize_grip_at(&arena, root, 195.0, 195.0).unwrap();
+        assert!(!info.allow_horizontal);
+        assert!(info.allow_vertical);
+    }
+
+    #[test]
+    fn resize_grip_child_takes_priority() {
+        let mut arena = NodeArena::new();
+        // Parent is resizable
+        let parent = make_resizable_element(
+            &mut arena,
+            0.0,
+            0.0,
+            300.0,
+            300.0,
+            Resize::Both,
+            Overflow::Hidden,
+        );
+        // Child overlaps parent's grip zone and is also resizable
+        let child = make_resizable_element(
+            &mut arena,
+            100.0,
+            100.0,
+            200.0,
+            200.0,
+            Resize::Both,
+            Overflow::Hidden,
+        );
+        arena.append_child(parent, child);
+
+        // Click at (295, 295): in child's grip zone (child ends at 300,300, grip starts at 284,284)
+        let info = find_resize_grip_at(&arena, parent, 295.0, 295.0).unwrap();
+        assert_eq!(info.node_id, child);
     }
 }

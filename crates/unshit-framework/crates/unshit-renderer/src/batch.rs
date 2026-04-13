@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use crate::atlas::{GlyphAtlas, GlyphEntry, GlyphKey};
 use crate::canvas::{CanvasCallback, CanvasRegistry};
+#[cfg(target_os = "windows")]
+use crate::dw_rasterizer::DwRasterizer;
 use crate::pipeline::image::ImageInstance;
 use crate::pipeline::quad::{QuadInstance, MAX_GRADIENT_STOPS};
 use crate::pipeline::text::GlyphInstance;
 use crate::svg_cache::SvgTessCache;
 use crate::svg_tess::SvgGeometry;
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
-#[cfg(target_os = "windows")]
-use crate::dw_rasterizer::DwRasterizer;
 
 /// Glyph rasterization backends.
 ///
@@ -35,8 +35,9 @@ use unshit_core::id::NodeId;
 use unshit_core::layout::TextMeasureCache;
 use unshit_core::scroll::{self, ScrollbarVisualState};
 use unshit_core::style::types::{
-    Background, Color, Display, FilterFunction, GradientStopPosition, Layer, LinearGradient,
-    Overflow, RadialGradient, RadialShape, RenderTarget, TextDecoration, Visibility, WhiteSpace,
+    Background, Color, CssResize, Display, FilterFunction, GradientStopPosition, Layer,
+    LinearGradient, Overflow, RadialGradient, RadialShape, RenderTarget, TextDecoration,
+    Visibility, WhiteSpace,
 };
 use unshit_core::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, SvgTransform, ViewBox};
 use unshit_core::tree::NodeArena;
@@ -209,6 +210,8 @@ fn pack_radial_gradient(
 pub struct ImageBatch {
     pub path: String,
     pub instances: Vec<ImageInstance>,
+    pub object_fit: unshit_core::style::types::ObjectFit,
+    pub object_position: unshit_core::style::types::ObjectPosition,
 }
 
 /// One queued SVG draw. `geometry` is an `Arc` pointer into the tessellation
@@ -1089,11 +1092,12 @@ fn walk_for_batch(
                 let content_w = rect.width - style.padding.left - style.padding.right;
                 let content_h = rect.height - style.padding.top - style.padding.bottom;
 
-                let text_max_w = if matches!(style.white_space, WhiteSpace::Nowrap | WhiteSpace::Pre) {
-                    None
-                } else {
-                    Some(content_w)
-                };
+                let text_max_w =
+                    if matches!(style.white_space, WhiteSpace::Nowrap | WhiteSpace::Pre) {
+                        None
+                    } else {
+                        Some(content_w)
+                    };
 
                 let (text_w, text_h) = unshit_core::layout::measure_text_cached(
                     text,
@@ -1241,12 +1245,19 @@ fn walk_for_batch(
                     clip_rect,
                 };
                 let layer_batch = batch.layer_mut(effective_layer);
-                if let Some(ib) = layer_batch.image_batches.iter_mut().find(|b| b.path == *path) {
+                if let Some(ib) = layer_batch
+                    .image_batches
+                    .iter_mut()
+                    .find(|b| b.path == *path && b.object_fit == style.object_fit)
+                {
                     ib.instances.push(instance);
                 } else {
-                    layer_batch
-                        .image_batches
-                        .push(ImageBatch { path: path.clone(), instances: vec![instance] });
+                    layer_batch.image_batches.push(ImageBatch {
+                        path: path.clone(),
+                        instances: vec![instance],
+                        object_fit: style.object_fit,
+                        object_position: style.object_position,
+                    });
                 }
             }
             ElementContent::Canvas if is_visible => {
@@ -1414,6 +1425,46 @@ fn walk_for_batch(
             );
         }
     }
+
+    // Resize grip indicator.
+    // Per CSS spec, `resize` only works when `overflow` is not `visible`.
+    if style.resize != CssResize::None && style.overflow != Overflow::Visible {
+        const GRIP_SIZE: f32 = 12.0;
+        const DOT_SIZE: f32 = 2.0;
+        const GRIP_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.35];
+
+        let base_x = render_x + rect.width - GRIP_SIZE;
+        let base_y = render_y + rect.height - GRIP_SIZE;
+
+        // Three diagonal dots (bottom-right corner grip pattern).
+        let dots: &[(f32, f32)] = &[
+            (GRIP_SIZE - 3.0, GRIP_SIZE - 3.0),
+            (GRIP_SIZE - 7.0, GRIP_SIZE - 3.0),
+            (GRIP_SIZE - 3.0, GRIP_SIZE - 7.0),
+            (GRIP_SIZE - 11.0, GRIP_SIZE - 3.0),
+            (GRIP_SIZE - 7.0, GRIP_SIZE - 7.0),
+            (GRIP_SIZE - 3.0, GRIP_SIZE - 11.0),
+        ];
+        for &(dx, dy) in dots {
+            batch.layer_mut(effective_layer).quad_instances.push(QuadInstance {
+                pos: [base_x + dx, base_y + dy],
+                size: [DOT_SIZE, DOT_SIZE],
+                color: GRIP_COLOR,
+                border_color: [0.0; 4],
+                border_width: [0.0; 4],
+                border_radius: [1.0; 4],
+                clip_rect: child_clip,
+                shadow_color: [0.0; 4],
+                shadow_offset: [0.0; 2],
+                shadow_params: [0.0; 2],
+                shadow_spread: [0.0; 2],
+                gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
+                gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
+                gradient_params: [0.0; 4],
+                gradient_extra: EMPTY_GRADIENT_EXTRA,
+            });
+        }
+    }
 }
 
 /// Walk an `SvgNode` tree, accumulate the SVG presentation cascade and
@@ -1577,13 +1628,8 @@ fn emit_text_glyphs_cached(
                 atlas.touch(&key);
                 entry
             } else {
-                let raster_result = rasterize_swash_for_atlas(
-                    rasterizer.swash,
-                    font_system,
-                    &physical,
-                    atlas,
-                    key,
-                );
+                let raster_result =
+                    rasterize_swash_for_atlas(rasterizer.swash, font_system, &physical, atlas, key);
                 match raster_result {
                     Some(entry) => entry,
                     None => continue,
@@ -2112,7 +2158,11 @@ fn emit_select_node(
 ///
 /// Cached: only re-measures when font_size or line_height changes.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
-fn measure_monospace_cell_width(font_system: &mut FontSystem, font_size: f32, line_height: f32) -> f32 {
+fn measure_monospace_cell_width(
+    font_system: &mut FontSystem,
+    font_size: f32,
+    line_height: f32,
+) -> f32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CACHED_SIZE: AtomicU32 = AtomicU32::new(0);
     static CACHED_LINE_HEIGHT: AtomicU32 = AtomicU32::new(0);
@@ -2140,11 +2190,7 @@ fn measure_monospace_cell_width(font_system: &mut FontSystem, font_size: f32, li
     );
     buffer.shape_until_scroll(font_system, false);
 
-    if let Some(glyph) = buffer
-        .layout_runs()
-        .flat_map(|run| run.glyphs.iter())
-        .next()
-    {
+    if let Some(glyph) = buffer.layout_runs().flat_map(|run| run.glyphs.iter()).next() {
         CACHED_SIZE.store(size_bits, Ordering::Relaxed);
         CACHED_LINE_HEIGHT.store(lh_bits, Ordering::Relaxed);
         CACHED_WIDTH.store(glyph.w.to_bits(), Ordering::Relaxed);
@@ -2188,8 +2234,7 @@ fn rasterize_swash_for_atlas(
     // grayscale alpha data must be expanded to RGBA. The subpixel shader reads
     // coverage from the RGB channels, so replicate alpha into all four channels.
     #[cfg(target_os = "windows")]
-    let glyph_data: Vec<u8> =
-        alpha_data.iter().flat_map(|&a| [a, a, a, a]).collect();
+    let glyph_data: Vec<u8> = alpha_data.iter().flat_map(|&a| [a, a, a, a]).collect();
     #[cfg(not(target_os = "windows"))]
     let glyph_data = alpha_data;
 
@@ -2396,12 +2441,14 @@ mod tests {
         assert!(
             (w_normal - w_tall).abs() < epsilon,
             "line_height should not affect advance width: normal={}, tall={}",
-            w_normal, w_tall
+            w_normal,
+            w_tall
         );
         assert!(
             (w_normal - w_tight).abs() < epsilon,
             "line_height should not affect advance width: normal={}, tight={}",
-            w_normal, w_tight
+            w_normal,
+            w_tight
         );
     }
 
@@ -2418,7 +2465,8 @@ mod tests {
             w1.to_bits(),
             w2.to_bits(),
             "cached value should be bit-identical: {} vs {}",
-            w1, w2
+            w1,
+            w2
         );
     }
 
@@ -2428,7 +2476,13 @@ mod tests {
 
     /// Helper: shape a single character through cosmic-text and return the
     /// resulting GlyphKey (the same computation emit_grid_cells performs).
-    fn shape_char_to_key(fs: &mut FontSystem, ch: char, font_size: f32, cell_h: f32, cell_w: f32) -> Option<GlyphKey> {
+    fn shape_char_to_key(
+        fs: &mut FontSystem,
+        ch: char,
+        font_size: f32,
+        cell_h: f32,
+        cell_w: f32,
+    ) -> Option<GlyphKey> {
         let metrics = cosmic_text::Metrics::new(font_size, cell_h);
         let mut buffer = cosmic_text::Buffer::new(fs, metrics);
         buffer.set_size(fs, Some(cell_w * 4.0), None);
@@ -2439,7 +2493,12 @@ mod tests {
         let family = cosmic_text::Family::Name("Consolas");
         #[cfg(not(target_os = "windows"))]
         let family = cosmic_text::Family::Monospace;
-        buffer.set_text(fs, ch_str, cosmic_text::Attrs::new().family(family), cosmic_text::Shaping::Advanced);
+        buffer.set_text(
+            fs,
+            ch_str,
+            cosmic_text::Attrs::new().family(family),
+            cosmic_text::Shaping::Advanced,
+        );
         buffer.shape_until_scroll(fs, false);
 
         for run in buffer.layout_runs() {
@@ -2504,10 +2563,7 @@ mod tests {
         for ch in '!'..='~' {
             if let Some(key) = shape_char_to_key(&mut fs, ch, font_size, cell_h, cell_w) {
                 if let Some(&prev_ch) = seen.get(&key.glyph_id) {
-                    panic!(
-                        "glyph_id {} collides between '{}' and '{}'",
-                        key.glyph_id, prev_ch, ch
-                    );
+                    panic!("glyph_id {} collides between '{}' and '{}'", key.glyph_id, prev_ch, ch);
                 }
                 seen.insert(key.glyph_id, ch);
             }

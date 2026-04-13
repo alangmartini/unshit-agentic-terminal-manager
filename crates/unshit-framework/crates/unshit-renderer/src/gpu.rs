@@ -4,6 +4,7 @@ use crate::canvas::PaintContext;
 use crate::image_cache::ImageCache;
 use crate::persistent_buffer::GpuPersistentBuffers;
 use crate::pipeline::backdrop_blur::{gaussian_weights, BackdropBlurPipeline, BlurUniforms};
+use crate::pipeline::image::ImageInstance;
 use crate::pipeline::image::ImagePipeline;
 use crate::pipeline::quad::QuadPipeline;
 use crate::pipeline::svg::{SvgInstanceUniforms, SvgPipeline};
@@ -262,10 +263,8 @@ impl GpuContext {
         width: u32,
         height: u32,
     ) -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends,
-            ..Default::default()
-        });
+        let instance =
+            wgpu::Instance::new(&wgpu::InstanceDescriptor { backends, ..Default::default() });
 
         let power = if force_fallback {
             wgpu::PowerPreference::LowPower
@@ -303,10 +302,7 @@ impl GpuContext {
             .await
             .ok()?;
 
-        eprintln!(
-            "[unshit-test] using adapter: {} (backend: {:?})",
-            info.name, info.backend
-        );
+        eprintln!("[unshit-test] using adapter: {} (backend: {:?})", info.name, info.backend);
         Some(Self::build_headless_context(
             Arc::new(device),
             Arc::new(queue),
@@ -640,12 +636,15 @@ impl GpuContext {
                         &self.queue,
                         &self.image_pipeline.texture_bind_group_layout,
                     ) {
-                        self.image_pipeline.upload_instances(
-                            &self.device,
-                            &self.queue,
+                        let instances = apply_object_fit(
                             &image_batch.instances,
+                            image_batch.object_fit,
+                            image_batch.object_position,
+                            entry.width as f32,
+                            entry.height as f32,
                         );
-                        let count = image_batch.instances.len() as u32;
+                        self.image_pipeline.upload_instances(&self.device, &self.queue, &instances);
+                        let count = instances.len() as u32;
                         pass.set_pipeline(&self.image_pipeline.pipeline);
                         pass.set_bind_group(0, &self.image_pipeline.uniform_bind_group, &[]);
                         pass.set_bind_group(1, &entry.bind_group, &[]);
@@ -1208,4 +1207,74 @@ impl GpuContext {
             pixels
         }
     }
+}
+
+/// Transform image instances based on CSS `object-fit` and `object-position`.
+///
+/// For `Fill`, instances are returned unchanged (image stretches to fill the box).
+/// For other modes, `pos` and `size` are adjusted so the image maintains its
+/// intrinsic aspect ratio while fitting/covering the layout box.
+fn apply_object_fit(
+    instances: &[ImageInstance],
+    object_fit: unshit_core::style::types::ObjectFit,
+    object_position: unshit_core::style::types::ObjectPosition,
+    img_w: f32,
+    img_h: f32,
+) -> Vec<ImageInstance> {
+    use unshit_core::style::types::ObjectFit;
+
+    if object_fit == ObjectFit::Fill || img_w == 0.0 || img_h == 0.0 {
+        return instances.to_vec();
+    }
+
+    instances
+        .iter()
+        .map(|inst| {
+            let box_w = inst.size[0];
+            let box_h = inst.size[1];
+            let img_ratio = img_w / img_h;
+            let box_ratio = box_w / box_h;
+
+            let (draw_w, draw_h) = match object_fit {
+                ObjectFit::Contain => {
+                    if img_ratio > box_ratio {
+                        (box_w, box_w / img_ratio)
+                    } else {
+                        (box_h * img_ratio, box_h)
+                    }
+                }
+                ObjectFit::Cover => {
+                    if img_ratio > box_ratio {
+                        (box_h * img_ratio, box_h)
+                    } else {
+                        (box_w, box_w / img_ratio)
+                    }
+                }
+                ObjectFit::None => (img_w, img_h),
+                ObjectFit::ScaleDown => {
+                    let (cw, ch) = if img_ratio > box_ratio {
+                        (box_w, box_w / img_ratio)
+                    } else {
+                        (box_h * img_ratio, box_h)
+                    };
+                    // Use intrinsic size if smaller than contain result.
+                    if img_w <= cw && img_h <= ch {
+                        (img_w, img_h)
+                    } else {
+                        (cw, ch)
+                    }
+                }
+                ObjectFit::Fill => unreachable!(),
+            };
+
+            let offset_x = (box_w - draw_w) * (object_position.x / 100.0);
+            let offset_y = (box_h - draw_h) * (object_position.y / 100.0);
+
+            ImageInstance {
+                pos: [inst.pos[0] + offset_x, inst.pos[1] + offset_y],
+                size: [draw_w, draw_h],
+                ..*inst
+            }
+        })
+        .collect()
 }

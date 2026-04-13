@@ -257,6 +257,10 @@ pub struct Element {
     pub prev_width: f32,
     pub prev_height: f32,
 
+    // CSS resize override (user-dragged dimensions, applied after cascade)
+    pub resize_override_width: Option<f32>,
+    pub resize_override_height: Option<f32>,
+
     // Resize handle
     pub resize_axis: Option<ResizeAxis>,
     pub on_pane_resize: Option<Arc<dyn Fn(&PaneResizeEvent) + Send + Sync>>,
@@ -322,7 +326,10 @@ impl Element {
             layout_rect: LayoutRect::default(),
             scroll_x: 0.0,
             scroll_y: 0.0,
-            dirty: DirtyFlags::STYLE | DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::CHILDREN,
+            dirty: DirtyFlags::STYLE
+                | DirtyFlags::LAYOUT
+                | DirtyFlags::PAINT
+                | DirtyFlags::CHILDREN,
             content: ElementContent::None,
             tab_index: None,
             captures_keyboard: false,
@@ -333,6 +340,8 @@ impl Element {
             on_resize: None,
             prev_width: 0.0,
             prev_height: 0.0,
+            resize_override_width: None,
+            resize_override_height: None,
             resize_axis: None,
             on_pane_resize: None,
             input_state: InputState::default(),

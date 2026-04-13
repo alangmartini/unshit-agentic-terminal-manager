@@ -220,6 +220,15 @@ pub enum StyleDeclaration {
     GridRowStart(types::GridPlacement),
     GridRowEnd(types::GridPlacement),
 
+    // CSS resize
+    Resize(types::CssResize),
+
+    // Box model
+    BoxSizing(types::BoxSizing),
+    AspectRatio(Option<f32>),
+    ObjectFit(types::ObjectFit),
+    ObjectPosition(types::ObjectPosition),
+
     // Resize handle
     ResizeAxis(crate::resize_handle::ResizeAxis),
 
@@ -924,7 +933,9 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "flex-basis" => StyleDeclaration::FlexBasis(parse_dimension(parser)?),
         "flex" => {
             // flex: none
-            if let Ok(ident) = parser.try_parse(|p| p.expect_ident().map(|s| s.as_ref().to_string()).map_err(|_| ())) {
+            if let Ok(ident) = parser
+                .try_parse(|p| p.expect_ident().map(|s| s.as_ref().to_string()).map_err(|_| ()))
+            {
                 if ident == "none" {
                     let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
                     return Ok(smallvec::smallvec![
@@ -942,9 +953,8 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             match shrink {
                 Ok(shrink_val) => {
                     // flex: <number> <number> [<dimension>]
-                    let basis = parser
-                        .try_parse(|p| parse_dimension(p))
-                        .unwrap_or(Dimension::Px(0.0));
+                    let basis =
+                        parser.try_parse(|p| parse_dimension(p)).unwrap_or(Dimension::Px(0.0));
                     let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
                     return Ok(smallvec::smallvec![
                         StyleDeclaration::FlexGrow(grow),
@@ -1056,6 +1066,75 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 _ => return Err(()),
             })
         }
+        "box-sizing" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            StyleDeclaration::BoxSizing(match val.as_ref() {
+                "content-box" => types::BoxSizing::ContentBox,
+                "border-box" => types::BoxSizing::BorderBox,
+                _ => return Err(()),
+            })
+        }
+        "aspect-ratio" => {
+            if parser
+                .try_parse(|p| {
+                    let ident = p.expect_ident().map_err(|_| ())?;
+                    if ident.as_ref() == "auto" {
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                })
+                .is_ok()
+            {
+                StyleDeclaration::AspectRatio(None)
+            } else {
+                let w: f32 = parser.expect_number().map_err(|_| ())?;
+                let ratio = if parser.try_parse(|p| p.expect_delim('/')).is_ok() {
+                    let h: f32 = parser.expect_number().map_err(|_| ())?;
+                    w / h
+                } else {
+                    w
+                };
+                StyleDeclaration::AspectRatio(Some(ratio))
+            }
+        }
+        "object-fit" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            StyleDeclaration::ObjectFit(match val.as_ref() {
+                "fill" => types::ObjectFit::Fill,
+                "contain" => types::ObjectFit::Contain,
+                "cover" => types::ObjectFit::Cover,
+                "none" => types::ObjectFit::None,
+                "scale-down" => types::ObjectFit::ScaleDown,
+                _ => return Err(()),
+            })
+        }
+        "object-position" => {
+            fn keyword_to_pct(s: &str) -> Option<f32> {
+                match s {
+                    "left" | "top" => Some(0.0),
+                    "center" => Some(50.0),
+                    "right" | "bottom" => Some(100.0),
+                    _ => std::option::Option::None,
+                }
+            }
+            fn parse_pos_value(parser: &mut Parser) -> Result<f32, ()> {
+                if let Ok(v) = parser.try_parse(|p| {
+                    let id = p.expect_ident().map_err(|_| ())?;
+                    keyword_to_pct(id.as_ref()).ok_or(())
+                }) {
+                    Ok(v)
+                } else if let Ok(pct) = parser.try_parse(|p| p.expect_percentage().map_err(|_| ()))
+                {
+                    Ok(pct * 100.0)
+                } else {
+                    parser.expect_number().map_err(|_| ())
+                }
+            }
+            let x = parse_pos_value(parser)?;
+            let y = parse_pos_value(parser).unwrap_or(x);
+            StyleDeclaration::ObjectPosition(types::ObjectPosition { x, y })
+        }
         "background" => match parser.try_parse(|p| parse_linear_gradient(p)) {
             Ok(gradient) => {
                 StyleDeclaration::Background(types::Background::LinearGradient(gradient))
@@ -1150,6 +1229,18 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 "help" => CursorStyle::Help,
                 "col-resize" => CursorStyle::ColResize,
                 "row-resize" => CursorStyle::RowResize,
+                "n-resize" => CursorStyle::NResize,
+                "s-resize" => CursorStyle::SResize,
+                "e-resize" => CursorStyle::EResize,
+                "w-resize" => CursorStyle::WResize,
+                "ne-resize" => CursorStyle::NeResize,
+                "nw-resize" => CursorStyle::NwResize,
+                "se-resize" => CursorStyle::SeResize,
+                "sw-resize" => CursorStyle::SwResize,
+                "ns-resize" => CursorStyle::NsResize,
+                "ew-resize" => CursorStyle::EwResize,
+                "nesw-resize" => CursorStyle::NeswResize,
+                "nwse-resize" => CursorStyle::NwseResize,
                 _ => return Err(()),
             })
         }
@@ -1444,6 +1535,18 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 StyleDeclaration::GridRowEnd(row_end),
                 StyleDeclaration::GridColumnEnd(col_end),
             ]);
+        }
+
+        // CSS resize
+        "resize" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            StyleDeclaration::Resize(match val.as_ref() {
+                "none" => types::CssResize::None,
+                "both" => types::CssResize::Both,
+                "horizontal" => types::CssResize::Horizontal,
+                "vertical" => types::CssResize::Vertical,
+                _ => return Err(()),
+            })
         }
 
         // Resize handle
@@ -3169,6 +3272,11 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::RowGap(v) => style.row_gap = *v,
         StyleDeclaration::ColumnGap(v) => style.column_gap = *v,
         StyleDeclaration::Overflow(v) => style.overflow = *v,
+        StyleDeclaration::Resize(v) => style.resize = *v,
+        StyleDeclaration::BoxSizing(v) => style.box_sizing = *v,
+        StyleDeclaration::AspectRatio(v) => style.aspect_ratio = *v,
+        StyleDeclaration::ObjectFit(v) => style.object_fit = *v,
+        StyleDeclaration::ObjectPosition(v) => style.object_position = *v,
         StyleDeclaration::Background(v) => style.background = v.clone(),
         StyleDeclaration::BorderColor(v) => style.border_color = *v,
         StyleDeclaration::BorderWidth(v) => style.border_width = *v,
@@ -3527,7 +3635,6 @@ mod tests {
         assert!(tag_pos < hover_pos && hover_pos < before_pos);
     }
 
-
     #[test]
     fn test_pseudo_element_selection_parses() {
         let parts = last_parts_of("p::selection { color: white; }");
@@ -3592,11 +3699,7 @@ mod tests {
             .pane-body::-webkit-scrollbar-track { background: #f1f1f1; }
             "#,
         );
-        assert_eq!(
-            sheet.rules.len(),
-            0,
-            "vendor pseudo-element rules must be discarded entirely"
-        );
+        assert_eq!(sheet.rules.len(), 0, "vendor pseudo-element rules must be discarded entirely");
     }
 
     #[test]
@@ -3638,11 +3741,8 @@ mod tests {
             2,
             "before and after rules must survive, scrollbar must be discarded"
         );
-        let pseudo_elements: Vec<_> = sheet
-            .rules
-            .iter()
-            .filter_map(|r| r.selector.pseudo_element())
-            .collect();
+        let pseudo_elements: Vec<_> =
+            sheet.rules.iter().filter_map(|r| r.selector.pseudo_element()).collect();
         assert!(pseudo_elements.contains(&PseudoElement::Before));
         assert!(pseudo_elements.contains(&PseudoElement::After));
     }
@@ -5059,11 +5159,7 @@ mod tests {
             StyleDeclaration::Top(v) => Some(*v),
             _ => None,
         });
-        assert_eq!(
-            top,
-            Some(Dimension::Px(10.0)),
-            "inset: 10px should expand top to 10px"
-        );
+        assert_eq!(top, Some(Dimension::Px(10.0)), "inset: 10px should expand top to 10px");
     }
 
     // Regression tests for #214: display: inline-flex and inline-block
@@ -5137,6 +5233,208 @@ mod tests {
     }
 
     #[test]
+    fn test_css_resize_all_values() {
+        let cases = [
+            ("none", types::CssResize::None),
+            ("both", types::CssResize::Both),
+            ("horizontal", types::CssResize::Horizontal),
+            ("vertical", types::CssResize::Vertical),
+        ];
+        for (css_val, expected) in &cases {
+            let decls = parse_decls(&format!(".x {{ resize: {}; }}", css_val));
+            let val = decls.iter().find_map(|d| match d {
+                StyleDeclaration::Resize(v) => Some(*v),
+                _ => None,
+            });
+            assert_eq!(val, Some(*expected), "failed for resize: {}", css_val);
+        }
+    }
+
+    #[test]
+    fn test_css_resize_invalid() {
+        let decls = parse_decls(".x { resize: magic; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::Resize(_) => Some(()),
+            _ => None,
+        });
+        assert!(val.is_none());
+    }
+
+    #[test]
+    fn test_object_fit_all_values() {
+        let cases = [
+            ("fill", types::ObjectFit::Fill),
+            ("contain", types::ObjectFit::Contain),
+            ("cover", types::ObjectFit::Cover),
+            ("none", types::ObjectFit::None),
+            ("scale-down", types::ObjectFit::ScaleDown),
+        ];
+        for (css_val, expected) in &cases {
+            let decls = parse_decls(&format!(".x {{ object-fit: {}; }}", css_val));
+            let val = decls.iter().find_map(|d| match d {
+                StyleDeclaration::ObjectFit(v) => Some(*v),
+                _ => None,
+            });
+            assert_eq!(val, Some(*expected), "failed for object-fit: {}", css_val);
+        }
+    }
+
+    #[test]
+    fn test_object_position_center() {
+        let decls = parse_decls(".x { object-position: center; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::ObjectPosition(v) => Some(*v),
+            _ => None,
+        });
+        let pos = val.unwrap();
+        assert!((pos.x - 50.0).abs() < 0.01);
+        assert!((pos.y - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_object_position_keywords() {
+        let decls = parse_decls(".x { object-position: left top; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::ObjectPosition(v) => Some(*v),
+            _ => None,
+        });
+        let pos = val.unwrap();
+        assert!((pos.x - 0.0).abs() < 0.01);
+        assert!((pos.y - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_object_position_percentages() {
+        let decls = parse_decls(".x { object-position: 25% 75%; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::ObjectPosition(v) => Some(*v),
+            _ => None,
+        });
+        let pos = val.unwrap();
+        assert!((pos.x - 25.0).abs() < 0.01);
+        assert!((pos.y - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_transition_min_max_properties() {
+        let cases = [
+            ("min-width", TransitionProperty::MinWidth),
+            ("max-width", TransitionProperty::MaxWidth),
+            ("min-height", TransitionProperty::MinHeight),
+            ("max-height", TransitionProperty::MaxHeight),
+        ];
+        for (css_val, expected) in &cases {
+            let decls = parse_decls(&format!(".x {{ transition: {} 0.3s ease; }}", css_val));
+            let defs = decls
+                .iter()
+                .find_map(|d| match d {
+                    StyleDeclaration::Transition(v) => Some(v),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("should have transition for {}", css_val));
+            assert_eq!(defs.len(), 1, "wrong count for {}", css_val);
+            assert_eq!(defs[0].property, *expected, "wrong property for {}", css_val);
+        }
+    }
+
+    #[test]
+    fn test_box_sizing_content_box() {
+        let decls = parse_decls(".x { box-sizing: content-box; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::BoxSizing(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(val, Some(types::BoxSizing::ContentBox));
+    }
+
+    #[test]
+    fn test_box_sizing_border_box() {
+        let decls = parse_decls(".x { box-sizing: border-box; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::BoxSizing(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(val, Some(types::BoxSizing::BorderBox));
+    }
+
+    #[test]
+    fn test_box_sizing_invalid() {
+        let decls = parse_decls(".x { box-sizing: magic; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::BoxSizing(_) => Some(()),
+            _ => None,
+        });
+        assert!(val.is_none());
+    }
+
+    #[test]
+    fn test_aspect_ratio_auto() {
+        let decls = parse_decls(".x { aspect-ratio: auto; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::AspectRatio(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(val, Some(None));
+    }
+
+    #[test]
+    fn test_aspect_ratio_single_number() {
+        let decls = parse_decls(".x { aspect-ratio: 1.5; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::AspectRatio(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(val, Some(Some(1.5)));
+    }
+
+    #[test]
+    fn test_aspect_ratio_fraction() {
+        let decls = parse_decls(".x { aspect-ratio: 16 / 9; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::AspectRatio(v) => Some(*v),
+            _ => None,
+        });
+        let ratio = val.unwrap().unwrap();
+        assert!((ratio - 16.0 / 9.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_aspect_ratio_square() {
+        let decls = parse_decls(".x { aspect-ratio: 1 / 1; }");
+        let val = decls.iter().find_map(|d| match d {
+            StyleDeclaration::AspectRatio(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(val, Some(Some(1.0)));
+    }
+
+    #[test]
+    fn test_directional_resize_cursors_parse() {
+        let cases = [
+            ("n-resize", CursorStyle::NResize),
+            ("s-resize", CursorStyle::SResize),
+            ("e-resize", CursorStyle::EResize),
+            ("w-resize", CursorStyle::WResize),
+            ("ne-resize", CursorStyle::NeResize),
+            ("nw-resize", CursorStyle::NwResize),
+            ("se-resize", CursorStyle::SeResize),
+            ("sw-resize", CursorStyle::SwResize),
+            ("ns-resize", CursorStyle::NsResize),
+            ("ew-resize", CursorStyle::EwResize),
+            ("nesw-resize", CursorStyle::NeswResize),
+            ("nwse-resize", CursorStyle::NwseResize),
+        ];
+        for (css_val, expected) in &cases {
+            let decls = parse_decls(&format!(".x {{ cursor: {}; }}", css_val));
+            let cursor = decls.iter().find_map(|d| match d {
+                StyleDeclaration::Cursor(v) => Some(*v),
+                _ => None,
+            });
+            assert_eq!(cursor, Some(*expected), "failed for cursor: {}", css_val);
+        }
+    }
+
+    #[test]
     fn test_pseudo_element_moz_placeholder_parses() {
         let parts = last_parts_of("input::-moz-placeholder { color: gray; }");
         assert!(parts
@@ -5154,11 +5452,8 @@ mod tests {
             "#,
         );
         assert_eq!(sheet.rules.len(), 3);
-        let pseudo_elements: Vec<_> = sheet
-            .rules
-            .iter()
-            .filter_map(|r| r.selector.pseudo_element())
-            .collect();
+        let pseudo_elements: Vec<_> =
+            sheet.rules.iter().filter_map(|r| r.selector.pseudo_element()).collect();
         assert!(pseudo_elements.contains(&PseudoElement::Before));
         assert!(pseudo_elements.contains(&PseudoElement::After));
         assert!(pseudo_elements.contains(&PseudoElement::Placeholder));

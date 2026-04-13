@@ -131,6 +131,10 @@ pub enum TransitionProperty {
     BoxShadow,
     LetterSpacing,
     LineHeight,
+    MinWidth,
+    MaxWidth,
+    MinHeight,
+    MaxHeight,
 }
 
 impl TransitionProperty {
@@ -154,6 +158,10 @@ impl TransitionProperty {
             "box-shadow" => Some(Self::BoxShadow),
             "letter-spacing" => Some(Self::LetterSpacing),
             "line-height" => Some(Self::LineHeight),
+            "min-width" => Some(Self::MinWidth),
+            "max-width" => Some(Self::MaxWidth),
+            "min-height" => Some(Self::MinHeight),
+            "max-height" => Some(Self::MaxHeight),
             _ => None,
         }
     }
@@ -487,6 +495,10 @@ pub fn extract_value(style: &ComputedStyle, prop: TransitionProperty) -> Animata
         TransitionProperty::BoxShadow => AnimatableValue::BoxShadow(style.box_shadow.clone()),
         TransitionProperty::LetterSpacing => AnimatableValue::Float(style.letter_spacing),
         TransitionProperty::LineHeight => AnimatableValue::Float(style.line_height),
+        TransitionProperty::MinWidth => AnimatableValue::Dimension(style.min_width),
+        TransitionProperty::MaxWidth => AnimatableValue::Dimension(style.max_width),
+        TransitionProperty::MinHeight => AnimatableValue::Dimension(style.min_height),
+        TransitionProperty::MaxHeight => AnimatableValue::Dimension(style.max_height),
         // All is handled by expanding to individual properties.
         TransitionProperty::All => AnimatableValue::Float(0.0),
     }
@@ -523,6 +535,10 @@ pub fn apply_value(style: &mut ComputedStyle, prop: TransitionProperty, value: &
             style.letter_spacing = *v;
         }
         (TransitionProperty::LineHeight, AnimatableValue::Float(v)) => style.line_height = *v,
+        (TransitionProperty::MinWidth, AnimatableValue::Dimension(v)) => style.min_width = *v,
+        (TransitionProperty::MaxWidth, AnimatableValue::Dimension(v)) => style.max_width = *v,
+        (TransitionProperty::MinHeight, AnimatableValue::Dimension(v)) => style.min_height = *v,
+        (TransitionProperty::MaxHeight, AnimatableValue::Dimension(v)) => style.max_height = *v,
         _ => {}
     }
 }
@@ -546,6 +562,10 @@ pub const ALL_ANIMATABLE: &[TransitionProperty] = &[
     TransitionProperty::BoxShadow,
     TransitionProperty::LetterSpacing,
     TransitionProperty::LineHeight,
+    TransitionProperty::MinWidth,
+    TransitionProperty::MaxWidth,
+    TransitionProperty::MinHeight,
+    TransitionProperty::MaxHeight,
 ];
 
 // ---------------------------------------------------------------------------
