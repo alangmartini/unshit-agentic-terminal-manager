@@ -199,3 +199,174 @@ fn default_shell() -> String {
         "bash".to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_creates_empty_manager() {
+        let mgr = PtyManager::new();
+        assert!(!mgr.has(0));
+        assert!(!mgr.has(1));
+        assert!(!mgr.has(999));
+    }
+
+    #[test]
+    fn has_returns_false_for_nonexistent_pane() {
+        let mgr = PtyManager::new();
+        assert!(!mgr.has(42));
+    }
+
+    #[test]
+    fn write_to_nonexistent_pane_returns_error() {
+        let mut mgr = PtyManager::new();
+        let result = mgr.write(42, b"hello");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn resize_nonexistent_pane_does_not_panic() {
+        let mut mgr = PtyManager::new();
+        mgr.resize(42, 120, 40); // should be a silent no-op
+    }
+
+    #[test]
+    fn destroy_nonexistent_pane_does_not_panic() {
+        let mut mgr = PtyManager::new();
+        mgr.destroy(42); // should be a silent no-op
+    }
+
+    #[test]
+    fn spawn_creates_pty_session() {
+        let mut mgr = PtyManager::new();
+        let pane_id = 10;
+
+        let result = mgr.spawn(pane_id, 80, 24);
+        assert!(result.is_ok(), "spawn failed: {:?}", result.err());
+
+        assert!(mgr.has(pane_id));
+    }
+
+    #[test]
+    fn write_to_spawned_pane_succeeds() {
+        let mut mgr = PtyManager::new();
+        let pane_id = 20;
+        let _reader = mgr.spawn(pane_id, 80, 24).expect("spawn failed");
+
+        let result = mgr.write(pane_id, b"echo hello\n");
+        assert!(result.is_ok(), "write failed: {:?}", result.err());
+
+        // Cleanup
+        mgr.destroy(pane_id);
+    }
+
+    #[test]
+    fn resize_spawned_pane_does_not_panic() {
+        let mut mgr = PtyManager::new();
+        let pane_id = 30;
+        let _reader = mgr.spawn(pane_id, 80, 24).expect("spawn failed");
+
+        mgr.resize(pane_id, 120, 40);
+        // Verify the session still exists after resize
+        assert!(mgr.has(pane_id));
+
+        mgr.destroy(pane_id);
+    }
+
+    #[test]
+    fn destroy_removes_pty_session() {
+        let mut mgr = PtyManager::new();
+        let pane_id = 40;
+        let _reader = mgr.spawn(pane_id, 80, 24).expect("spawn failed");
+        assert!(mgr.has(pane_id));
+
+        mgr.destroy(pane_id);
+        assert!(!mgr.has(pane_id));
+    }
+
+    #[test]
+    fn spawn_multiple_panes() {
+        let mut mgr = PtyManager::new();
+
+        let _r1 = mgr.spawn(1, 80, 24).expect("spawn 1 failed");
+        let _r2 = mgr.spawn(2, 100, 30).expect("spawn 2 failed");
+
+        assert!(mgr.has(1));
+        assert!(mgr.has(2));
+        assert!(!mgr.has(3));
+
+        mgr.destroy(1);
+        assert!(!mgr.has(1));
+        assert!(mgr.has(2));
+
+        mgr.destroy(2);
+        assert!(!mgr.has(2));
+    }
+
+    #[test]
+    fn resize_spawned_pane_updates_size() {
+        let mut mgr = PtyManager::new();
+        let pane_id = 50;
+        let _reader = mgr.spawn(pane_id, 80, 24).expect("spawn failed");
+
+        // Resize to new dimensions
+        mgr.resize(pane_id, 120, 40);
+
+        // Verify the pair's size was updated
+        let pair = mgr.pairs.get(&pane_id).unwrap();
+        assert_eq!(pair.size.cols, 120);
+        assert_eq!(pair.size.rows, 40);
+
+        mgr.destroy(pane_id);
+    }
+
+    #[test]
+    fn default_shell_returns_nonempty_string() {
+        let shell = default_shell();
+        assert!(!shell.is_empty());
+    }
+
+    #[test]
+    fn destroy_then_write_returns_error() {
+        let mut mgr = PtyManager::new();
+        let pane_id = 60;
+        let _reader = mgr.spawn(pane_id, 80, 24).expect("spawn failed");
+        mgr.destroy(pane_id);
+        let result = mgr.write(pane_id, b"test");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn destroy_then_resize_is_noop() {
+        let mut mgr = PtyManager::new();
+        let pane_id = 70;
+        let _reader = mgr.spawn(pane_id, 80, 24).expect("spawn failed");
+        mgr.destroy(pane_id);
+        // Should not panic
+        mgr.resize(pane_id, 120, 40);
+        assert!(!mgr.has(pane_id));
+    }
+
+    #[test]
+    fn write_error_message_contains_pane_id() {
+        let mut mgr = PtyManager::new();
+        let result = mgr.write(999, b"test");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("999"));
+    }
+
+    #[test]
+    fn multiple_writes_to_same_pane() {
+        let mut mgr = PtyManager::new();
+        let pane_id = 80;
+        let _reader = mgr.spawn(pane_id, 80, 24).expect("spawn failed");
+        // Multiple writes should all succeed
+        assert!(mgr.write(pane_id, b"echo 1\n").is_ok());
+        assert!(mgr.write(pane_id, b"echo 2\n").is_ok());
+        assert!(mgr.write(pane_id, b"echo 3\n").is_ok());
+        mgr.destroy(pane_id);
+    }
+}
