@@ -92,7 +92,13 @@ fn build_workspace(
 
     let mut body = ElementDef::new(Tag::Div).with_class("workspace-body");
     for (s_idx, subtab) in workspace.subtabs.iter().enumerate() {
-        body = body.with_child(build_subtab(workspace_index, s_idx, subtab, workspace, shared));
+        body = body.with_child(build_subtab(
+            workspace_index,
+            s_idx,
+            subtab,
+            workspace,
+            shared,
+        ));
         if subtab.label == "terminals"
             && workspace.terminals_expanded
             && !workspace.terminal_entries.is_empty()
@@ -100,8 +106,7 @@ fn build_workspace(
             let mut entries = ElementDef::new(Tag::Div).with_class("terminal-entries");
             let count = workspace.terminal_entries.len();
             for (t_idx, entry) in workspace.terminal_entries.iter().enumerate() {
-                entries =
-                    entries.with_child(build_terminal_entry(entry, t_idx == count - 1));
+                entries = entries.with_child(build_terminal_entry(entry, t_idx == count - 1));
             }
             body = body.with_child(entries);
         }

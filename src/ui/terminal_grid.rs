@@ -3,8 +3,8 @@ use unshit::core::event::{DragPhase, Event, EventType, Key, KeyEventKind, Modifi
 use unshit::core::style::parse::StyleDeclaration;
 
 use crate::state::{
-    apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with,
-    Pane, PaneId, ResizeDragSnapshot, SharedState, UiSnapshot,
+    apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane,
+    PaneId, ResizeDragSnapshot, SharedState, UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -34,8 +34,7 @@ pub fn build_terminal_grid(
         for (col_idx, pane) in row.iter().enumerate() {
             let is_active = pane.id == state.active_pane;
             if col_idx > 0 {
-                row_el =
-                    row_el.with_child(build_col_resizer(row_idx, col_idx, shared));
+                row_el = row_el.with_child(build_col_resizer(row_idx, col_idx, shared));
             }
             let col_ratio = state
                 .col_ratios
@@ -63,40 +62,38 @@ fn build_col_resizer(row_idx: usize, col_idx: usize, shared: &SharedState) -> El
     ElementDef::new(Tag::Div)
         .with_class("resizer")
         .with_class("resizer-h")
-        .on_drag(move |ev| {
-            match ev.phase {
-                DragPhase::Start => {
-                    mutate_with(&drag_shared, |st| {
-                        st.resize_drag = Some(ResizeDragSnapshot {
-                            horizontal: true,
-                            row_idx,
-                            col_idx: col_idx - 1,
-                            initial_ratios: st.col_ratios[row_idx].clone(),
-                            container_size: st.last_grid_width,
-                        });
+        .on_drag(move |ev| match ev.phase {
+            DragPhase::Start => {
+                mutate_with(&drag_shared, |st| {
+                    st.resize_drag = Some(ResizeDragSnapshot {
+                        horizontal: true,
+                        row_idx,
+                        col_idx: col_idx - 1,
+                        initial_ratios: st.col_ratios[row_idx].clone(),
+                        container_size: st.last_grid_width,
                     });
-                }
-                DragPhase::Update => {
-                    mutate_with(&drag_shared, |st| {
-                        let drag = match st.resize_drag {
-                            Some(ref d) => d.clone(),
-                            None => return,
-                        };
-                        apply_ratio_delta(
-                            &mut st.col_ratios[drag.row_idx],
-                            drag.col_idx,
-                            drag.col_idx + 1,
-                            &drag.initial_ratios,
-                            ev.total_delta_x,
-                            drag.container_size,
-                        );
-                    });
-                }
-                DragPhase::End => {
-                    mutate_with(&drag_shared, |st| {
-                        st.resize_drag = None;
-                    });
-                }
+                });
+            }
+            DragPhase::Update => {
+                mutate_with(&drag_shared, |st| {
+                    let drag = match st.resize_drag {
+                        Some(ref d) => d.clone(),
+                        None => return,
+                    };
+                    apply_ratio_delta(
+                        &mut st.col_ratios[drag.row_idx],
+                        drag.col_idx,
+                        drag.col_idx + 1,
+                        &drag.initial_ratios,
+                        ev.total_delta_x,
+                        drag.container_size,
+                    );
+                });
+            }
+            DragPhase::End => {
+                mutate_with(&drag_shared, |st| {
+                    st.resize_drag = None;
+                });
             }
         })
 }
@@ -108,40 +105,38 @@ fn build_row_resizer(row_idx: usize, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("resizer")
         .with_class("resizer-v")
-        .on_drag(move |ev| {
-            match ev.phase {
-                DragPhase::Start => {
-                    mutate_with(&drag_shared, |st| {
-                        st.resize_drag = Some(ResizeDragSnapshot {
-                            horizontal: false,
-                            row_idx: row_idx - 1,
-                            col_idx: 0,
-                            initial_ratios: st.row_ratios.clone(),
-                            container_size: st.last_grid_height,
-                        });
+        .on_drag(move |ev| match ev.phase {
+            DragPhase::Start => {
+                mutate_with(&drag_shared, |st| {
+                    st.resize_drag = Some(ResizeDragSnapshot {
+                        horizontal: false,
+                        row_idx: row_idx - 1,
+                        col_idx: 0,
+                        initial_ratios: st.row_ratios.clone(),
+                        container_size: st.last_grid_height,
                     });
-                }
-                DragPhase::Update => {
-                    mutate_with(&drag_shared, |st| {
-                        let drag = match st.resize_drag {
-                            Some(ref d) => d.clone(),
-                            None => return,
-                        };
-                        apply_ratio_delta(
-                            &mut st.row_ratios,
-                            drag.row_idx,
-                            drag.row_idx + 1,
-                            &drag.initial_ratios,
-                            ev.total_delta_y,
-                            drag.container_size,
-                        );
-                    });
-                }
-                DragPhase::End => {
-                    mutate_with(&drag_shared, |st| {
-                        st.resize_drag = None;
-                    });
-                }
+                });
+            }
+            DragPhase::Update => {
+                mutate_with(&drag_shared, |st| {
+                    let drag = match st.resize_drag {
+                        Some(ref d) => d.clone(),
+                        None => return,
+                    };
+                    apply_ratio_delta(
+                        &mut st.row_ratios,
+                        drag.row_idx,
+                        drag.row_idx + 1,
+                        &drag.initial_ratios,
+                        ev.total_delta_y,
+                        drag.container_size,
+                    );
+                });
+            }
+            DragPhase::End => {
+                mutate_with(&drag_shared, |st| {
+                    st.resize_drag = None;
+                });
             }
         })
 }

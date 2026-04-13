@@ -461,8 +461,7 @@ impl Element {
 
         // Apply inline style overrides. Since StyleDeclaration does not derive
         // PartialEq, mark LAYOUT dirty whenever either side is non-empty.
-        let overrides_changed =
-            !self.style_overrides.is_empty() || !def.style_overrides.is_empty();
+        let overrides_changed = !self.style_overrides.is_empty() || !def.style_overrides.is_empty();
         self.style_overrides = def.style_overrides.clone();
         if overrides_changed {
             flags |= DirtyFlags::LAYOUT;

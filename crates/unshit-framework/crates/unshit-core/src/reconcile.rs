@@ -188,8 +188,7 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     element.on_unmount = def.on_unmount.clone();
     // Transfer inline style overrides. Since StyleDeclaration does not derive
     // PartialEq, mark LAYOUT dirty whenever either side is non-empty.
-    let overrides_changed =
-        !element.style_overrides.is_empty() || !def.style_overrides.is_empty();
+    let overrides_changed = !element.style_overrides.is_empty() || !def.style_overrides.is_empty();
     element.style_overrides = def.style_overrides.clone();
     // Transfer node_ref and refresh the stored NodeId in case the ref changed.
     if let Some(nr) = def.node_ref.clone() {
