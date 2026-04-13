@@ -4,9 +4,6 @@ use crate::notification::{AttentionUrgency, BellConfig, BellState};
 use crate::shortcut::{key_combo_from_winit, ShortcutResolver};
 use crate::window;
 use cosmic_text::{FontSystem, SwashCache};
-use unshit_renderer::batch::Rasterizer;
-#[cfg(target_os = "windows")]
-use unshit_renderer::dw_rasterizer::DwRasterizer;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use unshit_core::build::{
@@ -25,8 +22,11 @@ use unshit_core::style::theme::Theme;
 use unshit_core::style::transition::ActiveTransitions;
 use unshit_core::style::types::Layer;
 use unshit_core::tree::NodeArena;
+use unshit_renderer::batch::Rasterizer;
 use unshit_renderer::batch::{self, BatchCache, ShapedTextCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
+#[cfg(target_os = "windows")]
+use unshit_renderer::dw_rasterizer::DwRasterizer;
 use unshit_renderer::gpu::GpuContext;
 use unshit_renderer::pipeline::quad::QuadInstance;
 use winit::application::ApplicationHandler;
@@ -653,10 +653,7 @@ impl ApplicationHandler for AppHandler {
         // Run the initial subscription reconcile so streams start immediately.
         #[cfg(feature = "async")]
         if let Some(ref mut mgr) = self.app.subscription_manager {
-            let sink = EventSink::new(
-                self.app.event_tx.clone(),
-                Arc::clone(&self.app.proxy_cell),
-            );
+            let sink = EventSink::new(self.app.event_tx.clone(), Arc::clone(&self.app.proxy_cell));
             mgr.reconcile(self.app.runtime.handle(), &sink);
         }
 
@@ -944,6 +941,7 @@ impl ApplicationHandler for AppHandler {
                                 .unwrap_or(NodeId::DANGLING);
                                 if new_focused != state.interaction.focused {
                                     state.interaction.focused = new_focused;
+                                    state.interaction.focus_via_keyboard = false;
                                     update_focus_context(state);
                                     state.needs_restyle = true;
                                     state.window.request_redraw();
@@ -1037,47 +1035,60 @@ impl ApplicationHandler for AppHandler {
                                     }
                                 }
 
-                                // Text selection: start on mousedown over text
+                                // Text selection: start on mousedown over text.
+                                // Respect user-select: none to prevent selection.
+                                let user_select_none = state
+                                    .arena
+                                    .get(hovered)
+                                    .map(|e| {
+                                        e.computed_style.user_select
+                                            == unshit_core::style::types::UserSelect::None
+                                    })
+                                    .unwrap_or(false);
                                 let pos = state.interaction.last_cursor_pos;
-                                if let Some((text_node, byte_offset)) = layout::text_hit_at(
-                                    &state.arena,
-                                    hovered,
-                                    pos.0,
-                                    pos.1,
-                                    &mut state.font_system,
-                                ) {
-                                    if is_double_click {
-                                        // Double-click: select the word at the click position
-                                        if let Some(elem) = state.arena.get(text_node) {
-                                            if let ElementContent::Text(ref text) = elem.content {
-                                                let (start, end) =
-                                                    word_boundary_at(text, byte_offset);
-                                                state.interaction.text_selection =
-                                                    Some(TextSelection {
-                                                        anchor_element: text_node,
-                                                        anchor_offset: start,
-                                                        focus_element: text_node,
-                                                        focus_offset: end,
-                                                    });
-                                                // Reset last_click_time so a third click is not another double-click
-                                                state.interaction.last_click_time = None;
+                                if !user_select_none {
+                                    if let Some((text_node, byte_offset)) = layout::text_hit_at(
+                                        &state.arena,
+                                        hovered,
+                                        pos.0,
+                                        pos.1,
+                                        &mut state.font_system,
+                                    ) {
+                                        if is_double_click {
+                                            // Double-click: select the word at the click position
+                                            if let Some(elem) = state.arena.get(text_node) {
+                                                if let ElementContent::Text(ref text) = elem.content
+                                                {
+                                                    let (start, end) =
+                                                        word_boundary_at(text, byte_offset);
+                                                    state.interaction.text_selection =
+                                                        Some(TextSelection {
+                                                            anchor_element: text_node,
+                                                            anchor_offset: start,
+                                                            focus_element: text_node,
+                                                            focus_offset: end,
+                                                        });
+                                                    // Reset last_click_time so a third click is not another double-click
+                                                    state.interaction.last_click_time = None;
+                                                }
                                             }
+                                            state.interaction.selecting = false;
+                                        } else {
+                                            state.interaction.text_selection =
+                                                Some(TextSelection {
+                                                    anchor_element: text_node,
+                                                    anchor_offset: byte_offset,
+                                                    focus_element: text_node,
+                                                    focus_offset: byte_offset,
+                                                });
+                                            state.interaction.selecting = true;
                                         }
-                                        state.interaction.selecting = false;
+                                        state.window.request_redraw();
                                     } else {
-                                        state.interaction.text_selection = Some(TextSelection {
-                                            anchor_element: text_node,
-                                            anchor_offset: byte_offset,
-                                            focus_element: text_node,
-                                            focus_offset: byte_offset,
-                                        });
-                                        state.interaction.selecting = true;
+                                        state.interaction.text_selection = None;
+                                        state.interaction.selecting = false;
                                     }
-                                    state.window.request_redraw();
-                                } else {
-                                    state.interaction.text_selection = None;
-                                    state.interaction.selecting = false;
-                                }
+                                } // user-select gate
                             }
                         }
                         ElementState::Released => {
@@ -1328,14 +1339,13 @@ impl ApplicationHandler for AppHandler {
                     // hovered element up to the root, firing the first handler
                     // found (bubble semantics).
                     let pos = state.interaction.last_cursor_pos;
-                    let scroll_evt = unshit_core::event::Event::Scroll(
-                        unshit_core::event::ScrollEvent {
+                    let scroll_evt =
+                        unshit_core::event::Event::Scroll(unshit_core::event::ScrollEvent {
                             delta_x,
                             delta_y,
                             x: pos.0,
                             y: pos.1,
-                        },
-                    );
+                        });
                     let mut node = state.interaction.hovered;
                     loop {
                         if let Some(element) = state.arena.get(node) {
@@ -1461,6 +1471,7 @@ impl ApplicationHandler for AppHandler {
                         state.interaction.hovered,
                         state.interaction.active,
                         state.interaction.focused,
+                        state.interaction.focus_via_keyboard,
                         Some(frame_start),
                         Some(&mut state.active_transitions),
                     );
@@ -1518,6 +1529,7 @@ impl ApplicationHandler for AppHandler {
                         state.interaction.hovered,
                         state.interaction.active,
                         state.interaction.focused,
+                        state.interaction.focus_via_keyboard,
                         Some(frame_start),
                         Some(&mut state.active_transitions),
                     );
@@ -2329,6 +2341,7 @@ fn dispatch_command(
             if let Some(id) = new_focused {
                 if id != state.interaction.focused {
                     state.interaction.focused = id;
+                    state.interaction.focus_via_keyboard = true;
                     update_focus_context(state);
                     state.needs_restyle = true;
                     state.window.request_redraw();
@@ -2340,6 +2353,7 @@ fn dispatch_command(
             if let Some(id) = new_focused {
                 if id != state.interaction.focused {
                     state.interaction.focused = id;
+                    state.interaction.focus_via_keyboard = true;
                     update_focus_context(state);
                     state.needs_restyle = true;
                     state.window.request_redraw();
@@ -2368,6 +2382,8 @@ fn apply_cursor_icon(window: &dyn Window, arena: &NodeArena, hovered: NodeId) {
         arena
             .get(hovered)
             .map(|elem| match elem.computed_style.cursor {
+                CursorStyle::Default => CursorIcon::Default,
+                CursorStyle::None => CursorIcon::Default,
                 CursorStyle::Pointer => CursorIcon::Pointer,
                 CursorStyle::Text => CursorIcon::Text,
                 CursorStyle::Grab => CursorIcon::Grab,
@@ -2377,9 +2393,23 @@ fn apply_cursor_icon(window: &dyn Window, arena: &NodeArena, hovered: NodeId) {
                 CursorStyle::Move => CursorIcon::Move,
                 CursorStyle::Wait => CursorIcon::Wait,
                 CursorStyle::Help => CursorIcon::Help,
+                CursorStyle::Progress => CursorIcon::Progress,
                 CursorStyle::ColResize => CursorIcon::ColResize,
                 CursorStyle::RowResize => CursorIcon::RowResize,
-                CursorStyle::Default => CursorIcon::Default,
+                CursorStyle::NResize => CursorIcon::NResize,
+                CursorStyle::SResize => CursorIcon::SResize,
+                CursorStyle::EResize => CursorIcon::EResize,
+                CursorStyle::WResize => CursorIcon::WResize,
+                CursorStyle::NeResize => CursorIcon::NeResize,
+                CursorStyle::NwResize => CursorIcon::NwResize,
+                CursorStyle::SeResize => CursorIcon::SeResize,
+                CursorStyle::SwResize => CursorIcon::SwResize,
+                CursorStyle::EwResize => CursorIcon::EwResize,
+                CursorStyle::NsResize => CursorIcon::NsResize,
+                CursorStyle::NeswResize => CursorIcon::NeswResize,
+                CursorStyle::NwseResize => CursorIcon::NwseResize,
+                CursorStyle::ZoomIn => CursorIcon::ZoomIn,
+                CursorStyle::ZoomOut => CursorIcon::ZoomOut,
             })
             .unwrap_or(CursorIcon::Default)
     } else {

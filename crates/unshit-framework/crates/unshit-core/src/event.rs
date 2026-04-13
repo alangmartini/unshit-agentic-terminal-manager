@@ -368,6 +368,9 @@ pub struct InteractionState {
     pub drag_target: Option<NodeId>,
     /// Whether the drag threshold has been exceeded and DragStart was dispatched.
     pub dragging: bool,
+    /// Whether the current focus was gained via keyboard (Tab) rather than mouse click.
+    /// Used by `:focus-visible` pseudo-class matching.
+    pub focus_via_keyboard: bool,
     /// Last position delivered to the drag handler (for computing per-move deltas).
     pub drag_last_pos: (f32, f32),
     /// Mouse button that started the drag.
@@ -390,6 +393,7 @@ impl Default for InteractionState {
             drag_origin: None,
             drag_target: None,
             dragging: false,
+            focus_via_keyboard: false,
             drag_last_pos: (0.0, 0.0),
             drag_button: MouseButton::Left,
         }

@@ -624,6 +624,7 @@ pub enum CssPosition {
 pub enum CursorStyle {
     #[default]
     Default,
+    None,
     Pointer,
     Text,
     Grab,
@@ -633,8 +634,23 @@ pub enum CursorStyle {
     Move,
     Wait,
     Help,
+    Progress,
     ColResize,
     RowResize,
+    NResize,
+    SResize,
+    EResize,
+    WResize,
+    NeResize,
+    NwResize,
+    SeResize,
+    SwResize,
+    EwResize,
+    NsResize,
+    NeswResize,
+    NwseResize,
+    ZoomIn,
+    ZoomOut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -659,6 +675,15 @@ impl Default for PointerEvents {
     fn default() -> Self {
         PointerEvents::Auto
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UserSelect {
+    #[default]
+    Auto,
+    None,
+    Text,
+    All,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -974,6 +999,7 @@ pub struct ComputedStyle {
     // Visibility / pointer behavior
     pub visibility: Visibility,
     pub pointer_events: PointerEvents,
+    pub user_select: UserSelect,
 
     // Keyboard capture
     pub keyboard_capture: bool,
@@ -1057,6 +1083,7 @@ impl Default for ComputedStyle {
             cursor: CursorStyle::Default,
             visibility: Visibility::Visible,
             pointer_events: PointerEvents::Auto,
+            user_select: UserSelect::Auto,
             keyboard_capture: false,
             layer: Layer::Content,
             render_target: RenderTarget::Inline,
@@ -1084,6 +1111,7 @@ impl ComputedStyle {
         self.cursor = parent.cursor;
         self.visibility = parent.visibility;
         self.pointer_events = parent.pointer_events;
+        self.user_select = parent.user_select;
     }
 
     pub fn to_taffy_style(&self) -> taffy::Style {

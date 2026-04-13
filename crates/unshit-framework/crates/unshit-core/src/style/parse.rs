@@ -79,6 +79,8 @@ pub enum PseudoClass {
     Hover,
     Active,
     Focus,
+    FocusVisible,
+    FocusWithin,
     FirstChild,
     LastChild,
     NthChild(i32),
@@ -219,6 +221,9 @@ pub enum StyleDeclaration {
     GridColumnEnd(types::GridPlacement),
     GridRowStart(types::GridPlacement),
     GridRowEnd(types::GridPlacement),
+
+    // User select
+    UserSelect(UserSelect),
 
     // Resize handle
     ResizeAxis(crate::resize_handle::ResizeAxis),
@@ -819,6 +824,12 @@ fn parse_simple_selector(s: &str) -> Result<Vec<SelectorPart>, ()> {
                     "hover" => parts.push(SelectorPart::PseudoClass(PseudoClass::Hover)),
                     "active" => parts.push(SelectorPart::PseudoClass(PseudoClass::Active)),
                     "focus" => parts.push(SelectorPart::PseudoClass(PseudoClass::Focus)),
+                    "focus-visible" => {
+                        parts.push(SelectorPart::PseudoClass(PseudoClass::FocusVisible))
+                    }
+                    "focus-within" => {
+                        parts.push(SelectorPart::PseudoClass(PseudoClass::FocusWithin))
+                    }
                     "first-child" => parts.push(SelectorPart::PseudoClass(PseudoClass::FirstChild)),
                     "last-child" => parts.push(SelectorPart::PseudoClass(PseudoClass::LastChild)),
                     // :root matches the root element; treat as universal for matching.
@@ -924,7 +935,9 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "flex-basis" => StyleDeclaration::FlexBasis(parse_dimension(parser)?),
         "flex" => {
             // flex: none
-            if let Ok(ident) = parser.try_parse(|p| p.expect_ident().map(|s| s.as_ref().to_string()).map_err(|_| ())) {
+            if let Ok(ident) = parser
+                .try_parse(|p| p.expect_ident().map(|s| s.as_ref().to_string()).map_err(|_| ()))
+            {
                 if ident == "none" {
                     let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
                     return Ok(smallvec::smallvec![
@@ -942,9 +955,8 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             match shrink {
                 Ok(shrink_val) => {
                     // flex: <number> <number> [<dimension>]
-                    let basis = parser
-                        .try_parse(|p| parse_dimension(p))
-                        .unwrap_or(Dimension::Px(0.0));
+                    let basis =
+                        parser.try_parse(|p| parse_dimension(p)).unwrap_or(Dimension::Px(0.0));
                     let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
                     return Ok(smallvec::smallvec![
                         StyleDeclaration::FlexGrow(grow),
@@ -1138,7 +1150,8 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "cursor" => {
             let val = parser.expect_ident().map_err(|_| ())?;
             StyleDeclaration::Cursor(match val.as_ref() {
-                "default" => CursorStyle::Default,
+                "default" | "auto" => CursorStyle::Default,
+                "none" => CursorStyle::None,
                 "pointer" => CursorStyle::Pointer,
                 "text" => CursorStyle::Text,
                 "grab" => CursorStyle::Grab,
@@ -1148,8 +1161,23 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 "move" => CursorStyle::Move,
                 "wait" => CursorStyle::Wait,
                 "help" => CursorStyle::Help,
+                "progress" => CursorStyle::Progress,
                 "col-resize" => CursorStyle::ColResize,
                 "row-resize" => CursorStyle::RowResize,
+                "n-resize" => CursorStyle::NResize,
+                "s-resize" => CursorStyle::SResize,
+                "e-resize" => CursorStyle::EResize,
+                "w-resize" => CursorStyle::WResize,
+                "ne-resize" => CursorStyle::NeResize,
+                "nw-resize" => CursorStyle::NwResize,
+                "se-resize" => CursorStyle::SeResize,
+                "sw-resize" => CursorStyle::SwResize,
+                "ew-resize" => CursorStyle::EwResize,
+                "ns-resize" => CursorStyle::NsResize,
+                "nesw-resize" => CursorStyle::NeswResize,
+                "nwse-resize" => CursorStyle::NwseResize,
+                "zoom-in" => CursorStyle::ZoomIn,
+                "zoom-out" => CursorStyle::ZoomOut,
                 _ => return Err(()),
             })
         }
@@ -1166,6 +1194,16 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             StyleDeclaration::PointerEvents(match val.as_ref() {
                 "auto" => PointerEvents::Auto,
                 "none" => PointerEvents::None,
+                _ => return Err(()),
+            })
+        }
+        "user-select" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            StyleDeclaration::UserSelect(match val.as_ref() {
+                "auto" => UserSelect::Auto,
+                "none" => UserSelect::None,
+                "text" => UserSelect::Text,
+                "all" => UserSelect::All,
                 _ => return Err(()),
             })
         }
@@ -3206,6 +3244,7 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::Cursor(v) => style.cursor = *v,
         StyleDeclaration::Visibility(v) => style.visibility = *v,
         StyleDeclaration::PointerEvents(v) => style.pointer_events = *v,
+        StyleDeclaration::UserSelect(v) => style.user_select = *v,
         StyleDeclaration::Position(v) => style.position = *v,
         StyleDeclaration::Top(v) => style.top = Some(*v),
         StyleDeclaration::Right(v) => style.right = Some(*v),
@@ -3527,7 +3566,6 @@ mod tests {
         assert!(tag_pos < hover_pos && hover_pos < before_pos);
     }
 
-
     #[test]
     fn test_pseudo_element_selection_parses() {
         let parts = last_parts_of("p::selection { color: white; }");
@@ -3592,11 +3630,7 @@ mod tests {
             .pane-body::-webkit-scrollbar-track { background: #f1f1f1; }
             "#,
         );
-        assert_eq!(
-            sheet.rules.len(),
-            0,
-            "vendor pseudo-element rules must be discarded entirely"
-        );
+        assert_eq!(sheet.rules.len(), 0, "vendor pseudo-element rules must be discarded entirely");
     }
 
     #[test]
@@ -3638,11 +3672,8 @@ mod tests {
             2,
             "before and after rules must survive, scrollbar must be discarded"
         );
-        let pseudo_elements: Vec<_> = sheet
-            .rules
-            .iter()
-            .filter_map(|r| r.selector.pseudo_element())
-            .collect();
+        let pseudo_elements: Vec<_> =
+            sheet.rules.iter().filter_map(|r| r.selector.pseudo_element()).collect();
         assert!(pseudo_elements.contains(&PseudoElement::Before));
         assert!(pseudo_elements.contains(&PseudoElement::After));
     }
@@ -5059,11 +5090,7 @@ mod tests {
             StyleDeclaration::Top(v) => Some(*v),
             _ => None,
         });
-        assert_eq!(
-            top,
-            Some(Dimension::Px(10.0)),
-            "inset: 10px should expand top to 10px"
-        );
+        assert_eq!(top, Some(Dimension::Px(10.0)), "inset: 10px should expand top to 10px");
     }
 
     // Regression tests for #214: display: inline-flex and inline-block
@@ -5154,13 +5181,103 @@ mod tests {
             "#,
         );
         assert_eq!(sheet.rules.len(), 3);
-        let pseudo_elements: Vec<_> = sheet
-            .rules
-            .iter()
-            .filter_map(|r| r.selector.pseudo_element())
-            .collect();
+        let pseudo_elements: Vec<_> =
+            sheet.rules.iter().filter_map(|r| r.selector.pseudo_element()).collect();
         assert!(pseudo_elements.contains(&PseudoElement::Before));
         assert!(pseudo_elements.contains(&PseudoElement::After));
         assert!(pseudo_elements.contains(&PseudoElement::Placeholder));
+    }
+
+    // -----------------------------------------------------------------
+    // Cursor CSS property: new values
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_cursor_all_values() {
+        let values = [
+            ("default", CursorStyle::Default),
+            ("auto", CursorStyle::Default),
+            ("none", CursorStyle::None),
+            ("pointer", CursorStyle::Pointer),
+            ("text", CursorStyle::Text),
+            ("grab", CursorStyle::Grab),
+            ("grabbing", CursorStyle::Grabbing),
+            ("not-allowed", CursorStyle::NotAllowed),
+            ("crosshair", CursorStyle::Crosshair),
+            ("move", CursorStyle::Move),
+            ("wait", CursorStyle::Wait),
+            ("help", CursorStyle::Help),
+            ("progress", CursorStyle::Progress),
+            ("col-resize", CursorStyle::ColResize),
+            ("row-resize", CursorStyle::RowResize),
+            ("n-resize", CursorStyle::NResize),
+            ("s-resize", CursorStyle::SResize),
+            ("e-resize", CursorStyle::EResize),
+            ("w-resize", CursorStyle::WResize),
+            ("ne-resize", CursorStyle::NeResize),
+            ("nw-resize", CursorStyle::NwResize),
+            ("se-resize", CursorStyle::SeResize),
+            ("sw-resize", CursorStyle::SwResize),
+            ("ew-resize", CursorStyle::EwResize),
+            ("ns-resize", CursorStyle::NsResize),
+            ("nesw-resize", CursorStyle::NeswResize),
+            ("nwse-resize", CursorStyle::NwseResize),
+            ("zoom-in", CursorStyle::ZoomIn),
+            ("zoom-out", CursorStyle::ZoomOut),
+        ];
+        for (css_val, expected) in values {
+            let css = format!(".x {{ cursor: {}; }}", css_val);
+            let decls = parse_decls(&css);
+            let cursor = decls.iter().find_map(|d| match d {
+                StyleDeclaration::Cursor(v) => Some(*v),
+                _ => None,
+            });
+            assert_eq!(cursor, Some(expected), "cursor: {css_val} should parse to {expected:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // user-select CSS property
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_user_select_values() {
+        let values = [
+            ("auto", UserSelect::Auto),
+            ("none", UserSelect::None),
+            ("text", UserSelect::Text),
+            ("all", UserSelect::All),
+        ];
+        for (css_val, expected) in values {
+            let css = format!(".x {{ user-select: {}; }}", css_val);
+            let decls = parse_decls(&css);
+            let us = decls.iter().find_map(|d| match d {
+                StyleDeclaration::UserSelect(v) => Some(*v),
+                _ => None,
+            });
+            assert_eq!(us, Some(expected), "user-select: {css_val} should parse to {expected:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // :focus-visible and :focus-within pseudo-class selectors
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_focus_visible_selector() {
+        let parts = last_parts_of(".btn:focus-visible { outline: 2px solid blue; }");
+        assert!(
+            parts.iter().any(|p| matches!(p, SelectorPart::PseudoClass(PseudoClass::FocusVisible))),
+            "should parse :focus-visible pseudo-class"
+        );
+    }
+
+    #[test]
+    fn test_focus_within_selector() {
+        let parts = last_parts_of(".container:focus-within { border-color: #00ff00; }");
+        assert!(
+            parts.iter().any(|p| matches!(p, SelectorPart::PseudoClass(PseudoClass::FocusWithin))),
+            "should parse :focus-within pseudo-class"
+        );
     }
 }
