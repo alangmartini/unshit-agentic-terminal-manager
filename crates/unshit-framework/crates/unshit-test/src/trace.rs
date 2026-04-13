@@ -128,7 +128,12 @@ impl TraceRecorder {
     }
 
     /// Build a screenshot filename for the given step index and action.
-    pub fn screenshot_path_for(&self, test_name: &str, step_index: usize, action: &TraceAction) -> PathBuf {
+    pub fn screenshot_path_for(
+        &self,
+        test_name: &str,
+        step_index: usize,
+        action: &TraceAction,
+    ) -> PathBuf {
         let dir = self.output_dir.join(test_name);
         let label = action.short_label();
         let filename = format!("step_{:03}_{}.png", step_index + 1, label);
@@ -160,11 +165,19 @@ impl Default for TraceRecorder {
 impl TraceStep {
     /// Write this step as a JSON object into `out`.
     fn write_json(&self, out: &mut String) {
-        let _ = write!(out, r#"{{"frame":{},"elapsed_ms":{},"action":"#, self.frame_number, self.elapsed_ms);
+        let _ = write!(
+            out,
+            r#"{{"frame":{},"elapsed_ms":{},"action":"#,
+            self.frame_number, self.elapsed_ms
+        );
         self.action.write_json(out);
         match &self.screenshot_path {
             Some(p) => {
-                let _ = write!(out, r#","screenshot":"{}"}}"#, p.display().to_string().replace('\\', "/"));
+                let _ = write!(
+                    out,
+                    r#","screenshot":"{}"}}"#,
+                    p.display().to_string().replace('\\', "/")
+                );
             }
             None => out.push_str(r#","screenshot":null}"#),
         }
@@ -205,14 +218,18 @@ impl TraceAction {
                 let _ = write!(
                     out,
                     r#"{{"type":"{}","selector":"{}","x":{},"y":{}}}"#,
-                    type_name, escape_json(selector), x, y,
+                    type_name,
+                    escape_json(selector),
+                    x,
+                    y,
                 );
             }
             TraceAction::Fill { selector, text } => {
                 let _ = write!(
                     out,
                     r#"{{"type":"Fill","selector":"{}","text":"{}"}}"#,
-                    escape_json(selector), escape_json(text),
+                    escape_json(selector),
+                    escape_json(text),
                 );
             }
             TraceAction::Clear { selector } => {
@@ -222,32 +239,44 @@ impl TraceAction {
                 let _ = write!(
                     out,
                     r#"{{"type":"Press","selector":"{}","key":"{}"}}"#,
-                    escape_json(selector), escape_json(key),
+                    escape_json(selector),
+                    escape_json(key),
                 );
             }
             TraceAction::Scroll { selector, dx, dy } => {
                 let _ = write!(
                     out,
                     r#"{{"type":"Scroll","selector":"{}","dx":{},"dy":{}}}"#,
-                    escape_json(selector), dx, dy,
+                    escape_json(selector),
+                    dx,
+                    dy,
                 );
             }
             TraceAction::SelectOption { selector, value } => {
                 let _ = write!(
                     out,
                     r#"{{"type":"SelectOption","selector":"{}","value":"{}"}}"#,
-                    escape_json(selector), escape_json(value),
+                    escape_json(selector),
+                    escape_json(value),
                 );
             }
             TraceAction::Assertion { selector, kind, expected, actual, passed } => {
                 let _ = write!(
                     out,
                     r#"{{"type":"Assertion","selector":"{}","kind":"{}","expected":"{}","actual":"{}","passed":{}}}"#,
-                    escape_json(selector), escape_json(kind), escape_json(expected), escape_json(actual), passed,
+                    escape_json(selector),
+                    escape_json(kind),
+                    escape_json(expected),
+                    escape_json(actual),
+                    passed,
                 );
             }
             TraceAction::Custom { description } => {
-                let _ = write!(out, r#"{{"type":"Custom","description":"{}"}}"#, escape_json(description));
+                let _ = write!(
+                    out,
+                    r#"{{"type":"Custom","description":"{}"}}"#,
+                    escape_json(description)
+                );
             }
         }
     }
@@ -281,16 +310,9 @@ mod tests {
         let mut recorder = TraceRecorder::new();
         recorder.enable();
 
-        recorder.record(TraceAction::Click {
-            selector: ".btn".into(),
-            x: 50.0,
-            y: 25.0,
-        });
+        recorder.record(TraceAction::Click { selector: ".btn".into(), x: 50.0, y: 25.0 });
         recorder.tick_frame();
-        recorder.record(TraceAction::Fill {
-            selector: "#name".into(),
-            text: "hello".into(),
-        });
+        recorder.record(TraceAction::Fill { selector: "#name".into(), text: "hello".into() });
         recorder.tick_frame();
         recorder.record(TraceAction::Assertion {
             selector: ".label".into(),
@@ -315,11 +337,7 @@ mod tests {
         let mut recorder = TraceRecorder::new();
         // Not enabled
 
-        recorder.record(TraceAction::Click {
-            selector: ".btn".into(),
-            x: 10.0,
-            y: 20.0,
-        });
+        recorder.record(TraceAction::Click { selector: ".btn".into(), x: 10.0, y: 20.0 });
 
         assert!(recorder.steps().is_empty());
     }
@@ -329,11 +347,7 @@ mod tests {
         let mut recorder = TraceRecorder::new();
         recorder.enable();
 
-        recorder.record(TraceAction::Click {
-            selector: ".btn".into(),
-            x: 50.0,
-            y: 25.0,
-        });
+        recorder.record(TraceAction::Click { selector: ".btn".into(), x: 50.0, y: 25.0 });
         recorder.record(TraceAction::Assertion {
             selector: ".output".into(),
             kind: "text".into(),
@@ -377,9 +391,7 @@ mod tests {
         recorder.enable();
         recorder.set_output_dir(dir.clone());
 
-        recorder.record(TraceAction::Custom {
-            description: "test step".into(),
-        });
+        recorder.record(TraceAction::Custom { description: "test step".into() });
 
         let path = recorder.save("my_test");
         assert!(path.exists(), "trace.json should be written to disk");
@@ -405,11 +417,7 @@ mod tests {
     #[test]
     fn screenshot_path_format() {
         let recorder = TraceRecorder::new();
-        let action = TraceAction::Click {
-            selector: ".btn".into(),
-            x: 0.0,
-            y: 0.0,
-        };
+        let action = TraceAction::Click { selector: ".btn".into(), x: 0.0, y: 0.0 };
         let path = recorder.screenshot_path_for("my_test", 0, &action);
         let filename = path.file_name().unwrap().to_str().unwrap();
         assert_eq!(filename, "step_001_click.png");

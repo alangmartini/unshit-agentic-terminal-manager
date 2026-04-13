@@ -46,10 +46,7 @@ struct SelectorSegment {
 impl SelectorChain {
     fn new(selector: &str) -> Self {
         Self {
-            segments: vec![SelectorSegment {
-                selector: selector.to_owned(),
-                filters: Vec::new(),
-            }],
+            segments: vec![SelectorSegment { selector: selector.to_owned(), filters: Vec::new() }],
         }
     }
 
@@ -62,10 +59,7 @@ impl SelectorChain {
     }
 
     fn chain(mut self, selector: &str) -> Self {
-        self.segments.push(SelectorSegment {
-            selector: selector.to_owned(),
-            filters: Vec::new(),
-        });
+        self.segments.push(SelectorSegment { selector: selector.to_owned(), filters: Vec::new() });
         self
     }
 
@@ -195,18 +189,12 @@ pub struct Locator<'a> {
 impl<'a> Locator<'a> {
     /// Narrow the search to descendants matching `selector`.
     pub fn locator(self, selector: &str) -> Locator<'a> {
-        Locator {
-            harness: self.harness,
-            chain: self.chain.chain(selector),
-        }
+        Locator { harness: self.harness, chain: self.chain.chain(selector) }
     }
 
     /// Pick the n-th match (0-based).
     pub fn nth(self, index: usize) -> Locator<'a> {
-        Locator {
-            harness: self.harness,
-            chain: self.chain.with_filter(LocatorFilter::Nth(index)),
-        }
+        Locator { harness: self.harness, chain: self.chain.with_filter(LocatorFilter::Nth(index)) }
     }
 
     /// Keep only matches whose text content contains `text`.
@@ -315,9 +303,10 @@ impl<'a> Locator<'a> {
         retry_until(self.harness, DEFAULT_TIMEOUT_FRAMES, move |h| {
             match resolve_first(h, &chain) {
                 Some(id) => {
-                    let e = h.arena().get(id).ok_or_else(|| {
-                        format!("  Locator: {}\n  Node not found in arena", desc)
-                    })?;
+                    let e = h
+                        .arena()
+                        .get(id)
+                        .ok_or_else(|| format!("  Locator: {}\n  Node not found in arena", desc))?;
                     if e.layout_rect.width > 0.0 && e.layout_rect.height > 0.0 {
                         Ok(())
                     } else {
@@ -327,10 +316,9 @@ impl<'a> Locator<'a> {
                         ))
                     }
                 }
-                None => Err(format!(
-                    "  Locator: {}\n  Expected: visible\n  Actual: no matches",
-                    desc
-                )),
+                None => {
+                    Err(format!("  Locator: {}\n  Expected: visible\n  Actual: no matches", desc))
+                }
             }
         });
     }
@@ -426,15 +414,18 @@ impl<'a> Locator<'a> {
             let id = resolve_first(h, &chain).ok_or_else(|| {
                 format!("  Locator: {}\n  Expected class: {:?}\n  Actual: no matches", desc, cls)
             })?;
-            let e = h.arena().get(id).ok_or_else(|| {
-                format!("  Locator: {}\n  Node not found in arena", desc)
-            })?;
+            let e = h
+                .arena()
+                .get(id)
+                .ok_or_else(|| format!("  Locator: {}\n  Node not found in arena", desc))?;
             if e.classes.iter().any(|c| c == &cls) {
                 Ok(())
             } else {
                 Err(format!(
                     "  Locator: {}\n  Expected class: {:?}\n  Actual classes: {:?}",
-                    desc, cls, e.classes.to_vec()
+                    desc,
+                    cls,
+                    e.classes.to_vec()
                 ))
             }
         });
@@ -449,9 +440,10 @@ impl<'a> Locator<'a> {
             let id = resolve_first(h, &chain).ok_or_else(|| {
                 format!("  Locator: {}\n  Expected value: {:?}\n  Actual: no matches", desc, exp)
             })?;
-            let e = h.arena().get(id).ok_or_else(|| {
-                format!("  Locator: {}\n  Node not found in arena", desc)
-            })?;
+            let e = h
+                .arena()
+                .get(id)
+                .ok_or_else(|| format!("  Locator: {}\n  Node not found in arena", desc))?;
             let snap = snapshot_from(id, e);
             if snap.input_value.as_deref() == Some(exp.as_str()) {
                 Ok(())
@@ -487,25 +479,16 @@ impl TestHarness {
     /// The locator is lazy: it does not resolve until an action or assertion
     /// is called. Chaining `.locator()` narrows the search to descendants.
     pub fn locator(&mut self, selector: &str) -> Locator<'_> {
-        Locator {
-            harness: self,
-            chain: SelectorChain::new(selector),
-        }
+        Locator { harness: self, chain: SelectorChain::new(selector) }
     }
 
     /// Create a locator matching elements whose text content equals `text`.
     pub fn locator_by_text(&mut self, text: &str) -> Locator<'_> {
-        Locator {
-            harness: self,
-            chain: SelectorChain::new_by_text(text),
-        }
+        Locator { harness: self, chain: SelectorChain::new_by_text(text) }
     }
 
     /// Create a locator matching elements whose text content contains `text`.
     pub fn locator_by_text_contains(&mut self, text: &str) -> Locator<'_> {
-        Locator {
-            harness: self,
-            chain: SelectorChain::new_by_text_contains(text),
-        }
+        Locator { harness: self, chain: SelectorChain::new_by_text_contains(text) }
     }
 }

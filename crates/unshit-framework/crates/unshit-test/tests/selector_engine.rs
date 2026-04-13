@@ -32,33 +32,23 @@ fn make_tree() -> ElementTree {
                 ElementDef::new(Tag::Div)
                     .with_class("sidebar")
                     .with_child(
-                        ElementDef::new(Tag::Div)
-                            .with_class("menu-item")
-                            .with_class("first"),
+                        ElementDef::new(Tag::Div).with_class("menu-item").with_class("first"),
                     )
                     .with_child(
-                        ElementDef::new(Tag::Div)
-                            .with_class("menu-item")
-                            .with_class("second"),
+                        ElementDef::new(Tag::Div).with_class("menu-item").with_class("second"),
                     )
                     .with_child(
-                        ElementDef::new(Tag::Div)
-                            .with_class("menu-item")
-                            .with_class("third"),
+                        ElementDef::new(Tag::Div).with_class("menu-item").with_class("third"),
                     ),
             )
             .with_child(
                 ElementDef::new(Tag::Div)
                     .with_class("content")
                     .with_child(
-                        ElementDef::new(Tag::Button)
-                            .with_id("submit")
-                            .with_class("primary"),
+                        ElementDef::new(Tag::Button).with_id("submit").with_class("primary"),
                     )
                     .with_child(
-                        ElementDef::new(Tag::Span)
-                            .with_class("label")
-                            .with_text("Click me"),
+                        ElementDef::new(Tag::Span).with_class("label").with_text("Click me"),
                     )
                     .with_child(
                         ElementDef::new(Tag::Input)
@@ -337,7 +327,8 @@ fn deep_descendant_chain() {
 fn mixed_child_and_descendant() {
     let h = TestHarness::new(simple_css(), make_tree, 800.0, 600.0);
     // .root > .content > button#submit
-    let snap =
-        h.query(".root > .content > button#submit").expect("should find via mixed combinator chain");
+    let snap = h
+        .query(".root > .content > button#submit")
+        .expect("should find via mixed combinator chain");
     assert_eq!(snap.id, Some("submit".to_string()));
 }

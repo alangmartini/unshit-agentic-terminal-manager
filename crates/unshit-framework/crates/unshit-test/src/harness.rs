@@ -1,7 +1,4 @@
 use cosmic_text::{FontSystem, SwashCache};
-use unshit_renderer::batch::Rasterizer;
-#[cfg(target_os = "windows")]
-use unshit_renderer::dw_rasterizer::DwRasterizer;
 use unshit_core::dirty::DirtyFlags;
 use unshit_core::element::{SelectOption, SelectState, Tag, *};
 use unshit_core::event::*;
@@ -12,7 +9,10 @@ use unshit_core::style::cascade;
 use unshit_core::style::parse::CompiledStylesheet;
 use unshit_core::style::pseudo::PseudoSideTable;
 use unshit_core::tree::NodeArena;
+use unshit_renderer::batch::Rasterizer;
 use unshit_renderer::batch::{self, BatchCache, ShapedTextCache};
+#[cfg(target_os = "windows")]
+use unshit_renderer::dw_rasterizer::DwRasterizer;
 use unshit_renderer::gpu::GpuContext;
 
 use crate::trace::TraceRecorder;
@@ -67,6 +67,7 @@ impl TestHarness {
             interaction.hovered,
             interaction.active,
             interaction.focused,
+            interaction.focus_via_keyboard,
         );
 
         let mut pseudo_table = PseudoSideTable::new();
@@ -155,6 +156,7 @@ impl TestHarness {
             self.interaction.hovered,
             self.interaction.active,
             self.interaction.focused,
+            self.interaction.focus_via_keyboard,
             None,
             None,
         );
@@ -193,6 +195,7 @@ impl TestHarness {
                 self.interaction.hovered,
                 self.interaction.active,
                 self.interaction.focused,
+                self.interaction.focus_via_keyboard,
             );
 
             unshit_core::build::resolve_pseudo_elements(
@@ -550,8 +553,17 @@ pub(crate) fn resolve_all_styles(
     hovered: NodeId,
     active: Option<NodeId>,
     focused: NodeId,
+    focus_via_keyboard: bool,
 ) {
-    let new_style = cascade::resolve_style(arena, stylesheet, node_id, hovered, active, focused);
+    let new_style = cascade::resolve_style_fv(
+        arena,
+        stylesheet,
+        node_id,
+        hovered,
+        active,
+        focused,
+        focus_via_keyboard,
+    );
     let children = arena.children(node_id);
 
     if let Some(element) = arena.get_mut(node_id) {
@@ -559,7 +571,15 @@ pub(crate) fn resolve_all_styles(
     }
 
     for child_id in children {
-        resolve_all_styles(arena, stylesheet, child_id, hovered, active, focused);
+        resolve_all_styles(
+            arena,
+            stylesheet,
+            child_id,
+            hovered,
+            active,
+            focused,
+            focus_via_keyboard,
+        );
     }
 }
 

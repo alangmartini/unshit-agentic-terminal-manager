@@ -186,6 +186,11 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     // Transfer lifecycle hooks. on_mount is NOT re-fired on update (only on initial build).
     // on_unmount is updated so the latest closure fires when the node is eventually removed.
     element.on_unmount = def.on_unmount.clone();
+    // Transfer inline style overrides. Since StyleDeclaration does not derive
+    // PartialEq, mark LAYOUT dirty whenever either side is non-empty.
+    let overrides_changed =
+        !element.style_overrides.is_empty() || !def.style_overrides.is_empty();
+    element.style_overrides = def.style_overrides.clone();
     // Transfer node_ref and refresh the stored NodeId in case the ref changed.
     if let Some(nr) = def.node_ref.clone() {
         nr.set(node_id);
@@ -206,7 +211,8 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     }
 
     let style_dirty = id_changed || classes_changed;
-    let layout_dirty = content_changed || tab_index_changed || captures_keyboard_changed;
+    let layout_dirty =
+        content_changed || tab_index_changed || captures_keyboard_changed || overrides_changed;
 
     if style_dirty {
         element.dirty |= DirtyFlags::STYLE;
@@ -440,6 +446,7 @@ pub fn build_subtree(
     element.input_state.checked = def.checked;
     element.on_mount = def.on_mount.clone();
     element.on_unmount = def.on_unmount.clone();
+    element.style_overrides = def.style_overrides.clone();
 
     // For select elements: populate SelectState from the def's options list.
     // Option-tag children are consumed here and NOT added to the arena tree.

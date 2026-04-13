@@ -15,11 +15,7 @@ fn simple_harness() -> TestHarness {
             root: ElementDef::new(Tag::Div)
                 .with_class("root")
                 .with_child(ElementDef::new(Tag::Div).with_class("box"))
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("label")
-                        .with_text("Count: 5"),
-                )
+                .with_child(ElementDef::new(Tag::Span).with_class("label").with_text("Count: 5"))
                 .with_child(ElementDef::new(Tag::Div).with_class("hidden"))
                 .with_child(ElementDef::new(Tag::Div).with_class("item").with_class("active"))
                 .with_child(ElementDef::new(Tag::Div).with_class("item"))
@@ -177,9 +173,7 @@ fn expect_count_fails() {
 #[test]
 fn expect_element_custom_predicate_passes() {
     let mut h = simple_harness();
-    h.expect_element(".box", |snap| {
-        snap.layout_rect.width >= 100.0
-    });
+    h.expect_element(".box", |snap| snap.layout_rect.width >= 100.0);
 }
 
 #[test]
@@ -200,14 +194,12 @@ fn expect_checked_passes() {
     let mut h = TestHarness::new(
         css,
         || ElementTree {
-            root: ElementDef::new(Tag::Div)
-                .with_class("root")
-                .with_child(
-                    ElementDef::new(Tag::Input)
-                        .with_class("cb")
-                        .with_input_type(InputType::Checkbox)
-                        .with_checked(true),
-                ),
+            root: ElementDef::new(Tag::Div).with_class("root").with_child(
+                ElementDef::new(Tag::Input)
+                    .with_class("cb")
+                    .with_input_type(InputType::Checkbox)
+                    .with_checked(true),
+            ),
         },
         800.0,
         600.0,
@@ -224,14 +216,12 @@ fn expect_not_checked_passes() {
     let mut h = TestHarness::new(
         css,
         || ElementTree {
-            root: ElementDef::new(Tag::Div)
-                .with_class("root")
-                .with_child(
-                    ElementDef::new(Tag::Input)
-                        .with_class("cb")
-                        .with_input_type(InputType::Checkbox)
-                        .with_checked(false),
-                ),
+            root: ElementDef::new(Tag::Div).with_class("root").with_child(
+                ElementDef::new(Tag::Input)
+                    .with_class("cb")
+                    .with_input_type(InputType::Checkbox)
+                    .with_checked(false),
+            ),
         },
         800.0,
         600.0,
@@ -252,11 +242,7 @@ fn expect_value_passes_for_input() {
         || ElementTree {
             root: ElementDef::new(Tag::Div)
                 .with_class("root")
-                .with_child(
-                    ElementDef::new(Tag::Input)
-                        .with_class("inp")
-                        .with_tab_index(0),
-                ),
+                .with_child(ElementDef::new(Tag::Input).with_class("inp").with_tab_index(0)),
         },
         800.0,
         600.0,
@@ -282,11 +268,7 @@ fn expect_focused_passes() {
         || ElementTree {
             root: ElementDef::new(Tag::Div)
                 .with_class("root")
-                .with_child(
-                    ElementDef::new(Tag::Input)
-                        .with_class("inp")
-                        .with_tab_index(0),
-                ),
+                .with_child(ElementDef::new(Tag::Input).with_class("inp").with_tab_index(0)),
         },
         800.0,
         600.0,
@@ -329,14 +311,12 @@ fn expect_text_collects_from_children() {
     let mut h = TestHarness::new(
         css,
         || ElementTree {
-            root: ElementDef::new(Tag::Div)
-                .with_class("root")
-                .with_child(
-                    ElementDef::new(Tag::Div)
-                        .with_class("container")
-                        .with_child(ElementDef::new(Tag::Span).with_text("Hello "))
-                        .with_child(ElementDef::new(Tag::Span).with_text("World")),
-                ),
+            root: ElementDef::new(Tag::Div).with_class("root").with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("container")
+                    .with_child(ElementDef::new(Tag::Span).with_text("Hello "))
+                    .with_child(ElementDef::new(Tag::Span).with_text("World")),
+            ),
         },
         800.0,
         600.0,

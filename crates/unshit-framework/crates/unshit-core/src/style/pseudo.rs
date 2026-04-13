@@ -265,6 +265,7 @@ fn resolve_pseudo_slot(
         hovered,
         active,
         focused,
+        false,
         Some(slot),
     );
 
@@ -758,9 +759,8 @@ mod tests {
             &mut table,
         );
 
-        let before_id = table
-            .get(root, PseudoElement::Before)
-            .expect("before pseudo-element should exist");
+        let before_id =
+            table.get(root, PseudoElement::Before).expect("before pseudo-element should exist");
         let before_elem = arena.get(before_id).unwrap();
         assert_eq!(
             before_elem.computed_style.position,
@@ -770,23 +770,24 @@ mod tests {
 
         // Run the full layout pipeline.
         let mut font_system = cosmic_text::FontSystem::new();
-        crate::layout::sync_element_to_taffy(
-            &mut arena, &mut taffy, root, &mut font_system,
-        );
+        crate::layout::sync_element_to_taffy(&mut arena, &mut taffy, root, &mut font_system);
 
         let root_taffy = arena.get(root).unwrap().taffy_node.unwrap();
         let mut cache = crate::layout::TextMeasureCache::default();
         crate::layout::compute_layout(
-            &mut taffy, root_taffy, 100.0, 100.0, &mut font_system, &mut cache,
+            &mut taffy,
+            root_taffy,
+            100.0,
+            100.0,
+            &mut font_system,
+            &mut cache,
         );
         crate::layout::read_layout_results(&mut arena, &taffy, root, 0.0, 0.0);
 
         // Collect user (non-synthetic) children.
         let children = arena.children(root);
-        let user_children: Vec<NodeId> = children
-            .into_iter()
-            .filter(|id| !arena.get(*id).unwrap().synthetic)
-            .collect();
+        let user_children: Vec<NodeId> =
+            children.into_iter().filter(|id| !arena.get(*id).unwrap().synthetic).collect();
         assert_eq!(user_children.len(), 2, "should have exactly 2 user children");
 
         // With the pseudo-element out of flow, each child should get 50px
@@ -800,7 +801,8 @@ mod tests {
                 (h - 50.0).abs() < 1.0,
                 "child {} should be ~50px tall (got {:.1}px); pseudo-element \
                  is incorrectly participating in flex layout",
-                i, h,
+                i,
+                h,
             );
         }
 
@@ -835,9 +837,8 @@ mod tests {
             &mut table,
         );
 
-        let placeholder_id = table
-            .get(root, PseudoElement::Placeholder)
-            .expect("placeholder node should exist");
+        let placeholder_id =
+            table.get(root, PseudoElement::Placeholder).expect("placeholder node should exist");
 
         let placeholder_elem = arena.get(placeholder_id).expect("placeholder element");
         assert!(placeholder_elem.synthetic);

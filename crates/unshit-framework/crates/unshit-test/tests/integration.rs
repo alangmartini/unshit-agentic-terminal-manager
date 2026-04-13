@@ -87,12 +87,7 @@ fn full_counter_flow() {
     let c = click_count.clone();
     let i = inc_cb.clone();
     let d = dec_cb.clone();
-    let mut h = TestHarness::new(
-        APP_CSS,
-        move || counter_tree(&c, &i, &d),
-        400.0,
-        300.0,
-    );
+    let mut h = TestHarness::new(APP_CSS, move || counter_tree(&c, &i, &d), 400.0, 300.0);
 
     h.expect_text(".counter-display", "Count: 0");
     h.expect_visible(".btn.inc");
@@ -252,39 +247,25 @@ fn selector_locator_chaining_nested_cards() {
                     ElementDef::new(Tag::Div)
                         .with_class("card")
                         .with_child(
-                            ElementDef::new(Tag::Span)
-                                .with_class("title")
-                                .with_text("Card A"),
+                            ElementDef::new(Tag::Span).with_class("title").with_text("Card A"),
                         )
                         .with_child(
-                            ElementDef::new(Tag::Button)
-                                .with_class("action")
-                                .with_text("Edit"),
+                            ElementDef::new(Tag::Button).with_class("action").with_text("Edit"),
                         ),
                 )
                 .with_child(
                     ElementDef::new(Tag::Div)
                         .with_class("card")
                         .with_child(
-                            ElementDef::new(Tag::Span)
-                                .with_class("title")
-                                .with_text("Card B"),
+                            ElementDef::new(Tag::Span).with_class("title").with_text("Card B"),
                         )
                         .with_child(
-                            ElementDef::new(Tag::Button)
-                                .with_class("action")
-                                .with_text("Delete"),
+                            ElementDef::new(Tag::Button).with_class("action").with_text("Delete"),
                         ),
                 )
-                .with_child(
-                    ElementDef::new(Tag::Div)
-                        .with_class("card")
-                        .with_child(
-                            ElementDef::new(Tag::Span)
-                                .with_class("title")
-                                .with_text("Card C"),
-                        ),
-                ),
+                .with_child(ElementDef::new(Tag::Div).with_class("card").with_child(
+                    ElementDef::new(Tag::Span).with_class("title").with_text("Card C"),
+                )),
         },
         600.0,
         500.0,
@@ -432,18 +413,9 @@ fn trace_recording_captures_actions() {
     assert!(steps.len() >= 3, "expected at least 3 traced steps, got {}", steps.len());
 
     // Verify action types in order
-    assert!(
-        matches!(steps[0].action, TraceAction::Click { .. }),
-        "first step should be Click"
-    );
-    assert!(
-        matches!(steps[1].action, TraceAction::Hover { .. }),
-        "second step should be Hover"
-    );
-    assert!(
-        matches!(steps[2].action, TraceAction::Fill { .. }),
-        "third step should be Fill"
-    );
+    assert!(matches!(steps[0].action, TraceAction::Click { .. }), "first step should be Click");
+    assert!(matches!(steps[1].action, TraceAction::Hover { .. }), "second step should be Hover");
+    assert!(matches!(steps[2].action, TraceAction::Fill { .. }), "third step should be Fill");
 
     // Verify selectors are recorded
     if let TraceAction::Click { ref selector, .. } = steps[0].action {
@@ -461,11 +433,7 @@ fn trace_disabled_records_nothing() {
         || ElementTree {
             root: ElementDef::new(Tag::Div)
                 .with_class("app")
-                .with_child(
-                    ElementDef::new(Tag::Button)
-                        .with_class("btn")
-                        .with_text("Click"),
-                ),
+                .with_child(ElementDef::new(Tag::Button).with_class("btn").with_text("Click")),
         },
         400.0,
         300.0,
@@ -485,13 +453,11 @@ fn trace_disabled_records_nothing() {
 fn value_display_tree(counter: &Arc<AtomicU32>) -> ElementTree {
     let val = counter.load(Ordering::SeqCst);
     ElementTree {
-        root: ElementDef::new(Tag::Div)
-            .with_class("app")
-            .with_child(
-                ElementDef::new(Tag::Span)
-                    .with_class("counter-display")
-                    .with_text(format!("Value: {}", val)),
-            ),
+        root: ElementDef::new(Tag::Div).with_class("app").with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("counter-display")
+                .with_text(format!("Value: {}", val)),
+        ),
     }
 }
 
@@ -500,12 +466,7 @@ fn assertion_retry_after_rebuild() {
     let counter = Arc::new(AtomicU32::new(0));
 
     let c = counter.clone();
-    let mut h = TestHarness::new(
-        APP_CSS,
-        move || value_display_tree(&c),
-        400.0,
-        300.0,
-    );
+    let mut h = TestHarness::new(APP_CSS, move || value_display_tree(&c), 400.0, 300.0);
 
     h.expect_text(".counter-display", "Value: 0");
 
@@ -530,21 +491,9 @@ fn test_app_full_flow() {
         || ElementTree {
             root: ElementDef::new(Tag::Div)
                 .with_class("app")
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("header")
-                        .with_text("My App"),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Input)
-                        .with_class("field")
-                        .with_tab_index(1),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Button)
-                        .with_class("btn")
-                        .with_text("Go"),
-                ),
+                .with_child(ElementDef::new(Tag::Span).with_class("header").with_text("My App"))
+                .with_child(ElementDef::new(Tag::Input).with_class("field").with_tab_index(1))
+                .with_child(ElementDef::new(Tag::Button).with_class("btn").with_text("Go")),
         },
         400.0,
         300.0,
@@ -580,13 +529,9 @@ fn ui_test_macro_integration() {
     let mut h = TestHarness::new(
         APP_CSS,
         || ElementTree {
-            root: ElementDef::new(Tag::Div)
-                .with_class("app")
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("title")
-                        .with_text("Hello from ui_test"),
-                ),
+            root: ElementDef::new(Tag::Div).with_class("app").with_child(
+                ElementDef::new(Tag::Span).with_class("title").with_text("Hello from ui_test"),
+            ),
         },
         400.0,
         200.0,
@@ -604,21 +549,14 @@ fn ui_test_macro_with_config_integration() {
         || ElementTree {
             root: ElementDef::new(Tag::Div)
                 .with_class("app")
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("label")
-                        .with_text("configured"),
-                ),
+                .with_child(ElementDef::new(Tag::Span).with_class("label").with_text("configured")),
         },
         400.0,
         200.0,
     );
 
     let snap = h.query(".label").unwrap();
-    assert_eq!(
-        snap.content,
-        ElementContent::Text("configured".to_string())
-    );
+    assert_eq!(snap.content, ElementContent::Text("configured".to_string()));
 }
 
 // ===========================================================================
@@ -633,25 +571,23 @@ fn select_dropdown_full_flow() {
     let mut h = TestHarness::new(
         APP_CSS,
         move || ElementTree {
-            root: ElementDef::new(Tag::Div)
-                .with_class("app")
-                .with_child(
-                    ElementDef::new(Tag::Select)
-                        .with_class("select")
-                        .with_class("size")
-                        .with_options(vec![
-                            ("small".into(), "Small".into()),
-                            ("medium".into(), "Medium".into()),
-                            ("large".into(), "Large".into()),
-                        ])
-                        .with_selected_index(0)
-                        .on_change({
-                            let s = selected_cb.clone();
-                            move |val| {
-                                *s.lock().unwrap() = val.to_string();
-                            }
-                        }),
-                ),
+            root: ElementDef::new(Tag::Div).with_class("app").with_child(
+                ElementDef::new(Tag::Select)
+                    .with_class("select")
+                    .with_class("size")
+                    .with_options(vec![
+                        ("small".into(), "Small".into()),
+                        ("medium".into(), "Medium".into()),
+                        ("large".into(), "Large".into()),
+                    ])
+                    .with_selected_index(0)
+                    .on_change({
+                        let s = selected_cb.clone();
+                        move |val| {
+                            *s.lock().unwrap() = val.to_string();
+                        }
+                    }),
+            ),
         },
         400.0,
         300.0,
@@ -695,14 +631,8 @@ fn existence_and_visibility_assertions() {
         || ElementTree {
             root: ElementDef::new(Tag::Div)
                 .with_class("app")
-                .with_child(
-                    ElementDef::new(Tag::Div)
-                        .with_class("visible-box"),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Div)
-                        .with_class("zero-box"),
-                ),
+                .with_child(ElementDef::new(Tag::Div).with_class("visible-box"))
+                .with_child(ElementDef::new(Tag::Div).with_class("zero-box")),
         },
         400.0,
         300.0,
@@ -735,20 +665,18 @@ fn input_type_and_key_press() {
     let mut h = TestHarness::new(
         APP_CSS,
         move || ElementTree {
-            root: ElementDef::new(Tag::Div)
-                .with_class("app")
-                .with_child(
-                    ElementDef::new(Tag::Input)
-                        .with_class("field")
-                        .with_class("search")
-                        .with_tab_index(1)
-                        .on_submit({
-                            let s = submitted_cb.clone();
-                            move |val| {
-                                *s.lock().unwrap() = val.to_string();
-                            }
-                        }),
-                ),
+            root: ElementDef::new(Tag::Div).with_class("app").with_child(
+                ElementDef::new(Tag::Input)
+                    .with_class("field")
+                    .with_class("search")
+                    .with_tab_index(1)
+                    .on_submit({
+                        let s = submitted_cb.clone();
+                        move |val| {
+                            *s.lock().unwrap() = val.to_string();
+                        }
+                    }),
+            ),
         },
         400.0,
         200.0,
@@ -859,11 +787,7 @@ fn rebuild_re_resolves_locators() {
         || ElementTree {
             root: ElementDef::new(Tag::Div)
                 .with_class("app")
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("title")
-                        .with_text("Before"),
-                ),
+                .with_child(ElementDef::new(Tag::Span).with_class("title").with_text("Before")),
         },
         400.0,
         200.0,
@@ -876,16 +800,8 @@ fn rebuild_re_resolves_locators() {
     h.rebuild(|| ElementTree {
         root: ElementDef::new(Tag::Div)
             .with_class("app")
-            .with_child(
-                ElementDef::new(Tag::Span)
-                    .with_class("title")
-                    .with_text("After"),
-            )
-            .with_child(
-                ElementDef::new(Tag::Div)
-                    .with_class("card")
-                    .with_text("New card"),
-            ),
+            .with_child(ElementDef::new(Tag::Span).with_class("title").with_text("After"))
+            .with_child(ElementDef::new(Tag::Div).with_class("card").with_text("New card")),
     });
 
     // Locators re-resolve against current tree

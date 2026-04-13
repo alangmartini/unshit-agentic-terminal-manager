@@ -180,6 +180,7 @@ impl TestHarness {
             .unwrap_or(NodeId::DANGLING);
         if new_focused != self.interaction.focused {
             self.interaction.focused = new_focused;
+            self.interaction.focus_via_keyboard = false;
             self.needs_restyle = true;
         }
 
@@ -379,6 +380,7 @@ impl TestHarness {
         if let Some(id) = next_focusable(&self.arena, self.root, self.interaction.focused) {
             if id != self.interaction.focused {
                 self.interaction.focused = id;
+                self.interaction.focus_via_keyboard = true;
                 self.needs_restyle = true;
             }
         }
@@ -389,6 +391,7 @@ impl TestHarness {
         if let Some(id) = prev_focusable(&self.arena, self.root, self.interaction.focused) {
             if id != self.interaction.focused {
                 self.interaction.focused = id;
+                self.interaction.focus_via_keyboard = true;
                 self.needs_restyle = true;
             }
         }

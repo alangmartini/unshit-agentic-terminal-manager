@@ -100,10 +100,7 @@ impl DwRasterizer {
             return None;
         }
 
-        let metrics = self
-            .font_face
-            .design_glyph_metrics(&[glyph_index], false)
-            .ok()?;
+        let metrics = self.font_face.design_glyph_metrics(&[glyph_index], false).ok()?;
         let gm = &metrics[0];
 
         let scale = pixel_size / self.design_units_per_em as f32;
@@ -116,9 +113,7 @@ impl DwRasterizer {
         let baseline_x = pad as f32;
         let baseline_y = (pixel_size * 1.3).round();
 
-        let rt = self
-            .gdi_interop
-            .create_bitmap_render_target(rt_width, rt_height);
+        let rt = self.gdi_interop.create_bitmap_render_target(rt_width, rt_height);
         rt.set_pixels_per_dip(1.0);
 
         let rect = rt.draw_glyph_run(
@@ -129,10 +124,7 @@ impl DwRasterizer {
             pixel_size,
             &[glyph_index],
             &[0.0_f32],
-            &[GlyphOffset {
-                advanceOffset: 0.0,
-                ascenderOffset: 0.0,
-            }],
+            &[GlyphOffset { advanceOffset: 0.0, ascenderOffset: 0.0 }],
             &self.rendering_params,
             &(255.0, 255.0, 255.0),
         );
@@ -246,11 +238,7 @@ mod tests {
     fn dw_advance_width_is_positive() {
         let dw = DwRasterizer::new("Consolas");
         let advance = dw.measure_advance_width('M', 14.0);
-        assert!(
-            advance > 0.0,
-            "advance width for 'M' at 14px must be positive, got {}",
-            advance
-        );
+        assert!(advance > 0.0, "advance width for 'M' at 14px must be positive, got {}", advance);
     }
 
     // Regression: issue #17. In a monospace font every character must

@@ -9,6 +9,7 @@ use crate::style::cascade;
 use crate::style::parse::CompiledStylesheet;
 use crate::style::pseudo::{self, PseudoSideTable};
 use crate::style::transition::{self, ActiveTransitions};
+use crate::style::types::Dimension;
 use crate::tree::NodeArena;
 use cosmic_text::FontSystem;
 use std::time::Instant;
@@ -111,7 +112,7 @@ pub fn resolve_all_styles(
     focused: NodeId,
 ) {
     resolve_all_styles_with_transitions(
-        arena, stylesheet, node_id, hovered, active, focused, None, None,
+        arena, stylesheet, node_id, hovered, active, focused, false, None, None,
     );
 }
 
@@ -164,13 +165,21 @@ pub fn resolve_all_styles_with_transitions(
     hovered: NodeId,
     active: Option<NodeId>,
     focused: NodeId,
+    focus_via_keyboard: bool,
     now: Option<Instant>,
     mut active_transitions: Option<&mut ActiveTransitions>,
 ) {
-    let new_style = cascade::resolve_style(arena, stylesheet, node_id, hovered, active, focused);
-    let sel_style = cascade::resolve_selection_style(
-        arena, stylesheet, node_id, hovered, active, focused,
+    let new_style = cascade::resolve_style_fv(
+        arena,
+        stylesheet,
+        node_id,
+        hovered,
+        active,
+        focused,
+        focus_via_keyboard,
     );
+    let sel_style =
+        cascade::resolve_selection_style(arena, stylesheet, node_id, hovered, active, focused);
     let children = arena.children(node_id);
 
     if let Some(element) = arena.get_mut(node_id) {
@@ -195,6 +204,20 @@ pub fn resolve_all_styles_with_transitions(
 
         element.computed_style = new_style;
         element.selection_style = sel_style;
+        // Apply inline style overrides (highest precedence, post-cascade).
+        for decl in &element.style_overrides {
+            crate::style::parse::apply_declaration(&mut element.computed_style, decl);
+        }
+
+        // Apply user-driven resize overrides (from CSS resize drag) so they
+        // persist across style recalculations.
+        if let Some(w) = element.resize_override_width {
+            element.computed_style.width = Dimension::Px(w);
+        }
+        if let Some(h) = element.resize_override_height {
+            element.computed_style.height = Dimension::Px(h);
+        }
+
         // Clear style dirty flags now that this node has been processed.
         element.dirty.remove(DirtyFlags::STYLE | DirtyFlags::SUBTREE_STYLE);
     }
@@ -214,7 +237,14 @@ pub fn resolve_all_styles_with_transitions(
         // so we use a raw pointer trick or just handle it differently.
         // Actually, Option<&mut T> can be reborrowed:
         resolve_all_styles_with_transitions(
-            arena, stylesheet, child_id, hovered, active, focused, now,
+            arena,
+            stylesheet,
+            child_id,
+            hovered,
+            active,
+            focused,
+            focus_via_keyboard,
+            now,
             None, // Children track themselves individually.
         );
         // After resolving child, check if it has active transitions and track it.
@@ -245,6 +275,7 @@ pub fn resolve_dirty_styles_with_transitions(
     hovered: NodeId,
     active: Option<NodeId>,
     focused: NodeId,
+    focus_via_keyboard: bool,
     now: Option<Instant>,
     mut active_transitions: Option<&mut ActiveTransitions>,
 ) {
@@ -268,7 +299,15 @@ pub fn resolve_dirty_styles_with_transitions(
         arena.get(node_id).map(|e| e.dirty.contains(DirtyFlags::STYLE)).unwrap_or(false);
 
     let new_style = if node_style_dirty {
-        Some(cascade::resolve_style(arena, stylesheet, node_id, hovered, active, focused))
+        Some(cascade::resolve_style_fv(
+            arena,
+            stylesheet,
+            node_id,
+            hovered,
+            active,
+            focused,
+            focus_via_keyboard,
+        ))
     } else {
         None
     };
@@ -303,6 +342,19 @@ pub fn resolve_dirty_styles_with_transitions(
 
             element.computed_style = new_style;
             element.selection_style = sel_style;
+            // Apply inline style overrides (highest precedence, post-cascade).
+            for decl in &element.style_overrides {
+                crate::style::parse::apply_declaration(&mut element.computed_style, decl);
+            }
+
+            // Apply user-driven resize overrides (from CSS resize drag).
+            if let Some(w) = element.resize_override_width {
+                element.computed_style.width = Dimension::Px(w);
+            }
+            if let Some(h) = element.resize_override_height {
+                element.computed_style.height = Dimension::Px(h);
+            }
+
             // Clear the node's own STYLE flag now that it has been resolved.
             element.dirty.remove(DirtyFlags::STYLE);
         }
@@ -320,7 +372,14 @@ pub fn resolve_dirty_styles_with_transitions(
     // We need to reborrow for recursion since active_transitions is &mut.
     for child_id in children {
         resolve_dirty_styles_with_transitions(
-            arena, stylesheet, child_id, hovered, active, focused, now,
+            arena,
+            stylesheet,
+            child_id,
+            hovered,
+            active,
+            focused,
+            focus_via_keyboard,
+            now,
             None, // Children track themselves individually.
         );
         // After resolving child, check if it has active transitions and track it.
@@ -589,6 +648,7 @@ mod tests {
             root, // hovered
             None,
             NodeId::DANGLING,
+            false,
             Some(now),
             Some(&mut at),
         );
@@ -627,6 +687,7 @@ mod tests {
             root,
             None,
             NodeId::DANGLING,
+            false,
             Some(now),
             Some(&mut at),
         );
@@ -673,6 +734,7 @@ mod tests {
             root,
             None,
             NodeId::DANGLING,
+            false,
             Some(now),
             Some(&mut at),
         );
@@ -716,6 +778,7 @@ mod tests {
             root,
             None,
             NodeId::DANGLING,
+            false,
             Some(now),
             Some(&mut at),
         );
@@ -751,6 +814,7 @@ mod tests {
             root,
             None,
             NodeId::DANGLING,
+            false,
             Some(now),
             Some(&mut at),
         );
@@ -788,6 +852,7 @@ mod tests {
             root,
             None,
             NodeId::DANGLING,
+            false,
             Some(now),
             Some(&mut at),
         );

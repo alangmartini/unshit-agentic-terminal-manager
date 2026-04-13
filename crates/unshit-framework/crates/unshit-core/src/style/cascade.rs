@@ -13,7 +13,29 @@ pub fn resolve_style(
     active: Option<NodeId>,
     focused: NodeId,
 ) -> ComputedStyle {
-    resolve_style_with_pseudo(arena, stylesheet, node_id, hovered, active, focused, None)
+    resolve_style_with_pseudo(arena, stylesheet, node_id, hovered, active, focused, false, None)
+}
+
+/// Variant that passes through `focus_via_keyboard` for `:focus-visible`.
+pub fn resolve_style_fv(
+    arena: &NodeArena,
+    stylesheet: &CompiledStylesheet,
+    node_id: NodeId,
+    hovered: NodeId,
+    active: Option<NodeId>,
+    focused: NodeId,
+    focus_via_keyboard: bool,
+) -> ComputedStyle {
+    resolve_style_with_pseudo(
+        arena,
+        stylesheet,
+        node_id,
+        hovered,
+        active,
+        focused,
+        focus_via_keyboard,
+        None,
+    )
 }
 
 /// Resolve styles for `node_id`. When `pseudo_target` is `Some(pe)`, this
@@ -28,6 +50,7 @@ pub fn resolve_style_with_pseudo(
     hovered: NodeId,
     active: Option<NodeId>,
     focused: NodeId,
+    focus_via_keyboard: bool,
     pseudo_target: Option<PseudoElement>,
 ) -> ComputedStyle {
     let Some(element) = arena.get(node_id) else {
@@ -47,7 +70,16 @@ pub fn resolve_style_with_pseudo(
         if rule_pseudo != pseudo_target {
             continue;
         }
-        if selector_matches(&rule.selector, element, arena, node_id, hovered, active, focused) {
+        if selector_matches(
+            &rule.selector,
+            element,
+            arena,
+            node_id,
+            hovered,
+            active,
+            focused,
+            focus_via_keyboard,
+        ) {
             for decl in &rule.declarations {
                 apply_declaration(&mut style, decl);
             }
@@ -73,7 +105,16 @@ pub fn resolve_selection_style(
         if rule.selector.pseudo_element() != Some(PseudoElement::Selection) {
             continue;
         }
-        if selector_matches(&rule.selector, element, arena, node_id, hovered, active, focused) {
+        if selector_matches(
+            &rule.selector,
+            element,
+            arena,
+            node_id,
+            hovered,
+            active,
+            focused,
+            false,
+        ) {
             matched = true;
             for decl in &rule.declarations {
                 match decl {
@@ -99,13 +140,23 @@ fn selector_matches(
     hovered: NodeId,
     active: Option<NodeId>,
     focused: NodeId,
+    focus_via_keyboard: bool,
 ) -> bool {
     if chain.parts.is_empty() {
         return false;
     }
 
     let (ref last_parts, _) = chain.parts[chain.parts.len() - 1];
-    if !parts_match(last_parts, element, arena, node_id, hovered, active, focused) {
+    if !parts_match(
+        last_parts,
+        element,
+        arena,
+        node_id,
+        hovered,
+        active,
+        focused,
+        focus_via_keyboard,
+    ) {
         return false;
     }
 
@@ -119,7 +170,16 @@ fn selector_matches(
     while part_idx >= 0 && !current.is_dangling() {
         let (ref parts, ref _combinator) = chain.parts[part_idx as usize];
         if let Some(ancestor) = arena.get(current) {
-            if parts_match(parts, ancestor, arena, current, hovered, active, focused) {
+            if parts_match(
+                parts,
+                ancestor,
+                arena,
+                current,
+                hovered,
+                active,
+                focused,
+                focus_via_keyboard,
+            ) {
                 part_idx -= 1;
                 current = ancestor.parent;
             } else {
@@ -150,6 +210,7 @@ fn parts_match(
     hovered: NodeId,
     active: Option<NodeId>,
     focused: NodeId,
+    focus_via_keyboard: bool,
 ) -> bool {
     for part in parts {
         match part {
@@ -191,6 +252,20 @@ fn parts_match(
                 PseudoClass::Focus => {
                     // :focus only matches the exact focused element, not ancestors
                     if node_id != focused {
+                        return false;
+                    }
+                }
+                PseudoClass::FocusVisible => {
+                    // :focus-visible matches the focused element only when focus
+                    // was gained via keyboard (Tab), not mouse click.
+                    if node_id != focused || !focus_via_keyboard {
+                        return false;
+                    }
+                }
+                PseudoClass::FocusWithin => {
+                    // :focus-within matches when this node is the focused element
+                    // or an ancestor of the focused element.
+                    if !is_or_ancestor_of(arena, node_id, focused) {
                         return false;
                     }
                 }
