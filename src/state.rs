@@ -88,6 +88,12 @@ pub struct TerminalTab {
     pub name: String,
     pub subtitle: String,
     pub status: TabStatus,
+    /// Per-tab pane layout. Stored when the tab is inactive; the live
+    /// `AppState` fields are used when the tab is active.
+    pub panes: Vec<Vec<Pane>>,
+    pub active_pane: PaneId,
+    pub row_ratios: Vec<f32>,
+    pub col_ratios: Vec<Vec<f32>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -419,13 +425,6 @@ pub fn seed_state() -> AppState {
         },
     ];
 
-    let tabs = vec![TerminalTab {
-        id: "t1".to_string(),
-        name: "shell".to_string(),
-        subtitle: "bash".to_string(),
-        status: TabStatus::Running,
-    }];
-
     let default_pane = Pane {
         id: PaneId(1),
         title: "shell".to_string(),
@@ -433,7 +432,18 @@ pub fn seed_state() -> AppState {
         pid: 0,
         cpu: 0.0,
     };
-    let panes = vec![vec![default_pane]];
+    let panes = vec![vec![default_pane.clone()]];
+
+    let tabs = vec![TerminalTab {
+        id: "t1".to_string(),
+        name: "shell".to_string(),
+        subtitle: "bash".to_string(),
+        status: TabStatus::Running,
+        panes: panes.clone(),
+        active_pane: PaneId(1),
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    }];
 
     let mut toggles = BTreeMap::new();
     toggles.insert("restore-on-startup".to_string(), true);
@@ -486,31 +496,127 @@ where
     f(&mut guard)
 }
 
+fn save_tab_state(state: &mut AppState) {
+    let tab = &mut state.tabs[state.active_tab];
+    tab.panes = state.panes.clone();
+    tab.active_pane = state.active_pane;
+    tab.row_ratios = state.row_ratios.clone();
+    tab.col_ratios = state.col_ratios.clone();
+}
+
+fn load_tab_state(state: &mut AppState) {
+    let tab = &state.tabs[state.active_tab];
+    state.panes = tab.panes.clone();
+    state.active_pane = tab.active_pane;
+    state.row_ratios = tab.row_ratios.clone();
+    state.col_ratios = tab.col_ratios.clone();
+}
+
+pub fn mutate_switch_tab(state: &mut AppState, new_index: usize) {
+    if new_index >= state.tabs.len() || new_index == state.active_tab {
+        return;
+    }
+    save_tab_state(state);
+    state.active_tab = new_index;
+    load_tab_state(state);
+}
+
 pub fn mutate_add_tab(state: &mut AppState) {
+    save_tab_state(state);
+
     let id_num = state.next_id;
     state.next_id += 1;
-    let id = format!("t{}", id_num);
-    state.tabs.push(TerminalTab {
-        id,
+    let pane_id = PaneId(id_num);
+
+    // Compute PTY dimensions from current cell metrics.
+    let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w();
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let (cols, rows) = compute_pty_dimensions(
+        state.last_grid_width,
+        state.last_grid_height,
+        cell_w,
+        cell_h,
+    );
+
+    // Spawn PTY eagerly so the terminal is live immediately.
+    let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+    match state.pty_manager.spawn(id_num, cols, rows) {
+        Ok(reader) => {
+            state.terminals.insert(id_num, terminal);
+            crate::bridge::register_reader(id_num, reader);
+        }
+        Err(e) => {
+            log::error!("failed to spawn PTY for new tab pane {}: {}", id_num, e);
+            terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
+            state.terminals.insert(id_num, terminal);
+        }
+    }
+
+    let pane = Pane {
+        id: pane_id,
+        title: "shell".to_string(),
+        subtitle: "bash".to_string(),
+        pid: 0,
+        cpu: 0.0,
+    };
+
+    let tab = TerminalTab {
+        id: format!("t{}", id_num),
         name: "shell".to_string(),
         subtitle: "bash".to_string(),
         status: TabStatus::Running,
-    });
+        panes: vec![vec![pane.clone()]],
+        active_pane: pane_id,
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+
+    state.tabs.push(tab);
     state.active_tab = state.tabs.len() - 1;
+
+    // Load the new tab's pane state into the live fields.
+    state.panes = vec![vec![pane]];
+    state.active_pane = pane_id;
+    state.row_ratios = vec![1.0];
+    state.col_ratios = vec![vec![1.0]];
 }
 
 pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     if index >= state.tabs.len() {
         return;
     }
+
+    let is_active = state.active_tab == index;
+
+    // Collect pane IDs to destroy: live fields for the active tab,
+    // stored fields for a background tab.
+    let pane_ids: Vec<u32> = if is_active {
+        state.panes.iter().flatten().map(|p| p.id.0).collect()
+    } else {
+        state.tabs[index]
+            .panes
+            .iter()
+            .flatten()
+            .map(|p| p.id.0)
+            .collect()
+    };
+
+    for id in &pane_ids {
+        state.pty_manager.destroy(*id);
+        state.terminals.remove(id);
+    }
+
     state.tabs.remove(index);
+
     if state.tabs.is_empty() {
+        // mutate_add_tab handles creating a fresh tab with PTY + pane.
         mutate_add_tab(state);
-        state.active_tab = 0;
         return;
     }
-    if state.active_tab == index {
+
+    if is_active {
         state.active_tab = index.min(state.tabs.len() - 1);
+        load_tab_state(state);
     } else if state.active_tab > index {
         state.active_tab -= 1;
     }
@@ -783,21 +889,23 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             true
         }
         "tab.next" => {
-            if state.tabs.is_empty() {
+            if state.tabs.len() <= 1 {
                 return false;
             }
-            state.active_tab = (state.active_tab + 1) % state.tabs.len();
+            let new_idx = (state.active_tab + 1) % state.tabs.len();
+            mutate_switch_tab(state, new_idx);
             true
         }
         "tab.prev" => {
-            if state.tabs.is_empty() {
+            if state.tabs.len() <= 1 {
                 return false;
             }
-            state.active_tab = if state.active_tab == 0 {
+            let new_idx = if state.active_tab == 0 {
                 state.tabs.len() - 1
             } else {
                 state.active_tab - 1
             };
+            mutate_switch_tab(state, new_idx);
             true
         }
         "pane.split_right" => {
@@ -837,7 +945,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if other.starts_with("tab.switch:") => {
             if let Ok(index) = other["tab.switch:".len()..].parse::<usize>() {
                 if index < state.tabs.len() && state.active_tab != index {
-                    state.active_tab = index;
+                    mutate_switch_tab(state, index);
                     return true;
                 }
             }

@@ -86,9 +86,7 @@ fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedSt
     let activate_state = shared.clone();
     btn = btn.on_click(move || {
         mutate_with(&activate_state, |st| {
-            if st.active_tab != index {
-                st.active_tab = index;
-            }
+            dispatch(st, &format!("tab.switch:{}", index));
         });
     });
 
