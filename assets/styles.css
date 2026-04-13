@@ -101,6 +101,12 @@
   box-sizing: border-box;
 }
 
+svg {
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+}
+
 html, body {
   height: 100%;
   overflow: hidden;

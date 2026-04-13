@@ -74,9 +74,7 @@ impl PtyManager {
             pixel_height: 0,
         };
 
-        let pty_pair = pty_system
-            .openpty(size)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let pty_pair = pty_system.openpty(size).map_err(std::io::Error::other)?;
 
         let shell = default_shell();
 
@@ -90,17 +88,17 @@ impl PtyManager {
         let child = pty_pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         let reader = pty_pair
             .master
             .try_clone_reader()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         let writer = pty_pair
             .master
             .take_writer()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         self.pairs.insert(
             pane_id,

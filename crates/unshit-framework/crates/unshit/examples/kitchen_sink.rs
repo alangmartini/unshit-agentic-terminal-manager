@@ -44,6 +44,7 @@ impl CustomPainter for GradientPainter {
         _queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         _rect: LayoutRect,
+        sample_count: u32,
     ) {
         let mut lock = self.pipeline.lock().unwrap();
         if lock.is_some() {
@@ -85,7 +86,11 @@ impl CustomPainter for GradientPainter {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview: None,
             cache: None,
         });

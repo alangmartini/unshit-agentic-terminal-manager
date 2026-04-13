@@ -388,10 +388,11 @@ impl ShapedTextCache {
 /// Records the primitives produced by a single node (and its subtree) in the
 /// previous frame for a specific layer. Used by `BatchCache` to replay cached
 /// output for clean (non-dirty) nodes without rebuilding.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct BatchRange {
     pub quads: Vec<QuadInstance>,
     pub glyphs: Vec<GlyphInstance>,
+    pub svgs: Vec<SvgDrawCall>,
 }
 
 /// Per-frame cache that stores the actual `QuadInstance` and `GlyphInstance`
@@ -442,16 +443,17 @@ impl BatchCache {
         self.pending.clear();
     }
 
-    /// Record the quads and glyphs emitted for `node_id` on `layer_index`
-    /// during the current frame into the staging map.
+    /// Record the quads, glyphs, and SVG draws emitted for `node_id` on
+    /// `layer_index` during the current frame into the staging map.
     pub fn record(
         &mut self,
         node_id: NodeId,
         layer_index: usize,
         quads: Vec<QuadInstance>,
         glyphs: Vec<GlyphInstance>,
+        svgs: Vec<SvgDrawCall>,
     ) {
-        self.pending.insert((node_id, layer_index), BatchRange { quads, glyphs });
+        self.pending.insert((node_id, layer_index), BatchRange { quads, glyphs, svgs });
     }
 
     /// Retrieve the cached instances for `node_id` on `layer_index` from the
@@ -614,13 +616,10 @@ fn walk_for_batch(
     let node_dirty = element.dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT);
     if !node_dirty {
         if let Some(cached) = batch_cache.get(node_id, layer_index) {
-            // Re-emit the cached quad and glyph instances from the previous frame.
-            // Image, canvas, and SVG batches are more complex to cache so they
-            // always go through the full path when dirty.  Quad + glyph covers
-            // the vast majority of nodes.
             let lb = batch.layer_mut(effective_layer);
             lb.quad_instances.extend_from_slice(&cached.quads);
             lb.glyph_instances.extend_from_slice(&cached.glyphs);
+            lb.svg_draws.extend_from_slice(&cached.svgs);
             return;
         }
         // No cached data available: fall through to render this node so it
@@ -631,6 +630,7 @@ fn walk_for_batch(
     // range after all children have been processed.
     let quad_start = batch.layer_mut(effective_layer).quad_instances.len();
     let glyph_start = batch.layer_mut(effective_layer).glyph_instances.len();
+    let svg_start = batch.layer_mut(effective_layer).svg_draws.len();
 
     let is_visible = style.visibility == Visibility::Visible;
 
@@ -1378,7 +1378,8 @@ fn walk_for_batch(
         let lb = batch.layer_mut(effective_layer);
         let quads = lb.quad_instances[quad_start..].to_vec();
         let glyphs = lb.glyph_instances[glyph_start..].to_vec();
-        batch_cache.record(node_id, layer_index, quads, glyphs);
+        let svgs = lb.svg_draws[svg_start..].to_vec();
+        batch_cache.record(node_id, layer_index, quads, glyphs, svgs);
     }
 
     // Overlay scrollbar rendering.
@@ -2358,7 +2359,7 @@ mod tests {
         // Simulate "frame 1": record something for the root node.
         batch_cache.begin_frame();
         // Dirty node produces output; we fake it by recording an empty range.
-        batch_cache.record(root, 0, vec![], vec![]);
+        batch_cache.record(root, 0, vec![], vec![], vec![]);
         batch_cache.commit_frame();
 
         batch
@@ -2398,7 +2399,7 @@ mod tests {
 
         // Populate staging with a fake record.
         cache.begin_frame();
-        cache.record(NodeId::DANGLING, 0, vec![], vec![]);
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![]);
         // Before commit, `get` reads from the previous frame (empty).
         assert!(cache.get(NodeId::DANGLING, 0).is_none());
 

@@ -35,6 +35,7 @@ impl TextPipeline {
         format: wgpu::TextureFormat,
         atlas_view: &wgpu::TextureView,
         atlas_sampler: &wgpu::Sampler,
+        sample_count: u32,
     ) -> Self {
         #[cfg(target_os = "windows")]
         let shader_src = include_str!("../shaders/text_subpixel.wgsl");
@@ -179,7 +180,11 @@ impl TextPipeline {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview: None,
             cache: None,
         });
