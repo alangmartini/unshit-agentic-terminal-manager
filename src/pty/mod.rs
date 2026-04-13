@@ -23,6 +23,12 @@ pub struct PtyManager {
     pairs: HashMap<u32, PtyPair>,
 }
 
+impl Default for PtyManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PtyManager {
     /// Create an empty manager with no active sessions.
     pub fn new() -> Self {
@@ -136,9 +142,30 @@ impl PtyManager {
         }
     }
 
+    /// Kill all child processes and remove every PTY entry.
+    pub fn destroy_all(&mut self) {
+        let ids: Vec<u32> = self.pairs.keys().copied().collect();
+        for id in ids {
+            self.destroy(id);
+        }
+    }
+
     /// Check whether a PTY session exists for the given pane.
     pub fn has(&self, pane_id: u32) -> bool {
         self.pairs.contains_key(&pane_id)
+    }
+}
+
+impl Drop for PtyManager {
+    fn drop(&mut self) {
+        self.destroy_all();
+    }
+}
+
+impl Drop for PtyPair {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

@@ -225,11 +225,15 @@ fn main() {
             })),
             on_close: Some(Arc::new(move || {
                 let mut guard = close_shared.lock().expect("state mutex poisoned");
-                let ids: Vec<u32> = guard.terminals.keys().copied().collect();
-                for id in ids {
-                    guard.pty_manager.destroy(id);
-                }
+                guard.pty_manager.destroy_all();
                 guard.terminals.clear();
+                drop(guard);
+                // Force-exit the process. Without this, tokio's Runtime::drop
+                // blocks indefinitely waiting for spawn_blocking reader tasks
+                // (bridge.rs) that are stuck on pipe reads. The readers hold
+                // cloned PTY pipe handles that keep the .exe locked on Windows
+                // (os error 32), preventing cargo from rebuilding.
+                std::process::exit(0);
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
