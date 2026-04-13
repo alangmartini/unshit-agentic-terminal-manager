@@ -610,6 +610,50 @@ body::after {
   50% { opacity: 0.4; }
 }
 
+.subtab.disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.subtab.disabled:hover {
+  background: transparent;
+  color: var(--fg-secondary);
+}
+
+.subtab-chevron {
+  color: var(--fg-tertiary);
+  font-size: 9px;
+  width: 10px;
+  transition: transform var(--dur-norm) var(--ease-std);
+}
+
+.terminal-entries {
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.terminal-entry {
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-1) var(--sp-6) var(--sp-1) calc(var(--sp-6) + 32px);
+  color: var(--fg-secondary);
+  font-size: var(--t-sm);
+  transition: background var(--dur-fast), color var(--dur-fast);
+  cursor: default;
+}
+
+.terminal-entry:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+
+.terminal-entry-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .sidebar-footer {
   flex-direction: column;
