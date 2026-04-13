@@ -759,8 +759,53 @@ impl ApplicationHandler for AppHandler {
                 }
                 state.interaction.last_cursor_pos = pos;
 
+                // Handle active CSS resize drag
+                if let Some(info) = state.interaction.resize_drag {
+                    use unshit_core::style::types::Dimension;
+                    let dx = pos.0 - info.origin.0;
+                    let dy = pos.1 - info.origin.1;
+                    if let Some(element) = state.arena.get_mut(info.node_id) {
+                        let style = &element.computed_style;
+                        // Clamp to min/max constraints
+                        let min_w = match style.min_width {
+                            Dimension::Px(v) => v,
+                            _ => 0.0,
+                        };
+                        let max_w = match style.max_width {
+                            Dimension::Px(v) => v,
+                            _ => f32::MAX,
+                        };
+                        let min_h = match style.min_height {
+                            Dimension::Px(v) => v,
+                            _ => 0.0,
+                        };
+                        let max_h = match style.max_height {
+                            Dimension::Px(v) => v,
+                            _ => f32::MAX,
+                        };
+                        if info.allow_horizontal {
+                            let new_w = (info.initial_width + dx).clamp(min_w.max(20.0), max_w);
+                            element.resize_override_width = Some(new_w);
+                        }
+                        if info.allow_vertical {
+                            let new_h = (info.initial_height + dy).clamp(min_h.max(20.0), max_h);
+                            element.resize_override_height = Some(new_h);
+                        }
+                    }
+                    // Set appropriate cursor during resize drag
+                    let cursor = match (info.allow_horizontal, info.allow_vertical) {
+                        (true, true) => CursorIcon::NwseResize,
+                        (true, false) => CursorIcon::EwResize,
+                        (false, true) => CursorIcon::NsResize,
+                        _ => CursorIcon::Default,
+                    };
+                    state.window.set_cursor(cursor.into());
+                    state.needs_rebuild = true;
+                    state.needs_restyle = true;
+                    state.window.request_redraw();
+                }
                 // Handle active scrollbar drag
-                if let Some(ref drag) = state.interaction.scrollbar_drag {
+                else if let Some(ref drag) = state.interaction.scrollbar_drag {
                     let drag = *drag;
                     let cursor_pos = match drag.axis {
                         ScrollbarAxis::Vertical => pos.1,
@@ -904,6 +949,15 @@ impl ApplicationHandler for AppHandler {
                                         }
                                     }
                                 }
+                                state.window.request_redraw();
+                            } else if let Some(resize_info) = find_resize_grip_at(
+                                &state.arena,
+                                state.root,
+                                state.interaction.last_cursor_pos.0,
+                                state.interaction.last_cursor_pos.1,
+                            ) {
+                                // CSS resize: start resize drag
+                                state.interaction.resize_drag = Some(resize_info);
                                 state.window.request_redraw();
                             } else {
                                 // Begin potential drag: record origin for threshold check
@@ -1092,7 +1146,10 @@ impl ApplicationHandler for AppHandler {
                             }
                         }
                         ElementState::Released => {
-                            if state.interaction.scrollbar_drag.is_some() {
+                            if state.interaction.resize_drag.is_some() {
+                                state.interaction.resize_drag = None;
+                                state.window.request_redraw();
+                            } else if state.interaction.scrollbar_drag.is_some() {
                                 state.interaction.scrollbar_drag = None;
                                 state.scrollbar_visual.clear_drag();
                                 state.window.request_redraw();
@@ -2404,8 +2461,8 @@ fn apply_cursor_icon(window: &dyn Window, arena: &NodeArena, hovered: NodeId) {
                 CursorStyle::NwResize => CursorIcon::NwResize,
                 CursorStyle::SeResize => CursorIcon::SeResize,
                 CursorStyle::SwResize => CursorIcon::SwResize,
-                CursorStyle::EwResize => CursorIcon::EwResize,
                 CursorStyle::NsResize => CursorIcon::NsResize,
+                CursorStyle::EwResize => CursorIcon::EwResize,
                 CursorStyle::NeswResize => CursorIcon::NeswResize,
                 CursorStyle::NwseResize => CursorIcon::NwseResize,
                 CursorStyle::ZoomIn => CursorIcon::ZoomIn,

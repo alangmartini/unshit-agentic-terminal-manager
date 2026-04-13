@@ -645,12 +645,52 @@ pub enum CursorStyle {
     NwResize,
     SeResize,
     SwResize,
-    EwResize,
     NsResize,
+    EwResize,
     NeswResize,
     NwseResize,
     ZoomIn,
     ZoomOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CssResize {
+    #[default]
+    None,
+    Both,
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ObjectFit {
+    #[default]
+    Fill,
+    Contain,
+    Cover,
+    None,
+    ScaleDown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjectPosition {
+    /// Horizontal position as a percentage (0.0 = left, 50.0 = center, 100.0 = right).
+    pub x: f32,
+    /// Vertical position as a percentage (0.0 = top, 50.0 = center, 100.0 = bottom).
+    pub y: f32,
+}
+
+impl Default for ObjectPosition {
+    fn default() -> Self {
+        Self { x: 50.0, y: 50.0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BoxSizing {
+    ContentBox,
+    #[default]
+    BorderBox,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -940,6 +980,10 @@ pub struct ComputedStyle {
     pub row_gap: f32,
     pub column_gap: f32,
     pub overflow: Overflow,
+    pub box_sizing: BoxSizing,
+    pub aspect_ratio: Option<f32>,
+    pub object_fit: ObjectFit,
+    pub object_position: ObjectPosition,
 
     // Grid container properties
     pub grid_template_columns: Vec<GridTrackDef>,
@@ -1008,7 +1052,8 @@ pub struct ComputedStyle {
     pub layer: Layer,
     pub render_target: RenderTarget,
 
-    // Resize handle
+    // Resize
+    pub resize: CssResize,
     pub resize_axis: Option<ResizeAxis>,
 
     // Bell / notification
@@ -1042,6 +1087,10 @@ impl Default for ComputedStyle {
             row_gap: 0.0,
             column_gap: 0.0,
             overflow: Overflow::Visible,
+            box_sizing: BoxSizing::BorderBox,
+            aspect_ratio: None,
+            object_fit: ObjectFit::Fill,
+            object_position: ObjectPosition::default(),
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
             grid_auto_columns: Vec::new(),
@@ -1087,6 +1136,7 @@ impl Default for ComputedStyle {
             keyboard_capture: false,
             layer: Layer::Content,
             render_target: RenderTarget::Inline,
+            resize: CssResize::None,
             resize_axis: None,
             bell_style: BellStyle::Both,
         }
@@ -1209,6 +1259,11 @@ impl ComputedStyle {
             grid_row: taffy::Line {
                 start: grid_placement_to_taffy(self.grid_row_start),
                 end: grid_placement_to_taffy(self.grid_row_end),
+            },
+            aspect_ratio: self.aspect_ratio,
+            box_sizing: match self.box_sizing {
+                BoxSizing::ContentBox => taffy::BoxSizing::ContentBox,
+                BoxSizing::BorderBox => taffy::BoxSizing::BorderBox,
             },
             ..Default::default()
         }

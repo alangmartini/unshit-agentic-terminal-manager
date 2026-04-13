@@ -35,8 +35,9 @@ use unshit_core::id::NodeId;
 use unshit_core::layout::TextMeasureCache;
 use unshit_core::scroll::{self, ScrollbarVisualState};
 use unshit_core::style::types::{
-    Background, Color, Display, FilterFunction, GradientStopPosition, Layer, LinearGradient,
-    Overflow, RadialGradient, RadialShape, RenderTarget, TextDecoration, Visibility, WhiteSpace,
+    Background, Color, CssResize, Display, FilterFunction, GradientStopPosition, Layer,
+    LinearGradient, Overflow, RadialGradient, RadialShape, RenderTarget, TextDecoration,
+    Visibility, WhiteSpace,
 };
 use unshit_core::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, SvgTransform, ViewBox};
 use unshit_core::tree::NodeArena;
@@ -209,6 +210,8 @@ fn pack_radial_gradient(
 pub struct ImageBatch {
     pub path: String,
     pub instances: Vec<ImageInstance>,
+    pub object_fit: unshit_core::style::types::ObjectFit,
+    pub object_position: unshit_core::style::types::ObjectPosition,
 }
 
 /// One queued SVG draw. `geometry` is an `Arc` pointer into the tessellation
@@ -1242,12 +1245,19 @@ fn walk_for_batch(
                     clip_rect,
                 };
                 let layer_batch = batch.layer_mut(effective_layer);
-                if let Some(ib) = layer_batch.image_batches.iter_mut().find(|b| b.path == *path) {
+                if let Some(ib) = layer_batch
+                    .image_batches
+                    .iter_mut()
+                    .find(|b| b.path == *path && b.object_fit == style.object_fit)
+                {
                     ib.instances.push(instance);
                 } else {
-                    layer_batch
-                        .image_batches
-                        .push(ImageBatch { path: path.clone(), instances: vec![instance] });
+                    layer_batch.image_batches.push(ImageBatch {
+                        path: path.clone(),
+                        instances: vec![instance],
+                        object_fit: style.object_fit,
+                        object_position: style.object_position,
+                    });
                 }
             }
             ElementContent::Canvas if is_visible => {
@@ -1413,6 +1423,46 @@ fn walk_for_batch(
                 [geom.thumb_w, geom.thumb_h],
                 thumb_color,
             );
+        }
+    }
+
+    // Resize grip indicator.
+    // Per CSS spec, `resize` only works when `overflow` is not `visible`.
+    if style.resize != CssResize::None && style.overflow != Overflow::Visible {
+        const GRIP_SIZE: f32 = 12.0;
+        const DOT_SIZE: f32 = 2.0;
+        const GRIP_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.35];
+
+        let base_x = render_x + rect.width - GRIP_SIZE;
+        let base_y = render_y + rect.height - GRIP_SIZE;
+
+        // Three diagonal dots (bottom-right corner grip pattern).
+        let dots: &[(f32, f32)] = &[
+            (GRIP_SIZE - 3.0, GRIP_SIZE - 3.0),
+            (GRIP_SIZE - 7.0, GRIP_SIZE - 3.0),
+            (GRIP_SIZE - 3.0, GRIP_SIZE - 7.0),
+            (GRIP_SIZE - 11.0, GRIP_SIZE - 3.0),
+            (GRIP_SIZE - 7.0, GRIP_SIZE - 7.0),
+            (GRIP_SIZE - 3.0, GRIP_SIZE - 11.0),
+        ];
+        for &(dx, dy) in dots {
+            batch.layer_mut(effective_layer).quad_instances.push(QuadInstance {
+                pos: [base_x + dx, base_y + dy],
+                size: [DOT_SIZE, DOT_SIZE],
+                color: GRIP_COLOR,
+                border_color: [0.0; 4],
+                border_width: [0.0; 4],
+                border_radius: [1.0; 4],
+                clip_rect: child_clip,
+                shadow_color: [0.0; 4],
+                shadow_offset: [0.0; 2],
+                shadow_params: [0.0; 2],
+                shadow_spread: [0.0; 2],
+                gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
+                gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
+                gradient_params: [0.0; 4],
+                gradient_extra: EMPTY_GRADIENT_EXTRA,
+            });
         }
     }
 }
