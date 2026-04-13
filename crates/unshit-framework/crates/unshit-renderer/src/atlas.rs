@@ -97,11 +97,7 @@ impl GlyphAtlas {
         Self::new_with_format(device, size, wgpu::TextureFormat::R8Unorm)
     }
 
-    pub fn new_with_format(
-        device: &wgpu::Device,
-        size: u32,
-        format: wgpu::TextureFormat,
-    ) -> Self {
+    pub fn new_with_format(device: &wgpu::Device, size: u32, format: wgpu::TextureFormat) -> Self {
         let bytes_per_pixel = match format {
             wgpu::TextureFormat::R8Unorm => 1,
             wgpu::TextureFormat::Rgba8Unorm => 4,

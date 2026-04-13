@@ -298,7 +298,9 @@ fn parse_compound(input: &str) -> Result<CompoundSelector, String> {
                 chars.next(); // consume ':'
                 let name = take_ident(&mut chars);
                 match name.as_str() {
-                    "first-child" => parts.push(SimpleSelector::PseudoClass(PseudoClass::FirstChild)),
+                    "first-child" => {
+                        parts.push(SimpleSelector::PseudoClass(PseudoClass::FirstChild))
+                    }
                     "last-child" => parts.push(SimpleSelector::PseudoClass(PseudoClass::LastChild)),
                     "checked" => parts.push(SimpleSelector::PseudoClass(PseudoClass::Checked)),
                     "focused" => parts.push(SimpleSelector::PseudoClass(PseudoClass::Focused)),
@@ -506,35 +508,31 @@ fn matches_simple(
         SimpleSelector::Tag(tag) => element.tag_name() == tag.as_str(),
         SimpleSelector::Class(cls) => element.classes.iter().any(|c| c == cls),
         SimpleSelector::Id(id) => element.id.as_deref() == Some(id.as_str()),
-        SimpleSelector::Attribute { name, value } => {
-            match name.as_str() {
-                "placeholder" => element.placeholder.as_deref() == Some(value.as_str()),
-                "type" => {
-                    let elem_type = match element.input_state.input_type {
-                        InputType::Text => "text",
-                        InputType::Password => "password",
-                        InputType::Checkbox => "checkbox",
-                        InputType::Radio => "radio",
-                        InputType::Number => "number",
-                        InputType::Range => "range",
-                        InputType::Hidden => "hidden",
-                    };
-                    elem_type == value.as_str()
-                }
-                "name" => element.name.as_deref() == Some(value.as_str()),
-                "id" => element.id.as_deref() == Some(value.as_str()),
-                "class" => element.classes.iter().any(|c| c == value),
-                "value" => element.input_state.value == *value,
-                _ => false,
+        SimpleSelector::Attribute { name, value } => match name.as_str() {
+            "placeholder" => element.placeholder.as_deref() == Some(value.as_str()),
+            "type" => {
+                let elem_type = match element.input_state.input_type {
+                    InputType::Text => "text",
+                    InputType::Password => "password",
+                    InputType::Checkbox => "checkbox",
+                    InputType::Radio => "radio",
+                    InputType::Number => "number",
+                    InputType::Range => "range",
+                    InputType::Hidden => "hidden",
+                };
+                elem_type == value.as_str()
             }
-        }
+            "name" => element.name.as_deref() == Some(value.as_str()),
+            "id" => element.id.as_deref() == Some(value.as_str()),
+            "class" => element.classes.iter().any(|c| c == value),
+            "value" => element.input_state.value == *value,
+            _ => false,
+        },
         SimpleSelector::PseudoClass(pseudo) => match pseudo {
             PseudoClass::FirstChild => is_first_child(arena, node_id, element),
             PseudoClass::LastChild => is_last_child(arena, node_id, element),
             PseudoClass::NthChild(n) => is_nth_child(arena, node_id, element, *n),
-            PseudoClass::Checked => {
-                element.tag == Tag::Input && element.input_state.checked
-            }
+            PseudoClass::Checked => element.tag == Tag::Input && element.input_state.checked,
             // Focus lives on InteractionState, not on elements; always false here.
             PseudoClass::Focused => false,
         },
@@ -640,10 +638,7 @@ mod tests {
         let sel = q.selector.unwrap();
         assert_eq!(
             sel.head.parts,
-            vec![
-                SimpleSelector::Tag("div".into()),
-                SimpleSelector::Class("active".into()),
-            ]
+            vec![SimpleSelector::Tag("div".into()), SimpleSelector::Class("active".into()),]
         );
     }
 
@@ -668,10 +663,7 @@ mod tests {
         assert_eq!(sel.head.parts, vec![SimpleSelector::Class("sidebar".into())]);
         assert_eq!(sel.tail.len(), 1);
         assert_eq!(sel.tail[0].0, Combinator::Descendant);
-        assert_eq!(
-            sel.tail[0].1.parts,
-            vec![SimpleSelector::Class("menu-item".into())]
-        );
+        assert_eq!(sel.tail[0].1.parts, vec![SimpleSelector::Class("menu-item".into())]);
     }
 
     #[test]
@@ -681,10 +673,7 @@ mod tests {
         assert_eq!(sel.head.parts, vec![SimpleSelector::Class("nav".into())]);
         assert_eq!(sel.tail.len(), 1);
         assert_eq!(sel.tail[0].0, Combinator::Child);
-        assert_eq!(
-            sel.tail[0].1.parts,
-            vec![SimpleSelector::Class("link".into())]
-        );
+        assert_eq!(sel.tail[0].1.parts, vec![SimpleSelector::Class("link".into())]);
     }
 
     #[test]
@@ -693,10 +682,7 @@ mod tests {
         let sel = q.selector.unwrap();
         assert_eq!(
             sel.head.parts,
-            vec![SimpleSelector::Attribute {
-                name: "placeholder".into(),
-                value: "Search".into()
-            }]
+            vec![SimpleSelector::Attribute { name: "placeholder".into(), value: "Search".into() }]
         );
     }
 
@@ -704,20 +690,14 @@ mod tests {
     fn parse_pseudo_nth_child() {
         let q = parse_query(":nth-child(2)").unwrap();
         let sel = q.selector.unwrap();
-        assert_eq!(
-            sel.head.parts,
-            vec![SimpleSelector::PseudoClass(PseudoClass::NthChild(2))]
-        );
+        assert_eq!(sel.head.parts, vec![SimpleSelector::PseudoClass(PseudoClass::NthChild(2))]);
     }
 
     #[test]
     fn parse_pseudo_first_child() {
         let q = parse_query(":first-child").unwrap();
         let sel = q.selector.unwrap();
-        assert_eq!(
-            sel.head.parts,
-            vec![SimpleSelector::PseudoClass(PseudoClass::FirstChild)]
-        );
+        assert_eq!(sel.head.parts, vec![SimpleSelector::PseudoClass(PseudoClass::FirstChild)]);
     }
 
     #[test]
@@ -757,10 +737,7 @@ mod tests {
     fn parse_pseudo_checked() {
         let q = parse_query(":checked").unwrap();
         let sel = q.selector.unwrap();
-        assert_eq!(
-            sel.head.parts,
-            vec![SimpleSelector::PseudoClass(PseudoClass::Checked)]
-        );
+        assert_eq!(sel.head.parts, vec![SimpleSelector::PseudoClass(PseudoClass::Checked)]);
     }
 
     #[test]
@@ -771,10 +748,7 @@ mod tests {
             sel.head.parts,
             vec![
                 SimpleSelector::Tag("input".into()),
-                SimpleSelector::Attribute {
-                    name: "type".into(),
-                    value: "checkbox".into(),
-                },
+                SimpleSelector::Attribute { name: "type".into(), value: "checkbox".into() },
             ]
         );
     }

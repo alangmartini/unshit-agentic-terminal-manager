@@ -17,11 +17,7 @@ enum CheckResult {
 impl TestHarness {
     /// Core retry loop. Calls `check` each frame; returns on Pass or panics
     /// after `max_frames` with the last Fail message.
-    fn retry_until(
-        &mut self,
-        max_frames: usize,
-        mut check: impl FnMut(&mut Self) -> CheckResult,
-    ) {
+    fn retry_until(&mut self, max_frames: usize, mut check: impl FnMut(&mut Self) -> CheckResult) {
         for _ in 0..max_frames {
             if matches!(check(self), CheckResult::Pass) {
                 return;
@@ -31,10 +27,9 @@ impl TestHarness {
         // Final attempt after the last step
         match check(self) {
             CheckResult::Pass => {}
-            CheckResult::Fail(msg) => panic!(
-                "Assertion failed after {} frames:\n{}",
-                max_frames, msg,
-            ),
+            CheckResult::Fail(msg) => {
+                panic!("Assertion failed after {} frames:\n{}", max_frames, msg,)
+            }
         }
     }
 
@@ -138,12 +133,7 @@ impl TestHarness {
         self.expect_text_with_timeout(selector, expected, DEFAULT_TIMEOUT_FRAMES);
     }
 
-    pub fn expect_text_with_timeout(
-        &mut self,
-        selector: &str,
-        expected: &str,
-        max_frames: usize,
-    ) {
+    pub fn expect_text_with_timeout(&mut self, selector: &str, expected: &str, max_frames: usize) {
         let sel = selector.to_owned();
         let exp = expected.to_owned();
         self.retry_until(max_frames, |h| match h.query(&sel) {
@@ -213,12 +203,7 @@ impl TestHarness {
         self.expect_class_with_timeout(selector, class, DEFAULT_TIMEOUT_FRAMES);
     }
 
-    pub fn expect_class_with_timeout(
-        &mut self,
-        selector: &str,
-        class: &str,
-        max_frames: usize,
-    ) {
+    pub fn expect_class_with_timeout(&mut self, selector: &str, class: &str, max_frames: usize) {
         let sel = selector.to_owned();
         let cls = class.to_owned();
         self.retry_until(max_frames, |h| match h.query(&sel) {
@@ -299,12 +284,7 @@ impl TestHarness {
         self.expect_value_with_timeout(selector, expected, DEFAULT_TIMEOUT_FRAMES);
     }
 
-    pub fn expect_value_with_timeout(
-        &mut self,
-        selector: &str,
-        expected: &str,
-        max_frames: usize,
-    ) {
+    pub fn expect_value_with_timeout(&mut self, selector: &str, expected: &str, max_frames: usize) {
         let sel = selector.to_owned();
         let exp = expected.to_owned();
         self.retry_until(max_frames, |h| match h.query(&sel) {
@@ -379,11 +359,7 @@ impl TestHarness {
     // -- Custom predicate ----------------------------------------------------
 
     /// Assert that the element matching `selector` satisfies `predicate`.
-    pub fn expect_element(
-        &mut self,
-        selector: &str,
-        predicate: impl Fn(&ElementSnapshot) -> bool,
-    ) {
+    pub fn expect_element(&mut self, selector: &str, predicate: impl Fn(&ElementSnapshot) -> bool) {
         self.expect_element_with_timeout(selector, predicate, DEFAULT_TIMEOUT_FRAMES);
     }
 

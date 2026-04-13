@@ -30,33 +30,21 @@ impl TestHarness {
     /// Resolves the element center, performs mouse_down + step + mouse_up + step.
     pub fn click_on(&mut self, selector: &str) {
         let (cx, cy) = self.resolve_center(selector);
-        self.trace.record(TraceAction::Click {
-            selector: selector.to_owned(),
-            x: cx,
-            y: cy,
-        });
+        self.trace.record(TraceAction::Click { selector: selector.to_owned(), x: cx, y: cy });
         self.click(cx, cy);
     }
 
     /// Double-click on the first element matching `selector`.
     pub fn double_click_on(&mut self, selector: &str) {
         let (cx, cy) = self.resolve_center(selector);
-        self.trace.record(TraceAction::DoubleClick {
-            selector: selector.to_owned(),
-            x: cx,
-            y: cy,
-        });
+        self.trace.record(TraceAction::DoubleClick { selector: selector.to_owned(), x: cx, y: cy });
         self.double_click(cx, cy);
     }
 
     /// Right-click (context menu) on the first element matching `selector`.
     pub fn right_click_on(&mut self, selector: &str) {
         let (cx, cy) = self.resolve_center(selector);
-        self.trace.record(TraceAction::RightClick {
-            selector: selector.to_owned(),
-            x: cx,
-            y: cy,
-        });
+        self.trace.record(TraceAction::RightClick { selector: selector.to_owned(), x: cx, y: cy });
         self.right_click(cx, cy);
     }
 
@@ -64,11 +52,7 @@ impl TestHarness {
     /// and advance one frame so :hover styles resolve.
     pub fn hover_on(&mut self, selector: &str) {
         let (cx, cy) = self.resolve_center(selector);
-        self.trace.record(TraceAction::Hover {
-            selector: selector.to_owned(),
-            x: cx,
-            y: cy,
-        });
+        self.trace.record(TraceAction::Hover { selector: selector.to_owned(), x: cx, y: cy });
         self.mouse_move(cx, cy);
         self.step();
     }
@@ -90,10 +74,8 @@ impl TestHarness {
     /// Simulates a user clicking the field, clearing it, then typing
     /// the new value.
     pub fn fill(&mut self, selector: &str, text: &str) {
-        self.trace.record(TraceAction::Fill {
-            selector: selector.to_owned(),
-            text: text.to_owned(),
-        });
+        self.trace
+            .record(TraceAction::Fill { selector: selector.to_owned(), text: text.to_owned() });
         let snap = self.resolve(selector);
         let node_id = snap.node_id;
         let r = snap.layout_rect;
@@ -105,9 +87,7 @@ impl TestHarness {
 
     /// Clear the input matching `selector`.
     pub fn clear(&mut self, selector: &str) {
-        self.trace.record(TraceAction::Clear {
-            selector: selector.to_owned(),
-        });
+        self.trace.record(TraceAction::Clear { selector: selector.to_owned() });
         let snap = self.resolve(selector);
         let node_id = snap.node_id;
         let r = snap.layout_rect;
@@ -143,10 +123,8 @@ impl TestHarness {
     ///
     /// The element is focused (clicked) before the key is pressed.
     pub fn press_on(&mut self, selector: &str, key_str: &str) {
-        self.trace.record(TraceAction::Press {
-            selector: selector.to_owned(),
-            key: key_str.to_owned(),
-        });
+        self.trace
+            .record(TraceAction::Press { selector: selector.to_owned(), key: key_str.to_owned() });
         let (cx, cy) = self.resolve_center(selector);
         self.click(cx, cy);
         self.press_key_str(key_str);
@@ -179,20 +157,14 @@ impl TestHarness {
         let node_id = self.resolve(selector).node_id;
         let index = {
             let ss = self.select_state(node_id).unwrap_or_else(|| {
-                panic!(
-                    "select_option_on: element matching '{}' is not a <select>",
-                    selector
-                )
+                panic!("select_option_on: element matching '{}' is not a <select>", selector)
             });
-            ss.options
-                .iter()
-                .position(|o| o.value == value)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "select_option_on: no option with value '{}' in select '{}'",
-                        value, selector
-                    )
-                })
+            ss.options.iter().position(|o| o.value == value).unwrap_or_else(|| {
+                panic!(
+                    "select_option_on: no option with value '{}' in select '{}'",
+                    value, selector
+                )
+            })
         };
         self.select_choose(node_id, index as u32);
         self.step();
@@ -202,10 +174,7 @@ impl TestHarness {
     pub fn select_option_by_index_on(&mut self, selector: &str, index: usize) {
         let node_id = self.resolve(selector).node_id;
         let _ = self.select_state(node_id).unwrap_or_else(|| {
-            panic!(
-                "select_option_by_index_on: element matching '{}' is not a <select>",
-                selector
-            )
+            panic!("select_option_by_index_on: element matching '{}' is not a <select>", selector)
         });
         self.select_choose(node_id, index as u32);
         self.step();

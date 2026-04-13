@@ -1,7 +1,4 @@
 use cosmic_text::{FontSystem, SwashCache};
-use unshit_renderer::batch::Rasterizer;
-#[cfg(target_os = "windows")]
-use unshit_renderer::dw_rasterizer::DwRasterizer;
 use unshit_core::dirty::DirtyFlags;
 use unshit_core::element::{SelectOption, SelectState, Tag, *};
 use unshit_core::event::*;
@@ -12,7 +9,10 @@ use unshit_core::style::cascade;
 use unshit_core::style::parse::CompiledStylesheet;
 use unshit_core::style::pseudo::PseudoSideTable;
 use unshit_core::tree::NodeArena;
+use unshit_renderer::batch::Rasterizer;
 use unshit_renderer::batch::{self, BatchCache, ShapedTextCache};
+#[cfg(target_os = "windows")]
+use unshit_renderer::dw_rasterizer::DwRasterizer;
 use unshit_renderer::gpu::GpuContext;
 
 use crate::trace::TraceRecorder;

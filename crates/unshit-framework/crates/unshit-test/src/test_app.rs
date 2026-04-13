@@ -27,9 +27,7 @@ enum TestBackend {
 }
 
 pub(crate) fn env_is_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
 }
 
 impl TestApp {
@@ -59,10 +57,7 @@ impl TestApp {
             TestBackend::Headless(TestHarness::new(css, &tree_fn, width, height))
         };
 
-        Self {
-            backend,
-            slow_mo,
-        }
+        Self { backend, slow_mo }
     }
 
     /// Returns `true` when running in headed (windowed) mode.
@@ -446,19 +441,15 @@ fn stdin_has_input() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unshit_core::element::{ElementDef, ElementTree, Tag};
     use std::time::Instant;
+    use unshit_core::element::{ElementDef, ElementTree, Tag};
 
     fn simple_tree() -> ElementTree {
         ElementTree {
             root: ElementDef::new(Tag::Div)
                 .with_class("container")
-                .with_child(
-                    ElementDef::new(Tag::Span).with_class("label"),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Div).with_class("button"),
-                ),
+                .with_child(ElementDef::new(Tag::Span).with_class("label"))
+                .with_child(ElementDef::new(Tag::Div).with_class("button")),
         }
     }
 
@@ -477,12 +468,7 @@ mod tests {
     fn test_app_query_works_headless() {
         std::env::remove_var("UNSHIT_TEST_HEADED");
 
-        let app = TestApp::new(
-            ".container { width: 100%; }",
-            simple_tree,
-            800.0,
-            600.0,
-        );
+        let app = TestApp::new(".container { width: 100%; }", simple_tree, 800.0, 600.0);
 
         let result = app.query(".container");
         assert!(result.is_some(), "should find .container");
@@ -519,12 +505,8 @@ mod tests {
     fn test_app_click_works_headless() {
         std::env::remove_var("UNSHIT_TEST_HEADED");
 
-        let mut app = TestApp::new(
-            ".button { width: 100px; height: 40px; }",
-            simple_tree,
-            800.0,
-            600.0,
-        );
+        let mut app =
+            TestApp::new(".button { width: 100px; height: 40px; }", simple_tree, 800.0, 600.0);
 
         // click should not panic even if no element is at coordinates
         app.click(50.0, 20.0);
@@ -577,10 +559,7 @@ mod tests {
         let start = Instant::now();
         app.pause();
         let elapsed = start.elapsed();
-        assert!(
-            elapsed.as_millis() < 100,
-            "pause() in headless mode should be a no-op"
-        );
+        assert!(elapsed.as_millis() < 100, "pause() in headless mode should be a no-op");
     }
 
     #[test]
