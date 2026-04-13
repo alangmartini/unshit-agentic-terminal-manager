@@ -1,6 +1,8 @@
 use unshit::core::element::*;
 
-use crate::state::{mutate_with, SharedState, Subtab, UiSnapshot, Workspace};
+use crate::state::{
+    mutate_add_workspace, mutate_with, SharedState, Subtab, TerminalEntry, UiSnapshot, Workspace,
+};
 use crate::ui::icons::*;
 
 pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -17,13 +19,14 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         sidebar = sidebar.with_class("collapsed");
     }
     sidebar
-        .with_child(build_sidebar_head())
+        .with_child(build_sidebar_head(shared))
         .with_child(scroll)
         .with_child(build_sidebar_footer())
         .with_child(build_sidebar_hints())
 }
 
-fn build_sidebar_head() -> ElementDef {
+fn build_sidebar_head(shared: &SharedState) -> ElementDef {
+    let add_state = shared.clone();
     ElementDef::new(Tag::Div)
         .with_class("sidebar-head")
         .with_child(
@@ -38,6 +41,11 @@ fn build_sidebar_head() -> ElementDef {
                     ElementDef::new(Tag::Button)
                         .with_class("icon-btn")
                         .with_class("tight")
+                        .on_click(move || {
+                            mutate_with(&add_state, |st| {
+                                mutate_add_workspace(st);
+                            });
+                        })
                         .with_child(svg_icon(icon_plus())),
                 )
                 .with_child(
@@ -80,24 +88,23 @@ fn build_workspace(
             ElementDef::new(Tag::Span)
                 .with_class("workspace-name")
                 .with_text(workspace.name.clone()),
-        )
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("workspace-meta")
-                .with_child({
-                    let mut branch_tag = ElementDef::new(Tag::Span)
-                        .with_class("branch-tag")
-                        .with_text(workspace.branch.clone());
-                    if workspace.branch_muted {
-                        branch_tag = branch_tag.with_class("muted");
-                    }
-                    branch_tag
-                }),
         );
 
     let mut body = ElementDef::new(Tag::Div).with_class("workspace-body");
     for (s_idx, subtab) in workspace.subtabs.iter().enumerate() {
-        body = body.with_child(build_subtab(workspace_index, s_idx, subtab, shared));
+        body = body.with_child(build_subtab(workspace_index, s_idx, subtab, workspace, shared));
+        if subtab.label == "terminals"
+            && workspace.terminals_expanded
+            && !workspace.terminal_entries.is_empty()
+        {
+            let mut entries = ElementDef::new(Tag::Div).with_class("terminal-entries");
+            let count = workspace.terminal_entries.len();
+            for (t_idx, entry) in workspace.terminal_entries.iter().enumerate() {
+                entries =
+                    entries.with_child(build_terminal_entry(entry, t_idx == count - 1));
+            }
+            body = body.with_child(entries);
+        }
     }
 
     let mut container = ElementDef::new(Tag::Div).with_class("workspace");
@@ -114,31 +121,60 @@ fn build_subtab(
     workspace_index: usize,
     subtab_index: usize,
     subtab: &Subtab,
+    workspace: &Workspace,
     shared: &SharedState,
 ) -> ElementDef {
     let mut btn = ElementDef::new(Tag::Button).with_class("subtab");
     if subtab.active {
         btn = btn.with_class("active");
     }
+    if subtab.disabled {
+        btn = btn.with_class("disabled");
+    }
 
-    let s = shared.clone();
-    let (wi, si) = (workspace_index, subtab_index);
-    btn = btn.on_click(move || {
-        mutate_with(&s, |st| {
-            st.active_workspace = wi;
-            if let Some(ws) = st.workspaces.get_mut(wi) {
-                for (i, sub) in ws.subtabs.iter_mut().enumerate() {
-                    sub.active = i == si;
+    if subtab.label == "terminals" {
+        let s = shared.clone();
+        let wi = workspace_index;
+        btn = btn.on_click(move || {
+            mutate_with(&s, |st| {
+                if let Some(ws) = st.workspaces.get_mut(wi) {
+                    ws.terminals_expanded = !ws.terminals_expanded;
                 }
-            }
+            });
         });
-    });
+    } else if !subtab.disabled {
+        let s = shared.clone();
+        let (wi, si) = (workspace_index, subtab_index);
+        btn = btn.on_click(move || {
+            mutate_with(&s, |st| {
+                st.active_workspace = wi;
+                if let Some(ws) = st.workspaces.get_mut(wi) {
+                    for (i, sub) in ws.subtabs.iter_mut().enumerate() {
+                        sub.active = i == si;
+                    }
+                }
+            });
+        });
+    }
 
-    btn = btn.with_child(
-        ElementDef::new(Tag::Span)
-            .with_class("tree-glyph")
-            .with_text(subtab.tree_glyph),
-    );
+    if subtab.label == "terminals" {
+        let chevron = if workspace.terminals_expanded {
+            "\u{25BE}"
+        } else {
+            "\u{25B8}"
+        };
+        btn = btn.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("subtab-chevron")
+                .with_text(chevron),
+        );
+    } else {
+        btn = btn.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("tree-glyph")
+                .with_text(subtab.tree_glyph),
+        );
+    }
 
     if let Some(icon) = subtab.icon {
         btn = btn.with_child(
@@ -165,6 +201,33 @@ fn build_subtab(
     }
 
     btn
+}
+
+fn build_terminal_entry(entry: &TerminalEntry, is_last: bool) -> ElementDef {
+    let glyph = if is_last { "\u{2514}" } else { "\u{251C}" };
+
+    let mut row = ElementDef::new(Tag::Div)
+        .with_class("terminal-entry")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("tree-glyph")
+                .with_text(glyph),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("terminal-entry-name")
+                .with_text(entry.name.clone()),
+        );
+
+    let mut tag = ElementDef::new(Tag::Span)
+        .with_class("branch-tag")
+        .with_text(entry.branch.clone());
+    if entry.branch_muted {
+        tag = tag.with_class("muted");
+    }
+    row = row.with_child(tag);
+
+    row
 }
 
 fn build_sidebar_footer() -> ElementDef {

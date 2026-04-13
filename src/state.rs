@@ -45,9 +45,9 @@ impl SettingsSection {
 pub struct Workspace {
     pub num: u32,
     pub name: String,
-    pub branch: String,
-    pub branch_muted: bool,
     pub collapsed: bool,
+    pub terminals_expanded: bool,
+    pub terminal_entries: Vec<TerminalEntry>,
     pub subtabs: Vec<Subtab>,
 }
 
@@ -57,6 +57,7 @@ pub struct Subtab {
     pub count: Option<u32>,
     pub pulse: bool,
     pub active: bool,
+    pub disabled: bool,
     pub icon: Option<SubtabIcon>,
     pub tree_glyph: &'static str,
 }
@@ -68,6 +69,13 @@ pub enum SubtabIcon {
     GitBranch,
     Folder,
     EnvList,
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalEntry {
+    pub name: String,
+    pub branch: String,
+    pub branch_muted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -130,8 +138,28 @@ impl AppState {
     /// Clone everything except the non-Clone PTY manager and terminals.
     /// UI builders call this to get a snapshot for rendering.
     pub fn ui_snapshot(&self) -> UiSnapshot {
+        let mut workspaces = self.workspaces.clone();
+        // Populate the active workspace's terminal entries from actual panes.
+        if let Some(ws) = workspaces.get_mut(self.active_workspace) {
+            let entries: Vec<TerminalEntry> = self
+                .panes
+                .iter()
+                .flatten()
+                .map(|p| TerminalEntry {
+                    name: p.title.clone(),
+                    branch: "main".to_string(),
+                    branch_muted: false,
+                })
+                .collect();
+            for sub in &mut ws.subtabs {
+                if sub.label == "terminals" {
+                    sub.count = Some(entries.len() as u32);
+                }
+            }
+            ws.terminal_entries = entries;
+        }
         UiSnapshot {
-            workspaces: self.workspaces.clone(),
+            workspaces,
             active_workspace: self.active_workspace,
             tabs: self.tabs.clone(),
             active_tab: self.active_tab,
@@ -177,20 +205,49 @@ pub struct UiSnapshot {
     pub clock_hhmm: String,
 }
 
+fn current_folder_name() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "workspace".to_string())
+}
+
 pub fn seed_state() -> AppState {
     let workspaces = vec![
         Workspace {
             num: 1,
-            name: "main".to_string(),
-            branch: "main".to_string(),
-            branch_muted: false,
+            name: current_folder_name(),
             collapsed: false,
+            terminals_expanded: true,
+            terminal_entries: vec![
+                TerminalEntry {
+                    name: "shell".to_string(),
+                    branch: "main".to_string(),
+                    branch_muted: false,
+                },
+                TerminalEntry {
+                    name: "build".to_string(),
+                    branch: "main".to_string(),
+                    branch_muted: false,
+                },
+                TerminalEntry {
+                    name: "dev-server".to_string(),
+                    branch: "main".to_string(),
+                    branch_muted: false,
+                },
+                TerminalEntry {
+                    name: "logs".to_string(),
+                    branch: "main".to_string(),
+                    branch_muted: false,
+                },
+            ],
             subtabs: vec![
                 Subtab {
                     label: "terminals".to_string(),
                     count: Some(4),
                     pulse: false,
                     active: true,
+                    disabled: false,
                     icon: Some(SubtabIcon::Terminal),
                     tree_glyph: "\u{251C}",
                 },
@@ -199,6 +256,7 @@ pub fn seed_state() -> AppState {
                     count: Some(2),
                     pulse: true,
                     active: false,
+                    disabled: true,
                     icon: Some(SubtabIcon::User),
                     tree_glyph: "\u{251C}",
                 },
@@ -207,6 +265,7 @@ pub fn seed_state() -> AppState {
                     count: Some(3),
                     pulse: false,
                     active: false,
+                    disabled: true,
                     icon: Some(SubtabIcon::GitBranch),
                     tree_glyph: "\u{251C}",
                 },
@@ -215,6 +274,7 @@ pub fn seed_state() -> AppState {
                     count: Some(1),
                     pulse: false,
                     active: false,
+                    disabled: true,
                     icon: Some(SubtabIcon::Folder),
                     tree_glyph: "\u{251C}",
                 },
@@ -223,6 +283,7 @@ pub fn seed_state() -> AppState {
                     count: None,
                     pulse: false,
                     active: false,
+                    disabled: true,
                     icon: Some(SubtabIcon::EnvList),
                     tree_glyph: "\u{2514}",
                 },
@@ -231,15 +292,27 @@ pub fn seed_state() -> AppState {
         Workspace {
             num: 2,
             name: "api".to_string(),
-            branch: "fix/pdf-export".to_string(),
-            branch_muted: false,
             collapsed: false,
+            terminals_expanded: false,
+            terminal_entries: vec![
+                TerminalEntry {
+                    name: "shell".to_string(),
+                    branch: "fix/pdf-export".to_string(),
+                    branch_muted: false,
+                },
+                TerminalEntry {
+                    name: "tests".to_string(),
+                    branch: "fix/pdf-export".to_string(),
+                    branch_muted: false,
+                },
+            ],
             subtabs: vec![
                 Subtab {
                     label: "terminals".to_string(),
                     count: Some(2),
                     pulse: false,
                     active: false,
+                    disabled: false,
                     icon: Some(SubtabIcon::Terminal),
                     tree_glyph: "\u{251C}",
                 },
@@ -248,6 +321,7 @@ pub fn seed_state() -> AppState {
                     count: Some(1),
                     pulse: false,
                     active: false,
+                    disabled: true,
                     icon: Some(SubtabIcon::User),
                     tree_glyph: "\u{251C}",
                 },
@@ -256,6 +330,7 @@ pub fn seed_state() -> AppState {
                     count: Some(2),
                     pulse: false,
                     active: false,
+                    disabled: true,
                     icon: Some(SubtabIcon::GitBranch),
                     tree_glyph: "\u{2514}",
                 },
@@ -264,15 +339,20 @@ pub fn seed_state() -> AppState {
         Workspace {
             num: 3,
             name: "infra".to_string(),
-            branch: "staging".to_string(),
-            branch_muted: false,
             collapsed: true,
+            terminals_expanded: false,
+            terminal_entries: vec![TerminalEntry {
+                name: "shell".to_string(),
+                branch: "staging".to_string(),
+                branch_muted: false,
+            }],
             subtabs: vec![
                 Subtab {
                     label: "terminals".to_string(),
                     count: Some(1),
                     pulse: false,
                     active: false,
+                    disabled: false,
                     icon: Some(SubtabIcon::Terminal),
                     tree_glyph: "\u{251C}",
                 },
@@ -281,6 +361,7 @@ pub fn seed_state() -> AppState {
                     count: None,
                     pulse: false,
                     active: false,
+                    disabled: true,
                     icon: Some(SubtabIcon::Folder),
                     tree_glyph: "\u{2514}",
                 },
@@ -289,14 +370,15 @@ pub fn seed_state() -> AppState {
         Workspace {
             num: 4,
             name: "scratch".to_string(),
-            branch: "no branch".to_string(),
-            branch_muted: true,
             collapsed: true,
+            terminals_expanded: false,
+            terminal_entries: vec![],
             subtabs: vec![Subtab {
                 label: "terminals".to_string(),
                 count: Some(0),
                 pulse: false,
                 active: false,
+                disabled: false,
                 icon: None,
                 tree_glyph: "\u{2514}",
             }],
@@ -393,6 +475,26 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     } else if state.active_tab > index {
         state.active_tab -= 1;
     }
+}
+
+pub fn mutate_add_workspace(state: &mut AppState) {
+    let num = state.workspaces.len() as u32 + 1;
+    state.workspaces.push(Workspace {
+        num,
+        name: format!("workspace-{}", num),
+        collapsed: false,
+        terminals_expanded: false,
+        terminal_entries: vec![],
+        subtabs: vec![Subtab {
+            label: "terminals".to_string(),
+            count: Some(0),
+            pulse: false,
+            active: false,
+            disabled: false,
+            icon: Some(SubtabIcon::Terminal),
+            tree_glyph: "\u{2514}",
+        }],
+    });
 }
 
 pub fn find_pane_coord(state: &AppState, target: PaneId) -> Option<(usize, usize)> {
@@ -618,6 +720,10 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
+            true
+        }
+        "workspace.add" => {
+            mutate_add_workspace(state);
             true
         }
         "font.inc" => {
