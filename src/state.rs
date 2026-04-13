@@ -7,6 +7,8 @@ pub const MAX_COLS: usize = 4;
 pub const MAX_ROWS: usize = 4;
 pub const MIN_FONT_SIZE: u32 = 8;
 pub const MAX_FONT_SIZE: u32 = 32;
+/// Minimum flex-grow ratio for any pane (prevents collapsing below ~10%).
+pub const MIN_PANE_RATIO: f32 = 0.1;
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
@@ -97,6 +99,21 @@ pub struct Pane {
     pub cpu: f32,
 }
 
+/// Snapshot captured at the start of a pane resizer drag.
+#[derive(Clone, Debug)]
+pub struct ResizeDragSnapshot {
+    /// True for horizontal resizer (between columns), false for vertical (between rows).
+    pub horizontal: bool,
+    /// Row index of the track before the resizer.
+    pub row_idx: usize,
+    /// Column index of the track before the resizer (only used when horizontal).
+    pub col_idx: usize,
+    /// Snapshot of the ratios at drag start.
+    pub initial_ratios: Vec<f32>,
+    /// Total pixel size of the container along the drag axis.
+    pub container_size: f32,
+}
+
 pub struct AppState {
     pub workspaces: Vec<Workspace>,
     pub active_workspace: usize,
@@ -124,6 +141,12 @@ pub struct AppState {
     /// Last known physical pixel dimensions of the terminal grid element.
     pub last_grid_width: f32,
     pub last_grid_height: f32,
+    /// Flex-grow ratios for each row. Length matches `panes.len()`.
+    pub row_ratios: Vec<f32>,
+    /// Flex-grow ratios for columns within each row. `col_ratios[r].len()` matches `panes[r].len()`.
+    pub col_ratios: Vec<Vec<f32>>,
+    /// Transient drag state, populated on DragPhase::Start, cleared on End.
+    pub resize_drag: Option<ResizeDragSnapshot>,
 }
 
 impl AppState {
@@ -148,6 +171,8 @@ impl AppState {
             mem_gb: self.mem_gb,
             net_kbps: self.net_kbps,
             clock_hhmm: self.clock_hhmm.clone(),
+            row_ratios: self.row_ratios.clone(),
+            col_ratios: self.col_ratios.clone(),
         }
     }
 
@@ -175,6 +200,8 @@ pub struct UiSnapshot {
     pub mem_gb: f32,
     pub net_kbps: f32,
     pub clock_hhmm: String,
+    pub row_ratios: Vec<f32>,
+    pub col_ratios: Vec<Vec<f32>>,
 }
 
 pub fn seed_state() -> AppState {
@@ -350,6 +377,9 @@ pub fn seed_state() -> AppState {
         cell_width_ratio: 0.6,
         last_grid_width: 0.0,
         last_grid_height: 0.0,
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+        resize_drag: None,
     }
 }
 
@@ -448,6 +478,11 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
         cpu: 0.0,
     };
     state.panes[row_idx].insert(col_idx + 1, new_pane);
+    // Split the existing column ratio in half with the new pane.
+    let existing = state.col_ratios[row_idx][col_idx];
+    let half = existing / 2.0;
+    state.col_ratios[row_idx][col_idx] = half;
+    state.col_ratios[row_idx].insert(col_idx + 1, half);
     state.active_pane = pane_id;
 }
 
@@ -493,6 +528,12 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
         cpu: 0.0,
     };
     state.panes.insert(row_idx + 1, vec![new_pane]);
+    // Split the existing row ratio in half with the new row.
+    let existing = state.row_ratios[row_idx];
+    let half = existing / 2.0;
+    state.row_ratios[row_idx] = half;
+    state.row_ratios.insert(row_idx + 1, half);
+    state.col_ratios.insert(row_idx + 1, vec![1.0]);
     state.active_pane = pane_id;
 }
 
@@ -505,8 +546,24 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
     state.pty_manager.destroy(target.0);
     state.terminals.remove(&target.0);
 
+    // Absorb the closed pane's column ratio into a neighbor.
+    let closed_ratio = state.col_ratios[row_idx][col_idx];
+    state.col_ratios[row_idx].remove(col_idx);
+    if !state.col_ratios[row_idx].is_empty() {
+        let absorb_idx = if col_idx > 0 { col_idx - 1 } else { 0 };
+        state.col_ratios[row_idx][absorb_idx] += closed_ratio;
+    }
+
     state.panes[row_idx].remove(col_idx);
     if state.panes[row_idx].is_empty() {
+        // Absorb the empty row's ratio into a neighbor.
+        let closed_row_ratio = state.row_ratios[row_idx];
+        state.row_ratios.remove(row_idx);
+        state.col_ratios.remove(row_idx);
+        if !state.row_ratios.is_empty() {
+            let absorb_idx = if row_idx > 0 { row_idx - 1 } else { 0 };
+            state.row_ratios[absorb_idx] += closed_row_ratio;
+        }
         state.panes.remove(row_idx);
     }
     if state.panes.is_empty() {
@@ -544,6 +601,8 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
             pid: 0,
             cpu: 0.0,
         }]);
+        state.row_ratios = vec![1.0];
+        state.col_ratios = vec![vec![1.0]];
         state.active_pane = pane_id;
         return;
     }
@@ -552,6 +611,32 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         let new_col = col_idx.min(state.panes[new_row].len() - 1);
         state.active_pane = state.panes[new_row][new_col].id;
     }
+}
+
+/// Adjust two adjacent ratios by a pixel delta relative to the container size.
+/// Uses the `initial` snapshot so that each drag update recomputes from the
+/// original ratios + total_delta, avoiding accumulated floating point drift.
+pub fn apply_ratio_delta(
+    ratios: &mut [f32],
+    before_idx: usize,
+    after_idx: usize,
+    initial: &[f32],
+    delta_px: f32,
+    container_px: f32,
+) {
+    if container_px <= 0.0 {
+        return;
+    }
+    let total_ratio: f32 = initial.iter().sum();
+    let delta_ratio = (delta_px / container_px) * total_ratio;
+
+    let pair_sum = initial[before_idx] + initial[after_idx];
+    let new_before = (initial[before_idx] + delta_ratio)
+        .clamp(MIN_PANE_RATIO, pair_sum - MIN_PANE_RATIO);
+    let new_after = pair_sum - new_before;
+
+    ratios[before_idx] = new_before;
+    ratios[after_idx] = new_after;
 }
 
 pub fn mutate_font_size_delta(state: &mut AppState, delta: i32) {
@@ -966,5 +1051,98 @@ mod tests {
             "estimated rows ({}) outside reasonable 30..60 range",
             rows
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pane ratio tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn seed_state_has_initial_ratios() {
+        let state = seed_state();
+        assert_eq!(state.row_ratios, vec![1.0]);
+        assert_eq!(state.col_ratios, vec![vec![1.0]]);
+        assert!(state.resize_drag.is_none());
+    }
+
+    #[test]
+    fn apply_ratio_delta_positive() {
+        let initial = vec![1.0, 1.0];
+        let mut ratios = initial.clone();
+        // Drag 200px right in a 1000px container: shift 20% of total ratio.
+        apply_ratio_delta(&mut ratios, 0, 1, &initial, 200.0, 1000.0);
+        assert!((ratios[0] - 1.4).abs() < 0.001, "before={}", ratios[0]);
+        assert!((ratios[1] - 0.6).abs() < 0.001, "after={}", ratios[1]);
+    }
+
+    #[test]
+    fn apply_ratio_delta_negative() {
+        let initial = vec![1.0, 1.0];
+        let mut ratios = initial.clone();
+        apply_ratio_delta(&mut ratios, 0, 1, &initial, -200.0, 1000.0);
+        assert!((ratios[0] - 0.6).abs() < 0.001, "before={}", ratios[0]);
+        assert!((ratios[1] - 1.4).abs() < 0.001, "after={}", ratios[1]);
+    }
+
+    #[test]
+    fn apply_ratio_delta_clamps_to_minimum() {
+        let initial = vec![0.5, 0.5];
+        let mut ratios = initial.clone();
+        // Drag far enough to try to collapse the "after" pane.
+        apply_ratio_delta(&mut ratios, 0, 1, &initial, 900.0, 1000.0);
+        assert!(
+            ratios[1] >= MIN_PANE_RATIO,
+            "after pane ratio {} must not go below MIN_PANE_RATIO",
+            ratios[1]
+        );
+        assert!(
+            (ratios[0] + ratios[1] - 1.0).abs() < 0.001,
+            "pair sum must be preserved"
+        );
+    }
+
+    #[test]
+    fn apply_ratio_delta_clamps_negative_to_minimum() {
+        let initial = vec![0.5, 0.5];
+        let mut ratios = initial.clone();
+        apply_ratio_delta(&mut ratios, 0, 1, &initial, -900.0, 1000.0);
+        assert!(
+            ratios[0] >= MIN_PANE_RATIO,
+            "before pane ratio {} must not go below MIN_PANE_RATIO",
+            ratios[0]
+        );
+    }
+
+    #[test]
+    fn apply_ratio_delta_zero_is_noop() {
+        let initial = vec![1.0, 1.0];
+        let mut ratios = initial.clone();
+        apply_ratio_delta(&mut ratios, 0, 1, &initial, 0.0, 1000.0);
+        assert_eq!(ratios, initial);
+    }
+
+    #[test]
+    fn apply_ratio_delta_zero_container_is_noop() {
+        let initial = vec![1.0, 1.0];
+        let mut ratios = initial.clone();
+        apply_ratio_delta(&mut ratios, 0, 1, &initial, 100.0, 0.0);
+        assert_eq!(ratios, initial);
+    }
+
+    #[test]
+    fn apply_ratio_delta_preserves_pair_sum() {
+        let initial = vec![0.3, 0.7, 0.5];
+        let mut ratios = initial.clone();
+        apply_ratio_delta(&mut ratios, 1, 2, &initial, 150.0, 800.0);
+        let pair_sum = ratios[1] + ratios[2];
+        let expected = initial[1] + initial[2];
+        assert!(
+            (pair_sum - expected).abs() < 0.001,
+            "pair sum {} must equal initial {}",
+            pair_sum,
+            expected
+        );
+        // Third element should be unchanged.
+        assert_eq!(ratios[0], initial[0]);
     }
 }

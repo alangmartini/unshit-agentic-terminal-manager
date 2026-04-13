@@ -1,9 +1,10 @@
 use unshit::core::element::*;
-use unshit::core::event::{Event, EventType, Key, KeyEventKind, Modifiers};
+use unshit::core::event::{DragPhase, Event, EventType, Key, KeyEventKind, Modifiers};
+use unshit::core::style::parse::StyleDeclaration;
 
 use crate::state::{
-    mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane, PaneId,
-    SharedState, UiSnapshot,
+    apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with,
+    Pane, PaneId, ResizeDragSnapshot, SharedState, UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -26,26 +27,123 @@ pub fn build_terminal_grid(
     let single_pane = is_single_pane(&state.panes);
 
     for (row_idx, row) in state.panes.iter().enumerate() {
-        let mut row_el = ElementDef::new(Tag::Div).with_class("pane-row");
+        let row_ratio = state.row_ratios.get(row_idx).copied().unwrap_or(1.0);
+        let mut row_el = ElementDef::new(Tag::Div)
+            .with_class("pane-row")
+            .with_style(StyleDeclaration::FlexGrow(row_ratio));
         for (col_idx, pane) in row.iter().enumerate() {
             let is_active = pane.id == state.active_pane;
-            // Add resizer between panes (except before the first one).
             if col_idx > 0 {
-                row_el = row_el.with_child(ElementDef::new(Tag::Div).with_class("pane-resizer"));
+                row_el =
+                    row_el.with_child(build_col_resizer(row_idx, col_idx, shared));
             }
-            row_el = row_el.with_child(build_pane(pane, is_active, single_pane, shared, grids));
+            let col_ratio = state
+                .col_ratios
+                .get(row_idx)
+                .and_then(|r| r.get(col_idx))
+                .copied()
+                .unwrap_or(1.0);
+            let pane_el = build_pane(pane, is_active, single_pane, shared, grids)
+                .with_style(StyleDeclaration::FlexGrow(col_ratio));
+            row_el = row_el.with_child(pane_el);
         }
         if row_idx > 0 {
-            grid_el = grid_el.with_child(
-                ElementDef::new(Tag::Div)
-                    .with_class("pane-resizer")
-                    .with_class("vertical"),
-            );
+            grid_el = grid_el.with_child(build_row_resizer(row_idx, shared));
         }
         grid_el = grid_el.with_child(row_el);
     }
 
     grid_el
+}
+
+/// Vertical divider between columns within a row. Dragging left/right adjusts
+/// the flex-grow ratios of the two adjacent panes.
+fn build_col_resizer(row_idx: usize, col_idx: usize, shared: &SharedState) -> ElementDef {
+    let drag_shared = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("resizer")
+        .with_class("resizer-h")
+        .on_drag(move |ev| {
+            match ev.phase {
+                DragPhase::Start => {
+                    mutate_with(&drag_shared, |st| {
+                        st.resize_drag = Some(ResizeDragSnapshot {
+                            horizontal: true,
+                            row_idx,
+                            col_idx: col_idx - 1,
+                            initial_ratios: st.col_ratios[row_idx].clone(),
+                            container_size: st.last_grid_width,
+                        });
+                    });
+                }
+                DragPhase::Update => {
+                    mutate_with(&drag_shared, |st| {
+                        let drag = match st.resize_drag {
+                            Some(ref d) => d.clone(),
+                            None => return,
+                        };
+                        apply_ratio_delta(
+                            &mut st.col_ratios[drag.row_idx],
+                            drag.col_idx,
+                            drag.col_idx + 1,
+                            &drag.initial_ratios,
+                            ev.total_delta_x,
+                            drag.container_size,
+                        );
+                    });
+                }
+                DragPhase::End => {
+                    mutate_with(&drag_shared, |st| {
+                        st.resize_drag = None;
+                    });
+                }
+            }
+        })
+}
+
+/// Horizontal divider between rows. Dragging up/down adjusts the flex-grow
+/// ratios of the two adjacent rows.
+fn build_row_resizer(row_idx: usize, shared: &SharedState) -> ElementDef {
+    let drag_shared = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("resizer")
+        .with_class("resizer-v")
+        .on_drag(move |ev| {
+            match ev.phase {
+                DragPhase::Start => {
+                    mutate_with(&drag_shared, |st| {
+                        st.resize_drag = Some(ResizeDragSnapshot {
+                            horizontal: false,
+                            row_idx: row_idx - 1,
+                            col_idx: 0,
+                            initial_ratios: st.row_ratios.clone(),
+                            container_size: st.last_grid_height,
+                        });
+                    });
+                }
+                DragPhase::Update => {
+                    mutate_with(&drag_shared, |st| {
+                        let drag = match st.resize_drag {
+                            Some(ref d) => d.clone(),
+                            None => return,
+                        };
+                        apply_ratio_delta(
+                            &mut st.row_ratios,
+                            drag.row_idx,
+                            drag.row_idx + 1,
+                            &drag.initial_ratios,
+                            ev.total_delta_y,
+                            drag.container_size,
+                        );
+                    });
+                }
+                DragPhase::End => {
+                    mutate_with(&drag_shared, |st| {
+                        st.resize_drag = None;
+                    });
+                }
+            }
+        })
 }
 
 fn build_pane(
