@@ -3,6 +3,7 @@ use crate::cursor::CursorState;
 use crate::dirty::DirtyFlags;
 use crate::id::{NodeId, NodeRef};
 use crate::resize_handle::{PaneResizeEvent, ResizeAxis};
+use crate::style::parse::StyleDeclaration;
 use crate::style::transition::RunningTransition;
 use crate::style::types::{ComputedStyle, SelectionStyle};
 use crate::svg::types::SvgNode;
@@ -303,6 +304,10 @@ pub struct Element {
     // Optional ref handle. When set, the reconciler writes the NodeId into this
     // handle after mounting and clears it before unmounting.
     pub node_ref: Option<NodeRef>,
+
+    /// Inline style overrides applied after the CSS cascade. These take
+    /// highest precedence, equivalent to HTML `style="..."` attributes.
+    pub style_overrides: SmallVec<[StyleDeclaration; 2]>,
 }
 
 impl Element {
@@ -351,6 +356,7 @@ impl Element {
             synthetic: false,
             memo_key: None,
             node_ref: None,
+            style_overrides: SmallVec::new(),
         }
     }
 
@@ -444,6 +450,15 @@ impl Element {
         // Note: input_state.value, cursor_pos, checked, numeric_value are NOT
         // updated here (preserved like scroll state).
 
+        // Apply inline style overrides. Since StyleDeclaration does not derive
+        // PartialEq, mark LAYOUT dirty whenever either side is non-empty.
+        let overrides_changed =
+            !self.style_overrides.is_empty() || !def.style_overrides.is_empty();
+        self.style_overrides = def.style_overrides.clone();
+        if overrides_changed {
+            flags |= DirtyFlags::LAYOUT;
+        }
+
         // For select elements: update options list but preserve open/highlighted state.
         if self.tag == Tag::Select {
             let new_opts: Vec<SelectOption> = def
@@ -503,6 +518,8 @@ pub struct ElementDef {
     /// Optional ref handle. When set, the reconciler writes the allocated
     /// `NodeId` into this handle after mounting and clears it on unmount.
     pub node_ref: Option<NodeRef>,
+    /// Inline style overrides applied after the CSS cascade.
+    pub style_overrides: SmallVec<[StyleDeclaration; 2]>,
 }
 
 impl ElementDef {
@@ -539,6 +556,7 @@ impl ElementDef {
             on_mount: None,
             on_unmount: None,
             node_ref: None,
+            style_overrides: SmallVec::new(),
         }
     }
 
@@ -734,6 +752,12 @@ impl ElementDef {
     /// `NodeId` into `node_ref` after mounting and clear it before unmounting.
     pub fn with_ref(mut self, node_ref: NodeRef) -> Self {
         self.node_ref = Some(node_ref);
+        self
+    }
+
+    /// Add an inline style override that takes precedence over CSS cascade.
+    pub fn with_style(mut self, decl: StyleDeclaration) -> Self {
+        self.style_overrides.push(decl);
         self
     }
 }

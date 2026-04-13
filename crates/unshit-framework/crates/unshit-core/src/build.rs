@@ -195,6 +195,10 @@ pub fn resolve_all_styles_with_transitions(
 
         element.computed_style = new_style;
         element.selection_style = sel_style;
+        // Apply inline style overrides (highest precedence, post-cascade).
+        for decl in &element.style_overrides {
+            crate::style::parse::apply_declaration(&mut element.computed_style, decl);
+        }
         // Clear style dirty flags now that this node has been processed.
         element.dirty.remove(DirtyFlags::STYLE | DirtyFlags::SUBTREE_STYLE);
     }
@@ -303,6 +307,10 @@ pub fn resolve_dirty_styles_with_transitions(
 
             element.computed_style = new_style;
             element.selection_style = sel_style;
+            // Apply inline style overrides (highest precedence, post-cascade).
+            for decl in &element.style_overrides {
+                crate::style::parse::apply_declaration(&mut element.computed_style, decl);
+            }
             // Clear the node's own STYLE flag now that it has been resolved.
             element.dirty.remove(DirtyFlags::STYLE);
         }
