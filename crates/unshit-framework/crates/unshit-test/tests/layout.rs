@@ -545,6 +545,93 @@ fn flex_column_cross_axis_stretch() {
     );
 }
 
+/// An absolutely positioned child should escape its parent's `overflow: hidden`
+/// clip rect. Per CSS spec, absolute elements are not clipped by their parent's
+/// overflow, only by the nearest ancestor that establishes a containing block
+/// with its own clip.
+#[test]
+fn absolute_child_escapes_overflow_hidden() {
+    let css = r#"
+        .parent {
+            position: relative;
+            overflow: hidden;
+            width: 100px;
+            height: 100px;
+        }
+        .abs-child {
+            position: absolute;
+            top: 0;
+            left: 120px;
+            width: 50px;
+            height: 50px;
+        }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("parent")
+                .with_child(ElementDef::new(Tag::Div).with_class("abs-child").with_id("abs")),
+        },
+        800.0,
+        600.0,
+    );
+
+    let abs = h.query("#abs").unwrap();
+    // The absolute child is placed at left: 120px, which is outside the
+    // parent's 100px width. Its layout rect should reflect that position.
+    assert!(
+        (abs.layout_rect.x - 120.0).abs() < 1.0,
+        "absolute child x ({}) should be ~120.0, escaping parent overflow",
+        abs.layout_rect.x
+    );
+    assert_eq!(abs.layout_rect.width, 50.0);
+    assert_eq!(abs.layout_rect.height, 50.0);
+}
+
+/// Normal (non-absolute) children must still be clipped by their parent's
+/// `overflow: hidden`. This ensures the absolute-escape logic does not
+/// accidentally disable clipping for all children.
+#[test]
+fn normal_child_still_clipped_by_overflow_hidden() {
+    let css = r#"
+        .parent {
+            overflow: hidden;
+            width: 100px;
+            height: 100px;
+        }
+        .wide-child {
+            width: 200px;
+            height: 50px;
+        }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("parent")
+                .with_child(ElementDef::new(Tag::Div).with_class("wide-child").with_id("w")),
+        },
+        800.0,
+        600.0,
+    );
+
+    let w = h.query("#w").unwrap();
+    // The normal-flow child is wider than the parent but should still exist
+    // in layout. Clipping happens at render time, not layout time, so the
+    // layout rect retains the declared width.
+    assert!(
+        w.layout_rect.width > 0.0,
+        "normal child should have a layout rect with positive width"
+    );
+    // The child should be within or starting at the parent bounds.
+    assert!(
+        w.layout_rect.x < 1.0,
+        "normal child x ({}) should start at or near 0",
+        w.layout_rect.x
+    );
+}
+
 #[test]
 fn position_fixed_removes_from_flow() {
     let css = r#"

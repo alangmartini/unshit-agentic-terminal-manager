@@ -35,8 +35,8 @@ use unshit_core::id::NodeId;
 use unshit_core::layout::TextMeasureCache;
 use unshit_core::scroll::{self, ScrollbarVisualState};
 use unshit_core::style::types::{
-    Background, Color, CssResize, Display, FilterFunction, GradientStopPosition, Layer,
-    LinearGradient, Overflow, RadialGradient, RadialShape, RenderTarget, TextDecoration,
+    Background, Color, CssPosition, CssResize, Display, FilterFunction, GradientStopPosition,
+    Layer, LinearGradient, Overflow, RadialGradient, RadialShape, RenderTarget, TextDecoration,
     Visibility, WhiteSpace,
 };
 use unshit_core::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, SvgTransform, ViewBox};
@@ -1367,6 +1367,19 @@ fn walk_for_batch(
     }
 
     for &child in &children_ids {
+        // Per CSS spec, absolutely positioned children escape their
+        // parent's overflow clip and scroll offset.
+        let (effective_clip, eff_scroll_x, eff_scroll_y) =
+            if let Some(child_elem) = arena.get(child) {
+                if matches!(child_elem.computed_style.position, CssPosition::Absolute | CssPosition::Fixed) {
+                    (clip_rect, scroll_offset_x, scroll_offset_y)
+                } else {
+                    (child_clip, child_scroll_x, child_scroll_y)
+                }
+            } else {
+                (child_clip, child_scroll_x, child_scroll_y)
+            };
+
         walk_for_batch(
             arena,
             child,
@@ -1378,9 +1391,9 @@ fn walk_for_batch(
             measure_cache,
             shaped_cache,
             svg_cache,
-            child_clip,
-            child_scroll_x,
-            child_scroll_y,
+            effective_clip,
+            eff_scroll_x,
+            eff_scroll_y,
             text_selection,
             registry,
             scrollbar_state,
