@@ -1299,6 +1299,7 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 "static" => CssPosition::Static,
                 "relative" => CssPosition::Relative,
                 "absolute" => CssPosition::Absolute,
+                "fixed" => CssPosition::Fixed,
                 _ => return Err(()),
             })
         }
@@ -5575,6 +5576,34 @@ mod tests {
         assert!(
             parts.iter().any(|p| matches!(p, SelectorPart::PseudoClass(PseudoClass::FocusWithin))),
             "should parse :focus-within pseudo-class"
+        );
+    }
+
+    #[test]
+    fn test_position_fixed_parsed() {
+        let decls = parse_decls(".x { position: fixed; }");
+        let pos = decls.iter().find_map(|d| match d {
+            StyleDeclaration::Position(p) => Some(*p),
+            _ => None,
+        });
+        assert_eq!(
+            pos,
+            Some(CssPosition::Fixed),
+            "position: fixed should parse to CssPosition::Fixed"
+        );
+    }
+
+    #[test]
+    fn test_position_fixed_maps_to_absolute_in_taffy() {
+        use crate::style::types::ComputedStyle;
+
+        let mut style = ComputedStyle::default();
+        style.position = CssPosition::Fixed;
+        let taffy = style.to_taffy_style();
+        assert_eq!(
+            taffy.position,
+            taffy::Position::Absolute,
+            "CssPosition::Fixed should map to taffy::Position::Absolute"
         );
     }
 }
