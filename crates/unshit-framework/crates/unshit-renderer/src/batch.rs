@@ -1344,9 +1344,29 @@ fn walk_for_batch(
         }
     }
 
-    let mut child = element.first_child;
-    while !child.is_dangling() {
-        let next = arena.get(child).map(|e| e.next_sibling).unwrap_or(NodeId::DANGLING);
+    // Collect children into a Vec so we can sort by z-index.
+    // Stable sort preserves DOM order for children with equal z-index.
+    let mut children_ids: Vec<NodeId> = Vec::new();
+    let mut needs_sort = false;
+    {
+        let mut c = element.first_child;
+        while !c.is_dangling() {
+            if !needs_sort {
+                let z = arena.get(c).map(|e| e.computed_style.z_index).unwrap_or(0);
+                if z != 0 {
+                    needs_sort = true;
+                }
+            }
+            children_ids.push(c);
+            c = arena.get(c).map(|e| e.next_sibling).unwrap_or(NodeId::DANGLING);
+        }
+    }
+    if needs_sort {
+        children_ids
+            .sort_by_key(|&id| arena.get(id).map(|e| e.computed_style.z_index).unwrap_or(0));
+    }
+
+    for &child in &children_ids {
         walk_for_batch(
             arena,
             child,
@@ -1369,7 +1389,6 @@ fn walk_for_batch(
             portals,
             batch_cache,
         );
-        child = next;
     }
 
     // Snapshot the primitives emitted by this node and its subtree into the

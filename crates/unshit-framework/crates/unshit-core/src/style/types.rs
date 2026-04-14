@@ -1002,6 +1002,7 @@ pub struct ComputedStyle {
     pub right: Option<Dimension>,
     pub bottom: Option<Dimension>,
     pub left: Option<Dimension>,
+    pub z_index: i32,
 
     // Visual
     pub background: Background,
@@ -1105,6 +1106,7 @@ impl Default for ComputedStyle {
             right: None,
             bottom: None,
             left: None,
+            z_index: 0,
             background: Background::default(),
             border_color: Color::TRANSPARENT,
             border_width: Edges::ZERO,
