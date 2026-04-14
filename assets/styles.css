@@ -306,6 +306,7 @@ body::after {
   color: var(--fg-tertiary);
   border-radius: var(--r-md);
   transition: all var(--dur-fast) var(--ease-std);
+  position: relative;
 }
 
 .icon-btn:hover {
@@ -924,6 +925,7 @@ body::after {
   margin-right: var(--sp-3);
   width: 26px;
   height: 26px;
+  position: relative;
   color: var(--fg-tertiary);
   border-radius: var(--r-md);
   display: inline-flex;
@@ -1107,6 +1109,7 @@ body::after {
   align-items: center;
   justify-content: center;
   transition: all var(--dur-fast);
+  position: relative;
 }
 
 .pane-action:hover {
@@ -2099,6 +2102,41 @@ body.dragging-pane {
 
 .agent-badge.disabled::before {
   background: var(--fg-muted);
+}
+
+/* Tooltips: child span approach (avoids pseudo-element blink) */
+.tt {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  padding: 2px 6px;
+  background: var(--bg-elevated);
+  color: var(--fg-secondary);
+  font-size: var(--t-xs);
+  white-space: nowrap;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border-soft);
+  box-shadow: var(--shadow-sm);
+  layer: tooltip;
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.icon-btn:hover > .tt {
+  visibility: visible;
+  opacity: 1;
+}
+
+.tab-add:hover > .tt {
+  visibility: visible;
+  opacity: 1;
+}
+
+.pane-action:hover > .tt {
+  visibility: visible;
+  opacity: 1;
 }
 
 

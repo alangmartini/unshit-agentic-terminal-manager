@@ -10,6 +10,12 @@ pub fn svg_icon(node: SvgNode) -> ElementDef {
     ElementDef::new(Tag::Div).with_svg(node)
 }
 
+pub fn tooltip(text: &str) -> ElementDef {
+    ElementDef::new(Tag::Span)
+        .with_class("tt")
+        .with_text(text)
+}
+
 fn group(attrs: SvgAttrs, children: Vec<SvgNode>) -> SvgNode {
     SvgNode {
         primitive: SvgPrimitive::Group,

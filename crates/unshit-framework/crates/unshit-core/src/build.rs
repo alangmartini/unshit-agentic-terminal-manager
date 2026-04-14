@@ -169,7 +169,7 @@ pub fn resolve_all_styles_with_transitions(
     now: Option<Instant>,
     mut active_transitions: Option<&mut ActiveTransitions>,
 ) {
-    let new_style = cascade::resolve_style_fv(
+    let mut new_style = cascade::resolve_style_fv(
         arena,
         stylesheet,
         node_id,
@@ -202,20 +202,48 @@ pub fn resolve_all_styles_with_transitions(
             element.previous_style = Some(Box::new(new_style.clone()));
         }
 
-        element.computed_style = new_style;
-        element.selection_style = sel_style;
-        // Apply inline style overrides (highest precedence, post-cascade).
+        // Apply inline style overrides to the NEW cascade result so both
+        // old and new sides include overrides for the comparison below.
         for decl in &element.style_overrides {
-            crate::style::parse::apply_declaration(&mut element.computed_style, decl);
+            crate::style::parse::apply_declaration(&mut new_style, decl);
         }
-
-        // Apply user-driven resize overrides (from CSS resize drag) so they
-        // persist across style recalculations.
         if let Some(w) = element.resize_override_width {
-            element.computed_style.width = Dimension::Px(w);
+            new_style.width = Dimension::Px(w);
         }
         if let Some(h) = element.resize_override_height {
-            element.computed_style.height = Dimension::Px(h);
+            new_style.height = Dimension::Px(h);
+        }
+
+        // Compare scale-invariant paint properties between old (DPI-scaled +
+        // overrides from previous frame) and new (overrides applied above, not
+        // yet scaled). scale_by() only mutates dimensional fields (sizes,
+        // spacing, borders, shadow geometry, font_size, letter_spacing), so
+        // colours, opacity, visibility, and enum properties are safe to
+        // compare across the scaling boundary. This avoids marking every node
+        // PAINT-dirty on hover, which was causing the batch renderer to
+        // re-emit all SVGs every frame (visible as flickering).
+        let old = &element.computed_style;
+        let paint_changed = old.color != new_style.color
+            || old.background != new_style.background
+            || old.opacity != new_style.opacity
+            || old.visibility != new_style.visibility
+            || old.border_color != new_style.border_color
+            || old.outline_color != new_style.outline_color
+            || old.cursor != new_style.cursor
+            || old.text_decoration != new_style.text_decoration
+            || old.text_decoration_color != new_style.text_decoration_color
+            || old.font_weight != new_style.font_weight
+            || old.font_family != new_style.font_family;
+        let layout_changed = old.display != new_style.display;
+
+        element.computed_style = new_style;
+        element.selection_style = sel_style;
+
+        if paint_changed || layout_changed {
+            element.dirty |= DirtyFlags::PAINT;
+        }
+        if layout_changed {
+            element.dirty |= DirtyFlags::LAYOUT;
         }
 
         // Clear style dirty flags now that this node has been processed.
@@ -232,10 +260,7 @@ pub fn resolve_all_styles_with_transitions(
     }
 
     // We need to reborrow for recursion since active_transitions is &mut.
-    for child_id in children {
-        // We can't pass `active_transitions` directly in a loop due to borrow rules,
-        // so we use a raw pointer trick or just handle it differently.
-        // Actually, Option<&mut T> can be reborrowed:
+    for child_id in children.iter().copied() {
         resolve_all_styles_with_transitions(
             arena,
             stylesheet,
@@ -250,6 +275,20 @@ pub fn resolve_all_styles_with_transitions(
         // After resolving child, check if it has active transitions and track it.
         if let Some(ref mut at) = active_transitions {
             collect_active_transitions_subtree(arena, child_id, at);
+        }
+    }
+
+    // Propagate SUBTREE_PAINT upward so the batch renderer knows to walk
+    // into this subtree instead of replaying a stale cached snapshot.
+    let any_child_paint = children.iter().any(|&c| {
+        arena.get(c).map_or(false, |e| {
+            e.dirty
+                .intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT)
+        })
+    });
+    if any_child_paint {
+        if let Some(element) = arena.get_mut(node_id) {
+            element.dirty |= DirtyFlags::SUBTREE_PAINT;
         }
     }
 }
@@ -413,6 +452,26 @@ fn collect_active_transitions_subtree(
     }
 }
 
+/// Walk from `start` to the root, setting `SUBTREE_PAINT` on every
+/// ancestor. Stops early when it reaches an ancestor that already has
+/// the flag (the chain above is already marked).
+fn propagate_subtree_paint(arena: &mut NodeArena, start: NodeId) {
+    let mut current = arena.get(start).map(|e| e.parent).unwrap_or(NodeId::DANGLING);
+    while !current.is_dangling() {
+        let already = arena
+            .get(current)
+            .map(|e| e.dirty.contains(DirtyFlags::SUBTREE_PAINT))
+            .unwrap_or(true);
+        if already {
+            break;
+        }
+        if let Some(elem) = arena.get_mut(current) {
+            elem.dirty |= DirtyFlags::SUBTREE_PAINT;
+        }
+        current = arena.get(current).map(|e| e.parent).unwrap_or(NodeId::DANGLING);
+    }
+}
+
 /// Tick all active transitions in the arena: interpolate values, apply to
 /// computed styles, remove completed transitions. Returns true if any
 /// transitions are still active.
@@ -424,23 +483,31 @@ pub fn tick_all_transitions(
     let mut i = 0;
     while i < active.nodes.len() {
         let node_id = active.nodes[i];
-        if let Some(element) = arena.get_mut(node_id) {
+
+        let keep = if let Some(element) = arena.get_mut(node_id) {
             let still_active = transition::tick_transitions(
                 &mut element.computed_style,
                 &mut element.running_transitions,
                 now,
             );
-            if !still_active {
-                active.nodes.swap_remove(i);
-                // don't increment i
-                continue;
-            }
+            // Transition interpolated the style; mark for repaint.
+            element.dirty |= DirtyFlags::PAINT;
+            still_active
         } else {
-            // Node was deallocated.
-            active.nodes.swap_remove(i);
-            continue;
+            false // node deallocated
+        };
+
+        // Propagate SUBTREE_PAINT to ancestors so the batch renderer
+        // walks into this subtree (arena borrow released above).
+        if arena.get(node_id).is_some() {
+            propagate_subtree_paint(arena, node_id);
         }
-        i += 1;
+
+        if keep {
+            i += 1;
+        } else {
+            active.nodes.swap_remove(i);
+        }
     }
 
     active.has_active()
@@ -516,6 +583,18 @@ pub fn mark_paint_dirty(arena: &mut NodeArena, node_id: NodeId) {
     for child_id in children {
         mark_paint_dirty(arena, child_id);
     }
+}
+
+/// Returns true if any node in the subtree has the LAYOUT dirty flag set.
+pub fn has_layout_dirty(arena: &NodeArena, node_id: NodeId) -> bool {
+    let Some(element) = arena.get(node_id) else {
+        return false;
+    };
+    if element.dirty.contains(DirtyFlags::LAYOUT) {
+        return true;
+    }
+    let children = arena.children(node_id);
+    children.into_iter().any(|c| has_layout_dirty(arena, c))
 }
 
 /// Recursively set the LAYOUT dirty flag on every node in the subtree.

@@ -695,12 +695,35 @@ fn collect_selector_text(parser: &mut Parser) -> Result<String, ()> {
             Ok(Token::CurlyBracketBlock) => {
                 let slice = parser.slice_from(start);
                 let selector_text = slice.trim().trim_end_matches('{').trim();
-                return Ok(selector_text.to_string());
+                let selector_text = strip_css_comments(selector_text);
+                return Ok(selector_text);
             }
             Ok(_) => continue,
             Err(_) => return Err(()),
         }
     }
+}
+
+/// Strip `/* ... */` comments from raw CSS text so they never leak into
+/// selector parsing. The cssparser crate treats comments as whitespace in
+/// the token stream, but `slice_from` returns raw source text which still
+/// contains them.
+fn strip_css_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    let result = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    result
 }
 
 fn parse_selector_string(s: &str) -> Result<SelectorChain, ()> {
@@ -5304,6 +5327,52 @@ mod tests {
             _ => None,
         });
         assert_eq!(display, Some(Display::None));
+    }
+
+    #[test]
+    fn comment_before_rule_does_not_corrupt_selector() {
+        let css = r#"
+            /* tooltip styles */
+            .tt { display: none; }
+        "#;
+        let sheet = CompiledStylesheet::parse(css);
+        assert_eq!(sheet.rules.len(), 1);
+        let chain = &sheet.rules[0].selector;
+        assert_eq!(chain.parts.len(), 1);
+        assert_eq!(chain.parts[0].0, vec![SelectorPart::Class("tt".into())]);
+        let display = sheet.rules[0].declarations.iter().find_map(|d| match d {
+            StyleDeclaration::Display(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(display, Some(Display::None));
+    }
+
+    #[test]
+    fn multiline_comment_between_rules_stripped() {
+        let css = r#"
+            .a { color: red; }
+            /* this is a long
+               multi-line comment */
+            .b { color: blue; }
+        "#;
+        let sheet = CompiledStylesheet::parse(css);
+        assert_eq!(sheet.rules.len(), 2);
+        let sel_b = &sheet.rules.iter().find(|r| {
+            r.selector.parts.last().map_or(false, |(parts, _)| {
+                parts.contains(&SelectorPart::Class("b".into()))
+            })
+        }).expect(".b rule must exist").selector;
+        assert_eq!(sel_b.parts.len(), 1);
+    }
+
+    #[test]
+    fn inline_comment_within_selector_stripped() {
+        let css = ".foo /* ignore */ .bar { color: red; }";
+        let sheet = CompiledStylesheet::parse(css);
+        assert_eq!(sheet.rules.len(), 1);
+        let chain = &sheet.rules[0].selector;
+        // .foo .bar is a descendant selector with two parts
+        assert_eq!(chain.parts.len(), 2);
     }
 
     #[test]

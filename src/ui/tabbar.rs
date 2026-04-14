@@ -14,10 +14,12 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     tabs = tabs.with_child(
         ElementDef::new(Tag::Button)
             .with_class("tab-add")
+            .with_id("btn-tab-add")
             .on_click(move || {
                 mutate_with(&add_state, |st| dispatch(st, "tab.new"));
             })
-            .with_child(svg_icon(icon_plus())),
+            .with_child(svg_icon(icon_plus()))
+            .with_child(tooltip("New Tab")),
     );
 
     let split_h_state = shared.clone();
@@ -32,7 +34,8 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                 .on_click(move || {
                     mutate_with(&split_h_state, |st| dispatch(st, "pane.split_right"));
                 })
-                .with_child(svg_icon(icon_split_h())),
+                .with_child(svg_icon(icon_split_h()))
+                .with_child(tooltip("Split Right")),
         )
         .with_child(
             ElementDef::new(Tag::Button)
@@ -41,19 +44,22 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                 .on_click(move || {
                     mutate_with(&split_v_state, |st| dispatch(st, "pane.split_down"));
                 })
-                .with_child(svg_icon(icon_split_v())),
+                .with_child(svg_icon(icon_split_v()))
+                .with_child(tooltip("Split Down")),
         )
         .with_child(
             ElementDef::new(Tag::Button)
                 .with_class("icon-btn")
                 .with_id("btn-grid")
-                .with_child(svg_icon(icon_grid())),
+                .with_child(svg_icon(icon_grid()))
+                .with_child(tooltip("Grid Layout")),
         )
         .with_child(
             ElementDef::new(Tag::Button)
                 .with_class("icon-btn")
                 .with_id("btn-balance")
-                .with_child(svg_icon(icon_balance())),
+                .with_child(svg_icon(icon_balance()))
+                .with_child(tooltip("Balance Panes")),
         )
         .with_child(ElementDef::new(Tag::Div).with_class("tabbar-divider"))
         .with_child(
@@ -63,7 +69,8 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                 .on_click(move || {
                     mutate_with(&settings_state, |st| dispatch(st, "modal.open"));
                 })
-                .with_child(svg_icon(icon_settings())),
+                .with_child(svg_icon(icon_settings()))
+                .with_child(tooltip("Settings")),
         );
 
     ElementDef::new(Tag::Div)

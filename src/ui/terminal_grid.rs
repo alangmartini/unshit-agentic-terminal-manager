@@ -206,7 +206,8 @@ fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> El
                 .with_child(
                     ElementDef::new(Tag::Button)
                         .with_class("pane-action")
-                        .with_child(svg_icon(icon_search())),
+                        .with_child(svg_icon(icon_search()))
+                        .with_child(tooltip("Search")),
                 )
                 .with_child(
                     ElementDef::new(Tag::Button)
@@ -214,7 +215,8 @@ fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> El
                         .on_click(move || {
                             mutate_with(&split_h_state, |st| mutate_split_right(st, pane_id));
                         })
-                        .with_child(svg_icon(icon_split_h())),
+                        .with_child(svg_icon(icon_split_h()))
+                        .with_child(tooltip("Split Right")),
                 )
                 .with_child(
                     ElementDef::new(Tag::Button)
@@ -222,7 +224,8 @@ fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> El
                         .on_click(move || {
                             mutate_with(&split_v_state, |st| mutate_split_down(st, pane_id));
                         })
-                        .with_child(svg_icon(icon_split_v())),
+                        .with_child(svg_icon(icon_split_v()))
+                        .with_child(tooltip("Split Down")),
                 )
                 .with_child(
                     ElementDef::new(Tag::Button)
@@ -231,7 +234,8 @@ fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> El
                         .on_click(move || {
                             mutate_with(&close_state, |st| mutate_close_pane(st, pane_id));
                         })
-                        .with_child(svg_icon(icon_close())),
+                        .with_child(svg_icon(icon_close()))
+                        .with_child(tooltip("Close Pane")),
                 ),
         )
 }

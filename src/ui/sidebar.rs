@@ -42,6 +42,7 @@ fn build_sidebar_head(shared: &SharedState) -> ElementDef {
                     ElementDef::new(Tag::Button)
                         .with_class("icon-btn")
                         .with_class("tight")
+                        .with_id("btn-add-workspace")
                         .on_click(move || {
                             let picked = rfd::FileDialog::new()
                                 .set_title("Select workspace folder")
@@ -52,13 +53,16 @@ fn build_sidebar_head(shared: &SharedState) -> ElementDef {
                                 });
                             }
                         })
-                        .with_child(svg_icon(icon_plus())),
+                        .with_child(svg_icon(icon_plus()))
+                        .with_child(tooltip("Add Workspace")),
                 )
                 .with_child(
                     ElementDef::new(Tag::Button)
                         .with_class("icon-btn")
                         .with_class("tight")
-                        .with_child(svg_icon(icon_chevrons())),
+                        .with_id("btn-collapse-all")
+                        .with_child(svg_icon(icon_chevrons()))
+                        .with_child(tooltip("Collapse All")),
                 ),
         )
 }

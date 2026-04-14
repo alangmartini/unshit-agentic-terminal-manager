@@ -7,7 +7,7 @@ use cosmic_text::{FontSystem, SwashCache};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use unshit_core::build::{
-    build_tree_from_def, mark_layout_dirty, resolve_all_styles,
+    build_tree_from_def, has_layout_dirty, mark_layout_dirty, resolve_all_styles,
     resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
     sync_all_animations, tick_all_animations, tick_all_transitions,
 };
@@ -1643,20 +1643,24 @@ impl ApplicationHandler for AppHandler {
                     scale_all_styles(&mut state.arena, state.root, state.scale_factor);
                     metrics.scale_us = t2.elapsed().as_micros() as u64;
 
-                    mark_layout_dirty(&mut state.arena, state.root);
-
-                    let t3 = Instant::now();
-                    let (w, h) = state.gpu.window_size();
-                    run_layout_pipeline(
-                        &mut state.arena,
-                        &mut state.taffy,
-                        state.root,
-                        &mut state.font_system,
-                        w,
-                        h,
-                        &mut state.measure_cache,
-                    );
-                    metrics.layout_us = t3.elapsed().as_micros() as u64;
+                    // Only relayout when at least one node's layout-affecting
+                    // styles actually changed. Pure paint changes (color,
+                    // background, opacity, visibility) skip relayout, which
+                    // prevents hover-induced hit-test oscillation.
+                    if has_layout_dirty(&state.arena, state.root) {
+                        let t3 = Instant::now();
+                        let (w, h) = state.gpu.window_size();
+                        run_layout_pipeline(
+                            &mut state.arena,
+                            &mut state.taffy,
+                            state.root,
+                            &mut state.font_system,
+                            w,
+                            h,
+                            &mut state.measure_cache,
+                        );
+                        metrics.layout_us = t3.elapsed().as_micros() as u64;
+                    }
 
                     metrics.node_count = state.arena.len();
                     state.needs_restyle = false;

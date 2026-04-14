@@ -74,16 +74,20 @@ pub fn build_titlebar(shared: &SharedState) -> ElementDef {
                     ElementDef::new(Tag::Button)
                         .with_class("icon-btn")
                         .with_class("tight")
+                        .with_id("btn-sidebar")
                         .on_click(move || {
                             mutate_with(&sidebar_state, |st| dispatch(st, "sidebar.toggle"));
                         })
-                        .with_child(svg_icon(icon_sidebar_toggle())),
+                        .with_child(svg_icon(icon_sidebar_toggle()))
+                        .with_child(tooltip("Toggle Sidebar")),
                 )
                 .with_child(
                     ElementDef::new(Tag::Button)
                         .with_class("icon-btn")
                         .with_class("tight")
-                        .with_child(svg_icon(icon_fullscreen_corners())),
+                        .with_id("btn-fullscreen")
+                        .with_child(svg_icon(icon_fullscreen_corners()))
+                        .with_child(tooltip("Fullscreen")),
                 ),
         )
 }
