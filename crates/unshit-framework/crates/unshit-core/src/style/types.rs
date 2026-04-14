@@ -618,6 +618,7 @@ pub enum CssPosition {
     Static,
     Relative,
     Absolute,
+    Fixed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1236,13 +1237,23 @@ impl ComputedStyle {
             },
             position: match self.position {
                 CssPosition::Static | CssPosition::Relative => taffy::Position::Relative,
-                CssPosition::Absolute => taffy::Position::Absolute,
+                CssPosition::Absolute | CssPosition::Fixed => taffy::Position::Absolute,
             },
-            inset: taffy::Rect {
-                left: opt_dim_to_taffy_auto(self.left),
-                right: opt_dim_to_taffy_auto(self.right),
-                top: opt_dim_to_taffy_auto(self.top),
-                bottom: opt_dim_to_taffy_auto(self.bottom),
+            inset: {
+                // Static elements ignore inset (top/right/bottom/left) per CSS spec
+                let inset_val = |d| {
+                    if self.position == CssPosition::Static {
+                        taffy::LengthPercentageAuto::Auto
+                    } else {
+                        opt_dim_to_taffy_auto(d)
+                    }
+                };
+                taffy::Rect {
+                    left: inset_val(self.left),
+                    right: inset_val(self.right),
+                    top: inset_val(self.top),
+                    bottom: inset_val(self.bottom),
+                }
             },
             grid_template_columns: grid_track_defs_to_taffy(&self.grid_template_columns),
             grid_template_rows: grid_track_defs_to_taffy(&self.grid_template_rows),
