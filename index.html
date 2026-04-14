@@ -349,14 +349,16 @@
         </div>
 
         <div class="modal-body">
-          <section class="modal-section">
+
+          <!-- ====== General ====== -->
+          <section class="modal-section" data-section="general">
             <h3 class="modal-section-title">general</h3>
             <div class="setting-row">
               <div class="setting-meta">
                 <span class="setting-label">Default shell</span>
                 <span class="setting-desc">Command run when opening a new terminal</span>
               </div>
-              <select class="input select">
+              <select class="input select" aria-label="Default shell">
                 <option>bash</option>
                 <option>zsh</option>
                 <option>fish</option>
@@ -368,75 +370,365 @@
                 <span class="setting-label">Working directory</span>
                 <span class="setting-desc">Starting directory for new terminals</span>
               </div>
-              <input class="input" type="text" value="~/projects/main" />
+              <input class="input" type="text" value="~/projects/main" aria-label="Working directory" />
             </div>
             <div class="setting-row">
               <div class="setting-meta">
                 <span class="setting-label">Restore on startup</span>
                 <span class="setting-desc">Reopen last active session and panes</span>
               </div>
-              <button class="toggle on" aria-pressed="true"></button>
+              <button class="toggle on" role="switch" aria-checked="true" aria-label="Restore on startup"></button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Confirm before closing</span>
+                <span class="setting-desc">Warn when closing a tab with a running process</span>
+              </div>
+              <button class="toggle on" role="switch" aria-checked="true" aria-label="Confirm before closing"></button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Start minimized</span>
+                <span class="setting-desc">Launch to system tray on startup</span>
+              </div>
+              <button class="toggle" role="switch" aria-checked="false" aria-label="Start minimized"></button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Check for updates</span>
+                <span class="setting-desc">Notify when a new version is available</span>
+              </div>
+              <button class="toggle on" role="switch" aria-checked="true" aria-label="Check for updates"></button>
             </div>
           </section>
 
-          <section class="modal-section">
+          <!-- ====== Appearance ====== -->
+          <section class="modal-section" data-section="appearance">
             <h3 class="modal-section-title">appearance</h3>
             <div class="setting-row">
               <div class="setting-meta">
                 <span class="setting-label">Theme</span>
-                <span class="setting-desc">Visual palette</span>
+                <span class="setting-desc">Visual palette for the entire application</span>
               </div>
-              <div class="theme-chips">
-                <button class="theme-chip amber active" title="Amber"></button>
-                <button class="theme-chip green" title="Green"></button>
-                <button class="theme-chip cyan" title="Cyan"></button>
-                <button class="theme-chip mono" title="Mono"></button>
+              <div class="theme-chips" role="radiogroup" aria-label="Theme selection">
+                <button class="theme-chip amber active" title="Amber" role="radio" aria-checked="true"></button>
+                <button class="theme-chip green" title="Green" role="radio" aria-checked="false"></button>
+                <button class="theme-chip cyan" title="Cyan" role="radio" aria-checked="false"></button>
+                <button class="theme-chip mono" title="Mono" role="radio" aria-checked="false"></button>
               </div>
             </div>
             <div class="setting-row">
               <div class="setting-meta">
                 <span class="setting-label">Font size</span>
-                <span class="setting-desc">Terminal output size</span>
+                <span class="setting-desc">Terminal output size in points</span>
               </div>
-              <div class="stepper">
-                <button class="stepper-btn">−</button>
+              <div class="stepper" role="group" aria-label="Font size">
+                <button class="stepper-btn" aria-label="Decrease font size">&minus;</button>
                 <span class="stepper-val tnum">13</span>
-                <button class="stepper-btn">+</button>
+                <button class="stepper-btn" aria-label="Increase font size">+</button>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Cursor style</span>
+                <span class="setting-desc">Terminal cursor appearance</span>
+              </div>
+              <div class="cursor-group" role="radiogroup" aria-label="Cursor style">
+                <button class="cursor-option active" role="radio" aria-checked="true" title="Block cursor">
+                  <span class="cursor-preview block-cursor" aria-hidden="true"></span>
+                  <span>block</span>
+                </button>
+                <button class="cursor-option" role="radio" aria-checked="false" title="Underline cursor">
+                  <span class="cursor-preview underline-cursor" aria-hidden="true"></span>
+                  <span>line</span>
+                </button>
+                <button class="cursor-option" role="radio" aria-checked="false" title="Bar cursor">
+                  <span class="cursor-preview bar-cursor" aria-hidden="true"></span>
+                  <span>bar</span>
+                </button>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Terminal opacity</span>
+                <span class="setting-desc">Window transparency level</span>
+              </div>
+              <div class="slider-control">
+                <input type="range" class="slider" min="50" max="100" value="100" aria-label="Terminal opacity" />
+                <span class="slider-val tnum">100%</span>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Line height</span>
+                <span class="setting-desc">Spacing between terminal rows</span>
+              </div>
+              <div class="stepper" role="group" aria-label="Line height">
+                <button class="stepper-btn" aria-label="Decrease line height">&minus;</button>
+                <span class="stepper-val tnum">1.4</span>
+                <button class="stepper-btn" aria-label="Increase line height">+</button>
               </div>
             </div>
             <div class="setting-row">
               <div class="setting-meta">
                 <span class="setting-label">Glow effect</span>
-                <span class="setting-desc">Subtle CRT-style text shadow</span>
+                <span class="setting-desc">Subtle CRT-style text shadow on output</span>
               </div>
-              <button class="toggle on" aria-pressed="true"></button>
+              <button class="toggle on" role="switch" aria-checked="true" aria-label="Glow effect"></button>
             </div>
             <div class="setting-row">
               <div class="setting-meta">
                 <span class="setting-label">Background texture</span>
-                <span class="setting-desc">Warm ambient gradient</span>
+                <span class="setting-desc">Warm ambient gradient behind content</span>
               </div>
-              <button class="toggle on" aria-pressed="true"></button>
+              <button class="toggle on" role="switch" aria-checked="true" aria-label="Background texture"></button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Font ligatures</span>
+                <span class="setting-desc">Combine character pairs like =&gt; and !=</span>
+              </div>
+              <button class="toggle on" role="switch" aria-checked="true" aria-label="Font ligatures"></button>
             </div>
           </section>
 
-          <section class="modal-section">
+          <!-- ====== Shell ====== -->
+          <section class="modal-section" data-section="shell">
             <h3 class="modal-section-title">shell</h3>
             <div class="setting-row">
               <div class="setting-meta">
                 <span class="setting-label">Shell integration</span>
                 <span class="setting-desc">Inject prompt markers for smart scrollback</span>
               </div>
-              <button class="toggle on" aria-pressed="true"></button>
+              <button class="toggle on" role="switch" aria-checked="true" aria-label="Shell integration"></button>
             </div>
             <div class="setting-row">
               <div class="setting-meta">
                 <span class="setting-label">History size</span>
                 <span class="setting-desc">Lines retained per pane</span>
               </div>
-              <input class="input" type="text" value="50000" />
+              <input class="input" type="text" value="50000" aria-label="History size" />
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Scroll on output</span>
+                <span class="setting-desc">Auto-scroll terminal when new output arrives</span>
+              </div>
+              <button class="toggle on" role="switch" aria-checked="true" aria-label="Scroll on output"></button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Bell notification</span>
+                <span class="setting-desc">Flash tab badge when terminal rings the bell</span>
+              </div>
+              <button class="toggle" role="switch" aria-checked="false" aria-label="Bell notification"></button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Word separators</span>
+                <span class="setting-desc">Characters that break word selection on double-click</span>
+              </div>
+              <input class="input compact" type="text" value=" /\()&quot;'-.,:;&lt;&gt;~!@#$%^&amp;*|+=[]{}`~?" aria-label="Word separators" />
             </div>
           </section>
+
+          <!-- ====== Keybinds ====== -->
+          <section class="modal-section" data-section="keybinds">
+            <h3 class="modal-section-title">keybinds</h3>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">New terminal</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">T</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Close tab</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">W</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Split right</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">D</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Split down</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">Shift</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">D</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Next tab</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">Tab</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Previous tab</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">Shift</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">Tab</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Command palette</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">K</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Toggle sidebar</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">B</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Settings</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">,</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Zoom in</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">=</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Zoom out</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">Ctrl</kbd>
+                <span class="keybind-sep">+</span>
+                <kbd class="keybind-key">-</kbd>
+              </div>
+            </div>
+            <div class="keybind-row">
+              <div class="setting-meta">
+                <span class="setting-label">Fullscreen</span>
+              </div>
+              <div class="keybind-keys">
+                <kbd class="keybind-key">F11</kbd>
+              </div>
+            </div>
+            <div class="keybind-footer">
+              <button class="btn ghost">reset to defaults</button>
+            </div>
+          </section>
+
+          <!-- ====== Agents ====== -->
+          <section class="modal-section" data-section="agents">
+            <h3 class="modal-section-title">agents</h3>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Auto-discovery</span>
+                <span class="setting-desc">Detect installed AI agents on PATH</span>
+              </div>
+              <button class="toggle on" role="switch" aria-checked="true" aria-label="Agent auto-discovery"></button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-meta">
+                <span class="setting-label">Default timeout</span>
+                <span class="setting-desc">Seconds before an agent task is canceled</span>
+              </div>
+              <div class="stepper" role="group" aria-label="Default timeout">
+                <button class="stepper-btn" aria-label="Decrease timeout">&minus;</button>
+                <span class="stepper-val tnum">300</span>
+                <button class="stepper-btn" aria-label="Increase timeout">+</button>
+              </div>
+            </div>
+
+            <div class="agent-list-header">
+              <span class="agent-list-title">configured agents</span>
+              <span class="agent-list-count">3</span>
+            </div>
+            <div class="agent-row">
+              <div class="agent-icon">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 6l2 2l-2 2"></path><path d="M8 10h4"></path></svg>
+              </div>
+              <div class="agent-info">
+                <span class="agent-name">claude</span>
+                <span class="agent-path">~/.local/bin/claude</span>
+              </div>
+              <div class="agent-controls">
+                <span class="agent-badge running">running</span>
+                <button class="toggle on" role="switch" aria-checked="true" aria-label="Enable claude agent"></button>
+              </div>
+            </div>
+            <div class="agent-row">
+              <div class="agent-icon">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 6l2 2l-2 2"></path><path d="M8 10h4"></path></svg>
+              </div>
+              <div class="agent-info">
+                <span class="agent-name">amp</span>
+                <span class="agent-path">~/.local/bin/amp</span>
+              </div>
+              <div class="agent-controls">
+                <span class="agent-badge idle">idle</span>
+                <button class="toggle on" role="switch" aria-checked="true" aria-label="Enable amp agent"></button>
+              </div>
+            </div>
+            <div class="agent-row">
+              <div class="agent-icon">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 6l2 2l-2 2"></path><path d="M8 10h4"></path></svg>
+              </div>
+              <div class="agent-info">
+                <span class="agent-name">codex</span>
+                <span class="agent-path">~/.local/bin/codex</span>
+              </div>
+              <div class="agent-controls">
+                <span class="agent-badge disabled">disabled</span>
+                <button class="toggle" role="switch" aria-checked="false" aria-label="Enable codex agent"></button>
+              </div>
+            </div>
+          </section>
+
         </div>
 
         <div class="modal-footer">
