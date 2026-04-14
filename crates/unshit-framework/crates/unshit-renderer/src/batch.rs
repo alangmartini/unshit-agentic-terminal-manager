@@ -266,6 +266,23 @@ pub struct BackdropBoundary {
     pub dirty: bool,
 }
 
+/// Identifies which primitive type a draw span covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrawKind {
+    Quad,
+    Glyph,
+}
+
+/// A contiguous range of primitives to draw in a specific order.
+/// The GPU render loop processes spans sequentially, switching pipelines
+/// as needed, to preserve correct occlusion (painter's algorithm).
+#[derive(Clone, Copy, Debug)]
+pub struct DrawSpan {
+    pub kind: DrawKind,
+    pub start: u32,
+    pub count: u32,
+}
+
 pub struct FrameBatch {
     pub quad_instances: Vec<QuadInstance>,
     pub glyph_instances: Vec<GlyphInstance>,
@@ -275,6 +292,10 @@ pub struct FrameBatch {
     /// Backdrop filter boundaries collected during the walk, in draw order.
     /// When empty the renderer fast path runs with zero extra cost.
     pub backdrop_boundaries: Vec<BackdropBoundary>,
+    /// Draw spans for interleaved quad/glyph rendering to fix text occlusion.
+    /// When non-empty, the GPU render loop processes spans sequentially
+    /// instead of rendering all quads then all glyphs.
+    pub draw_spans: Vec<DrawSpan>,
 }
 
 impl Default for FrameBatch {
@@ -292,6 +313,7 @@ impl FrameBatch {
             canvas_callbacks: Vec::new(),
             svg_draws: Vec::new(),
             backdrop_boundaries: Vec::new(),
+            draw_spans: Vec::with_capacity(1024),
         }
     }
 
@@ -302,6 +324,7 @@ impl FrameBatch {
         self.canvas_callbacks.clear();
         self.svg_draws.clear();
         self.backdrop_boundaries.clear();
+        self.draw_spans.clear();
     }
 }
 
@@ -393,6 +416,7 @@ pub struct BatchRange {
     pub quads: Vec<QuadInstance>,
     pub glyphs: Vec<GlyphInstance>,
     pub svgs: Vec<SvgDrawCall>,
+    pub draw_spans: Vec<DrawSpan>,
 }
 
 /// Per-frame cache that stores the actual `QuadInstance` and `GlyphInstance`
@@ -443,8 +467,8 @@ impl BatchCache {
         self.pending.clear();
     }
 
-    /// Record the quads, glyphs, and SVG draws emitted for `node_id` on
-    /// `layer_index` during the current frame into the staging map.
+    /// Record the quads, glyphs, SVG draws, and draw spans emitted for
+    /// `node_id` on `layer_index` during the current frame into the staging map.
     pub fn record(
         &mut self,
         node_id: NodeId,
@@ -452,8 +476,9 @@ impl BatchCache {
         quads: Vec<QuadInstance>,
         glyphs: Vec<GlyphInstance>,
         svgs: Vec<SvgDrawCall>,
+        draw_spans: Vec<DrawSpan>,
     ) {
-        self.pending.insert((node_id, layer_index), BatchRange { quads, glyphs, svgs });
+        self.pending.insert((node_id, layer_index), BatchRange { quads, glyphs, svgs, draw_spans });
     }
 
     /// Retrieve the cached instances for `node_id` on `layer_index` from the
@@ -553,6 +578,16 @@ pub fn build_render_batch(
     }
 }
 
+/// Flush accumulated primitives of `kind` into `draw_spans` if `end > cursor`.
+/// Returns the new cursor position.
+#[inline]
+fn flush_span(spans: &mut Vec<DrawSpan>, kind: DrawKind, cursor: usize, end: usize) -> usize {
+    if end > cursor {
+        spans.push(DrawSpan { kind, start: cursor as u32, count: (end - cursor) as u32 });
+    }
+    end
+}
+
 /// Clear PAINT and SUBTREE_PAINT flags on every node in a subtree after a
 /// frame has been rendered. Call this after `build_render_batch` completes.
 /// This requires mutable access to the arena; kept as a separate step so
@@ -617,9 +652,22 @@ fn walk_for_batch(
     if !node_dirty {
         if let Some(cached) = batch_cache.get(node_id, layer_index) {
             let lb = batch.layer_mut(effective_layer);
+            let quad_offset = lb.quad_instances.len() as u32;
+            let glyph_offset = lb.glyph_instances.len() as u32;
             lb.quad_instances.extend_from_slice(&cached.quads);
             lb.glyph_instances.extend_from_slice(&cached.glyphs);
             lb.svg_draws.extend_from_slice(&cached.svgs);
+            for span in &cached.draw_spans {
+                let offset = match span.kind {
+                    DrawKind::Quad => quad_offset,
+                    DrawKind::Glyph => glyph_offset,
+                };
+                lb.draw_spans.push(DrawSpan {
+                    kind: span.kind,
+                    start: span.start + offset,
+                    count: span.count,
+                });
+            }
             return;
         }
         // No cached data available: fall through to render this node so it
@@ -631,6 +679,11 @@ fn walk_for_batch(
     let quad_start = batch.layer_mut(effective_layer).quad_instances.len();
     let glyph_start = batch.layer_mut(effective_layer).glyph_instances.len();
     let svg_start = batch.layer_mut(effective_layer).svg_draws.len();
+    let span_start = batch.layer_mut(effective_layer).draw_spans.len();
+
+    // Running cursors for draw span tracking. Updated after each flush.
+    let mut quad_cursor = quad_start;
+    let mut glyph_cursor = glyph_start;
 
     let is_visible = style.visibility == Visibility::Visible;
 
@@ -837,6 +890,13 @@ fn walk_for_batch(
                 gradient_extra: EMPTY_GRADIENT_EXTRA,
             });
         }
+    }
+
+    // Flush background/outline/shadow/border quads before text emission.
+    {
+        let lb = batch.layer_mut(effective_layer);
+        let end = lb.quad_instances.len();
+        quad_cursor = flush_span(&mut lb.draw_spans, DrawKind::Quad, quad_cursor, end);
     }
 
     // Input element rendering
@@ -1344,6 +1404,16 @@ fn walk_for_batch(
         }
     }
 
+    // Flush text/content glyphs and any interleaved quads (selection
+    // highlights, text decorations, input cursors) before child recursion.
+    {
+        let lb = batch.layer_mut(effective_layer);
+        let qend = lb.quad_instances.len();
+        let gend = lb.glyph_instances.len();
+        quad_cursor = flush_span(&mut lb.draw_spans, DrawKind::Quad, quad_cursor, qend);
+        glyph_cursor = flush_span(&mut lb.draw_spans, DrawKind::Glyph, glyph_cursor, gend);
+    }
+
     let mut child = element.first_child;
     while !child.is_dangling() {
         let next = arena.get(child).map(|e| e.next_sibling).unwrap_or(NodeId::DANGLING);
@@ -1372,15 +1442,19 @@ fn walk_for_batch(
         child = next;
     }
 
-    // Snapshot the primitives emitted by this node and its subtree into the
-    // pending cache.  Future frames can replay this data when the node is clean.
+    // Flush any quads/glyphs accumulated by children.
     {
         let lb = batch.layer_mut(effective_layer);
-        let quads = lb.quad_instances[quad_start..].to_vec();
-        let glyphs = lb.glyph_instances[glyph_start..].to_vec();
-        let svgs = lb.svg_draws[svg_start..].to_vec();
-        batch_cache.record(node_id, layer_index, quads, glyphs, svgs);
+        let qend = lb.quad_instances.len();
+        let gend = lb.glyph_instances.len();
+        quad_cursor = flush_span(&mut lb.draw_spans, DrawKind::Quad, quad_cursor, qend);
+        let _ = flush_span(&mut lb.draw_spans, DrawKind::Glyph, glyph_cursor, gend);
     }
+
+    // Snapshot the primitives emitted by this node and its subtree into the
+    // pending cache.  Future frames can replay this data when the node is clean.
+    // (draw_spans are snapshotted *after* scrollbar/grip emission below so the
+    // cache replay is complete; see the second snapshot block.)
 
     // Overlay scrollbar rendering.
     // Emitted after children so the scrollbar draws on top of content.
@@ -1465,6 +1539,23 @@ fn walk_for_batch(
                 gradient_extra: EMPTY_GRADIENT_EXTRA,
             });
         }
+    }
+
+    // Flush scrollbar/resize grip quads.
+    {
+        let lb = batch.layer_mut(effective_layer);
+        let qend = lb.quad_instances.len();
+        let _ = flush_span(&mut lb.draw_spans, DrawKind::Quad, quad_cursor, qend);
+    }
+
+    // Snapshot primitives and draw spans into the pending cache.
+    {
+        let lb = batch.layer_mut(effective_layer);
+        let quads = lb.quad_instances[quad_start..].to_vec();
+        let glyphs = lb.glyph_instances[glyph_start..].to_vec();
+        let svgs = lb.svg_draws[svg_start..].to_vec();
+        let spans = lb.draw_spans[span_start..].to_vec();
+        batch_cache.record(node_id, layer_index, quads, glyphs, svgs, spans);
     }
 }
 
@@ -2359,7 +2450,7 @@ mod tests {
         // Simulate "frame 1": record something for the root node.
         batch_cache.begin_frame();
         // Dirty node produces output; we fake it by recording an empty range.
-        batch_cache.record(root, 0, vec![], vec![], vec![]);
+        batch_cache.record(root, 0, vec![], vec![], vec![], vec![]);
         batch_cache.commit_frame();
 
         batch
@@ -2399,7 +2490,7 @@ mod tests {
 
         // Populate staging with a fake record.
         cache.begin_frame();
-        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![]);
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], vec![]);
         // Before commit, `get` reads from the previous frame (empty).
         assert!(cache.get(NodeId::DANGLING, 0).is_none());
 
@@ -2411,6 +2502,103 @@ mod tests {
         // still readable from `get` (it references `ranges`, not `pending`).
         cache.begin_frame();
         assert!(cache.get(NodeId::DANGLING, 0).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // DrawSpan recording tests (text occlusion fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn draw_spans_are_recorded_in_batch_cache() {
+        let spans = vec![
+            DrawSpan { kind: DrawKind::Quad, start: 0, count: 3 },
+            DrawSpan { kind: DrawKind::Glyph, start: 0, count: 5 },
+            DrawSpan { kind: DrawKind::Quad, start: 3, count: 2 },
+        ];
+        let mut cache = BatchCache::new();
+        cache.begin_frame();
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans.clone());
+        cache.commit_frame();
+
+        let cached = cache.get(NodeId::DANGLING, 0).expect("should have cached entry");
+        assert_eq!(cached.draw_spans.len(), 3);
+        assert_eq!(cached.draw_spans[0].kind, DrawKind::Quad);
+        assert_eq!(cached.draw_spans[0].start, 0);
+        assert_eq!(cached.draw_spans[0].count, 3);
+        assert_eq!(cached.draw_spans[1].kind, DrawKind::Glyph);
+        assert_eq!(cached.draw_spans[1].count, 5);
+        assert_eq!(cached.draw_spans[2].kind, DrawKind::Quad);
+        assert_eq!(cached.draw_spans[2].start, 3);
+        assert_eq!(cached.draw_spans[2].count, 2);
+    }
+
+    #[test]
+    fn draw_spans_replayed_with_offset_adjustment() {
+        // Record spans at known positions.
+        let spans = vec![
+            DrawSpan { kind: DrawKind::Quad, start: 0, count: 2 },
+            DrawSpan { kind: DrawKind::Glyph, start: 0, count: 3 },
+        ];
+        let mut cache = BatchCache::new();
+        cache.begin_frame();
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans);
+        cache.commit_frame();
+
+        // Replay into a batch that already has some data, simulating offset.
+        let mut batch = FrameBatch::new();
+        // Simulate pre-existing data by pushing dummy instances.
+        let dummy_quad = QuadInstance {
+            pos: [0.0; 2],
+            size: [10.0; 2],
+            color: [1.0; 4],
+            border_color: [0.0; 4],
+            border_width: [0.0; 4],
+            border_radius: [0.0; 4],
+            clip_rect: [0.0, 0.0, 100.0, 100.0],
+            shadow_color: [0.0; 4],
+            shadow_offset: [0.0; 2],
+            shadow_params: [0.0; 2],
+            shadow_spread: [0.0; 2],
+            gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
+            gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
+            gradient_params: [0.0; 4],
+            gradient_extra: EMPTY_GRADIENT_EXTRA,
+        };
+        batch.quad_instances.push(dummy_quad);
+
+        // Replay cached data with offset.
+        let cached = cache.get(NodeId::DANGLING, 0).unwrap();
+        let quad_offset = batch.quad_instances.len() as u32;
+        let glyph_offset = batch.glyph_instances.len() as u32;
+        batch.quad_instances.extend_from_slice(&cached.quads);
+        batch.glyph_instances.extend_from_slice(&cached.glyphs);
+        for span in &cached.draw_spans {
+            let offset = match span.kind {
+                DrawKind::Quad => quad_offset,
+                DrawKind::Glyph => glyph_offset,
+            };
+            batch.draw_spans.push(DrawSpan {
+                kind: span.kind,
+                start: span.start + offset,
+                count: span.count,
+            });
+        }
+
+        // The quad span should be offset by 1 (one pre-existing quad).
+        assert_eq!(batch.draw_spans.len(), 2);
+        assert_eq!(batch.draw_spans[0].kind, DrawKind::Quad);
+        assert_eq!(batch.draw_spans[0].start, 1); // offset by 1
+        assert_eq!(batch.draw_spans[1].kind, DrawKind::Glyph);
+        assert_eq!(batch.draw_spans[1].start, 0); // glyph offset was 0
+    }
+
+    #[test]
+    fn frame_batch_clear_resets_draw_spans() {
+        let mut batch = FrameBatch::new();
+        batch.draw_spans.push(DrawSpan { kind: DrawKind::Quad, start: 0, count: 1 });
+        assert_eq!(batch.draw_spans.len(), 1);
+        batch.clear();
+        assert!(batch.draw_spans.is_empty());
     }
 
     // -----------------------------------------------------------------------
