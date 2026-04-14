@@ -181,6 +181,7 @@ pub enum StyleDeclaration {
     Right(Dimension),
     Bottom(Dimension),
     Left(Dimension),
+    ZIndex(i32),
     OutlineColor(Color),
     OutlineWidth(f32),
     OutlineOffset(f32),
@@ -1299,6 +1300,7 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 "static" => CssPosition::Static,
                 "relative" => CssPosition::Relative,
                 "absolute" => CssPosition::Absolute,
+                "fixed" => CssPosition::Fixed,
                 _ => return Err(()),
             })
         }
@@ -1306,17 +1308,26 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "right" => StyleDeclaration::Right(parse_dimension(parser)?),
         "bottom" => StyleDeclaration::Bottom(parse_dimension(parser)?),
         "left" => StyleDeclaration::Left(parse_dimension(parser)?),
+        "z-index" => {
+            let val = parser.expect_integer().map_err(|_| ())?;
+            StyleDeclaration::ZIndex(val)
+        }
         "inset" => {
-            // CSS `inset` shorthand expands to top, right, bottom, left.
-            // Only the single-value form (`inset: <value>`) is supported;
-            // multi-value forms are not yet handled.
-            let dim = parse_dimension(parser)?;
+            // CSS `inset` shorthand: 1/2/3/4-value forms matching the spec.
+            let values = parse_dimension_list(parser);
+            let (top, right, bottom, left) = match values.len() {
+                1 => (values[0], values[0], values[0], values[0]),
+                2 => (values[0], values[1], values[0], values[1]),
+                3 => (values[0], values[1], values[2], values[1]),
+                4 => (values[0], values[1], values[2], values[3]),
+                _ => return Err(()),
+            };
             let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
             return Ok(smallvec::smallvec![
-                StyleDeclaration::Top(dim),
-                StyleDeclaration::Right(dim),
-                StyleDeclaration::Bottom(dim),
-                StyleDeclaration::Left(dim),
+                StyleDeclaration::Top(top),
+                StyleDeclaration::Right(right),
+                StyleDeclaration::Bottom(bottom),
+                StyleDeclaration::Left(left),
             ]);
         }
         "letter-spacing" => StyleDeclaration::LetterSpacing(parse_px(parser)?),
@@ -1755,6 +1766,17 @@ fn parse_px_list(parser: &mut Parser) -> Vec<f32> {
     let mut values = Vec::with_capacity(4);
     while values.len() < 4 {
         match parser.try_parse(|p| parse_px(p)) {
+            Ok(v) => values.push(v),
+            Err(_) => break,
+        }
+    }
+    values
+}
+
+fn parse_dimension_list(parser: &mut Parser) -> Vec<Dimension> {
+    let mut values = Vec::with_capacity(4);
+    while values.len() < 4 {
+        match parser.try_parse(|p| parse_dimension(p)) {
             Ok(v) => values.push(v),
             Err(_) => break,
         }
@@ -3345,6 +3367,7 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::Right(v) => style.right = Some(*v),
         StyleDeclaration::Bottom(v) => style.bottom = Some(*v),
         StyleDeclaration::Left(v) => style.left = Some(*v),
+        StyleDeclaration::ZIndex(v) => style.z_index = *v,
         StyleDeclaration::OutlineColor(v) => style.outline_color = *v,
         StyleDeclaration::OutlineWidth(v) => style.outline_width = *v,
         StyleDeclaration::OutlineOffset(v) => style.outline_offset = *v,
@@ -3709,6 +3732,57 @@ mod tests {
         assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == zero));
         assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == zero));
         assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == zero));
+    }
+
+    #[test]
+    fn test_inset_two_values() {
+        let decls = parse_decls(".x { inset: 10px 20px; }");
+        assert_eq!(decls.len(), 4);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == Dimension::Px(20.0)));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == Dimension::Px(20.0)));
+    }
+
+    #[test]
+    fn test_inset_three_values() {
+        let decls = parse_decls(".x { inset: 10px 20px 30px; }");
+        assert_eq!(decls.len(), 4);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == Dimension::Px(20.0)));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == Dimension::Px(30.0)));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == Dimension::Px(20.0)));
+    }
+
+    #[test]
+    fn test_inset_four_values() {
+        let decls = parse_decls(".x { inset: 10px 20px 30px 40px; }");
+        assert_eq!(decls.len(), 4);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == Dimension::Px(20.0)));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == Dimension::Px(30.0)));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == Dimension::Px(40.0)));
+    }
+
+    #[test]
+    fn test_inset_auto_mixed() {
+        let decls = parse_decls(".x { inset: auto 10px; }");
+        assert_eq!(decls.len(), 4);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == Dimension::Auto));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == Dimension::Auto));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == Dimension::Px(10.0)));
+    }
+
+    #[test]
+    fn test_inset_percent() {
+        let decls = parse_decls(".x { inset: 50%; }");
+        assert_eq!(decls.len(), 4);
+        let pct50 = Dimension::Percent(50.0);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == pct50));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == pct50));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == pct50));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == pct50));
     }
 
     #[test]
@@ -5575,6 +5649,74 @@ mod tests {
         assert!(
             parts.iter().any(|p| matches!(p, SelectorPart::PseudoClass(PseudoClass::FocusWithin))),
             "should parse :focus-within pseudo-class"
+        );
+    }
+
+    #[test]
+    fn test_z_index_positive() {
+        let decls = parse_decls(".x { z-index: 10; }");
+        let zi = decls.iter().find_map(|d| match d {
+            StyleDeclaration::ZIndex(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(zi, Some(10));
+    }
+
+    #[test]
+    fn test_z_index_negative() {
+        let decls = parse_decls(".x { z-index: -5; }");
+        let zi = decls.iter().find_map(|d| match d {
+            StyleDeclaration::ZIndex(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(zi, Some(-5));
+    }
+
+    #[test]
+    fn test_z_index_zero() {
+        let decls = parse_decls(".x { z-index: 0; }");
+        let zi = decls.iter().find_map(|d| match d {
+            StyleDeclaration::ZIndex(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(zi, Some(0));
+    }
+
+    #[test]
+    fn test_z_index_applied_to_computed_style() {
+        let decls = parse_decls(".x { z-index: 42; }");
+        let mut style = ComputedStyle::default();
+        for d in &decls {
+            apply_declaration(&mut style, d);
+        }
+        assert_eq!(style.z_index, 42);
+    }
+
+    #[test]
+    fn test_position_fixed_parsed() {
+        let decls = parse_decls(".x { position: fixed; }");
+        let pos = decls.iter().find_map(|d| match d {
+            StyleDeclaration::Position(p) => Some(*p),
+            _ => None,
+        });
+        assert_eq!(
+            pos,
+            Some(CssPosition::Fixed),
+            "position: fixed should parse to CssPosition::Fixed"
+        );
+    }
+
+    #[test]
+    fn test_position_fixed_maps_to_absolute_in_taffy() {
+        use crate::style::types::ComputedStyle;
+
+        let mut style = ComputedStyle::default();
+        style.position = CssPosition::Fixed;
+        let taffy = style.to_taffy_style();
+        assert_eq!(
+            taffy.position,
+            taffy::Position::Absolute,
+            "CssPosition::Fixed should map to taffy::Position::Absolute"
         );
     }
 }

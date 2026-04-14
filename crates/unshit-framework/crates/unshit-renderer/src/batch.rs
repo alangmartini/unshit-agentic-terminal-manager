@@ -1344,21 +1344,40 @@ fn walk_for_batch(
         }
     }
 
-    let mut child = element.first_child;
-    while !child.is_dangling() {
-        // Single arena lookup per child: extract sibling link and position.
-        let (next, effective_clip, eff_scroll_x, eff_scroll_y) =
+    // Collect children into a Vec so we can sort by z-index.
+    // Stable sort preserves DOM order for children with equal z-index.
+    let mut children_ids: Vec<NodeId> = Vec::new();
+    let mut needs_sort = false;
+    {
+        let mut c = element.first_child;
+        while !c.is_dangling() {
+            if !needs_sort {
+                let z = arena.get(c).map(|e| e.computed_style.z_index).unwrap_or(0);
+                if z != 0 {
+                    needs_sort = true;
+                }
+            }
+            children_ids.push(c);
+            c = arena.get(c).map(|e| e.next_sibling).unwrap_or(NodeId::DANGLING);
+        }
+    }
+    if needs_sort {
+        children_ids
+            .sort_by_key(|&id| arena.get(id).map(|e| e.computed_style.z_index).unwrap_or(0));
+    }
+
+    for &child in &children_ids {
+        // Per CSS spec, absolutely positioned children escape their
+        // parent's overflow clip and scroll offset.
+        let (effective_clip, eff_scroll_x, eff_scroll_y) =
             if let Some(child_elem) = arena.get(child) {
-                let clip_scroll = if child_elem.computed_style.position == CssPosition::Absolute {
-                    // Per CSS spec, absolutely positioned children escape
-                    // their parent's overflow clip and scroll offset.
+                if matches!(child_elem.computed_style.position, CssPosition::Absolute | CssPosition::Fixed) {
                     (clip_rect, scroll_offset_x, scroll_offset_y)
                 } else {
                     (child_clip, child_scroll_x, child_scroll_y)
-                };
-                (child_elem.next_sibling, clip_scroll.0, clip_scroll.1, clip_scroll.2)
+                }
             } else {
-                (NodeId::DANGLING, child_clip, child_scroll_x, child_scroll_y)
+                (child_clip, child_scroll_x, child_scroll_y)
             };
 
         walk_for_batch(
@@ -1383,7 +1402,6 @@ fn walk_for_batch(
             portals,
             batch_cache,
         );
-        child = next;
     }
 
     // Snapshot the primitives emitted by this node and its subtree into the
