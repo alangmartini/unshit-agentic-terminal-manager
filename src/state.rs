@@ -15,6 +15,54 @@ pub const MAX_SIDEBAR_WIDTH: f32 = 500.0;
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
+#[derive(Clone, Debug)]
+pub struct AgentEntry {
+    pub name: String,
+    pub path: String,
+    pub status: AgentStatus,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentStatus {
+    Running,
+    Idle,
+    Disabled,
+}
+
+impl AgentStatus {
+    pub fn css_class(self) -> &'static str {
+        match self {
+            AgentStatus::Running => "running",
+            AgentStatus::Idle => "idle",
+            AgentStatus::Disabled => "disabled",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentStatus::Running => "running",
+            AgentStatus::Idle => "idle",
+            AgentStatus::Disabled => "disabled",
+        }
+    }
+}
+
+pub const KEYBINDS: &[(&str, &[&str])] = &[
+    ("New terminal", &["Ctrl", "T"]),
+    ("Close tab", &["Ctrl", "W"]),
+    ("Split right", &["Ctrl", "D"]),
+    ("Split down", &["Ctrl", "Shift", "D"]),
+    ("Next tab", &["Ctrl", "Tab"]),
+    ("Previous tab", &["Ctrl", "Shift", "Tab"]),
+    ("Command palette", &["Ctrl", "K"]),
+    ("Toggle sidebar", &["Ctrl", "B"]),
+    ("Settings", &["Ctrl", ","]),
+    ("Zoom in", &["Ctrl", "="]),
+    ("Zoom out", &["Ctrl", "-"]),
+    ("Fullscreen", &["F11"]),
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSection {
     General,
@@ -143,7 +191,12 @@ pub struct AppState {
     pub settings_section: SettingsSection,
     pub theme: String,
     pub font_size_pt: u32,
+    pub cursor_style: String,
+    pub opacity: u32,
+    pub line_height_10x: u32,
+    pub agent_timeout: u32,
     pub toggles: BTreeMap<String, bool>,
+    pub agents: Vec<AgentEntry>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
@@ -205,7 +258,12 @@ impl AppState {
             settings_section: self.settings_section,
             theme: self.theme.clone(),
             font_size_pt: self.font_size_pt,
+            cursor_style: self.cursor_style.clone(),
+            opacity: self.opacity,
+            line_height_10x: self.line_height_10x,
+            agent_timeout: self.agent_timeout,
             toggles: self.toggles.clone(),
+            agents: self.agents.clone(),
             palette_open: self.palette_open,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
@@ -235,7 +293,12 @@ pub struct UiSnapshot {
     pub settings_section: SettingsSection,
     pub theme: String,
     pub font_size_pt: u32,
+    pub cursor_style: String,
+    pub opacity: u32,
+    pub line_height_10x: u32,
+    pub agent_timeout: u32,
     pub toggles: BTreeMap<String, bool>,
+    pub agents: Vec<AgentEntry>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
@@ -456,6 +519,34 @@ pub fn seed_state() -> AppState {
     toggles.insert("glow-effect".to_string(), true);
     toggles.insert("background-texture".to_string(), true);
     toggles.insert("shell-integration".to_string(), true);
+    toggles.insert("confirm-before-closing".to_string(), true);
+    toggles.insert("check-for-updates".to_string(), true);
+    toggles.insert("start-minimized".to_string(), false);
+    toggles.insert("scroll-on-output".to_string(), true);
+    toggles.insert("bell-notification".to_string(), false);
+    toggles.insert("font-ligatures".to_string(), true);
+    toggles.insert("auto-discovery".to_string(), true);
+
+    let agents = vec![
+        AgentEntry {
+            name: "claude".to_string(),
+            path: "~/.local/bin/claude".to_string(),
+            status: AgentStatus::Running,
+            enabled: true,
+        },
+        AgentEntry {
+            name: "amp".to_string(),
+            path: "~/.local/bin/amp".to_string(),
+            status: AgentStatus::Idle,
+            enabled: true,
+        },
+        AgentEntry {
+            name: "codex".to_string(),
+            path: "~/.local/bin/codex".to_string(),
+            status: AgentStatus::Disabled,
+            enabled: false,
+        },
+    ];
 
     AppState {
         workspaces,
@@ -468,7 +559,12 @@ pub fn seed_state() -> AppState {
         settings_section: SettingsSection::General,
         theme: "amber".to_string(),
         font_size_pt: 13,
+        cursor_style: "block".to_string(),
+        opacity: 100,
+        line_height_10x: 14,
+        agent_timeout: 300,
         toggles,
+        agents,
         palette_open: false,
         sidebar_collapsed: false,
         sidebar_width: 252.0,
@@ -974,6 +1070,57 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             state.palette_open = !state.palette_open;
             true
         }
+        "line_height.inc" => {
+            if state.line_height_10x < 25 {
+                state.line_height_10x += 1;
+                true
+            } else {
+                false
+            }
+        }
+        "line_height.dec" => {
+            if state.line_height_10x > 10 {
+                state.line_height_10x -= 1;
+                true
+            } else {
+                false
+            }
+        }
+        "agent_timeout.inc" => {
+            if state.agent_timeout < 600 {
+                state.agent_timeout = (state.agent_timeout + 30).min(600);
+                true
+            } else {
+                false
+            }
+        }
+        "agent_timeout.dec" => {
+            if state.agent_timeout > 30 {
+                state.agent_timeout = state.agent_timeout.saturating_sub(30).max(30);
+                true
+            } else {
+                false
+            }
+        }
+        other if other.starts_with("cursor.set:") => {
+            let style = &other["cursor.set:".len()..];
+            if matches!(style, "block" | "line" | "bar") && state.cursor_style != style {
+                state.cursor_style = style.to_string();
+                true
+            } else {
+                false
+            }
+        }
+        other if other.starts_with("opacity.set:") => {
+            if let Ok(val) = other["opacity.set:".len()..].parse::<u32>() {
+                let clamped = val.clamp(50, 100);
+                if state.opacity != clamped {
+                    state.opacity = clamped;
+                    return true;
+                }
+            }
+            false
+        }
         other if other.starts_with("tab.switch:") => {
             if let Ok(index) = other["tab.switch:".len()..].parse::<usize>() {
                 if index < state.tabs.len() && state.active_tab != index {
@@ -1133,7 +1280,12 @@ mod tests {
             settings_section: SettingsSection::General,
             theme: "amber".to_string(),
             font_size_pt: 13,
+            cursor_style: "block".to_string(),
+            opacity: 100,
+            line_height_10x: 14,
+            agent_timeout: 300,
             toggles: BTreeMap::new(),
+            agents: vec![],
             palette_open: false,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
@@ -2138,5 +2290,188 @@ mod tests {
         let mut state = seed_state();
         state.active_workspace = 1; // demo workspace with no path
         assert_eq!(active_workspace_cwd(&state), None);
+    }
+
+    // -- new settings state fields --------------------------------------------
+
+    #[test]
+    fn seed_state_defaults_cursor_style_block() {
+        let state = seed_state();
+        assert_eq!(state.cursor_style, "block");
+    }
+
+    #[test]
+    fn seed_state_defaults_opacity_100() {
+        let state = seed_state();
+        assert_eq!(state.opacity, 100);
+    }
+
+    #[test]
+    fn seed_state_defaults_line_height_14() {
+        let state = seed_state();
+        assert_eq!(state.line_height_10x, 14);
+    }
+
+    #[test]
+    fn seed_state_defaults_agent_timeout_300() {
+        let state = seed_state();
+        assert_eq!(state.agent_timeout, 300);
+    }
+
+    #[test]
+    fn seed_state_has_eleven_toggles() {
+        let state = seed_state();
+        assert_eq!(state.toggles.len(), 11);
+    }
+
+    #[test]
+    fn seed_state_has_three_agents() {
+        let state = seed_state();
+        assert_eq!(state.agents.len(), 3);
+        assert_eq!(state.agents[0].name, "claude");
+        assert_eq!(state.agents[1].name, "amp");
+        assert_eq!(state.agents[2].name, "codex");
+    }
+
+    #[test]
+    fn keybinds_has_twelve_entries() {
+        assert_eq!(KEYBINDS.len(), 12);
+    }
+
+    #[test]
+    fn agent_status_css_class() {
+        assert_eq!(AgentStatus::Running.css_class(), "running");
+        assert_eq!(AgentStatus::Idle.css_class(), "idle");
+        assert_eq!(AgentStatus::Disabled.css_class(), "disabled");
+    }
+
+    #[test]
+    fn ui_snapshot_copies_new_fields() {
+        let state = seed_state();
+        let snap = state.ui_snapshot();
+        assert_eq!(snap.cursor_style, "block");
+        assert_eq!(snap.opacity, 100);
+        assert_eq!(snap.line_height_10x, 14);
+        assert_eq!(snap.agent_timeout, 300);
+        assert_eq!(snap.agents.len(), 3);
+    }
+
+    // -- dispatch: cursor.set -------------------------------------------------
+
+    #[test]
+    fn dispatch_cursor_set_line() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "cursor.set:line"));
+        assert_eq!(state.cursor_style, "line");
+    }
+
+    #[test]
+    fn dispatch_cursor_set_bar() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "cursor.set:bar"));
+        assert_eq!(state.cursor_style, "bar");
+    }
+
+    #[test]
+    fn dispatch_cursor_set_same_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "cursor.set:block")); // already block
+    }
+
+    #[test]
+    fn dispatch_cursor_set_invalid_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "cursor.set:unknown"));
+    }
+
+    // -- dispatch: opacity.set ------------------------------------------------
+
+    #[test]
+    fn dispatch_opacity_set() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "opacity.set:75"));
+        assert_eq!(state.opacity, 75);
+    }
+
+    #[test]
+    fn dispatch_opacity_set_clamps_low() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "opacity.set:10"));
+        assert_eq!(state.opacity, 50);
+    }
+
+    #[test]
+    fn dispatch_opacity_set_clamps_high() {
+        let mut state = test_state();
+        state.opacity = 90;
+        assert!(dispatch(&mut state, "opacity.set:200"));
+        assert_eq!(state.opacity, 100);
+    }
+
+    #[test]
+    fn dispatch_opacity_set_same_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "opacity.set:100")); // already 100
+    }
+
+    // -- dispatch: line_height.inc/dec ----------------------------------------
+
+    #[test]
+    fn dispatch_line_height_inc() {
+        let mut state = test_state();
+        assert_eq!(state.line_height_10x, 14);
+        assert!(dispatch(&mut state, "line_height.inc"));
+        assert_eq!(state.line_height_10x, 15);
+    }
+
+    #[test]
+    fn dispatch_line_height_dec() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "line_height.dec"));
+        assert_eq!(state.line_height_10x, 13);
+    }
+
+    #[test]
+    fn dispatch_line_height_inc_clamps_at_25() {
+        let mut state = test_state();
+        state.line_height_10x = 25;
+        assert!(!dispatch(&mut state, "line_height.inc"));
+    }
+
+    #[test]
+    fn dispatch_line_height_dec_clamps_at_10() {
+        let mut state = test_state();
+        state.line_height_10x = 10;
+        assert!(!dispatch(&mut state, "line_height.dec"));
+    }
+
+    // -- dispatch: agent_timeout.inc/dec --------------------------------------
+
+    #[test]
+    fn dispatch_agent_timeout_inc() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "agent_timeout.inc"));
+        assert_eq!(state.agent_timeout, 330);
+    }
+
+    #[test]
+    fn dispatch_agent_timeout_dec() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "agent_timeout.dec"));
+        assert_eq!(state.agent_timeout, 270);
+    }
+
+    #[test]
+    fn dispatch_agent_timeout_inc_clamps_at_600() {
+        let mut state = test_state();
+        state.agent_timeout = 600;
+        assert!(!dispatch(&mut state, "agent_timeout.inc"));
+    }
+
+    #[test]
+    fn dispatch_agent_timeout_dec_clamps_at_30() {
+        let mut state = test_state();
+        state.agent_timeout = 30;
+        assert!(!dispatch(&mut state, "agent_timeout.dec"));
     }
 }

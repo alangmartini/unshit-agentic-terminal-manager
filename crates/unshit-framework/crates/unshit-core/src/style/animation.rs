@@ -136,7 +136,7 @@ impl AnimationDriver {
     /// Returns true while at least one animation is ticking. The app loop
     /// uses this to decide whether to keep requesting redraws.
     pub fn has_active(&self) -> bool {
-        !self.running.is_empty()
+        self.running.values().any(|states| states.iter().any(|s| !s.completed))
     }
 
     /// Push the full set of animations for a single node, replacing any
@@ -239,13 +239,18 @@ impl AnimationDriver {
                 }
             }
 
-            let mut any_alive = false;
-            let mut i = 0;
-            while i < states.len() {
-                let state = &mut states[i];
+            let mut any_needs_tick = false;
+            for state in states.iter_mut() {
+                // Already completed animations are kept in the list so
+                // sync_node can match them by def and avoid restarting.
+                // They don't apply values or request redraws.
+                if state.completed {
+                    continue;
+                }
+
                 // Paused animations do not advance the playhead.
                 if state.def.play_state == AnimationPlayState::Paused {
-                    any_alive = true;
+                    any_needs_tick = true;
                     // Still apply the frozen sample so the element renders
                     // the same values every frame while paused.
                     apply_sample(
@@ -254,7 +259,6 @@ impl AnimationDriver {
                         stylesheet,
                         state.paused_at.unwrap_or(state.start_time),
                     );
-                    i += 1;
                     continue;
                 }
 
@@ -267,18 +271,20 @@ impl AnimationDriver {
 
                 let completed = apply_sample(&mut style_snapshot, state, stylesheet, now);
                 if completed {
-                    let keep = match state.def.fill_mode {
-                        AnimationFillMode::Forwards | AnimationFillMode::Both => true,
-                        _ => false,
-                    };
                     state.completed = true;
-                    if !keep {
-                        states.swap_remove(i);
-                        continue;
+                    // Forwards/Both fill modes keep applying the final
+                    // frame values, so they still need ticks. Other fill
+                    // modes (None/Backwards) just sit inert.
+                    let needs_fill = matches!(
+                        state.def.fill_mode,
+                        AnimationFillMode::Forwards | AnimationFillMode::Both
+                    );
+                    if needs_fill {
+                        any_needs_tick = true;
                     }
+                } else {
+                    any_needs_tick = true;
                 }
-                any_alive = true;
-                i += 1;
             }
 
             if let Some(el) = arena.get_mut(*node_id) {
@@ -288,8 +294,13 @@ impl AnimationDriver {
                 }
             }
 
-            if !any_alive {
+            // Only remove the node entry when all states have been cleared
+            // (e.g. by sync_node detecting the CSS animation was removed).
+            // Completed animations stay so sync_node does not restart them.
+            if states.is_empty() {
                 dead_nodes.push(*node_id);
+            } else if any_needs_tick {
+                // At least one animation still needs sampling.
             }
         }
 
@@ -818,6 +829,55 @@ mod tests {
             (style.opacity - 0.5).abs() < 0.02,
             "expected ~0.5 opacity at t=0 with -500ms delay, got {}",
             style.opacity
+        );
+    }
+
+    /// Regression test: a completed animation with fill_mode::None must NOT
+    /// restart when sync_node is called again on the next frame. The
+    /// completed state stays in the running list so the def matches.
+    #[test]
+    fn completed_no_fill_animation_does_not_restart() {
+        let sheet = stylesheet_with_opacity_keyframes("fade", 0.0, 1.0);
+        let def = def_linear("fade", 100); // fill_mode: None
+        let t0 = Instant::now();
+
+        // Allocate an arena node first so we have a valid NodeId.
+        let mut arena = crate::tree::NodeArena::new();
+        let node = arena.alloc(crate::element::Element::new(crate::element::Tag::Div));
+
+        let mut driver = AnimationDriver::new();
+        let base = ComputedStyle::default(); // opacity = 1.0
+
+        // First sync: starts the animation.
+        driver.sync_node(node, &[def.clone()], &base, t0);
+        assert!(driver.has_active(), "animation should be active after sync");
+
+        let t_done = t0 + Duration::from_millis(200);
+        driver.tick(&mut arena, &sheet, t_done);
+
+        // Animation completed, should no longer be active.
+        assert!(
+            !driver.has_active(),
+            "completed no-fill animation should not be active"
+        );
+        // But the state must still exist in running so sync_node can match it.
+        assert!(
+            driver.running.contains_key(&node),
+            "completed state must be retained in running map"
+        );
+
+        // Second sync: same def. Must NOT restart.
+        let t1 = t_done + Duration::from_millis(16);
+        driver.sync_node(node, &[def], &base, t1);
+        let states = driver.running.get(&node).unwrap();
+        assert_eq!(states.len(), 1);
+        assert!(
+            states[0].completed,
+            "animation should still be marked completed after re-sync"
+        );
+        assert_eq!(
+            states[0].start_time, t0,
+            "start_time should be original, not the re-sync time"
         );
     }
 }

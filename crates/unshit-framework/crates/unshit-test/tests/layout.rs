@@ -722,3 +722,61 @@ fn position_static_ignores_top_left() {
         b.layout_rect.x
     );
 }
+
+#[test]
+fn fixed_overlay_covers_viewport_in_flex_column() {
+    // Reproduces the settings modal scenario: a position:fixed overlay
+    // with inset:0 inside a flex-column container should cover the full
+    // viewport, not stack after the other flex children.
+    let css = r#"
+        .app {
+            display: flex; flex-direction: column;
+            width: 100%; height: 100%;
+            position: relative;
+        }
+        .header { height: 40px; width: 100%; }
+        .body   { flex: 1; width: 100%; }
+        .overlay {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("app")
+                .with_child(ElementDef::new(Tag::Div).with_class("header").with_id("hdr"))
+                .with_child(ElementDef::new(Tag::Div).with_class("body").with_id("body"))
+                .with_child(ElementDef::new(Tag::Div).with_class("overlay").with_id("overlay")),
+        },
+        1024.0,
+        768.0,
+    );
+
+    let overlay = h.query("#overlay").unwrap();
+    assert!(
+        overlay.layout_rect.x.abs() < 1.0,
+        "overlay x ({}) should be 0",
+        overlay.layout_rect.x
+    );
+    assert!(
+        overlay.layout_rect.y.abs() < 1.0,
+        "overlay y ({}) should be 0, not stacked after siblings",
+        overlay.layout_rect.y
+    );
+    assert!(
+        (overlay.layout_rect.width - 1024.0).abs() < 1.0,
+        "overlay width ({}) should be viewport width (1024)",
+        overlay.layout_rect.width
+    );
+    assert!(
+        (overlay.layout_rect.height - 768.0).abs() < 1.0,
+        "overlay height ({}) should be viewport height (768)",
+        overlay.layout_rect.height
+    );
+}

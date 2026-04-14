@@ -42,8 +42,16 @@ pub fn build_terminal_grid(
                 .and_then(|r| r.get(col_idx))
                 .copied()
                 .unwrap_or(1.0);
-            let pane_el = build_pane(pane, is_active, single_pane, shared, grids)
-                .with_style(StyleDeclaration::FlexGrow(col_ratio));
+            let capture_keyboard = is_active && !state.settings_open;
+            let pane_el = build_pane(
+                pane,
+                is_active,
+                capture_keyboard,
+                single_pane,
+                shared,
+                grids,
+            )
+            .with_style(StyleDeclaration::FlexGrow(col_ratio));
             row_el = row_el.with_child(pane_el);
         }
         if row_idx > 0 {
@@ -144,6 +152,7 @@ fn build_row_resizer(row_idx: usize, shared: &SharedState) -> ElementDef {
 fn build_pane(
     pane: &Pane,
     is_active: bool,
+    capture_keyboard: bool,
     single_pane: bool,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
@@ -160,7 +169,7 @@ fn build_pane(
         });
     });
 
-    let body = build_pane_body(pane.id, is_active, shared, grids);
+    let body = build_pane_body(pane.id, capture_keyboard, shared, grids);
     container
         .with_child(build_pane_header(pane, single_pane, shared))
         .with_child(body)
@@ -238,7 +247,7 @@ fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> El
 
 fn build_pane_body(
     pane_id: PaneId,
-    is_active: bool,
+    capture_keyboard: bool,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
@@ -255,7 +264,7 @@ fn build_pane_body(
         // framework ignores click-to-focus and keyboard events never arrive.
         grid_el = grid_el.with_tab_index(0);
 
-        if is_active {
+        if capture_keyboard {
             grid_el = grid_el.captures_keyboard(true);
 
             // Register keyboard capture handler to send input to PTY.
@@ -532,7 +541,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &shared, &grids);
+        let el = build_pane(&pane, true, true, false, &shared, &grids);
         assert!(el.classes.contains(&"pane".to_string()));
         assert!(el.classes.contains(&"active".to_string()));
     }
@@ -542,7 +551,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &shared, &grids);
+        let el = build_pane(&pane, false, false, false, &shared, &grids);
         assert!(el.classes.contains(&"pane".to_string()));
         assert!(!el.classes.contains(&"active".to_string()));
     }
@@ -552,7 +561,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &shared, &grids);
+        let el = build_pane(&pane, true, true, false, &shared, &grids);
         assert_eq!(el.children.len(), 2);
         assert!(el.children[0].classes.contains(&"pane-header".to_string()));
         assert!(el.children[1].classes.contains(&"pane-body".to_string()));
@@ -563,7 +572,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &shared, &grids);
+        let el = build_pane(&pane, false, false, false, &shared, &grids);
         assert!(el.on_click.is_some());
     }
 
@@ -692,7 +701,7 @@ mod tests {
         let shared = make_shared();
         let pane = make_pane_titled(42, "shell");
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &shared, &grids);
+        let el = build_pane(&pane, false, false, false, &shared, &grids);
         (el.on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().active_pane, PaneId(42));
     }
