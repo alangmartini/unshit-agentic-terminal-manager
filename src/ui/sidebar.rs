@@ -372,11 +372,7 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
         ElementDef::new(Tag::Div).with_class("ctx-menu-separator")
     }
 
-    let collapse_label = if is_collapsed {
-        "Expand"
-    } else {
-        "Collapse"
-    };
+    let collapse_label = if is_collapsed { "Expand" } else { "Collapse" };
 
     let mut menu = ElementDef::new(Tag::Div)
         .with_class("ctx-menu")

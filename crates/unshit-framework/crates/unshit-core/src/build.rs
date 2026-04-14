@@ -1071,9 +1071,7 @@ mod tests {
 
     /// Helper: build a two-level parent/child arena with the given CSS.
     /// Returns (arena, parent, child, stylesheet).
-    fn setup_parent_child(
-        css: &str,
-    ) -> (NodeArena, NodeId, NodeId, CompiledStylesheet) {
+    fn setup_parent_child(css: &str) -> (NodeArena, NodeId, NodeId, CompiledStylesheet) {
         let stylesheet = CompiledStylesheet::parse(css);
         let mut arena = NodeArena::new();
         let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
@@ -1191,12 +1189,7 @@ mod tests {
         clear_paint_flags_subtree_rec(&mut arena, parent);
 
         // Sample the animation mid-way.
-        tick_all_animations(
-            &mut arena,
-            &mut driver,
-            &stylesheet,
-            now + Duration::from_millis(100),
-        );
+        tick_all_animations(&mut arena, &mut driver, &stylesheet, now + Duration::from_millis(100));
 
         assert!(
             arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT),
@@ -1228,12 +1221,7 @@ mod tests {
         // Drive one tick past the end so the animation transitions to
         // `completed = true`. PAINT should still be set on this frame
         // because the final value was just applied.
-        tick_all_animations(
-            &mut arena,
-            &mut driver,
-            &stylesheet,
-            now + Duration::from_millis(200),
-        );
+        tick_all_animations(&mut arena, &mut driver, &stylesheet, now + Duration::from_millis(200));
 
         // Pretend a frame rendered and clear the flags.
         clear_paint_flags_subtree_rec(&mut arena, parent);
@@ -1241,12 +1229,7 @@ mod tests {
         // Tick again far past the end. The animation is already completed
         // and has fill_mode: None, so no values should be applied and no
         // paint flags should be raised.
-        tick_all_animations(
-            &mut arena,
-            &mut driver,
-            &stylesheet,
-            now + Duration::from_millis(500),
-        );
+        tick_all_animations(&mut arena, &mut driver, &stylesheet, now + Duration::from_millis(500));
 
         assert!(
             !arena.get(child).unwrap().dirty.intersects(DirtyFlags::PAINT),

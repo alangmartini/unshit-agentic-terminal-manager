@@ -140,9 +140,7 @@ impl AnimationDriver {
     /// restarting them on the next restyle, but they do NOT count as
     /// active here so the app loop stops requesting redraws for them.
     pub fn has_active(&self) -> bool {
-        self.running
-            .values()
-            .any(|states| states.iter().any(|s| !s.completed))
+        self.running.values().any(|states| states.iter().any(|s| !s.completed))
     }
 
     /// Push the full set of animations for a single node, replacing any

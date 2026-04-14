@@ -1476,7 +1476,10 @@ fn walk_for_batch(
         // parent's overflow clip and scroll offset.
         let (effective_clip, eff_scroll_x, eff_scroll_y) =
             if let Some(child_elem) = arena.get(child) {
-                if matches!(child_elem.computed_style.position, CssPosition::Absolute | CssPosition::Fixed) {
+                if matches!(
+                    child_elem.computed_style.position,
+                    CssPosition::Absolute | CssPosition::Fixed
+                ) {
                     (clip_rect, scroll_offset_x, scroll_offset_y)
                 } else {
                     (child_clip, child_scroll_x, child_scroll_y)
@@ -2601,10 +2604,7 @@ mod tests {
         // of re-rendering. The fix guarantees the cached entry is carried
         // forward into the current staging map.
         cache.begin_frame();
-        assert!(
-            cache.replay(id, 0).is_some(),
-            "frame 2 must replay from frame 1's committed data",
-        );
+        assert!(cache.replay(id, 0).is_some(), "frame 2 must replay from frame 1's committed data",);
         cache.commit_frame();
 
         // Frame 3: without the fix, the frame-2 commit swap would have
@@ -2612,10 +2612,7 @@ mod tests {
         // fix, `replay` cloned the range into `pending` during frame 2,
         // so the entry survives the swap.
         cache.begin_frame();
-        assert!(
-            cache.get(id, 0).is_some(),
-            "replayed entry must persist across commit_frame",
-        );
+        assert!(cache.get(id, 0).is_some(), "replayed entry must persist across commit_frame",);
 
         // Frame 4: repeat to confirm the carry-forward is stable across
         // multiple consecutive replay cycles, not just the first one.
