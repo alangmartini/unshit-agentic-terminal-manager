@@ -1307,16 +1307,21 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "bottom" => StyleDeclaration::Bottom(parse_dimension(parser)?),
         "left" => StyleDeclaration::Left(parse_dimension(parser)?),
         "inset" => {
-            // CSS `inset` shorthand expands to top, right, bottom, left.
-            // Only the single-value form (`inset: <value>`) is supported;
-            // multi-value forms are not yet handled.
-            let dim = parse_dimension(parser)?;
+            // CSS `inset` shorthand: 1/2/3/4-value forms matching the spec.
+            let values = parse_dimension_list(parser);
+            let (top, right, bottom, left) = match values.len() {
+                1 => (values[0], values[0], values[0], values[0]),
+                2 => (values[0], values[1], values[0], values[1]),
+                3 => (values[0], values[1], values[2], values[1]),
+                4 => (values[0], values[1], values[2], values[3]),
+                _ => return Err(()),
+            };
             let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
             return Ok(smallvec::smallvec![
-                StyleDeclaration::Top(dim),
-                StyleDeclaration::Right(dim),
-                StyleDeclaration::Bottom(dim),
-                StyleDeclaration::Left(dim),
+                StyleDeclaration::Top(top),
+                StyleDeclaration::Right(right),
+                StyleDeclaration::Bottom(bottom),
+                StyleDeclaration::Left(left),
             ]);
         }
         "letter-spacing" => StyleDeclaration::LetterSpacing(parse_px(parser)?),
@@ -1755,6 +1760,17 @@ fn parse_px_list(parser: &mut Parser) -> Vec<f32> {
     let mut values = Vec::with_capacity(4);
     while values.len() < 4 {
         match parser.try_parse(|p| parse_px(p)) {
+            Ok(v) => values.push(v),
+            Err(_) => break,
+        }
+    }
+    values
+}
+
+fn parse_dimension_list(parser: &mut Parser) -> Vec<Dimension> {
+    let mut values = Vec::with_capacity(4);
+    while values.len() < 4 {
+        match parser.try_parse(|p| parse_dimension(p)) {
             Ok(v) => values.push(v),
             Err(_) => break,
         }
@@ -3709,6 +3725,57 @@ mod tests {
         assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == zero));
         assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == zero));
         assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == zero));
+    }
+
+    #[test]
+    fn test_inset_two_values() {
+        let decls = parse_decls(".x { inset: 10px 20px; }");
+        assert_eq!(decls.len(), 4);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == Dimension::Px(20.0)));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == Dimension::Px(20.0)));
+    }
+
+    #[test]
+    fn test_inset_three_values() {
+        let decls = parse_decls(".x { inset: 10px 20px 30px; }");
+        assert_eq!(decls.len(), 4);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == Dimension::Px(20.0)));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == Dimension::Px(30.0)));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == Dimension::Px(20.0)));
+    }
+
+    #[test]
+    fn test_inset_four_values() {
+        let decls = parse_decls(".x { inset: 10px 20px 30px 40px; }");
+        assert_eq!(decls.len(), 4);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == Dimension::Px(20.0)));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == Dimension::Px(30.0)));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == Dimension::Px(40.0)));
+    }
+
+    #[test]
+    fn test_inset_auto_mixed() {
+        let decls = parse_decls(".x { inset: auto 10px; }");
+        assert_eq!(decls.len(), 4);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == Dimension::Auto));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == Dimension::Px(10.0)));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == Dimension::Auto));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == Dimension::Px(10.0)));
+    }
+
+    #[test]
+    fn test_inset_percent() {
+        let decls = parse_decls(".x { inset: 50%; }");
+        assert_eq!(decls.len(), 4);
+        let pct50 = Dimension::Percent(50.0);
+        assert!(matches!(&decls[0], StyleDeclaration::Top(d) if *d == pct50));
+        assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == pct50));
+        assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == pct50));
+        assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == pct50));
     }
 
     #[test]
