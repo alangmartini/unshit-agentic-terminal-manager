@@ -139,7 +139,7 @@ fn right_click_fires_context_menu_handler() {
         root: ElementDef::new(Tag::Div).with_class("root").with_child(
             ElementDef::new(Tag::Button).with_class("btn").on_context_menu({
                 let c = counter_clone.clone();
-                move || {
+                move |_x, _y| {
                     c.fetch_add(1, Ordering::SeqCst);
                 }
             }),
@@ -167,7 +167,7 @@ fn right_click_miss_does_not_fire() {
         root: ElementDef::new(Tag::Div).with_class("root").with_child(
             ElementDef::new(Tag::Button).with_class("btn").on_context_menu({
                 let c = counter_clone.clone();
-                move || {
+                move |_x, _y| {
                     c.fetch_add(1, Ordering::SeqCst);
                 }
             }),
@@ -196,7 +196,7 @@ fn right_click_bubbles_to_parent() {
                 .with_class("parent")
                 .on_context_menu({
                     let c = counter_clone.clone();
-                    move || {
+                    move |_x, _y| {
                         c.fetch_add(1, Ordering::SeqCst);
                     }
                 })
@@ -234,7 +234,7 @@ fn right_click_does_not_fire_on_click() {
                 })
                 .on_context_menu({
                     let c = ctx_clone.clone();
-                    move || {
+                    move |_x, _y| {
                         c.fetch_add(1, Ordering::SeqCst);
                     }
                 }),

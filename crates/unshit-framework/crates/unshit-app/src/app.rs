@@ -1214,7 +1214,8 @@ impl ApplicationHandler for AppHandler {
                     }
                 } else if mouse_button == Some(winit::event::MouseButton::Right) {
                     if button_state == ElementState::Pressed {
-                        if dispatch_context_menu(&state.arena, state.interaction.hovered) {
+                        let (cx, cy) = state.interaction.last_cursor_pos;
+                        if dispatch_context_menu(&state.arena, state.interaction.hovered, cx, cy) {
                             state.needs_rebuild = true;
                             state.window.request_redraw();
                         }

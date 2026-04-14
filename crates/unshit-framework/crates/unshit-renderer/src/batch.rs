@@ -683,7 +683,7 @@ fn walk_for_batch(
 
     // Running cursors for draw span tracking. Updated after each flush.
     let mut quad_cursor = quad_start;
-    let mut glyph_cursor = glyph_start;
+    let glyph_cursor = glyph_start;
 
     let is_visible = style.visibility == Visibility::Visible;
 
@@ -1410,8 +1410,8 @@ fn walk_for_batch(
         let lb = batch.layer_mut(effective_layer);
         let qend = lb.quad_instances.len();
         let gend = lb.glyph_instances.len();
-        quad_cursor = flush_span(&mut lb.draw_spans, DrawKind::Quad, quad_cursor, qend);
-        glyph_cursor = flush_span(&mut lb.draw_spans, DrawKind::Glyph, glyph_cursor, gend);
+        let _ = flush_span(&mut lb.draw_spans, DrawKind::Quad, quad_cursor, qend);
+        let _ = flush_span(&mut lb.draw_spans, DrawKind::Glyph, glyph_cursor, gend);
     }
 
     // Collect children into a Vec so we can sort by z-index.
@@ -1473,13 +1473,18 @@ fn walk_for_batch(
         );
     }
 
-    // Flush any quads/glyphs accumulated by children.
+    // Children have already flushed their own draw spans internally
+    // during their recursive `walk_for_batch` calls.  Do NOT flush a
+    // span here: it would create duplicate overlapping spans that
+    // re-draw all children's quads then all glyphs, destroying the
+    // interleaved draw order and causing text occlusion (earlier DOM
+    // text renders on top of later DOM backgrounds).
+    //
+    // Just advance quad_cursor past children's contributions so the
+    // scrollbar/grip flush below starts at the right offset.
     {
         let lb = batch.layer_mut(effective_layer);
-        let qend = lb.quad_instances.len();
-        let gend = lb.glyph_instances.len();
-        quad_cursor = flush_span(&mut lb.draw_spans, DrawKind::Quad, quad_cursor, qend);
-        let _ = flush_span(&mut lb.draw_spans, DrawKind::Glyph, glyph_cursor, gend);
+        quad_cursor = lb.quad_instances.len();
     }
 
     // Snapshot the primitives emitted by this node and its subtree into the

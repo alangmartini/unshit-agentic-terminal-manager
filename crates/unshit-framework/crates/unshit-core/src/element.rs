@@ -250,7 +250,7 @@ pub struct Element {
     // Event handlers
     pub handlers: SmallVec<[(crate::event::EventType, EventHandler); 2]>,
     pub on_click: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub on_context_menu: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub on_context_menu: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
     pub on_drag: Option<Arc<dyn Fn(&crate::event::DragEvent) + Send + Sync>>,
     pub on_resize: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
 
@@ -496,7 +496,7 @@ pub struct ElementDef {
     pub on_click: Option<Arc<dyn Fn() + Send + Sync>>,
     pub tab_index: Option<i32>,
     pub captures_keyboard: bool,
-    pub on_context_menu: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub on_context_menu: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
     pub on_drag: Option<Arc<dyn Fn(&crate::event::DragEvent) + Send + Sync>>,
     pub on_resize: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
     pub handlers: SmallVec<[(crate::event::EventType, EventHandler); 2]>,
@@ -573,7 +573,7 @@ impl ElementDef {
         self
     }
 
-    pub fn on_context_menu(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+    pub fn on_context_menu(mut self, f: impl Fn(f32, f32) + Send + Sync + 'static) -> Self {
         self.on_context_menu = Some(Arc::new(f));
         self
     }

@@ -310,7 +310,7 @@ impl TestHarness {
     /// by walking up the parent chain for an `on_context_menu` handler.
     pub fn right_click(&mut self, x: f32, y: f32) {
         self.mouse_move(x, y);
-        dispatch_context_menu(&self.arena, self.interaction.hovered);
+        dispatch_context_menu(&self.arena, self.interaction.hovered, x, y);
         self.step();
     }
 

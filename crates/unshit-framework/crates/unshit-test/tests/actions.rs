@@ -57,7 +57,7 @@ fn right_click_on_fires_context_menu() {
             root: ElementDef::new(Tag::Div).with_class("root").with_child(
                 ElementDef::new(Tag::Div).with_class("menu").on_context_menu({
                     let c = c.clone();
-                    move || {
+                    move |_x, _y| {
                         c.fetch_add(1, Ordering::SeqCst);
                     }
                 }),
