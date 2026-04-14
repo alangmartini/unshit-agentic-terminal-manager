@@ -1,5 +1,5 @@
 use crate::atlas::GlyphAtlas;
-use crate::batch::{BackdropBoundary, LayeredBatch};
+use crate::batch::{BackdropBoundary, DrawKind, LayeredBatch};
 use crate::canvas::PaintContext;
 use crate::image_cache::ImageCache;
 use crate::persistent_buffer::GpuPersistentBuffers;
@@ -695,106 +695,253 @@ impl GpuContext {
             let mut svg_next: usize = 0;
 
             for (layer_idx, layer_batch) in self.layered_batch.layers.iter().enumerate() {
-                let quad_count = layer_batch.quad_instances.len() as u32;
-                if quad_count > 0 {
-                    self.quad_pipeline.upload_instances(
-                        &self.device,
-                        &self.queue,
-                        &layer_batch.quad_instances,
-                    );
-                    pass.set_pipeline(&self.quad_pipeline.pipeline);
-                    pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                    pass.set_vertex_buffer(0, self.quad_pipeline.instance_buffer.slice(..));
-                    pass.draw(0..6, 0..quad_count);
-                }
+                if layer_batch.draw_spans.is_empty() {
+                    // Fallback: existing render order (all quads, SVG, text, images, canvas)
+                    let quad_count = layer_batch.quad_instances.len() as u32;
+                    if quad_count > 0 {
+                        self.quad_pipeline.upload_instances(
+                            &self.device,
+                            &self.queue,
+                            &layer_batch.quad_instances,
+                        );
+                        pass.set_pipeline(&self.quad_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.quad_pipeline.instance_buffer.slice(..));
+                        pass.draw(0..6, 0..quad_count);
+                    }
 
-                // SVG pass. Runs after quads and before text so icon fills
-                // draw on top of background quads but under text content.
-                if !layer_batch.svg_draws.is_empty() {
-                    pass.set_pipeline(&self.svg_pipeline.pipeline);
-                    pass.set_bind_group(0, self.svg_pipeline.global_bind_group(), &[]);
-                    for _draw in &layer_batch.svg_draws {
-                        // Advance to the matching entry in `svg_keys`. We
-                        // only emitted entries for draws whose geometry
-                        // was non empty and successfully uploaded.
-                        if let Some((entry_layer, _draw_idx, geom_key)) =
-                            svg_keys.get(svg_next).copied()
-                        {
-                            if entry_layer == layer_idx {
-                                self.svg_pipeline.draw(&mut pass, geom_key, svg_next as u32);
-                                svg_next += 1;
+                    // SVG pass.
+                    if !layer_batch.svg_draws.is_empty() {
+                        pass.set_pipeline(&self.svg_pipeline.pipeline);
+                        pass.set_bind_group(0, self.svg_pipeline.global_bind_group(), &[]);
+                        for _draw in &layer_batch.svg_draws {
+                            if let Some((entry_layer, _draw_idx, geom_key)) =
+                                svg_keys.get(svg_next).copied()
+                            {
+                                if entry_layer == layer_idx {
+                                    self.svg_pipeline.draw(&mut pass, geom_key, svg_next as u32);
+                                    svg_next += 1;
+                                }
                             }
                         }
                     }
-                }
 
-                let glyph_count = layer_batch.glyph_instances.len() as u32;
-                if glyph_count > 0 {
-                    self.text_pipeline.upload_instances(
-                        &self.device,
-                        &self.queue,
-                        &layer_batch.glyph_instances,
-                    );
-                    pass.set_pipeline(&self.text_pipeline.pipeline);
-                    pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
-                    pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
-                    pass.set_vertex_buffer(0, self.text_pipeline.instance_buffer.slice(..));
-                    pass.draw(0..6, 0..glyph_count);
-                }
-
-                for image_batch in &layer_batch.image_batches {
-                    if let Some(entry) = self.image_cache.get_or_load(
-                        &image_batch.path,
-                        &self.device,
-                        &self.queue,
-                        &self.image_pipeline.texture_bind_group_layout,
-                    ) {
-                        let instances = apply_object_fit(
-                            &image_batch.instances,
-                            image_batch.object_fit,
-                            image_batch.object_position,
-                            entry.width as f32,
-                            entry.height as f32,
+                    let glyph_count = layer_batch.glyph_instances.len() as u32;
+                    if glyph_count > 0 {
+                        self.text_pipeline.upload_instances(
+                            &self.device,
+                            &self.queue,
+                            &layer_batch.glyph_instances,
                         );
-                        self.image_pipeline.upload_instances(&self.device, &self.queue, &instances);
-                        let count = instances.len() as u32;
-                        pass.set_pipeline(&self.image_pipeline.pipeline);
-                        pass.set_bind_group(0, &self.image_pipeline.uniform_bind_group, &[]);
-                        pass.set_bind_group(1, &entry.bind_group, &[]);
-                        pass.set_vertex_buffer(0, self.image_pipeline.instance_buffer.slice(..));
-                        pass.draw(0..6, 0..count);
+                        pass.set_pipeline(&self.text_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
+                        pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.text_pipeline.instance_buffer.slice(..));
+                        pass.draw(0..6, 0..glyph_count);
                     }
-                }
 
-                // Canvas painters for this layer
-                if !layer_batch.canvas_callbacks.is_empty() {
-                    for cb in &layer_batch.canvas_callbacks {
-                        let sx = cb.rect.x.max(cb.clip_rect[0]);
-                        let sy = cb.rect.y.max(cb.clip_rect[1]);
-                        let sr = (cb.rect.x + cb.rect.width).min(cb.clip_rect[0] + cb.clip_rect[2]);
-                        let sb =
-                            (cb.rect.y + cb.rect.height).min(cb.clip_rect[1] + cb.clip_rect[3]);
-                        let sw = (sr - sx).max(0.0);
-                        let sh = (sb - sy).max(0.0);
-                        if sw > 0.0 && sh > 0.0 {
-                            pass.set_scissor_rect(sx as u32, sy as u32, sw as u32, sh as u32);
-                            let gpu_buf =
-                                cb.node_id.and_then(|id| self.gpu_persistent_buffers.get(id));
-                            let ctx = PaintContext {
-                                rect: cb.rect,
-                                clip_rect: cb.clip_rect,
-                                viewport_size: (vw, vh),
-                                surface_format: format,
-                                device: &self.device,
-                                queue: &self.queue,
-                                persistent_buffer: gpu_buf,
-                                sample_count: MSAA_SAMPLE_COUNT,
-                            };
-                            cb.painter.paint(&ctx, &mut pass);
+                    for image_batch in &layer_batch.image_batches {
+                        if let Some(entry) = self.image_cache.get_or_load(
+                            &image_batch.path,
+                            &self.device,
+                            &self.queue,
+                            &self.image_pipeline.texture_bind_group_layout,
+                        ) {
+                            let instances = apply_object_fit(
+                                &image_batch.instances,
+                                image_batch.object_fit,
+                                image_batch.object_position,
+                                entry.width as f32,
+                                entry.height as f32,
+                            );
+                            self.image_pipeline.upload_instances(
+                                &self.device,
+                                &self.queue,
+                                &instances,
+                            );
+                            let count = instances.len() as u32;
+                            pass.set_pipeline(&self.image_pipeline.pipeline);
+                            pass.set_bind_group(0, &self.image_pipeline.uniform_bind_group, &[]);
+                            pass.set_bind_group(1, &entry.bind_group, &[]);
+                            pass.set_vertex_buffer(
+                                0,
+                                self.image_pipeline.instance_buffer.slice(..),
+                            );
+                            pass.draw(0..6, 0..count);
                         }
                     }
-                    // Reset scissor to full viewport
-                    pass.set_scissor_rect(0, 0, vw as u32, vh as u32);
+
+                    // Canvas painters for this layer
+                    if !layer_batch.canvas_callbacks.is_empty() {
+                        for cb in &layer_batch.canvas_callbacks {
+                            let sx = cb.rect.x.max(cb.clip_rect[0]);
+                            let sy = cb.rect.y.max(cb.clip_rect[1]);
+                            let sr =
+                                (cb.rect.x + cb.rect.width).min(cb.clip_rect[0] + cb.clip_rect[2]);
+                            let sb =
+                                (cb.rect.y + cb.rect.height).min(cb.clip_rect[1] + cb.clip_rect[3]);
+                            let sw = (sr - sx).max(0.0);
+                            let sh = (sb - sy).max(0.0);
+                            if sw > 0.0 && sh > 0.0 {
+                                pass.set_scissor_rect(sx as u32, sy as u32, sw as u32, sh as u32);
+                                let gpu_buf =
+                                    cb.node_id.and_then(|id| self.gpu_persistent_buffers.get(id));
+                                let ctx = PaintContext {
+                                    rect: cb.rect,
+                                    clip_rect: cb.clip_rect,
+                                    viewport_size: (vw, vh),
+                                    surface_format: format,
+                                    device: &self.device,
+                                    queue: &self.queue,
+                                    persistent_buffer: gpu_buf,
+                                    sample_count: MSAA_SAMPLE_COUNT,
+                                };
+                                cb.painter.paint(&ctx, &mut pass);
+                            }
+                        }
+                        // Reset scissor to full viewport
+                        pass.set_scissor_rect(0, 0, vw as u32, vh as u32);
+                    }
+                } else {
+                    // Interleaved rendering path: upload all instances once,
+                    // then draw spans sequentially to preserve painter's algorithm
+                    // occlusion for overlapping elements.
+                    let quad_count = layer_batch.quad_instances.len() as u32;
+                    let glyph_count = layer_batch.glyph_instances.len() as u32;
+
+                    if quad_count > 0 {
+                        self.quad_pipeline.upload_instances(
+                            &self.device,
+                            &self.queue,
+                            &layer_batch.quad_instances,
+                        );
+                    }
+                    if glyph_count > 0 {
+                        self.text_pipeline.upload_instances(
+                            &self.device,
+                            &self.queue,
+                            &layer_batch.glyph_instances,
+                        );
+                    }
+
+                    let mut current_kind: Option<DrawKind> = None;
+                    for span in &layer_batch.draw_spans {
+                        if span.count == 0 {
+                            continue;
+                        }
+                        match span.kind {
+                            DrawKind::Quad => {
+                                if current_kind != Some(DrawKind::Quad) {
+                                    pass.set_pipeline(&self.quad_pipeline.pipeline);
+                                    pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
+                                    pass.set_vertex_buffer(
+                                        0,
+                                        self.quad_pipeline.instance_buffer.slice(..),
+                                    );
+                                    current_kind = Some(DrawKind::Quad);
+                                }
+                                pass.draw(0..6, span.start..span.start + span.count);
+                            }
+                            DrawKind::Glyph => {
+                                if current_kind != Some(DrawKind::Glyph) {
+                                    pass.set_pipeline(&self.text_pipeline.pipeline);
+                                    pass.set_bind_group(
+                                        0,
+                                        &self.text_pipeline.uniform_bind_group,
+                                        &[],
+                                    );
+                                    pass.set_bind_group(
+                                        1,
+                                        &self.text_pipeline.atlas_bind_group,
+                                        &[],
+                                    );
+                                    pass.set_vertex_buffer(
+                                        0,
+                                        self.text_pipeline.instance_buffer.slice(..),
+                                    );
+                                    current_kind = Some(DrawKind::Glyph);
+                                }
+                                pass.draw(0..6, span.start..span.start + span.count);
+                            }
+                        }
+                    }
+
+                    // SVG, Image, Canvas render after interleaved quads+text
+                    if !layer_batch.svg_draws.is_empty() {
+                        pass.set_pipeline(&self.svg_pipeline.pipeline);
+                        pass.set_bind_group(0, self.svg_pipeline.global_bind_group(), &[]);
+                        for _draw in &layer_batch.svg_draws {
+                            if let Some((entry_layer, _draw_idx, geom_key)) =
+                                svg_keys.get(svg_next).copied()
+                            {
+                                if entry_layer == layer_idx {
+                                    self.svg_pipeline.draw(&mut pass, geom_key, svg_next as u32);
+                                    svg_next += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    for image_batch in &layer_batch.image_batches {
+                        if let Some(entry) = self.image_cache.get_or_load(
+                            &image_batch.path,
+                            &self.device,
+                            &self.queue,
+                            &self.image_pipeline.texture_bind_group_layout,
+                        ) {
+                            let instances = apply_object_fit(
+                                &image_batch.instances,
+                                image_batch.object_fit,
+                                image_batch.object_position,
+                                entry.width as f32,
+                                entry.height as f32,
+                            );
+                            self.image_pipeline.upload_instances(
+                                &self.device,
+                                &self.queue,
+                                &instances,
+                            );
+                            let count = instances.len() as u32;
+                            pass.set_pipeline(&self.image_pipeline.pipeline);
+                            pass.set_bind_group(0, &self.image_pipeline.uniform_bind_group, &[]);
+                            pass.set_bind_group(1, &entry.bind_group, &[]);
+                            pass.set_vertex_buffer(
+                                0,
+                                self.image_pipeline.instance_buffer.slice(..),
+                            );
+                            pass.draw(0..6, 0..count);
+                        }
+                    }
+
+                    if !layer_batch.canvas_callbacks.is_empty() {
+                        for cb in &layer_batch.canvas_callbacks {
+                            let sx = cb.rect.x.max(cb.clip_rect[0]);
+                            let sy = cb.rect.y.max(cb.clip_rect[1]);
+                            let sr =
+                                (cb.rect.x + cb.rect.width).min(cb.clip_rect[0] + cb.clip_rect[2]);
+                            let sb =
+                                (cb.rect.y + cb.rect.height).min(cb.clip_rect[1] + cb.clip_rect[3]);
+                            let sw = (sr - sx).max(0.0);
+                            let sh = (sb - sy).max(0.0);
+                            if sw > 0.0 && sh > 0.0 {
+                                pass.set_scissor_rect(sx as u32, sy as u32, sw as u32, sh as u32);
+                                let gpu_buf =
+                                    cb.node_id.and_then(|id| self.gpu_persistent_buffers.get(id));
+                                let ctx = PaintContext {
+                                    rect: cb.rect,
+                                    clip_rect: cb.clip_rect,
+                                    viewport_size: (vw, vh),
+                                    surface_format: format,
+                                    device: &self.device,
+                                    queue: &self.queue,
+                                    persistent_buffer: gpu_buf,
+                                    sample_count: MSAA_SAMPLE_COUNT,
+                                };
+                                cb.painter.paint(&ctx, &mut pass);
+                            }
+                        }
+                        pass.set_scissor_rect(0, 0, vw as u32, vh as u32);
+                    }
                 }
             }
         }
@@ -1023,11 +1170,81 @@ impl GpuContext {
                         occlusion_query_set: None,
                     });
 
-                    if quad_cur < quad_end {
-                        pass.set_pipeline(quad_rp);
-                        pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                        pass.set_vertex_buffer(0, self.quad_pipeline.instance_buffer.slice(..));
-                        pass.draw(0..6, quad_cur..quad_end);
+                    // Check if draw_spans are available for interleaved rendering.
+                    let layer_spans = &self.layered_batch.layers[layer_idx].draw_spans;
+                    if !layer_spans.is_empty() {
+                        // Interleaved rendering within this sub-range.
+                        let mut current_kind: Option<DrawKind> = None;
+                        for span in layer_spans {
+                            if span.count == 0 {
+                                continue;
+                            }
+                            let span_end = span.start + span.count;
+                            match span.kind {
+                                DrawKind::Quad => {
+                                    // Only draw the portion of this span that falls
+                                    // within the current sub-range [quad_cur, quad_end).
+                                    let lo = span.start.max(quad_cur);
+                                    let hi = span_end.min(quad_end);
+                                    if lo < hi {
+                                        if current_kind != Some(DrawKind::Quad) {
+                                            pass.set_pipeline(quad_rp);
+                                            pass.set_bind_group(
+                                                0,
+                                                &self.quad_pipeline.bind_group,
+                                                &[],
+                                            );
+                                            pass.set_vertex_buffer(
+                                                0,
+                                                self.quad_pipeline.instance_buffer.slice(..),
+                                            );
+                                            current_kind = Some(DrawKind::Quad);
+                                        }
+                                        pass.draw(0..6, lo..hi);
+                                    }
+                                }
+                                DrawKind::Glyph => {
+                                    let lo = span.start.max(glyph_cur);
+                                    let hi = span_end.min(glyph_end);
+                                    if lo < hi {
+                                        if current_kind != Some(DrawKind::Glyph) {
+                                            pass.set_pipeline(text_rp);
+                                            pass.set_bind_group(
+                                                0,
+                                                &self.text_pipeline.uniform_bind_group,
+                                                &[],
+                                            );
+                                            pass.set_bind_group(
+                                                1,
+                                                &self.text_pipeline.atlas_bind_group,
+                                                &[],
+                                            );
+                                            pass.set_vertex_buffer(
+                                                0,
+                                                self.text_pipeline.instance_buffer.slice(..),
+                                            );
+                                            current_kind = Some(DrawKind::Glyph);
+                                        }
+                                        pass.draw(0..6, lo..hi);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Fallback: original all-quads-then-all-glyphs order.
+                        if quad_cur < quad_end {
+                            pass.set_pipeline(quad_rp);
+                            pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
+                            pass.set_vertex_buffer(0, self.quad_pipeline.instance_buffer.slice(..));
+                            pass.draw(0..6, quad_cur..quad_end);
+                        }
+                        if glyph_cur < glyph_end {
+                            pass.set_pipeline(text_rp);
+                            pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
+                            pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
+                            pass.set_vertex_buffer(0, self.text_pipeline.instance_buffer.slice(..));
+                            pass.draw(0..6, glyph_cur..glyph_end);
+                        }
                     }
 
                     // SVG sub range.
@@ -1047,14 +1264,6 @@ impl GpuContext {
                             }
                             svg_next += 1;
                         }
-                    }
-
-                    if glyph_cur < glyph_end {
-                        pass.set_pipeline(text_rp);
-                        pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
-                        pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
-                        pass.set_vertex_buffer(0, self.text_pipeline.instance_buffer.slice(..));
-                        pass.draw(0..6, glyph_cur..glyph_end);
                     }
 
                     if image_cur < image_end {

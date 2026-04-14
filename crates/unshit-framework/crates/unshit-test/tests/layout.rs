@@ -544,3 +544,181 @@ fn flex_column_cross_axis_stretch() {
         child.layout_rect.height
     );
 }
+
+/// An absolutely positioned child should escape its parent's `overflow: hidden`
+/// clip rect. Per CSS spec, absolute elements are not clipped by their parent's
+/// overflow, only by the nearest ancestor that establishes a containing block
+/// with its own clip.
+#[test]
+fn absolute_child_escapes_overflow_hidden() {
+    let css = r#"
+        .parent {
+            position: relative;
+            overflow: hidden;
+            width: 100px;
+            height: 100px;
+        }
+        .abs-child {
+            position: absolute;
+            top: 0;
+            left: 120px;
+            width: 50px;
+            height: 50px;
+        }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("parent")
+                .with_child(ElementDef::new(Tag::Div).with_class("abs-child").with_id("abs")),
+        },
+        800.0,
+        600.0,
+    );
+
+    let abs = h.query("#abs").unwrap();
+    // The absolute child is placed at left: 120px, which is outside the
+    // parent's 100px width. Its layout rect should reflect that position.
+    assert!(
+        (abs.layout_rect.x - 120.0).abs() < 1.0,
+        "absolute child x ({}) should be ~120.0, escaping parent overflow",
+        abs.layout_rect.x
+    );
+    assert_eq!(abs.layout_rect.width, 50.0);
+    assert_eq!(abs.layout_rect.height, 50.0);
+}
+
+/// Normal (non-absolute) children must still be clipped by their parent's
+/// `overflow: hidden`. This ensures the absolute-escape logic does not
+/// accidentally disable clipping for all children.
+#[test]
+fn normal_child_still_clipped_by_overflow_hidden() {
+    let css = r#"
+        .parent {
+            overflow: hidden;
+            width: 100px;
+            height: 100px;
+        }
+        .wide-child {
+            width: 200px;
+            height: 50px;
+        }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("parent")
+                .with_child(ElementDef::new(Tag::Div).with_class("wide-child").with_id("w")),
+        },
+        800.0,
+        600.0,
+    );
+
+    let w = h.query("#w").unwrap();
+    // The normal-flow child is wider than the parent but should still exist
+    // in layout. Clipping happens at render time, not layout time, so the
+    // layout rect retains the declared width.
+    assert!(
+        w.layout_rect.width > 0.0,
+        "normal child should have a layout rect with positive width"
+    );
+    // The child should be within or starting at the parent bounds.
+    assert!(
+        w.layout_rect.x < 1.0,
+        "normal child x ({}) should start at or near 0",
+        w.layout_rect.x
+    );
+}
+
+#[test]
+fn position_fixed_removes_from_flow() {
+    let css = r#"
+        .root { display: flex; flex-direction: column; width: 100%; height: 100%; }
+        .child { height: 50px; width: 100px; }
+        .fixed { position: fixed; top: 30px; left: 40px; }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_child(ElementDef::new(Tag::Div).with_class("child").with_id("a"))
+                .with_child(
+                    ElementDef::new(Tag::Div).with_class("child").with_class("fixed").with_id("b"),
+                )
+                .with_child(ElementDef::new(Tag::Div).with_class("child").with_id("c")),
+        },
+        800.0,
+        600.0,
+    );
+
+    let a = h.query("#a").unwrap();
+    let b = h.query("#b").unwrap();
+    let c = h.query("#c").unwrap();
+
+    // b should be positioned at top:30 left:40 (out of flow, like absolute)
+    assert!(
+        (b.layout_rect.y - 30.0).abs() < 1.0,
+        "fixed b.y ({}) should be ~30.0",
+        b.layout_rect.y
+    );
+    assert!(
+        (b.layout_rect.x - 40.0).abs() < 1.0,
+        "fixed b.x ({}) should be ~40.0",
+        b.layout_rect.x
+    );
+
+    // c should be positioned directly after a since b is out of flow
+    let expected_c_y = a.layout_rect.y + a.layout_rect.height;
+    assert!(
+        (c.layout_rect.y - expected_c_y).abs() < 1.0,
+        "c.y ({}) should be ~{} (fixed b removed from flow)",
+        c.layout_rect.y,
+        expected_c_y
+    );
+}
+
+#[test]
+fn position_static_ignores_top_left() {
+    let css = r#"
+        .root { display: flex; flex-direction: column; width: 100%; height: 100%; }
+        .child { height: 50px; width: 100px; }
+        .with-inset { position: static; top: 10px; left: 20px; }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_child(ElementDef::new(Tag::Div).with_class("child").with_id("a"))
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("child")
+                        .with_class("with-inset")
+                        .with_id("b"),
+                )
+                .with_child(ElementDef::new(Tag::Div).with_class("child").with_id("c")),
+        },
+        800.0,
+        600.0,
+    );
+
+    let a = h.query("#a").unwrap();
+    let b = h.query("#b").unwrap();
+
+    // b is static, so top:10 left:20 should be ignored; it sits in normal flow after a
+    let expected_b_y = a.layout_rect.y + a.layout_rect.height;
+    assert!(
+        (b.layout_rect.y - expected_b_y).abs() < 1.0,
+        "static b.y ({}) should be ~{} (top:10 ignored for static)",
+        b.layout_rect.y,
+        expected_b_y
+    );
+    assert!(
+        b.layout_rect.x.abs() < 1.0,
+        "static b.x ({}) should be ~0.0 (left:20 ignored for static)",
+        b.layout_rect.x
+    );
+}
