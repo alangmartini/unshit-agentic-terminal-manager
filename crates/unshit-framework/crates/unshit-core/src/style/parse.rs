@@ -181,6 +181,7 @@ pub enum StyleDeclaration {
     Right(Dimension),
     Bottom(Dimension),
     Left(Dimension),
+    ZIndex(i32),
     OutlineColor(Color),
     OutlineWidth(f32),
     OutlineOffset(f32),
@@ -1307,6 +1308,10 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "right" => StyleDeclaration::Right(parse_dimension(parser)?),
         "bottom" => StyleDeclaration::Bottom(parse_dimension(parser)?),
         "left" => StyleDeclaration::Left(parse_dimension(parser)?),
+        "z-index" => {
+            let val = parser.expect_integer().map_err(|_| ())?;
+            StyleDeclaration::ZIndex(val)
+        }
         "inset" => {
             // CSS `inset` shorthand: 1/2/3/4-value forms matching the spec.
             let values = parse_dimension_list(parser);
@@ -3362,6 +3367,7 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::Right(v) => style.right = Some(*v),
         StyleDeclaration::Bottom(v) => style.bottom = Some(*v),
         StyleDeclaration::Left(v) => style.left = Some(*v),
+        StyleDeclaration::ZIndex(v) => style.z_index = *v,
         StyleDeclaration::OutlineColor(v) => style.outline_color = *v,
         StyleDeclaration::OutlineWidth(v) => style.outline_width = *v,
         StyleDeclaration::OutlineOffset(v) => style.outline_offset = *v,
@@ -5644,6 +5650,46 @@ mod tests {
             parts.iter().any(|p| matches!(p, SelectorPart::PseudoClass(PseudoClass::FocusWithin))),
             "should parse :focus-within pseudo-class"
         );
+    }
+
+    #[test]
+    fn test_z_index_positive() {
+        let decls = parse_decls(".x { z-index: 10; }");
+        let zi = decls.iter().find_map(|d| match d {
+            StyleDeclaration::ZIndex(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(zi, Some(10));
+    }
+
+    #[test]
+    fn test_z_index_negative() {
+        let decls = parse_decls(".x { z-index: -5; }");
+        let zi = decls.iter().find_map(|d| match d {
+            StyleDeclaration::ZIndex(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(zi, Some(-5));
+    }
+
+    #[test]
+    fn test_z_index_zero() {
+        let decls = parse_decls(".x { z-index: 0; }");
+        let zi = decls.iter().find_map(|d| match d {
+            StyleDeclaration::ZIndex(v) => Some(*v),
+            _ => None,
+        });
+        assert_eq!(zi, Some(0));
+    }
+
+    #[test]
+    fn test_z_index_applied_to_computed_style() {
+        let decls = parse_decls(".x { z-index: 42; }");
+        let mut style = ComputedStyle::default();
+        for d in &decls {
+            apply_declaration(&mut style, d);
+        }
+        assert_eq!(style.z_index, 42);
     }
 
     #[test]
