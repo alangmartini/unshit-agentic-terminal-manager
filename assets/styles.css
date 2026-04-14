@@ -1349,6 +1349,68 @@ body.dragging-pane {
 }
 
 
+/* ---- Context Menu ---- */
+
+.ctx-menu-hidden {
+  display: none;
+}
+
+.ctx-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+}
+
+.ctx-menu {
+  position: fixed;
+  min-width: 180px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 4px 0;
+  box-shadow: var(--shadow-lg);
+  z-index: 201;
+  flex-direction: column;
+}
+
+.ctx-menu-header {
+  padding: 6px 12px;
+  font-size: 11px;
+  color: var(--fg-tertiary);
+  overflow: hidden;
+}
+
+.ctx-menu-separator {
+  height: 1px;
+  background: var(--border-hair);
+  margin: 4px 8px;
+}
+
+.ctx-menu-item {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--fg-primary);
+  cursor: pointer;
+}
+
+.ctx-menu-item:hover {
+  background: var(--bg-hover);
+}
+
+.ctx-menu-item.danger {
+  color: var(--rust);
+}
+
+.ctx-menu-item.danger:hover {
+  background: rgba(201, 85, 58, 0.15);
+}
+
+.ctx-menu-item-label {
+  /* inherits font size and color from parent */
+}
+
+/* ---- Settings Modal ---- */
+
 .modal-overlay {
   position: fixed;
   inset: 0;

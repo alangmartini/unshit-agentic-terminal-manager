@@ -725,7 +725,7 @@ fn card_events(
     ElementDef::new(Tag::Div)
         .with_class("card")
         .with_tab_index(9)
-        .on_context_menu(move || {
+        .on_context_menu(move |_x, _y| {
             rc_ctx.store(true, Ordering::Relaxed);
             cc_ctx.fetch_add(1, Ordering::Relaxed);
         })

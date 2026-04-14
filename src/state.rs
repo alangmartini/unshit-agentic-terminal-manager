@@ -15,6 +15,13 @@ pub const MAX_SIDEBAR_WIDTH: f32 = 500.0;
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
+#[derive(Clone, Debug)]
+pub struct CtxMenu {
+    pub x: f32,
+    pub y: f32,
+    pub workspace_idx: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSection {
     General,
@@ -168,6 +175,8 @@ pub struct AppState {
     pub col_ratios: Vec<Vec<f32>>,
     /// Transient drag state, populated on DragPhase::Start, cleared on End.
     pub resize_drag: Option<ResizeDragSnapshot>,
+    /// Context menu state: Some when open, None when closed.
+    pub ctx_menu: Option<CtxMenu>,
 }
 
 impl AppState {
@@ -215,6 +224,7 @@ impl AppState {
             clock_hhmm: self.clock_hhmm.clone(),
             row_ratios: self.row_ratios.clone(),
             col_ratios: self.col_ratios.clone(),
+            ctx_menu: self.ctx_menu.clone(),
         }
     }
 
@@ -245,6 +255,7 @@ pub struct UiSnapshot {
     pub clock_hhmm: String,
     pub row_ratios: Vec<f32>,
     pub col_ratios: Vec<Vec<f32>>,
+    pub ctx_menu: Option<CtxMenu>,
 }
 
 fn current_folder_name() -> String {
@@ -487,6 +498,7 @@ pub fn seed_state() -> AppState {
         row_ratios: vec![1.0],
         col_ratios: vec![vec![1.0]],
         resize_drag: None,
+        ctx_menu: None,
     }
 }
 
@@ -660,6 +672,20 @@ pub fn mutate_add_workspace_with_path(state: &mut AppState, path: Option<PathBuf
         }],
     });
     state.active_workspace = state.workspaces.len() - 1;
+}
+
+pub fn mutate_remove_workspace(state: &mut AppState, idx: usize) {
+    if state.workspaces.len() <= 1 || idx >= state.workspaces.len() {
+        return;
+    }
+    state.workspaces.remove(idx);
+    // Renumber remaining workspaces.
+    for (i, ws) in state.workspaces.iter_mut().enumerate() {
+        ws.num = i as u32 + 1;
+    }
+    if state.active_workspace >= state.workspaces.len() {
+        state.active_workspace = state.workspaces.len() - 1;
+    }
 }
 
 pub fn find_pane_coord(state: &AppState, target: PaneId) -> Option<(usize, usize)> {
@@ -896,8 +922,20 @@ pub fn mutate_font_size_delta(state: &mut AppState, delta: i32) {
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
     match command {
         "modal.close" => {
+            let mut changed = false;
+            if state.ctx_menu.is_some() {
+                state.ctx_menu = None;
+                changed = true;
+            }
             if state.settings_open {
                 state.settings_open = false;
+                changed = true;
+            }
+            changed
+        }
+        "ctx_menu.close" => {
+            if state.ctx_menu.is_some() {
+                state.ctx_menu = None;
                 true
             } else {
                 false
@@ -978,6 +1016,34 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if let Ok(index) = other["tab.switch:".len()..].parse::<usize>() {
                 if index < state.tabs.len() && state.active_tab != index {
                     mutate_switch_tab(state, index);
+                    return true;
+                }
+            }
+            false
+        }
+        other if other.starts_with("workspace.remove:") => {
+            if let Ok(idx) = other["workspace.remove:".len()..].parse::<usize>() {
+                state.ctx_menu = None;
+                mutate_remove_workspace(state, idx);
+                return true;
+            }
+            false
+        }
+        other if other.starts_with("workspace.collapse:") => {
+            if let Ok(idx) = other["workspace.collapse:".len()..].parse::<usize>() {
+                state.ctx_menu = None;
+                if let Some(ws) = state.workspaces.get_mut(idx) {
+                    ws.collapsed = !ws.collapsed;
+                    return true;
+                }
+            }
+            false
+        }
+        other if other.starts_with("workspace.switch:") => {
+            if let Ok(idx) = other["workspace.switch:".len()..].parse::<usize>() {
+                state.ctx_menu = None;
+                if idx < state.workspaces.len() {
+                    state.active_workspace = idx;
                     return true;
                 }
             }
@@ -1152,6 +1218,7 @@ mod tests {
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
             resize_drag: None,
+            ctx_menu: None,
         }
     }
 
@@ -1449,6 +1516,95 @@ mod tests {
     fn dispatch_unknown_returns_false() {
         let mut state = test_state();
         assert!(!dispatch(&mut state, "nonexistent.command"));
+    }
+
+    // -- context menu ---------------------------------------------------------
+
+    #[test]
+    fn ctx_menu_close_clears_state() {
+        let mut state = test_state();
+        state.ctx_menu = Some(CtxMenu {
+            x: 100.0,
+            y: 200.0,
+            workspace_idx: 0,
+        });
+        assert!(dispatch(&mut state, "ctx_menu.close"));
+        assert!(state.ctx_menu.is_none());
+    }
+
+    #[test]
+    fn ctx_menu_close_returns_false_when_already_closed() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "ctx_menu.close"));
+    }
+
+    #[test]
+    fn modal_close_also_closes_ctx_menu() {
+        let mut state = test_state();
+        state.ctx_menu = Some(CtxMenu {
+            x: 10.0,
+            y: 20.0,
+            workspace_idx: 0,
+        });
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.ctx_menu.is_none());
+    }
+
+    #[test]
+    fn workspace_remove_closes_ctx_menu() {
+        let mut state = test_state();
+        state.ctx_menu = Some(CtxMenu {
+            x: 0.0,
+            y: 0.0,
+            workspace_idx: 0,
+        });
+        assert!(dispatch(&mut state, "workspace.remove:1"));
+        assert!(state.ctx_menu.is_none());
+    }
+
+    #[test]
+    fn workspace_remove_does_not_remove_last() {
+        let mut state = test_state();
+        // Remove workspaces until one remains.
+        while state.workspaces.len() > 1 {
+            state.workspaces.pop();
+        }
+        let before = state.workspaces.len();
+        mutate_remove_workspace(&mut state, 0);
+        assert_eq!(state.workspaces.len(), before);
+    }
+
+    #[test]
+    fn workspace_remove_renumbers() {
+        let mut state = test_state();
+        mutate_add_workspace(&mut state);
+        mutate_add_workspace(&mut state);
+        mutate_add_workspace(&mut state);
+        let count = state.workspaces.len();
+        assert!(count >= 3);
+        mutate_remove_workspace(&mut state, 1);
+        assert_eq!(state.workspaces.len(), count - 1);
+        for (i, ws) in state.workspaces.iter().enumerate() {
+            assert_eq!(ws.num, i as u32 + 1);
+        }
+    }
+
+    #[test]
+    fn workspace_collapse_via_dispatch() {
+        let mut state = test_state();
+        mutate_add_workspace(&mut state);
+        let before = state.workspaces[0].collapsed;
+        assert!(dispatch(&mut state, "workspace.collapse:0"));
+        assert_ne!(state.workspaces[0].collapsed, before);
+    }
+
+    #[test]
+    fn workspace_switch_via_dispatch() {
+        let mut state = test_state();
+        mutate_add_workspace(&mut state);
+        mutate_add_workspace(&mut state);
+        assert!(dispatch(&mut state, "workspace.switch:1"));
+        assert_eq!(state.active_workspace, 1);
     }
 
     // -- find_active_pane / is_on ---------------------------------------------

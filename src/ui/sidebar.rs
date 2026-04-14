@@ -1,8 +1,8 @@
 use unshit::core::element::*;
 
 use crate::state::{
-    mutate_add_workspace_with_path, mutate_with, SharedState, Subtab, TerminalEntry, UiSnapshot,
-    Workspace,
+    mutate_add_workspace_with_path, mutate_with, CtxMenu, SharedState, Subtab, TerminalEntry,
+    UiSnapshot, Workspace,
 };
 use crate::ui::icons::*;
 
@@ -69,6 +69,7 @@ fn build_workspace(
     shared: &SharedState,
 ) -> ElementDef {
     let head_state = shared.clone();
+    let ctx_state = shared.clone();
     let idx = workspace_index;
     let head = ElementDef::new(Tag::Div)
         .with_class("workspace-head")
@@ -78,6 +79,15 @@ fn build_workspace(
                 if let Some(ws) = st.workspaces.get_mut(idx) {
                     ws.collapsed = !ws.collapsed;
                 }
+            });
+        })
+        .on_context_menu(move |x, y| {
+            mutate_with(&ctx_state, |st| {
+                st.ctx_menu = Some(CtxMenu {
+                    x,
+                    y,
+                    workspace_idx: idx,
+                });
             });
         })
         .with_child(
@@ -307,6 +317,100 @@ fn hint_item(key: &str, label: &str) -> ElementDef {
                 .with_text(key.to_string()),
         )
         .with_child(ElementDef::new(Tag::Span).with_text(label.to_string()))
+}
+
+pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    use unshit::core::style::parse::StyleDeclaration;
+    use unshit::core::style::types::Dimension;
+
+    let ctx = match &snap.ctx_menu {
+        Some(c) => c,
+        None => return ElementDef::new(Tag::Div).with_class("ctx-menu-hidden"),
+    };
+
+    let ws_idx = ctx.workspace_idx;
+    let ws_name = snap
+        .workspaces
+        .get(ws_idx)
+        .map(|w| w.name.clone())
+        .unwrap_or_default();
+    let is_collapsed = snap
+        .workspaces
+        .get(ws_idx)
+        .map(|w| w.collapsed)
+        .unwrap_or(false);
+    let can_remove = snap.workspaces.len() > 1;
+
+    // Backdrop: clicking outside the menu closes it.
+    let backdrop_shared = shared.clone();
+    let backdrop = ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-backdrop")
+        .on_click(move || {
+            mutate_with(&backdrop_shared, |st| {
+                st.ctx_menu = None;
+            });
+        });
+
+    // Menu items.
+    fn menu_item(label: &str, shared: &SharedState, command: String) -> ElementDef {
+        let s = shared.clone();
+        ElementDef::new(Tag::Div)
+            .with_class("ctx-menu-item")
+            .on_click(move || {
+                mutate_with(&s, |st| {
+                    crate::state::dispatch(st, &command);
+                });
+            })
+            .with_child(
+                ElementDef::new(Tag::Span)
+                    .with_class("ctx-menu-item-label")
+                    .with_text(label.to_string()),
+            )
+    }
+
+    fn menu_separator() -> ElementDef {
+        ElementDef::new(Tag::Div).with_class("ctx-menu-separator")
+    }
+
+    let collapse_label = if is_collapsed {
+        "Expand"
+    } else {
+        "Collapse"
+    };
+
+    let mut menu = ElementDef::new(Tag::Div)
+        .with_class("ctx-menu")
+        .with_style(StyleDeclaration::Left(Dimension::Px(ctx.x)))
+        .with_style(StyleDeclaration::Top(Dimension::Px(ctx.y)))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("ctx-menu-header")
+                .with_text(ws_name),
+        )
+        .with_child(menu_separator())
+        .with_child(menu_item(
+            "Set active",
+            shared,
+            format!("workspace.switch:{}", ws_idx),
+        ))
+        .with_child(menu_item(
+            collapse_label,
+            shared,
+            format!("workspace.collapse:{}", ws_idx),
+        ));
+
+    if can_remove {
+        menu = menu.with_child(menu_separator()).with_child(
+            menu_item(
+                "Remove workspace",
+                shared,
+                format!("workspace.remove:{}", ws_idx),
+            )
+            .with_class("danger"),
+        );
+    }
+
+    backdrop.with_child(menu)
 }
 
 #[cfg(test)]

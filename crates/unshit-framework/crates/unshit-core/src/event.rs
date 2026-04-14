@@ -790,11 +790,11 @@ pub fn find_context_menu_handler(arena: &NodeArena, start: NodeId) -> Option<Nod
 
 /// Walk up the tree from the hovered element to find and invoke the nearest
 /// `on_context_menu` handler. Returns `true` if a handler was called.
-pub fn dispatch_context_menu(arena: &NodeArena, hovered: NodeId) -> bool {
+pub fn dispatch_context_menu(arena: &NodeArena, hovered: NodeId, x: f32, y: f32) -> bool {
     if let Some(handler_node) = find_context_menu_handler(arena, hovered) {
         if let Some(element) = arena.get(handler_node) {
             if let Some(ref on_context_menu) = element.on_context_menu {
-                on_context_menu();
+                on_context_menu(x, y);
                 return true;
             }
         }

@@ -155,6 +155,7 @@ mod tests {
             sidebar_width: 252.0,
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
+            ctx_menu: None,
             cpu_pct: 0.0,
             mem_gb: 0.0,
             net_kbps: 0.0,

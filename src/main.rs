@@ -17,7 +17,7 @@ use crate::state::{
     MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
 };
 use crate::ui::settings::build_settings_modal;
-use crate::ui::sidebar::build_sidebar;
+use crate::ui::sidebar::{build_ctx_menu_overlay, build_sidebar};
 use crate::ui::statusbar::build_statusbar;
 use crate::ui::tabbar::build_tabbar;
 use crate::ui::terminal_grid::build_terminal_grid;
@@ -94,7 +94,8 @@ fn build_tree(
                             .with_child(build_statusbar(snap)),
                     ),
             )
-            .with_child(modal_overlay),
+            .with_child(modal_overlay)
+            .with_child(build_ctx_menu_overlay(snap, shared)),
     }
 }
 
