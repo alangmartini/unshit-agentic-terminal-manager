@@ -10,7 +10,7 @@ use unshit::app::{App, AppConfig, FontSource};
 use unshit::core::element::*;
 use unshit::core::event::DragPhase;
 use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::Dimension;
+use unshit::core::style::types::{AlignItems, CssPosition, Dimension, JustifyContent};
 use unshit::core::trace::{
     append_terminal_trace_line, terminal_trace_enabled, terminal_trace_file_path,
 };
@@ -33,20 +33,6 @@ fn build_tree(
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementTree {
-    let mut modal_overlay = ElementDef::new(Tag::Div)
-        .with_class("modal-overlay")
-        .with_id("settings-modal");
-    if snap.settings_open {
-        modal_overlay = modal_overlay.with_class("open");
-    }
-    {
-        let s = shared.clone();
-        modal_overlay = modal_overlay.on_click(move || {
-            mutate_with(&s, |st| dispatch(st, "modal.close"));
-        });
-    }
-    modal_overlay = modal_overlay.with_child(build_settings_modal(snap, shared));
-
     let sidebar = build_sidebar(snap, shared)
         .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
         .with_style(StyleDeclaration::MinWidth(Dimension::Px(
@@ -79,26 +65,47 @@ fn build_tree(
             }
         });
 
+    let mut root = ElementDef::new(Tag::Div)
+        .with_class("app")
+        .with_child(build_titlebar(shared))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("layout")
+                .with_child(sidebar)
+                .with_child(sidebar_resizer)
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("content")
+                        .with_class("role-main")
+                        .with_child(build_tabbar(snap, shared))
+                        .with_child(build_terminal_grid(snap, shared, grids))
+                        .with_child(build_statusbar(snap)),
+                ),
+        );
+
+    if snap.settings_open {
+        let s = shared.clone();
+        root = root.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("modal-overlay")
+                .with_class("open")
+                .with_id("settings-modal")
+                .with_style(StyleDeclaration::Position(CssPosition::Fixed))
+                .with_style(StyleDeclaration::Top(Dimension::Px(0.0)))
+                .with_style(StyleDeclaration::Right(Dimension::Px(0.0)))
+                .with_style(StyleDeclaration::Bottom(Dimension::Px(0.0)))
+                .with_style(StyleDeclaration::Left(Dimension::Px(0.0)))
+                .with_style(StyleDeclaration::AlignItems(AlignItems::Center))
+                .with_style(StyleDeclaration::JustifyContent(JustifyContent::Center))
+                .on_click(move || {
+                    mutate_with(&s, |st| dispatch(st, "modal.close"));
+                })
+                .with_child(build_settings_modal(snap, shared)),
+        );
+    }
+
     ElementTree {
-        root: ElementDef::new(Tag::Div)
-            .with_class("app")
-            .with_child(build_titlebar(shared))
-            .with_child(
-                ElementDef::new(Tag::Div)
-                    .with_class("layout")
-                    .with_child(sidebar)
-                    .with_child(sidebar_resizer)
-                    .with_child(
-                        ElementDef::new(Tag::Div)
-                            .with_class("content")
-                            .with_class("role-main")
-                            .with_child(build_tabbar(snap, shared))
-                            .with_child(build_terminal_grid(snap, shared, grids))
-                            .with_child(build_statusbar(snap)),
-                    ),
-            )
-            .with_child(modal_overlay)
-            .with_child(build_ctx_menu_overlay(snap, shared)),
+        root: root.with_child(build_ctx_menu_overlay(snap, shared)),
     }
 }
 

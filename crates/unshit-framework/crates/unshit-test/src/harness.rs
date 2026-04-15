@@ -620,7 +620,7 @@ pub(crate) fn run_layout_pipeline(
     height: f32,
     cache: &mut TextMeasureCache,
 ) {
-    layout::sync_element_to_taffy(arena, taffy, root, font_system);
+    layout::sync_element_to_taffy(arena, taffy, root, font_system, width, height);
     if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
         layout::compute_layout(taffy, tn, width, height, font_system, cache);
         layout::read_layout_results(arena, taffy, root, 0.0, 0.0);

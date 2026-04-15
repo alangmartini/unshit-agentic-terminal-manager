@@ -1749,13 +1749,12 @@ fn parse_backdrop_filter(parser: &mut Parser) -> Result<Option<types::BackdropFi
 fn parse_dimension(parser: &mut Parser) -> Result<Dimension, ()> {
     match parser.next().map_err(|_| ())? {
         Token::Ident(ref s) if s.as_ref() == "auto" => Ok(Dimension::Auto),
-        Token::Dimension { value, unit, .. } => {
-            if unit.as_ref() == "%" {
-                Ok(Dimension::Percent(*value))
-            } else {
-                Ok(Dimension::Px(*value))
-            }
-        }
+        Token::Dimension { value, unit, .. } => match unit.as_ref() {
+            "%" => Ok(Dimension::Percent(*value)),
+            "vh" => Ok(Dimension::Vh(*value)),
+            "vw" => Ok(Dimension::Vw(*value)),
+            _ => Ok(Dimension::Px(*value)),
+        },
         Token::Percentage { unit_value, .. } => Ok(Dimension::Percent(*unit_value * 100.0)),
         Token::Number { value, .. } => Ok(Dimension::Px(*value)),
         _ => Err(()),
@@ -3786,6 +3785,42 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_vh_unit() {
+        let decls = parse_decls(".x { max-height: 80vh; }");
+        assert_eq!(decls.len(), 1);
+        assert!(
+            matches!(&decls[0], StyleDeclaration::MaxHeight(d) if *d == Dimension::Vh(80.0)),
+            "80vh should parse to Dimension::Vh(80.0), got {:?}",
+            decls[0]
+        );
+    }
+
+    #[test]
+    fn test_parse_vw_unit() {
+        let decls = parse_decls(".x { max-width: 50vw; }");
+        assert_eq!(decls.len(), 1);
+        assert!(
+            matches!(&decls[0], StyleDeclaration::MaxWidth(d) if *d == Dimension::Vw(50.0)),
+            "50vw should parse to Dimension::Vw(50.0), got {:?}",
+            decls[0]
+        );
+    }
+
+    #[test]
+    fn test_parse_vh_vw_fractional() {
+        let decls = parse_decls(".x { width: 33.5vw; height: 66.7vh; }");
+        assert_eq!(decls.len(), 2);
+        assert!(matches!(
+            &decls[0],
+            StyleDeclaration::Width(d) if *d == Dimension::Vw(33.5)
+        ));
+        assert!(matches!(
+            &decls[1],
+            StyleDeclaration::Height(d) if *d == Dimension::Vh(66.7)
+        ));
+    }
+
+    #[test]
     fn test_vendor_pseudo_element_rejects_selector() {
         // Vendor-prefixed pseudo-elements like ::-webkit-scrollbar must cause
         // the entire selector to be rejected so that declarations inside the
@@ -5712,7 +5747,7 @@ mod tests {
 
         let mut style = ComputedStyle::default();
         style.position = CssPosition::Fixed;
-        let taffy = style.to_taffy_style();
+        let taffy = style.to_taffy_style(800.0, 600.0);
         assert_eq!(
             taffy.position,
             taffy::Position::Absolute,

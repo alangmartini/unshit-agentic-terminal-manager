@@ -83,11 +83,19 @@ fn build_workspace(
         })
         .on_context_menu(move |x, y| {
             mutate_with(&ctx_state, |st| {
-                st.ctx_menu = Some(CtxMenu {
-                    x,
-                    y,
-                    workspace_idx: idx,
-                });
+                // Toggle: if the menu is already open for this workspace, close it.
+                if st.ctx_menu.as_ref().is_some_and(|m| m.workspace_idx == idx) {
+                    st.ctx_menu = None;
+                } else {
+                    // Divide by scale_factor: cursor coords are physical pixels,
+                    // but Dimension::Px values get multiplied by scale_all_styles.
+                    let sf = st.scale_factor;
+                    st.ctx_menu = Some(CtxMenu {
+                        x: x / sf,
+                        y: y / sf,
+                        workspace_idx: idx,
+                    });
+                }
             });
         })
         .with_child(
@@ -341,12 +349,18 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
         .unwrap_or(false);
     let can_remove = snap.workspaces.len() > 1;
 
-    // Backdrop: clicking outside the menu closes it.
+    // Backdrop: clicking (left or right) outside the menu closes it.
     let backdrop_shared = shared.clone();
+    let backdrop_ctx_shared = shared.clone();
     let backdrop = ElementDef::new(Tag::Div)
         .with_class("ctx-menu-backdrop")
         .on_click(move || {
             mutate_with(&backdrop_shared, |st| {
+                st.ctx_menu = None;
+            });
+        })
+        .on_context_menu(move |_x, _y| {
+            mutate_with(&backdrop_ctx_shared, |st| {
                 st.ctx_menu = None;
             });
         });

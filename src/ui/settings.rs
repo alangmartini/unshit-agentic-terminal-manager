@@ -1,4 +1,6 @@
 use unshit::core::element::*;
+use unshit::core::style::parse::StyleDeclaration;
+use unshit::core::style::types::{Dimension, FlexDirection, Overflow};
 
 use crate::state::{dispatch, is_on, mutate_with, SettingsSection, SharedState, UiSnapshot};
 use crate::ui::icons::*;
@@ -6,6 +8,10 @@ use crate::ui::icons::*;
 pub fn build_settings_modal(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal")
+        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
+        .with_style(StyleDeclaration::Width(Dimension::Px(680.0)))
+        .with_style(StyleDeclaration::Height(Dimension::Percent(80.0)))
+        .with_style(StyleDeclaration::MaxHeight(Dimension::Percent(80.0)))
         .with_child(build_modal_header(shared))
         .with_child(build_modal_nav(state.settings_section, shared))
         .with_child(build_modal_body(state, shared))
@@ -64,6 +70,11 @@ fn build_modal_nav(active: SettingsSection, shared: &SharedState) -> ElementDef 
 fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal-body")
+        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
+        .with_style(StyleDeclaration::FlexGrow(1.0))
+        .with_style(StyleDeclaration::FlexBasis(Dimension::Auto))
+        .with_style(StyleDeclaration::Overflow(Overflow::Scroll))
+        .with_style(StyleDeclaration::MinHeight(Dimension::Px(0.0)))
         .with_child(build_general_section(state, shared))
         .with_child(build_appearance_section(state, shared))
         .with_child(build_shell_section(state, shared))
@@ -72,6 +83,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
 fn build_general_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal-section")
+        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("modal-section-title")
@@ -149,6 +161,7 @@ fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> Element
 
     ElementDef::new(Tag::Div)
         .with_class("modal-section")
+        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("modal-section-title")
@@ -175,6 +188,7 @@ fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> Element
 fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal-section")
+        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("modal-section-title")
@@ -248,6 +262,7 @@ fn setting_row(label: &str, desc: &str, control: ElementDef) -> ElementDef {
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("setting-meta")
+                .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("setting-label")
