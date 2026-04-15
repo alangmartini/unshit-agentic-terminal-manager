@@ -273,7 +273,7 @@ body::after {
   padding: 4px var(--sp-5) 4px var(--sp-4);
   color: var(--fg-tertiary);
   font-size: var(--t-xs);
-  transition: all var(--dur-fast) var(--ease-std);
+  transition: color var(--dur-fast) var(--ease-std), background var(--dur-fast) var(--ease-std), border-color var(--dur-fast) var(--ease-std), box-shadow var(--dur-fast) var(--ease-std), opacity var(--dur-fast) var(--ease-std), transform var(--dur-fast) var(--ease-std);
 }
 
 .pill-btn:hover {
@@ -305,7 +305,7 @@ body::after {
   justify-content: center;
   color: var(--fg-tertiary);
   border-radius: var(--r-md);
-  transition: all var(--dur-fast) var(--ease-std);
+  transition: color var(--dur-fast) var(--ease-std), background var(--dur-fast) var(--ease-std), border-color var(--dur-fast) var(--ease-std), box-shadow var(--dur-fast) var(--ease-std), opacity var(--dur-fast) var(--ease-std), transform var(--dur-fast) var(--ease-std);
 }
 
 .icon-btn:hover {
@@ -901,7 +901,7 @@ body::after {
   align-items: center;
   justify-content: center;
   border-radius: var(--r-sm);
-  transition: all var(--dur-fast);
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast), box-shadow var(--dur-fast), opacity var(--dur-fast), transform var(--dur-fast);
   font-size: var(--t-xl);
   line-height: 1;
   cursor: pointer;
@@ -929,7 +929,7 @@ body::after {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: all var(--dur-fast);
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast), box-shadow var(--dur-fast), opacity var(--dur-fast), transform var(--dur-fast);
 }
 
 .tab-add:hover {
@@ -1106,7 +1106,7 @@ body::after {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: all var(--dur-fast);
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast), box-shadow var(--dur-fast), opacity var(--dur-fast), transform var(--dur-fast);
 }
 
 .pane-action:hover {
@@ -1507,7 +1507,7 @@ body.dragging-pane {
   font-size: var(--t-sm);
   padding: var(--sp-2) var(--sp-3);
   border-radius: var(--r-sm);
-  transition: all var(--dur-fast);
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast), box-shadow var(--dur-fast), opacity var(--dur-fast), transform var(--dur-fast);
   white-space: nowrap;
   position: relative;
 }
@@ -1639,7 +1639,7 @@ body.dragging-pane {
   padding: var(--sp-2) var(--sp-4);
   border-radius: var(--r-sm);
   min-width: 180px;
-  transition: all var(--dur-fast);
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast), box-shadow var(--dur-fast), opacity var(--dur-fast), transform var(--dur-fast);
 }
 
 .input:focus {
@@ -1667,7 +1667,7 @@ body.dragging-pane {
   border: 1px solid var(--border-default);
   border-radius: 999px;
   position: relative;
-  transition: all var(--dur-norm) var(--ease-std);
+  transition: color var(--dur-norm) var(--ease-std), background var(--dur-norm) var(--ease-std), border-color var(--dur-norm) var(--ease-std), box-shadow var(--dur-norm) var(--ease-std), opacity var(--dur-norm) var(--ease-std), transform var(--dur-norm) var(--ease-std);
   flex-shrink: 0;
 }
 
@@ -1680,7 +1680,7 @@ body.dragging-pane {
   height: 14px;
   background: var(--fg-tertiary);
   border-radius: 50%;
-  transition: all var(--dur-norm) var(--ease-std);
+  transition: color var(--dur-norm) var(--ease-std), background var(--dur-norm) var(--ease-std), border-color var(--dur-norm) var(--ease-std), box-shadow var(--dur-norm) var(--ease-std), opacity var(--dur-norm) var(--ease-std), transform var(--dur-norm) var(--ease-std);
 }
 
 .toggle.on {
@@ -1707,7 +1707,7 @@ body.dragging-pane {
   border-radius: var(--r-md);
   border: 1px solid var(--border-default);
   position: relative;
-  transition: all var(--dur-fast);
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast), box-shadow var(--dur-fast), opacity var(--dur-fast), transform var(--dur-fast);
 }
 
 .theme-chip:hover {
@@ -1740,7 +1740,7 @@ body.dragging-pane {
   height: 20px;
   color: var(--fg-tertiary);
   border-radius: var(--r-sm);
-  transition: all var(--dur-fast);
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast), box-shadow var(--dur-fast), opacity var(--dur-fast), transform var(--dur-fast);
 }
 
 .stepper-btn:hover {
@@ -1762,7 +1762,7 @@ body.dragging-pane {
   border-radius: var(--r-sm);
   font-size: var(--t-sm);
   font-weight: 500;
-  transition: all var(--dur-fast) var(--ease-std);
+  transition: color var(--dur-fast) var(--ease-std), background var(--dur-fast) var(--ease-std), border-color var(--dur-fast) var(--ease-std), box-shadow var(--dur-fast) var(--ease-std), opacity var(--dur-fast) var(--ease-std), transform var(--dur-fast) var(--ease-std);
 }
 
 .btn.ghost {
@@ -1814,7 +1814,7 @@ body.dragging-pane {
   border-radius: var(--r-sm);
   color: var(--fg-tertiary);
   font-size: var(--t-xs);
-  transition: all var(--dur-fast) var(--ease-std);
+  transition: color var(--dur-fast) var(--ease-std), background var(--dur-fast) var(--ease-std), border-color var(--dur-fast) var(--ease-std), box-shadow var(--dur-fast) var(--ease-std), opacity var(--dur-fast) var(--ease-std), transform var(--dur-fast) var(--ease-std);
   white-space: nowrap;
 }
 
@@ -1895,7 +1895,7 @@ body.dragging-pane {
   border-radius: 50%;
   cursor: pointer;
   box-shadow: 0 0 8px rgba(212, 163, 72, 0.35);
-  transition: all var(--dur-fast) var(--ease-std);
+  transition: color var(--dur-fast) var(--ease-std), background var(--dur-fast) var(--ease-std), border-color var(--dur-fast) var(--ease-std), box-shadow var(--dur-fast) var(--ease-std), opacity var(--dur-fast) var(--ease-std), transform var(--dur-fast) var(--ease-std);
 }
 
 .slider::-webkit-slider-thumb:hover {

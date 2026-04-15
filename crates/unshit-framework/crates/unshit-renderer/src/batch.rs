@@ -683,7 +683,9 @@ fn walk_for_batch(
     // the next `commit_frame` swap. Calling the pure `get` here would
     // leak the entry on the next commit and force clean nodes to alternate
     // between cache hits and forced re-renders every other frame.
-    let node_dirty = element.dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT);
+    // TODO(perf): cache replay is disabled while we debug blinking (#41/#42).
+    // Re-enable once the root cause of stale cache entries is found.
+    let node_dirty = true;
     if !node_dirty {
         if let Some(cached) = batch_cache.replay(node_id, layer_index) {
             let lb = batch.layer_mut(effective_layer);

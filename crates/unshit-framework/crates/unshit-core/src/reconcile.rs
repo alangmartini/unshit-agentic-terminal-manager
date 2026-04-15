@@ -214,10 +214,10 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
         content_changed || tab_index_changed || captures_keyboard_changed || overrides_changed;
 
     if style_dirty {
-        element.dirty |= DirtyFlags::STYLE;
+        element.dirty |= DirtyFlags::STYLE | DirtyFlags::PAINT;
     }
     if layout_dirty || input_type_changed {
-        element.dirty |= DirtyFlags::LAYOUT;
+        element.dirty |= DirtyFlags::LAYOUT | DirtyFlags::PAINT;
     }
 
     // Propagate SUBTREE_STYLE to ancestors so the cascade can skip clean
