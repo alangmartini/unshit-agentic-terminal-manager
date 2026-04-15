@@ -13,9 +13,23 @@ use crate::svg_cache::SvgTessCache;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Once;
+use std::sync::OnceLock;
+use unshit_core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 use wgpu;
 
 static BACKDROP_FALLBACK_LOG: Once = Once::new();
+
+fn use_subpixel_text_shader() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_SUBPIXEL_TEXT").is_some())
+}
+
+fn trace_text_draw_ranges() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        terminal_trace_enabled() && std::env::var_os("TM_TRACE_TEXT_RANGES").is_some()
+    })
+}
 
 /// MSAA sample count for the main content pipelines. Set to 1 to disable.
 const MSAA_SAMPLE_COUNT: u32 = 4;
@@ -187,8 +201,15 @@ impl GpuContext {
 
         let quad_pipeline = QuadPipeline::new(&device, surface_format, MSAA_SAMPLE_COUNT);
         #[cfg(target_os = "windows")]
-        let glyph_atlas =
-            GlyphAtlas::new_with_format(&device, 2048, wgpu::TextureFormat::Rgba8Unorm);
+        let glyph_atlas = GlyphAtlas::new_with_format(
+            &device,
+            2048,
+            if use_subpixel_text_shader() {
+                wgpu::TextureFormat::Rgba8Unorm
+            } else {
+                wgpu::TextureFormat::R8Unorm
+            },
+        );
         #[cfg(not(target_os = "windows"))]
         let glyph_atlas = GlyphAtlas::new(&device);
         let text_pipeline = TextPipeline::new(
@@ -412,8 +433,15 @@ impl GpuContext {
         });
         let quad_pipeline = QuadPipeline::new(&device, format, MSAA_SAMPLE_COUNT);
         #[cfg(target_os = "windows")]
-        let glyph_atlas =
-            GlyphAtlas::new_with_format(&device, 2048, wgpu::TextureFormat::Rgba8Unorm);
+        let glyph_atlas = GlyphAtlas::new_with_format(
+            &device,
+            2048,
+            if use_subpixel_text_shader() {
+                wgpu::TextureFormat::Rgba8Unorm
+            } else {
+                wgpu::TextureFormat::R8Unorm
+            },
+        );
         #[cfg(not(target_os = "windows"))]
         let glyph_atlas = GlyphAtlas::new(&device);
         let text_pipeline = TextPipeline::new(
@@ -557,8 +585,76 @@ impl GpuContext {
         }
     }
 
+    /// Rebuild text atlas bind groups so pipelines sample from the current
+    /// atlas texture/view after atlas recreation events.
+    pub fn refresh_glyph_atlas_bind_groups(&mut self) {
+        self.text_pipeline.rebuild_atlas_bind_group(
+            &self.device,
+            &self.glyph_atlas.texture_view,
+            &self.glyph_atlas.sampler,
+        );
+        if let Some(pipeline) = self.backdrop_text_pipeline.as_mut() {
+            pipeline.rebuild_atlas_bind_group(
+                &self.device,
+                &self.glyph_atlas.texture_view,
+                &self.glyph_atlas.sampler,
+            );
+        }
+    }
+
+    /// Upload one combined quad buffer and one combined glyph buffer for all
+    /// layers, then return each layer's base offset into those global buffers.
+    fn upload_content_instance_buffers(&mut self) -> (Vec<u32>, Vec<u32>) {
+        let mut quad_bases = Vec::with_capacity(self.layered_batch.layers.len());
+        let mut glyph_bases = Vec::with_capacity(self.layered_batch.layers.len());
+
+        let total_quads: usize =
+            self.layered_batch.layers.iter().map(|layer| layer.quad_instances.len()).sum();
+        let total_glyphs: usize =
+            self.layered_batch.layers.iter().map(|layer| layer.glyph_instances.len()).sum();
+
+        let mut all_quads = Vec::with_capacity(total_quads);
+        let mut all_glyphs = Vec::with_capacity(total_glyphs);
+
+        for layer in &self.layered_batch.layers {
+            quad_bases.push(all_quads.len() as u32);
+            glyph_bases.push(all_glyphs.len() as u32);
+            all_quads.extend_from_slice(&layer.quad_instances);
+            all_glyphs.extend_from_slice(&layer.glyph_instances);
+        }
+
+        if !all_quads.is_empty() {
+            self.quad_pipeline.upload_instances(&self.device, &self.queue, &all_quads);
+        }
+        if !all_glyphs.is_empty() {
+            self.text_pipeline.upload_instances(&self.device, &self.queue, &all_glyphs);
+        }
+
+        (quad_bases, glyph_bases)
+    }
+
     pub fn render(&mut self) {
         let (vw, vh) = self.window_size();
+
+        if trace_text_draw_ranges() {
+            for (layer_idx, layer_batch) in self.layered_batch.layers.iter().enumerate() {
+                let glyph_spans = layer_batch
+                    .draw_spans
+                    .iter()
+                    .filter(|span| matches!(span.kind, DrawKind::Glyph))
+                    .map(|span| format!("{}+{}", span.start, span.count))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                append_terminal_trace_line(&format!(
+                    "terminal-trace stage=gpu_glyph_ranges layer={} glyphs={} quads={} spans={} fallback={}",
+                    layer_idx,
+                    layer_batch.glyph_instances.len(),
+                    layer_batch.quad_instances.len(),
+                    glyph_spans,
+                    layer_batch.draw_spans.is_empty(),
+                ));
+            }
+        }
 
         self.quad_pipeline.update_uniforms(&self.queue, vw, vh);
         self.text_pipeline.update_uniforms(&self.queue, vw, vh);
@@ -591,6 +687,7 @@ impl GpuContext {
         }
         self.svg_pipeline.prune_unreferenced(&live_geometries);
         self.svg_pipeline.upload_instances(&self.device, &self.queue, &svg_instance_buffer);
+        let (quad_bases, glyph_bases) = self.upload_content_instance_buffers();
 
         let (surface_view, surface_output) = match &self.target {
             RenderTarget::Window { surface, config } => {
@@ -654,7 +751,16 @@ impl GpuContext {
                 .as_ref()
                 .unwrap()
                 .create_view(&wgpu::TextureViewDescriptor::default());
-            self.render_with_backdrop_path(&mut encoder, &view, &svg_keys, vw, vh, format);
+            self.render_with_backdrop_path(
+                &mut encoder,
+                &view,
+                &svg_keys,
+                &quad_bases,
+                &glyph_bases,
+                vw,
+                vh,
+                format,
+            );
         } else {
             let render_view: &wgpu::TextureView = if self.capture_enabled {
                 self.capture_view.as_ref().unwrap()
@@ -695,19 +801,16 @@ impl GpuContext {
             let mut svg_next: usize = 0;
 
             for (layer_idx, layer_batch) in self.layered_batch.layers.iter().enumerate() {
+                let quad_base = quad_bases[layer_idx];
+                let glyph_base = glyph_bases[layer_idx];
                 if layer_batch.draw_spans.is_empty() {
                     // Fallback: existing render order (all quads, SVG, text, images, canvas)
                     let quad_count = layer_batch.quad_instances.len() as u32;
                     if quad_count > 0 {
-                        self.quad_pipeline.upload_instances(
-                            &self.device,
-                            &self.queue,
-                            &layer_batch.quad_instances,
-                        );
                         pass.set_pipeline(&self.quad_pipeline.pipeline);
                         pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
                         pass.set_vertex_buffer(0, self.quad_pipeline.instance_buffer.slice(..));
-                        pass.draw(0..6, 0..quad_count);
+                        pass.draw(0..6, quad_base..quad_base + quad_count);
                     }
 
                     // SVG pass.
@@ -728,16 +831,11 @@ impl GpuContext {
 
                     let glyph_count = layer_batch.glyph_instances.len() as u32;
                     if glyph_count > 0 {
-                        self.text_pipeline.upload_instances(
-                            &self.device,
-                            &self.queue,
-                            &layer_batch.glyph_instances,
-                        );
                         pass.set_pipeline(&self.text_pipeline.pipeline);
                         pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
                         pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
                         pass.set_vertex_buffer(0, self.text_pipeline.instance_buffer.slice(..));
-                        pass.draw(0..6, 0..glyph_count);
+                        pass.draw(0..6, glyph_base..glyph_base + glyph_count);
                     }
 
                     for image_batch in &layer_batch.image_batches {
@@ -806,24 +904,6 @@ impl GpuContext {
                     // Interleaved rendering path: upload all instances once,
                     // then draw spans sequentially to preserve painter's algorithm
                     // occlusion for overlapping elements.
-                    let quad_count = layer_batch.quad_instances.len() as u32;
-                    let glyph_count = layer_batch.glyph_instances.len() as u32;
-
-                    if quad_count > 0 {
-                        self.quad_pipeline.upload_instances(
-                            &self.device,
-                            &self.queue,
-                            &layer_batch.quad_instances,
-                        );
-                    }
-                    if glyph_count > 0 {
-                        self.text_pipeline.upload_instances(
-                            &self.device,
-                            &self.queue,
-                            &layer_batch.glyph_instances,
-                        );
-                    }
-
                     let mut current_kind: Option<DrawKind> = None;
                     for span in &layer_batch.draw_spans {
                         if span.count == 0 {
@@ -840,7 +920,8 @@ impl GpuContext {
                                     );
                                     current_kind = Some(DrawKind::Quad);
                                 }
-                                pass.draw(0..6, span.start..span.start + span.count);
+                                let start = quad_base + span.start;
+                                pass.draw(0..6, start..start + span.count);
                             }
                             DrawKind::Glyph => {
                                 if current_kind != Some(DrawKind::Glyph) {
@@ -861,7 +942,8 @@ impl GpuContext {
                                     );
                                     current_kind = Some(DrawKind::Glyph);
                                 }
-                                pass.draw(0..6, span.start..span.start + span.count);
+                                let start = glyph_base + span.start;
+                                pass.draw(0..6, start..start + span.count);
                             }
                         }
                     }
@@ -1052,6 +1134,8 @@ impl GpuContext {
         encoder: &mut wgpu::CommandEncoder,
         render_view: &wgpu::TextureView,
         svg_keys: &[(usize, usize, usize)],
+        quad_bases: &[u32],
+        glyph_bases: &[u32],
         vw: f32,
         vh: f32,
         format: wgpu::TextureFormat,
@@ -1077,6 +1161,8 @@ impl GpuContext {
         // does not work here.
         #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..self.layered_batch.layers.len() {
+            let quad_base = quad_bases[layer_idx];
+            let glyph_base = glyph_bases[layer_idx];
             let mut quad_cur: u32 = 0;
             let mut glyph_cur: u32 = 0;
             let mut svg_cur: u32 = 0;
@@ -1106,19 +1192,6 @@ impl GpuContext {
                             layer_batch.canvas_callbacks.len() as u32,
                         )
                     };
-
-                if quad_cur < quad_end {
-                    let slice: Vec<_> = self.layered_batch.layers[layer_idx].quad_instances
-                        [..quad_end as usize]
-                        .to_vec();
-                    self.quad_pipeline.upload_instances(&self.device, &self.queue, &slice);
-                }
-                if glyph_cur < glyph_end {
-                    let slice: Vec<_> = self.layered_batch.layers[layer_idx].glyph_instances
-                        [..glyph_end as usize]
-                        .to_vec();
-                    self.text_pipeline.upload_instances(&self.device, &self.queue, &slice);
-                }
 
                 // Collect the canvas callbacks for this slice outside the
                 // render pass scope so the `Arc<dyn CustomPainter>` inside
@@ -1200,7 +1273,7 @@ impl GpuContext {
                                             );
                                             current_kind = Some(DrawKind::Quad);
                                         }
-                                        pass.draw(0..6, lo..hi);
+                                        pass.draw(0..6, quad_base + lo..quad_base + hi);
                                     }
                                 }
                                 DrawKind::Glyph => {
@@ -1225,7 +1298,7 @@ impl GpuContext {
                                             );
                                             current_kind = Some(DrawKind::Glyph);
                                         }
-                                        pass.draw(0..6, lo..hi);
+                                        pass.draw(0..6, glyph_base + lo..glyph_base + hi);
                                     }
                                 }
                             }
@@ -1236,14 +1309,14 @@ impl GpuContext {
                             pass.set_pipeline(quad_rp);
                             pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
                             pass.set_vertex_buffer(0, self.quad_pipeline.instance_buffer.slice(..));
-                            pass.draw(0..6, quad_cur..quad_end);
+                            pass.draw(0..6, quad_base + quad_cur..quad_base + quad_end);
                         }
                         if glyph_cur < glyph_end {
                             pass.set_pipeline(text_rp);
                             pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
                             pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
                             pass.set_vertex_buffer(0, self.text_pipeline.instance_buffer.slice(..));
-                            pass.draw(0..6, glyph_cur..glyph_end);
+                            pass.draw(0..6, glyph_base + glyph_cur..glyph_base + glyph_end);
                         }
                     }
 

@@ -9,10 +9,21 @@ use crate::style::cascade;
 use crate::style::parse::CompiledStylesheet;
 use crate::style::pseudo::{self, PseudoSideTable};
 use crate::style::transition::{self, ActiveTransitions};
-use crate::style::types::Dimension;
+use crate::style::types::{ComputedStyle, Dimension, SelectionStyle};
 use crate::tree::NodeArena;
 use cosmic_text::FontSystem;
 use std::time::Instant;
+
+#[inline]
+fn style_resolution_changed(
+    previous_style: Option<&ComputedStyle>,
+    previous_selection: Option<SelectionStyle>,
+    resolved_style: &ComputedStyle,
+    selection_style: Option<SelectionStyle>,
+) -> bool {
+    previous_style.is_none_or(|prev| prev != resolved_style)
+        || previous_selection != selection_style
+}
 
 /// Recursively build an arena tree from an [`ElementDef`], linking parent/child/sibling pointers.
 #[allow(clippy::only_used_in_recursion)]
@@ -169,7 +180,7 @@ pub fn resolve_all_styles_with_transitions(
     now: Option<Instant>,
     mut active_transitions: Option<&mut ActiveTransitions>,
 ) {
-    let new_style = cascade::resolve_style_fv(
+    let mut resolved_style = cascade::resolve_style_fv(
         arena,
         stylesheet,
         node_id,
@@ -183,53 +194,51 @@ pub fn resolve_all_styles_with_transitions(
     let children = arena.children(node_id);
 
     if let Some(element) = arena.get_mut(node_id) {
+        let had_paint_dirty = element.dirty.contains(DirtyFlags::PAINT);
+        // Apply inline and runtime overrides before diffing or starting
+        // transitions so comparisons happen on the final resolved style.
+        for decl in &element.style_overrides {
+            crate::style::parse::apply_declaration(&mut resolved_style, decl);
+        }
+        if let Some(w) = element.resize_override_width {
+            resolved_style.width = Dimension::Px(w);
+        }
+        if let Some(h) = element.resize_override_height {
+            resolved_style.height = Dimension::Px(h);
+        }
+
+        let style_changed = style_resolution_changed(
+            element.previous_style.as_deref(),
+            element.selection_style,
+            &resolved_style,
+            sel_style,
+        );
+
         // If the new style declares transitions and we have a previous style to diff against,
         // start transitions for changed properties.
-        if let (Some(now), true) = (now, !new_style.transitions.is_empty()) {
+        if let (Some(now), true) = (now, !resolved_style.transitions.is_empty()) {
             if let Some(ref prev) = element.previous_style {
                 transition::start_transitions(
                     prev,
-                    &new_style,
-                    &new_style.transitions,
+                    &resolved_style,
+                    &resolved_style.transitions,
                     &mut element.running_transitions,
                     now,
                 );
             }
         }
 
-        // Store the resolved (target) style as previous for the next diff.
-        if !new_style.transitions.is_empty() {
-            element.previous_style = Some(Box::new(new_style.clone()));
-        }
-
-        element.computed_style = new_style;
+        element.previous_style = Some(Box::new(resolved_style.clone()));
+        element.computed_style = resolved_style;
         element.selection_style = sel_style;
-        // Apply inline style overrides (highest precedence, post-cascade).
-        for decl in &element.style_overrides {
-            crate::style::parse::apply_declaration(&mut element.computed_style, decl);
-        }
-
-        // Apply user-driven resize overrides (from CSS resize drag) so they
-        // persist across style recalculations.
-        if let Some(w) = element.resize_override_width {
-            element.computed_style.width = Dimension::Px(w);
-        }
-        if let Some(h) = element.resize_override_height {
-            element.computed_style.height = Dimension::Px(h);
-        }
 
         // Clear style dirty flags now that this node has been processed.
         element.dirty.remove(DirtyFlags::STYLE | DirtyFlags::SUBTREE_STYLE);
 
-        // Always mark paint-dirty after restyle. A targeted comparison
-        // (visual_props_changed) is defeated by DPI scaling: scale_all_styles
-        // mutates computed_style after restyle, so the "old" style is scaled
-        // while the "new" cascade result is unscaled, causing a false diff on
-        // every frame. Unconditional PAINT is safe here because the batch
-        // cache replay fix ensures idle frames carry forward correctly.
-        element.dirty.insert(DirtyFlags::PAINT);
-        if !children.is_empty() {
-            element.dirty.insert(DirtyFlags::SUBTREE_PAINT);
+        if style_changed || had_paint_dirty {
+            element.dirty.insert(DirtyFlags::PAINT);
+        } else {
+            element.dirty.remove(DirtyFlags::PAINT);
         }
     }
 
@@ -243,7 +252,7 @@ pub fn resolve_all_styles_with_transitions(
     }
 
     // We need to reborrow for recursion since active_transitions is &mut.
-    for child_id in children {
+    for &child_id in &children {
         // We can't pass `active_transitions` directly in a loop due to borrow rules,
         // so we use a raw pointer trick or just handle it differently.
         // Actually, Option<&mut T> can be reborrowed:
@@ -261,6 +270,21 @@ pub fn resolve_all_styles_with_transitions(
         // After resolving child, check if it has active transitions and track it.
         if let Some(ref mut at) = active_transitions {
             collect_active_transitions_subtree(arena, child_id, at);
+        }
+    }
+
+    let child_paint_dirty = children.iter().any(|&child_id| {
+        arena
+            .get(child_id)
+            .map(|child| child.dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT))
+            .unwrap_or(false)
+    });
+
+    if let Some(element) = arena.get_mut(node_id) {
+        if child_paint_dirty {
+            element.dirty.insert(DirtyFlags::SUBTREE_PAINT);
+        } else {
+            element.dirty.remove(DirtyFlags::SUBTREE_PAINT);
         }
     }
 }
@@ -309,7 +333,7 @@ pub fn resolve_dirty_styles_with_transitions(
     let node_style_dirty =
         arena.get(node_id).map(|e| e.dirty.contains(DirtyFlags::STYLE)).unwrap_or(false);
 
-    let new_style = if node_style_dirty {
+    let resolved_style = if node_style_dirty {
         Some(cascade::resolve_style_fv(
             arena,
             stylesheet,
@@ -330,49 +354,51 @@ pub fn resolve_dirty_styles_with_transitions(
 
     let children = arena.children(node_id);
 
-    if let Some(new_style) = new_style {
+    if let Some(mut resolved_style) = resolved_style {
         if let Some(element) = arena.get_mut(node_id) {
+            let had_paint_dirty = element.dirty.contains(DirtyFlags::PAINT);
+            for decl in &element.style_overrides {
+                crate::style::parse::apply_declaration(&mut resolved_style, decl);
+            }
+            if let Some(w) = element.resize_override_width {
+                resolved_style.width = Dimension::Px(w);
+            }
+            if let Some(h) = element.resize_override_height {
+                resolved_style.height = Dimension::Px(h);
+            }
+
+            let style_changed = style_resolution_changed(
+                element.previous_style.as_deref(),
+                element.selection_style,
+                &resolved_style,
+                sel_style,
+            );
+
             // If the new style declares transitions and we have a previous style to diff against,
             // start transitions for changed properties.
-            if let (Some(now), true) = (now, !new_style.transitions.is_empty()) {
+            if let (Some(now), true) = (now, !resolved_style.transitions.is_empty()) {
                 if let Some(ref prev) = element.previous_style {
                     transition::start_transitions(
                         prev,
-                        &new_style,
-                        &new_style.transitions,
+                        &resolved_style,
+                        &resolved_style.transitions,
                         &mut element.running_transitions,
                         now,
                     );
                 }
             }
 
-            // Store the resolved (target) style as previous for the next diff.
-            if !new_style.transitions.is_empty() {
-                element.previous_style = Some(Box::new(new_style.clone()));
-            }
-
-            element.computed_style = new_style;
+            element.previous_style = Some(Box::new(resolved_style.clone()));
+            element.computed_style = resolved_style;
             element.selection_style = sel_style;
-            // Apply inline style overrides (highest precedence, post-cascade).
-            for decl in &element.style_overrides {
-                crate::style::parse::apply_declaration(&mut element.computed_style, decl);
-            }
-
-            // Apply user-driven resize overrides (from CSS resize drag).
-            if let Some(w) = element.resize_override_width {
-                element.computed_style.width = Dimension::Px(w);
-            }
-            if let Some(h) = element.resize_override_height {
-                element.computed_style.height = Dimension::Px(h);
-            }
 
             // Clear the node's own STYLE flag now that it has been resolved.
             element.dirty.remove(DirtyFlags::STYLE);
 
-            // Unconditional PAINT (see resolve_all_styles_with_transitions).
-            element.dirty.insert(DirtyFlags::PAINT);
-            if !children.is_empty() {
-                element.dirty.insert(DirtyFlags::SUBTREE_PAINT);
+            if style_changed || had_paint_dirty {
+                element.dirty.insert(DirtyFlags::PAINT);
+            } else {
+                element.dirty.remove(DirtyFlags::PAINT);
             }
         }
     }
@@ -387,7 +413,7 @@ pub fn resolve_dirty_styles_with_transitions(
     }
 
     // We need to reborrow for recursion since active_transitions is &mut.
-    for child_id in children {
+    for &child_id in &children {
         resolve_dirty_styles_with_transitions(
             arena,
             stylesheet,
@@ -402,6 +428,21 @@ pub fn resolve_dirty_styles_with_transitions(
         // After resolving child, check if it has active transitions and track it.
         if let Some(ref mut at) = active_transitions {
             collect_active_transitions_subtree(arena, child_id, at);
+        }
+    }
+
+    let child_paint_dirty = children.iter().any(|&child_id| {
+        arena
+            .get(child_id)
+            .map(|child| child.dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT))
+            .unwrap_or(false)
+    });
+
+    if let Some(element) = arena.get_mut(node_id) {
+        if child_paint_dirty {
+            element.dirty.insert(DirtyFlags::SUBTREE_PAINT);
+        } else {
+            element.dirty.remove(DirtyFlags::SUBTREE_PAINT);
         }
     }
 
@@ -671,6 +712,24 @@ mod tests {
         resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
 
         (arena, root, stylesheet)
+    }
+
+    fn setup_parent_child(
+        css: &str,
+    ) -> (NodeArena, NodeId, NodeId, CompiledStylesheet, taffy::TaffyTree<TextMeasureCtx>) {
+        let stylesheet = CompiledStylesheet::parse(css);
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+
+        let def = ElementDef::new(Tag::Div)
+            .with_class("root")
+            .with_child(ElementDef::new(Tag::Div).with_class("leaf"));
+        let root = build_tree_from_def(&def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let leaf = arena.get(root).unwrap().first_child;
+
+        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+
+        (arena, root, leaf, stylesheet, taffy)
     }
 
     #[test]
@@ -1149,6 +1208,72 @@ mod tests {
             arena.get(root).unwrap().dirty.contains(DirtyFlags::PAINT),
             "ticked transition node must be PAINT dirty; got {:?}",
             arena.get(root).unwrap().dirty
+        );
+    }
+
+    #[test]
+    fn unchanged_restyle_does_not_mark_paint_dirty() {
+        let css = ".box { color: #fff; }";
+        let (mut arena, root, stylesheet) = setup(css);
+
+        arena.get_mut(root).unwrap().dirty = DirtyFlags::empty();
+
+        resolve_all_styles_with_transitions(
+            &mut arena,
+            &stylesheet,
+            root,
+            NodeId::DANGLING,
+            None,
+            NodeId::DANGLING,
+            false,
+            Some(Instant::now()),
+            None,
+        );
+
+        let dirty = arena.get(root).unwrap().dirty;
+        assert!(
+            !dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT),
+            "unchanged restyle should stay clean; got {:?}",
+            dirty
+        );
+    }
+
+    #[test]
+    fn hovered_leaf_marks_ancestor_subtree_paint_only() {
+        let css = r#"
+            .root { color: #fff; }
+            .leaf { color: #fff; }
+            .leaf:hover { color: #0f0; }
+        "#;
+        let (mut arena, root, leaf, stylesheet, _taffy) = setup_parent_child(css);
+
+        arena.get_mut(root).unwrap().dirty = DirtyFlags::empty();
+        arena.get_mut(leaf).unwrap().dirty = DirtyFlags::empty();
+
+        resolve_all_styles_with_transitions(
+            &mut arena,
+            &stylesheet,
+            root,
+            leaf,
+            None,
+            NodeId::DANGLING,
+            false,
+            Some(Instant::now()),
+            None,
+        );
+
+        let root_dirty = arena.get(root).unwrap().dirty;
+        let leaf_dirty = arena.get(leaf).unwrap().dirty;
+        assert!(leaf_dirty.contains(DirtyFlags::PAINT), "hovered leaf must be PAINT dirty");
+        assert!(
+            root_dirty.contains(DirtyFlags::SUBTREE_PAINT),
+            "ancestor must carry SUBTREE_PAINT when child changed; got {:?}",
+            root_dirty
+        );
+        assert!(
+            !root_dirty.contains(DirtyFlags::PAINT),
+            "ancestor should not get PAINT when only child changed; got {:?}",
+            root_dirty
         );
     }
 }

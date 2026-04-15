@@ -9,12 +9,25 @@ use std::collections::VecDeque;
 
 use unshit::core::cell_grid::{color_256, Cell, CellAttrs, CellGrid, ANSI_16};
 use unshit::core::style::types::Color;
+use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 use vte::{Params, Perform};
 
 pub mod keys;
 
 /// Maximum number of scrollback lines retained per terminal.
 const MAX_SCROLLBACK: usize = 10_000;
+
+fn preview_bytes(bytes: &[u8], limit: usize) -> String {
+    let mut preview = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]).into_owned();
+    preview = preview
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\u{1b}', "\\x1b");
+    if bytes.len() > limit {
+        preview.push_str("...");
+    }
+    preview
+}
 
 /// Terminal emulator state.
 ///
@@ -99,6 +112,22 @@ impl Terminal {
         self.parser = parser;
         // Sync cursor position to the grid so the renderer can draw it.
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
+
+        if terminal_trace_enabled() && !bytes.is_empty() {
+            let rows = self.grid.debug_rows(4, 96);
+            append_terminal_trace_line(&format!(
+                "terminal-trace stage=process_bytes bytes={} cursor=({}, {}) rows={} cols={} row0={:?} row1={:?} row2={:?} row3={:?}",
+                preview_bytes(bytes, 120),
+                self.cursor_row,
+                self.cursor_col,
+                self.rows,
+                self.cols,
+                rows.first().cloned().unwrap_or_default(),
+                rows.get(1).cloned().unwrap_or_default(),
+                rows.get(2).cloned().unwrap_or_default(),
+                rows.get(3).cloned().unwrap_or_default(),
+            ));
+        }
     }
 
     /// Immutable reference to the backing cell grid.
@@ -173,7 +202,21 @@ impl Terminal {
     /// the upper portion of the live screen, with the cursor hidden.
     pub fn display_grid(&self) -> CellGrid {
         if self.scroll_offset == 0 {
-            return self.grid.clone();
+            let view = self.grid.clone();
+            if terminal_trace_enabled() {
+                let rows = view.debug_rows(4, 96);
+                append_terminal_trace_line(&format!(
+                    "terminal-trace stage=display_grid_live scroll_offset=0 cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?}",
+                    self.cursor_row,
+                    self.cursor_col,
+                    self.grid.cursor_visible(),
+                    rows.first().cloned().unwrap_or_default(),
+                    rows.get(1).cloned().unwrap_or_default(),
+                    rows.get(2).cloned().unwrap_or_default(),
+                    rows.get(3).cloned().unwrap_or_default(),
+                ));
+            }
+            return view;
         }
 
         let mut view = CellGrid::new(self.rows, self.cols);
@@ -209,6 +252,19 @@ impl Terminal {
 
         // Hide cursor when scrolled back.
         view.set_cursor_visible(false);
+        if terminal_trace_enabled() {
+            let rows = view.debug_rows(4, 96);
+            append_terminal_trace_line(&format!(
+                "terminal-trace stage=display_grid_scrollback scroll_offset={} cursor=({}, {}) row0={:?} row1={:?} row2={:?} row3={:?}",
+                self.scroll_offset,
+                self.cursor_row,
+                self.cursor_col,
+                rows.first().cloned().unwrap_or_default(),
+                rows.get(1).cloned().unwrap_or_default(),
+                rows.get(2).cloned().unwrap_or_default(),
+                rows.get(3).cloned().unwrap_or_default(),
+            ));
+        }
         view
     }
 

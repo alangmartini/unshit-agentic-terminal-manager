@@ -1524,9 +1524,14 @@ impl ApplicationHandler for AppHandler {
                 {
                     let atlas_frame = state.gpu.glyph_atlas.lru.frame_counter;
                     if atlas_frame > 0 && atlas_frame % 300 == 0 {
+                        let prev_generation = state.gpu.glyph_atlas.generation;
                         let device = state.gpu.device.clone();
                         let queue = state.gpu.queue.clone();
                         state.gpu.glyph_atlas.evict_unused(300, &device, &queue);
+                        if state.gpu.glyph_atlas.generation != prev_generation {
+                            state.shaped_cache.clear();
+                            state.gpu.refresh_glyph_atlas_bind_groups();
+                        }
                     }
                 }
 

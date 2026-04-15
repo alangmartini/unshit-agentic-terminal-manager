@@ -5,10 +5,23 @@ use std::sync::{Arc, Mutex};
 
 use futures_core::Stream;
 use unshit::app::{EventSink, ExternalEvent, Subscription};
+use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 
 use crate::state::SharedState;
 
 static PENDING_READERS: Mutex<Option<HashMap<u32, Box<dyn Read + Send>>>> = Mutex::new(None);
+
+fn preview_bytes(bytes: &[u8], limit: usize) -> String {
+    let mut preview = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]).into_owned();
+    preview = preview
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\u{1b}', "\\x1b");
+    if bytes.len() > limit {
+        preview.push_str("...");
+    }
+    preview
+}
 
 pub fn register_reader(pane_id: u32, reader: Box<dyn Read + Send>) {
     let mut guard = PENDING_READERS.lock().unwrap();
@@ -86,6 +99,21 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                             while let Ok(more) = rx.try_recv() {
                                 terminal.process_bytes(&more);
                                 batched += 1;
+                            }
+                            if terminal_trace_enabled() {
+                                let rows = terminal.grid().debug_rows(4, 96);
+                                append_terminal_trace_line(&format!(
+                                    "terminal-trace stage=bridge_after_process pane={} batched={} bytes={} cursor=({}, {}) row0={:?} row1={:?} row2={:?} row3={:?}",
+                                    pane_id,
+                                    batched,
+                                    preview_bytes(&data, 120),
+                                    terminal.grid().cursor_row(),
+                                    terminal.grid().cursor_col(),
+                                    rows.first().cloned().unwrap_or_default(),
+                                    rows.get(1).cloned().unwrap_or_default(),
+                                    rows.get(2).cloned().unwrap_or_default(),
+                                    rows.get(3).cloned().unwrap_or_default(),
+                                ));
                             }
                         }
                     }

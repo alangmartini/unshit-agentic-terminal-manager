@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+use std::sync::OnceLock;
 use wgpu;
 
 #[repr(C)]
@@ -29,6 +30,16 @@ pub struct TextPipeline {
     uniform_buffer: wgpu::Buffer,
 }
 
+fn use_subpixel_text_shader() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_SUBPIXEL_TEXT").is_some())
+}
+
+fn use_debug_solid_text_shader() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TM_DEBUG_SOLID_TEXT").is_some())
+}
+
 impl TextPipeline {
     pub fn new(
         device: &wgpu::Device,
@@ -38,9 +49,19 @@ impl TextPipeline {
         sample_count: u32,
     ) -> Self {
         #[cfg(target_os = "windows")]
-        let shader_src = include_str!("../shaders/text_subpixel.wgsl");
+        let shader_src = if use_debug_solid_text_shader() {
+            include_str!("../shaders/text_debug_solid.wgsl")
+        } else if use_subpixel_text_shader() {
+            include_str!("../shaders/text_subpixel.wgsl")
+        } else {
+            include_str!("../shaders/text.wgsl")
+        };
         #[cfg(not(target_os = "windows"))]
-        let shader_src = include_str!("../shaders/text.wgsl");
+        let shader_src = if use_debug_solid_text_shader() {
+            include_str!("../shaders/text_debug_solid.wgsl")
+        } else {
+            include_str!("../shaders/text.wgsl")
+        };
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("text shader"),
@@ -152,18 +173,22 @@ impl TextPipeline {
                     blend: Some({
                         #[cfg(target_os = "windows")]
                         {
-                            // Premultiplied alpha for subpixel blending
-                            wgpu::BlendState {
-                                color: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                                alpha: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
+                            if use_subpixel_text_shader() {
+                                // Premultiplied alpha for subpixel blending
+                                wgpu::BlendState {
+                                    color: wgpu::BlendComponent {
+                                        src_factor: wgpu::BlendFactor::One,
+                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                        operation: wgpu::BlendOperation::Add,
+                                    },
+                                    alpha: wgpu::BlendComponent {
+                                        src_factor: wgpu::BlendFactor::One,
+                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                        operation: wgpu::BlendOperation::Add,
+                                    },
+                                }
+                            } else {
+                                wgpu::BlendState::ALPHA_BLENDING
                             }
                         }
                         #[cfg(not(target_os = "windows"))]
