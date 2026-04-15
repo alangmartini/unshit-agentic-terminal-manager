@@ -84,11 +84,7 @@ fn build_workspace(
         .on_context_menu(move |x, y| {
             mutate_with(&ctx_state, |st| {
                 // Toggle: if the menu is already open for this workspace, close it.
-                if st
-                    .ctx_menu
-                    .as_ref()
-                    .map_or(false, |m| m.workspace_idx == idx)
-                {
+                if st.ctx_menu.as_ref().is_some_and(|m| m.workspace_idx == idx) {
                     st.ctx_menu = None;
                 } else {
                     // Divide by scale_factor: cursor coords are physical pixels,
