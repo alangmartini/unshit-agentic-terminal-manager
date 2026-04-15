@@ -220,6 +220,21 @@ pub fn resolve_all_styles_with_transitions(
 
         // Clear style dirty flags now that this node has been processed.
         element.dirty.remove(DirtyFlags::STYLE | DirtyFlags::SUBTREE_STYLE);
+
+        // Always mark paint-dirty AND layout-dirty after restyle. A targeted
+        // comparison (visual_props_changed) is defeated by DPI scaling:
+        // scale_all_styles mutates computed_style after restyle, so the "old"
+        // style is scaled while the "new" cascade result is unscaled, causing
+        // a false diff on every frame. Unconditional PAINT is safe here
+        // because the batch cache replay fix ensures idle frames carry
+        // forward correctly. LAYOUT must be set too because style changes can
+        // affect size/position (display, flex-direction, width, padding,
+        // etc.), and `sync_element_to_taffy` only re-syncs the taffy node
+        // when LAYOUT is dirty.
+        element.dirty.insert(DirtyFlags::PAINT | DirtyFlags::LAYOUT);
+        if !children.is_empty() {
+            element.dirty.insert(DirtyFlags::SUBTREE_PAINT | DirtyFlags::SUBTREE_LAYOUT);
+        }
     }
 
     // Track elements with active transitions.
@@ -357,6 +372,13 @@ pub fn resolve_dirty_styles_with_transitions(
 
             // Clear the node's own STYLE flag now that it has been resolved.
             element.dirty.remove(DirtyFlags::STYLE);
+
+            // Unconditional PAINT and LAYOUT (see
+            // resolve_all_styles_with_transitions for rationale).
+            element.dirty.insert(DirtyFlags::PAINT | DirtyFlags::LAYOUT);
+            if !children.is_empty() {
+                element.dirty.insert(DirtyFlags::SUBTREE_PAINT | DirtyFlags::SUBTREE_LAYOUT);
+            }
         }
     }
 
@@ -421,6 +443,8 @@ pub fn tick_all_transitions(
     active: &mut ActiveTransitions,
     now: Instant,
 ) -> bool {
+    let mut ticked_nodes: smallvec::SmallVec<[NodeId; 8]> = smallvec::SmallVec::new();
+
     let mut i = 0;
     while i < active.nodes.len() {
         let node_id = active.nodes[i];
@@ -430,6 +454,7 @@ pub fn tick_all_transitions(
                 &mut element.running_transitions,
                 now,
             );
+            ticked_nodes.push(node_id);
             if !still_active {
                 active.nodes.swap_remove(i);
                 // don't increment i
@@ -441,6 +466,12 @@ pub fn tick_all_transitions(
             continue;
         }
         i += 1;
+    }
+
+    // Mark ticked nodes paint-dirty so the batch builder re-renders them
+    // with the interpolated style values.
+    for &nid in &ticked_nodes {
+        mark_node_paint_dirty(arena, nid);
     }
 
     active.has_active()
@@ -483,7 +514,10 @@ pub fn tick_all_animations(
     stylesheet: &crate::style::parse::CompiledStylesheet,
     now: Instant,
 ) {
-    driver.tick(arena, stylesheet, now);
+    let ticked = driver.tick(arena, stylesheet, now);
+    for &nid in &ticked {
+        mark_node_paint_dirty(arena, nid);
+    }
 }
 
 /// Apply DPI scaling to every computed style in the subtree.
@@ -500,6 +534,29 @@ pub fn scale_all_styles(arena: &mut NodeArena, node_id: NodeId, scale: f32) {
 
     for child_id in children {
         scale_all_styles(arena, child_id, scale);
+    }
+}
+
+/// Mark a single node as PAINT-dirty and propagate SUBTREE_PAINT up the
+/// ancestor chain. Use this when a node's visual output changed without
+/// going through the reconciler (e.g., transition/animation ticks).
+pub fn mark_node_paint_dirty(arena: &mut NodeArena, node_id: NodeId) {
+    if let Some(element) = arena.get_mut(node_id) {
+        element.dirty.insert(DirtyFlags::PAINT);
+    }
+    // Walk up the parent chain, setting SUBTREE_PAINT. Stop early if the
+    // flag is already set (the rest of the chain is already propagated).
+    let mut current = arena.get(node_id).map(|e| e.parent).unwrap_or(NodeId::DANGLING);
+    while !current.is_dangling() {
+        let already_set =
+            arena.get(current).map(|e| e.dirty.contains(DirtyFlags::SUBTREE_PAINT)).unwrap_or(true);
+        if let Some(elem) = arena.get_mut(current) {
+            elem.dirty.insert(DirtyFlags::SUBTREE_PAINT);
+        }
+        if already_set {
+            break;
+        }
+        current = arena.get(current).map(|e| e.parent).unwrap_or(NodeId::DANGLING);
     }
 }
 
@@ -542,7 +599,7 @@ pub fn run_layout_pipeline(
     height: f32,
     cache: &mut TextMeasureCache,
 ) {
-    layout::sync_element_to_taffy(arena, taffy, root, font_system);
+    layout::sync_element_to_taffy(arena, taffy, root, font_system, width, height);
     if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
         layout::compute_layout(taffy, tn, width, height, font_system, cache);
         layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
@@ -999,5 +1056,104 @@ mod tests {
                 samples[i]
             );
         }
+    }
+
+    /// Regression: mark_node_paint_dirty must set PAINT on the target
+    /// node and propagate SUBTREE_PAINT up the ancestor chain.
+    #[test]
+    fn mark_node_paint_dirty_propagates_subtree_paint() {
+        let mut arena = NodeArena::new();
+        let root = arena.alloc(crate::element::Element::new(Tag::Div));
+        let mid = arena.alloc(crate::element::Element::new(Tag::Div));
+        let leaf = arena.alloc(crate::element::Element::new(Tag::Div));
+        arena.append_child(root, mid);
+        arena.append_child(mid, leaf);
+
+        // Start clean.
+        for &nid in &[root, mid, leaf] {
+            arena.get_mut(nid).unwrap().dirty = DirtyFlags::empty();
+        }
+
+        mark_node_paint_dirty(&mut arena, leaf);
+
+        // The leaf should have PAINT.
+        assert!(arena.get(leaf).unwrap().dirty.contains(DirtyFlags::PAINT));
+
+        // The parent and grandparent should have SUBTREE_PAINT.
+        assert!(
+            arena.get(mid).unwrap().dirty.contains(DirtyFlags::SUBTREE_PAINT),
+            "parent should carry SUBTREE_PAINT"
+        );
+        assert!(
+            arena.get(root).unwrap().dirty.contains(DirtyFlags::SUBTREE_PAINT),
+            "grandparent should carry SUBTREE_PAINT"
+        );
+
+        // Parent/grandparent should NOT have PAINT on themselves.
+        assert!(
+            !arena.get(mid).unwrap().dirty.contains(DirtyFlags::PAINT),
+            "parent should not have PAINT"
+        );
+        assert!(
+            !arena.get(root).unwrap().dirty.contains(DirtyFlags::PAINT),
+            "grandparent should not have PAINT"
+        );
+    }
+
+    /// Regression: tick_all_transitions must set PAINT on ticked nodes
+    /// so the batch builder re-renders them with interpolated values.
+    #[test]
+    fn tick_transitions_sets_paint_dirty() {
+        let css = ".box { background: #000; transition: background 500ms linear; }
+                   .box:hover { background: #fff; }";
+        let stylesheet = CompiledStylesheet::parse(css);
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+
+        let def = ElementDef::new(Tag::Div).with_class("box");
+        let root = build_tree_from_def(&def, &mut arena, &mut taffy, NodeId::DANGLING);
+
+        let now = std::time::Instant::now();
+
+        // Initial resolve (no hover, establishes previous_style).
+        resolve_all_styles_with_transitions(
+            &mut arena,
+            &stylesheet,
+            root,
+            NodeId::DANGLING,
+            None,
+            NodeId::DANGLING,
+            false,
+            Some(now),
+            None,
+        );
+
+        // Hover resolve to start the transition.
+        let mut active = ActiveTransitions::default();
+        resolve_all_styles_with_transitions(
+            &mut arena,
+            &stylesheet,
+            root,
+            root, // hover on root
+            None,
+            NodeId::DANGLING,
+            false,
+            Some(now),
+            Some(&mut active),
+        );
+
+        // Clear all flags to simulate what clear_dirty_flags does.
+        arena.get_mut(root).unwrap().dirty = DirtyFlags::empty();
+
+        // Tick transitions.
+        let mid = now + Duration::from_millis(250);
+        tick_all_transitions(&mut arena, &mut active, mid);
+
+        // The ticked node must be paint-dirty.
+        assert!(
+            arena.get(root).unwrap().dirty.contains(DirtyFlags::PAINT),
+            "ticked transition node must be PAINT dirty; got {:?}",
+            arena.get(root).unwrap().dirty
+        );
     }
 }

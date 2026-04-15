@@ -214,10 +214,13 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
         content_changed || tab_index_changed || captures_keyboard_changed || overrides_changed;
 
     if style_dirty {
-        element.dirty |= DirtyFlags::STYLE;
+        // Class/id changes re-run the cascade, which can swap in entirely
+        // different layout properties (display, flex-direction, width, etc.).
+        // Mark LAYOUT alongside STYLE so `sync_element_to_taffy` re-syncs.
+        element.dirty |= DirtyFlags::STYLE | DirtyFlags::LAYOUT | DirtyFlags::PAINT;
     }
     if layout_dirty || input_type_changed {
-        element.dirty |= DirtyFlags::LAYOUT;
+        element.dirty |= DirtyFlags::LAYOUT | DirtyFlags::PAINT;
     }
 
     // Propagate SUBTREE_STYLE to ancestors so the cascade can skip clean
@@ -225,6 +228,7 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     // ancestor walk starts from the correct node.
     if style_dirty {
         mark_ancestors_dirty(arena, node_id, DirtyFlags::SUBTREE_STYLE);
+        mark_ancestors_dirty(arena, node_id, DirtyFlags::SUBTREE_LAYOUT);
     }
     if layout_dirty {
         mark_ancestors_dirty(arena, node_id, DirtyFlags::SUBTREE_LAYOUT);

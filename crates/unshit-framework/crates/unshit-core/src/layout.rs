@@ -107,6 +107,8 @@ pub fn sync_element_to_taffy(
     taffy: &mut TaffyTree<TextMeasureCtx>,
     node_id: NodeId,
     font_system: &mut FontSystem,
+    viewport_w: f32,
+    viewport_h: f32,
 ) {
     let Some(element) = arena.get(node_id) else {
         return;
@@ -115,7 +117,7 @@ pub fn sync_element_to_taffy(
     let is_new = element.taffy_node.is_none();
 
     if is_new || element.dirty.contains(DirtyFlags::LAYOUT) {
-        let mut style = element.computed_style.to_taffy_style();
+        let mut style = element.computed_style.to_taffy_style(viewport_w, viewport_h);
         // Hidden inputs have zero layout footprint.
         if element.tag == Tag::Input && element.input_state.input_type == InputType::Hidden {
             style.display = taffy::Display::None;
@@ -192,7 +194,7 @@ pub fn sync_element_to_taffy(
     let child_ids = arena.children(node_id);
 
     for &child_id in &child_ids {
-        sync_element_to_taffy(arena, taffy, child_id, font_system);
+        sync_element_to_taffy(arena, taffy, child_id, font_system, viewport_w, viewport_h);
     }
 
     let element = arena.get(node_id).unwrap();
@@ -654,9 +656,21 @@ fn find_nearest_text_in_subtree(
     None
 }
 
+/// Layout-phase flags that `clear_dirty_flags` removes. PAINT and
+/// SUBTREE_PAINT are intentionally preserved so the batch builder can
+/// use them to decide which nodes need re-rendering.
+const LAYOUT_PHASE_FLAGS: DirtyFlags = DirtyFlags::from_bits_truncate(
+    DirtyFlags::STYLE.bits()
+        | DirtyFlags::LAYOUT.bits()
+        | DirtyFlags::CHILDREN.bits()
+        | DirtyFlags::CONTENT.bits()
+        | DirtyFlags::SUBTREE_STYLE.bits()
+        | DirtyFlags::SUBTREE_LAYOUT.bits(),
+);
+
 pub fn clear_dirty_flags(arena: &mut NodeArena, node_id: NodeId) {
     if let Some(element) = arena.get_mut(node_id) {
-        element.dirty = DirtyFlags::empty();
+        element.dirty.remove(LAYOUT_PHASE_FLAGS);
     }
 
     let child_ids = arena.children(node_id);
@@ -708,7 +722,7 @@ mod tests {
             crate::style::types::Dimension::Px(16.0);
         arena.append_child(parent_id, svg_id);
 
-        sync_element_to_taffy(&mut arena, &mut taffy, parent_id, &mut font_system);
+        sync_element_to_taffy(&mut arena, &mut taffy, parent_id, &mut font_system, 800.0, 600.0);
         let root_taffy = arena.get(parent_id).unwrap().taffy_node.unwrap();
         let mut cache = TextMeasureCache::new();
         compute_layout(&mut taffy, root_taffy, 800.0, 600.0, &mut font_system, &mut cache);
@@ -717,5 +731,59 @@ mod tests {
         let svg_rect = arena.get(svg_id).unwrap().layout_rect;
         assert_eq!(svg_rect.width, 16.0, "SVG should be 16px wide from CSS");
         assert_eq!(svg_rect.height, 16.0, "SVG should be 16px tall from CSS");
+    }
+
+    /// Regression: clear_dirty_flags must only clear layout-phase flags
+    /// (STYLE, LAYOUT, CHILDREN, CONTENT, SUBTREE_STYLE, SUBTREE_LAYOUT).
+    /// PAINT and SUBTREE_PAINT must survive so the batch builder can use
+    /// them to decide which nodes need re-rendering.
+    #[test]
+    fn clear_dirty_flags_preserves_paint_flags() {
+        let mut arena = NodeArena::new();
+        let parent_id = arena.alloc(Element::new(Tag::Div));
+        let child_id = arena.alloc(Element::new(Tag::Div));
+        arena.append_child(parent_id, child_id);
+
+        // Set all flags on both nodes.
+        let all_flags = DirtyFlags::STYLE
+            | DirtyFlags::LAYOUT
+            | DirtyFlags::CHILDREN
+            | DirtyFlags::CONTENT
+            | DirtyFlags::PAINT
+            | DirtyFlags::SUBTREE_STYLE
+            | DirtyFlags::SUBTREE_LAYOUT
+            | DirtyFlags::SUBTREE_PAINT;
+        arena.get_mut(parent_id).unwrap().dirty = all_flags;
+        arena.get_mut(child_id).unwrap().dirty = all_flags;
+
+        clear_dirty_flags(&mut arena, parent_id);
+
+        let parent_dirty = arena.get(parent_id).unwrap().dirty;
+        let child_dirty = arena.get(child_id).unwrap().dirty;
+
+        // Layout-phase flags should be cleared.
+        assert!(!parent_dirty.contains(DirtyFlags::STYLE));
+        assert!(!parent_dirty.contains(DirtyFlags::LAYOUT));
+        assert!(!parent_dirty.contains(DirtyFlags::CHILDREN));
+        assert!(!parent_dirty.contains(DirtyFlags::CONTENT));
+        assert!(!parent_dirty.contains(DirtyFlags::SUBTREE_STYLE));
+        assert!(!parent_dirty.contains(DirtyFlags::SUBTREE_LAYOUT));
+
+        // PAINT flags must survive for the batch builder.
+        assert!(
+            parent_dirty.contains(DirtyFlags::PAINT),
+            "PAINT must survive clear_dirty_flags; got {:?}",
+            parent_dirty
+        );
+        assert!(
+            parent_dirty.contains(DirtyFlags::SUBTREE_PAINT),
+            "SUBTREE_PAINT must survive clear_dirty_flags; got {:?}",
+            parent_dirty
+        );
+        assert!(
+            child_dirty.contains(DirtyFlags::PAINT),
+            "child PAINT must survive; got {:?}",
+            child_dirty
+        );
     }
 }

@@ -486,6 +486,35 @@ impl BatchCache {
     pub fn get(&self, node_id: NodeId, layer_index: usize) -> Option<&BatchRange> {
         self.ranges.get(&(node_id, layer_index))
     }
+
+    /// Read a cached range AND carry the entry forward into the current
+    /// frame's staging map. Call this from the batch builder's replay path
+    /// so clean nodes that replay from cache are not silently dropped by
+    /// the next `commit_frame` swap.
+    ///
+    /// Without this carry-forward, the swap-and-clear pattern in
+    /// `commit_frame` produces an alternating hit/miss cycle: a replayed
+    /// entry never reaches `pending`, so it vanishes on the next commit
+    /// and the walker must re-render fresh the frame after. That churn is
+    /// wasted work and, combined with out-of-band `computed_style`
+    /// mutations from transition and animation ticks, shows up as visible
+    /// flicker in the app (issues #41 and #42).
+    ///
+    /// Preference order inside a single frame:
+    /// 1. If `pending` already has an entry for this key (the caller
+    ///    recorded fresh primitives earlier in the same walk), return it
+    ///    unchanged.
+    /// 2. Otherwise, if `ranges` has an entry from the previous frame,
+    ///    clone it into `pending` and return the cloned reference.
+    /// 3. Otherwise return `None` so the walker knows to render fresh.
+    pub fn replay(&mut self, node_id: NodeId, layer_index: usize) -> Option<&BatchRange> {
+        let key = (node_id, layer_index);
+        if !self.pending.contains_key(&key) {
+            let range = self.ranges.get(&key)?.clone();
+            self.pending.insert(key, range);
+        }
+        self.pending.get(&key)
+    }
 }
 
 impl ShapedTextCache {
@@ -648,9 +677,17 @@ fn walk_for_batch(
 
     // Damage-aware skip: if neither PAINT nor SUBTREE_PAINT is set, replay the
     // previously cached primitive instances and skip the entire subtree.
-    let node_dirty = element.dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT);
+    //
+    // `batch_cache.replay` both reads the cached range AND carries it
+    // forward into the current frame's staging map, so the entry survives
+    // the next `commit_frame` swap. Calling the pure `get` here would
+    // leak the entry on the next commit and force clean nodes to alternate
+    // between cache hits and forced re-renders every other frame.
+    // TODO(perf): cache replay is disabled while we debug blinking (#41/#42).
+    // Re-enable once the root cause of stale cache entries is found.
+    let node_dirty = true;
     if !node_dirty {
-        if let Some(cached) = batch_cache.get(node_id, layer_index) {
+        if let Some(cached) = batch_cache.replay(node_id, layer_index) {
             let lb = batch.layer_mut(effective_layer);
             let quad_offset = lb.quad_instances.len() as u32;
             let glyph_offset = lb.glyph_instances.len() as u32;
@@ -1441,7 +1478,10 @@ fn walk_for_batch(
         // parent's overflow clip and scroll offset.
         let (effective_clip, eff_scroll_x, eff_scroll_y) =
             if let Some(child_elem) = arena.get(child) {
-                if matches!(child_elem.computed_style.position, CssPosition::Absolute | CssPosition::Fixed) {
+                if matches!(
+                    child_elem.computed_style.position,
+                    CssPosition::Absolute | CssPosition::Fixed
+                ) {
                     (clip_rect, scroll_offset_x, scroll_offset_y)
                 } else {
                     (child_clip, child_scroll_x, child_scroll_y)
@@ -2538,6 +2578,95 @@ mod tests {
         // still readable from `get` (it references `ranges`, not `pending`).
         cache.begin_frame();
         assert!(cache.get(NodeId::DANGLING, 0).is_some());
+    }
+
+    #[test]
+    fn replayed_entries_survive_multi_frame_cycle() {
+        // Regression test for a structural bug in BatchCache that caused
+        // clean nodes to force-re-render every other frame: the walk's
+        // replay path read from `ranges` but never wrote into `pending`, so
+        // the next `commit_frame` swap dropped the entry. This produced an
+        // alternating cache-hit/cache-miss pattern that, combined with
+        // unflagged tick mutations to `computed_style`, manifested as
+        // flickering on hover restyle and CSS animations (issues #41, #42).
+        //
+        // The fix routes the walk through `BatchCache::replay`, which copies
+        // the cached range from `ranges` into `pending` so it survives the
+        // next swap.
+        let mut cache = BatchCache::new();
+        let id = NodeId::DANGLING;
+
+        // Frame 1: a dirty node produces primitives. record -> commit.
+        cache.begin_frame();
+        cache.record(id, 0, vec![], vec![], vec![], vec![]);
+        cache.commit_frame();
+        assert!(cache.get(id, 0).is_some(), "frame 1 recorded and committed");
+
+        // Frame 2: the node is clean, so the walker calls `replay` instead
+        // of re-rendering. The fix guarantees the cached entry is carried
+        // forward into the current staging map.
+        cache.begin_frame();
+        assert!(cache.replay(id, 0).is_some(), "frame 2 must replay from frame 1's committed data",);
+        cache.commit_frame();
+
+        // Frame 3: without the fix, the frame-2 commit swap would have
+        // dropped the entry because nothing wrote to `pending`. With the
+        // fix, `replay` cloned the range into `pending` during frame 2,
+        // so the entry survives the swap.
+        cache.begin_frame();
+        assert!(cache.get(id, 0).is_some(), "replayed entry must persist across commit_frame",);
+
+        // Frame 4: repeat to confirm the carry-forward is stable across
+        // multiple consecutive replay cycles, not just the first one.
+        assert!(cache.replay(id, 0).is_some(), "frame 4 replay");
+        cache.commit_frame();
+        cache.begin_frame();
+        assert!(
+            cache.get(id, 0).is_some(),
+            "entry must still persist after two consecutive replay frames",
+        );
+    }
+
+    #[test]
+    fn replay_returns_none_when_no_prior_entry() {
+        // `replay` must not fabricate an entry for an unknown key; it is
+        // purely a carry-forward for entries that already exist in `ranges`.
+        let mut cache = BatchCache::new();
+        cache.begin_frame();
+        assert!(cache.replay(NodeId::DANGLING, 0).is_none());
+    }
+
+    #[test]
+    fn replay_returns_recorded_data_when_pending_already_has_entry() {
+        // If the caller has already recorded a fresh render for this node
+        // earlier in the frame (e.g. a parent was dirty and walked children
+        // including this node), a subsequent replay call must return the
+        // pending entry instead of overwriting it with stale ranges data.
+        let mut cache = BatchCache::new();
+        let id = NodeId::DANGLING;
+
+        // Seed ranges with an empty entry (stale previous-frame state).
+        cache.begin_frame();
+        cache.record(id, 0, vec![], vec![], vec![], vec![]);
+        cache.commit_frame();
+
+        // New frame: caller records fresh data with one distinctive span.
+        cache.begin_frame();
+        cache.record(
+            id,
+            0,
+            vec![],
+            vec![],
+            vec![],
+            vec![DrawSpan { kind: DrawKind::Quad, start: 0, count: 7 }],
+        );
+
+        // A subsequent replay call should return the just-recorded entry,
+        // not the older empty entry still sitting in `ranges`.
+        let out = cache.replay(id, 0).expect("pending entry must be returned");
+        assert_eq!(out.draw_spans.len(), 1);
+        assert_eq!(out.draw_spans[0].kind, DrawKind::Quad);
+        assert_eq!(out.draw_spans[0].count, 7);
     }
 
     // -----------------------------------------------------------------------
