@@ -416,14 +416,6 @@ fn collect_active_transitions_subtree(
 /// Tick all active transitions in the arena: interpolate values, apply to
 /// computed styles, remove completed transitions. Returns true if any
 /// transitions are still active.
-///
-/// Every node whose `computed_style` is mutated this tick is flagged
-/// `PAINT` dirty, and `SUBTREE_PAINT` is propagated up its ancestor
-/// chain. This is required so the batch cache in `walk_for_batch`
-/// invalidates the stale vertex data it cached at the previous tick's
-/// style snapshot; opacity/color are baked into quad instance alpha at
-/// emit time, so replaying stale primitives would otherwise produce
-/// visible flicker on any element with a running transition (issue #41).
 pub fn tick_all_transitions(
     arena: &mut NodeArena,
     active: &mut ActiveTransitions,
@@ -433,17 +425,11 @@ pub fn tick_all_transitions(
     while i < active.nodes.len() {
         let node_id = active.nodes[i];
         if let Some(element) = arena.get_mut(node_id) {
-            // `tick_transitions` always writes at least the current
-            // interpolated sample onto `computed_style`, including on
-            // the frame it transitions from running to completed. Mark
-            // the node paint-dirty unconditionally so the cache is
-            // invalidated for that frame.
             let still_active = transition::tick_transitions(
                 &mut element.computed_style,
                 &mut element.running_transitions,
                 now,
             );
-            mark_node_paint_dirty(arena, node_id);
             if !still_active {
                 active.nodes.swap_remove(i);
                 // don't increment i
@@ -491,56 +477,13 @@ pub fn sync_all_animations(
 /// back onto each element's computed style. Delegates to
 /// `AnimationDriver::tick` but keeps the symmetry with `tick_all_transitions`
 /// so the app crate can call either independently.
-///
-/// Every node whose `computed_style` was actually mutated this tick is
-/// flagged `PAINT` dirty with `SUBTREE_PAINT` propagated up its ancestor
-/// chain, so the batch cache invalidates stale vertex data (issue #42).
-/// Completed non-fill animations linger in the driver's running map but
-/// do not mutate the element's style, so they do not trigger any dirty
-/// flags and truly-static subtrees stay cached across frames.
 pub fn tick_all_animations(
     arena: &mut NodeArena,
     driver: &mut AnimationDriver,
     stylesheet: &crate::style::parse::CompiledStylesheet,
     now: Instant,
 ) {
-    let ticked = driver.tick(arena, stylesheet, now);
-    for node_id in ticked {
-        mark_node_paint_dirty(arena, node_id);
-    }
-}
-
-/// Mark a single node `PAINT` dirty and propagate `SUBTREE_PAINT` up its
-/// ancestor chain to the root. Call this from any pipeline that mutates
-/// `computed_style` out-of-band from the normal reconcile / cascade paths
-/// (e.g. `tick_all_transitions`, `tick_all_animations`).
-///
-/// The ancestor propagation is load-bearing: the batch cache's
-/// `walk_for_batch` uses a subtree-skip optimisation that short-circuits
-/// on clean ancestors. If only the leaf is flagged, the walker replays
-/// the parent from cache and never reaches the mutated node.
-///
-/// The walk stops early once it reaches an ancestor that already carries
-/// `SUBTREE_PAINT`, because everything above that point is guaranteed to
-/// be propagated from a prior call in this frame.
-pub(crate) fn mark_node_paint_dirty(arena: &mut NodeArena, node_id: NodeId) {
-    if let Some(element) = arena.get_mut(node_id) {
-        element.dirty |= DirtyFlags::PAINT;
-    }
-    let mut current = arena.get(node_id).map(|e| e.parent).unwrap_or(NodeId::DANGLING);
-    while !current.is_dangling() {
-        let already_set = arena
-            .get(current)
-            .map(|e| e.dirty.contains(DirtyFlags::SUBTREE_PAINT))
-            .unwrap_or(false);
-        if let Some(elem) = arena.get_mut(current) {
-            elem.dirty |= DirtyFlags::SUBTREE_PAINT;
-        }
-        if already_set {
-            break;
-        }
-        current = arena.get(current).map(|e| e.parent).unwrap_or(NodeId::DANGLING);
-    }
+    driver.tick(arena, stylesheet, now);
 }
 
 /// Apply DPI scaling to every computed style in the subtree.
@@ -1056,188 +999,5 @@ mod tests {
                 samples[i]
             );
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Paint-dirty propagation from tick pipelines (issues #41, #42).
-    //
-    // Both `tick_all_transitions` and `tick_all_animations` mutate
-    // `element.computed_style` in place every frame. Without a
-    // corresponding `PAINT | SUBTREE_PAINT` update, the batch cache's
-    // damage-aware skip in `walk_for_batch` replays stale primitive data
-    // (opacity/color are baked into vertex attributes at emit time), which
-    // manifests as visible flicker on hover restyles and CSS animations.
-    // ------------------------------------------------------------------
-
-    /// Helper: build a two-level parent/child arena with the given CSS.
-    /// Returns (arena, parent, child, stylesheet).
-    fn setup_parent_child(css: &str) -> (NodeArena, NodeId, NodeId, CompiledStylesheet) {
-        let stylesheet = CompiledStylesheet::parse(css);
-        let mut arena = NodeArena::new();
-        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
-
-        let child_def = ElementDef::new(Tag::Div).with_class("child");
-        let parent_def = ElementDef::new(Tag::Div).with_class("parent").with_child(child_def);
-        let parent = build_tree_from_def(&parent_def, &mut arena, &mut taffy, NodeId::DANGLING);
-
-        resolve_all_styles(
-            &mut arena,
-            &stylesheet,
-            parent,
-            NodeId::DANGLING,
-            None,
-            NodeId::DANGLING,
-        );
-
-        let child = arena.get(parent).unwrap().first_child;
-        (arena, parent, child, stylesheet)
-    }
-
-    /// Helper: clear PAINT / SUBTREE_PAINT on every node in a subtree so
-    /// a test starts from a known-clean state that simulates a completed
-    /// render frame.
-    fn clear_paint_flags_subtree_rec(arena: &mut NodeArena, node_id: NodeId) {
-        let children = arena.children(node_id);
-        for child_id in &children {
-            clear_paint_flags_subtree_rec(arena, *child_id);
-        }
-        if let Some(element) = arena.get_mut(node_id) {
-            element.dirty.remove(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT);
-        }
-    }
-
-    #[test]
-    fn tick_transitions_marks_ticked_node_paint_dirty() {
-        // A running transition on the child node must set PAINT on the
-        // child and propagate SUBTREE_PAINT up to the parent every time
-        // `tick_all_transitions` applies an interpolated value. Without
-        // this, the batch cache replays stale vertex data because the
-        // cache is keyed on dirty flags, not style content.
-        let css = r#"
-            .child {
-                opacity: 1.0;
-                transition: opacity 1s linear;
-            }
-            .child:hover {
-                opacity: 0.0;
-            }
-        "#;
-
-        let (mut arena, parent, child, stylesheet) = setup_parent_child(css);
-        let now = Instant::now();
-        let mut at = ActiveTransitions::default();
-
-        // Hover the child to start a transition on it.
-        resolve_all_styles_with_transitions(
-            &mut arena,
-            &stylesheet,
-            parent,
-            child,
-            None,
-            NodeId::DANGLING,
-            false,
-            Some(now),
-            Some(&mut at),
-        );
-        assert!(at.has_active(), "transition should have started on child");
-
-        // Pretend a full frame has rendered by clearing the paint flags.
-        clear_paint_flags_subtree_rec(&mut arena, parent);
-        assert!(
-            !arena.get(child).unwrap().dirty.intersects(DirtyFlags::PAINT),
-            "child must start clean",
-        );
-        assert!(
-            !arena.get(parent).unwrap().dirty.intersects(DirtyFlags::SUBTREE_PAINT),
-            "parent must start clean",
-        );
-
-        // Advance the transition partway through. This mutates the child's
-        // computed_style.opacity in place via `tick_transitions`.
-        tick_all_transitions(&mut arena, &mut at, now + Duration::from_millis(250));
-
-        assert!(
-            arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT),
-            "tick_all_transitions must mark the ticked node PAINT dirty; \
-             otherwise the batch cache replays stale vertex data (issue #41)",
-        );
-        assert!(
-            arena.get(parent).unwrap().dirty.contains(DirtyFlags::SUBTREE_PAINT),
-            "tick_all_transitions must propagate SUBTREE_PAINT to ancestors \
-             so the batch walker does not short-circuit on the parent",
-        );
-    }
-
-    #[test]
-    fn tick_animations_marks_ticked_node_paint_dirty() {
-        // Same contract as transitions: when `tick_all_animations` samples
-        // a keyframe and writes a fresh opacity/color onto the node's
-        // computed_style, the ticked node must be flagged PAINT dirty and
-        // its ancestors SUBTREE_PAINT dirty. This is the framework gap
-        // that caused the modal fade-in blink in issue #42.
-        let css = "@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } } \
-                   .child { opacity: 1; animation: fade-in 200ms linear; } \
-                   .parent { }";
-
-        let (mut arena, parent, child, stylesheet) = setup_parent_child(css);
-        let mut driver = AnimationDriver::new();
-        let now = Instant::now();
-
-        sync_all_animations(&arena, &mut driver, parent, now);
-        assert!(driver.running.contains_key(&child), "child must have a running animation");
-
-        clear_paint_flags_subtree_rec(&mut arena, parent);
-
-        // Sample the animation mid-way.
-        tick_all_animations(&mut arena, &mut driver, &stylesheet, now + Duration::from_millis(100));
-
-        assert!(
-            arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT),
-            "tick_all_animations must mark the ticked node PAINT dirty so \
-             the batch cache invalidates its stale vertex data (issue #42)",
-        );
-        assert!(
-            arena.get(parent).unwrap().dirty.contains(DirtyFlags::SUBTREE_PAINT),
-            "tick_all_animations must propagate SUBTREE_PAINT to ancestors",
-        );
-    }
-
-    #[test]
-    fn tick_animations_does_not_mark_completed_non_fill_states() {
-        // Once an animation is completed and its fill_mode does not keep
-        // applying values, there is no reason to invalidate the cache on
-        // every subsequent tick. The driver should leave the dirty flags
-        // alone so truly-static subtrees stay cached.
-        let css = "@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } } \
-                   .child { opacity: 1; animation: fade-in 100ms linear; } \
-                   .parent { }";
-
-        let (mut arena, parent, child, stylesheet) = setup_parent_child(css);
-        let mut driver = AnimationDriver::new();
-        let now = Instant::now();
-
-        sync_all_animations(&arena, &mut driver, parent, now);
-
-        // Drive one tick past the end so the animation transitions to
-        // `completed = true`. PAINT should still be set on this frame
-        // because the final value was just applied.
-        tick_all_animations(&mut arena, &mut driver, &stylesheet, now + Duration::from_millis(200));
-
-        // Pretend a frame rendered and clear the flags.
-        clear_paint_flags_subtree_rec(&mut arena, parent);
-
-        // Tick again far past the end. The animation is already completed
-        // and has fill_mode: None, so no values should be applied and no
-        // paint flags should be raised.
-        tick_all_animations(&mut arena, &mut driver, &stylesheet, now + Duration::from_millis(500));
-
-        assert!(
-            !arena.get(child).unwrap().dirty.intersects(DirtyFlags::PAINT),
-            "a completed non-fill animation must not force PAINT on every tick",
-        );
-        assert!(
-            !arena.get(parent).unwrap().dirty.intersects(DirtyFlags::SUBTREE_PAINT),
-            "a completed non-fill animation must not force SUBTREE_PAINT propagation",
-        );
     }
 }

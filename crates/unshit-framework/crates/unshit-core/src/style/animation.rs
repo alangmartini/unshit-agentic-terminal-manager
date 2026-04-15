@@ -133,14 +133,10 @@ impl AnimationDriver {
         Self::default()
     }
 
-    /// Returns true while at least one animation is actively progressing
-    /// (i.e. not yet completed, or completed with a fill mode that keeps
-    /// applying values). Completed non-fill animations linger in the
-    /// running map so `sync_node` can match them by def and avoid
-    /// restarting them on the next restyle, but they do NOT count as
-    /// active here so the app loop stops requesting redraws for them.
+    /// Returns true while at least one animation is ticking. The app loop
+    /// uses this to decide whether to keep requesting redraws.
     pub fn has_active(&self) -> bool {
-        self.running.values().any(|states| states.iter().any(|s| !s.completed))
+        !self.running.is_empty()
     }
 
     /// Push the full set of animations for a single node, replacing any
@@ -208,25 +204,8 @@ impl AnimationDriver {
     /// The tick only touches properties that the animations actually
     /// reference, so it can coexist with the transition ticker without
     /// clobbering its output.
-    ///
-    /// Completed animations with `fill_mode: None` are kept in the running
-    /// list (but flagged `completed = true`) so the next `sync_node` call
-    /// can match them by def and avoid recreating a brand-new state that
-    /// restarts the animation from zero. They contribute nothing to the
-    /// per-frame output once completed.
-    ///
-    /// Returns the set of nodes whose `computed_style` was actually mutated
-    /// this tick. Callers use this list to flag `PAINT | SUBTREE_PAINT`
-    /// dirty so the batch cache invalidates stale vertex data for those
-    /// subtrees (see issues #41 and #42).
-    pub fn tick(
-        &mut self,
-        arena: &mut NodeArena,
-        stylesheet: &CompiledStylesheet,
-        now: Instant,
-    ) -> SmallVec<[NodeId; 8]> {
+    pub fn tick(&mut self, arena: &mut NodeArena, stylesheet: &CompiledStylesheet, now: Instant) {
         let mut dead_nodes: SmallVec<[NodeId; 4]> = SmallVec::new();
-        let mut ticked_nodes: SmallVec<[NodeId; 8]> = SmallVec::new();
         for (node_id, states) in self.running.iter_mut() {
             if arena.get(*node_id).is_none() {
                 dead_nodes.push(*node_id);
@@ -249,15 +228,8 @@ impl AnimationDriver {
             // Collect the union of animated properties up front so we can
             // restore only those fields onto the element. Anything outside
             // this set (transitions, hover rollovers) stays intact.
-            //
-            // Skip completed states here too: they contribute no touched
-            // properties and should not cause the element's computed_style
-            // to be overwritten on a frame that does not animate anything.
             let mut touched: SmallVec<[TransitionProperty; 8]> = SmallVec::new();
             for state in states.iter() {
-                if state.completed {
-                    continue;
-                }
                 if let Some(rule) = stylesheet.keyframes.get(state.name.as_ref()) {
                     for prop in collect_animated_properties(rule) {
                         if !touched.contains(&prop) {
@@ -267,19 +239,13 @@ impl AnimationDriver {
                 }
             }
 
-            let mut applied_this_tick = false;
-            for i in 0..states.len() {
+            let mut any_alive = false;
+            let mut i = 0;
+            while i < states.len() {
                 let state = &mut states[i];
-
-                // Completed non-fill animations linger so `sync_node` can
-                // match them by def and avoid restarting the animation on
-                // the next restyle. They contribute nothing to the frame.
-                if state.completed {
-                    continue;
-                }
-
                 // Paused animations do not advance the playhead.
                 if state.def.play_state == AnimationPlayState::Paused {
+                    any_alive = true;
                     // Still apply the frozen sample so the element renders
                     // the same values every frame while paused.
                     apply_sample(
@@ -288,7 +254,7 @@ impl AnimationDriver {
                         stylesheet,
                         state.paused_at.unwrap_or(state.start_time),
                     );
-                    applied_this_tick = true;
+                    i += 1;
                     continue;
                 }
 
@@ -300,28 +266,36 @@ impl AnimationDriver {
                 }
 
                 let completed = apply_sample(&mut style_snapshot, state, stylesheet, now);
-                applied_this_tick = true;
                 if completed {
+                    let keep = match state.def.fill_mode {
+                        AnimationFillMode::Forwards | AnimationFillMode::Both => true,
+                        _ => false,
+                    };
                     state.completed = true;
+                    if !keep {
+                        states.swap_remove(i);
+                        continue;
+                    }
+                }
+                any_alive = true;
+                i += 1;
+            }
+
+            if let Some(el) = arena.get_mut(*node_id) {
+                for prop in &touched {
+                    let value = transition::extract_value(&style_snapshot, *prop);
+                    transition::apply_value(&mut el.computed_style, *prop, &value);
                 }
             }
 
-            if applied_this_tick {
-                if let Some(el) = arena.get_mut(*node_id) {
-                    for prop in &touched {
-                        let value = transition::extract_value(&style_snapshot, *prop);
-                        transition::apply_value(&mut el.computed_style, *prop, &value);
-                    }
-                }
-                ticked_nodes.push(*node_id);
+            if !any_alive {
+                dead_nodes.push(*node_id);
             }
         }
 
         for id in dead_nodes {
             self.running.remove(&id);
         }
-
-        ticked_nodes
     }
 
     /// Compute the soonest instant at which any running animation needs to
