@@ -15,6 +15,7 @@ pub mod scroll;
 pub mod shortcut;
 pub mod style;
 pub mod svg;
+pub mod trace;
 pub mod tree;
 
 pub mod prelude {

@@ -1,10 +1,18 @@
 use rustc_hash::FxHashMap;
+use std::sync::OnceLock;
 use wgpu;
 
 const ATLAS_SIZE: u32 = 2048;
 
+fn use_subpixel_text_shader() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_SUBPIXEL_TEXT").is_some())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GlyphKey {
+    /// Stable namespace derived from the shaping font id plus glyph-rendering
+    /// flags. This keeps atlas entries from different fonts/styles isolated.
     pub font_id: u64,
     pub glyph_id: u16,
     pub font_size_tenths: u16,
@@ -86,6 +94,9 @@ pub struct GlyphAtlas {
     pub format: wgpu::TextureFormat,
     /// Bytes per pixel (1 for R8Unorm, 4 for Rgba8Unorm).
     pub bytes_per_pixel: u32,
+    /// Monotonic generation that bumps when atlas residency changes in a way
+    /// that can invalidate cached glyph UV usage.
+    pub generation: u64,
 }
 
 impl GlyphAtlas {
@@ -105,7 +116,9 @@ impl GlyphAtlas {
         };
 
         let filter = match format {
-            wgpu::TextureFormat::Rgba8Unorm => wgpu::FilterMode::Nearest,
+            wgpu::TextureFormat::Rgba8Unorm if use_subpixel_text_shader() => {
+                wgpu::FilterMode::Nearest
+            }
             _ => wgpu::FilterMode::Linear,
         };
 
@@ -142,7 +155,13 @@ impl GlyphAtlas {
             max_size: size,
             format,
             bytes_per_pixel,
+            generation: 0,
         }
+    }
+
+    #[inline]
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Record that a glyph was used in the current frame (for LRU tracking).
@@ -196,6 +215,10 @@ impl GlyphAtlas {
 
         if !has_free_shelf && !has_y_space {
             self.rebuild(device, queue);
+        } else {
+            // Cache residency changed (some glyph entries were removed), so any
+            // renderer-side cached glyph instances must be considered stale.
+            self.bump_generation();
         }
     }
 
@@ -233,6 +256,7 @@ impl GlyphAtlas {
         self.cache.clear();
         self.lru.last_used.clear();
         self.pending_uploads.clear();
+        self.bump_generation();
     }
 
     pub fn get_or_insert(

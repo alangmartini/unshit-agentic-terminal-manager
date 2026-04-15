@@ -11,6 +11,9 @@ use unshit::core::element::*;
 use unshit::core::event::DragPhase;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{AlignItems, CssPosition, Dimension, JustifyContent};
+use unshit::core::trace::{
+    append_terminal_trace_line, terminal_trace_enabled, terminal_trace_file_path,
+};
 
 use crate::state::{
     dispatch, mutate_with, resize_all_terminals, seed_state, SharedState, UiSnapshot,
@@ -155,6 +158,13 @@ fn main() {
     )
     .init();
 
+    if terminal_trace_enabled() {
+        append_terminal_trace_line(&format!(
+            "terminal-trace stage=startup trace_file={}",
+            terminal_trace_file_path().display()
+        ));
+    }
+
     let shared: SharedState = Arc::new(std::sync::Mutex::new(seed_state()));
 
     // Measure the actual monospace cell width ratio for later use (split
@@ -293,6 +303,20 @@ fn main() {
                     let mut grid = t.display_grid();
                     if id != active_id {
                         grid.set_cursor_visible(false);
+                    }
+                    if terminal_trace_enabled() && id == active_id {
+                        let rows = grid.debug_rows(4, 96);
+                        append_terminal_trace_line(&format!(
+                            "terminal-trace stage=main_snapshot pane={} active=true cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?}",
+                            id,
+                            grid.cursor_row(),
+                            grid.cursor_col(),
+                            grid.cursor_visible(),
+                            rows.first().cloned().unwrap_or_default(),
+                            rows.get(1).cloned().unwrap_or_default(),
+                            rows.get(2).cloned().unwrap_or_default(),
+                            rows.get(3).cloned().unwrap_or_default(),
+                        ));
                     }
                     (id, grid)
                 })

@@ -204,6 +204,23 @@ impl CellGrid {
         self.dirty.fill(false);
     }
 
+    /// Debug helper: render a row range as plain text, substituting empty cells
+    /// with spaces so logs can compare terminal/parser output across stages.
+    pub fn debug_row_string(&self, row: usize, start_col: usize, len: usize) -> String {
+        if row >= self.rows {
+            return String::new();
+        }
+        (start_col..start_col.saturating_add(len).min(self.cols))
+            .map(|col| self.get_cell(row, col).map(|cell| cell.ch).unwrap_or('\0'))
+            .map(|ch| if ch == '\0' { ' ' } else { ch })
+            .collect()
+    }
+
+    /// Debug helper: dump the first `rows` rows up to `cols` columns.
+    pub fn debug_rows(&self, rows: usize, cols: usize) -> Vec<String> {
+        (0..rows.min(self.rows)).map(|row| self.debug_row_string(row, 0, cols)).collect()
+    }
+
     /// Returns `true` if any cell is marked dirty.
     pub fn has_dirty_cells(&self) -> bool {
         self.dirty.iter().any(|&d| d)

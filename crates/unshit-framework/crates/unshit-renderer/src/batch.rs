@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::atlas::{GlyphAtlas, GlyphEntry, GlyphKey};
 use crate::canvas::{CanvasCallback, CanvasRegistry};
@@ -25,7 +25,7 @@ pub struct Rasterizer<'a> {
     #[cfg(target_os = "windows")]
     pub dw: &'a DwRasterizer,
 }
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use unshit_core::cell_grid::{CellAttrs, CellGrid};
 use unshit_core::cursor::CursorShape;
 use unshit_core::dirty::DirtyFlags;
@@ -40,6 +40,7 @@ use unshit_core::style::types::{
     Visibility, WhiteSpace,
 };
 use unshit_core::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, SvgTransform, ViewBox};
+use unshit_core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 use unshit_core::tree::NodeArena;
 
 /// Zero value for the gradient stop color slots in `QuadInstance`. Used at
@@ -56,6 +57,38 @@ pub(crate) const EMPTY_GRADIENT_EXTRA: [f32; 4] = [0.0; 4];
 
 /// One shot flag so the stop truncation warning does not spam logs.
 static GRADIENT_TRUNCATE_WARNED: AtomicBool = AtomicBool::new(false);
+static LAST_TERMINAL_RENDER_TRACE_HASH: AtomicU64 = AtomicU64::new(0);
+
+fn terminal_grid_trace_hash(grid: &CellGrid) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    grid.rows().hash(&mut hasher);
+    grid.cols().hash(&mut hasher);
+    grid.cursor_row().hash(&mut hasher);
+    grid.cursor_col().hash(&mut hasher);
+    grid.cursor_visible().hash(&mut hasher);
+    for row in grid.debug_rows(4, 96) {
+        row.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[cfg(target_os = "windows")]
+fn use_directwrite_grid_rasterization() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_DIRECTWRITE_GRID").is_some())
+}
+
+#[inline]
+fn atlas_font_namespace(cache_key: &cosmic_text::CacheKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cache_key.font_id.hash(&mut hasher);
+    cache_key.flags.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Compute the projected axis length of a gradient inside a box of size
 /// `(w, h)` for the given angle in degrees.
@@ -417,6 +450,10 @@ pub struct BatchRange {
     pub glyphs: Vec<GlyphInstance>,
     pub svgs: Vec<SvgDrawCall>,
     pub draw_spans: Vec<DrawSpan>,
+    /// Unique glyph atlas keys used by this node range (including subtree).
+    pub glyph_keys: Vec<GlyphKey>,
+    /// Glyph atlas generation this range was built against.
+    pub atlas_generation: u64,
 }
 
 /// Per-frame cache that stores the actual `QuadInstance` and `GlyphInstance`
@@ -477,8 +514,13 @@ impl BatchCache {
         glyphs: Vec<GlyphInstance>,
         svgs: Vec<SvgDrawCall>,
         draw_spans: Vec<DrawSpan>,
+        glyph_keys: Vec<GlyphKey>,
+        atlas_generation: u64,
     ) {
-        self.pending.insert((node_id, layer_index), BatchRange { quads, glyphs, svgs, draw_spans });
+        self.pending.insert(
+            (node_id, layer_index),
+            BatchRange { quads, glyphs, svgs, draw_spans, glyph_keys, atlas_generation },
+        );
     }
 
     /// Retrieve the cached instances for `node_id` on `layer_index` from the
@@ -507,10 +549,18 @@ impl BatchCache {
     /// 2. Otherwise, if `ranges` has an entry from the previous frame,
     ///    clone it into `pending` and return the cloned reference.
     /// 3. Otherwise return `None` so the walker knows to render fresh.
-    pub fn replay(&mut self, node_id: NodeId, layer_index: usize) -> Option<&BatchRange> {
+    pub fn replay(
+        &mut self,
+        node_id: NodeId,
+        layer_index: usize,
+        atlas_generation: u64,
+    ) -> Option<&BatchRange> {
         let key = (node_id, layer_index);
         if !self.pending.contains_key(&key) {
             let range = self.ranges.get(&key)?.clone();
+            if range.atlas_generation != atlas_generation {
+                return None;
+            }
             self.pending.insert(key, range);
         }
         self.pending.get(&key)
@@ -578,6 +628,7 @@ pub fn build_render_batch(
         Layer::Content,
         &mut portals,
         batch_cache,
+        None,
     );
 
     // Process deferred portal nodes with fresh viewport clip
@@ -603,6 +654,7 @@ pub fn build_render_batch(
             target_layer,
             &mut Vec::new(),
             batch_cache,
+            None,
         );
     }
 }
@@ -653,6 +705,7 @@ fn walk_for_batch(
     current_layer: Layer,
     portals: &mut Vec<(NodeId, Layer)>,
     batch_cache: &mut BatchCache,
+    parent_glyph_keys: Option<&mut FxHashSet<GlyphKey>>,
 ) {
     let Some(element) = arena.get(node_id) else {
         return;
@@ -683,11 +736,16 @@ fn walk_for_batch(
     // the next `commit_frame` swap. Calling the pure `get` here would
     // leak the entry on the next commit and force clean nodes to alternate
     // between cache hits and forced re-renders every other frame.
-    // TODO(perf): cache replay is disabled while we debug blinking (#41/#42).
-    // Re-enable once the root cause of stale cache entries is found.
-    let node_dirty = true;
+    //
+    // Replay is additionally gated on glyph atlas generation. Cached ranges
+    // built against an older atlas generation are discarded so stale UVs are
+    // never replayed after atlas eviction/repack.
+    let node_dirty = element.dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT);
     if !node_dirty {
-        if let Some(cached) = batch_cache.replay(node_id, layer_index) {
+        if let Some(cached) = batch_cache.replay(node_id, layer_index, atlas.generation) {
+            for key in &cached.glyph_keys {
+                atlas.touch(key);
+            }
             let lb = batch.layer_mut(effective_layer);
             let quad_offset = lb.quad_instances.len() as u32;
             let glyph_offset = lb.glyph_instances.len() as u32;
@@ -705,6 +763,11 @@ fn walk_for_batch(
                     count: span.count,
                 });
             }
+            if let Some(parent_keys) = parent_glyph_keys {
+                for key in &cached.glyph_keys {
+                    parent_keys.insert(*key);
+                }
+            }
             return;
         }
         // No cached data available: fall through to render this node so it
@@ -717,6 +780,7 @@ fn walk_for_batch(
     let glyph_start = batch.layer_mut(effective_layer).glyph_instances.len();
     let svg_start = batch.layer_mut(effective_layer).svg_draws.len();
     let span_start = batch.layer_mut(effective_layer).draw_spans.len();
+    let mut node_glyph_keys: FxHashSet<GlyphKey> = FxHashSet::default();
 
     // Running cursors for draw span tracking. Updated after each flush.
     let mut quad_cursor = quad_start;
@@ -987,6 +1051,7 @@ fn walk_for_batch(
                         font_system,
                         rasterizer,
                         shaped_cache,
+                        Some(&mut node_glyph_keys),
                     );
                 }
             }
@@ -1096,6 +1161,7 @@ fn walk_for_batch(
                         font_system,
                         rasterizer,
                         shaped_cache,
+                        Some(&mut node_glyph_keys),
                     );
                 }
 
@@ -1295,6 +1361,7 @@ fn walk_for_batch(
                     font_system,
                     rasterizer,
                     shaped_cache,
+                    Some(&mut node_glyph_keys),
                 );
 
                 // Text decoration line rendering
@@ -1382,11 +1449,16 @@ fn walk_for_batch(
             ElementContent::Grid(ref grid) if is_visible => {
                 // cell_h derives from CSS line_height (the source of truth).
                 let cell_h = style.font_size * style.line_height;
-                // On Windows, use DirectWrite advance width so the grid
-                // spacing matches the DW-rasterized glyphs. On other
-                // platforms, cosmic-text handles everything.
+                // Grid cell width must match the active glyph shaping/raster
+                // path. When TM_FORCE_DIRECTWRITE_GRID is off, the terminal
+                // uses swash/cosmic-text on Windows too, so use the same
+                // monospace width measurement there.
                 #[cfg(target_os = "windows")]
-                let cell_w = rasterizer.dw.measure_advance_width('M', style.font_size);
+                let cell_w = if use_directwrite_grid_rasterization() {
+                    rasterizer.dw.measure_advance_width('M', style.font_size)
+                } else {
+                    measure_monospace_cell_width(font_system, style.font_size, cell_h)
+                };
                 #[cfg(not(target_os = "windows"))]
                 let cell_w = measure_monospace_cell_width(font_system, style.font_size, cell_h);
 
@@ -1418,6 +1490,7 @@ fn walk_for_batch(
                     atlas,
                     font_system,
                     rasterizer,
+                    Some(&mut node_glyph_keys),
                 );
             }
             ElementContent::Svg(ref node) if is_visible => {
@@ -1510,6 +1583,7 @@ fn walk_for_batch(
             effective_layer,
             portals,
             batch_cache,
+            Some(&mut node_glyph_keys),
         );
     }
 
@@ -1630,8 +1704,35 @@ fn walk_for_batch(
         let quads = lb.quad_instances[quad_start..].to_vec();
         let glyphs = lb.glyph_instances[glyph_start..].to_vec();
         let svgs = lb.svg_draws[svg_start..].to_vec();
-        let spans = lb.draw_spans[span_start..].to_vec();
-        batch_cache.record(node_id, layer_index, quads, glyphs, svgs, spans);
+        let quad_start_u32 = quad_start as u32;
+        let glyph_start_u32 = glyph_start as u32;
+        let spans = lb.draw_spans[span_start..]
+            .iter()
+            .map(|span| DrawSpan {
+                kind: span.kind,
+                start: match span.kind {
+                    DrawKind::Quad => span.start.saturating_sub(quad_start_u32),
+                    DrawKind::Glyph => span.start.saturating_sub(glyph_start_u32),
+                },
+                count: span.count,
+            })
+            .collect::<Vec<_>>();
+        let glyph_keys = node_glyph_keys.iter().copied().collect::<Vec<_>>();
+        batch_cache.record(
+            node_id,
+            layer_index,
+            quads,
+            glyphs,
+            svgs,
+            spans,
+            glyph_keys,
+            atlas.generation,
+        );
+    }
+    if let Some(parent_keys) = parent_glyph_keys {
+        for key in node_glyph_keys {
+            parent_keys.insert(key);
+        }
     }
 }
 
@@ -1746,16 +1847,28 @@ fn emit_text_glyphs_cached(
     font_system: &mut FontSystem,
     rasterizer: &mut Rasterizer<'_>,
     shaped_cache: &mut ShapedTextCache,
+    mut glyph_keys_out: Option<&mut FxHashSet<GlyphKey>>,
 ) {
     let cache_key =
         ShapedTextCache::make_key(text, font_size, line_height, letter_spacing, max_width);
     let color_linear = color.to_linear_f32();
 
-    // Check if we have a cached shaped result
-    if let Some(entry) = shaped_cache.map.get(&cache_key) {
-        for cg in &entry.glyphs {
-            if let Some(atlas_entry) = atlas.cache.get(&cg.atlas_key).copied() {
+    // Check if we have a cached shaped result. If any atlas key is missing,
+    // invalidate this shaped entry and rebuild so glyphs are never silently
+    // dropped on atlas churn.
+    if let Some(entry) = shaped_cache.map.get(&cache_key).cloned() {
+        let atlas_ready = entry.glyphs.iter().all(|cg| atlas.cache.contains_key(&cg.atlas_key));
+        if atlas_ready {
+            for cg in &entry.glyphs {
+                let atlas_entry = atlas
+                    .cache
+                    .get(&cg.atlas_key)
+                    .copied()
+                    .expect("atlas_ready guarantees all shaped glyph keys exist");
                 atlas.touch(&cg.atlas_key);
+                if let Some(keys) = glyph_keys_out.as_deref_mut() {
+                    keys.insert(cg.atlas_key);
+                }
                 batch.glyph_instances.push(GlyphInstance {
                     pos: [x + cg.rel_x, y + cg.rel_y],
                     size: atlas_entry.size,
@@ -1765,8 +1878,9 @@ fn emit_text_glyphs_cached(
                     clip_rect,
                 });
             }
+            return;
         }
-        return;
+        shaped_cache.map.remove(&cache_key);
     }
 
     // Cache miss: shape text and populate cache
@@ -1785,7 +1899,7 @@ fn emit_text_glyphs_cached(
             let physical = glyph.physical((ls_offset, 0.0), 1.0);
 
             let key = GlyphKey {
-                font_id: physical.cache_key.font_size_bits as u64,
+                font_id: atlas_font_namespace(&physical.cache_key),
                 glyph_id: physical.cache_key.glyph_id,
                 font_size_tenths: (font_size * 10.0) as u16,
                 subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
@@ -1808,6 +1922,9 @@ fn emit_text_glyphs_cached(
             let rel_y = run_y + physical.y as f32 + entry.offset[1];
 
             cached_glyphs.push(CachedGlyph { rel_x, rel_y, atlas_key: key });
+            if let Some(keys) = glyph_keys_out.as_deref_mut() {
+                keys.insert(key);
+            }
 
             batch.glyph_instances.push(GlyphInstance {
                 pos: [x + rel_x, y + rel_y],
@@ -1842,26 +1959,36 @@ fn emit_grid_cells(
     atlas: &mut GlyphAtlas,
     font_system: &mut FontSystem,
     rasterizer: &mut Rasterizer<'_>,
+    mut glyph_keys_out: Option<&mut FxHashSet<GlyphKey>>,
 ) {
     let rows = grid.rows();
     let cols = grid.cols();
     let cells = grid.cells();
     let dirty = grid.dirty_flags();
+    let trace_hash = terminal_grid_trace_hash(grid);
+    let trace_this_grid = terminal_trace_enabled()
+        && LAST_TERMINAL_RENDER_TRACE_HASH.swap(trace_hash, Ordering::Relaxed) != trace_hash;
+    let trace_rows = if trace_this_grid { Some(grid.debug_rows(4, 96)) } else { None };
+    let mut trace_glyphs: Vec<String> = Vec::new();
 
-    // Per-frame glyph cache: maps a character to its resolved shaping result
-    // (GlyphKey + AtlasEntry + physical offsets). In a monospace grid every
-    // occurrence of the same codepoint produces an identical glyph at the same
-    // subpixel position, so we only need to run cosmic-text shaping once per
-    // unique character per frame. The cache is local (rebuilt each frame), so
-    // font-size changes are handled automatically.
-    struct CachedGlyph {
+    // Shape each unique character once, then cache the fully resolved glyph
+    // per actual atlas key. Fractional cell origins can change the subpixel
+    // bins, so caching only by `char` is incorrect when cell_w/cell_h are not
+    // integers.
+    struct ResolvedGlyph {
         key: GlyphKey,
         entry: GlyphEntry,
         physical_x: i32,
         physical_y: i32,
         line_y: f32,
     }
-    let mut glyph_cache: FxHashMap<char, Option<CachedGlyph>> = FxHashMap::default();
+    #[derive(Clone)]
+    struct PrototypeGlyph {
+        glyph: cosmic_text::LayoutGlyph,
+        line_y: f32,
+    }
+    let mut prototype_cache: FxHashMap<char, Option<PrototypeGlyph>> = FxHashMap::default();
+    let mut glyph_cache: FxHashMap<GlyphKey, ResolvedGlyph> = FxHashMap::default();
 
     // Reusable buffer for glyph shaping on cache miss.
     let metrics = cosmic_text::Metrics::new(font_size, cell_h);
@@ -1933,95 +2060,133 @@ fn emit_grid_cells(
             }
             fg_linear[3] *= opacity;
 
-            // Fast path: look up the per-frame glyph cache before running
-            // cosmic-text shaping. Same char = same glyph in a monospace grid.
-            if let Some(cached) = glyph_cache.get(&cell.ch) {
-                if let Some(cg) = cached {
-                    atlas.touch(&cg.key);
-                    let gx = px + cg.physical_x as f32 + cg.entry.offset[0];
-                    let gy = py + cg.line_y + cg.physical_y as f32 + cg.entry.offset[1];
-                    batch.glyph_instances.push(GlyphInstance {
-                        pos: [gx, gy],
-                        size: cg.entry.size,
-                        uv_min: [cg.entry.uv_rect[0], cg.entry.uv_rect[1]],
-                        uv_max: [cg.entry.uv_rect[2], cg.entry.uv_rect[3]],
-                        color: fg_linear,
-                        clip_rect,
-                    });
-                }
+            let prototype = if let Some(cached) = prototype_cache.get(&cell.ch) {
+                cached.clone()
+            } else {
+                let ch_str = cell.ch.encode_utf8(&mut ch_buf);
+                #[cfg(target_os = "windows")]
+                let family = cosmic_text::Family::Name(&rasterizer.dw.font_family);
+                #[cfg(not(target_os = "windows"))]
+                let family = cosmic_text::Family::Monospace;
+                buffer.set_text(
+                    font_system,
+                    ch_str,
+                    cosmic_text::Attrs::new().family(family),
+                    cosmic_text::Shaping::Advanced,
+                );
+                buffer.shape_until_scroll(font_system, false);
+
+                let shaped = buffer.layout_runs().find_map(|run| {
+                    run.glyphs
+                        .first()
+                        .cloned()
+                        .map(|glyph| PrototypeGlyph { glyph, line_y: run.line_y })
+                });
+                prototype_cache.insert(cell.ch, shaped.clone());
+                shaped
+            };
+
+            let Some(prototype) = prototype else {
                 continue;
-            }
+            };
 
-            // Cache miss: shape with cosmic-text and store the result.
-            let ch_str = cell.ch.encode_utf8(&mut ch_buf);
-            #[cfg(target_os = "windows")]
-            let family = cosmic_text::Family::Name(&rasterizer.dw.font_family);
-            #[cfg(not(target_os = "windows"))]
-            let family = cosmic_text::Family::Monospace;
-            buffer.set_text(
-                font_system,
-                ch_str,
-                cosmic_text::Attrs::new().family(family),
-                cosmic_text::Shaping::Advanced,
-            );
-            buffer.shape_until_scroll(font_system, false);
+            let px_floor = px.floor();
+            let py_floor = py.floor();
+            let physical = prototype.glyph.physical((px - px_floor, py - py_floor), 1.0);
+            let key = GlyphKey {
+                font_id: atlas_font_namespace(&physical.cache_key),
+                glyph_id: physical.cache_key.glyph_id,
+                font_size_tenths: (font_size * 10.0) as u16,
+                subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
+                    | (physical.cache_key.y_bin as u8),
+            };
 
-            let mut cached_result: Option<CachedGlyph> = None;
-
-            for run in buffer.layout_runs() {
-                for glyph in run.glyphs.iter() {
-                    let physical = glyph.physical((0.0, 0.0), 1.0);
-
-                    let key = GlyphKey {
-                        font_id: physical.cache_key.font_size_bits as u64,
-                        glyph_id: physical.cache_key.glyph_id,
-                        font_size_tenths: (font_size * 10.0) as u16,
-                        subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
-                            | (physical.cache_key.y_bin as u8),
-                    };
-
-                    let entry = if let Some(entry) = atlas.cache.get(&key).copied() {
-                        atlas.touch(&key);
-                        entry
-                    } else {
-                        match rasterize_grid_glyph_for_atlas(
-                            rasterizer,
-                            font_system,
-                            &physical,
-                            cell.ch,
-                            font_size,
-                            atlas,
-                            key,
-                        ) {
-                            Some(entry) => entry,
-                            None => continue,
-                        }
-                    };
-
-                    cached_result = Some(CachedGlyph {
+            let was_cached = glyph_cache.contains_key(&key);
+            let resolved = if let Some(cached) = glyph_cache.get(&key) {
+                atlas.touch(&cached.key);
+                cached
+            } else {
+                let entry = if let Some(entry) = atlas.cache.get(&key).copied() {
+                    atlas.touch(&key);
+                    entry
+                } else {
+                    match rasterize_grid_glyph_for_atlas(
+                        rasterizer,
+                        font_system,
+                        &physical,
+                        cell.ch,
+                        font_size,
+                        atlas,
                         key,
-                        entry,
-                        physical_x: physical.x,
-                        physical_y: physical.y,
-                        line_y: run.line_y,
-                    });
+                    ) {
+                        Some(entry) => entry,
+                        None => continue,
+                    }
+                };
 
-                    let gx = px + physical.x as f32 + entry.offset[0];
-                    let gy = py + run.line_y + physical.y as f32 + entry.offset[1];
+                glyph_cache.entry(key).or_insert(ResolvedGlyph {
+                    key,
+                    entry,
+                    physical_x: physical.x,
+                    physical_y: physical.y,
+                    line_y: prototype.line_y,
+                })
+            };
 
-                    batch.glyph_instances.push(GlyphInstance {
-                        pos: [gx, gy],
-                        size: entry.size,
-                        uv_min: [entry.uv_rect[0], entry.uv_rect[1]],
-                        uv_max: [entry.uv_rect[2], entry.uv_rect[3]],
-                        color: fg_linear,
-                        clip_rect,
-                    });
-                }
+            if let Some(keys) = glyph_keys_out.as_deref_mut() {
+                keys.insert(resolved.key);
             }
 
-            glyph_cache.insert(cell.ch, cached_result);
+            let gx = px_floor + resolved.physical_x as f32 + resolved.entry.offset[0];
+            let gy =
+                py_floor + resolved.line_y + resolved.physical_y as f32 + resolved.entry.offset[1];
+            if trace_this_grid && row < 4 && trace_glyphs.len() < 64 {
+                trace_glyphs.push(format!(
+                    "{} r{}c{} ch={:?} key=({}, {}, {}) pos=({:.1}, {:.1})",
+                    if was_cached { "cache" } else { "miss" },
+                    row,
+                    col,
+                    cell.ch,
+                    resolved.key.font_id,
+                    resolved.key.glyph_id,
+                    resolved.key.subpixel_bin,
+                    gx,
+                    gy,
+                ));
+            }
+
+            batch.glyph_instances.push(GlyphInstance {
+                pos: [gx, gy],
+                size: resolved.entry.size,
+                uv_min: [resolved.entry.uv_rect[0], resolved.entry.uv_rect[1]],
+                uv_max: [resolved.entry.uv_rect[2], resolved.entry.uv_rect[3]],
+                color: fg_linear,
+                clip_rect,
+            });
         }
+    }
+
+    if trace_this_grid {
+        let rows_dump = trace_rows.unwrap_or_default();
+        let dirty_count = dirty.iter().filter(|&&bit| bit).count();
+        append_terminal_trace_line(&format!(
+            "terminal-trace stage=emit_grid_cells rows={} cols={} dirty={} origin=({:.1}, {:.1}) cell=({:.2}, {:.2}) cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?} glyphs={}",
+            rows,
+            cols,
+            dirty_count,
+            origin_x,
+            origin_y,
+            cell_w,
+            cell_h,
+            grid.cursor_row(),
+            grid.cursor_col(),
+            grid.cursor_visible(),
+            rows_dump.first().cloned().unwrap_or_default(),
+            rows_dump.get(1).cloned().unwrap_or_default(),
+            rows_dump.get(2).cloned().unwrap_or_default(),
+            rows_dump.get(3).cloned().unwrap_or_default(),
+            trace_glyphs.join(" | "),
+        ));
     }
 
     // Draw cursor block when visible.
@@ -2180,6 +2345,7 @@ fn emit_select_node(
             font_system,
             rasterizer,
             shaped_cache,
+            None,
         );
     }
 
@@ -2204,6 +2370,7 @@ fn emit_select_node(
             font_system,
             rasterizer,
             shaped_cache,
+            None,
         );
     }
 
@@ -2294,6 +2461,7 @@ fn emit_select_node(
                 font_system,
                 rasterizer,
                 shaped_cache,
+                None,
             );
         }
 
@@ -2313,6 +2481,7 @@ fn emit_select_node(
             font_system,
             rasterizer,
             shaped_cache,
+            None,
         );
     }
 }
@@ -2398,13 +2567,13 @@ fn rasterize_swash_for_atlas(
             .collect(),
     };
 
-    // On Windows the atlas is RGBA8 (for DirectWrite subpixel glyphs), so swash's
-    // grayscale alpha data must be expanded to RGBA. The subpixel shader reads
-    // coverage from the RGB channels, so replicate alpha into all four channels.
-    #[cfg(target_os = "windows")]
-    let glyph_data: Vec<u8> = alpha_data.iter().flat_map(|&a| [a, a, a, a]).collect();
-    #[cfg(not(target_os = "windows"))]
-    let glyph_data = alpha_data;
+    // Match the upload shape to the current atlas format. The Windows path can
+    // now run either a monochrome R8 atlas or the old RGBA subpixel atlas.
+    let glyph_data = if atlas.bytes_per_pixel == 4 {
+        alpha_data.iter().flat_map(|&a| [a, a, a, a]).collect()
+    } else {
+        alpha_data
+    };
 
     let entry = atlas.get_or_insert(key, w, h, glyph_data, [bearing_x, bearing_y])?;
     atlas.touch(&key);
@@ -2425,15 +2594,28 @@ fn rasterize_grid_glyph_for_atlas(
 ) -> Option<crate::atlas::GlyphEntry> {
     #[cfg(target_os = "windows")]
     {
-        let _ = (font_system, physical); // not needed on DirectWrite path
-        let rg = rasterizer.dw.rasterize_glyph(ch, font_size)?;
-        if rg.width == 0 || rg.height == 0 {
-            return None;
+        if use_directwrite_grid_rasterization() {
+            let _ = (font_system, physical); // not needed on DirectWrite path
+            let rg = rasterizer.dw.rasterize_glyph(ch, font_size)?;
+            if rg.width == 0 || rg.height == 0 {
+                return None;
+            }
+            let entry = atlas.get_or_insert(
+                key,
+                rg.width,
+                rg.height,
+                rg.data,
+                [rg.bearing_x, rg.bearing_y],
+            )?;
+            atlas.touch(&key);
+            Some(entry)
+        } else {
+            // The trace shows terminal content stays correct through batching,
+            // so prefer the swash path until the Windows-specific raster data
+            // corruption is understood. TM_FORCE_DIRECTWRITE_GRID=1 restores
+            // the old path for A/B verification.
+            rasterize_swash_for_atlas(rasterizer.swash, font_system, physical, atlas, key)
         }
-        let entry =
-            atlas.get_or_insert(key, rg.width, rg.height, rg.data, [rg.bearing_x, rg.bearing_y])?;
-        atlas.touch(&key);
-        Some(entry)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -2526,7 +2708,7 @@ mod tests {
         // Simulate "frame 1": record something for the root node.
         batch_cache.begin_frame();
         // Dirty node produces output; we fake it by recording an empty range.
-        batch_cache.record(root, 0, vec![], vec![], vec![], vec![]);
+        batch_cache.record(root, 0, vec![], vec![], vec![], vec![], vec![], 0);
         batch_cache.commit_frame();
 
         batch
@@ -2566,7 +2748,7 @@ mod tests {
 
         // Populate staging with a fake record.
         cache.begin_frame();
-        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], vec![]);
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], vec![], vec![], 0);
         // Before commit, `get` reads from the previous frame (empty).
         assert!(cache.get(NodeId::DANGLING, 0).is_none());
 
@@ -2598,7 +2780,7 @@ mod tests {
 
         // Frame 1: a dirty node produces primitives. record -> commit.
         cache.begin_frame();
-        cache.record(id, 0, vec![], vec![], vec![], vec![]);
+        cache.record(id, 0, vec![], vec![], vec![], vec![], vec![], 0);
         cache.commit_frame();
         assert!(cache.get(id, 0).is_some(), "frame 1 recorded and committed");
 
@@ -2606,7 +2788,10 @@ mod tests {
         // of re-rendering. The fix guarantees the cached entry is carried
         // forward into the current staging map.
         cache.begin_frame();
-        assert!(cache.replay(id, 0).is_some(), "frame 2 must replay from frame 1's committed data",);
+        assert!(
+            cache.replay(id, 0, 0).is_some(),
+            "frame 2 must replay from frame 1's committed data",
+        );
         cache.commit_frame();
 
         // Frame 3: without the fix, the frame-2 commit swap would have
@@ -2618,7 +2803,7 @@ mod tests {
 
         // Frame 4: repeat to confirm the carry-forward is stable across
         // multiple consecutive replay cycles, not just the first one.
-        assert!(cache.replay(id, 0).is_some(), "frame 4 replay");
+        assert!(cache.replay(id, 0, 0).is_some(), "frame 4 replay");
         cache.commit_frame();
         cache.begin_frame();
         assert!(
@@ -2633,7 +2818,21 @@ mod tests {
         // purely a carry-forward for entries that already exist in `ranges`.
         let mut cache = BatchCache::new();
         cache.begin_frame();
-        assert!(cache.replay(NodeId::DANGLING, 0).is_none());
+        assert!(cache.replay(NodeId::DANGLING, 0, 0).is_none());
+    }
+
+    #[test]
+    fn replay_returns_none_when_atlas_generation_mismatches() {
+        // Atlas-aware invalidation: cached ranges built against an older atlas
+        // generation must not be replayed.
+        let mut cache = BatchCache::new();
+        let id = NodeId::DANGLING;
+        cache.begin_frame();
+        cache.record(id, 0, vec![], vec![], vec![], vec![], vec![], 7);
+        cache.commit_frame();
+
+        cache.begin_frame();
+        assert!(cache.replay(id, 0, 8).is_none(), "generation mismatch must force fresh render",);
     }
 
     #[test]
@@ -2647,7 +2846,7 @@ mod tests {
 
         // Seed ranges with an empty entry (stale previous-frame state).
         cache.begin_frame();
-        cache.record(id, 0, vec![], vec![], vec![], vec![]);
+        cache.record(id, 0, vec![], vec![], vec![], vec![], vec![], 0);
         cache.commit_frame();
 
         // New frame: caller records fresh data with one distinctive span.
@@ -2659,11 +2858,13 @@ mod tests {
             vec![],
             vec![],
             vec![DrawSpan { kind: DrawKind::Quad, start: 0, count: 7 }],
+            vec![],
+            0,
         );
 
         // A subsequent replay call should return the just-recorded entry,
         // not the older empty entry still sitting in `ranges`.
-        let out = cache.replay(id, 0).expect("pending entry must be returned");
+        let out = cache.replay(id, 0, 0).expect("pending entry must be returned");
         assert_eq!(out.draw_spans.len(), 1);
         assert_eq!(out.draw_spans[0].kind, DrawKind::Quad);
         assert_eq!(out.draw_spans[0].count, 7);
@@ -2682,7 +2883,7 @@ mod tests {
         ];
         let mut cache = BatchCache::new();
         cache.begin_frame();
-        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans.clone());
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans.clone(), vec![], 0);
         cache.commit_frame();
 
         let cached = cache.get(NodeId::DANGLING, 0).expect("should have cached entry");
@@ -2698,6 +2899,54 @@ mod tests {
     }
 
     #[test]
+    fn cached_draw_spans_must_be_node_local_before_replay() {
+        let quad_start = 11_u32;
+        let glyph_start = 37_u32;
+        let absolute_spans = vec![
+            DrawSpan { kind: DrawKind::Quad, start: quad_start, count: 2 },
+            DrawSpan { kind: DrawKind::Glyph, start: glyph_start, count: 4 },
+            DrawSpan { kind: DrawKind::Quad, start: quad_start + 2, count: 1 },
+            DrawSpan { kind: DrawKind::Glyph, start: glyph_start + 4, count: 3 },
+        ];
+
+        let normalized = absolute_spans
+            .iter()
+            .map(|span| DrawSpan {
+                kind: span.kind,
+                start: match span.kind {
+                    DrawKind::Quad => span.start - quad_start,
+                    DrawKind::Glyph => span.start - glyph_start,
+                },
+                count: span.count,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(normalized[0].start, 0);
+        assert_eq!(normalized[1].start, 0);
+        assert_eq!(normalized[2].start, 2);
+        assert_eq!(normalized[3].start, 4);
+
+        let quad_offset = 100_u32;
+        let glyph_offset = 200_u32;
+        let replayed = normalized
+            .iter()
+            .map(|span| DrawSpan {
+                kind: span.kind,
+                start: match span.kind {
+                    DrawKind::Quad => quad_offset + span.start,
+                    DrawKind::Glyph => glyph_offset + span.start,
+                },
+                count: span.count,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(replayed[0].start, 100);
+        assert_eq!(replayed[1].start, 200);
+        assert_eq!(replayed[2].start, 102);
+        assert_eq!(replayed[3].start, 204);
+    }
+
+    #[test]
     fn draw_spans_replayed_with_offset_adjustment() {
         // Record spans at known positions.
         let spans = vec![
@@ -2706,7 +2955,7 @@ mod tests {
         ];
         let mut cache = BatchCache::new();
         cache.begin_frame();
-        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans);
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans, vec![], 0);
         cache.commit_frame();
 
         // Replay into a batch that already has some data, simulating offset.
@@ -2859,7 +3108,7 @@ mod tests {
             for glyph in run.glyphs.iter() {
                 let physical = glyph.physical((0.0, 0.0), 1.0);
                 return Some(GlyphKey {
-                    font_id: physical.cache_key.font_size_bits as u64,
+                    font_id: atlas_font_namespace(&physical.cache_key),
                     glyph_id: physical.cache_key.glyph_id,
                     font_size_tenths: (font_size * 10.0) as u16,
                     subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
@@ -2885,6 +3134,60 @@ mod tests {
         let key2 = shape_char_to_key(&mut fs, 'A', font_size, cell_h, cell_w)
             .expect("'A' should produce a glyph on second call");
         assert_eq!(key1, key2, "same char must yield identical GlyphKey");
+    }
+
+    #[test]
+    fn atlas_font_namespace_includes_render_flags() {
+        let (plain, _, _) = cosmic_text::CacheKey::new(
+            cosmic_text::fontdb::ID::dummy(),
+            42,
+            14.0,
+            (0.0, 0.0),
+            cosmic_text::CacheKeyFlags::empty(),
+        );
+        let (italic, _, _) = cosmic_text::CacheKey::new(
+            cosmic_text::fontdb::ID::dummy(),
+            42,
+            14.0,
+            (0.0, 0.0),
+            cosmic_text::CacheKeyFlags::FAKE_ITALIC,
+        );
+
+        assert_ne!(
+            atlas_font_namespace(&plain),
+            atlas_font_namespace(&italic),
+            "atlas font namespace must differ when glyph render flags differ",
+        );
+    }
+
+    #[test]
+    fn atlas_font_namespace_includes_font_identity() {
+        let fs = FontSystem::new();
+        let ids: Vec<_> = fs.db().faces().take(2).map(|face| face.id).collect();
+        if ids.len() < 2 {
+            return;
+        }
+
+        let (a, _, _) = cosmic_text::CacheKey::new(
+            ids[0],
+            42,
+            14.0,
+            (0.0, 0.0),
+            cosmic_text::CacheKeyFlags::empty(),
+        );
+        let (b, _, _) = cosmic_text::CacheKey::new(
+            ids[1],
+            42,
+            14.0,
+            (0.0, 0.0),
+            cosmic_text::CacheKeyFlags::empty(),
+        );
+
+        assert_ne!(
+            atlas_font_namespace(&a),
+            atlas_font_namespace(&b),
+            "atlas font namespace must differ for different font ids",
+        );
     }
 
     /// Different characters must produce different glyph IDs so the cache
