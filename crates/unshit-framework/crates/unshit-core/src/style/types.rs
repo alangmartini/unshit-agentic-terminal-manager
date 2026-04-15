@@ -413,6 +413,10 @@ pub enum Dimension {
     Auto,
     Px(f32),
     Percent(f32),
+    /// Viewport height unit: 1vh = 1% of viewport height.
+    Vh(f32),
+    /// Viewport width unit: 1vw = 1% of viewport width.
+    Vw(f32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1167,7 +1171,7 @@ impl ComputedStyle {
         self.user_select = parent.user_select;
     }
 
-    pub fn to_taffy_style(&self) -> taffy::Style {
+    pub fn to_taffy_style(&self, viewport_w: f32, viewport_h: f32) -> taffy::Style {
         taffy::Style {
             display: match self.display {
                 Display::Flex | Display::InlineFlex => taffy::Display::Flex,
@@ -1183,7 +1187,7 @@ impl ComputedStyle {
             },
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
-            flex_basis: dim_to_taffy(self.flex_basis),
+            flex_basis: dim_to_taffy(self.flex_basis, viewport_w, viewport_h),
             align_items: Some(match self.align_items {
                 AlignItems::Start => taffy::AlignItems::FlexStart,
                 AlignItems::End => taffy::AlignItems::FlexEnd,
@@ -1214,16 +1218,16 @@ impl ComputedStyle {
                 AlignContent::SpaceEvenly => taffy::AlignContent::SpaceEvenly,
             }),
             size: taffy::Size {
-                width: dim_to_taffy(self.width),
-                height: dim_to_taffy(self.height),
+                width: dim_to_taffy(self.width, viewport_w, viewport_h),
+                height: dim_to_taffy(self.height, viewport_w, viewport_h),
             },
             min_size: taffy::Size {
-                width: dim_to_taffy(self.min_width),
-                height: dim_to_taffy(self.min_height),
+                width: dim_to_taffy(self.min_width, viewport_w, viewport_h),
+                height: dim_to_taffy(self.min_height, viewport_w, viewport_h),
             },
             max_size: taffy::Size {
-                width: dim_to_taffy(self.max_width),
-                height: dim_to_taffy(self.max_height),
+                width: dim_to_taffy(self.max_width, viewport_w, viewport_h),
+                height: dim_to_taffy(self.max_height, viewport_w, viewport_h),
             },
             padding: edges_to_taffy_rect(self.padding),
             margin: edges_to_taffy_rect_auto(self.margin),
@@ -1245,7 +1249,7 @@ impl ComputedStyle {
                     if self.position == CssPosition::Static {
                         taffy::LengthPercentageAuto::Auto
                     } else {
-                        opt_dim_to_taffy_auto(d)
+                        opt_dim_to_taffy_auto(d, viewport_w, viewport_h)
                     }
                 };
                 taffy::Rect {
@@ -1291,11 +1295,16 @@ fn overflow_to_taffy(o: Overflow) -> taffy::Overflow {
     }
 }
 
-fn dim_to_taffy(d: Dimension) -> taffy::Dimension {
+fn dim_to_taffy(d: Dimension, viewport_w: f32, viewport_h: f32) -> taffy::Dimension {
     match d {
         Dimension::Auto => taffy::Dimension::Auto,
         Dimension::Px(v) => taffy::Dimension::Length(v),
         Dimension::Percent(v) => taffy::Dimension::Percent(v / 100.0),
+        // Viewport units are resolved to absolute pixels against the current
+        // viewport. Taffy does not natively support vh/vw, so we eagerly
+        // convert to a pixel length.
+        Dimension::Vh(v) => taffy::Dimension::Length(v / 100.0 * viewport_h),
+        Dimension::Vw(v) => taffy::Dimension::Length(v / 100.0 * viewport_w),
     }
 }
 
@@ -1308,11 +1317,17 @@ fn edges_to_taffy_rect(e: Edges) -> taffy::Rect<taffy::LengthPercentage> {
     }
 }
 
-fn opt_dim_to_taffy_auto(d: Option<Dimension>) -> taffy::LengthPercentageAuto {
+fn opt_dim_to_taffy_auto(
+    d: Option<Dimension>,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> taffy::LengthPercentageAuto {
     match d {
         None | Some(Dimension::Auto) => taffy::LengthPercentageAuto::Auto,
         Some(Dimension::Px(v)) => taffy::LengthPercentageAuto::Length(v),
         Some(Dimension::Percent(v)) => taffy::LengthPercentageAuto::Percent(v / 100.0),
+        Some(Dimension::Vh(v)) => taffy::LengthPercentageAuto::Length(v / 100.0 * viewport_h),
+        Some(Dimension::Vw(v)) => taffy::LengthPercentageAuto::Length(v / 100.0 * viewport_w),
     }
 }
 
@@ -1507,5 +1522,58 @@ fn scale_grid_track_def(d: &mut GridTrackDef, s: f32) {
                 scale_grid_track_size(t, s);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vh_resolves_against_viewport_height() {
+        // 50vh with a 600px viewport height should resolve to 300px.
+        let taffy_dim = dim_to_taffy(Dimension::Vh(50.0), 800.0, 600.0);
+        assert_eq!(taffy_dim, taffy::Dimension::Length(300.0));
+    }
+
+    #[test]
+    fn vw_resolves_against_viewport_width() {
+        // 25vw with an 800px viewport width should resolve to 200px.
+        let taffy_dim = dim_to_taffy(Dimension::Vw(25.0), 800.0, 600.0);
+        assert_eq!(taffy_dim, taffy::Dimension::Length(200.0));
+    }
+
+    #[test]
+    fn vh_vw_zero_yields_zero_length() {
+        assert_eq!(dim_to_taffy(Dimension::Vh(0.0), 800.0, 600.0), taffy::Dimension::Length(0.0));
+        assert_eq!(dim_to_taffy(Dimension::Vw(0.0), 800.0, 600.0), taffy::Dimension::Length(0.0));
+    }
+
+    #[test]
+    fn opt_dim_vh_vw_resolves() {
+        assert_eq!(
+            opt_dim_to_taffy_auto(Some(Dimension::Vh(100.0)), 800.0, 600.0),
+            taffy::LengthPercentageAuto::Length(600.0)
+        );
+        assert_eq!(
+            opt_dim_to_taffy_auto(Some(Dimension::Vw(10.0)), 800.0, 600.0),
+            taffy::LengthPercentageAuto::Length(80.0)
+        );
+    }
+
+    #[test]
+    fn scale_dim_leaves_vh_vw_unchanged() {
+        // Viewport units are scale-independent (like Percent).
+        assert_eq!(scale_dim(Dimension::Vh(50.0), 2.0), Dimension::Vh(50.0));
+        assert_eq!(scale_dim(Dimension::Vw(25.0), 1.5), Dimension::Vw(25.0));
+    }
+
+    #[test]
+    fn to_taffy_style_applies_viewport_to_max_height() {
+        let mut style = ComputedStyle::default();
+        style.max_height = Dimension::Vh(80.0);
+        let taffy_style = style.to_taffy_style(1000.0, 500.0);
+        // 80vh of a 500px-tall viewport = 400px.
+        assert_eq!(taffy_style.max_size.height, taffy::Dimension::Length(400.0));
     }
 }

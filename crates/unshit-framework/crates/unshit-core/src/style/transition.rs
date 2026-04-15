@@ -266,6 +266,8 @@ fn lerp_dimension(a: &Dimension, b: &Dimension, t: f32) -> Dimension {
         (Dimension::Percent(a_v), Dimension::Percent(b_v)) => {
             Dimension::Percent(lerp_f32(*a_v, *b_v, t))
         }
+        (Dimension::Vh(a_v), Dimension::Vh(b_v)) => Dimension::Vh(lerp_f32(*a_v, *b_v, t)),
+        (Dimension::Vw(a_v), Dimension::Vw(b_v)) => Dimension::Vw(lerp_f32(*a_v, *b_v, t)),
         // Different units or Auto: snap.
         _ => {
             if t >= 0.5 {
@@ -879,6 +881,31 @@ mod tests {
         let b = Dimension::Percent(50.0);
         let result = lerp_dimension(&a, &b, 0.6);
         assert_eq!(result, Dimension::Percent(50.0)); // t >= 0.5, snaps to b.
+    }
+
+    #[test]
+    fn test_lerp_dimension_vh_same_unit() {
+        let a = Dimension::Vh(10.0);
+        let b = Dimension::Vh(30.0);
+        let result = lerp_dimension(&a, &b, 0.5);
+        assert_eq!(result, Dimension::Vh(20.0));
+    }
+
+    #[test]
+    fn test_lerp_dimension_vw_same_unit() {
+        let a = Dimension::Vw(20.0);
+        let b = Dimension::Vw(60.0);
+        let result = lerp_dimension(&a, &b, 0.25);
+        assert_eq!(result, Dimension::Vw(30.0));
+    }
+
+    #[test]
+    fn test_lerp_dimension_vh_to_vw_snaps() {
+        // Different viewport axes cannot be interpolated linearly.
+        let a = Dimension::Vh(10.0);
+        let b = Dimension::Vw(50.0);
+        let result = lerp_dimension(&a, &b, 0.7);
+        assert_eq!(result, Dimension::Vw(50.0)); // snaps to b when t >= 0.5
     }
 
     #[test]

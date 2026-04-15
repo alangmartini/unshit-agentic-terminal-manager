@@ -770,7 +770,14 @@ mod tests {
 
         // Run the full layout pipeline.
         let mut font_system = cosmic_text::FontSystem::new();
-        crate::layout::sync_element_to_taffy(&mut arena, &mut taffy, root, &mut font_system);
+        crate::layout::sync_element_to_taffy(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            100.0,
+            100.0,
+        );
 
         let root_taffy = arena.get(root).unwrap().taffy_node.unwrap();
         let mut cache = crate::layout::TextMeasureCache::default();

@@ -107,6 +107,8 @@ pub fn sync_element_to_taffy(
     taffy: &mut TaffyTree<TextMeasureCtx>,
     node_id: NodeId,
     font_system: &mut FontSystem,
+    viewport_w: f32,
+    viewport_h: f32,
 ) {
     let Some(element) = arena.get(node_id) else {
         return;
@@ -115,7 +117,7 @@ pub fn sync_element_to_taffy(
     let is_new = element.taffy_node.is_none();
 
     if is_new || element.dirty.contains(DirtyFlags::LAYOUT) {
-        let mut style = element.computed_style.to_taffy_style();
+        let mut style = element.computed_style.to_taffy_style(viewport_w, viewport_h);
         // Hidden inputs have zero layout footprint.
         if element.tag == Tag::Input && element.input_state.input_type == InputType::Hidden {
             style.display = taffy::Display::None;
@@ -192,7 +194,7 @@ pub fn sync_element_to_taffy(
     let child_ids = arena.children(node_id);
 
     for &child_id in &child_ids {
-        sync_element_to_taffy(arena, taffy, child_id, font_system);
+        sync_element_to_taffy(arena, taffy, child_id, font_system, viewport_w, viewport_h);
     }
 
     let element = arena.get(node_id).unwrap();
@@ -720,7 +722,7 @@ mod tests {
             crate::style::types::Dimension::Px(16.0);
         arena.append_child(parent_id, svg_id);
 
-        sync_element_to_taffy(&mut arena, &mut taffy, parent_id, &mut font_system);
+        sync_element_to_taffy(&mut arena, &mut taffy, parent_id, &mut font_system, 800.0, 600.0);
         let root_taffy = arena.get(parent_id).unwrap().taffy_node.unwrap();
         let mut cache = TextMeasureCache::new();
         compute_layout(&mut taffy, root_taffy, 800.0, 600.0, &mut font_system, &mut cache);

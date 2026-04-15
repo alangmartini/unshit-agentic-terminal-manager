@@ -221,15 +221,19 @@ pub fn resolve_all_styles_with_transitions(
         // Clear style dirty flags now that this node has been processed.
         element.dirty.remove(DirtyFlags::STYLE | DirtyFlags::SUBTREE_STYLE);
 
-        // Always mark paint-dirty after restyle. A targeted comparison
-        // (visual_props_changed) is defeated by DPI scaling: scale_all_styles
-        // mutates computed_style after restyle, so the "old" style is scaled
-        // while the "new" cascade result is unscaled, causing a false diff on
-        // every frame. Unconditional PAINT is safe here because the batch
-        // cache replay fix ensures idle frames carry forward correctly.
-        element.dirty.insert(DirtyFlags::PAINT);
+        // Always mark paint-dirty AND layout-dirty after restyle. A targeted
+        // comparison (visual_props_changed) is defeated by DPI scaling:
+        // scale_all_styles mutates computed_style after restyle, so the "old"
+        // style is scaled while the "new" cascade result is unscaled, causing
+        // a false diff on every frame. Unconditional PAINT is safe here
+        // because the batch cache replay fix ensures idle frames carry
+        // forward correctly. LAYOUT must be set too because style changes can
+        // affect size/position (display, flex-direction, width, padding,
+        // etc.), and `sync_element_to_taffy` only re-syncs the taffy node
+        // when LAYOUT is dirty.
+        element.dirty.insert(DirtyFlags::PAINT | DirtyFlags::LAYOUT);
         if !children.is_empty() {
-            element.dirty.insert(DirtyFlags::SUBTREE_PAINT);
+            element.dirty.insert(DirtyFlags::SUBTREE_PAINT | DirtyFlags::SUBTREE_LAYOUT);
         }
     }
 
@@ -369,10 +373,11 @@ pub fn resolve_dirty_styles_with_transitions(
             // Clear the node's own STYLE flag now that it has been resolved.
             element.dirty.remove(DirtyFlags::STYLE);
 
-            // Unconditional PAINT (see resolve_all_styles_with_transitions).
-            element.dirty.insert(DirtyFlags::PAINT);
+            // Unconditional PAINT and LAYOUT (see
+            // resolve_all_styles_with_transitions for rationale).
+            element.dirty.insert(DirtyFlags::PAINT | DirtyFlags::LAYOUT);
             if !children.is_empty() {
-                element.dirty.insert(DirtyFlags::SUBTREE_PAINT);
+                element.dirty.insert(DirtyFlags::SUBTREE_PAINT | DirtyFlags::SUBTREE_LAYOUT);
             }
         }
     }
@@ -594,7 +599,7 @@ pub fn run_layout_pipeline(
     height: f32,
     cache: &mut TextMeasureCache,
 ) {
-    layout::sync_element_to_taffy(arena, taffy, root, font_system);
+    layout::sync_element_to_taffy(arena, taffy, root, font_system, width, height);
     if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
         layout::compute_layout(taffy, tn, width, height, font_system, cache);
         layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
