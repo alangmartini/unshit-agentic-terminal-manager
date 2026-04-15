@@ -10,7 +10,7 @@ use unshit::app::{App, AppConfig, FontSource};
 use unshit::core::element::*;
 use unshit::core::event::DragPhase;
 use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::Dimension;
+use unshit::core::style::types::{AlignItems, CssPosition, Dimension, JustifyContent};
 
 use crate::state::{
     dispatch, mutate_with, resize_all_terminals, seed_state, SharedState, UiSnapshot,
@@ -87,6 +87,13 @@ fn build_tree(
                 .with_class("modal-overlay")
                 .with_class("open")
                 .with_id("settings-modal")
+                .with_style(StyleDeclaration::Position(CssPosition::Fixed))
+                .with_style(StyleDeclaration::Top(Dimension::Px(0.0)))
+                .with_style(StyleDeclaration::Right(Dimension::Px(0.0)))
+                .with_style(StyleDeclaration::Bottom(Dimension::Px(0.0)))
+                .with_style(StyleDeclaration::Left(Dimension::Px(0.0)))
+                .with_style(StyleDeclaration::AlignItems(AlignItems::Center))
+                .with_style(StyleDeclaration::JustifyContent(JustifyContent::Center))
                 .on_click(move || {
                     mutate_with(&s, |st| dispatch(st, "modal.close"));
                 })
