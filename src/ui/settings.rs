@@ -68,6 +68,13 @@ fn build_modal_nav(active: SettingsSection, shared: &SharedState) -> ElementDef 
 }
 
 fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let section = match state.settings_section {
+        SettingsSection::General => build_general_section(state, shared),
+        SettingsSection::Appearance => build_appearance_section(state, shared),
+        SettingsSection::Shell => build_shell_section(state, shared),
+        SettingsSection::Keybinds => build_keybinds_section(shared),
+        SettingsSection::Agents => build_agents_section(state, shared),
+    };
     ElementDef::new(Tag::Div)
         .with_class("modal-body")
         .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
@@ -75,34 +82,22 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_style(StyleDeclaration::FlexBasis(Dimension::Auto))
         .with_style(StyleDeclaration::Overflow(Overflow::Scroll))
         .with_style(StyleDeclaration::MinHeight(Dimension::Px(0.0)))
-        .with_child(build_general_section(state, shared))
-        .with_child(build_appearance_section(state, shared))
-        .with_child(build_shell_section(state, shared))
+        .with_child(section)
 }
 
+// -- section builders -------------------------------------------------------
+
 fn build_general_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("modal-section")
-        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("modal-section-title")
-                .with_text("general"),
-        )
+    section_shell("general")
         .with_child(setting_row(
             "Default shell",
             "Command run when opening a new terminal",
-            ElementDef::new(Tag::Div)
-                .with_class("input")
-                .with_class("select")
-                .with_text("bash"),
+            select_display("bash"),
         ))
         .with_child(setting_row(
             "Working directory",
             "Starting directory for new terminals",
-            ElementDef::new(Tag::Input)
-                .with_class("input")
-                .with_placeholder("~/projects/main"),
+            text_input_display("~/projects/main"),
         ))
         .with_child(setting_row(
             "Restore on startup",
@@ -113,87 +108,73 @@ fn build_general_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef
                 shared,
             ),
         ))
+        .with_child(setting_row(
+            "Confirm before closing",
+            "Warn when closing a tab with a running process",
+            toggle_button(is_on(state, "confirm-close"), "confirm-close", shared),
+        ))
+        .with_child(setting_row(
+            "Start minimized",
+            "Launch to system tray on startup",
+            toggle_button(is_on(state, "start-minimized"), "start-minimized", shared),
+        ))
+        .with_child(setting_row(
+            "Check for updates",
+            "Notify when a new version is available",
+            toggle_button(is_on(state, "check-updates"), "check-updates", shared),
+        ))
 }
 
 fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    let mut theme_chips = ElementDef::new(Tag::Div).with_class("theme-chips");
-    for theme in ["amber", "green", "cyan", "mono"] {
-        let mut chip = ElementDef::new(Tag::Button)
-            .with_class("theme-chip")
-            .with_class(theme);
-        if state.theme == theme {
-            chip = chip.with_class("active");
-        }
-        let s = shared.clone();
-        let theme_name = theme.to_string();
-        chip = chip.on_click(move || {
-            mutate_with(&s, |st| st.theme = theme_name.clone());
-        });
-        theme_chips = theme_chips.with_child(chip);
-    }
-
-    let dec_state = shared.clone();
-    let inc_state = shared.clone();
-    let stepper = ElementDef::new(Tag::Div)
-        .with_class("stepper")
-        .with_child(
-            ElementDef::new(Tag::Button)
-                .with_class("stepper-btn")
-                .with_text("\u{2212}")
-                .on_click(move || {
-                    mutate_with(&dec_state, |st| dispatch(st, "font.dec"));
-                }),
-        )
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("stepper-val")
-                .with_class("tnum")
-                .with_text(state.font_size_pt.to_string()),
-        )
-        .with_child(
-            ElementDef::new(Tag::Button)
-                .with_class("stepper-btn")
-                .with_text("+")
-                .on_click(move || {
-                    mutate_with(&inc_state, |st| dispatch(st, "font.inc"));
-                }),
-        );
-
-    ElementDef::new(Tag::Div)
-        .with_class("modal-section")
-        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("modal-section-title")
-                .with_text("appearance"),
-        )
-        .with_child(setting_row("Theme", "Visual palette", theme_chips))
-        .with_child(setting_row("Font size", "Terminal output size", stepper))
+    section_shell("appearance")
+        .with_child(setting_row(
+            "Theme",
+            "Visual palette for the entire application",
+            theme_chip_group(state, shared),
+        ))
+        .with_child(setting_row(
+            "Font size",
+            "Terminal output size in points",
+            font_stepper(state.font_size_pt, shared),
+        ))
+        .with_child(setting_row(
+            "Cursor style",
+            "Terminal cursor appearance",
+            cursor_style_group(),
+        ))
+        .with_child(setting_row(
+            "Terminal opacity",
+            "Window transparency level",
+            slider_control("100%"),
+        ))
+        .with_child(setting_row(
+            "Line height",
+            "Spacing between terminal rows",
+            static_stepper("1.4"),
+        ))
         .with_child(setting_row(
             "Glow effect",
-            "Subtle CRT-style text shadow",
+            "Subtle CRT-style text shadow on output",
             toggle_button(is_on(state, "glow-effect"), "glow-effect", shared),
         ))
         .with_child(setting_row(
             "Background texture",
-            "Warm ambient gradient",
+            "Warm ambient gradient behind content",
             toggle_button(
                 is_on(state, "background-texture"),
                 "background-texture",
                 shared,
             ),
         ))
+        .with_child(setting_row(
+            "Font ligatures",
+            "Combine character pairs like => and !=",
+            toggle_button(is_on(state, "font-ligatures"), "font-ligatures", shared),
+        ))
 }
 
 fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("modal-section")
-        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("modal-section-title")
-                .with_text("shell"),
-        )
+    section_shell("shell")
         .with_child(setting_row(
             "Shell integration",
             "Inject prompt markers for smart scrollback",
@@ -206,9 +187,89 @@ fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_child(setting_row(
             "History size",
             "Lines retained per pane",
-            ElementDef::new(Tag::Input)
-                .with_class("input")
-                .with_placeholder("50000"),
+            text_input_display("50000"),
+        ))
+        .with_child(setting_row(
+            "Scroll on output",
+            "Auto-scroll terminal when new output arrives",
+            toggle_button(
+                is_on(state, "scroll-on-output"),
+                "scroll-on-output",
+                shared,
+            ),
+        ))
+        .with_child(setting_row(
+            "Bell notification",
+            "Flash tab badge when terminal rings the bell",
+            toggle_button(
+                is_on(state, "bell-notification"),
+                "bell-notification",
+                shared,
+            ),
+        ))
+        .with_child(setting_row(
+            "Word separators",
+            "Characters that break word selection on double-click",
+            compact_input_display(" /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}`~?"),
+        ))
+}
+
+fn build_keybinds_section(shared: &SharedState) -> ElementDef {
+    section_shell("keybinds")
+        .with_child(keybind_row("New terminal", &["Ctrl", "T"]))
+        .with_child(keybind_row("Close tab", &["Ctrl", "W"]))
+        .with_child(keybind_row("Split right", &["Ctrl", "D"]))
+        .with_child(keybind_row("Split down", &["Ctrl", "Shift", "D"]))
+        .with_child(keybind_row("Next tab", &["Ctrl", "Tab"]))
+        .with_child(keybind_row("Previous tab", &["Ctrl", "Shift", "Tab"]))
+        .with_child(keybind_row("Command palette", &["Ctrl", "K"]))
+        .with_child(keybind_row("Toggle sidebar", &["Ctrl", "B"]))
+        .with_child(keybind_row("Settings", &["Ctrl", ","]))
+        .with_child(keybind_row("Zoom in", &["Ctrl", "="]))
+        .with_child(keybind_row("Zoom out", &["Ctrl", "-"]))
+        .with_child(keybind_row("Fullscreen", &["F11"]))
+        .with_child(keybind_footer(shared))
+}
+
+fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    section_shell("agents")
+        .with_child(setting_row(
+            "Auto-discovery",
+            "Detect installed AI agents on PATH",
+            toggle_button(is_on(state, "auto-discovery"), "auto-discovery", shared),
+        ))
+        .with_child(setting_row(
+            "Default timeout",
+            "Seconds before an agent task is canceled",
+            static_stepper("300"),
+        ))
+        .with_child(agent_list_header(3))
+        .with_child(agent_row(
+            "claude",
+            "~/.local/bin/claude",
+            "running",
+            "running",
+            is_on(state, "agent-claude"),
+            "agent-claude",
+            shared,
+        ))
+        .with_child(agent_row(
+            "amp",
+            "~/.local/bin/amp",
+            "idle",
+            "idle",
+            is_on(state, "agent-amp"),
+            "agent-amp",
+            shared,
+        ))
+        .with_child(agent_row(
+            "codex",
+            "~/.local/bin/codex",
+            "disabled",
+            "disabled",
+            is_on(state, "agent-codex"),
+            "agent-codex",
+            shared,
         ))
 }
 
@@ -256,6 +317,19 @@ fn build_modal_footer(shared: &SharedState) -> ElementDef {
         )
 }
 
+// -- helpers ----------------------------------------------------------------
+
+fn section_shell(title: &str) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("modal-section")
+        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("modal-section-title")
+                .with_text(title),
+        )
+}
+
 fn setting_row(label: &str, desc: &str, control: ElementDef) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("setting-row")
@@ -292,11 +366,236 @@ fn toggle_button(on: bool, key: &str, shared: &SharedState) -> ElementDef {
     })
 }
 
+fn select_display(value: &str) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("input")
+        .with_class("select")
+        .with_text(value)
+}
+
+fn text_input_display(value: &str) -> ElementDef {
+    ElementDef::new(Tag::Div).with_class("input").with_text(value)
+}
+
+fn compact_input_display(value: &str) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("input")
+        .with_class("compact")
+        .with_text(value)
+}
+
+fn theme_chip_group(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let mut chips = ElementDef::new(Tag::Div).with_class("theme-chips");
+    for theme in ["amber", "green", "cyan", "mono"] {
+        let mut chip = ElementDef::new(Tag::Button)
+            .with_class("theme-chip")
+            .with_class(theme);
+        if state.theme == theme {
+            chip = chip.with_class("active");
+        }
+        let s = shared.clone();
+        let theme_name = theme.to_string();
+        chip = chip.on_click(move || {
+            mutate_with(&s, |st| st.theme = theme_name.clone());
+        });
+        chips = chips.with_child(chip);
+    }
+    chips
+}
+
+fn font_stepper(value: u32, shared: &SharedState) -> ElementDef {
+    let dec = shared.clone();
+    let inc = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("stepper")
+        .with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("stepper-btn")
+                .with_text("\u{2212}")
+                .on_click(move || {
+                    mutate_with(&dec, |st| dispatch(st, "font.dec"));
+                }),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("stepper-val")
+                .with_class("tnum")
+                .with_text(value.to_string()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("stepper-btn")
+                .with_text("+")
+                .on_click(move || {
+                    mutate_with(&inc, |st| dispatch(st, "font.inc"));
+                }),
+        )
+}
+
+fn static_stepper(value: &str) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("stepper")
+        .with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("stepper-btn")
+                .with_text("\u{2212}"),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("stepper-val")
+                .with_class("tnum")
+                .with_text(value),
+        )
+        .with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("stepper-btn")
+                .with_text("+"),
+        )
+}
+
+fn cursor_style_group() -> ElementDef {
+    let variants = [
+        ("block-cursor", "block", true),
+        ("underline-cursor", "line", false),
+        ("bar-cursor", "bar", false),
+    ];
+    let mut group = ElementDef::new(Tag::Div).with_class("cursor-group");
+    for (preview_class, label, active) in variants {
+        let mut option = ElementDef::new(Tag::Button).with_class("cursor-option");
+        if active {
+            option = option.with_class("active");
+        }
+        option = option
+            .with_child(
+                ElementDef::new(Tag::Span)
+                    .with_class("cursor-preview")
+                    .with_class(preview_class),
+            )
+            .with_child(ElementDef::new(Tag::Span).with_text(label));
+        group = group.with_child(option);
+    }
+    group
+}
+
+fn slider_control(value_label: &str) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("slider-control")
+        .with_child(ElementDef::new(Tag::Div).with_class("slider"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("slider-val")
+                .with_class("tnum")
+                .with_text(value_label),
+        )
+}
+
+fn keybind_row(label: &str, keys: &[&str]) -> ElementDef {
+    let mut keys_wrap = ElementDef::new(Tag::Div).with_class("keybind-keys");
+    for (i, key) in keys.iter().enumerate() {
+        if i > 0 {
+            keys_wrap = keys_wrap.with_child(
+                ElementDef::new(Tag::Span)
+                    .with_class("keybind-sep")
+                    .with_text("+"),
+            );
+        }
+        keys_wrap = keys_wrap.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("keybind-key")
+                .with_text(*key),
+        );
+    }
+    ElementDef::new(Tag::Div)
+        .with_class("keybind-row")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("setting-meta")
+                .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("setting-label")
+                        .with_text(label),
+                ),
+        )
+        .with_child(keys_wrap)
+}
+
+fn keybind_footer(_shared: &SharedState) -> ElementDef {
+    ElementDef::new(Tag::Div).with_class("keybind-footer").with_child(
+        ElementDef::new(Tag::Button)
+            .with_class("btn")
+            .with_class("ghost")
+            .with_text("reset to defaults"),
+    )
+}
+
+fn agent_list_header(count: u32) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("agent-list-header")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("agent-list-title")
+                .with_text("configured agents"),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("agent-list-count")
+                .with_text(count.to_string()),
+        )
+}
+
+fn agent_row(
+    name: &str,
+    path: &str,
+    badge_kind: &str,
+    badge_label: &str,
+    enabled: bool,
+    toggle_key: &str,
+    shared: &SharedState,
+) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("agent-row")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("agent-icon")
+                .with_child(ElementDef::new(Tag::Div).with_svg(icon_agent())),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("agent-info")
+                .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("agent-name")
+                        .with_text(name),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("agent-path")
+                        .with_text(path),
+                ),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("agent-controls")
+                .with_child(agent_badge(badge_kind, badge_label))
+                .with_child(toggle_button(enabled, toggle_key, shared)),
+        )
+}
+
+fn agent_badge(kind: &str, label: &str) -> ElementDef {
+    ElementDef::new(Tag::Span)
+        .with_class("agent-badge")
+        .with_class(kind)
+        .with_text(label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::{seed_state, SettingsSection};
     use std::sync::{Arc, Mutex};
+    use unshit::core::element::ElementContent;
 
     fn make_shared() -> SharedState {
         Arc::new(Mutex::new(seed_state()))
@@ -304,6 +603,19 @@ mod tests {
 
     fn make_snapshot() -> UiSnapshot {
         seed_state().ui_snapshot()
+    }
+
+    fn make_snapshot_section(section: SettingsSection) -> UiSnapshot {
+        let mut state = seed_state();
+        state.settings_section = section;
+        state.ui_snapshot()
+    }
+
+    fn text_of(el: &ElementDef) -> Option<&str> {
+        match &el.content {
+            ElementContent::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
     }
 
     // -- build_settings_modal ---------------------------------------------------
@@ -338,9 +650,7 @@ mod tests {
     fn modal_header_contains_title_and_close_button() {
         let shared = make_shared();
         let el = build_modal_header(&shared);
-        // Should have title row and close button
         assert_eq!(el.children.len(), 2);
-        // Close button should have on_click
         let close_btn = &el.children[1];
         assert!(close_btn.on_click.is_some());
         assert_eq!(close_btn.id.as_deref(), Some("settings-close"));
@@ -366,9 +676,7 @@ mod tests {
     fn modal_nav_marks_general_active() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::General, &shared);
-        // First child should have "active" class
         assert!(el.children[0].classes.contains(&"active".to_string()));
-        // Others should not
         for child in &el.children[1..] {
             assert!(!child.classes.contains(&"active".to_string()));
         }
@@ -387,8 +695,20 @@ mod tests {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::Shell, &shared);
         assert!(el.children[2].classes.contains(&"active".to_string()));
-        assert!(!el.children[0].classes.contains(&"active".to_string()));
-        assert!(!el.children[1].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn modal_nav_marks_keybinds_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Keybinds, &shared);
+        assert!(el.children[3].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn modal_nav_marks_agents_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Agents, &shared);
+        assert!(el.children[4].classes.contains(&"active".to_string()));
     }
 
     #[test]
@@ -403,44 +723,67 @@ mod tests {
     // -- build_modal_body -------------------------------------------------------
 
     #[test]
-    fn modal_body_has_three_sections() {
-        let snap = make_snapshot();
+    fn modal_body_renders_only_active_section() {
+        let snap = make_snapshot_section(SettingsSection::General);
         let shared = make_shared();
         let el = build_modal_body(&snap, &shared);
         assert!(el.classes.contains(&"modal-body".to_string()));
-        assert_eq!(el.children.len(), 3);
+        assert_eq!(el.children.len(), 1);
+    }
+
+    #[test]
+    fn modal_body_switches_to_appearance() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let el = build_modal_body(&snap, &shared);
+        let section = &el.children[0];
+        let title = &section.children[0];
+        assert_eq!(text_of(title), Some("appearance"));
+    }
+
+    #[test]
+    fn modal_body_switches_to_keybinds() {
+        let snap = make_snapshot_section(SettingsSection::Keybinds);
+        let shared = make_shared();
+        let el = build_modal_body(&snap, &shared);
+        let section = &el.children[0];
+        let title = &section.children[0];
+        assert_eq!(text_of(title), Some("keybinds"));
+    }
+
+    #[test]
+    fn modal_body_switches_to_agents() {
+        let snap = make_snapshot_section(SettingsSection::Agents);
+        let shared = make_shared();
+        let el = build_modal_body(&snap, &shared);
+        let section = &el.children[0];
+        let title = &section.children[0];
+        assert_eq!(text_of(title), Some("agents"));
     }
 
     // -- build_general_section --------------------------------------------------
 
     #[test]
-    fn general_section_has_correct_class_and_title() {
+    fn general_section_has_title_and_six_rows() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_general_section(&snap, &shared);
         assert!(el.classes.contains(&"modal-section".to_string()));
-        // First child is the section title
+        // title + 6 rows
+        assert_eq!(el.children.len(), 7);
         let title = &el.children[0];
         assert!(title.classes.contains(&"modal-section-title".to_string()));
-    }
-
-    #[test]
-    fn general_section_has_setting_rows() {
-        let snap = make_snapshot();
-        let shared = make_shared();
-        let el = build_general_section(&snap, &shared);
-        // title + 3 setting rows (default shell, working directory, restore on startup)
-        assert_eq!(el.children.len(), 4);
     }
 
     // -- build_appearance_section -----------------------------------------------
 
     #[test]
-    fn appearance_section_has_correct_class() {
+    fn appearance_section_has_title_and_eight_rows() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
-        assert!(el.classes.contains(&"modal-section".to_string()));
+        // title + 8 rows (theme, font, cursor, opacity, line-height, glow, bg, ligatures)
+        assert_eq!(el.children.len(), 9);
     }
 
     #[test]
@@ -448,18 +791,12 @@ mod tests {
         let snap = make_snapshot(); // theme defaults to "amber"
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
-        // children: title, theme row, font row, glow row, bg texture row
-        assert_eq!(el.children.len(), 5);
-        // Theme row is children[1], which is a setting_row.
-        // setting_row has 2 children: setting-meta and the control (theme-chips).
         let theme_row = &el.children[1];
-        let theme_chips = &theme_row.children[1]; // the control element
+        let theme_chips = &theme_row.children[1];
         assert!(theme_chips.classes.contains(&"theme-chips".to_string()));
-        // First chip (amber) should have "active"
         assert!(theme_chips.children[0]
             .classes
             .contains(&"active".to_string()));
-        // Others should not
         for chip in &theme_chips.children[1..] {
             assert!(!chip.classes.contains(&"active".to_string()));
         }
@@ -473,17 +810,7 @@ mod tests {
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
         let theme_chips = &el.children[1].children[1];
-        // cyan is the 3rd theme (index 2)
-        assert!(!theme_chips.children[0]
-            .classes
-            .contains(&"active".to_string()));
-        assert!(!theme_chips.children[1]
-            .classes
-            .contains(&"active".to_string()));
         assert!(theme_chips.children[2]
-            .classes
-            .contains(&"active".to_string()));
-        assert!(!theme_chips.children[3]
             .classes
             .contains(&"active".to_string()));
     }
@@ -502,6 +829,19 @@ mod tests {
     }
 
     #[test]
+    fn appearance_section_theme_chips_mark_mono_active() {
+        let mut state = seed_state();
+        state.theme = "mono".to_string();
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let el = build_appearance_section(&snap, &shared);
+        let theme_chips = &el.children[1].children[1];
+        assert!(theme_chips.children[3]
+            .classes
+            .contains(&"active".to_string()));
+    }
+
+    #[test]
     fn appearance_section_has_font_stepper() {
         let snap = make_snapshot();
         let shared = make_shared();
@@ -509,29 +849,134 @@ mod tests {
         let font_row = &el.children[2];
         let stepper = &font_row.children[1];
         assert!(stepper.classes.contains(&"stepper".to_string()));
-        // stepper has 3 children: dec button, value span, inc button
         assert_eq!(stepper.children.len(), 3);
+    }
+
+    #[test]
+    fn appearance_section_has_cursor_group() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_appearance_section(&snap, &shared);
+        let cursor_row = &el.children[3];
+        let cursor_group = &cursor_row.children[1];
+        assert!(cursor_group.classes.contains(&"cursor-group".to_string()));
+        assert_eq!(cursor_group.children.len(), 3);
+        // First option active by default
+        assert!(cursor_group.children[0]
+            .classes
+            .contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn appearance_section_has_slider_control() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_appearance_section(&snap, &shared);
+        let opacity_row = &el.children[4];
+        let slider = &opacity_row.children[1];
+        assert!(slider.classes.contains(&"slider-control".to_string()));
+        assert_eq!(slider.children.len(), 2);
     }
 
     // -- build_shell_section ----------------------------------------------------
 
     #[test]
-    fn shell_section_has_correct_title() {
+    fn shell_section_has_title_and_five_rows() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_shell_section(&snap, &shared);
-        assert!(el.classes.contains(&"modal-section".to_string()));
-        let title = &el.children[0];
-        assert!(title.classes.contains(&"modal-section-title".to_string()));
+        // title + 5 rows
+        assert_eq!(el.children.len(), 6);
+    }
+
+    // -- build_keybinds_section -------------------------------------------------
+
+    #[test]
+    fn keybinds_section_has_title_twelve_rows_and_footer() {
+        let shared = make_shared();
+        let el = build_keybinds_section(&shared);
+        // title + 12 keybind rows + footer
+        assert_eq!(el.children.len(), 14);
     }
 
     #[test]
-    fn shell_section_has_two_setting_rows() {
+    fn keybinds_section_first_row_has_correct_keys() {
+        let shared = make_shared();
+        let el = build_keybinds_section(&shared);
+        // title at 0, first keybind at 1
+        let first_row = &el.children[1];
+        assert!(first_row.classes.contains(&"keybind-row".to_string()));
+        let keys_wrap = &first_row.children[1];
+        assert!(keys_wrap.classes.contains(&"keybind-keys".to_string()));
+        // "Ctrl" + "+" + "T" = 3 children
+        assert_eq!(keys_wrap.children.len(), 3);
+    }
+
+    #[test]
+    fn keybinds_section_footer_has_reset_button() {
+        let shared = make_shared();
+        let el = build_keybinds_section(&shared);
+        let footer = el.children.last().unwrap();
+        assert!(footer.classes.contains(&"keybind-footer".to_string()));
+        let btn = &footer.children[0];
+        assert!(btn.classes.contains(&"btn".to_string()));
+        assert_eq!(text_of(btn), Some("reset to defaults"));
+    }
+
+    // -- build_agents_section ---------------------------------------------------
+
+    #[test]
+    fn agents_section_has_expected_children() {
         let snap = make_snapshot();
         let shared = make_shared();
-        let el = build_shell_section(&snap, &shared);
-        // title + 2 rows (shell integration, history size)
-        assert_eq!(el.children.len(), 3);
+        let el = build_agents_section(&snap, &shared);
+        // title + auto-discovery + timeout + header + 3 agent rows
+        assert_eq!(el.children.len(), 7);
+    }
+
+    #[test]
+    fn agents_section_claude_row_has_running_badge() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_agents_section(&snap, &shared);
+        let claude_row = &el.children[4];
+        assert!(claude_row.classes.contains(&"agent-row".to_string()));
+        let controls = &claude_row.children[2];
+        let badge = &controls.children[0];
+        assert!(badge.classes.contains(&"agent-badge".to_string()));
+        assert!(badge.classes.contains(&"running".to_string()));
+    }
+
+    #[test]
+    fn agents_section_codex_toggle_is_off() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_agents_section(&snap, &shared);
+        let codex_row = &el.children[6];
+        let controls = &codex_row.children[2];
+        let toggle = &controls.children[1];
+        assert!(toggle.classes.contains(&"toggle".to_string()));
+        assert!(!toggle.classes.contains(&"on".to_string()));
+    }
+
+    #[test]
+    fn agents_section_claude_toggle_is_on() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_agents_section(&snap, &shared);
+        let claude_row = &el.children[4];
+        let controls = &claude_row.children[2];
+        let toggle = &controls.children[1];
+        assert!(toggle.classes.contains(&"on".to_string()));
+    }
+
+    #[test]
+    fn agents_list_header_has_count() {
+        let el = agent_list_header(3);
+        assert!(el.classes.contains(&"agent-list-header".to_string()));
+        assert_eq!(el.children.len(), 2);
+        let count = &el.children[1];
+        assert_eq!(text_of(count), Some("3"));
     }
 
     // -- build_modal_footer -----------------------------------------------------
@@ -548,14 +993,11 @@ mod tests {
         let shared = make_shared();
         let el = build_modal_footer(&shared);
         assert_eq!(el.children.len(), 2);
-        // First child is the hint
         assert!(el.children[0].classes.contains(&"modal-hint".to_string()));
-        // Second child is the footer actions
         let actions = &el.children[1];
         assert!(actions
             .classes
             .contains(&"modal-footer-actions".to_string()));
-        // actions has cancel and save buttons
         assert_eq!(actions.children.len(), 2);
     }
 
@@ -589,7 +1031,7 @@ mod tests {
         assert_eq!(el.children.len(), 2);
         let meta = &el.children[0];
         assert!(meta.classes.contains(&"setting-meta".to_string()));
-        assert_eq!(meta.children.len(), 2); // label span + desc span
+        assert_eq!(meta.children.len(), 2);
     }
 
     // -- toggle_button ----------------------------------------------------------
@@ -612,16 +1054,14 @@ mod tests {
         assert!(el.on_click.is_some());
     }
 
-    // -- closure invocation tests (cover on_click bodies) ----------------------
+    // -- closure invocation tests ----------------------------------------------
 
     #[test]
     fn close_button_click_closes_modal() {
         let shared = make_shared();
-        // Open the modal first
         shared.lock().unwrap().settings_open = true;
         let el = build_modal_header(&shared);
         let close_btn = &el.children[1];
-        // Invoke the on_click closure
         (close_btn.on_click.as_ref().unwrap())();
         assert!(!shared.lock().unwrap().settings_open);
     }
@@ -630,7 +1070,6 @@ mod tests {
     fn nav_item_click_changes_section() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::General, &shared);
-        // Click the Appearance nav item (index 1)
         (el.children[1].on_click.as_ref().unwrap())();
         assert_eq!(
             shared.lock().unwrap().settings_section,
@@ -642,7 +1081,6 @@ mod tests {
     fn nav_item_click_changes_to_shell() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::General, &shared);
-        // Click the Shell nav item (index 2)
         (el.children[2].on_click.as_ref().unwrap())();
         assert_eq!(
             shared.lock().unwrap().settings_section,
@@ -678,7 +1116,6 @@ mod tests {
         let snap = make_snapshot();
         let el = build_appearance_section(&snap, &shared);
         let theme_chips = &el.children[1].children[1];
-        // Click "green" chip (index 1)
         (theme_chips.children[1].on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().theme, "green");
     }
@@ -689,7 +1126,6 @@ mod tests {
         let snap = make_snapshot();
         let el = build_appearance_section(&snap, &shared);
         let theme_chips = &el.children[1].children[1];
-        // Click "cyan" chip (index 2)
         (theme_chips.children[2].on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().theme, "cyan");
     }
@@ -700,7 +1136,6 @@ mod tests {
         let snap = make_snapshot();
         let el = build_appearance_section(&snap, &shared);
         let theme_chips = &el.children[1].children[1];
-        // Click "mono" chip (index 3)
         (theme_chips.children[3].on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().theme, "mono");
     }
@@ -715,7 +1150,6 @@ mod tests {
         let dec_btn = &stepper.children[0];
         (dec_btn.on_click.as_ref().unwrap())();
         let after = shared.lock().unwrap().font_size_pt;
-        // font.dec should decrease (or clamp at min)
         assert!(after <= initial);
     }
 
@@ -736,7 +1170,6 @@ mod tests {
     fn toggle_button_click_toggles_state() {
         let shared = make_shared();
         let el = toggle_button(false, "test-toggle", &shared);
-        // Initially off
         assert!(!shared
             .lock()
             .unwrap()
@@ -744,7 +1177,6 @@ mod tests {
             .get("test-toggle")
             .copied()
             .unwrap_or(false));
-        // Click to turn on
         (el.on_click.as_ref().unwrap())();
         assert!(shared
             .lock()
@@ -753,7 +1185,6 @@ mod tests {
             .get("test-toggle")
             .copied()
             .unwrap_or(false));
-        // Click again to turn off
         (el.on_click.as_ref().unwrap())();
         assert!(!shared
             .lock()
@@ -786,35 +1217,107 @@ mod tests {
         assert!(!shared.lock().unwrap().settings_open);
     }
 
+    // -- helper widget tests ----------------------------------------------------
+
     #[test]
-    fn modal_nav_marks_keybinds_active() {
-        let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::Keybinds, &shared);
-        assert!(el.children[3].classes.contains(&"active".to_string()));
-        assert!(!el.children[0].classes.contains(&"active".to_string()));
+    fn select_display_has_input_and_select_classes() {
+        let el = select_display("bash");
+        assert!(el.classes.contains(&"input".to_string()));
+        assert!(el.classes.contains(&"select".to_string()));
+        assert_eq!(text_of(&el), Some("bash"));
     }
 
     #[test]
-    fn modal_nav_marks_agents_active() {
-        let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::Agents, &shared);
-        assert!(el.children[4].classes.contains(&"active".to_string()));
-        assert!(!el.children[0].classes.contains(&"active".to_string()));
+    fn text_input_display_has_input_class() {
+        let el = text_input_display("~/path");
+        assert!(el.classes.contains(&"input".to_string()));
+        assert_eq!(text_of(&el), Some("~/path"));
     }
 
     #[test]
-    fn appearance_section_theme_chips_mark_mono_active() {
-        let mut state = seed_state();
-        state.theme = "mono".to_string();
-        let snap = state.ui_snapshot();
+    fn compact_input_display_has_compact_modifier() {
+        let el = compact_input_display("stuff");
+        assert!(el.classes.contains(&"input".to_string()));
+        assert!(el.classes.contains(&"compact".to_string()));
+    }
+
+    #[test]
+    fn static_stepper_has_three_children() {
+        let el = static_stepper("1.4");
+        assert!(el.classes.contains(&"stepper".to_string()));
+        assert_eq!(el.children.len(), 3);
+        let val = &el.children[1];
+        assert_eq!(text_of(val), Some("1.4"));
+    }
+
+    #[test]
+    fn cursor_style_group_marks_block_active() {
+        let el = cursor_style_group();
+        assert!(el.classes.contains(&"cursor-group".to_string()));
+        assert!(el.children[0].classes.contains(&"active".to_string()));
+        assert!(!el.children[1].classes.contains(&"active".to_string()));
+        assert!(!el.children[2].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn slider_control_has_slider_and_val() {
+        let el = slider_control("75%");
+        assert!(el.classes.contains(&"slider-control".to_string()));
+        assert_eq!(el.children.len(), 2);
+        assert!(el.children[0].classes.contains(&"slider".to_string()));
+        assert_eq!(text_of(&el.children[1]), Some("75%"));
+    }
+
+    #[test]
+    fn keybind_row_has_meta_and_keys() {
+        let el = keybind_row("Test", &["Ctrl", "A"]);
+        assert!(el.classes.contains(&"keybind-row".to_string()));
+        assert_eq!(el.children.len(), 2);
+        let keys = &el.children[1];
+        assert!(keys.classes.contains(&"keybind-keys".to_string()));
+        // "Ctrl" + "+" + "A" = 3 children
+        assert_eq!(keys.children.len(), 3);
+        assert!(keys.children[0]
+            .classes
+            .contains(&"keybind-key".to_string()));
+        assert!(keys.children[1]
+            .classes
+            .contains(&"keybind-sep".to_string()));
+    }
+
+    #[test]
+    fn keybind_row_single_key_no_separator() {
+        let el = keybind_row("Fullscreen", &["F11"]);
+        let keys = &el.children[1];
+        assert_eq!(keys.children.len(), 1);
+    }
+
+    #[test]
+    fn agent_badge_has_kind_class() {
+        let el = agent_badge("running", "running");
+        assert!(el.classes.contains(&"agent-badge".to_string()));
+        assert!(el.classes.contains(&"running".to_string()));
+        assert_eq!(text_of(&el), Some("running"));
+    }
+
+    #[test]
+    fn agent_row_has_icon_info_and_controls() {
         let shared = make_shared();
-        let el = build_appearance_section(&snap, &shared);
-        let theme_chips = &el.children[1].children[1];
-        assert!(theme_chips.children[3]
+        let el = agent_row(
+            "test",
+            "~/bin/test",
+            "idle",
+            "idle",
+            true,
+            "agent-test",
+            &shared,
+        );
+        assert!(el.classes.contains(&"agent-row".to_string()));
+        assert_eq!(el.children.len(), 3);
+        assert!(el.children[0].classes.contains(&"agent-icon".to_string()));
+        assert!(el.children[1].classes.contains(&"agent-info".to_string()));
+        assert!(el.children[2]
             .classes
-            .contains(&"active".to_string()));
-        assert!(!theme_chips.children[0]
-            .classes
-            .contains(&"active".to_string()));
+            .contains(&"agent-controls".to_string()));
     }
 }

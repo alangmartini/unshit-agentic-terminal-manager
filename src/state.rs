@@ -464,9 +464,19 @@ pub fn seed_state() -> AppState {
 
     let mut toggles = BTreeMap::new();
     toggles.insert("restore-on-startup".to_string(), true);
+    toggles.insert("confirm-close".to_string(), true);
+    toggles.insert("start-minimized".to_string(), false);
+    toggles.insert("check-updates".to_string(), true);
     toggles.insert("glow-effect".to_string(), true);
     toggles.insert("background-texture".to_string(), true);
+    toggles.insert("font-ligatures".to_string(), true);
     toggles.insert("shell-integration".to_string(), true);
+    toggles.insert("scroll-on-output".to_string(), true);
+    toggles.insert("bell-notification".to_string(), false);
+    toggles.insert("auto-discovery".to_string(), true);
+    toggles.insert("agent-claude".to_string(), true);
+    toggles.insert("agent-amp".to_string(), true);
+    toggles.insert("agent-codex".to_string(), false);
 
     AppState {
         workspaces,
