@@ -1,6 +1,6 @@
 //! Tests for the CellGrid rendering primitive.
 
-use unshit_core::cell_grid::{color_256, Cell, CellAttrs, CellGrid, ANSI_16};
+use unshit_core::cell_grid::{color_256, Cell, CellAttrs, CellGrid, LineDamage, ANSI_16};
 use unshit_core::style::types::Color;
 
 // ---------------------------------------------------------------------------
@@ -436,4 +436,226 @@ fn element_content_grid_variant_equality() {
     let g2 = CellGrid::new(2, 2);
     assert_eq!(ElementContent::Grid(g1.clone()), ElementContent::Grid(g2));
     assert_ne!(ElementContent::Grid(g1), ElementContent::None);
+}
+
+// ---------------------------------------------------------------------------
+// Line damage tracking (Tier 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn line_damage_default_is_clean() {
+    let ld = LineDamage::default();
+    assert!(ld.is_clean());
+    assert_eq!(ld.first_dirty_col, u16::MAX);
+    assert_eq!(ld.seqno, 0);
+}
+
+#[test]
+fn line_damage_mark_col_expands_range_and_bumps_seqno() {
+    let mut ld = LineDamage::default();
+    ld.mark_col(5);
+    assert!(!ld.is_clean());
+    assert_eq!(ld.first_dirty_col, 5);
+    assert_eq!(ld.last_dirty_col, 5);
+    assert_eq!(ld.seqno, 1);
+
+    ld.mark_col(10);
+    assert_eq!(ld.first_dirty_col, 5);
+    assert_eq!(ld.last_dirty_col, 10);
+    assert_eq!(ld.seqno, 2);
+
+    ld.mark_col(2);
+    assert_eq!(ld.first_dirty_col, 2);
+    assert_eq!(ld.last_dirty_col, 10);
+    assert_eq!(ld.seqno, 3);
+}
+
+#[test]
+fn line_damage_clear_cols_preserves_seqno() {
+    let mut ld = LineDamage::default();
+    ld.mark_col(3);
+    ld.mark_col(9);
+    let seqno = ld.seqno;
+    ld.clear_cols();
+    assert!(ld.is_clean());
+    assert_eq!(ld.seqno, seqno);
+}
+
+#[test]
+fn new_grid_marks_every_line_fully_damaged() {
+    let g = CellGrid::new(3, 5);
+    let ld = g.line_damage();
+    assert_eq!(ld.len(), 3);
+    for row in ld {
+        assert!(!row.is_clean());
+        assert_eq!(row.first_dirty_col, 0);
+        assert_eq!(row.last_dirty_col, 4);
+    }
+}
+
+#[test]
+fn set_cell_dirties_only_its_line() {
+    let mut g = CellGrid::new(3, 5);
+    g.clear_dirty();
+    let seq_before_0 = g.line_damage()[0].seqno;
+    let seq_before_1 = g.line_damage()[1].seqno;
+    let seq_before_2 = g.line_damage()[2].seqno;
+
+    g.set_cell(1, 3, Cell::with_char('X'));
+
+    // Row 1 becomes dirty with col 3..=3 and its seqno bumps.
+    assert!(!g.line_damage()[1].is_clean());
+    assert_eq!(g.line_damage()[1].first_dirty_col, 3);
+    assert_eq!(g.line_damage()[1].last_dirty_col, 3);
+    assert_eq!(g.line_damage()[1].seqno, seq_before_1 + 1);
+
+    // Other rows stay clean with unchanged seqno.
+    assert!(g.line_damage()[0].is_clean());
+    assert!(g.line_damage()[2].is_clean());
+    assert_eq!(g.line_damage()[0].seqno, seq_before_0);
+    assert_eq!(g.line_damage()[2].seqno, seq_before_2);
+}
+
+#[test]
+fn clear_dirty_resets_cols_but_keeps_seqno_monotonic() {
+    let mut g = CellGrid::new(2, 4);
+    g.clear_dirty();
+    g.set_cell(0, 1, Cell::with_char('A'));
+    let bumped = g.line_damage()[0].seqno;
+    assert!(bumped > 0);
+
+    g.clear_dirty();
+    assert!(g.line_damage()[0].is_clean());
+    // Seqno must NOT be reset — renderers compare it to a checkpoint.
+    assert_eq!(g.line_damage()[0].seqno, bumped);
+}
+
+#[test]
+fn vte_write_bumps_seqno_for_touched_row_only() {
+    // Simulates the monotonic seqno contract: each cell write increments the
+    // row's seqno even if the cell value is the same.
+    let mut g = CellGrid::new(2, 3);
+    g.clear_dirty();
+    let s0_initial = g.line_damage()[0].seqno;
+    let s1_initial = g.line_damage()[1].seqno;
+
+    // Write the same char 3x to row 0.
+    g.set_cell(0, 0, Cell::with_char('A'));
+    g.set_cell(0, 0, Cell::with_char('A'));
+    g.set_cell(0, 0, Cell::with_char('A'));
+
+    assert_eq!(g.line_damage()[0].seqno, s0_initial + 3);
+    // Row 1 untouched.
+    assert_eq!(g.line_damage()[1].seqno, s1_initial);
+}
+
+#[test]
+fn renderer_can_skip_line_using_seqno_checkpoint() {
+    // The checkpoint pattern: renderer stores last-seen seqno per row and
+    // skips rows whose current seqno equals the checkpoint.
+    let mut g = CellGrid::new(2, 3);
+    g.set_cell(0, 0, Cell::with_char('A'));
+    g.set_cell(1, 0, Cell::with_char('B'));
+
+    // Renderer processes and checkpoints.
+    let checkpoints: Vec<u64> = g.line_damage().iter().map(|ld| ld.seqno).collect();
+    g.clear_dirty();
+
+    // No writes happened. Renderer should see seqnos match.
+    for (row, &expected) in checkpoints.iter().enumerate() {
+        assert_eq!(g.line_damage()[row].seqno, expected);
+    }
+
+    // Now write to row 0 only.
+    g.set_cell(0, 1, Cell::with_char('C'));
+    assert_ne!(g.line_damage()[0].seqno, checkpoints[0]);
+    assert_eq!(g.line_damage()[1].seqno, checkpoints[1]);
+}
+
+#[test]
+fn scroll_up_shifts_damage_with_grid() {
+    // When we scroll up by 1, row 1 content moves to row 0, etc. The damage
+    // map must move with it so clean rows stay clean (positionally). The
+    // newly exposed bottom row becomes fully damaged.
+    let mut g = CellGrid::new(3, 4);
+    g.clear_dirty();
+
+    // Dirty only the middle row.
+    g.set_cell(1, 2, Cell::with_char('M'));
+    let ld_mid_before = g.line_damage()[1];
+    assert!(!ld_mid_before.is_clean());
+
+    // Before scrolling, rows 0 and 2 are clean.
+    assert!(g.line_damage()[0].is_clean());
+    assert!(g.line_damage()[2].is_clean());
+
+    g.scroll_up(1);
+
+    // After scroll_up(1): the old middle row's damage now sits at row 0.
+    assert!(!g.line_damage()[0].is_clean());
+    assert_eq!(g.line_damage()[0].first_dirty_col, 2);
+    assert_eq!(g.line_damage()[0].last_dirty_col, 2);
+    // The previously clean row 2 is now at row 1, but scroll bumped every
+    // shifted row's seqno so renderers re-paint (content moved visually).
+    assert!(g.line_damage()[0].seqno > ld_mid_before.seqno);
+    // Bottom row is newly exposed -> fully damaged.
+    assert!(!g.line_damage()[2].is_clean());
+    assert_eq!(g.line_damage()[2].first_dirty_col, 0);
+    assert_eq!(g.line_damage()[2].last_dirty_col, 3);
+}
+
+#[test]
+fn scroll_up_zero_does_not_touch_damage() {
+    let mut g = CellGrid::new(2, 2);
+    g.set_cell(0, 0, Cell::with_char('A'));
+    g.clear_dirty();
+    let pre: Vec<LineDamage> = g.line_damage().to_vec();
+    g.scroll_up(0);
+    assert_eq!(g.line_damage(), pre.as_slice());
+}
+
+#[test]
+fn resize_rebuilds_line_damage_and_marks_all() {
+    let mut g = CellGrid::new(2, 3);
+    g.clear_dirty();
+    assert!(g.line_damage().iter().all(|ld| ld.is_clean()));
+
+    g.resize(4, 5);
+    assert_eq!(g.line_damage().len(), 4);
+    for ld in g.line_damage() {
+        assert!(!ld.is_clean());
+        assert_eq!(ld.first_dirty_col, 0);
+        assert_eq!(ld.last_dirty_col, 4);
+    }
+}
+
+#[test]
+fn clear_marks_every_line_damaged() {
+    let mut g = CellGrid::new(2, 3);
+    g.clear_dirty();
+    g.clear();
+    for ld in g.line_damage() {
+        assert!(!ld.is_clean());
+        assert_eq!(ld.first_dirty_col, 0);
+        assert_eq!(ld.last_dirty_col, 2);
+    }
+}
+
+#[test]
+fn set_wide_cell_marks_both_columns() {
+    let mut g = CellGrid::new(1, 4);
+    g.clear_dirty();
+    g.set_wide_cell(0, 1, Cell::with_char('漢'));
+    let ld = g.line_damage()[0];
+    assert!(!ld.is_clean());
+    assert_eq!(ld.first_dirty_col, 1);
+    assert_eq!(ld.last_dirty_col, 2);
+}
+
+#[test]
+fn line_damage_for_out_of_bounds_returns_none() {
+    let g = CellGrid::new(2, 2);
+    assert!(g.line_damage_for(0).is_some());
+    assert!(g.line_damage_for(1).is_some());
+    assert!(g.line_damage_for(2).is_none());
 }
