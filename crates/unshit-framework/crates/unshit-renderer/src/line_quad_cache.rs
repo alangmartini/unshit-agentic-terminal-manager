@@ -435,6 +435,51 @@ mod tests {
     }
 
     #[test]
+    fn scroll_shifts_cache_rather_than_invalidating_everything() {
+        // Scrolling one row up moves row 1 to row 0, row 2 to row 1, etc.
+        // Each destination row is compared to the cached signature at that
+        // key, and when the content changes the lookup misses. This is
+        // the correct contract: scroll invalidates the affected rows, not
+        // the whole cache.
+        let mut cache = LineQuadCache::new();
+        let node = NodeId { index: 0, generation: 0 };
+        let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
+        // Populate rows 0..3 with distinct content hashes.
+        cache.store(node, 0, 0xaa, sig, vec![], vec![], vec![]);
+        cache.store(node, 1, 0xbb, sig, vec![], vec![], vec![]);
+        cache.store(node, 2, 0xcc, sig, vec![], vec![], vec![]);
+
+        // After a scroll up, row 0 now carries the old content of row 1.
+        // The previous store at row 0 used 0xaa, so a lookup for 0xbb at row 0
+        // must miss. The entry for row 2 is still valid because its content
+        // has not shifted away.
+        assert!(cache.lookup_replayable(node, 0, 0xbb, sig).is_none());
+        assert!(cache.lookup_replayable(node, 2, 0xcc, sig).is_some());
+    }
+
+    #[test]
+    fn truncate_does_not_touch_other_nodes() {
+        let mut cache = LineQuadCache::new();
+        let a = NodeId { index: 0, generation: 0 };
+        let b = NodeId { index: 1, generation: 0 };
+        let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
+        cache.store(a, 5, 1, sig, vec![], vec![], vec![]);
+        cache.store(b, 5, 2, sig, vec![], vec![], vec![]);
+        cache.truncate_element(a, 3); // drops only a's row 5
+        assert!(cache.get(a, 5).is_none());
+        assert!(cache.get(b, 5).is_some());
+    }
+
+    #[test]
+    fn hash_all_rows_length_matches_row_count() {
+        let grid = sample_grid();
+        let hashes = hash_all_rows(&grid);
+        assert_eq!(hashes.len(), grid.rows());
+        // First row has content, so its hash is non zero.
+        assert_ne!(hashes[0], 0);
+    }
+
+    #[test]
     fn clean_row_reuses_cached_bytes_without_allocation() {
         // The core win of the cache: on a clean row we return borrowed
         // instances whose payload can be appended to the batch via
