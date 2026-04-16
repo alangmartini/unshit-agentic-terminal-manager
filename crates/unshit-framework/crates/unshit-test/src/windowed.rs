@@ -24,7 +24,7 @@ use unshit_core::layout::{TextMeasureCache, TextMeasureCtx};
 use unshit_core::scroll::ScrollbarVisualState;
 use unshit_core::style::parse::CompiledStylesheet;
 use unshit_core::tree::NodeArena;
-use unshit_renderer::batch::{self, BatchCache, ShapedTextCache};
+use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache};
 use unshit_renderer::gpu::GpuContext;
 
 use crate::query::{matches_selector, snapshot_from};
@@ -71,6 +71,7 @@ struct WindowedState {
     dw_rasterizer: DwRasterizer,
     shaped_cache: ShapedTextCache,
     batch_cache: BatchCache,
+    shape_cache: ShapeCache,
     interaction: InteractionState,
     measure_cache: TextMeasureCache,
     scale_factor: f32,
@@ -146,6 +147,7 @@ impl ApplicationHandler for InitHandler<'_> {
             dw_rasterizer: DwRasterizer::new("Consolas"),
             shaped_cache: ShapedTextCache::new(),
             batch_cache: BatchCache::new(),
+            shape_cache: ShapeCache::new(),
             interaction: InteractionState::default(),
             measure_cache,
             scale_factor,
@@ -381,6 +383,7 @@ impl WindowedTest {
             &mut state.measure_cache,
             &mut state.shaped_cache,
             &mut state.gpu.svg_cache,
+            &mut state.shape_cache,
             state.interaction.text_selection.as_ref(),
             None,
             &state.scrollbar_visual,
