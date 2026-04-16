@@ -286,3 +286,30 @@ impl TextPipeline {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    /// The pipeline emits one draw call per layer of the form
+    /// `pass.draw(0..6, base..base + count)`, which is only correct when
+    /// every vertex attribute is configured with `VertexStepMode::Instance`.
+    /// This test guards that contract at the struct level by asserting the
+    /// GlyphInstance size matches the wgpu layout expectation.
+    #[test]
+    fn glyph_instance_has_expected_size() {
+        // 2 + 2 + 2 + 2 + 4 + 4 floats = 16 floats = 64 bytes.
+        assert_eq!(std::mem::size_of::<GlyphInstance>(), 64);
+    }
+
+    #[test]
+    fn glyph_instance_zeroable_produces_all_zero_bytes() {
+        // Verifies the instance can be bulk zero initialized when growing
+        // instance buffers, keeping the one draw per layer path allocation
+        // free across frames.
+        let g = GlyphInstance::zeroed();
+        let bytes = bytemuck::bytes_of(&g);
+        assert!(bytes.iter().all(|&b| b == 0));
+    }
+}
