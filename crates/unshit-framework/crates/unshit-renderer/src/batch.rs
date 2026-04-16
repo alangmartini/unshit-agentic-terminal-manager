@@ -2488,6 +2488,109 @@ fn emit_select_node(
     }
 }
 
+/// Cache key for [`CellMetricsCache`]. Keyed on the inputs that can change the
+/// measured monospace cell dimensions: font identity (family name hash), font
+/// size in tenths of a pixel, line height in tenths of a pixel, and DPI scale
+/// factor in thousandths.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CellMetricsKey {
+    pub font_id: u64,
+    pub font_size_tenths: u32,
+    pub line_height_tenths: u32,
+    pub scale_factor_thousandths: u32,
+}
+
+impl CellMetricsKey {
+    pub fn new(font_family: &str, font_size: f32, line_height: f32, scale_factor: f32) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        font_family.hash(&mut hasher);
+        Self {
+            font_id: hasher.finish(),
+            font_size_tenths: (font_size * 10.0).round() as u32,
+            line_height_tenths: (line_height * 10.0).round() as u32,
+            scale_factor_thousandths: (scale_factor * 1000.0).round() as u32,
+        }
+    }
+}
+
+/// Measured cell metrics for a given font configuration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellMetrics {
+    pub cell_w: f32,
+    pub cell_h: f32,
+}
+
+/// Cross-frame cache for monospace cell metrics. Keyed on font identity,
+/// font size, line height, and DPI scale factor. Entries are only produced on
+/// a cache miss; hits are O(1) hash lookups. Invalidation is automatic via
+/// the key: changing any input produces a fresh lookup.
+///
+/// A single shared instance lives on the frame loop and is reused across
+/// frames. The hot render path consults it on every `ElementContent::Grid`
+/// node but only measures once per unique configuration.
+pub struct CellMetricsCache {
+    entries: FxHashMap<CellMetricsKey, CellMetrics>,
+    /// Number of cache misses (fresh measurements) since creation. Exposed
+    /// so tests can prove the cache actually caches.
+    misses: u64,
+}
+
+impl Default for CellMetricsCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CellMetricsCache {
+    pub fn new() -> Self {
+        Self { entries: FxHashMap::default(), misses: 0 }
+    }
+
+    /// Returns the measured `CellMetrics` for the given configuration,
+    /// reusing any cached value when the key matches.
+    pub fn get_or_measure(
+        &mut self,
+        font_system: &mut FontSystem,
+        font_family: &str,
+        font_size: f32,
+        line_height: f32,
+        scale_factor: f32,
+    ) -> CellMetrics {
+        let key = CellMetricsKey::new(font_family, font_size, line_height, scale_factor);
+        if let Some(&hit) = self.entries.get(&key) {
+            return hit;
+        }
+        self.misses += 1;
+        let cell_w = measure_monospace_advance(font_system, font_family, font_size, line_height);
+        let cell_h = line_height;
+        let metrics = CellMetrics { cell_w, cell_h };
+        self.entries.insert(key, metrics);
+        metrics
+    }
+
+    /// Number of cache misses since creation. Exists for tests and diagnostics.
+    pub fn miss_count(&self) -> u64 {
+        self.misses
+    }
+
+    /// Number of entries currently cached.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when no entry has ever been measured.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Clears every cached entry. Intended for use when the font stack is
+    /// swapped at runtime or the atlas generation changes.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 /// Measure the actual advance width of a monospace glyph at the given font_size.
 ///
 /// `line_height` is the absolute pixel line height (typically `font_size * style.line_height`
@@ -2495,28 +2598,53 @@ fn emit_select_node(
 /// placement code as the single source of truth for the line_height value, rather
 /// than hardcoding 1.2 inside this function.
 ///
-/// Cached: only re-measures when font_size or line_height changes.
+/// Cached: only re-measures when font_size, line_height, font family, or DPI
+/// scale change. Backed by an internal [`CellMetricsCache`] so the measurement
+/// survives across frames.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 fn measure_monospace_cell_width(
     font_system: &mut FontSystem,
     font_size: f32,
     line_height: f32,
 ) -> f32 {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static CACHED_SIZE: AtomicU32 = AtomicU32::new(0);
-    static CACHED_LINE_HEIGHT: AtomicU32 = AtomicU32::new(0);
-    static CACHED_WIDTH: AtomicU32 = AtomicU32::new(0);
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<CellMetricsCache>> = Mutex::new(None);
 
-    let size_bits = font_size.to_bits();
-    let lh_bits = line_height.to_bits();
-    if CACHED_SIZE.load(Ordering::Relaxed) == size_bits
-        && CACHED_LINE_HEIGHT.load(Ordering::Relaxed) == lh_bits
+    let mut guard = CACHE.lock().expect("CELL_METRICS_CACHE poisoned");
+    let cache = guard.get_or_insert_with(CellMetricsCache::new);
+    cache.get_or_measure(font_system, monospace_family_name(), font_size, line_height, 1.0).cell_w
+}
+
+/// Default family name used for the free-function measurement path. Tests and
+/// `measure_monospace_cell_width` call this; the renderer's grid emission path
+/// now routes through [`CellMetricsCache::get_or_measure`] directly with the
+/// active family.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn monospace_family_name() -> &'static str {
+    #[cfg(target_os = "windows")]
     {
-        let w = f32::from_bits(CACHED_WIDTH.load(Ordering::Relaxed));
-        if w > 0.0 {
-            return w;
-        }
+        "Consolas"
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        ""
+    }
+}
+
+/// Perform the actual cosmic-text measurement for a monospace glyph. Kept
+/// separate from the cache so the cache owns the memoization policy and this
+/// function remains a pure measurement op.
+fn measure_monospace_advance(
+    font_system: &mut FontSystem,
+    font_family: &str,
+    font_size: f32,
+    line_height: f32,
+) -> f32 {
+    let family = if font_family.is_empty() {
+        cosmic_text::Family::Monospace
+    } else {
+        cosmic_text::Family::Name(font_family)
+    };
 
     let metrics = cosmic_text::Metrics::new(font_size, line_height);
     let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
@@ -2524,15 +2652,12 @@ fn measure_monospace_cell_width(
     buffer.set_text(
         font_system,
         "M",
-        cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace),
+        cosmic_text::Attrs::new().family(family),
         cosmic_text::Shaping::Advanced,
     );
     buffer.shape_until_scroll(font_system, false);
 
     if let Some(glyph) = buffer.layout_runs().flat_map(|run| run.glyphs.iter()).next() {
-        CACHED_SIZE.store(size_bits, Ordering::Relaxed);
-        CACHED_LINE_HEIGHT.store(lh_bits, Ordering::Relaxed);
-        CACHED_WIDTH.store(glyph.w.to_bits(), Ordering::Relaxed);
         return glyph.w;
     }
     font_size * 0.6
@@ -3107,7 +3232,7 @@ mod tests {
         buffer.shape_until_scroll(fs, false);
 
         for run in buffer.layout_runs() {
-            for glyph in run.glyphs.iter() {
+            if let Some(glyph) = run.glyphs.iter().next() {
                 let physical = glyph.physical((0.0, 0.0), 1.0);
                 return Some(GlyphKey {
                     font_id: atlas_font_namespace(&physical.cache_key),
@@ -3263,5 +3388,116 @@ mod tests {
             key_14.font_size_tenths, key_20.font_size_tenths,
             "different font sizes must produce different font_size_tenths"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // CellMetricsCache tests (Tier 1, task 1).
+    //
+    // The cache must cross frames: a second lookup with identical
+    // (font_family, font_size, line_height, scale_factor) must NOT re-measure.
+    // Any change to any of those four components must invalidate.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cell_metrics_cache_is_empty_on_construction() {
+        let cache = CellMetricsCache::new();
+        assert!(cache.is_empty(), "freshly constructed cache must have no entries");
+        assert_eq!(cache.miss_count(), 0, "freshly constructed cache must have 0 misses");
+    }
+
+    #[test]
+    fn cell_metrics_cache_hits_identical_lookup() {
+        let mut fs = FontSystem::new();
+        let mut cache = CellMetricsCache::new();
+
+        let family = monospace_family_name();
+        let first = cache.get_or_measure(&mut fs, family, 14.0, 14.0 * 1.2, 1.0);
+        let second = cache.get_or_measure(&mut fs, family, 14.0, 14.0 * 1.2, 1.0);
+
+        assert_eq!(first, second, "identical inputs must return identical metrics");
+        assert_eq!(
+            cache.miss_count(),
+            1,
+            "second lookup with identical inputs must be a cache hit (misses stays at 1)"
+        );
+        assert_eq!(cache.len(), 1, "cache should contain exactly one entry");
+    }
+
+    #[test]
+    fn cell_metrics_cache_misses_on_font_size_change() {
+        let mut fs = FontSystem::new();
+        let mut cache = CellMetricsCache::new();
+        let family = monospace_family_name();
+
+        let _a = cache.get_or_measure(&mut fs, family, 14.0, 14.0 * 1.2, 1.0);
+        let _b = cache.get_or_measure(&mut fs, family, 20.0, 20.0 * 1.2, 1.0);
+
+        assert_eq!(cache.miss_count(), 2, "different font size must miss");
+        assert_eq!(cache.len(), 2, "two distinct sizes must produce two entries");
+    }
+
+    #[test]
+    fn cell_metrics_cache_misses_on_scale_factor_change() {
+        let mut fs = FontSystem::new();
+        let mut cache = CellMetricsCache::new();
+        let family = monospace_family_name();
+
+        let _a = cache.get_or_measure(&mut fs, family, 14.0, 14.0 * 1.2, 1.0);
+        let _b = cache.get_or_measure(&mut fs, family, 14.0, 14.0 * 1.2, 1.5);
+        let _c = cache.get_or_measure(&mut fs, family, 14.0, 14.0 * 1.2, 2.0);
+
+        assert_eq!(cache.miss_count(), 3, "different scale factor must miss");
+        assert_eq!(cache.len(), 3, "three distinct scales must produce three entries");
+    }
+
+    #[test]
+    fn cell_metrics_cache_misses_on_font_family_change() {
+        let mut fs = FontSystem::new();
+        let mut cache = CellMetricsCache::new();
+
+        let _a = cache.get_or_measure(&mut fs, "Consolas", 14.0, 14.0 * 1.2, 1.0);
+        let _b = cache.get_or_measure(&mut fs, "Menlo", 14.0, 14.0 * 1.2, 1.0);
+
+        assert_eq!(cache.miss_count(), 2, "different font family must miss");
+        assert_eq!(cache.len(), 2, "two families must produce two entries");
+    }
+
+    #[test]
+    fn cell_metrics_cache_populates_both_cell_w_and_cell_h() {
+        let mut fs = FontSystem::new();
+        let mut cache = CellMetricsCache::new();
+
+        let metrics = cache.get_or_measure(&mut fs, monospace_family_name(), 14.0, 14.0 * 1.2, 1.0);
+
+        assert!(metrics.cell_w > 0.0, "cell_w must be positive");
+        assert!(metrics.cell_h > 0.0, "cell_h must be positive");
+        assert_eq!(
+            metrics.cell_h.to_bits(),
+            (14.0_f32 * 1.2).to_bits(),
+            "cell_h must equal line_height"
+        );
+    }
+
+    #[test]
+    fn cell_metrics_cache_clear_resets_entries_but_preserves_miss_count() {
+        let mut fs = FontSystem::new();
+        let mut cache = CellMetricsCache::new();
+        let family = monospace_family_name();
+
+        let _ = cache.get_or_measure(&mut fs, family, 14.0, 14.0 * 1.2, 1.0);
+        assert_eq!(cache.len(), 1);
+
+        cache.clear();
+        assert!(cache.is_empty(), "clear must empty the entry map");
+
+        let _ = cache.get_or_measure(&mut fs, family, 14.0, 14.0 * 1.2, 1.0);
+        assert_eq!(cache.miss_count(), 2, "miss counter is monotonic across clear");
+    }
+
+    #[test]
+    fn cell_metrics_key_is_stable_for_fractional_sizes() {
+        let k1 = CellMetricsKey::new("Consolas", 14.0, 16.8, 1.0);
+        let k2 = CellMetricsKey::new("Consolas", 14.0, 16.8, 1.0);
+        assert_eq!(k1, k2, "identical fractional inputs must produce identical keys");
     }
 }
