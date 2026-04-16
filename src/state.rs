@@ -643,18 +643,8 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     }
 }
 
-pub fn mutate_add_workspace(state: &mut AppState) {
-    mutate_add_workspace_with_path(state, None);
-}
-
-pub fn mutate_add_workspace_with_path(state: &mut AppState, path: Option<PathBuf>) {
-    let num = state.workspaces.len() as u32 + 1;
-    let name = path
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| format!("workspace-{}", num));
-    state.workspaces.push(Workspace {
+pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace {
+    Workspace {
         num,
         name,
         path,
@@ -670,7 +660,21 @@ pub fn mutate_add_workspace_with_path(state: &mut AppState, path: Option<PathBuf
             icon: Some(SubtabIcon::Terminal),
             tree_glyph: "\u{2514}",
         }],
-    });
+    }
+}
+
+pub fn mutate_add_workspace(state: &mut AppState) {
+    mutate_add_workspace_with_path(state, None);
+}
+
+pub fn mutate_add_workspace_with_path(state: &mut AppState, path: Option<PathBuf>) {
+    let num = state.workspaces.len() as u32 + 1;
+    let name = path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("workspace-{}", num));
+    state.workspaces.push(new_workspace(num, name, path));
     state.active_workspace = state.workspaces.len() - 1;
 }
 
@@ -996,6 +1000,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "workspace.add" => {
             mutate_add_workspace(state);
+            crate::persist::save_workspaces(state);
             true
         }
         "font.inc" => {
@@ -1025,6 +1030,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if let Ok(idx) = other["workspace.remove:".len()..].parse::<usize>() {
                 state.ctx_menu = None;
                 mutate_remove_workspace(state, idx);
+                crate::persist::save_workspaces(state);
                 return true;
             }
             false

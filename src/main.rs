@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod persist;
 pub mod pty;
 pub mod state;
 pub mod terminal;
@@ -16,8 +17,8 @@ use unshit::core::trace::{
 };
 
 use crate::state::{
-    dispatch, mutate_with, resize_all_terminals, seed_state, SharedState, UiSnapshot,
-    MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
+    dispatch, mutate_with, new_workspace, resize_all_terminals, seed_state, SharedState,
+    UiSnapshot, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
 };
 use crate::ui::settings::build_settings_modal;
 use crate::ui::sidebar::{build_ctx_menu_overlay, build_sidebar};
@@ -165,7 +166,28 @@ fn main() {
         ));
     }
 
-    let shared: SharedState = Arc::new(std::sync::Mutex::new(seed_state()));
+    if let Some(path) = persist::default_config_path() {
+        persist::install(path);
+    }
+
+    let mut initial_state = seed_state();
+    if let Some(persisted) = persist::load_workspaces() {
+        if !persisted.workspaces.is_empty() {
+            initial_state.workspaces = persisted
+                .workspaces
+                .into_iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let mut ws = new_workspace((i + 1) as u32, entry.name, entry.path);
+                    ws.collapsed = entry.collapsed;
+                    ws
+                })
+                .collect();
+            let last = initial_state.workspaces.len() - 1;
+            initial_state.active_workspace = persisted.active_workspace.min(last);
+        }
+    }
+    let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
 
     // Measure the actual monospace cell width ratio for later use (split
     // pane spawns, etc.). Do NOT pre-publish cell metrics to the global
