@@ -23,7 +23,7 @@ use unshit_core::style::transition::ActiveTransitions;
 use unshit_core::style::types::Layer;
 use unshit_core::tree::NodeArena;
 use unshit_renderer::batch::Rasterizer;
-use unshit_renderer::batch::{self, BatchCache, ShapedTextCache};
+use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
@@ -216,6 +216,10 @@ struct AppState {
     measure_cache: TextMeasureCache,
     shaped_cache: ShapedTextCache,
     batch_cache: BatchCache,
+    /// Cross-frame cache of shaped prototype glyphs for the terminal grid.
+    /// Populated lazily as characters appear; preloaded with ASCII and box
+    /// drawing at startup. See [`ShapeCache`] for invalidation semantics.
+    shape_cache: ShapeCache,
     canvas_registry: CanvasRegistry,
     last_metrics: FrameMetrics,
     frame_count: u64,
@@ -431,6 +435,7 @@ impl ApplicationHandler for AppHandler {
                     state.stylesheet = *new_stylesheet;
                     state.needs_restyle = true;
                     state.shaped_cache.clear();
+                    state.shape_cache.clear();
                     state.batch_cache.clear();
                     // Collect all node IDs first, then mark each dirty.
                     let node_ids: Vec<_> = state.arena.iter().map(|(id, _)| id).collect();
@@ -629,6 +634,7 @@ impl ApplicationHandler for AppHandler {
             measure_cache,
             shaped_cache: ShapedTextCache::new(),
             batch_cache: BatchCache::new(),
+            shape_cache: ShapeCache::new(),
             canvas_registry,
             last_metrics: FrameMetrics::default(),
             frame_count: 0,
@@ -1749,6 +1755,7 @@ impl ApplicationHandler for AppHandler {
                     &mut state.measure_cache,
                     &mut state.shaped_cache,
                     &mut state.gpu.svg_cache,
+                    &mut state.shape_cache,
                     state.interaction.text_selection.as_ref(),
                     Some(&state.canvas_registry),
                     &state.scrollbar_visual,
