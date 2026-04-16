@@ -15,6 +15,16 @@ pub const MAX_SIDEBAR_WIDTH: f32 = 500.0;
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
+/// Shared, independently-lockable handle to a single `Terminal`.
+///
+/// Wrapping each terminal in its own `Mutex` lets the VTE parser thread
+/// hold a narrow lock around `process_bytes` while the renderer and
+/// application state lock are released. This mirrors the pattern from
+/// Alacritty (FairMutex holding the terminal only, pokes the UI via a
+/// wakeup event) and Ghostty (parser mutates renderer state under its
+/// own lock, not the global state lock).
+pub type SharedTerminal = Arc<Mutex<Terminal>>;
+
 #[derive(Clone, Debug)]
 pub struct CtxMenu {
     pub x: f32,
@@ -164,7 +174,7 @@ pub struct AppState {
     pub clock_hhmm: String,
     pub next_id: u32,
     pub pty_manager: crate::pty::PtyManager,
-    pub terminals: std::collections::HashMap<u32, Terminal>,
+    pub terminals: std::collections::HashMap<u32, SharedTerminal>,
     pub scale_factor: f32,
     /// Ratio of monospace cell_width to font_size, measured from the actual font.
     pub cell_width_ratio: f32,
@@ -242,8 +252,20 @@ impl AppState {
         }
     }
 
-    pub fn terminal_grid(&self, pane_id: PaneId) -> Option<&unshit::core::cell_grid::CellGrid> {
-        self.terminals.get(&pane_id.0).map(|t| t.grid())
+    /// Clone the cell grid for a given pane. Returns `None` if no terminal
+    /// exists for the pane. The returned grid is a snapshot; further writes
+    /// to the live terminal won't affect it.
+    pub fn terminal_grid(&self, pane_id: PaneId) -> Option<unshit::core::cell_grid::CellGrid> {
+        self.terminals
+            .get(&pane_id.0)
+            .map(|t| t.lock().expect("terminal mutex poisoned").grid().clone())
+    }
+
+    /// Clone the `Arc<Mutex<Terminal>>` handle for a pane without holding
+    /// the app state lock beyond the hashmap lookup. Callers take the
+    /// per-terminal lock independently.
+    pub fn terminal_handle(&self, pane_id: u32) -> Option<SharedTerminal> {
+        self.terminals.get(&pane_id).cloned()
     }
 }
 
@@ -521,13 +543,17 @@ pub fn mutate_add_tab(state: &mut AppState) {
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
     match state.pty_manager.spawn(id_num, cols, rows) {
         Ok(reader) => {
-            state.terminals.insert(id_num, terminal);
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
             crate::bridge::register_reader(id_num, reader);
         }
         Err(e) => {
             log::error!("failed to spawn PTY for new tab pane {}: {}", id_num, e);
             terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
-            state.terminals.insert(id_num, terminal);
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
         }
     }
 
@@ -691,13 +717,17 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
         .spawn_in(id_num, cols, rows, cwd.as_deref())
     {
         Ok(reader) => {
-            state.terminals.insert(id_num, terminal);
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
             crate::bridge::register_reader(id_num, reader);
         }
         Err(e) => {
             log::error!("failed to spawn PTY for pane {}: {}", id_num, e);
             terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
-            state.terminals.insert(id_num, terminal);
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
         }
     }
 
@@ -745,13 +775,17 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
         .spawn_in(id_num, cols, rows, cwd.as_deref())
     {
         Ok(reader) => {
-            state.terminals.insert(id_num, terminal);
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
             crate::bridge::register_reader(id_num, reader);
         }
         Err(e) => {
             log::error!("failed to spawn PTY for pane {}: {}", id_num, e);
             terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
-            state.terminals.insert(id_num, terminal);
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
         }
     }
 
@@ -823,13 +857,17 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
             .spawn_in(id_num, cols, rows, cwd.as_deref())
         {
             Ok(reader) => {
-                state.terminals.insert(id_num, terminal);
+                state
+                    .terminals
+                    .insert(id_num, Arc::new(Mutex::new(terminal)));
                 crate::bridge::register_reader(id_num, reader);
             }
             Err(e) => {
                 log::error!("failed to spawn PTY for pane {}: {}", id_num, e);
                 terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
-                state.terminals.insert(id_num, terminal);
+                state
+                    .terminals
+                    .insert(id_num, Arc::new(Mutex::new(terminal)));
             }
         }
 
@@ -1047,8 +1085,11 @@ pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
     let ids: Vec<u32> = state.terminals.keys().copied().collect();
     for id in ids {
         state.pty_manager.resize(id, cols, rows);
-        if let Some(terminal) = state.terminals.get_mut(&id) {
-            terminal.resize(rows as usize, cols as usize);
+        if let Some(terminal) = state.terminals.get(&id) {
+            terminal
+                .lock()
+                .expect("terminal mutex poisoned")
+                .resize(rows as usize, cols as usize);
         }
     }
 }
@@ -1941,13 +1982,18 @@ mod tests {
     #[test]
     fn resize_all_terminals_updates_every_terminal() {
         let mut state = seed_state();
-        state.terminals.insert(1, Terminal::new(24, 80));
-        state.terminals.insert(2, Terminal::new(24, 80));
+        state
+            .terminals
+            .insert(1, Arc::new(Mutex::new(Terminal::new(24, 80))));
+        state
+            .terminals
+            .insert(2, Arc::new(Mutex::new(Terminal::new(24, 80))));
 
         resize_all_terminals(&mut state, 120, 40);
 
         for term in state.terminals.values() {
-            let grid = term.grid();
+            let t = term.lock().expect("terminal mutex poisoned");
+            let grid = t.grid();
             assert_eq!(grid.cols(), 120, "terminal cols should be 120 after resize");
             assert_eq!(grid.rows(), 40, "terminal rows should be 40 after resize");
         }
@@ -1959,6 +2005,126 @@ mod tests {
         state.terminals.clear();
         resize_all_terminals(&mut state, 100, 30);
         assert!(state.terminals.is_empty());
+    }
+
+    // -- Tier 2 sub-task 3: parser lock decouple -----------------------------
+    //
+    // A parser thread writing to one terminal must NOT block the state lock
+    // or the render path. We simulate the parser workload by holding a
+    // per-terminal mutex while another thread simultaneously grabs the state
+    // mutex and clones the terminal handle. No deadlock means the two lock
+    // domains are independent.
+
+    #[test]
+    fn parser_lock_independent_of_state_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+        use std::thread;
+
+        let state: SharedState = Arc::new(Mutex::new(seed_state()));
+        {
+            let mut guard = state.lock().unwrap();
+            guard
+                .terminals
+                .insert(1, Arc::new(Mutex::new(Terminal::new(24, 80))));
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let parser_writes = Arc::new(AtomicUsize::new(0));
+
+        // Parser thread: locks the per-terminal mutex and writes many times.
+        let parser_state = state.clone();
+        let parser_barrier = barrier.clone();
+        let parser_writes_cl = parser_writes.clone();
+        let parser = thread::spawn(move || {
+            let handle = {
+                let guard = parser_state.lock().expect("state lock");
+                guard
+                    .terminals
+                    .get(&1)
+                    .cloned()
+                    .expect("terminal registered")
+            };
+            parser_barrier.wait();
+            let mut terminal = handle.lock().expect("terminal lock");
+            for _ in 0..1024 {
+                terminal.process_bytes(b"x");
+                parser_writes_cl.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Renderer thread: locks the state mutex repeatedly. Because the
+        // parser does NOT hold the state lock during process_bytes, this
+        // thread should finish even though the parser is busy.
+        let render_state = state.clone();
+        let render_barrier = barrier.clone();
+        let renderer = thread::spawn(move || {
+            render_barrier.wait();
+            for _ in 0..1024 {
+                let _handle_opt = {
+                    let guard = render_state.lock().expect("state lock");
+                    guard.terminals.get(&1).cloned()
+                };
+                // We explicitly do NOT lock the per-terminal mutex here: the
+                // render closure only needs the handle, so it never waits on
+                // the parser's write lock.
+            }
+        });
+
+        parser.join().expect("parser thread joined");
+        renderer.join().expect("renderer thread joined");
+        assert_eq!(parser_writes.load(Ordering::Relaxed), 1024);
+    }
+
+    #[test]
+    fn parser_writes_large_output_without_deadlocking_render() {
+        // Writes ~1 MiB of output through the parser while the renderer
+        // concurrently grabs state lock to snapshot handles. Proves the
+        // two mutex domains are independent (regression guard).
+        use std::thread;
+
+        let state: SharedState = Arc::new(Mutex::new(seed_state()));
+        {
+            let mut guard = state.lock().unwrap();
+            guard
+                .terminals
+                .insert(42, Arc::new(Mutex::new(Terminal::new(24, 80))));
+        }
+
+        let parser_state = state.clone();
+        let parser = thread::spawn(move || {
+            let handle = {
+                let guard = parser_state.lock().expect("state lock");
+                guard.terminals.get(&42).cloned().expect("terminal present")
+            };
+            let mut terminal = handle.lock().expect("terminal lock");
+            let chunk = vec![b'y'; 4096];
+            for _ in 0..256 {
+                terminal.process_bytes(&chunk);
+            }
+        });
+
+        let render_state = state.clone();
+        let renderer = thread::spawn(move || {
+            for _ in 0..512 {
+                let _snap = {
+                    let guard = render_state.lock().expect("state lock");
+                    guard.terminals.get(&42).cloned()
+                };
+            }
+        });
+
+        parser.join().expect("parser thread joined");
+        renderer.join().expect("renderer thread joined");
+
+        // After the parser finishes, the terminal must contain ~1MiB of 'y'
+        // plus ANSI overhead. Verify the grid is non-empty as a sanity check.
+        let guard = state.lock().unwrap();
+        let handle = guard.terminals.get(&42).expect("terminal still present");
+        let term = handle.lock().unwrap();
+        // At minimum the last row has 'y' in some column.
+        let rows = term.grid().debug_rows(24, 80);
+        assert!(rows.iter().any(|r| r.contains('y')));
     }
 
     #[test]

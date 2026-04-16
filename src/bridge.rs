@@ -90,31 +90,45 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                 // Batch all buffered chunks into a single rebuild to avoid
                 // triggering one full tree-rebuild per PTY read (the framework
                 // does not coalesce RequestRebuild events).
+                //
+                // Tier 2 sub-task 3 (parser lock decouple): grab the state
+                // mutex ONLY to look up the per-pane Terminal handle, then
+                // release it before running the VTE parser. The VTE parse
+                // holds only the per-terminal mutex, so the render closure
+                // and other state mutators can proceed concurrently on the
+                // state lock.
                 while let Some(data) = rx.recv().await {
+                    let terminal_handle: Option<crate::state::SharedTerminal> = {
+                        let guard = shared.lock().expect("state mutex poisoned");
+                        guard.terminals.get(&pane_id).cloned()
+                    };
+                    let Some(terminal_handle) = terminal_handle else {
+                        continue;
+                    };
+
                     let mut batched = 1u32;
                     {
-                        let mut guard = shared.lock().expect("state mutex poisoned");
-                        if let Some(terminal) = guard.terminals.get_mut(&pane_id) {
-                            terminal.process_bytes(&data);
-                            while let Ok(more) = rx.try_recv() {
-                                terminal.process_bytes(&more);
-                                batched += 1;
-                            }
-                            if terminal_trace_enabled() {
-                                let rows = terminal.grid().debug_rows(4, 96);
-                                append_terminal_trace_line(&format!(
-                                    "terminal-trace stage=bridge_after_process pane={} batched={} bytes={} cursor=({}, {}) row0={:?} row1={:?} row2={:?} row3={:?}",
-                                    pane_id,
-                                    batched,
-                                    preview_bytes(&data, 120),
-                                    terminal.grid().cursor_row(),
-                                    terminal.grid().cursor_col(),
-                                    rows.first().cloned().unwrap_or_default(),
-                                    rows.get(1).cloned().unwrap_or_default(),
-                                    rows.get(2).cloned().unwrap_or_default(),
-                                    rows.get(3).cloned().unwrap_or_default(),
-                                ));
-                            }
+                        let mut terminal =
+                            terminal_handle.lock().expect("terminal mutex poisoned");
+                        terminal.process_bytes(&data);
+                        while let Ok(more) = rx.try_recv() {
+                            terminal.process_bytes(&more);
+                            batched += 1;
+                        }
+                        if terminal_trace_enabled() {
+                            let rows = terminal.grid().debug_rows(4, 96);
+                            append_terminal_trace_line(&format!(
+                                "terminal-trace stage=bridge_after_process pane={} batched={} bytes={} cursor=({}, {}) row0={:?} row1={:?} row2={:?} row3={:?}",
+                                pane_id,
+                                batched,
+                                preview_bytes(&data, 120),
+                                terminal.grid().cursor_row(),
+                                terminal.grid().cursor_col(),
+                                rows.first().cloned().unwrap_or_default(),
+                                rows.get(1).cloned().unwrap_or_default(),
+                                rows.get(2).cloned().unwrap_or_default(),
+                                rows.get(3).cloned().unwrap_or_default(),
+                            ));
                         }
                     }
                     if batched > 1 {
@@ -152,7 +166,10 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                         // Inactive panes never show a cursor.
                         let active_id = guard.active_pane.0;
                         let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
-                        for (&id, terminal) in guard.terminals.iter_mut() {
+                        for (&id, terminal_handle) in guard.terminals.iter() {
+                            let mut terminal = terminal_handle
+                                .lock()
+                                .expect("terminal mutex poisoned");
                             if id == active_id {
                                 if win_focused {
                                     terminal.grid_mut().set_cursor_visible(visible);
@@ -208,7 +225,10 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                             rows as usize,
                                             cols as usize,
                                         );
-                                        guard.terminals.insert(*id, terminal);
+                                        guard.terminals.insert(
+                                            *id,
+                                            std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+                                        );
                                         match guard.pty_manager.spawn_in(*id, cols, rows, cwd.as_deref()) {
                                             Ok(reader) => {
                                                 crate::bridge::register_reader(*id, reader);
@@ -222,11 +242,16 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                     "failed to spawn deferred PTY for pane {}: {}",
                                                     id, e
                                                 );
-                                                if let Some(t) = guard.terminals.get_mut(id) {
-                                                    t.process_bytes(
-                                                        format!("Failed to spawn shell: {}\r\n", e)
+                                                if let Some(t) = guard.terminals.get(id) {
+                                                    t.lock()
+                                                        .expect("terminal mutex poisoned")
+                                                        .process_bytes(
+                                                            format!(
+                                                                "Failed to spawn shell: {}\r\n",
+                                                                e
+                                                            )
                                                             .as_bytes(),
-                                                    );
+                                                        );
                                                 }
                                             }
                                         }
@@ -238,8 +263,10 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                     guard.terminals.keys().copied().collect();
                                 for id in existing_ids {
                                     guard.pty_manager.resize(id, cols, rows);
-                                    if let Some(t) = guard.terminals.get_mut(&id) {
-                                        t.resize(rows as usize, cols as usize);
+                                    if let Some(t) = guard.terminals.get(&id) {
+                                        t.lock()
+                                            .expect("terminal mutex poisoned")
+                                            .resize(rows as usize, cols as usize);
                                     }
                                 }
                             }
@@ -271,8 +298,10 @@ fn resize_poll_subscription(shared: SharedState) -> Subscription {
                             let ids: Vec<u32> = guard.terminals.keys().copied().collect();
                             for id in ids {
                                 guard.pty_manager.resize(id, cols, rows);
-                                if let Some(t) = guard.terminals.get_mut(&id) {
-                                    t.resize(rows as usize, cols as usize);
+                                if let Some(t) = guard.terminals.get(&id) {
+                                    t.lock()
+                                        .expect("terminal mutex poisoned")
+                                        .resize(rows as usize, cols as usize);
                                 }
                             }
                         } // guard drops before yield

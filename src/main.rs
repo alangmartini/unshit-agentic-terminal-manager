@@ -233,7 +233,10 @@ fn main() {
         let pane_id = guard.active_pane.0;
         let cwd = crate::state::active_workspace_cwd(&guard);
         let terminal = crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
-        guard.terminals.insert(pane_id, terminal);
+        guard.terminals.insert(
+            pane_id,
+            std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+        );
         match guard
             .pty_manager
             .spawn_in(pane_id, init_cols, init_rows, cwd.as_deref())
@@ -243,8 +246,10 @@ fn main() {
             }
             Err(e) => {
                 log::error!("failed to spawn initial PTY: {}", e);
-                if let Some(t) = guard.terminals.get_mut(&pane_id) {
-                    t.process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
+                if let Some(t) = guard.terminals.get(&pane_id) {
+                    t.lock()
+                        .expect("terminal mutex poisoned")
+                        .process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
                 }
             }
         }
@@ -316,13 +321,35 @@ fn main() {
             ..Default::default()
         },
         move || {
-            let mut guard = tree_shared.lock().expect("state mutex poisoned");
-            let snap = guard.ui_snapshot();
-            let active_id = guard.active_pane.0;
-            let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = guard
-                .terminals
-                .iter_mut()
-                .map(|(&id, t)| {
+            // Phase 1: grab the state mutex only long enough to snapshot UI
+            // data and clone the per-terminal `Arc<Mutex<Terminal>>` handles.
+            // The parser thread writing to a single terminal can acquire its
+            // own lock independently of this closure.
+            let (snap, active_id, handles): (
+                crate::state::UiSnapshot,
+                u32,
+                Vec<(u32, crate::state::SharedTerminal)>,
+            ) = {
+                let guard = tree_shared.lock().expect("state mutex poisoned");
+                let snap = guard.ui_snapshot();
+                let active_id = guard.active_pane.0;
+                let handles: Vec<_> = guard
+                    .terminals
+                    .iter()
+                    .map(|(&id, t)| (id, t.clone()))
+                    .collect();
+                (snap, active_id, handles)
+            };
+
+            // Phase 2: without the state mutex, take each per-terminal lock
+            // individually, clone its display grid, and clear its dirty
+            // flags. Tier 2 sub-task 3: the parser thread is not blocked by
+            // the state lock during this phase — only by the specific
+            // terminal it is writing to.
+            let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = handles
+                .into_iter()
+                .map(|(id, handle)| {
+                    let mut t = handle.lock().expect("terminal mutex poisoned");
                     let mut grid = t.display_grid();
                     if id != active_id {
                         grid.set_cursor_visible(false);
@@ -351,7 +378,6 @@ fn main() {
                     (id, grid)
                 })
                 .collect();
-            drop(guard);
             build_tree(&snap, &tree_shared, &grids)
         },
     );
