@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod git;
 pub mod persist;
 pub mod pty;
 pub mod state;
