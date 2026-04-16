@@ -9,6 +9,46 @@ fn use_subpixel_text_shader() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_SUBPIXEL_TEXT").is_some())
 }
 
+/// Kind of atlas a glyph belongs to.
+///
+/// Monochrome text glyphs use a single channel coverage (R8Unorm). Color
+/// glyphs like emoji use full BGRA/RGBA so their palette is preserved.
+/// Ghostty and Zed both keep these textures separate so the fragment shader
+/// can sample the correct format without branching on per glyph state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GlyphAtlasKind {
+    /// Grayscale alpha coverage, one byte per texel.
+    Mono,
+    /// Full color bitmap (RGBA or BGRA), four bytes per texel. Used for
+    /// emoji and other color glyphs.
+    Color,
+}
+
+impl GlyphAtlasKind {
+    /// Map a cosmic-text swash content tag to the atlas kind it belongs in.
+    pub fn from_swash_content(content: cosmic_text::SwashContent) -> Self {
+        match content {
+            cosmic_text::SwashContent::Color => GlyphAtlasKind::Color,
+            cosmic_text::SwashContent::Mask | cosmic_text::SwashContent::SubpixelMask => {
+                GlyphAtlasKind::Mono
+            }
+        }
+    }
+
+    /// Returns `true` for color glyphs.
+    pub fn is_color(self) -> bool {
+        matches!(self, GlyphAtlasKind::Color)
+    }
+
+    /// Texture format the atlas of this kind should use.
+    pub fn texture_format(self) -> wgpu::TextureFormat {
+        match self {
+            GlyphAtlasKind::Mono => wgpu::TextureFormat::R8Unorm,
+            GlyphAtlasKind::Color => wgpu::TextureFormat::Rgba8Unorm,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GlyphKey {
     /// Stable namespace derived from the shaping font id plus glyph-rendering
@@ -360,6 +400,103 @@ impl GlyphAtlas {
     }
 }
 
+/// Pair of atlases, one for monochrome text coverage and one for color
+/// glyphs. The renderer inserts a glyph into the atlas indicated by its
+/// `GlyphAtlasKind` so the fragment shader never has to branch on format.
+///
+/// Access via `atlas_for` / `atlas_for_mut`; callers obtain the correct
+/// atlas for the `GlyphAtlasKind` they want to touch.
+///
+/// The color atlas is allocated lazily the first time a color glyph is
+/// inserted, so runs that only render monochrome text pay zero extra
+/// cost.
+pub struct GlyphAtlasSet {
+    pub mono: GlyphAtlas,
+    color: Option<GlyphAtlas>,
+    size: u32,
+}
+
+impl GlyphAtlasSet {
+    /// Create a new set with the monochrome atlas pre allocated. The color
+    /// atlas is created on first use.
+    pub fn new(device: &wgpu::Device) -> Self {
+        Self::new_with_size(device, ATLAS_SIZE)
+    }
+
+    pub fn new_with_size(device: &wgpu::Device, size: u32) -> Self {
+        let mono = GlyphAtlas::new_with_format(device, size, wgpu::TextureFormat::R8Unorm);
+        Self { mono, color: None, size }
+    }
+
+    /// Immutable access to the atlas for a given kind. Returns `None` for
+    /// the color atlas when it has not yet been allocated.
+    pub fn atlas_for(&self, kind: GlyphAtlasKind) -> Option<&GlyphAtlas> {
+        match kind {
+            GlyphAtlasKind::Mono => Some(&self.mono),
+            GlyphAtlasKind::Color => self.color.as_ref(),
+        }
+    }
+
+    /// Mutable access to the atlas for a given kind. Lazily allocates the
+    /// color atlas on first request.
+    pub fn atlas_for_mut(
+        &mut self,
+        kind: GlyphAtlasKind,
+        device: &wgpu::Device,
+    ) -> &mut GlyphAtlas {
+        match kind {
+            GlyphAtlasKind::Mono => &mut self.mono,
+            GlyphAtlasKind::Color => self.color.get_or_insert_with(|| {
+                GlyphAtlas::new_with_format(device, self.size, wgpu::TextureFormat::Rgba8Unorm)
+            }),
+        }
+    }
+
+    /// Advance the LRU frame counter for both atlases.
+    pub fn advance_frame(&mut self) {
+        self.mono.advance_frame();
+        if let Some(c) = self.color.as_mut() {
+            c.advance_frame();
+        }
+    }
+
+    /// Evict unused glyphs from both atlases.
+    pub fn evict_unused(
+        &mut self,
+        max_unused_frames: u64,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        self.mono.evict_unused(max_unused_frames, device, queue);
+        if let Some(c) = self.color.as_mut() {
+            c.evict_unused(max_unused_frames, device, queue);
+        }
+    }
+
+    /// Upload all pending glyphs queued on both atlases.
+    pub fn upload_pending(&mut self, queue: &wgpu::Queue) {
+        self.mono.upload_pending(queue);
+        if let Some(c) = self.color.as_mut() {
+            c.upload_pending(queue);
+        }
+    }
+
+    /// Whether the color atlas has been allocated. Used by pipelines that
+    /// only bind the color atlas when there is at least one color glyph.
+    pub fn has_color_atlas(&self) -> bool {
+        self.color.is_some()
+    }
+}
+
+/// Tagged entry returned when inserting or looking up a glyph through the
+/// set. Callers emit one instance per glyph carrying this kind so the
+/// draw pass routes it to the correct bind group.
+#[derive(Clone, Copy, Debug)]
+pub struct GlyphEntryTagged {
+    pub entry: GlyphEntry,
+    pub kind: GlyphAtlasKind,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +587,45 @@ mod tests {
         }
         lru.advance_frame();
         assert!(lru.stale_keys(10).is_empty(), "no stale keys expected");
+    }
+
+    // -- Atlas kind routing ---------------------------------------------------
+
+    #[test]
+    fn swash_color_maps_to_color_atlas_kind() {
+        assert_eq!(
+            GlyphAtlasKind::from_swash_content(cosmic_text::SwashContent::Color),
+            GlyphAtlasKind::Color
+        );
+    }
+
+    #[test]
+    fn swash_mask_maps_to_mono_atlas_kind() {
+        assert_eq!(
+            GlyphAtlasKind::from_swash_content(cosmic_text::SwashContent::Mask),
+            GlyphAtlasKind::Mono
+        );
+    }
+
+    #[test]
+    fn swash_subpixel_mask_maps_to_mono_atlas_kind() {
+        // Subpixel masks carry coverage information, not color. They
+        // belong on the monochrome atlas.
+        assert_eq!(
+            GlyphAtlasKind::from_swash_content(cosmic_text::SwashContent::SubpixelMask),
+            GlyphAtlasKind::Mono
+        );
+    }
+
+    #[test]
+    fn mono_kind_uses_r8_format() {
+        assert_eq!(GlyphAtlasKind::Mono.texture_format(), wgpu::TextureFormat::R8Unorm);
+        assert!(!GlyphAtlasKind::Mono.is_color());
+    }
+
+    #[test]
+    fn color_kind_uses_rgba8_format() {
+        assert_eq!(GlyphAtlasKind::Color.texture_format(), wgpu::TextureFormat::Rgba8Unorm);
+        assert!(GlyphAtlasKind::Color.is_color());
     }
 }
