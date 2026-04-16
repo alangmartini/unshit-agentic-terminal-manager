@@ -239,6 +239,10 @@ struct AppState {
     theme: Theme,
     /// Whether the one-shot on_cell_metrics callback has already fired.
     cell_metrics_fired: bool,
+    /// Coalesces redraw requests into at most one paint per
+    /// `FramePacer::min_interval`. Prevents per-PTY-chunk rebuild storms
+    /// from dominating the event loop. See [`crate::frame_pacer`].
+    frame_pacer: crate::frame_pacer::FramePacer,
 }
 
 impl App {
@@ -654,6 +658,7 @@ impl ApplicationHandler for AppHandler {
             bell_state: BellState::new(BellConfig::default()),
             theme: self.app.config.theme.clone(),
             cell_metrics_fired: false,
+            frame_pacer: crate::frame_pacer::FramePacer::new(),
         });
 
         // Run the initial subscription reconcile so streams start immediately.
@@ -1521,6 +1526,24 @@ impl ApplicationHandler for AppHandler {
 
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
+
+                // Frame pacing (Tier 1, task 3). Coalesce RequestRebuild and
+                // input-driven redraws into at most one paint per
+                // frame_pacer.min_interval. If the pacer says wait, schedule
+                // a WaitUntil and bail out early so the event loop sleeps
+                // until the coalescing deadline. No rendering happens from
+                // the PTY reader or input handlers; every paint goes
+                // through this single gate.
+                match state.frame_pacer.on_redraw_requested(frame_start) {
+                    crate::frame_pacer::PaceDecision::PaintNow => {}
+                    crate::frame_pacer::PaceDecision::WaitUntil(deadline) => {
+                        event_loop
+                            .set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+                        state.window.request_redraw();
+                        return;
+                    }
+                }
+
                 let mut metrics = FrameMetrics::default();
 
                 // Advance LRU frame counter at the start of each rendered frame.
@@ -1914,6 +1937,10 @@ impl ApplicationHandler for AppHandler {
                         state.window.request_redraw();
                     }
                 }
+
+                // Record this paint in the frame pacer so subsequent
+                // redraws are gated until the coalescing interval elapses.
+                state.frame_pacer.record_paint(frame_start);
 
                 metrics.total_us = frame_start.elapsed().as_micros() as u64;
                 metrics.rss_bytes = get_rss_bytes();

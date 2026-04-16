@@ -2,6 +2,7 @@ pub mod app;
 pub mod clipboard;
 pub mod event_sink;
 pub mod font;
+pub mod frame_pacer;
 pub mod notification;
 #[cfg(feature = "async")]
 pub mod runtime;
@@ -16,6 +17,7 @@ pub use event_sink::{EventSink, ExternalEvent, SendError};
 pub use font::{
     check_fallback_chain, load_custom_fonts, FallbackChain, FontLoadReport, FontSource,
 };
+pub use frame_pacer::{FramePacer, PaceDecision};
 pub use notification::{AttentionUrgency, BellConfig, BellState, BellStyle};
 #[cfg(feature = "async")]
 pub use runtime::AsyncRuntime;
