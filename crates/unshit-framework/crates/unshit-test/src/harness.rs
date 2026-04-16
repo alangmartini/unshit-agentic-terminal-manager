@@ -407,6 +407,7 @@ impl TestHarness {
             &self.scrollbar_visual,
             self.interaction.focused,
             &mut self.batch_cache,
+            None,
         );
         self.batch_cache.commit_frame();
         batch::clear_paint_flags_subtree(&mut self.arena, self.root);
