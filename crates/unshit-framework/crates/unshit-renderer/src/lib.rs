@@ -5,6 +5,7 @@ pub mod canvas;
 pub mod dw_rasterizer;
 pub mod gpu;
 pub mod image_cache;
+pub mod line_quad_cache;
 pub mod persistent_buffer;
 pub mod pipeline;
 pub mod svg_cache;
