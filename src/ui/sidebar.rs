@@ -485,6 +485,7 @@ mod tests {
                     tree_glyph: "\u{2514}",
                 },
             ],
+            git_branch: None,
         }
     }
 
@@ -592,6 +593,7 @@ mod tests {
             name: "zsh".to_string(),
             branch: "main".to_string(),
             branch_muted: true,
+            branch_error: false,
         };
         let el = build_terminal_entry(&entry, false);
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
@@ -604,6 +606,7 @@ mod tests {
             name: "zsh".to_string(),
             branch: "main".to_string(),
             branch_muted: false,
+            branch_error: false,
         };
         let el = build_terminal_entry(&entry, false);
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");

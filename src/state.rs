@@ -62,6 +62,7 @@ pub struct Workspace {
     pub terminals_expanded: bool,
     pub terminal_entries: Vec<TerminalEntry>,
     pub subtabs: Vec<Subtab>,
+    pub git_branch: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +90,7 @@ pub struct TerminalEntry {
     pub name: String,
     pub branch: String,
     pub branch_muted: bool,
+    pub branch_error: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -184,24 +186,36 @@ impl AppState {
     /// UI builders call this to get a snapshot for rendering.
     pub fn ui_snapshot(&self) -> UiSnapshot {
         let mut workspaces = self.workspaces.clone();
-        // Populate the active workspace's terminal entries from actual panes.
-        if let Some(ws) = workspaces.get_mut(self.active_workspace) {
-            let entries: Vec<TerminalEntry> = self
-                .panes
-                .iter()
-                .flatten()
-                .map(|p| TerminalEntry {
-                    name: p.title.clone(),
-                    branch: "main".to_string(),
-                    branch_muted: false,
-                })
-                .collect();
-            for sub in &mut ws.subtabs {
-                if sub.label == "terminals" {
-                    sub.count = Some(entries.len() as u32);
+        let active_idx = self.active_workspace;
+        for (idx, ws) in workspaces.iter_mut().enumerate() {
+            let (branch_text, branch_error) = match &ws.git_branch {
+                Some(b) => (b.clone(), false),
+                None => ("no git".to_string(), true),
+            };
+            if idx == active_idx {
+                let entries: Vec<TerminalEntry> = self
+                    .panes
+                    .iter()
+                    .flatten()
+                    .map(|p| TerminalEntry {
+                        name: p.title.clone(),
+                        branch: branch_text.clone(),
+                        branch_muted: false,
+                        branch_error,
+                    })
+                    .collect();
+                for sub in &mut ws.subtabs {
+                    if sub.label == "terminals" {
+                        sub.count = Some(entries.len() as u32);
+                    }
+                }
+                ws.terminal_entries = entries;
+            } else {
+                for entry in &mut ws.terminal_entries {
+                    entry.branch = branch_text.clone();
+                    entry.branch_error = branch_error;
                 }
             }
-            ws.terminal_entries = entries;
         }
         UiSnapshot {
             workspaces,
@@ -266,11 +280,13 @@ fn current_folder_name() -> String {
 }
 
 pub fn seed_state() -> AppState {
+    let ws1_path = std::env::current_dir().ok();
+    let ws1_branch = ws1_path.as_deref().and_then(crate::git::detect_git_branch);
     let workspaces = vec![
         Workspace {
             num: 1,
             name: current_folder_name(),
-            path: std::env::current_dir().ok(),
+            path: ws1_path,
             collapsed: false,
             terminals_expanded: true,
             terminal_entries: vec![
@@ -278,70 +294,37 @@ pub fn seed_state() -> AppState {
                     name: "shell".to_string(),
                     branch: "main".to_string(),
                     branch_muted: false,
+                    branch_error: false,
                 },
                 TerminalEntry {
                     name: "build".to_string(),
                     branch: "main".to_string(),
                     branch_muted: false,
+                    branch_error: false,
                 },
                 TerminalEntry {
                     name: "dev-server".to_string(),
                     branch: "main".to_string(),
                     branch_muted: false,
+                    branch_error: false,
                 },
                 TerminalEntry {
                     name: "logs".to_string(),
                     branch: "main".to_string(),
                     branch_muted: false,
+                    branch_error: false,
                 },
             ],
-            subtabs: vec![
-                Subtab {
-                    label: "terminals".to_string(),
-                    count: Some(4),
-                    pulse: false,
-                    active: true,
-                    disabled: false,
-                    icon: Some(SubtabIcon::Terminal),
-                    tree_glyph: "\u{251C}",
-                },
-                Subtab {
-                    label: "agents".to_string(),
-                    count: Some(2),
-                    pulse: true,
-                    active: false,
-                    disabled: true,
-                    icon: Some(SubtabIcon::User),
-                    tree_glyph: "\u{251C}",
-                },
-                Subtab {
-                    label: "worktrees".to_string(),
-                    count: Some(3),
-                    pulse: false,
-                    active: false,
-                    disabled: true,
-                    icon: Some(SubtabIcon::GitBranch),
-                    tree_glyph: "\u{251C}",
-                },
-                Subtab {
-                    label: "sessions".to_string(),
-                    count: Some(1),
-                    pulse: false,
-                    active: false,
-                    disabled: true,
-                    icon: Some(SubtabIcon::Folder),
-                    tree_glyph: "\u{251C}",
-                },
-                Subtab {
-                    label: "environment".to_string(),
-                    count: None,
-                    pulse: false,
-                    active: false,
-                    disabled: true,
-                    icon: Some(SubtabIcon::EnvList),
-                    tree_glyph: "\u{2514}",
-                },
-            ],
+            subtabs: vec![Subtab {
+                label: "terminals".to_string(),
+                count: Some(4),
+                pulse: false,
+                active: true,
+                disabled: false,
+                icon: Some(SubtabIcon::Terminal),
+                tree_glyph: "\u{2514}",
+            }],
+            git_branch: ws1_branch,
         },
         Workspace {
             num: 2,
@@ -354,42 +337,25 @@ pub fn seed_state() -> AppState {
                     name: "shell".to_string(),
                     branch: "fix/pdf-export".to_string(),
                     branch_muted: false,
+                    branch_error: false,
                 },
                 TerminalEntry {
                     name: "tests".to_string(),
                     branch: "fix/pdf-export".to_string(),
                     branch_muted: false,
+                    branch_error: false,
                 },
             ],
-            subtabs: vec![
-                Subtab {
-                    label: "terminals".to_string(),
-                    count: Some(2),
-                    pulse: false,
-                    active: false,
-                    disabled: false,
-                    icon: Some(SubtabIcon::Terminal),
-                    tree_glyph: "\u{251C}",
-                },
-                Subtab {
-                    label: "agents".to_string(),
-                    count: Some(1),
-                    pulse: false,
-                    active: false,
-                    disabled: true,
-                    icon: Some(SubtabIcon::User),
-                    tree_glyph: "\u{251C}",
-                },
-                Subtab {
-                    label: "worktrees".to_string(),
-                    count: Some(2),
-                    pulse: false,
-                    active: false,
-                    disabled: true,
-                    icon: Some(SubtabIcon::GitBranch),
-                    tree_glyph: "\u{2514}",
-                },
-            ],
+            subtabs: vec![Subtab {
+                label: "terminals".to_string(),
+                count: Some(2),
+                pulse: false,
+                active: false,
+                disabled: false,
+                icon: Some(SubtabIcon::Terminal),
+                tree_glyph: "\u{2514}",
+            }],
+            git_branch: None,
         },
         Workspace {
             num: 3,
@@ -401,27 +367,18 @@ pub fn seed_state() -> AppState {
                 name: "shell".to_string(),
                 branch: "staging".to_string(),
                 branch_muted: false,
+                branch_error: false,
             }],
-            subtabs: vec![
-                Subtab {
-                    label: "terminals".to_string(),
-                    count: Some(1),
-                    pulse: false,
-                    active: false,
-                    disabled: false,
-                    icon: Some(SubtabIcon::Terminal),
-                    tree_glyph: "\u{251C}",
-                },
-                Subtab {
-                    label: "sessions".to_string(),
-                    count: None,
-                    pulse: false,
-                    active: false,
-                    disabled: true,
-                    icon: Some(SubtabIcon::Folder),
-                    tree_glyph: "\u{2514}",
-                },
-            ],
+            subtabs: vec![Subtab {
+                label: "terminals".to_string(),
+                count: Some(1),
+                pulse: false,
+                active: false,
+                disabled: false,
+                icon: Some(SubtabIcon::Terminal),
+                tree_glyph: "\u{2514}",
+            }],
+            git_branch: None,
         },
         Workspace {
             num: 4,
@@ -439,6 +396,7 @@ pub fn seed_state() -> AppState {
                 icon: None,
                 tree_glyph: "\u{2514}",
             }],
+            git_branch: None,
         },
     ];
 
@@ -644,6 +602,7 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
 }
 
 pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace {
+    let git_branch = path.as_deref().and_then(crate::git::detect_git_branch);
     Workspace {
         num,
         name,
@@ -660,6 +619,7 @@ pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace
             icon: Some(SubtabIcon::Terminal),
             tree_glyph: "\u{2514}",
         }],
+        git_branch,
     }
 }
 
