@@ -89,6 +89,9 @@ name = "terminal-manager"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 unshit = { path = "crates/unshit-framework/crates/unshit", features = ["async", "clipboard"] }
 cosmic-text = "0.12"
