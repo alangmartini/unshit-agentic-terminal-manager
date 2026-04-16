@@ -19,6 +19,7 @@ use wgpu;
 
 static BACKDROP_FALLBACK_LOG: Once = Once::new();
 
+#[cfg(target_os = "windows")]
 fn use_subpixel_text_shader() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_SUBPIXEL_TEXT").is_some())
