@@ -49,6 +49,7 @@ fn build_sidebar_head(shared: &SharedState) -> ElementDef {
                             if let Some(folder) = picked {
                                 mutate_with(&add_state, |st| {
                                     mutate_add_workspace_with_path(st, Some(folder));
+                                    crate::persist::save_workspaces(st);
                                 });
                             }
                         })
