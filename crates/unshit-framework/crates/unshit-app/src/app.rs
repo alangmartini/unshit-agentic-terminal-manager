@@ -243,6 +243,11 @@ struct AppState {
     /// `FramePacer::min_interval`. Prevents per-PTY-chunk rebuild storms
     /// from dominating the event loop. See [`crate::frame_pacer`].
     frame_pacer: crate::frame_pacer::FramePacer,
+    /// Rolling window of per-frame durations. Debug-only; emits p50/p95/
+    /// p99 quantiles once per second via `log::info!`. See
+    /// [`crate::frame_probe`].
+    #[cfg(debug_assertions)]
+    frame_probe: crate::frame_probe::FrameProbe,
 }
 
 impl App {
@@ -659,6 +664,8 @@ impl ApplicationHandler for AppHandler {
             theme: self.app.config.theme.clone(),
             cell_metrics_fired: false,
             frame_pacer: crate::frame_pacer::FramePacer::new(),
+            #[cfg(debug_assertions)]
+            frame_probe: crate::frame_probe::FrameProbe::new(),
         });
 
         // Run the initial subscription reconcile so streams start immediately.
@@ -1944,6 +1951,20 @@ impl ApplicationHandler for AppHandler {
 
                 metrics.total_us = frame_start.elapsed().as_micros() as u64;
                 metrics.rss_bytes = get_rss_bytes();
+
+                // Debug-only per-second frame-time probe. Feeds this frame's
+                // duration into a rolling window and emits p50/p95/p99
+                // quantiles once per second. Release builds skip the whole
+                // block via cfg(debug_assertions); see crate::frame_probe.
+                #[cfg(debug_assertions)]
+                {
+                    state
+                        .frame_probe
+                        .record_frame(std::time::Duration::from_micros(metrics.total_us));
+                    if let Some(snap) = state.frame_probe.maybe_emit(Instant::now()) {
+                        log::info!("[FRAME] {}", snap);
+                    }
+                }
 
                 // Log slow frames
                 if metrics.total_us > 8333 {

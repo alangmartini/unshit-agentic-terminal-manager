@@ -3,6 +3,8 @@ pub mod clipboard;
 pub mod event_sink;
 pub mod font;
 pub mod frame_pacer;
+#[cfg(debug_assertions)]
+pub mod frame_probe;
 pub mod notification;
 #[cfg(feature = "async")]
 pub mod runtime;
