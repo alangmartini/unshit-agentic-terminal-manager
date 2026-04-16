@@ -847,8 +847,7 @@ mod tests {
                 s.push(cell.ch);
             }
         }
-        s.trim_end_matches(|c: char| c == ' ' || c == '\0')
-            .to_string()
+        s.trim_end_matches([' ', '\0']).to_string()
     }
 
     /// Helper: extract the char stored in a cell at (row, col).
