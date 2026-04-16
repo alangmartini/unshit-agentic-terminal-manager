@@ -229,6 +229,36 @@ impl LineDamage {
 }
 
 // ---------------------------------------------------------------------------
+// Style runs (run-length batching by style)
+// ---------------------------------------------------------------------------
+
+/// Rendered style signature for a cell. Two adjacent cells with the same
+/// `StyleKey` can share a shaped text run and a single merged background
+/// quad. `fg` and `bg` already account for the `INVERSE` attribute.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StyleKey {
+    pub fg: Color,
+    pub bg: Color,
+    pub attrs: CellAttrs,
+}
+
+/// A maximal run of cells on a single row that share the same `StyleKey`.
+/// `end_col` is exclusive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StyleRun {
+    pub start_col: usize,
+    pub end_col: usize,
+    pub style: StyleKey,
+}
+
+impl StyleRun {
+    /// Number of columns covered by the run.
+    pub fn col_count(&self) -> usize {
+        self.end_col.saturating_sub(self.start_col)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CellGrid
 // ---------------------------------------------------------------------------
 
@@ -306,6 +336,69 @@ impl CellGrid {
     /// of bounds).
     pub fn line_damage_for(&self, row: usize) -> Option<&LineDamage> {
         self.line_damage.get(row)
+    }
+
+    /// Collect maximal runs of adjacent cells on `row` that share the same
+    /// rendered style (foreground color, background color, and attributes
+    /// flags). Used by the renderer to group cells into a single
+    /// `BatchedTextRun` so shaping and background quads can be emitted once
+    /// per run instead of per cell.
+    ///
+    /// When the row has zero cols or is out of bounds an empty vector is
+    /// returned.
+    pub fn compute_style_runs(&self, row: usize) -> Vec<StyleRun> {
+        self.compute_style_runs_in_range(row, 0, self.cols)
+    }
+
+    /// Same as [`CellGrid::compute_style_runs`] but limited to the half-open
+    /// column range `[start_col, end_col)`. Runs never cross the provided
+    /// range boundaries.
+    pub fn compute_style_runs_in_range(
+        &self,
+        row: usize,
+        start_col: usize,
+        end_col: usize,
+    ) -> Vec<StyleRun> {
+        if row >= self.rows {
+            return Vec::new();
+        }
+        let end_col = end_col.min(self.cols);
+        if start_col >= end_col {
+            return Vec::new();
+        }
+
+        let mut runs: Vec<StyleRun> = Vec::new();
+        let row_base = row * self.cols;
+        let mut cur: Option<StyleRun> = None;
+        for col in start_col..end_col {
+            let cell = &self.cells[row_base + col];
+            let (fg, bg) = if cell.attrs.contains(CellAttrs::INVERSE) {
+                (cell.bg, cell.fg)
+            } else {
+                (cell.fg, cell.bg)
+            };
+
+            let key = StyleKey { fg, bg, attrs: cell.attrs };
+
+            match cur.as_mut() {
+                Some(run) if run.style == key => {
+                    // Wide continuation cells belong to the run of the wide
+                    // primary cell. Extending the run's end column keeps the
+                    // merged background rect covering both halves.
+                    run.end_col = col + 1;
+                }
+                _ => {
+                    if let Some(finished) = cur.take() {
+                        runs.push(finished);
+                    }
+                    cur = Some(StyleRun { start_col: col, end_col: col + 1, style: key });
+                }
+            }
+        }
+        if let Some(finished) = cur.take() {
+            runs.push(finished);
+        }
+        runs
     }
 
     /// Clear all dirty flags (called by the renderer after batching). Also

@@ -316,12 +316,12 @@ fn main() {
             ..Default::default()
         },
         move || {
-            let guard = tree_shared.lock().expect("state mutex poisoned");
+            let mut guard = tree_shared.lock().expect("state mutex poisoned");
             let snap = guard.ui_snapshot();
             let active_id = guard.active_pane.0;
             let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = guard
                 .terminals
-                .iter()
+                .iter_mut()
                 .map(|(&id, t)| {
                     let mut grid = t.display_grid();
                     if id != active_id {
@@ -341,6 +341,13 @@ fn main() {
                             rows.get(3).cloned().unwrap_or_default(),
                         ));
                     }
+                    // Perf Tier 2: the cloned grid retains every dirty flag and
+                    // LineDamage entry for the renderer to act on, while the
+                    // live grid is cleared so the next frame's damage reflects
+                    // only new writes. Per-row LineDamage seqnos are preserved
+                    // (see CellGrid::clear_dirty) so any future renderer that
+                    // checkpoints across frames can still compare them.
+                    t.grid_mut().clear_dirty();
                     (id, grid)
                 })
                 .collect();

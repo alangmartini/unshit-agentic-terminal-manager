@@ -659,3 +659,148 @@ fn line_damage_for_out_of_bounds_returns_none() {
     assert!(g.line_damage_for(1).is_some());
     assert!(g.line_damage_for(2).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Style-run grouping (Tier 2 run-length batching)
+// ---------------------------------------------------------------------------
+
+fn styled(ch: char, fg: Color, bg: Color, attrs: CellAttrs) -> Cell {
+    Cell { ch, fg, bg, attrs, wide_continuation: false }
+}
+
+#[test]
+fn compute_style_runs_merges_adjacent_same_style() {
+    let mut g = CellGrid::new(1, 4);
+    let fg = Color::rgb(255, 255, 255);
+    let bg = Color::rgb(0, 0, 0);
+    for col in 0..4 {
+        g.set_cell(0, col, styled('x', fg, bg, CellAttrs::empty()));
+    }
+    let runs = g.compute_style_runs(0);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].start_col, 0);
+    assert_eq!(runs[0].end_col, 4);
+    assert_eq!(runs[0].style.fg, fg);
+    assert_eq!(runs[0].style.bg, bg);
+}
+
+#[test]
+fn compute_style_runs_splits_on_bg_change() {
+    let mut g = CellGrid::new(1, 4);
+    let fg = Color::rgb(255, 255, 255);
+    let bg_a = Color::rgb(10, 10, 10);
+    let bg_b = Color::rgb(20, 20, 20);
+    g.set_cell(0, 0, styled('a', fg, bg_a, CellAttrs::empty()));
+    g.set_cell(0, 1, styled('a', fg, bg_a, CellAttrs::empty()));
+    g.set_cell(0, 2, styled('b', fg, bg_b, CellAttrs::empty()));
+    g.set_cell(0, 3, styled('b', fg, bg_b, CellAttrs::empty()));
+    let runs = g.compute_style_runs(0);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].end_col, 2);
+    assert_eq!(runs[1].start_col, 2);
+    assert_eq!(runs[1].end_col, 4);
+}
+
+#[test]
+fn compute_style_runs_splits_on_fg_change() {
+    let mut g = CellGrid::new(1, 3);
+    let bg = Color::rgb(0, 0, 0);
+    let fg_a = Color::rgb(255, 0, 0);
+    let fg_b = Color::rgb(0, 255, 0);
+    g.set_cell(0, 0, styled('a', fg_a, bg, CellAttrs::empty()));
+    g.set_cell(0, 1, styled('b', fg_b, bg, CellAttrs::empty()));
+    g.set_cell(0, 2, styled('c', fg_b, bg, CellAttrs::empty()));
+    let runs = g.compute_style_runs(0);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].col_count(), 1);
+    assert_eq!(runs[1].col_count(), 2);
+}
+
+#[test]
+fn compute_style_runs_splits_on_attrs_change() {
+    let mut g = CellGrid::new(1, 3);
+    let fg = Color::rgb(255, 255, 255);
+    let bg = Color::rgb(0, 0, 0);
+    g.set_cell(0, 0, styled('a', fg, bg, CellAttrs::empty()));
+    g.set_cell(0, 1, styled('b', fg, bg, CellAttrs::BOLD));
+    g.set_cell(0, 2, styled('c', fg, bg, CellAttrs::BOLD));
+    let runs = g.compute_style_runs(0);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].style.attrs, CellAttrs::empty());
+    assert_eq!(runs[1].style.attrs, CellAttrs::BOLD);
+}
+
+#[test]
+fn compute_style_runs_inverse_normalizes_colors() {
+    let mut g = CellGrid::new(1, 2);
+    let fg = Color::rgb(255, 0, 0);
+    let bg = Color::rgb(0, 0, 255);
+    // Cell 0 is plain fg/bg, cell 1 is inverse of the same colors -> after
+    // normalization these are NOT the same run (fg and bg swap).
+    g.set_cell(0, 0, styled('a', fg, bg, CellAttrs::empty()));
+    g.set_cell(0, 1, styled('b', fg, bg, CellAttrs::INVERSE));
+    let runs = g.compute_style_runs(0);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].style.fg, fg);
+    assert_eq!(runs[0].style.bg, bg);
+    assert_eq!(runs[1].style.fg, bg);
+    assert_eq!(runs[1].style.bg, fg);
+}
+
+#[test]
+fn compute_style_runs_never_cross_rows() {
+    let mut g = CellGrid::new(2, 3);
+    let fg = Color::rgb(255, 255, 255);
+    let bg = Color::rgb(0, 0, 0);
+    for r in 0..2 {
+        for c in 0..3 {
+            g.set_cell(r, c, styled('x', fg, bg, CellAttrs::empty()));
+        }
+    }
+    let row0 = g.compute_style_runs(0);
+    let row1 = g.compute_style_runs(1);
+    assert_eq!(row0.len(), 1);
+    assert_eq!(row1.len(), 1);
+    assert_eq!(row0[0].end_col, 3);
+    assert_eq!(row1[0].end_col, 3);
+}
+
+#[test]
+fn compute_style_runs_in_range_honors_bounds() {
+    let mut g = CellGrid::new(1, 5);
+    let fg = Color::rgb(255, 255, 255);
+    let bg = Color::rgb(0, 0, 0);
+    for c in 0..5 {
+        g.set_cell(0, c, styled('x', fg, bg, CellAttrs::empty()));
+    }
+    let runs = g.compute_style_runs_in_range(0, 1, 4);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].start_col, 1);
+    assert_eq!(runs[0].end_col, 4);
+}
+
+#[test]
+fn compute_style_runs_empty_on_bad_inputs() {
+    let g = CellGrid::new(2, 3);
+    assert!(g.compute_style_runs(10).is_empty());
+    assert!(g.compute_style_runs_in_range(0, 3, 3).is_empty());
+    assert!(g.compute_style_runs_in_range(0, 5, 10).is_empty());
+}
+
+#[test]
+fn compute_style_runs_wide_continuation_shares_style() {
+    // A wide primary cell at col 0 and its continuation at col 1 share the
+    // same (fg, bg, attrs) so they merge into a single run whose col range
+    // covers both halves.
+    let mut g = CellGrid::new(1, 3);
+    let fg = Color::rgb(255, 255, 255);
+    let bg = Color::rgb(0, 0, 0);
+    // Use set_wide_cell to produce a primary + continuation pair.
+    g.set_wide_cell(0, 0, styled('漢', fg, bg, CellAttrs::empty()));
+    // Fill col 2 with the same style so the whole row is one run.
+    g.set_cell(0, 2, styled('a', fg, bg, CellAttrs::empty()));
+    let runs = g.compute_style_runs(0);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].start_col, 0);
+    assert_eq!(runs[0].end_col, 3);
+}

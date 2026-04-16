@@ -2203,41 +2203,62 @@ fn emit_grid_cells(
     buffer.set_size(font_system, Some(cell_w * 4.0), None);
     let mut ch_buf = [0u8; 4];
 
+    // -- Run-length emit helpers --------------------------------------------
+
+    /// Resolve (fg, bg) accounting for the INVERSE attribute.
+    #[inline]
+    fn resolve_colors(cell: &unshit_core::cell_grid::Cell) -> (Color, Color) {
+        if cell.attrs.contains(CellAttrs::INVERSE) {
+            (cell.bg, cell.fg)
+        } else {
+            (cell.fg, cell.bg)
+        }
+    }
+
     for row in 0..rows {
-        for col in 0..cols {
-            let idx = row * cols + col;
-            if !dirty[idx] {
+        // Sub-task 1: line-level skip. Rows with no pending damage contribute
+        // nothing this frame, so we never touch their cells or glyphs.
+        let line_dmg = grid.line_damage_for(row).copied();
+        let (scan_start, scan_end) = match line_dmg {
+            Some(ld) if !ld.is_clean() => {
+                (ld.first_dirty_col as usize, (ld.last_dirty_col as usize + 1).min(cols))
+            }
+            // Clean row -> skip entirely.
+            Some(_) => continue,
+            // No damage entry (shouldn't happen within bounds but guard anyway).
+            None => (0, cols),
+        };
+        if scan_start >= scan_end {
+            continue;
+        }
+
+        let py = origin_y + row as f32 * cell_h;
+
+        // -- Sub-task 2: merge background quads by style ---------------------
+        //
+        // Use the shared `compute_style_runs_in_range` so adjacent cells with
+        // the same (fg, bg, attrs) fuse into a single QuadInstance. This is
+        // the same pattern as Zed's BatchedTextRun: one quad per run instead
+        // of one quad per cell.
+        for run in grid.compute_style_runs_in_range(row, scan_start, scan_end) {
+            // Skip runs whose entire column range has no per-cell damage
+            // pending this frame. This is what keeps partial-row repaints
+            // from redrawing surrounding clean columns.
+            let run_has_damage = (run.start_col..run.end_col)
+                .any(|c| dirty.get(row * cols + c).copied().unwrap_or(false));
+            if !run_has_damage {
                 continue;
             }
-
-            let cell = &cells[idx];
-            let px = origin_x + col as f32 * cell_w;
-            let py = origin_y + row as f32 * cell_h;
-
-            // Resolve fg/bg (INVERSE swaps them)
-            let (fg, bg) = if cell.attrs.contains(CellAttrs::INVERSE) {
-                (cell.bg, cell.fg)
-            } else {
-                (cell.fg, cell.bg)
-            };
-
-            // Background quad (always emitted so damage is painted)
+            let bg = run.style.bg;
             if bg.a > 0 {
                 let mut bg_color = bg.to_linear_f32();
                 bg_color[3] *= opacity;
-
-                // Wide chars span 2 columns
-                let quad_w = if cell.wide_continuation {
-                    0.0
-                } else if !cell.is_empty() && is_wide_char(cell.ch) {
-                    cell_w * 2.0
-                } else {
-                    cell_w
-                };
-                if quad_w > 0.0 {
+                let px = origin_x + run.start_col as f32 * cell_w;
+                let width = run.col_count() as f32 * cell_w;
+                if width > 0.0 {
                     batch.quad_instances.push(QuadInstance {
                         pos: [px, py],
-                        size: [quad_w, cell_h],
+                        size: [width, cell_h],
                         color: bg_color,
                         border_color: [0.0; 4],
                         border_width: [0.0; 4],
@@ -2254,13 +2275,21 @@ fn emit_grid_cells(
                     });
                 }
             }
+        }
 
-            // Skip glyph for empty cells and continuation cells
+        // -- Per-cell glyph emission within the same damaged range ----------
+        for col in scan_start..scan_end {
+            let idx = row * cols + col;
+            if !dirty[idx] {
+                continue;
+            }
+            let cell = &cells[idx];
+            // Skip glyph for empty cells and wide continuation cells.
             if cell.is_empty() || cell.wide_continuation {
                 continue;
             }
 
-            // DIM attribute halves the foreground alpha
+            let (fg, _) = resolve_colors(cell);
             let mut fg_linear = fg.to_linear_f32();
             if cell.attrs.contains(CellAttrs::DIM) {
                 fg_linear[3] *= 0.5;
@@ -2273,6 +2302,7 @@ fn emit_grid_cells(
                 style: SHAPE_STYLE_REGULAR,
                 font_size_tenths: shape_font_size_tenths,
             };
+            let px = origin_x + col as f32 * cell_w;
             // Cross-frame ShapeCache. Hit path bypasses set_text and
             // shape_until_scroll entirely; miss path shapes once and stores.
             let prototype = if let Some(entry) = shape_cache.get(&cache_key) {
@@ -2963,6 +2993,7 @@ fn rasterize_grid_glyph_for_atlas(
 
 /// Rough heuristic: returns `true` for characters that typically occupy two
 /// columns in a monospace grid (CJK Unified Ideographs, fullwidth forms, etc.).
+#[allow(dead_code)]
 fn is_wide_char(ch: char) -> bool {
     let cp = ch as u32;
     // CJK Unified Ideographs
