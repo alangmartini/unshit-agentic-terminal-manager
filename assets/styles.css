@@ -501,6 +501,12 @@ body::after {
   border-color: var(--border-soft);
 }
 
+.branch-tag.error {
+  color: var(--rust);
+  background: rgba(201, 85, 58, 0.08);
+  border-color: rgba(201, 85, 58, 0.25);
+}
+
 .workspace-body {
   flex-direction: column;
   padding: var(--sp-1) 0 var(--sp-2);

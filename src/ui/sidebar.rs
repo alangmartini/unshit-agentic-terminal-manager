@@ -255,6 +255,9 @@ fn build_terminal_entry(entry: &TerminalEntry, is_last: bool) -> ElementDef {
     if entry.branch_muted {
         tag = tag.with_class("muted");
     }
+    if entry.branch_error {
+        tag = tag.with_class("error");
+    }
     row = row.with_child(tag);
 
     row
@@ -611,6 +614,32 @@ mod tests {
         let el = build_terminal_entry(&entry, false);
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(!has_class(branch_tag, "muted"));
+    }
+
+    #[test]
+    fn terminal_entry_branch_error() {
+        let entry = TerminalEntry {
+            name: "zsh".to_string(),
+            branch: "main".to_string(),
+            branch_muted: false,
+            branch_error: true,
+        };
+        let el = build_terminal_entry(&entry, false);
+        let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
+        assert!(has_class(branch_tag, "error"));
+    }
+
+    #[test]
+    fn terminal_entry_branch_not_error() {
+        let entry = TerminalEntry {
+            name: "zsh".to_string(),
+            branch: "main".to_string(),
+            branch_muted: false,
+            branch_error: false,
+        };
+        let el = build_terminal_entry(&entry, false);
+        let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
+        assert!(!has_class(branch_tag, "error"));
     }
 
     #[test]
