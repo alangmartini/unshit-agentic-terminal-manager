@@ -520,7 +520,7 @@ body::after {
   align-items: center;
   gap: var(--sp-3);
   width: 100%;
-  padding: var(--sp-2) var(--sp-6) var(--sp-2) var(--sp-6);
+  padding: var(--sp-2) var(--sp-6) var(--sp-2) calc(var(--sp-6) + var(--sp-4));
   color: var(--fg-secondary);
   font-size: var(--t-sm);
   text-align: left;
