@@ -13,6 +13,7 @@
 // Module-level cfg(debug_assertions) is attached at the mod declaration
 // in lib.rs; do not duplicate it here.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Capacity of the rolling frame-time window. Sized so the 99th percentile
@@ -39,9 +40,10 @@ pub struct FrameQuantiles {
 /// copy-and-sort the window at emit time. With a 240-slot window that
 /// cost is negligible compared to the frame it describes.
 pub struct FrameProbe {
-    /// Timestamps + durations of recent frames. Durations are microseconds
-    /// so the sort is integer-only.
-    samples: Vec<u64>,
+    /// Rolling window of frame durations in microseconds. A `VecDeque` lets
+    /// eviction of the oldest sample run in O(1) instead of the O(n) shift a
+    /// `Vec::remove(0)` would incur.
+    samples: VecDeque<u64>,
     /// Time the last summary was emitted. `None` until the first emit.
     last_emit: Option<Instant>,
     /// Interval between emitted summaries.
@@ -58,7 +60,7 @@ impl FrameProbe {
     /// Build a probe with the default one-second reporting interval.
     pub fn new() -> Self {
         Self {
-            samples: Vec::with_capacity(WINDOW_CAPACITY),
+            samples: VecDeque::with_capacity(WINDOW_CAPACITY),
             last_emit: None,
             report_interval: Duration::from_secs(1),
         }
@@ -67,7 +69,7 @@ impl FrameProbe {
     /// Build a probe with a custom reporting interval. Tests use this so
     /// they do not need to wait a full second.
     pub fn with_report_interval(report_interval: Duration) -> Self {
-        Self { samples: Vec::with_capacity(WINDOW_CAPACITY), last_emit: None, report_interval }
+        Self { samples: VecDeque::with_capacity(WINDOW_CAPACITY), last_emit: None, report_interval }
     }
 
     /// Number of samples currently in the window.
@@ -80,9 +82,9 @@ impl FrameProbe {
     /// `WINDOW_CAPACITY` frames.
     pub fn record_frame(&mut self, frame_time: Duration) {
         if self.samples.len() == WINDOW_CAPACITY {
-            self.samples.remove(0);
+            self.samples.pop_front();
         }
-        self.samples.push(frame_time.as_micros() as u64);
+        self.samples.push_back(frame_time.as_micros() as u64);
     }
 
     /// Returns `Some(summary)` if the reporting interval has elapsed and at
@@ -112,7 +114,7 @@ impl FrameProbe {
         if self.samples.is_empty() {
             return FrameQuantiles::default();
         }
-        let mut sorted = self.samples.clone();
+        let mut sorted: Vec<u64> = self.samples.iter().copied().collect();
         sorted.sort_unstable();
         let n = sorted.len();
         FrameQuantiles {
