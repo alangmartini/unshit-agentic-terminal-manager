@@ -288,6 +288,51 @@ impl CellGrid {
         }
     }
 
+    /// Copy `count` rows of cells from `src_row..src_row + count` to
+    /// `dst_row..dst_row + count` using `copy_within`, and mark every
+    /// destination row fully damaged.
+    ///
+    /// This is the efficient primitive terminal-level scroll / insert-line /
+    /// delete-line ops use to reposition a contiguous block of rows without
+    /// touching `set_cell` per cell. Overlapping source and destination
+    /// ranges are handled correctly because `copy_within` performs the
+    /// overlap-safe shift.
+    ///
+    /// Damage is marked on the destination rows only; the caller is
+    /// responsible for clearing or repopulating rows outside
+    /// `dst_row..dst_row + count` if the shift vacates them. Mirrors PR #62:
+    /// the retained line quad cache is keyed by `(NodeId, row_index,
+    /// content_hash)`, so every destination row must be fully damaged so the
+    /// renderer re-emits against the post-shift row indices.
+    ///
+    /// `dst_row`, `src_row`, and `count` are clamped so the copy stays
+    /// within `0..self.rows`. A zero-count shift is a no-op.
+    pub fn shift_rows(&mut self, dst_row: usize, src_row: usize, count: usize) {
+        if count == 0 || self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        let max_count = self.rows.saturating_sub(dst_row.max(src_row));
+        let count = count.min(max_count);
+        if count == 0 {
+            return;
+        }
+        if dst_row != src_row {
+            let src_start = src_row * self.cols;
+            let src_end = src_start + count * self.cols;
+            let dst_start = dst_row * self.cols;
+            self.cells.copy_within(src_start..src_end, dst_start);
+            // Per-cell dirty flags: the shifted cells are now at the
+            // destination indices. Mark the destination cells dirty so
+            // checkpoint-based per-cell consumers re-render.
+            let dst_cells_end = dst_start + count * self.cols;
+            self.dirty[dst_start..dst_cells_end].fill(true);
+        }
+        Self::mark_all_lines_fully_damaged(
+            &mut self.line_damage[dst_row..dst_row + count],
+            self.cols,
+        );
+    }
+
     /// Create a new grid filled with default (empty) cells.
     pub fn new(rows: usize, cols: usize) -> Self {
         let len = rows * cols;
@@ -737,5 +782,85 @@ mod tests {
         let h = CellGrid::global_cell_h();
         assert!((w - 9.5).abs() < f32::EPSILON);
         assert!((h - 18.0).abs() < f32::EPSILON);
+    }
+
+    // -- shift_rows ---------------------------------------------------------
+
+    #[test]
+    fn shift_rows_copies_cells_and_marks_destinations_damaged() {
+        let mut g = CellGrid::new(4, 3);
+        for r in 0..4 {
+            let ch = (b'A' + r as u8) as char;
+            for c in 0..3 {
+                g.set_cell(r, c, Cell::with_char(ch));
+            }
+        }
+        g.clear_dirty();
+        let seqs_before: Vec<u64> = g.line_damage().iter().map(|ld| ld.seqno).collect();
+
+        // Shift rows 0..2 to rows 1..3 (mirrors scroll_down(1) inside rows 0..3).
+        g.shift_rows(1, 0, 2);
+
+        // Destination rows 1 and 2 contain the original rows 0 and 1.
+        assert_eq!(g.get_cell(1, 0).unwrap().ch, 'A');
+        assert_eq!(g.get_cell(2, 0).unwrap().ch, 'B');
+
+        let last_col = (g.cols() - 1) as u16;
+        // Destination rows are fully damaged with bumped seqno.
+        for (row, ld) in g.line_damage().iter().enumerate().take(3).skip(1) {
+            assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col");
+            assert_eq!(ld.last_dirty_col, last_col, "row {row} last_dirty_col");
+            assert!(ld.seqno > seqs_before[row], "row {row} seqno must advance");
+        }
+        // Rows outside the destination stay clean.
+        assert!(g.line_damage()[0].is_clean(), "row 0 must remain clean");
+        assert!(g.line_damage()[3].is_clean(), "row 3 must remain clean");
+    }
+
+    #[test]
+    fn shift_rows_upward_overlapping_shift_preserves_content() {
+        let mut g = CellGrid::new(4, 3);
+        for r in 0..4 {
+            let ch = (b'A' + r as u8) as char;
+            for c in 0..3 {
+                g.set_cell(r, c, Cell::with_char(ch));
+            }
+        }
+
+        // Shift rows 1..4 up into rows 0..3 (mirrors scroll_up(1)).
+        g.shift_rows(0, 1, 3);
+
+        assert_eq!(g.get_cell(0, 0).unwrap().ch, 'B');
+        assert_eq!(g.get_cell(1, 0).unwrap().ch, 'C');
+        assert_eq!(g.get_cell(2, 0).unwrap().ch, 'D');
+    }
+
+    #[test]
+    fn shift_rows_zero_count_is_noop() {
+        let mut g = CellGrid::new(3, 3);
+        g.clear_dirty();
+
+        g.shift_rows(1, 0, 0);
+
+        assert!(
+            g.line_damage().iter().all(|ld| ld.is_clean()),
+            "zero-count shift must leave all rows clean",
+        );
+    }
+
+    #[test]
+    fn shift_rows_clamps_out_of_bounds_count() {
+        let mut g = CellGrid::new(3, 3);
+        g.clear_dirty();
+
+        // Count past self.rows is clamped.
+        g.shift_rows(0, 1, 100);
+
+        let last_col = (g.cols() - 1) as u16;
+        // rows 0..2 (2 rows) are the clamped destination.
+        for (row, ld) in g.line_damage().iter().enumerate().take(2) {
+            assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col");
+            assert_eq!(ld.last_dirty_col, last_col, "row {row} last_dirty_col");
+        }
     }
 }

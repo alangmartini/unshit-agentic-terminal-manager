@@ -289,18 +289,18 @@ impl Terminal {
 
     /// Scroll the grid down by one line. Moves all rows down and clears the
     /// top row.
+    ///
+    /// Uses `CellGrid::shift_rows` (copy_within + mark destination rows
+    /// fully damaged) to mirror the PR #62 `scroll_up` invariant: every
+    /// affected row is marked fully damaged so the retained line quad cache
+    /// (keyed by row index + content hash) re-emits against the post-shift
+    /// row indices. `clear_row` handles the vacated top row.
     fn scroll_down(&mut self) {
         if self.rows == 0 {
             return;
         }
-        // Shift rows down manually: copy row N-1 into row N, from bottom up.
-        for row in (1..self.rows).rev() {
-            for col in 0..self.cols {
-                if let Some(cell) = self.grid.get_cell(row - 1, col).copied() {
-                    self.grid.set_cell(row, col, cell);
-                }
-            }
-        }
+        // Shift rows 0..rows-1 down into rows 1..rows, then blank row 0.
+        self.grid.shift_rows(1, 0, self.rows - 1);
         self.clear_row(0);
     }
 
@@ -550,33 +550,47 @@ impl<'a> Perform for Performer<'a> {
             // -- Line insert/delete --------------------------------------------
 
             // IL: Insert Lines
+            //
+            // Uses `CellGrid::shift_rows` to move rows at/below the cursor
+            // down by `n`, then blanks the newly exposed rows. Mirrors the
+            // PR #62 `scroll_up` invariant: every row at and below the
+            // cursor is marked fully damaged so the retained line quad
+            // cache re-emits against the post-shift row indices.
             'L' => {
                 let n = p0();
-                for _ in 0..n {
-                    // Shift rows down starting from cursor row.
-                    for row in (t.cursor_row + 1..t.rows).rev() {
-                        for col in 0..t.cols {
-                            if let Some(cell) = t.grid.get_cell(row - 1, col).copied() {
-                                t.grid.set_cell(row, col, cell);
-                            }
-                        }
+                let cursor_row = t.cursor_row;
+                let rows = t.rows;
+                let n = n.min(rows.saturating_sub(cursor_row));
+                if n > 0 {
+                    let move_count = rows.saturating_sub(cursor_row + n);
+                    if move_count > 0 {
+                        t.grid.shift_rows(cursor_row + n, cursor_row, move_count);
                     }
-                    t.clear_row(t.cursor_row);
+                    for row in cursor_row..cursor_row + n {
+                        t.clear_row(row);
+                    }
                 }
             }
             // DL: Delete Lines
+            //
+            // Uses `CellGrid::shift_rows` to move rows below the cursor up
+            // by `n`, then blanks the newly exposed rows at the bottom.
+            // Mirrors the PR #62 `scroll_up` invariant: every row at and
+            // below the cursor is marked fully damaged so the retained line
+            // quad cache re-emits against the post-shift row indices.
             'M' if intermediates.is_empty() => {
                 let n = p0();
-                for _ in 0..n {
-                    // Shift rows up starting from cursor row.
-                    for row in t.cursor_row..t.rows.saturating_sub(1) {
-                        for col in 0..t.cols {
-                            if let Some(cell) = t.grid.get_cell(row + 1, col).copied() {
-                                t.grid.set_cell(row, col, cell);
-                            }
-                        }
+                let cursor_row = t.cursor_row;
+                let rows = t.rows;
+                let n = n.min(rows.saturating_sub(cursor_row));
+                if n > 0 {
+                    let move_count = rows.saturating_sub(cursor_row + n);
+                    if move_count > 0 {
+                        t.grid.shift_rows(cursor_row, cursor_row + n, move_count);
                     }
-                    t.clear_row(t.rows.saturating_sub(1));
+                    for row in rows.saturating_sub(n)..rows {
+                        t.clear_row(row);
+                    }
                 }
             }
 
@@ -2108,5 +2122,153 @@ mod tests {
             0,
             "CSI 3 J should clear the scrollback buffer"
         );
+    }
+
+    // -- Line-damage regression tests (issue #63) -----------------------------
+    //
+    // After PR #62 patched CellGrid::scroll_up to full-damage every row, the
+    // symmetric terminal-level ops that also shift which row an index points
+    // to must do the same. Reference emulators (Alacritty, WezTerm, Kitty)
+    // full-damage every affected row on scroll_down, insert-lines, and
+    // delete-lines so the retained line quad cache rebuilds against the
+    // post-shift row indices.
+
+    /// Populate every cell on every row with distinct content, then clear
+    /// damage so the starting line_damage state is fully clean.
+    fn fill_and_clean_damage(term: &mut Terminal) {
+        for r in 0..term.rows {
+            let ch = (b'A' + (r as u8 % 26)) as char;
+            for c in 0..term.cols {
+                let cell = Cell {
+                    ch,
+                    fg: DEFAULT_FG,
+                    bg: DEFAULT_BG,
+                    attrs: CellAttrs::empty(),
+                    wide_continuation: false,
+                };
+                term.grid.set_cell(r, c, cell);
+            }
+        }
+        term.grid.clear_dirty();
+        assert!(
+            term.grid.line_damage().iter().all(|ld| ld.is_clean()),
+            "precondition: every row must be clean after clear_dirty",
+        );
+    }
+
+    fn assert_rows_fully_damaged(term: &Terminal, rows: std::ops::Range<usize>) {
+        let last_col = term.cols.saturating_sub(1) as u16;
+        for row in rows {
+            let ld = term.grid.line_damage()[row];
+            assert!(!ld.is_clean(), "row {row} must be damaged");
+            assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col");
+            assert_eq!(
+                ld.last_dirty_col, last_col,
+                "row {row} last_dirty_col must equal cols - 1",
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_down_marks_every_row_fully_damaged_so_line_cache_reemits() {
+        // Regression: Terminal::scroll_down shifts content into every row
+        // index. The retained line quad cache is keyed by row index and
+        // content hash, so every row must be marked fully damaged and its
+        // seqno bumped so the renderer re-emits and rebuilds the cache.
+        let mut term = Terminal::new(4, 5);
+        fill_and_clean_damage(&mut term);
+        let seqs_before: Vec<u64> = term.grid.line_damage().iter().map(|ld| ld.seqno).collect();
+
+        term.scroll_down();
+
+        assert_rows_fully_damaged(&term, 0..term.rows);
+        for (row, ld) in term.grid.line_damage().iter().enumerate() {
+            assert!(
+                ld.seqno > seqs_before[row],
+                "row {row} seqno must advance after scroll_down",
+            );
+        }
+    }
+
+    #[test]
+    fn insert_lines_marks_affected_rows_fully_damaged() {
+        // Regression: CSI L (Insert Lines) shifts rows down starting at the
+        // cursor. The cursor row and every row below must be marked fully
+        // damaged, not merely per-column-dirtied with stale cache state.
+        let mut term = Terminal::new(5, 6);
+        // Cursor row 1: rows 1..=4 must be full-damaged.
+        term.process_bytes(b"\x1b[2;1H"); // move to row 1, col 0 (1-indexed)
+        fill_and_clean_damage(&mut term);
+        let seqs_before: Vec<u64> = term.grid.line_damage().iter().map(|ld| ld.seqno).collect();
+
+        term.process_bytes(b"\x1b[2L"); // Insert 2 blank lines
+
+        let cursor_row = term.cursor_row;
+        let rows = term.rows;
+        assert_rows_fully_damaged(&term, cursor_row..rows);
+        for (row, ld) in term
+            .grid
+            .line_damage()
+            .iter()
+            .enumerate()
+            .take(rows)
+            .skip(cursor_row)
+        {
+            assert!(
+                ld.seqno > seqs_before[row],
+                "row {row} seqno must advance after insert lines",
+            );
+        }
+    }
+
+    #[test]
+    fn delete_lines_marks_affected_rows_fully_damaged() {
+        // Regression: CSI M (Delete Lines) shifts rows up starting at the
+        // cursor. The cursor row and every row below must be marked fully
+        // damaged, not merely per-column-dirtied with stale cache state.
+        let mut term = Terminal::new(5, 6);
+        // Cursor row 1: rows 1..=4 must be full-damaged.
+        term.process_bytes(b"\x1b[2;1H"); // move to row 1, col 0 (1-indexed)
+        fill_and_clean_damage(&mut term);
+        let seqs_before: Vec<u64> = term.grid.line_damage().iter().map(|ld| ld.seqno).collect();
+
+        term.process_bytes(b"\x1b[2M"); // Delete 2 lines
+
+        let cursor_row = term.cursor_row;
+        let rows = term.rows;
+        assert_rows_fully_damaged(&term, cursor_row..rows);
+        for (row, ld) in term
+            .grid
+            .line_damage()
+            .iter()
+            .enumerate()
+            .take(rows)
+            .skip(cursor_row)
+        {
+            assert!(
+                ld.seqno > seqs_before[row],
+                "row {row} seqno must advance after delete lines",
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_index_at_top_marks_rows_fully_damaged() {
+        // Regression: ESC M (Reverse Index) at the top of the screen
+        // piggybacks on scroll_down, so it inherits the full-damage fix.
+        let mut term = Terminal::new(4, 5);
+        term.process_bytes(b"\x1b[1;1H"); // move cursor to row 0
+        fill_and_clean_damage(&mut term);
+        let seqs_before: Vec<u64> = term.grid.line_damage().iter().map(|ld| ld.seqno).collect();
+
+        term.process_bytes(b"\x1bM"); // Reverse Index
+
+        assert_rows_fully_damaged(&term, 0..term.rows);
+        for (row, ld) in term.grid.line_damage().iter().enumerate() {
+            assert!(
+                ld.seqno > seqs_before[row],
+                "row {row} seqno must advance after reverse index at top",
+            );
+        }
     }
 }
