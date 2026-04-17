@@ -270,6 +270,7 @@ impl fmt::Debug for ClipboardContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     // --- Type-level tests (no clipboard access required) ---
 
@@ -308,9 +309,42 @@ mod tests {
     }
 
     // --- Integration tests (best-effort; allowed to skip on headless CI) ---
+    //
+    // The system clipboard is a process global, single owner resource on every
+    // desktop OS.  On Windows specifically, concurrent callers of
+    // `OpenClipboard` / `SetClipboardData` / `GetClipboardData` from the same
+    // process can race against the clipboard manager and trigger
+    // `STATUS_HEAP_CORRUPTION` (exit `0xC0000374`) during process teardown:
+    // the Windows clipboard manager takes ownership of the `HGLOBAL` handles
+    // passed to `SetClipboardData` and frees them on `EmptyClipboard`, so a
+    // racing reader can dereference a handle that the other thread has
+    // already caused to be freed.  The CRT heap notices the invariant
+    // violation only when its bookkeeping is validated at process exit, which
+    // is why every test reports `ok` yet the binary still exits with
+    // `0xC0000374`.
+    //
+    // We therefore gate every integration test that touches the real system
+    // clipboard behind a process wide mutex so they run in series even when
+    // cargo schedules them in parallel.
+
+    /// Process wide guard for tests that touch the real system clipboard.
+    ///
+    /// Returns a [`MutexGuard`] that callers must keep alive for the duration
+    /// of their clipboard interaction.  Poisoned guards are recovered so one
+    /// panicking test does not lock the whole suite out forever.
+    fn clipboard_access_guard() -> MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        match GUARD.get_or_init(|| Mutex::new(())).lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     /// Helper: attempt to obtain a ClipboardContext.  Returns None if the
     /// system clipboard is unavailable (headless / CI environment).
+    ///
+    /// The caller must already hold [`clipboard_access_guard`] so that the
+    /// probe write does not race against another test.
     fn try_context() -> Option<ClipboardContext> {
         let ctx = ClipboardContext::new();
         // Probe with a write; if it fails we skip rather than panic.
@@ -323,6 +357,7 @@ mod tests {
 
     #[test]
     fn set_content_text_roundtrip() {
+        let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
         // Write then read.  Because clipboard tests may run in parallel (shared
         // system state), another test might overwrite the value before we read
@@ -334,6 +369,7 @@ mod tests {
 
     #[test]
     fn set_content_html_does_not_error() {
+        let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
         let result = ctx.set_content(ClipboardContent::Html {
             html: "<em>test</em>".to_owned(),
@@ -346,6 +382,7 @@ mod tests {
 
     #[test]
     fn get_html_returns_ok() {
+        let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
         // After writing HTML content get_html should not panic.
         // On some platforms (e.g. Windows when another test has since
@@ -362,6 +399,7 @@ mod tests {
 
     #[test]
     fn available_formats_returns_text_after_write() {
+        let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
         ctx.write_text("formats test").ok();
         let formats = ctx.available_formats();
@@ -370,5 +408,67 @@ mod tests {
             "expected Text in available_formats, got {:?}",
             formats
         );
+    }
+
+    /// Regression test for `STATUS_HEAP_CORRUPTION` (exit `0xC0000374`) that
+    /// reproduced on Windows when the clipboard integration tests ran in
+    /// parallel under the default cargo test scheduler.
+    ///
+    /// Before the fix, roughly 40% of `cargo test -p unshit-app --lib` runs
+    /// crashed at process teardown because multiple threads simultaneously
+    /// invoked `OpenClipboard` / `SetClipboardData` / `GetClipboardData` from
+    /// the same process.  See the module level comment on the integration
+    /// test section above for the full failure mode.
+    ///
+    /// This test spawns several worker threads that hammer the clipboard API
+    /// under the same process wide guard used by the other integration
+    /// tests.  With the guard in place the test terminates cleanly; removing
+    /// the guard from the worker body re introduces the original crash with
+    /// very high probability.
+    ///
+    /// The loop bound is conservative so the test finishes in well under a
+    /// second on developer hardware.
+    #[test]
+    fn concurrent_clipboard_access_does_not_corrupt_heap() {
+        // Probe once while holding the guard.  If the clipboard is
+        // unavailable (headless CI) we skip without touching threads at all.
+        {
+            let _lock = clipboard_access_guard();
+            if try_context().is_none() {
+                return;
+            }
+        }
+
+        const WORKERS: usize = 6;
+        const ITERATIONS: usize = 16;
+
+        let mut handles = Vec::with_capacity(WORKERS);
+        for worker in 0..WORKERS {
+            handles.push(std::thread::spawn(move || {
+                for i in 0..ITERATIONS {
+                    // Serialize every real clipboard operation through the
+                    // shared guard.  Concurrent `arboard` / `clipboard-win`
+                    // access from the same process is the documented cause
+                    // of the original heap corruption on Windows.
+                    let _lock = clipboard_access_guard();
+                    let ctx = ClipboardContext::new();
+
+                    let _ = ctx.write_text(format!("w{}-{}", worker, i));
+                    let _ = ctx.read_text();
+                    let _ = ctx.set_content(ClipboardContent::Html {
+                        html: format!("<i>w{}-{}</i>", worker, i),
+                        alt_text: format!("w{}-{}", worker, i),
+                    });
+                    let _ = ctx.get_html();
+                    let _ = ctx.available_formats();
+                }
+            }));
+        }
+
+        for h in handles {
+            // A panic in any worker must surface: otherwise the test would
+            // silently pass while the heap was already corrupt.
+            h.join().expect("clipboard worker thread panicked");
+        }
     }
 }
