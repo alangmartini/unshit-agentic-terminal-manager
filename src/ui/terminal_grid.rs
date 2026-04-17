@@ -278,7 +278,9 @@ fn build_pane_body(
                         // Shift+PageUp: scroll back half a page.
                         if has_shift && no_ctrl && no_alt && kb.key == Key::PageUp {
                             mutate_with(&kbd_shared, |st| {
-                                if let Some(terminal) = st.terminals.get_mut(&kbd_pane_id.0) {
+                                if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
+                                    let mut terminal =
+                                        handle.lock().expect("terminal mutex poisoned");
                                     let half = (terminal.grid().rows() / 2).max(1);
                                     terminal.scroll_view_up(half);
                                 }
@@ -289,7 +291,9 @@ fn build_pane_body(
                         // Shift+PageDown: scroll forward half a page.
                         if has_shift && no_ctrl && no_alt && kb.key == Key::PageDown {
                             mutate_with(&kbd_shared, |st| {
-                                if let Some(terminal) = st.terminals.get_mut(&kbd_pane_id.0) {
+                                if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
+                                    let mut terminal =
+                                        handle.lock().expect("terminal mutex poisoned");
                                     let half = (terminal.grid().rows() / 2).max(1);
                                     terminal.scroll_view_down(half);
                                 }
@@ -299,7 +303,8 @@ fn build_pane_body(
 
                         // Any other key while scrolled back snaps to live view.
                         mutate_with(&kbd_shared, |st| {
-                            if let Some(terminal) = st.terminals.get_mut(&kbd_pane_id.0) {
+                            if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
+                                let mut terminal = handle.lock().expect("terminal mutex poisoned");
                                 if terminal.scroll_offset() > 0 {
                                     terminal.reset_scroll();
                                 }
@@ -339,7 +344,9 @@ fn build_pane_body(
                         };
                         if lines != 0 {
                             mutate_with(&scroll_shared, |st| {
-                                if let Some(terminal) = st.terminals.get_mut(&scroll_pane_id.0) {
+                                if let Some(handle) = st.terminals.get(&scroll_pane_id.0) {
+                                    let mut terminal =
+                                        handle.lock().expect("terminal mutex poisoned");
                                     if lines > 0 {
                                         terminal.scroll_view_up(lines as usize);
                                     } else {
@@ -375,8 +382,11 @@ fn build_pane_body(
                         let cols = (w / cell_w).max(1.0) as u16;
                         let rows = (h / cell_h).max(1.0) as u16;
                         st.pty_manager.resize(resize_pane_id.0, cols, rows);
-                        if let Some(terminal) = st.terminals.get_mut(&resize_pane_id.0) {
-                            terminal.resize(rows as usize, cols as usize);
+                        if let Some(handle) = st.terminals.get(&resize_pane_id.0) {
+                            handle
+                                .lock()
+                                .expect("terminal mutex poisoned")
+                                .resize(rows as usize, cols as usize);
                         }
                     }
                 });

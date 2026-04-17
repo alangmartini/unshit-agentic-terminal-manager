@@ -142,6 +142,112 @@ impl Cell {
 }
 
 // ---------------------------------------------------------------------------
+// Line damage tracking
+// ---------------------------------------------------------------------------
+
+/// Damage state for a single row.
+///
+/// Mirrors Alacritty's `LineDamageBounds` and WezTerm's `changed_since(seqno)`
+/// pattern. `first_dirty_col..=last_dirty_col` is inclusive on both ends and
+/// invalid (no damage) when `first_dirty_col > last_dirty_col`.
+///
+/// The monotonic `seqno` is bumped on every cell write on that row. The
+/// renderer checkpoints the last seqno it rendered and may skip a row when
+/// the stored seqno matches the checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineDamage {
+    /// First dirty column (inclusive). `u16::MAX` when the row is clean.
+    pub first_dirty_col: u16,
+    /// Last dirty column (inclusive). `0` when the row is clean (paired with
+    /// `first_dirty_col == u16::MAX` to indicate clean state).
+    pub last_dirty_col: u16,
+    /// Monotonically increasing write counter for this row. The renderer
+    /// compares this against its last-seen value to decide whether the row
+    /// needs re-rendering even when `first_dirty_col..=last_dirty_col` was
+    /// already processed by an earlier pass this frame.
+    pub seqno: u64,
+}
+
+impl Default for LineDamage {
+    fn default() -> Self {
+        // Start clean: first > last means no damage. seqno 0 is the initial
+        // value. Renderers that have never seen this line use 0 too, so the
+        // first frame still triggers a draw via the seqno compare.
+        Self { first_dirty_col: u16::MAX, last_dirty_col: 0, seqno: 0 }
+    }
+}
+
+impl LineDamage {
+    /// `true` when this row has no pending damage to paint.
+    pub fn is_clean(&self) -> bool {
+        self.first_dirty_col == u16::MAX
+    }
+
+    /// Expand the damaged column range to include `col` and bump the seqno.
+    pub fn mark_col(&mut self, col: u16) {
+        self.mark_range(col, col);
+    }
+
+    /// Expand the damaged column range to `[start, end]` (inclusive) and bump
+    /// the seqno. Used by full-row operations (clear, scroll) where touching
+    /// every column is cheaper than calling `mark_col` in a loop.
+    pub fn mark_range(&mut self, start: u16, end: u16) {
+        if start > end {
+            return;
+        }
+        if self.is_clean() {
+            self.first_dirty_col = start;
+            self.last_dirty_col = end;
+        } else {
+            if start < self.first_dirty_col {
+                self.first_dirty_col = start;
+            }
+            if end > self.last_dirty_col {
+                self.last_dirty_col = end;
+            }
+        }
+        self.seqno = self.seqno.saturating_add(1);
+    }
+
+    /// Reset the dirty column range, leaving the seqno untouched. Called by
+    /// the renderer after it has emitted quads for this row.
+    pub fn clear_cols(&mut self) {
+        self.first_dirty_col = u16::MAX;
+        self.last_dirty_col = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Style runs (run-length batching by style)
+// ---------------------------------------------------------------------------
+
+/// Rendered style signature for a cell. Two adjacent cells with the same
+/// `StyleKey` can share a shaped text run and a single merged background
+/// quad. `fg` and `bg` already account for the `INVERSE` attribute.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StyleKey {
+    pub fg: Color,
+    pub bg: Color,
+    pub attrs: CellAttrs,
+}
+
+/// A maximal run of cells on a single row that share the same `StyleKey`.
+/// `end_col` is exclusive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StyleRun {
+    pub start_col: usize,
+    pub end_col: usize,
+    pub style: StyleKey,
+}
+
+impl StyleRun {
+    /// Number of columns covered by the run.
+    pub fn col_count(&self) -> usize {
+        self.end_col.saturating_sub(self.start_col)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CellGrid
 // ---------------------------------------------------------------------------
 
@@ -156,6 +262,9 @@ pub struct CellGrid {
     /// corresponding entry is set to `true`. The renderer reads and clears
     /// these to determine which cells need re-batching.
     dirty: Vec<bool>,
+    /// Per-row damage summary (first/last dirty column + seqno). The renderer
+    /// iterates this and skips clean lines entirely without touching cells.
+    line_damage: Vec<LineDamage>,
     cursor_row: usize,
     cursor_col: usize,
     cursor_visible: bool,
@@ -165,14 +274,29 @@ pub struct CellGrid {
 }
 
 impl CellGrid {
+    /// Maximum dirty-column index representable by a `LineDamage` when a row
+    /// has `cols` columns. `cols` is clamped to fit a `u16`.
+    #[inline]
+    fn last_col_u16(cols: usize) -> u16 {
+        cols.saturating_sub(1).min(u16::MAX as usize) as u16
+    }
+
     /// Create a new grid filled with default (empty) cells.
     pub fn new(rows: usize, cols: usize) -> Self {
         let len = rows * cols;
+        // Start fully damaged on both the per-cell and per-line trackers so
+        // the first render pass paints every row.
+        let mut line_damage = vec![LineDamage::default(); rows];
+        let last_col = Self::last_col_u16(cols);
+        for ld in &mut line_damage {
+            ld.mark_range(0, last_col);
+        }
         Self {
             rows,
             cols,
             cells: vec![Cell::default(); len],
             dirty: vec![true; len],
+            line_damage,
             cursor_row: 0,
             cursor_col: 0,
             cursor_visible: true,
@@ -199,9 +323,88 @@ impl CellGrid {
         &self.dirty
     }
 
-    /// Clear all dirty flags (called by the renderer after batching).
+    /// Access the per-line damage slice (read-only). Length equals `rows()`.
+    pub fn line_damage(&self) -> &[LineDamage] {
+        &self.line_damage
+    }
+
+    /// Borrow a single row's damage entry (returns `None` when `row` is out
+    /// of bounds).
+    pub fn line_damage_for(&self, row: usize) -> Option<&LineDamage> {
+        self.line_damage.get(row)
+    }
+
+    /// Collect maximal runs of adjacent cells on `row` that share the same
+    /// rendered style (foreground color, background color, and attributes
+    /// flags). Used by the renderer to group cells into a single
+    /// `BatchedTextRun` so shaping and background quads can be emitted once
+    /// per run instead of per cell.
+    ///
+    /// When the row has zero cols or is out of bounds an empty vector is
+    /// returned.
+    pub fn compute_style_runs(&self, row: usize) -> Vec<StyleRun> {
+        self.compute_style_runs_in_range(row, 0, self.cols)
+    }
+
+    /// Same as [`CellGrid::compute_style_runs`] but limited to the half-open
+    /// column range `[start_col, end_col)`. Runs never cross the provided
+    /// range boundaries.
+    pub fn compute_style_runs_in_range(
+        &self,
+        row: usize,
+        start_col: usize,
+        end_col: usize,
+    ) -> Vec<StyleRun> {
+        if row >= self.rows {
+            return Vec::new();
+        }
+        let end_col = end_col.min(self.cols);
+        if start_col >= end_col {
+            return Vec::new();
+        }
+
+        let mut runs: Vec<StyleRun> = Vec::new();
+        let row_base = row * self.cols;
+        let mut cur: Option<StyleRun> = None;
+        for col in start_col..end_col {
+            let cell = &self.cells[row_base + col];
+            let (fg, bg) = if cell.attrs.contains(CellAttrs::INVERSE) {
+                (cell.bg, cell.fg)
+            } else {
+                (cell.fg, cell.bg)
+            };
+
+            let key = StyleKey { fg, bg, attrs: cell.attrs };
+
+            match cur.as_mut() {
+                Some(run) if run.style == key => {
+                    // Wide continuation cells belong to the run of the wide
+                    // primary cell. Extending the run's end column keeps the
+                    // merged background rect covering both halves.
+                    run.end_col = col + 1;
+                }
+                _ => {
+                    if let Some(finished) = cur.take() {
+                        runs.push(finished);
+                    }
+                    cur = Some(StyleRun { start_col: col, end_col: col + 1, style: key });
+                }
+            }
+        }
+        if let Some(finished) = cur.take() {
+            runs.push(finished);
+        }
+        runs
+    }
+
+    /// Clear all dirty flags (called by the renderer after batching). Also
+    /// clears per-line damaged column ranges; seqnos are preserved so
+    /// renderers can checkpoint their last-seen value.
     pub fn clear_dirty(&mut self) {
         self.dirty.fill(false);
+        for ld in &mut self.line_damage {
+            ld.clear_cols();
+        }
     }
 
     /// Debug helper: render a row range as plain text, substituting empty cells
@@ -334,6 +537,9 @@ impl CellGrid {
         if let Some(i) = self.idx(row, col) {
             self.cells[i] = cell;
             self.dirty[i] = true;
+            if let Some(ld) = self.line_damage.get_mut(row) {
+                ld.mark_col(col.min(u16::MAX as usize) as u16);
+            }
         }
     }
 
@@ -365,16 +571,29 @@ impl CellGrid {
             };
             self.dirty[i] = true;
         }
+        if let Some(ld) = self.line_damage.get_mut(row) {
+            let start = col.min(u16::MAX as usize) as u16;
+            let end = (col + 1).min(u16::MAX as usize) as u16;
+            ld.mark_range(start, end);
+        }
     }
 
     /// Clear every cell to the default (empty) state and mark all dirty.
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
         self.dirty.fill(true);
+        let last_col = Self::last_col_u16(self.cols);
+        for ld in &mut self.line_damage {
+            ld.mark_range(0, last_col);
+        }
     }
 
     /// Scroll the grid contents up by `n` rows. The bottom `n` rows are
     /// filled with default (empty) cells. All affected cells are marked dirty.
+    ///
+    /// The per-line damage map is shifted together with the cells so a row
+    /// that was clean before the scroll stays clean afterwards (its content
+    /// only moved). Newly blank rows at the bottom are marked fully dirty.
     pub fn scroll_up(&mut self, n: usize) {
         if n == 0 {
             return;
@@ -392,9 +611,26 @@ impl CellGrid {
             *cell = Cell::default();
         }
 
-        // Mark everything dirty (conservative; a smarter approach could track
-        // only the moved/cleared region, but full-dirty is correct).
+        // Every cell position changed visually, so mark the whole per-cell
+        // map dirty; the per-line damage map below is shifted row-for-row.
         self.dirty.fill(true);
+
+        // Shift per-line damage: row R+n becomes row R. Bump each shifted
+        // seqno so renderers re-paint even when the target row was clean
+        // before the scroll.
+        let rows = self.rows;
+        if n < rows {
+            for r in 0..rows - n {
+                self.line_damage[r] = self.line_damage[r + n];
+                self.line_damage[r].seqno = self.line_damage[r].seqno.saturating_add(1);
+            }
+        }
+        // Newly exposed blank rows at the bottom are fully damaged.
+        let last_col = Self::last_col_u16(self.cols);
+        let start_blank = rows.saturating_sub(n);
+        for r in start_blank..rows {
+            self.line_damage[r].mark_range(0, last_col);
+        }
     }
 
     /// Resize the grid. Existing content in the overlapping region is
@@ -420,6 +656,15 @@ impl CellGrid {
         self.cols = new_cols;
         self.cells = new_cells;
         self.dirty = vec![true; new_rows * new_cols];
+        // Rebuild `line_damage` sized to `new_rows` and mark every row fully
+        // damaged with a fresh seqno so renderers re-render regardless of
+        // their previous checkpoint.
+        let mut new_line_damage = vec![LineDamage::default(); new_rows];
+        let last_col = Self::last_col_u16(new_cols);
+        for ld in &mut new_line_damage {
+            ld.mark_range(0, last_col);
+        }
+        self.line_damage = new_line_damage;
     }
 }
 
