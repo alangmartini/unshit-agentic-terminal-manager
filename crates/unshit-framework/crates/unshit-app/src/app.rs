@@ -220,6 +220,7 @@ struct AppState {
     /// Populated lazily as characters appear; preloaded with ASCII and box
     /// drawing at startup. See [`ShapeCache`] for invalidation semantics.
     shape_cache: ShapeCache,
+    line_quad_cache: unshit_renderer::line_quad_cache::LineQuadCache,
     canvas_registry: CanvasRegistry,
     last_metrics: FrameMetrics,
     frame_count: u64,
@@ -644,6 +645,7 @@ impl ApplicationHandler for AppHandler {
             shaped_cache: ShapedTextCache::new(),
             batch_cache: BatchCache::new(),
             shape_cache: ShapeCache::new(),
+            line_quad_cache: unshit_renderer::line_quad_cache::LineQuadCache::new(),
             canvas_registry,
             last_metrics: FrameMetrics::default(),
             frame_count: 0,
@@ -1788,6 +1790,7 @@ impl ApplicationHandler for AppHandler {
                     &state.scrollbar_visual,
                     state.interaction.focused,
                     &mut state.batch_cache,
+                    Some(&mut state.line_quad_cache),
                 );
                 state.batch_cache.commit_frame();
                 batch::clear_paint_flags_subtree(&mut state.arena, state.root);

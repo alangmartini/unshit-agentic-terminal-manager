@@ -389,6 +389,7 @@ impl WindowedTest {
             &state.scrollbar_visual,
             state.interaction.focused,
             &mut state.batch_cache,
+            None,
         );
         state.batch_cache.commit_frame();
         batch::clear_paint_flags_subtree(&mut state.arena, state.root);

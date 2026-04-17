@@ -7,6 +7,7 @@ use crate::atlas::{GlyphAtlas, GlyphEntry, GlyphKey};
 use crate::canvas::{CanvasCallback, CanvasRegistry};
 #[cfg(target_os = "windows")]
 use crate::dw_rasterizer::DwRasterizer;
+use crate::line_quad_cache::{hash_row_cells, LineGeometrySig, LineQuadCache};
 use crate::pipeline::image::ImageInstance;
 use crate::pipeline::quad::{QuadInstance, MAX_GRADIENT_STOPS};
 use crate::pipeline::text::GlyphInstance;
@@ -781,6 +782,7 @@ pub fn build_render_batch(
     scrollbar_state: &ScrollbarVisualState,
     focused: NodeId,
     batch_cache: &mut BatchCache,
+    mut line_cache: Option<&mut LineQuadCache>,
 ) {
     let initial_clip = [0.0_f32, 0.0, 9999.0, 9999.0];
     let mut portals: Vec<(NodeId, Layer)> = Vec::new();
@@ -807,6 +809,7 @@ pub fn build_render_batch(
         &mut portals,
         batch_cache,
         None,
+        line_cache.as_deref_mut(),
     );
 
     // Process deferred portal nodes with fresh viewport clip
@@ -834,6 +837,7 @@ pub fn build_render_batch(
             &mut Vec::new(),
             batch_cache,
             None,
+            line_cache.as_deref_mut(),
         );
     }
 }
@@ -886,6 +890,7 @@ fn walk_for_batch(
     portals: &mut Vec<(NodeId, Layer)>,
     batch_cache: &mut BatchCache,
     parent_glyph_keys: Option<&mut FxHashSet<GlyphKey>>,
+    mut line_cache: Option<&mut LineQuadCache>,
 ) {
     let Some(element) = arena.get(node_id) else {
         return;
@@ -1672,6 +1677,8 @@ fn walk_for_batch(
                     rasterizer,
                     shape_cache,
                     Some(&mut node_glyph_keys),
+                    node_id,
+                    line_cache.as_deref_mut(),
                 );
             }
             ElementContent::Svg(ref node) if is_visible => {
@@ -1766,6 +1773,7 @@ fn walk_for_batch(
             portals,
             batch_cache,
             Some(&mut node_glyph_keys),
+            line_cache.as_deref_mut(),
         );
     }
 
@@ -2135,11 +2143,23 @@ pub fn shape_cache_font_id(font_family: &str) -> u64 {
     hasher.finish()
 }
 
+/// Local struct shared by `emit_grid_cells` and `emit_grid_row_fresh` so
+/// both paths resolve glyphs into the same shape.
+struct ResolvedGlyph {
+    key: GlyphKey,
+    entry: GlyphEntry,
+    physical_x: i32,
+    physical_y: i32,
+    line_y: f32,
+}
+
 /// Emit background quads and glyph instances for a `CellGrid`.
 ///
-/// This path skips cosmic-text shaping entirely. For each non-empty cell the
-/// glyph is looked up in the atlas by rendering a single codepoint through
-/// the swash rasterizer (one char at a time, fixed advance width).
+/// This path skips cosmic-text shaping entirely for already rasterized
+/// glyphs. When a retained per line quad cache is provided, rows whose
+/// content and geometry signatures still match the cache are replayed by
+/// appending the previously emitted vertex instances to the frame batch,
+/// skipping shaping, rasterization, and iteration.
 #[allow(clippy::too_many_arguments)]
 fn emit_grid_cells(
     grid: &CellGrid,
@@ -2156,28 +2176,25 @@ fn emit_grid_cells(
     rasterizer: &mut Rasterizer<'_>,
     shape_cache: &mut ShapeCache,
     mut glyph_keys_out: Option<&mut FxHashSet<GlyphKey>>,
+    node_id: NodeId,
+    mut line_cache: Option<&mut LineQuadCache>,
 ) {
     let rows = grid.rows();
     let cols = grid.cols();
     let cells = grid.cells();
-    let dirty = grid.dirty_flags();
     let trace_hash = terminal_grid_trace_hash(grid);
     let trace_this_grid = terminal_trace_enabled()
         && LAST_TERMINAL_RENDER_TRACE_HASH.swap(trace_hash, Ordering::Relaxed) != trace_hash;
     let trace_rows = if trace_this_grid { Some(grid.debug_rows(4, 96)) } else { None };
     let mut trace_glyphs: Vec<String> = Vec::new();
 
+    let atlas_generation = atlas.generation;
+
     // Shape each unique character once, then cache the fully resolved glyph
     // per actual atlas key. Fractional cell origins can change the subpixel
     // bins, so caching only by `char` is incorrect when cell_w/cell_h are not
-    // integers.
-    struct ResolvedGlyph {
-        key: GlyphKey,
-        entry: GlyphEntry,
-        physical_x: i32,
-        physical_y: i32,
-        line_y: f32,
-    }
+    // integers. This cache is shared across every row we actually emit
+    // (cache miss path) in this pass.
     let mut glyph_cache: FxHashMap<GlyphKey, ResolvedGlyph> = FxHashMap::default();
 
     // Precompute the (font_family, font_id, style) fields for the ShapeCache
@@ -2203,210 +2220,145 @@ fn emit_grid_cells(
     buffer.set_size(font_system, Some(cell_w * 4.0), None);
     let mut ch_buf = [0u8; 4];
 
+    let dirty = grid.dirty_flags();
+
+    // Geometry inputs are constant across every row of a single grid pass,
+    // so build the geometry signature once and reuse it for every row probe.
+    let geom_sig = LineGeometrySig::new(
+        origin_x,
+        origin_y,
+        cell_w,
+        cell_h,
+        font_size,
+        opacity,
+        clip_rect,
+        cols as u32,
+        atlas_generation,
+    );
+
+    // Drop any cached rows that refer to rows past the current grid height.
+    // This is cheap and keeps memory bounded when the grid shrinks.
+    if let Some(cache) = line_cache.as_deref_mut() {
+        cache.truncate_element(node_id, rows as u32);
+    }
+
     for row in 0..rows {
-        // Skip lines with no pending damage so we never touch their cells or
-        // glyphs. When a grid has no LineDamage entry (out-of-bounds, should
-        // not happen given line_damage.len() == rows) fall back to scanning
-        // the whole row.
-        let (scan_start, scan_end) = match grid.line_damage_for(row) {
-            Some(ld) if !ld.is_clean() => {
-                (ld.first_dirty_col as usize, (ld.last_dirty_col as usize + 1).min(cols))
+        // Determine which columns in this row have damage. A fully clean row
+        // (no cells touched since the last clear_dirty) takes the cache replay
+        // fast path when available, and is skipped otherwise (matching the
+        // Tier 2 line damage skip behavior).
+        let damage_range = grid.line_damage_for(row).and_then(|ld| {
+            if ld.is_clean() {
+                None
+            } else {
+                Some((ld.first_dirty_col as usize, (ld.last_dirty_col as usize + 1).min(cols)))
             }
-            Some(_) => continue,
-            None => (0, cols),
+        });
+        let row_is_clean = match grid.line_damage_for(row) {
+            Some(ld) => ld.is_clean(),
+            None => false,
         };
+
+        let content_sig = hash_row_cells(cells, row, cols);
+
+        // Cache probe: replay the cached instances for this row when the
+        // content hash and geometry signature still match. Works for both
+        // clean and dirty rows because the hash captures any visible change.
+        if let Some(cache) = line_cache.as_deref_mut() {
+            if let Some(hit) = cache.lookup_replayable(node_id, row as u32, content_sig, geom_sig) {
+                batch.quad_instances.extend_from_slice(&hit.quads);
+                batch.glyph_instances.extend_from_slice(&hit.glyphs);
+                for key in &hit.glyph_keys {
+                    atlas.touch(key);
+                    if let Some(keys) = glyph_keys_out.as_deref_mut() {
+                        keys.insert(*key);
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Clean row with no cache hit: nothing to emit. This preserves the
+        // Tier 2 damage-skip guarantee that unchanged rows incur zero
+        // per-cell work when the line cache is unavailable.
+        if row_is_clean {
+            continue;
+        }
+
+        let (scan_start, scan_end) = damage_range.unwrap_or((0, cols));
         if scan_start >= scan_end {
             continue;
         }
 
-        let py = origin_y + row as f32 * cell_h;
-        let row_base = row * cols;
+        // Cache miss on a dirty row: emit fresh into local buffers using the
+        // Tier 2 two pass structure (run batched background, then per cell
+        // glyphs) and store the result in the line cache for next frame.
+        let mut row_quads: Vec<QuadInstance> = Vec::new();
+        let mut row_glyphs: Vec<GlyphInstance> = Vec::new();
+        let mut row_keys: Vec<GlyphKey> = Vec::new();
 
-        // Merge adjacent cells with the same (fg, bg, attrs) into a single
-        // background QuadInstance via `compute_style_runs_in_range`, mirroring
-        // Zed's BatchedTextRun pattern: one quad per run instead of one per
-        // cell.
-        for run in grid.compute_style_runs_in_range(row, scan_start, scan_end) {
-            // A run is only emitted when at least one of its columns is dirty
-            // this frame. Without this check a partial-row repaint would also
-            // redraw the surrounding clean columns that happened to share the
-            // same style.
-            let run_has_damage = (run.start_col..run.end_col).any(|c| dirty[row_base + c]);
-            if !run_has_damage {
-                continue;
-            }
-            let bg = run.style.bg;
-            if bg.a > 0 {
-                let mut bg_color = bg.to_linear_f32();
-                bg_color[3] *= opacity;
-                let px = origin_x + run.start_col as f32 * cell_w;
-                let width = run.col_count() as f32 * cell_w;
-                if width > 0.0 {
-                    batch.quad_instances.push(QuadInstance {
-                        pos: [px, py],
-                        size: [width, cell_h],
-                        color: bg_color,
-                        border_color: [0.0; 4],
-                        border_width: [0.0; 4],
-                        border_radius: [0.0; 4],
-                        clip_rect,
-                        shadow_color: [0.0; 4],
-                        shadow_offset: [0.0; 2],
-                        shadow_params: [0.0; 2],
-                        shadow_spread: [0.0; 2],
-                        gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
-                        gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
-                        gradient_params: [0.0; 4],
-                        gradient_extra: EMPTY_GRADIENT_EXTRA,
-                    });
-                }
+        emit_grid_row_fresh(
+            grid,
+            cells,
+            dirty,
+            row,
+            cols,
+            scan_start,
+            scan_end,
+            origin_x,
+            origin_y,
+            cell_w,
+            cell_h,
+            font_size,
+            opacity,
+            clip_rect,
+            shape_font_id,
+            SHAPE_STYLE_REGULAR,
+            shape_font_size_tenths,
+            family_name,
+            &mut row_quads,
+            &mut row_glyphs,
+            &mut row_keys,
+            &mut glyph_cache,
+            shape_cache,
+            atlas,
+            font_system,
+            rasterizer,
+            &mut buffer,
+            &mut ch_buf,
+            trace_this_grid,
+            &mut trace_glyphs,
+        );
+
+        // Forward to the frame batch.
+        batch.quad_instances.extend_from_slice(&row_quads);
+        batch.glyph_instances.extend_from_slice(&row_glyphs);
+        if let Some(keys) = glyph_keys_out.as_deref_mut() {
+            for key in &row_keys {
+                keys.insert(*key);
             }
         }
 
-        // Emit per-cell glyphs across the same damaged range.
-        for col in scan_start..scan_end {
-            let idx = row_base + col;
-            if !dirty[idx] {
-                continue;
-            }
-            let cell = &cells[idx];
-            // Skip glyph for empty cells and wide continuation cells.
-            if cell.is_empty() || cell.wide_continuation {
-                continue;
-            }
-
-            // INVERSE swaps fg/bg; only fg is needed here since the bg quad
-            // was already emitted via the run loop above.
-            let fg = if cell.attrs.contains(CellAttrs::INVERSE) { cell.bg } else { cell.fg };
-            let mut fg_linear = fg.to_linear_f32();
-            if cell.attrs.contains(CellAttrs::DIM) {
-                fg_linear[3] *= 0.5;
-            }
-            fg_linear[3] *= opacity;
-
-            let cache_key = ShapeCacheKey {
-                ch: cell.ch,
-                font_id: shape_font_id,
-                style: SHAPE_STYLE_REGULAR,
-                font_size_tenths: shape_font_size_tenths,
-            };
-            let px = origin_x + col as f32 * cell_w;
-            // Cross-frame ShapeCache. Hit path bypasses set_text and
-            // shape_until_scroll entirely; miss path shapes once and stores.
-            let prototype = if let Some(entry) = shape_cache.get(&cache_key) {
-                entry.clone()
-            } else {
-                let ch_str = cell.ch.encode_utf8(&mut ch_buf);
-                #[cfg(target_os = "windows")]
-                let family = cosmic_text::Family::Name(family_name);
-                #[cfg(not(target_os = "windows"))]
-                let family = cosmic_text::Family::Monospace;
-                buffer.set_text(
-                    font_system,
-                    ch_str,
-                    cosmic_text::Attrs::new().family(family),
-                    cosmic_text::Shaping::Advanced,
-                );
-                buffer.shape_until_scroll(font_system, false);
-
-                let shaped = buffer.layout_runs().find_map(|run| {
-                    run.glyphs
-                        .first()
-                        .cloned()
-                        .map(|glyph| ShapedGlyphEntry { layout_glyph: glyph, line_y: run.line_y })
-                });
-                shape_cache.insert(cache_key, shaped.clone());
-                shaped
-            };
-
-            let Some(prototype) = prototype else {
-                continue;
-            };
-
-            let px_floor = px.floor();
-            let py_floor = py.floor();
-            let physical = prototype.layout_glyph.physical((px - px_floor, py - py_floor), 1.0);
-            let key = GlyphKey {
-                font_id: atlas_font_namespace(&physical.cache_key),
-                glyph_id: physical.cache_key.glyph_id,
-                font_size_tenths: (font_size * 10.0) as u16,
-                subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
-                    | (physical.cache_key.y_bin as u8),
-            };
-
-            let was_cached = glyph_cache.contains_key(&key);
-            let resolved = if let Some(cached) = glyph_cache.get(&key) {
-                atlas.touch(&cached.key);
-                cached
-            } else {
-                let entry = if let Some(entry) = atlas.cache.get(&key).copied() {
-                    atlas.touch(&key);
-                    entry
-                } else {
-                    match rasterize_grid_glyph_for_atlas(
-                        rasterizer,
-                        font_system,
-                        &physical,
-                        cell.ch,
-                        font_size,
-                        atlas,
-                        key,
-                    ) {
-                        Some(entry) => entry,
-                        None => continue,
-                    }
-                };
-
-                glyph_cache.entry(key).or_insert(ResolvedGlyph {
-                    key,
-                    entry,
-                    physical_x: physical.x,
-                    physical_y: physical.y,
-                    line_y: prototype.line_y,
-                })
-            };
-
-            if let Some(keys) = glyph_keys_out.as_deref_mut() {
-                keys.insert(resolved.key);
-            }
-
-            let gx = px_floor + resolved.physical_x as f32 + resolved.entry.offset[0];
-            let gy =
-                py_floor + resolved.line_y + resolved.physical_y as f32 + resolved.entry.offset[1];
-            if trace_this_grid && row < 4 && trace_glyphs.len() < 64 {
-                trace_glyphs.push(format!(
-                    "{} r{}c{} ch={:?} key=({}, {}, {}) pos=({:.1}, {:.1})",
-                    if was_cached { "cache" } else { "miss" },
-                    row,
-                    col,
-                    cell.ch,
-                    resolved.key.font_id,
-                    resolved.key.glyph_id,
-                    resolved.key.subpixel_bin,
-                    gx,
-                    gy,
-                ));
-            }
-
-            batch.glyph_instances.push(GlyphInstance {
-                pos: [gx, gy],
-                size: resolved.entry.size,
-                uv_min: [resolved.entry.uv_rect[0], resolved.entry.uv_rect[1]],
-                uv_max: [resolved.entry.uv_rect[2], resolved.entry.uv_rect[3]],
-                color: fg_linear,
-                clip_rect,
-            });
+        // Store the fresh row in the cache.
+        if let Some(cache) = line_cache.as_deref_mut() {
+            cache.store(
+                node_id,
+                row as u32,
+                content_sig,
+                geom_sig,
+                row_quads,
+                row_glyphs,
+                row_keys,
+            );
         }
     }
 
     if trace_this_grid {
         let rows_dump = trace_rows.unwrap_or_default();
-        let dirty_count = dirty.iter().filter(|&&bit| bit).count();
         append_terminal_trace_line(&format!(
-            "terminal-trace stage=emit_grid_cells rows={} cols={} dirty={} origin=({:.1}, {:.1}) cell=({:.2}, {:.2}) cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?} glyphs={}",
+            "terminal-trace stage=emit_grid_cells rows={} cols={} origin=({:.1}, {:.1}) cell=({:.2}, {:.2}) cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?} glyphs={}",
             rows,
             cols,
-            dirty_count,
             origin_x,
             origin_y,
             cell_w,
@@ -2422,7 +2374,10 @@ fn emit_grid_cells(
         ));
     }
 
-    // Draw cursor block when visible.
+    // Draw cursor block when visible. The cursor moves every frame in the
+    // typical interactive case; we do not cache it, because the pertinent
+    // row's content hash may still be stable while the cursor shifts inside
+    // that row.
     if grid.cursor_visible() {
         let crow = grid.cursor_row();
         let ccol = grid.cursor_col();
@@ -2430,7 +2385,6 @@ fn emit_grid_cells(
             let cx = origin_x + ccol as f32 * cell_w;
             let cy = origin_y + crow as f32 * cell_h;
 
-            // Use the foreground color of the cell under the cursor.
             let cursor_idx = crow * cols + ccol;
             let cell_fg = cells[cursor_idx].fg;
             let mut cursor_color = cell_fg.to_linear_f32();
@@ -2454,6 +2408,223 @@ fn emit_grid_cells(
                 gradient_extra: EMPTY_GRADIENT_EXTRA,
             });
         }
+    }
+}
+
+/// Emit one row of a cell grid into three output buffers, doing all
+/// shaping and atlas uploads needed for that row. Called by
+/// `emit_grid_cells` on cache miss. Uses Tier 2's two pass layout:
+/// first one merged background `QuadInstance` per style run in the
+/// damaged column range, then a per cell glyph pass over dirty columns
+/// using the cross frame `ShapeCache`.
+#[allow(clippy::too_many_arguments)]
+fn emit_grid_row_fresh(
+    grid: &CellGrid,
+    cells: &[unshit_core::cell_grid::Cell],
+    dirty: &[bool],
+    row: usize,
+    cols: usize,
+    scan_start: usize,
+    scan_end: usize,
+    origin_x: f32,
+    origin_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    opacity: f32,
+    clip_rect: [f32; 4],
+    shape_font_id: u64,
+    shape_style: u64,
+    shape_font_size_tenths: u32,
+    family_name: &str,
+    row_quads: &mut Vec<QuadInstance>,
+    row_glyphs: &mut Vec<GlyphInstance>,
+    row_keys: &mut Vec<GlyphKey>,
+    glyph_cache: &mut FxHashMap<GlyphKey, ResolvedGlyph>,
+    shape_cache: &mut ShapeCache,
+    atlas: &mut GlyphAtlas,
+    font_system: &mut FontSystem,
+    rasterizer: &mut Rasterizer<'_>,
+    buffer: &mut cosmic_text::Buffer,
+    ch_buf: &mut [u8; 4],
+    trace_this_grid: bool,
+    trace_glyphs: &mut Vec<String>,
+) {
+    let py = origin_y + row as f32 * cell_h;
+    let row_base = row * cols;
+
+    // Merge adjacent cells with the same (fg, bg, attrs) into a single
+    // background QuadInstance via `compute_style_runs_in_range`, mirroring
+    // Zed's BatchedTextRun pattern: one quad per run instead of one per cell.
+    for run in grid.compute_style_runs_in_range(row, scan_start, scan_end) {
+        // A run is only emitted when at least one of its columns is dirty
+        // this frame. Without this check a partial-row repaint would also
+        // redraw the surrounding clean columns that happened to share the
+        // same style.
+        let run_has_damage = (run.start_col..run.end_col).any(|c| dirty[row_base + c]);
+        if !run_has_damage {
+            continue;
+        }
+        let bg = run.style.bg;
+        if bg.a > 0 {
+            let mut bg_color = bg.to_linear_f32();
+            bg_color[3] *= opacity;
+            let px = origin_x + run.start_col as f32 * cell_w;
+            let width = run.col_count() as f32 * cell_w;
+            if width > 0.0 {
+                row_quads.push(QuadInstance {
+                    pos: [px, py],
+                    size: [width, cell_h],
+                    color: bg_color,
+                    border_color: [0.0; 4],
+                    border_width: [0.0; 4],
+                    border_radius: [0.0; 4],
+                    clip_rect,
+                    shadow_color: [0.0; 4],
+                    shadow_offset: [0.0; 2],
+                    shadow_params: [0.0; 2],
+                    shadow_spread: [0.0; 2],
+                    gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
+                    gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
+                    gradient_params: [0.0; 4],
+                    gradient_extra: EMPTY_GRADIENT_EXTRA,
+                });
+            }
+        }
+    }
+
+    // Emit per-cell glyphs across the same damaged range.
+    for col in scan_start..scan_end {
+        let idx = row_base + col;
+        if !dirty[idx] {
+            continue;
+        }
+        let cell = &cells[idx];
+        // Skip glyph for empty cells and wide continuation cells.
+        if cell.is_empty() || cell.wide_continuation {
+            continue;
+        }
+
+        // INVERSE swaps fg/bg; only fg is needed here since the bg quad
+        // was already emitted via the run loop above.
+        let fg = if cell.attrs.contains(CellAttrs::INVERSE) { cell.bg } else { cell.fg };
+        let mut fg_linear = fg.to_linear_f32();
+        if cell.attrs.contains(CellAttrs::DIM) {
+            fg_linear[3] *= 0.5;
+        }
+        fg_linear[3] *= opacity;
+
+        let cache_key = ShapeCacheKey {
+            ch: cell.ch,
+            font_id: shape_font_id,
+            style: shape_style,
+            font_size_tenths: shape_font_size_tenths,
+        };
+        let px = origin_x + col as f32 * cell_w;
+        // Cross-frame ShapeCache. Hit path bypasses set_text and
+        // shape_until_scroll entirely; miss path shapes once and stores.
+        let prototype = if let Some(entry) = shape_cache.get(&cache_key) {
+            entry.clone()
+        } else {
+            let ch_str = cell.ch.encode_utf8(ch_buf);
+            #[cfg(target_os = "windows")]
+            let family = cosmic_text::Family::Name(family_name);
+            #[cfg(not(target_os = "windows"))]
+            let family = cosmic_text::Family::Monospace;
+            // Silence unused on non-windows.
+            let _ = family_name;
+            buffer.set_text(
+                font_system,
+                ch_str,
+                cosmic_text::Attrs::new().family(family),
+                cosmic_text::Shaping::Advanced,
+            );
+            buffer.shape_until_scroll(font_system, false);
+
+            let shaped = buffer.layout_runs().find_map(|run| {
+                run.glyphs
+                    .first()
+                    .cloned()
+                    .map(|glyph| ShapedGlyphEntry { layout_glyph: glyph, line_y: run.line_y })
+            });
+            shape_cache.insert(cache_key, shaped.clone());
+            shaped
+        };
+
+        let Some(prototype) = prototype else {
+            continue;
+        };
+
+        let px_floor = px.floor();
+        let py_floor = py.floor();
+        let physical = prototype.layout_glyph.physical((px - px_floor, py - py_floor), 1.0);
+        let key = GlyphKey {
+            font_id: atlas_font_namespace(&physical.cache_key),
+            glyph_id: physical.cache_key.glyph_id,
+            font_size_tenths: (font_size * 10.0) as u16,
+            subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
+                | (physical.cache_key.y_bin as u8),
+        };
+
+        let was_cached = glyph_cache.contains_key(&key);
+        let resolved = if let Some(cached) = glyph_cache.get(&key) {
+            atlas.touch(&cached.key);
+            cached
+        } else {
+            let entry = if let Some(entry) = atlas.cache.get(&key).copied() {
+                atlas.touch(&key);
+                entry
+            } else {
+                match rasterize_grid_glyph_for_atlas(
+                    rasterizer,
+                    font_system,
+                    &physical,
+                    cell.ch,
+                    font_size,
+                    atlas,
+                    key,
+                ) {
+                    Some(entry) => entry,
+                    None => continue,
+                }
+            };
+
+            glyph_cache.entry(key).or_insert(ResolvedGlyph {
+                key,
+                entry,
+                physical_x: physical.x,
+                physical_y: physical.y,
+                line_y: prototype.line_y,
+            })
+        };
+
+        row_keys.push(resolved.key);
+
+        let gx = px_floor + resolved.physical_x as f32 + resolved.entry.offset[0];
+        let gy = py_floor + resolved.line_y + resolved.physical_y as f32 + resolved.entry.offset[1];
+        if trace_this_grid && row < 4 && trace_glyphs.len() < 64 {
+            trace_glyphs.push(format!(
+                "{} r{}c{} ch={:?} key=({}, {}, {}) pos=({:.1}, {:.1})",
+                if was_cached { "cache" } else { "miss" },
+                row,
+                col,
+                cell.ch,
+                resolved.key.font_id,
+                resolved.key.glyph_id,
+                resolved.key.subpixel_bin,
+                gx,
+                gy,
+            ));
+        }
+
+        row_glyphs.push(GlyphInstance {
+            pos: [gx, gy],
+            size: resolved.entry.size,
+            uv_min: [resolved.entry.uv_rect[0], resolved.entry.uv_rect[1]],
+            uv_max: [resolved.entry.uv_rect[2], resolved.entry.uv_rect[3]],
+            color: fg_linear,
+            clip_rect,
+        });
     }
 }
 
