@@ -705,10 +705,7 @@ impl ShapeCache {
     ///
     /// Call this at the start of each frame before the first lookup.
     pub fn retune(&mut self, font_family: &str, scale_factor: f32, font_size: f32) {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        font_family.hash(&mut hasher);
-        let font_id = hasher.finish();
+        let font_id = shape_cache_font_id(font_family);
         let scale = (scale_factor * 1000.0).round() as u32;
         let size = (font_size * 10.0).round() as u32;
 
@@ -2718,11 +2715,8 @@ pub struct CellMetricsKey {
 
 impl CellMetricsKey {
     pub fn new(font_family: &str, font_size: f32, line_height: f32, scale_factor: f32) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        font_family.hash(&mut hasher);
         Self {
-            font_id: hasher.finish(),
+            font_id: shape_cache_font_id(font_family),
             font_size_tenths: (font_size * 10.0).round() as u32,
             line_height_tenths: (line_height * 10.0).round() as u32,
             scale_factor_thousandths: (scale_factor * 1000.0).round() as u32,
