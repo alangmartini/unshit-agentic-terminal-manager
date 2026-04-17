@@ -782,11 +782,10 @@ pub fn build_render_batch(
     scrollbar_state: &ScrollbarVisualState,
     focused: NodeId,
     batch_cache: &mut BatchCache,
-    line_cache: Option<&mut LineQuadCache>,
+    mut line_cache: Option<&mut LineQuadCache>,
 ) {
     let initial_clip = [0.0_f32, 0.0, 9999.0, 9999.0];
     let mut portals: Vec<(NodeId, Layer)> = Vec::new();
-    let mut line_cache = line_cache;
     walk_for_batch(
         arena,
         root,
@@ -2223,6 +2222,20 @@ fn emit_grid_cells(
 
     let dirty = grid.dirty_flags();
 
+    // Geometry inputs are constant across every row of a single grid pass,
+    // so build the geometry signature once and reuse it for every row probe.
+    let geom_sig = LineGeometrySig::new(
+        origin_x,
+        origin_y,
+        cell_w,
+        cell_h,
+        font_size,
+        opacity,
+        clip_rect,
+        cols as u32,
+        atlas_generation,
+    );
+
     // Drop any cached rows that refer to rows past the current grid height.
     // This is cheap and keeps memory bounded when the grid shrinks.
     if let Some(cache) = line_cache.as_deref_mut() {
@@ -2247,17 +2260,6 @@ fn emit_grid_cells(
         };
 
         let content_sig = hash_row_cells(cells, row, cols);
-        let geom_sig = LineGeometrySig::new(
-            origin_x,
-            origin_y,
-            cell_w,
-            cell_h,
-            font_size,
-            opacity,
-            clip_rect,
-            cols as u32,
-            atlas_generation,
-        );
 
         // Cache probe: replay the cached instances for this row when the
         // content hash and geometry signature still match. Works for both
