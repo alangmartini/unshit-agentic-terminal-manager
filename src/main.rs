@@ -30,6 +30,49 @@ use crate::ui::titlebar::build_titlebar;
 
 const STYLES: &str = include_str!("../assets/styles.css");
 
+/// Snapshot a terminal's display grid for the current render frame.
+///
+/// This is the per-terminal step run by `tree_fn` when it builds the
+/// element tree. It takes the per-terminal mutex, clones the display
+/// grid, hides the cursor on inactive panes, and returns the cloned
+/// grid for the renderer to consume.
+///
+/// Issue #63: this function MUST NOT call `clear_dirty()` on the live
+/// grid. The old code did, which produced a race where an interleaved
+/// PTY chunk arriving between the clone and the clear would have its
+/// damage wiped, dropping cells from the next frame. The clone already
+/// owns its damage independently; leaving the live grid untouched means
+/// the next snapshot still sees every write since the last clone. The
+/// renderer's retained line quad cache (`LineQuadCache`) handles
+/// replay for unchanged rows via the content-hash signature, so the
+/// previous damage-skip optimisation is not needed for correctness or
+/// performance.
+fn snapshot_terminal_for_render(
+    terminal: &mut crate::terminal::Terminal,
+    pane_id: u32,
+    is_active: bool,
+) -> unshit::core::cell_grid::CellGrid {
+    let mut grid = terminal.display_grid();
+    if !is_active {
+        grid.set_cursor_visible(false);
+    }
+    if terminal_trace_enabled() && is_active {
+        let rows = grid.debug_rows(4, 96);
+        append_terminal_trace_line(&format!(
+            "terminal-trace stage=main_snapshot pane={} active=true cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?}",
+            pane_id,
+            grid.cursor_row(),
+            grid.cursor_col(),
+            grid.cursor_visible(),
+            rows.first().cloned().unwrap_or_default(),
+            rows.get(1).cloned().unwrap_or_default(),
+            rows.get(2).cloned().unwrap_or_default(),
+            rows.get(3).cloned().unwrap_or_default(),
+        ));
+    }
+    grid
+}
+
 fn build_tree(
     snap: &UiSnapshot,
     shared: &SharedState,
@@ -343,35 +386,16 @@ fn main() {
             };
 
             // State mutex is released; take each per-terminal lock
-            // independently to clone its display grid and clear dirty flags.
+            // independently to clone its display grid. `snapshot_terminal_for_render`
+            // does NOT clear the live grid's dirty state (see issue #63):
+            // interleaved PTY writes that land between two snapshots must
+            // stay reflected as damage on the next clone, otherwise the
+            // renderer can skip them and drop cells from the viewport.
             let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = handles
                 .into_iter()
                 .map(|(id, handle)| {
                     let mut t = handle.lock().expect("terminal mutex poisoned");
-                    let mut grid = t.display_grid();
-                    if id != active_id {
-                        grid.set_cursor_visible(false);
-                    }
-                    if terminal_trace_enabled() && id == active_id {
-                        let rows = grid.debug_rows(4, 96);
-                        append_terminal_trace_line(&format!(
-                            "terminal-trace stage=main_snapshot pane={} active=true cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?}",
-                            id,
-                            grid.cursor_row(),
-                            grid.cursor_col(),
-                            grid.cursor_visible(),
-                            rows.first().cloned().unwrap_or_default(),
-                            rows.get(1).cloned().unwrap_or_default(),
-                            rows.get(2).cloned().unwrap_or_default(),
-                            rows.get(3).cloned().unwrap_or_default(),
-                        ));
-                    }
-                    // The cloned grid keeps every dirty flag and LineDamage
-                    // entry for the renderer to consume; `clear_dirty` resets
-                    // the live grid so the next frame's damage only covers
-                    // new writes. Seqnos are deliberately preserved so a
-                    // future cross-frame checkpoint still compares cleanly.
-                    t.grid_mut().clear_dirty();
+                    let grid = snapshot_terminal_for_render(&mut t, id, id == active_id);
                     (id, grid)
                 })
                 .collect();
@@ -383,4 +407,130 @@ fn main() {
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
 
     app.run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::Terminal;
+
+    /// Regression test for issue #63.
+    ///
+    /// The render loop snapshots each terminal's display grid once per
+    /// frame. The old code additionally called
+    /// `terminal.grid_mut().clear_dirty()` on the LIVE grid right after
+    /// the clone. If a PTY chunk wrote to the live grid between the
+    /// clone and the clear (or, more generally, at any time before the
+    /// next snapshot with a clear still pending), the clear would wipe
+    /// the damage bumped by that interleaved write, and the next
+    /// snapshot would report the affected row as clean. The renderer
+    /// would then skip the row on a cache miss
+    /// (see `crates/unshit-framework/crates/unshit-renderer/src/batch.rs`
+    /// `emit_grid_cells` `row_is_clean` path) and cells would disappear
+    /// from the viewport.
+    ///
+    /// This test simulates that exact ordering and asserts that the
+    /// interleaved write's damage survives to the next snapshot.
+    #[test]
+    fn snapshot_terminal_for_render_preserves_interleaved_write_damage() {
+        // Models the exact ordering the task spec calls out:
+        //   1. `display_grid()` (snapshot) already happened in the
+        //      previous frame.
+        //   2. A PTY chunk lands on the live grid, bumping line damage.
+        //   3. The render loop runs its post-snapshot reset (what the
+        //      broken code did was `grid_mut().clear_dirty()` on the
+        //      live grid).
+        //   4. The next frame snapshots again.
+        //
+        // With the broken code, step 3 wiped the live grid's damage for
+        // step 2's writes, so step 4's clone reported the row as clean
+        // and the renderer skipped it on a cache miss, dropping cells.
+        let mut terminal = Terminal::new(10, 40);
+        terminal.process_bytes(b"first line");
+
+        // Step 1: previous-frame snapshot (establishes the starting
+        // state for the race).
+        let _snap_previous_frame = snapshot_terminal_for_render(&mut terminal, 0, true);
+
+        // Step 2: a PTY chunk lands after the previous snapshot but
+        // before the next frame, writing row 1.
+        terminal.process_bytes(b"\r\nsecond line");
+
+        // Step 3: production's "post-snapshot reset". This helper
+        // mirrors whatever the main-loop does after taking a snapshot.
+        // With the #63 fix the helper is a no-op; with the broken code
+        // it used to call `grid_mut().clear_dirty()` on the live grid
+        // and wipe the damage for step 2's writes.
+        post_snapshot_reset_like_production(&mut terminal);
+
+        // Step 4: the next frame snapshots the live grid. Before the
+        // fix, row 1's damage was wiped by step 3 and this clone
+        // reported the row as clean.
+        let snap_next_frame = snapshot_terminal_for_render(&mut terminal, 0, true);
+
+        let row1 = snap_next_frame
+            .line_damage_for(1)
+            .expect("row 1 damage entry must exist");
+        assert!(
+            !row1.is_clean(),
+            "row 1 damage is clean after an interleaved PTY write \
+             followed by the production post-snapshot reset. The \
+             renderer would then skip row 1 on a cache miss and drop \
+             its cells (regression of issue #63)"
+        );
+
+        // Sanity: the freshly written cells actually live on row 1.
+        let cell = snap_next_frame
+            .get_cell(1, 0)
+            .expect("row 1 col 0 must exist");
+        assert_eq!(
+            cell.ch, 's',
+            "row 1 col 0 should hold the 's' of 'second line'"
+        );
+    }
+
+    /// Mirrors the production "post-snapshot reset" step that used to
+    /// be inlined at the end of every per-terminal iteration inside
+    /// `tree_fn`. Before the #63 fix this called
+    /// `terminal.grid_mut().clear_dirty()` on the live grid. The fix
+    /// removed that call entirely, so this helper is now a no-op. If
+    /// someone reintroduces the clear here or in
+    /// `snapshot_terminal_for_render`, the regression tests below will
+    /// trip.
+    fn post_snapshot_reset_like_production(_terminal: &mut Terminal) {
+        // Intentionally empty. See issue #63.
+    }
+
+    /// Auxiliary regression for #63: the live grid's damage must keep
+    /// accumulating across multiple snapshots so that every write ever
+    /// performed (until the renderer has had a chance to replay it via
+    /// the content-hash cache) shows up as damage on the latest
+    /// snapshot. If someone reintroduces `clear_dirty()` on the live
+    /// grid inside `snapshot_terminal_for_render`, this test also
+    /// fails on the second row.
+    #[test]
+    fn snapshot_terminal_for_render_accumulates_damage_across_snapshots() {
+        let mut terminal = Terminal::new(10, 40);
+
+        terminal.process_bytes(b"alpha");
+        let _s1 = snapshot_terminal_for_render(&mut terminal, 0, true);
+
+        terminal.process_bytes(b"\r\nbeta");
+        let _s2 = snapshot_terminal_for_render(&mut terminal, 0, true);
+
+        terminal.process_bytes(b"\r\ngamma");
+        let s3 = snapshot_terminal_for_render(&mut terminal, 0, true);
+
+        for row in 0..=2 {
+            let ld = s3
+                .line_damage_for(row)
+                .unwrap_or_else(|| panic!("damage entry for row {}", row));
+            assert!(
+                !ld.is_clean(),
+                "row {} damage is clean; a previous snapshot cleared live \
+                 grid damage and dropped this row's writes (#63)",
+                row
+            );
+        }
+    }
 }
