@@ -591,7 +591,7 @@ impl ShapedTextCache {
 }
 
 // ---------------------------------------------------------------------------
-// ShapeCache (Tier 1, task 2)
+// ShapeCache
 //
 // Persistent, cross-frame cache of shaped prototype glyphs for the terminal
 // grid. The hot path in `emit_grid_cells` shapes every unique character it
@@ -2820,7 +2820,7 @@ fn measure_monospace_cell_width(
     use std::sync::Mutex;
     static CACHE: Mutex<Option<CellMetricsCache>> = Mutex::new(None);
 
-    let mut guard = CACHE.lock().expect("CELL_METRICS_CACHE poisoned");
+    let mut guard = CACHE.lock().expect("cell metrics cache mutex poisoned");
     let cache = guard.get_or_insert_with(CellMetricsCache::new);
     cache.get_or_measure(font_system, monospace_family_name(), font_size, line_height, 1.0).cell_w
 }
@@ -3601,7 +3601,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // CellMetricsCache tests (Tier 1, task 1).
+    // CellMetricsCache tests.
     //
     // The cache must cross frames: a second lookup with identical
     // (font_family, font_size, line_height, scale_factor) must NOT re-measure.
@@ -3712,7 +3712,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ShapeCache tests (Tier 1, task 2).
+    // ShapeCache tests.
     //
     // The ShapeCache is a cross-frame cache. Tests verify:
     //   * Cache hit on second lookup.

@@ -1534,13 +1534,10 @@ impl ApplicationHandler for AppHandler {
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
 
-                // Frame pacing (Tier 1, task 3). Coalesce RequestRebuild and
-                // input-driven redraws into at most one paint per
-                // frame_pacer.min_interval. If the pacer says wait, schedule
-                // a WaitUntil and bail out early so the event loop sleeps
-                // until the coalescing deadline. No rendering happens from
-                // the PTY reader or input handlers; every paint goes
-                // through this single gate.
+                // Coalesce RequestRebuild and input-driven redraws into at
+                // most one paint per frame_pacer.min_interval. When the
+                // pacer says wait, schedule a WaitUntil and bail out so
+                // the event loop sleeps until the coalescing deadline.
                 match state.frame_pacer.on_redraw_requested(frame_start) {
                     crate::frame_pacer::PaceDecision::PaintNow => {}
                     crate::frame_pacer::PaceDecision::WaitUntil(deadline) => {

@@ -1,4 +1,4 @@
-//! Frame pacing utilities (Tier 1, task 3).
+//! Frame pacing utilities.
 //!
 //! Coalesces redraw requests so that the event loop paints at most once per
 //! `min_frame_interval`. The framework currently does not expose a vsync

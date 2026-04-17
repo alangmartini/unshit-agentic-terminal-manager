@@ -1,4 +1,4 @@
-//! Frame-time probe (Tier 1, task 4).
+//! Frame-time probe.
 //!
 //! Records per-frame wall-clock durations in a small ring buffer and emits
 //! p50/p95/p99 quantiles plus min/max/frame count once per second. Debug
