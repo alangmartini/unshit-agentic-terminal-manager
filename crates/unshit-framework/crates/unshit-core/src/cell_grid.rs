@@ -281,16 +281,20 @@ impl CellGrid {
         cols.saturating_sub(1).min(u16::MAX as usize) as u16
     }
 
+    fn mark_all_lines_fully_damaged(lines: &mut [LineDamage], cols: usize) {
+        let last_col = Self::last_col_u16(cols);
+        for ld in lines {
+            ld.mark_range(0, last_col);
+        }
+    }
+
     /// Create a new grid filled with default (empty) cells.
     pub fn new(rows: usize, cols: usize) -> Self {
         let len = rows * cols;
         // Start fully damaged on both the per-cell and per-line trackers so
         // the first render pass paints every row.
         let mut line_damage = vec![LineDamage::default(); rows];
-        let last_col = Self::last_col_u16(cols);
-        for ld in &mut line_damage {
-            ld.mark_range(0, last_col);
-        }
+        Self::mark_all_lines_fully_damaged(&mut line_damage, cols);
         Self {
             rows,
             cols,
@@ -582,18 +586,18 @@ impl CellGrid {
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
         self.dirty.fill(true);
-        let last_col = Self::last_col_u16(self.cols);
-        for ld in &mut self.line_damage {
-            ld.mark_range(0, last_col);
-        }
+        Self::mark_all_lines_fully_damaged(&mut self.line_damage, self.cols);
     }
 
     /// Scroll the grid contents up by `n` rows. The bottom `n` rows are
     /// filled with default (empty) cells. All affected cells are marked dirty.
     ///
-    /// The per-line damage map is shifted together with the cells so a row
-    /// that was clean before the scroll stays clean afterwards (its content
-    /// only moved). Newly blank rows at the bottom are marked fully dirty.
+    /// Every row is marked fully damaged. The retained line quad cache is
+    /// keyed by `(NodeId, row_index, content_hash)` with absolute quad
+    /// positions baked into each entry, so a shifted row cannot reuse the
+    /// cache entry stored at its old row index. Forcing full-row damage
+    /// makes the renderer re-emit every row and rebuild the cache against
+    /// the post-scroll row indices.
     pub fn scroll_up(&mut self, n: usize) {
         if n == 0 {
             return;
@@ -602,35 +606,14 @@ impl CellGrid {
         let shift = n * self.cols;
         let total = self.rows * self.cols;
 
-        // Move surviving rows up
         self.cells.copy_within(shift..total, 0);
 
-        // Clear the bottom n rows
         let clear_start = total - shift;
-        for cell in &mut self.cells[clear_start..] {
-            *cell = Cell::default();
-        }
+        self.cells[clear_start..].fill(Cell::default());
 
-        // Every cell position changed visually, so mark the whole per-cell
-        // map dirty; the per-line damage map below is shifted row-for-row.
         self.dirty.fill(true);
 
-        // Shift per-line damage: row R+n becomes row R. Bump each shifted
-        // seqno so renderers re-paint even when the target row was clean
-        // before the scroll.
-        let rows = self.rows;
-        if n < rows {
-            for r in 0..rows - n {
-                self.line_damage[r] = self.line_damage[r + n];
-                self.line_damage[r].seqno = self.line_damage[r].seqno.saturating_add(1);
-            }
-        }
-        // Newly exposed blank rows at the bottom are fully damaged.
-        let last_col = Self::last_col_u16(self.cols);
-        let start_blank = rows.saturating_sub(n);
-        for r in start_blank..rows {
-            self.line_damage[r].mark_range(0, last_col);
-        }
+        Self::mark_all_lines_fully_damaged(&mut self.line_damage, self.cols);
     }
 
     /// Resize the grid. Existing content in the overlapping region is
@@ -660,10 +643,7 @@ impl CellGrid {
         // damaged with a fresh seqno so renderers re-render regardless of
         // their previous checkpoint.
         let mut new_line_damage = vec![LineDamage::default(); new_rows];
-        let last_col = Self::last_col_u16(new_cols);
-        for ld in &mut new_line_damage {
-            ld.mark_range(0, last_col);
-        }
+        Self::mark_all_lines_fully_damaged(&mut new_line_damage, new_cols);
         self.line_damage = new_line_damage;
     }
 }

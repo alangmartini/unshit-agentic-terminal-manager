@@ -293,6 +293,39 @@ fn scroll_up_zero_is_noop() {
     assert!(!g.has_dirty_cells());
 }
 
+#[test]
+fn scroll_up_damages_every_previously_clean_row() {
+    // Regression: scroll_up used to preserve the clean status of shifted
+    // rows. Combined with a content-hash-keyed line quad cache in the
+    // renderer, that caused skipped emission for rows whose content had
+    // moved, leaving the viewport empty after a terminal scroll.
+    let mut g = CellGrid::new(4, 3);
+    for r in 0..4 {
+        let ch = (b'A' + r as u8) as char;
+        for c in 0..3 {
+            g.set_cell(r, c, Cell::with_char(ch));
+        }
+    }
+    g.clear_dirty();
+    assert!(
+        g.line_damage().iter().all(|ld| ld.is_clean()),
+        "precondition: every row must be clean after clear_dirty",
+    );
+
+    g.scroll_up(1);
+
+    assert_all_rows_fully_damaged(&g);
+}
+
+fn assert_all_rows_fully_damaged(g: &CellGrid) {
+    let last_col = g.cols().saturating_sub(1) as u16;
+    for (row, ld) in g.line_damage().iter().enumerate() {
+        assert!(!ld.is_clean(), "row {row} must be damaged");
+        assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col");
+        assert_eq!(ld.last_dirty_col, last_col, "row {row} last_dirty_col");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // resize
 // ---------------------------------------------------------------------------
@@ -573,35 +606,27 @@ fn renderer_can_skip_line_using_seqno_checkpoint() {
 }
 
 #[test]
-fn scroll_up_shifts_damage_with_grid() {
-    // When we scroll up by 1, row 1 content moves to row 0, etc. The damage
-    // map must move with it so clean rows stay clean (positionally). The
-    // newly exposed bottom row becomes fully damaged.
+fn scroll_up_bumps_seqno_for_every_row() {
+    // Per-row seqnos must advance on every row after scroll_up so
+    // checkpoint-based renderers re-paint, not just the rows whose
+    // columns were written between clear_dirty and the scroll.
     let mut g = CellGrid::new(3, 4);
     g.clear_dirty();
 
-    // Dirty only the middle row.
     g.set_cell(1, 2, Cell::with_char('M'));
-    let ld_mid_before = g.line_damage()[1];
-    assert!(!ld_mid_before.is_clean());
+    assert!(!g.line_damage()[1].is_clean());
 
-    // Before scrolling, rows 0 and 2 are clean.
-    assert!(g.line_damage()[0].is_clean());
-    assert!(g.line_damage()[2].is_clean());
+    let seqs_before: Vec<u64> = g.line_damage().iter().map(|ld| ld.seqno).collect();
 
     g.scroll_up(1);
 
-    // After scroll_up(1): the old middle row's damage now sits at row 0.
-    assert!(!g.line_damage()[0].is_clean());
-    assert_eq!(g.line_damage()[0].first_dirty_col, 2);
-    assert_eq!(g.line_damage()[0].last_dirty_col, 2);
-    // The previously clean row 2 is now at row 1, but scroll bumped every
-    // shifted row's seqno so renderers re-paint (content moved visually).
-    assert!(g.line_damage()[0].seqno > ld_mid_before.seqno);
-    // Bottom row is newly exposed -> fully damaged.
-    assert!(!g.line_damage()[2].is_clean());
-    assert_eq!(g.line_damage()[2].first_dirty_col, 0);
-    assert_eq!(g.line_damage()[2].last_dirty_col, 3);
+    assert_all_rows_fully_damaged(&g);
+    for (row, ld) in g.line_damage().iter().enumerate() {
+        assert!(
+            ld.seqno > seqs_before[row],
+            "row {row} seqno must advance so subscribers re-paint",
+        );
+    }
 }
 
 #[test]
