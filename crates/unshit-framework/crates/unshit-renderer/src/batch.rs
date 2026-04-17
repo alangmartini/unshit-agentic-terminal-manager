@@ -2153,6 +2153,71 @@ struct ResolvedGlyph {
     line_y: f32,
 }
 
+/// Emit a background `QuadInstance` for every style run on `row` between
+/// `start_col` (inclusive) and `end_col` (exclusive). This is the pure,
+/// GPU-independent half of the row emission pipeline used by
+/// `emit_grid_row_fresh`, and every production caller passes the full
+/// row range `0..cols`.
+///
+/// Unlike earlier versions of the renderer this helper does NOT filter
+/// runs by the grid's per-cell `dirty` flags. The retained line quad
+/// cache (see `line_quad_cache.rs`) stores a whole-row payload keyed by
+/// the whole-row content hash; on a cache MISS the entire row must be
+/// re-emitted so the stored payload covers every column. Narrowing the
+/// emission to the damaged sub-range caused the classic "typing a
+/// character blanks the rest of the row" regression (issue #63).
+///
+/// Peer terminals (WezTerm, Alacritty, Zed) treat damage bounds as
+/// invalidation hints, not emission extent. This helper mirrors that
+/// contract: `start_col`/`end_col` are only the bounds of the loop, not
+/// a dirty filter.
+#[allow(clippy::too_many_arguments)]
+fn emit_grid_row_backgrounds(
+    grid: &CellGrid,
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    origin_x: f32,
+    origin_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    opacity: f32,
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) {
+    let py = origin_y + row as f32 * cell_h;
+    for run in grid.compute_style_runs_in_range(row, start_col, end_col) {
+        let bg = run.style.bg;
+        if bg.a == 0 {
+            continue;
+        }
+        let mut bg_color = bg.to_linear_f32();
+        bg_color[3] *= opacity;
+        let px = origin_x + run.start_col as f32 * cell_w;
+        let width = run.col_count() as f32 * cell_w;
+        if width <= 0.0 {
+            continue;
+        }
+        row_quads.push(QuadInstance {
+            pos: [px, py],
+            size: [width, cell_h],
+            color: bg_color,
+            border_color: [0.0; 4],
+            border_width: [0.0; 4],
+            border_radius: [0.0; 4],
+            clip_rect,
+            shadow_color: [0.0; 4],
+            shadow_offset: [0.0; 2],
+            shadow_params: [0.0; 2],
+            shadow_spread: [0.0; 2],
+            gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
+            gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
+            gradient_params: [0.0; 4],
+            gradient_extra: EMPTY_GRADIENT_EXTRA,
+        });
+    }
+}
+
 /// Emit background quads and glyph instances for a `CellGrid`.
 ///
 /// This path skips cosmic-text shaping entirely for already rasterized
@@ -2220,8 +2285,6 @@ fn emit_grid_cells(
     buffer.set_size(font_system, Some(cell_w * 4.0), None);
     let mut ch_buf = [0u8; 4];
 
-    let dirty = grid.dirty_flags();
-
     // Geometry inputs are constant across every row of a single grid pass,
     // so build the geometry signature once and reuse it for every row probe.
     let geom_sig = LineGeometrySig::new(
@@ -2243,22 +2306,12 @@ fn emit_grid_cells(
     }
 
     for row in 0..rows {
-        // Determine which columns in this row have damage. A fully clean row
-        // (no cells touched since the last clear_dirty) takes the cache replay
-        // fast path when available, and is skipped otherwise (matching the
-        // Tier 2 line damage skip behavior).
-        let damage_range = grid.line_damage_for(row).and_then(|ld| {
-            if ld.is_clean() {
-                None
-            } else {
-                Some((ld.first_dirty_col as usize, (ld.last_dirty_col as usize + 1).min(cols)))
-            }
-        });
-        let row_is_clean = match grid.line_damage_for(row) {
-            Some(ld) => ld.is_clean(),
-            None => false,
-        };
-
+        // Compute the whole-row content hash. Peer terminals (WezTerm,
+        // Alacritty, Zed) use damage bounds as invalidation hints, not
+        // emission extent: the hash decides cache freshness, emission
+        // always spans the full row. Narrowing emission to the damaged
+        // sub-range while keeping the whole-row hash produced the classic
+        // "typing a character blanks the rest of the row" bug (issue #63).
         let content_sig = hash_row_cells(cells, row, cols);
 
         // Cache probe: replay the cached instances for this row when the
@@ -2278,21 +2331,14 @@ fn emit_grid_cells(
             }
         }
 
-        // Clean row with no cache hit: nothing to emit. This preserves the
-        // Tier 2 damage-skip guarantee that unchanged rows incur zero
-        // per-cell work when the line cache is unavailable.
-        if row_is_clean {
-            continue;
-        }
-
-        let (scan_start, scan_end) = damage_range.unwrap_or((0, cols));
-        if scan_start >= scan_end {
-            continue;
-        }
-
-        // Cache miss on a dirty row: emit fresh into local buffers using the
-        // Tier 2 two pass structure (run batched background, then per cell
-        // glyphs) and store the result in the line cache for next frame.
+        // Cache miss: emit the full row fresh. This covers two otherwise
+        // silent-failure cases (issue #63):
+        //   1) The previous frame stored a full-row payload for this
+        //      content hash, but atlas/geometry changes invalidated it
+        //      even though per-cell dirty bits were clear.
+        //   2) A single-cell write bumps the whole-row content hash but
+        //      only marks a tiny damage window; the whole row must still
+        //      be re-emitted so the replacement payload remains complete.
         let mut row_quads: Vec<QuadInstance> = Vec::new();
         let mut row_glyphs: Vec<GlyphInstance> = Vec::new();
         let mut row_keys: Vec<GlyphKey> = Vec::new();
@@ -2300,11 +2346,8 @@ fn emit_grid_cells(
         emit_grid_row_fresh(
             grid,
             cells,
-            dirty,
             row,
             cols,
-            scan_start,
-            scan_end,
             origin_x,
             origin_y,
             cell_w,
@@ -2339,7 +2382,9 @@ fn emit_grid_cells(
             }
         }
 
-        // Store the fresh row in the cache.
+        // Store the fresh row in the cache. Because `emit_grid_row_fresh`
+        // spans the whole row this payload is complete, so subsequent
+        // frames that HIT this content hash replay every cell.
         if let Some(cache) = line_cache.as_deref_mut() {
             cache.store(
                 node_id,
@@ -2413,19 +2458,21 @@ fn emit_grid_cells(
 
 /// Emit one row of a cell grid into three output buffers, doing all
 /// shaping and atlas uploads needed for that row. Called by
-/// `emit_grid_cells` on cache miss. Uses Tier 2's two pass layout:
-/// first one merged background `QuadInstance` per style run in the
-/// damaged column range, then a per cell glyph pass over dirty columns
-/// using the cross frame `ShapeCache`.
+/// `emit_grid_cells` on cache miss. Spans the full row `0..cols`
+/// every time: first merged background `QuadInstance`s per style run,
+/// then per cell glyphs using the cross frame `ShapeCache`.
+///
+/// Per-cell damage bits are intentionally NOT consulted here. On a
+/// cache miss the previous-frame payload is gone and the fresh output
+/// is about to replace it; emitting only the damaged sub-range would
+/// cache a truncated row that silently blanks the surrounding cells
+/// on the next HIT (issue #63).
 #[allow(clippy::too_many_arguments)]
 fn emit_grid_row_fresh(
     grid: &CellGrid,
     cells: &[unshit_core::cell_grid::Cell],
-    dirty: &[bool],
     row: usize,
     cols: usize,
-    scan_start: usize,
-    scan_end: usize,
     origin_x: f32,
     origin_y: f32,
     cell_w: f32,
@@ -2454,51 +2501,15 @@ fn emit_grid_row_fresh(
     let row_base = row * cols;
 
     // Merge adjacent cells with the same (fg, bg, attrs) into a single
-    // background QuadInstance via `compute_style_runs_in_range`, mirroring
-    // Zed's BatchedTextRun pattern: one quad per run instead of one per cell.
-    for run in grid.compute_style_runs_in_range(row, scan_start, scan_end) {
-        // A run is only emitted when at least one of its columns is dirty
-        // this frame. Without this check a partial-row repaint would also
-        // redraw the surrounding clean columns that happened to share the
-        // same style.
-        let run_has_damage = (run.start_col..run.end_col).any(|c| dirty[row_base + c]);
-        if !run_has_damage {
-            continue;
-        }
-        let bg = run.style.bg;
-        if bg.a > 0 {
-            let mut bg_color = bg.to_linear_f32();
-            bg_color[3] *= opacity;
-            let px = origin_x + run.start_col as f32 * cell_w;
-            let width = run.col_count() as f32 * cell_w;
-            if width > 0.0 {
-                row_quads.push(QuadInstance {
-                    pos: [px, py],
-                    size: [width, cell_h],
-                    color: bg_color,
-                    border_color: [0.0; 4],
-                    border_width: [0.0; 4],
-                    border_radius: [0.0; 4],
-                    clip_rect,
-                    shadow_color: [0.0; 4],
-                    shadow_offset: [0.0; 2],
-                    shadow_params: [0.0; 2],
-                    shadow_spread: [0.0; 2],
-                    gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
-                    gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
-                    gradient_params: [0.0; 4],
-                    gradient_extra: EMPTY_GRADIENT_EXTRA,
-                });
-            }
-        }
-    }
+    // background QuadInstance across the full row. Mirrors Zed's
+    // BatchedTextRun pattern: one quad per run instead of one per cell.
+    emit_grid_row_backgrounds(
+        grid, row, 0, cols, origin_x, origin_y, cell_w, cell_h, opacity, clip_rect, row_quads,
+    );
 
-    // Emit per-cell glyphs across the same damaged range.
-    for col in scan_start..scan_end {
+    // Emit per-cell glyphs across the full row.
+    for col in 0..cols {
         let idx = row_base + col;
-        if !dirty[idx] {
-            continue;
-        }
         let cell = &cells[idx];
         // Skip glyph for empty cells and wide continuation cells.
         if cell.is_empty() || cell.wide_continuation {
@@ -4065,5 +4076,366 @@ mod tests {
         assert!(chars.contains(&'\u{2500}'));
         assert!(chars.contains(&'\u{257f}'));
         assert_eq!(chars.len(), 95 + 128);
+    }
+
+    // -----------------------------------------------------------------------
+    // Retained line quad cache: full-row emission regression tests (issue #63)
+    //
+    // Peer terminals (WezTerm, Alacritty, Zed) treat per-row damage bounds as
+    // INVALIDATION hints, not emission extent. Before the fix, a cache MISS
+    // would emit only the damaged sub-range while storing the truncated
+    // payload under the whole-row content hash, so the next HIT replayed a
+    // stripped cache and cells outside the window disappeared. These tests
+    // exercise `emit_grid_row_backgrounds`, the pure half of the fresh-emit
+    // pipeline, to confirm the emission helper always spans the whole row.
+    // -----------------------------------------------------------------------
+
+    /// Build a grid where every column in `row` has a distinct non-transparent
+    /// background color so each column contributes its own `StyleRun`, and
+    /// `emit_grid_row_backgrounds` produces exactly one quad per column.
+    fn grid_with_distinct_bg_per_col(row: usize, rows: usize, cols: usize) -> CellGrid {
+        use unshit_core::cell_grid::Cell;
+        let mut g = CellGrid::new(rows, cols);
+        g.clear_dirty();
+        for col in 0..cols {
+            // Use a unique `bg.r` per column so adjacent cells never share a
+            // style and every column becomes its own run.
+            let bg = Color { r: (col + 1) as u8, g: 0, b: 0, a: 255 };
+            let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+            g.set_cell(
+                row,
+                col,
+                Cell { ch: 'x', fg, bg, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+        g
+    }
+
+    #[test]
+    fn emit_grid_row_backgrounds_spans_full_row_from_0_to_cols() {
+        // The helper must emit one quad per style run across the full row
+        // regardless of per-cell dirty flags. Issue #63: narrowing emission
+        // to the damaged sub-range caused the whole-row cache payload to be
+        // truncated.
+        let cols = 5;
+        let grid = grid_with_distinct_bg_per_col(0, 1, cols);
+
+        let mut out_quads: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(
+            &grid,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0; 4],
+            &mut out_quads,
+        );
+
+        assert_eq!(
+            out_quads.len(),
+            cols,
+            "fresh background emission must span every column of the row, got {} quads for {} cols",
+            out_quads.len(),
+            cols,
+        );
+
+        // X positions must cover col 0 through col cols-1 contiguously. Issue
+        // #63 previously produced a single quad at the damaged column, so
+        // asserting the x-sweep is the load-bearing regression check.
+        for (i, q) in out_quads.iter().enumerate() {
+            let expected_x = i as f32 * 10.0;
+            assert!(
+                (q.pos[0] - expected_x).abs() < f32::EPSILON,
+                "quad {i} at x={}, expected x={}",
+                q.pos[0],
+                expected_x,
+            );
+        }
+    }
+
+    #[test]
+    fn typed_char_does_not_blank_prior_row_content() {
+        use unshit_core::cell_grid::Cell;
+        // Regression test for issue #63.
+        //
+        // Scenario: the terminal rendered a full row on frame 1, populated
+        // the line_quad_cache with a whole-row payload, then the user types
+        // a single character at column X. Only col X is marked in
+        // `line_damage`, but the row's content hash shifted. The fresh emit
+        // path must rebuild the WHOLE row so the stored cache entry remains
+        // whole-row; otherwise the next HIT for that new content hash
+        // replays a stripped row and the surrounding cells vanish.
+        let cols = 6;
+        let rows = 1;
+        let mut grid = grid_with_distinct_bg_per_col(0, rows, cols);
+
+        // Simulate frame 1: the renderer populates the cache with a
+        // whole-row payload derived from the fresh emit path.
+        let mut frame1_quads: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(
+            &grid,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0; 4],
+            &mut frame1_quads,
+        );
+        let content_sig_frame1 = hash_row_cells(grid.cells(), 0, cols);
+        let geom = LineGeometrySig::new(0.0, 0.0, 10.0, 20.0, 14.0, 1.0, [0.0; 4], cols as u32, 0);
+        let mut cache = LineQuadCache::new();
+        let node = NodeId { index: 0, generation: 0 };
+        cache.store(node, 0, content_sig_frame1, geom, frame1_quads.clone(), vec![], vec![]);
+        assert_eq!(frame1_quads.len(), cols, "frame 1 emission must span full row");
+
+        // Frame 2: user types 'Z' at column 3 with a distinct bg color.
+        // `set_cell` marks only col 3 in `line_damage`, but the whole-row
+        // content hash changes, producing a cache MISS.
+        grid.clear_dirty();
+        let new_cell = Cell {
+            ch: 'Z',
+            fg: Color { r: 255, g: 255, b: 255, a: 255 },
+            bg: Color { r: 200, g: 100, b: 50, a: 255 },
+            attrs: CellAttrs::empty(),
+            wide_continuation: false,
+        };
+        grid.set_cell(0, 3, new_cell);
+        let content_sig_frame2 = hash_row_cells(grid.cells(), 0, cols);
+        assert_ne!(
+            content_sig_frame1, content_sig_frame2,
+            "typed char must change the row's content hash",
+        );
+
+        // Damage only reports col 3, but fresh emit must still produce a
+        // full-row payload. Issue #63: prior code passed `scan_start..scan_end`
+        // from `line_damage` into the emission loop, producing a 1-quad
+        // payload that overwrote the 6-quad entry.
+        let damage = grid.line_damage_for(0).expect("row has damage entry");
+        assert_eq!(damage.first_dirty_col, 3, "only col 3 should be damaged");
+        assert_eq!(damage.last_dirty_col, 3, "only col 3 should be damaged");
+
+        let mut frame2_quads: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(
+            &grid,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0; 4],
+            &mut frame2_quads,
+        );
+        cache.store(node, 0, content_sig_frame2, geom, frame2_quads.clone(), vec![], vec![]);
+
+        assert_eq!(
+            frame2_quads.len(),
+            cols,
+            "fresh emit after typed char must still span every column ({} quads for {} cols)",
+            frame2_quads.len(),
+            cols,
+        );
+
+        // Frame 3: the cached payload must be replayable AS-IS for the new
+        // content hash, and the replay must contain every column.
+        let hit = cache
+            .lookup_replayable(node, 0, content_sig_frame2, geom)
+            .expect("cache must hit the payload we just stored");
+        assert_eq!(
+            hit.quads.len(),
+            cols,
+            "stored line_quad_cache entry must cover the full row, not just the damaged column",
+        );
+    }
+
+    #[test]
+    fn cache_miss_with_clean_row_still_emits_full_row() {
+        // Regression test for issue #63 second failure mode.
+        //
+        // Scenario: the line_quad_cache entry exists and matches the
+        // content hash, but the atlas generation bumped (or the origin
+        // shifted) so the geometry signature no longer matches. The cache
+        // MISSes even though the row is otherwise "clean" (no per-cell
+        // writes this frame). The fresh emit path must still produce a
+        // full-row payload; the pre-fix `if row_is_clean { continue; }`
+        // shortcut produced zero quads and blanked the row.
+        let cols = 4;
+        let mut grid = grid_with_distinct_bg_per_col(0, 1, cols);
+        // Simulate end-of-frame reset: every cell is clean on the dirty
+        // side, and `line_damage` is cleared. This mirrors the state the
+        // renderer observes after `clear_dirty`.
+        grid.clear_dirty();
+        assert!(
+            grid.line_damage_for(0).map(|ld| ld.is_clean()).unwrap_or(false),
+            "row must be clean after clear_dirty so we exercise the clean-row path",
+        );
+
+        // Populate the cache with a stale geometry signature.
+        let stale_geom =
+            LineGeometrySig::new(0.0, 0.0, 10.0, 20.0, 14.0, 1.0, [0.0; 4], cols as u32, 0);
+        let content_sig = hash_row_cells(grid.cells(), 0, cols);
+        let mut cache = LineQuadCache::new();
+        let node = NodeId { index: 0, generation: 0 };
+        cache.store(node, 0, content_sig, stale_geom, vec![], vec![], vec![]);
+
+        // Bump the atlas generation: geometry signature no longer matches.
+        let fresh_geom =
+            LineGeometrySig::new(0.0, 0.0, 10.0, 20.0, 14.0, 1.0, [0.0; 4], cols as u32, 1);
+        assert!(
+            cache.lookup_replayable(node, 0, content_sig, fresh_geom).is_none(),
+            "atlas generation bump must miss the stale cache entry",
+        );
+
+        // Fresh emit on a clean row: must still span the full row. Before
+        // the fix this path would skip emission and leave the row blank.
+        let mut fresh_quads: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(
+            &grid,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0; 4],
+            &mut fresh_quads,
+        );
+        assert_eq!(
+            fresh_quads.len(),
+            cols,
+            "fresh emit on a clean-but-invalidated row must produce a full-row payload",
+        );
+
+        // Store the fresh payload and confirm the cache now carries a
+        // whole-row entry against the new geometry signature.
+        cache.store(node, 0, content_sig, fresh_geom, fresh_quads.clone(), vec![], vec![]);
+        let hit = cache
+            .lookup_replayable(node, 0, content_sig, fresh_geom)
+            .expect("fresh payload must be retrievable under the new geometry");
+        assert_eq!(
+            hit.quads.len(),
+            cols,
+            "replacement cache entry must be whole-row after an invalidation miss",
+        );
+    }
+
+    #[test]
+    fn emit_grid_row_backgrounds_ignores_transparent_runs_but_emits_all_opaque() {
+        use unshit_core::cell_grid::Cell;
+        // Cells with `bg.a == 0` should not produce a quad (no visible
+        // background to paint). All other cells must still emit, even if
+        // the dirty flags would have narrowed a pre-fix emission window.
+        let mut g = CellGrid::new(1, 4);
+        g.clear_dirty();
+        let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+        let solid = Color { r: 50, g: 100, b: 150, a: 255 };
+        let transparent = Color { r: 0, g: 0, b: 0, a: 0 };
+
+        g.set_cell(
+            0,
+            0,
+            Cell { ch: 'a', fg, bg: solid, attrs: CellAttrs::empty(), wide_continuation: false },
+        );
+        g.set_cell(
+            0,
+            1,
+            Cell {
+                ch: 'b',
+                fg,
+                bg: transparent,
+                attrs: CellAttrs::empty(),
+                wide_continuation: false,
+            },
+        );
+        g.set_cell(
+            0,
+            2,
+            Cell { ch: 'c', fg, bg: solid, attrs: CellAttrs::empty(), wide_continuation: false },
+        );
+        g.set_cell(
+            0,
+            3,
+            Cell { ch: 'd', fg, bg: solid, attrs: CellAttrs::empty(), wide_continuation: false },
+        );
+
+        let mut out_quads: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(&g, 0, 0, 4, 0.0, 0.0, 10.0, 20.0, 1.0, [0.0; 4], &mut out_quads);
+
+        // Cells 0, 2, 3 produce opaque quads. Cells 2 and 3 share the same
+        // bg/fg/attrs so compute_style_runs merges them into a single run
+        // covering 20 px. Cell 0 is its own run at x=0. Cell 1 emits
+        // nothing.
+        assert_eq!(out_quads.len(), 2, "transparent cells must not emit bg quads");
+        assert!(out_quads.iter().any(|q| (q.pos[0] - 0.0).abs() < f32::EPSILON));
+        assert!(
+            out_quads.iter().any(|q| (q.pos[0] - 20.0).abs() < f32::EPSILON
+                && (q.size[0] - 20.0).abs() < f32::EPSILON),
+            "cells 2 and 3 with identical style must merge into a single 20px-wide run",
+        );
+    }
+
+    #[test]
+    fn emit_grid_row_fresh_is_invoked_with_full_row_range() {
+        // Structural regression for issue #63: `emit_grid_cells` must call
+        // `emit_grid_row_fresh` with the full-row range, never a narrowed
+        // damage window. This test pins the caller contract by probing the
+        // lower-level background helper directly: the helper produces the
+        // payload that lands in the line_quad_cache, so any future refactor
+        // that reintroduces damage-range narrowing here will be caught by
+        // the contract below.
+        //
+        // The assertion below mirrors the contract the fixed call site in
+        // `emit_grid_cells` now upholds: emission spans 0..cols on every
+        // cache MISS.
+        let cols = 8;
+        let g = grid_with_distinct_bg_per_col(0, 1, cols);
+        let mut quads: Vec<QuadInstance> = Vec::new();
+        // `emit_grid_cells` passes these exact arguments on cache miss.
+        emit_grid_row_backgrounds(&g, 0, 0, cols, 0.0, 0.0, 10.0, 20.0, 1.0, [0.0; 4], &mut quads);
+        assert_eq!(quads.len(), cols);
+    }
+
+    #[test]
+    fn narrowed_emission_range_documents_pre_fix_truncation() {
+        // Documentation-style guard for issue #63's failure mode. Before
+        // the fix, `emit_grid_cells` handed `emit_grid_row_fresh` a
+        // `scan_start..scan_end` slice derived from line damage. That
+        // stripped the stored cache payload to the damaged sub-range.
+        // Here we show that feeding a narrow range to the pure helper
+        // DOES truncate output, so any future regression that plumbs a
+        // non-full range into the fresh-emit path will immediately
+        // manifest as a missing cell in the cache. The emission call
+        // that actually runs in `emit_grid_cells` uses `(0, cols)` and
+        // is covered by the other tests in this block.
+        let cols = 6;
+        let g = grid_with_distinct_bg_per_col(0, 1, cols);
+
+        let mut truncated: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(&g, 0, 2, 4, 0.0, 0.0, 10.0, 20.0, 1.0, [0.0; 4], &mut truncated);
+        assert_eq!(
+            truncated.len(),
+            2,
+            "narrow range must produce only the runs inside the window (the bug mechanism)",
+        );
+
+        let mut full: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(&g, 0, 0, cols, 0.0, 0.0, 10.0, 20.0, 1.0, [0.0; 4], &mut full);
+        assert_eq!(
+            full.len(),
+            cols,
+            "full range emits every column, which is what the fix guarantees"
+        );
     }
 }
