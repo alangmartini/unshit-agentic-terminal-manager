@@ -281,16 +281,20 @@ impl CellGrid {
         cols.saturating_sub(1).min(u16::MAX as usize) as u16
     }
 
+    fn mark_all_lines_fully_damaged(lines: &mut [LineDamage], cols: usize) {
+        let last_col = Self::last_col_u16(cols);
+        for ld in lines {
+            ld.mark_range(0, last_col);
+        }
+    }
+
     /// Create a new grid filled with default (empty) cells.
     pub fn new(rows: usize, cols: usize) -> Self {
         let len = rows * cols;
         // Start fully damaged on both the per-cell and per-line trackers so
         // the first render pass paints every row.
         let mut line_damage = vec![LineDamage::default(); rows];
-        let last_col = Self::last_col_u16(cols);
-        for ld in &mut line_damage {
-            ld.mark_range(0, last_col);
-        }
+        Self::mark_all_lines_fully_damaged(&mut line_damage, cols);
         Self {
             rows,
             cols,
@@ -582,10 +586,7 @@ impl CellGrid {
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
         self.dirty.fill(true);
-        let last_col = Self::last_col_u16(self.cols);
-        for ld in &mut self.line_damage {
-            ld.mark_range(0, last_col);
-        }
+        Self::mark_all_lines_fully_damaged(&mut self.line_damage, self.cols);
     }
 
     /// Scroll the grid contents up by `n` rows. The bottom `n` rows are
@@ -608,16 +609,11 @@ impl CellGrid {
         self.cells.copy_within(shift..total, 0);
 
         let clear_start = total - shift;
-        for cell in &mut self.cells[clear_start..] {
-            *cell = Cell::default();
-        }
+        self.cells[clear_start..].fill(Cell::default());
 
         self.dirty.fill(true);
 
-        let last_col = Self::last_col_u16(self.cols);
-        for ld in &mut self.line_damage {
-            ld.mark_range(0, last_col);
-        }
+        Self::mark_all_lines_fully_damaged(&mut self.line_damage, self.cols);
     }
 
     /// Resize the grid. Existing content in the overlapping region is
@@ -647,10 +643,7 @@ impl CellGrid {
         // damaged with a fresh seqno so renderers re-render regardless of
         // their previous checkpoint.
         let mut new_line_damage = vec![LineDamage::default(); new_rows];
-        let last_col = Self::last_col_u16(new_cols);
-        for ld in &mut new_line_damage {
-            ld.mark_range(0, last_col);
-        }
+        Self::mark_all_lines_fully_damaged(&mut new_line_damage, new_cols);
         self.line_damage = new_line_damage;
     }
 }

@@ -294,15 +294,11 @@ fn scroll_up_zero_is_noop() {
 }
 
 #[test]
-fn scroll_up_marks_every_row_fully_damaged_so_line_cache_reemits() {
-    // Regression: the tier 3 line quad cache is keyed by
-    // (NodeId, row_index, content_hash). When scroll_up preserved the
-    // "clean" state of shifted rows, the renderer saw those rows as
-    // clean, probed the cache with the NEW content hash at the OLD row
-    // index, missed, and then skipped emission because the row was
-    // clean. Result: after a terminal scroll the viewport rendered
-    // empty even though cells held real content (visible by scrolling
-    // back into the composed view that rebuilds via set_cell).
+fn scroll_up_damages_every_previously_clean_row() {
+    // Regression: scroll_up used to preserve the clean status of shifted
+    // rows. Combined with a content-hash-keyed line quad cache in the
+    // renderer, that caused skipped emission for rows whose content had
+    // moved, leaving the viewport empty after a terminal scroll.
     let mut g = CellGrid::new(4, 3);
     for r in 0..4 {
         let ch = (b'A' + r as u8) as char;
@@ -318,13 +314,15 @@ fn scroll_up_marks_every_row_fully_damaged_so_line_cache_reemits() {
 
     g.scroll_up(1);
 
+    assert_all_rows_fully_damaged(&g);
+}
+
+fn assert_all_rows_fully_damaged(g: &CellGrid) {
+    let last_col = g.cols().saturating_sub(1) as u16;
     for (row, ld) in g.line_damage().iter().enumerate() {
-        assert!(
-            !ld.is_clean(),
-            "row {row} stayed clean after scroll_up; renderer will skip re-emit and the line quad cache will serve stale quads",
-        );
+        assert!(!ld.is_clean(), "row {row} must be damaged");
         assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col");
-        assert_eq!(ld.last_dirty_col, 2, "row {row} last_dirty_col");
+        assert_eq!(ld.last_dirty_col, last_col, "row {row} last_dirty_col");
     }
 }
 
@@ -608,28 +606,22 @@ fn renderer_can_skip_line_using_seqno_checkpoint() {
 }
 
 #[test]
-fn scroll_up_marks_every_row_fully_damaged_and_bumps_seqno() {
-    // scroll_up must mark every row fully damaged (not shift the per-row
-    // damage along with the cells). The retained line quad cache is keyed
-    // by (NodeId, row_index, content_hash); a shifted row carries new
-    // content at the same row index, so its previously stored cache entry
-    // is stale. Per-row seqnos must also bump so subscribers relying on
-    // the generation counter re-paint.
+fn scroll_up_bumps_seqno_for_every_row() {
+    // Per-row seqnos must advance on every row after scroll_up so
+    // checkpoint-based renderers re-paint, not just the rows whose
+    // columns were written between clear_dirty and the scroll.
     let mut g = CellGrid::new(3, 4);
     g.clear_dirty();
 
     g.set_cell(1, 2, Cell::with_char('M'));
-    let ld_mid_before = g.line_damage()[1];
-    assert!(!ld_mid_before.is_clean());
+    assert!(!g.line_damage()[1].is_clean());
 
     let seqs_before: Vec<u64> = g.line_damage().iter().map(|ld| ld.seqno).collect();
 
     g.scroll_up(1);
 
+    assert_all_rows_fully_damaged(&g);
     for (row, ld) in g.line_damage().iter().enumerate() {
-        assert!(!ld.is_clean(), "row {row} must be damaged after scroll_up");
-        assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col");
-        assert_eq!(ld.last_dirty_col, 3, "row {row} last_dirty_col");
         assert!(
             ld.seqno > seqs_before[row],
             "row {row} seqno must advance so subscribers re-paint",
