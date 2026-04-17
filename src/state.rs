@@ -1946,7 +1946,7 @@ mod tests {
 
         resize_all_terminals(&mut state, 120, 40);
 
-        for (_, term) in &state.terminals {
+        for term in state.terminals.values() {
             let grid = term.grid();
             assert_eq!(grid.cols(), 120, "terminal cols should be 120 after resize");
             assert_eq!(grid.rows(), 40, "terminal rows should be 40 after resize");

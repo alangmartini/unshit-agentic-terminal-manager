@@ -10,7 +10,7 @@ use unshit_core::style::parse::CompiledStylesheet;
 use unshit_core::style::pseudo::PseudoSideTable;
 use unshit_core::tree::NodeArena;
 use unshit_renderer::batch::Rasterizer;
-use unshit_renderer::batch::{self, BatchCache, ShapedTextCache};
+use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
 use unshit_renderer::gpu::GpuContext;
@@ -28,6 +28,7 @@ pub struct TestHarness {
     pub(crate) dw_rasterizer: DwRasterizer,
     pub(crate) shaped_cache: ShapedTextCache,
     pub(crate) batch_cache: BatchCache,
+    pub(crate) shape_cache: ShapeCache,
     pub(crate) gpu: Option<GpuContext>,
     pub(crate) interaction: InteractionState,
     pub(crate) scale_factor: f32,
@@ -109,6 +110,7 @@ impl TestHarness {
             dw_rasterizer: DwRasterizer::new("Consolas"),
             shaped_cache: ShapedTextCache::new(),
             batch_cache: BatchCache::new(),
+            shape_cache: ShapeCache::new(),
             gpu: None,
             interaction,
             scale_factor: 1.0,
@@ -399,6 +401,7 @@ impl TestHarness {
             &mut self.measure_cache,
             &mut self.shaped_cache,
             &mut gpu.svg_cache,
+            &mut self.shape_cache,
             self.interaction.text_selection.as_ref(),
             None,
             &self.scrollbar_visual,

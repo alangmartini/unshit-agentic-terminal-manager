@@ -23,7 +23,7 @@ use unshit_core::style::transition::ActiveTransitions;
 use unshit_core::style::types::Layer;
 use unshit_core::tree::NodeArena;
 use unshit_renderer::batch::Rasterizer;
-use unshit_renderer::batch::{self, BatchCache, ShapedTextCache};
+use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
@@ -216,6 +216,10 @@ struct AppState {
     measure_cache: TextMeasureCache,
     shaped_cache: ShapedTextCache,
     batch_cache: BatchCache,
+    /// Cross-frame cache of shaped prototype glyphs for the terminal grid.
+    /// Populated lazily as characters appear; preloaded with ASCII and box
+    /// drawing at startup. See [`ShapeCache`] for invalidation semantics.
+    shape_cache: ShapeCache,
     canvas_registry: CanvasRegistry,
     last_metrics: FrameMetrics,
     frame_count: u64,
@@ -235,6 +239,15 @@ struct AppState {
     theme: Theme,
     /// Whether the one-shot on_cell_metrics callback has already fired.
     cell_metrics_fired: bool,
+    /// Coalesces redraw requests into at most one paint per
+    /// `FramePacer::min_interval`. Prevents per-PTY-chunk rebuild storms
+    /// from dominating the event loop. See [`crate::frame_pacer`].
+    frame_pacer: crate::frame_pacer::FramePacer,
+    /// Rolling window of per-frame durations. Debug-only; emits p50/p95/
+    /// p99 quantiles once per second via `log::info!`. See
+    /// [`crate::frame_probe`].
+    #[cfg(debug_assertions)]
+    frame_probe: crate::frame_probe::FrameProbe,
 }
 
 impl App {
@@ -431,6 +444,7 @@ impl ApplicationHandler for AppHandler {
                     state.stylesheet = *new_stylesheet;
                     state.needs_restyle = true;
                     state.shaped_cache.clear();
+                    state.shape_cache.clear();
                     state.batch_cache.clear();
                     // Collect all node IDs first, then mark each dirty.
                     let node_ids: Vec<_> = state.arena.iter().map(|(id, _)| id).collect();
@@ -629,6 +643,7 @@ impl ApplicationHandler for AppHandler {
             measure_cache,
             shaped_cache: ShapedTextCache::new(),
             batch_cache: BatchCache::new(),
+            shape_cache: ShapeCache::new(),
             canvas_registry,
             last_metrics: FrameMetrics::default(),
             frame_count: 0,
@@ -648,6 +663,9 @@ impl ApplicationHandler for AppHandler {
             bell_state: BellState::new(BellConfig::default()),
             theme: self.app.config.theme.clone(),
             cell_metrics_fired: false,
+            frame_pacer: crate::frame_pacer::FramePacer::new(),
+            #[cfg(debug_assertions)]
+            frame_probe: crate::frame_probe::FrameProbe::new(),
         });
 
         // Run the initial subscription reconcile so streams start immediately.
@@ -1515,6 +1533,21 @@ impl ApplicationHandler for AppHandler {
 
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
+
+                // Coalesce RequestRebuild and input-driven redraws into at
+                // most one paint per frame_pacer.min_interval. When the
+                // pacer says wait, schedule a WaitUntil and bail out so
+                // the event loop sleeps until the coalescing deadline.
+                match state.frame_pacer.on_redraw_requested(frame_start) {
+                    crate::frame_pacer::PaceDecision::PaintNow => {}
+                    crate::frame_pacer::PaceDecision::WaitUntil(deadline) => {
+                        event_loop
+                            .set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+                        state.window.request_redraw();
+                        return;
+                    }
+                }
+
                 let mut metrics = FrameMetrics::default();
 
                 // Advance LRU frame counter at the start of each rendered frame.
@@ -1749,6 +1782,7 @@ impl ApplicationHandler for AppHandler {
                     &mut state.measure_cache,
                     &mut state.shaped_cache,
                     &mut state.gpu.svg_cache,
+                    &mut state.shape_cache,
                     state.interaction.text_selection.as_ref(),
                     Some(&state.canvas_registry),
                     &state.scrollbar_visual,
@@ -1908,8 +1942,26 @@ impl ApplicationHandler for AppHandler {
                     }
                 }
 
+                // Record this paint in the frame pacer so subsequent
+                // redraws are gated until the coalescing interval elapses.
+                state.frame_pacer.record_paint(frame_start);
+
                 metrics.total_us = frame_start.elapsed().as_micros() as u64;
                 metrics.rss_bytes = get_rss_bytes();
+
+                // Debug-only per-second frame-time probe. Feeds this frame's
+                // duration into a rolling window and emits p50/p95/p99
+                // quantiles once per second. Release builds skip the whole
+                // block via cfg(debug_assertions); see crate::frame_probe.
+                #[cfg(debug_assertions)]
+                {
+                    state
+                        .frame_probe
+                        .record_frame(std::time::Duration::from_micros(metrics.total_us));
+                    if let Some(snap) = state.frame_probe.maybe_emit(Instant::now()) {
+                        log::info!("[FRAME] {}", snap);
+                    }
+                }
 
                 // Log slow frames
                 if metrics.total_us > 8333 {
