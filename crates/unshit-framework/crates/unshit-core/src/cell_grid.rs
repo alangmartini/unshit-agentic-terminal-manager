@@ -185,18 +185,7 @@ impl LineDamage {
 
     /// Expand the damaged column range to include `col` and bump the seqno.
     pub fn mark_col(&mut self, col: u16) {
-        if self.is_clean() {
-            self.first_dirty_col = col;
-            self.last_dirty_col = col;
-        } else {
-            if col < self.first_dirty_col {
-                self.first_dirty_col = col;
-            }
-            if col > self.last_dirty_col {
-                self.last_dirty_col = col;
-            }
-        }
-        self.seqno = self.seqno.saturating_add(1);
+        self.mark_range(col, col);
     }
 
     /// Expand the damaged column range to `[start, end]` (inclusive) and bump
@@ -285,15 +274,22 @@ pub struct CellGrid {
 }
 
 impl CellGrid {
+    /// Maximum dirty-column index representable by a `LineDamage` when a row
+    /// has `cols` columns. `cols` is clamped to fit a `u16`.
+    #[inline]
+    fn last_col_u16(cols: usize) -> u16 {
+        cols.saturating_sub(1).min(u16::MAX as usize) as u16
+    }
+
     /// Create a new grid filled with default (empty) cells.
     pub fn new(rows: usize, cols: usize) -> Self {
         let len = rows * cols;
         // Start fully damaged on both the per-cell and per-line trackers so
         // the first render pass paints every row.
         let mut line_damage = vec![LineDamage::default(); rows];
-        let cols_u16 = cols.saturating_sub(1).min(u16::MAX as usize) as u16;
+        let last_col = Self::last_col_u16(cols);
         for ld in &mut line_damage {
-            ld.mark_range(0, cols_u16);
+            ld.mark_range(0, last_col);
         }
         Self {
             rows,
@@ -586,7 +582,7 @@ impl CellGrid {
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
         self.dirty.fill(true);
-        let last_col = self.cols.saturating_sub(1).min(u16::MAX as usize) as u16;
+        let last_col = Self::last_col_u16(self.cols);
         for ld in &mut self.line_damage {
             ld.mark_range(0, last_col);
         }
@@ -615,25 +611,24 @@ impl CellGrid {
             *cell = Cell::default();
         }
 
-        // Shift per-cell dirty flags (the renderer still uses them for quad
-        // emission). Every cell position changed so mark everything dirty.
+        // Every cell position changed visually, so mark the whole per-cell
+        // map dirty; the per-line damage map below is shifted row-for-row.
         self.dirty.fill(true);
 
-        // Shift per-line damage: row R+n becomes row R. Newly exposed rows
-        // at the bottom get fully damaged.
+        // Shift per-line damage: row R+n becomes row R. Bump each shifted
+        // seqno so renderers re-paint even when the target row was clean
+        // before the scroll.
         let rows = self.rows;
         if n < rows {
             for r in 0..rows - n {
                 self.line_damage[r] = self.line_damage[r + n];
-                // Always bump the seqno so renderers re-render even when the
-                // target row's seqno was unchanged pre-scroll.
                 self.line_damage[r].seqno = self.line_damage[r].seqno.saturating_add(1);
             }
         }
-        let last_col = self.cols.saturating_sub(1).min(u16::MAX as usize) as u16;
+        // Newly exposed blank rows at the bottom are fully damaged.
+        let last_col = Self::last_col_u16(self.cols);
         let start_blank = rows.saturating_sub(n);
         for r in start_blank..rows {
-            // Blank rows at the bottom: mark fully dirty and bump seqno.
             self.line_damage[r].mark_range(0, last_col);
         }
     }
@@ -661,11 +656,11 @@ impl CellGrid {
         self.cols = new_cols;
         self.cells = new_cells;
         self.dirty = vec![true; new_rows * new_cols];
-        // Rebuild line_damage sized to new_rows and mark everything fully
-        // damaged with a fresh seqno. Renderers see a higher seqno and
-        // re-render regardless of their checkpoint.
+        // Rebuild `line_damage` sized to `new_rows` and mark every row fully
+        // damaged with a fresh seqno so renderers re-render regardless of
+        // their previous checkpoint.
         let mut new_line_damage = vec![LineDamage::default(); new_rows];
-        let last_col = new_cols.saturating_sub(1).min(u16::MAX as usize) as u16;
+        let last_col = Self::last_col_u16(new_cols);
         for ld in &mut new_line_damage {
             ld.mark_range(0, last_col);
         }
