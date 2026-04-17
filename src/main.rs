@@ -321,10 +321,11 @@ fn main() {
             ..Default::default()
         },
         move || {
-            // Phase 1: grab the state mutex only long enough to snapshot UI
-            // data and clone the per-terminal `Arc<Mutex<Terminal>>` handles.
-            // The parser thread writing to a single terminal can acquire its
-            // own lock independently of this closure.
+            // Grab the state mutex only long enough to snapshot the UI and
+            // clone per-terminal `Arc<Mutex<Terminal>>` handles, then drop
+            // it. The parser thread writing to any single terminal holds
+            // only that terminal's mutex, so it never contends with this
+            // closure on the state lock.
             let (snap, active_id, handles): (
                 crate::state::UiSnapshot,
                 u32,
@@ -341,11 +342,8 @@ fn main() {
                 (snap, active_id, handles)
             };
 
-            // Phase 2: without the state mutex, take each per-terminal lock
-            // individually, clone its display grid, and clear its dirty
-            // flags. Tier 2 sub-task 3: the parser thread is not blocked by
-            // the state lock during this phase — only by the specific
-            // terminal it is writing to.
+            // State mutex is released; take each per-terminal lock
+            // independently to clone its display grid and clear dirty flags.
             let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = handles
                 .into_iter()
                 .map(|(id, handle)| {
@@ -368,12 +366,11 @@ fn main() {
                             rows.get(3).cloned().unwrap_or_default(),
                         ));
                     }
-                    // Perf Tier 2: the cloned grid retains every dirty flag and
-                    // LineDamage entry for the renderer to act on, while the
-                    // live grid is cleared so the next frame's damage reflects
-                    // only new writes. Per-row LineDamage seqnos are preserved
-                    // (see CellGrid::clear_dirty) so any future renderer that
-                    // checkpoints across frames can still compare them.
+                    // The cloned grid keeps every dirty flag and LineDamage
+                    // entry for the renderer to consume; `clear_dirty` resets
+                    // the live grid so the next frame's damage only covers
+                    // new writes. Seqnos are deliberately preserved so a
+                    // future cross-frame checkpoint still compares cleanly.
                     t.grid_mut().clear_dirty();
                     (id, grid)
                 })

@@ -91,12 +91,11 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                 // triggering one full tree-rebuild per PTY read (the framework
                 // does not coalesce RequestRebuild events).
                 //
-                // Tier 2 sub-task 3 (parser lock decouple): grab the state
-                // mutex ONLY to look up the per-pane Terminal handle, then
-                // release it before running the VTE parser. The VTE parse
-                // holds only the per-terminal mutex, so the render closure
-                // and other state mutators can proceed concurrently on the
-                // state lock.
+                // Acquire the state mutex only to look up the per-pane
+                // Terminal handle, then release it before running the VTE
+                // parser. `process_bytes` holds only the per-terminal mutex so
+                // the render closure and other state mutators can proceed
+                // concurrently on the state lock.
                 while let Some(data) = rx.recv().await {
                     let terminal_handle: Option<crate::state::SharedTerminal> = {
                         let guard = shared.lock().expect("state mutex poisoned");

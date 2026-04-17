@@ -2007,7 +2007,7 @@ mod tests {
         assert!(state.terminals.is_empty());
     }
 
-    // -- Tier 2 sub-task 3: parser lock decouple -----------------------------
+    // -- Parser lock decoupling -----------------------------------------------
     //
     // A parser thread writing to one terminal must NOT block the state lock
     // or the render path. We simulate the parser workload by holding a
