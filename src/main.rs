@@ -422,6 +422,8 @@ fn main() {
                 resize_all_terminals(&mut guard, cols, rows);
             })),
             on_frame_metrics: Some(Box::new(|m| crate::bench::record_frame(m))),
+            #[cfg(feature = "input-latency-histogram")]
+            on_input_latency: Some(Box::new(|snap| crate::bench::record_input_latency(snap))),
             ..Default::default()
         },
         move || {

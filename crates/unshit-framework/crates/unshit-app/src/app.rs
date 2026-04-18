@@ -109,6 +109,16 @@ pub struct AppConfig {
     /// render pass that produces non-zero values, giving the application a
     /// reliable point to compute initial PTY dimensions.
     pub on_cell_metrics: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
+    /// Callback invoked on every rendered frame right after
+    /// `record_frame_presented` runs, with a fresh snapshot of the
+    /// input latency histograms.
+    ///
+    /// Only present when the `input-latency-histogram` cargo feature is
+    /// enabled. Lets callers pipe snapshots into bench aggregation or a
+    /// debug HUD without polling.
+    #[cfg(feature = "input-latency-histogram")]
+    #[allow(clippy::type_complexity)]
+    pub on_input_latency: Option<Box<dyn Fn(&crate::input_latency::InputLatencySnapshot) + Send>>,
 }
 
 impl Default for AppConfig {
@@ -132,6 +142,8 @@ impl Default for AppConfig {
             on_scale_factor: None,
             on_close: None,
             on_cell_metrics: None,
+            #[cfg(feature = "input-latency-histogram")]
+            on_input_latency: None,
         }
     }
 }
@@ -258,6 +270,12 @@ struct AppState {
     /// [`crate::frame_probe`].
     #[cfg(debug_assertions)]
     frame_probe: crate::frame_probe::FrameProbe,
+    /// Nanosecond-grained input latency histograms. See
+    /// [`crate::input_latency`]. Only present when the
+    /// `input-latency-histogram` cargo feature is enabled; the field
+    /// disappears entirely from the struct layout otherwise.
+    #[cfg(feature = "input-latency-histogram")]
+    pub(crate) input_latency: crate::input_latency::InputLatencyTracker,
 }
 
 /// How long after the last external event the loop keeps scheduling
@@ -348,6 +366,17 @@ impl App {
         if let Some(ref mut state) = self.state {
             state.bell_state = BellState::new(config);
         }
+    }
+
+    /// Return a fresh snapshot of the input latency histograms.
+    ///
+    /// Returns `None` before the event loop starts (no [`AppState`] yet)
+    /// or when the `input-latency-histogram` cargo feature is not
+    /// compiled in. See [`crate::input_latency`] for the full
+    /// instrument description.
+    #[cfg(feature = "input-latency-histogram")]
+    pub fn input_latency_snapshot(&self) -> Option<crate::input_latency::InputLatencySnapshot> {
+        self.state.as_ref().map(|s| s.input_latency.snapshot())
     }
 
     /// Request window attention at the given urgency level.
@@ -725,6 +754,9 @@ impl ApplicationHandler for AppHandler {
             last_activity: Instant::now(),
             #[cfg(debug_assertions)]
             frame_probe: crate::frame_probe::FrameProbe::new(),
+            #[cfg(feature = "input-latency-histogram")]
+            input_latency: crate::input_latency::InputLatencyTracker::new()
+                .expect("hdrhistogram construction with valid sigfigs cannot fail"),
         });
 
         // Run the initial subscription reconcile so streams start immediately.
@@ -806,8 +838,26 @@ impl ApplicationHandler for AppHandler {
                 | WindowEvent::ModifiersChanged(_)
                 | WindowEvent::Ime(_)
         );
+        // The subset of activity events that count as user input for the
+        // input latency instrument. SurfaceResized and Focused are
+        // external events but not "input"; excluding them matches the
+        // six variants called out in the issue #85 plan.
+        #[cfg(feature = "input-latency-histogram")]
+        let is_input = matches!(
+            event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::PointerButton { .. }
+                | WindowEvent::PointerMoved { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::Ime(_)
+        );
         if is_activity {
             state.mark_activity(Instant::now());
+            #[cfg(feature = "input-latency-histogram")]
+            if is_input {
+                state.input_latency.record_event(Instant::now());
+            }
         }
 
         match event {
@@ -1613,6 +1663,13 @@ impl ApplicationHandler for AppHandler {
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
 
+                // Flip the input latency tracker BEFORE the pacer early
+                // return so events that arrive during a pacer sleep are
+                // counted as mid draw drops rather than leaking into the
+                // next frame's latency sample.
+                #[cfg(feature = "input-latency-histogram")]
+                state.input_latency.mark_frame_start();
+
                 // Coalesce RequestRebuild and input-driven redraws into at
                 // most one paint per frame_pacer.min_interval. When the
                 // pacer says wait, schedule a WaitUntil and bail out so
@@ -2053,6 +2110,17 @@ impl ApplicationHandler for AppHandler {
                 // Fire the on_frame_metrics callback if registered.
                 if let Some(ref cb) = self.app.config.on_frame_metrics {
                     cb(&metrics);
+                }
+
+                // Close the input latency frame window only on the path
+                // that actually rendered. Pacer skipped frames bailed
+                // out well above; they never reach this line.
+                #[cfg(feature = "input-latency-histogram")]
+                {
+                    state.input_latency.record_frame_presented(Instant::now());
+                    if let Some(ref cb) = self.app.config.on_input_latency {
+                        cb(&state.input_latency.snapshot());
+                    }
                 }
 
                 state.last_metrics = metrics;

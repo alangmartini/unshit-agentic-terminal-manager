@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use unshit::app::FrameMetrics;
+#[cfg(feature = "input-latency-histogram")]
+use unshit::app::InputLatencySnapshot;
 
 use crate::state::SharedState;
 
@@ -65,6 +67,8 @@ struct BenchState {
     gpu_us_sum: u64,
     frames: u64,
     active: bool,
+    #[cfg(feature = "input-latency-histogram")]
+    latency_snapshot: Option<InputLatencySnapshot>,
 }
 
 impl BenchState {
@@ -77,6 +81,8 @@ impl BenchState {
             gpu_us_sum: 0,
             frames: 0,
             active: false,
+            #[cfg(feature = "input-latency-histogram")]
+            latency_snapshot: None,
         }
     }
 }
@@ -102,6 +108,19 @@ pub fn record_frame(m: &FrameMetrics) {
     s.frames += 1;
 }
 
+/// Called once per rendered frame by the framework when the
+/// `input-latency-histogram` feature is enabled. Stores the latest
+/// snapshot so `build_report` can read it without polling. No-op
+/// unless the bench is active.
+#[cfg(feature = "input-latency-histogram")]
+pub fn record_input_latency(snap: &InputLatencySnapshot) {
+    let mut s = state().lock().unwrap();
+    if !s.active {
+        return;
+    }
+    s.latency_snapshot = Some(snap.clone());
+}
+
 fn activate() {
     let mut s = state().lock().unwrap();
     s.active = true;
@@ -111,6 +130,10 @@ fn activate() {
     s.batch_us_sum = 0;
     s.gpu_us_sum = 0;
     s.frames = 0;
+    #[cfg(feature = "input-latency-histogram")]
+    {
+        s.latency_snapshot = None;
+    }
 }
 
 fn deactivate() {
@@ -132,6 +155,22 @@ struct Report {
     layout_ms_avg: f64,
     batch_ms_avg: f64,
     gpu_ms_avg: f64,
+    #[cfg(feature = "input-latency-histogram")]
+    input_latency_p50_us: f64,
+    #[cfg(feature = "input-latency-histogram")]
+    input_latency_p95_us: f64,
+    #[cfg(feature = "input-latency-histogram")]
+    input_latency_p99_us: f64,
+    #[cfg(feature = "input-latency-histogram")]
+    input_latency_max_us: f64,
+    #[cfg(feature = "input-latency-histogram")]
+    events_per_frame_p50: f64,
+    #[cfg(feature = "input-latency-histogram")]
+    events_per_frame_p95: f64,
+    #[cfg(feature = "input-latency-histogram")]
+    events_per_frame_max: u64,
+    #[cfg(feature = "input-latency-histogram")]
+    mid_draw_events_dropped: u64,
 }
 
 fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
@@ -158,6 +197,27 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
     } else {
         0.0
     };
+    #[cfg(feature = "input-latency-histogram")]
+    let (lat_p50, lat_p95, lat_p99, lat_max, ev_p50, ev_p95, ev_max, mid_draw) = {
+        if let Some(ref snap) = s.latency_snapshot {
+            let lat = &snap.latency_ns;
+            let ev = &snap.events_per_frame;
+            let us = |ns: u64| (ns as f64) / 1000.0;
+            (
+                us(lat.value_at_quantile(0.50)),
+                us(lat.value_at_quantile(0.95)),
+                us(lat.value_at_quantile(0.99)),
+                us(lat.max()),
+                ev.value_at_quantile(0.50) as f64,
+                ev.value_at_quantile(0.95) as f64,
+                ev.max(),
+                snap.mid_draw_events_dropped,
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0)
+        }
+    };
+
     Report {
         mode: mode.as_str(),
         duration_s: elapsed.as_secs_f64(),
@@ -171,6 +231,22 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         layout_ms_avg: avg_ms(s.layout_us_sum),
         batch_ms_avg: avg_ms(s.batch_us_sum),
         gpu_ms_avg: avg_ms(s.gpu_us_sum),
+        #[cfg(feature = "input-latency-histogram")]
+        input_latency_p50_us: lat_p50,
+        #[cfg(feature = "input-latency-histogram")]
+        input_latency_p95_us: lat_p95,
+        #[cfg(feature = "input-latency-histogram")]
+        input_latency_p99_us: lat_p99,
+        #[cfg(feature = "input-latency-histogram")]
+        input_latency_max_us: lat_max,
+        #[cfg(feature = "input-latency-histogram")]
+        events_per_frame_p50: ev_p50,
+        #[cfg(feature = "input-latency-histogram")]
+        events_per_frame_p95: ev_p95,
+        #[cfg(feature = "input-latency-histogram")]
+        events_per_frame_max: ev_max,
+        #[cfg(feature = "input-latency-histogram")]
+        mid_draw_events_dropped: mid_draw,
     }
 }
 
@@ -230,6 +306,17 @@ pub fn start(config: BenchConfig, shared: SharedState) {
             report.p99_ms,
             report.max_ms
         );
+        #[cfg(feature = "input-latency-histogram")]
+        log::info!(
+            "[bench] input latency p50={:.2}us p95={:.2}us p99={:.2}us max={:.2}us ev/frame p50={:.0} p95={:.0} mid_draw_dropped={}",
+            report.input_latency_p50_us,
+            report.input_latency_p95_us,
+            report.input_latency_p99_us,
+            report.input_latency_max_us,
+            report.events_per_frame_p50,
+            report.events_per_frame_p95,
+            report.mid_draw_events_dropped,
+        );
 
         if let Err(e) = std::fs::write(&config.out_path, &json) {
             log::error!("[bench] failed to write {:?}: {}", config.out_path, e);
@@ -274,9 +361,25 @@ fn run_type_burst(shared: &SharedState, pane_id: u32, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Test-only mutex that serializes every test in this module. The
+    /// bench harness exposes a process-wide `STATE` mutex; running two
+    /// tests in parallel would let one test's `activate` or
+    /// `deactivate` call interleave with another test's assertion. The
+    /// pre-existing tests relied on luck; this lock removes the flake.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        // Deliberately ignore poison: one failing test leaving a
+        // poisoned guard should not mask the next test's own failure
+        // diagnostics.
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn bench_mode_parse_known() {
+        let _g = guard();
         assert!(matches!(
             BenchMode::parse("dir-loop"),
             Some(BenchMode::DirLoop)
@@ -289,6 +392,7 @@ mod tests {
 
     #[test]
     fn bench_mode_parse_unknown() {
+        let _g = guard();
         assert!(BenchMode::parse("").is_none());
         assert!(BenchMode::parse("dir_loop").is_none());
         assert!(BenchMode::parse("DIR-LOOP").is_none());
@@ -296,6 +400,7 @@ mod tests {
 
     #[test]
     fn record_frame_ignored_when_inactive() {
+        let _g = guard();
         // State may have been touched by other tests; just assert
         // frames do not increment while inactive.
         deactivate();
@@ -310,6 +415,7 @@ mod tests {
 
     #[test]
     fn record_frame_accumulates_when_active() {
+        let _g = guard();
         activate();
         let before = state().lock().unwrap().frames;
         record_frame(&FrameMetrics {
@@ -332,6 +438,7 @@ mod tests {
 
     #[test]
     fn build_report_computes_percentiles() {
+        let _g = guard();
         activate();
         {
             let mut s = state().lock().unwrap();
@@ -354,5 +461,114 @@ mod tests {
         assert!((r.p50_ms - 5.0).abs() < 0.001);
         assert!((r.max_ms - 10.0).abs() < 0.001);
         deactivate();
+    }
+
+    /// Issue #85 feature-off test: the JSON report must NOT contain
+    /// any input latency keys when the cargo feature is absent.
+    #[cfg(not(feature = "input-latency-histogram"))]
+    #[test]
+    fn bench_report_omits_latency_stats_when_feature_off() {
+        let _g = guard();
+        activate();
+        let report = build_report(BenchMode::DirLoop, Duration::from_secs(1));
+        deactivate();
+        let json = serde_json::to_string(&report).unwrap();
+        for key in [
+            "input_latency_p50_us",
+            "input_latency_p95_us",
+            "input_latency_p99_us",
+            "input_latency_max_us",
+            "events_per_frame_p50",
+            "events_per_frame_p95",
+            "events_per_frame_max",
+            "mid_draw_events_dropped",
+        ] {
+            assert!(
+                !json.contains(key),
+                "feature off but JSON contains {}: {}",
+                key,
+                json
+            );
+        }
+    }
+
+    /// Issue #85 feature-on test: the JSON report must contain the
+    /// eight latency keys whenever the feature is active, even when
+    /// zero input events were observed.
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn bench_report_emits_latency_stats_when_feature_on() {
+        let _g = guard();
+        activate();
+        let report = build_report(BenchMode::DirLoop, Duration::from_secs(1));
+        deactivate();
+        let json = serde_json::to_string(&report).unwrap();
+        for key in [
+            "input_latency_p50_us",
+            "input_latency_p95_us",
+            "input_latency_p99_us",
+            "input_latency_max_us",
+            "events_per_frame_p50",
+            "events_per_frame_p95",
+            "events_per_frame_max",
+            "mid_draw_events_dropped",
+        ] {
+            assert!(
+                json.contains(key),
+                "feature on but JSON missing {}: {}",
+                key,
+                json
+            );
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let p50 = parsed
+            .get("input_latency_p50_us")
+            .and_then(|v| v.as_f64())
+            .expect("input_latency_p50_us must be a finite number");
+        assert!(p50.is_finite());
+    }
+
+    /// Issue #85 feature-on test: feeding a synthetic snapshot into
+    /// `record_input_latency` makes `build_report` surface the
+    /// recorded quantiles. Exercises the full recorder to report
+    /// pipeline without needing a live event loop.
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn bench_report_quantiles_reflect_recorded_snapshot() {
+        use crate::bench::record_input_latency;
+        use unshit::app::InputLatencyTracker;
+
+        let _g = guard();
+        activate();
+        // Clear any residue from other tests.
+        {
+            let mut s = state().lock().unwrap();
+            s.latency_snapshot = None;
+        }
+
+        let mut tracker = InputLatencyTracker::new().unwrap();
+        let base = Instant::now();
+        // Three frames of known latencies: 1ms, 2ms, 5ms.
+        for &lat_ms in &[1u64, 2, 5] {
+            tracker.record_event(base);
+            tracker.record_frame_presented(base + Duration::from_millis(lat_ms));
+        }
+        let snap = tracker.snapshot();
+        record_input_latency(&snap);
+
+        let report = build_report(BenchMode::DirLoop, Duration::from_secs(1));
+        deactivate();
+
+        // p50 of [1,2,5] in hdrhistogram is the middle value, 2ms = 2000us.
+        assert!(
+            (report.input_latency_p50_us - 2000.0).abs() < 200.0,
+            "p50 {} us not near 2000 us",
+            report.input_latency_p50_us
+        );
+        assert!(
+            report.input_latency_max_us >= 4900.0,
+            "max {} us should reflect the 5ms sample",
+            report.input_latency_max_us
+        );
     }
 }
