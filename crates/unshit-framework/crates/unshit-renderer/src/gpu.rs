@@ -20,6 +20,13 @@ use wgpu;
 
 static BACKDROP_FALLBACK_LOG: Once = Once::new();
 
+/// Per layer, per image batch draw plan. Each entry is
+/// `(slot, count)`: `slot` indexes into
+/// `GpuContext::current_image_instance_buffers` (or equals `usize::MAX`
+/// when the batch was skipped) and `count` is the instance count to
+/// draw.
+type ImageLayerPlan = Vec<Vec<(usize, u32)>>;
+
 #[cfg(target_os = "windows")]
 fn use_subpixel_text_shader() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -119,16 +126,14 @@ pub struct GpuContext {
     backdrop_image_pipeline: Option<ImagePipeline>,
     backdrop_svg_pipeline: Option<SvgPipeline>,
 
-    /// Pooled instance buffer holding this frame's quad data. Acquired
-    /// from `quad_pipeline.instance_pool` during `prepare`, referenced
-    /// during the render pass, and released in the
-    /// `on_submitted_work_done` callback after `queue.submit`.
+    /// Pooled instance buffers holding this frame's data. Acquired
+    /// during `prepare`, referenced during the render pass, and
+    /// released in the `on_submitted_work_done` callback after
+    /// `queue.submit`. Images need one pooled buffer per batch because
+    /// batch writes happen mid render pass and cannot safely share one
+    /// buffer.
     current_quad_instance_buffer: Option<PooledBuffer<QuadInstance>>,
-    /// Mirror of `current_quad_instance_buffer` for glyphs.
     current_glyph_instance_buffer: Option<PooledBuffer<GlyphInstance>>,
-    /// Mirror of `current_quad_instance_buffer` for images. One pooled
-    /// buffer per image batch so mid pass writes never race. Populated
-    /// in the same loop that records the draws and drained after submit.
     current_image_instance_buffers: Vec<PooledBuffer<ImageInstance>>,
 }
 
@@ -708,16 +713,24 @@ impl GpuContext {
     }
 
     /// Fetch the currently acquired quad buffer for draw recording.
-    /// Callers check `is_some()` before issuing quad draws so empty
-    /// frames (no quads) do not reference a stale or uninitialised
-    /// buffer.
-    fn current_quad_buffer(&self) -> Option<&wgpu::Buffer> {
-        self.current_quad_instance_buffer.as_ref().map(|p| p.as_buffer())
+    /// Call sites guard with `quad_count > 0`, which implies the pool
+    /// produced a buffer in `upload_content_instance_buffers`; the
+    /// `expect` traps renderer bugs (e.g. counts and uploads drifting
+    /// out of sync) instead of silently skipping draws.
+    fn current_quad_buffer(&self) -> &wgpu::Buffer {
+        self.current_quad_instance_buffer
+            .as_ref()
+            .map(|p| p.as_buffer())
+            .expect("quad pool buffer must be acquired before draw")
     }
 
     /// Fetch the currently acquired glyph buffer for draw recording.
-    fn current_glyph_buffer(&self) -> Option<&wgpu::Buffer> {
-        self.current_glyph_instance_buffer.as_ref().map(|p| p.as_buffer())
+    /// See [`Self::current_quad_buffer`] for the invariant.
+    fn current_glyph_buffer(&self) -> &wgpu::Buffer {
+        self.current_glyph_instance_buffer
+            .as_ref()
+            .map(|p| p.as_buffer())
+            .expect("glyph pool buffer must be acquired before draw")
     }
 
     /// Pre acquire one pooled buffer per image batch across all layers
@@ -726,19 +739,15 @@ impl GpuContext {
     ///
     /// Image batches are walked in the same fixed order the render pass
     /// uses, so the nth batch in the returned `Vec` corresponds 1:1 with
-    /// the nth batch encountered inside the pass. Returns a per layer
-    /// list of per batch data: (batch index into the flat pool vec,
-    /// instance count, entry width, entry height).
-    #[allow(clippy::type_complexity)]
-    fn upload_image_instance_buffers(&mut self) -> Vec<Vec<(usize, u32)>> {
+    /// the nth batch encountered inside the pass.
+    fn upload_image_instance_buffers(&mut self) -> ImageLayerPlan {
         // Clear any leftover pooled buffers from the previous frame.
         // Normally these are released by `on_submitted_work_done`, but
         // a frame with zero images followed by a frame with images
         // would otherwise pile up if we did not defend against it.
         self.current_image_instance_buffers.clear();
 
-        let mut per_layer: Vec<Vec<(usize, u32)>> =
-            Vec::with_capacity(self.layered_batch.layers.len());
+        let mut per_layer: ImageLayerPlan = Vec::with_capacity(self.layered_batch.layers.len());
 
         for layer_idx in 0..self.layered_batch.layers.len() {
             let batch_count = self.layered_batch.layers[layer_idx].image_batches.len();
@@ -989,12 +998,7 @@ impl GpuContext {
                     if quad_count > 0 {
                         pass.set_pipeline(&self.quad_pipeline.pipeline);
                         pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                        pass.set_vertex_buffer(
-                            0,
-                            self.current_quad_buffer()
-                                .expect("quad pool buffer must be acquired before draw")
-                                .slice(..),
-                        );
+                        pass.set_vertex_buffer(0, self.current_quad_buffer().slice(..));
                         pass.draw(0..6, quad_base..quad_base + quad_count);
                     }
 
@@ -1019,12 +1023,7 @@ impl GpuContext {
                         pass.set_pipeline(&self.text_pipeline.pipeline);
                         pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
                         pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
-                        pass.set_vertex_buffer(
-                            0,
-                            self.current_glyph_buffer()
-                                .expect("glyph pool buffer must be acquired before draw")
-                                .slice(..),
-                        );
+                        pass.set_vertex_buffer(0, self.current_glyph_buffer().slice(..));
                         pass.draw(0..6, glyph_base..glyph_base + glyph_count);
                     }
 
@@ -1090,12 +1089,7 @@ impl GpuContext {
                                 if current_kind != Some(DrawKind::Quad) {
                                     pass.set_pipeline(&self.quad_pipeline.pipeline);
                                     pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                                    pass.set_vertex_buffer(
-                                        0,
-                                        self.current_quad_buffer()
-                                            .expect("quad pool buffer must be acquired before draw")
-                                            .slice(..),
-                                    );
+                                    pass.set_vertex_buffer(0, self.current_quad_buffer().slice(..));
                                     current_kind = Some(DrawKind::Quad);
                                 }
                                 let start = quad_base + span.start;
@@ -1116,11 +1110,7 @@ impl GpuContext {
                                     );
                                     pass.set_vertex_buffer(
                                         0,
-                                        self.current_glyph_buffer()
-                                            .expect(
-                                                "glyph pool buffer must be acquired before draw",
-                                            )
-                                            .slice(..),
+                                        self.current_glyph_buffer().slice(..),
                                     );
                                     current_kind = Some(DrawKind::Glyph);
                                 }
@@ -1320,7 +1310,7 @@ impl GpuContext {
         svg_keys: &[(usize, usize, usize)],
         quad_bases: &[u32],
         glyph_bases: &[u32],
-        image_layer_plan: &[Vec<(usize, u32)>],
+        image_layer_plan: &ImageLayerPlan,
         vw: f32,
         vh: f32,
         format: wgpu::TextureFormat,
@@ -1454,9 +1444,7 @@ impl GpuContext {
                                             );
                                             pass.set_vertex_buffer(
                                                 0,
-                                                self.current_quad_buffer()
-                                                    .expect("quad pool buffer must be acquired before draw")
-                                                    .slice(..),
+                                                self.current_quad_buffer().slice(..),
                                             );
                                             current_kind = Some(DrawKind::Quad);
                                         }
@@ -1481,9 +1469,7 @@ impl GpuContext {
                                             );
                                             pass.set_vertex_buffer(
                                                 0,
-                                                self.current_glyph_buffer()
-                                                    .expect("glyph pool buffer must be acquired before draw")
-                                                    .slice(..),
+                                                self.current_glyph_buffer().slice(..),
                                             );
                                             current_kind = Some(DrawKind::Glyph);
                                         }
@@ -1497,24 +1483,14 @@ impl GpuContext {
                         if quad_cur < quad_end {
                             pass.set_pipeline(quad_rp);
                             pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                            pass.set_vertex_buffer(
-                                0,
-                                self.current_quad_buffer()
-                                    .expect("quad pool buffer must be acquired before draw")
-                                    .slice(..),
-                            );
+                            pass.set_vertex_buffer(0, self.current_quad_buffer().slice(..));
                             pass.draw(0..6, quad_base + quad_cur..quad_base + quad_end);
                         }
                         if glyph_cur < glyph_end {
                             pass.set_pipeline(text_rp);
                             pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
                             pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
-                            pass.set_vertex_buffer(
-                                0,
-                                self.current_glyph_buffer()
-                                    .expect("glyph pool buffer must be acquired before draw")
-                                    .slice(..),
-                            );
+                            pass.set_vertex_buffer(0, self.current_glyph_buffer().slice(..));
                             pass.draw(0..6, glyph_base + glyph_cur..glyph_base + glyph_end);
                         }
                     }
@@ -1543,15 +1519,15 @@ impl GpuContext {
                         let end = (image_end as usize).min(image_count);
                         let layer_image_plan = &image_layer_plan[layer_idx];
                         for i in (image_cur as usize)..end {
-                            let path = {
-                                let ib = &self.layered_batch.layers[layer_idx].image_batches[i];
-                                ib.path.clone()
-                            };
                             let (slot, count) = layer_image_plan[i];
                             if count == 0 {
                                 continue;
                             }
-                            let Some(entry) = self.image_cache.get(&path) else { continue };
+                            let image_batch =
+                                &self.layered_batch.layers[layer_idx].image_batches[i];
+                            let Some(entry) = self.image_cache.get(&image_batch.path) else {
+                                continue;
+                            };
                             let Some(buffer) = self.image_instance_buffer(slot) else {
                                 continue;
                             };

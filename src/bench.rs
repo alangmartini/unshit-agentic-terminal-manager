@@ -192,8 +192,7 @@ struct Report {
     /// ~6.944 on 144Hz, ~4.166 on 240Hz.
     pacer_min_interval_ms: f64,
     /// Minimum frame time observed in microseconds. Lower bound on the
-    /// per frame cost of the renderer, below which hardware limits
-    /// dominate.
+    /// per frame cost of the pool below which hardware limits dominate.
     min_us: u64,
     /// 1st percentile frame time in milliseconds. Characterises the
     /// fastest path through the renderer where pool overhead matters.
