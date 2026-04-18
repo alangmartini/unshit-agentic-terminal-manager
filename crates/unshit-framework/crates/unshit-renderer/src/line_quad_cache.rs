@@ -127,6 +127,17 @@ fn hash_color(hasher: &mut rustc_hash::FxHasher, c: Color) {
 }
 
 /// Cached vertex instances for a single row.
+///
+/// After issue #52 Step 4 the cache tracks which cached glyph belongs to
+/// which column so the renderer can splice only the damaged column range
+/// on a content-signature miss with matching geometry. Backgrounds are
+/// always re-emitted fresh for the full row because style runs are
+/// comparatively cheap (O(cols)) and can legally shift boundaries as
+/// adjacent cell styles change.
+///
+/// `glyph_col_index[col] == Some(i)` means `glyphs[i]` and `glyph_keys[i]`
+/// belong to the cell at column `col`. A `None` entry means the cell had
+/// no glyph (empty cell, wide continuation, or glyph shaping failed).
 #[derive(Clone, Debug, Default)]
 pub struct CachedLineState {
     pub content_sig: u64,
@@ -137,6 +148,9 @@ pub struct CachedLineState {
     /// cover replayed lines even when the batch builder never re
     /// rasterized them this frame.
     pub glyph_keys: Vec<GlyphKey>,
+    /// Per-column index into `glyphs`/`glyph_keys`. `None` when the cell
+    /// at that column produced no glyph. Length is `cols`.
+    pub glyph_col_index: Vec<Option<u32>>,
 }
 
 /// Per element cache: one `CachedLineState` per `(NodeId, line_id)` where
@@ -192,6 +206,13 @@ impl LineQuadCache {
     }
 
     /// Insert or overwrite an entry for `(node, line_id)`.
+    ///
+    /// `glyph_col_index` maps each column of the row to an index into
+    /// `glyphs`/`glyph_keys`. Callers that do not track per-column
+    /// indices can pass an empty vec, which disables the Step 4 column
+    /// splice fast path for that entry. See `CachedLineState` for the
+    /// full contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn store(
         &mut self,
         node: NodeId,
@@ -201,10 +222,18 @@ impl LineQuadCache {
         quads: Vec<QuadInstance>,
         glyphs: Vec<GlyphInstance>,
         glyph_keys: Vec<GlyphKey>,
+        glyph_col_index: Vec<Option<u32>>,
     ) {
         self.lines.insert(
             (node, line_id),
-            CachedLineState { content_sig, geometry: Some(geometry), quads, glyphs, glyph_keys },
+            CachedLineState {
+                content_sig,
+                geometry: Some(geometry),
+                quads,
+                glyphs,
+                glyph_keys,
+                glyph_col_index,
+            },
         );
     }
 
@@ -358,7 +387,16 @@ mod tests {
         // Cache key is (node, line_id): use a distinct id to prove the
         // map stores what we asked for.
         let line_id: u64 = 0xdeadbeef;
-        cache.store(node, line_id, 0xdeadbeef, sig, quads.clone(), glyphs.clone(), keys.clone());
+        cache.store(
+            node,
+            line_id,
+            0xdeadbeef,
+            sig,
+            quads.clone(),
+            glyphs.clone(),
+            keys.clone(),
+            vec![],
+        );
 
         let hit = cache.lookup_replayable(node, line_id, 0xdeadbeef, sig);
         assert!(hit.is_some(), "must hit cache for matching content + geometry");
@@ -374,7 +412,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         let line_id: u64 = 7;
-        cache.store(node, line_id, 0x1111, sig, vec![], vec![], vec![]);
+        cache.store(node, line_id, 0x1111, sig, vec![], vec![], vec![], vec![]);
         assert!(cache.lookup_replayable(node, line_id, 0x1111, sig).is_some());
         // Different content hash -> miss.
         assert!(cache.lookup_replayable(node, line_id, 0x2222, sig).is_none());
@@ -386,7 +424,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         let line_id: u64 = 11;
-        cache.store(node, line_id, 0x1, sig, vec![], vec![], vec![]);
+        cache.store(node, line_id, 0x1, sig, vec![], vec![], vec![], vec![]);
         let moved = LineGeometrySig::new(10.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         assert!(cache.lookup_replayable(node, line_id, 0x1, moved).is_none());
     }
@@ -397,7 +435,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 3);
         let line_id: u64 = 42;
-        cache.store(node, line_id, 0xaaaa, sig, vec![], vec![], vec![]);
+        cache.store(node, line_id, 0xaaaa, sig, vec![], vec![], vec![], vec![]);
         let bumped = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 4);
         assert!(
             cache.lookup_replayable(node, line_id, 0xaaaa, bumped).is_none(),
@@ -412,7 +450,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         for id in 0..5u64 {
-            cache.store(node, id, id, sig, vec![], vec![], vec![]);
+            cache.store(node, id, id, sig, vec![], vec![], vec![], vec![]);
         }
         assert_eq!(cache.len(), 5);
         let mut retain: FxHashSet<u64> = FxHashSet::default();
@@ -431,8 +469,8 @@ mod tests {
         let a = NodeId { index: 0, generation: 0 };
         let b = NodeId { index: 1, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
-        cache.store(a, 0, 1, sig, vec![], vec![], vec![]);
-        cache.store(b, 0, 2, sig, vec![], vec![], vec![]);
+        cache.store(a, 0, 1, sig, vec![], vec![], vec![], vec![]);
+        cache.store(b, 0, 2, sig, vec![], vec![], vec![], vec![]);
         cache.forget_element(a);
         assert!(cache.get(a, 0).is_none());
         assert!(cache.get(b, 0).is_some());
@@ -465,9 +503,9 @@ mod tests {
         let id_a: u64 = 100;
         let id_b: u64 = 101;
         let id_c: u64 = 102;
-        cache.store(node, id_a, 0xaa, sig, vec![], vec![], vec![]);
-        cache.store(node, id_b, 0xbb, sig, vec![], vec![], vec![]);
-        cache.store(node, id_c, 0xcc, sig, vec![], vec![], vec![]);
+        cache.store(node, id_a, 0xaa, sig, vec![], vec![], vec![], vec![]);
+        cache.store(node, id_b, 0xbb, sig, vec![], vec![], vec![], vec![]);
+        cache.store(node, id_c, 0xcc, sig, vec![], vec![], vec![], vec![]);
 
         // After a scroll_up(1) inside CellGrid, the lines that held ids
         // 101 and 102 have rotated to earlier row indices while keeping
@@ -483,8 +521,8 @@ mod tests {
         let a = NodeId { index: 0, generation: 0 };
         let b = NodeId { index: 1, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
-        cache.store(a, 5, 1, sig, vec![], vec![], vec![]);
-        cache.store(b, 5, 2, sig, vec![], vec![], vec![]);
+        cache.store(a, 5, 1, sig, vec![], vec![], vec![], vec![]);
+        cache.store(b, 5, 2, sig, vec![], vec![], vec![], vec![]);
         // Retain nothing under `a`; `b`'s entries must survive.
         let retain: FxHashSet<u64> = FxHashSet::default();
         cache.retain_element_ids(a, &retain);
@@ -529,7 +567,7 @@ mod tests {
             gradient_extra: [0.0; 4],
         };
         let line_id: u64 = 9;
-        cache.store(node, line_id, 42, sig, vec![quad], vec![], vec![]);
+        cache.store(node, line_id, 42, sig, vec![quad], vec![], vec![], vec![]);
 
         let hit1 = cache.lookup_replayable(node, line_id, 42, sig).unwrap();
         let first_bytes = bytemuck::bytes_of(&hit1.quads[0]).to_vec();
@@ -553,7 +591,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         let line_id: u64 = 42;
-        cache.store(node, line_id, 0xbeef, sig, vec![], vec![], vec![]);
+        cache.store(node, line_id, 0xbeef, sig, vec![], vec![], vec![], vec![]);
 
         // Simulate a scroll: the same line identity now occupies a
         // different row. Under the new cache key, this is a no-op.
@@ -577,7 +615,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         let line_id: u64 = 77;
-        cache.store(node, line_id, 0xa1a1, sig, vec![], vec![], vec![]);
+        cache.store(node, line_id, 0xa1a1, sig, vec![], vec![], vec![], vec![]);
         // Same id, new content hash -> miss.
         assert!(
             cache.lookup_replayable(node, line_id, 0xb2b2, sig).is_none(),
