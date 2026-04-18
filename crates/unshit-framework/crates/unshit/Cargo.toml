@@ -19,6 +19,7 @@ unshit-app = { version = "0.1.0", path = "../unshit-app" }
 default = ["clipboard"]
 clipboard = ["unshit-app/clipboard"]
 async = ["unshit-app/async"]
+input-latency-histogram = ["unshit-app/input-latency-histogram"]
 
 [lints]
 workspace = true

@@ -28,6 +28,7 @@ tokio = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 notify = { version = "6", optional = true }
+hdrhistogram = { version = "7.5", optional = true }
 
 [features]
 default = ["clipboard", "hot-reload"]
@@ -35,6 +36,7 @@ clipboard = ["dep:arboard"]
 async = ["dep:tokio", "dep:tokio-stream", "dep:futures-core"]
 notifications = []
 hot-reload = ["dep:notify"]
+input-latency-histogram = ["dep:hdrhistogram"]
 
 [dev-dependencies]
 tokio = { workspace = true }

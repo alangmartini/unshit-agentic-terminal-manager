@@ -89,6 +89,9 @@ name = "terminal-manager"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+input-latency-histogram = ["unshit/input-latency-histogram"]
+
 [lints]
 workspace = true
 
