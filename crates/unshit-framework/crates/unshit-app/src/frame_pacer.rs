@@ -28,10 +28,12 @@ pub enum PaceDecision {
     WaitUntil(Instant),
 }
 
-/// Coalescing frame pacer. Default interval is 8ms, matching Ghostty's
-/// default and close to Kitty's 10ms input batch interval. The interval is
-/// a ceiling on paint rate; actual paints may be rarer when there is
-/// nothing to redraw.
+/// Coalescing frame pacer. The interval is derived from the active
+/// monitor's refresh rate via [`Self::with_refresh_rate_mhz`]; the legacy
+/// 8ms default (matching Ghostty's default and close to Kitty's 10ms input
+/// batch interval) is kept as a fallback when the monitor does not report
+/// a refresh rate. The interval is a ceiling on paint rate; actual paints
+/// may be rarer when there is nothing to redraw.
 pub struct FramePacer {
     /// Minimum interval between two consecutive paints.
     min_interval: Duration,
@@ -46,8 +48,14 @@ impl Default for FramePacer {
 }
 
 impl FramePacer {
-    /// 8 milliseconds. See module documentation for the rationale.
+    /// 8 milliseconds. See module documentation for the rationale. Used as
+    /// the fallback when the active monitor does not report a refresh rate.
     pub const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(8);
+
+    /// Floor on the interval derived from a refresh rate. Sub-millisecond
+    /// periods (e.g. a hypothetical 1000Hz panel) would cause the event
+    /// loop to wake so often that the pacer becomes useless; clamp to 1ms.
+    pub const MIN_DERIVED_INTERVAL: Duration = Duration::from_millis(1);
 
     /// Construct a pacer with the default coalescing interval (8ms).
     pub fn new() -> Self {
@@ -58,6 +66,40 @@ impl FramePacer {
     /// and future experimentation.
     pub fn with_min_interval(min_interval: Duration) -> Self {
         Self { min_interval, last_paint: None }
+    }
+
+    /// Construct a pacer whose coalescing interval is derived from the
+    /// active monitor's refresh rate, measured in millihertz. Pass 0 to
+    /// force the historic 8ms fallback. Values above ~1000Hz are clamped
+    /// to [`Self::MIN_DERIVED_INTERVAL`].
+    pub fn with_refresh_rate_mhz(mhz: u32) -> Self {
+        Self { min_interval: Self::interval_from_mhz(mhz), last_paint: None }
+    }
+
+    /// Update the coalescing interval after construction. Called when the
+    /// window crosses a monitor boundary and the new display reports a
+    /// different refresh rate. Pass 0 to fall back to the default.
+    pub fn set_refresh_rate_mhz(&mut self, mhz: u32) {
+        self.min_interval = Self::interval_from_mhz(mhz);
+    }
+
+    /// Pure helper: `mhz -> Duration`. `mhz == 0` returns
+    /// [`Self::DEFAULT_MIN_INTERVAL`] so the pacer keeps working when the
+    /// compositor cannot enumerate the display's refresh rate. Results are
+    /// clamped to [`Self::MIN_DERIVED_INTERVAL`] on the fast end.
+    pub fn interval_from_mhz(mhz: u32) -> Duration {
+        if mhz == 0 {
+            return Self::DEFAULT_MIN_INTERVAL;
+        }
+        // mhz is frames per 1000 seconds. interval_ns = 1e12 / mhz.
+        // Use u64 for the division: 1e12 does not fit in u32 for low rates.
+        let interval_ns = 1_000_000_000_000u64 / (mhz as u64);
+        let interval = Duration::from_nanos(interval_ns);
+        if interval < Self::MIN_DERIVED_INTERVAL {
+            Self::MIN_DERIVED_INTERVAL
+        } else {
+            interval
+        }
     }
 
     /// Minimum interval between two paints. Exposed for diagnostics.
@@ -121,6 +163,31 @@ impl FramePacer {
             }
         }
     }
+}
+
+/// Abstract source of the active display's refresh rate.
+///
+/// Implementors return the millihertz value from whatever backing API is
+/// appropriate: winit's `Window::current_monitor().current_video_mode()`,
+/// a platform-specific vsync query, or a test fake. Returning `None`
+/// means the source could not determine a rate and the pacer should fall
+/// back to [`FramePacer::DEFAULT_MIN_INTERVAL`].
+pub trait MonitorRefreshSource {
+    /// The active monitor's refresh rate in millihertz, if known.
+    fn current_refresh_mhz(&self) -> Option<u32>;
+}
+
+/// Update a pacer's coalescing interval from the given refresh source.
+///
+/// `None` from the source maps to 0 mHz, which
+/// [`FramePacer::interval_from_mhz`] converts into
+/// [`FramePacer::DEFAULT_MIN_INTERVAL`]. Callers run this from
+/// `WindowEvent::Moved` and scale-factor-change branches; it is safe to
+/// call from any event handler as long as the cost of the source query
+/// is acceptable. See the `app.rs` integration for the debounce policy.
+pub fn refresh_pacer_from_source(pacer: &mut FramePacer, source: &dyn MonitorRefreshSource) {
+    let mhz = source.current_refresh_mhz().unwrap_or(0);
+    pacer.set_refresh_rate_mhz(mhz);
 }
 
 #[cfg(test)]
@@ -262,5 +329,113 @@ mod tests {
         // Elapsed saturates to zero, which is < min_interval, so we wait.
         let expected = t0 + Duration::from_millis(100) + Duration::from_millis(8);
         assert_decisions_eq(decision, PaceDecision::WaitUntil(expected));
+    }
+
+    // === Refresh-rate derived interval (capillary #82) ===
+
+    #[test]
+    fn with_refresh_rate_mhz_120000_gives_8333us() {
+        // 120000 mHz == 120 Hz. Expected interval: 1e12 / 120000 = 8_333_333 ns.
+        let pacer = FramePacer::with_refresh_rate_mhz(120_000);
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(8_333_333));
+    }
+
+    #[test]
+    fn with_refresh_rate_mhz_144000_gives_6944us() {
+        // 144000 mHz == 144 Hz. Expected interval: 1e12 / 144000 = 6_944_444 ns.
+        let pacer = FramePacer::with_refresh_rate_mhz(144_000);
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(6_944_444));
+    }
+
+    #[test]
+    fn with_refresh_rate_mhz_165000_gives_6060us() {
+        // 165000 mHz == 165 Hz. Expected interval: 1e12 / 165000 = 6_060_606 ns.
+        let pacer = FramePacer::with_refresh_rate_mhz(165_000);
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(6_060_606));
+    }
+
+    #[test]
+    fn with_refresh_rate_mhz_240000_gives_4166us() {
+        // 240000 mHz == 240 Hz. Expected interval: 1e12 / 240000 = 4_166_666 ns.
+        let pacer = FramePacer::with_refresh_rate_mhz(240_000);
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(4_166_666));
+    }
+
+    #[test]
+    fn with_refresh_rate_mhz_zero_falls_back_to_default() {
+        // The monitor returned no refresh rate (None). Fallback must
+        // equal the historic default so we never regress older behavior.
+        let pacer = FramePacer::with_refresh_rate_mhz(0);
+        assert_eq!(pacer.min_interval(), FramePacer::DEFAULT_MIN_INTERVAL);
+        assert_eq!(pacer.min_interval(), FramePacer::new().min_interval());
+    }
+
+    #[test]
+    fn with_refresh_rate_mhz_absurd_1000000_clamps_to_1ms() {
+        // 1000 Hz panels do not exist, but the pacer must never wake the
+        // event loop at faster than MIN_DERIVED_INTERVAL regardless of
+        // what the compositor reports.
+        let pacer = FramePacer::with_refresh_rate_mhz(1_000_000);
+        assert_eq!(pacer.min_interval(), FramePacer::MIN_DERIVED_INTERVAL);
+        assert_eq!(pacer.min_interval(), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn set_refresh_rate_mhz_updates_existing_pacer() {
+        let mut pacer = FramePacer::with_refresh_rate_mhz(120_000);
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(8_333_333));
+        pacer.set_refresh_rate_mhz(144_000);
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(6_944_444));
+    }
+
+    #[test]
+    fn interval_from_mhz_is_monotonic_decreasing_in_mhz() {
+        // For any sorted increasing list of mhz values, the derived
+        // interval must be non-increasing. Clamps at the ends are fine;
+        // just no inversions between neighbors.
+        let rates = [60_000u32, 75_000, 100_000, 120_000, 144_000, 165_000, 240_000, 360_000];
+        let mut prev = FramePacer::interval_from_mhz(rates[0]);
+        for r in &rates[1..] {
+            let cur = FramePacer::interval_from_mhz(*r);
+            assert!(
+                cur <= prev,
+                "interval at {}mhz ({:?}) must not exceed interval at slower rate ({:?})",
+                r,
+                cur,
+                prev
+            );
+            prev = cur;
+        }
+    }
+
+    // === Regression guards ===
+
+    #[test]
+    fn default_min_interval_is_still_8ms_after_refactor() {
+        // regression for #81 item 1 fallback path: ensure the legacy
+        // 8ms default never changes silently during a refactor.
+        assert_eq!(FramePacer::new().min_interval(), Duration::from_millis(8));
+        assert_eq!(FramePacer::DEFAULT_MIN_INTERVAL, Duration::from_millis(8));
+    }
+
+    #[test]
+    fn speculative_deadline_respects_derived_interval_after_rate_change() {
+        // regression for #82: when the window crosses monitors and the
+        // pacer rate changes, the speculative deadline must use the new
+        // shorter interval rather than a stale one.
+        let mut pacer = FramePacer::with_refresh_rate_mhz(120_000);
+        let t0 = Instant::now();
+        pacer.record_paint(t0);
+
+        // Before the rate change: speculative deadline is t0 + ~8.333ms.
+        let expected_120 = t0 + Duration::from_nanos(8_333_333);
+        assert_eq!(pacer.speculative_deadline(t0), expected_120);
+
+        // Simulate moving to a 240Hz panel.
+        pacer.set_refresh_rate_mhz(240_000);
+
+        // After the rate change: speculative deadline is t0 + ~4.166ms.
+        let expected_240 = t0 + Duration::from_nanos(4_166_666);
+        assert_eq!(pacer.speculative_deadline(t0), expected_240);
     }
 }
