@@ -415,8 +415,22 @@ struct ShapedTextEntry {
 }
 
 /// Cache for shaped text layouts. Keyed on text content + font params + width.
+///
+/// Storage is double buffered: each `finish_frame` swaps the previous and
+/// current maps and clears the new current. Lookups promote matching entries
+/// from previous into current, so the live set is bounded by the last two
+/// frames of hits. Entries untouched for two consecutive frames are dropped
+/// with no explicit eviction pass.
+///
+/// `last_atlas_generation` guards against coarse atlas invalidations: when
+/// the glyph atlas bumps its generation (eviction, rebuild), `finish_frame`
+/// wipes both halves on the next call before the swap so stale atlas UVs
+/// never survive into a new frame cycle. The per glyph residency check in
+/// `emit_shaped_text_run` remains the primary correctness mechanism for
+/// mid frame churn.
 pub struct ShapedTextCache {
-    map: FxHashMap<ShapedCacheKey, ShapedTextEntry>,
+    buf: crate::double_buffered::DoubleBufferedCache<ShapedCacheKey, ShapedTextEntry>,
+    last_atlas_generation: u64,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -436,11 +450,39 @@ impl Default for ShapedTextCache {
 
 impl ShapedTextCache {
     pub fn new() -> Self {
-        Self { map: FxHashMap::with_capacity_and_hasher(256, Default::default()) }
+        Self {
+            buf: crate::double_buffered::DoubleBufferedCache::with_capacity(256),
+            last_atlas_generation: 0,
+        }
     }
 
+    /// Empty both halves. Call on font family, DPI, or size changes.
     pub fn clear(&mut self) {
-        self.map.clear();
+        self.buf.clear();
+    }
+
+    /// Total entries across both halves. Primarily a diagnostic.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// True when both halves are empty.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// End of frame marker. Swaps previous and current, dropping any entry
+    /// that was not touched this frame. If `atlas_generation` differs from
+    /// the last observed value the entire cache is cleared first. This is a
+    /// defense in depth layer on top of the per glyph residency check in
+    /// `emit_shaped_text_run`.
+    pub fn finish_frame(&mut self, atlas_generation: u64) {
+        if atlas_generation != self.last_atlas_generation {
+            self.buf.clear();
+            self.last_atlas_generation = atlas_generation;
+            return;
+        }
+        self.buf.finish_frame();
     }
 }
 
@@ -627,14 +669,25 @@ pub struct ShapedGlyphEntry {
 /// `(char, font_id, style, font_size)`. The key is independent of subpixel
 /// bin and cell origin so it remains valid as the pane scrolls or moves.
 ///
+/// Storage is double buffered (see [`DoubleBufferedCache`]): each
+/// `finish_frame` swaps the previous and current maps. Entries untouched for
+/// two consecutive frames are dropped with no explicit eviction pass. Preload
+/// and terminal hot characters promote on every frame, so the preload set
+/// effectively never evicts; rarely touched characters age out automatically.
+///
 /// Invalidation is coarse on purpose: any change to the global font stack,
 /// DPI scale, or font size should call [`ShapeCache::clear`]. Per-character
 /// invalidation is intentionally not supported because monospace advances
 /// are stable inside a single font configuration.
+///
+/// [`DoubleBufferedCache`]: crate::double_buffered::DoubleBufferedCache
 pub struct ShapeCache {
-    entries: FxHashMap<ShapeCacheKey, Option<ShapedGlyphEntry>>,
+    entries: crate::double_buffered::DoubleBufferedCache<ShapeCacheKey, Option<ShapedGlyphEntry>>,
     hits: u64,
     misses: u64,
+    /// Hits promoted out of the previous frame's map. Diagnostic only; the
+    /// caller cannot act on this breakdown mid frame.
+    previous_hits: u64,
     /// Identity of the cache configuration used to populate entries. When
     /// any of these shift we drop everything; see [`ShapeCache::retune`].
     configured_font_id: u64,
@@ -652,16 +705,18 @@ impl ShapeCache {
     pub fn new() -> Self {
         Self {
             // Sized for 95 ASCII + typical box-drawing + growth headroom.
-            entries: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            entries: crate::double_buffered::DoubleBufferedCache::with_capacity(256),
             hits: 0,
             misses: 0,
+            previous_hits: 0,
             configured_font_id: 0,
             configured_scale_thousandths: 0,
             configured_font_size_tenths: 0,
         }
     }
 
-    /// Hits since the most recent [`ShapeCache::clear`].
+    /// Hits since the most recent [`ShapeCache::clear`]. Includes both
+    /// `current` frame hits and `previous` frame hits that got promoted.
     pub fn hits(&self) -> u64 {
         self.hits
     }
@@ -669,6 +724,14 @@ impl ShapeCache {
     /// Misses since the most recent [`ShapeCache::clear`].
     pub fn misses(&self) -> u64 {
         self.misses
+    }
+
+    /// Subset of [`ShapeCache::hits`] that came from the previous frame's
+    /// map (entries promoted during lookup). A high ratio indicates the
+    /// working set exceeds a single frame of unique characters. Reset by
+    /// [`ShapeCache::clear`].
+    pub fn previous_hits(&self) -> u64 {
+        self.previous_hits
     }
 
     /// Rough cache hit rate in the range 0.0..=1.0. Returns 0.0 when no
@@ -682,7 +745,7 @@ impl ShapeCache {
         }
     }
 
-    /// Number of entries currently cached.
+    /// Number of entries currently cached across both halves.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -698,6 +761,13 @@ impl ShapeCache {
         self.entries.clear();
         self.hits = 0;
         self.misses = 0;
+        self.previous_hits = 0;
+    }
+
+    /// Swap previous and current halves, dropping any entry not touched this
+    /// frame. Call once per frame after `build_render_batch` completes.
+    pub fn finish_frame(&mut self) {
+        self.entries.finish_frame();
     }
 
     /// Ensure the cache matches the active font/scale/size configuration.
@@ -721,13 +791,22 @@ impl ShapeCache {
         }
     }
 
-    /// Look up a cached shaped entry. Records a hit or miss either way.
-    /// Callers that miss must call [`ShapeCache::insert`] with the shaped
-    /// result so the next frame hits.
+    /// Look up a cached shaped entry, promoting any hit from `previous` to
+    /// `current`. Records a hit or miss either way. Callers that miss must
+    /// call [`ShapeCache::insert`] with the shaped result so the next frame
+    /// hits.
+    ///
+    /// Counters: `hits` increments on any match, `previous_hits` additionally
+    /// increments when the entry was promoted out of the previous frame's
+    /// map.
     pub fn get(&mut self, key: &ShapeCacheKey) -> Option<&Option<ShapedGlyphEntry>> {
-        if let Some(entry) = self.entries.get(key) {
+        let was_in_current = self.entries.contains_in_current(key);
+        if self.entries.get_or_promote(key).is_some() {
             self.hits += 1;
-            Some(entry)
+            if !was_in_current {
+                self.previous_hits += 1;
+            }
+            self.entries.peek(key)
         } else {
             self.misses += 1;
             None
@@ -752,15 +831,19 @@ impl ShapeCache {
     /// pushes the cache hit rate above 95 percent within a screenful of
     /// output.
     ///
-    /// Insert-only: on repeat calls existing entries are left untouched so
-    /// this is safe to call more than once.
+    /// Insert-only: on repeat calls existing entries are left untouched if
+    /// present in either half.
     pub fn preload_defaults(
         &mut self,
         shape: &mut dyn FnMut(char) -> (ShapeCacheKey, Option<ShapedGlyphEntry>),
     ) {
         for ch in Self::default_preload_chars() {
             let (key, value) = shape(ch);
-            self.entries.entry(key).or_insert(value);
+            // Only insert if neither half already has the entry; this
+            // preserves idempotence on repeated preload calls.
+            if self.entries.peek(&key).is_none() {
+                self.entries.insert(key, value);
+            }
         }
     }
 }
@@ -2046,7 +2129,11 @@ fn emit_text_glyphs_cached(
     // Check if we have a cached shaped result. If any atlas key is missing,
     // invalidate this shaped entry and rebuild so glyphs are never silently
     // dropped on atlas churn.
-    if let Some(entry) = shaped_cache.map.get(&cache_key).cloned() {
+    //
+    // `get_or_promote` walks both halves of the double buffered cache and
+    // promotes a hit out of `previous` into `current` so it survives the
+    // next `finish_frame` swap.
+    if let Some(entry) = shaped_cache.buf.get_or_promote(&cache_key).cloned() {
         let atlas_ready = entry.glyphs.iter().all(|cg| atlas.cache.contains_key(&cg.atlas_key));
         if atlas_ready {
             for cg in &entry.glyphs {
@@ -2070,7 +2157,7 @@ fn emit_text_glyphs_cached(
             }
             return;
         }
-        shaped_cache.map.remove(&cache_key);
+        shaped_cache.buf.remove(&cache_key);
     }
 
     // Cache miss: shape text and populate cache
@@ -2127,7 +2214,7 @@ fn emit_text_glyphs_cached(
         }
     }
 
-    shaped_cache.map.insert(cache_key, ShapedTextEntry { glyphs: cached_glyphs });
+    shaped_cache.buf.insert(cache_key, ShapedTextEntry { glyphs: cached_glyphs });
 }
 
 /// Hash a font family name into the stable `font_id` used by
@@ -4416,6 +4503,245 @@ mod tests {
         assert!(chars.contains(&'\u{2500}'));
         assert!(chars.contains(&'\u{257f}'));
         assert_eq!(chars.len(), 95 + 128);
+    }
+
+    // -----------------------------------------------------------------------
+    // Double buffered ShapeCache tests (issue #83).
+    //
+    // The shape cache is now backed by a two frame map. Each `finish_frame`
+    // swaps previous and current and clears the new current. Entries not
+    // touched for two consecutive frames are evicted automatically. Preload
+    // and hot characters promote every frame so they never evict.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shape_cache_promotes_across_frame_boundary() {
+        let mut cache = ShapeCache::new();
+        let key = key_for('Z', "Consolas", 14.0);
+        cache.insert(key, fake_shape('Z'));
+        cache.finish_frame(); // entry now lives in previous
+        let first_hit = cache.get(&key);
+        assert!(first_hit.is_some(), "promoted entry must be readable");
+        assert_eq!(cache.len(), 1, "promotion preserves the single entry");
+        assert_eq!(cache.previous_hits(), 1, "the hit came from previous");
+    }
+
+    #[test]
+    fn shape_cache_untouched_chars_evict_after_two_frames() {
+        let mut cache = ShapeCache::new();
+        let key = key_for('Q', "Consolas", 14.0);
+        cache.insert(key, fake_shape('Q'));
+        // finish_frame 1: moves to previous.
+        cache.finish_frame();
+        // finish_frame 2: previous not touched this frame => dropped.
+        cache.finish_frame();
+        assert!(cache.get(&key).is_none(), "untouched entry must evict after two frame boundaries");
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn shape_cache_preload_survives_first_finish_frame_pair() {
+        // Preload, simulate a frame of hits on every default char, finish,
+        // then hit them all again. None of the preloaded entries should be
+        // evicted because each one got promoted on the second frame.
+        let mut cache = ShapeCache::new();
+        cache.preload_defaults(&mut |ch| (key_for(ch, "Consolas", 14.0), fake_shape(ch)));
+        let preload_count = cache.len();
+        assert!(preload_count >= 95 + 128, "preload populates at least ASCII + box-drawing");
+
+        // Frame 1: touch every preloaded key so each gets promoted into
+        // current. `finish_frame` then pushes them to previous for frame 2.
+        for ch in ShapeCache::default_preload_chars() {
+            assert!(cache.get(&key_for(ch, "Consolas", 14.0)).is_some());
+        }
+        cache.finish_frame();
+
+        // Frame 2: touch every preloaded key again. Each lookup must still
+        // succeed (promotion pulls the entry back into current).
+        for ch in ShapeCache::default_preload_chars() {
+            assert!(
+                cache.get(&key_for(ch, "Consolas", 14.0)).is_some(),
+                "preloaded entry for {ch:?} must survive the first finish_frame pair",
+            );
+        }
+        cache.finish_frame();
+
+        // Frame 3: still reachable.
+        for ch in ShapeCache::default_preload_chars() {
+            assert!(
+                cache.get(&key_for(ch, "Consolas", 14.0)).is_some(),
+                "preloaded entry for {ch:?} must still be reachable on frame 3",
+            );
+        }
+    }
+
+    #[test]
+    fn shape_cache_retune_clears_both_halves() {
+        let mut cache = ShapeCache::new();
+        cache.retune("Consolas", 1.0, 14.0);
+        cache.insert(key_for('A', "Consolas", 14.0), fake_shape('A'));
+        cache.finish_frame(); // A in previous
+        cache.insert(key_for('B', "Consolas", 14.0), fake_shape('B')); // B in current
+        assert_eq!(cache.len(), 2, "both halves populated before retune");
+
+        // Change font family: retune calls clear(), which empties both halves.
+        cache.retune("Menlo", 1.0, 14.0);
+        assert!(cache.is_empty(), "retune must empty previous AND current");
+        assert_eq!(cache.hits(), 0, "clear resets hit counter");
+        assert_eq!(cache.misses(), 0, "clear resets miss counter");
+        assert_eq!(cache.previous_hits(), 0, "clear resets previous-hit counter");
+    }
+
+    #[test]
+    fn shape_cache_previous_hit_counter_classifies_promotion() {
+        let mut cache = ShapeCache::new();
+        let key = key_for('A', "Consolas", 14.0);
+        cache.insert(key, fake_shape('A'));
+        assert_eq!(cache.previous_hits(), 0);
+
+        // First lookup hits current (no promotion).
+        let _ = cache.get(&key);
+        assert_eq!(cache.previous_hits(), 0, "current-frame hit does not bump previous_hits");
+
+        // After finish_frame the entry sits in previous. Next lookup promotes.
+        cache.finish_frame();
+        let _ = cache.get(&key);
+        assert_eq!(cache.previous_hits(), 1, "promoted hit increments previous_hits");
+
+        // Subsequent lookup in the same frame is a current-frame hit.
+        let _ = cache.get(&key);
+        assert_eq!(cache.previous_hits(), 1, "same-frame repeat does not bump previous_hits");
+    }
+
+    #[test]
+    fn shape_cache_size_bounded_under_unique_char_workload() {
+        // Rendering 1000 unique chars over 10 frames with no repeats across
+        // frames must never balloon the cache: the live set stays bounded by
+        // the last two frames (~200 entries). Before double buffering, the
+        // cache accumulated all 1000.
+        let mut cache = ShapeCache::new();
+        const PER_FRAME: u32 = 100;
+        const FRAMES: u32 = 10;
+
+        for frame in 0..FRAMES {
+            for i in 0..PER_FRAME {
+                let code = 0x100 + frame * PER_FRAME + i; // never collides across frames
+                if let Some(ch) = char::from_u32(code) {
+                    let key = key_for(ch, "Consolas", 14.0);
+                    cache.insert(key, None); // value does not matter for size bounding
+                }
+            }
+            cache.finish_frame();
+        }
+        // After 10 frames, only frames 9's entries (current at finish time,
+        // now previous after the last swap) and the empty new current remain.
+        // The bound is 2 * PER_FRAME to account for the final two frame
+        // halves of hits.
+        let bound = 2 * PER_FRAME as usize;
+        assert!(
+            cache.len() <= bound,
+            "double buffered shape cache must stay below {bound} entries, got {}",
+            cache.len(),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Double buffered ShapedTextCache tests (issue #83).
+    // -----------------------------------------------------------------------
+
+    fn shaped_text_entry(n: usize) -> ShapedTextEntry {
+        // Build a synthetic entry with `n` zero-valued glyphs. The atlas
+        // residency check lives outside the cache itself, so for in-memory
+        // cache tests an empty glyph vec is sufficient.
+        let _ = n;
+        ShapedTextEntry { glyphs: Vec::new() }
+    }
+
+    fn shaped_key_for(text: &str) -> ShapedCacheKey {
+        ShapedTextCache::make_key(text, 14.0, 1.2, 0.0, None)
+    }
+
+    #[test]
+    fn shaped_text_cache_new_is_empty() {
+        let c = ShapedTextCache::new();
+        assert!(c.is_empty());
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn shaped_text_cache_promotes_across_frame_boundary() {
+        let mut cache = ShapedTextCache::new();
+        let key = shaped_key_for("hello");
+        cache.buf.insert(key.clone(), shaped_text_entry(1));
+        cache.finish_frame(0); // no atlas change => swap
+                               // The entry now lives in previous. A lookup must find it and
+                               // promote.
+        let hit = cache.buf.get_or_promote(&key);
+        assert!(hit.is_some(), "entry must survive one finish_frame");
+    }
+
+    #[test]
+    fn shaped_text_cache_untouched_entries_evict_after_two_finish_frame() {
+        let mut cache = ShapedTextCache::new();
+        let key = shaped_key_for("ephemeral");
+        cache.buf.insert(key.clone(), shaped_text_entry(0));
+        cache.finish_frame(0); // to previous
+        cache.finish_frame(0); // dropped
+        assert!(cache.buf.peek(&key).is_none(), "untouched entry evicts after two boundaries");
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn shaped_text_cache_atlas_generation_bump_clears_cache_at_finish_frame() {
+        let mut cache = ShapedTextCache::new();
+        let k1 = shaped_key_for("alpha");
+        let k2 = shaped_key_for("beta");
+        cache.buf.insert(k1.clone(), shaped_text_entry(0));
+        cache.finish_frame(0); // k1 now in previous
+        cache.buf.insert(k2.clone(), shaped_text_entry(0)); // k2 in current
+        assert_eq!(cache.len(), 2);
+
+        // Atlas generation bump: finish_frame with a new generation wipes
+        // the cache before it can swap, protecting against stale UVs.
+        cache.finish_frame(1);
+        assert!(cache.is_empty(), "atlas generation change must clear the cache");
+    }
+
+    #[test]
+    fn shaped_text_cache_clear_empties_both_halves() {
+        let mut cache = ShapedTextCache::new();
+        let k1 = shaped_key_for("alpha");
+        let k2 = shaped_key_for("beta");
+        cache.buf.insert(k1, shaped_text_entry(0));
+        cache.finish_frame(0);
+        cache.buf.insert(k2, shaped_text_entry(0));
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert!(cache.is_empty(), "clear must drop entries from previous AND current");
+    }
+
+    #[test]
+    fn shaped_text_cache_size_bounded_under_unique_strings_workload() {
+        // Ten frames of 100 unique strings with no repeats across frames.
+        // The live set must never exceed two frames' worth after the swap.
+        let mut cache = ShapedTextCache::new();
+        const PER_FRAME: u32 = 100;
+        const FRAMES: u32 = 10;
+
+        for frame in 0..FRAMES {
+            for i in 0..PER_FRAME {
+                let text = format!("frame-{frame}-str-{i}");
+                let key = shaped_key_for(&text);
+                cache.buf.insert(key, shaped_text_entry(0));
+            }
+            cache.finish_frame(0);
+        }
+        let bound = 2 * PER_FRAME as usize;
+        assert!(
+            cache.len() <= bound,
+            "double buffered shaped text cache must stay below {bound} entries, got {}",
+            cache.len(),
+        );
     }
 
     // -----------------------------------------------------------------------

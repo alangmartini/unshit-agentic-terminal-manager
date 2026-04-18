@@ -93,6 +93,13 @@ where
         self.current.get(k).or_else(|| self.previous.get(k))
     }
 
+    /// True when `k` is present in the `current` half only. Useful to
+    /// classify a hit as "current frame" vs "promoted from previous frame"
+    /// before calling `get_or_promote` (which fuses both cases).
+    pub fn contains_in_current(&self, k: &K) -> bool {
+        self.current.contains_key(k)
+    }
+
     /// Insert into `current`. Does not touch `previous`. An existing entry
     /// in `current` is overwritten; an entry in `previous` with the same key
     /// is not removed but will be evicted at the next `finish_frame`.
@@ -206,7 +213,11 @@ mod tests {
         cache.insert(1, 42);
         cache.finish_frame(); // moves to previous
         cache.finish_frame(); // drops (previous was not touched)
-        assert_eq!(cache.get_or_promote(&1), None, "untouched entry must evict after 2 finish_frame");
+        assert_eq!(
+            cache.get_or_promote(&1),
+            None,
+            "untouched entry must evict after 2 finish_frame"
+        );
         assert_eq!(cache.len(), 0);
     }
 
@@ -259,7 +270,7 @@ mod tests {
         cache.insert(1, 10);
         cache.finish_frame(); // moves (1, 10) to previous
         cache.insert(1, 20); // writes to current only
-        // Lookup should prefer current.
+                             // Lookup should prefer current.
         assert_eq!(cache.get_or_promote(&1), Some(&20));
         // previous still had (1, 10) but after get_or_promote found (1, 20)
         // in current, the entry in previous is orphaned. It gets dropped at
