@@ -26,3 +26,14 @@ image = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 dwrote = { workspace = true }
 winapi = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }
+
+[features]
+default = []
+# Fallback for adapters where `Queue::on_submitted_work_done` is
+# unreliable (observed on some D3D12 drivers). When enabled the renderer
+# recycles pooled instance buffers via a ring of `desired_maximum_frame_latency + 1 = 3`
+# slots keyed by a frame counter instead of the callback path.
+instance-pool-ring-fallback = []

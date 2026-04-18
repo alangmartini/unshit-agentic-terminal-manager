@@ -97,4 +97,12 @@ impl ImageCache {
 
         self.entries.get(path)
     }
+
+    /// Look up a cached image entry without loading. Returns `None` if
+    /// the entry has not been fetched via `get_or_load` first. Used by
+    /// the renderer's mid pass image walk so the render pass never
+    /// triggers a cache mutation.
+    pub fn get(&self, path: &str) -> Option<&ImageEntry> {
+        self.entries.get(path)
+    }
 }

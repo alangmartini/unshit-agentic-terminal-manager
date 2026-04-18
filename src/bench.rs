@@ -33,6 +33,11 @@ use crate::state::SharedState;
 pub enum BenchMode {
     DirLoop,
     TypeBurst,
+    /// Stress mode for issue #86 (epic #81 item 2): run the dir-loop
+    /// workload at the hardware's sustained rate while reporting per
+    /// frame counters for the instance buffer pool. Used to verify the
+    /// pool is not a new hotspot under 120 fps class loads.
+    InstancePoolStress,
 }
 
 impl BenchMode {
@@ -40,6 +45,7 @@ impl BenchMode {
         match s {
             "dir-loop" => Some(Self::DirLoop),
             "type-burst" => Some(Self::TypeBurst),
+            "instance-pool-stress" => Some(Self::InstancePoolStress),
             _ => None,
         }
     }
@@ -48,6 +54,7 @@ impl BenchMode {
         match self {
             Self::DirLoop => "dir-loop",
             Self::TypeBurst => "type-burst",
+            Self::InstancePoolStress => "instance-pool-stress",
         }
     }
 }
@@ -182,9 +189,15 @@ struct Report {
     mid_draw_events_dropped: u64,
     /// Frame pacer coalescing interval in milliseconds, derived from the
     /// active monitor's refresh rate. 8.0 on the historic fallback path;
-    /// ~6.944 on 144Hz, ~4.166 on 240Hz. Makes before/after bench
-    /// comparisons legible by exposing the effective frame-rate ceiling.
+    /// ~6.944 on 144Hz, ~4.166 on 240Hz.
     pacer_min_interval_ms: f64,
+    /// Minimum frame time observed in microseconds. Lower bound on the
+    /// per frame cost of the renderer, below which hardware limits
+    /// dominate.
+    min_us: u64,
+    /// 1st percentile frame time in milliseconds. Characterises the
+    /// fastest path through the renderer where pool overhead matters.
+    p01_ms: f64,
 }
 
 fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
@@ -231,6 +244,7 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
             (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0)
         }
     };
+    let min_us = sorted.first().copied().unwrap_or(0);
 
     Report {
         mode: mode.as_str(),
@@ -262,6 +276,8 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         #[cfg(feature = "input-latency-histogram")]
         mid_draw_events_dropped: mid_draw,
         pacer_min_interval_ms: s.last_pacer_min_interval_ns as f64 / 1_000_000.0,
+        min_us,
+        p01_ms: pct(0.01) as f64 / 1000.0,
     }
 }
 
@@ -305,6 +321,9 @@ pub fn start(config: BenchConfig, shared: SharedState) {
         match config.mode {
             BenchMode::DirLoop => run_dir_loop(&shared, pane_id, config.duration),
             BenchMode::TypeBurst => run_type_burst(&shared, pane_id, config.duration),
+            BenchMode::InstancePoolStress => {
+                run_instance_pool_stress(&shared, pane_id, config.duration)
+            }
         }
 
         let elapsed = t_start.elapsed();
@@ -374,6 +393,22 @@ fn run_type_burst(shared: &SharedState, pane_id: u32, duration: Duration) {
     }
 }
 
+/// Stress mode for the instance buffer pool. Drives the same scroll
+/// heavy workload as `dir-loop` but at a faster write cadence (10ms vs
+/// 80ms) to produce more frames per second. The renderer acquires and
+/// releases one pooled buffer per submission per frame; this variant
+/// simply exercises the pool more aggressively and exposes any memory
+/// leak or bind group churn that would otherwise only show up at 120
+/// plus fps.
+fn run_instance_pool_stress(shared: &SharedState, pane_id: u32, duration: Duration) {
+    let interval = Duration::from_millis(10);
+    let end = Instant::now() + duration;
+    while Instant::now() < end {
+        write_pty(shared, pane_id, b"dir\r\n");
+        std::thread::sleep(interval);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +434,10 @@ mod tests {
         assert!(matches!(
             BenchMode::parse("type-burst"),
             Some(BenchMode::TypeBurst)
+        ));
+        assert!(matches!(
+            BenchMode::parse("instance-pool-stress"),
+            Some(BenchMode::InstancePoolStress)
         ));
     }
 

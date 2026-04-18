@@ -2,6 +2,8 @@ use bytemuck::{Pod, Zeroable};
 use std::sync::OnceLock;
 use wgpu;
 
+use crate::instance_buffer_pool::InstanceBufferPool;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GlyphInstance {
@@ -22,8 +24,9 @@ struct Uniforms {
 
 pub struct TextPipeline {
     pub pipeline: wgpu::RenderPipeline,
-    pub instance_buffer: wgpu::Buffer,
-    pub instance_capacity: usize,
+    /// Pool of per submission glyph instance buffers. See
+    /// [`crate::instance_buffer_pool`] for the lifetime protocol.
+    pub instance_pool: InstanceBufferPool<GlyphInstance>,
     pub uniform_bind_group: wgpu::BindGroup,
     pub atlas_bind_group: wgpu::BindGroup,
     pub atlas_bind_group_layout: wgpu::BindGroupLayout,
@@ -216,17 +219,15 @@ impl TextPipeline {
         });
 
         let initial_capacity = 16384;
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("glyph instances"),
-            size: (initial_capacity * std::mem::size_of::<GlyphInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let instance_pool = InstanceBufferPool::<GlyphInstance>::new(
+            "glyph instances",
+            initial_capacity,
+            wgpu::BufferUsages::VERTEX,
+        );
 
         Self {
             pipeline,
-            instance_buffer,
-            instance_capacity: initial_capacity,
+            instance_pool,
             uniform_bind_group,
             atlas_bind_group,
             atlas_bind_group_layout,
@@ -237,31 +238,6 @@ impl TextPipeline {
     pub fn update_uniforms(&self, queue: &wgpu::Queue, width: f32, height: f32) {
         let uniforms = Uniforms { viewport: [width, height], _pad: [0.0; 2] };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-    }
-
-    pub fn upload_instances(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        instances: &[GlyphInstance],
-    ) {
-        if instances.is_empty() {
-            return;
-        }
-
-        let needed = instances.len();
-        if needed > self.instance_capacity {
-            let new_capacity = needed.next_power_of_two();
-            self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("glyph instances"),
-                size: (new_capacity * std::mem::size_of::<GlyphInstance>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.instance_capacity = new_capacity;
-        }
-
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
     }
 
     pub fn rebuild_atlas_bind_group(
