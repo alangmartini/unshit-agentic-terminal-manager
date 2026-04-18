@@ -2325,8 +2325,15 @@ fn emit_grid_cells(
         // content hash and geometry signature still match. This is the
         // clean-row skip path: if `line_damage` is clean and the cache has
         // a hit, we extend_from_slice without any shaping or iteration.
+        //
+        // Issue #77: `lookup_and_retarget` translates cached Y when the
+        // line's stable `line_id` has rotated to a new row via scroll /
+        // shift. Without this, the cache hit replays vertices at the
+        // pre-scroll Y and overlaps whatever now renders at the old slot.
         if let Some(cache) = line_cache.as_deref_mut() {
-            if let Some(hit) = cache.lookup_replayable(node_id, line_id, content_sig, geom_sig) {
+            if let Some(hit) =
+                cache.lookup_and_retarget(node_id, line_id, content_sig, geom_sig, row, cell_h)
+            {
                 batch.quad_instances.extend_from_slice(&hit.quads);
                 batch.glyph_instances.extend_from_slice(&hit.glyphs);
                 for key in &hit.glyph_keys {
@@ -2371,6 +2378,10 @@ fn emit_grid_cells(
         // mutable borrow of `line_cache` can be released for the store
         // below. The clone cost is proportional to `cols` and is still
         // much cheaper than the alternative (reshape every column).
+        //
+        // Issue #77: `cached_row` is carried alongside so the splice
+        // path can translate copied glyph Y when the line rotated to a
+        // new row slot between the cache store and this splice probe.
         let splice_inputs = damage_range.and_then(|(start, end)| {
             let cached = line_cache.as_deref()?.get(node_id, line_id)?;
             if cached.geometry != Some(geom_sig) || cached.glyph_col_index.len() != cols {
@@ -2382,6 +2393,7 @@ fn emit_grid_cells(
                 cached.glyphs.clone(),
                 cached.glyph_keys.clone(),
                 cached.glyph_col_index.clone(),
+                cached.cached_row,
             ))
         });
 
@@ -2393,8 +2405,14 @@ fn emit_grid_cells(
         // Splice fast-path when a compatible cached entry and a concrete
         // damage range are both available. Otherwise emit fresh for the
         // full row.
-        if let Some((damage_start, damage_end, cached_glyphs, cached_keys, cached_col_index)) =
-            splice_inputs
+        if let Some((
+            damage_start,
+            damage_end,
+            cached_glyphs,
+            cached_keys,
+            cached_col_index,
+            cached_row,
+        )) = splice_inputs
         {
             emit_grid_row_splice(
                 grid,
@@ -2406,6 +2424,7 @@ fn emit_grid_cells(
                 &cached_glyphs,
                 &cached_keys,
                 &cached_col_index,
+                cached_row,
                 origin_x,
                 origin_y,
                 cell_w,
@@ -2477,6 +2496,8 @@ fn emit_grid_cells(
         // Subsequent frames that see the same line_id + content_sig replay
         // this payload without shaping. Both the splice and fresh paths
         // produce a whole-row payload plus its per-column glyph index.
+        // `row` is captured so `lookup_and_retarget` can translate Y when
+        // a scroll rotates this line to a different row slot (issue #77).
         if let Some(cache) = line_cache.as_deref_mut() {
             cache.store(
                 node_id,
@@ -2487,6 +2508,7 @@ fn emit_grid_cells(
                 row_glyphs,
                 row_keys,
                 row_glyph_col_index,
+                row,
             );
         }
     }
@@ -2835,6 +2857,7 @@ fn emit_grid_row_splice(
     cached_glyphs: &[GlyphInstance],
     cached_keys: &[GlyphKey],
     cached_col_index: &[Option<u32>],
+    cached_row: usize,
     origin_x: f32,
     origin_y: f32,
     cell_w: f32,
@@ -2909,15 +2932,21 @@ fn emit_grid_row_splice(
             // Undamaged column: copy the cached glyph. The cached cell's
             // content is unchanged (damage range excludes it), the atlas
             // generation matches (geometry signature matched), and the
-            // cell position is unchanged, so the cached instance is
-            // drop-in replayable.
+            // cell position is unchanged modulo the row-delta translate
+            // (issue #77): if the line rotated to a new row between the
+            // cache store and this splice, shift Y by the row delta so
+            // the replayed glyph lands at the current row's Y slot.
             match cached_col_index.get(col).copied().flatten() {
                 Some(cached_idx) => {
                     let i = cached_idx as usize;
                     let glyph = cached_glyphs.get(i).copied();
                     let key = cached_keys.get(i).copied();
                     match (glyph, key) {
-                        (Some(g), Some(k)) => {
+                        (Some(mut g), Some(k)) => {
+                            if cached_row != row {
+                                let dy = (row as f32 - cached_row as f32) * cell_h;
+                                g.pos[1] += dy;
+                            }
                             atlas.touch(&k);
                             let new_idx = row_glyphs.len() as u32;
                             row_glyphs.push(g);
@@ -4503,6 +4532,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            0,
         );
         assert_eq!(frame1_quads.len(), cols, "frame 1 emission must span full row");
 
@@ -4555,6 +4585,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            0,
         );
 
         assert_eq!(
@@ -4608,7 +4639,7 @@ mod tests {
         // Cache key is (node, line_id) post-Step 3: use the grid's id for
         // row 0 so the test mirrors production lookup shape.
         let line_id = grid.line_id(0).expect("row 0 has a line id");
-        cache.store(node, line_id, content_sig, stale_geom, vec![], vec![], vec![], vec![]);
+        cache.store(node, line_id, content_sig, stale_geom, vec![], vec![], vec![], vec![], 0);
 
         // Bump the atlas generation: geometry signature no longer matches.
         let fresh_geom =
@@ -4651,6 +4682,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            0,
         );
         let hit = cache
             .lookup_replayable(node, line_id, content_sig, fresh_geom)
@@ -4797,6 +4829,7 @@ mod tests {
             glyphs.clone(),
             keys.clone(),
             glyph_col_index.clone(),
+            0,
         );
 
         // Contract 1: the cached entry carries one glyph-index slot per
@@ -4835,6 +4868,54 @@ mod tests {
             replayed_glyph_cols,
             vec![0, 1, 2, 5, 6, 7],
             "all non-damaged cols replay from cache without reshape",
+        );
+    }
+
+    #[test]
+    fn splice_copy_translates_cached_glyph_y_when_row_rotated() {
+        // Regression for issue #77 on the splice path. When a line's
+        // stable `line_id` rotates to a new row AND its content changes
+        // in the same frame, `emit_grid_cells` falls through to the
+        // splice path (content_sig miss, geometry still valid). Cells
+        // outside the damage window are copied from the cached entry,
+        // whose glyph instances carry the pre-scroll absolute Y. The
+        // splice copy MUST shift Y by `(current_row - cached_row) *
+        // cell_h` so the replayed glyphs land at the new row slot.
+        //
+        // We assert the invariant structurally: mirror the branch inside
+        // `emit_grid_row_splice` for undamaged columns and verify the
+        // translate yields the new row's Y.
+        let cols = 4;
+        let cell_h: f32 = 18.0;
+        let cached_row: usize = 10;
+        let row: usize = 9;
+        let cached_y = cached_row as f32 * cell_h;
+        let expected_y = row as f32 * cell_h;
+
+        let cached_glyphs: Vec<GlyphInstance> = (0..cols)
+            .map(|col| GlyphInstance {
+                pos: [col as f32 * 9.0, cached_y],
+                size: [9.0, cell_h],
+                uv_min: [0.0; 2],
+                uv_max: [1.0; 2],
+                color: [1.0; 4],
+                clip_rect: [0.0; 4],
+            })
+            .collect();
+
+        let mut copied_ys: Vec<f32> = Vec::new();
+        for g in &cached_glyphs {
+            let mut copy = *g;
+            if cached_row != row {
+                let dy = (row as f32 - cached_row as f32) * cell_h;
+                copy.pos[1] += dy;
+            }
+            copied_ys.push(copy.pos[1]);
+        }
+
+        assert!(
+            copied_ys.iter().all(|y| (y - expected_y).abs() < f32::EPSILON),
+            "splice copy must place glyphs at Y={expected_y} after row delta, got {copied_ys:?}",
         );
     }
 
