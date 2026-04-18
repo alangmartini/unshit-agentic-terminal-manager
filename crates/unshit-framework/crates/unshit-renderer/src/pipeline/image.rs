@@ -1,6 +1,8 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu;
 
+use crate::instance_buffer_pool::InstanceBufferPool;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct ImageInstance {
@@ -21,8 +23,11 @@ struct Uniforms {
 
 pub struct ImagePipeline {
     pub pipeline: wgpu::RenderPipeline,
-    pub instance_buffer: wgpu::Buffer,
-    pub instance_capacity: usize,
+    /// Pool of per batch image instance buffers. Images acquire a
+    /// separate pooled buffer per `image_batch` because batch writes
+    /// are mid render pass and cannot safely share one buffer. See
+    /// [`crate::instance_buffer_pool`] for the lifetime protocol.
+    pub instance_pool: InstanceBufferPool<ImageInstance>,
     pub uniform_bind_group: wgpu::BindGroup,
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
@@ -142,17 +147,15 @@ impl ImagePipeline {
         });
 
         let initial_capacity = 256;
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("image instances"),
-            size: (initial_capacity * std::mem::size_of::<ImageInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let instance_pool = InstanceBufferPool::<ImageInstance>::new(
+            "image instances",
+            initial_capacity,
+            wgpu::BufferUsages::VERTEX,
+        );
 
         Self {
             pipeline,
-            instance_buffer,
-            instance_capacity: initial_capacity,
+            instance_pool,
             uniform_bind_group,
             texture_bind_group_layout,
             uniform_buffer,
@@ -162,30 +165,5 @@ impl ImagePipeline {
     pub fn update_uniforms(&self, queue: &wgpu::Queue, width: f32, height: f32) {
         let uniforms = Uniforms { viewport: [width, height], _pad: [0.0; 2] };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-    }
-
-    pub fn upload_instances(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        instances: &[ImageInstance],
-    ) {
-        if instances.is_empty() {
-            return;
-        }
-
-        let needed = instances.len();
-        if needed > self.instance_capacity {
-            let new_capacity = needed.next_power_of_two();
-            self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("image instances"),
-                size: (new_capacity * std::mem::size_of::<ImageInstance>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.instance_capacity = new_capacity;
-        }
-
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
     }
 }

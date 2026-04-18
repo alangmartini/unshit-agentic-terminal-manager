@@ -12,6 +12,7 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::instance_buffer_pool::{InstanceBufferPool, PooledBuffer};
 use crate::svg_tess::{SvgGeometry, SvgVertex};
 
 /// Uniform block passed for the whole frame (just the viewport).
@@ -53,6 +54,22 @@ impl Default for SvgInstanceUniforms {
 /// Uniform block stride once padded to the minimum dynamic offset alignment.
 const INSTANCE_UNIFORM_STRIDE: u64 = 256;
 
+/// Fully padded slot used as `T` for the SVG instance pool. One slot
+/// equals one dynamic offset alignment unit so the pool stores
+/// `slot_count * 256` bytes end to end; writes at `i * 256` offset land
+/// in the `i`th slot.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct SvgInstanceSlot {
+    bytes: [u8; INSTANCE_UNIFORM_STRIDE as usize],
+}
+
+impl Default for SvgInstanceSlot {
+    fn default() -> Self {
+        Self { bytes: [0u8; INSTANCE_UNIFORM_STRIDE as usize] }
+    }
+}
+
 /// GPU side resources for a single tessellated geometry.
 struct GeometryGpu {
     vertex_buffer: wgpu::Buffer,
@@ -67,9 +84,24 @@ pub struct SvgPipeline {
     global_uniform_buffer: wgpu::Buffer,
 
     instance_bind_group_layout: wgpu::BindGroupLayout,
-    instance_bind_group: wgpu::BindGroup,
-    instance_uniform_buffer: wgpu::Buffer,
-    instance_capacity: usize,
+    /// Pool of per submission instance uniform buffers. Each slot is
+    /// padded to `INSTANCE_UNIFORM_STRIDE` (256 bytes) so the pool
+    /// stores `slot_count * 256` bytes contiguously. See
+    /// [`crate::instance_buffer_pool`] for the lifetime protocol.
+    instance_pool: InstanceBufferPool<SvgInstanceSlot>,
+    /// The currently acquired pooled buffer for this frame. Stored on
+    /// the pipeline so bind groups constructed for it stay valid for
+    /// the whole render pass. Must be taken and released by
+    /// `GpuContext::render` after `queue.submit`.
+    current_instance_buffer: Option<PooledBuffer<SvgInstanceSlot>>,
+    /// Bind group keyed on the address of the currently held pooled
+    /// buffer. Rebuilt whenever the acquired buffer differs from the
+    /// one that backed the previous bind group (e.g. after pool grow,
+    /// or simply when the pool handed out a different recycled buffer).
+    current_instance_bind_group: Option<wgpu::BindGroup>,
+    /// Cache key for `current_instance_bind_group` so we can detect
+    /// when the buffer behind the bind group changed identity.
+    current_instance_buffer_id: u64,
 
     // Lookup from an `Arc<SvgGeometry>` identity (pointer value) to the
     // uploaded GPU buffers. Keeping this map on the pipeline means the
@@ -134,15 +166,11 @@ impl SvgPipeline {
             });
 
         let initial_instance_capacity = 64usize;
-        let instance_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("svg instance uniforms"),
-            size: INSTANCE_UNIFORM_STRIDE * initial_instance_capacity as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let instance_bind_group =
-            make_instance_bind_group(device, &instance_bind_group_layout, &instance_uniform_buffer);
+        let instance_pool = InstanceBufferPool::<SvgInstanceSlot>::new(
+            "svg instance uniforms",
+            initial_instance_capacity,
+            wgpu::BufferUsages::UNIFORM,
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("svg pipeline layout"),
@@ -198,9 +226,10 @@ impl SvgPipeline {
             global_bind_group,
             global_uniform_buffer,
             instance_bind_group_layout,
-            instance_bind_group,
-            instance_uniform_buffer,
-            instance_capacity: initial_instance_capacity,
+            instance_pool,
+            current_instance_buffer: None,
+            current_instance_bind_group: None,
+            current_instance_buffer_id: 0,
             geometry_gpu: HashMap::new(),
         }
     }
@@ -218,7 +247,10 @@ impl SvgPipeline {
 
     /// Upload a new instance uniform block, resizing the buffer if needed.
     ///
-    /// Returns the byte offset to use with `set_bind_group` dynamic offsets.
+    /// Acquires a fresh pooled buffer for this frame, writes each
+    /// instance into its own aligned slot, and caches the matching
+    /// bind group so `draw` can reference it without a rebuild when
+    /// the pool returned the same buffer as last frame.
     pub fn upload_instances(
         &mut self,
         device: &wgpu::Device,
@@ -226,39 +258,48 @@ impl SvgPipeline {
         instances: &[SvgInstanceUniforms],
     ) {
         if instances.is_empty() {
+            // Still drop any outstanding pooled buffer so the caller
+            // can release it inside `on_submitted_work_done`.
+            self.current_instance_buffer = None;
+            self.current_instance_bind_group = None;
             return;
         }
         let needed = instances.len();
-        if needed > self.instance_capacity {
-            let new_capacity = needed.next_power_of_two().max(64);
-            self.instance_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("svg instance uniforms"),
-                size: INSTANCE_UNIFORM_STRIDE * new_capacity as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.instance_capacity = new_capacity;
-            self.instance_bind_group = make_instance_bind_group(
+        let pooled = self.instance_pool.acquire(device, needed.max(64));
+
+        // Build one padded slot per instance. The pool stores
+        // `SvgInstanceSlot` elements (256 bytes each) contiguously so a
+        // single `pooled.write` call lays them out at the aligned byte
+        // offsets the shader expects.
+        let mut slots = vec![SvgInstanceSlot::default(); needed];
+        for (slot, instance) in slots.iter_mut().zip(instances.iter()) {
+            let bytes = bytemuck::bytes_of(instance);
+            slot.bytes[..bytes.len()].copy_from_slice(bytes);
+        }
+        pooled.write(queue, &slots);
+
+        // Use the buffer's heap pointer as a stable identity for bind
+        // group caching. The pointer stays valid as long as the pooled
+        // buffer is held.
+        let buffer_id = pooled.as_buffer() as *const wgpu::Buffer as u64;
+        if self.current_instance_buffer_id != buffer_id
+            || self.current_instance_bind_group.is_none()
+        {
+            self.current_instance_bind_group = Some(make_instance_bind_group(
                 device,
                 &self.instance_bind_group_layout,
-                &self.instance_uniform_buffer,
-            );
+                pooled.as_buffer(),
+            ));
+            self.current_instance_buffer_id = buffer_id;
         }
+        self.current_instance_buffer = Some(pooled);
+    }
 
-        // Write each instance at its own aligned offset.
-        let mut scratch = vec![0u8; INSTANCE_UNIFORM_STRIDE as usize];
-        for (i, instance) in instances.iter().enumerate() {
-            let bytes = bytemuck::bytes_of(instance);
-            scratch[..bytes.len()].copy_from_slice(bytes);
-            for b in &mut scratch[bytes.len()..] {
-                *b = 0;
-            }
-            queue.write_buffer(
-                &self.instance_uniform_buffer,
-                (i as u64) * INSTANCE_UNIFORM_STRIDE,
-                &scratch,
-            );
-        }
+    /// Hand off the current pooled buffer so the caller can release it
+    /// inside `on_submitted_work_done`. Must be invoked after
+    /// `queue.submit` for the frame that used the buffer.
+    pub fn take_current_instance_buffer(&mut self) -> Option<PooledBuffer<SvgInstanceSlot>> {
+        self.current_instance_buffer.take()
     }
 
     /// Ensure a GPU buffer exists for the given cached geometry, uploading
@@ -299,8 +340,8 @@ impl SvgPipeline {
         &self.global_bind_group
     }
 
-    pub fn instance_bind_group(&self) -> &wgpu::BindGroup {
-        &self.instance_bind_group
+    pub fn instance_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.current_instance_bind_group.as_ref()
     }
 
     pub fn instance_stride() -> u64 {
@@ -309,7 +350,8 @@ impl SvgPipeline {
 
     /// Record a single draw call for the given geometry key and instance
     /// index. The caller must have already set the pipeline and the global
-    /// bind group.
+    /// bind group. Returns `false` if the instance pool has not been
+    /// populated for this frame.
     pub fn draw<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
@@ -317,8 +359,9 @@ impl SvgPipeline {
         instance_index: u32,
     ) -> bool {
         let Some(entry) = self.geometry_gpu.get(&key) else { return false };
+        let Some(bind_group) = self.current_instance_bind_group.as_ref() else { return false };
         let offset = (instance_index as u64) * INSTANCE_UNIFORM_STRIDE;
-        pass.set_bind_group(1, &self.instance_bind_group, &[offset as u32]);
+        pass.set_bind_group(1, bind_group, &[offset as u32]);
         pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
         pass.set_index_buffer(entry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..entry.index_count, 0, 0..1);

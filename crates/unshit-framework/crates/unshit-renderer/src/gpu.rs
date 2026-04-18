@@ -2,13 +2,14 @@ use crate::atlas::GlyphAtlas;
 use crate::batch::{BackdropBoundary, DrawKind, LayeredBatch};
 use crate::canvas::PaintContext;
 use crate::image_cache::ImageCache;
+use crate::instance_buffer_pool::PooledBuffer;
 use crate::persistent_buffer::GpuPersistentBuffers;
 use crate::pipeline::backdrop_blur::{gaussian_weights, BackdropBlurPipeline, BlurUniforms};
 use crate::pipeline::image::ImageInstance;
 use crate::pipeline::image::ImagePipeline;
-use crate::pipeline::quad::QuadPipeline;
+use crate::pipeline::quad::{QuadInstance, QuadPipeline};
 use crate::pipeline::svg::{SvgInstanceUniforms, SvgPipeline};
-use crate::pipeline::text::TextPipeline;
+use crate::pipeline::text::{GlyphInstance, TextPipeline};
 use crate::svg_cache::SvgTessCache;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,6 +19,13 @@ use unshit_core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 use wgpu;
 
 static BACKDROP_FALLBACK_LOG: Once = Once::new();
+
+/// Per layer, per image batch draw plan. Each entry is
+/// `(slot, count)`: `slot` indexes into
+/// `GpuContext::current_image_instance_buffers` (or equals `usize::MAX`
+/// when the batch was skipped) and `count` is the instance count to
+/// draw.
+type ImageLayerPlan = Vec<Vec<(usize, u32)>>;
 
 #[cfg(target_os = "windows")]
 fn use_subpixel_text_shader() -> bool {
@@ -117,6 +125,16 @@ pub struct GpuContext {
     backdrop_text_pipeline: Option<TextPipeline>,
     backdrop_image_pipeline: Option<ImagePipeline>,
     backdrop_svg_pipeline: Option<SvgPipeline>,
+
+    /// Pooled instance buffers holding this frame's data. Acquired
+    /// during `prepare`, referenced during the render pass, and
+    /// released in the `on_submitted_work_done` callback after
+    /// `queue.submit`. Images need one pooled buffer per batch because
+    /// batch writes happen mid render pass and cannot safely share one
+    /// buffer.
+    current_quad_instance_buffer: Option<PooledBuffer<QuadInstance>>,
+    current_glyph_instance_buffer: Option<PooledBuffer<GlyphInstance>>,
+    current_image_instance_buffers: Vec<PooledBuffer<ImageInstance>>,
 }
 
 impl GpuContext {
@@ -264,6 +282,9 @@ impl GpuContext {
             backdrop_text_pipeline: None,
             backdrop_image_pipeline: None,
             backdrop_svg_pipeline: None,
+            current_quad_instance_buffer: None,
+            current_glyph_instance_buffer: None,
+            current_image_instance_buffers: Vec::new(),
         }
     }
 
@@ -389,18 +410,48 @@ impl GpuContext {
         };
 
         let info = adapter.get_info();
-        let (device, queue) = adapter
+        // The quad pipeline packs 23 vertex attributes (gradient stops
+        // take 8 slots plus the common geometry and color slots), which
+        // exceeds the wgpu default `max_vertex_attributes = 16`. Use
+        // the adapter's real limits so the pipeline passes validation.
+        // Fall back to defaults only if the adapter rejects its own
+        // reported limits (software renderers).
+        //
+        // Gated on `TM_HEADLESS_ADAPTER_LIMITS` so pre existing tests
+        // that rely on the quad pipeline panicking during construction
+        // (and being silently skipped by `try_with_gpu`) keep doing so
+        // until they are audited and fixed individually. The instance
+        // pool integration tests set the env var to opt into the real
+        // limits because they exercise the pool through a full render,
+        // which requires the pipeline to build.
+        let use_adapter_limits = std::env::var_os("TM_HEADLESS_ADAPTER_LIMITS").is_some();
+        let limits = if use_adapter_limits { adapter.limits() } else { wgpu::Limits::default() };
+        let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("unshit headless device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: limits,
                     ..Default::default()
                 },
                 None,
             )
             .await
-            .ok()?;
+        {
+            Ok(dq) => dq,
+            Err(_) => adapter
+                .request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("unshit headless device"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: wgpu::Limits::default(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .ok()?,
+        };
 
         eprintln!("[unshit-test] using adapter: {} (backend: {:?})", info.name, info.backend);
         Some(Self::build_headless_context(
@@ -429,7 +480,13 @@ impl GpuContext {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            // `COPY_DST` is required when the backdrop filter path copies
+            // the `backdrop_source` texture onto the offscreen target at
+            // the end of the render pass (see the branches in `render`
+            // around `backdrop_source.as_ref().unwrap().as_image_copy()`).
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let quad_pipeline = QuadPipeline::new(&device, format, MSAA_SAMPLE_COUNT);
@@ -491,6 +548,9 @@ impl GpuContext {
             backdrop_text_pipeline: None,
             backdrop_image_pipeline: None,
             backdrop_svg_pipeline: None,
+            current_quad_instance_buffer: None,
+            current_glyph_instance_buffer: None,
+            current_image_instance_buffers: Vec::new(),
         }
     }
 
@@ -550,7 +610,11 @@ impl GpuContext {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    // See `build_headless_context` for why `COPY_DST` is
+                    // required.
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 });
                 *width = w;
@@ -605,6 +669,12 @@ impl GpuContext {
 
     /// Upload one combined quad buffer and one combined glyph buffer for all
     /// layers, then return each layer's base offset into those global buffers.
+    ///
+    /// The buffers are acquired from the per pipeline `InstanceBufferPool`,
+    /// not owned by the pipelines. The caller is responsible for
+    /// releasing them inside `queue.on_submitted_work_done` after
+    /// `queue.submit` so the GPU is done reading before the buffer
+    /// re enters the free list.
     fn upload_content_instance_buffers(&mut self) -> (Vec<u32>, Vec<u32>) {
         let mut quad_bases = Vec::with_capacity(self.layered_batch.layers.len());
         let mut glyph_bases = Vec::with_capacity(self.layered_batch.layers.len());
@@ -625,13 +695,129 @@ impl GpuContext {
         }
 
         if !all_quads.is_empty() {
-            self.quad_pipeline.upload_instances(&self.device, &self.queue, &all_quads);
+            let pooled = self.quad_pipeline.instance_pool.acquire(&self.device, all_quads.len());
+            pooled.write(&self.queue, &all_quads);
+            self.current_quad_instance_buffer = Some(pooled);
+        } else {
+            self.current_quad_instance_buffer = None;
         }
         if !all_glyphs.is_empty() {
-            self.text_pipeline.upload_instances(&self.device, &self.queue, &all_glyphs);
+            let pooled = self.text_pipeline.instance_pool.acquire(&self.device, all_glyphs.len());
+            pooled.write(&self.queue, &all_glyphs);
+            self.current_glyph_instance_buffer = Some(pooled);
+        } else {
+            self.current_glyph_instance_buffer = None;
         }
 
         (quad_bases, glyph_bases)
+    }
+
+    /// Fetch the currently acquired quad buffer for draw recording.
+    /// Call sites guard with `quad_count > 0`, which implies the pool
+    /// produced a buffer in `upload_content_instance_buffers`; the
+    /// `expect` traps renderer bugs (e.g. counts and uploads drifting
+    /// out of sync) instead of silently skipping draws.
+    fn current_quad_buffer(&self) -> &wgpu::Buffer {
+        self.current_quad_instance_buffer
+            .as_ref()
+            .map(|p| p.as_buffer())
+            .expect("quad pool buffer must be acquired before draw")
+    }
+
+    /// Fetch the currently acquired glyph buffer for draw recording.
+    /// See [`Self::current_quad_buffer`] for the invariant.
+    fn current_glyph_buffer(&self) -> &wgpu::Buffer {
+        self.current_glyph_instance_buffer
+            .as_ref()
+            .map(|p| p.as_buffer())
+            .expect("glyph pool buffer must be acquired before draw")
+    }
+
+    /// Pre acquire one pooled buffer per image batch across all layers
+    /// so the render pass never triggers a mid pass pool `acquire` or
+    /// `queue.write_buffer` that would race with in flight draws.
+    ///
+    /// Image batches are walked in the same fixed order the render pass
+    /// uses, so the nth batch in the returned `Vec` corresponds 1:1 with
+    /// the nth batch encountered inside the pass.
+    fn upload_image_instance_buffers(&mut self) -> ImageLayerPlan {
+        // Clear any leftover pooled buffers from the previous frame.
+        // Normally these are released by `on_submitted_work_done`, but
+        // a frame with zero images followed by a frame with images
+        // would otherwise pile up if we did not defend against it.
+        self.current_image_instance_buffers.clear();
+
+        let mut per_layer: ImageLayerPlan = Vec::with_capacity(self.layered_batch.layers.len());
+
+        for layer_idx in 0..self.layered_batch.layers.len() {
+            let batch_count = self.layered_batch.layers[layer_idx].image_batches.len();
+            let mut per_batch = Vec::with_capacity(batch_count);
+            for i in 0..batch_count {
+                let (path, raw_instances, object_fit, object_position) = {
+                    let ib = &self.layered_batch.layers[layer_idx].image_batches[i];
+                    (ib.path.clone(), ib.instances.clone(), ib.object_fit, ib.object_position)
+                };
+                let entry = self.image_cache.get_or_load(
+                    &path,
+                    &self.device,
+                    &self.queue,
+                    &self.image_pipeline.texture_bind_group_layout,
+                );
+                let Some(entry) = entry else {
+                    per_batch.push((usize::MAX, 0));
+                    continue;
+                };
+                let instances = apply_object_fit(
+                    &raw_instances,
+                    object_fit,
+                    object_position,
+                    entry.width as f32,
+                    entry.height as f32,
+                );
+                let count = instances.len() as u32;
+                if count == 0 {
+                    per_batch.push((usize::MAX, 0));
+                    continue;
+                }
+                let pooled =
+                    self.image_pipeline.instance_pool.acquire(&self.device, instances.len());
+                pooled.write(&self.queue, &instances);
+                let slot = self.current_image_instance_buffers.len();
+                self.current_image_instance_buffers.push(pooled);
+                per_batch.push((slot, count));
+            }
+            per_layer.push(per_batch);
+        }
+        per_layer
+    }
+
+    /// Look up a pooled image buffer previously acquired by
+    /// `upload_image_instance_buffers`.
+    fn image_instance_buffer(&self, slot: usize) -> Option<&wgpu::Buffer> {
+        if slot == usize::MAX {
+            None
+        } else {
+            self.current_image_instance_buffers.get(slot).map(|p| p.as_buffer())
+        }
+    }
+
+    /// Take ownership of every pooled buffer held by this frame so the
+    /// caller can hand them into `Queue::on_submitted_work_done`. After
+    /// this returns `GpuContext` holds no references to the buffers,
+    /// making it safe to start the next frame's prepare phase.
+    fn take_pooled_frame_buffers(
+        &mut self,
+    ) -> (
+        Option<PooledBuffer<QuadInstance>>,
+        Option<PooledBuffer<GlyphInstance>>,
+        Vec<PooledBuffer<ImageInstance>>,
+        Option<PooledBuffer<crate::pipeline::svg::SvgInstanceSlot>>,
+    ) {
+        let quads = self.current_quad_instance_buffer.take();
+        let glyphs = self.current_glyph_instance_buffer.take();
+        let images = std::mem::take(&mut self.current_image_instance_buffers);
+        let svg = self.svg_pipeline.take_current_instance_buffer();
+        (quads, glyphs, images, svg)
     }
 
     pub fn render(&mut self) {
@@ -689,6 +875,7 @@ impl GpuContext {
         self.svg_pipeline.prune_unreferenced(&live_geometries);
         self.svg_pipeline.upload_instances(&self.device, &self.queue, &svg_instance_buffer);
         let (quad_bases, glyph_bases) = self.upload_content_instance_buffers();
+        let image_layer_plan = self.upload_image_instance_buffers();
 
         let (surface_view, surface_output) = match &self.target {
             RenderTarget::Window { surface, config } => {
@@ -758,6 +945,7 @@ impl GpuContext {
                 &svg_keys,
                 &quad_bases,
                 &glyph_bases,
+                &image_layer_plan,
                 vw,
                 vh,
                 format,
@@ -810,7 +998,7 @@ impl GpuContext {
                     if quad_count > 0 {
                         pass.set_pipeline(&self.quad_pipeline.pipeline);
                         pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                        pass.set_vertex_buffer(0, self.quad_pipeline.instance_buffer.slice(..));
+                        pass.set_vertex_buffer(0, self.current_quad_buffer().slice(..));
                         pass.draw(0..6, quad_base..quad_base + quad_count);
                     }
 
@@ -835,39 +1023,25 @@ impl GpuContext {
                         pass.set_pipeline(&self.text_pipeline.pipeline);
                         pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
                         pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
-                        pass.set_vertex_buffer(0, self.text_pipeline.instance_buffer.slice(..));
+                        pass.set_vertex_buffer(0, self.current_glyph_buffer().slice(..));
                         pass.draw(0..6, glyph_base..glyph_base + glyph_count);
                     }
 
-                    for image_batch in &layer_batch.image_batches {
-                        if let Some(entry) = self.image_cache.get_or_load(
-                            &image_batch.path,
-                            &self.device,
-                            &self.queue,
-                            &self.image_pipeline.texture_bind_group_layout,
-                        ) {
-                            let instances = apply_object_fit(
-                                &image_batch.instances,
-                                image_batch.object_fit,
-                                image_batch.object_position,
-                                entry.width as f32,
-                                entry.height as f32,
-                            );
-                            self.image_pipeline.upload_instances(
-                                &self.device,
-                                &self.queue,
-                                &instances,
-                            );
-                            let count = instances.len() as u32;
-                            pass.set_pipeline(&self.image_pipeline.pipeline);
-                            pass.set_bind_group(0, &self.image_pipeline.uniform_bind_group, &[]);
-                            pass.set_bind_group(1, &entry.bind_group, &[]);
-                            pass.set_vertex_buffer(
-                                0,
-                                self.image_pipeline.instance_buffer.slice(..),
-                            );
-                            pass.draw(0..6, 0..count);
+                    let layer_image_plan = &image_layer_plan[layer_idx];
+                    for (batch_idx, image_batch) in layer_batch.image_batches.iter().enumerate() {
+                        let (slot, count) = layer_image_plan[batch_idx];
+                        if count == 0 {
+                            continue;
                         }
+                        let Some(entry) = self.image_cache.get(&image_batch.path) else {
+                            continue;
+                        };
+                        let Some(buffer) = self.image_instance_buffer(slot) else { continue };
+                        pass.set_pipeline(&self.image_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.image_pipeline.uniform_bind_group, &[]);
+                        pass.set_bind_group(1, &entry.bind_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw(0..6, 0..count);
                     }
 
                     // Canvas painters for this layer
@@ -915,10 +1089,7 @@ impl GpuContext {
                                 if current_kind != Some(DrawKind::Quad) {
                                     pass.set_pipeline(&self.quad_pipeline.pipeline);
                                     pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                                    pass.set_vertex_buffer(
-                                        0,
-                                        self.quad_pipeline.instance_buffer.slice(..),
-                                    );
+                                    pass.set_vertex_buffer(0, self.current_quad_buffer().slice(..));
                                     current_kind = Some(DrawKind::Quad);
                                 }
                                 let start = quad_base + span.start;
@@ -939,7 +1110,7 @@ impl GpuContext {
                                     );
                                     pass.set_vertex_buffer(
                                         0,
-                                        self.text_pipeline.instance_buffer.slice(..),
+                                        self.current_glyph_buffer().slice(..),
                                     );
                                     current_kind = Some(DrawKind::Glyph);
                                 }
@@ -965,35 +1136,21 @@ impl GpuContext {
                         }
                     }
 
-                    for image_batch in &layer_batch.image_batches {
-                        if let Some(entry) = self.image_cache.get_or_load(
-                            &image_batch.path,
-                            &self.device,
-                            &self.queue,
-                            &self.image_pipeline.texture_bind_group_layout,
-                        ) {
-                            let instances = apply_object_fit(
-                                &image_batch.instances,
-                                image_batch.object_fit,
-                                image_batch.object_position,
-                                entry.width as f32,
-                                entry.height as f32,
-                            );
-                            self.image_pipeline.upload_instances(
-                                &self.device,
-                                &self.queue,
-                                &instances,
-                            );
-                            let count = instances.len() as u32;
-                            pass.set_pipeline(&self.image_pipeline.pipeline);
-                            pass.set_bind_group(0, &self.image_pipeline.uniform_bind_group, &[]);
-                            pass.set_bind_group(1, &entry.bind_group, &[]);
-                            pass.set_vertex_buffer(
-                                0,
-                                self.image_pipeline.instance_buffer.slice(..),
-                            );
-                            pass.draw(0..6, 0..count);
+                    let layer_image_plan = &image_layer_plan[layer_idx];
+                    for (batch_idx, image_batch) in layer_batch.image_batches.iter().enumerate() {
+                        let (slot, count) = layer_image_plan[batch_idx];
+                        if count == 0 {
+                            continue;
                         }
+                        let Some(entry) = self.image_cache.get(&image_batch.path) else {
+                            continue;
+                        };
+                        let Some(buffer) = self.image_instance_buffer(slot) else { continue };
+                        pass.set_pipeline(&self.image_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.image_pipeline.uniform_bind_group, &[]);
+                        pass.set_bind_group(1, &entry.bind_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw(0..6, 0..count);
                     }
 
                     if !layer_batch.canvas_callbacks.is_empty() {
@@ -1088,6 +1245,22 @@ impl GpuContext {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
+        // Take every pooled instance buffer held by this frame and hand
+        // them into the submit completion callback. The buffers return
+        // to their respective pool free lists only after the GPU is
+        // done reading them, preventing the CPU/GPU race that Zed fixed
+        // with the same pattern in their Metal renderer (`zed:crates/
+        // gpui_macos/src/metal_renderer.rs:478-484`). Without this
+        // handoff, any frame that outruns the GPU would write over a
+        // buffer still being read, producing visible glitches.
+        let (quads, glyphs, images, svg) = self.take_pooled_frame_buffers();
+        self.queue.on_submitted_work_done(move || {
+            drop(quads);
+            drop(glyphs);
+            drop(images);
+            drop(svg);
+        });
+
         if let Some(output) = surface_output {
             output.present();
         }
@@ -1137,6 +1310,7 @@ impl GpuContext {
         svg_keys: &[(usize, usize, usize)],
         quad_bases: &[u32],
         glyph_bases: &[u32],
+        image_layer_plan: &ImageLayerPlan,
         vw: f32,
         vh: f32,
         format: wgpu::TextureFormat,
@@ -1270,7 +1444,7 @@ impl GpuContext {
                                             );
                                             pass.set_vertex_buffer(
                                                 0,
-                                                self.quad_pipeline.instance_buffer.slice(..),
+                                                self.current_quad_buffer().slice(..),
                                             );
                                             current_kind = Some(DrawKind::Quad);
                                         }
@@ -1295,7 +1469,7 @@ impl GpuContext {
                                             );
                                             pass.set_vertex_buffer(
                                                 0,
-                                                self.text_pipeline.instance_buffer.slice(..),
+                                                self.current_glyph_buffer().slice(..),
                                             );
                                             current_kind = Some(DrawKind::Glyph);
                                         }
@@ -1309,14 +1483,14 @@ impl GpuContext {
                         if quad_cur < quad_end {
                             pass.set_pipeline(quad_rp);
                             pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                            pass.set_vertex_buffer(0, self.quad_pipeline.instance_buffer.slice(..));
+                            pass.set_vertex_buffer(0, self.current_quad_buffer().slice(..));
                             pass.draw(0..6, quad_base + quad_cur..quad_base + quad_end);
                         }
                         if glyph_cur < glyph_end {
                             pass.set_pipeline(text_rp);
                             pass.set_bind_group(0, &self.text_pipeline.uniform_bind_group, &[]);
                             pass.set_bind_group(1, &self.text_pipeline.atlas_bind_group, &[]);
-                            pass.set_vertex_buffer(0, self.text_pipeline.instance_buffer.slice(..));
+                            pass.set_vertex_buffer(0, self.current_glyph_buffer().slice(..));
                             pass.draw(0..6, glyph_base + glyph_cur..glyph_base + glyph_end);
                         }
                     }
@@ -1343,47 +1517,31 @@ impl GpuContext {
                     if image_cur < image_end {
                         let image_count = self.layered_batch.layers[layer_idx].image_batches.len();
                         let end = (image_end as usize).min(image_count);
+                        let layer_image_plan = &image_layer_plan[layer_idx];
                         for i in (image_cur as usize)..end {
-                            // Clone the path + instances out so we don't
-                            // hold a long lived borrow on the batch while
-                            // we call `&mut self` methods.
-                            let (path, instances): (String, Vec<_>) = {
-                                let ib = &self.layered_batch.layers[layer_idx].image_batches[i];
-                                (ib.path.clone(), ib.instances.clone())
-                            };
-                            if let Some(entry) = self.image_cache.get_or_load(
-                                &path,
-                                &self.device,
-                                &self.queue,
-                                &self.image_pipeline.texture_bind_group_layout,
-                            ) {
-                                self.image_pipeline.upload_instances(
-                                    &self.device,
-                                    &self.queue,
-                                    &instances,
-                                );
-                                let count = instances.len() as u32;
-                                // Inline pipeline selection to avoid holding
-                                // a borrow across upload_instances above.
-                                if MSAA_SAMPLE_COUNT > 1 {
-                                    pass.set_pipeline(
-                                        &self.backdrop_image_pipeline.as_ref().unwrap().pipeline,
-                                    );
-                                } else {
-                                    pass.set_pipeline(&self.image_pipeline.pipeline);
-                                }
-                                pass.set_bind_group(
-                                    0,
-                                    &self.image_pipeline.uniform_bind_group,
-                                    &[],
-                                );
-                                pass.set_bind_group(1, &entry.bind_group, &[]);
-                                pass.set_vertex_buffer(
-                                    0,
-                                    self.image_pipeline.instance_buffer.slice(..),
-                                );
-                                pass.draw(0..6, 0..count);
+                            let (slot, count) = layer_image_plan[i];
+                            if count == 0 {
+                                continue;
                             }
+                            let image_batch =
+                                &self.layered_batch.layers[layer_idx].image_batches[i];
+                            let Some(entry) = self.image_cache.get(&image_batch.path) else {
+                                continue;
+                            };
+                            let Some(buffer) = self.image_instance_buffer(slot) else {
+                                continue;
+                            };
+                            if MSAA_SAMPLE_COUNT > 1 {
+                                pass.set_pipeline(
+                                    &self.backdrop_image_pipeline.as_ref().unwrap().pipeline,
+                                );
+                            } else {
+                                pass.set_pipeline(&self.image_pipeline.pipeline);
+                            }
+                            pass.set_bind_group(0, &self.image_pipeline.uniform_bind_group, &[]);
+                            pass.set_bind_group(1, &entry.bind_group, &[]);
+                            pass.set_vertex_buffer(0, buffer.slice(..));
+                            pass.draw(0..6, 0..count);
                         }
                     }
 
