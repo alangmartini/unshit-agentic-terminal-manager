@@ -364,18 +364,27 @@ impl CellGrid {
         id
     }
 
-    /// Reset the stable identity of `row` to a fresh `line_id`. Called when
-    /// the logical line at `row` is discarded wholesale (scroll vacates a
-    /// row, `clear_row` blanks a row, grid-wide `clear`, DECALN). The line
-    /// quad cache keyed on `(NodeId, line_id)` will miss for this row
-    /// because the old cached entry belongs to a line identity that no
-    /// longer occupies `row`.
+    /// Reset the stable identity of `row` to a fresh `line_id` and mark
+    /// the row fully damaged. Called when the logical line at `row` is
+    /// discarded wholesale (scroll vacates a row, `clear_row` blanks a
+    /// row, grid-wide `clear`, DECALN). The line quad cache keyed on
+    /// `(NodeId, line_id)` will miss for this row because the old cached
+    /// entry belongs to a line identity that no longer occupies `row`.
+    ///
+    /// Full-row damage is set alongside the fresh id so the column-range
+    /// splice fast path in the renderer (issue #52 Step 4) does the right
+    /// thing on the follow-up frame: a wholesale-discarded row cannot be
+    /// spliced from a partial range, it must be re-emitted in full.
     pub fn reset_line_identity(&mut self, row: usize) {
         if row >= self.rows {
             return;
         }
         let new_id = self.allocate_line_id();
         self.line_ids[row] = new_id;
+        let last_col = Self::last_col_u16(self.cols);
+        if let Some(ld) = self.line_damage.get_mut(row) {
+            ld.mark_range(0, last_col);
+        }
     }
 
     /// Create a new grid filled with default (empty) cells.
@@ -1000,5 +1009,183 @@ mod tests {
             row1_damage_before,
             "row 0 must inherit row 1's pre-shift damage",
         );
+    }
+
+    // -- Column-range LineDamage narrowing (issue #52 Step 4) ---------------
+    //
+    // Step 4 mirrors Alacritty's `LineDamageBounds` + `damage_point(line, col,
+    // col)` pattern: `set_cell` narrows the row's damage to the written column
+    // instead of marking the entire row fully damaged. The renderer uses the
+    // narrowed bounds to splice only the damaged column range on cache miss,
+    // replacing PR #70's "emit full row on cache miss" widening.
+
+    #[test]
+    fn line_damage_narrows_on_single_cell_write() {
+        // A single cell write narrows the row's damage window to the exact
+        // column touched. Before Step 4, `mark_col` already did this via
+        // `mark_range(col, col)`, but this test pins the contract against
+        // future refactors that might widen the range (e.g., a regression
+        // back to PR #70's full-row mark).
+        let mut g = CellGrid::new(5, 10);
+        g.clear_dirty();
+        for ld in g.line_damage() {
+            assert!(ld.is_clean(), "grid must start clean after clear_dirty");
+        }
+
+        g.set_cell(3, 7, Cell::with_char('x'));
+
+        let row_damage = g.line_damage_for(3).expect("row 3 damage entry must exist");
+        assert!(!row_damage.is_clean(), "row 3 must have damage after set_cell");
+        assert_eq!(
+            row_damage.first_dirty_col, 7,
+            "first_dirty_col must be the column that was written",
+        );
+        assert_eq!(
+            row_damage.last_dirty_col, 7,
+            "last_dirty_col must be the column that was written",
+        );
+
+        // Rows other than the one touched must remain clean.
+        for row in 0..5 {
+            if row == 3 {
+                continue;
+            }
+            assert!(
+                g.line_damage_for(row).map(|ld| ld.is_clean()).unwrap_or(false),
+                "row {row} must remain clean after a write to row 3",
+            );
+        }
+    }
+
+    #[test]
+    fn line_damage_extends_range_on_consecutive_writes() {
+        // Consecutive writes to the same row extend the damage window to
+        // the union of columns touched. The renderer consumes this as the
+        // bounds of columns to re-emit on cache miss.
+        let mut g = CellGrid::new(5, 12);
+        g.clear_dirty();
+
+        g.set_cell(3, 5, Cell::with_char('a'));
+        g.set_cell(3, 9, Cell::with_char('b'));
+
+        let row_damage = g.line_damage_for(3).expect("row 3 damage entry must exist");
+        assert_eq!(row_damage.first_dirty_col, 5, "first_dirty_col must be the leftmost write");
+        assert_eq!(row_damage.last_dirty_col, 9, "last_dirty_col must be the rightmost write");
+    }
+
+    #[test]
+    fn line_damage_mark_all_still_covers_full_row() {
+        // `mark_all_lines_fully_damaged` remains the correct API for
+        // whole-row invalidation (DECALN, clear, resize). Narrowing
+        // `set_cell` must not change this contract.
+        let rows = 4;
+        let cols = 8;
+        let mut g = CellGrid::new(rows, cols);
+        g.clear_dirty();
+
+        CellGrid::mark_all_lines_fully_damaged(&mut g.line_damage, cols);
+
+        let last_col = CellGrid::last_col_u16(cols);
+        for (row, ld) in g.line_damage().iter().enumerate() {
+            assert!(!ld.is_clean(), "row {row} must be damaged after mark_all");
+            assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col must be 0 after mark_all",);
+            assert_eq!(
+                ld.last_dirty_col, last_col,
+                "row {row} last_dirty_col must be cols-1 after mark_all",
+            );
+        }
+    }
+
+    // -- Canonical Step 4 regression names (issue #52 spec) ----------------
+    //
+    // The names below match the spec literally so future reviewers can map
+    // each check against the action plan. The contracts overlap with the
+    // three tests above; keeping both sets pins the invariants from two
+    // angles and guards against name-drift during refactors.
+
+    #[test]
+    fn set_cell_narrows_line_damage_to_col_range() {
+        // Writing to (row=5, col=10) narrows the row's damage to the
+        // exact column touched and bumps the seqno. Mirrors Alacritty's
+        // `damage_point(line, col, col)` primitive.
+        let mut g = CellGrid::new(10, 20);
+        g.clear_dirty();
+        let seqno_before = g.line_damage_for(5).unwrap().seqno;
+
+        g.set_cell(5, 10, Cell::with_char('x'));
+
+        let ld = g.line_damage_for(5).expect("row 5 damage entry must exist");
+        assert_eq!(ld.first_dirty_col, 10, "first=10 after single-col write");
+        assert_eq!(ld.last_dirty_col, 10, "last=10 after single-col write");
+        assert!(ld.seqno > seqno_before, "seqno must bump on set_cell");
+    }
+
+    #[test]
+    fn multi_col_writes_accumulate_damage_range() {
+        // Three writes at cols (3, 17, 8) yield damage first=3, last=17.
+        // The renderer uses this as the closed column range to emit on
+        // cache miss.
+        let mut g = CellGrid::new(10, 30);
+        g.clear_dirty();
+
+        g.set_cell(5, 3, Cell::with_char('a'));
+        g.set_cell(5, 17, Cell::with_char('b'));
+        g.set_cell(5, 8, Cell::with_char('c'));
+
+        let ld = g.line_damage_for(5).expect("row 5 damage entry must exist");
+        assert_eq!(ld.first_dirty_col, 3, "first_dirty_col must be leftmost write");
+        assert_eq!(ld.last_dirty_col, 17, "last_dirty_col must be rightmost write");
+    }
+
+    #[test]
+    fn set_cell_other_row_leaves_damage_clean() {
+        // Writing to row 5 must not dirty row 6. Per-row damage keeps
+        // the renderer's row-skip logic precise.
+        let mut g = CellGrid::new(10, 20);
+        g.clear_dirty();
+
+        g.set_cell(5, 3, Cell::with_char('x'));
+
+        assert!(!g.line_damage_for(5).unwrap().is_clean(), "row 5 must be damaged");
+        assert!(g.line_damage_for(6).unwrap().is_clean(), "row 6 must stay clean");
+    }
+
+    #[test]
+    fn mark_all_lines_fully_damaged_still_works_for_scroll_edge_case() {
+        // `mark_all_lines_fully_damaged` is used by the scroll edge case
+        // (discarded rows, DECALN, resize) where the column range must
+        // cover `0..cols`. Step 4's set_cell narrowing must not regress
+        // that contract.
+        let cols = 12;
+        let mut g = CellGrid::new(6, cols);
+        g.clear_dirty();
+
+        CellGrid::mark_all_lines_fully_damaged(&mut g.line_damage, cols);
+
+        let last_col = CellGrid::last_col_u16(cols);
+        for (row, ld) in g.line_damage().iter().enumerate() {
+            assert!(!ld.is_clean(), "row {row} must be damaged after mark_all");
+            assert_eq!(ld.first_dirty_col, 0, "row {row} first=0");
+            assert_eq!(ld.last_dirty_col, last_col, "row {row} last=cols-1");
+        }
+    }
+
+    #[test]
+    fn reset_line_identity_resets_damage_to_full() {
+        // When a row's logical line is discarded wholesale (scroll
+        // vacates, clear_row, DECALN), the cache key for that row must
+        // miss and the row must be re-emitted in full. `reset_line_identity`
+        // rotates the line id and marks the row fully damaged so the
+        // column-range splice path (Step 4) does not truncate the emit.
+        let cols = 10;
+        let mut g = CellGrid::new(4, cols);
+        g.clear_dirty();
+
+        g.reset_line_identity(2);
+
+        let ld = g.line_damage_for(2).expect("row 2 damage entry must exist");
+        assert!(!ld.is_clean(), "row 2 must be damaged after reset_line_identity");
+        assert_eq!(ld.first_dirty_col, 0, "first=0 covers full row");
+        assert_eq!(ld.last_dirty_col, CellGrid::last_col_u16(cols), "last=cols-1 covers full row",);
     }
 }

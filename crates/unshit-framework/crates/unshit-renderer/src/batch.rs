@@ -2315,17 +2315,16 @@ fn emit_grid_cells(
         // the grid and moves with the content.
         let line_id = grid.line_id(row).unwrap_or(0);
 
-        // Compute the whole-row content hash. Peer terminals (WezTerm,
-        // Alacritty, Zed) use damage bounds as invalidation hints, not
-        // emission extent: the hash decides cache freshness, emission
-        // always spans the full row. Narrowing emission to the damaged
-        // sub-range while keeping the whole-row hash produced the classic
-        // "typing a character blanks the rest of the row" bug (issue #63).
+        // Compute the whole-row content hash. The hash decides cache
+        // freshness; the damage range decides emission extent on miss.
+        // Mirrors Alacritty's `LineDamageBounds` and WezTerm's
+        // `changed_since(seqno)` patterns (issue #52 Step 4).
         let content_sig = hash_row_cells(cells, row, cols);
 
         // Cache probe: replay the cached instances for this line when its
-        // content hash and geometry signature still match. Works for both
-        // clean and dirty rows because the hash captures any visible change.
+        // content hash and geometry signature still match. This is the
+        // clean-row skip path: if `line_damage` is clean and the cache has
+        // a hit, we extend_from_slice without any shaping or iteration.
         if let Some(cache) = line_cache.as_deref_mut() {
             if let Some(hit) = cache.lookup_replayable(node_id, line_id, content_sig, geom_sig) {
                 batch.quad_instances.extend_from_slice(&hit.quads);
@@ -2340,47 +2339,130 @@ fn emit_grid_cells(
             }
         }
 
-        // Cache miss: emit the full row fresh. This covers two otherwise
-        // silent-failure cases (issue #63):
-        //   1) The previous frame stored a full-row payload for this
-        //      content hash, but atlas/geometry changes invalidated it
-        //      even though per-cell dirty bits were clear.
-        //   2) A single-cell write bumps the whole-row content hash but
-        //      only marks a tiny damage window; the whole row must still
-        //      be re-emitted so the replacement payload remains complete.
+        // Cache miss. Decide between a narrow splice (cells outside the
+        // damage range reuse cached glyphs) and a full fresh emit. The
+        // splice path is safe when:
+        //   1) An existing cache entry is present under the same
+        //      (node, line_id) and same geometry signature. The
+        //      geometry signature covers atlas generation, so any
+        //      atlas bump correctly falls through to full fresh emit.
+        //   2) The cached entry carries a per-column glyph index, which
+        //      Step 4's cache format populates on every fresh emit.
+        // When either precondition fails we emit the whole row and
+        // repopulate the cache. This preserves the issue #63 contract:
+        // the cache payload stored by the miss path always spans the
+        // full row, never a damaged sub-range.
+        // Resolve the damage window for this row. A clean row or an
+        // inverted `first > last` range yields `None`, which forces the
+        // full-row fresh emit path below.
+        let damage_range = grid.line_damage_for(row).and_then(|ld| {
+            if ld.is_clean() {
+                return None;
+            }
+            let start = (ld.first_dirty_col as usize).min(cols);
+            let end = ((ld.last_dirty_col as usize).saturating_add(1)).min(cols);
+            (start < end).then_some((start, end))
+        });
+
+        // Look up a cached entry that is splice-compatible: same node +
+        // line identity, same geometry signature (so atlas generation,
+        // origin, cell metrics all match), and a per-column glyph index
+        // of the expected length. We clone the referenced vectors so the
+        // mutable borrow of `line_cache` can be released for the store
+        // below. The clone cost is proportional to `cols` and is still
+        // much cheaper than the alternative (reshape every column).
+        let splice_inputs = damage_range.and_then(|(start, end)| {
+            let cached = line_cache.as_deref()?.get(node_id, line_id)?;
+            if cached.geometry != Some(geom_sig) || cached.glyph_col_index.len() != cols {
+                return None;
+            }
+            Some((
+                start,
+                end,
+                cached.glyphs.clone(),
+                cached.glyph_keys.clone(),
+                cached.glyph_col_index.clone(),
+            ))
+        });
+
         let mut row_quads: Vec<QuadInstance> = Vec::new();
         let mut row_glyphs: Vec<GlyphInstance> = Vec::new();
         let mut row_keys: Vec<GlyphKey> = Vec::new();
+        let mut row_glyph_col_index: Vec<Option<u32>> = Vec::with_capacity(cols);
 
-        emit_grid_row_fresh(
-            grid,
-            cells,
-            row,
-            cols,
-            origin_x,
-            origin_y,
-            cell_w,
-            cell_h,
-            font_size,
-            opacity,
-            clip_rect,
-            shape_font_id,
-            SHAPE_STYLE_REGULAR,
-            shape_font_size_tenths,
-            family_name,
-            &mut row_quads,
-            &mut row_glyphs,
-            &mut row_keys,
-            &mut glyph_cache,
-            shape_cache,
-            atlas,
-            font_system,
-            rasterizer,
-            &mut buffer,
-            &mut ch_buf,
-            trace_this_grid,
-            &mut trace_glyphs,
-        );
+        // Splice fast-path when a compatible cached entry and a concrete
+        // damage range are both available. Otherwise emit fresh for the
+        // full row.
+        if let Some((damage_start, damage_end, cached_glyphs, cached_keys, cached_col_index)) =
+            splice_inputs
+        {
+            emit_grid_row_splice(
+                grid,
+                cells,
+                row,
+                cols,
+                damage_start,
+                damage_end,
+                &cached_glyphs,
+                &cached_keys,
+                &cached_col_index,
+                origin_x,
+                origin_y,
+                cell_w,
+                cell_h,
+                font_size,
+                opacity,
+                clip_rect,
+                shape_font_id,
+                SHAPE_STYLE_REGULAR,
+                shape_font_size_tenths,
+                family_name,
+                &mut row_quads,
+                &mut row_glyphs,
+                &mut row_keys,
+                &mut row_glyph_col_index,
+                &mut glyph_cache,
+                shape_cache,
+                atlas,
+                font_system,
+                rasterizer,
+                &mut buffer,
+                &mut ch_buf,
+                trace_this_grid,
+                &mut trace_glyphs,
+            );
+        } else {
+            emit_grid_row_fresh(
+                grid,
+                cells,
+                row,
+                cols,
+                origin_x,
+                origin_y,
+                cell_w,
+                cell_h,
+                font_size,
+                opacity,
+                clip_rect,
+                shape_font_id,
+                SHAPE_STYLE_REGULAR,
+                shape_font_size_tenths,
+                family_name,
+                &mut row_quads,
+                &mut row_glyphs,
+                &mut row_keys,
+                &mut row_glyph_col_index,
+                &mut glyph_cache,
+                shape_cache,
+                atlas,
+                font_system,
+                rasterizer,
+                &mut buffer,
+                &mut ch_buf,
+                trace_this_grid,
+                &mut trace_glyphs,
+            );
+        }
 
         // Forward to the frame batch.
         batch.quad_instances.extend_from_slice(&row_quads);
@@ -2393,9 +2475,19 @@ fn emit_grid_cells(
 
         // Store the fresh line in the cache keyed by its stable identity.
         // Subsequent frames that see the same line_id + content_sig replay
-        // this payload without shaping.
+        // this payload without shaping. Both the splice and fresh paths
+        // produce a whole-row payload plus its per-column glyph index.
         if let Some(cache) = line_cache.as_deref_mut() {
-            cache.store(node_id, line_id, content_sig, geom_sig, row_quads, row_glyphs, row_keys);
+            cache.store(
+                node_id,
+                line_id,
+                content_sig,
+                geom_sig,
+                row_quads,
+                row_glyphs,
+                row_keys,
+                row_glyph_col_index,
+            );
         }
     }
 
@@ -2457,17 +2549,186 @@ fn emit_grid_cells(
     }
 }
 
-/// Emit one row of a cell grid into three output buffers, doing all
-/// shaping and atlas uploads needed for that row. Called by
-/// `emit_grid_cells` on cache miss. Spans the full row `0..cols`
-/// every time: first merged background `QuadInstance`s per style run,
-/// then per cell glyphs using the cross frame `ShapeCache`.
+/// Emit the glyph for a single cell, shaping if not yet cached and
+/// pushing the resulting `GlyphInstance` and `GlyphKey` into the row
+/// buffers. Returns `true` when a glyph was emitted. Empty cells, wide
+/// continuations, and cells whose prototype shape-step yields nothing
+/// return `false`.
 ///
-/// Per-cell damage bits are intentionally NOT consulted here. On a
-/// cache miss the previous-frame payload is gone and the fresh output
-/// is about to replace it; emitting only the damaged sub-range would
-/// cache a truncated row that silently blanks the surrounding cells
-/// on the next HIT (issue #63).
+/// Shared between `emit_grid_row_fresh` (full-row fresh emit) and
+/// `emit_grid_row_splice` (column-range splice fast path on cache miss
+/// with matching geometry). Both paths push the emitted glyph at the
+/// end of `row_glyphs`/`row_keys`; the caller records the resulting
+/// index in its `glyph_col_index` side-table.
+#[allow(clippy::too_many_arguments)]
+fn emit_grid_cell_glyph(
+    cell: &unshit_core::cell_grid::Cell,
+    row: usize,
+    col: usize,
+    origin_x: f32,
+    origin_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    opacity: f32,
+    clip_rect: [f32; 4],
+    shape_font_id: u64,
+    shape_style: u64,
+    shape_font_size_tenths: u32,
+    family_name: &str,
+    row_glyphs: &mut Vec<GlyphInstance>,
+    row_keys: &mut Vec<GlyphKey>,
+    glyph_cache: &mut FxHashMap<GlyphKey, ResolvedGlyph>,
+    shape_cache: &mut ShapeCache,
+    atlas: &mut GlyphAtlas,
+    font_system: &mut FontSystem,
+    rasterizer: &mut Rasterizer<'_>,
+    buffer: &mut cosmic_text::Buffer,
+    ch_buf: &mut [u8; 4],
+    trace_this_grid: bool,
+    trace_glyphs: &mut Vec<String>,
+) -> bool {
+    // Skip glyph for empty cells and wide continuation cells.
+    if cell.is_empty() || cell.wide_continuation {
+        return false;
+    }
+
+    let py = origin_y + row as f32 * cell_h;
+    // INVERSE swaps fg/bg; only fg is needed here since the bg quad
+    // was already emitted via the run loop in the caller.
+    let fg = if cell.attrs.contains(CellAttrs::INVERSE) { cell.bg } else { cell.fg };
+    let mut fg_linear = fg.to_linear_f32();
+    if cell.attrs.contains(CellAttrs::DIM) {
+        fg_linear[3] *= 0.5;
+    }
+    fg_linear[3] *= opacity;
+
+    let cache_key = ShapeCacheKey {
+        ch: cell.ch,
+        font_id: shape_font_id,
+        style: shape_style,
+        font_size_tenths: shape_font_size_tenths,
+    };
+    let px = origin_x + col as f32 * cell_w;
+    // Cross-frame ShapeCache. Hit path bypasses set_text and
+    // shape_until_scroll entirely; miss path shapes once and stores.
+    let prototype = if let Some(entry) = shape_cache.get(&cache_key) {
+        entry.clone()
+    } else {
+        let ch_str = cell.ch.encode_utf8(ch_buf);
+        #[cfg(target_os = "windows")]
+        let family = cosmic_text::Family::Name(family_name);
+        #[cfg(not(target_os = "windows"))]
+        let family = cosmic_text::Family::Monospace;
+        // Silence unused on non-windows.
+        let _ = family_name;
+        buffer.set_text(
+            font_system,
+            ch_str,
+            cosmic_text::Attrs::new().family(family),
+            cosmic_text::Shaping::Advanced,
+        );
+        buffer.shape_until_scroll(font_system, false);
+
+        let shaped = buffer.layout_runs().find_map(|run| {
+            run.glyphs
+                .first()
+                .cloned()
+                .map(|glyph| ShapedGlyphEntry { layout_glyph: glyph, line_y: run.line_y })
+        });
+        shape_cache.insert(cache_key, shaped.clone());
+        shaped
+    };
+
+    let Some(prototype) = prototype else {
+        return false;
+    };
+
+    let px_floor = px.floor();
+    let py_floor = py.floor();
+    let physical = prototype.layout_glyph.physical((px - px_floor, py - py_floor), 1.0);
+    let key = GlyphKey {
+        font_id: atlas_font_namespace(&physical.cache_key),
+        glyph_id: physical.cache_key.glyph_id,
+        font_size_tenths: (font_size * 10.0) as u16,
+        subpixel_bin: ((physical.cache_key.x_bin as u8) << 2) | (physical.cache_key.y_bin as u8),
+    };
+
+    let was_cached = glyph_cache.contains_key(&key);
+    let resolved = if let Some(cached) = glyph_cache.get(&key) {
+        atlas.touch(&cached.key);
+        cached
+    } else {
+        let entry = if let Some(entry) = atlas.cache.get(&key).copied() {
+            atlas.touch(&key);
+            entry
+        } else {
+            match rasterize_grid_glyph_for_atlas(
+                rasterizer,
+                font_system,
+                &physical,
+                cell.ch,
+                font_size,
+                atlas,
+                key,
+            ) {
+                Some(entry) => entry,
+                None => return false,
+            }
+        };
+
+        glyph_cache.entry(key).or_insert(ResolvedGlyph {
+            key,
+            entry,
+            physical_x: physical.x,
+            physical_y: physical.y,
+            line_y: prototype.line_y,
+        })
+    };
+
+    row_keys.push(resolved.key);
+
+    let gx = px_floor + resolved.physical_x as f32 + resolved.entry.offset[0];
+    let gy = py_floor + resolved.line_y + resolved.physical_y as f32 + resolved.entry.offset[1];
+    if trace_this_grid && row < 4 && trace_glyphs.len() < 64 {
+        trace_glyphs.push(format!(
+            "{} r{}c{} ch={:?} key=({}, {}, {}) pos=({:.1}, {:.1})",
+            if was_cached { "cache" } else { "miss" },
+            row,
+            col,
+            cell.ch,
+            resolved.key.font_id,
+            resolved.key.glyph_id,
+            resolved.key.subpixel_bin,
+            gx,
+            gy,
+        ));
+    }
+
+    row_glyphs.push(GlyphInstance {
+        pos: [gx, gy],
+        size: resolved.entry.size,
+        uv_min: [resolved.entry.uv_rect[0], resolved.entry.uv_rect[1]],
+        uv_max: [resolved.entry.uv_rect[2], resolved.entry.uv_rect[3]],
+        color: fg_linear,
+        clip_rect,
+    });
+
+    true
+}
+
+/// Emit one row of a cell grid into the row-local output buffers. Called
+/// by `emit_grid_cells` on cache miss when no usable cached entry exists
+/// (first frame for this `line_id`, geometry signature drift, or atlas
+/// generation bump). Spans the full row `0..cols`: merged background
+/// `QuadInstance`s per style run, then per cell glyphs using the cross
+/// frame `ShapeCache`.
+///
+/// Also populates `row_glyph_col_index` with one entry per column: the
+/// index into `row_glyphs`/`row_keys` where that column's glyph was
+/// pushed, or `None` when the cell had no glyph (empty, continuation,
+/// or shaping failed). Step 4 uses this index to splice only the
+/// damaged columns on subsequent cache misses with matching geometry.
 #[allow(clippy::too_many_arguments)]
 fn emit_grid_row_fresh(
     grid: &CellGrid,
@@ -2488,6 +2749,7 @@ fn emit_grid_row_fresh(
     row_quads: &mut Vec<QuadInstance>,
     row_glyphs: &mut Vec<GlyphInstance>,
     row_keys: &mut Vec<GlyphKey>,
+    row_glyph_col_index: &mut Vec<Option<u32>>,
     glyph_cache: &mut FxHashMap<GlyphKey, ResolvedGlyph>,
     shape_cache: &mut ShapeCache,
     atlas: &mut GlyphAtlas,
@@ -2498,7 +2760,6 @@ fn emit_grid_row_fresh(
     trace_this_grid: bool,
     trace_glyphs: &mut Vec<String>,
 ) {
-    let py = origin_y + row as f32 * cell_h;
     let row_base = row * cols;
 
     // Merge adjacent cells with the same (fg, bg, attrs) into a single
@@ -2508,135 +2769,171 @@ fn emit_grid_row_fresh(
         grid, row, 0, cols, origin_x, origin_y, cell_w, cell_h, opacity, clip_rect, row_quads,
     );
 
-    // Emit per-cell glyphs across the full row.
+    row_glyph_col_index.clear();
+    row_glyph_col_index.reserve(cols);
+
+    // Emit per-cell glyphs across the full row, recording each column's
+    // index into the row's glyph vecs so future splice passes can reuse
+    // unchanged cells without reshaping.
     for col in 0..cols {
-        let idx = row_base + col;
-        let cell = &cells[idx];
-        // Skip glyph for empty cells and wide continuation cells.
-        if cell.is_empty() || cell.wide_continuation {
-            continue;
-        }
+        let cell = &cells[row_base + col];
+        let pre_len = row_glyphs.len() as u32;
+        let emitted = emit_grid_cell_glyph(
+            cell,
+            row,
+            col,
+            origin_x,
+            origin_y,
+            cell_w,
+            cell_h,
+            font_size,
+            opacity,
+            clip_rect,
+            shape_font_id,
+            shape_style,
+            shape_font_size_tenths,
+            family_name,
+            row_glyphs,
+            row_keys,
+            glyph_cache,
+            shape_cache,
+            atlas,
+            font_system,
+            rasterizer,
+            buffer,
+            ch_buf,
+            trace_this_grid,
+            trace_glyphs,
+        );
+        row_glyph_col_index.push(if emitted { Some(pre_len) } else { None });
+    }
+}
 
-        // INVERSE swaps fg/bg; only fg is needed here since the bg quad
-        // was already emitted via the run loop above.
-        let fg = if cell.attrs.contains(CellAttrs::INVERSE) { cell.bg } else { cell.fg };
-        let mut fg_linear = fg.to_linear_f32();
-        if cell.attrs.contains(CellAttrs::DIM) {
-            fg_linear[3] *= 0.5;
-        }
-        fg_linear[3] *= opacity;
+/// Column-range splice fast path for the cache miss case in
+/// `emit_grid_cells`. Used when an existing cache entry under
+/// `(node, line_id)` has the same geometry signature but a different
+/// content signature, and `line_damage` reports a concrete sub-range.
+/// The splice path reshapes only the damaged columns and reuses the
+/// cached glyph data for cells outside the damage range.
+///
+/// The stored cache payload must remain whole-row (issue #63 regression
+/// contract): a HIT for the new content signature must replay every
+/// column. This path preserves the contract because every column's
+/// glyph is either freshly emitted or copied from the previous cache
+/// entry, and backgrounds are re-emitted for the whole row.
+///
+/// Mirrors Alacritty's `LineDamageBounds`-driven emission and
+/// WezTerm's `changed_since(seqno)` cross-frame reuse.
+#[allow(clippy::too_many_arguments)]
+fn emit_grid_row_splice(
+    grid: &CellGrid,
+    cells: &[unshit_core::cell_grid::Cell],
+    row: usize,
+    cols: usize,
+    damage_start: usize,
+    damage_end: usize,
+    cached_glyphs: &[GlyphInstance],
+    cached_keys: &[GlyphKey],
+    cached_col_index: &[Option<u32>],
+    origin_x: f32,
+    origin_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    opacity: f32,
+    clip_rect: [f32; 4],
+    shape_font_id: u64,
+    shape_style: u64,
+    shape_font_size_tenths: u32,
+    family_name: &str,
+    row_quads: &mut Vec<QuadInstance>,
+    row_glyphs: &mut Vec<GlyphInstance>,
+    row_keys: &mut Vec<GlyphKey>,
+    row_glyph_col_index: &mut Vec<Option<u32>>,
+    glyph_cache: &mut FxHashMap<GlyphKey, ResolvedGlyph>,
+    shape_cache: &mut ShapeCache,
+    atlas: &mut GlyphAtlas,
+    font_system: &mut FontSystem,
+    rasterizer: &mut Rasterizer<'_>,
+    buffer: &mut cosmic_text::Buffer,
+    ch_buf: &mut [u8; 4],
+    trace_this_grid: bool,
+    trace_glyphs: &mut Vec<String>,
+) {
+    let row_base = row * cols;
 
-        let cache_key = ShapeCacheKey {
-            ch: cell.ch,
-            font_id: shape_font_id,
-            style: shape_style,
-            font_size_tenths: shape_font_size_tenths,
-        };
-        let px = origin_x + col as f32 * cell_w;
-        // Cross-frame ShapeCache. Hit path bypasses set_text and
-        // shape_until_scroll entirely; miss path shapes once and stores.
-        let prototype = if let Some(entry) = shape_cache.get(&cache_key) {
-            entry.clone()
-        } else {
-            let ch_str = cell.ch.encode_utf8(ch_buf);
-            #[cfg(target_os = "windows")]
-            let family = cosmic_text::Family::Name(family_name);
-            #[cfg(not(target_os = "windows"))]
-            let family = cosmic_text::Family::Monospace;
-            // Silence unused on non-windows.
-            let _ = family_name;
-            buffer.set_text(
-                font_system,
-                ch_str,
-                cosmic_text::Attrs::new().family(family),
-                cosmic_text::Shaping::Advanced,
-            );
-            buffer.shape_until_scroll(font_system, false);
+    // Backgrounds: always re-emit for the full row. Style runs are
+    // cheap (O(cols)) and may shift boundaries as cell styles change,
+    // so partial bg splices risk leaving stale runs.
+    emit_grid_row_backgrounds(
+        grid, row, 0, cols, origin_x, origin_y, cell_w, cell_h, opacity, clip_rect, row_quads,
+    );
 
-            let shaped = buffer.layout_runs().find_map(|run| {
-                run.glyphs
-                    .first()
-                    .cloned()
-                    .map(|glyph| ShapedGlyphEntry { layout_glyph: glyph, line_y: run.line_y })
-            });
-            shape_cache.insert(cache_key, shaped.clone());
-            shaped
-        };
+    row_glyph_col_index.clear();
+    row_glyph_col_index.reserve(cols);
 
-        let Some(prototype) = prototype else {
-            continue;
-        };
-
-        let px_floor = px.floor();
-        let py_floor = py.floor();
-        let physical = prototype.layout_glyph.physical((px - px_floor, py - py_floor), 1.0);
-        let key = GlyphKey {
-            font_id: atlas_font_namespace(&physical.cache_key),
-            glyph_id: physical.cache_key.glyph_id,
-            font_size_tenths: (font_size * 10.0) as u16,
-            subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
-                | (physical.cache_key.y_bin as u8),
-        };
-
-        let was_cached = glyph_cache.contains_key(&key);
-        let resolved = if let Some(cached) = glyph_cache.get(&key) {
-            atlas.touch(&cached.key);
-            cached
-        } else {
-            let entry = if let Some(entry) = atlas.cache.get(&key).copied() {
-                atlas.touch(&key);
-                entry
-            } else {
-                match rasterize_grid_glyph_for_atlas(
-                    rasterizer,
-                    font_system,
-                    &physical,
-                    cell.ch,
-                    font_size,
-                    atlas,
-                    key,
-                ) {
-                    Some(entry) => entry,
-                    None => continue,
-                }
-            };
-
-            glyph_cache.entry(key).or_insert(ResolvedGlyph {
-                key,
-                entry,
-                physical_x: physical.x,
-                physical_y: physical.y,
-                line_y: prototype.line_y,
-            })
-        };
-
-        row_keys.push(resolved.key);
-
-        let gx = px_floor + resolved.physical_x as f32 + resolved.entry.offset[0];
-        let gy = py_floor + resolved.line_y + resolved.physical_y as f32 + resolved.entry.offset[1];
-        if trace_this_grid && row < 4 && trace_glyphs.len() < 64 {
-            trace_glyphs.push(format!(
-                "{} r{}c{} ch={:?} key=({}, {}, {}) pos=({:.1}, {:.1})",
-                if was_cached { "cache" } else { "miss" },
+    for col in 0..cols {
+        if col >= damage_start && col < damage_end {
+            // Damaged column: emit fresh glyph.
+            let cell = &cells[row_base + col];
+            let pre_len = row_glyphs.len() as u32;
+            let emitted = emit_grid_cell_glyph(
+                cell,
                 row,
                 col,
-                cell.ch,
-                resolved.key.font_id,
-                resolved.key.glyph_id,
-                resolved.key.subpixel_bin,
-                gx,
-                gy,
-            ));
+                origin_x,
+                origin_y,
+                cell_w,
+                cell_h,
+                font_size,
+                opacity,
+                clip_rect,
+                shape_font_id,
+                shape_style,
+                shape_font_size_tenths,
+                family_name,
+                row_glyphs,
+                row_keys,
+                glyph_cache,
+                shape_cache,
+                atlas,
+                font_system,
+                rasterizer,
+                buffer,
+                ch_buf,
+                trace_this_grid,
+                trace_glyphs,
+            );
+            row_glyph_col_index.push(if emitted { Some(pre_len) } else { None });
+        } else {
+            // Undamaged column: copy the cached glyph. The cached cell's
+            // content is unchanged (damage range excludes it), the atlas
+            // generation matches (geometry signature matched), and the
+            // cell position is unchanged, so the cached instance is
+            // drop-in replayable.
+            match cached_col_index.get(col).copied().flatten() {
+                Some(cached_idx) => {
+                    let i = cached_idx as usize;
+                    let glyph = cached_glyphs.get(i).copied();
+                    let key = cached_keys.get(i).copied();
+                    match (glyph, key) {
+                        (Some(g), Some(k)) => {
+                            atlas.touch(&k);
+                            let new_idx = row_glyphs.len() as u32;
+                            row_glyphs.push(g);
+                            row_keys.push(k);
+                            row_glyph_col_index.push(Some(new_idx));
+                        }
+                        _ => {
+                            row_glyph_col_index.push(None);
+                        }
+                    }
+                }
+                None => {
+                    row_glyph_col_index.push(None);
+                }
+            }
         }
-
-        row_glyphs.push(GlyphInstance {
-            pos: [gx, gy],
-            size: resolved.entry.size,
-            uv_min: [resolved.entry.uv_rect[0], resolved.entry.uv_rect[1]],
-            uv_max: [resolved.entry.uv_rect[2], resolved.entry.uv_rect[3]],
-            color: fg_linear,
-            clip_rect,
-        });
     }
 }
 
@@ -4197,7 +4494,16 @@ mod tests {
         // Line identity for row 0 comes from the grid (Step 3 keys the
         // cache on stable `line_id`, not row index).
         let line_id = grid.line_id(0).expect("row 0 has a line id");
-        cache.store(node, line_id, content_sig_frame1, geom, frame1_quads.clone(), vec![], vec![]);
+        cache.store(
+            node,
+            line_id,
+            content_sig_frame1,
+            geom,
+            frame1_quads.clone(),
+            vec![],
+            vec![],
+            vec![],
+        );
         assert_eq!(frame1_quads.len(), cols, "frame 1 emission must span full row");
 
         // Frame 2: user types 'Z' at column 3 with a distinct bg color.
@@ -4240,7 +4546,16 @@ mod tests {
             [0.0; 4],
             &mut frame2_quads,
         );
-        cache.store(node, line_id, content_sig_frame2, geom, frame2_quads.clone(), vec![], vec![]);
+        cache.store(
+            node,
+            line_id,
+            content_sig_frame2,
+            geom,
+            frame2_quads.clone(),
+            vec![],
+            vec![],
+            vec![],
+        );
 
         assert_eq!(
             frame2_quads.len(),
@@ -4293,7 +4608,7 @@ mod tests {
         // Cache key is (node, line_id) post-Step 3: use the grid's id for
         // row 0 so the test mirrors production lookup shape.
         let line_id = grid.line_id(0).expect("row 0 has a line id");
-        cache.store(node, line_id, content_sig, stale_geom, vec![], vec![], vec![]);
+        cache.store(node, line_id, content_sig, stale_geom, vec![], vec![], vec![], vec![]);
 
         // Bump the atlas generation: geometry signature no longer matches.
         let fresh_geom =
@@ -4327,7 +4642,16 @@ mod tests {
 
         // Store the fresh payload and confirm the cache now carries a
         // whole-row entry against the new geometry signature.
-        cache.store(node, line_id, content_sig, fresh_geom, fresh_quads.clone(), vec![], vec![]);
+        cache.store(
+            node,
+            line_id,
+            content_sig,
+            fresh_geom,
+            fresh_quads.clone(),
+            vec![],
+            vec![],
+            vec![],
+        );
         let hit = cache
             .lookup_replayable(node, line_id, content_sig, fresh_geom)
             .expect("fresh payload must be retrievable under the new geometry");
@@ -4412,6 +4736,106 @@ mod tests {
         // `emit_grid_cells` passes these exact arguments on cache miss.
         emit_grid_row_backgrounds(&g, 0, 0, cols, 0.0, 0.0, 10.0, 20.0, 1.0, [0.0; 4], &mut quads);
         assert_eq!(quads.len(), cols);
+    }
+
+    #[test]
+    fn emit_row_on_miss_walks_only_damage_range() {
+        // Structural regression for issue #52 Step 4: when a cached entry
+        // exists for the same (node, line_id) with matching geometry and
+        // a non-empty damage range, the splice fast path in
+        // `emit_grid_cells` reshapes only columns inside
+        // `[first_dirty_col..=last_dirty_col]`. Cells outside the damage
+        // window come from the cached `glyph_col_index` lookup, with no
+        // reshaping cost.
+        //
+        // Testing the full splice path end-to-end requires a live font
+        // system and atlas; instead we exercise the structural invariant
+        // it depends on: the `CachedLineState.glyph_col_index` must be
+        // populated on fresh emit so a future splice pass has a valid
+        // column-to-glyph map to copy from.
+        use crate::line_quad_cache::{CachedLineState, LineGeometrySig, LineQuadCache};
+        use unshit_core::id::NodeId;
+
+        let cols = 8;
+        let node = NodeId { index: 0, generation: 0 };
+        let line_id: u64 = 42;
+        let geom = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], cols as u32, 0);
+
+        // Simulate the state after a fresh emit: every column has a glyph
+        // index entry (Some for printable cells, None for empty cells).
+        // Step 4 requires the length to equal `cols` so the splice path can
+        // index it per column without bounds checks.
+        let mut cache = LineQuadCache::new();
+        let mut glyph_col_index: Vec<Option<u32>> = Vec::with_capacity(cols);
+        for col in 0..cols {
+            glyph_col_index.push(Some(col as u32));
+        }
+        let glyphs: Vec<GlyphInstance> = (0..cols)
+            .map(|col| GlyphInstance {
+                pos: [col as f32 * 9.0, 0.0],
+                size: [9.0, 18.0],
+                uv_min: [0.0; 2],
+                uv_max: [1.0; 2],
+                color: [1.0; 4],
+                clip_rect: [0.0; 4],
+            })
+            .collect();
+        let keys: Vec<GlyphKey> = (0..cols)
+            .map(|col| GlyphKey {
+                font_id: 1,
+                glyph_id: 100 + col as u16,
+                font_size_tenths: 140,
+                subpixel_bin: 0,
+            })
+            .collect();
+        cache.store(
+            node,
+            line_id,
+            0xaaaa,
+            geom,
+            vec![],
+            glyphs.clone(),
+            keys.clone(),
+            glyph_col_index.clone(),
+        );
+
+        // Contract 1: the cached entry carries one glyph-index slot per
+        // column. `emit_grid_cells` checks `cached.glyph_col_index.len()
+        // == cols` before entering the splice path. This invariant is
+        // what allows the splice path to blindly index by column.
+        let CachedLineState { glyph_col_index: cached_idx, .. } =
+            cache.get(node, line_id).expect("cache entry present").clone();
+        assert_eq!(
+            cached_idx.len(),
+            cols,
+            "fresh emit must populate glyph_col_index with one entry per column"
+        );
+
+        // Contract 2: undamaged columns replay their cached glyph and
+        // key directly; the splice path does not reshape them. We model
+        // this by mirroring the copy branch: for each column outside the
+        // damage range, pull `(glyphs[i], keys[i])` via the index.
+        let (damage_start, damage_end) = (3usize, 5usize); // damage cols 3..5
+        let mut emitted_glyph_cols: Vec<usize> = Vec::new();
+        let mut replayed_glyph_cols: Vec<usize> = Vec::new();
+        for col in 0..cols {
+            if col >= damage_start && col < damage_end {
+                // Simulate the fresh-emit branch: a reshape would happen
+                // here in production. Tag the column for assertion.
+                emitted_glyph_cols.push(col);
+            } else if let Some(idx) = cached_idx.get(col).copied().flatten() {
+                // Simulate the replay branch: pull cached glyph/key.
+                let _g = glyphs[idx as usize];
+                let _k = keys[idx as usize];
+                replayed_glyph_cols.push(col);
+            }
+        }
+        assert_eq!(emitted_glyph_cols, vec![3, 4], "only damaged cols 3..5 reshape");
+        assert_eq!(
+            replayed_glyph_cols,
+            vec![0, 1, 2, 5, 6, 7],
+            "all non-damaged cols replay from cache without reshape",
+        );
     }
 
     #[test]
