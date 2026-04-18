@@ -5,6 +5,7 @@ pub mod damage;
 pub mod dirty;
 pub mod element;
 pub mod event;
+pub mod frame_arena;
 pub mod grid_font;
 pub mod id;
 pub mod input;

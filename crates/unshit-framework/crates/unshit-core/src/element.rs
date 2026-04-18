@@ -774,6 +774,238 @@ pub struct ElementTree {
     pub root: ElementDef,
 }
 
+// ---------------------------------------------------------------------------
+// Bump-arena element definitions (additive path, see frame_arena module).
+// ---------------------------------------------------------------------------
+
+/// Arena-backed variant of [`ElementContent`]. Text and image payloads are
+/// stored as `&'a str` slices carved out of a [`crate::frame_arena::FrameArena`]
+/// rather than owned `String`s, so the user does not pay a heap allocation per
+/// `with_text` or `with_image` call.
+///
+/// `Grid` and `Svg` content currently still live in owned form because the
+/// payload types (`CellGrid`, `SvgNode`) carry their own internal allocations.
+/// They pass through unchanged; the arena path only saves the per-element
+/// allocations that happen during tree walking.
+pub enum ElementContentBump<'a> {
+    None,
+    Text(&'a str),
+    Image(&'a str),
+    Canvas,
+    Grid(CellGrid),
+    Svg(SvgNode),
+}
+
+impl<'a> ElementContentBump<'a> {
+    /// Materialize into an owned [`ElementContent`] by copying string slices
+    /// out of the arena. Used when the reconciler transfers bump-tree data
+    /// into the persistent [`crate::tree::NodeArena`].
+    pub fn to_owned_content(&self) -> ElementContent {
+        match self {
+            ElementContentBump::None => ElementContent::None,
+            ElementContentBump::Text(s) => ElementContent::Text((*s).to_owned()),
+            ElementContentBump::Image(s) => ElementContent::Image((*s).to_owned()),
+            ElementContentBump::Canvas => ElementContent::Canvas,
+            ElementContentBump::Grid(g) => ElementContent::Grid(g.clone()),
+            ElementContentBump::Svg(n) => ElementContent::Svg(n.clone()),
+        }
+    }
+}
+
+/// Arena-backed mirror of [`ElementDef`]. Lives for the duration of a single
+/// frame, backed by a [`crate::frame_arena::FrameArena`].
+///
+/// String fields (`id`, `key`, `classes`, `placeholder`, `name`) are stored
+/// as `&'a str` slices that point into the arena. Children arrays use
+/// [`bumpalo::collections::Vec`] so growth stays inside the arena chunk.
+///
+/// Closure fields remain `Arc<dyn Fn>` and DO NOT live in the arena. This is
+/// load bearing: Arc has real `Drop` semantics and arena reset skips Drop.
+/// See the `frame_arena` module docs for the full invariant.
+pub struct ElementDefBump<'a> {
+    pub tag: Tag,
+    pub id: Option<&'a str>,
+    pub key: Option<&'a str>,
+    pub classes: bumpalo::collections::Vec<'a, &'a str>,
+    pub content: ElementContentBump<'a>,
+    pub children: bumpalo::collections::Vec<'a, ElementDefBump<'a>>,
+    pub on_click: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub tab_index: Option<i32>,
+    pub captures_keyboard: bool,
+    pub on_context_menu: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
+    pub on_drag: Option<Arc<dyn Fn(&crate::event::DragEvent) + Send + Sync>>,
+    pub on_resize: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
+    pub handlers: bumpalo::collections::Vec<'a, (crate::event::EventType, EventHandler)>,
+    pub resize_axis: Option<ResizeAxis>,
+    pub on_pane_resize: Option<Arc<dyn Fn(&PaneResizeEvent) + Send + Sync>>,
+    pub placeholder: Option<&'a str>,
+    pub on_change: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    pub on_submit: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    pub persistent_buffer: bool,
+    pub memo_key: Option<u64>,
+    pub input_type: InputType,
+    pub checked: bool,
+    pub min: Option<f32>,
+    pub max: Option<f32>,
+    pub step: Option<f32>,
+    pub name: Option<&'a str>,
+    pub options: bumpalo::collections::Vec<'a, (&'a str, &'a str)>,
+    pub selected_index: Option<u32>,
+    pub on_mount: Option<Arc<dyn Fn(NodeId) + Send + Sync>>,
+    pub on_unmount: Option<Arc<dyn Fn(NodeId) + Send + Sync>>,
+    pub node_ref: Option<NodeRef>,
+    pub style_overrides: bumpalo::collections::Vec<'a, StyleDeclaration>,
+}
+
+impl<'a> ElementDefBump<'a> {
+    /// Construct an empty bump-backed definition rooted in the given arena.
+    pub fn new_in(tag: Tag, arena: &'a crate::frame_arena::FrameArena) -> Self {
+        let bump = arena.bump();
+        Self {
+            tag,
+            id: None,
+            key: None,
+            classes: bumpalo::collections::Vec::new_in(bump),
+            content: ElementContentBump::None,
+            children: bumpalo::collections::Vec::new_in(bump),
+            on_click: None,
+            tab_index: None,
+            captures_keyboard: false,
+            on_context_menu: None,
+            on_drag: None,
+            on_resize: None,
+            handlers: bumpalo::collections::Vec::new_in(bump),
+            resize_axis: None,
+            on_pane_resize: None,
+            placeholder: None,
+            on_change: None,
+            on_submit: None,
+            persistent_buffer: false,
+            memo_key: None,
+            input_type: InputType::Text,
+            checked: false,
+            min: None,
+            max: None,
+            step: None,
+            name: None,
+            options: bumpalo::collections::Vec::new_in(bump),
+            selected_index: None,
+            on_mount: None,
+            on_unmount: None,
+            node_ref: None,
+            style_overrides: bumpalo::collections::Vec::new_in(bump),
+        }
+    }
+
+    pub fn with_id(mut self, arena: &'a crate::frame_arena::FrameArena, id: &str) -> Self {
+        self.id = Some(arena.alloc_str(id));
+        self
+    }
+
+    pub fn with_key(mut self, arena: &'a crate::frame_arena::FrameArena, key: &str) -> Self {
+        self.key = Some(arena.alloc_str(key));
+        self
+    }
+
+    pub fn with_class(mut self, arena: &'a crate::frame_arena::FrameArena, class: &str) -> Self {
+        self.classes.push(arena.alloc_str(class));
+        self
+    }
+
+    pub fn with_text(mut self, arena: &'a crate::frame_arena::FrameArena, text: &str) -> Self {
+        self.content = ElementContentBump::Text(arena.alloc_str(text));
+        self
+    }
+
+    pub fn with_child(mut self, child: ElementDefBump<'a>) -> Self {
+        self.children.push(child);
+        self
+    }
+
+    pub fn with_placeholder(
+        mut self,
+        arena: &'a crate::frame_arena::FrameArena,
+        text: &str,
+    ) -> Self {
+        self.placeholder = Some(arena.alloc_str(text));
+        self
+    }
+
+    pub fn with_name(mut self, arena: &'a crate::frame_arena::FrameArena, name: &str) -> Self {
+        self.name = Some(arena.alloc_str(name));
+        self
+    }
+
+    pub fn with_memo_key(mut self, key: u64) -> Self {
+        self.memo_key = Some(key);
+        self
+    }
+
+    pub fn with_tab_index(mut self, index: i32) -> Self {
+        self.tab_index = Some(index);
+        self
+    }
+
+    pub fn with_input_type(mut self, input_type: InputType) -> Self {
+        self.input_type = input_type;
+        self
+    }
+
+    pub fn on_click(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_click = Some(Arc::new(f));
+        self
+    }
+
+    /// Materialize this bump tree into a fully owned [`ElementDef`].
+    ///
+    /// Copies strings and vecs out of the arena into the global heap. Useful
+    /// as a transitional aid: callers who already own an `ElementDefBump`
+    /// but still need to route it through `tree_fn` can do so until the
+    /// bump-aware path (`tree_fn_bump`) is wired up.
+    pub fn to_owned_def(&self) -> ElementDef {
+        ElementDef {
+            tag: self.tag,
+            id: self.id.map(|s| s.to_owned()),
+            key: self.key.map(|s| s.to_owned()),
+            classes: self.classes.iter().map(|&s| s.to_owned()).collect(),
+            content: self.content.to_owned_content(),
+            children: self.children.iter().map(|c| c.to_owned_def()).collect(),
+            on_click: self.on_click.clone(),
+            tab_index: self.tab_index,
+            captures_keyboard: self.captures_keyboard,
+            on_context_menu: self.on_context_menu.clone(),
+            on_drag: self.on_drag.clone(),
+            on_resize: self.on_resize.clone(),
+            handlers: self.handlers.iter().cloned().collect(),
+            resize_axis: self.resize_axis,
+            on_pane_resize: self.on_pane_resize.clone(),
+            placeholder: self.placeholder.map(|s| s.to_owned()),
+            on_change: self.on_change.clone(),
+            on_submit: self.on_submit.clone(),
+            persistent_buffer: self.persistent_buffer,
+            memo_key: self.memo_key,
+            input_type: self.input_type,
+            checked: self.checked,
+            min: self.min,
+            max: self.max,
+            step: self.step,
+            name: self.name.map(|s| s.to_owned()),
+            options: self.options.iter().map(|&(v, l)| (v.to_owned(), l.to_owned())).collect(),
+            selected_index: self.selected_index,
+            on_mount: self.on_mount.clone(),
+            on_unmount: self.on_unmount.clone(),
+            node_ref: self.node_ref.clone(),
+            style_overrides: self.style_overrides.iter().cloned().collect(),
+        }
+    }
+}
+
+/// A tree rooted in a bump-backed definition. Mirror of [`ElementTree`]; has
+/// the same lifetime as the arena the tree was built in.
+pub struct ElementTreeBump<'a> {
+    pub root: ElementDefBump<'a>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,5 +1195,128 @@ mod tests {
 
         assert!(state.preedit.is_none());
         assert!(state.preedit_cursor.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // ElementDefBump tests (arena-backed variant).
+    // -----------------------------------------------------------------
+    mod bump_variant {
+        use super::*;
+        use crate::frame_arena::FrameArena;
+
+        /// Empty bump def mirrors owned def defaults for a Div.
+        #[test]
+        fn element_def_bump_defaults_match_owned() {
+            let arena = FrameArena::with_capacity(4096);
+            let bump_def = ElementDefBump::new_in(Tag::Div, &arena);
+            let owned_def = ElementDef::new(Tag::Div);
+
+            assert_eq!(bump_def.tag, owned_def.tag);
+            assert_eq!(bump_def.id, None);
+            assert_eq!(bump_def.classes.len(), 0);
+            assert_eq!(bump_def.children.len(), 0);
+            assert!(matches!(bump_def.content, ElementContentBump::None));
+            assert!(matches!(owned_def.content, ElementContent::None));
+        }
+
+        /// `with_class` and `with_id` allocate string slices into the arena
+        /// and the slices round trip through `to_owned_def`.
+        #[test]
+        fn element_def_bump_builder_class_id_round_trip() {
+            let arena = FrameArena::with_capacity(4096);
+            let bump_def = ElementDefBump::new_in(Tag::Div, &arena)
+                .with_id(&arena, "root")
+                .with_class(&arena, "highlight")
+                .with_class(&arena, "bordered");
+
+            assert_eq!(bump_def.id, Some("root"));
+            assert_eq!(bump_def.classes.len(), 2);
+            assert_eq!(bump_def.classes[0], "highlight");
+            assert_eq!(bump_def.classes[1], "bordered");
+
+            let owned = bump_def.to_owned_def();
+            assert_eq!(owned.id.as_deref(), Some("root"));
+            assert_eq!(owned.classes[..], ["highlight".to_string(), "bordered".to_string()][..]);
+        }
+
+        /// Nested children via `with_child` preserve structure.
+        #[test]
+        fn element_def_bump_nested_children_structure() {
+            let arena = FrameArena::with_capacity(4096);
+            let bump_def = ElementDefBump::new_in(Tag::Div, &arena)
+                .with_class(&arena, "parent")
+                .with_child(
+                    ElementDefBump::new_in(Tag::Span, &arena)
+                        .with_class(&arena, "child-a")
+                        .with_text(&arena, "a"),
+                )
+                .with_child(
+                    ElementDefBump::new_in(Tag::Span, &arena).with_class(&arena, "child-b"),
+                );
+
+            assert_eq!(bump_def.children.len(), 2);
+            assert_eq!(bump_def.children[0].tag, Tag::Span);
+            assert_eq!(bump_def.children[0].classes[0], "child-a");
+            if let ElementContentBump::Text(t) = bump_def.children[0].content {
+                assert_eq!(t, "a");
+            } else {
+                panic!("expected Text content");
+            }
+            assert_eq!(bump_def.children[1].classes[0], "child-b");
+        }
+
+        /// `to_owned_def` produces a structurally identical `ElementDef`.
+        #[test]
+        fn element_def_bump_to_owned_structural_parity() {
+            let arena = FrameArena::with_capacity(4096);
+            let bump_def = ElementDefBump::new_in(Tag::Div, &arena)
+                .with_id(&arena, "root")
+                .with_class(&arena, "box")
+                .with_child(ElementDefBump::new_in(Tag::Span, &arena).with_text(&arena, "hello"));
+
+            let owned = bump_def.to_owned_def();
+            assert_eq!(owned.tag, Tag::Div);
+            assert_eq!(owned.id.as_deref(), Some("root"));
+            assert_eq!(owned.classes[0], "box");
+            assert_eq!(owned.children.len(), 1);
+            assert_eq!(owned.children[0].tag, Tag::Span);
+            if let ElementContent::Text(t) = &owned.children[0].content {
+                assert_eq!(t, "hello");
+            } else {
+                panic!("expected text child");
+            }
+        }
+
+        /// Strings allocated via `with_class` point into the arena.
+        #[test]
+        fn element_def_bump_strings_live_in_arena() {
+            let arena = FrameArena::with_capacity(4096);
+            let class_literal = "stable";
+            let bump_def =
+                ElementDefBump::new_in(Tag::Div, &arena).with_class(&arena, class_literal);
+
+            // The arena slice must equal the input but be a distinct copy.
+            assert_eq!(bump_def.classes[0], class_literal);
+            // The stored pointer must NOT be the literal's pointer: arena
+            // allocation copies into the chunk.
+            assert_ne!(bump_def.classes[0].as_ptr(), class_literal.as_ptr());
+        }
+
+        /// Arc closures are retained by clone, not by reference, so they
+        /// outlive the arena reset. (Drop safety documentation.)
+        #[test]
+        fn element_def_bump_preserves_arc_closures() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let counter = Arc::new(AtomicUsize::new(0));
+            let c2 = Arc::clone(&counter);
+            let arena = FrameArena::with_capacity(4096);
+            let bump_def = ElementDefBump::new_in(Tag::Button, &arena).on_click(move || {
+                c2.fetch_add(1, Ordering::SeqCst);
+            });
+
+            assert!(bump_def.on_click.is_some());
+            bump_def.on_click.as_ref().unwrap()();
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        }
     }
 }

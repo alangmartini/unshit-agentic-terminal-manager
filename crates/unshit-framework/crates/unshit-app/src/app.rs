@@ -13,6 +13,7 @@ use unshit_core::build::{
 };
 use unshit_core::element::*;
 use unshit_core::event::*;
+use unshit_core::frame_arena::FrameArena;
 use unshit_core::id::NodeId;
 use unshit_core::layout::{self, TextMeasureCache, TextMeasureCtx};
 use unshit_core::scroll::{self, ScrollbarAxis, ScrollbarPart, ScrollbarVisualState};
@@ -119,7 +120,21 @@ pub struct AppConfig {
     #[cfg(feature = "input-latency-histogram")]
     #[allow(clippy::type_complexity)]
     pub on_input_latency: Option<Box<dyn Fn(&crate::input_latency::InputLatencySnapshot) + Send>>,
+    /// Optional arena-aware tree function. When set, the frame loop
+    /// allocates the tree into the per-frame [`FrameArena`] and routes
+    /// through the bump reconcile path instead of the owned
+    /// [`unshit_core::element::ElementTree`] returned by
+    /// [`App::new`]'s `tree_fn`.
+    ///
+    /// This is ADDITIVE: leaving it `None` keeps the owned path intact.
+    pub tree_fn_bump: Option<TreeFnBump>,
 }
+
+/// Type alias for the bump-aware tree builder. The closure must be valid
+/// for any arbitrary arena lifetime, which is why the signature uses an
+/// HRTB `for<'a>`.
+pub type TreeFnBump =
+    Box<dyn for<'a> Fn(&'a FrameArena) -> unshit_core::element::ElementTreeBump<'a>>;
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -144,6 +159,7 @@ impl Default for AppConfig {
             on_cell_metrics: None,
             #[cfg(feature = "input-latency-histogram")]
             on_input_latency: None,
+            tree_fn_bump: None,
         }
     }
 }
@@ -288,6 +304,12 @@ struct AppState {
     /// [`ACTIVITY_WINDOW`] to avoid hitting the compositor on every
     /// pixel of motion. See [`refresh_pacer_from_window`].
     last_refresh_probe: Instant,
+    /// Per-frame bump allocator for the transient [`ElementDefBump`]
+    /// tree. Reset at the end of each rendered frame; preserves chunk
+    /// capacity across resets so steady-state allocation work drops to
+    /// zero. Only used when [`AppConfig::tree_fn_bump`] is set; left
+    /// unused otherwise.
+    frame_arena: FrameArena,
 }
 
 /// How long after the last external event the loop keeps scheduling
@@ -823,6 +845,7 @@ impl ApplicationHandler for AppHandler {
             input_latency: crate::input_latency::InputLatencyTracker::new()
                 .expect("hdrhistogram construction with valid sigfigs cannot fail"),
             last_refresh_probe: Instant::now(),
+            frame_arena: FrameArena::default(),
         });
 
         // Run the initial subscription reconcile so streams start immediately.
@@ -1787,13 +1810,33 @@ impl ApplicationHandler for AppHandler {
 
                 if state.needs_rebuild {
                     let t0 = Instant::now();
-                    let new_tree = (self.app.tree_fn)();
-                    let pending_mounts = unshit_core::reconcile::reconcile(
-                        &mut state.arena,
-                        &mut state.taffy,
-                        state.root,
-                        &new_tree.root,
-                    );
+                    // Prefer the bump path when configured. The bump tree
+                    // is built into the per-frame arena, reconciled, and
+                    // the arena is reset at the end of the frame to keep
+                    // chunk capacity for the next frame (zed pattern).
+                    let pending_mounts =
+                        if let Some(ref tree_fn_bump) = self.app.config.tree_fn_bump {
+                            // Borrow the arena immutably for the lifetime
+                            // of the returned bump tree. The tree is
+                            // consumed fully inside reconcile_bump; the
+                            // borrow ends before the frame-end arena
+                            // reset.
+                            let bump_tree = (tree_fn_bump)(&state.frame_arena);
+                            unshit_core::reconcile::reconcile_bump(
+                                &mut state.arena,
+                                &mut state.taffy,
+                                state.root,
+                                &bump_tree.root,
+                            )
+                        } else {
+                            let new_tree = (self.app.tree_fn)();
+                            unshit_core::reconcile::reconcile(
+                                &mut state.arena,
+                                &mut state.taffy,
+                                state.root,
+                                &new_tree.root,
+                            )
+                        };
                     // Fire mount callbacks now that the arena borrow is released.
                     for (node_id, cb) in pending_mounts {
                         cb(node_id);
@@ -2206,6 +2249,13 @@ impl ApplicationHandler for AppHandler {
                 }
 
                 state.last_metrics = metrics;
+
+                // Reset the per-frame bump arena now that the tree has
+                // been fully consumed by reconcile and the render batch
+                // has been submitted. O(1) pointer reset; preserves
+                // chunk capacity for the next frame. Safe to call even
+                // when no bump tree was built this frame.
+                state.frame_arena.reset();
 
                 state.frame_count += 1;
                 let fps_elapsed = state.fps_timer.elapsed();
