@@ -1,6 +1,7 @@
 pub mod atlas;
 pub mod batch;
 pub mod canvas;
+pub mod double_buffered;
 #[cfg(target_os = "windows")]
 pub mod dw_rasterizer;
 pub mod gpu;

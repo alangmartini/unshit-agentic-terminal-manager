@@ -392,6 +392,9 @@ impl WindowedTest {
             None,
         );
         state.batch_cache.commit_frame();
+        // Mirror the production per-frame eviction in `unshit-app::app`.
+        state.shaped_cache.finish_frame(state.gpu.glyph_atlas.generation);
+        state.shape_cache.finish_frame();
         batch::clear_paint_flags_subtree(&mut state.arena, state.root);
         state.gpu.render();
 

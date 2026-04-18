@@ -2051,6 +2051,11 @@ impl ApplicationHandler for AppHandler {
                     Some(&mut state.line_quad_cache),
                 );
                 state.batch_cache.commit_frame();
+                // Atlas generation is passed so `ShapedTextCache` can detect
+                // coarse atlas residency changes between frames on top of the
+                // per-glyph check in `emit_shaped_text_run`.
+                state.shaped_cache.finish_frame(state.gpu.glyph_atlas.generation);
+                state.shape_cache.finish_frame();
                 batch::clear_paint_flags_subtree(&mut state.arena, state.root);
                 metrics.batch_build_us = t4.elapsed().as_micros() as u64;
 

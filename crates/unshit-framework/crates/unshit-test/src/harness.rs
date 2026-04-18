@@ -410,6 +410,9 @@ impl TestHarness {
             None,
         );
         self.batch_cache.commit_frame();
+        // Mirror the production per-frame eviction in `unshit-app::app`.
+        self.shaped_cache.finish_frame(gpu.glyph_atlas.generation);
+        self.shape_cache.finish_frame();
         batch::clear_paint_flags_subtree(&mut self.arena, self.root);
         gpu.render();
         gpu.read_pixels()
