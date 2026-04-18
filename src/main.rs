@@ -229,6 +229,16 @@ fn parse_bench_args() -> Option<crate::bench::BenchConfig> {
 fn main() {
     let bench_config = parse_bench_args();
 
+    // When running in bench mode on Windows, force the PTY to spawn cmd.exe
+    // so `dir` produces real Windows output. Otherwise the user's SHELL env
+    // (often `/usr/bin/bash` from Git Bash) wins in `pty::default_shell`,
+    // and `dir` becomes a "command not found" two-liner. Bench numbers from
+    // bash would undermeasure the scroll-heavy workload the issue targets.
+    #[cfg(windows)]
+    if bench_config.is_some() {
+        std::env::set_var("SHELL", "cmd.exe");
+    }
+
     // Guard against ghost handles (#32): ensure the process exits
     // immediately on Ctrl+C or panic so spawn_blocking reader tasks
     // (bridge.rs) cannot keep the .exe locked on Windows (os error 32).
