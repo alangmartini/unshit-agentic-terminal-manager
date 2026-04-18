@@ -66,6 +66,12 @@ struct BenchState {
     batch_us_sum: u64,
     gpu_us_sum: u64,
     frames: u64,
+    /// Most recent pacer coalescing interval, in nanoseconds. Captured
+    /// from [`FrameMetrics::pacer_min_interval_ns`] each frame. Constant
+    /// across the bench on a stationary window; changes if the user
+    /// drags the window to a different monitor mid-run (uncommon but
+    /// supported).
+    last_pacer_min_interval_ns: u64,
     active: bool,
     #[cfg(feature = "input-latency-histogram")]
     latency_snapshot: Option<InputLatencySnapshot>,
@@ -80,6 +86,7 @@ impl BenchState {
             batch_us_sum: 0,
             gpu_us_sum: 0,
             frames: 0,
+            last_pacer_min_interval_ns: 0,
             active: false,
             #[cfg(feature = "input-latency-histogram")]
             latency_snapshot: None,
@@ -105,6 +112,7 @@ pub fn record_frame(m: &FrameMetrics) {
     s.layout_us_sum += m.layout_us;
     s.batch_us_sum += m.batch_build_us;
     s.gpu_us_sum += m.gpu_render_us;
+    s.last_pacer_min_interval_ns = m.pacer_min_interval_ns;
     s.frames += 1;
 }
 
@@ -134,6 +142,7 @@ fn activate() {
     {
         s.latency_snapshot = None;
     }
+    s.last_pacer_min_interval_ns = 0;
 }
 
 fn deactivate() {
@@ -171,6 +180,11 @@ struct Report {
     events_per_frame_max: u64,
     #[cfg(feature = "input-latency-histogram")]
     mid_draw_events_dropped: u64,
+    /// Frame pacer coalescing interval in milliseconds, derived from the
+    /// active monitor's refresh rate. 8.0 on the historic fallback path;
+    /// ~6.944 on 144Hz, ~4.166 on 240Hz. Makes before/after bench
+    /// comparisons legible by exposing the effective frame-rate ceiling.
+    pacer_min_interval_ms: f64,
 }
 
 fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
@@ -247,6 +261,7 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         events_per_frame_max: ev_max,
         #[cfg(feature = "input-latency-histogram")]
         mid_draw_events_dropped: mid_draw,
+        pacer_min_interval_ms: s.last_pacer_min_interval_ns as f64 / 1_000_000.0,
     }
 }
 
@@ -298,13 +313,14 @@ pub fn start(config: BenchConfig, shared: SharedState) {
         let report = build_report(config.mode, elapsed);
         let json = serde_json::to_string_pretty(&report).unwrap();
         log::info!(
-            "[bench] done frames={} fps={:.1} p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms",
+            "[bench] done frames={} fps={:.1} p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms pacer={:.3}ms",
             report.frames,
             report.fps_mean,
             report.p50_ms,
             report.p95_ms,
             report.p99_ms,
-            report.max_ms
+            report.max_ms,
+            report.pacer_min_interval_ms,
         );
         #[cfg(feature = "input-latency-histogram")]
         log::info!(
@@ -366,14 +382,10 @@ mod tests {
     /// Test-only mutex that serializes every test in this module. The
     /// bench harness exposes a process-wide `STATE` mutex; running two
     /// tests in parallel would let one test's `activate` or
-    /// `deactivate` call interleave with another test's assertion. The
-    /// pre-existing tests relied on luck; this lock removes the flake.
+    /// `deactivate` call interleave with another test's assertion.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        // Deliberately ignore poison: one failing test leaving a
-        // poisoned guard should not mask the next test's own failure
-        // diagnostics.
         TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -440,15 +452,6 @@ mod tests {
     fn build_report_computes_percentiles() {
         let _g = guard();
         activate();
-        {
-            let mut s = state().lock().unwrap();
-            s.samples_us.clear();
-            s.frames = 0;
-            s.tree_build_us_sum = 0;
-            s.layout_us_sum = 0;
-            s.batch_us_sum = 0;
-            s.gpu_us_sum = 0;
-        }
         for ms in 1..=10u64 {
             record_frame(&FrameMetrics {
                 total_us: ms * 1000,
@@ -570,5 +573,32 @@ mod tests {
             "max {} us should reflect the 5ms sample",
             report.input_latency_max_us
         );
+    }
+
+    #[test]
+    fn report_records_pacer_min_interval_from_last_frame() {
+        let _g = guard();
+        activate();
+        record_frame(&FrameMetrics {
+            total_us: 5_000,
+            pacer_min_interval_ns: 6_944_444,
+            ..Default::default()
+        });
+        let r = build_report(BenchMode::DirLoop, Duration::from_secs(1));
+        assert!(
+            (r.pacer_min_interval_ms - 6.944_444).abs() < 0.001,
+            "expected ~6.944ms, got {}",
+            r.pacer_min_interval_ms
+        );
+        deactivate();
+    }
+
+    #[test]
+    fn report_pacer_min_interval_is_zero_without_frames() {
+        let _g = guard();
+        activate();
+        let r = build_report(BenchMode::DirLoop, Duration::from_secs(1));
+        assert_eq!(r.pacer_min_interval_ms, 0.0);
+        deactivate();
     }
 }
