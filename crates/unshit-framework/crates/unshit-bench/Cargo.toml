@@ -37,5 +37,9 @@ harness = false
 name = "reconcile"
 harness = false
 
+[[bench]]
+name = "frame_arena"
+harness = false
+
 [lints]
 workspace = true

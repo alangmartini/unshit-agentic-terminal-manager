@@ -990,11 +990,7 @@ impl<'a> ElementDefBump<'a> {
             max: self.max,
             step: self.step,
             name: self.name.map(|s| s.to_owned()),
-            options: self
-                .options
-                .iter()
-                .map(|&(v, l)| (v.to_owned(), l.to_owned()))
-                .collect(),
+            options: self.options.iter().map(|&(v, l)| (v.to_owned(), l.to_owned())).collect(),
             selected_index: self.selected_index,
             on_mount: self.on_mount.clone(),
             on_unmount: self.on_unmount.clone(),
@@ -1276,9 +1272,7 @@ mod tests {
             let bump_def = ElementDefBump::new_in(Tag::Div, &arena)
                 .with_id(&arena, "root")
                 .with_class(&arena, "box")
-                .with_child(
-                    ElementDefBump::new_in(Tag::Span, &arena).with_text(&arena, "hello"),
-                );
+                .with_child(ElementDefBump::new_in(Tag::Span, &arena).with_text(&arena, "hello"));
 
             let owned = bump_def.to_owned_def();
             assert_eq!(owned.tag, Tag::Div);

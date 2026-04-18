@@ -27,13 +27,8 @@ fn reconcile_accepts_bump_tree() {
     let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
     let mut pending = Vec::new();
 
-    let root_id = build_subtree_bump(
-        &bump_def,
-        &mut node_arena,
-        &mut taffy,
-        NodeId::DANGLING,
-        &mut pending,
-    );
+    let root_id =
+        build_subtree_bump(&bump_def, &mut node_arena, &mut taffy, NodeId::DANGLING, &mut pending);
 
     assert!(!root_id.is_dangling());
     let root = node_arena.get(root_id).expect("root should be allocated");
@@ -136,7 +131,6 @@ fn panic_during_bump_tree_build_recovers_after_reset() {
 
     // Resetting the arena recovers; the next frame builds cleanly.
     frame_arena.reset();
-    let recovered =
-        ElementDefBump::new_in(Tag::Div, &frame_arena).with_class(&frame_arena, "ok");
+    let recovered = ElementDefBump::new_in(Tag::Div, &frame_arena).with_class(&frame_arena, "ok");
     assert_eq!(recovered.classes[0], "ok");
 }

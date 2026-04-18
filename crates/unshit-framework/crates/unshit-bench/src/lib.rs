@@ -3,7 +3,8 @@
 use taffy::TaffyTree;
 use unshit_core::build::build_tree_from_def;
 pub use unshit_core::build::{resolve_all_styles, run_layout_pipeline};
-use unshit_core::element::{ElementDef, Tag};
+use unshit_core::element::{ElementDef, ElementDefBump, Tag};
+use unshit_core::frame_arena::FrameArena;
 use unshit_core::id::NodeId;
 use unshit_core::layout::TextMeasureCtx;
 use unshit_core::tree::NodeArena;
@@ -368,4 +369,74 @@ pub fn reconcile_tree(
     new_def: &ElementDef,
 ) {
     unshit_core::reconcile::reconcile(arena, taffy, root, new_def);
+}
+
+/// Arena-backed mirror of [`build_large_tree_def`]. Produces the same
+/// 500 node shape but backed by a [`FrameArena`]. Returns the bump tree
+/// so the caller can read it or reconcile it with zero owned-heap
+/// allocations during construction.
+///
+/// NOTE: The returned tree borrows from the passed arena. Keep the
+/// arena alive at least as long as the tree.
+pub fn build_large_tree_def_bump<'a>(arena: &'a FrameArena) -> ElementDefBump<'a> {
+    let mut root =
+        ElementDefBump::new_in(Tag::Div, arena).with_class(arena, "root").with_id(arena, "app");
+
+    for section_i in 0..10u32 {
+        let mut section = ElementDefBump::new_in(Tag::Div, arena)
+            .with_class(arena, "section")
+            .with_class(arena, if section_i % 2 == 0 { "even" } else { "odd" });
+
+        let title_text = arena.alloc_str(&format!("Section {}", section_i + 1));
+        let header =
+            ElementDefBump::new_in(Tag::Div, arena).with_class(arena, "header").with_child(
+                ElementDefBump::new_in(Tag::Text, arena)
+                    .with_class(arena, "title")
+                    .with_text(arena, title_text),
+            );
+        section = section.with_child(header);
+
+        for row_i in 0..5u32 {
+            let mut row = ElementDefBump::new_in(Tag::Div, arena)
+                .with_class(arena, "row")
+                .with_class(arena, if row_i % 2 == 0 { "row-even" } else { "row-odd" });
+
+            let label_text = arena.alloc_str(&format!("Item {}.{}", section_i + 1, row_i + 1));
+            row = row.with_child(
+                ElementDefBump::new_in(Tag::Span, arena)
+                    .with_class(arena, "label")
+                    .with_text(arena, label_text),
+            );
+
+            for col_i in 0..5u32 {
+                let cell_text = arena.alloc_str(&format!("Value {}", col_i * 10 + row_i));
+                row = row.with_child(
+                    ElementDefBump::new_in(Tag::Span, arena)
+                        .with_class(arena, "cell")
+                        .with_class(arena, if col_i % 2 == 0 { "primary" } else { "secondary" })
+                        .with_text(arena, cell_text),
+                );
+            }
+
+            for btn_i in 0..3u32 {
+                let (variant, label) = match btn_i {
+                    0 => ("btn-primary", "Edit"),
+                    1 => ("btn-secondary", "Copy"),
+                    _ => ("btn-danger", "Delete"),
+                };
+                row = row.with_child(
+                    ElementDefBump::new_in(Tag::Button, arena)
+                        .with_class(arena, "btn")
+                        .with_class(arena, variant)
+                        .with_text(arena, label),
+                );
+            }
+
+            section = section.with_child(row);
+        }
+
+        root = root.with_child(section);
+    }
+
+    root
 }
