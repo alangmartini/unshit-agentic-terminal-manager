@@ -65,12 +65,24 @@ where
     where
         K: Clone,
     {
+        self.get_or_promote_tracked(k).map(|(v, _)| v)
+    }
+
+    /// Like [`Self::get_or_promote`] but also reports whether the entry was
+    /// promoted out of `previous` on this call. The flag is `true` when the
+    /// lookup moved the entry across halves, `false` when it was already in
+    /// `current`. Useful for diagnostic counters that classify hits without
+    /// doing a second hash lookup.
+    pub fn get_or_promote_tracked(&mut self, k: &K) -> Option<(&V, bool)>
+    where
+        K: Clone,
+    {
         if self.current.contains_key(k) {
-            return self.current.get(k);
+            return self.current.get(k).map(|v| (v, false));
         }
         let value = self.previous.remove(k)?;
         self.current.insert(k.clone(), value);
-        self.current.get(k)
+        self.current.get(k).map(|v| (v, true))
     }
 
     /// Look up `k`. If present in `current`, return a mutable reference. If
@@ -91,13 +103,6 @@ where
     /// render path; this is only useful for diagnostics.
     pub fn peek(&self, k: &K) -> Option<&V> {
         self.current.get(k).or_else(|| self.previous.get(k))
-    }
-
-    /// True when `k` is present in the `current` half only. Useful to
-    /// classify a hit as "current frame" vs "promoted from previous frame"
-    /// before calling `get_or_promote` (which fuses both cases).
-    pub fn contains_in_current(&self, k: &K) -> bool {
-        self.current.contains_key(k)
     }
 
     /// Insert into `current`. Does not touch `previous`. An existing entry

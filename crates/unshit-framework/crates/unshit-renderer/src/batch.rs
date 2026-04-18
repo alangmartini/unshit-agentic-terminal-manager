@@ -800,16 +800,18 @@ impl ShapeCache {
     /// increments when the entry was promoted out of the previous frame's
     /// map.
     pub fn get(&mut self, key: &ShapeCacheKey) -> Option<&Option<ShapedGlyphEntry>> {
-        let was_in_current = self.entries.contains_in_current(key);
-        if self.entries.get_or_promote(key).is_some() {
-            self.hits += 1;
-            if !was_in_current {
-                self.previous_hits += 1;
+        match self.entries.get_or_promote_tracked(key) {
+            Some((entry, promoted)) => {
+                self.hits += 1;
+                if promoted {
+                    self.previous_hits += 1;
+                }
+                Some(entry)
             }
-            self.entries.peek(key)
-        } else {
-            self.misses += 1;
-            None
+            None => {
+                self.misses += 1;
+                None
+            }
         }
     }
 
@@ -2128,11 +2130,8 @@ fn emit_text_glyphs_cached(
 
     // Check if we have a cached shaped result. If any atlas key is missing,
     // invalidate this shaped entry and rebuild so glyphs are never silently
-    // dropped on atlas churn.
-    //
-    // `get_or_promote` walks both halves of the double buffered cache and
-    // promotes a hit out of `previous` into `current` so it survives the
-    // next `finish_frame` swap.
+    // dropped on atlas churn. `get_or_promote` moves a hit from `previous`
+    // into `current` so it survives the next `finish_frame` swap.
     if let Some(entry) = shaped_cache.buf.get_or_promote(&cache_key).cloned() {
         let atlas_ready = entry.glyphs.iter().all(|cg| atlas.cache.contains_key(&cg.atlas_key));
         if atlas_ready {
@@ -4649,11 +4648,10 @@ mod tests {
     // Double buffered ShapedTextCache tests (issue #83).
     // -----------------------------------------------------------------------
 
-    fn shaped_text_entry(n: usize) -> ShapedTextEntry {
-        // Build a synthetic entry with `n` zero-valued glyphs. The atlas
-        // residency check lives outside the cache itself, so for in-memory
-        // cache tests an empty glyph vec is sufficient.
-        let _ = n;
+    // Size and bounding tests only care about key presence; the atlas
+    // residency check lives outside the cache itself, so an empty glyph
+    // vec is sufficient.
+    fn shaped_text_entry() -> ShapedTextEntry {
         ShapedTextEntry { glyphs: Vec::new() }
     }
 
@@ -4672,7 +4670,7 @@ mod tests {
     fn shaped_text_cache_promotes_across_frame_boundary() {
         let mut cache = ShapedTextCache::new();
         let key = shaped_key_for("hello");
-        cache.buf.insert(key.clone(), shaped_text_entry(1));
+        cache.buf.insert(key.clone(), shaped_text_entry());
         cache.finish_frame(0); // no atlas change => swap
                                // The entry now lives in previous. A lookup must find it and
                                // promote.
@@ -4684,7 +4682,7 @@ mod tests {
     fn shaped_text_cache_untouched_entries_evict_after_two_finish_frame() {
         let mut cache = ShapedTextCache::new();
         let key = shaped_key_for("ephemeral");
-        cache.buf.insert(key.clone(), shaped_text_entry(0));
+        cache.buf.insert(key.clone(), shaped_text_entry());
         cache.finish_frame(0); // to previous
         cache.finish_frame(0); // dropped
         assert!(cache.buf.peek(&key).is_none(), "untouched entry evicts after two boundaries");
@@ -4696,9 +4694,9 @@ mod tests {
         let mut cache = ShapedTextCache::new();
         let k1 = shaped_key_for("alpha");
         let k2 = shaped_key_for("beta");
-        cache.buf.insert(k1.clone(), shaped_text_entry(0));
+        cache.buf.insert(k1.clone(), shaped_text_entry());
         cache.finish_frame(0); // k1 now in previous
-        cache.buf.insert(k2.clone(), shaped_text_entry(0)); // k2 in current
+        cache.buf.insert(k2.clone(), shaped_text_entry()); // k2 in current
         assert_eq!(cache.len(), 2);
 
         // Atlas generation bump: finish_frame with a new generation wipes
@@ -4712,9 +4710,9 @@ mod tests {
         let mut cache = ShapedTextCache::new();
         let k1 = shaped_key_for("alpha");
         let k2 = shaped_key_for("beta");
-        cache.buf.insert(k1, shaped_text_entry(0));
+        cache.buf.insert(k1, shaped_text_entry());
         cache.finish_frame(0);
-        cache.buf.insert(k2, shaped_text_entry(0));
+        cache.buf.insert(k2, shaped_text_entry());
         assert_eq!(cache.len(), 2);
         cache.clear();
         assert!(cache.is_empty(), "clear must drop entries from previous AND current");
@@ -4732,7 +4730,7 @@ mod tests {
             for i in 0..PER_FRAME {
                 let text = format!("frame-{frame}-str-{i}");
                 let key = shaped_key_for(&text);
-                cache.buf.insert(key, shaped_text_entry(0));
+                cache.buf.insert(key, shaped_text_entry());
             }
             cache.finish_frame(0);
         }

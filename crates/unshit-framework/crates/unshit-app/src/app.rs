@@ -2051,12 +2051,9 @@ impl ApplicationHandler for AppHandler {
                     Some(&mut state.line_quad_cache),
                 );
                 state.batch_cache.commit_frame();
-                // Advance the double buffered shape caches together with the
-                // batch cache so untouched entries are evicted one frame
-                // later, matching Zed's LineLayoutCache. Pass the glyph
-                // atlas generation so ShapedTextCache can wipe itself on
-                // coarse atlas residency changes in addition to the per
-                // glyph check in `emit_shaped_text_run`.
+                // Atlas generation is passed so `ShapedTextCache` can detect
+                // coarse atlas residency changes between frames on top of the
+                // per-glyph check in `emit_shaped_text_run`.
                 state.shaped_cache.finish_frame(state.gpu.glyph_atlas.generation);
                 state.shape_cache.finish_frame();
                 batch::clear_paint_flags_subtree(&mut state.arena, state.root);

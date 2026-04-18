@@ -392,10 +392,7 @@ impl WindowedTest {
             None,
         );
         state.batch_cache.commit_frame();
-        // Mirror production: advance the double buffered shape caches so
-        // windowed tests exercise the same per frame eviction semantics as
-        // `unshit-app` does in its main render pump (see
-        // `crates/unshit-app/src/app.rs` next to `batch_cache.commit_frame`).
+        // Mirror the production per-frame eviction in `unshit-app::app`.
         state.shaped_cache.finish_frame(state.gpu.glyph_atlas.generation);
         state.shape_cache.finish_frame();
         batch::clear_paint_flags_subtree(&mut state.arena, state.root);
