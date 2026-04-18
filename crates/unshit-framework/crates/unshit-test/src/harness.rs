@@ -410,6 +410,12 @@ impl TestHarness {
             None,
         );
         self.batch_cache.commit_frame();
+        // Mirror production: advance the double buffered shape caches so
+        // tests exercise the same per frame eviction semantics as
+        // `unshit-app` does in its main render pump (see
+        // `crates/unshit-app/src/app.rs` next to `batch_cache.commit_frame`).
+        self.shaped_cache.finish_frame(gpu.glyph_atlas.generation);
+        self.shape_cache.finish_frame();
         batch::clear_paint_flags_subtree(&mut self.arena, self.root);
         gpu.render();
         gpu.read_pixels()
