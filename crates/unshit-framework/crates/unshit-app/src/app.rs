@@ -251,6 +251,46 @@ struct AppState {
     frame_probe: crate::frame_probe::FrameProbe,
 }
 
+/// Snapshot the dirty-state signals that drive the post-paint paint-loop
+/// scheduling in `RedrawRequested`. See issue #52 step 2.
+///
+/// The per-node paint-dirty walk is only a safety net:
+/// `clear_paint_flags_subtree` runs during the paint so in the common case
+/// no node carries `PAINT`/`SUBTREE_PAINT` after we return. The walk is
+/// O(arena) so we short-circuit it whenever a cheaper flag already reports
+/// dirty, keeping the frame-time overhead near zero on the hot path.
+fn collect_dirty_signals(
+    state: &AppState,
+    event_rx: &flume::Receiver<ExternalEvent>,
+) -> crate::frame_pacer::DirtySignals {
+    let needs_rebuild = state.needs_rebuild;
+    let needs_restyle = state.needs_restyle;
+    let needs_relayout = state.needs_relayout;
+    let has_pending_events = !event_rx.is_empty();
+
+    // Short-circuit: if any cheap flag is set, the scheduler already knows
+    // to schedule another paint, so the arena walk would be wasted work.
+    let any_node_paint_dirty =
+        if needs_rebuild || needs_restyle || needs_relayout || has_pending_events {
+            false
+        } else {
+            state.arena.iter().any(|(_, element)| {
+                element.dirty.intersects(
+                    unshit_core::dirty::DirtyFlags::PAINT
+                        | unshit_core::dirty::DirtyFlags::SUBTREE_PAINT,
+                )
+            })
+        };
+
+    crate::frame_pacer::DirtySignals {
+        needs_rebuild,
+        needs_restyle,
+        needs_relayout,
+        has_pending_events,
+        any_node_paint_dirty,
+    }
+}
+
 impl App {
     pub fn new(config: AppConfig, tree_fn: impl Fn() -> ElementTree + 'static) -> Self {
         let (event_tx, event_rx) = flume::unbounded();
@@ -1899,12 +1939,36 @@ impl ApplicationHandler for AppHandler {
                     state.window.request_redraw();
                 }
 
-                // Unified wake-time calculation covering all animation sources:
-                // cursor blink, CSS keyframe animations, and CSS transitions.
-                // When any source is active we set WaitUntil to the minimum
-                // wake time across all sources, so the event loop sleeps
-                // between frames instead of busy-polling.
+                // Record this paint in the frame pacer so subsequent
+                // redraws are gated until the coalescing interval elapses.
+                // Must happen before the post-paint dirty check below so the
+                // pacer can compute the next eligible paint deadline from an
+                // up-to-date `last_paint` timestamp.
+                state.frame_pacer.record_paint(frame_start);
+
+                // Unified wake-time calculation. Three classes of follow-up
+                // paint can be scheduled here:
+                //   1. Animation-driven wakes: cursor blink, CSS keyframe
+                //      animations, CSS transitions. Each has a future
+                //      `Instant` at which the next frame is needed.
+                //   2. Pending-dirty wakes (issue #52 step 2): any state
+                //      that was not drained in this paint (needs_rebuild,
+                //      flume still has PTY chunks, a node kept PAINT
+                //      dirty). These want the *next* vsync, gated by the
+                //      frame pacer's coalescing interval.
+                //   3. Canvas-driven redraws: `any_canvas_needs_repaint()`
+                //      already called `request_redraw` above and does not
+                //      participate in this block.
+                //
+                // We pick the earliest deadline across (1) and (2) so the
+                // event loop wakes exactly once per cycle instead of
+                // bouncing between two WaitUntil values.
+                //
+                // When nothing in either class has work we leave
+                // `ControlFlow` at its idle default (`Wait`), preserving
+                // zero-CPU idle per the step 2 constraint.
                 {
+                    let now = Instant::now();
                     let mut next_wake: Option<Instant> = None;
 
                     // Cursor blink.
@@ -1938,16 +2002,43 @@ impl ApplicationHandler for AppHandler {
                         });
                     }
 
+                    // Post-paint dirty check: if any state is still dirty
+                    // (most commonly because a PTY chunk landed in the flume
+                    // channel while we were painting and has not yet been
+                    // drained by `proxy_wake_up`) the pacer schedules the
+                    // next paint at the vsync cadence. See
+                    // `FramePacer::should_schedule_next_paint` and
+                    // `DirtySignals`.
+                    let dirty = collect_dirty_signals(state, &self.event_rx);
+                    let mut dirty_request_redraw = false;
+                    if let Some(decision) = state.frame_pacer.should_schedule_next_paint(now, dirty)
+                    {
+                        dirty_request_redraw = true;
+                        match decision {
+                            crate::frame_pacer::PaceDecision::PaintNow => {
+                                // Interval already elapsed; queue next frame
+                                // immediately. No deadline update needed.
+                            }
+                            crate::frame_pacer::PaceDecision::WaitUntil(deadline) => {
+                                next_wake = Some(match next_wake {
+                                    Some(current) if current <= deadline => current,
+                                    _ => deadline,
+                                });
+                            }
+                        }
+                    }
+
                     if let Some(wake) = next_wake {
                         event_loop
                             .set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wake));
                         state.window.request_redraw();
+                    } else if dirty_request_redraw {
+                        // Dirty + PaintNow path (pacer interval already
+                        // elapsed). Leave ControlFlow on its current value
+                        // and just queue the next frame.
+                        state.window.request_redraw();
                     }
                 }
-
-                // Record this paint in the frame pacer so subsequent
-                // redraws are gated until the coalescing interval elapses.
-                state.frame_pacer.record_paint(frame_start);
 
                 metrics.total_us = frame_start.elapsed().as_micros() as u64;
                 metrics.rss_bytes = get_rss_bytes();
