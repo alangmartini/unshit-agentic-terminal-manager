@@ -294,11 +294,18 @@ fn scroll_up_zero_is_noop() {
 }
 
 #[test]
-fn scroll_up_damages_every_previously_clean_row() {
-    // Regression: scroll_up used to preserve the clean status of shifted
-    // rows. Combined with a content-hash-keyed line quad cache in the
-    // renderer, that caused skipped emission for rows whose content had
-    // moved, leaving the viewport empty after a terminal scroll.
+fn scroll_up_only_damages_new_bottom_row_issue_62_non_regression() {
+    // Non-regression guard for issue #62. Original symptom: scroll_up
+    // preserved the clean status of shifted rows, so a content-hash-keyed
+    // line quad cache (keyed on row index) replayed stale quads at the
+    // rotated row indices and the viewport went blank after a scroll.
+    //
+    // After issue #52 Step 3 the cache is keyed on stable `line_id`
+    // instead of row index. A scrolled line keeps its identity, so the
+    // cache hit at the new row index is correct. We therefore no longer
+    // need to full-damage every row on scroll; damage is restricted to
+    // the bottom `n` rows that become newly empty. The original #62 bug
+    // cannot return because the cache no longer depends on row index.
     let mut g = CellGrid::new(4, 3);
     for r in 0..4 {
         let ch = (b'A' + r as u8) as char;
@@ -311,10 +318,39 @@ fn scroll_up_damages_every_previously_clean_row() {
         g.line_damage().iter().all(|ld| ld.is_clean()),
         "precondition: every row must be clean after clear_dirty",
     );
+    // Capture line ids before scroll so we can assert identity rotation.
+    let ids_before: Vec<u64> = g.line_ids().to_vec();
 
     g.scroll_up(1);
 
-    assert_all_rows_fully_damaged(&g);
+    // Top rows 0..rows-1 keep their line_id from the row that rotated in.
+    for row in 0..g.rows() - 1 {
+        assert_eq!(
+            g.line_id(row),
+            Some(ids_before[row + 1]),
+            "row {row} must inherit line_id from source row {}",
+            row + 1,
+        );
+    }
+    // The new bottom row is a freshly allocated line identity.
+    let new_bottom_id = g.line_id(g.rows() - 1).unwrap();
+    assert!(
+        !ids_before.contains(&new_bottom_id),
+        "new bottom line id {new_bottom_id} must not appear in pre-scroll ids {ids_before:?}",
+    );
+
+    // Top rows remain clean: the cache hit for their stable line_id is
+    // correct, so no damage is needed.
+    let last_col = g.cols().saturating_sub(1) as u16;
+    for row in 0..g.rows() - 1 {
+        let ld = g.line_damage()[row];
+        assert!(ld.is_clean(), "row {row} must remain clean because its content did not change",);
+    }
+    // Only the new bottom row is fully damaged (content emptied).
+    let bottom = g.line_damage()[g.rows() - 1];
+    assert!(!bottom.is_clean(), "bottom row must be damaged (new empty line)");
+    assert_eq!(bottom.first_dirty_col, 0);
+    assert_eq!(bottom.last_dirty_col, last_col);
 }
 
 fn assert_all_rows_fully_damaged(g: &CellGrid) {
@@ -606,10 +642,13 @@ fn renderer_can_skip_line_using_seqno_checkpoint() {
 }
 
 #[test]
-fn scroll_up_bumps_seqno_for_every_row() {
-    // Per-row seqnos must advance on every row after scroll_up so
-    // checkpoint-based renderers re-paint, not just the rows whose
-    // columns were written between clear_dirty and the scroll.
+fn scroll_up_bumps_seqno_only_for_new_bottom_row() {
+    // Updated for issue #52 Step 3: after stable-line-id keys the line
+    // quad cache, scroll_up no longer full-damages every row because
+    // surviving lines replay under their stable id. Damage rotates with
+    // the content so each row's damage entry describes its current
+    // cells. Only the bottom row that became freshly empty has its
+    // content changed, so only its seqno advances.
     let mut g = CellGrid::new(3, 4);
     g.clear_dirty();
 
@@ -620,11 +659,20 @@ fn scroll_up_bumps_seqno_for_every_row() {
 
     g.scroll_up(1);
 
-    assert_all_rows_fully_damaged(&g);
-    for (row, ld) in g.line_damage().iter().enumerate() {
-        assert!(
-            ld.seqno > seqs_before[row],
-            "row {row} seqno must advance so subscribers re-paint",
+    // Only the bottom row advances its seqno (new empty line).
+    let bottom = g.rows() - 1;
+    assert!(
+        g.line_damage()[bottom].seqno > seqs_before[bottom],
+        "bottom row seqno must advance because it holds a new empty line",
+    );
+    // Surviving rows carry the seqno of the source row they inherited
+    // content from (damage rotated with the cells, same as line_id).
+    for row in 0..bottom {
+        assert_eq!(
+            g.line_damage()[row].seqno,
+            seqs_before[row + 1],
+            "row {row} must carry the seqno of source row {} after rotation",
+            row + 1,
         );
     }
 }

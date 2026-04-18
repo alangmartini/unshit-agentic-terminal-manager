@@ -5,8 +5,11 @@
 //! vertex instances. When most rows of the grid are unchanged between
 //! frames, that iteration and shaping work is pure waste.
 //!
-//! This cache stores the vertex instances produced for a single row
-//! keyed on `(NodeId, row_index)`. Each entry carries a content
+//! This cache stores the vertex instances produced for a single line
+//! keyed on `(NodeId, line_id)` where `line_id` is a stable identity
+//! assigned by `CellGrid`. Because line identity moves with the cells
+//! across scroll and shift operations, a cached line replays at its
+//! new row index with no re-emission. Each entry carries a content
 //! signature computed from the row cells, plus the geometry inputs
 //! (origin, cell width/height, font size, opacity, clip rectangle,
 //! and the glyph atlas generation) the entry was built against.
@@ -19,9 +22,9 @@
 //! existing per cell emit path and the fresh instances replace the
 //! cached entry.
 //!
-//! This mirrors the WezTerm `line_quad_cache` pattern from commit
-//! f03dc68f96161229f8c213c13df9a8dacc9d5fc6 (2022 08 26), adapted to
-//! the unshit renderer's instance based pipeline.
+//! This mirrors WezTerm's stable `id` attached to `Line` appdata,
+//! Kitty's `linebuf_index`, and Ghostty's `PageList` line tracking,
+//! adapted to the unshit renderer's instance based pipeline.
 
 use rustc_hash::FxHashMap;
 use std::hash::Hasher;
@@ -136,10 +139,13 @@ pub struct CachedLineState {
     pub glyph_keys: Vec<GlyphKey>,
 }
 
-/// Per element cache: one `CachedLineState` per `(NodeId, row)`.
+/// Per element cache: one `CachedLineState` per `(NodeId, line_id)` where
+/// `line_id` is the stable identity assigned by `CellGrid`. The pane's
+/// root element `NodeId` namespaces the cache so multiple panes never
+/// collide on line identities that happen to repeat.
 #[derive(Default)]
 pub struct LineQuadCache {
-    lines: FxHashMap<(NodeId, u32), CachedLineState>,
+    lines: FxHashMap<(NodeId, u64), CachedLineState>,
 }
 
 impl LineQuadCache {
@@ -153,7 +159,7 @@ impl LineQuadCache {
         self.lines.clear();
     }
 
-    /// Total number of cached rows, across every element.
+    /// Total number of cached lines, across every element.
     pub fn len(&self) -> usize {
         self.lines.len()
     }
@@ -163,8 +169,8 @@ impl LineQuadCache {
     }
 
     /// Returns the cached line, if any.
-    pub fn get(&self, node: NodeId, row: u32) -> Option<&CachedLineState> {
-        self.lines.get(&(node, row))
+    pub fn get(&self, node: NodeId, line_id: u64) -> Option<&CachedLineState> {
+        self.lines.get(&(node, line_id))
     }
 
     /// Returns the cached line when its content signature and
@@ -173,11 +179,11 @@ impl LineQuadCache {
     pub fn lookup_replayable(
         &self,
         node: NodeId,
-        row: u32,
+        line_id: u64,
         content_sig: u64,
         geometry: LineGeometrySig,
     ) -> Option<&CachedLineState> {
-        let cached = self.lines.get(&(node, row))?;
+        let cached = self.lines.get(&(node, line_id))?;
         if cached.content_sig == content_sig && cached.geometry == Some(geometry) {
             Some(cached)
         } else {
@@ -185,11 +191,11 @@ impl LineQuadCache {
         }
     }
 
-    /// Insert or overwrite an entry for `(node, row)`.
+    /// Insert or overwrite an entry for `(node, line_id)`.
     pub fn store(
         &mut self,
         node: NodeId,
-        row: u32,
+        line_id: u64,
         content_sig: u64,
         geometry: LineGeometrySig,
         quads: Vec<QuadInstance>,
@@ -197,15 +203,16 @@ impl LineQuadCache {
         glyph_keys: Vec<GlyphKey>,
     ) {
         self.lines.insert(
-            (node, row),
+            (node, line_id),
             CachedLineState { content_sig, geometry: Some(geometry), quads, glyphs, glyph_keys },
         );
     }
 
-    /// Drop any cached rows at row indices >= `rows` for this node.
-    /// Used after a grid shrink so stale rows don't linger.
-    pub fn truncate_element(&mut self, node: NodeId, rows: u32) {
-        self.lines.retain(|(n, r), _| !(*n == node && *r >= rows));
+    /// Drop any cached lines for this node whose `line_id` is not in
+    /// `retain_ids`. Used after a grid shrink or a full wipe so stale
+    /// identities don't linger and leak memory.
+    pub fn retain_element_ids(&mut self, node: NodeId, retain_ids: &rustc_hash::FxHashSet<u64>) {
+        self.lines.retain(|(n, id), _| *n != node || retain_ids.contains(id));
     }
 
     /// Drop every cached row for a single element. Used on
@@ -348,9 +355,12 @@ mod tests {
         let keys =
             vec![GlyphKey { font_id: 1, glyph_id: 2, font_size_tenths: 140, subpixel_bin: 0 }];
 
-        cache.store(node, 3, 0xdeadbeef, sig, quads.clone(), glyphs.clone(), keys.clone());
+        // Cache key is (node, line_id): use a distinct id to prove the
+        // map stores what we asked for.
+        let line_id: u64 = 0xdeadbeef;
+        cache.store(node, line_id, 0xdeadbeef, sig, quads.clone(), glyphs.clone(), keys.clone());
 
-        let hit = cache.lookup_replayable(node, 3, 0xdeadbeef, sig);
+        let hit = cache.lookup_replayable(node, line_id, 0xdeadbeef, sig);
         assert!(hit.is_some(), "must hit cache for matching content + geometry");
         let hit = hit.unwrap();
         assert_eq!(hit.quads.len(), 1);
@@ -363,10 +373,11 @@ mod tests {
         let mut cache = LineQuadCache::new();
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
-        cache.store(node, 0, 0x1111, sig, vec![], vec![], vec![]);
-        assert!(cache.lookup_replayable(node, 0, 0x1111, sig).is_some());
+        let line_id: u64 = 7;
+        cache.store(node, line_id, 0x1111, sig, vec![], vec![], vec![]);
+        assert!(cache.lookup_replayable(node, line_id, 0x1111, sig).is_some());
         // Different content hash -> miss.
-        assert!(cache.lookup_replayable(node, 0, 0x2222, sig).is_none());
+        assert!(cache.lookup_replayable(node, line_id, 0x2222, sig).is_none());
     }
 
     #[test]
@@ -374,9 +385,10 @@ mod tests {
         let mut cache = LineQuadCache::new();
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
-        cache.store(node, 0, 0x1, sig, vec![], vec![], vec![]);
+        let line_id: u64 = 11;
+        cache.store(node, line_id, 0x1, sig, vec![], vec![], vec![]);
         let moved = LineGeometrySig::new(10.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
-        assert!(cache.lookup_replayable(node, 0, 0x1, moved).is_none());
+        assert!(cache.lookup_replayable(node, line_id, 0x1, moved).is_none());
     }
 
     #[test]
@@ -384,24 +396,29 @@ mod tests {
         let mut cache = LineQuadCache::new();
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 3);
-        cache.store(node, 0, 0xaaaa, sig, vec![], vec![], vec![]);
+        let line_id: u64 = 42;
+        cache.store(node, line_id, 0xaaaa, sig, vec![], vec![], vec![]);
         let bumped = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 4);
         assert!(
-            cache.lookup_replayable(node, 0, 0xaaaa, bumped).is_none(),
+            cache.lookup_replayable(node, line_id, 0xaaaa, bumped).is_none(),
             "atlas generation bump must invalidate cached rows"
         );
     }
 
     #[test]
-    fn cache_truncate_element_drops_rows_past_new_height() {
+    fn cache_retain_element_ids_drops_lines_not_in_set() {
+        use rustc_hash::FxHashSet;
         let mut cache = LineQuadCache::new();
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
-        for row in 0..5u32 {
-            cache.store(node, row, row as u64, sig, vec![], vec![], vec![]);
+        for id in 0..5u64 {
+            cache.store(node, id, id, sig, vec![], vec![], vec![]);
         }
         assert_eq!(cache.len(), 5);
-        cache.truncate_element(node, 2);
+        let mut retain: FxHashSet<u64> = FxHashSet::default();
+        retain.insert(0);
+        retain.insert(1);
+        cache.retain_element_ids(node, &retain);
         assert_eq!(cache.len(), 2);
         assert!(cache.get(node, 0).is_some());
         assert!(cache.get(node, 1).is_some());
@@ -435,37 +452,42 @@ mod tests {
     }
 
     #[test]
-    fn scroll_shifts_cache_rather_than_invalidating_everything() {
-        // Scrolling one row up moves row 1 to row 0, row 2 to row 1, etc.
-        // Each destination row is compared to the cached signature at that
-        // key, and when the content changes the lookup misses. This is
-        // the correct contract: scroll invalidates the affected rows, not
-        // the whole cache.
+    fn scroll_survives_cache_because_line_id_follows_content() {
+        // With the cache keyed on stable `line_id`, a scroll that moves
+        // the same logical line to a different row index is a no-op for
+        // the cache: looking up by the line's identity still hits. This
+        // is the core win of the line-identity design: surviving lines
+        // replay their cached payload without a re-emission.
         let mut cache = LineQuadCache::new();
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
-        // Populate rows 0..3 with distinct content hashes.
-        cache.store(node, 0, 0xaa, sig, vec![], vec![], vec![]);
-        cache.store(node, 1, 0xbb, sig, vec![], vec![], vec![]);
-        cache.store(node, 2, 0xcc, sig, vec![], vec![], vec![]);
+        // Populate three distinct lines with distinct content hashes.
+        let id_a: u64 = 100;
+        let id_b: u64 = 101;
+        let id_c: u64 = 102;
+        cache.store(node, id_a, 0xaa, sig, vec![], vec![], vec![]);
+        cache.store(node, id_b, 0xbb, sig, vec![], vec![], vec![]);
+        cache.store(node, id_c, 0xcc, sig, vec![], vec![], vec![]);
 
-        // After a scroll up, row 0 now carries the old content of row 1.
-        // The previous store at row 0 used 0xaa, so a lookup for 0xbb at row 0
-        // must miss. The entry for row 2 is still valid because its content
-        // has not shifted away.
-        assert!(cache.lookup_replayable(node, 0, 0xbb, sig).is_none());
-        assert!(cache.lookup_replayable(node, 2, 0xcc, sig).is_some());
+        // After a scroll_up(1) inside CellGrid, the lines that held ids
+        // 101 and 102 have rotated to earlier row indices while keeping
+        // their identity and content. The cache must still hit for them.
+        assert!(cache.lookup_replayable(node, id_b, 0xbb, sig).is_some());
+        assert!(cache.lookup_replayable(node, id_c, 0xcc, sig).is_some());
     }
 
     #[test]
-    fn truncate_does_not_touch_other_nodes() {
+    fn retain_does_not_touch_other_nodes() {
+        use rustc_hash::FxHashSet;
         let mut cache = LineQuadCache::new();
         let a = NodeId { index: 0, generation: 0 };
         let b = NodeId { index: 1, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         cache.store(a, 5, 1, sig, vec![], vec![], vec![]);
         cache.store(b, 5, 2, sig, vec![], vec![], vec![]);
-        cache.truncate_element(a, 3); // drops only a's row 5
+        // Retain nothing under `a`; `b`'s entries must survive.
+        let retain: FxHashSet<u64> = FxHashSet::default();
+        cache.retain_element_ids(a, &retain);
         assert!(cache.get(a, 5).is_none());
         assert!(cache.get(b, 5).is_some());
     }
@@ -506,14 +528,60 @@ mod tests {
             gradient_params: [0.0; 4],
             gradient_extra: [0.0; 4],
         };
-        cache.store(node, 0, 42, sig, vec![quad], vec![], vec![]);
+        let line_id: u64 = 9;
+        cache.store(node, line_id, 42, sig, vec![quad], vec![], vec![]);
 
-        let hit1 = cache.lookup_replayable(node, 0, 42, sig).unwrap();
+        let hit1 = cache.lookup_replayable(node, line_id, 42, sig).unwrap();
         let first_bytes = bytemuck::bytes_of(&hit1.quads[0]).to_vec();
 
-        let hit2 = cache.lookup_replayable(node, 0, 42, sig).unwrap();
+        let hit2 = cache.lookup_replayable(node, line_id, 42, sig).unwrap();
         let second_bytes = bytemuck::bytes_of(&hit2.quads[0]).to_vec();
 
         assert_eq!(first_bytes, second_bytes);
+    }
+
+    // -- Issue #52 Step 3 regression tests ---------------------------------
+
+    #[test]
+    fn line_quad_cache_survives_scroll() {
+        // Regression: Step 3 of issue #52 keyed the cache on stable
+        // `line_id` so a scroll no longer forces every row to miss. A
+        // line stored under id 42 must still be retrievable after a
+        // simulated scroll (i.e., the "row index" of that line has
+        // changed in the grid but its identity has not).
+        let mut cache = LineQuadCache::new();
+        let node = NodeId { index: 0, generation: 0 };
+        let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
+        let line_id: u64 = 42;
+        cache.store(node, line_id, 0xbeef, sig, vec![], vec![], vec![]);
+
+        // Simulate a scroll: the same line identity now occupies a
+        // different row. Under the new cache key, this is a no-op.
+        assert!(
+            cache.get(node, line_id).is_some(),
+            "cache lookup by stable line_id must survive scroll",
+        );
+        assert!(
+            cache.lookup_replayable(node, line_id, 0xbeef, sig).is_some(),
+            "replayable cache lookup by line_id must survive scroll",
+        );
+    }
+
+    #[test]
+    fn line_quad_cache_invalidates_on_content_change() {
+        // Regression: content-signature gating still invalidates the
+        // cache when the logical line's content changes, even though
+        // line identity is stable. This is the Red path of issue #52
+        // Step 3's correctness invariant.
+        let mut cache = LineQuadCache::new();
+        let node = NodeId { index: 0, generation: 0 };
+        let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
+        let line_id: u64 = 77;
+        cache.store(node, line_id, 0xa1a1, sig, vec![], vec![], vec![]);
+        // Same id, new content hash -> miss.
+        assert!(
+            cache.lookup_replayable(node, line_id, 0xb2b2, sig).is_none(),
+            "content-sig mismatch must miss even when line identity is stable",
+        );
     }
 }

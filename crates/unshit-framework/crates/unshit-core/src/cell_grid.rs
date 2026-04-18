@@ -265,6 +265,16 @@ pub struct CellGrid {
     /// Per-row damage summary (first/last dirty column + seqno). The renderer
     /// iterates this and skips clean lines entirely without touching cells.
     line_damage: Vec<LineDamage>,
+    /// Stable identity of the logical line currently at each row. Moves with
+    /// the content on scroll / shift operations so cache consumers keyed by
+    /// line identity (see `LineQuadCache`) can replay unchanged rows after
+    /// the rows rotate. Mirrors Kitty's `linebuf_index`, Ghostty's
+    /// `PageList`, and WezTerm's stable `id` attached to `Line` appdata.
+    line_ids: Vec<u64>,
+    /// Monotonic counter. Every time a row becomes a fresh "new" logical
+    /// line (initial grid, scroll discard, resize, DECALN, clear) the
+    /// counter is bumped and the resulting id is assigned.
+    next_line_id: u64,
     cursor_row: usize,
     cursor_col: usize,
     cursor_visible: bool,
@@ -289,21 +299,29 @@ impl CellGrid {
     }
 
     /// Copy `count` rows of cells from `src_row..src_row + count` to
-    /// `dst_row..dst_row + count` using `copy_within`, and mark every
-    /// destination row fully damaged.
+    /// `dst_row..dst_row + count` using `copy_within`.
+    ///
+    /// The stable `line_ids` that identify the logical line at each row
+    /// are copied alongside the cells so the destination rows inherit the
+    /// source rows' identities. Because the retained line quad cache is
+    /// keyed on `(NodeId, line_id)` rather than `(NodeId, row_index)`, the
+    /// cached payload for each shifted line remains valid at its new row
+    /// index: the line moves, its cache entry moves with it.
+    ///
+    /// Per-row damage rotates with the content too: a clean source row
+    /// produces a clean destination row because the line's content has
+    /// not changed; only its row index has. This replaces PR #62 / #70's
+    /// behavior of full-damaging every destination row, which was only
+    /// needed when the cache key included the row index. Callers that
+    /// blank the vacated source rows (scroll_down, IL, DL) must also
+    /// reset those rows' line identity via `reset_line_identity` so the
+    /// cache misses against the blanked content.
     ///
     /// This is the efficient primitive terminal-level scroll / insert-line /
     /// delete-line ops use to reposition a contiguous block of rows without
     /// touching `set_cell` per cell. Overlapping source and destination
     /// ranges are handled correctly because `copy_within` performs the
     /// overlap-safe shift.
-    ///
-    /// Damage is marked on the destination rows only; the caller is
-    /// responsible for clearing or repopulating rows outside
-    /// `dst_row..dst_row + count` if the shift vacates them. Mirrors PR #62:
-    /// the retained line quad cache is keyed by `(NodeId, row_index,
-    /// content_hash)`, so every destination row must be fully damaged so the
-    /// renderer re-emits against the post-shift row indices.
     ///
     /// `dst_row`, `src_row`, and `count` are clamped so the copy stays
     /// within `0..self.rows`. A zero-count shift is a no-op.
@@ -326,11 +344,38 @@ impl CellGrid {
             // checkpoint-based per-cell consumers re-render.
             let dst_cells_end = dst_start + count * self.cols;
             self.dirty[dst_start..dst_cells_end].fill(true);
+            // Stable line identity follows the content. Copy the source
+            // ids into the destination range so the line quad cache (keyed
+            // on line_id) replays the shifted lines at their new row
+            // indices without a cache miss.
+            self.line_ids.copy_within(src_row..src_row + count, dst_row);
+            // Rotate per-row damage alongside the content so each row's
+            // damage entry continues to describe the cells currently at
+            // that row.
+            self.line_damage.copy_within(src_row..src_row + count, dst_row);
         }
-        Self::mark_all_lines_fully_damaged(
-            &mut self.line_damage[dst_row..dst_row + count],
-            self.cols,
-        );
+    }
+
+    /// Allocate the next monotonic `line_id` and bump the counter.
+    #[inline]
+    fn allocate_line_id(&mut self) -> u64 {
+        let id = self.next_line_id;
+        self.next_line_id = self.next_line_id.wrapping_add(1);
+        id
+    }
+
+    /// Reset the stable identity of `row` to a fresh `line_id`. Called when
+    /// the logical line at `row` is discarded wholesale (scroll vacates a
+    /// row, `clear_row` blanks a row, grid-wide `clear`, DECALN). The line
+    /// quad cache keyed on `(NodeId, line_id)` will miss for this row
+    /// because the old cached entry belongs to a line identity that no
+    /// longer occupies `row`.
+    pub fn reset_line_identity(&mut self, row: usize) {
+        if row >= self.rows {
+            return;
+        }
+        let new_id = self.allocate_line_id();
+        self.line_ids[row] = new_id;
     }
 
     /// Create a new grid filled with default (empty) cells.
@@ -340,12 +385,25 @@ impl CellGrid {
         // the first render pass paints every row.
         let mut line_damage = vec![LineDamage::default(); rows];
         Self::mark_all_lines_fully_damaged(&mut line_damage, cols);
+        // Allocate a unique stable id for each initial row. Starting at 1
+        // keeps 0 available as a "never assigned" sentinel if callers ever
+        // need it.
+        let mut next_line_id: u64 = 1;
+        let line_ids: Vec<u64> = (0..rows)
+            .map(|_| {
+                let id = next_line_id;
+                next_line_id = next_line_id.wrapping_add(1);
+                id
+            })
+            .collect();
         Self {
             rows,
             cols,
             cells: vec![Cell::default(); len],
             dirty: vec![true; len],
             line_damage,
+            line_ids,
+            next_line_id,
             cursor_row: 0,
             cursor_col: 0,
             cursor_visible: true,
@@ -381,6 +439,21 @@ impl CellGrid {
     /// of bounds).
     pub fn line_damage_for(&self, row: usize) -> Option<&LineDamage> {
         self.line_damage.get(row)
+    }
+
+    /// Read-only slice of stable line ids, one per row. The id identifies
+    /// the logical line currently occupying `row`; it moves with the cells
+    /// across scroll and shift operations so caches keyed on line identity
+    /// survive row-index rotation.
+    pub fn line_ids(&self) -> &[u64] {
+        &self.line_ids
+    }
+
+    /// Return the stable id of the logical line at `row`, or `None` when
+    /// `row` is out of bounds.
+    #[inline]
+    pub fn line_id(&self, row: usize) -> Option<u64> {
+        self.line_ids.get(row).copied()
     }
 
     /// Collect maximal runs of adjacent cells on `row` that share the same
@@ -628,21 +701,34 @@ impl CellGrid {
     }
 
     /// Clear every cell to the default (empty) state and mark all dirty.
+    /// Every row gets a fresh `line_id` because the logical line at every
+    /// row has been discarded.
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
         self.dirty.fill(true);
         Self::mark_all_lines_fully_damaged(&mut self.line_damage, self.cols);
+        // Every logical line is gone. Assign fresh identities so caches
+        // keyed on `line_id` miss for every row and rebuild against the
+        // blank content.
+        for row in 0..self.rows {
+            let id = self.allocate_line_id();
+            self.line_ids[row] = id;
+        }
     }
 
     /// Scroll the grid contents up by `n` rows. The bottom `n` rows are
-    /// filled with default (empty) cells. All affected cells are marked dirty.
+    /// filled with default (empty) cells and receive fresh `line_id`s.
+    /// The surviving lines (previously at rows `[n..rows]`) rotate into
+    /// rows `[0..rows - n]` carrying their stable `line_id`s with them, so
+    /// the retained line quad cache (keyed on `(NodeId, line_id)`) replays
+    /// those lines at their new row indices without re-emission.
     ///
-    /// Every row is marked fully damaged. The retained line quad cache is
-    /// keyed by `(NodeId, row_index, content_hash)` with absolute quad
-    /// positions baked into each entry, so a shifted row cannot reuse the
-    /// cache entry stored at its old row index. Forcing full-row damage
-    /// makes the renderer re-emit every row and rebuild the cache against
-    /// the post-scroll row indices.
+    /// Damage is marked on the bottom `n` rows only (their content
+    /// actually changed). The shifted rows rotate their damage entries
+    /// alongside their content so each row's damage continues to reflect
+    /// the row's current data. This reverts PR #62's unconditional
+    /// full-damage-every-row behavior; with line identity in the cache
+    /// key the surviving lines no longer need a forced re-emit.
     pub fn scroll_up(&mut self, n: usize) {
         if n == 0 {
             return;
@@ -658,12 +744,34 @@ impl CellGrid {
 
         self.dirty.fill(true);
 
-        Self::mark_all_lines_fully_damaged(&mut self.line_damage, self.cols);
+        // Rotate line ids left by `n`: the top `rows - n` rows inherit the
+        // line identities of the rows that rotated into them. `copy_within`
+        // handles overlapping source/destination correctly.
+        let kept = self.rows - n;
+        if kept > 0 {
+            self.line_ids.copy_within(n..self.rows, 0);
+            // Rotate per-row damage alongside the content so each row's
+            // damage entry continues to describe the cells currently at
+            // that row. Surviving rows carry their pre-scroll damage
+            // state (clean stays clean, partial stays partial).
+            self.line_damage.copy_within(n..self.rows, 0);
+        }
+        // Assign fresh ids to the `n` newly empty bottom rows and mark
+        // only those rows fully damaged.
+        let last_col = Self::last_col_u16(self.cols);
+        for row in kept..self.rows {
+            let id = self.allocate_line_id();
+            self.line_ids[row] = id;
+            if let Some(ld) = self.line_damage.get_mut(row) {
+                ld.mark_range(0, last_col);
+            }
+        }
     }
 
     /// Resize the grid. Existing content in the overlapping region is
-    /// preserved; new cells are default-initialized. All cells are marked
-    /// dirty after resize.
+    /// preserved, along with the stable `line_id`s of rows that survive
+    /// the resize. New rows receive fresh `line_id`s. All cells are marked
+    /// dirty after resize so renderers re-emit regardless of cache state.
     pub fn resize(&mut self, new_rows: usize, new_cols: usize) {
         if new_rows == self.rows && new_cols == self.cols {
             return;
@@ -680,6 +788,18 @@ impl CellGrid {
                 .copy_from_slice(&self.cells[src_start..src_start + copy_cols]);
         }
 
+        // Preserve line identity for rows that survive the resize. New rows
+        // allocate fresh ids so the line quad cache misses for them and
+        // rebuilds against the blank content.
+        let mut new_line_ids: Vec<u64> = Vec::with_capacity(new_rows);
+        for row in 0..new_rows {
+            if row < copy_rows {
+                new_line_ids.push(self.line_ids[row]);
+            } else {
+                new_line_ids.push(self.allocate_line_id());
+            }
+        }
+
         self.rows = new_rows;
         self.cols = new_cols;
         self.cells = new_cells;
@@ -690,6 +810,7 @@ impl CellGrid {
         let mut new_line_damage = vec![LineDamage::default(); new_rows];
         Self::mark_all_lines_fully_damaged(&mut new_line_damage, new_cols);
         self.line_damage = new_line_damage;
+        self.line_ids = new_line_ids;
     }
 }
 
@@ -787,7 +908,12 @@ mod tests {
     // -- shift_rows ---------------------------------------------------------
 
     #[test]
-    fn shift_rows_copies_cells_and_marks_destinations_damaged() {
+    fn shift_rows_copies_cells_and_rotates_identity_and_damage() {
+        // After issue #52 Step 3, shift_rows rotates content, line_ids, and
+        // per-row damage together. A clean source row produces a clean
+        // destination row because the logical line's content has not
+        // changed, only the index it occupies. The retained line quad
+        // cache (keyed on `line_id`) replays the line at its new index.
         let mut g = CellGrid::new(4, 3);
         for r in 0..4 {
             let ch = (b'A' + r as u8) as char;
@@ -796,7 +922,7 @@ mod tests {
             }
         }
         g.clear_dirty();
-        let seqs_before: Vec<u64> = g.line_damage().iter().map(|ld| ld.seqno).collect();
+        let ids_before: Vec<u64> = g.line_ids().to_vec();
 
         // Shift rows 0..2 to rows 1..3 (mirrors scroll_down(1) inside rows 0..3).
         g.shift_rows(1, 0, 2);
@@ -805,13 +931,21 @@ mod tests {
         assert_eq!(g.get_cell(1, 0).unwrap().ch, 'A');
         assert_eq!(g.get_cell(2, 0).unwrap().ch, 'B');
 
-        let last_col = (g.cols() - 1) as u16;
-        // Destination rows are fully damaged with bumped seqno.
-        for (row, ld) in g.line_damage().iter().enumerate().take(3).skip(1) {
-            assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col");
-            assert_eq!(ld.last_dirty_col, last_col, "row {row} last_dirty_col");
-            assert!(ld.seqno > seqs_before[row], "row {row} seqno must advance");
-        }
+        // Stable identity rotates with content: rows 1 and 2 now carry
+        // the ids that rows 0 and 1 had before the shift.
+        assert_eq!(g.line_id(1), Some(ids_before[0]));
+        assert_eq!(g.line_id(2), Some(ids_before[1]));
+
+        // Damage rotates alongside content; source rows were clean so
+        // destination rows are clean too.
+        assert!(
+            g.line_damage()[1].is_clean(),
+            "row 1 must be clean because source row 0 was clean",
+        );
+        assert!(
+            g.line_damage()[2].is_clean(),
+            "row 2 must be clean because source row 1 was clean",
+        );
         // Rows outside the destination stay clean.
         assert!(g.line_damage()[0].is_clean(), "row 0 must remain clean");
         assert!(g.line_damage()[3].is_clean(), "row 3 must remain clean");
@@ -851,16 +985,20 @@ mod tests {
     #[test]
     fn shift_rows_clamps_out_of_bounds_count() {
         let mut g = CellGrid::new(3, 3);
-        g.clear_dirty();
+        // Populate row 1 with a dirty write so its damage is non-clean;
+        // this tests that damage rotates correctly into row 0.
+        g.set_cell(1, 1, Cell::with_char('X'));
+        let row1_damage_before = g.line_damage()[1];
 
         // Count past self.rows is clamped.
         g.shift_rows(0, 1, 100);
 
-        let last_col = (g.cols() - 1) as u16;
-        // rows 0..2 (2 rows) are the clamped destination.
-        for (row, ld) in g.line_damage().iter().enumerate().take(2) {
-            assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col");
-            assert_eq!(ld.last_dirty_col, last_col, "row {row} last_dirty_col");
-        }
+        // rows 0..2 (2 rows) are the clamped destination; row 0 inherits
+        // the damage that was at row 1 before the shift.
+        assert_eq!(
+            g.line_damage()[0],
+            row1_damage_before,
+            "row 0 must inherit row 1's pre-shift damage",
+        );
     }
 }
