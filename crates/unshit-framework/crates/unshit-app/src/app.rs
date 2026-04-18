@@ -182,6 +182,12 @@ pub struct FrameMetrics {
     pub atlas_fill_ratio: f32,
     pub gpu_upload_bytes: u64,
     pub damage_area_px: u64,
+    /// Current frame pacer coalescing interval in nanoseconds, derived
+    /// from the active monitor's refresh rate (see [`crate::frame_pacer`]).
+    /// Constant across frames on a stationary window; changes when the
+    /// window crosses monitor boundaries. Used by the bench harness to
+    /// report the effective frame-rate ceiling alongside measured fps.
+    pub pacer_min_interval_ns: u64,
 }
 
 impl std::fmt::Display for FrameMetrics {
@@ -276,6 +282,12 @@ struct AppState {
     /// disappears entirely from the struct layout otherwise.
     #[cfg(feature = "input-latency-histogram")]
     pub(crate) input_latency: crate::input_latency::InputLatencyTracker,
+    /// Timestamp of the last time the pacer re-read the current
+    /// monitor's refresh rate. `WindowEvent::Moved` fires once per mouse
+    /// move during a drag; we debounce monitor probes to at most once per
+    /// [`ACTIVITY_WINDOW`] to avoid hitting the compositor on every
+    /// pixel of motion. See [`refresh_pacer_from_window`].
+    last_refresh_probe: Instant,
 }
 
 /// How long after the last external event the loop keeps scheduling
@@ -295,6 +307,40 @@ pub(crate) fn is_within_activity_window(
     now.saturating_duration_since(last_activity) < window
 }
 
+/// Adapter that exposes a winit [`Window`] as a
+/// [`crate::frame_pacer::MonitorRefreshSource`]. The adapter is the sole
+/// point in the framework that talks to winit's monitor APIs; the pacer
+/// logic and tests depend only on the trait.
+struct WindowRefreshSource<'a>(&'a dyn Window);
+
+impl<'a> crate::frame_pacer::MonitorRefreshSource for WindowRefreshSource<'a> {
+    fn current_refresh_mhz(&self) -> Option<u32> {
+        self.0
+            .current_monitor()
+            .or_else(|| self.0.primary_monitor())
+            .and_then(|m| m.current_video_mode())
+            .and_then(|v| v.refresh_rate_millihertz())
+            .map(|nz| nz.get())
+    }
+}
+
+/// Update the pacer's coalescing interval from the window's current
+/// monitor, if it can be determined. Called on window creation, after
+/// scale-factor changes inside [`WindowEvent::SurfaceResized`], and from
+/// [`WindowEvent::Moved`]. Silently falls back to
+/// [`crate::frame_pacer::FramePacer::DEFAULT_MIN_INTERVAL`] when the
+/// platform cannot enumerate the monitor's refresh rate (headless / some
+/// Wayland configs).
+fn refresh_pacer_from_window(state: &mut AppState) {
+    let source = WindowRefreshSource(&*state.window);
+    crate::frame_pacer::refresh_pacer_from_source(&mut state.frame_pacer, &source);
+    state.last_refresh_probe = Instant::now();
+    log::info!(
+        "pacer coalescing interval: {:.3}ms",
+        state.frame_pacer.min_interval().as_secs_f64() * 1000.0
+    );
+}
+
 impl AppState {
     /// Record that external activity (user input, PTY output, resize, etc.)
     /// occurred at `now`. Opens the window during which `about_to_wait`
@@ -309,6 +355,14 @@ impl AppState {
     /// runs at the pacer rhythm even when no dirty flag is set.
     fn is_recently_active(&self, now: Instant) -> bool {
         is_within_activity_window(self.last_activity, now, ACTIVITY_WINDOW)
+    }
+
+    /// Whether enough time has elapsed since the last monitor refresh
+    /// probe to justify re-querying the compositor. Winit
+    /// `WindowEvent::Moved` fires on every drag delta; without this gate
+    /// we would hit `current_monitor()` once per pixel of motion.
+    fn should_reprobe_refresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_refresh_probe) >= ACTIVITY_WINDOW
     }
 }
 
@@ -562,6 +616,19 @@ impl ApplicationHandler for AppHandler {
             cb(scale_factor);
         }
 
+        // Read the active monitor's refresh rate so the frame pacer can
+        // coalesce at the real panel rhythm rather than the historic 8ms
+        // default. Falls back to 0 (and thus `DEFAULT_MIN_INTERVAL`) on
+        // platforms or configurations that cannot report the rate.
+        let startup_refresh_mhz = window
+            .current_monitor()
+            .or_else(|| window.primary_monitor())
+            .and_then(|m| m.current_video_mode())
+            .and_then(|v| v.refresh_rate_millihertz())
+            .map(|nz| nz.get())
+            .unwrap_or(0);
+        log::info!("Display refresh rate: {} mHz", startup_refresh_mhz);
+
         let mut gpu = pollster::block_on(GpuContext::new(window.clone()));
 
         // Apply configurable atlas size bound if set.
@@ -746,7 +813,7 @@ impl ApplicationHandler for AppHandler {
             bell_state: BellState::new(BellConfig::default()),
             theme: self.app.config.theme.clone(),
             cell_metrics_fired: false,
-            frame_pacer: crate::frame_pacer::FramePacer::new(),
+            frame_pacer: crate::frame_pacer::FramePacer::with_refresh_rate_mhz(startup_refresh_mhz),
             // Treat window creation as activity so the first few frames
             // after startup run at the speculative pacer rhythm. This
             // smooths over the initial PTY-spawn / cell-metrics dance on
@@ -757,6 +824,7 @@ impl ApplicationHandler for AppHandler {
             #[cfg(feature = "input-latency-histogram")]
             input_latency: crate::input_latency::InputLatencyTracker::new()
                 .expect("hdrhistogram construction with valid sigfigs cannot fail"),
+            last_refresh_probe: Instant::now(),
         });
 
         // Run the initial subscription reconcile so streams start immediately.
@@ -887,12 +955,27 @@ impl ApplicationHandler for AppHandler {
                     if let Some(ref cb) = self.app.config.on_scale_factor {
                         cb(new_scale);
                     }
+                    // Scale factor changes almost always correlate with a
+                    // monitor crossing, so re-probe the refresh rate now
+                    // rather than waiting for the next `Moved` event.
+                    refresh_pacer_from_window(state);
                     state.needs_rebuild = true;
                 } else {
                     // Just a resize, only re-layout needed
                     state.needs_relayout = true;
                 }
                 state.window.request_redraw();
+            }
+
+            WindowEvent::Moved(_position) => {
+                // A drag delta fires one event per mouse move; debounce so
+                // we only re-read the compositor every ACTIVITY_WINDOW.
+                // Monitors with different refresh rates (e.g. 144 + 60)
+                // update within 250ms of the drag settling.
+                let now = Instant::now();
+                if state.should_reprobe_refresh(now) {
+                    refresh_pacer_from_window(state);
+                }
             }
 
             WindowEvent::PointerMoved { position, .. } => {
@@ -2085,6 +2168,7 @@ impl ApplicationHandler for AppHandler {
 
                 metrics.total_us = frame_start.elapsed().as_micros() as u64;
                 metrics.rss_bytes = get_rss_bytes();
+                metrics.pacer_min_interval_ns = state.frame_pacer.min_interval().as_nanos() as u64;
 
                 // Debug-only per-second frame-time probe. Feeds this frame's
                 // duration into a rolling window and emits p50/p95/p99
@@ -3278,12 +3362,14 @@ mod tests {
             atlas_fill_ratio: 0.75,
             gpu_upload_bytes: 8192,
             damage_area_px: 1920 * 1080,
+            pacer_min_interval_ns: 6_944_444,
         };
         assert_eq!(m.quad_count, 128);
         assert_eq!(m.glyph_count, 512);
         assert!((m.atlas_fill_ratio - 0.75).abs() < f32::EPSILON);
         assert_eq!(m.gpu_upload_bytes, 8192);
         assert_eq!(m.damage_area_px, 1920 * 1080);
+        assert_eq!(m.pacer_min_interval_ns, 6_944_444);
     }
 
     #[test]
