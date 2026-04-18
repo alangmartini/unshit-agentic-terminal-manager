@@ -277,8 +277,14 @@ mod tests {
 
     #[test]
     fn bench_mode_parse_known() {
-        assert!(matches!(BenchMode::parse("dir-loop"), Some(BenchMode::DirLoop)));
-        assert!(matches!(BenchMode::parse("type-burst"), Some(BenchMode::TypeBurst)));
+        assert!(matches!(
+            BenchMode::parse("dir-loop"),
+            Some(BenchMode::DirLoop)
+        ));
+        assert!(matches!(
+            BenchMode::parse("type-burst"),
+            Some(BenchMode::TypeBurst)
+        ));
     }
 
     #[test]
