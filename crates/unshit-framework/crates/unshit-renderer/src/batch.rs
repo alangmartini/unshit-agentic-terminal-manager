@@ -2299,13 +2299,22 @@ fn emit_grid_cells(
         atlas_generation,
     );
 
-    // Drop any cached rows that refer to rows past the current grid height.
-    // This is cheap and keeps memory bounded when the grid shrinks.
+    // Drop any cached lines whose identity no longer appears in the
+    // current grid. This keeps memory bounded on grid shrink and on any
+    // full-grid identity reset (clear, DECALN). `retain_ids` is built
+    // from the grid's stable line_ids.
     if let Some(cache) = line_cache.as_deref_mut() {
-        cache.truncate_element(node_id, rows as u32);
+        let retain_ids: FxHashSet<u64> = grid.line_ids().iter().copied().collect();
+        cache.retain_element_ids(node_id, &retain_ids);
     }
 
     for row in 0..rows {
+        // Stable line identity: the cache is keyed on `(node, line_id)`
+        // so a scroll that rotates this line to a new row index replays
+        // the cached payload without a miss. `line_id` is assigned by
+        // the grid and moves with the content.
+        let line_id = grid.line_id(row).unwrap_or(0);
+
         // Compute the whole-row content hash. Peer terminals (WezTerm,
         // Alacritty, Zed) use damage bounds as invalidation hints, not
         // emission extent: the hash decides cache freshness, emission
@@ -2314,11 +2323,11 @@ fn emit_grid_cells(
         // "typing a character blanks the rest of the row" bug (issue #63).
         let content_sig = hash_row_cells(cells, row, cols);
 
-        // Cache probe: replay the cached instances for this row when the
+        // Cache probe: replay the cached instances for this line when its
         // content hash and geometry signature still match. Works for both
         // clean and dirty rows because the hash captures any visible change.
         if let Some(cache) = line_cache.as_deref_mut() {
-            if let Some(hit) = cache.lookup_replayable(node_id, row as u32, content_sig, geom_sig) {
+            if let Some(hit) = cache.lookup_replayable(node_id, line_id, content_sig, geom_sig) {
                 batch.quad_instances.extend_from_slice(&hit.quads);
                 batch.glyph_instances.extend_from_slice(&hit.glyphs);
                 for key in &hit.glyph_keys {
@@ -2382,19 +2391,11 @@ fn emit_grid_cells(
             }
         }
 
-        // Store the fresh row in the cache. Because `emit_grid_row_fresh`
-        // spans the whole row this payload is complete, so subsequent
-        // frames that HIT this content hash replay every cell.
+        // Store the fresh line in the cache keyed by its stable identity.
+        // Subsequent frames that see the same line_id + content_sig replay
+        // this payload without shaping.
         if let Some(cache) = line_cache.as_deref_mut() {
-            cache.store(
-                node_id,
-                row as u32,
-                content_sig,
-                geom_sig,
-                row_quads,
-                row_glyphs,
-                row_keys,
-            );
+            cache.store(node_id, line_id, content_sig, geom_sig, row_quads, row_glyphs, row_keys);
         }
     }
 
@@ -4193,7 +4194,10 @@ mod tests {
         let geom = LineGeometrySig::new(0.0, 0.0, 10.0, 20.0, 14.0, 1.0, [0.0; 4], cols as u32, 0);
         let mut cache = LineQuadCache::new();
         let node = NodeId { index: 0, generation: 0 };
-        cache.store(node, 0, content_sig_frame1, geom, frame1_quads.clone(), vec![], vec![]);
+        // Line identity for row 0 comes from the grid (Step 3 keys the
+        // cache on stable `line_id`, not row index).
+        let line_id = grid.line_id(0).expect("row 0 has a line id");
+        cache.store(node, line_id, content_sig_frame1, geom, frame1_quads.clone(), vec![], vec![]);
         assert_eq!(frame1_quads.len(), cols, "frame 1 emission must span full row");
 
         // Frame 2: user types 'Z' at column 3 with a distinct bg color.
@@ -4236,7 +4240,7 @@ mod tests {
             [0.0; 4],
             &mut frame2_quads,
         );
-        cache.store(node, 0, content_sig_frame2, geom, frame2_quads.clone(), vec![], vec![]);
+        cache.store(node, line_id, content_sig_frame2, geom, frame2_quads.clone(), vec![], vec![]);
 
         assert_eq!(
             frame2_quads.len(),
@@ -4249,7 +4253,7 @@ mod tests {
         // Frame 3: the cached payload must be replayable AS-IS for the new
         // content hash, and the replay must contain every column.
         let hit = cache
-            .lookup_replayable(node, 0, content_sig_frame2, geom)
+            .lookup_replayable(node, line_id, content_sig_frame2, geom)
             .expect("cache must hit the payload we just stored");
         assert_eq!(
             hit.quads.len(),
@@ -4286,13 +4290,16 @@ mod tests {
         let content_sig = hash_row_cells(grid.cells(), 0, cols);
         let mut cache = LineQuadCache::new();
         let node = NodeId { index: 0, generation: 0 };
-        cache.store(node, 0, content_sig, stale_geom, vec![], vec![], vec![]);
+        // Cache key is (node, line_id) post-Step 3: use the grid's id for
+        // row 0 so the test mirrors production lookup shape.
+        let line_id = grid.line_id(0).expect("row 0 has a line id");
+        cache.store(node, line_id, content_sig, stale_geom, vec![], vec![], vec![]);
 
         // Bump the atlas generation: geometry signature no longer matches.
         let fresh_geom =
             LineGeometrySig::new(0.0, 0.0, 10.0, 20.0, 14.0, 1.0, [0.0; 4], cols as u32, 1);
         assert!(
-            cache.lookup_replayable(node, 0, content_sig, fresh_geom).is_none(),
+            cache.lookup_replayable(node, line_id, content_sig, fresh_geom).is_none(),
             "atlas generation bump must miss the stale cache entry",
         );
 
@@ -4320,9 +4327,9 @@ mod tests {
 
         // Store the fresh payload and confirm the cache now carries a
         // whole-row entry against the new geometry signature.
-        cache.store(node, 0, content_sig, fresh_geom, fresh_quads.clone(), vec![], vec![]);
+        cache.store(node, line_id, content_sig, fresh_geom, fresh_quads.clone(), vec![], vec![]);
         let hit = cache
-            .lookup_replayable(node, 0, content_sig, fresh_geom)
+            .lookup_replayable(node, line_id, content_sig, fresh_geom)
             .expect("fresh payload must be retrievable under the new geometry");
         assert_eq!(
             hit.quads.len(),
