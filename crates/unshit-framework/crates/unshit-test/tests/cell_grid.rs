@@ -1,6 +1,6 @@
 //! Tests for the CellGrid rendering primitive.
 
-use unshit_core::cell_grid::{color_256, Cell, CellAttrs, CellGrid, LineDamage, ANSI_16};
+use unshit_core::cell_grid::{color_256, BgRun, Cell, CellAttrs, CellGrid, LineDamage, ANSI_16};
 use unshit_core::style::types::Color;
 
 // ---------------------------------------------------------------------------
@@ -876,4 +876,245 @@ fn compute_style_runs_wide_continuation_shares_style() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].start_col, 0);
     assert_eq!(runs[0].end_col, 3);
+}
+
+// ---------------------------------------------------------------------------
+// compute_bg_runs (issue #84)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compute_bg_runs_merges_across_fg_changes() {
+    // Row with uniform bg and varying fg must collapse to a single bg run.
+    // This is the core win of #84: colorized text rows emit one bg quad
+    // instead of one per style run.
+    let mut g = CellGrid::new(1, 6);
+    let bg = Color::rgb(30, 60, 120);
+    let fg_a = Color::rgb(255, 255, 255);
+    let fg_b = Color::rgb(200, 80, 80);
+    let fg_c = Color::rgb(80, 200, 80);
+    g.set_cell(0, 0, styled('a', fg_a, bg, CellAttrs::empty()));
+    g.set_cell(0, 1, styled('b', fg_b, bg, CellAttrs::empty()));
+    g.set_cell(0, 2, styled('c', fg_c, bg, CellAttrs::empty()));
+    g.set_cell(0, 3, styled('d', fg_a, bg, CellAttrs::empty()));
+    g.set_cell(0, 4, styled('e', fg_b, bg, CellAttrs::empty()));
+    g.set_cell(0, 5, styled('f', fg_c, bg, CellAttrs::empty()));
+
+    let runs = g.compute_bg_runs(0);
+
+    assert_eq!(runs.len(), 1, "uniform bg with varying fg must merge into one run");
+    assert_eq!(runs[0], BgRun { start_col: 0, end_col: 6, bg });
+}
+
+#[test]
+fn compute_bg_runs_splits_on_bg_change() {
+    // Two bg stripes separated by a color boundary must produce exactly
+    // two runs, not one per style run.
+    let mut g = CellGrid::new(1, 6);
+    let fg = Color::rgb(255, 255, 255);
+    let red = Color::rgb(200, 30, 30);
+    let green = Color::rgb(30, 200, 30);
+    for col in 0..3 {
+        g.set_cell(0, col, styled('x', fg, red, CellAttrs::empty()));
+    }
+    for col in 3..6 {
+        g.set_cell(0, col, styled('x', fg, green, CellAttrs::empty()));
+    }
+
+    let runs = g.compute_bg_runs(0);
+
+    assert_eq!(
+        runs,
+        vec![
+            BgRun { start_col: 0, end_col: 3, bg: red },
+            BgRun { start_col: 3, end_col: 6, bg: green },
+        ]
+    );
+}
+
+#[test]
+fn compute_bg_runs_ignores_attribute_changes() {
+    // BOLD/ITALIC/UNDERLINE changes must NOT split a bg run. These attrs
+    // affect glyph rendering but not the underlying bg color.
+    let mut g = CellGrid::new(1, 4);
+    let fg = Color::rgb(255, 255, 255);
+    let bg = Color::rgb(50, 50, 100);
+    g.set_cell(0, 0, styled('a', fg, bg, CellAttrs::empty()));
+    g.set_cell(0, 1, styled('b', fg, bg, CellAttrs::BOLD));
+    g.set_cell(0, 2, styled('c', fg, bg, CellAttrs::ITALIC));
+    g.set_cell(0, 3, styled('d', fg, bg, CellAttrs::UNDERLINE));
+
+    let runs = g.compute_bg_runs(0);
+
+    assert_eq!(runs, vec![BgRun { start_col: 0, end_col: 4, bg }]);
+}
+
+#[test]
+fn compute_bg_runs_wide_primary_and_continuation_merge() {
+    // The continuation cell of a wide glyph stores the primary's bg
+    // (see `set_wide_cell`). A narrow cell with the same bg past the
+    // continuation must merge into the same bg run.
+    let mut g = CellGrid::new(1, 4);
+    let fg = Color::rgb(255, 255, 255);
+    let bg = Color::rgb(90, 90, 90);
+    g.set_wide_cell(0, 0, styled('漢', fg, bg, CellAttrs::empty()));
+    g.set_cell(0, 2, styled('a', fg, bg, CellAttrs::empty()));
+    // Cell at col 3 has a different bg, ensuring we really split there.
+    let other_bg = Color::rgb(30, 30, 30);
+    g.set_cell(0, 3, styled('b', fg, other_bg, CellAttrs::empty()));
+
+    let runs = g.compute_bg_runs(0);
+
+    assert_eq!(
+        runs,
+        vec![
+            BgRun { start_col: 0, end_col: 3, bg },
+            BgRun { start_col: 3, end_col: 4, bg: other_bg },
+        ]
+    );
+}
+
+#[test]
+fn compute_bg_runs_inverse_uses_fg_as_effective_bg() {
+    // A cell with INVERSE has its fg and bg swapped at emission time. The
+    // bg run pass applies the swap before comparing so inverse cells
+    // sharing a post swap bg merge.
+    let mut g = CellGrid::new(1, 3);
+    let yellow = Color::rgb(255, 200, 50);
+    let black = Color::rgb(0, 0, 0);
+    // Cell 0: inverse sets effective bg = yellow (fg before swap).
+    g.set_cell(0, 0, styled('a', yellow, black, CellAttrs::INVERSE));
+    // Cell 1: non inverse with bg = yellow. Merges with cell 0.
+    g.set_cell(0, 1, styled('b', black, yellow, CellAttrs::empty()));
+    // Cell 2: non inverse with bg = black. Splits.
+    g.set_cell(0, 2, styled('c', yellow, black, CellAttrs::empty()));
+
+    let runs = g.compute_bg_runs(0);
+
+    assert_eq!(
+        runs,
+        vec![
+            BgRun { start_col: 0, end_col: 2, bg: yellow },
+            BgRun { start_col: 2, end_col: 3, bg: black },
+        ]
+    );
+}
+
+#[test]
+fn compute_bg_runs_range_clips_to_window() {
+    // Callers may narrow the emission range; runs must never cross the
+    // requested boundaries.
+    let mut g = CellGrid::new(1, 6);
+    let fg = Color::rgb(255, 255, 255);
+    let bg = Color::rgb(90, 180, 90);
+    for col in 0..6 {
+        g.set_cell(0, col, styled('x', fg, bg, CellAttrs::empty()));
+    }
+
+    let runs = g.compute_bg_runs_in_range(0, 2, 5);
+
+    assert_eq!(runs, vec![BgRun { start_col: 2, end_col: 5, bg }]);
+}
+
+#[test]
+fn compute_bg_runs_empty_on_bad_inputs() {
+    // Out of bounds row or zero width range returns an empty vector.
+    let g = CellGrid::new(2, 4);
+    assert!(g.compute_bg_runs(10).is_empty());
+    assert!(g.compute_bg_runs_in_range(0, 2, 2).is_empty());
+    assert!(g.compute_bg_runs_in_range(0, 5, 10).is_empty());
+}
+
+#[test]
+fn compute_bg_runs_collapses_default_bg_row() {
+    // A fully default row (bg = TRANSPARENT for every cell) is a single
+    // run with alpha 0. The renderer is responsible for eliding alpha 0
+    // quads; this test pins the underlying primitive behavior so the
+    // elision contract has a stable foundation.
+    let g = CellGrid::new(1, 8);
+    let runs = g.compute_bg_runs(0);
+    assert_eq!(runs.len(), 1, "default row is one bg run");
+    assert_eq!(runs[0].bg, Color::TRANSPARENT);
+    assert_eq!(runs[0].start_col, 0);
+    assert_eq!(runs[0].end_col, 8);
+}
+
+#[test]
+fn compute_bg_runs_recomputes_correctly_after_single_cell_bg_change() {
+    // Integration contract #84 test 12: splice path rebuilds bg runs
+    // correctly when only bg changes in one cell. Mirrors the splice
+    // flow: row starts uniform, a single cell's bg is rewritten, and
+    // the next compute_bg_runs call must reflect the new boundary.
+    let mut g = CellGrid::new(1, 10);
+    let fg = Color::rgb(255, 255, 255);
+    let red = Color::rgb(200, 20, 20);
+    for col in 0..10 {
+        g.set_cell(0, col, styled('x', fg, red, CellAttrs::empty()));
+    }
+    // Initial state: one single run.
+    assert_eq!(g.compute_bg_runs(0), vec![BgRun { start_col: 0, end_col: 10, bg: red }]);
+
+    // Change col 3's bg to blue (fg unchanged). The splice path
+    // re-emits bg for the full row, so we verify the recomputed runs
+    // directly.
+    let blue = Color::rgb(20, 30, 200);
+    g.set_cell(0, 3, styled('Z', fg, blue, CellAttrs::empty()));
+
+    let runs = g.compute_bg_runs(0);
+    assert_eq!(
+        runs,
+        vec![
+            BgRun { start_col: 0, end_col: 3, bg: red },
+            BgRun { start_col: 3, end_col: 4, bg: blue },
+            BgRun { start_col: 4, end_col: 10, bg: red },
+        ]
+    );
+}
+
+#[test]
+fn compute_bg_runs_stays_consistent_when_fg_changes_alongside_bg() {
+    // Integration contract #84 test 13: when fg and bg both change in
+    // the same cell, the bg runs are driven solely by the new bg. The
+    // fg change must not appear as a new bg split.
+    let mut g = CellGrid::new(1, 8);
+    let fg_before = Color::rgb(255, 255, 255);
+    let fg_after = Color::rgb(255, 230, 80);
+    let red = Color::rgb(200, 20, 20);
+    let cyan = Color::rgb(20, 200, 200);
+    for col in 0..8 {
+        g.set_cell(0, col, styled('x', fg_before, red, CellAttrs::empty()));
+    }
+
+    g.set_cell(0, 5, styled('y', fg_after, cyan, CellAttrs::empty()));
+
+    let runs = g.compute_bg_runs(0);
+    assert_eq!(
+        runs,
+        vec![
+            BgRun { start_col: 0, end_col: 5, bg: red },
+            BgRun { start_col: 5, end_col: 6, bg: cyan },
+            BgRun { start_col: 6, end_col: 8, bg: red },
+        ]
+    );
+}
+
+#[test]
+fn compute_bg_runs_merges_regardless_of_fg_change_only() {
+    // Integration contract #84: a fg-only change must not split the bg
+    // run at that column. This is the core reason the bg pass exists.
+    let mut g = CellGrid::new(1, 6);
+    let fg_a = Color::rgb(200, 80, 80);
+    let fg_b = Color::rgb(80, 200, 80);
+    let bg = Color::rgb(30, 30, 30);
+    for col in 0..6 {
+        let fg = if col == 3 { fg_b } else { fg_a };
+        g.set_cell(0, col, styled('x', fg, bg, CellAttrs::empty()));
+    }
+
+    let runs = g.compute_bg_runs(0);
+
+    assert_eq!(
+        runs,
+        vec![BgRun { start_col: 0, end_col: 6, bg }],
+        "fg-only change must not split bg run",
+    );
 }
