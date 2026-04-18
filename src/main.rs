@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod bridge;
 pub mod git;
 pub mod persist;
@@ -182,7 +183,52 @@ fn user_shortcut_bindings() -> Vec<(String, String)> {
     ]
 }
 
+fn parse_bench_args() -> Option<crate::bench::BenchConfig> {
+    let mut args = std::env::args().skip(1);
+    let mut mode: Option<crate::bench::BenchMode> = None;
+    let mut duration_secs: f64 = 10.0;
+    let mut warmup_secs: f64 = 2.5;
+    let mut out_path: std::path::PathBuf = "bench.json".into();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--bench" => {
+                if let Some(m) = args.next() {
+                    mode = crate::bench::BenchMode::parse(&m);
+                    if mode.is_none() {
+                        eprintln!("unknown bench mode: {m}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--duration" => {
+                if let Some(s) = args.next() {
+                    duration_secs = s.parse().unwrap_or(duration_secs);
+                }
+            }
+            "--warmup" => {
+                if let Some(s) = args.next() {
+                    warmup_secs = s.parse().unwrap_or(warmup_secs);
+                }
+            }
+            "--out" => {
+                if let Some(s) = args.next() {
+                    out_path = s.into();
+                }
+            }
+            _ => {}
+        }
+    }
+    mode.map(|mode| crate::bench::BenchConfig {
+        mode,
+        duration: std::time::Duration::from_secs_f64(duration_secs),
+        warmup: std::time::Duration::from_secs_f64(warmup_secs),
+        out_path,
+    })
+}
+
 fn main() {
+    let bench_config = parse_bench_args();
+
     // Guard against ghost handles (#32): ensure the process exits
     // immediately on Ctrl+C or panic so spawn_blocking reader tasks
     // (bridge.rs) cannot keep the .exe locked on Windows (os error 32).
@@ -298,6 +344,10 @@ fn main() {
         }
     }
 
+    if let Some(cfg) = bench_config {
+        crate::bench::start(cfg, shared.clone());
+    }
+
     let tree_shared = shared.clone();
     let command_shared = shared.clone();
     let metrics_shared = shared.clone();
@@ -361,6 +411,7 @@ fn main() {
                 );
                 resize_all_terminals(&mut guard, cols, rows);
             })),
+            on_frame_metrics: Some(Box::new(|m| crate::bench::record_frame(m))),
             ..Default::default()
         },
         move || {

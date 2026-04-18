@@ -7,3 +7,4 @@ Cargo.lock
 target2/
 prototype/
 .omx/
+bench*.json
