@@ -333,12 +333,13 @@ impl<'a> crate::frame_pacer::MonitorRefreshSource for WindowRefreshSource<'a> {
 /// Wayland configs).
 fn refresh_pacer_from_window(state: &mut AppState) {
     let source = WindowRefreshSource(&*state.window);
+    let before = state.frame_pacer.min_interval();
     crate::frame_pacer::refresh_pacer_from_source(&mut state.frame_pacer, &source);
     state.last_refresh_probe = Instant::now();
-    log::info!(
-        "pacer coalescing interval: {:.3}ms",
-        state.frame_pacer.min_interval().as_secs_f64() * 1000.0
-    );
+    let after = state.frame_pacer.min_interval();
+    if after != before {
+        log::info!("pacer coalescing interval: {:.3}ms", after.as_secs_f64() * 1000.0);
+    }
 }
 
 impl AppState {
@@ -620,13 +621,10 @@ impl ApplicationHandler for AppHandler {
         // coalesce at the real panel rhythm rather than the historic 8ms
         // default. Falls back to 0 (and thus `DEFAULT_MIN_INTERVAL`) on
         // platforms or configurations that cannot report the rate.
-        let startup_refresh_mhz = window
-            .current_monitor()
-            .or_else(|| window.primary_monitor())
-            .and_then(|m| m.current_video_mode())
-            .and_then(|v| v.refresh_rate_millihertz())
-            .map(|nz| nz.get())
-            .unwrap_or(0);
+        let startup_refresh_mhz = {
+            use crate::frame_pacer::MonitorRefreshSource as _;
+            WindowRefreshSource(&*window).current_refresh_mhz().unwrap_or(0)
+        };
         log::info!("Display refresh rate: {} mHz", startup_refresh_mhz);
 
         let mut gpu = pollster::block_on(GpuContext::new(window.clone()));

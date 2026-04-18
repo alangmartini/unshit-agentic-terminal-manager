@@ -182,7 +182,8 @@ struct Report {
     mid_draw_events_dropped: u64,
     /// Frame pacer coalescing interval in milliseconds, derived from the
     /// active monitor's refresh rate. 8.0 on the historic fallback path;
-    /// ~6.944 on 144Hz, ~4.166 on 240Hz.
+    /// ~6.944 on 144Hz, ~4.166 on 240Hz. Makes before/after bench
+    /// comparisons legible by exposing the effective frame-rate ceiling.
     pacer_min_interval_ms: f64,
 }
 
@@ -451,16 +452,6 @@ mod tests {
     fn build_report_computes_percentiles() {
         let _g = guard();
         activate();
-        {
-            let mut s = state().lock().unwrap();
-            s.samples_us.clear();
-            s.frames = 0;
-            s.tree_build_us_sum = 0;
-            s.layout_us_sum = 0;
-            s.batch_us_sum = 0;
-            s.gpu_us_sum = 0;
-            s.last_pacer_min_interval_ns = 0;
-        }
         for ms in 1..=10u64 {
             record_frame(&FrameMetrics {
                 total_us: ms * 1000,
@@ -588,16 +579,6 @@ mod tests {
     fn report_records_pacer_min_interval_from_last_frame() {
         let _g = guard();
         activate();
-        {
-            let mut s = state().lock().unwrap();
-            s.samples_us.clear();
-            s.frames = 0;
-            s.tree_build_us_sum = 0;
-            s.layout_us_sum = 0;
-            s.batch_us_sum = 0;
-            s.gpu_us_sum = 0;
-            s.last_pacer_min_interval_ns = 0;
-        }
         record_frame(&FrameMetrics {
             total_us: 5_000,
             pacer_min_interval_ns: 6_944_444,
@@ -616,16 +597,6 @@ mod tests {
     fn report_pacer_min_interval_is_zero_without_frames() {
         let _g = guard();
         activate();
-        {
-            let mut s = state().lock().unwrap();
-            s.samples_us.clear();
-            s.frames = 0;
-            s.tree_build_us_sum = 0;
-            s.layout_us_sum = 0;
-            s.batch_us_sum = 0;
-            s.gpu_us_sum = 0;
-            s.last_pacer_min_interval_ns = 0;
-        }
         let r = build_report(BenchMode::DirLoop, Duration::from_secs(1));
         assert_eq!(r.pacer_min_interval_ms, 0.0);
         deactivate();
