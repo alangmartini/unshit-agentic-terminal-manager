@@ -151,6 +151,13 @@ pub struct CachedLineState {
     /// Per-column index into `glyphs`/`glyph_keys`. `None` when the cell
     /// at that column produced no glyph. Length is `cols`.
     pub glyph_col_index: Vec<Option<u32>>,
+    /// Row index at the time the payload was built. The vertex instances
+    /// in `quads` and `glyphs` carry absolute Y positions computed from
+    /// this row. Issue #77: when a line's stable `line_id` rotates to a
+    /// new row via `CellGrid::scroll_up` / `shift_rows`, replay must
+    /// translate Y by `(current_row - cached_row) * cell_h` so the
+    /// cached payload paints at its new row slot rather than the old.
+    pub cached_row: usize,
 }
 
 /// Per element cache: one `CachedLineState` per `(NodeId, line_id)` where
@@ -212,6 +219,11 @@ impl LineQuadCache {
     /// indices can pass an empty vec, which disables the Step 4 column
     /// splice fast path for that entry. See `CachedLineState` for the
     /// full contract.
+    ///
+    /// `cached_row` is the row index the vertex instances were built
+    /// against. `lookup_and_retarget` uses it to translate Y when the
+    /// line rotates to a new row via scroll / shift without a content
+    /// change (issue #77).
     #[allow(clippy::too_many_arguments)]
     pub fn store(
         &mut self,
@@ -223,6 +235,7 @@ impl LineQuadCache {
         glyphs: Vec<GlyphInstance>,
         glyph_keys: Vec<GlyphKey>,
         glyph_col_index: Vec<Option<u32>>,
+        cached_row: usize,
     ) {
         self.lines.insert(
             (node, line_id),
@@ -233,8 +246,47 @@ impl LineQuadCache {
                 glyphs,
                 glyph_keys,
                 glyph_col_index,
+                cached_row,
             },
         );
+    }
+
+    /// Look up a replayable entry and retarget its vertex Y positions
+    /// to `current_row` when the cached row differs. Returns the
+    /// (possibly translated) entry. The translation is applied in
+    /// place and `cached_row` is updated so subsequent replays at the
+    /// same row hit the pure slice fast path without recomputation.
+    ///
+    /// Issue #77: `CellGrid::scroll_up` / `shift_rows` rotate
+    /// `line_id` alongside content. The cache keyed on stable
+    /// `line_id` hits for a scrolled line, but the vertex instances
+    /// still carry the pre-scroll absolute Y. Without this method,
+    /// the pure slice fast path replays at the old row slot and
+    /// overlaps whatever the new row is rendering there.
+    pub fn lookup_and_retarget(
+        &mut self,
+        node: NodeId,
+        line_id: u64,
+        content_sig: u64,
+        geometry: LineGeometrySig,
+        current_row: usize,
+        cell_h: f32,
+    ) -> Option<&CachedLineState> {
+        let cached = self.lines.get_mut(&(node, line_id))?;
+        if cached.content_sig != content_sig || cached.geometry != Some(geometry) {
+            return None;
+        }
+        if cached.cached_row != current_row {
+            let dy = (current_row as f32 - cached.cached_row as f32) * cell_h;
+            for q in cached.quads.iter_mut() {
+                q.pos[1] += dy;
+            }
+            for g in cached.glyphs.iter_mut() {
+                g.pos[1] += dy;
+            }
+            cached.cached_row = current_row;
+        }
+        Some(cached)
     }
 
     /// Drop any cached lines for this node whose `line_id` is not in
@@ -396,6 +448,7 @@ mod tests {
             glyphs.clone(),
             keys.clone(),
             vec![],
+            0,
         );
 
         let hit = cache.lookup_replayable(node, line_id, 0xdeadbeef, sig);
@@ -412,7 +465,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         let line_id: u64 = 7;
-        cache.store(node, line_id, 0x1111, sig, vec![], vec![], vec![], vec![]);
+        cache.store(node, line_id, 0x1111, sig, vec![], vec![], vec![], vec![], 0);
         assert!(cache.lookup_replayable(node, line_id, 0x1111, sig).is_some());
         // Different content hash -> miss.
         assert!(cache.lookup_replayable(node, line_id, 0x2222, sig).is_none());
@@ -424,7 +477,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         let line_id: u64 = 11;
-        cache.store(node, line_id, 0x1, sig, vec![], vec![], vec![], vec![]);
+        cache.store(node, line_id, 0x1, sig, vec![], vec![], vec![], vec![], 0);
         let moved = LineGeometrySig::new(10.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         assert!(cache.lookup_replayable(node, line_id, 0x1, moved).is_none());
     }
@@ -435,7 +488,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 3);
         let line_id: u64 = 42;
-        cache.store(node, line_id, 0xaaaa, sig, vec![], vec![], vec![], vec![]);
+        cache.store(node, line_id, 0xaaaa, sig, vec![], vec![], vec![], vec![], 0);
         let bumped = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 4);
         assert!(
             cache.lookup_replayable(node, line_id, 0xaaaa, bumped).is_none(),
@@ -450,7 +503,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         for id in 0..5u64 {
-            cache.store(node, id, id, sig, vec![], vec![], vec![], vec![]);
+            cache.store(node, id, id, sig, vec![], vec![], vec![], vec![], 0);
         }
         assert_eq!(cache.len(), 5);
         let mut retain: FxHashSet<u64> = FxHashSet::default();
@@ -469,8 +522,8 @@ mod tests {
         let a = NodeId { index: 0, generation: 0 };
         let b = NodeId { index: 1, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
-        cache.store(a, 0, 1, sig, vec![], vec![], vec![], vec![]);
-        cache.store(b, 0, 2, sig, vec![], vec![], vec![], vec![]);
+        cache.store(a, 0, 1, sig, vec![], vec![], vec![], vec![], 0);
+        cache.store(b, 0, 2, sig, vec![], vec![], vec![], vec![], 0);
         cache.forget_element(a);
         assert!(cache.get(a, 0).is_none());
         assert!(cache.get(b, 0).is_some());
@@ -503,9 +556,9 @@ mod tests {
         let id_a: u64 = 100;
         let id_b: u64 = 101;
         let id_c: u64 = 102;
-        cache.store(node, id_a, 0xaa, sig, vec![], vec![], vec![], vec![]);
-        cache.store(node, id_b, 0xbb, sig, vec![], vec![], vec![], vec![]);
-        cache.store(node, id_c, 0xcc, sig, vec![], vec![], vec![], vec![]);
+        cache.store(node, id_a, 0xaa, sig, vec![], vec![], vec![], vec![], 0);
+        cache.store(node, id_b, 0xbb, sig, vec![], vec![], vec![], vec![], 0);
+        cache.store(node, id_c, 0xcc, sig, vec![], vec![], vec![], vec![], 0);
 
         // After a scroll_up(1) inside CellGrid, the lines that held ids
         // 101 and 102 have rotated to earlier row indices while keeping
@@ -515,14 +568,102 @@ mod tests {
     }
 
     #[test]
+    fn lookup_and_retarget_translates_y_when_row_changes() {
+        // Regression for issue #77. Cached vertex instances carry
+        // absolute Y (origin_y + row * cell_h). When a line's stable
+        // `line_id` rotates to a different row via
+        // `CellGrid::scroll_up` / `shift_rows`, the cache hit path
+        // must translate the payload's Y to the new row slot. Without
+        // this, scrolled lines paint at their pre-scroll Y and overlap
+        // whatever now renders at the old slot, which is the overlap
+        // observed after heavy PTY output like `dir`.
+        let mut cache = LineQuadCache::new();
+        let node = NodeId { index: 0, generation: 0 };
+        let cell_h: f32 = 18.0;
+        let origin_y: f32 = 0.0;
+        let sig = LineGeometrySig::new(0.0, origin_y, 9.0, cell_h, 14.0, 1.0, [0.0; 4], 80, 0);
+        let line_id: u64 = 42;
+        let cached_row: usize = 10;
+        let cached_y = origin_y + cached_row as f32 * cell_h;
+
+        let mut quad = QuadInstance::zeroed();
+        quad.pos = [0.0, cached_y];
+        quad.size = [9.0, cell_h];
+        let mut glyph = GlyphInstance::zeroed();
+        glyph.pos = [0.0, cached_y];
+        glyph.size = [9.0, cell_h];
+        cache.store(
+            node,
+            line_id,
+            0xbeef,
+            sig,
+            vec![quad],
+            vec![glyph],
+            vec![],
+            vec![],
+            cached_row,
+        );
+
+        let current_row: usize = 9;
+        let expected_y = origin_y + current_row as f32 * cell_h;
+        let hit = cache
+            .lookup_and_retarget(node, line_id, 0xbeef, sig, current_row, cell_h)
+            .expect("cache must hit by stable line_id after scroll");
+        assert!(
+            (hit.quads[0].pos[1] - expected_y).abs() < f32::EPSILON,
+            "quad Y must translate from {cached_y} to {expected_y} on row change, got {}",
+            hit.quads[0].pos[1],
+        );
+        assert!(
+            (hit.glyphs[0].pos[1] - expected_y).abs() < f32::EPSILON,
+            "glyph Y must translate from {cached_y} to {expected_y} on row change, got {}",
+            hit.glyphs[0].pos[1],
+        );
+
+        // Second replay at the same current_row hits the fast path:
+        // cached_row is already up to date, no further translation.
+        let hit2 = cache
+            .lookup_and_retarget(node, line_id, 0xbeef, sig, current_row, cell_h)
+            .expect("cache must still hit on second replay");
+        assert!(
+            (hit2.quads[0].pos[1] - expected_y).abs() < f32::EPSILON,
+            "second replay must keep Y at {expected_y}, got {}",
+            hit2.quads[0].pos[1],
+        );
+    }
+
+    #[test]
+    fn lookup_and_retarget_is_noop_when_row_unchanged() {
+        // When the cached row matches the current row, the method must
+        // leave the payload untouched. This is the steady-state hot
+        // path: most frames reuse entries at the same row they were
+        // stored from, so translation cost stays paid only on scroll.
+        let mut cache = LineQuadCache::new();
+        let node = NodeId { index: 0, generation: 0 };
+        let cell_h: f32 = 18.0;
+        let sig = LineGeometrySig::new(0.0, 0.0, 9.0, cell_h, 14.0, 1.0, [0.0; 4], 80, 0);
+        let line_id: u64 = 7;
+        let stored_y = 5.0 * cell_h;
+        let mut quad = QuadInstance::zeroed();
+        quad.pos = [0.0, stored_y];
+        cache.store(node, line_id, 0xfeed, sig, vec![quad], vec![], vec![], vec![], 5);
+
+        let hit = cache.lookup_and_retarget(node, line_id, 0xfeed, sig, 5, cell_h).unwrap();
+        assert!(
+            (hit.quads[0].pos[1] - stored_y).abs() < f32::EPSILON,
+            "Y must remain at {stored_y} when cached_row == current_row",
+        );
+    }
+
+    #[test]
     fn retain_does_not_touch_other_nodes() {
         use rustc_hash::FxHashSet;
         let mut cache = LineQuadCache::new();
         let a = NodeId { index: 0, generation: 0 };
         let b = NodeId { index: 1, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
-        cache.store(a, 5, 1, sig, vec![], vec![], vec![], vec![]);
-        cache.store(b, 5, 2, sig, vec![], vec![], vec![], vec![]);
+        cache.store(a, 5, 1, sig, vec![], vec![], vec![], vec![], 0);
+        cache.store(b, 5, 2, sig, vec![], vec![], vec![], vec![], 0);
         // Retain nothing under `a`; `b`'s entries must survive.
         let retain: FxHashSet<u64> = FxHashSet::default();
         cache.retain_element_ids(a, &retain);
@@ -567,7 +708,7 @@ mod tests {
             gradient_extra: [0.0; 4],
         };
         let line_id: u64 = 9;
-        cache.store(node, line_id, 42, sig, vec![quad], vec![], vec![], vec![]);
+        cache.store(node, line_id, 42, sig, vec![quad], vec![], vec![], vec![], 0);
 
         let hit1 = cache.lookup_replayable(node, line_id, 42, sig).unwrap();
         let first_bytes = bytemuck::bytes_of(&hit1.quads[0]).to_vec();
@@ -591,7 +732,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         let line_id: u64 = 42;
-        cache.store(node, line_id, 0xbeef, sig, vec![], vec![], vec![], vec![]);
+        cache.store(node, line_id, 0xbeef, sig, vec![], vec![], vec![], vec![], 0);
 
         // Simulate a scroll: the same line identity now occupies a
         // different row. Under the new cache key, this is a no-op.
@@ -615,7 +756,7 @@ mod tests {
         let node = NodeId { index: 0, generation: 0 };
         let sig = LineGeometrySig::new(0.0, 0.0, 9.0, 18.0, 14.0, 1.0, [0.0; 4], 80, 0);
         let line_id: u64 = 77;
-        cache.store(node, line_id, 0xa1a1, sig, vec![], vec![], vec![], vec![]);
+        cache.store(node, line_id, 0xa1a1, sig, vec![], vec![], vec![], vec![], 0);
         // Same id, new content hash -> miss.
         assert!(
             cache.lookup_replayable(node, line_id, 0xb2b2, sig).is_none(),
