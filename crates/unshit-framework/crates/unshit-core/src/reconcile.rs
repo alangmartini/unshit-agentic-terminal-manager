@@ -1,7 +1,7 @@
 //! Tree reconciliation engine - diffs ElementDef against live Element tree.
 
 use crate::dirty::DirtyFlags;
-use crate::element::{Element, ElementDef, SelectOption, SelectState, Tag};
+use crate::element::{Element, ElementDef, ElementDefBump, SelectOption, SelectState, Tag};
 use crate::id::NodeId;
 use crate::layout::TextMeasureCtx;
 use crate::tree::NodeArena;
@@ -50,6 +50,45 @@ pub fn reconcile(
     let mut pending_mounts: PendingMounts = Vec::new();
     reconcile_inner(arena, taffy, node_id, new_def, &mut pending_mounts);
     pending_mounts
+}
+
+/// Bump-aware variant of [`reconcile`] that accepts an arena-backed
+/// [`ElementDefBump`] tree.
+///
+/// This is the additive entry point introduced with [`crate::frame_arena`].
+/// The caller passes a tree whose nodes, children vectors, and string
+/// slices all live inside a [`crate::frame_arena::FrameArena`]; the
+/// reconciler materializes the minimum required data into the persistent
+/// [`NodeArena`].
+///
+/// The current implementation converts each subtree to an owned
+/// [`ElementDef`] on demand via `to_owned_def`, then routes through the
+/// existing reconcile path. That keeps the diffing logic single sourced
+/// while still realizing the main performance win: user-side tree
+/// construction no longer allocates per node. A later follow-up may push
+/// the bump tree deeper into reconcile to drop the materialization step
+/// entirely.
+pub fn reconcile_bump<'a>(
+    arena: &mut NodeArena,
+    taffy: &mut TaffyTree<TextMeasureCtx>,
+    node_id: NodeId,
+    new_def: &ElementDefBump<'a>,
+) -> PendingMounts {
+    let owned = new_def.to_owned_def();
+    reconcile(arena, taffy, node_id, &owned)
+}
+
+/// Bump-aware variant of [`build_subtree`] used when the initial tree is
+/// produced via the arena path.
+pub fn build_subtree_bump<'a>(
+    def: &ElementDefBump<'a>,
+    arena: &mut NodeArena,
+    taffy: &mut TaffyTree<TextMeasureCtx>,
+    parent: NodeId,
+    pending_mounts: &mut PendingMounts,
+) -> NodeId {
+    let owned = def.to_owned_def();
+    build_subtree(&owned, arena, taffy, parent, pending_mounts)
 }
 
 fn reconcile_inner(
