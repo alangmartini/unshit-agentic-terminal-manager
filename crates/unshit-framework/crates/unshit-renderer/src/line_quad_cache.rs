@@ -131,9 +131,9 @@ fn hash_color(hasher: &mut rustc_hash::FxHasher, c: Color) {
 /// After issue #52 Step 4 the cache tracks which cached glyph belongs to
 /// which column so the renderer can splice only the damaged column range
 /// on a content-signature miss with matching geometry. Backgrounds are
-/// always re-emitted fresh for the full row because style runs are
+/// always re-emitted fresh for the full row because bg runs are
 /// comparatively cheap (O(cols)) and can legally shift boundaries as
-/// adjacent cell styles change.
+/// adjacent cell bg colors change.
 ///
 /// `glyph_col_index[col] == Some(i)` means `glyphs[i]` and `glyph_keys[i]`
 /// belong to the cell at column `col`. A `None` entry means the cell had

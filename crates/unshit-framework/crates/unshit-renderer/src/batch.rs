@@ -2153,9 +2153,12 @@ struct ResolvedGlyph {
     line_y: f32,
 }
 
-/// Emit a background `QuadInstance` for every style run on `row` between
-/// `start_col` (inclusive) and `end_col` (exclusive). This is the pure,
-/// GPU-independent half of the row emission pipeline used by
+/// Emit a background `QuadInstance` for every bg run on `row` between
+/// `start_col` (inclusive) and `end_col` (exclusive). Adjacent cells with
+/// matching background color merge regardless of foreground color or
+/// attribute flags (issue #84), so colorized text rows with uniform bg
+/// but varying fg per token collapse to a single bg quad. This is the
+/// pure, GPU-independent half of the row emission pipeline used by
 /// `emit_grid_row_fresh`, and every production caller passes the full
 /// row range `0..cols`.
 ///
@@ -2186,12 +2189,20 @@ fn emit_grid_row_backgrounds(
     row_quads: &mut Vec<QuadInstance>,
 ) {
     let py = origin_y + row as f32 * cell_h;
-    for run in grid.compute_style_runs_in_range(row, start_col, end_col) {
-        let bg = run.style.bg;
-        if bg.a == 0 {
+    // Issue #84: merge adjacent cells that share a bg regardless of fg
+    // or attrs. A typical colorized row has uniform bg but varies fg per
+    // token, so collapsing on bg alone cuts redundant bg quads. Mirrors
+    // Zed's `BackgroundRegion` pass.
+    for run in grid.compute_bg_runs_in_range(row, start_col, end_col) {
+        // Default background elision. The terminal cell `DEFAULT_BG` is
+        // fully transparent (see `src/terminal/mod.rs`), and the frame
+        // clear already paints the chrome color which shows through by
+        // design. Emitting a zero alpha quad is a visual no op and a
+        // waste of an instance, so skip it.
+        if run.bg.a == 0 {
             continue;
         }
-        let mut bg_color = bg.to_linear_f32();
+        let mut bg_color = run.bg.to_linear_f32();
         bg_color[3] *= opacity;
         let px = origin_x + run.start_col as f32 * cell_w;
         let width = run.col_count() as f32 * cell_w;
@@ -2784,9 +2795,11 @@ fn emit_grid_row_fresh(
 ) {
     let row_base = row * cols;
 
-    // Merge adjacent cells with the same (fg, bg, attrs) into a single
-    // background QuadInstance across the full row. Mirrors Zed's
-    // BatchedTextRun pattern: one quad per run instead of one per cell.
+    // Merge adjacent cells that share the same background color (ignoring
+    // fg and attrs) into a single background QuadInstance across the
+    // full row. Mirrors Zed's BackgroundRegion pass: one bg quad per bg
+    // color stripe instead of one per style run, so colorized text rows
+    // with uniform bg but varying fg collapse to a single quad.
     emit_grid_row_backgrounds(
         grid, row, 0, cols, origin_x, origin_y, cell_w, cell_h, opacity, clip_rect, row_quads,
     );
@@ -2885,9 +2898,9 @@ fn emit_grid_row_splice(
 ) {
     let row_base = row * cols;
 
-    // Backgrounds: always re-emit for the full row. Style runs are
-    // cheap (O(cols)) and may shift boundaries as cell styles change,
-    // so partial bg splices risk leaving stale runs.
+    // Backgrounds: always re-emit for the full row. Bg runs are cheap
+    // (O(cols)) and may shift boundaries as cell bg colors change, so
+    // partial bg splices risk leaving stale runs.
     emit_grid_row_backgrounds(
         grid, row, 0, cols, origin_x, origin_y, cell_w, cell_h, opacity, clip_rect, row_quads,
     );
@@ -4737,15 +4750,15 @@ mod tests {
         emit_grid_row_backgrounds(&g, 0, 0, 4, 0.0, 0.0, 10.0, 20.0, 1.0, [0.0; 4], &mut out_quads);
 
         // Cells 0, 2, 3 produce opaque quads. Cells 2 and 3 share the same
-        // bg/fg/attrs so compute_style_runs merges them into a single run
-        // covering 20 px. Cell 0 is its own run at x=0. Cell 1 emits
-        // nothing.
+        // bg so compute_bg_runs merges them into a single run covering
+        // 20 px. Cell 0 is its own run at x=0 because the transparent cell
+        // at col 1 splits the bg run. Cell 1 emits nothing.
         assert_eq!(out_quads.len(), 2, "transparent cells must not emit bg quads");
         assert!(out_quads.iter().any(|q| (q.pos[0] - 0.0).abs() < f32::EPSILON));
         assert!(
             out_quads.iter().any(|q| (q.pos[0] - 20.0).abs() < f32::EPSILON
                 && (q.size[0] - 20.0).abs() < f32::EPSILON),
-            "cells 2 and 3 with identical style must merge into a single 20px-wide run",
+            "cells 2 and 3 with identical bg must merge into a single 20px-wide run",
         );
     }
 
@@ -4949,5 +4962,361 @@ mod tests {
             cols,
             "full range emits every column, which is what the fix guarantees"
         );
+    }
+
+    // -- bg region merging (issue #84) --------------------------------------
+    //
+    // After issue #84 the bg emitter iterates `compute_bg_runs_in_range`
+    // instead of `compute_style_runs_in_range`. Rows with uniform bg but
+    // varying fg collapse to a single bg quad. The tests below pin the
+    // merged emission contract and the default-bg elision win.
+
+    #[test]
+    fn emit_grid_row_backgrounds_elides_default_transparent_bg() {
+        use unshit_core::cell_grid::Cell;
+        // Every cell in the row has the terminal DEFAULT_BG (alpha 0). The
+        // renderer must emit zero quads because a transparent quad is a
+        // visual no op and a waste of instance capacity. Pins the core
+        // elision proof the epic spec calls for.
+        let cols = 12;
+        let mut g = CellGrid::new(1, cols);
+        g.clear_dirty();
+        let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+        let transparent = Color { r: 0, g: 0, b: 0, a: 0 };
+        for col in 0..cols {
+            g.set_cell(
+                0,
+                col,
+                Cell {
+                    ch: 'x',
+                    fg,
+                    bg: transparent,
+                    attrs: CellAttrs::empty(),
+                    wide_continuation: false,
+                },
+            );
+        }
+
+        let mut row_quads: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(
+            &g,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0; 4],
+            &mut row_quads,
+        );
+
+        assert!(
+            row_quads.is_empty(),
+            "default transparent bg must emit zero quads; got {} quads",
+            row_quads.len(),
+        );
+    }
+
+    #[test]
+    fn emit_grid_row_backgrounds_merges_same_color_across_fg_boundary() {
+        use unshit_core::cell_grid::Cell;
+        // Row of 10 cells with uniform bg = blue (opaque) and fg
+        // alternating per cell. The style run pass would emit 10 quads;
+        // after #84 the bg pass merges them all into 1.
+        let cols = 10;
+        let mut g = CellGrid::new(1, cols);
+        g.clear_dirty();
+        let blue = Color { r: 20, g: 30, b: 200, a: 255 };
+        let fg_a = Color { r: 255, g: 255, b: 255, a: 255 };
+        let fg_b = Color { r: 10, g: 10, b: 10, a: 255 };
+        for col in 0..cols {
+            let fg = if col % 2 == 0 { fg_a } else { fg_b };
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg: blue, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+
+        let mut row_quads: Vec<QuadInstance> = Vec::new();
+        let cell_w = 10.0;
+        let cell_h = 20.0;
+        emit_grid_row_backgrounds(
+            &g,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            cell_w,
+            cell_h,
+            1.0,
+            [0.0; 4],
+            &mut row_quads,
+        );
+
+        assert_eq!(
+            row_quads.len(),
+            1,
+            "uniform bg across fg boundary must merge into one quad; got {}",
+            row_quads.len(),
+        );
+        let q = row_quads[0];
+        assert!((q.pos[0] - 0.0).abs() < f32::EPSILON, "x must be 0");
+        assert!(
+            (q.size[0] - cols as f32 * cell_w).abs() < f32::EPSILON,
+            "width must span every column: expected {}, got {}",
+            cols as f32 * cell_w,
+            q.size[0],
+        );
+        assert!((q.size[1] - cell_h).abs() < f32::EPSILON, "height must be one cell tall");
+    }
+
+    #[test]
+    fn emit_grid_row_backgrounds_splits_on_color_change() {
+        use unshit_core::cell_grid::Cell;
+        // 4 cells of red followed by 6 of green. fg varies per cell but
+        // that must not add quads, the bg pass splits only on bg change.
+        let cols = 10;
+        let mut g = CellGrid::new(1, cols);
+        g.clear_dirty();
+        let red = Color { r: 200, g: 20, b: 20, a: 255 };
+        let green = Color { r: 20, g: 200, b: 20, a: 255 };
+        let fg_a = Color { r: 255, g: 255, b: 255, a: 255 };
+        let fg_b = Color { r: 10, g: 10, b: 10, a: 255 };
+        for col in 0..4 {
+            let fg = if col % 2 == 0 { fg_a } else { fg_b };
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg: red, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+        for col in 4..cols {
+            let fg = if col % 2 == 0 { fg_a } else { fg_b };
+            g.set_cell(
+                0,
+                col,
+                Cell {
+                    ch: 'x',
+                    fg,
+                    bg: green,
+                    attrs: CellAttrs::empty(),
+                    wide_continuation: false,
+                },
+            );
+        }
+
+        let mut row_quads: Vec<QuadInstance> = Vec::new();
+        let cell_w = 10.0;
+        let cell_h = 20.0;
+        emit_grid_row_backgrounds(
+            &g,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            cell_w,
+            cell_h,
+            1.0,
+            [0.0; 4],
+            &mut row_quads,
+        );
+
+        assert_eq!(row_quads.len(), 2, "one quad per bg color stripe; got {}", row_quads.len());
+        let red_quad = row_quads
+            .iter()
+            .find(|q| (q.pos[0] - 0.0).abs() < f32::EPSILON)
+            .expect("red quad at x=0 must exist");
+        let green_quad = row_quads
+            .iter()
+            .find(|q| (q.pos[0] - 40.0).abs() < f32::EPSILON)
+            .expect("green quad at x=40 must exist");
+        assert!(
+            (red_quad.size[0] - 4.0 * cell_w).abs() < f32::EPSILON,
+            "red quad width must be 4 cells",
+        );
+        assert!(
+            (green_quad.size[0] - 6.0 * cell_w).abs() < f32::EPSILON,
+            "green quad width must be 6 cells",
+        );
+        let red_linear = red.to_linear_f32();
+        let green_linear = green.to_linear_f32();
+        assert!(
+            (red_quad.color[0] - red_linear[0]).abs() < f32::EPSILON,
+            "red quad color must match red bg",
+        );
+        assert!(
+            (green_quad.color[1] - green_linear[1]).abs() < f32::EPSILON,
+            "green quad color must match green bg",
+        );
+    }
+
+    #[test]
+    fn emit_grid_row_backgrounds_skips_zero_alpha_runs_mid_row() {
+        use unshit_core::cell_grid::Cell;
+        // Cols 0..3 red, cols 3..6 transparent (DEFAULT_BG), cols 6..10
+        // blue. The transparent middle run must be elided and the outer
+        // runs must not be merged across it.
+        let cols = 10;
+        let mut g = CellGrid::new(1, cols);
+        g.clear_dirty();
+        let red = Color { r: 200, g: 20, b: 20, a: 255 };
+        let blue = Color { r: 20, g: 30, b: 200, a: 255 };
+        let transparent = Color { r: 0, g: 0, b: 0, a: 0 };
+        let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+        for col in 0..3 {
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg: red, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+        for col in 3..6 {
+            g.set_cell(
+                0,
+                col,
+                Cell {
+                    ch: 'x',
+                    fg,
+                    bg: transparent,
+                    attrs: CellAttrs::empty(),
+                    wide_continuation: false,
+                },
+            );
+        }
+        for col in 6..cols {
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg: blue, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+
+        let mut row_quads: Vec<QuadInstance> = Vec::new();
+        let cell_w = 10.0;
+        let cell_h = 20.0;
+        emit_grid_row_backgrounds(
+            &g,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            cell_w,
+            cell_h,
+            1.0,
+            [0.0; 4],
+            &mut row_quads,
+        );
+
+        assert_eq!(
+            row_quads.len(),
+            2,
+            "transparent middle run must be elided; got {}",
+            row_quads.len(),
+        );
+        let red_quad = row_quads
+            .iter()
+            .find(|q| (q.pos[0] - 0.0).abs() < f32::EPSILON)
+            .expect("red quad at x=0 must exist");
+        let blue_quad = row_quads
+            .iter()
+            .find(|q| (q.pos[0] - 60.0).abs() < f32::EPSILON)
+            .expect("blue quad at x=60 must exist");
+        assert!(
+            (red_quad.size[0] - 3.0 * cell_w).abs() < f32::EPSILON,
+            "red quad width must be 3 cells (not merged across transparent gap)",
+        );
+        assert!(
+            (blue_quad.size[0] - 4.0 * cell_w).abs() < f32::EPSILON,
+            "blue quad width must be 4 cells",
+        );
+    }
+
+    #[test]
+    fn emit_grid_row_backgrounds_merges_across_attrs_boundary() {
+        use unshit_core::cell_grid::Cell;
+        // Regression pin for #84: bg runs ignore attribute flags (BOLD,
+        // ITALIC, etc.). Two cells with the same bg but different attrs
+        // must merge into a single bg quad, because the underlying bg
+        // color is visually identical.
+        let cols = 4;
+        let mut g = CellGrid::new(1, cols);
+        g.clear_dirty();
+        let red = Color { r: 200, g: 20, b: 20, a: 255 };
+        let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+        g.set_cell(
+            0,
+            0,
+            Cell { ch: 'a', fg, bg: red, attrs: CellAttrs::empty(), wide_continuation: false },
+        );
+        g.set_cell(
+            0,
+            1,
+            Cell { ch: 'b', fg, bg: red, attrs: CellAttrs::BOLD, wide_continuation: false },
+        );
+        g.set_cell(
+            0,
+            2,
+            Cell { ch: 'c', fg, bg: red, attrs: CellAttrs::ITALIC, wide_continuation: false },
+        );
+        g.set_cell(
+            0,
+            3,
+            Cell { ch: 'd', fg, bg: red, attrs: CellAttrs::UNDERLINE, wide_continuation: false },
+        );
+
+        let mut row_quads: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(
+            &g,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0; 4],
+            &mut row_quads,
+        );
+
+        assert_eq!(
+            row_quads.len(),
+            1,
+            "bg merging must ignore attribute flags; got {} quads",
+            row_quads.len(),
+        );
+        assert!((row_quads[0].size[0] - 40.0).abs() < f32::EPSILON, "quad must span all 4 cells");
+    }
+
+    #[test]
+    fn emit_grid_row_backgrounds_on_empty_row_emits_zero_quads() {
+        // Default-constructed CellGrid has Cell::default for every cell,
+        // which uses Color::TRANSPARENT as bg. The emitter must produce
+        // zero quads on such a row under the real full-row (0, cols) call
+        // shape. Pins the elision win under the call shape actually used
+        // by `emit_grid_cells`.
+        let cols = 20;
+        let g = CellGrid::new(1, cols);
+        let mut row_quads: Vec<QuadInstance> = Vec::new();
+        emit_grid_row_backgrounds(
+            &g,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0; 4],
+            &mut row_quads,
+        );
+        assert!(row_quads.is_empty(), "a blank row must emit zero bg quads");
     }
 }

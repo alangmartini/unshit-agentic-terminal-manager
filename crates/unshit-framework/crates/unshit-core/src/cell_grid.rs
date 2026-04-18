@@ -247,6 +247,28 @@ impl StyleRun {
     }
 }
 
+/// A maximal run of cells on a single row that share the same background
+/// color, regardless of foreground color or attribute flags. `end_col` is
+/// exclusive.
+///
+/// Used by the renderer to emit a single background quad per bg run instead
+/// of one per style run. On text heavy frames (colorized `ls`, syntax
+/// highlighted output) a row typically has uniform bg but varies fg per
+/// token; merging on bg alone collapses many redundant bg quads into one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BgRun {
+    pub start_col: usize,
+    pub end_col: usize,
+    pub bg: Color,
+}
+
+impl BgRun {
+    /// Number of columns covered by the run.
+    pub fn col_count(&self) -> usize {
+        self.end_col.saturating_sub(self.start_col)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CellGrid
 // ---------------------------------------------------------------------------
@@ -475,6 +497,66 @@ impl CellGrid {
     /// returned.
     pub fn compute_style_runs(&self, row: usize) -> Vec<StyleRun> {
         self.compute_style_runs_in_range(row, 0, self.cols)
+    }
+
+    /// Collect maximal runs of adjacent cells on `row` that share the same
+    /// background color, regardless of foreground color or attribute flags.
+    /// Used by the renderer to emit one background quad per bg run instead
+    /// of one per style run. Cells with `INVERSE` have their fg and bg
+    /// swapped (matching the style run path) before the bg is compared.
+    ///
+    /// When the row has zero cols or is out of bounds an empty vector is
+    /// returned.
+    pub fn compute_bg_runs(&self, row: usize) -> Vec<BgRun> {
+        self.compute_bg_runs_in_range(row, 0, self.cols)
+    }
+
+    /// Same as [`CellGrid::compute_bg_runs`] but limited to the half-open
+    /// column range `[start_col, end_col)`. Runs never cross the provided
+    /// range boundaries.
+    pub fn compute_bg_runs_in_range(
+        &self,
+        row: usize,
+        start_col: usize,
+        end_col: usize,
+    ) -> Vec<BgRun> {
+        if row >= self.rows {
+            return Vec::new();
+        }
+        let end_col = end_col.min(self.cols);
+        if start_col >= end_col {
+            return Vec::new();
+        }
+
+        let mut runs: Vec<BgRun> = Vec::new();
+        let row_base = row * self.cols;
+        let mut cur: Option<BgRun> = None;
+        for col in start_col..end_col {
+            let cell = &self.cells[row_base + col];
+            // INVERSE swaps fg and bg at emission time (see
+            // `compute_style_runs_in_range`), so the effective bg for
+            // merging is the stored fg when INVERSE is set. Wide
+            // continuation cells carry the primary cell's bg (see
+            // `set_wide_cell`), so the naive merge already rides the
+            // primary's run without special casing.
+            let bg = if cell.attrs.contains(CellAttrs::INVERSE) { cell.fg } else { cell.bg };
+
+            match cur.as_mut() {
+                Some(run) if run.bg == bg => {
+                    run.end_col = col + 1;
+                }
+                _ => {
+                    if let Some(finished) = cur.take() {
+                        runs.push(finished);
+                    }
+                    cur = Some(BgRun { start_col: col, end_col: col + 1, bg });
+                }
+            }
+        }
+        if let Some(finished) = cur.take() {
+            runs.push(finished);
+        }
+        runs
     }
 
     /// Same as [`CellGrid::compute_style_runs`] but limited to the half-open
@@ -1187,5 +1269,175 @@ mod tests {
         assert!(!ld.is_clean(), "row 2 must be damaged after reset_line_identity");
         assert_eq!(ld.first_dirty_col, 0, "first=0 covers full row");
         assert_eq!(ld.last_dirty_col, CellGrid::last_col_u16(cols), "last=cols-1 covers full row",);
+    }
+
+    // -- compute_bg_runs_in_range (issue #84) -------------------------------
+    //
+    // `compute_bg_runs_in_range` merges adjacent cells that share the same
+    // background color regardless of foreground color or attribute flags.
+    // It powers the background-quad emitter so colorized text rows (uniform
+    // bg, varying fg per token) emit one bg quad per row instead of one per
+    // style run.
+
+    #[test]
+    fn compute_bg_runs_merges_adjacent_same_bg_across_fg_change() {
+        // Row of 4 cells, bg = red, fg alternating white and cyan. The bg
+        // run pass must merge all four into a single run because bg is
+        // uniform, even though the style run pass would split them on fg.
+        let red = Color { r: 200, g: 0, b: 0, a: 255 };
+        let white = Color { r: 255, g: 255, b: 255, a: 255 };
+        let cyan = Color { r: 0, g: 200, b: 200, a: 255 };
+        let mut g = CellGrid::new(1, 4);
+        for col in 0..4 {
+            let fg = if col % 2 == 0 { white } else { cyan };
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg: red, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+
+        let runs = g.compute_bg_runs_in_range(0, 0, 4);
+
+        assert_eq!(runs.len(), 1, "uniform bg must collapse to a single run despite fg changes");
+        assert_eq!(runs[0], BgRun { start_col: 0, end_col: 4, bg: red });
+    }
+
+    #[test]
+    fn compute_bg_runs_splits_on_color_change() {
+        // Row of 6 cells: first 3 bg = red, next 3 bg = blue. fg varies so
+        // the style run pass would produce 6 runs; the bg pass yields 2.
+        let red = Color { r: 200, g: 0, b: 0, a: 255 };
+        let blue = Color { r: 0, g: 0, b: 200, a: 255 };
+        let fg_a = Color { r: 255, g: 255, b: 255, a: 255 };
+        let fg_b = Color { r: 10, g: 10, b: 10, a: 255 };
+        let mut g = CellGrid::new(1, 6);
+        for col in 0..3 {
+            let fg = if col % 2 == 0 { fg_a } else { fg_b };
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg: red, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+        for col in 3..6 {
+            let fg = if col % 2 == 0 { fg_a } else { fg_b };
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg: blue, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+
+        let runs = g.compute_bg_runs_in_range(0, 0, 6);
+
+        assert_eq!(
+            runs,
+            vec![
+                BgRun { start_col: 0, end_col: 3, bg: red },
+                BgRun { start_col: 3, end_col: 6, bg: blue },
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_bg_runs_wide_continuation_rides_primary() {
+        // A wide cell at col 2 stores the primary's bg at col 3 (the
+        // continuation cell). A narrow cell at col 4 with the same bg must
+        // merge with the wide cell's run so the bg quad covers cols 2..5.
+        let green = Color { r: 0, g: 200, b: 0, a: 255 };
+        let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+        let mut g = CellGrid::new(1, 6);
+        g.set_wide_cell(
+            0,
+            2,
+            Cell {
+                ch: '\u{4e2d}', // CJK "middle"
+                fg,
+                bg: green,
+                attrs: CellAttrs::empty(),
+                wide_continuation: false,
+            },
+        );
+        g.set_cell(
+            0,
+            4,
+            Cell { ch: 'a', fg, bg: green, attrs: CellAttrs::empty(), wide_continuation: false },
+        );
+
+        let runs = g.compute_bg_runs_in_range(0, 2, 5);
+
+        assert_eq!(runs, vec![BgRun { start_col: 2, end_col: 5, bg: green }]);
+    }
+
+    #[test]
+    fn compute_bg_runs_inverse_uses_fg_as_bg() {
+        // A single cell with INVERSE swaps fg and bg at emission time, so
+        // the effective bg is the stored fg. The pre-emit swap must be
+        // applied here so adjacent non-inverse cells with matching bg
+        // merge correctly.
+        let yellow = Color { r: 255, g: 230, b: 50, a: 255 };
+        let black = Color { r: 0, g: 0, b: 0, a: 255 };
+        let mut g = CellGrid::new(1, 1);
+        g.set_cell(
+            0,
+            0,
+            Cell {
+                ch: 'z',
+                fg: yellow,
+                bg: black,
+                attrs: CellAttrs::INVERSE,
+                wide_continuation: false,
+            },
+        );
+
+        let runs = g.compute_bg_runs_in_range(0, 0, 1);
+
+        assert_eq!(runs.len(), 1, "single cell must produce a single run");
+        assert_eq!(runs[0].bg, yellow, "INVERSE must surface stored fg as the effective bg color",);
+    }
+
+    #[test]
+    fn compute_bg_runs_range_respects_bounds() {
+        // Populate the whole row with bg = red, then ask for cols 2..5.
+        // Runs must be clipped to that window.
+        let red = Color { r: 200, g: 0, b: 0, a: 255 };
+        let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+        let mut g = CellGrid::new(1, 8);
+        for col in 0..8 {
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg: red, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+
+        let runs = g.compute_bg_runs_in_range(0, 2, 5);
+
+        assert_eq!(runs, vec![BgRun { start_col: 2, end_col: 5, bg: red }]);
+    }
+
+    #[test]
+    fn compute_bg_runs_empty_row_returns_empty() {
+        // A zero-width range (start == end) must return an empty vector
+        // without iterating any cell.
+        let g = CellGrid::new(1, 8);
+        assert_eq!(g.compute_bg_runs_in_range(0, 3, 3), Vec::new());
+        assert_eq!(g.compute_bg_runs_in_range(0, 5, 2), Vec::new());
+    }
+
+    #[test]
+    fn compute_bg_runs_out_of_bounds_row_returns_empty() {
+        // Row past `self.rows` returns an empty vec.
+        let g = CellGrid::new(2, 4);
+        assert_eq!(g.compute_bg_runs_in_range(2, 0, 4), Vec::new());
+        assert_eq!(g.compute_bg_runs_in_range(99, 0, 4), Vec::new());
+    }
+
+    #[test]
+    fn bg_run_col_count_returns_end_minus_start() {
+        let red = Color { r: 200, g: 0, b: 0, a: 255 };
+        let run = BgRun { start_col: 3, end_col: 9, bg: red };
+        assert_eq!(run.col_count(), 6);
     }
 }
