@@ -94,6 +94,33 @@ impl FramePacer {
             }
         }
     }
+
+    /// Absolute time at which the next speculative paint should fire.
+    ///
+    /// Returns `max(now, last_paint + min_interval)`. A speculative paint is
+    /// one the event loop schedules during a "recently active" window even
+    /// without a dirty flag, so that a PTY chunk or keystroke landing inside
+    /// the frame interval is displayed on the very next vsync rather than
+    /// waiting for the next external event. The pacer's `min_interval`
+    /// remains the hard cap on paint rate, so successive speculative frames
+    /// never run faster than 1 / `min_interval`.
+    ///
+    /// Caller is expected to hand the returned instant to winit
+    /// `ControlFlow::WaitUntil` and to also call `request_redraw()` so the
+    /// redraw fires as soon as the deadline elapses.
+    pub fn speculative_deadline(&self, now: Instant) -> Instant {
+        match self.last_paint {
+            None => now,
+            Some(last) => {
+                let next = last + self.min_interval;
+                if next > now {
+                    next
+                } else {
+                    now
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +211,41 @@ mod tests {
         let t = Instant::now();
         pacer.record_paint(t);
         assert_eq!(pacer.last_paint(), Some(t));
+    }
+
+    #[test]
+    fn speculative_deadline_before_any_paint_returns_now() {
+        // No paint has occurred yet, so a speculative frame can fire
+        // immediately. The caller still has to hand the deadline to winit
+        // WaitUntil, which treats a past deadline as "fire asap".
+        let pacer = FramePacer::new();
+        let now = Instant::now();
+        assert_eq!(pacer.speculative_deadline(now), now);
+    }
+
+    #[test]
+    fn speculative_deadline_respects_pacer_min_interval() {
+        // Immediately after a paint, the next speculative frame must wait
+        // until last_paint + min_interval to enforce the 125fps ceiling.
+        let mut pacer = FramePacer::with_min_interval(Duration::from_millis(8));
+        let t0 = Instant::now();
+        pacer.record_paint(t0);
+
+        let now = t0 + Duration::from_millis(2);
+        assert_eq!(pacer.speculative_deadline(now), t0 + Duration::from_millis(8));
+    }
+
+    #[test]
+    fn speculative_deadline_clamped_to_now_when_interval_elapsed() {
+        // If the pacer interval has already elapsed (we were waiting longer
+        // than min_interval for some reason), the deadline must not move
+        // backward; fire at `now` instead.
+        let mut pacer = FramePacer::with_min_interval(Duration::from_millis(8));
+        let t0 = Instant::now();
+        pacer.record_paint(t0);
+
+        let now = t0 + Duration::from_millis(20);
+        assert_eq!(pacer.speculative_deadline(now), now);
     }
 
     #[test]

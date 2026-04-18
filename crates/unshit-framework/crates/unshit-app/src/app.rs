@@ -5,7 +5,7 @@ use crate::shortcut::{key_combo_from_winit, ShortcutResolver};
 use crate::window;
 use cosmic_text::{FontSystem, SwashCache};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use unshit_core::build::{
     build_tree_from_def, mark_layout_dirty, resolve_all_styles,
     resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
@@ -244,11 +244,54 @@ struct AppState {
     /// `FramePacer::min_interval`. Prevents per-PTY-chunk rebuild storms
     /// from dominating the event loop. See [`crate::frame_pacer`].
     frame_pacer: crate::frame_pacer::FramePacer,
+    /// Timestamp of the most recent external-event-driven wake (proxy wake,
+    /// keyboard input, pointer input, resize, etc.). Used by `about_to_wait`
+    /// to decide whether to schedule a speculative repaint at the pacer
+    /// deadline. While this value is within [`ACTIVITY_WINDOW`] of now, the
+    /// event loop repaints at the pacer rhythm even without a dirty flag so
+    /// that a PTY chunk or keystroke landing mid-interval reaches the screen
+    /// on the very next frame. After [`ACTIVITY_WINDOW`] of silence the loop
+    /// falls back to `ControlFlow::Wait` and idle CPU returns to ~zero.
+    last_activity: Instant,
     /// Rolling window of per-frame durations. Debug-only; emits p50/p95/
     /// p99 quantiles once per second via `log::info!`. See
     /// [`crate::frame_probe`].
     #[cfg(debug_assertions)]
     frame_probe: crate::frame_probe::FrameProbe,
+}
+
+/// How long after the last external event the loop keeps scheduling
+/// speculative repaints. 250ms is long enough to coalesce bursts of
+/// keystrokes or PTY chunks without keeping the CPU warm after activity
+/// stops. Matches Ghostty's active-renderer-window concept.
+pub(crate) const ACTIVITY_WINDOW: Duration = Duration::from_millis(250);
+
+/// Pure function: whether `now` is within [`ACTIVITY_WINDOW`] of the
+/// recorded `last_activity`. Extracted so it can be unit-tested with a
+/// synthetic clock without constructing an entire [`AppState`].
+pub(crate) fn is_within_activity_window(
+    last_activity: Instant,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    now.saturating_duration_since(last_activity) < window
+}
+
+impl AppState {
+    /// Record that external activity (user input, PTY output, resize, etc.)
+    /// occurred at `now`. Opens the window during which `about_to_wait`
+    /// will schedule speculative frames.
+    fn mark_activity(&mut self, now: Instant) {
+        self.last_activity = now;
+    }
+
+    /// Whether the last external event occurred within
+    /// [`ACTIVITY_WINDOW`] of `now`. When true, `about_to_wait`
+    /// schedules a speculative repaint at the pacer deadline so painting
+    /// runs at the pacer rhythm even when no dirty flag is set.
+    fn is_recently_active(&self, now: Instant) -> bool {
+        is_within_activity_window(self.last_activity, now, ACTIVITY_WINDOW)
+    }
 }
 
 impl App {
@@ -420,7 +463,9 @@ impl ApplicationHandler for AppHandler {
         let Some(state) = self.app.state.as_mut() else {
             return;
         };
+        let mut saw_event = false;
         for event in self.event_rx.try_iter() {
+            saw_event = true;
             match event {
                 ExternalEvent::RequestRebuild => {
                     state.needs_rebuild = true;
@@ -458,6 +503,13 @@ impl ApplicationHandler for AppHandler {
                     state.needs_rebuild = true;
                 }
             }
+        }
+        if saw_event {
+            // An external source (PTY reader, subscription, bridge, hot
+            // reload, etc.) produced work for the UI thread. Count this as
+            // activity so `about_to_wait` schedules speculative frames
+            // during the next [`ACTIVITY_WINDOW`].
+            state.mark_activity(Instant::now());
         }
         state.window.request_redraw();
     }
@@ -666,6 +718,11 @@ impl ApplicationHandler for AppHandler {
             theme: self.app.config.theme.clone(),
             cell_metrics_fired: false,
             frame_pacer: crate::frame_pacer::FramePacer::new(),
+            // Treat window creation as activity so the first few frames
+            // after startup run at the speculative pacer rhythm. This
+            // smooths over the initial PTY-spawn / cell-metrics dance on
+            // the app side before any user input arrives.
+            last_activity: Instant::now(),
             #[cfg(debug_assertions)]
             frame_probe: crate::frame_probe::FrameProbe::new(),
         });
@@ -732,6 +789,26 @@ impl ApplicationHandler for AppHandler {
         let Some(state) = self.app.state.as_mut() else {
             return;
         };
+
+        // Classify the event as external activity so `about_to_wait` can
+        // schedule speculative repaints for the next [`ACTIVITY_WINDOW`].
+        // RedrawRequested is NOT activity; paints are driven BY activity,
+        // so including them here would create a self-sustaining loop that
+        // never returns to `ControlFlow::Wait`.
+        let is_activity = matches!(
+            event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::PointerButton { .. }
+                | WindowEvent::PointerMoved { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::SurfaceResized(_)
+                | WindowEvent::Focused(_)
+                | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::Ime(_)
+        );
+        if is_activity {
+            state.mark_activity(Instant::now());
+        }
 
         match event {
             WindowEvent::CloseRequested => {
@@ -2001,6 +2078,58 @@ impl ApplicationHandler for AppHandler {
             _ => {}
         }
     }
+
+    /// Fires right before the event loop blocks for the next event. We use
+    /// it to implement speculative painting: while the window has been
+    /// "recently active" (any external event within the last
+    /// [`ACTIVITY_WINDOW`]), we ask winit to wake up at the pacer deadline
+    /// and queue a redraw so the next frame fires at vsync rhythm even
+    /// without a dirty flag. Once activity stops we fall back to the
+    /// control flow the paint handler last set (animation wake-up or
+    /// `Wait`), keeping idle CPU near zero.
+    ///
+    /// This is the Ghostty `DRAW_INTERVAL` pattern: during bursts of
+    /// PTY output or typing we paint at the pacer rate so that each chunk
+    /// lands on the next frame. The paint itself is cheap on clean state
+    /// because the renderer short-circuits via the line-quad cache.
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let Some(state) = self.app.state.as_mut() else {
+            return;
+        };
+
+        let now = Instant::now();
+        if state.is_recently_active(now) {
+            // Pick the earlier of (speculative pacer deadline, any wake
+            // the paint handler already set for animations). Taking the
+            // min means a cursor-blink or transition wake-up that happens
+            // to fall before the speculative deadline still fires on
+            // time; the speculative deadline is what drives the paint
+            // rate during typing / PTY bursts.
+            let spec_deadline = state.frame_pacer.speculative_deadline(now);
+            let deadline = match event_loop.control_flow() {
+                winit::event_loop::ControlFlow::WaitUntil(prev) if prev < spec_deadline => prev,
+                _ => spec_deadline,
+            };
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+            state.window.request_redraw();
+        } else {
+            // Activity window has expired. If the current control flow is
+            // a stale speculative `WaitUntil` (already in the past), winit
+            // would spin-wake on every iteration; reset it so the loop
+            // truly sleeps. Preserve future-valued `WaitUntil` deadlines
+            // set by the paint handler for animations (cursor blink, CSS
+            // transitions, keyframes) by leaving them alone.
+            match event_loop.control_flow() {
+                winit::event_loop::ControlFlow::WaitUntil(deadline) if deadline <= now => {
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                }
+                winit::event_loop::ControlFlow::Poll => {
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Update highlighted_index for any open select dropdown based on cursor position.
@@ -3087,5 +3216,52 @@ mod tests {
         assert!((m.atlas_fill_ratio - 0.75).abs() < f32::EPSILON);
         assert_eq!(m.gpu_upload_bytes, 8192);
         assert_eq!(m.damage_area_px, 1920 * 1080);
+    }
+
+    #[test]
+    fn activity_window_is_250ms() {
+        // Document the chosen coalescing window. If this value changes,
+        // the speculative-frame behavior and idle CPU profile both move,
+        // so callers should understand the intent.
+        assert_eq!(ACTIVITY_WINDOW, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn is_recently_active_is_true_within_250ms() {
+        let last = Instant::now();
+        // Zero elapsed: just bumped activity, obviously within the window.
+        assert!(is_within_activity_window(last, last, ACTIVITY_WINDOW));
+
+        // 100ms later: still well inside the 250ms window.
+        let now = last + Duration::from_millis(100);
+        assert!(is_within_activity_window(last, now, ACTIVITY_WINDOW));
+
+        // 249ms later: right up against the boundary but still inside.
+        let now = last + Duration::from_millis(249);
+        assert!(is_within_activity_window(last, now, ACTIVITY_WINDOW));
+    }
+
+    #[test]
+    fn is_recently_active_is_false_after_250ms() {
+        let last = Instant::now();
+        // Exactly 250ms: boundary is exclusive, so this counts as idle
+        // and the event loop falls back to `ControlFlow::Wait`.
+        let now = last + Duration::from_millis(250);
+        assert!(!is_within_activity_window(last, now, ACTIVITY_WINDOW));
+
+        // 1s later: clearly idle.
+        let now = last + Duration::from_secs(1);
+        assert!(!is_within_activity_window(last, now, ACTIVITY_WINDOW));
+    }
+
+    #[test]
+    fn is_recently_active_handles_clock_skew() {
+        // If `now` somehow precedes `last_activity` (should not happen on
+        // winit but paranoia is cheap), `saturating_duration_since` returns
+        // zero and the helper reports "recently active". This matches the
+        // intuitive reading: no time has passed, so we just saw activity.
+        let last = Instant::now() + Duration::from_millis(100);
+        let now = last - Duration::from_millis(50);
+        assert!(is_within_activity_window(last, now, ACTIVITY_WINDOW));
     }
 }
