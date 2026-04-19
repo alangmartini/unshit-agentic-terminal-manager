@@ -692,7 +692,8 @@ pub fn mutate_add_workspace_with_path(state: &mut AppState, path: Option<PathBuf
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| format!("workspace-{}", num));
     state.workspaces.push(new_workspace(num, name, path));
-    state.active_workspace = state.workspaces.len() - 1;
+    let new_idx = state.workspaces.len() - 1;
+    mutate_switch_workspace(state, new_idx);
 }
 
 pub fn mutate_remove_workspace(state: &mut AppState, idx: usize) {
@@ -1079,6 +1080,17 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.ctx_menu = None;
                 if idx < state.workspaces.len() {
                     mutate_switch_workspace(state, idx);
+                    return true;
+                }
+            }
+            false
+        }
+        other if other.starts_with("workspace.new_terminal:") => {
+            if let Ok(idx) = other["workspace.new_terminal:".len()..].parse::<usize>() {
+                state.ctx_menu = None;
+                if idx < state.workspaces.len() {
+                    mutate_switch_workspace(state, idx);
+                    mutate_add_tab(state);
                     return true;
                 }
             }
@@ -2737,5 +2749,31 @@ mod tests {
             state.tabs.is_empty(),
             "tabs must be empty on empty workspace"
         );
+    }
+
+    #[test]
+    fn mutate_add_workspace_starts_with_no_terminals() {
+        let mut state = two_workspace_state();
+        let before = state.workspaces.len();
+        mutate_add_workspace(&mut state);
+        assert_eq!(state.workspaces.len(), before + 1);
+        assert_eq!(state.active_workspace, before);
+        assert!(
+            state.panes.is_empty(),
+            "a newly created workspace must start with no panes"
+        );
+        assert!(
+            state.tabs.is_empty(),
+            "a newly created workspace must start with no tabs"
+        );
+    }
+
+    #[test]
+    fn workspace_new_terminal_switches_and_spawns() {
+        let mut state = two_workspace_state();
+        assert!(dispatch(&mut state, "workspace.new_terminal:1"));
+        assert_eq!(state.active_workspace, 1);
+        assert!(!state.tabs.is_empty(), "new tab must be spawned");
+        assert!(!state.panes.is_empty(), "new pane must be spawned");
     }
 }

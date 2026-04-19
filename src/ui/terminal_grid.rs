@@ -187,7 +187,8 @@ fn build_pane(
     let pane_id = pane.id;
     container = container.on_click(move || {
         mutate_with(&activate_state, |st| {
-            st.active_pane = pane_id;
+            let ws_idx = st.active_workspace;
+            crate::state::dispatch(st, &format!("terminal.focus:{}:{}", ws_idx, pane_id.0));
         });
     });
 
@@ -779,6 +780,11 @@ mod tests {
     fn pane_click_sets_active_pane() {
         let shared = make_shared();
         let pane = make_pane_titled(42, "shell");
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.panes[0].push(pane.clone());
+            guard.col_ratios[0].push(1.0);
+        }
         let grids = std::collections::HashMap::new();
         let el = build_pane(&pane, false, false, &shared, &grids);
         (el.on_click.as_ref().unwrap())();

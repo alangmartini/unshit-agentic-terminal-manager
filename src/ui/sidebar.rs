@@ -428,6 +428,11 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
             format!("workspace.switch:{}", ws_idx),
         ))
         .with_child(menu_item(
+            "New terminal",
+            shared,
+            format!("workspace.new_terminal:{}", ws_idx),
+        ))
+        .with_child(menu_item(
             collapse_label,
             shared,
             format!("workspace.collapse:{}", ws_idx),
