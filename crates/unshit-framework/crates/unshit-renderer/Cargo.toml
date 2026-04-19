@@ -37,3 +37,12 @@ default = []
 # recycles pooled instance buffers via a ring of `desired_maximum_frame_latency + 1 = 3`
 # slots keyed by a frame counter instead of the callback path.
 instance-pool-ring-fallback = []
+# Experimental single pass fragment shader grid renderer. When enabled, the
+# renderer compiles in an alternative pipeline that uploads the cell grid as
+# a storage buffer (SSBO) and draws one full screen triangle. The fragment
+# stage computes the cell index from `gl_FragCoord` and samples the glyph
+# atlas directly. Off by default; enable with `--features grid-fragment-shader`
+# and the runtime flag `TM_USE_GRID_FRAGMENT_SHADER=1` to route
+# `ElementContent::Grid` through the new path. The instanced text path stays
+# intact as the unconditional fallback.
+grid-fragment-shader = []
