@@ -721,6 +721,27 @@ pub fn find_pane_coord(state: &AppState, target: PaneId) -> Option<(usize, usize
     None
 }
 
+/// Return the active pane of `ws_idx`, reading live state when that workspace
+/// is active and the saved tab state otherwise. `None` when the workspace has
+/// no tabs or the active pane id isn't present in its layout.
+pub fn workspace_active_pane(state: &AppState, ws_idx: usize) -> Option<PaneId> {
+    if ws_idx == state.active_workspace {
+        return state
+            .tabs
+            .get(state.active_tab)
+            .map(|tab| tab.active_pane)
+            .filter(|pid| find_pane_coord(state, *pid).is_some());
+    }
+    let ws = state.workspaces.get(ws_idx)?;
+    let tab = ws.tabs.get(ws.active_tab)?;
+    let pane_exists = tab.panes.iter().flatten().any(|p| p.id == tab.active_pane);
+    if pane_exists {
+        Some(tab.active_pane)
+    } else {
+        None
+    }
+}
+
 pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
     let Some((row_idx, col_idx)) = find_pane_coord(state, target) else {
         return;
@@ -2775,5 +2796,41 @@ mod tests {
         assert_eq!(state.active_workspace, 1);
         assert!(!state.tabs.is_empty(), "new tab must be spawned");
         assert!(!state.panes.is_empty(), "new pane must be spawned");
+    }
+
+    #[test]
+    fn workspace_active_pane_reads_live_for_active_workspace() {
+        let state = two_workspace_state();
+        assert_eq!(
+            super::workspace_active_pane(&state, 0),
+            Some(PaneId(1)),
+            "active workspace must report the live active pane"
+        );
+    }
+
+    #[test]
+    fn workspace_active_pane_reads_saved_for_inactive_workspace() {
+        let state = two_workspace_state();
+        assert_eq!(
+            super::workspace_active_pane(&state, 1),
+            Some(PaneId(7)),
+            "inactive workspace must report its saved active pane"
+        );
+    }
+
+    #[test]
+    fn workspace_active_pane_none_when_empty() {
+        let mut state = two_workspace_state();
+        state.workspaces[1].tabs = vec![];
+        assert!(
+            super::workspace_active_pane(&state, 1).is_none(),
+            "a workspace without tabs has no active pane"
+        );
+    }
+
+    #[test]
+    fn workspace_active_pane_none_for_out_of_range() {
+        let state = two_workspace_state();
+        assert!(super::workspace_active_pane(&state, 99).is_none());
     }
 }

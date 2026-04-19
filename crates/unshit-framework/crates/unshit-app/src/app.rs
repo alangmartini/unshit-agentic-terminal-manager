@@ -1483,11 +1483,36 @@ impl ApplicationHandler for AppHandler {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
                     // FIRST: check if focused element captures keyboard input
-                    let focused_captures = state
+                    let mut focused_captures = state
                         .arena
                         .get(state.interaction.focused)
                         .map(|e| e.captures_keyboard || e.computed_style.keyboard_capture)
                         .unwrap_or(false);
+
+                    // Fallback: when focus is on a non-capturing, non-editable element
+                    // (e.g., a sidebar entry or a button that was just clicked), route
+                    // keyboard events to any element that declares captures_keyboard.
+                    // This lets users type into a terminal pane immediately after
+                    // clicking UI that switches to it, without a second click.
+                    if !focused_captures {
+                        let focused_editable = state
+                            .arena
+                            .get(state.interaction.focused)
+                            .map(|e| matches!(e.tag, Tag::Input | Tag::Select))
+                            .unwrap_or(false);
+                        if !focused_editable {
+                            if let Some((fallback_id, _)) =
+                                state.arena.iter().find(|(_, e)| e.captures_keyboard)
+                            {
+                                if fallback_id != state.interaction.focused {
+                                    state.interaction.focused = fallback_id;
+                                    state.interaction.focus_via_keyboard = false;
+                                    state.needs_restyle = true;
+                                }
+                                focused_captures = true;
+                            }
+                        }
+                    }
 
                     if focused_captures {
                         if let Some(combo) =

@@ -80,7 +80,12 @@ fn build_workspace(
                 if let Some(ws) = st.workspaces.get_mut(idx) {
                     ws.collapsed = false;
                 }
-                crate::state::dispatch(st, &format!("workspace.switch:{}", idx));
+                let pane = crate::state::workspace_active_pane(st, idx);
+                let cmd = match pane {
+                    Some(pid) => format!("terminal.focus:{}:{}", idx, pid.0),
+                    None => format!("workspace.switch:{}", idx),
+                };
+                crate::state::dispatch(st, &cmd);
             });
         })
         .on_context_menu(move |x, y| {
@@ -708,6 +713,50 @@ mod tests {
         let head = find_by_class(&el, "workspace-head").unwrap();
         (head.on_click.as_ref().unwrap())();
         assert!(!shared.lock().unwrap().workspaces[1].collapsed);
+    }
+
+    #[test]
+    fn workspace_head_click_on_populated_workspace_focuses_active_pane() {
+        use crate::state::PaneId;
+        // Seed state has ws0 active with a live pane id 1, plus ws1 with no tabs.
+        let shared = make_shared();
+        // Switch to ws1 and create a terminal there so ws1 has a saved pane.
+        {
+            let mut st = shared.lock().unwrap();
+            crate::state::mutate_switch_workspace(&mut st, 1);
+            crate::state::mutate_add_tab(&mut st);
+        }
+        let new_pane_id = shared.lock().unwrap().active_pane;
+        // Switch back to ws0 so ws1's state is saved.
+        {
+            let mut st = shared.lock().unwrap();
+            crate::state::mutate_switch_workspace(&mut st, 0);
+        }
+        assert_eq!(shared.lock().unwrap().active_workspace, 0);
+        // Clicking ws1's head must switch workspace and set active_pane to
+        // ws1's saved pane, matching a terminal-entry click on that pane.
+        let ws = shared.lock().unwrap().ui_snapshot().workspaces[1].clone();
+        let el = build_workspace(1, &ws, &shared);
+        let head = find_by_class(&el, "workspace-head").unwrap();
+        (head.on_click.as_ref().unwrap())();
+        let st = shared.lock().unwrap();
+        assert_eq!(st.active_workspace, 1);
+        assert_eq!(st.active_pane, new_pane_id);
+        assert_ne!(new_pane_id, PaneId(0));
+    }
+
+    #[test]
+    fn workspace_head_click_on_empty_workspace_still_switches() {
+        // Seed: ws2 and ws3 have no saved tabs. Clicking their head must still
+        // switch active_workspace via the workspace.switch fallback.
+        let shared = make_shared();
+        assert_eq!(shared.lock().unwrap().active_workspace, 0);
+        assert!(shared.lock().unwrap().workspaces[2].tabs.is_empty());
+        let ws = shared.lock().unwrap().ui_snapshot().workspaces[2].clone();
+        let el = build_workspace(2, &ws, &shared);
+        let head = find_by_class(&el, "workspace-head").unwrap();
+        (head.on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().active_workspace, 2);
     }
 
     #[test]
