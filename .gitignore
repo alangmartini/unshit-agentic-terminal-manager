@@ -8,3 +8,6 @@ target2/
 prototype/
 .omx/
 bench*.json
+.claude/*
+!.claude/skills/
+!.claude/commands/
