@@ -223,6 +223,15 @@ impl GlyphIdTable {
         self.keys.get(key).copied()
     }
 
+    /// Reverse lookup: resolve a previously assigned id back to its
+    /// `GlyphKey`. Returns `None` for ids beyond `capacity_ids` and for
+    /// ids whose key was released via [`Self::remove`]. The fragment
+    /// shader path uses this when populating `GpuGlyphMeta` slots so it
+    /// can ask the atlas for the entry that matches each live id.
+    pub fn key_for(&self, id: u32) -> Option<GlyphKey> {
+        self.ids.get(id as usize).copied().flatten()
+    }
+
     /// Release the id assigned to `key` back to the free list. Subsequent
     /// lookups return `None`. The caller is responsible for also clearing
     /// the corresponding `GpuGlyphMeta` slot in the metadata buffer so the
@@ -336,6 +345,31 @@ where
         .collect()
 }
 
+/// Build the full `GpuGlyphMeta` slot vector keyed by the live ids in
+/// `ids`. Each id is resolved back to its `GlyphKey` via
+/// [`GlyphIdTable::key_for`], then `lookup` is called to fetch the atlas
+/// entry. Slots whose id was evicted, or whose lookup returned `None`,
+/// receive a zero filled meta so the storage buffer index math stays
+/// dense.
+///
+/// The closure based interface lets callers reuse the existing atlas
+/// (typically [`crate::atlas::GlyphAtlas::glyph_meta`]) without coupling
+/// this module to the atlas type, and keeps the function trivially
+/// testable without a GPU.
+pub fn build_glyph_meta_slots<F>(ids: &GlyphIdTable, mut lookup: F) -> Vec<GpuGlyphMeta>
+where
+    F: FnMut(&GlyphKey) -> Option<GlyphEntry>,
+{
+    (0..ids.capacity_ids())
+        .map(|id| {
+            ids.key_for(id)
+                .and_then(|k| lookup(&k))
+                .map(|e| GpuGlyphMeta::from_entry(&e))
+                .unwrap_or_else(GpuGlyphMeta::zeroed)
+        })
+        .collect()
+}
+
 /// Per terminal state for the fragment shader grid renderer. One instance
 /// per `ElementContent::Grid` node; survives across frames so the glyph id
 /// table and the last seen atlas generation remain stable.
@@ -431,6 +465,16 @@ impl GridFragmentState {
         self.last_atlas_generation = atlas_generation;
 
         FrameUploadPlan { rows, resized, atlas_generation_bumped: atlas_bumped }
+    }
+
+    /// Convenience wrapper that builds the `GpuGlyphMeta` slot vector for
+    /// this state's [`GlyphIdTable`]. Defers to
+    /// [`build_glyph_meta_slots`].
+    pub fn glyph_meta_slots<F>(&self, lookup: F) -> Vec<GpuGlyphMeta>
+    where
+        F: FnMut(&GlyphKey) -> Option<GlyphEntry>,
+    {
+        build_glyph_meta_slots(&self.glyph_ids, lookup)
     }
 }
 
@@ -780,5 +824,127 @@ mod tests {
         assert_eq!(plan.rows[0].0.byte_offset, 0);
         assert_eq!(plan.rows[1].0.byte_offset, stride);
         assert_eq!(plan.rows[2].0.byte_offset, 2 * stride);
+    }
+
+    fn make_key(glyph_id: u16) -> GlyphKey {
+        GlyphKey { font_id: 1, glyph_id, font_size_tenths: 120, subpixel_bin: 0 }
+    }
+
+    #[test]
+    fn key_for_returns_inserted_key() {
+        let mut table = GlyphIdTable::new();
+        let key = make_key(10);
+        let id = table.insert(key);
+        assert_eq!(table.key_for(id), Some(key));
+    }
+
+    #[test]
+    fn key_for_returns_none_for_unassigned_id() {
+        let table = GlyphIdTable::new();
+        assert_eq!(table.key_for(0), None);
+        assert_eq!(table.key_for(42), None);
+    }
+
+    #[test]
+    fn key_for_returns_none_after_remove() {
+        let mut table = GlyphIdTable::new();
+        let key = make_key(10);
+        let id = table.insert(key);
+        table.remove(&key);
+        assert_eq!(table.key_for(id), None);
+    }
+
+    #[test]
+    fn key_for_survives_after_freed_id_reuse() {
+        // Removing a key frees its id; the next insert must let `key_for`
+        // resolve the freed id back to the new key (not the old one).
+        let mut table = GlyphIdTable::new();
+        let key_a = make_key(10);
+        let key_b = make_key(11);
+        let id = table.insert(key_a);
+        table.remove(&key_a);
+        let id_again = table.insert(key_b);
+        assert_eq!(id, id_again);
+        assert_eq!(table.key_for(id), Some(key_b));
+    }
+
+    #[test]
+    fn build_glyph_meta_slots_maps_each_id_to_meta() {
+        let mut table = GlyphIdTable::new();
+        let key_a = make_key(10);
+        let key_b = make_key(11);
+        let id_a = table.insert(key_a);
+        let id_b = table.insert(key_b);
+
+        let entry_a =
+            GlyphEntry { uv_rect: [0.0, 0.0, 0.25, 0.5], offset: [1.0, 2.0], size: [8.0, 16.0] };
+        let entry_b =
+            GlyphEntry { uv_rect: [0.25, 0.0, 0.5, 0.5], offset: [3.0, 4.0], size: [8.0, 16.0] };
+
+        let slots = build_glyph_meta_slots(&table, |k| {
+            if *k == key_a {
+                Some(entry_a)
+            } else if *k == key_b {
+                Some(entry_b)
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[id_a as usize], GpuGlyphMeta::from_entry(&entry_a));
+        assert_eq!(slots[id_b as usize], GpuGlyphMeta::from_entry(&entry_b));
+    }
+
+    #[test]
+    fn build_glyph_meta_slots_returns_zeroed_for_lookup_miss() {
+        let mut table = GlyphIdTable::new();
+        let key = make_key(10);
+        let id = table.insert(key);
+
+        let slots = build_glyph_meta_slots(&table, |_| None);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[id as usize], GpuGlyphMeta::zeroed());
+    }
+
+    #[test]
+    fn build_glyph_meta_slots_zero_fills_evicted_id_slots() {
+        // Removing an id leaves a hole; the slot vector must keep the same
+        // length (capacity_ids does not shrink) so live ids index correctly.
+        let mut table = GlyphIdTable::new();
+        let key_a = make_key(10);
+        let key_b = make_key(11);
+        let id_a = table.insert(key_a);
+        let id_b = table.insert(key_b);
+        table.remove(&key_a);
+
+        let entry_b =
+            GlyphEntry { uv_rect: [0.25, 0.0, 0.5, 0.5], offset: [0.0, 0.0], size: [8.0, 16.0] };
+        let slots =
+            build_glyph_meta_slots(&table, |k| if *k == key_b { Some(entry_b) } else { None });
+
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[id_a as usize], GpuGlyphMeta::zeroed());
+        assert_eq!(slots[id_b as usize], GpuGlyphMeta::from_entry(&entry_b));
+    }
+
+    #[test]
+    fn build_glyph_meta_slots_empty_table_returns_empty_vec() {
+        let table = GlyphIdTable::new();
+        let slots = build_glyph_meta_slots(&table, |_| None);
+        assert!(slots.is_empty());
+    }
+
+    #[test]
+    fn grid_fragment_state_glyph_meta_slots_delegates_to_table() {
+        let mut state = GridFragmentState::new();
+        let key = make_key(10);
+        let id = state.glyph_ids.insert(key);
+        let entry =
+            GlyphEntry { uv_rect: [0.1, 0.2, 0.3, 0.4], offset: [5.0, 6.0], size: [7.0, 8.0] };
+
+        let slots = state.glyph_meta_slots(|k| if *k == key { Some(entry) } else { None });
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[id as usize], GpuGlyphMeta::from_entry(&entry));
     }
 }

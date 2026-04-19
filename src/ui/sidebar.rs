@@ -70,6 +70,7 @@ fn build_workspace(
     shared: &SharedState,
 ) -> ElementDef {
     let head_state = shared.clone();
+    let chevron_state = shared.clone();
     let ctx_state = shared.clone();
     let idx = workspace_index;
     let head = ElementDef::new(Tag::Div)
@@ -108,7 +109,14 @@ fn build_workspace(
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("chevron")
-                .with_text("\u{25BE}"),
+                .with_text("\u{25BE}")
+                .on_click(move || {
+                    mutate_with(&chevron_state, |st| {
+                        if let Some(ws) = st.workspaces.get_mut(idx) {
+                            ws.collapsed = !ws.collapsed;
+                        }
+                    });
+                }),
         )
         .with_child(
             ElementDef::new(Tag::Span)
@@ -620,6 +628,86 @@ mod tests {
         let ws = make_workspace(2, false);
         let el = build_workspace(0, &ws, &shared);
         assert!(!has_class(&el, "active"));
+    }
+
+    // -- Click behavior: chevron vs name area (issue #98) --
+
+    #[test]
+    fn workspace_head_click_switches_active_and_expands() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_workspace = 0;
+            guard.workspaces[2].collapsed = true;
+        }
+        let snapshot = shared.lock().unwrap().ui_snapshot();
+        let el = build_workspace(2, &snapshot.workspaces[2], &shared);
+        let head = find_by_class(&el, "workspace-head").expect("workspace-head");
+        (head.on_click.as_ref().expect("head on_click"))();
+
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.active_workspace, 2);
+        assert!(!guard.workspaces[2].collapsed);
+    }
+
+    #[test]
+    fn workspace_head_click_on_already_expanded_keeps_expanded() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_workspace = 0;
+            guard.workspaces[2].collapsed = false;
+        }
+        let snapshot = shared.lock().unwrap().ui_snapshot();
+        let el = build_workspace(2, &snapshot.workspaces[2], &shared);
+        let head = find_by_class(&el, "workspace-head").expect("workspace-head");
+        (head.on_click.as_ref().expect("head on_click"))();
+
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.active_workspace, 2);
+        assert!(!guard.workspaces[2].collapsed);
+    }
+
+    #[test]
+    fn chevron_click_toggles_collapse_and_does_not_change_active() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_workspace = 0;
+            guard.workspaces[1].collapsed = false;
+        }
+        let snapshot = shared.lock().unwrap().ui_snapshot();
+        let el = build_workspace(1, &snapshot.workspaces[1], &shared);
+        let head = find_by_class(&el, "workspace-head").expect("workspace-head");
+        let chevron = find_by_class(head, "chevron").expect("chevron");
+        (chevron.on_click.as_ref().expect("chevron on_click"))();
+
+        let guard = shared.lock().unwrap();
+        assert!(
+            guard.workspaces[1].collapsed,
+            "chevron should toggle collapse"
+        );
+        assert_eq!(
+            guard.active_workspace, 0,
+            "chevron should not change active"
+        );
+    }
+
+    #[test]
+    fn chevron_click_on_collapsed_expands() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.workspaces[1].collapsed = true;
+        }
+        let snapshot = shared.lock().unwrap().ui_snapshot();
+        let el = build_workspace(1, &snapshot.workspaces[1], &shared);
+        let head = find_by_class(&el, "workspace-head").expect("workspace-head");
+        let chevron = find_by_class(head, "chevron").expect("chevron");
+        (chevron.on_click.as_ref().expect("chevron on_click"))();
+
+        let guard = shared.lock().unwrap();
+        assert!(!guard.workspaces[1].collapsed);
     }
 
     #[test]

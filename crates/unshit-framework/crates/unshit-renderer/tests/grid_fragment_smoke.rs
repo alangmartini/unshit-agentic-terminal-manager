@@ -14,6 +14,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use unshit_core::cell_grid::{Cell, CellGrid};
+use unshit_renderer::atlas::{GlyphAtlas, GlyphAtlasKind, GlyphAtlasSet, GlyphKey};
 use unshit_renderer::grid_fragment_upload::{
     damaged_row_write_ranges, encode_row, pack_color_rgba, GpuCell, GpuGlyphMeta, GridFragmentState,
 };
@@ -242,6 +243,80 @@ fn state_flow_matches_expected_plan_structure() {
     for (range, cells) in &plan.rows {
         assert_eq!(range.byte_len, (cells.len() * std::mem::size_of::<GpuCell>()) as u64);
     }
+}
+
+#[test]
+fn glyph_meta_returns_uv_and_pixel_data_for_cached_key() {
+    // Step 3 (issue #96): the fragment path must reuse the atlas via a
+    // pure lookup. After insert, glyph_meta returns the same UV rect and
+    // pixel offset/size that get_or_insert produced.
+    require_gpu!(glyph_meta_returns_uv_and_pixel_data_for_cached_key, (device, _queue), {
+        let mut atlas = GlyphAtlas::new_with_size(&device, 64);
+        let key = GlyphKey { font_id: 1, glyph_id: 1, font_size_tenths: 120, subpixel_bin: 0 };
+        let inserted = atlas
+            .get_or_insert(key, 4, 4, vec![0u8; 16], [1.0, 2.0])
+            .expect("first insert must fit in a fresh atlas");
+
+        let meta = atlas.glyph_meta(&key).expect("inserted glyph must be queryable");
+        assert_eq!(meta.uv_rect, inserted.uv_rect);
+        assert_eq!(meta.offset, inserted.offset);
+        assert_eq!(meta.size, inserted.size);
+    });
+}
+
+#[test]
+fn glyph_meta_returns_none_for_missing_key() {
+    require_gpu!(glyph_meta_returns_none_for_missing_key, (device, _queue), {
+        let atlas = GlyphAtlas::new_with_size(&device, 64);
+        let key = GlyphKey { font_id: 1, glyph_id: 999, font_size_tenths: 120, subpixel_bin: 0 };
+        assert!(atlas.glyph_meta(&key).is_none());
+    });
+}
+
+#[test]
+fn glyph_meta_does_not_rasterize_on_miss() {
+    // Pure lookup: a miss must not insert a pending upload or grow the
+    // cache. This is the "do not rasterize twice" guarantee.
+    require_gpu!(glyph_meta_does_not_rasterize_on_miss, (device, _queue), {
+        let atlas = GlyphAtlas::new_with_size(&device, 64);
+        let cache_len_before = atlas.cache.len();
+        let pending_before = atlas.pending_uploads.len();
+        let key = GlyphKey { font_id: 1, glyph_id: 999, font_size_tenths: 120, subpixel_bin: 0 };
+        let _ = atlas.glyph_meta(&key);
+        assert_eq!(atlas.cache.len(), cache_len_before);
+        assert_eq!(atlas.pending_uploads.len(), pending_before);
+    });
+}
+
+#[test]
+fn glyph_atlas_set_glyph_meta_routes_to_mono() {
+    require_gpu!(glyph_atlas_set_glyph_meta_routes_to_mono, (device, _queue), {
+        let mut set = GlyphAtlasSet::new_with_size(&device, 64);
+        let key = GlyphKey { font_id: 1, glyph_id: 2, font_size_tenths: 120, subpixel_bin: 0 };
+        let inserted = set
+            .mono
+            .get_or_insert(key, 4, 4, vec![0u8; 16], [0.0, 0.0])
+            .expect("mono insert must fit");
+        let meta = set
+            .glyph_meta(GlyphAtlasKind::Mono, &key)
+            .expect("mono atlas must serve previously inserted key");
+        assert_eq!(meta.uv_rect, inserted.uv_rect);
+    });
+}
+
+#[test]
+fn glyph_atlas_set_glyph_meta_color_returns_none_until_allocated() {
+    // The color atlas is lazy-allocated; before the first color glyph
+    // touch the lookup must report a clean miss instead of panicking.
+    require_gpu!(
+        glyph_atlas_set_glyph_meta_color_returns_none_until_allocated,
+        (device, _queue),
+        {
+            let set = GlyphAtlasSet::new_with_size(&device, 64);
+            let key = GlyphKey { font_id: 1, glyph_id: 5, font_size_tenths: 120, subpixel_bin: 0 };
+            assert!(set.glyph_meta(GlyphAtlasKind::Color, &key).is_none());
+        }
+    );
 }
 
 #[test]
