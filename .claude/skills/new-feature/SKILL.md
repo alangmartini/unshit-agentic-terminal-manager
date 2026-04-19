@@ -117,7 +117,7 @@ Write the design brief to `design-brief.md`. If research reveals a signal the Ph
 1. Update the GitHub issue with acceptance criteria as **observable behaviors**, not implementation notes.
 2. For `depth = deep`: include a DoD table mapping each AC to the test file(s) that cover it. For `standard` and `express`: a plain bulleted AC list is enough; the PR body carries the mapping later.
 3. Use Plan mode to produce the implementation plan. Cite specific files from the design brief.
-4. Get plan approval from the user before writing code.
+4. Post the plan for visibility and proceed without blocking. The only required user checkpoint is the Phase 0 manifest confirmation; every later phase runs autonomously. If implementation later forces a plan deviation, note it in the PR body rather than blocking for approval. Phase 7 visual verification stays user-driven (project memory).
 
 ## Phase 3a: Contract test (always sequential)
 
