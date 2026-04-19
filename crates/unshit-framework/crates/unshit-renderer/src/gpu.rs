@@ -5,6 +5,8 @@ use crate::image_cache::ImageCache;
 use crate::instance_buffer_pool::PooledBuffer;
 use crate::persistent_buffer::GpuPersistentBuffers;
 use crate::pipeline::backdrop_blur::{gaussian_weights, BackdropBlurPipeline, BlurUniforms};
+#[cfg(feature = "grid-fragment-shader")]
+use crate::pipeline::grid_fragment_pass::GridFragmentPass;
 use crate::pipeline::image::ImageInstance;
 use crate::pipeline::image::ImagePipeline;
 use crate::pipeline::quad::{QuadInstance, QuadPipeline};
@@ -135,6 +137,13 @@ pub struct GpuContext {
     current_quad_instance_buffer: Option<PooledBuffer<QuadInstance>>,
     current_glyph_instance_buffer: Option<PooledBuffer<GlyphInstance>>,
     current_image_instance_buffers: Vec<PooledBuffer<ImageInstance>>,
+
+    /// Consumer for [`GridDrawRecord`](crate::batch::GridDrawRecord)s
+    /// produced by the batch walk when the experimental fragment shader
+    /// grid path is active. Step 2 wiring stub for issue #96: currently
+    /// tracks stats only; Step 4 will issue draw calls.
+    #[cfg(feature = "grid-fragment-shader")]
+    pub grid_fragment_pass: GridFragmentPass,
 }
 
 impl GpuContext {
@@ -285,6 +294,8 @@ impl GpuContext {
             current_quad_instance_buffer: None,
             current_glyph_instance_buffer: None,
             current_image_instance_buffers: Vec::new(),
+            #[cfg(feature = "grid-fragment-shader")]
+            grid_fragment_pass: GridFragmentPass::new(),
         }
     }
 
@@ -551,6 +562,8 @@ impl GpuContext {
             current_quad_instance_buffer: None,
             current_glyph_instance_buffer: None,
             current_image_instance_buffers: Vec::new(),
+            #[cfg(feature = "grid-fragment-shader")]
+            grid_fragment_pass: GridFragmentPass::new(),
         }
     }
 
@@ -847,6 +860,14 @@ impl GpuContext {
         self.text_pipeline.update_uniforms(&self.queue, vw, vh);
         self.image_pipeline.update_uniforms(&self.queue, vw, vh);
         self.svg_pipeline.update_globals(&self.queue, vw, vh);
+
+        #[cfg(feature = "grid-fragment-shader")]
+        {
+            self.grid_fragment_pass.begin_frame();
+            for layer_batch in &self.layered_batch.layers {
+                self.grid_fragment_pass.process(&layer_batch.grid_records);
+            }
+        }
 
         self.glyph_atlas.upload_pending(&self.queue);
 
