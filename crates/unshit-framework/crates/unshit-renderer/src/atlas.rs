@@ -375,6 +375,15 @@ impl GlyphAtlas {
         Some(entry)
     }
 
+    /// Pure cache lookup for the experimental fragment shader grid path.
+    /// Returns the cached [`GlyphEntry`] (atlas UV rect plus pixel offset
+    /// and size) for `key` or `None` when the key has not been inserted
+    /// or has been evicted. Never rasterizes; the fragment renderer must
+    /// reuse whatever is already resident.
+    pub fn glyph_meta(&self, key: &GlyphKey) -> Option<GlyphEntry> {
+        self.cache.get(key).copied()
+    }
+
     pub fn upload_pending(&mut self, queue: &wgpu::Queue) {
         for glyph in self.pending_uploads.drain(..) {
             queue.write_texture(
@@ -485,6 +494,15 @@ impl GlyphAtlasSet {
     /// only bind the color atlas when there is at least one color glyph.
     pub fn has_color_atlas(&self) -> bool {
         self.color.is_some()
+    }
+
+    /// Pure cache lookup that routes to the atlas matching `kind`. Returns
+    /// `None` when the requested atlas has not been allocated yet (the
+    /// color atlas is lazy) or when the key is not cached. Used by the
+    /// experimental fragment shader grid path to reuse the atlas without
+    /// re rasterizing.
+    pub fn glyph_meta(&self, kind: GlyphAtlasKind, key: &GlyphKey) -> Option<GlyphEntry> {
+        self.atlas_for(kind).and_then(|a| a.glyph_meta(key))
     }
 }
 
