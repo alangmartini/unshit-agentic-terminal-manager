@@ -1,6 +1,8 @@
 pub mod backdrop_blur;
 #[cfg(feature = "grid-fragment-shader")]
 pub mod grid_fragment;
+#[cfg(feature = "grid-fragment-shader")]
+pub mod grid_fragment_pass;
 pub mod image;
 pub mod quad;
 pub mod svg;

@@ -319,6 +319,28 @@ pub struct DrawSpan {
     pub count: u32,
 }
 
+/// Geometry captured for one `ElementContent::Grid` node when the
+/// experimental fragment shader path is active. Consumed by
+/// `GridFragmentPass::process` after the walk.
+///
+/// Intentionally free of GPU handles and cell data. Step 2 of the #96
+/// wiring plan captures geometry only; follow up steps will thread cell
+/// snapshots and glyph metadata through here.
+#[cfg(feature = "grid-fragment-shader")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GridDrawRecord {
+    pub node_id: NodeId,
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub cell_w: f32,
+    pub cell_h: f32,
+    pub cols: u32,
+    pub rows: u32,
+    pub font_size: f32,
+    pub opacity: f32,
+    pub clip_rect: [f32; 4],
+}
+
 pub struct FrameBatch {
     pub quad_instances: Vec<QuadInstance>,
     pub glyph_instances: Vec<GlyphInstance>,
@@ -332,6 +354,11 @@ pub struct FrameBatch {
     /// When non-empty, the GPU render loop processes spans sequentially
     /// instead of rendering all quads then all glyphs.
     pub draw_spans: Vec<DrawSpan>,
+    /// Grid nodes routed through the experimental fragment shader path
+    /// during this frame's walk. Empty when the feature is on but the
+    /// runtime flag is unset, and when no grid elements are visible.
+    #[cfg(feature = "grid-fragment-shader")]
+    pub grid_records: Vec<GridDrawRecord>,
 }
 
 impl Default for FrameBatch {
@@ -350,6 +377,8 @@ impl FrameBatch {
             svg_draws: Vec::new(),
             backdrop_boundaries: Vec::new(),
             draw_spans: Vec::with_capacity(1024),
+            #[cfg(feature = "grid-fragment-shader")]
+            grid_records: Vec::new(),
         }
     }
 
@@ -361,7 +390,51 @@ impl FrameBatch {
         self.svg_draws.clear();
         self.backdrop_boundaries.clear();
         self.draw_spans.clear();
+        #[cfg(feature = "grid-fragment-shader")]
+        self.grid_records.clear();
     }
+}
+
+/// Routing helper for the experimental fragment shader grid path.
+/// Pushes a [`GridDrawRecord`] onto `batch.grid_records` and returns `true`
+/// when `use_fragment` is set, indicating to the caller that
+/// `emit_grid_cells` must be skipped for this grid node.
+///
+/// Kept as a separate free function so tests can drive routing behavior
+/// without needing to toggle the process wide `TM_USE_GRID_FRAGMENT_SHADER`
+/// environment variable (which is cached behind a `OnceLock`).
+#[cfg(feature = "grid-fragment-shader")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_record_grid_for_fragment_path(
+    use_fragment: bool,
+    batch: &mut FrameBatch,
+    node_id: NodeId,
+    origin_x: f32,
+    origin_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    cols: u32,
+    rows: u32,
+    font_size: f32,
+    opacity: f32,
+    clip_rect: [f32; 4],
+) -> bool {
+    if !use_fragment {
+        return false;
+    }
+    batch.grid_records.push(GridDrawRecord {
+        node_id,
+        origin_x,
+        origin_y,
+        cell_w,
+        cell_h,
+        cols,
+        rows,
+        font_size,
+        opacity,
+        clip_rect,
+    });
+    true
 }
 
 pub struct LayeredBatch {
@@ -1747,24 +1820,44 @@ fn walk_for_batch(
                     unshit_core::cell_grid::CellGrid::publish_pending_resize(cols, rows);
                 }
 
-                emit_grid_cells(
-                    grid,
+                #[cfg(feature = "grid-fragment-shader")]
+                let routed_to_fragment = try_record_grid_for_fragment_path(
+                    crate::grid_fragment_upload::runtime_flag_enabled(),
+                    batch.layer_mut(effective_layer),
+                    node_id,
                     render_x + style.padding.left,
                     render_y + style.padding.top,
                     cell_w,
                     cell_h,
+                    cols as u32,
+                    rows as u32,
                     style.font_size,
                     opacity,
                     clip_rect,
-                    batch.layer_mut(effective_layer),
-                    atlas,
-                    font_system,
-                    rasterizer,
-                    shape_cache,
-                    Some(&mut node_glyph_keys),
-                    node_id,
-                    line_cache.as_deref_mut(),
                 );
+                #[cfg(not(feature = "grid-fragment-shader"))]
+                let routed_to_fragment = false;
+
+                if !routed_to_fragment {
+                    emit_grid_cells(
+                        grid,
+                        render_x + style.padding.left,
+                        render_y + style.padding.top,
+                        cell_w,
+                        cell_h,
+                        style.font_size,
+                        opacity,
+                        clip_rect,
+                        batch.layer_mut(effective_layer),
+                        atlas,
+                        font_system,
+                        rasterizer,
+                        shape_cache,
+                        Some(&mut node_glyph_keys),
+                        node_id,
+                        line_cache.as_deref_mut(),
+                    );
+                }
             }
             ElementContent::Svg(ref node) if is_visible => {
                 emit_svg_node(
@@ -5642,5 +5735,117 @@ mod tests {
             &mut row_quads,
         );
         assert!(row_quads.is_empty(), "a blank row must emit zero bg quads");
+    }
+
+    // Fragment shader routing tests (issue #96 step 2)
+    #[cfg(feature = "grid-fragment-shader")]
+    mod grid_fragment_routing {
+        use super::super::{try_record_grid_for_fragment_path, FrameBatch, GridDrawRecord};
+        use unshit_core::id::NodeId;
+
+        fn sample_clip() -> [f32; 4] {
+            [0.0, 0.0, 9999.0, 9999.0]
+        }
+
+        #[test]
+        fn off_does_not_push_any_record() {
+            let mut batch = FrameBatch::new();
+            let routed = try_record_grid_for_fragment_path(
+                false,
+                &mut batch,
+                NodeId::DANGLING,
+                10.0,
+                20.0,
+                8.0,
+                16.0,
+                80,
+                24,
+                14.0,
+                1.0,
+                sample_clip(),
+            );
+            assert!(!routed);
+            assert!(batch.grid_records.is_empty());
+        }
+
+        #[test]
+        fn on_pushes_record_with_geometry() {
+            let mut batch = FrameBatch::new();
+            let routed = try_record_grid_for_fragment_path(
+                true,
+                &mut batch,
+                NodeId::DANGLING,
+                10.0,
+                20.0,
+                8.5,
+                16.25,
+                80,
+                24,
+                14.0,
+                0.75,
+                sample_clip(),
+            );
+            assert!(routed);
+            assert_eq!(batch.grid_records.len(), 1);
+            assert_eq!(
+                batch.grid_records[0],
+                GridDrawRecord {
+                    node_id: NodeId::DANGLING,
+                    origin_x: 10.0,
+                    origin_y: 20.0,
+                    cell_w: 8.5,
+                    cell_h: 16.25,
+                    cols: 80,
+                    rows: 24,
+                    font_size: 14.0,
+                    opacity: 0.75,
+                    clip_rect: sample_clip(),
+                }
+            );
+        }
+
+        #[test]
+        fn on_repeated_calls_append_records() {
+            let mut batch = FrameBatch::new();
+            for _ in 0..3 {
+                try_record_grid_for_fragment_path(
+                    true,
+                    &mut batch,
+                    NodeId::DANGLING,
+                    0.0,
+                    0.0,
+                    8.0,
+                    16.0,
+                    80,
+                    24,
+                    14.0,
+                    1.0,
+                    sample_clip(),
+                );
+            }
+            assert_eq!(batch.grid_records.len(), 3);
+        }
+
+        #[test]
+        fn clear_drops_records() {
+            let mut batch = FrameBatch::new();
+            try_record_grid_for_fragment_path(
+                true,
+                &mut batch,
+                NodeId::DANGLING,
+                0.0,
+                0.0,
+                8.0,
+                16.0,
+                80,
+                24,
+                14.0,
+                1.0,
+                sample_clip(),
+            );
+            assert_eq!(batch.grid_records.len(), 1);
+            batch.clear();
+            assert!(batch.grid_records.is_empty());
+        }
     }
 }
