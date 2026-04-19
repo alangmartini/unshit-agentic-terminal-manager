@@ -20,6 +20,10 @@ pub fn build_terminal_grid(
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
+    if state.panes.is_empty() {
+        return build_empty_workspace(shared);
+    }
+
     let mut grid_el = ElementDef::new(Tag::Div)
         .with_class("terminal-grid")
         .with_id("terminal-grid");
@@ -53,6 +57,33 @@ pub fn build_terminal_grid(
     }
 
     grid_el
+}
+
+fn build_empty_workspace(shared: &SharedState) -> ElementDef {
+    let click_shared = shared.clone();
+    let button = ElementDef::new(Tag::Button)
+        .with_class("empty-workspace-new-terminal")
+        .with_tab_index(0)
+        .on_click(move || {
+            mutate_with(&click_shared, |st| {
+                crate::state::dispatch(st, "tab.new");
+            });
+        })
+        .with_text("New terminal".to_string());
+    ElementDef::new(Tag::Div)
+        .with_class("terminal-grid")
+        .with_class("empty")
+        .with_id("terminal-grid")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("empty-workspace")
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("empty-workspace-message")
+                        .with_text("No terminals in this workspace".to_string()),
+                )
+                .with_child(button),
+        )
 }
 
 /// Vertical divider between columns within a row. Dragging left/right adjusts
@@ -156,7 +187,8 @@ fn build_pane(
     let pane_id = pane.id;
     container = container.on_click(move || {
         mutate_with(&activate_state, |st| {
-            st.active_pane = pane_id;
+            let ws_idx = st.active_workspace;
+            crate::state::dispatch(st, &format!("terminal.focus:{}:{}", ws_idx, pane_id.0));
         });
     });
 
@@ -451,6 +483,18 @@ mod tests {
         Arc::new(Mutex::new(crate::state::seed_state()))
     }
 
+    fn find_by_class<'a>(def: &'a ElementDef, class: &str) -> Option<&'a ElementDef> {
+        if def.classes.iter().any(|c| c == class) {
+            return Some(def);
+        }
+        for child in &def.children {
+            if let Some(found) = find_by_class(child, class) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     fn find_terminal_content(def: &ElementDef) -> Option<&ElementDef> {
         if def.classes.iter().any(|c| c == "terminal-content") {
             return Some(def);
@@ -481,6 +525,41 @@ mod tests {
             }
         }
         def.children.iter().any(|c| tree_has_text(c, needle))
+    }
+
+    // -- build_terminal_grid: empty workspace -----------------------------------
+
+    #[test]
+    fn terminal_grid_empty_panes_shows_new_terminal_cta() {
+        let mut state = seed_state();
+        state.panes = vec![];
+        state.tabs = vec![];
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let grids = std::collections::HashMap::new();
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        assert!(el.classes.contains(&"empty".to_string()));
+        let btn = find_by_class(&el, "empty-workspace-new-terminal")
+            .expect("new terminal button missing");
+        assert!(btn.on_click.is_some());
+    }
+
+    #[test]
+    fn terminal_grid_empty_button_dispatches_tab_new() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.panes = vec![];
+            guard.tabs = vec![];
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let grids = std::collections::HashMap::new();
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        let btn = find_by_class(&el, "empty-workspace-new-terminal").unwrap();
+        (btn.on_click.as_ref().unwrap())();
+        let guard = shared.lock().unwrap();
+        assert!(!guard.tabs.is_empty(), "tab.new must populate state.tabs");
+        assert!(!guard.panes.is_empty(), "tab.new must populate state.panes");
     }
 
     // -- build_terminal_grid: single pane ---------------------------------------
@@ -701,6 +780,11 @@ mod tests {
     fn pane_click_sets_active_pane() {
         let shared = make_shared();
         let pane = make_pane_titled(42, "shell");
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.panes[0].push(pane.clone());
+            guard.col_ratios[0].push(1.0);
+        }
         let grids = std::collections::HashMap::new();
         let el = build_pane(&pane, false, false, &shared, &grids);
         (el.on_click.as_ref().unwrap())();

@@ -78,10 +78,15 @@ fn build_workspace(
         .with_tab_index(0)
         .on_click(move || {
             mutate_with(&head_state, |st| {
-                if idx < st.workspaces.len() {
-                    st.active_workspace = idx;
-                    st.workspaces[idx].collapsed = false;
+                if let Some(ws) = st.workspaces.get_mut(idx) {
+                    ws.collapsed = false;
                 }
+                let pane = crate::state::workspace_active_pane(st, idx);
+                let cmd = match pane {
+                    Some(pid) => format!("terminal.focus:{}:{}", idx, pid.0),
+                    None => format!("workspace.switch:{}", idx),
+                };
+                crate::state::dispatch(st, &cmd);
             });
         })
         .on_context_menu(move |x, y| {
@@ -140,7 +145,12 @@ fn build_workspace(
             let mut entries = ElementDef::new(Tag::Div).with_class("terminal-entries");
             let count = workspace.terminal_entries.len();
             for (t_idx, entry) in workspace.terminal_entries.iter().enumerate() {
-                entries = entries.with_child(build_terminal_entry(entry, t_idx == count - 1));
+                entries = entries.with_child(build_terminal_entry(
+                    workspace_index,
+                    entry,
+                    t_idx == count - 1,
+                    shared,
+                ));
             }
             body = body.with_child(entries);
         }
@@ -186,7 +196,7 @@ fn build_subtab(
         let (wi, si) = (workspace_index, subtab_index);
         btn = btn.on_click(move || {
             mutate_with(&s, |st| {
-                st.active_workspace = wi;
+                crate::state::mutate_switch_workspace(st, wi);
                 if let Some(ws) = st.workspaces.get_mut(wi) {
                     for (i, sub) in ws.subtabs.iter_mut().enumerate() {
                         sub.active = i == si;
@@ -242,11 +252,25 @@ fn build_subtab(
     btn
 }
 
-fn build_terminal_entry(entry: &TerminalEntry, is_last: bool) -> ElementDef {
+fn build_terminal_entry(
+    workspace_index: usize,
+    entry: &TerminalEntry,
+    is_last: bool,
+    shared: &SharedState,
+) -> ElementDef {
     let glyph = if is_last { "\u{2514}" } else { "\u{251C}" };
 
+    let click_shared = shared.clone();
+    let ws_idx = workspace_index;
+    let pane_id = entry.pane_id;
     let mut row = ElementDef::new(Tag::Div)
         .with_class("terminal-entry")
+        .with_tab_index(0)
+        .on_click(move || {
+            mutate_with(&click_shared, |st| {
+                crate::state::dispatch(st, &format!("terminal.focus:{}:{}", ws_idx, pane_id.0));
+            });
+        })
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("tree-glyph")
@@ -417,6 +441,11 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
             format!("workspace.switch:{}", ws_idx),
         ))
         .with_child(menu_item(
+            "New terminal",
+            shared,
+            format!("workspace.new_terminal:{}", ws_idx),
+        ))
+        .with_child(menu_item(
             collapse_label,
             shared,
             format!("workspace.collapse:{}", ws_idx),
@@ -498,6 +527,8 @@ mod tests {
                 },
             ],
             git_branch: None,
+            tabs: vec![],
+            active_tab: 0,
         }
     }
 
@@ -686,8 +717,9 @@ mod tests {
             branch: "main".to_string(),
             branch_muted: true,
             branch_error: false,
+            pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(&entry, false);
+        let el = build_terminal_entry(0, &entry, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(has_class(branch_tag, "muted"));
     }
@@ -699,8 +731,9 @@ mod tests {
             branch: "main".to_string(),
             branch_muted: false,
             branch_error: false,
+            pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(&entry, false);
+        let el = build_terminal_entry(0, &entry, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(!has_class(branch_tag, "muted"));
     }
@@ -712,8 +745,9 @@ mod tests {
             branch: "main".to_string(),
             branch_muted: false,
             branch_error: true,
+            pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(&entry, false);
+        let el = build_terminal_entry(0, &entry, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(has_class(branch_tag, "error"));
     }
@@ -725,8 +759,9 @@ mod tests {
             branch: "main".to_string(),
             branch_muted: false,
             branch_error: false,
+            pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(&entry, false);
+        let el = build_terminal_entry(0, &entry, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(!has_class(branch_tag, "error"));
     }
@@ -741,6 +776,75 @@ mod tests {
         assert_eq!(text_of(num_el), Some("3"));
         let name_el = find_by_class(head, "workspace-name").unwrap();
         assert_eq!(text_of(name_el), Some("ws-3"));
+    }
+
+    #[test]
+    fn workspace_head_click_switches_active_workspace() {
+        let shared = make_shared();
+        assert_eq!(shared.lock().unwrap().active_workspace, 0);
+        let ws = shared.lock().unwrap().ui_snapshot().workspaces[2].clone();
+        let el = build_workspace(2, &ws, &shared);
+        let head = find_by_class(&el, "workspace-head").unwrap();
+        (head.on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().active_workspace, 2);
+    }
+
+    #[test]
+    fn workspace_head_click_expands_collapsed_workspace() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.workspaces[1].collapsed = true;
+        }
+        let ws = shared.lock().unwrap().ui_snapshot().workspaces[1].clone();
+        let el = build_workspace(1, &ws, &shared);
+        let head = find_by_class(&el, "workspace-head").unwrap();
+        (head.on_click.as_ref().unwrap())();
+        assert!(!shared.lock().unwrap().workspaces[1].collapsed);
+    }
+
+    #[test]
+    fn workspace_head_click_on_populated_workspace_focuses_active_pane() {
+        use crate::state::PaneId;
+        // Seed state has ws0 active with a live pane id 1, plus ws1 with no tabs.
+        let shared = make_shared();
+        // Switch to ws1 and create a terminal there so ws1 has a saved pane.
+        {
+            let mut st = shared.lock().unwrap();
+            crate::state::mutate_switch_workspace(&mut st, 1);
+            crate::state::mutate_add_tab(&mut st);
+        }
+        let new_pane_id = shared.lock().unwrap().active_pane;
+        // Switch back to ws0 so ws1's state is saved.
+        {
+            let mut st = shared.lock().unwrap();
+            crate::state::mutate_switch_workspace(&mut st, 0);
+        }
+        assert_eq!(shared.lock().unwrap().active_workspace, 0);
+        // Clicking ws1's head must switch workspace and set active_pane to
+        // ws1's saved pane, matching a terminal-entry click on that pane.
+        let ws = shared.lock().unwrap().ui_snapshot().workspaces[1].clone();
+        let el = build_workspace(1, &ws, &shared);
+        let head = find_by_class(&el, "workspace-head").unwrap();
+        (head.on_click.as_ref().unwrap())();
+        let st = shared.lock().unwrap();
+        assert_eq!(st.active_workspace, 1);
+        assert_eq!(st.active_pane, new_pane_id);
+        assert_ne!(new_pane_id, PaneId(0));
+    }
+
+    #[test]
+    fn workspace_head_click_on_empty_workspace_still_switches() {
+        // Seed: ws2 and ws3 have no saved tabs. Clicking their head must still
+        // switch active_workspace via the workspace.switch fallback.
+        let shared = make_shared();
+        assert_eq!(shared.lock().unwrap().active_workspace, 0);
+        assert!(shared.lock().unwrap().workspaces[2].tabs.is_empty());
+        let ws = shared.lock().unwrap().ui_snapshot().workspaces[2].clone();
+        let el = build_workspace(2, &ws, &shared);
+        let head = find_by_class(&el, "workspace-head").unwrap();
+        (head.on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().active_workspace, 2);
     }
 
     #[test]
