@@ -78,8 +78,9 @@ fn build_workspace(
         .on_click(move || {
             mutate_with(&head_state, |st| {
                 if let Some(ws) = st.workspaces.get_mut(idx) {
-                    ws.collapsed = !ws.collapsed;
+                    ws.collapsed = false;
                 }
+                crate::state::dispatch(st, &format!("workspace.switch:{}", idx));
             });
         })
         .on_context_menu(move |x, y| {
@@ -182,7 +183,7 @@ fn build_subtab(
         let (wi, si) = (workspace_index, subtab_index);
         btn = btn.on_click(move || {
             mutate_with(&s, |st| {
-                st.active_workspace = wi;
+                crate::state::mutate_switch_workspace(st, wi);
                 if let Some(ws) = st.workspaces.get_mut(wi) {
                     for (i, sub) in ws.subtabs.iter_mut().enumerate() {
                         sub.active = i == si;
@@ -677,6 +678,31 @@ mod tests {
         assert_eq!(text_of(num_el), Some("3"));
         let name_el = find_by_class(head, "workspace-name").unwrap();
         assert_eq!(text_of(name_el), Some("ws-3"));
+    }
+
+    #[test]
+    fn workspace_head_click_switches_active_workspace() {
+        let shared = make_shared();
+        assert_eq!(shared.lock().unwrap().active_workspace, 0);
+        let ws = shared.lock().unwrap().ui_snapshot().workspaces[2].clone();
+        let el = build_workspace(2, &ws, &shared);
+        let head = find_by_class(&el, "workspace-head").unwrap();
+        (head.on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().active_workspace, 2);
+    }
+
+    #[test]
+    fn workspace_head_click_expands_collapsed_workspace() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.workspaces[1].collapsed = true;
+        }
+        let ws = shared.lock().unwrap().ui_snapshot().workspaces[1].clone();
+        let el = build_workspace(1, &ws, &shared);
+        let head = find_by_class(&el, "workspace-head").unwrap();
+        (head.on_click.as_ref().unwrap())();
+        assert!(!shared.lock().unwrap().workspaces[1].collapsed);
     }
 
     #[test]

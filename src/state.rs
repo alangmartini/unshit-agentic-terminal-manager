@@ -528,6 +528,12 @@ fn load_workspace_state(state: &mut AppState) {
     }
     let ws = &state.workspaces[state.active_workspace];
     if ws.tabs.is_empty() {
+        state.tabs = vec![];
+        state.active_tab = 0;
+        state.panes = vec![];
+        state.active_pane = PaneId(0);
+        state.row_ratios = vec![];
+        state.col_ratios = vec![];
         return;
     }
     state.tabs = ws.tabs.clone();
@@ -2712,5 +2718,24 @@ mod tests {
         let ws1 = &snap.workspaces[1];
         let ids: Vec<u32> = ws1.terminal_entries.iter().map(|e| e.pane_id.0).collect();
         assert_eq!(ids, vec![7, 8]);
+    }
+
+    #[test]
+    fn workspace_switch_to_empty_clears_live_panes() {
+        let mut state = two_workspace_state();
+        // Replace ws1 with an empty-tabs workspace (simulates a fresh/unvisited ws).
+        state.workspaces[1].tabs = vec![];
+        state.workspaces[1].active_tab = 0;
+
+        assert!(dispatch(&mut state, "workspace.switch:1"));
+        assert_eq!(state.active_workspace, 1);
+        assert!(
+            state.panes.is_empty(),
+            "panes must be empty on empty workspace"
+        );
+        assert!(
+            state.tabs.is_empty(),
+            "tabs must be empty on empty workspace"
+        );
     }
 }
