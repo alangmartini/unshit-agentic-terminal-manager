@@ -131,7 +131,12 @@ fn build_workspace(
             let mut entries = ElementDef::new(Tag::Div).with_class("terminal-entries");
             let count = workspace.terminal_entries.len();
             for (t_idx, entry) in workspace.terminal_entries.iter().enumerate() {
-                entries = entries.with_child(build_terminal_entry(entry, t_idx == count - 1));
+                entries = entries.with_child(build_terminal_entry(
+                    workspace_index,
+                    entry,
+                    t_idx == count - 1,
+                    shared,
+                ));
             }
             body = body.with_child(entries);
         }
@@ -233,11 +238,25 @@ fn build_subtab(
     btn
 }
 
-fn build_terminal_entry(entry: &TerminalEntry, is_last: bool) -> ElementDef {
+fn build_terminal_entry(
+    workspace_index: usize,
+    entry: &TerminalEntry,
+    is_last: bool,
+    shared: &SharedState,
+) -> ElementDef {
     let glyph = if is_last { "\u{2514}" } else { "\u{251C}" };
 
+    let click_shared = shared.clone();
+    let ws_idx = workspace_index;
+    let pane_id = entry.pane_id;
     let mut row = ElementDef::new(Tag::Div)
         .with_class("terminal-entry")
+        .with_tab_index(0)
+        .on_click(move || {
+            mutate_with(&click_shared, |st| {
+                crate::state::dispatch(st, &format!("terminal.focus:{}:{}", ws_idx, pane_id.0));
+            });
+        })
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("tree-glyph")
@@ -489,6 +508,8 @@ mod tests {
                 },
             ],
             git_branch: None,
+            tabs: vec![],
+            active_tab: 0,
         }
     }
 
@@ -597,8 +618,9 @@ mod tests {
             branch: "main".to_string(),
             branch_muted: true,
             branch_error: false,
+            pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(&entry, false);
+        let el = build_terminal_entry(0, &entry, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(has_class(branch_tag, "muted"));
     }
@@ -610,8 +632,9 @@ mod tests {
             branch: "main".to_string(),
             branch_muted: false,
             branch_error: false,
+            pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(&entry, false);
+        let el = build_terminal_entry(0, &entry, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(!has_class(branch_tag, "muted"));
     }
@@ -623,8 +646,9 @@ mod tests {
             branch: "main".to_string(),
             branch_muted: false,
             branch_error: true,
+            pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(&entry, false);
+        let el = build_terminal_entry(0, &entry, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(has_class(branch_tag, "error"));
     }
@@ -636,8 +660,9 @@ mod tests {
             branch: "main".to_string(),
             branch_muted: false,
             branch_error: false,
+            pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(&entry, false);
+        let el = build_terminal_entry(0, &entry, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(!has_class(branch_tag, "error"));
     }

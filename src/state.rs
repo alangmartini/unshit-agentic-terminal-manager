@@ -73,6 +73,11 @@ pub struct Workspace {
     pub terminal_entries: Vec<TerminalEntry>,
     pub subtabs: Vec<Subtab>,
     pub git_branch: Option<String>,
+    /// Per-workspace tab list. When this workspace is active, `AppState.tabs`
+    /// mirrors this (via workspace save/restore in `workspace.switch`). When
+    /// inactive, this is the source of truth.
+    pub tabs: Vec<TerminalTab>,
+    pub active_tab: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +106,9 @@ pub struct TerminalEntry {
     pub branch: String,
     pub branch_muted: bool,
     pub branch_error: bool,
+    /// Pane this entry represents. Links the sidebar row to a real pane so
+    /// clicks can focus that pane in that workspace.
+    pub pane_id: PaneId,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +220,7 @@ impl AppState {
                         branch: branch_text.clone(),
                         branch_muted: false,
                         branch_error,
+                        pane_id: p.id,
                     })
                     .collect();
                 for sub in &mut ws.subtabs {
@@ -221,10 +230,26 @@ impl AppState {
                 }
                 ws.terminal_entries = entries;
             } else {
-                for entry in &mut ws.terminal_entries {
-                    entry.branch = branch_text.clone();
-                    entry.branch_error = branch_error;
+                let entries: Vec<TerminalEntry> = ws
+                    .tabs
+                    .get(ws.active_tab)
+                    .map(|tab| tab.panes.iter().flatten().collect::<Vec<_>>())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| TerminalEntry {
+                        name: p.title.clone(),
+                        branch: branch_text.clone(),
+                        branch_muted: false,
+                        branch_error,
+                        pane_id: p.id,
+                    })
+                    .collect();
+                for sub in &mut ws.subtabs {
+                    if sub.label == "terminals" {
+                        sub.count = Some(entries.len() as u32);
+                    }
                 }
+                ws.terminal_entries = entries;
             }
         }
         UiSnapshot {
@@ -311,35 +336,10 @@ pub fn seed_state() -> AppState {
             path: ws1_path,
             collapsed: false,
             terminals_expanded: true,
-            terminal_entries: vec![
-                TerminalEntry {
-                    name: "shell".to_string(),
-                    branch: "main".to_string(),
-                    branch_muted: false,
-                    branch_error: false,
-                },
-                TerminalEntry {
-                    name: "build".to_string(),
-                    branch: "main".to_string(),
-                    branch_muted: false,
-                    branch_error: false,
-                },
-                TerminalEntry {
-                    name: "dev-server".to_string(),
-                    branch: "main".to_string(),
-                    branch_muted: false,
-                    branch_error: false,
-                },
-                TerminalEntry {
-                    name: "logs".to_string(),
-                    branch: "main".to_string(),
-                    branch_muted: false,
-                    branch_error: false,
-                },
-            ],
+            terminal_entries: vec![],
             subtabs: vec![Subtab {
                 label: "terminals".to_string(),
-                count: Some(4),
+                count: Some(1),
                 pulse: false,
                 active: true,
                 disabled: false,
@@ -347,6 +347,8 @@ pub fn seed_state() -> AppState {
                 tree_glyph: "\u{2514}",
             }],
             git_branch: ws1_branch,
+            tabs: vec![],
+            active_tab: 0,
         },
         Workspace {
             num: 2,
@@ -354,23 +356,10 @@ pub fn seed_state() -> AppState {
             path: None,
             collapsed: false,
             terminals_expanded: false,
-            terminal_entries: vec![
-                TerminalEntry {
-                    name: "shell".to_string(),
-                    branch: "fix/pdf-export".to_string(),
-                    branch_muted: false,
-                    branch_error: false,
-                },
-                TerminalEntry {
-                    name: "tests".to_string(),
-                    branch: "fix/pdf-export".to_string(),
-                    branch_muted: false,
-                    branch_error: false,
-                },
-            ],
+            terminal_entries: vec![],
             subtabs: vec![Subtab {
                 label: "terminals".to_string(),
-                count: Some(2),
+                count: Some(0),
                 pulse: false,
                 active: false,
                 disabled: false,
@@ -378,6 +367,8 @@ pub fn seed_state() -> AppState {
                 tree_glyph: "\u{2514}",
             }],
             git_branch: None,
+            tabs: vec![],
+            active_tab: 0,
         },
         Workspace {
             num: 3,
@@ -385,15 +376,10 @@ pub fn seed_state() -> AppState {
             path: None,
             collapsed: true,
             terminals_expanded: false,
-            terminal_entries: vec![TerminalEntry {
-                name: "shell".to_string(),
-                branch: "staging".to_string(),
-                branch_muted: false,
-                branch_error: false,
-            }],
+            terminal_entries: vec![],
             subtabs: vec![Subtab {
                 label: "terminals".to_string(),
-                count: Some(1),
+                count: Some(0),
                 pulse: false,
                 active: false,
                 disabled: false,
@@ -401,6 +387,8 @@ pub fn seed_state() -> AppState {
                 tree_glyph: "\u{2514}",
             }],
             git_branch: None,
+            tabs: vec![],
+            active_tab: 0,
         },
         Workspace {
             num: 4,
@@ -419,6 +407,8 @@ pub fn seed_state() -> AppState {
                 tree_glyph: "\u{2514}",
             }],
             git_branch: None,
+            tabs: vec![],
+            active_tab: 0,
         },
     ];
 
@@ -520,6 +510,39 @@ pub fn mutate_switch_tab(state: &mut AppState, new_index: usize) {
     save_tab_state(state);
     state.active_tab = new_index;
     load_tab_state(state);
+}
+
+fn save_workspace_state(state: &mut AppState) {
+    save_tab_state(state);
+    if state.active_workspace >= state.workspaces.len() {
+        return;
+    }
+    let ws = &mut state.workspaces[state.active_workspace];
+    ws.tabs = state.tabs.clone();
+    ws.active_tab = state.active_tab;
+}
+
+fn load_workspace_state(state: &mut AppState) {
+    if state.active_workspace >= state.workspaces.len() {
+        return;
+    }
+    let ws = &state.workspaces[state.active_workspace];
+    if ws.tabs.is_empty() {
+        return;
+    }
+    state.tabs = ws.tabs.clone();
+    state.active_tab = ws.active_tab.min(state.tabs.len() - 1);
+    load_tab_state(state);
+}
+
+/// Save the active workspace's live tabs/panes, switch, and load the target's saved view.
+pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
+    if new_index >= state.workspaces.len() || new_index == state.active_workspace {
+        return;
+    }
+    save_workspace_state(state);
+    state.active_workspace = new_index;
+    load_workspace_state(state);
 }
 
 pub fn mutate_add_tab(state: &mut AppState) {
@@ -646,6 +669,8 @@ pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace
             tree_glyph: "\u{2514}",
         }],
         git_branch,
+        tabs: vec![],
+        active_tab: 0,
     }
 }
 
@@ -1047,11 +1072,52 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if let Ok(idx) = other["workspace.switch:".len()..].parse::<usize>() {
                 state.ctx_menu = None;
                 if idx < state.workspaces.len() {
-                    state.active_workspace = idx;
+                    mutate_switch_workspace(state, idx);
                     return true;
                 }
             }
             false
+        }
+        other if other.starts_with("terminal.focus:") => {
+            let rest = &other["terminal.focus:".len()..];
+            let Some((ws_str, pane_str)) = rest.split_once(':') else {
+                return false;
+            };
+            let Ok(ws_idx) = ws_str.parse::<usize>() else {
+                return false;
+            };
+            let Ok(pane_num) = pane_str.parse::<u32>() else {
+                return false;
+            };
+            if ws_idx >= state.workspaces.len() {
+                log::warn!("terminal.focus: workspace index {} out of range", ws_idx);
+                return false;
+            }
+            let target = PaneId(pane_num);
+            let pane_exists = if ws_idx == state.active_workspace {
+                find_pane_coord(state, target).is_some()
+            } else {
+                let ws = &state.workspaces[ws_idx];
+                ws.tabs
+                    .get(ws.active_tab)
+                    .map(|tab| tab.panes.iter().flatten().any(|p| p.id == target))
+                    .unwrap_or(false)
+            };
+            if !pane_exists {
+                log::warn!(
+                    "terminal.focus: pane {} not found in workspace {}",
+                    pane_num,
+                    ws_idx
+                );
+                return false;
+            }
+            state.ctx_menu = None;
+            mutate_switch_workspace(state, ws_idx);
+            state.active_pane = target;
+            if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                tab.active_pane = target;
+            }
+            true
         }
         _ => false,
     }
@@ -2426,5 +2492,225 @@ mod tests {
         let mut state = seed_state();
         state.active_workspace = 1; // demo workspace with no path
         assert_eq!(active_workspace_cwd(&state), None);
+    }
+
+    // -- Per-workspace terminal routing (issue #101) -------------------------
+
+    /// Build a workspace pre-populated with one tab whose panes contain the
+    /// given pane ids. Used to simulate a workspace that "has terminals" for
+    /// click-routing tests.
+    fn workspace_with_panes(num: u32, name: &str, pane_ids: &[u32]) -> Workspace {
+        let panes: Vec<Vec<Pane>> = vec![pane_ids
+            .iter()
+            .map(|&id| Pane {
+                id: PaneId(id),
+                title: format!("shell-{}", id),
+                subtitle: "bash".to_string(),
+                pid: 0,
+                cpu: 0.0,
+            })
+            .collect()];
+        let first_id = PaneId(pane_ids[0]);
+        let tab = TerminalTab {
+            id: format!("t{}", num),
+            name: name.to_string(),
+            subtitle: "bash".to_string(),
+            status: TabStatus::Running,
+            panes,
+            active_pane: first_id,
+            row_ratios: vec![1.0],
+            col_ratios: vec![vec![1.0; pane_ids.len()]],
+        };
+        Workspace {
+            num,
+            name: name.to_string(),
+            path: None,
+            collapsed: false,
+            terminals_expanded: true,
+            terminal_entries: vec![],
+            subtabs: vec![],
+            git_branch: None,
+            tabs: vec![tab],
+            active_tab: 0,
+        }
+    }
+
+    /// AC1 contract: clicking a terminal entry under workspace B while
+    /// workspace A is active must switch active_workspace to B and focus the
+    /// clicked pane. This is the single failing test that locks the dispatch
+    /// shape for `terminal.focus:<ws_idx>:<pane_id>`.
+    #[test]
+    fn terminal_focus_switches_workspace_and_pane() {
+        let mut state = test_state();
+        state.workspaces = vec![
+            workspace_with_panes(1, "alpha", &[1]),
+            workspace_with_panes(2, "beta", &[7, 8]),
+        ];
+        state.active_workspace = 0;
+        // Mirror ws0's live view so "active workspace" is consistent.
+        state.tabs = state.workspaces[0].tabs.clone();
+        state.active_tab = 0;
+        state.panes = state.tabs[0].panes.clone();
+        state.active_pane = PaneId(1);
+        state.row_ratios = vec![1.0];
+        state.col_ratios = vec![vec![1.0]];
+
+        let handled = dispatch(&mut state, "terminal.focus:1:8");
+
+        assert!(handled, "terminal.focus must return true when handled");
+        assert_eq!(state.active_workspace, 1, "workspace must switch to 1");
+        assert_eq!(
+            state.active_pane,
+            PaneId(8),
+            "active pane must be the clicked one"
+        );
+    }
+
+    /// Build a two-workspace state where ws0 is active and both have panes.
+    /// Returned state has live state mirroring ws0.
+    fn two_workspace_state() -> AppState {
+        let mut state = test_state();
+        state.workspaces = vec![
+            workspace_with_panes(1, "alpha", &[1]),
+            workspace_with_panes(2, "beta", &[7, 8]),
+        ];
+        state.active_workspace = 0;
+        state.tabs = state.workspaces[0].tabs.clone();
+        state.active_tab = 0;
+        state.panes = state.tabs[0].panes.clone();
+        state.active_pane = PaneId(1);
+        state.row_ratios = vec![1.0];
+        state.col_ratios = vec![vec![1.0]];
+        state.next_id = 9;
+        state
+    }
+
+    #[test]
+    fn terminal_focus_invalid_workspace_returns_false() {
+        let mut state = two_workspace_state();
+        let handled = dispatch(&mut state, "terminal.focus:99:1");
+        assert!(!handled, "out-of-range workspace must not be handled");
+        assert_eq!(state.active_workspace, 0);
+    }
+
+    #[test]
+    fn terminal_focus_missing_pane_returns_false() {
+        let mut state = two_workspace_state();
+        let handled = dispatch(&mut state, "terminal.focus:1:999");
+        assert!(
+            !handled,
+            "nonexistent pane id in that workspace must not be handled"
+        );
+    }
+
+    #[test]
+    fn terminal_focus_malformed_returns_false() {
+        let mut state = two_workspace_state();
+        assert!(!dispatch(&mut state, "terminal.focus:"));
+        assert!(!dispatch(&mut state, "terminal.focus:1"));
+        assert!(!dispatch(&mut state, "terminal.focus:abc:7"));
+        assert!(!dispatch(&mut state, "terminal.focus:1:xyz"));
+    }
+
+    #[test]
+    fn terminal_focus_same_workspace_just_focuses_pane() {
+        let mut state = two_workspace_state();
+        // ws0 has one pane (id 1); add a second pane directly.
+        state.panes[0].push(Pane {
+            id: PaneId(42),
+            title: "extra".to_string(),
+            subtitle: "bash".to_string(),
+            pid: 0,
+            cpu: 0.0,
+        });
+        state.col_ratios[0].push(0.5);
+        state.col_ratios[0][0] = 0.5;
+        // Mirror into ws0's saved tab so lookup sees it.
+        state.workspaces[0].tabs[0].panes = state.panes.clone();
+        state.workspaces[0].tabs[0].col_ratios = state.col_ratios.clone();
+
+        let handled = dispatch(&mut state, "terminal.focus:0:42");
+        assert!(handled);
+        assert_eq!(state.active_workspace, 0);
+        assert_eq!(state.active_pane, PaneId(42));
+    }
+
+    #[test]
+    fn workspace_switch_preserves_pane_layout_of_both() {
+        let mut state = two_workspace_state();
+        let ws0_ids_before: Vec<Vec<u32>> = state.workspaces[0].tabs[0]
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id.0).collect())
+            .collect();
+        let ws1_ids_before: Vec<Vec<u32>> = state.workspaces[1].tabs[0]
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id.0).collect())
+            .collect();
+
+        assert!(dispatch(&mut state, "workspace.switch:1"));
+        assert_eq!(state.active_workspace, 1);
+        let live_ws1: Vec<Vec<u32>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id.0).collect())
+            .collect();
+        assert_eq!(live_ws1, ws1_ids_before);
+        assert_eq!(state.active_pane, PaneId(7));
+
+        assert!(dispatch(&mut state, "workspace.switch:0"));
+        assert_eq!(state.active_workspace, 0);
+        let live_ws0: Vec<Vec<u32>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id.0).collect())
+            .collect();
+        assert_eq!(live_ws0, ws0_ids_before);
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn workspace_switch_remembers_active_pane_per_workspace() {
+        let mut state = two_workspace_state();
+        // Start in ws0, go to ws1 and focus pane 8.
+        assert!(dispatch(&mut state, "terminal.focus:1:8"));
+        assert_eq!(state.active_pane, PaneId(8));
+        // Switch to ws0, then back to ws1: active pane must still be 8.
+        assert!(dispatch(&mut state, "workspace.switch:0"));
+        assert_eq!(state.active_pane, PaneId(1));
+        assert!(dispatch(&mut state, "workspace.switch:1"));
+        assert_eq!(state.active_pane, PaneId(8));
+    }
+
+    #[test]
+    fn workspace_switch_does_not_touch_terminals_map() {
+        let mut state = two_workspace_state();
+        let keys_before: Vec<u32> = {
+            let mut ks: Vec<u32> = state.terminals.keys().copied().collect();
+            ks.sort();
+            ks
+        };
+        assert!(dispatch(&mut state, "workspace.switch:1"));
+        assert!(dispatch(&mut state, "workspace.switch:0"));
+        let keys_after: Vec<u32> = {
+            let mut ks: Vec<u32> = state.terminals.keys().copied().collect();
+            ks.sort();
+            ks
+        };
+        assert_eq!(
+            keys_before, keys_after,
+            "terminals map (PTY handles) must survive workspace switches intact"
+        );
+    }
+
+    #[test]
+    fn ui_snapshot_inactive_workspace_entries_reflect_its_own_panes() {
+        let state = two_workspace_state();
+        let snap = state.ui_snapshot();
+        // ws1 is inactive; its terminal_entries must reflect pane ids 7 and 8.
+        let ws1 = &snap.workspaces[1];
+        let ids: Vec<u32> = ws1.terminal_entries.iter().map(|e| e.pane_id.0).collect();
+        assert_eq!(ids, vec![7, 8]);
     }
 }
