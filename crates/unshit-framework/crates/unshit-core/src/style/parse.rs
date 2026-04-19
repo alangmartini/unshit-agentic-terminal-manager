@@ -123,6 +123,17 @@ pub struct ParsedBoxShadow {
     pub inset: bool,
 }
 
+/// Identifies one edge of a box for per-side longhand CSS properties
+/// (e.g. `border-top-width`). Kept separate from the geometric `Edges`
+/// struct so the parser can carry the side tag in a declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
 #[derive(Debug, Clone)]
 pub enum StyleDeclaration {
     Content(ContentValue),
@@ -159,6 +170,11 @@ pub enum StyleDeclaration {
     Background(types::Background),
     BorderColor(Color),
     BorderWidth(Edges),
+    /// Per-side `border-<side>-width` longhand. CSS lets an author set
+    /// just one or two sides (`border-left-width`, `border-top-width`)
+    /// which is lossy through the shorthand `border-width` value, so
+    /// each side has its own declaration slot.
+    BorderSideWidth(BorderSide, f32),
     BorderRadius(Corners),
     Opacity(f32),
     BoxShadowList(SmallVec<[ParsedBoxShadow; 2]>),
@@ -742,13 +758,54 @@ fn collect_selector_text(parser: &mut Parser) -> Result<String, ()> {
         match parser.next() {
             Ok(Token::CurlyBracketBlock) => {
                 let slice = parser.slice_from(start);
-                let selector_text = slice.trim().trim_end_matches('{').trim();
-                return Ok(selector_text.to_string());
+                // cssparser's `Parser::next` skips whitespace and `/* ... */`
+                // comments between tokens, so `position()` may be captured
+                // before leading trivia. Strip comments from the raw slice
+                // before passing it to the selector parser; otherwise a rule
+                // like `/* nav */ .nav { ... }` ends up with a selector that
+                // still contains the comment tokens (e.g. `* / nav / .nav`)
+                // and never matches any element.
+                let without_comments = strip_block_comments(slice);
+                let selector_text =
+                    without_comments.trim().trim_end_matches('{').trim().to_string();
+                return Ok(selector_text);
             }
             Ok(_) => continue,
             Err(_) => return Err(()),
         }
     }
+}
+
+/// Strip `/* ... */` block comments from a CSS source fragment.
+///
+/// Keeps everything outside the comment markers verbatim, including
+/// whitespace. Used on raw selector slices before tokenisation so that
+/// `/* nav */ .nav` collapses to ` .nav`, avoiding spurious selector
+/// parts. An unterminated `/*` drops everything from that point on, which
+/// matches the cssparser tokenizer's tolerant behavior. Works at the char
+/// level so it is safe for non-ASCII content inside comments.
+fn strip_block_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut terminated = false;
+            while let Some(inner) = chars.next() {
+                if inner == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    terminated = true;
+                    break;
+                }
+            }
+            if !terminated {
+                break;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_selector_string(s: &str) -> Result<SelectorChain, ()> {
@@ -1220,6 +1277,18 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         }
         "border-color" => StyleDeclaration::BorderColor(parse_color(parser)?),
         "border-width" => StyleDeclaration::BorderWidth(parse_edges(parser)?),
+        "border-top-width" => {
+            StyleDeclaration::BorderSideWidth(BorderSide::Top, parse_px(parser)?)
+        }
+        "border-right-width" => {
+            StyleDeclaration::BorderSideWidth(BorderSide::Right, parse_px(parser)?)
+        }
+        "border-bottom-width" => {
+            StyleDeclaration::BorderSideWidth(BorderSide::Bottom, parse_px(parser)?)
+        }
+        "border-left-width" => {
+            StyleDeclaration::BorderSideWidth(BorderSide::Left, parse_px(parser)?)
+        }
         "border-radius" => StyleDeclaration::BorderRadius(parse_corners(parser)?),
         "opacity" => StyleDeclaration::Opacity(parse_number(parser)?),
         "color" => StyleDeclaration::Color(parse_color(parser)?),
@@ -3374,6 +3443,12 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::Background(v) => style.background = v.clone(),
         StyleDeclaration::BorderColor(v) => style.border_color = *v,
         StyleDeclaration::BorderWidth(v) => style.border_width = *v,
+        StyleDeclaration::BorderSideWidth(side, v) => match side {
+            BorderSide::Top => style.border_width.top = *v,
+            BorderSide::Right => style.border_width.right = *v,
+            BorderSide::Bottom => style.border_width.bottom = *v,
+            BorderSide::Left => style.border_width.left = *v,
+        },
         StyleDeclaration::BorderRadius(v) => style.border_radius = *v,
         StyleDeclaration::Opacity(v) => style.opacity = *v,
         StyleDeclaration::BoxShadowList(v) => {

@@ -350,16 +350,47 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Border
+    //
+    // `bw` packs the four side widths in (top, right, bottom, left)
+    // order, matching `Edges::to_array()`. Two paths:
+    //
+    //  * All four sides equal: the previous uniform SDF path is exact
+    //    and plays nicely with rounded corners.
+    //  * Mismatched sides: walk axis aligned distances from each edge
+    //    so e.g. `border-left-width: 1px` alone paints only a left
+    //    stripe. This ignores rounded corners (CSS requires all
+    //    corners be square for mismatched borders in practice), but
+    //    lets the common left-only / right-only patterns render.
     let bw = in.border_width;
     let max_border = max(max(bw.x, bw.y), max(bw.z, bw.w));
+    let min_border = min(min(bw.x, bw.y), min(bw.z, bw.w));
+    let uniform_border = (max_border - min_border) < 0.001;
     var rect_color: vec4<f32>;
 
     if max_border > 0.0 {
-        let avg_border = (bw.x + bw.y + bw.z + bw.w) * 0.25;
-        let inner_half = half - vec2(avg_border);
-        let inner_r = max(safe_r - avg_border, 0.0);
-        let inner_d = sdf_rounded_rect(p, inner_half, inner_r);
-        let border_factor = smoothstep(-0.5, 0.5, inner_d);
+        var border_factor: f32;
+        if uniform_border {
+            let avg_border = (bw.x + bw.y + bw.z + bw.w) * 0.25;
+            let inner_half = half - vec2(avg_border);
+            let inner_r = max(safe_r - avg_border, 0.0);
+            let inner_d = sdf_rounded_rect(p, inner_half, inner_r);
+            border_factor = smoothstep(-0.5, 0.5, inner_d);
+        } else {
+            // Distances from the four edges. rect_local is in [0, size].
+            let d_top = rect_local.y;
+            let d_left = rect_local.x;
+            let d_right = in.size.x - rect_local.x;
+            let d_bottom = in.size.y - rect_local.y;
+            // Each side contributes 1.0 when inside the stripe and
+            // smoothly fades at the inner edge. Widths of 0 discard
+            // their stripe entirely.
+            let f_top = select(smoothstep(bw.x + 0.5, bw.x - 0.5, d_top), 0.0, bw.x <= 0.0);
+            let f_right = select(smoothstep(bw.y + 0.5, bw.y - 0.5, d_right), 0.0, bw.y <= 0.0);
+            let f_bottom = select(smoothstep(bw.z + 0.5, bw.z - 0.5, d_bottom), 0.0, bw.z <= 0.0);
+            let f_left = select(smoothstep(bw.w + 0.5, bw.w - 0.5, d_left), 0.0, bw.w <= 0.0);
+            // Union of the four stripes (max), then clamp.
+            border_factor = clamp(max(max(f_top, f_right), max(f_bottom, f_left)), 0.0, 1.0);
+        }
         // Composite border OVER background (CSS-like alpha blending)
         let ba = in.border_color.a * border_factor;
         let one_minus_ba = 1.0 - ba;
