@@ -19,7 +19,6 @@
 //! clipspace triangle. All shading happens in the fragment stage.
 
 use bytemuck::{Pod, Zeroable};
-use wgpu;
 
 /// Uniform block matching the `Uniforms` struct in `grid_fragment.wgsl`.
 /// The two `_pad_*` fields keep the selection range and trailing values at

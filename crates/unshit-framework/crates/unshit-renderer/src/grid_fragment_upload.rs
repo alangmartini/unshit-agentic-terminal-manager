@@ -22,7 +22,7 @@ use bytemuck::{Pod, Zeroable};
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
-use unshit_core::cell_grid::{Cell, CellAttrs, CellGrid, LineDamage};
+use unshit_core::cell_grid::{Cell, CellAttrs, CellGrid};
 use unshit_core::style::types::Color;
 
 use crate::atlas::{GlyphEntry, GlyphKey};
@@ -170,14 +170,12 @@ pub fn unpack_flags(flags: u32) -> (CellAttrs, bool, bool) {
 /// stored colors unchanged. Callers that need the cursor bit set should
 /// pass `is_cursor = true` for the cursor cell.
 pub fn encode_cell(cell: &Cell, glyph_id: Option<u32>, is_cursor: bool) -> GpuCell {
-    let fg_rgba = pack_color_rgba(cell.fg);
-    let bg_rgba = pack_color_rgba(cell.bg);
-    let flags = pack_flags(cell, is_cursor);
-    let glyph_id = match glyph_id {
-        Some(id) => id,
-        None => EMPTY_GLYPH_ID,
-    };
-    GpuCell { glyph_id, fg_rgba, bg_rgba, flags }
+    GpuCell {
+        glyph_id: glyph_id.unwrap_or(EMPTY_GLYPH_ID),
+        fg_rgba: pack_color_rgba(cell.fg),
+        bg_rgba: pack_color_rgba(cell.bg),
+        flags: pack_flags(cell, is_cursor),
+    }
 }
 
 /// Stable assignment of `u32` glyph ids for `GlyphKey`s. Entries survive
@@ -408,14 +406,12 @@ impl GridFragmentState {
 
         let ranges = if resized || atlas_bumped {
             // Full rewrite: every row contributes, regardless of damage.
+            let stride = grid.cols() * std::mem::size_of::<GpuCell>();
             (0..grid.rows())
-                .map(|row| {
-                    let stride = grid.cols() * std::mem::size_of::<GpuCell>();
-                    RowWriteRange {
-                        row,
-                        byte_offset: (row * stride) as u64,
-                        byte_len: stride as u64,
-                    }
+                .map(|row| RowWriteRange {
+                    row,
+                    byte_offset: (row * stride) as u64,
+                    byte_len: stride as u64,
                 })
                 .collect()
         } else {
@@ -443,14 +439,6 @@ impl GridFragmentState {
 #[cfg(test)]
 pub(crate) fn test_glyph_entry() -> GlyphEntry {
     GlyphEntry { uv_rect: [0.0, 0.0, 0.25, 0.5], offset: [1.0, 2.0], size: [8.0, 16.0] }
-}
-
-/// Marker used by `LineDamage` helpers when they need a sentinel clean
-/// state. Kept here because the fragment upload path constructs its own
-/// damage slices for tests.
-#[inline]
-pub const fn clean_line_damage() -> LineDamage {
-    LineDamage { first_dirty_col: u16::MAX, last_dirty_col: 0, seqno: 0 }
 }
 
 #[cfg(test)]
@@ -715,12 +703,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1.len(), 2);
-    }
-
-    #[test]
-    fn clean_line_damage_is_actually_clean() {
-        // Guardrail: the sentinel constructor must match `LineDamage::is_clean()`.
-        assert!(clean_line_damage().is_clean());
     }
 
     #[test]
