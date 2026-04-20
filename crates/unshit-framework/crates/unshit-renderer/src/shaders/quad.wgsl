@@ -172,8 +172,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let shadow_p = p - in.shadow_offset;
         let shadow_d = sdf_rounded_rect(shadow_p, inset_half, inset_r);
         // Inset: shadow is strongest at d = 0 and fades into the interior.
-        let band = max(blur, 0.5);
-        let shadow_alpha = smoothstep(-band, band, shadow_d);
+        // Approximate a Gaussian erf with tanh so the falloff width matches
+        // CSS box-shadow conventions (a simple smoothstep over [-blur, blur]
+        // is too narrow and makes stacked shadows invisible past a few px).
+        let sigma = max(blur, 0.5);
+        let shadow_alpha = 0.5 + 0.5 * tanh(shadow_d / sigma * 0.75);
         // Clip softly to the outer rounded rect so the shadow does not
         // bleed past the visible edge.
         let edge_clip = 1.0 - smoothstep(-0.5, 0.5, d_outer);
@@ -194,8 +197,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let outer_r = safe_r + max(spread, 0.0);
         let shadow_p = p - in.shadow_offset;
         let shadow_d = sdf_rounded_rect(shadow_p, outer_half, outer_r);
-        let band = max(blur, 0.5);
-        let shadow_alpha = 1.0 - smoothstep(-band, band, shadow_d);
+        // See the inset path for why this uses tanh instead of smoothstep.
+        let sigma = max(blur, 0.5);
+        let shadow_alpha = 0.5 - 0.5 * tanh(shadow_d / sigma * 0.75);
         shadow = vec4(in.shadow_color.rgb, in.shadow_color.a * shadow_alpha);
     }
 
