@@ -80,13 +80,19 @@ pub fn icon_brand_chevron() -> SvgNode {
     )
 }
 
+/// Build the shell prompt glyph (">" chevron followed by a horizontal line).
+///
+/// Reused by `icon_search` and `icon_agent`. The chevron has fixed 2x2
+/// relative arms; only the horizontal start offset and line length vary
+/// between call sites.
+fn shell_prompt_path(chevron_x: u8, line_length: u8) -> SvgNode {
+    path_d(&format!("M{chevron_x} 6l2 2l-2 2M8 10h{line_length}"))
+}
+
 pub fn icon_search() -> SvgNode {
     group(
         root_attrs(1.5, StrokeLineCap::Round, StrokeLineJoin::Miter),
-        vec![
-            rect(2.0, 2.0, 12.0, 12.0, 1.0),
-            path_d("M5 6l2 2l-2 2M8 10h3"),
-        ],
+        vec![rect(2.0, 2.0, 12.0, 12.0, 1.0), shell_prompt_path(5, 3)],
     )
 }
 
@@ -222,9 +228,11 @@ pub fn icon_close() -> SvgNode {
 }
 
 pub fn icon_agent() -> SvgNode {
+    // Same shell prompt glyph as `icon_search`, but without the surrounding
+    // rect and with the chevron nudged 1px left / the tail extended 1px.
     group(
         root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Miter),
-        vec![path_d("M4 6l2 2l-2 2"), path_d("M8 10h4")],
+        vec![shell_prompt_path(4, 4)],
     )
 }
 
@@ -457,6 +465,75 @@ mod tests {
         let node = icon_close();
         assert!(matches!(node.primitive, SvgPrimitive::Group));
         assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn icon_agent_builds() {
+        let node = icon_agent();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        // Single combined shell-prompt path (chevron + horizontal line).
+        assert_eq!(node.children.len(), 1);
+    }
+
+    // -- shell_prompt_path dedup ----------------------------------------------
+
+    #[test]
+    fn shell_prompt_path_emits_combined_path() {
+        let node = shell_prompt_path(5, 3);
+        match &node.primitive {
+            SvgPrimitive::Path { d, .. } => {
+                assert_eq!(d, "M5 6l2 2l-2 2M8 10h3");
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn icon_agent_path_uses_shell_prompt_helper() {
+        // The agent icon's single child must be the `M4 6` chevron and `h4`
+        // line produced by shell_prompt_path(4, 4). This asserts the dedup
+        // stayed behavior preserving: same exact path data as before.
+        let node = icon_agent();
+        let child = &node.children[0];
+        match &child.primitive {
+            SvgPrimitive::Path { d, .. } => {
+                assert_eq!(d, "M4 6l2 2l-2 2M8 10h4");
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn icon_search_path_uses_shell_prompt_helper() {
+        // Second child of the search group is the combined chevron + h3 line.
+        let node = icon_search();
+        let child = &node.children[1];
+        match &child.primitive {
+            SvgPrimitive::Path { d, .. } => {
+                assert_eq!(d, "M5 6l2 2l-2 2M8 10h3");
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn icon_agent_and_icon_search_share_prompt_shape() {
+        // Extract the "prompt" path from each icon and confirm the chevron
+        // portion follows the same relative pattern (differs only in x and
+        // horizontal line length). This locks in the dedup invariant.
+        let agent_path = match &icon_agent().children[0].primitive {
+            SvgPrimitive::Path { d, .. } => d.clone(),
+            _ => panic!("agent has non-path child"),
+        };
+        let search_path = match &icon_search().children[1].primitive {
+            SvgPrimitive::Path { d, .. } => d.clone(),
+            _ => panic!("search has non-path child"),
+        };
+        // Both must follow the `M<x> 6l2 2l-2 2M8 10h<n>` template.
+        assert!(agent_path.contains("l2 2l-2 2"));
+        assert!(search_path.contains("l2 2l-2 2"));
+        assert!(agent_path.contains("M8 10h"));
+        assert!(search_path.contains("M8 10h"));
     }
 
     // -- subtab_icon_for covers all variants ----------------------------------
