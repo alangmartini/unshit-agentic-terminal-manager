@@ -150,6 +150,7 @@ mod tests {
             theme: "amber".into(),
             font_size_pt: 13,
             toggles: BTreeMap::new(),
+            agents: vec![],
             palette_open: false,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
