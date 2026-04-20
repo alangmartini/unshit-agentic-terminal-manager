@@ -67,7 +67,7 @@
         <li>Drop the output file below. Firefox Profiler opens in a new tab with the profile already loaded.</li>
       </ol>
 
-      <div class="row"><span class="label">Output</span><span class="path">target/profile/cpu.json.gz</span></div>
+      <div class="row"><span class="label">Output</span><span class="path" data-path-for="cpu.json.gz">target/profile/cpu.json.gz</span></div>
 
       <div class="drop" data-target="cpu">
         Drop <code>cpu.json.gz</code> here, or
@@ -92,7 +92,7 @@
         <li>Drop the output file on the zone below, or click Open Viewer and load it there</li>
       </ol>
 
-      <div class="row"><span class="label">Output</span><span class="path">target/profile/dhat-heap.json</span></div>
+      <div class="row"><span class="label">Output</span><span class="path" data-path-for="dhat-heap.json">target/profile/dhat-heap.json</span></div>
 
       <div class="drop" data-target="mem">
         Drop <code>dhat-heap.json</code> here, or
@@ -109,7 +109,7 @@
   </div>
 
   <div class="footer">
-    Tip: <code>./scripts/profile-all.ps1</code> runs both passes and opens this page. The <code>profiling</code> cargo feature gates the dhat allocator, so normal builds pay zero overhead.
+    Tip: <code>./scripts/profile-all.ps1</code> runs both passes and opens this page. The <code>profiling</code> cargo feature gates the dhat allocator, so normal builds pay zero overhead. Append <code>?dir=path/to/output</code> to this page's URL (or pass <code>-OutDir</code>/<code>--out-dir</code> to the profiler scripts, which forwards it) to update the displayed output paths.
   </div>
 </div>
 
@@ -123,6 +123,16 @@
     cpu: FIREFOX_PROFILER_ORIGIN + "/",
     mem: "https://nnethercote.github.io/dh_view/dh_view.html",
   };
+
+  const outDir = (() => {
+    const raw = new URLSearchParams(window.location.search).get("dir");
+    if (!raw) return "target/profile";
+    return raw.replace(/[\\/]+$/, "");
+  })();
+  const pathSeparator = outDir.includes("\\") ? "\\" : "/";
+  document.querySelectorAll("[data-path-for]").forEach((el) => {
+    el.textContent = `${outDir}${pathSeparator}${el.dataset.pathFor}`;
+  });
 
   function bytes(n) {
     if (n < 1024) return n + " B";
