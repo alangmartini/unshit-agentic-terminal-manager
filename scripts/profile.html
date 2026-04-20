@@ -64,7 +64,7 @@
       <ol class="steps">
         <li>Run <code>./scripts/profile-cpu.ps1</code> (Windows) or <code>./scripts/profile-cpu.sh</code></li>
         <li>Exercise the app, then close it to stop recording</li>
-        <li>Drop the output file on the zone below, or click Open Viewer and drag it onto the page that opens</li>
+        <li>Drop the output file below. Firefox Profiler opens in a new tab with the profile already loaded.</li>
       </ol>
 
       <div class="row"><span class="label">Output</span><span class="path">target/profile/cpu.json.gz</span></div>
@@ -75,7 +75,7 @@
       </div>
 
       <div class="row">
-        <a class="btn" href="https://profiler.firefox.com/" target="_blank" rel="noopener">Open Firefox Profiler</a>
+        <a class="btn secondary" href="https://profiler.firefox.com/" target="_blank" rel="noopener">Firefox Profiler</a>
         <a class="btn secondary" href="https://github.com/mstange/samply" target="_blank" rel="noopener">samply docs</a>
       </div>
 
@@ -114,13 +114,13 @@
 </div>
 
 <script>
-  // Drag-drop helper. Browsers sandbox file:// pages aggressively, so we
-  // cannot hand the file directly to a cross-origin viewer. Instead we
-  // stash the file handle and (a) open the external viewer in a new tab
-  // and (b) show the user the exact filename they just dropped so they
-  // know which file to drag onto the viewer window that just opened.
+  // Firefox Profiler accepts profiles via postMessage to its
+  // /from-post-message/ entry point. DHat's dh_view has no equivalent
+  // handshake, so memory profiles still need a manual drag-drop onto
+  // the viewer window.
+  const FIREFOX_PROFILER_ORIGIN = "https://profiler.firefox.com";
   const VIEWERS = {
-    cpu: "https://profiler.firefox.com/",
+    cpu: FIREFOX_PROFILER_ORIGIN + "/",
     mem: "https://nnethercote.github.io/dh_view/dh_view.html",
   };
 
@@ -130,11 +130,60 @@
     return (n / 1024 / 1024).toFixed(2) + " MiB";
   }
 
-  function handleFile(kind, file) {
+  async function injectIntoFirefoxProfiler(file) {
+    const viewer = window.open(
+      FIREFOX_PROFILER_ORIGIN + "/from-post-message/",
+      "_blank",
+    );
+    if (!viewer) return { ok: false, reason: "popup-blocked" };
+
+    const buffer = await file.arrayBuffer();
+
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        window.removeEventListener("message", listener);
+        resolve({ ok: false, reason: "no-ready" });
+      }, 15000);
+
+      function listener(e) {
+        if (e.origin !== FIREFOX_PROFILER_ORIGIN) return;
+        if (e.data && e.data.name === "ready:request") {
+          viewer.postMessage(
+            { name: "inject-profile", profile: buffer },
+            FIREFOX_PROFILER_ORIGIN,
+          );
+          clearTimeout(timeout);
+          window.removeEventListener("message", listener);
+          resolve({ ok: true });
+        }
+      }
+      window.addEventListener("message", listener);
+    });
+  }
+
+  function setStatus(kind, state, message) {
     const status = document.querySelector(`[data-status="${kind}"]`);
-    status.classList.remove("warn");
-    status.classList.add("ok");
-    status.textContent = `Loaded ${file.name} (${bytes(file.size)}). Opening viewer in a new tab; drag the same file onto it.`;
+    status.classList.remove("ok", "warn");
+    if (state) status.classList.add(state);
+    status.textContent = message;
+  }
+
+  async function handleFile(kind, file) {
+    if (kind === "cpu") {
+      setStatus("cpu", null, `Loading ${file.name} (${bytes(file.size)}) into Firefox Profiler...`);
+      const result = await injectIntoFirefoxProfiler(file);
+      if (result.ok) {
+        setStatus("cpu", "ok", `Loaded ${file.name} into Firefox Profiler.`);
+      } else if (result.reason === "popup-blocked") {
+        setStatus("cpu", "warn", `Popup blocked. Allow popups for this page, or open Firefox Profiler manually and drop ${file.name} on it.`);
+      } else {
+        setStatus("cpu", "warn", `Viewer never sent ready:request. Drop ${file.name} onto the opened tab manually.`);
+      }
+      return;
+    }
+
+    // DHat: no postMessage handshake available; fall back to manual drop.
+    setStatus("mem", "ok", `Loaded ${file.name} (${bytes(file.size)}). Opening viewer; drag the same file onto it.`);
     window.open(VIEWERS[kind], "_blank", "noopener");
   }
 
