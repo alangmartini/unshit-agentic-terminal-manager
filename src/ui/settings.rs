@@ -2,7 +2,9 @@ use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{Dimension, FlexDirection, Overflow};
 
-use crate::state::{dispatch, is_on, mutate_with, SettingsSection, SharedState, UiSnapshot};
+use crate::state::{
+    dispatch, is_on, mutate_with, SettingsSection, SharedState, ToggleKey, UiSnapshot,
+};
 use crate::ui::icons::*;
 
 pub fn build_settings_modal(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -104,28 +106,28 @@ fn build_general_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef
             shared,
             "Restore on startup",
             "Reopen last active session and panes",
-            "restore-on-startup",
+            ToggleKey::RestoreOnStartup,
         ))
         .with_child(toggle_row(
             state,
             shared,
             "Confirm before closing",
             "Warn when closing a tab with a running process",
-            "confirm-close",
+            ToggleKey::ConfirmClose,
         ))
         .with_child(toggle_row(
             state,
             shared,
             "Start minimized",
             "Launch to system tray on startup",
-            "start-minimized",
+            ToggleKey::StartMinimized,
         ))
         .with_child(toggle_row(
             state,
             shared,
             "Check for updates",
             "Notify when a new version is available",
-            "check-updates",
+            ToggleKey::CheckUpdates,
         ))
 }
 
@@ -161,21 +163,21 @@ fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> Element
             shared,
             "Glow effect",
             "Subtle CRT-style text shadow on output",
-            "glow-effect",
+            ToggleKey::GlowEffect,
         ))
         .with_child(toggle_row(
             state,
             shared,
             "Background texture",
             "Warm ambient gradient behind content",
-            "background-texture",
+            ToggleKey::BackgroundTexture,
         ))
         .with_child(toggle_row(
             state,
             shared,
             "Font ligatures",
             "Combine character pairs like => and !=",
-            "font-ligatures",
+            ToggleKey::FontLigatures,
         ))
 }
 
@@ -186,7 +188,7 @@ fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             shared,
             "Shell integration",
             "Inject prompt markers for smart scrollback",
-            "shell-integration",
+            ToggleKey::ShellIntegration,
         ))
         .with_child(setting_row(
             "History size",
@@ -198,14 +200,14 @@ fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             shared,
             "Scroll on output",
             "Auto-scroll terminal when new output arrives",
-            "scroll-on-output",
+            ToggleKey::ScrollOnOutput,
         ))
         .with_child(toggle_row(
             state,
             shared,
             "Bell notification",
             "Flash tab badge when terminal rings the bell",
-            "bell-notification",
+            ToggleKey::BellNotification,
         ))
         .with_child(setting_row(
             "Word separators",
@@ -232,47 +234,24 @@ fn build_keybinds_section() -> ElementDef {
 }
 
 fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    section_shell("agents")
+    let mut section = section_shell("agents")
         .with_child(toggle_row(
             state,
             shared,
             "Auto-discovery",
             "Detect installed AI agents on PATH",
-            "auto-discovery",
+            ToggleKey::AutoDiscovery,
         ))
         .with_child(setting_row(
             "Default timeout",
             "Seconds before an agent task is canceled",
             stepper("300", None),
         ))
-        .with_child(agent_list_header(3))
-        .with_child(agent_row(
-            "claude",
-            "~/.local/bin/claude",
-            "running",
-            "running",
-            is_on(state, "agent-claude"),
-            "agent-claude",
-            shared,
-        ))
-        .with_child(agent_row(
-            "amp",
-            "~/.local/bin/amp",
-            "idle",
-            "idle",
-            is_on(state, "agent-amp"),
-            "agent-amp",
-            shared,
-        ))
-        .with_child(agent_row(
-            "codex",
-            "~/.local/bin/codex",
-            "disabled",
-            "disabled",
-            is_on(state, "agent-codex"),
-            "agent-codex",
-            shared,
-        ))
+        .with_child(agent_list_header(AGENT_SPECS.len()));
+    for spec in AGENT_SPECS {
+        section = section.with_child(agent_row(spec, is_on(state, spec.toggle_key), shared));
+    }
+    section
 }
 
 fn build_modal_footer(shared: &SharedState) -> ElementDef {
@@ -358,21 +337,26 @@ fn setting_row(label: &str, desc: &str, control: ElementDef) -> ElementDef {
         .with_child(control)
 }
 
-fn toggle_row(state: &UiSnapshot, shared: &SharedState, label: &str, desc: &str, key: &str) -> ElementDef {
+fn toggle_row(
+    state: &UiSnapshot,
+    shared: &SharedState,
+    label: &str,
+    desc: &str,
+    key: ToggleKey,
+) -> ElementDef {
     setting_row(label, desc, toggle_button(is_on(state, key), key, shared))
 }
 
-fn toggle_button(on: bool, key: &str, shared: &SharedState) -> ElementDef {
+fn toggle_button(on: bool, key: ToggleKey, shared: &SharedState) -> ElementDef {
     let mut btn = ElementDef::new(Tag::Button).with_class("toggle");
     if on {
         btn = btn.with_class("on");
     }
-    let key_owned = key.to_string();
     let s = shared.clone();
     btn.on_click(move || {
         mutate_with(&s, |st| {
-            let next = !st.toggles.get(&key_owned).copied().unwrap_or(false);
-            st.toggles.insert(key_owned.clone(), next);
+            let next = !st.toggles.get(&key).copied().unwrap_or(false);
+            st.toggles.insert(key, next);
         });
     })
 }
@@ -538,7 +522,52 @@ fn keybind_footer() -> ElementDef {
         )
 }
 
-fn agent_list_header(count: u32) -> ElementDef {
+#[derive(Clone, Copy)]
+enum AgentStatus {
+    Running,
+    Idle,
+    Disabled,
+}
+
+impl AgentStatus {
+    fn kind(self) -> &'static str {
+        match self {
+            AgentStatus::Running => "running",
+            AgentStatus::Idle => "idle",
+            AgentStatus::Disabled => "disabled",
+        }
+    }
+}
+
+struct AgentSpec {
+    name: &'static str,
+    path: &'static str,
+    status: AgentStatus,
+    toggle_key: ToggleKey,
+}
+
+const AGENT_SPECS: &[AgentSpec] = &[
+    AgentSpec {
+        name: "claude",
+        path: "~/.local/bin/claude",
+        status: AgentStatus::Running,
+        toggle_key: ToggleKey::AgentClaude,
+    },
+    AgentSpec {
+        name: "amp",
+        path: "~/.local/bin/amp",
+        status: AgentStatus::Idle,
+        toggle_key: ToggleKey::AgentAmp,
+    },
+    AgentSpec {
+        name: "codex",
+        path: "~/.local/bin/codex",
+        status: AgentStatus::Disabled,
+        toggle_key: ToggleKey::AgentCodex,
+    },
+];
+
+fn agent_list_header(count: usize) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("agent-list-header")
         .with_child(
@@ -553,15 +582,8 @@ fn agent_list_header(count: u32) -> ElementDef {
         )
 }
 
-fn agent_row(
-    name: &str,
-    path: &str,
-    badge_kind: &str,
-    badge_label: &str,
-    enabled: bool,
-    toggle_key: &str,
-    shared: &SharedState,
-) -> ElementDef {
+fn agent_row(spec: &AgentSpec, enabled: bool, shared: &SharedState) -> ElementDef {
+    let label = spec.status.kind();
     ElementDef::new(Tag::Div)
         .with_class("agent-row")
         .with_child(
@@ -576,19 +598,19 @@ fn agent_row(
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("agent-name")
-                        .with_text(name),
+                        .with_text(spec.name),
                 )
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("agent-path")
-                        .with_text(path),
+                        .with_text(spec.path),
                 ),
         )
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("agent-controls")
-                .with_child(agent_badge(badge_kind, badge_label))
-                .with_child(toggle_button(enabled, toggle_key, shared)),
+                .with_child(agent_badge(spec.status.kind(), label))
+                .with_child(toggle_button(enabled, spec.toggle_key, shared)),
         )
 }
 
@@ -1043,7 +1065,7 @@ mod tests {
     #[test]
     fn toggle_button_on_has_on_class() {
         let shared = make_shared();
-        let el = toggle_button(true, "test-key", &shared);
+        let el = toggle_button(true, ToggleKey::GlowEffect, &shared);
         assert!(el.classes.contains(&"toggle".to_string()));
         assert!(el.classes.contains(&"on".to_string()));
         assert!(el.on_click.is_some());
@@ -1052,7 +1074,7 @@ mod tests {
     #[test]
     fn toggle_button_off_lacks_on_class() {
         let shared = make_shared();
-        let el = toggle_button(false, "test-key", &shared);
+        let el = toggle_button(false, ToggleKey::GlowEffect, &shared);
         assert!(el.classes.contains(&"toggle".to_string()));
         assert!(!el.classes.contains(&"on".to_string()));
         assert!(el.on_click.is_some());
@@ -1173,12 +1195,13 @@ mod tests {
     #[test]
     fn toggle_button_click_toggles_state() {
         let shared = make_shared();
-        let el = toggle_button(false, "test-toggle", &shared);
+        let key = ToggleKey::StartMinimized;
+        let el = toggle_button(false, key, &shared);
         assert!(!shared
             .lock()
             .unwrap()
             .toggles
-            .get("test-toggle")
+            .get(&key)
             .copied()
             .unwrap_or(false));
         (el.on_click.as_ref().unwrap())();
@@ -1186,7 +1209,7 @@ mod tests {
             .lock()
             .unwrap()
             .toggles
-            .get("test-toggle")
+            .get(&key)
             .copied()
             .unwrap_or(false));
         (el.on_click.as_ref().unwrap())();
@@ -1194,7 +1217,7 @@ mod tests {
             .lock()
             .unwrap()
             .toggles
-            .get("test-toggle")
+            .get(&key)
             .copied()
             .unwrap_or(false));
     }
@@ -1327,15 +1350,13 @@ mod tests {
     #[test]
     fn agent_row_has_icon_info_and_controls() {
         let shared = make_shared();
-        let el = agent_row(
-            "test",
-            "~/bin/test",
-            "idle",
-            "idle",
-            true,
-            "agent-test",
-            &shared,
-        );
+        let spec = AgentSpec {
+            name: "test",
+            path: "~/bin/test",
+            status: AgentStatus::Idle,
+            toggle_key: ToggleKey::AgentAmp,
+        };
+        let el = agent_row(&spec, true, &shared);
         assert!(el.classes.contains(&"agent-row".to_string()));
         assert_eq!(el.children.len(), 3);
         assert!(el.children[0].classes.contains(&"agent-icon".to_string()));
