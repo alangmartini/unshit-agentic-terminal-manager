@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/unshit-framework/crates/*"]
+members = ["crates/unshit-framework/crates/*", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
