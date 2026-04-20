@@ -217,8 +217,18 @@ fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         ))
 }
 
+/// Memo key for the keybinds section.
+///
+/// The keybinds section is a pure function of compile-time constants (no
+/// `&state`, no `&shared`). Tagging it with a stable memo key lets the
+/// reconciler skip the entire subtree on every rebuild once it has been
+/// mounted, which matters because the section is rebuilt on every tab
+/// switch even when nothing about it has changed.
+const KEYBINDS_MEMO_KEY: u64 = 0xBEEF_0001_CAFE_0002_u64;
+
 fn build_keybinds_section() -> ElementDef {
     section_shell("keybinds")
+        .with_memo_key(KEYBINDS_MEMO_KEY)
         .with_child(keybind_row("New terminal", &["Ctrl", "T"]))
         .with_child(keybind_row("Close tab", &["Ctrl", "W"]))
         .with_child(keybind_row("Split right", &["Ctrl", "D"]))
@@ -947,6 +957,24 @@ mod tests {
         let btn = &footer.children[0];
         assert!(btn.classes.contains(&"btn".to_string()));
         assert_eq!(text_of(btn), Some("reset to defaults"));
+    }
+
+    #[test]
+    fn keybinds_section_has_stable_memo_key() {
+        // The keybinds section is a pure function of compile-time constants.
+        // It must carry a stable memo key so the reconciler can skip its
+        // subtree on every rebuild triggered by tab switches.
+        let first = build_keybinds_section();
+        let second = build_keybinds_section();
+        assert_eq!(first.memo_key, Some(KEYBINDS_MEMO_KEY));
+        assert_eq!(first.memo_key, second.memo_key);
+    }
+
+    #[test]
+    fn keybinds_section_memo_key_is_nonzero() {
+        // A key of 0 would still work, but a nonzero key makes it obvious in
+        // debug output that memoization was deliberately configured.
+        assert_ne!(KEYBINDS_MEMO_KEY, 0);
     }
 
     // -- build_agents_section ---------------------------------------------------
