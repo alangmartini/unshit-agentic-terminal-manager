@@ -256,6 +256,11 @@ pub enum StyleDeclaration {
 
     // Bell / notification
     BellStyle(types::BellStyle),
+
+    /// `transform: translateX(<length-percentage>)`. Other transform
+    /// functions are parsed as an error today; see
+    /// `parse_transform_translate_x` for the shortlist of accepted forms.
+    TransformTranslateX(types::TransformX),
 }
 
 impl CompiledStylesheet {
@@ -1724,6 +1729,17 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             })
         }
 
+        // CSS `transform`. Today the parser recognises only a single
+        // `translateX(<length-percentage>)` entry. Every other transform
+        // function (`translate`, `translateY`, `scale`, `rotate`,
+        // `matrix`, ...) returns an error so the cascade drops the
+        // declaration while other, supported declarations on the same
+        // selector continue to apply. See `parse_transform_translate_x`.
+        "transform" => match parse_transform_translate_x(parser) {
+            Some(tx) => StyleDeclaration::TransformTranslateX(tx),
+            None => return Err(()),
+        },
+
         _ => return Err(()),
     };
 
@@ -2116,6 +2132,60 @@ fn parse_linear_gradient(parser: &mut Parser) -> Result<types::LinearGradient, (
             Ok(types::LinearGradient { angle_deg, stops, repeating })
         })
         .map_err(|_: cssparser::ParseError<'_, ()>| ())
+}
+
+/// Parse `transform: translateX(<length-percentage>)` and return the
+/// resolved `TransformX` value. Other transform functions (including
+/// `translate`, `translateY`, `scale`, `rotate`, `matrix`, and the plain
+/// `none` keyword) return `None` today so the declaration is dropped from
+/// the cascade and logged via the caller's error path.
+fn parse_transform_translate_x(parser: &mut Parser) -> Option<types::TransformX> {
+    // The input is a single function token like `translateX(50px)`. Peek
+    // the function name first.
+    let fn_name = match parser.next() {
+        Ok(Token::Function(name)) => name.clone(),
+        Ok(Token::Ident(id)) if id.as_ref().eq_ignore_ascii_case("none") => {
+            // `transform: none` is the CSS default. Returning `None` drops
+            // the declaration entirely, which leaves `transform_translate_x`
+            // at its default of `None` in the cascade. That matches the
+            // semantics of `none`.
+            return None;
+        }
+        _ => return None,
+    };
+
+    // TODO: accept scale(), rotate(), translate(), translateY(), matrix()
+    // here as real transforms instead of dropping them silently.
+    if !fn_name.as_ref().eq_ignore_ascii_case("translateX") {
+        // Drain the block so the outer parser stays consistent with the
+        // cssparser block invariant: once we see a Function token we must
+        // consume the matching close paren via parse_nested_block.
+        let _ = parser.parse_nested_block(|p| -> Result<(), cssparser::ParseError<'_, ()>> {
+            drain_tokens(p);
+            Ok(())
+        });
+        return None;
+    }
+
+    // Parse the inner `<length-percentage>` argument.
+    parser
+        .parse_nested_block(|p| -> Result<types::TransformX, cssparser::ParseError<'_, ()>> {
+            match p.next() {
+                Ok(Token::Percentage { unit_value, .. }) => {
+                    Ok(types::TransformX::Percent(*unit_value))
+                }
+                Ok(Token::Dimension { value, unit, .. })
+                    if unit.as_ref().eq_ignore_ascii_case("px") =>
+                {
+                    Ok(types::TransformX::Px(*value))
+                }
+                Ok(Token::Number { value, .. }) if *value == 0.0 => {
+                    Ok(types::TransformX::Px(0.0))
+                }
+                _ => Err(p.new_custom_error(())),
+            }
+        })
+        .ok()
 }
 
 /// Parse a single `<length-percentage>` token for the radial gradient grammar.
@@ -3646,6 +3716,10 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
 
         // Bell / notification
         StyleDeclaration::BellStyle(v) => style.bell_style = *v,
+
+        // CSS `transform: translateX(...)`. Replaces any prior value on the
+        // same element so later declarations win (standard cascade rule).
+        StyleDeclaration::TransformTranslateX(v) => style.transform_translate_x = Some(*v),
     }
 }
 

@@ -1134,7 +1134,17 @@ fn walk_for_batch(
     let rect = element.layout_rect;
     let opacity = style.opacity;
 
-    let render_x = rect.x - scroll_offset_x;
+    // CSS `transform: translateX(...)` is applied here as a pure render
+    // space offset. The layout rect keeps its in flow position so siblings
+    // and hit testing are unaffected; only the painted position shifts.
+    // Transform offsets propagate down into child scroll offsets so the
+    // whole subtree translates together.
+    let transform_dx = style
+        .transform_translate_x
+        .map(|t| t.resolve(rect.width))
+        .unwrap_or(0.0);
+
+    let render_x = rect.x - scroll_offset_x + transform_dx;
     let render_y = rect.y - scroll_offset_y;
 
     let clips_children = style.overflow != Overflow::Visible;
@@ -1152,6 +1162,12 @@ fn walk_for_batch(
     } else {
         (scroll_offset_x, scroll_offset_y)
     };
+    // Propagate the transform offset to children so the whole subtree
+    // moves with the translated element. A child's render_x is computed as
+    // `rect.x - scroll_offset_x`, so subtracting `transform_dx` from the
+    // scroll offset effectively adds it to the child's render position,
+    // matching the shift we already applied to this element's own paint.
+    let child_scroll_x = child_scroll_x - transform_dx;
 
     if is_visible && style.outline_width > 0.0 && style.outline_color.a > 0 {
         let expand = style.outline_width + style.outline_offset;
