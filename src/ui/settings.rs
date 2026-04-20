@@ -72,7 +72,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         SettingsSection::General => build_general_section(state, shared),
         SettingsSection::Appearance => build_appearance_section(state, shared),
         SettingsSection::Shell => build_shell_section(state, shared),
-        SettingsSection::Keybinds => build_keybinds_section(shared),
+        SettingsSection::Keybinds => build_keybinds_section(),
         SettingsSection::Agents => build_agents_section(state, shared),
     };
     ElementDef::new(Tag::Div)
@@ -192,11 +192,7 @@ fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_child(setting_row(
             "Scroll on output",
             "Auto-scroll terminal when new output arrives",
-            toggle_button(
-                is_on(state, "scroll-on-output"),
-                "scroll-on-output",
-                shared,
-            ),
+            toggle_button(is_on(state, "scroll-on-output"), "scroll-on-output", shared),
         ))
         .with_child(setting_row(
             "Bell notification",
@@ -214,7 +210,7 @@ fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         ))
 }
 
-fn build_keybinds_section(shared: &SharedState) -> ElementDef {
+fn build_keybinds_section() -> ElementDef {
     section_shell("keybinds")
         .with_child(keybind_row("New terminal", &["Ctrl", "T"]))
         .with_child(keybind_row("Close tab", &["Ctrl", "W"]))
@@ -228,7 +224,7 @@ fn build_keybinds_section(shared: &SharedState) -> ElementDef {
         .with_child(keybind_row("Zoom in", &["Ctrl", "="]))
         .with_child(keybind_row("Zoom out", &["Ctrl", "-"]))
         .with_child(keybind_row("Fullscreen", &["F11"]))
-        .with_child(keybind_footer(shared))
+        .with_child(keybind_footer())
 }
 
 fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -374,14 +370,13 @@ fn select_display(value: &str) -> ElementDef {
 }
 
 fn text_input_display(value: &str) -> ElementDef {
-    ElementDef::new(Tag::Div).with_class("input").with_text(value)
+    ElementDef::new(Tag::Div)
+        .with_class("input")
+        .with_text(value)
 }
 
 fn compact_input_display(value: &str) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("input")
-        .with_class("compact")
-        .with_text(value)
+    text_input_display(value).with_class("compact")
 }
 
 fn theme_chip_group(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -520,13 +515,15 @@ fn keybind_row(label: &str, keys: &[&str]) -> ElementDef {
         .with_child(keys_wrap)
 }
 
-fn keybind_footer(_shared: &SharedState) -> ElementDef {
-    ElementDef::new(Tag::Div).with_class("keybind-footer").with_child(
-        ElementDef::new(Tag::Button)
-            .with_class("btn")
-            .with_class("ghost")
-            .with_text("reset to defaults"),
-    )
+fn keybind_footer() -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("keybind-footer")
+        .with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("btn")
+                .with_class("ghost")
+                .with_text("reset to defaults"),
+        )
 }
 
 fn agent_list_header(count: u32) -> ElementDef {
@@ -893,29 +890,24 @@ mod tests {
 
     #[test]
     fn keybinds_section_has_title_twelve_rows_and_footer() {
-        let shared = make_shared();
-        let el = build_keybinds_section(&shared);
+        let el = build_keybinds_section();
         // title + 12 keybind rows + footer
         assert_eq!(el.children.len(), 14);
     }
 
     #[test]
     fn keybinds_section_first_row_has_correct_keys() {
-        let shared = make_shared();
-        let el = build_keybinds_section(&shared);
-        // title at 0, first keybind at 1
+        let el = build_keybinds_section();
         let first_row = &el.children[1];
         assert!(first_row.classes.contains(&"keybind-row".to_string()));
         let keys_wrap = &first_row.children[1];
         assert!(keys_wrap.classes.contains(&"keybind-keys".to_string()));
-        // "Ctrl" + "+" + "T" = 3 children
         assert_eq!(keys_wrap.children.len(), 3);
     }
 
     #[test]
     fn keybinds_section_footer_has_reset_button() {
-        let shared = make_shared();
-        let el = build_keybinds_section(&shared);
+        let el = build_keybinds_section();
         let footer = el.children.last().unwrap();
         assert!(footer.classes.contains(&"keybind-footer".to_string()));
         let btn = &footer.children[0];
