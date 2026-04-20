@@ -66,6 +66,10 @@ impl SettingsSection {
 /// Typed keys for the `AppState::toggles` map. Previously string literals
 /// like "confirm-close" were spread across the UI, with the type system
 /// no help against typos (e.g. "confirm-clsoe" silently read as `false`).
+///
+/// Agent enable/disable flags used to live here too (`AgentClaude`, etc.)
+/// but were moved to `AppState::agents` so general/appearance toggles and
+/// agent rows are not mixed in one map. See `AgentKey`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ToggleKey {
     RestoreOnStartup,
@@ -79,9 +83,6 @@ pub enum ToggleKey {
     ScrollOnOutput,
     BellNotification,
     AutoDiscovery,
-    AgentClaude,
-    AgentAmp,
-    AgentCodex,
 }
 
 impl ToggleKey {
@@ -98,9 +99,6 @@ impl ToggleKey {
             ToggleKey::ScrollOnOutput => "scroll-on-output",
             ToggleKey::BellNotification => "bell-notification",
             ToggleKey::AutoDiscovery => "auto-discovery",
-            ToggleKey::AgentClaude => "agent-claude",
-            ToggleKey::AgentAmp => "agent-amp",
-            ToggleKey::AgentCodex => "agent-codex",
         }
     }
 }
@@ -523,9 +521,6 @@ pub fn seed_state() -> AppState {
     toggles.insert(ToggleKey::ScrollOnOutput, true);
     toggles.insert(ToggleKey::BellNotification, false);
     toggles.insert(ToggleKey::AutoDiscovery, true);
-    toggles.insert(ToggleKey::AgentClaude, true);
-    toggles.insert(ToggleKey::AgentAmp, true);
-    toggles.insert(ToggleKey::AgentCodex, false);
 
     let agents = default_agents();
 
