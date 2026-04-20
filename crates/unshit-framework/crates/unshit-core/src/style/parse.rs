@@ -300,10 +300,13 @@ impl CompiledStylesheet {
             }
 
             // parse_rule always drains its block on failure, so no
-            // extra token skip is needed on the error path.
-            if let Ok(rule) = parse_rule(&mut parser, source_order) {
-                rules.push(rule);
-                source_order += 1;
+            // extra token skip is needed on the error path. A grouped
+            // selector like `.a, .b { ... }` returns one rule per sub
+            // selector; each gets its own source_order so cascade order
+            // matches the declaration order browsers use.
+            if let Ok(mut new_rules) = parse_rule(&mut parser, source_order) {
+                source_order += new_rules.len() as u32;
+                rules.append(&mut new_rules);
             }
         }
 
@@ -654,18 +657,35 @@ fn find_top_level_comma(s: &str) -> Option<usize> {
     None
 }
 
-fn parse_rule(parser: &mut Parser, source_order: u32) -> Result<CompiledRule, ()> {
+fn parse_rule(parser: &mut Parser, source_order: u32) -> Result<Vec<CompiledRule>, ()> {
     let selector_str = collect_selector_text(parser)?;
-    let selector = match parse_selector_string(&selector_str) {
-        Ok(s) => s,
-        Err(()) => {
-            // collect_selector_text already consumed the CurlyBracketBlock
-            // token; drain its contents to keep the parser consistent.
-            drain_nested_block(parser);
-            return Err(());
+    // Split comma-separated selector groups (`.a, .b, .c`) into individual
+    // selectors. Each becomes its own compiled rule with a shared copy of
+    // the declarations, matching CSS grouped selector semantics.
+    let selector_parts: Vec<&str> = split_top_level_commas(&selector_str);
+    let mut selectors: Vec<(SelectorChain, (u16, u16, u16))> =
+        Vec::with_capacity(selector_parts.len());
+    for part in selector_parts {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
         }
-    };
-    let specificity = compute_specificity(&selector);
+        match parse_selector_string(trimmed) {
+            Ok(s) => {
+                let spec = compute_specificity(&s);
+                selectors.push((s, spec));
+            }
+            // A single bad branch in a group should not poison the rest,
+            // but the parser already consumed the selector slice before the
+            // block so we fall through to drain and return Err only if we
+            // end up with no valid selectors at all.
+            Err(()) => continue,
+        }
+    }
+    if selectors.is_empty() {
+        drain_nested_block(parser);
+        return Err(());
+    }
 
     let declarations = parser
         .parse_nested_block(|parser| {
@@ -685,7 +705,35 @@ fn parse_rule(parser: &mut Parser, source_order: u32) -> Result<CompiledRule, ()
         })
         .map_err(|_: cssparser::ParseError<'_, ()>| ())?;
 
-    Ok(CompiledRule { selector, specificity, declarations, source_order })
+    Ok(selectors
+        .into_iter()
+        .enumerate()
+        .map(|(i, (selector, specificity))| CompiledRule {
+            selector,
+            specificity,
+            declarations: declarations.clone(),
+            source_order: source_order + i as u32,
+        })
+        .collect())
+}
+
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 fn collect_selector_text(parser: &mut Parser) -> Result<String, ()> {
