@@ -1102,6 +1102,15 @@ pub struct ComputedStyle {
     /// its fast path. The value, when present, is applied at paint time as
     /// a render space translation that does not disturb layout flow.
     pub transform_translate_x: Option<TransformX>,
+
+    /// Parsed `mask-image: linear-gradient(...)` mask.
+    ///
+    /// `None` means no mask is attached to this element and the renderer
+    /// emits its background quad through the normal solid / gradient path.
+    /// When set, the gradient is baked into the quad instance as an
+    /// auxiliary stop list and the fragment shader multiplies the final
+    /// output alpha by the mask's alpha channel.
+    pub mask_image: Option<LinearGradient>,
 }
 
 impl Default for ComputedStyle {
@@ -1185,6 +1194,7 @@ impl Default for ComputedStyle {
             resize_axis: None,
             bell_style: BellStyle::Both,
             transform_translate_x: None,
+            mask_image: None,
         }
     }
 }

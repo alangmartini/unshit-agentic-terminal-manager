@@ -261,6 +261,12 @@ pub enum StyleDeclaration {
     /// functions are parsed as an error today; see
     /// `parse_transform_translate_x` for the shortlist of accepted forms.
     TransformTranslateX(types::TransformX),
+
+    /// `mask-image: linear-gradient(...)`. Any non gradient mask source
+    /// (url, image(), none) parses to an error today. The linear gradient
+    /// branch is reused verbatim from `parse_linear_gradient` so the stop
+    /// list and fixup pass behave identically to a background gradient.
+    MaskImage(types::LinearGradient),
 }
 
 impl CompiledStylesheet {
@@ -1740,6 +1746,15 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             None => return Err(()),
         },
 
+        // CSS `mask-image`. Only the `linear-gradient(...)` branch is
+        // supported. `none`, `url()`, and other image sources parse to an
+        // error today. The underlying gradient parser is the same one
+        // used by `background: linear-gradient(...)`.
+        "mask-image" => {
+            let gradient = parse_mask_image(parser)?;
+            StyleDeclaration::MaskImage(gradient)
+        }
+
         _ => return Err(()),
     };
 
@@ -2099,20 +2114,35 @@ fn parse_linear_gradient(parser: &mut Parser) -> Result<types::LinearGradient, (
 
     parser
         .parse_nested_block(|p| {
-            // Optional leading `<angle>,`. If absent, CSS defaults to 180deg
-            // (gradient flows from top to bottom, first stop at the top).
+            // Optional leading `<angle>,` or `to <side>[ <side>],`. If both
+            // are absent, CSS defaults to 180deg (gradient flows top to
+            // bottom, first stop at the top). `to <side>` is the CSS Images
+            // Level 3 side based form that is commonly used for
+            // `mask-image: linear-gradient(to right, ...)`.
             let angle_deg = p
-                .try_parse(|p| match p.next() {
-                    Ok(Token::Dimension { value, unit, .. })
-                        if unit.as_ref().eq_ignore_ascii_case("deg") =>
-                    {
-                        let v = *value;
-                        match p.expect_comma() {
-                            Ok(_) => Ok(v),
-                            Err(_) => Err(()),
+                .try_parse(|p| -> Result<f32, ()> {
+                    match p.next() {
+                        Ok(Token::Dimension { value, unit, .. })
+                            if unit.as_ref().eq_ignore_ascii_case("deg") =>
+                        {
+                            let v = *value;
+                            p.expect_comma().map_err(|_| ())?;
+                            Ok(v)
                         }
+                        Ok(Token::Ident(name)) if name.as_ref().eq_ignore_ascii_case("to") => {
+                            // Consume one or two side keywords.
+                            let a = p.expect_ident_cloned().map_err(|_| ())?;
+                            let b = p.try_parse(|p| p.expect_ident_cloned()).ok();
+                            let degrees = sides_to_angle_deg(
+                                a.as_ref(),
+                                b.as_ref().map(|s| s.as_ref()),
+                            )
+                            .ok_or(())?;
+                            p.expect_comma().map_err(|_| ())?;
+                            Ok(degrees)
+                        }
+                        _ => Err(()),
                     }
-                    _ => Err(()),
                 })
                 .unwrap_or(180.0);
 
@@ -2132,6 +2162,79 @@ fn parse_linear_gradient(parser: &mut Parser) -> Result<types::LinearGradient, (
             Ok(types::LinearGradient { angle_deg, stops, repeating })
         })
         .map_err(|_: cssparser::ParseError<'_, ()>| ())
+}
+
+/// Translate CSS `to <side>[ <side>]` into a gradient angle in degrees.
+///
+/// The mapping follows CSS Images Level 3: `to top` is 0deg, `to right` is
+/// 90deg, `to bottom` is 180deg, `to left` is 270deg. Corners average the
+/// two adjacent side angles: `to top right` is 45deg, `to bottom right`
+/// 135deg, etc. Returns `None` on unknown or conflicting keywords.
+fn sides_to_angle_deg(a: &str, b: Option<&str>) -> Option<f32> {
+    fn side_deg(s: &str) -> Option<f32> {
+        match s.to_ascii_lowercase().as_str() {
+            "top" => Some(0.0),
+            "right" => Some(90.0),
+            "bottom" => Some(180.0),
+            "left" => Some(270.0),
+            _ => None,
+        }
+    }
+    match b {
+        None => side_deg(a),
+        Some(b_str) => {
+            // Accept vertical + horizontal in either order.
+            let vertical = matches!(
+                a.to_ascii_lowercase().as_str(),
+                "top" | "bottom"
+            ) || matches!(
+                b_str.to_ascii_lowercase().as_str(),
+                "top" | "bottom"
+            );
+            let horizontal = matches!(
+                a.to_ascii_lowercase().as_str(),
+                "left" | "right"
+            ) || matches!(
+                b_str.to_ascii_lowercase().as_str(),
+                "left" | "right"
+            );
+            if !(vertical && horizontal) {
+                return None;
+            }
+            // Corner angles: top right=45, bottom right=135, bottom left=225,
+            // top left=315.
+            let is_top = matches!(
+                a.to_ascii_lowercase().as_str(),
+                "top"
+            ) || matches!(
+                b_str.to_ascii_lowercase().as_str(),
+                "top"
+            );
+            let is_right = matches!(
+                a.to_ascii_lowercase().as_str(),
+                "right"
+            ) || matches!(
+                b_str.to_ascii_lowercase().as_str(),
+                "right"
+            );
+            match (is_top, is_right) {
+                (true, true) => Some(45.0),
+                (false, true) => Some(135.0),
+                (false, false) => Some(225.0),
+                (true, false) => Some(315.0),
+            }
+        }
+    }
+}
+
+/// Parse a `mask-image: <linear-gradient>` declaration. Accepts
+/// `linear-gradient(...)` and `repeating-linear-gradient(...)`. Other mask
+/// sources (`url(...)`, `image(...)`, `none`) are rejected so callers can
+/// cascade in the fallback.
+fn parse_mask_image(parser: &mut Parser) -> Result<types::LinearGradient, ()> {
+    // Reuse the existing gradient parser verbatim. The gradient grammar is
+    // identical in `background-image` and `mask-image` contexts.
+    parse_linear_gradient(parser)
 }
 
 /// Parse `transform: translateX(<length-percentage>)` and return the
@@ -3720,6 +3823,10 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         // CSS `transform: translateX(...)`. Replaces any prior value on the
         // same element so later declarations win (standard cascade rule).
         StyleDeclaration::TransformTranslateX(v) => style.transform_translate_x = Some(*v),
+
+        // CSS `mask-image: linear-gradient(...)`. Only the linear gradient
+        // form is supported; see `parse_mask_image`.
+        StyleDeclaration::MaskImage(g) => style.mask_image = Some(g.clone()),
     }
 }
 

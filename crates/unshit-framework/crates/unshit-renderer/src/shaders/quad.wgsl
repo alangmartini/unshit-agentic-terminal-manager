@@ -28,6 +28,9 @@ struct QuadInstance {
     @location(20) gradient_stop_positions_hi: vec4<f32>,
     @location(21) gradient_params: vec4<f32>,
     @location(22) gradient_extra: vec4<f32>,
+    @location(23) mask_stops_01: vec4<f32>,
+    @location(24) mask_stops_23: vec4<f32>,
+    @location(25) mask_params: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -56,6 +59,9 @@ struct VertexOutput {
     @location(21) gradient_params: vec4<f32>,
     @location(22) gradient_extra: vec4<f32>,
     @location(23) pixel_pos: vec2<f32>,
+    @location(24) mask_stops_01: vec4<f32>,
+    @location(25) mask_stops_23: vec4<f32>,
+    @location(26) mask_params: vec4<f32>,
 };
 
 @vertex
@@ -112,6 +118,9 @@ fn vs_main(
     out.gradient_params = instance.gradient_params;
     out.gradient_extra = instance.gradient_extra;
     out.pixel_pos = pixel_pos;
+    out.mask_stops_01 = instance.mask_stops_01;
+    out.mask_stops_23 = instance.mask_stops_23;
+    out.mask_params = instance.mask_params;
     return out;
 }
 
@@ -405,6 +414,65 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         rect_color = base_color;
     }
     rect_color = vec4(rect_color.rgb, rect_color.a * outer_alpha);
+
+    // `mask-image: linear-gradient(...)`. When `mask_params.w >= 2` the
+    // fragment samples the mask gradient's alpha at the current pixel and
+    // multiplies the rect alpha by it, implementing the CSS alpha masking
+    // semantics from the CSS Masking Module Level 1 spec. The mask is a
+    // simple linear gradient; positions and alpha values are packed two
+    // per stop in `mask_stops_01` / `mask_stops_23`.
+    let mask_count = i32(in.mask_params.w + 0.5);
+    if (mask_count >= 2) {
+        let mask_angle = in.mask_params.x;
+        let mask_dir = vec2<f32>(sin(mask_angle), -cos(mask_angle));
+        let normalized = rect_local / in.size;
+        let mask_t = dot(normalized - vec2(0.5), mask_dir) + 0.5;
+
+        var mask_alphas = array<f32, 4>(
+            in.mask_stops_01.x,
+            in.mask_stops_01.z,
+            in.mask_stops_23.x,
+            in.mask_stops_23.z,
+        );
+        var mask_positions = array<f32, 4>(
+            in.mask_stops_01.y,
+            in.mask_stops_01.w,
+            in.mask_stops_23.y,
+            in.mask_stops_23.w,
+        );
+        let m_last_idx = mask_count - 1;
+        let m_first = mask_positions[0];
+        let m_last = mask_positions[m_last_idx];
+        var mask_alpha: f32;
+        if (mask_t <= m_first) {
+            mask_alpha = mask_alphas[0];
+        } else if (mask_t >= m_last) {
+            mask_alpha = mask_alphas[m_last_idx];
+        } else {
+            var seg_lo_a: f32 = mask_alphas[0];
+            var seg_hi_a: f32 = mask_alphas[0];
+            var seg_lo_p: f32 = mask_positions[0];
+            var seg_hi_p: f32 = mask_positions[0];
+            var m_found: bool = false;
+            for (var i: i32 = 0; i < 3; i = i + 1) {
+                if (!m_found && i + 1 < mask_count) {
+                    let p0 = mask_positions[i];
+                    let p1 = mask_positions[i + 1];
+                    if (mask_t >= p0 && mask_t <= p1) {
+                        seg_lo_a = mask_alphas[i];
+                        seg_hi_a = mask_alphas[i + 1];
+                        seg_lo_p = p0;
+                        seg_hi_p = p1;
+                        m_found = true;
+                    }
+                }
+            }
+            let m_range = max(seg_hi_p - seg_lo_p, 1e-6);
+            let m_local = clamp((mask_t - seg_lo_p) / m_range, 0.0, 1.0);
+            mask_alpha = mix(seg_lo_a, seg_hi_a, m_local);
+        }
+        rect_color = vec4(rect_color.rgb, rect_color.a * clamp(mask_alpha, 0.0, 1.0));
+    }
 
     // Composite: shadow behind rect (over operator), premultiplied output.
     let result = vec4(
