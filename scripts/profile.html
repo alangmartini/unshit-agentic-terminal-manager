@@ -64,18 +64,18 @@
       <ol class="steps">
         <li>Run <code>./scripts/profile-cpu.ps1</code> (Windows) or <code>./scripts/profile-cpu.sh</code></li>
         <li>Exercise the app, then close it to stop recording</li>
-        <li>Drop the output file on the zone below, or click Open Viewer and drag it onto the page that opens</li>
+        <li>Drop the output file on the zone below. The Firefox Profiler tab opens and loads it automatically via postMessage.</li>
       </ol>
 
-      <div class="row"><span class="label">Output</span><span class="path">target/profile/cpu.json.gz</span></div>
+      <div class="row"><span class="label">Output</span><span class="path" data-path="cpu" data-file="cpu.json.gz"></span></div>
 
       <div class="drop" data-target="cpu">
-        Drop <code>cpu.json.gz</code> here, or
+        Drop your <code data-file-hint="cpu">.json.gz</code> or <code>.json</code> file here, or
         <label>browse<input type="file" accept=".gz,.json,application/gzip,application/json"></label>
       </div>
 
       <div class="row">
-        <a class="btn" href="https://profiler.firefox.com/" target="_blank" rel="noopener">Open Firefox Profiler</a>
+        <a class="btn" href="https://profiler.firefox.com/" target="_blank" rel="noopener" data-viewer="cpu">Open Firefox Profiler</a>
         <a class="btn secondary" href="https://github.com/mstange/samply" target="_blank" rel="noopener">samply docs</a>
       </div>
 
@@ -89,18 +89,18 @@
       <ol class="steps">
         <li>Run <code>./scripts/profile-memory.ps1</code> (Windows) or <code>./scripts/profile-memory.sh</code></li>
         <li>Exercise the app, then close it to flush the profile</li>
-        <li>Drop the output file on the zone below, or click Open Viewer and load it there</li>
+        <li>Drop the output file on the zone below, or click Open Viewer and load it there (DHat does not yet support automatic handoff)</li>
       </ol>
 
-      <div class="row"><span class="label">Output</span><span class="path">target/profile/dhat-heap.json</span></div>
+      <div class="row"><span class="label">Output</span><span class="path" data-path="mem" data-file="dhat-heap.json"></span></div>
 
       <div class="drop" data-target="mem">
-        Drop <code>dhat-heap.json</code> here, or
+        Drop your <code data-file-hint="mem">.json</code> file here, or
         <label>browse<input type="file" accept=".json,application/json"></label>
       </div>
 
       <div class="row">
-        <a class="btn" href="https://nnethercote.github.io/dh_view/dh_view.html" target="_blank" rel="noopener">Open DHat Viewer</a>
+        <a class="btn" href="https://nnethercote.github.io/dh_view/dh_view.html" target="_blank" rel="noopener" data-viewer="mem">Open DHat Viewer</a>
         <a class="btn secondary" href="https://github.com/nnethercote/dhat" target="_blank" rel="noopener">dhat docs</a>
       </div>
 
@@ -109,20 +109,36 @@
   </div>
 
   <div class="footer">
-    Tip: <code>./scripts/profile-all.ps1</code> runs both passes and opens this page. The <code>profiling</code> cargo feature gates the dhat allocator, so normal builds pay zero overhead.
+    Tip: <code>./scripts/profile-all.ps1</code> runs both passes and opens this page. The <code>profiling</code> cargo feature gates the dhat allocator, so normal builds pay zero overhead. Append <code>?dir=path/to/output</code> to this URL to update the displayed output paths when using a custom <code>-OutDir</code>.
   </div>
 </div>
 
 <script>
-  // Drag-drop helper. Browsers sandbox file:// pages aggressively, so we
-  // cannot hand the file directly to a cross-origin viewer. Instead we
-  // stash the file handle and (a) open the external viewer in a new tab
-  // and (b) show the user the exact filename they just dropped so they
-  // know which file to drag onto the viewer window that just opened.
-  const VIEWERS = {
-    cpu: "https://profiler.firefox.com/",
-    mem: "https://nnethercote.github.io/dh_view/dh_view.html",
-  };
+  // Firefox Profiler supports a postMessage handoff that eliminates the
+  // manual drag: we open the profiler, wait for its "ready:request"
+  // message, then reply with "inject-profile" carrying the file bytes.
+  // See https://github.com/firefox-devtools/profiler/blob/main/docs-developer/loading-in-profiles.md
+  //
+  // DHat's viewer does not expose a similar API, so memory profiles still
+  // require a manual drop on the DHat viewer tab.
+
+  const FIREFOX_VIEWER = "https://profiler.firefox.com/from-post-message/";
+  const DHAT_VIEWER = "https://nnethercote.github.io/dh_view/dh_view.html";
+
+  // Resolve the output directory hint from the query string. Falls back to
+  // the default `target/profile` so the displayed paths stay correct when a
+  // custom -OutDir is passed to the profile-*.ps1 scripts.
+  const params = new URLSearchParams(window.location.search);
+  const rawDir = params.get("dir");
+  const outDir = (rawDir && rawDir.length > 0)
+    ? rawDir.replace(/[\\/]+$/, "")
+    : "target/profile";
+  const separator = outDir.includes("\\") ? "\\" : "/";
+
+  document.querySelectorAll("[data-path]").forEach((el) => {
+    const file = el.dataset.file;
+    el.textContent = `${outDir}${separator}${file}`;
+  });
 
   function bytes(n) {
     if (n < 1024) return n + " B";
@@ -130,12 +146,69 @@
     return (n / 1024 / 1024).toFixed(2) + " MiB";
   }
 
-  function handleFile(kind, file) {
+  function setStatus(kind, text, tone) {
     const status = document.querySelector(`[data-status="${kind}"]`);
-    status.classList.remove("warn");
-    status.classList.add("ok");
-    status.textContent = `Loaded ${file.name} (${bytes(file.size)}). Opening viewer in a new tab; drag the same file onto it.`;
-    window.open(VIEWERS[kind], "_blank", "noopener");
+    if (!status) return;
+    status.classList.remove("ok", "warn");
+    if (tone) status.classList.add(tone);
+    status.textContent = text;
+  }
+
+  // Hand a file off to the Firefox Profiler using its postMessage protocol.
+  // The profiler posts `{ name: 'ready:request' }` to its opener once the
+  // from-post-message route is active; we reply with the raw bytes.
+  async function handoffFirefox(file) {
+    const viewer = window.open(FIREFOX_VIEWER, "_blank");
+    if (!viewer) {
+      setStatus("cpu", "Popup blocked. Allow popups for this page and drop the file again.", "warn");
+      return;
+    }
+    setStatus("cpu", `Loaded ${file.name} (${bytes(file.size)}). Opening Firefox Profiler and handing off via postMessage...`, "ok");
+
+    const buffer = await file.arrayBuffer();
+    let delivered = false;
+
+    const onMessage = (event) => {
+      if (event.source !== viewer) return;
+      const data = event.data;
+      if (!data || typeof data !== "object") return;
+      if (data.name === "ready:request") {
+        viewer.postMessage({ name: "inject-profile", profile: buffer }, "*", [buffer]);
+        delivered = true;
+        setStatus("cpu", `Sent ${file.name} (${bytes(file.size)}) to Firefox Profiler.`, "ok");
+      } else if (data.name === "profile-loaded") {
+        window.removeEventListener("message", onMessage);
+      }
+    };
+    window.addEventListener("message", onMessage);
+
+    // If the profiler tab never asks for the profile (blocked, offline, old
+    // route), fall back after a grace period so the user knows to drag it in.
+    setTimeout(() => {
+      if (!delivered) {
+        window.removeEventListener("message", onMessage);
+        setStatus(
+          "cpu",
+          `Automatic handoff timed out. Drag ${file.name} onto the Firefox Profiler tab manually.`,
+          "warn",
+        );
+      }
+    }, 15000);
+  }
+
+  function handoffDhat(file) {
+    setStatus("mem", `Loaded ${file.name} (${bytes(file.size)}). Opening DHat Viewer; drag the file onto it (no automatic handoff available).`, "ok");
+    window.open(DHAT_VIEWER, "_blank", "noopener");
+  }
+
+  function handleFile(kind, file) {
+    if (kind === "cpu") {
+      handoffFirefox(file).catch((err) => {
+        setStatus("cpu", `Handoff failed: ${err.message}. Drag the file onto the viewer manually.`, "warn");
+      });
+    } else {
+      handoffDhat(file);
+    }
   }
 
   document.querySelectorAll(".drop").forEach((zone) => {
