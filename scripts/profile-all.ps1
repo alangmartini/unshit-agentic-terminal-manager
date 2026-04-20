@@ -1,9 +1,7 @@
 #Requires -Version 5.1
 <#
-  Convenience wrapper: runs the CPU profile pass and the memory profile pass
-  back to back, then opens the dashboard in the default browser. Each pass
-  launches the app; use the UI for a representative workload, then close the
-  window to advance to the next pass.
+  Thin wrapper. The real implementation lives in xtask/ and is invoked via
+  `cargo xtask profile all` or the `cargo profile-all` alias.
 #>
 
 param(
@@ -15,10 +13,5 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
-& (Join-Path $PSScriptRoot "profile-cpu.ps1") -OutDir $OutDir
-& (Join-Path $PSScriptRoot "profile-memory.ps1") -OutDir $OutDir
-
-$dash = Join-Path $PSScriptRoot "profile.html"
-Write-Host ""
-Write-Host "==> Opening $dash" -ForegroundColor Cyan
-Start-Process $dash
+cargo xtask profile all --out-dir $OutDir
+if ($LASTEXITCODE -ne 0) { throw "cargo xtask profile all failed" }
