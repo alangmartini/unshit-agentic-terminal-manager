@@ -1,6 +1,7 @@
 use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{Dimension, FlexDirection, Overflow};
+use unshit::prelude::SvgNode;
 
 use crate::state::{
     dispatch, is_on, mutate_with, SettingsSection, SharedState, ToggleKey, UiSnapshot,
@@ -46,7 +47,7 @@ fn build_modal_header(shared: &SharedState) -> ElementDef {
                 .on_click(move || {
                     mutate_with(&close_state, |st| dispatch(st, "modal.close"));
                 })
-                .with_child(ElementDef::new(Tag::Div).with_svg(icon_close())),
+                .with_child(svg_icon(icon_close())),
         )
 }
 
@@ -491,24 +492,25 @@ fn slider_control(value_label: &str) -> ElementDef {
 
 fn keybind_row(label: &str, keys: &[&str]) -> ElementDef {
     let mut keys_wrap = ElementDef::new(Tag::Div).with_class("keybind-keys");
-    for (i, key) in keys.iter().enumerate() {
-        if i > 0 {
-            keys_wrap = keys_wrap.with_child(
-                ElementDef::new(Tag::Span)
-                    .with_class("keybind-sep")
-                    .with_text("+"),
-            );
-        }
-        keys_wrap = keys_wrap.with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("keybind-key")
-                .with_text(*key),
-        );
+    for key in keys {
+        keys_wrap = keys_wrap.with_child(pill("keybind-key", None, key));
     }
     ElementDef::new(Tag::Div)
         .with_class("keybind-row")
         .with_child(setting_meta(label, None))
         .with_child(keys_wrap)
+}
+
+fn pill(base: &str, modifier: Option<&str>, text: &str) -> ElementDef {
+    let mut el = ElementDef::new(Tag::Span).with_class(base).with_text(text);
+    if let Some(m) = modifier {
+        el = el.with_class(m);
+    }
+    el
+}
+
+fn svg_icon(svg: SvgNode) -> ElementDef {
+    ElementDef::new(Tag::Div).with_svg(svg)
 }
 
 fn keybind_footer() -> ElementDef {
@@ -589,7 +591,7 @@ fn agent_row(spec: &AgentSpec, enabled: bool, shared: &SharedState) -> ElementDe
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("agent-icon")
-                .with_child(ElementDef::new(Tag::Div).with_svg(icon_agent())),
+                .with_child(svg_icon(icon_agent())),
         )
         .with_child(
             ElementDef::new(Tag::Div)
@@ -615,10 +617,7 @@ fn agent_row(spec: &AgentSpec, enabled: bool, shared: &SharedState) -> ElementDe
 }
 
 fn agent_badge(kind: &str, label: &str) -> ElementDef {
-    ElementDef::new(Tag::Span)
-        .with_class("agent-badge")
-        .with_class(kind)
-        .with_text(label)
+    pill("agent-badge", Some(kind), label)
 }
 
 #[cfg(test)]
@@ -936,7 +935,8 @@ mod tests {
         assert!(first_row.classes.contains(&"keybind-row".to_string()));
         let keys_wrap = &first_row.children[1];
         assert!(keys_wrap.classes.contains(&"keybind-keys".to_string()));
-        assert_eq!(keys_wrap.children.len(), 3);
+        // Separator lives in CSS (::before), so only the key pills render.
+        assert_eq!(keys_wrap.children.len(), 2);
     }
 
     #[test]
@@ -1322,14 +1322,14 @@ mod tests {
         assert_eq!(el.children.len(), 2);
         let keys = &el.children[1];
         assert!(keys.classes.contains(&"keybind-keys".to_string()));
-        // "Ctrl" + "+" + "A" = 3 children
-        assert_eq!(keys.children.len(), 3);
-        assert!(keys.children[0]
-            .classes
-            .contains(&"keybind-key".to_string()));
-        assert!(keys.children[1]
-            .classes
-            .contains(&"keybind-sep".to_string()));
+        // Separator is now CSS ::before, so only two key pills render.
+        assert_eq!(keys.children.len(), 2);
+        assert!(keys
+            .children
+            .iter()
+            .all(|c| c.classes.contains(&"keybind-key".to_string())));
+        assert_eq!(text_of(&keys.children[0]), Some("Ctrl"));
+        assert_eq!(text_of(&keys.children[1]), Some("A"));
     }
 
     #[test]
