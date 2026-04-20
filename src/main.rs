@@ -31,6 +31,50 @@ use crate::ui::titlebar::build_titlebar;
 
 const STYLES: &str = include_str!("../assets/styles.css");
 
+// Heap profiling via dhat. Only compiled in when --features profiling is set.
+//
+// The profiler writes `target/profile/dhat-heap.json` on drop, which can be
+// loaded into the dhat viewer. We keep the `Profiler` inside a static Mutex
+// because all of our process-exit paths (`std::process::exit` in the ctrl-c
+// handler, panic hook, and `on_close` callback) bypass normal stack unwinding
+// and therefore skip Drop. `finalize_profiler` pulls the value out and drops
+// it explicitly right before the exit call, flushing the JSON output.
+#[cfg(feature = "profiling")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "profiling")]
+static PROFILER: std::sync::Mutex<Option<dhat::Profiler>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "profiling")]
+fn init_profiler() {
+    let out_dir = std::path::Path::new("target").join("profile");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let out_path = out_dir.join("dhat-heap.json");
+    let profiler = dhat::Profiler::builder()
+        .file_name(&out_path)
+        .build();
+    *PROFILER.lock().expect("profiler mutex poisoned") = Some(profiler);
+    eprintln!(
+        "[profiling] dhat heap profiling active; output: {}",
+        out_path.display()
+    );
+}
+
+#[cfg(feature = "profiling")]
+fn finalize_profiler() {
+    if let Ok(mut guard) = PROFILER.lock() {
+        if let Some(p) = guard.take() {
+            drop(p);
+            eprintln!("[profiling] dhat heap profile flushed to target/profile/dhat-heap.json");
+        }
+    }
+}
+
+#[cfg(not(feature = "profiling"))]
+#[inline]
+fn finalize_profiler() {}
+
 /// Snapshot a terminal's display grid for the current render frame.
 ///
 /// This is the per-terminal step run by `tree_fn` when it builds the
@@ -227,6 +271,9 @@ fn parse_bench_args() -> Option<crate::bench::BenchConfig> {
 }
 
 fn main() {
+    #[cfg(feature = "profiling")]
+    init_profiler();
+
     let bench_config = parse_bench_args();
 
     // When running in bench mode on Windows, force the PTY to spawn cmd.exe
@@ -245,9 +292,11 @@ fn main() {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_panic(info);
+        finalize_profiler();
         std::process::exit(1);
     }));
     ctrlc::set_handler(|| {
+        finalize_profiler();
         std::process::exit(0);
     })
     .expect("failed to set Ctrl+C handler");
@@ -397,6 +446,9 @@ fn main() {
                     guard.pty_manager.destroy_all();
                     guard.terminals.clear();
                 }
+                // Flush heap profile (no-op without --features profiling) so
+                // dhat writes its JSON before we bypass Drop via exit() below.
+                finalize_profiler();
                 // Force-exit the process. Without this, tokio's Runtime::drop
                 // blocks indefinitely waiting for spawn_blocking reader tasks
                 // (bridge.rs) that are stuck on pipe reads. The readers hold

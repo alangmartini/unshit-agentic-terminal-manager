@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terminal Manager Profiling Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --accent-strong: #1f6feb;
+    --ok: #238636;
+    --ok-hover: #2ea043;
+    --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.55; }
+  a { color: var(--accent); }
+  code { background: var(--bg); padding: 2px 6px; border-radius: 4px; font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; color: var(--accent); }
+  .container { max-width: 1080px; margin: 0 auto; padding: 48px 24px 80px; }
+  header h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.01em; }
+  header p { margin: 0; color: var(--muted); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; margin-top: 32px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px 24px 20px; display: flex; flex-direction: column; }
+  .card h2 { margin: 0 0 6px; font-size: 18px; }
+  .card .subtitle { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+  .drop { border: 2px dashed var(--border); border-radius: 8px; padding: 18px; text-align: center; color: var(--muted); font-size: 13px; margin: 8px 0 14px; transition: border-color .15s, background .15s, color .15s; }
+  .drop.hover { border-color: var(--accent); background: rgba(88,166,255,0.06); color: var(--text); }
+  .drop input { display: none; }
+  .drop label { cursor: pointer; color: var(--accent); text-decoration: underline; }
+  .path { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; background: var(--bg); border: 1px solid var(--border); padding: 8px 12px; border-radius: 6px; font-size: 12.5px; color: var(--accent); word-break: break-all; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 10px 0; flex-wrap: wrap; }
+  .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; min-width: 72px; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 9px 14px; background: var(--ok); color: white; text-decoration: none; border-radius: 6px; font-weight: 500; border: none; cursor: pointer; font-size: 13.5px; }
+  .btn:hover { background: var(--ok-hover); }
+  .btn.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn.secondary:hover { border-color: var(--accent); color: var(--accent); }
+  .steps { margin: 0; padding-left: 20px; color: var(--muted); font-size: 13px; }
+  .steps li { margin: 4px 0; }
+  .steps code { color: var(--accent); }
+  .footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; background: rgba(88,166,255,0.1); color: var(--accent); font-size: 11px; font-weight: 500; border: 1px solid rgba(88,166,255,0.3); }
+  .status { margin-top: auto; padding-top: 12px; font-size: 12px; color: var(--muted); }
+  .status.ok { color: var(--ok-hover); }
+  .status.warn { color: var(--warn); }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Profiling Dashboard</h1>
+    <p>CPU and heap profiles for the Terminal Manager. Run the scripts, then hand the output files to the viewers below.</p>
+  </header>
+
+  <div class="cards">
+    <section class="card" data-kind="cpu">
+      <h2>CPU Profile <span class="badge">samply</span></h2>
+      <p class="subtitle">Sample-based profiler output in Gecko/Firefox Profiler format.</p>
+
+      <ol class="steps">
+        <li>Run <code>./scripts/profile-cpu.ps1</code> (Windows) or <code>./scripts/profile-cpu.sh</code></li>
+        <li>Exercise the app, then close it to stop recording</li>
+        <li>Drop the output file on the zone below, or click Open Viewer and drag it onto the page that opens</li>
+      </ol>
+
+      <div class="row"><span class="label">Output</span><span class="path">target/profile/cpu.json.gz</span></div>
+
+      <div class="drop" data-target="cpu">
+        Drop <code>cpu.json.gz</code> here, or
+        <label>browse<input type="file" accept=".gz,.json,application/gzip,application/json"></label>
+      </div>
+
+      <div class="row">
+        <a class="btn" href="https://profiler.firefox.com/" target="_blank" rel="noopener">Open Firefox Profiler</a>
+        <a class="btn secondary" href="https://github.com/mstange/samply" target="_blank" rel="noopener">samply docs</a>
+      </div>
+
+      <div class="status" data-status="cpu">Waiting for a profile to be dropped.</div>
+    </section>
+
+    <section class="card" data-kind="mem">
+      <h2>Memory Profile <span class="badge">dhat</span></h2>
+      <p class="subtitle">Heap allocation profile with per-allocation backtraces and live-bytes timelines.</p>
+
+      <ol class="steps">
+        <li>Run <code>./scripts/profile-memory.ps1</code> (Windows) or <code>./scripts/profile-memory.sh</code></li>
+        <li>Exercise the app, then close it to flush the profile</li>
+        <li>Drop the output file on the zone below, or click Open Viewer and load it there</li>
+      </ol>
+
+      <div class="row"><span class="label">Output</span><span class="path">target/profile/dhat-heap.json</span></div>
+
+      <div class="drop" data-target="mem">
+        Drop <code>dhat-heap.json</code> here, or
+        <label>browse<input type="file" accept=".json,application/json"></label>
+      </div>
+
+      <div class="row">
+        <a class="btn" href="https://nnethercote.github.io/dh_view/dh_view.html" target="_blank" rel="noopener">Open DHat Viewer</a>
+        <a class="btn secondary" href="https://github.com/nnethercote/dhat" target="_blank" rel="noopener">dhat docs</a>
+      </div>
+
+      <div class="status" data-status="mem">Waiting for a profile to be dropped.</div>
+    </section>
+  </div>
+
+  <div class="footer">
+    Tip: <code>./scripts/profile-all.ps1</code> runs both passes and opens this page. The <code>profiling</code> cargo feature gates the dhat allocator, so normal builds pay zero overhead.
+  </div>
+</div>
+
+<script>
+  // Drag-drop helper. Browsers sandbox file:// pages aggressively, so we
+  // cannot hand the file directly to a cross-origin viewer. Instead we
+  // stash the file handle and (a) open the external viewer in a new tab
+  // and (b) show the user the exact filename they just dropped so they
+  // know which file to drag onto the viewer window that just opened.
+  const VIEWERS = {
+    cpu: "https://profiler.firefox.com/",
+    mem: "https://nnethercote.github.io/dh_view/dh_view.html",
+  };
+
+  function bytes(n) {
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KiB";
+    return (n / 1024 / 1024).toFixed(2) + " MiB";
+  }
+
+  function handleFile(kind, file) {
+    const status = document.querySelector(`[data-status="${kind}"]`);
+    status.classList.remove("warn");
+    status.classList.add("ok");
+    status.textContent = `Loaded ${file.name} (${bytes(file.size)}). Opening viewer in a new tab; drag the same file onto it.`;
+    const url = URL.createObjectURL(file);
+    // Open the viewer. The user then drags the file onto the viewer window.
+    window.open(VIEWERS[kind], "_blank", "noopener");
+    // Release the blob URL after a delay so the browser can still reference it if needed.
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+
+  document.querySelectorAll(".drop").forEach((zone) => {
+    const kind = zone.dataset.target;
+    const input = zone.querySelector("input[type=file]");
+
+    zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("hover"); });
+    zone.addEventListener("dragleave", () => zone.classList.remove("hover"));
+    zone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      zone.classList.remove("hover");
+      const file = e.dataTransfer.files[0];
+      if (file) handleFile(kind, file);
+    });
+    input.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (file) handleFile(kind, file);
+    });
+  });
+</script>
+</body>
+</html>
