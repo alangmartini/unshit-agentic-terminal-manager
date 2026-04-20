@@ -46,10 +46,19 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[cfg(feature = "profiling")]
 static PROFILER: std::sync::Mutex<Option<dhat::Profiler>> = std::sync::Mutex::new(None);
 
+/// Returns `true` if `init_profiler` should proceed to build a new
+/// profiler. Extracted as a pure function so the idempotency guard
+/// (refs #107) can be unit tested without engaging dhat's global
+/// allocator, which cannot safely be re-initialized in-process.
+#[cfg(feature = "profiling")]
+fn should_init_profiler<T>(slot: &Option<T>) -> bool {
+    slot.is_none()
+}
+
 #[cfg(feature = "profiling")]
 fn init_profiler() {
     let mut guard = PROFILER.lock().unwrap();
-    if guard.is_some() {
+    if !should_init_profiler(&*guard) {
         eprintln!("[profiling] init_profiler called twice, ignoring");
         return;
     }
@@ -67,6 +76,26 @@ fn init_profiler() {
         "[profiling] dhat heap profiling active; output: {}",
         out_path.display()
     );
+}
+
+#[cfg(all(test, feature = "profiling"))]
+mod profiler_tests {
+    use super::should_init_profiler;
+
+    // Regression test for issue #107: init_profiler must early-return
+    // when the PROFILER slot is already populated, otherwise a second
+    // call would drop the in-flight profiler and flush a partial JSON.
+    #[test]
+    fn should_init_profiler_returns_true_when_slot_is_empty() {
+        let slot: Option<u32> = None;
+        assert!(should_init_profiler(&slot));
+    }
+
+    #[test]
+    fn should_init_profiler_returns_false_when_slot_is_populated() {
+        let slot: Option<u32> = Some(0);
+        assert!(!should_init_profiler(&slot));
+    }
 }
 
 #[cfg(feature = "profiling")]
