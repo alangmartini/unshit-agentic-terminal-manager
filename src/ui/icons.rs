@@ -221,6 +221,13 @@ pub fn icon_close() -> SvgNode {
     )
 }
 
+pub fn icon_agent() -> SvgNode {
+    group(
+        root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Miter),
+        vec![path_d("M4 6l2 2l-2 2"), path_d("M8 10h4")],
+    )
+}
+
 pub fn subtab_icon_for(kind: SubtabIcon) -> SvgNode {
     match kind {
         SubtabIcon::Terminal => icon_terminal(),
