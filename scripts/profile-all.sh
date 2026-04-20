@@ -16,6 +16,6 @@ echo
 echo "==> Opening $DASH"
 case "$(uname -s)" in
   Darwin) open "$DASH" ;;
-  MINGW*|MSYS*|CYGWIN*) start "" "$DASH" ;;
+  MINGW*|MSYS*|CYGWIN*) cmd.exe //c start "" "$DASH" ;;
   *) xdg-open "$DASH" >/dev/null 2>&1 || echo "open $DASH in your browser" ;;
 esac
