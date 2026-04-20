@@ -4,7 +4,8 @@ use unshit::core::style::types::{Dimension, FlexDirection, Overflow};
 use unshit::prelude::SvgNode;
 
 use crate::state::{
-    dispatch, is_on, mutate_with, SettingsSection, SharedState, ToggleKey, UiSnapshot,
+    agent_enabled, dispatch, is_on, mutate_toggle_agent, mutate_with, AgentKey, SettingsSection,
+    SharedState, ToggleKey, UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -260,7 +261,7 @@ fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef 
         ))
         .with_child(agent_list_header(AGENT_SPECS.len()));
     for spec in AGENT_SPECS {
-        section = section.with_child(agent_row(spec, is_on(state, spec.toggle_key), shared));
+        section = section.with_child(agent_row(spec, agent_enabled(state, spec.key), shared));
     }
     section
 }
@@ -555,7 +556,7 @@ struct AgentSpec {
     name: &'static str,
     path: &'static str,
     status: AgentStatus,
-    toggle_key: ToggleKey,
+    key: AgentKey,
 }
 
 const AGENT_SPECS: &[AgentSpec] = &[
@@ -563,19 +564,19 @@ const AGENT_SPECS: &[AgentSpec] = &[
         name: "claude",
         path: "~/.local/bin/claude",
         status: AgentStatus::Running,
-        toggle_key: ToggleKey::AgentClaude,
+        key: AgentKey::Claude,
     },
     AgentSpec {
         name: "amp",
         path: "~/.local/bin/amp",
         status: AgentStatus::Idle,
-        toggle_key: ToggleKey::AgentAmp,
+        key: AgentKey::Amp,
     },
     AgentSpec {
         name: "codex",
         path: "~/.local/bin/codex",
         status: AgentStatus::Disabled,
-        toggle_key: ToggleKey::AgentCodex,
+        key: AgentKey::Codex,
     },
 ];
 
@@ -622,8 +623,22 @@ fn agent_row(spec: &AgentSpec, enabled: bool, shared: &SharedState) -> ElementDe
             ElementDef::new(Tag::Div)
                 .with_class("agent-controls")
                 .with_child(agent_badge(spec.status.kind(), label))
-                .with_child(toggle_button(enabled, spec.toggle_key, shared)),
+                .with_child(agent_toggle_button(enabled, spec.key, shared)),
         )
+}
+
+/// Toggle button for an agent row. Mirrors `toggle_button` but writes to
+/// the typed `state.agents` vec via `mutate_toggle_agent` instead of the
+/// generic `state.toggles` map.
+fn agent_toggle_button(on: bool, key: AgentKey, shared: &SharedState) -> ElementDef {
+    let mut btn = ElementDef::new(Tag::Button).with_class("toggle");
+    if on {
+        btn = btn.with_class("on");
+    }
+    let s = shared.clone();
+    btn.on_click(move || {
+        mutate_with(&s, |st| mutate_toggle_agent(st, key));
+    })
 }
 
 fn agent_badge(kind: &str, label: &str) -> ElementDef {
@@ -1033,6 +1048,39 @@ mod tests {
         assert_eq!(text_of(count), Some("3"));
     }
 
+    #[test]
+    fn agent_toggle_click_writes_to_agents_field() {
+        // refs #107 - agent enabled state lives in `state.agents`, not in
+        // the generic `state.toggles` map. Clicking an agent row's toggle
+        // must flip the corresponding `Agent::enabled` field.
+        let shared = make_shared();
+        let snap = make_snapshot();
+        let el = build_agents_section(&snap, &shared);
+        let claude_row = &el.children[4];
+        let toggle = &claude_row.children[2].children[1];
+
+        let was_on = agent_enabled(&shared.lock().unwrap().ui_snapshot(), AgentKey::Claude);
+        (toggle.on_click.as_ref().unwrap())();
+        let is_on_now = agent_enabled(&shared.lock().unwrap().ui_snapshot(), AgentKey::Claude);
+        assert_ne!(was_on, is_on_now);
+    }
+
+    #[test]
+    fn agent_toggle_click_does_not_touch_toggles_map() {
+        // refs #107 - before the split, agent toggles wrote to `state.toggles`.
+        // After the split they must only touch `state.agents`.
+        let shared = make_shared();
+        let snap = make_snapshot();
+        let el = build_agents_section(&snap, &shared);
+        let claude_row = &el.children[4];
+        let toggle = &claude_row.children[2].children[1];
+
+        let toggles_before = shared.lock().unwrap().toggles.clone();
+        (toggle.on_click.as_ref().unwrap())();
+        let toggles_after = shared.lock().unwrap().toggles.clone();
+        assert_eq!(toggles_before, toggles_after);
+    }
+
     // -- build_modal_footer -----------------------------------------------------
 
     #[test]
@@ -1382,7 +1430,7 @@ mod tests {
             name: "test",
             path: "~/bin/test",
             status: AgentStatus::Idle,
-            toggle_key: ToggleKey::AgentAmp,
+            key: AgentKey::Amp,
         };
         let el = agent_row(&spec, true, &shared);
         assert!(el.classes.contains(&"agent-row".to_string()));
