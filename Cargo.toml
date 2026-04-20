@@ -91,6 +91,7 @@ edition = "2021"
 
 [features]
 input-latency-histogram = ["unshit/input-latency-histogram"]
+profiling = ["dep:dhat"]
 
 [lints]
 workspace = true
@@ -112,3 +113,4 @@ rfd = "0.15"
 ctrlc = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dhat = { version = "0.3", optional = true }
