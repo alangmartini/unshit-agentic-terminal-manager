@@ -63,6 +63,48 @@ impl SettingsSection {
     }
 }
 
+/// Typed keys for the `AppState::toggles` map. Previously string literals
+/// like "confirm-close" were spread across the UI, with the type system
+/// no help against typos (e.g. "confirm-clsoe" silently read as `false`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ToggleKey {
+    RestoreOnStartup,
+    ConfirmClose,
+    StartMinimized,
+    CheckUpdates,
+    GlowEffect,
+    BackgroundTexture,
+    FontLigatures,
+    ShellIntegration,
+    ScrollOnOutput,
+    BellNotification,
+    AutoDiscovery,
+    AgentClaude,
+    AgentAmp,
+    AgentCodex,
+}
+
+impl ToggleKey {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToggleKey::RestoreOnStartup => "restore-on-startup",
+            ToggleKey::ConfirmClose => "confirm-close",
+            ToggleKey::StartMinimized => "start-minimized",
+            ToggleKey::CheckUpdates => "check-updates",
+            ToggleKey::GlowEffect => "glow-effect",
+            ToggleKey::BackgroundTexture => "background-texture",
+            ToggleKey::FontLigatures => "font-ligatures",
+            ToggleKey::ShellIntegration => "shell-integration",
+            ToggleKey::ScrollOnOutput => "scroll-on-output",
+            ToggleKey::BellNotification => "bell-notification",
+            ToggleKey::AutoDiscovery => "auto-discovery",
+            ToggleKey::AgentClaude => "agent-claude",
+            ToggleKey::AgentAmp => "agent-amp",
+            ToggleKey::AgentCodex => "agent-codex",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Workspace {
     pub num: u32,
@@ -170,7 +212,7 @@ pub struct AppState {
     pub settings_section: SettingsSection,
     pub theme: String,
     pub font_size_pt: u32,
-    pub toggles: BTreeMap<String, bool>,
+    pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
@@ -308,7 +350,7 @@ pub struct UiSnapshot {
     pub settings_section: SettingsSection,
     pub theme: String,
     pub font_size_pt: u32,
-    pub toggles: BTreeMap<String, bool>,
+    pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
@@ -435,20 +477,20 @@ pub fn seed_state() -> AppState {
     }];
 
     let mut toggles = BTreeMap::new();
-    toggles.insert("restore-on-startup".to_string(), true);
-    toggles.insert("confirm-close".to_string(), true);
-    toggles.insert("start-minimized".to_string(), false);
-    toggles.insert("check-updates".to_string(), true);
-    toggles.insert("glow-effect".to_string(), true);
-    toggles.insert("background-texture".to_string(), true);
-    toggles.insert("font-ligatures".to_string(), true);
-    toggles.insert("shell-integration".to_string(), true);
-    toggles.insert("scroll-on-output".to_string(), true);
-    toggles.insert("bell-notification".to_string(), false);
-    toggles.insert("auto-discovery".to_string(), true);
-    toggles.insert("agent-claude".to_string(), true);
-    toggles.insert("agent-amp".to_string(), true);
-    toggles.insert("agent-codex".to_string(), false);
+    toggles.insert(ToggleKey::RestoreOnStartup, true);
+    toggles.insert(ToggleKey::ConfirmClose, true);
+    toggles.insert(ToggleKey::StartMinimized, false);
+    toggles.insert(ToggleKey::CheckUpdates, true);
+    toggles.insert(ToggleKey::GlowEffect, true);
+    toggles.insert(ToggleKey::BackgroundTexture, true);
+    toggles.insert(ToggleKey::FontLigatures, true);
+    toggles.insert(ToggleKey::ShellIntegration, true);
+    toggles.insert(ToggleKey::ScrollOnOutput, true);
+    toggles.insert(ToggleKey::BellNotification, false);
+    toggles.insert(ToggleKey::AutoDiscovery, true);
+    toggles.insert(ToggleKey::AgentClaude, true);
+    toggles.insert(ToggleKey::AgentAmp, true);
+    toggles.insert(ToggleKey::AgentCodex, false);
 
     AppState {
         workspaces,
@@ -1171,8 +1213,8 @@ pub fn find_active_pane(state: &UiSnapshot) -> &Pane {
     &state.panes[0][0]
 }
 
-pub fn is_on(state: &UiSnapshot, key: &str) -> bool {
-    state.toggles.get(key).copied().unwrap_or(false)
+pub fn is_on(state: &UiSnapshot, key: ToggleKey) -> bool {
+    state.toggles.get(&key).copied().unwrap_or(false)
 }
 
 /// Resize all active terminals and their PTYs to the given column/row count.
@@ -1734,13 +1776,13 @@ mod tests {
     #[test]
     fn is_on_returns_value_or_false() {
         let mut state = test_state();
-        state.toggles.insert("glow".to_string(), true);
-        state.toggles.insert("dim".to_string(), false);
+        state.toggles.insert(ToggleKey::GlowEffect, true);
+        state.toggles.insert(ToggleKey::BackgroundTexture, false);
         let snap = state.ui_snapshot();
 
-        assert!(is_on(&snap, "glow"));
-        assert!(!is_on(&snap, "dim"));
-        assert!(!is_on(&snap, "nonexistent"));
+        assert!(is_on(&snap, ToggleKey::GlowEffect));
+        assert!(!is_on(&snap, ToggleKey::BackgroundTexture));
+        assert!(!is_on(&snap, ToggleKey::ConfirmClose));
     }
 
     // -- ui_snapshot ----------------------------------------------------------

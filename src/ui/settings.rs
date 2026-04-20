@@ -1,8 +1,11 @@
 use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{Dimension, FlexDirection, Overflow};
+use unshit::prelude::SvgNode;
 
-use crate::state::{dispatch, is_on, mutate_with, SettingsSection, SharedState, UiSnapshot};
+use crate::state::{
+    dispatch, is_on, mutate_with, SettingsSection, SharedState, ToggleKey, UiSnapshot,
+};
 use crate::ui::icons::*;
 
 pub fn build_settings_modal(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -44,7 +47,7 @@ fn build_modal_header(shared: &SharedState) -> ElementDef {
                 .on_click(move || {
                     mutate_with(&close_state, |st| dispatch(st, "modal.close"));
                 })
-                .with_child(ElementDef::new(Tag::Div).with_svg(icon_close())),
+                .with_child(svg_icon(icon_close())),
         )
 }
 
@@ -99,29 +102,33 @@ fn build_general_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef
             "Starting directory for new terminals",
             text_input_display("~/projects/main"),
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Restore on startup",
             "Reopen last active session and panes",
-            toggle_button(
-                is_on(state, "restore-on-startup"),
-                "restore-on-startup",
-                shared,
-            ),
+            ToggleKey::RestoreOnStartup,
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Confirm before closing",
             "Warn when closing a tab with a running process",
-            toggle_button(is_on(state, "confirm-close"), "confirm-close", shared),
+            ToggleKey::ConfirmClose,
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Start minimized",
             "Launch to system tray on startup",
-            toggle_button(is_on(state, "start-minimized"), "start-minimized", shared),
+            ToggleKey::StartMinimized,
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Check for updates",
             "Notify when a new version is available",
-            toggle_button(is_on(state, "check-updates"), "check-updates", shared),
+            ToggleKey::CheckUpdates,
         ))
 }
 
@@ -150,58 +157,58 @@ fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> Element
         .with_child(setting_row(
             "Line height",
             "Spacing between terminal rows",
-            static_stepper("1.4"),
+            stepper("1.4", None),
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Glow effect",
             "Subtle CRT-style text shadow on output",
-            toggle_button(is_on(state, "glow-effect"), "glow-effect", shared),
+            ToggleKey::GlowEffect,
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Background texture",
             "Warm ambient gradient behind content",
-            toggle_button(
-                is_on(state, "background-texture"),
-                "background-texture",
-                shared,
-            ),
+            ToggleKey::BackgroundTexture,
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Font ligatures",
             "Combine character pairs like => and !=",
-            toggle_button(is_on(state, "font-ligatures"), "font-ligatures", shared),
+            ToggleKey::FontLigatures,
         ))
 }
 
 fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     section_shell("shell")
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Shell integration",
             "Inject prompt markers for smart scrollback",
-            toggle_button(
-                is_on(state, "shell-integration"),
-                "shell-integration",
-                shared,
-            ),
+            ToggleKey::ShellIntegration,
         ))
         .with_child(setting_row(
             "History size",
             "Lines retained per pane",
             text_input_display("50000"),
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Scroll on output",
             "Auto-scroll terminal when new output arrives",
-            toggle_button(is_on(state, "scroll-on-output"), "scroll-on-output", shared),
+            ToggleKey::ScrollOnOutput,
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Bell notification",
             "Flash tab badge when terminal rings the bell",
-            toggle_button(
-                is_on(state, "bell-notification"),
-                "bell-notification",
-                shared,
-            ),
+            ToggleKey::BellNotification,
         ))
         .with_child(setting_row(
             "Word separators",
@@ -228,45 +235,24 @@ fn build_keybinds_section() -> ElementDef {
 }
 
 fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    section_shell("agents")
-        .with_child(setting_row(
+    let mut section = section_shell("agents")
+        .with_child(toggle_row(
+            state,
+            shared,
             "Auto-discovery",
             "Detect installed AI agents on PATH",
-            toggle_button(is_on(state, "auto-discovery"), "auto-discovery", shared),
+            ToggleKey::AutoDiscovery,
         ))
         .with_child(setting_row(
             "Default timeout",
             "Seconds before an agent task is canceled",
-            static_stepper("300"),
+            stepper("300", None),
         ))
-        .with_child(agent_list_header(3))
-        .with_child(agent_row(
-            "claude",
-            "~/.local/bin/claude",
-            "running",
-            "running",
-            is_on(state, "agent-claude"),
-            "agent-claude",
-            shared,
-        ))
-        .with_child(agent_row(
-            "amp",
-            "~/.local/bin/amp",
-            "idle",
-            "idle",
-            is_on(state, "agent-amp"),
-            "agent-amp",
-            shared,
-        ))
-        .with_child(agent_row(
-            "codex",
-            "~/.local/bin/codex",
-            "disabled",
-            "disabled",
-            is_on(state, "agent-codex"),
-            "agent-codex",
-            shared,
-        ))
+        .with_child(agent_list_header(AGENT_SPECS.len()));
+    for spec in AGENT_SPECS {
+        section = section.with_child(agent_row(spec, is_on(state, spec.toggle_key), shared));
+    }
+    section
 }
 
 fn build_modal_footer(shared: &SharedState) -> ElementDef {
@@ -326,38 +312,52 @@ fn section_shell(title: &str) -> ElementDef {
         )
 }
 
+fn setting_meta(label: &str, desc: Option<&str>) -> ElementDef {
+    let mut meta = ElementDef::new(Tag::Div)
+        .with_class("setting-meta")
+        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("setting-label")
+                .with_text(label),
+        );
+    if let Some(desc) = desc {
+        meta = meta.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("setting-desc")
+                .with_text(desc),
+        );
+    }
+    meta
+}
+
 fn setting_row(label: &str, desc: &str, control: ElementDef) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("setting-row")
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("setting-meta")
-                .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("setting-label")
-                        .with_text(label),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("setting-desc")
-                        .with_text(desc),
-                ),
-        )
+        .with_child(setting_meta(label, Some(desc)))
         .with_child(control)
 }
 
-fn toggle_button(on: bool, key: &str, shared: &SharedState) -> ElementDef {
+fn toggle_row(
+    state: &UiSnapshot,
+    shared: &SharedState,
+    label: &str,
+    desc: &str,
+    key: ToggleKey,
+) -> ElementDef {
+    setting_row(label, desc, toggle_button(is_on(state, key), key, shared))
+}
+
+fn toggle_button(on: bool, key: ToggleKey, shared: &SharedState) -> ElementDef {
     let mut btn = ElementDef::new(Tag::Button).with_class("toggle");
     if on {
         btn = btn.with_class("on");
     }
-    let key_owned = key.to_string();
     let s = shared.clone();
     btn.on_click(move || {
         mutate_with(&s, |st| {
-            let next = !st.toggles.get(&key_owned).copied().unwrap_or(false);
-            st.toggles.insert(key_owned.clone(), next);
+            let next = !st.toggles.get(&key).copied().unwrap_or(false);
+            st.toggles.insert(key, next);
         });
     })
 }
@@ -398,54 +398,60 @@ fn theme_chip_group(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     chips
 }
 
-fn font_stepper(value: u32, shared: &SharedState) -> ElementDef {
-    let dec = shared.clone();
-    let inc = shared.clone();
-    ElementDef::new(Tag::Div)
-        .with_class("stepper")
-        .with_child(
+type StepCallback = Box<dyn Fn() + Send + Sync + 'static>;
+
+struct StepCallbacks {
+    on_dec: StepCallback,
+    on_inc: StepCallback,
+}
+
+fn stepper(value: &str, callbacks: Option<StepCallbacks>) -> ElementDef {
+    let (dec, inc) = match callbacks {
+        Some(cb) => (
             ElementDef::new(Tag::Button)
                 .with_class("stepper-btn")
                 .with_text("\u{2212}")
-                .on_click(move || {
-                    mutate_with(&dec, |st| dispatch(st, "font.dec"));
-                }),
-        )
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("stepper-val")
-                .with_class("tnum")
-                .with_text(value.to_string()),
-        )
-        .with_child(
+                .on_click(cb.on_dec),
             ElementDef::new(Tag::Button)
                 .with_class("stepper-btn")
                 .with_text("+")
-                .on_click(move || {
-                    mutate_with(&inc, |st| dispatch(st, "font.inc"));
-                }),
-        )
-}
-
-fn static_stepper(value: &str) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("stepper")
-        .with_child(
+                .on_click(cb.on_inc),
+        ),
+        None => (
             ElementDef::new(Tag::Button)
                 .with_class("stepper-btn")
+                .with_class("disabled")
                 .with_text("\u{2212}"),
-        )
+            ElementDef::new(Tag::Button)
+                .with_class("stepper-btn")
+                .with_class("disabled")
+                .with_text("+"),
+        ),
+    };
+    ElementDef::new(Tag::Div)
+        .with_class("stepper")
+        .with_child(dec)
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("stepper-val")
                 .with_class("tnum")
                 .with_text(value),
         )
-        .with_child(
-            ElementDef::new(Tag::Button)
-                .with_class("stepper-btn")
-                .with_text("+"),
-        )
+        .with_child(inc)
+}
+
+fn font_stepper(value: u32, shared: &SharedState) -> ElementDef {
+    let dec_shared = shared.clone();
+    let inc_shared = shared.clone();
+    let callbacks = StepCallbacks {
+        on_dec: Box::new(move || {
+            mutate_with(&dec_shared, |st| dispatch(st, "font.dec"));
+        }),
+        on_inc: Box::new(move || {
+            mutate_with(&inc_shared, |st| dispatch(st, "font.inc"));
+        }),
+    };
+    stepper(&value.to_string(), Some(callbacks))
 }
 
 fn cursor_style_group() -> ElementDef {
@@ -486,33 +492,25 @@ fn slider_control(value_label: &str) -> ElementDef {
 
 fn keybind_row(label: &str, keys: &[&str]) -> ElementDef {
     let mut keys_wrap = ElementDef::new(Tag::Div).with_class("keybind-keys");
-    for (i, key) in keys.iter().enumerate() {
-        if i > 0 {
-            keys_wrap = keys_wrap.with_child(
-                ElementDef::new(Tag::Span)
-                    .with_class("keybind-sep")
-                    .with_text("+"),
-            );
-        }
-        keys_wrap = keys_wrap.with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("keybind-key")
-                .with_text(*key),
-        );
+    for key in keys {
+        keys_wrap = keys_wrap.with_child(pill("keybind-key", None, key));
     }
     ElementDef::new(Tag::Div)
         .with_class("keybind-row")
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("setting-meta")
-                .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("setting-label")
-                        .with_text(label),
-                ),
-        )
+        .with_child(setting_meta(label, None))
         .with_child(keys_wrap)
+}
+
+fn pill(base: &str, modifier: Option<&str>, text: &str) -> ElementDef {
+    let mut el = ElementDef::new(Tag::Span).with_class(base).with_text(text);
+    if let Some(m) = modifier {
+        el = el.with_class(m);
+    }
+    el
+}
+
+fn svg_icon(svg: SvgNode) -> ElementDef {
+    ElementDef::new(Tag::Div).with_svg(svg)
 }
 
 fn keybind_footer() -> ElementDef {
@@ -526,7 +524,52 @@ fn keybind_footer() -> ElementDef {
         )
 }
 
-fn agent_list_header(count: u32) -> ElementDef {
+#[derive(Clone, Copy)]
+enum AgentStatus {
+    Running,
+    Idle,
+    Disabled,
+}
+
+impl AgentStatus {
+    fn kind(self) -> &'static str {
+        match self {
+            AgentStatus::Running => "running",
+            AgentStatus::Idle => "idle",
+            AgentStatus::Disabled => "disabled",
+        }
+    }
+}
+
+struct AgentSpec {
+    name: &'static str,
+    path: &'static str,
+    status: AgentStatus,
+    toggle_key: ToggleKey,
+}
+
+const AGENT_SPECS: &[AgentSpec] = &[
+    AgentSpec {
+        name: "claude",
+        path: "~/.local/bin/claude",
+        status: AgentStatus::Running,
+        toggle_key: ToggleKey::AgentClaude,
+    },
+    AgentSpec {
+        name: "amp",
+        path: "~/.local/bin/amp",
+        status: AgentStatus::Idle,
+        toggle_key: ToggleKey::AgentAmp,
+    },
+    AgentSpec {
+        name: "codex",
+        path: "~/.local/bin/codex",
+        status: AgentStatus::Disabled,
+        toggle_key: ToggleKey::AgentCodex,
+    },
+];
+
+fn agent_list_header(count: usize) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("agent-list-header")
         .with_child(
@@ -541,21 +584,14 @@ fn agent_list_header(count: u32) -> ElementDef {
         )
 }
 
-fn agent_row(
-    name: &str,
-    path: &str,
-    badge_kind: &str,
-    badge_label: &str,
-    enabled: bool,
-    toggle_key: &str,
-    shared: &SharedState,
-) -> ElementDef {
+fn agent_row(spec: &AgentSpec, enabled: bool, shared: &SharedState) -> ElementDef {
+    let label = spec.status.kind();
     ElementDef::new(Tag::Div)
         .with_class("agent-row")
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("agent-icon")
-                .with_child(ElementDef::new(Tag::Div).with_svg(icon_agent())),
+                .with_child(svg_icon(icon_agent())),
         )
         .with_child(
             ElementDef::new(Tag::Div)
@@ -564,27 +600,24 @@ fn agent_row(
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("agent-name")
-                        .with_text(name),
+                        .with_text(spec.name),
                 )
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("agent-path")
-                        .with_text(path),
+                        .with_text(spec.path),
                 ),
         )
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("agent-controls")
-                .with_child(agent_badge(badge_kind, badge_label))
-                .with_child(toggle_button(enabled, toggle_key, shared)),
+                .with_child(agent_badge(spec.status.kind(), label))
+                .with_child(toggle_button(enabled, spec.toggle_key, shared)),
         )
 }
 
 fn agent_badge(kind: &str, label: &str) -> ElementDef {
-    ElementDef::new(Tag::Span)
-        .with_class("agent-badge")
-        .with_class(kind)
-        .with_text(label)
+    pill("agent-badge", Some(kind), label)
 }
 
 #[cfg(test)]
@@ -902,7 +935,8 @@ mod tests {
         assert!(first_row.classes.contains(&"keybind-row".to_string()));
         let keys_wrap = &first_row.children[1];
         assert!(keys_wrap.classes.contains(&"keybind-keys".to_string()));
-        assert_eq!(keys_wrap.children.len(), 3);
+        // Separator lives in CSS (::before), so only the key pills render.
+        assert_eq!(keys_wrap.children.len(), 2);
     }
 
     #[test]
@@ -1031,7 +1065,7 @@ mod tests {
     #[test]
     fn toggle_button_on_has_on_class() {
         let shared = make_shared();
-        let el = toggle_button(true, "test-key", &shared);
+        let el = toggle_button(true, ToggleKey::GlowEffect, &shared);
         assert!(el.classes.contains(&"toggle".to_string()));
         assert!(el.classes.contains(&"on".to_string()));
         assert!(el.on_click.is_some());
@@ -1040,7 +1074,7 @@ mod tests {
     #[test]
     fn toggle_button_off_lacks_on_class() {
         let shared = make_shared();
-        let el = toggle_button(false, "test-key", &shared);
+        let el = toggle_button(false, ToggleKey::GlowEffect, &shared);
         assert!(el.classes.contains(&"toggle".to_string()));
         assert!(!el.classes.contains(&"on".to_string()));
         assert!(el.on_click.is_some());
@@ -1161,12 +1195,13 @@ mod tests {
     #[test]
     fn toggle_button_click_toggles_state() {
         let shared = make_shared();
-        let el = toggle_button(false, "test-toggle", &shared);
+        let key = ToggleKey::StartMinimized;
+        let el = toggle_button(false, key, &shared);
         assert!(!shared
             .lock()
             .unwrap()
             .toggles
-            .get("test-toggle")
+            .get(&key)
             .copied()
             .unwrap_or(false));
         (el.on_click.as_ref().unwrap())();
@@ -1174,7 +1209,7 @@ mod tests {
             .lock()
             .unwrap()
             .toggles
-            .get("test-toggle")
+            .get(&key)
             .copied()
             .unwrap_or(false));
         (el.on_click.as_ref().unwrap())();
@@ -1182,7 +1217,7 @@ mod tests {
             .lock()
             .unwrap()
             .toggles
-            .get("test-toggle")
+            .get(&key)
             .copied()
             .unwrap_or(false));
     }
@@ -1234,12 +1269,32 @@ mod tests {
     }
 
     #[test]
-    fn static_stepper_has_three_children() {
-        let el = static_stepper("1.4");
+    fn stepper_without_callbacks_disables_buttons() {
+        let el = stepper("1.4", None);
         assert!(el.classes.contains(&"stepper".to_string()));
         assert_eq!(el.children.len(), 3);
         let val = &el.children[1];
         assert_eq!(text_of(val), Some("1.4"));
+        let dec = &el.children[0];
+        let inc = &el.children[2];
+        assert!(dec.classes.contains(&"disabled".to_string()));
+        assert!(inc.classes.contains(&"disabled".to_string()));
+        assert!(dec.on_click.is_none());
+        assert!(inc.on_click.is_none());
+    }
+
+    #[test]
+    fn stepper_with_callbacks_wires_handlers() {
+        let callbacks = StepCallbacks {
+            on_dec: Box::new(|| {}),
+            on_inc: Box::new(|| {}),
+        };
+        let el = stepper("7", Some(callbacks));
+        let dec = &el.children[0];
+        let inc = &el.children[2];
+        assert!(!dec.classes.contains(&"disabled".to_string()));
+        assert!(dec.on_click.is_some());
+        assert!(inc.on_click.is_some());
     }
 
     #[test]
@@ -1267,14 +1322,14 @@ mod tests {
         assert_eq!(el.children.len(), 2);
         let keys = &el.children[1];
         assert!(keys.classes.contains(&"keybind-keys".to_string()));
-        // "Ctrl" + "+" + "A" = 3 children
-        assert_eq!(keys.children.len(), 3);
-        assert!(keys.children[0]
-            .classes
-            .contains(&"keybind-key".to_string()));
-        assert!(keys.children[1]
-            .classes
-            .contains(&"keybind-sep".to_string()));
+        // Separator is now CSS ::before, so only two key pills render.
+        assert_eq!(keys.children.len(), 2);
+        assert!(keys
+            .children
+            .iter()
+            .all(|c| c.classes.contains(&"keybind-key".to_string())));
+        assert_eq!(text_of(&keys.children[0]), Some("Ctrl"));
+        assert_eq!(text_of(&keys.children[1]), Some("A"));
     }
 
     #[test]
@@ -1295,15 +1350,13 @@ mod tests {
     #[test]
     fn agent_row_has_icon_info_and_controls() {
         let shared = make_shared();
-        let el = agent_row(
-            "test",
-            "~/bin/test",
-            "idle",
-            "idle",
-            true,
-            "agent-test",
-            &shared,
-        );
+        let spec = AgentSpec {
+            name: "test",
+            path: "~/bin/test",
+            status: AgentStatus::Idle,
+            toggle_key: ToggleKey::AgentAmp,
+        };
+        let el = agent_row(&spec, true, &shared);
         assert!(el.classes.contains(&"agent-row".to_string()));
         assert_eq!(el.children.len(), 3);
         assert!(el.children[0].classes.contains(&"agent-icon".to_string()));

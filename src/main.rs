@@ -48,11 +48,21 @@ static PROFILER: std::sync::Mutex<Option<dhat::Profiler>> = std::sync::Mutex::ne
 
 #[cfg(feature = "profiling")]
 fn init_profiler() {
+    let mut guard = PROFILER.lock().unwrap();
+    if guard.is_some() {
+        eprintln!("[profiling] init_profiler called twice, ignoring");
+        return;
+    }
     let out_dir = std::path::Path::new("target").join("profile");
-    let _ = std::fs::create_dir_all(&out_dir);
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!(
+            "[profiling] failed to create {}: {e}; dhat will panic on build()",
+            out_dir.display()
+        );
+    }
     let out_path = out_dir.join("dhat-heap.json");
     let profiler = dhat::Profiler::builder().file_name(&out_path).build();
-    *PROFILER.lock().expect("profiler mutex poisoned") = Some(profiler);
+    *guard = Some(profiler);
     eprintln!(
         "[profiling] dhat heap profiling active; output: {}",
         out_path.display()

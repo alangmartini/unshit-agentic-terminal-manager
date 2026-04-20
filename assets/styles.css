@@ -1785,6 +1785,11 @@ body.dragging-pane {
   background: var(--bg-hover);
 }
 
+.stepper-btn.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
 .stepper-val {
   min-width: 28px;
   text-align: center;
@@ -2031,10 +2036,12 @@ body.dragging-pane {
   box-shadow: 0 1px 0 var(--border-default), 0 0 6px rgba(212, 163, 72, 0.1);
 }
 
-.keybind-sep {
+.keybind-key:not(:first-child)::before {
+  content: "+";
   color: var(--fg-muted);
   font-size: var(--t-xs);
   line-height: 1;
+  margin-right: 3px;
 }
 
 .keybind-footer {
