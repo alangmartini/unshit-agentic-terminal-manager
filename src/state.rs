@@ -210,47 +210,49 @@ impl AppState {
                 Some(b) => (b.clone(), false),
                 None => ("no git".to_string(), true),
             };
-            if idx == active_idx {
-                let entries: Vec<TerminalEntry> = self
-                    .panes
+            let entry_from = |p: &Pane| TerminalEntry {
+                name: p.title.clone(),
+                branch: branch_text.clone(),
+                branch_muted: false,
+                branch_error,
+                pane_id: p.id,
+            };
+            let entries: Vec<TerminalEntry> = if idx == active_idx {
+                // Active workspace: live panes for the active tab, saved
+                // panes for every other tab. Every pane across every tab
+                // shows up as its own entry.
+                self.tabs
                     .iter()
-                    .flatten()
-                    .map(|p| TerminalEntry {
-                        name: p.title.clone(),
-                        branch: branch_text.clone(),
-                        branch_muted: false,
-                        branch_error,
-                        pane_id: p.id,
+                    .enumerate()
+                    .flat_map(|(t_idx, tab)| {
+                        if t_idx == self.active_tab {
+                            self.panes
+                                .iter()
+                                .flatten()
+                                .map(&entry_from)
+                                .collect::<Vec<_>>()
+                        } else {
+                            tab.panes
+                                .iter()
+                                .flatten()
+                                .map(&entry_from)
+                                .collect::<Vec<_>>()
+                        }
                     })
-                    .collect();
-                for sub in &mut ws.subtabs {
-                    if sub.label == "terminals" {
-                        sub.count = Some(entries.len() as u32);
-                    }
-                }
-                ws.terminal_entries = entries;
+                    .collect()
             } else {
-                let entries: Vec<TerminalEntry> = ws
-                    .tabs
-                    .get(ws.active_tab)
-                    .map(|tab| tab.panes.iter().flatten().collect::<Vec<_>>())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| TerminalEntry {
-                        name: p.title.clone(),
-                        branch: branch_text.clone(),
-                        branch_muted: false,
-                        branch_error,
-                        pane_id: p.id,
-                    })
-                    .collect();
-                for sub in &mut ws.subtabs {
-                    if sub.label == "terminals" {
-                        sub.count = Some(entries.len() as u32);
-                    }
+                // Inactive workspace: everything is in saved state.
+                ws.tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.iter().flatten().map(&entry_from))
+                    .collect()
+            };
+            for sub in &mut ws.subtabs {
+                if sub.label == "terminals" {
+                    sub.count = Some(entries.len() as u32);
                 }
-                ws.terminal_entries = entries;
             }
+            ws.terminal_entries = entries;
         }
         UiSnapshot {
             workspaces,
@@ -643,8 +645,14 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     state.tabs.remove(index);
 
     if state.tabs.is_empty() {
-        // mutate_add_tab handles creating a fresh tab with PTY + pane.
-        mutate_add_tab(state);
+        // Workspace has no tabs left. Leave live state empty so the terminal
+        // grid falls back to its empty-state canvas instead of auto-spawning
+        // a fresh terminal the user didn't ask for.
+        state.active_tab = 0;
+        state.panes = vec![];
+        state.active_pane = PaneId(0);
+        state.row_ratios = vec![];
+        state.col_ratios = vec![];
         return;
     }
 
@@ -889,57 +897,29 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         state.panes.remove(row_idx);
     }
     if state.panes.is_empty() {
-        let id_num = state.next_id;
-        state.next_id += 1;
-        let pane_id = PaneId(id_num);
-
-        // Use real cell metrics when available; fall back to 80x24.
-        let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w();
-        let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
-        let (cols, rows) = compute_pty_dimensions(
-            state.last_grid_width,
-            state.last_grid_height,
-            cell_w,
-            cell_h,
-        );
-
-        let cwd = active_workspace_cwd(state);
-        let mut terminal = Terminal::new(rows as usize, cols as usize);
-        match state
-            .pty_manager
-            .spawn_in(id_num, cols, rows, cwd.as_deref())
-        {
-            Ok(reader) => {
-                state
-                    .terminals
-                    .insert(id_num, Arc::new(Mutex::new(terminal)));
-                crate::bridge::register_reader(id_num, reader);
-            }
-            Err(e) => {
-                log::error!("failed to spawn PTY for pane {}: {}", id_num, e);
-                terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
-                state
-                    .terminals
-                    .insert(id_num, Arc::new(Mutex::new(terminal)));
-            }
-        }
-
-        state.panes.push(vec![Pane {
-            id: pane_id,
-            title: "shell".to_string(),
-            subtitle: "bash".to_string(),
-            pid: 0,
-            cpu: 0.0,
-        }]);
-        state.row_ratios = vec![1.0];
-        state.col_ratios = vec![vec![1.0]];
-        state.active_pane = pane_id;
+        // Last pane of the active tab is gone: close the whole tab so the
+        // tab bar and sidebar reflect the loss. When this was the last tab
+        // the workspace falls back to its empty state canvas.
+        let active_tab = state.active_tab;
+        mutate_close_tab(state, active_tab);
         return;
     }
     if state.active_pane == target {
         let new_row = row_idx.min(state.panes.len() - 1);
         let new_col = col_idx.min(state.panes[new_row].len() - 1);
         state.active_pane = state.panes[new_row][new_col].id;
+    }
+    sync_live_tab_from_panes(state);
+}
+
+/// Copy the live pane layout back into `tabs[active_tab]` so the per-tab
+/// saved view stays in sync without waiting for a tab or workspace switch.
+fn sync_live_tab_from_panes(state: &mut AppState) {
+    if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+        tab.panes = state.panes.clone();
+        tab.active_pane = state.active_pane;
+        tab.row_ratios = state.row_ratios.clone();
+        tab.col_ratios = state.col_ratios.clone();
     }
 }
 
@@ -1395,13 +1375,16 @@ mod tests {
     }
 
     #[test]
-    fn close_last_tab_creates_new_one() {
+    fn close_last_tab_leaves_workspace_empty() {
         let mut state = test_state();
         // only one tab
         mutate_close_tab(&mut state, 0);
-        assert_eq!(state.tabs.len(), 1);
+        assert!(
+            state.tabs.is_empty(),
+            "closing the last tab must not auto-respawn a new one"
+        );
+        assert!(state.panes.is_empty(), "live panes must be cleared");
         assert_eq!(state.active_tab, 0);
-        assert_eq!(state.tabs[0].id, "t2"); // new tab was created
     }
 
     #[test]
@@ -1924,21 +1907,39 @@ mod tests {
     }
 
     #[test]
-    fn close_last_pane_auto_creates_new_one() {
+    fn close_last_pane_closes_tab_and_leaves_workspace_empty() {
         let mut state = seed_state();
         let original_pane = state.active_pane;
 
         mutate_close_pane(&mut state, original_pane);
 
-        // Should still have exactly one pane
-        assert_eq!(state.panes.len(), 1);
-        assert_eq!(state.panes[0].len(), 1);
-        // The new pane should have a different id
-        assert_ne!(state.active_pane, original_pane);
-        // Old terminal removed
+        assert!(
+            state.panes.is_empty(),
+            "closing the last pane must not auto-spawn a replacement"
+        );
+        assert!(
+            state.tabs.is_empty(),
+            "closing the last pane must close the containing tab"
+        );
         assert!(!state.terminals.contains_key(&original_pane.0));
-        // New terminal created
-        assert!(state.terminals.contains_key(&state.active_pane.0));
+    }
+
+    #[test]
+    fn close_pane_syncs_live_layout_into_active_tab() {
+        let mut state = seed_state();
+        let first = state.active_pane;
+        mutate_split_right(&mut state, first);
+        // active_pane is now the new right pane; close it.
+        let second = state.active_pane;
+        mutate_close_pane(&mut state, second);
+
+        let tab = &state.tabs[state.active_tab];
+        assert_eq!(
+            tab.panes[0].len(),
+            1,
+            "active tab's saved panes must mirror live state after close"
+        );
+        assert_eq!(tab.active_pane, first);
     }
 
     #[test]
@@ -2751,6 +2752,22 @@ mod tests {
         let ws1 = &snap.workspaces[1];
         let ids: Vec<u32> = ws1.terminal_entries.iter().map(|e| e.pane_id.0).collect();
         assert_eq!(ids, vec![7, 8]);
+    }
+
+    #[test]
+    fn ui_snapshot_active_workspace_entries_span_all_tabs() {
+        let mut state = seed_state();
+        // seed_state starts with one tab holding PaneId(1). Add a second tab.
+        mutate_add_tab(&mut state);
+        let snap = state.ui_snapshot();
+        let ws0 = &snap.workspaces[0];
+        let ids: Vec<u32> = ws0.terminal_entries.iter().map(|e| e.pane_id.0).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "active workspace must list panes from every tab"
+        );
+        assert!(ids.contains(&1), "first tab's pane must appear");
     }
 
     #[test]
