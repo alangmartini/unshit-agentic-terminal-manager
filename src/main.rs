@@ -51,9 +51,7 @@ fn init_profiler() {
     let out_dir = std::path::Path::new("target").join("profile");
     let _ = std::fs::create_dir_all(&out_dir);
     let out_path = out_dir.join("dhat-heap.json");
-    let profiler = dhat::Profiler::builder()
-        .file_name(&out_path)
-        .build();
+    let profiler = dhat::Profiler::builder().file_name(&out_path).build();
     *PROFILER.lock().expect("profiler mutex poisoned") = Some(profiler);
     eprintln!(
         "[profiling] dhat heap profiling active; output: {}",
@@ -63,11 +61,13 @@ fn init_profiler() {
 
 #[cfg(feature = "profiling")]
 fn finalize_profiler() {
-    if let Ok(mut guard) = PROFILER.lock() {
-        if let Some(p) = guard.take() {
-            drop(p);
-            eprintln!("[profiling] dhat heap profile flushed to target/profile/dhat-heap.json");
-        }
+    // Recover through poison: if we crash mid-flush we still want the JSON on disk.
+    let mut guard = PROFILER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(p) = guard.take() {
+        drop(p);
+        eprintln!("[profiling] dhat heap profile flushed to target/profile/dhat-heap.json");
     }
 }
 

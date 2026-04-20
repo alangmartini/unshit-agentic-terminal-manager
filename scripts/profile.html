@@ -135,11 +135,7 @@
     status.classList.remove("warn");
     status.classList.add("ok");
     status.textContent = `Loaded ${file.name} (${bytes(file.size)}). Opening viewer in a new tab; drag the same file onto it.`;
-    const url = URL.createObjectURL(file);
-    // Open the viewer. The user then drags the file onto the viewer window.
     window.open(VIEWERS[kind], "_blank", "noopener");
-    // Release the blob URL after a delay so the browser can still reference it if needed.
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
 
   document.querySelectorAll(".drop").forEach((zone) => {
