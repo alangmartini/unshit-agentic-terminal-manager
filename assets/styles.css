@@ -1785,6 +1785,11 @@ body.dragging-pane {
   background: var(--bg-hover);
 }
 
+.stepper-btn.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
 .stepper-val {
   min-width: 28px;
   text-align: center;

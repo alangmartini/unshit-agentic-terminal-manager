@@ -99,29 +99,33 @@ fn build_general_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef
             "Starting directory for new terminals",
             text_input_display("~/projects/main"),
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Restore on startup",
             "Reopen last active session and panes",
-            toggle_button(
-                is_on(state, "restore-on-startup"),
-                "restore-on-startup",
-                shared,
-            ),
+            "restore-on-startup",
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Confirm before closing",
             "Warn when closing a tab with a running process",
-            toggle_button(is_on(state, "confirm-close"), "confirm-close", shared),
+            "confirm-close",
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Start minimized",
             "Launch to system tray on startup",
-            toggle_button(is_on(state, "start-minimized"), "start-minimized", shared),
+            "start-minimized",
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Check for updates",
             "Notify when a new version is available",
-            toggle_button(is_on(state, "check-updates"), "check-updates", shared),
+            "check-updates",
         ))
 }
 
@@ -150,58 +154,58 @@ fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> Element
         .with_child(setting_row(
             "Line height",
             "Spacing between terminal rows",
-            static_stepper("1.4"),
+            stepper("1.4", None),
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Glow effect",
             "Subtle CRT-style text shadow on output",
-            toggle_button(is_on(state, "glow-effect"), "glow-effect", shared),
+            "glow-effect",
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Background texture",
             "Warm ambient gradient behind content",
-            toggle_button(
-                is_on(state, "background-texture"),
-                "background-texture",
-                shared,
-            ),
+            "background-texture",
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Font ligatures",
             "Combine character pairs like => and !=",
-            toggle_button(is_on(state, "font-ligatures"), "font-ligatures", shared),
+            "font-ligatures",
         ))
 }
 
 fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     section_shell("shell")
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Shell integration",
             "Inject prompt markers for smart scrollback",
-            toggle_button(
-                is_on(state, "shell-integration"),
-                "shell-integration",
-                shared,
-            ),
+            "shell-integration",
         ))
         .with_child(setting_row(
             "History size",
             "Lines retained per pane",
             text_input_display("50000"),
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Scroll on output",
             "Auto-scroll terminal when new output arrives",
-            toggle_button(is_on(state, "scroll-on-output"), "scroll-on-output", shared),
+            "scroll-on-output",
         ))
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Bell notification",
             "Flash tab badge when terminal rings the bell",
-            toggle_button(
-                is_on(state, "bell-notification"),
-                "bell-notification",
-                shared,
-            ),
+            "bell-notification",
         ))
         .with_child(setting_row(
             "Word separators",
@@ -229,15 +233,17 @@ fn build_keybinds_section() -> ElementDef {
 
 fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     section_shell("agents")
-        .with_child(setting_row(
+        .with_child(toggle_row(
+            state,
+            shared,
             "Auto-discovery",
             "Detect installed AI agents on PATH",
-            toggle_button(is_on(state, "auto-discovery"), "auto-discovery", shared),
+            "auto-discovery",
         ))
         .with_child(setting_row(
             "Default timeout",
             "Seconds before an agent task is canceled",
-            static_stepper("300"),
+            stepper("300", None),
         ))
         .with_child(agent_list_header(3))
         .with_child(agent_row(
@@ -326,25 +332,34 @@ fn section_shell(title: &str) -> ElementDef {
         )
 }
 
+fn setting_meta(label: &str, desc: Option<&str>) -> ElementDef {
+    let mut meta = ElementDef::new(Tag::Div)
+        .with_class("setting-meta")
+        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("setting-label")
+                .with_text(label),
+        );
+    if let Some(desc) = desc {
+        meta = meta.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("setting-desc")
+                .with_text(desc),
+        );
+    }
+    meta
+}
+
 fn setting_row(label: &str, desc: &str, control: ElementDef) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("setting-row")
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("setting-meta")
-                .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("setting-label")
-                        .with_text(label),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("setting-desc")
-                        .with_text(desc),
-                ),
-        )
+        .with_child(setting_meta(label, Some(desc)))
         .with_child(control)
+}
+
+fn toggle_row(state: &UiSnapshot, shared: &SharedState, label: &str, desc: &str, key: &str) -> ElementDef {
+    setting_row(label, desc, toggle_button(is_on(state, key), key, shared))
 }
 
 fn toggle_button(on: bool, key: &str, shared: &SharedState) -> ElementDef {
@@ -398,54 +413,60 @@ fn theme_chip_group(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     chips
 }
 
-fn font_stepper(value: u32, shared: &SharedState) -> ElementDef {
-    let dec = shared.clone();
-    let inc = shared.clone();
-    ElementDef::new(Tag::Div)
-        .with_class("stepper")
-        .with_child(
+type StepCallback = Box<dyn Fn() + Send + Sync + 'static>;
+
+struct StepCallbacks {
+    on_dec: StepCallback,
+    on_inc: StepCallback,
+}
+
+fn stepper(value: &str, callbacks: Option<StepCallbacks>) -> ElementDef {
+    let (dec, inc) = match callbacks {
+        Some(cb) => (
             ElementDef::new(Tag::Button)
                 .with_class("stepper-btn")
                 .with_text("\u{2212}")
-                .on_click(move || {
-                    mutate_with(&dec, |st| dispatch(st, "font.dec"));
-                }),
-        )
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("stepper-val")
-                .with_class("tnum")
-                .with_text(value.to_string()),
-        )
-        .with_child(
+                .on_click(cb.on_dec),
             ElementDef::new(Tag::Button)
                 .with_class("stepper-btn")
                 .with_text("+")
-                .on_click(move || {
-                    mutate_with(&inc, |st| dispatch(st, "font.inc"));
-                }),
-        )
-}
-
-fn static_stepper(value: &str) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("stepper")
-        .with_child(
+                .on_click(cb.on_inc),
+        ),
+        None => (
             ElementDef::new(Tag::Button)
                 .with_class("stepper-btn")
+                .with_class("disabled")
                 .with_text("\u{2212}"),
-        )
+            ElementDef::new(Tag::Button)
+                .with_class("stepper-btn")
+                .with_class("disabled")
+                .with_text("+"),
+        ),
+    };
+    ElementDef::new(Tag::Div)
+        .with_class("stepper")
+        .with_child(dec)
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("stepper-val")
                 .with_class("tnum")
                 .with_text(value),
         )
-        .with_child(
-            ElementDef::new(Tag::Button)
-                .with_class("stepper-btn")
-                .with_text("+"),
-        )
+        .with_child(inc)
+}
+
+fn font_stepper(value: u32, shared: &SharedState) -> ElementDef {
+    let dec_shared = shared.clone();
+    let inc_shared = shared.clone();
+    let callbacks = StepCallbacks {
+        on_dec: Box::new(move || {
+            mutate_with(&dec_shared, |st| dispatch(st, "font.dec"));
+        }),
+        on_inc: Box::new(move || {
+            mutate_with(&inc_shared, |st| dispatch(st, "font.inc"));
+        }),
+    };
+    stepper(&value.to_string(), Some(callbacks))
 }
 
 fn cursor_style_group() -> ElementDef {
@@ -502,16 +523,7 @@ fn keybind_row(label: &str, keys: &[&str]) -> ElementDef {
     }
     ElementDef::new(Tag::Div)
         .with_class("keybind-row")
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("setting-meta")
-                .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("setting-label")
-                        .with_text(label),
-                ),
-        )
+        .with_child(setting_meta(label, None))
         .with_child(keys_wrap)
 }
 
@@ -1234,12 +1246,32 @@ mod tests {
     }
 
     #[test]
-    fn static_stepper_has_three_children() {
-        let el = static_stepper("1.4");
+    fn stepper_without_callbacks_disables_buttons() {
+        let el = stepper("1.4", None);
         assert!(el.classes.contains(&"stepper".to_string()));
         assert_eq!(el.children.len(), 3);
         let val = &el.children[1];
         assert_eq!(text_of(val), Some("1.4"));
+        let dec = &el.children[0];
+        let inc = &el.children[2];
+        assert!(dec.classes.contains(&"disabled".to_string()));
+        assert!(inc.classes.contains(&"disabled".to_string()));
+        assert!(dec.on_click.is_none());
+        assert!(inc.on_click.is_none());
+    }
+
+    #[test]
+    fn stepper_with_callbacks_wires_handlers() {
+        let callbacks = StepCallbacks {
+            on_dec: Box::new(|| {}),
+            on_inc: Box::new(|| {}),
+        };
+        let el = stepper("7", Some(callbacks));
+        let dec = &el.children[0];
+        let inc = &el.children[2];
+        assert!(!dec.classes.contains(&"disabled".to_string()));
+        assert!(dec.on_click.is_some());
+        assert!(inc.on_click.is_some());
     }
 
     #[test]
