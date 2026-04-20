@@ -9,7 +9,12 @@ use crate::ui::icons::*;
 pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let mut scroll = ElementDef::new(Tag::Div).with_class("sidebar-scroll");
     for (w_idx, workspace) in state.workspaces.iter().enumerate() {
-        scroll = scroll.with_child(build_workspace(w_idx, workspace, shared));
+        scroll = scroll.with_child(build_workspace(
+            w_idx,
+            w_idx == state.active_workspace,
+            workspace,
+            shared,
+        ));
     }
 
     let mut sidebar = ElementDef::new(Tag::Div)
@@ -66,6 +71,7 @@ fn build_sidebar_head(shared: &SharedState) -> ElementDef {
 
 fn build_workspace(
     workspace_index: usize,
+    is_active: bool,
     workspace: &Workspace,
     shared: &SharedState,
 ) -> ElementDef {
@@ -160,7 +166,7 @@ fn build_workspace(
     if workspace.collapsed {
         container = container.with_class("collapsed");
     }
-    if workspace.num == 1 {
+    if is_active {
         container = container.with_class("active");
     }
     container.with_child(head).with_child(body)
@@ -600,7 +606,7 @@ mod tests {
     fn workspace_not_collapsed_has_no_collapsed_class() {
         let shared = make_shared();
         let ws = make_workspace(2, false);
-        let el = build_workspace(0, &ws, &shared);
+        let el = build_workspace(0, false, &ws, &shared);
         assert!(has_class(&el, "workspace"));
         assert!(!has_class(&el, "collapsed"));
     }
@@ -609,25 +615,39 @@ mod tests {
     fn workspace_collapsed_has_collapsed_class() {
         let shared = make_shared();
         let ws = make_workspace(2, true);
-        let el = build_workspace(0, &ws, &shared);
+        let el = build_workspace(0, false, &ws, &shared);
         assert!(has_class(&el, "workspace"));
         assert!(has_class(&el, "collapsed"));
     }
 
     #[test]
-    fn workspace_num_1_is_active() {
+    fn workspace_gets_active_class_when_is_active() {
         let shared = make_shared();
         let ws = make_workspace(1, false);
-        let el = build_workspace(0, &ws, &shared);
+        let el = build_workspace(0, true, &ws, &shared);
         assert!(has_class(&el, "active"));
     }
 
     #[test]
-    fn workspace_num_2_is_not_active() {
+    fn workspace_gets_no_active_class_when_not_is_active() {
         let shared = make_shared();
         let ws = make_workspace(2, false);
-        let el = build_workspace(0, &ws, &shared);
+        let el = build_workspace(0, false, &ws, &shared);
         assert!(!has_class(&el, "active"));
+    }
+
+    // Regression for issue #104.
+    #[test]
+    fn workspace_active_class_independent_of_workspace_num() {
+        let shared = make_shared();
+        let ws_num_5 = make_workspace(5, false);
+        let ws_num_1 = make_workspace(1, false);
+
+        let el_active = build_workspace(2, true, &ws_num_5, &shared);
+        let el_other = build_workspace(0, false, &ws_num_1, &shared);
+
+        assert!(has_class(&el_active, "active"));
+        assert!(!has_class(&el_other, "active"));
     }
 
     // -- Click behavior: chevron vs name area (issue #98) --
@@ -641,7 +661,12 @@ mod tests {
             guard.workspaces[2].collapsed = true;
         }
         let snapshot = shared.lock().unwrap().ui_snapshot();
-        let el = build_workspace(2, &snapshot.workspaces[2], &shared);
+        let el = build_workspace(
+            2,
+            2 == snapshot.active_workspace,
+            &snapshot.workspaces[2],
+            &shared,
+        );
         let head = find_by_class(&el, "workspace-head").expect("workspace-head");
         (head.on_click.as_ref().expect("head on_click"))();
 
@@ -659,7 +684,12 @@ mod tests {
             guard.workspaces[2].collapsed = false;
         }
         let snapshot = shared.lock().unwrap().ui_snapshot();
-        let el = build_workspace(2, &snapshot.workspaces[2], &shared);
+        let el = build_workspace(
+            2,
+            2 == snapshot.active_workspace,
+            &snapshot.workspaces[2],
+            &shared,
+        );
         let head = find_by_class(&el, "workspace-head").expect("workspace-head");
         (head.on_click.as_ref().expect("head on_click"))();
 
@@ -677,7 +707,12 @@ mod tests {
             guard.workspaces[1].collapsed = false;
         }
         let snapshot = shared.lock().unwrap().ui_snapshot();
-        let el = build_workspace(1, &snapshot.workspaces[1], &shared);
+        let el = build_workspace(
+            1,
+            1 == snapshot.active_workspace,
+            &snapshot.workspaces[1],
+            &shared,
+        );
         let head = find_by_class(&el, "workspace-head").expect("workspace-head");
         let chevron = find_by_class(head, "chevron").expect("chevron");
         (chevron.on_click.as_ref().expect("chevron on_click"))();
@@ -701,7 +736,12 @@ mod tests {
             guard.workspaces[1].collapsed = true;
         }
         let snapshot = shared.lock().unwrap().ui_snapshot();
-        let el = build_workspace(1, &snapshot.workspaces[1], &shared);
+        let el = build_workspace(
+            1,
+            1 == snapshot.active_workspace,
+            &snapshot.workspaces[1],
+            &shared,
+        );
         let head = find_by_class(&el, "workspace-head").expect("workspace-head");
         let chevron = find_by_class(head, "chevron").expect("chevron");
         (chevron.on_click.as_ref().expect("chevron on_click"))();
@@ -770,7 +810,7 @@ mod tests {
     fn workspace_head_shows_name_and_num() {
         let shared = make_shared();
         let ws = make_workspace(3, false);
-        let el = build_workspace(0, &ws, &shared);
+        let el = build_workspace(0, false, &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         let num_el = find_by_class(head, "workspace-num").unwrap();
         assert_eq!(text_of(num_el), Some("3"));
@@ -783,7 +823,7 @@ mod tests {
         let shared = make_shared();
         assert_eq!(shared.lock().unwrap().active_workspace, 0);
         let ws = shared.lock().unwrap().ui_snapshot().workspaces[2].clone();
-        let el = build_workspace(2, &ws, &shared);
+        let el = build_workspace(2, false, &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         (head.on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().active_workspace, 2);
@@ -797,7 +837,7 @@ mod tests {
             guard.workspaces[1].collapsed = true;
         }
         let ws = shared.lock().unwrap().ui_snapshot().workspaces[1].clone();
-        let el = build_workspace(1, &ws, &shared);
+        let el = build_workspace(1, false, &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         (head.on_click.as_ref().unwrap())();
         assert!(!shared.lock().unwrap().workspaces[1].collapsed);
@@ -824,7 +864,7 @@ mod tests {
         // Clicking ws1's head must switch workspace and set active_pane to
         // ws1's saved pane, matching a terminal-entry click on that pane.
         let ws = shared.lock().unwrap().ui_snapshot().workspaces[1].clone();
-        let el = build_workspace(1, &ws, &shared);
+        let el = build_workspace(1, false, &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         (head.on_click.as_ref().unwrap())();
         let st = shared.lock().unwrap();
@@ -841,7 +881,7 @@ mod tests {
         assert_eq!(shared.lock().unwrap().active_workspace, 0);
         assert!(shared.lock().unwrap().workspaces[2].tabs.is_empty());
         let ws = shared.lock().unwrap().ui_snapshot().workspaces[2].clone();
-        let el = build_workspace(2, &ws, &shared);
+        let el = build_workspace(2, false, &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         (head.on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().active_workspace, 2);
@@ -851,7 +891,7 @@ mod tests {
     fn workspace_body_has_subtabs() {
         let shared = make_shared();
         let ws = make_workspace(2, false);
-        let el = build_workspace(0, &ws, &shared);
+        let el = build_workspace(0, false, &ws, &shared);
         let body = find_by_class(&el, "workspace-body").unwrap();
         assert_eq!(body.children.len(), 2);
     }
