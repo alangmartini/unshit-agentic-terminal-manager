@@ -2413,6 +2413,73 @@ fn parse_color(parser: &mut Parser) -> Result<Color, ()> {
                 Ok(Color::rgba(r, g, b, a))
             })
             .map_err(|_: cssparser::ParseError<'_, ()>| ()),
+        Token::Function(ref name) if name.as_ref() == "oklch" => parser
+            .parse_nested_block(|p| parse_oklch_body(p).map_err(|_| p.new_custom_error(())))
+            .map_err(|_: cssparser::ParseError<'_, ()>| ()),
+        _ => Err(()),
+    }
+}
+
+/// Parse the body of an `oklch(L C H)` or `oklch(L C H / A)` function.
+///
+/// Grammar (CSS Color Level 4):
+/// * L: number `0.0..=1.0` or percentage `0%..=100%` (percentage of 1.0)
+/// * C: number (clamped to `>= 0.0`) or percentage (percentage of `0.4`)
+/// * H: number in degrees, or `<angle>` (deg/grad/rad/turn)
+/// * A: optional, separated by `/`; number `0.0..=1.0` or percentage
+fn parse_oklch_body(parser: &mut Parser) -> Result<Color, ()> {
+    let lightness = parse_oklch_lightness(parser)?;
+    let chroma = parse_oklch_chroma(parser)?;
+    let hue_rad = parse_oklch_hue(parser)?;
+    let alpha = if parser.try_parse(|p| p.expect_delim('/')).is_ok() {
+        parse_alpha_unit(parser)?
+    } else {
+        1.0
+    };
+
+    let a = chroma * hue_rad.cos();
+    let b = chroma * hue_rad.sin();
+    Ok(crate::style::transition::oklab_to_srgb(lightness, a, b, alpha))
+}
+
+fn parse_oklch_lightness(parser: &mut Parser) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        Token::Number { value, .. } => Ok(value.clamp(0.0, 1.0)),
+        Token::Percentage { unit_value, .. } => Ok(unit_value.clamp(0.0, 1.0)),
+        _ => Err(()),
+    }
+}
+
+fn parse_oklch_chroma(parser: &mut Parser) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        Token::Number { value, .. } => Ok(value.max(0.0)),
+        // CSS Color 4: 100% chroma in oklch equals 0.4 numeric.
+        Token::Percentage { unit_value, .. } => Ok((unit_value * 0.4).max(0.0)),
+        _ => Err(()),
+    }
+}
+
+/// Parse the hue component and return it in radians.
+fn parse_oklch_hue(parser: &mut Parser) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        // Bare number is degrees per CSS Color 4.
+        Token::Number { value, .. } => Ok(value.to_radians()),
+        Token::Dimension { value, unit, .. } => match unit.as_ref() {
+            "deg" => Ok(value.to_radians()),
+            "rad" => Ok(*value),
+            "grad" => Ok(value * std::f32::consts::PI / 200.0),
+            "turn" => Ok(value * std::f32::consts::TAU),
+            _ => Err(()),
+        },
+        _ => Err(()),
+    }
+}
+
+/// Alpha as a `0.0..=1.0` float. Accepts a number or a percentage.
+fn parse_alpha_unit(parser: &mut Parser) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        Token::Number { value, .. } => Ok(value.clamp(0.0, 1.0)),
+        Token::Percentage { unit_value, .. } => Ok(unit_value.clamp(0.0, 1.0)),
         _ => Err(()),
     }
 }
@@ -5875,6 +5942,120 @@ mod tests {
             taffy.position,
             taffy::Position::Absolute,
             "CssPosition::Fixed should map to taffy::Position::Absolute"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `oklch()` color function parsing.
+    //
+    // The Organiza Nota Wireframes v1 and v2 palettes are defined in
+    // oklch, e.g. `oklch(0.65 0.17 145)` for the stamp-green accent.
+    // Before support landed, these calls produced a parse error and the
+    // variables fell back to the default color, silently breaking the
+    // wireframe theme.
+    // -----------------------------------------------------------------
+
+    fn parse_single_color(css: &str) -> Option<Color> {
+        let mut input = ParserInput::new(css);
+        let mut parser = Parser::new(&mut input);
+        parse_color(&mut parser).ok()
+    }
+
+    #[test]
+    fn oklch_zero_chroma_at_full_lightness_is_white() {
+        let c = parse_single_color("oklch(1.0 0.0 0.0)").expect("oklch parse");
+        assert_eq!(
+            (c.r, c.g, c.b, c.a),
+            (255, 255, 255, 255),
+            "oklch(1.0 0.0 0.0) must round-trip to pure white"
+        );
+    }
+
+    #[test]
+    fn oklch_zero_lightness_is_black() {
+        let c = parse_single_color("oklch(0.0 0.0 0.0)").expect("oklch parse");
+        assert_eq!(
+            (c.r, c.g, c.b, c.a),
+            (0, 0, 0, 255),
+            "oklch(0.0 0.0 0.0) must round-trip to pure black"
+        );
+    }
+
+    #[test]
+    fn oklch_with_chroma_produces_hue_colored_output() {
+        // L=0.65, C=0.17, H=145deg is the wireframes v1 stamp green. The
+        // exact sRGB output depends on gamma conversion; assert the hue
+        // signature: green dominates over red and blue.
+        let c = parse_single_color("oklch(0.65 0.17 145)").expect("oklch parse");
+        assert!(
+            c.g > c.r && c.g > c.b,
+            "oklch(0.65 0.17 145) should have green dominance, got rgba({}, {}, {}, {})",
+            c.r,
+            c.g,
+            c.b,
+            c.a
+        );
+    }
+
+    #[test]
+    fn oklch_alpha_slash_syntax_populates_alpha_channel() {
+        let c = parse_single_color("oklch(0.65 0.17 40 / 0.5)").expect("oklch parse");
+        // 0.5 alpha rounds to 128 (0.5 * 255 = 127.5, banker's round to 128).
+        assert!(
+            (c.a as i32 - 128).abs() <= 1,
+            "oklch(... / 0.5) must set alpha near 128, got {}",
+            c.a
+        );
+    }
+
+    #[test]
+    fn oklch_lightness_percentage_equals_unit_number() {
+        let pct = parse_single_color("oklch(50% 0.0 0.0)").expect("percent parse");
+        let num = parse_single_color("oklch(0.5 0.0 0.0)").expect("number parse");
+        assert_eq!(
+            (pct.r, pct.g, pct.b),
+            (num.r, num.g, num.b),
+            "oklch(50% ...) must equal oklch(0.5 ...) modulo rounding"
+        );
+    }
+
+    #[test]
+    fn oklch_chroma_percentage_equals_number_scaled_by_0_4() {
+        // CSS Color Level 4 says C of 100% equals 0.4 numeric. So
+        // oklch(0.65 50% 145) must equal oklch(0.65 0.2 145).
+        let pct = parse_single_color("oklch(0.65 50% 145)").expect("percent parse");
+        let num = parse_single_color("oklch(0.65 0.2 145)").expect("number parse");
+        assert_eq!(
+            (pct.r, pct.g, pct.b),
+            (num.r, num.g, num.b),
+            "oklch chroma 50% must equal 0.2"
+        );
+    }
+
+    #[test]
+    fn oklch_hue_angle_deg_keyword_accepted() {
+        let no_unit = parse_single_color("oklch(0.65 0.17 145)").expect("bare hue parse");
+        let deg = parse_single_color("oklch(0.65 0.17 145deg)").expect("deg hue parse");
+        assert_eq!(
+            (no_unit.r, no_unit.g, no_unit.b),
+            (deg.r, deg.g, deg.b),
+            "bare hue number and deg angle must match"
+        );
+    }
+
+    #[test]
+    fn oklch_without_alpha_slash_is_opaque() {
+        let c = parse_single_color("oklch(0.5 0.1 60)").expect("oklch parse");
+        assert_eq!(c.a, 255, "oklch without alpha must be fully opaque");
+    }
+
+    #[test]
+    fn oklch_rejects_malformed_input() {
+        assert!(parse_single_color("oklch()").is_none(), "oklch() is invalid");
+        assert!(parse_single_color("oklch(0.5)").is_none(), "oklch missing C and H is invalid");
+        assert!(
+            parse_single_color("oklch(0.5 0.1)").is_none(),
+            "oklch missing H is invalid"
         );
     }
 }

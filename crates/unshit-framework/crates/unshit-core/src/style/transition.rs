@@ -384,7 +384,7 @@ fn srgb_to_oklab(c: Color) -> [f32; 3] {
 }
 
 /// Convert Oklab [L, a, b] + alpha back to sRGB u8 Color.
-fn oklab_to_srgb(l: f32, a: f32, b: f32, alpha: f32) -> Color {
+pub(crate) fn oklab_to_srgb(l: f32, a: f32, b: f32, alpha: f32) -> Color {
     // Oklab to LMS (inverse M2)
     let l_ = l + 0.3963377774 * a + 0.2158037573 * b;
     let m_ = l - 0.1055613458 * a - 0.0638541728 * b;
