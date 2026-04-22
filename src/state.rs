@@ -656,8 +656,12 @@ pub fn mutate_add_tab(state: &mut AppState) {
     );
 
     // Spawn PTY eagerly so the terminal is live immediately.
+    let cwd = active_workspace_cwd(state);
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
-    match state.pty_manager.spawn(id_num, cols, rows) {
+    match state
+        .pty_manager
+        .spawn_in(id_num, cols, rows, cwd.as_deref())
+    {
         Ok(reader) => {
             state
                 .terminals
@@ -1473,6 +1477,30 @@ mod tests {
         assert_eq!(state.tabs[1].id, "t2");
         assert_eq!(state.active_tab, 1);
         assert_eq!(state.next_id, 3);
+    }
+
+    #[test]
+    fn add_tab_spawns_pty_in_active_workspace_cwd() {
+        // Regression: a new tab spawned from the "+" button used
+        // PtyManager::spawn (no cwd), so the shell landed in the home dir
+        // and the PowerShell profile's Set-Location then won. Splits already
+        // passed active_workspace_cwd; tab add must too.
+        let mut state = seed_state();
+        let ws_path = PathBuf::from(if cfg!(windows) {
+            r"C:\tmp\ws"
+        } else {
+            "/tmp/ws"
+        });
+        mutate_add_workspace_with_path(&mut state, Some(ws_path.clone()));
+
+        let new_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+
+        assert_eq!(
+            state.pty_manager.spawn_cwd(new_pane_id),
+            Some(ws_path.as_path()),
+            "new tab must spawn its PTY in the active workspace cwd",
+        );
     }
 
     #[test]

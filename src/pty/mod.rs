@@ -8,7 +8,7 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A single PTY session: the child process, a writer for stdin, the master PTY
 /// handle (needed for resize), and the current terminal size.
@@ -17,6 +17,7 @@ pub struct PtyPair {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     size: PtySize,
+    spawn_cwd: Option<PathBuf>,
 }
 
 /// Manages PTY sessions keyed by pane ID.
@@ -116,10 +117,20 @@ impl PtyManager {
                 writer,
                 master: pty_pair.master,
                 size,
+                spawn_cwd: cwd.map(Path::to_path_buf),
             },
         );
 
         Ok(reader)
+    }
+
+    /// Return the directory the pane's shell was spawned in, if one was
+    /// provided to [`spawn_in`](Self::spawn_in). Intended for tests and
+    /// diagnostics; mirrors the `cwd` argument used at spawn time.
+    pub fn spawn_cwd(&self, pane_id: u32) -> Option<&Path> {
+        self.pairs
+            .get(&pane_id)
+            .and_then(|p| p.spawn_cwd.as_deref())
     }
 
     /// Write raw bytes to the PTY stdin for the given pane.
