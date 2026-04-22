@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod bridge;
 pub mod git;
+pub mod keybinds;
 pub mod persist;
 pub mod pty;
 pub mod state;
