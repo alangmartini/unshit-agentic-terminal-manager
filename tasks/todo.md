@@ -17,10 +17,11 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 - [x] Unit tests: aliases, Ctrl+W = tab.close.active, Ctrl+Shift+W = pane.close, system shortcuts intact
 - [ ] Visual verify: all three new combos plus all existing combos still work (pending user)
 
-### A3: Last-pane-closes-tab semantics in `pane.close`
-- [ ] Check existing behavior; update if needed
-- [ ] Unit tests: 1-pane tab -> tab closes; 2-pane tab -> pane closes and ratios normalize
-- [ ] `cargo test state::` green
+### A3: Last-pane-closes-tab semantics in `pane.close` [DONE]
+- [x] Verified existing behavior (mutate_close_pane:984-991); no code change needed
+- [x] Added `dispatch_pane_close_on_last_pane_closes_tab` regression test (locks down Unsplit semantics via dispatch path)
+- [x] Added `close_pane_absorbs_ratio_into_neighbor` (pins ratio math)
+- [x] 559/559 tests green
 
 ### Checkpoint 1
 - [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green

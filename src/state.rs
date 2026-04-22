@@ -2210,6 +2210,48 @@ mod tests {
         assert_eq!(state.panes[0].len(), pane_count - 1);
     }
 
+    #[test]
+    fn dispatch_pane_close_on_last_pane_closes_tab() {
+        // Unsplit (Ctrl+Shift+W) is dispatched as `pane.close`. When the
+        // focused pane is the tab's only pane, closing it must close the
+        // whole tab. Locks down the A3 semantics so future refactors
+        // cannot silently regress to "leave empty tab behind".
+        let mut state = seed_state();
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 1);
+        let original_tab_count = state.tabs.len();
+
+        assert!(dispatch(&mut state, "pane.close"));
+
+        assert!(state.panes.is_empty(), "last pane must be gone");
+        assert_eq!(
+            state.tabs.len(),
+            original_tab_count - 1,
+            "closing the last pane must close the tab"
+        );
+    }
+
+    #[test]
+    fn close_pane_absorbs_ratio_into_neighbor() {
+        // After a split, the two panes share 0.5/0.5 of the row. Closing
+        // one must hand its ratio to the neighbor so the surviving pane
+        // fills the row (1.0 total) rather than leaving a visual gap.
+        let mut state = seed_state();
+        let first = state.active_pane;
+        mutate_split_right(&mut state, first);
+        let second = state.active_pane;
+        assert_eq!(state.col_ratios[0], vec![0.5, 0.5]);
+
+        mutate_close_pane(&mut state, second);
+
+        assert_eq!(state.col_ratios[0].len(), 1);
+        assert!(
+            (state.col_ratios[0][0] - 1.0).abs() < 1e-6,
+            "surviving pane must absorb closed pane's ratio, got {}",
+            state.col_ratios[0][0]
+        );
+    }
+
     // -- dispatch tab.next / tab.prev with empty tabs -------------------------
 
     #[test]
