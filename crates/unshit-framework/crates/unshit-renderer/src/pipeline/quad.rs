@@ -10,6 +10,15 @@ use crate::instance_buffer_pool::InstanceBufferPool;
 /// log; the terminal-manager corpus needs at most 4.
 pub const MAX_GRADIENT_STOPS: usize = 8;
 
+/// Maximum number of gradient stops packed into the `mask-image` slots of a
+/// single `QuadInstance`.
+///
+/// Mask gradients store only the alpha channel of each stop and a position,
+/// packed two per `vec4`. Four stops are enough for the canonical edge
+/// fade pattern `transparent -> solid -> solid -> transparent` that
+/// `mask-image` is most commonly used for.
+pub const MAX_MASK_STOPS: usize = 4;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct QuadInstance {
@@ -46,6 +55,19 @@ pub struct QuadInstance {
     /// sign of `gradient_params.y` (`< 0` means circle, `>= 0` means
     /// ellipse).
     pub gradient_extra: [f32; 4],
+
+    /// Mask gradient stops, packed as `[alpha0, pos0, alpha1, pos1]` in
+    /// `mask_stops_01` and `[alpha2, pos2, alpha3, pos3]` in
+    /// `mask_stops_23`. Positions are in `[0, 1]` along the projected
+    /// mask axis. Zero means "no mask" (see `mask_params.w`).
+    pub mask_stops_01: [f32; 4],
+    pub mask_stops_23: [f32; 4],
+
+    /// Mask parameters: `[angle_rad, 0, 0, stop_count]`. A `stop_count` of
+    /// zero selects the "no mask" fast path in the shader and leaves the
+    /// fragment alpha untouched. Values of `>= 2` enable mask alpha
+    /// modulation of the final rect color.
+    pub mask_params: [f32; 4],
 }
 
 #[repr(C)]
@@ -134,6 +156,9 @@ impl QuadPipeline {
             20 => Float32x4, // gradient_stop_positions[4..8]
             21 => Float32x4, // gradient_params
             22 => Float32x4, // gradient_extra (radial center and radii)
+            23 => Float32x4, // mask_stops_01 (alpha0, pos0, alpha1, pos1)
+            24 => Float32x4, // mask_stops_23 (alpha2, pos2, alpha3, pos3)
+            25 => Float32x4, // mask_params (angle_rad, 0, 0, stop_count)
         ];
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

@@ -609,7 +609,22 @@ impl ElementDef {
     }
 
     pub fn with_class(mut self, class: impl Into<String>) -> Self {
-        self.classes.push(class.into());
+        let raw = class.into();
+        // Mirror HTML semantics: `class="a b c"` is three classes, not
+        // one. Splitting here keeps call sites ergonomic and lets CSS
+        // selectors like `.a.b` match an element built with
+        // `with_class("a b")`.
+        let mut any = false;
+        for token in raw.split_whitespace() {
+            self.classes.push(token.to_string());
+            any = true;
+        }
+        // Preserve legacy behavior for an empty or whitespace only
+        // argument so the call still produces one slot. Unlikely in
+        // practice but keeps the method total.
+        if !any {
+            self.classes.push(raw);
+        }
         self
     }
 

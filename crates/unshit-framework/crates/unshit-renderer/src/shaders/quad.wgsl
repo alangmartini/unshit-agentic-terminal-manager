@@ -28,6 +28,9 @@ struct QuadInstance {
     @location(20) gradient_stop_positions_hi: vec4<f32>,
     @location(21) gradient_params: vec4<f32>,
     @location(22) gradient_extra: vec4<f32>,
+    @location(23) mask_stops_01: vec4<f32>,
+    @location(24) mask_stops_23: vec4<f32>,
+    @location(25) mask_params: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -56,6 +59,9 @@ struct VertexOutput {
     @location(21) gradient_params: vec4<f32>,
     @location(22) gradient_extra: vec4<f32>,
     @location(23) pixel_pos: vec2<f32>,
+    @location(24) mask_stops_01: vec4<f32>,
+    @location(25) mask_stops_23: vec4<f32>,
+    @location(26) mask_params: vec4<f32>,
 };
 
 @vertex
@@ -112,6 +118,9 @@ fn vs_main(
     out.gradient_params = instance.gradient_params;
     out.gradient_extra = instance.gradient_extra;
     out.pixel_pos = pixel_pos;
+    out.mask_stops_01 = instance.mask_stops_01;
+    out.mask_stops_23 = instance.mask_stops_23;
+    out.mask_params = instance.mask_params;
     return out;
 }
 
@@ -172,8 +181,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let shadow_p = p - in.shadow_offset;
         let shadow_d = sdf_rounded_rect(shadow_p, inset_half, inset_r);
         // Inset: shadow is strongest at d = 0 and fades into the interior.
-        let band = max(blur, 0.5);
-        let shadow_alpha = smoothstep(-band, band, shadow_d);
+        // Approximate a Gaussian erf with tanh so the falloff width matches
+        // CSS box-shadow conventions (a simple smoothstep over [-blur, blur]
+        // is too narrow and makes stacked shadows invisible past a few px).
+        let sigma = max(blur, 0.5);
+        let shadow_alpha = 0.5 + 0.5 * tanh(shadow_d / sigma * 0.75);
         // Clip softly to the outer rounded rect so the shadow does not
         // bleed past the visible edge.
         let edge_clip = 1.0 - smoothstep(-0.5, 0.5, d_outer);
@@ -194,8 +206,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let outer_r = safe_r + max(spread, 0.0);
         let shadow_p = p - in.shadow_offset;
         let shadow_d = sdf_rounded_rect(shadow_p, outer_half, outer_r);
-        let band = max(blur, 0.5);
-        let shadow_alpha = 1.0 - smoothstep(-band, band, shadow_d);
+        // See the inset path for why this uses tanh instead of smoothstep.
+        let sigma = max(blur, 0.5);
+        let shadow_alpha = 0.5 - 0.5 * tanh(shadow_d / sigma * 0.75);
         shadow = vec4(in.shadow_color.rgb, in.shadow_color.a * shadow_alpha);
     }
 
@@ -346,16 +359,47 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Border
+    //
+    // `bw` packs the four side widths in (top, right, bottom, left)
+    // order, matching `Edges::to_array()`. Two paths:
+    //
+    //  * All four sides equal: the previous uniform SDF path is exact
+    //    and plays nicely with rounded corners.
+    //  * Mismatched sides: walk axis aligned distances from each edge
+    //    so e.g. `border-left-width: 1px` alone paints only a left
+    //    stripe. This ignores rounded corners (CSS requires all
+    //    corners be square for mismatched borders in practice), but
+    //    lets the common left-only / right-only patterns render.
     let bw = in.border_width;
     let max_border = max(max(bw.x, bw.y), max(bw.z, bw.w));
+    let min_border = min(min(bw.x, bw.y), min(bw.z, bw.w));
+    let uniform_border = (max_border - min_border) < 0.001;
     var rect_color: vec4<f32>;
 
     if max_border > 0.0 {
-        let avg_border = (bw.x + bw.y + bw.z + bw.w) * 0.25;
-        let inner_half = half - vec2(avg_border);
-        let inner_r = max(safe_r - avg_border, 0.0);
-        let inner_d = sdf_rounded_rect(p, inner_half, inner_r);
-        let border_factor = smoothstep(-0.5, 0.5, inner_d);
+        var border_factor: f32;
+        if uniform_border {
+            let avg_border = (bw.x + bw.y + bw.z + bw.w) * 0.25;
+            let inner_half = half - vec2(avg_border);
+            let inner_r = max(safe_r - avg_border, 0.0);
+            let inner_d = sdf_rounded_rect(p, inner_half, inner_r);
+            border_factor = smoothstep(-0.5, 0.5, inner_d);
+        } else {
+            // Distances from the four edges. rect_local is in [0, size].
+            let d_top = rect_local.y;
+            let d_left = rect_local.x;
+            let d_right = in.size.x - rect_local.x;
+            let d_bottom = in.size.y - rect_local.y;
+            // Each side contributes 1.0 when inside the stripe and
+            // smoothly fades at the inner edge. Widths of 0 discard
+            // their stripe entirely.
+            let f_top = select(smoothstep(bw.x + 0.5, bw.x - 0.5, d_top), 0.0, bw.x <= 0.0);
+            let f_right = select(smoothstep(bw.y + 0.5, bw.y - 0.5, d_right), 0.0, bw.y <= 0.0);
+            let f_bottom = select(smoothstep(bw.z + 0.5, bw.z - 0.5, d_bottom), 0.0, bw.z <= 0.0);
+            let f_left = select(smoothstep(bw.w + 0.5, bw.w - 0.5, d_left), 0.0, bw.w <= 0.0);
+            // Union of the four stripes (max), then clamp.
+            border_factor = clamp(max(max(f_top, f_right), max(f_bottom, f_left)), 0.0, 1.0);
+        }
         // Composite border OVER background (CSS-like alpha blending)
         let ba = in.border_color.a * border_factor;
         let one_minus_ba = 1.0 - ba;
@@ -370,6 +414,65 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         rect_color = base_color;
     }
     rect_color = vec4(rect_color.rgb, rect_color.a * outer_alpha);
+
+    // `mask-image: linear-gradient(...)`. When `mask_params.w >= 2` the
+    // fragment samples the mask gradient's alpha at the current pixel and
+    // multiplies the rect alpha by it, implementing the CSS alpha masking
+    // semantics from the CSS Masking Module Level 1 spec. The mask is a
+    // simple linear gradient; positions and alpha values are packed two
+    // per stop in `mask_stops_01` / `mask_stops_23`.
+    let mask_count = i32(in.mask_params.w + 0.5);
+    if (mask_count >= 2) {
+        let mask_angle = in.mask_params.x;
+        let mask_dir = vec2<f32>(sin(mask_angle), -cos(mask_angle));
+        let normalized = rect_local / in.size;
+        let mask_t = dot(normalized - vec2(0.5), mask_dir) + 0.5;
+
+        var mask_alphas = array<f32, 4>(
+            in.mask_stops_01.x,
+            in.mask_stops_01.z,
+            in.mask_stops_23.x,
+            in.mask_stops_23.z,
+        );
+        var mask_positions = array<f32, 4>(
+            in.mask_stops_01.y,
+            in.mask_stops_01.w,
+            in.mask_stops_23.y,
+            in.mask_stops_23.w,
+        );
+        let m_last_idx = mask_count - 1;
+        let m_first = mask_positions[0];
+        let m_last = mask_positions[m_last_idx];
+        var mask_alpha: f32;
+        if (mask_t <= m_first) {
+            mask_alpha = mask_alphas[0];
+        } else if (mask_t >= m_last) {
+            mask_alpha = mask_alphas[m_last_idx];
+        } else {
+            var seg_lo_a: f32 = mask_alphas[0];
+            var seg_hi_a: f32 = mask_alphas[0];
+            var seg_lo_p: f32 = mask_positions[0];
+            var seg_hi_p: f32 = mask_positions[0];
+            var m_found: bool = false;
+            for (var i: i32 = 0; i < 3; i = i + 1) {
+                if (!m_found && i + 1 < mask_count) {
+                    let p0 = mask_positions[i];
+                    let p1 = mask_positions[i + 1];
+                    if (mask_t >= p0 && mask_t <= p1) {
+                        seg_lo_a = mask_alphas[i];
+                        seg_hi_a = mask_alphas[i + 1];
+                        seg_lo_p = p0;
+                        seg_hi_p = p1;
+                        m_found = true;
+                    }
+                }
+            }
+            let m_range = max(seg_hi_p - seg_lo_p, 1e-6);
+            let m_local = clamp((mask_t - seg_lo_p) / m_range, 0.0, 1.0);
+            mask_alpha = mix(seg_lo_a, seg_hi_a, m_local);
+        }
+        rect_color = vec4(rect_color.rgb, rect_color.a * clamp(mask_alpha, 0.0, 1.0));
+    }
 
     // Composite: shadow behind rect (over operator), premultiplied output.
     let result = vec4(

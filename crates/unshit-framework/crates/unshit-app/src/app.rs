@@ -2175,6 +2175,9 @@ impl ApplicationHandler for AppHandler {
                                 unshit_renderer::pipeline::quad::MAX_GRADIENT_STOPS],
                             gradient_params: [0.0, 0.0, 0.0, 0.0],
                             gradient_extra: [0.0, 0.0, 0.0, 0.0],
+                            mask_stops_01: [0.0, 0.0, 0.0, 0.0],
+                            mask_stops_23: [0.0, 0.0, 0.0, 0.0],
+                            mask_params: [0.0, 0.0, 0.0, 0.0],
                         },
                     );
                 }
