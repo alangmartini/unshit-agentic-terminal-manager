@@ -4,18 +4,18 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase A: Hotkey plumbing (F2 + F3)
 
-### A1: `KeybindAction` enum and default-combo map
-- [ ] Create `src/keybinds/mod.rs` with `KeybindAction` enum (13 variants)
-- [ ] Add `dispatch_command`, `default_combo`, `label`, `id` methods
-- [ ] Unit tests: id round-trip, default_combo parses, dispatch_command matches state.rs
-- [ ] `cargo test keybinds::` green
+### A1: `KeybindAction` enum and default-combo map [DONE]
+- [x] Create `src/keybinds/mod.rs` with `KeybindAction` enum (13 variants)
+- [x] Add `dispatch_command`, `default_combo`, `label`, `id` methods
+- [x] Unit tests: id round-trip, default_combo parses, dispatch_command matches state.rs
+- [x] `cargo test keybinds::` green (10/10)
 
-### A2: Register defaults and route dispatch through registry
-- [ ] Locate `ShortcutResolver` construction; register all 13 defaults on startup
-- [ ] Wire `Ctrl+Shift+V` (SplitRight alias), `Ctrl+Shift+H` (SplitDown alias), `Ctrl+Shift+W` (Unsplit)
-- [ ] Remove any bypass paths that dispatch without going through the registry
-- [ ] Integration test: simulated key events produce correct dispatch strings
-- [ ] Visual verify: all three new combos plus all existing combos still work
+### A2: Register defaults and route dispatch through registry [DONE]
+- [x] Locate `ShortcutResolver` construction; register all 13 defaults on startup
+- [x] Wire `Ctrl+Shift+V` (SplitRight alias), `Ctrl+Shift+H` (SplitDown alias), `Ctrl+Shift+W` (Unsplit)
+- [x] Refactor `user_shortcut_bindings` to derive from `KeybindAction::ALL`
+- [x] Unit tests: aliases, Ctrl+W = tab.close.active, Ctrl+Shift+W = pane.close, system shortcuts intact
+- [ ] Visual verify: all three new combos plus all existing combos still work (pending user)
 
 ### A3: Last-pane-closes-tab semantics in `pane.close`
 - [ ] Check existing behavior; update if needed

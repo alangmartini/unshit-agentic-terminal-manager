@@ -240,31 +240,7 @@ fn build_tree(
 }
 
 fn user_shortcut_bindings() -> Vec<(String, String)> {
-    vec![
-        ("Ctrl+T".to_string(), "tab.new".to_string()),
-        ("Ctrl+W".to_string(), "pane.close".to_string()),
-        ("Ctrl+D".to_string(), "pane.split_right".to_string()),
-        ("Ctrl+Shift+D".to_string(), "pane.split_down".to_string()),
-        ("Ctrl+B".to_string(), "sidebar.toggle".to_string()),
-        ("Ctrl+,".to_string(), "modal.open".to_string()),
-        ("Ctrl+K".to_string(), "palette.toggle".to_string()),
-        ("Ctrl+Shift+P".to_string(), "palette.toggle".to_string()),
-        ("Escape".to_string(), "modal.close".to_string()),
-        ("Ctrl+1".to_string(), "tab.switch:0".to_string()),
-        ("Ctrl+2".to_string(), "tab.switch:1".to_string()),
-        ("Ctrl+3".to_string(), "tab.switch:2".to_string()),
-        ("Ctrl+4".to_string(), "tab.switch:3".to_string()),
-        ("Ctrl+5".to_string(), "tab.switch:4".to_string()),
-        ("Ctrl+6".to_string(), "tab.switch:5".to_string()),
-        ("Ctrl+7".to_string(), "tab.switch:6".to_string()),
-        ("Ctrl+8".to_string(), "tab.switch:7".to_string()),
-        ("Ctrl+9".to_string(), "tab.switch:8".to_string()),
-        ("Ctrl+=".to_string(), "font.inc".to_string()),
-        ("Ctrl+Shift+=".to_string(), "font.inc".to_string()),
-        ("Ctrl+-".to_string(), "font.dec".to_string()),
-        ("Ctrl+Tab".to_string(), "tab.next".to_string()),
-        ("Ctrl+Shift+Tab".to_string(), "tab.prev".to_string()),
-    ]
+    crate::keybinds::registry::default_shortcut_bindings()
 }
 
 fn parse_bench_args() -> Option<crate::bench::BenchConfig> {
