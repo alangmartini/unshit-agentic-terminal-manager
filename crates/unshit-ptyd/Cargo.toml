@@ -1,0 +1,19 @@
+[package]
+name = "unshit-ptyd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Background PTY daemon for the terminal-manager UI. Owns PTYs, parsers, and scrollback so terminals outlive the UI."
+
+[lints]
+workspace = true
+
+[lib]
+name = "unshit_ptyd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "unshit-ptyd"
+path = "src/main.rs"
+
+[dependencies]
