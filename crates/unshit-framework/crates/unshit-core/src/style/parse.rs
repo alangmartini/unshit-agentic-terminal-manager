@@ -3233,6 +3233,11 @@ fn parse_grid_track_size_single(parser: &mut Parser) -> Result<types::GridTrackS
                 Ok(types::GridTrackSize::fr(*value))
             } else if unit_str == "%" {
                 Ok(types::GridTrackSize::fixed_percent(*value))
+            } else if unit_str == "vh" || unit_str == "vw" {
+                // Grid track sizes have no viewport context at parse time,
+                // so vh/vw must fail rather than silently becoming px.
+                // Mirrors the rejection in `parse_px`.
+                Err(())
             } else {
                 Ok(types::GridTrackSize::fixed_px(*value))
             }
@@ -3265,10 +3270,17 @@ fn parse_grid_function_track(parser: &mut Parser) -> Result<types::GridTrackSize
             .parse_nested_block(|p| {
                 let tok = p.next().cloned().map_err(|_| p.new_custom_error(()))?;
                 match tok {
-                    Token::Dimension { value, .. } => Ok(types::GridTrackSize {
-                        min: types::GridMinTrackSize::Auto,
-                        max: types::GridMaxTrackSize::FitContent(value),
-                    }),
+                    Token::Dimension { value, unit, .. } => {
+                        if unit.as_ref() == "vh" || unit.as_ref() == "vw" {
+                            // Viewport units cannot resolve at parse time.
+                            Err(p.new_custom_error(()))
+                        } else {
+                            Ok(types::GridTrackSize {
+                                min: types::GridMinTrackSize::Auto,
+                                max: types::GridMaxTrackSize::FitContent(value),
+                            })
+                        }
+                    }
                     Token::Percentage { unit_value, .. } => Ok(types::GridTrackSize {
                         min: types::GridMinTrackSize::Auto,
                         max: types::GridMaxTrackSize::FitContentPercent(unit_value * 100.0),
@@ -3298,8 +3310,11 @@ fn parse_grid_min_track_size(parser: &mut Parser) -> Result<types::GridMinTrackS
 
     match parser.next().map_err(|_| ())? {
         Token::Dimension { value, unit, .. } => {
-            if unit.as_ref() == "%" {
+            let unit_str = unit.as_ref();
+            if unit_str == "%" {
                 Ok(types::GridMinTrackSize::Percent(*value))
+            } else if unit_str == "vh" || unit_str == "vw" {
+                Err(())
             } else {
                 Ok(types::GridMinTrackSize::Px(*value))
             }
@@ -3330,6 +3345,8 @@ fn parse_grid_max_track_size(parser: &mut Parser) -> Result<types::GridMaxTrackS
                 Ok(types::GridMaxTrackSize::Fr(*value))
             } else if unit_str == "%" {
                 Ok(types::GridMaxTrackSize::Percent(*value))
+            } else if unit_str == "vh" || unit_str == "vw" {
+                Err(())
             } else {
                 Ok(types::GridMaxTrackSize::Px(*value))
             }
@@ -6178,5 +6195,63 @@ mod tests {
         let mut input = ParserInput::new("5vw");
         let mut parser = Parser::new(&mut input);
         assert!(parse_px(&mut parser).is_err(), "parse_px must reject 5vw");
+    }
+
+    #[test]
+    fn grid_track_parsers_reject_vh_and_vw() {
+        // Grid track sizes likewise have no viewport context at parse
+        // time. Letting `grid-template-rows: 50vh` silently degrade to
+        // `50px` would misposition rows at any non-100px viewport. Pin
+        // rejection across all four grid entry points.
+        for css in ["50vh", "50vw"] {
+            let mut input = ParserInput::new(css);
+            let mut parser = Parser::new(&mut input);
+            assert!(
+                parse_grid_track_size_single(&mut parser).is_err(),
+                "parse_grid_track_size_single must reject {}",
+                css
+            );
+
+            let mut input = ParserInput::new(css);
+            let mut parser = Parser::new(&mut input);
+            assert!(
+                parse_grid_min_track_size(&mut parser).is_err(),
+                "parse_grid_min_track_size must reject {}",
+                css
+            );
+
+            let mut input = ParserInput::new(css);
+            let mut parser = Parser::new(&mut input);
+            assert!(
+                parse_grid_max_track_size(&mut parser).is_err(),
+                "parse_grid_max_track_size must reject {}",
+                css
+            );
+        }
+
+        // fit-content(50vh) lives inside parse_grid_function_track, which
+        // is reached via parse_grid_track_size_single.
+        for css in ["fit-content(50vh)", "fit-content(50vw)"] {
+            let mut input = ParserInput::new(css);
+            let mut parser = Parser::new(&mut input);
+            assert!(
+                parse_grid_track_size_single(&mut parser).is_err(),
+                "fit-content must reject {}",
+                css
+            );
+        }
+    }
+
+    #[test]
+    fn oklch_leaves_trailing_tokens_for_caller() {
+        // parse_color consumes one color literal and stops. Trailing
+        // tokens past the closing `)` are the caller's responsibility to
+        // validate via expect_exhausted. Pin this contract so a future
+        // refactor that tightens parse_color doesn't silently break
+        // callers that compose a color with other productions.
+        assert!(
+            parse_single_color("oklch(0.5 0.1 60) garbage").is_some(),
+            "parse_color must stop at the oklch() call and leave trailing tokens untouched"
+        );
     }
 }
