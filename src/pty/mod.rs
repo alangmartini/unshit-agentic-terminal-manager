@@ -81,6 +81,15 @@ impl PtyManager {
         let mut cmd = CommandBuilder::new(&shell);
         if let Some(dir) = cwd {
             cmd.cwd(dir);
+            // PowerShell profiles commonly end with `Set-Location <some-dir>`,
+            // which overrides the OS-level cwd we just set. Pass the same dir
+            // via `-NoExit -Command "Set-Location ..."` so it runs AFTER the
+            // profile and wins.
+            if is_powershell_shell(&shell) {
+                for arg in build_powershell_cwd_args(dir) {
+                    cmd.arg(arg);
+                }
+            }
         } else if let Some(home) = dirs::home_dir() {
             cmd.cwd(home);
         }
@@ -196,6 +205,28 @@ fn default_shell() -> String {
     } else {
         "bash".to_string()
     }
+}
+
+/// Returns true when `shell` points at `powershell` or `pwsh` (with or
+/// without a `.exe` suffix, any path prefix, case-insensitive stem).
+fn is_powershell_shell(shell: &str) -> bool {
+    Path::new(shell)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|stem| stem.eq_ignore_ascii_case("powershell") || stem.eq_ignore_ascii_case("pwsh"))
+        .unwrap_or(false)
+}
+
+/// Build the `-NoExit -Command "Set-Location ..."` args that force PowerShell
+/// into `dir` *after* the user profile has run. Single quotes in the path are
+/// doubled to keep the PowerShell single-quoted string well-formed.
+fn build_powershell_cwd_args(dir: &Path) -> Vec<String> {
+    let escaped = dir.to_string_lossy().replace('\'', "''");
+    vec![
+        "-NoExit".to_string(),
+        "-Command".to_string(),
+        format!("Set-Location -LiteralPath '{escaped}'"),
+    ]
 }
 
 #[cfg(test)]
@@ -366,5 +397,50 @@ mod tests {
         assert!(mgr.write(pane_id, b"echo 2\n").is_ok());
         assert!(mgr.write(pane_id, b"echo 3\n").is_ok());
         mgr.destroy(pane_id);
+    }
+
+    #[test]
+    fn is_powershell_shell_detects_known_variants() {
+        assert!(is_powershell_shell("powershell.exe"));
+        assert!(is_powershell_shell("powershell"));
+        assert!(is_powershell_shell("pwsh.exe"));
+        assert!(is_powershell_shell("pwsh"));
+        assert!(is_powershell_shell("PowerShell.exe"));
+        assert!(is_powershell_shell(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(is_powershell_shell("/usr/bin/pwsh"));
+    }
+
+    #[test]
+    fn is_powershell_shell_rejects_non_powershell_shells() {
+        assert!(!is_powershell_shell("bash"));
+        assert!(!is_powershell_shell("/bin/bash"));
+        assert!(!is_powershell_shell("zsh"));
+        assert!(!is_powershell_shell("cmd.exe"));
+        assert!(!is_powershell_shell("fish"));
+        assert!(!is_powershell_shell(""));
+    }
+
+    #[test]
+    fn build_powershell_cwd_args_emits_noexit_command_set_location() {
+        let args = build_powershell_cwd_args(Path::new(r"C:\Users\alanm\project"));
+        assert_eq!(
+            args,
+            vec![
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                r"Set-Location -LiteralPath 'C:\Users\alanm\project'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_powershell_cwd_args_doubles_single_quotes_in_path() {
+        // Regression: a path containing a single quote must be escaped by
+        // doubling, otherwise the PowerShell single-quoted string breaks
+        // and we either fail to cd or (worse) execute injected code.
+        let args = build_powershell_cwd_args(Path::new(r"C:\Users\a'b\proj"));
+        assert_eq!(args[2], r"Set-Location -LiteralPath 'C:\Users\a''b\proj'");
     }
 }
