@@ -8,19 +8,15 @@
 /// once the IPC layer lands so clients can version-gate behavior.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Parsed CLI invocation. No subcommands, only top-level flags for now.
+/// Parsed CLI invocation.
+///
+/// `Run` is a loud-failing stub in slice 1 so accidental callers fail
+/// instead of silently hanging; the real daemon loop lands in slice 2.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParsedArgs {
-    /// `unshit-ptyd` with no arguments: run the daemon event loop. At
-    /// slice 1 this is a stub that exits nonzero with a "not yet
-    /// implemented" message so any caller who accidentally relies on it
-    /// fails loudly.
     Run,
-    /// `--status`: print a one-line health banner and exit 0.
     Status,
-    /// `--help` / `-h`: print usage and exit 0.
     Help,
-    /// `--version` / `-V`: print version and exit 0.
     Version,
 }
 
@@ -79,8 +75,8 @@ where
 
 /// One-line health banner printed for `--status`.
 ///
-/// Format is locked down by a test so `--status` stays scriptable.
-/// Columns are whitespace-separated so simple `awk '{print $3}'` works.
+/// Whitespace-separated so `awk '{print $3}'` keeps working as future
+/// slices add fields; format is pinned by tests.
 pub fn status_line() -> String {
     format!("unshit-ptyd {} idle sessions=0", DAEMON_VERSION)
 }
