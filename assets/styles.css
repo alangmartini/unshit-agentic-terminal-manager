@@ -483,16 +483,21 @@ body::after {
 }
 
 .branch-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font-size: var(--t-xs);
+  line-height: 1.4;
   color: var(--sage);
-  padding: 0 var(--sp-2);
-  border-radius: var(--r-sm);
+  padding: 2px var(--sp-3);
+  border-radius: var(--r-md);
   background: rgba(139, 168, 92, 0.08);
   border: 1px solid rgba(139, 168, 92, 0.2);
-  max-width: 100px;
+  max-width: 140px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: center;
 }
 
 .branch-tag.muted {
