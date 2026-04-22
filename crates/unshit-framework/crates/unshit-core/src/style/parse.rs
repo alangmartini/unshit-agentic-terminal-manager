@@ -1782,7 +1782,17 @@ fn parse_content_value(parser: &mut Parser) -> Result<ContentValue, ()> {
 
 fn parse_px(parser: &mut Parser) -> Result<f32, ()> {
     match parser.next().map_err(|_| ())? {
-        Token::Dimension { value, .. } => Ok(*value),
+        Token::Dimension { value, unit, .. } => {
+            // Viewport relative units cannot resolve without layout context.
+            // Reject `vh`/`vw` here so properties that use the px pathway
+            // (padding, border-width, gap, etc.) error loudly instead of
+            // silently treating `5vh` as `5px`. Broadening the pathway to
+            // accept viewport units is tracked as a framework gap.
+            if unit.as_ref() == "vh" || unit.as_ref() == "vw" {
+                return Err(());
+            }
+            Ok(*value)
+        }
         Token::Number { value, .. } => Ok(*value),
         _ => Err(()),
     }
@@ -6057,5 +6067,116 @@ mod tests {
             parse_single_color("oklch(0.5 0.1)").is_none(),
             "oklch missing H is invalid"
         );
+    }
+
+    #[test]
+    fn oklch_clamps_lightness_above_one_to_white() {
+        let over = parse_single_color("oklch(2.0 0.0 0)").expect("over-range L parses");
+        let clamped = parse_single_color("oklch(1.0 0.0 0)").expect("boundary L parses");
+        assert_eq!(
+            (over.r, over.g, over.b),
+            (clamped.r, clamped.g, clamped.b),
+            "L above 1.0 must clamp to 1.0 (white)"
+        );
+    }
+
+    #[test]
+    fn oklch_clamps_negative_lightness_to_black() {
+        let neg = parse_single_color("oklch(-0.5 0.0 0)").expect("negative L parses");
+        let clamped = parse_single_color("oklch(0.0 0.0 0)").expect("boundary L parses");
+        assert_eq!(
+            (neg.r, neg.g, neg.b),
+            (clamped.r, clamped.g, clamped.b),
+            "L below 0.0 must clamp to 0.0 (black)"
+        );
+    }
+
+    #[test]
+    fn oklch_clamps_negative_chroma_to_zero() {
+        let neg = parse_single_color("oklch(0.5 -0.1 60)").expect("negative C parses");
+        let clamped = parse_single_color("oklch(0.5 0.0 60)").expect("zero C parses");
+        assert_eq!(
+            (neg.r, neg.g, neg.b),
+            (clamped.r, clamped.g, clamped.b),
+            "negative chroma must clamp to 0 (grayscale)"
+        );
+    }
+
+    #[test]
+    fn oklch_clamps_over_range_alpha() {
+        let over = parse_single_color("oklch(0.5 0.1 60 / 2.0)").expect("over-range alpha parses");
+        assert_eq!(over.a, 255, "alpha above 1.0 must clamp to fully opaque");
+
+        let neg = parse_single_color("oklch(0.5 0.1 60 / -0.5)").expect("negative alpha parses");
+        assert_eq!(neg.a, 0, "alpha below 0.0 must clamp to fully transparent");
+    }
+
+    #[test]
+    fn oklch_alpha_percentage_equals_unit_number() {
+        let pct = parse_single_color("oklch(0.5 0.1 60 / 50%)").expect("percent alpha parses");
+        let num = parse_single_color("oklch(0.5 0.1 60 / 0.5)").expect("number alpha parses");
+        assert_eq!(pct.a, num.a, "50% alpha must equal 0.5 numeric");
+    }
+
+    #[test]
+    fn oklch_hue_in_radians_matches_equivalent_degrees() {
+        // pi/4 rad = 45 deg.
+        let rad = parse_single_color("oklch(0.6 0.12 0.7853982rad)").expect("rad hue parses");
+        let deg = parse_single_color("oklch(0.6 0.12 45)").expect("deg hue parses");
+        assert!(
+            (rad.r as i32 - deg.r as i32).abs() <= 1
+                && (rad.g as i32 - deg.g as i32).abs() <= 1
+                && (rad.b as i32 - deg.b as i32).abs() <= 1,
+            "pi/4 rad and 45 deg must round to within 1 sRGB unit"
+        );
+    }
+
+    #[test]
+    fn oklch_hue_in_gradians_matches_equivalent_degrees() {
+        // 100 grad = 90 deg.
+        let grad = parse_single_color("oklch(0.6 0.12 100grad)").expect("grad hue parses");
+        let deg = parse_single_color("oklch(0.6 0.12 90)").expect("deg hue parses");
+        assert!(
+            (grad.r as i32 - deg.r as i32).abs() <= 1
+                && (grad.g as i32 - deg.g as i32).abs() <= 1
+                && (grad.b as i32 - deg.b as i32).abs() <= 1,
+            "100 grad and 90 deg must round to within 1 sRGB unit"
+        );
+    }
+
+    #[test]
+    fn oklch_hue_in_turns_matches_equivalent_degrees() {
+        // 0.25 turn = 90 deg.
+        let turn = parse_single_color("oklch(0.6 0.12 0.25turn)").expect("turn hue parses");
+        let deg = parse_single_color("oklch(0.6 0.12 90)").expect("deg hue parses");
+        assert!(
+            (turn.r as i32 - deg.r as i32).abs() <= 1
+                && (turn.g as i32 - deg.g as i32).abs() <= 1
+                && (turn.b as i32 - deg.b as i32).abs() <= 1,
+            "0.25 turn and 90 deg must round to within 1 sRGB unit"
+        );
+    }
+
+    #[test]
+    fn oklch_rejects_unknown_hue_angle_unit() {
+        assert!(
+            parse_single_color("oklch(0.5 0.1 60foo)").is_none(),
+            "unknown hue angle unit must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_px_rejects_vh_and_vw() {
+        // The px pathway is used for padding, border-width, gap, etc. It
+        // has no viewport context and cannot resolve viewport units, so
+        // `padding: 5vh` must fail to parse rather than silently becoming
+        // `padding: 5px`. See `parse_px`.
+        let mut input = ParserInput::new("5vh");
+        let mut parser = Parser::new(&mut input);
+        assert!(parse_px(&mut parser).is_err(), "parse_px must reject 5vh");
+
+        let mut input = ParserInput::new("5vw");
+        let mut parser = Parser::new(&mut input);
+        assert!(parse_px(&mut parser).is_err(), "parse_px must reject 5vw");
     }
 }
