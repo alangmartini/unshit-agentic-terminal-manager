@@ -15,8 +15,8 @@ pub use codec::{read_frame, write_frame, Frame};
 pub use error::{ProtocolError, MAX_FRAME_LEN};
 pub use frame::{FrameHeader, KIND_CONTROL, KIND_EVENT, KIND_OUTPUT, LEN_PREFIX_SIZE};
 pub use message::{
-    read_request, read_response, read_server_event, write_request, write_response,
-    write_server_event, Request, Response, ServerEvent, SessionInfo,
+    decode_output_payload, read_request, read_response, read_server_event, write_output_frame,
+    write_request, write_response, write_server_event, Request, Response, ServerEvent, SessionInfo,
 };
 
 /// Wire protocol version advertised in `HelloAck`. Bump on any

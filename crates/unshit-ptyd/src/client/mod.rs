@@ -13,13 +13,13 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, WriteHalf};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
-    message::{write_request, Request, Response, ServerEvent, SessionInfo},
-    read_frame, ProtocolError, KIND_CONTROL, KIND_EVENT,
+    message::{decode_output_payload, write_request, Request, Response, ServerEvent, SessionInfo},
+    read_frame, ProtocolError, KIND_CONTROL, KIND_EVENT, KIND_OUTPUT,
 };
 use crate::transport::{connect, ClientConnection};
 
@@ -252,6 +252,19 @@ where
                     let _ = tx.send(resp);
                 }
             }
+            KIND_OUTPUT => {
+                let (session_id, bytes) = match decode_output_payload(&frame.payload) {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let event = ServerEvent::Output {
+                    session_id,
+                    bytes: bytes.to_vec(),
+                };
+                if events.send(event).await.is_err() {
+                    return;
+                }
+            }
             KIND_EVENT => {
                 let event: ServerEvent = match serde_json::from_slice(&frame.payload) {
                     Ok(ev) => ev,
@@ -265,12 +278,6 @@ where
         }
     }
 }
-
-// `ReadHalf` is only named so the compiler can see the concrete type
-// bound; rustc still infers it from the split() call sites. Keep the
-// import alive to document intent.
-#[allow(dead_code)]
-type _ReadHalfAlias = ReadHalf<ClientConnection>;
 
 #[cfg(test)]
 mod tests {

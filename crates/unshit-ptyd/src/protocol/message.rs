@@ -11,8 +11,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::error::ProtocolError;
-use super::frame::{KIND_CONTROL, KIND_EVENT};
+use super::frame::{KIND_CONTROL, KIND_EVENT, KIND_OUTPUT};
 use super::{read_frame, write_frame};
+
+/// Size of the session id prefix on `KIND_OUTPUT` frames.
+pub const OUTPUT_SESSION_ID_SIZE: usize = 8;
 
 /// Client-to-daemon control requests.
 ///
@@ -132,14 +135,16 @@ impl Response {
     }
 }
 
-/// Server-pushed unsolicited events. Carried on `KIND_EVENT` frames so
-/// a client can distinguish them from solicited responses while sharing
-/// the same connection.
+/// Server-pushed unsolicited events.
+///
+/// `Output` rides on `KIND_OUTPUT` with a pure-binary payload of
+/// `u64 session_id (LE) | raw bytes` so PTY output skips serde entirely
+/// and is not inflated ~4x by JSON array-of-u8 encoding. Other variants
+/// (none yet; session_exited and session_crashed arrive in slice 4)
+/// ride on `KIND_EVENT` as JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerEvent {
-    /// Raw PTY output bytes from `session_id`. Bytes are a JSON array
-    /// of u8 for the same reasons described on [`Request::Write`].
     Output { session_id: u64, bytes: Vec<u8> },
 }
 
@@ -194,12 +199,12 @@ where
     write_frame(writer, KIND_CONTROL, &bytes).await
 }
 
-/// Reads one frame and decodes it as a [`ServerEvent`].
+/// Reads one server-pushed frame and decodes it as a [`ServerEvent`].
 ///
-/// Event frames are pushed by the daemon on its own schedule, so the
-/// client typically runs this in a dedicated reader task. A control
-/// frame surfacing here is a protocol violation from the client's
-/// perspective and maps to `UnknownKind(KIND_CONTROL)`.
+/// Dispatches on frame kind: `KIND_OUTPUT` carries the binary payload
+/// used for PTY bytes; `KIND_EVENT` carries JSON for future event
+/// variants. A control frame surfacing here is a protocol violation
+/// and maps to `UnknownKind`.
 pub async fn read_server_event<R>(reader: &mut R) -> Result<Option<ServerEvent>, ProtocolError>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -207,20 +212,69 @@ where
     let Some(frame) = read_frame(reader).await? else {
         return Ok(None);
     };
-    if frame.kind != KIND_EVENT {
-        return Err(ProtocolError::UnknownKind(frame.kind));
+    match frame.kind {
+        KIND_OUTPUT => {
+            let (session_id, bytes) = decode_output_payload(&frame.payload)?;
+            Ok(Some(ServerEvent::Output {
+                session_id,
+                bytes: bytes.to_vec(),
+            }))
+        }
+        KIND_EVENT => {
+            let ev: ServerEvent = serde_json::from_slice(&frame.payload)?;
+            Ok(Some(ev))
+        }
+        other => Err(ProtocolError::UnknownKind(other)),
     }
-    let ev: ServerEvent = serde_json::from_slice(&frame.payload)?;
-    Ok(Some(ev))
 }
 
-/// Serializes `event` as JSON and writes it as a `KIND_EVENT` frame.
+/// Writes `event` to the wire, using `KIND_OUTPUT` for `Output` and
+/// `KIND_EVENT` JSON for everything else.
 pub async fn write_server_event<W>(writer: &mut W, event: &ServerEvent) -> Result<(), ProtocolError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let bytes = serde_json::to_vec(event)?;
-    write_frame(writer, KIND_EVENT, &bytes).await
+    match event {
+        ServerEvent::Output { session_id, bytes } => {
+            write_output_frame(writer, *session_id, bytes).await
+        }
+    }
+}
+
+/// Writes a `KIND_OUTPUT` frame directly from a session id and a slice
+/// of raw bytes. Avoids the `ServerEvent::Output { .., bytes: bytes.to_vec() }`
+/// clone that `write_server_event` would otherwise force on the caller.
+pub async fn write_output_frame<W>(
+    writer: &mut W,
+    session_id: u64,
+    bytes: &[u8],
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut payload = Vec::with_capacity(OUTPUT_SESSION_ID_SIZE + bytes.len());
+    payload.extend_from_slice(&session_id.to_le_bytes());
+    payload.extend_from_slice(bytes);
+    write_frame(writer, KIND_OUTPUT, &payload).await
+}
+
+/// Splits a `KIND_OUTPUT` frame payload into `(session_id, bytes)`.
+///
+/// The payload must begin with an 8-byte little-endian session id and
+/// may carry zero or more trailing bytes. A shorter payload is a
+/// protocol violation.
+pub fn decode_output_payload(payload: &[u8]) -> Result<(u64, &[u8]), ProtocolError> {
+    if payload.len() < OUTPUT_SESSION_ID_SIZE {
+        return Err(ProtocolError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "output frame payload shorter than 8-byte session id",
+        )));
+    }
+    let (id_bytes, rest) = payload.split_at(OUTPUT_SESSION_ID_SIZE);
+    let id_array: [u8; OUTPUT_SESSION_ID_SIZE] = id_bytes
+        .try_into()
+        .expect("slice split_at guarantees length");
+    Ok((u64::from_le_bytes(id_array), rest))
 }
 
 #[cfg(test)]
@@ -496,6 +550,48 @@ mod tests {
         let got = read_server_event(&mut b).await.unwrap().expect("event");
         writer.await.unwrap();
         assert_eq!(got, ev);
+    }
+
+    #[tokio::test]
+    async fn write_server_event_output_uses_kind_output_frame() {
+        // Pin the on-wire choice: Output MUST ride KIND_OUTPUT with the
+        // binary layout (u64 session_id LE + raw bytes), not KIND_EVENT
+        // with JSON. Regressing this would re-inflate PTY output ~4x.
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        let sent = ServerEvent::Output {
+            session_id: 0x0102_0304_0506_0708,
+            bytes: b"xy".to_vec(),
+        };
+        let writer = tokio::spawn(async move {
+            write_server_event(&mut a, &sent).await.unwrap();
+        });
+        let frame = read_frame(&mut b).await.unwrap().expect("frame");
+        writer.await.unwrap();
+        assert_eq!(frame.kind, KIND_OUTPUT);
+        assert_eq!(frame.payload.len(), OUTPUT_SESSION_ID_SIZE + 2);
+        let (id, bytes) = decode_output_payload(&frame.payload).unwrap();
+        assert_eq!(id, 0x0102_0304_0506_0708);
+        assert_eq!(bytes, b"xy");
+    }
+
+    #[test]
+    fn decode_output_payload_rejects_short_body() {
+        // Seven bytes is one short of the 8-byte session-id prefix.
+        let err = decode_output_payload(&[0u8; 7]).unwrap_err();
+        match err {
+            ProtocolError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_output_payload_accepts_empty_trailing_bytes() {
+        // An 8-byte payload carrying only the session id (no trailing
+        // bytes) is legal: the shell can send a zero-byte chunk.
+        let payload = 17u64.to_le_bytes();
+        let (id, rest) = decode_output_payload(&payload).unwrap();
+        assert_eq!(id, 17);
+        assert!(rest.is_empty());
     }
 
     #[tokio::test]
