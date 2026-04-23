@@ -1080,6 +1080,37 @@ body::after {
   flex: 1;
 }
 
+.pane-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 20px;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+  cursor: grab;
+  opacity: 0.4;
+  transition: opacity var(--dur-fast) var(--ease-std),
+              color var(--dur-fast) var(--ease-std);
+}
+
+.pane-grip svg {
+  width: 12px;
+  height: 14px;
+}
+
+.pane:hover .pane-grip,
+.pane.active .pane-grip {
+  opacity: 1;
+  color: var(--fg-secondary);
+}
+
+.pane-grip.dragging,
+.pane-grip:active {
+  cursor: grabbing;
+  color: var(--amber-100);
+}
+
 .pane-status-dot {
   width: 6px;
   height: 6px;

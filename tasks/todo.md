@@ -71,13 +71,14 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase C: Pane extract to tab (F4)
 
-### C1: Pane header visibility + grip
-- [ ] `build_pane_header` renders only when `panes.len() > 1`
-- [ ] Add grip icon on the left; title center; metadata right
-- [ ] CSS: `cursor: grab` / `grabbing`
-- [ ] Click (not drag) focuses the pane
-- [ ] Unit test: single-pane tab omits header; multi-pane tab includes it
-- [ ] Visual verify
+### C1: Pane header visibility + grip [DONE]
+- [x] `build_pane` omits `build_pane_header` entirely when single_pane
+- [x] Added `icon_grip` (6-dot SVG) and wired into `pane-header-left`
+- [x] CSS: `.pane-grip` with `cursor: grab` / `grabbing`, opacity fades on hover/active
+- [x] Click-to-focus on the pane container still works (grip inherits)
+- [x] Updated existing test `pane_header_left_has_grip_dot_title_subtitle` for new 4-child order
+- [x] New tests `single_pane_tab_omits_pane_header` and `multi_pane_tab_renders_header_with_grip`
+- [x] 588/588 tests green, clippy clean
 
 ### C2: Drag state + `pane.extract_to_tab` dispatch
 - [ ] Create `src/drag/mod.rs` with `DragState` enum (`Idle`, `DraggingPane`)

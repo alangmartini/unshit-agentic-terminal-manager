@@ -193,25 +193,32 @@ fn build_pane(
     });
 
     let body = build_pane_body(pane.id, is_active, shared, grids);
-    container
-        .with_child(build_pane_header(pane, single_pane, shared))
-        .with_child(body)
+    // Header is only meaningful in multi-pane tabs: the tab bar already
+    // shows title/subtitle for the single-pane case, and the pane's drag
+    // grip (used by the extract-to-tab flow) would have nothing to act on
+    // when there is only one pane in the tab.
+    if !single_pane {
+        container = container.with_child(build_pane_header(pane, shared));
+    }
+    container.with_child(body)
 }
 
-fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> ElementDef {
+fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
     let meta = format!("pid {} \u{00B7} {:.1}%", pane.pid, pane.cpu);
     let pane_id = pane.id;
     let split_h_state = shared.clone();
     let split_v_state = shared.clone();
     let close_state = shared.clone();
-    let mut header = ElementDef::new(Tag::Div).with_class("pane-header");
-
-    // When there is only a single pane the tab bar already shows the title and
-    // subtitle, so we omit the left section to avoid visual duplication.
-    if !single_pane {
-        header = header.with_child(
+    let header = ElementDef::new(Tag::Div)
+        .with_class("pane-header")
+        .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("pane-header-left")
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("pane-grip")
+                        .with_svg(icon_grip()),
+                )
                 .with_child(ElementDef::new(Tag::Span).with_class("pane-status-dot"))
                 .with_child(
                     ElementDef::new(Tag::Span)
@@ -224,7 +231,6 @@ fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> El
                         .with_text(format!("\u{00B7} {}", pane.subtitle)),
                 ),
         );
-    }
 
     header
         .with_child(
@@ -662,7 +668,7 @@ mod tests {
     fn pane_header_has_correct_class() {
         let pane = make_pane_titled(42, "zsh");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         assert!(el.classes.contains(&"pane-header".to_string()));
     }
 
@@ -670,7 +676,7 @@ mod tests {
     fn pane_header_has_three_sections() {
         let pane = make_pane_titled(42, "zsh");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         // left, meta, right
         assert_eq!(el.children.len(), 3);
         assert!(el.children[0]
@@ -686,7 +692,7 @@ mod tests {
     fn pane_header_meta_shows_pid_and_cpu() {
         let pane = make_pane_titled(42, "zsh");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let meta = &el.children[1];
         // meta text should contain "pid 1234" and "5.3%"
         if let unshit::core::element::ElementContent::Text(ref text) = meta.content {
@@ -701,7 +707,7 @@ mod tests {
     fn pane_header_right_has_action_buttons() {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let right = &el.children[2];
         // search, split_h, split_v, close = 4 buttons
         assert_eq!(right.children.len(), 4);
@@ -795,7 +801,7 @@ mod tests {
     fn pane_header_split_h_has_click_handler() {
         let shared = make_shared();
         let pane = make_pane_titled(1, "shell");
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let right = &el.children[2];
         // split_h is the second action button (index 1)
         let split_h = &right.children[1];
@@ -807,7 +813,7 @@ mod tests {
     fn pane_header_split_v_has_click_handler() {
         let shared = make_shared();
         let pane = make_pane_titled(1, "shell");
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let right = &el.children[2];
         // split_v is the third action button (index 2)
         let split_v = &right.children[2];
@@ -819,7 +825,7 @@ mod tests {
     fn pane_header_close_has_click_handler_and_danger_class() {
         let shared = make_shared();
         let pane = make_pane_titled(1, "shell");
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let right = &el.children[2];
         // close is the last action button (index 3)
         let close_btn = &right.children[3];
@@ -874,18 +880,19 @@ mod tests {
     }
 
     #[test]
-    fn pane_header_left_has_status_dot_title_subtitle() {
+    fn pane_header_left_has_grip_dot_title_subtitle() {
         let pane = make_pane_titled(1, "zsh");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let left = &el.children[0];
         assert!(left.classes.contains(&"pane-header-left".to_string()));
-        assert_eq!(left.children.len(), 3);
-        assert!(left.children[0]
+        assert_eq!(left.children.len(), 4);
+        assert!(left.children[0].classes.contains(&"pane-grip".to_string()));
+        assert!(left.children[1]
             .classes
             .contains(&"pane-status-dot".to_string()));
-        assert!(left.children[1].classes.contains(&"pane-title".to_string()));
-        assert!(left.children[2]
+        assert!(left.children[2].classes.contains(&"pane-title".to_string()));
+        assert!(left.children[3]
             .classes
             .contains(&"pane-subtitle".to_string()));
     }
@@ -1017,63 +1024,50 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pane header deduplication: single pane hides title/subtitle
+    // Pane header visibility: single-pane tabs omit the header entirely
     // -----------------------------------------------------------------------
 
-    /// When there is only one pane the tab bar already shows "shell  bash", so
-    /// the pane header must NOT duplicate the title and subtitle.
+    /// Single-pane tabs have no pane header at all. The tab bar already
+    /// shows title/subtitle and a single pane cannot be extracted, so
+    /// the grip and action buttons would be clutter.
     #[test]
-    fn single_pane_header_omits_title_and_subtitle() {
+    fn single_pane_tab_omits_pane_header() {
         let shared = test_shared();
         let pane = make_pane(1);
-        let header = build_pane_header(&pane, true, &shared);
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, true, true, &shared, &grids);
 
         assert!(
-            !tree_has_class(&header, "pane-header-left"),
-            "single-pane header must not contain .pane-header-left"
-        );
-        assert!(
-            !tree_has_class(&header, "pane-title"),
-            "single-pane header must not contain .pane-title"
-        );
-        assert!(
-            !tree_has_class(&header, "pane-subtitle"),
-            "single-pane header must not contain .pane-subtitle"
-        );
-        // Meta and action buttons must still be present.
-        assert!(
-            tree_has_class(&header, "pane-meta"),
-            "single-pane header must still contain .pane-meta"
-        );
-        assert!(
-            tree_has_class(&header, "pane-header-right"),
-            "single-pane header must still contain .pane-header-right"
+            !tree_has_class(&el, "pane-header"),
+            "single-pane tab must not render a pane-header"
         );
     }
 
-    /// When there are multiple panes (split layout) every pane header must
-    /// show its title and subtitle so the user can tell them apart.
+    /// Multi-pane tabs include a header with a grip on the left so each
+    /// pane can be dragged. The header also carries title/subtitle and
+    /// action buttons so the user can distinguish panes and manage them.
     #[test]
-    fn multi_pane_header_shows_title_and_subtitle() {
+    fn multi_pane_tab_renders_header_with_grip() {
         let shared = test_shared();
         let pane = make_pane(1);
-        let header = build_pane_header(&pane, false, &shared);
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, true, false, &shared, &grids);
 
         assert!(
-            tree_has_class(&header, "pane-header-left"),
-            "multi-pane header must contain .pane-header-left"
+            tree_has_class(&el, "pane-header"),
+            "multi-pane tab must render a pane-header"
         );
         assert!(
-            tree_has_class(&header, "pane-title"),
-            "multi-pane header must contain .pane-title"
+            tree_has_class(&el, "pane-grip"),
+            "multi-pane header must include a pane-grip for drag"
         );
         assert!(
-            tree_has_text(&header, "shell"),
+            tree_has_class(&el, "pane-title"),
+            "multi-pane header must show the pane title"
+        );
+        assert!(
+            tree_has_text(&el, "shell"),
             "multi-pane header must display the pane title text"
-        );
-        assert!(
-            tree_has_text(&header, "bash"),
-            "multi-pane header must display the pane subtitle text"
         );
     }
 

@@ -176,6 +176,26 @@ pub fn icon_env_list() -> SvgNode {
     )
 }
 
+/// Six-dot drag grip (two columns by three rows). Stroke-based via
+/// small filled circles so it matches the rest of the amber line-art
+/// icon set in light weight.
+pub fn icon_grip() -> SvgNode {
+    let mut attrs = root_attrs(1.0, StrokeLineCap::Round, StrokeLineJoin::Round);
+    attrs.fill = Some(SvgPaint::Current);
+    attrs.stroke = Some(SvgPaint::None);
+    group(
+        attrs,
+        vec![
+            circle(6.0, 4.0, 1.0),
+            circle(10.0, 4.0, 1.0),
+            circle(6.0, 8.0, 1.0),
+            circle(10.0, 8.0, 1.0),
+            circle(6.0, 12.0, 1.0),
+            circle(10.0, 12.0, 1.0),
+        ],
+    )
+}
+
 pub fn icon_split_h() -> SvgNode {
     group(
         root_attrs(1.4, StrokeLineCap::Butt, StrokeLineJoin::Miter),
