@@ -288,6 +288,28 @@ impl Drop for Session {
 }
 
 fn run_reader(
+    reader: Box<dyn Read + Send>,
+    output_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    terminal: Arc<Mutex<Terminal>>,
+) {
+    // The reader body can panic if the VTE parser hits a bug on
+    // malformed input, if process_bytes indexes out-of-bounds after a
+    // resize race, or if any other internal invariant is violated.
+    // Catching here fulfils the slice-6 "a panic in one session's
+    // parser thread must not take the daemon down" acceptance
+    // criterion: the task exits cleanly, the child stays killable
+    // through the normal Session::kill path, and every other session's
+    // reader keeps streaming on its own thread.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        run_reader_inner(reader, output_tx, terminal);
+    }));
+    if let Err(payload) = result {
+        let msg = panic_payload_str(&payload);
+        log::error!("session reader panicked: {msg}; reader exiting");
+    }
+}
+
+fn run_reader_inner(
     mut reader: Box<dyn Read + Send>,
     output_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
     terminal: Arc<Mutex<Terminal>>,
@@ -313,6 +335,16 @@ fn run_reader(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return,
         }
+    }
+}
+
+fn panic_payload_str(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
     }
 }
 
@@ -577,5 +609,36 @@ mod tests {
         );
 
         session.kill();
+    }
+
+    /// Regression for F4.2 (crash isolation): a panic inside
+    /// `run_reader_inner` must be trapped by `run_reader`'s
+    /// `catch_unwind` wrapper, never propagating to the task that
+    /// spawned it. Without the wrapper a VTE parser bug would take the
+    /// daemon's spawn_blocking task with it, killing every other
+    /// session running on the shared blocking pool.
+    #[test]
+    fn run_reader_catches_panic_from_reader() {
+        struct PanickingReader;
+        impl Read for PanickingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("synthetic reader panic");
+            }
+        }
+
+        let terminal = Arc::new(Mutex::new(Terminal::new(24, 80, 0)));
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+        let output_tx = Arc::new(Mutex::new(Some(tx)));
+
+        // Call directly on the current thread so any escaped panic
+        // would fail the test; catch_unwind inside run_reader must
+        // swallow it.
+        run_reader(Box::new(PanickingReader), output_tx, Arc::clone(&terminal));
+
+        // Terminal state is still accessible: the Mutex is not poisoned
+        // (the panic happened before any terminal lock was acquired, and
+        // catch_unwind does not mark Mutexes we never held).
+        let guard = terminal.lock().expect("terminal mutex must be unpoisoned");
+        assert_eq!(guard.grid().rows(), 24);
     }
 }
