@@ -80,13 +80,13 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 - [x] New tests `single_pane_tab_omits_pane_header` and `multi_pane_tab_renders_header_with_grip`
 - [x] 588/588 tests green, clippy clean
 
-### C2: Drag state + `pane.extract_to_tab` dispatch
-- [ ] Create `src/drag/mod.rs` with `DragState` enum (`Idle`, `DraggingPane`)
-- [ ] Add `AppState.drag`
-- [ ] Implement `drag.start_pane`, `drag.update`, `drag.end` dispatch arms
-- [ ] Implement `pane.extract_to_tab:<pane>:<index>`: move terminal+PTY to new tab, reflow source
-- [ ] Confirm PTY handoff works without respawn (or surface the blocker)
-- [ ] Unit tests: extract from 2-pane tab; extract only pane -> tab closes; PTY survives
+### C2: Drag state + `pane.extract_to_tab` dispatch [DONE]
+- [x] Create `src/drag/mod.rs` with `DragState` enum (`Idle`, `DraggingPane`)
+- [x] Add `AppState.drag` (+ `UiSnapshot.drag`, default Idle)
+- [x] Implement `drag.start_pane:<pane>:<x>:<y>`, `drag.update:<x>:<y>`, `drag.end` dispatch arms (7 new tests)
+- [x] Implement `pane.extract_to_tab:<pane>:<index>`: PTY handle preserved, ratios reflowed, new tab activated (9 new tests)
+- [x] PTY handoff verified via Arc::strong_count — no respawn
+- [x] 607/607 tests green, clippy/fmt clean
 
 ### C3: Header `on_drag` + tab bar drop target
 - [ ] Attach `on_drag` to the pane header element

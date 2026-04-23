@@ -162,6 +162,7 @@ mod tests {
             net_kbps: 0.0,
             clock_hhmm: "00:00".into(),
             keybinds: crate::keybinds::KeybindsState::default(),
+            drag: crate::drag::DragState::default(),
         }
     }
 

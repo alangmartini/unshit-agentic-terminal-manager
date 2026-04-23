@@ -274,6 +274,9 @@ pub struct AppState {
     /// Changes here persist to disk but only take effect on next restart
     /// (the framework's shortcut resolver snapshots the bindings at build).
     pub keybinds: crate::keybinds::KeybindsState,
+    /// Transient drag state for pane-header / tab drags. `Idle` at rest,
+    /// `DraggingPane { .. }` once the cursor exceeds the 4px threshold.
+    pub drag: crate::drag::DragState,
 }
 
 impl AppState {
@@ -355,6 +358,7 @@ impl AppState {
             col_ratios: self.col_ratios.clone(),
             ctx_menu: self.ctx_menu.clone(),
             keybinds: self.keybinds.clone(),
+            drag: self.drag,
         }
     }
 
@@ -400,6 +404,7 @@ pub struct UiSnapshot {
     pub col_ratios: Vec<Vec<f32>>,
     pub ctx_menu: Option<CtxMenu>,
     pub keybinds: crate::keybinds::KeybindsState,
+    pub drag: crate::drag::DragState,
 }
 
 fn current_folder_name() -> String {
@@ -565,6 +570,7 @@ pub fn seed_state() -> AppState {
         keybinds: crate::keybinds::KeybindsState::with_overrides(
             crate::keybinds::loader::load_if_installed(),
         ),
+        drag: crate::drag::DragState::default(),
     }
 }
 
@@ -1006,6 +1012,90 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
     sync_live_tab_from_panes(state);
 }
 
+/// Move `target` out of the active tab into a new tab inserted at
+/// `new_tab_index`. The PTY handle and terminal emulator state are
+/// kept untouched so the running process, scrollback and cwd survive
+/// the move.
+///
+/// - When the active tab holds multiple panes, the pane is removed from
+///   its row and the freed column ratio is absorbed by a neighbor, then
+///   a fresh `TerminalTab` holding the extracted pane is inserted at
+///   `new_tab_index`.
+/// - When the active tab holds only `target`, the source tab is removed
+///   (without destroying the PTY) and the new tab takes its place. The
+///   tab count stays the same.
+///
+/// After extraction the newly inserted tab becomes active. A bad
+/// `target` id or a call that would leave no tabs at all is a no-op.
+pub fn mutate_extract_pane_to_tab(state: &mut AppState, target: PaneId, new_tab_index: usize) {
+    let Some((row_idx, col_idx)) = find_pane_coord(state, target) else {
+        return;
+    };
+
+    let extracted_pane = state.panes[row_idx][col_idx].clone();
+    let extracted_id = extracted_pane.id.0;
+    let source_tab_idx = state.active_tab;
+    let live_pane_count: usize = state.panes.iter().map(|r| r.len()).sum();
+
+    if live_pane_count == 1 {
+        // Source tab becomes empty after extraction. Drop it from `tabs`
+        // without going through `mutate_close_tab` (which would destroy
+        // the PTY we want to migrate). Clear live layout fields so the
+        // new tab can re-seed them via `load_tab_state`.
+        state.tabs.remove(source_tab_idx);
+        state.panes.clear();
+        state.row_ratios.clear();
+        state.col_ratios.clear();
+    } else {
+        let closed_ratio = state.col_ratios[row_idx][col_idx];
+        state.col_ratios[row_idx].remove(col_idx);
+        if !state.col_ratios[row_idx].is_empty() {
+            let absorb_idx = if col_idx > 0 { col_idx - 1 } else { 0 };
+            state.col_ratios[row_idx][absorb_idx] += closed_ratio;
+        }
+        state.panes[row_idx].remove(col_idx);
+        if state.panes[row_idx].is_empty() {
+            let closed_row_ratio = state.row_ratios[row_idx];
+            state.row_ratios.remove(row_idx);
+            state.col_ratios.remove(row_idx);
+            if !state.row_ratios.is_empty() {
+                let absorb_idx = if row_idx > 0 { row_idx - 1 } else { 0 };
+                state.row_ratios[absorb_idx] += closed_row_ratio;
+            }
+            state.panes.remove(row_idx);
+        }
+        if state.active_pane == target {
+            let new_row = row_idx.min(state.panes.len() - 1);
+            let new_col = col_idx.min(state.panes[new_row].len() - 1);
+            state.active_pane = state.panes[new_row][new_col].id;
+        }
+        sync_live_tab_from_panes(state);
+    }
+
+    let new_tab = TerminalTab {
+        id: format!("t{}", extracted_id),
+        name: extracted_pane.title.clone(),
+        subtitle: extracted_pane.subtitle.clone(),
+        status: TabStatus::Running,
+        panes: vec![vec![extracted_pane]],
+        active_pane: PaneId(extracted_id),
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+
+    // When the source tab was removed above, any `new_tab_index` past
+    // the removed slot shifts left by one.
+    let adjusted_index = if live_pane_count == 1 && new_tab_index > source_tab_idx {
+        new_tab_index - 1
+    } else {
+        new_tab_index
+    };
+    let insertion_index = adjusted_index.min(state.tabs.len());
+    state.tabs.insert(insertion_index, new_tab);
+    state.active_tab = insertion_index;
+    load_tab_state(state);
+}
+
 /// Copy the live pane layout back into `tabs[active_tab]` so the per-tab
 /// saved view stays in sync without waiting for a tab or workspace switch.
 fn sync_live_tab_from_panes(state: &mut AppState) {
@@ -1118,6 +1208,19 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         "pane.close" => {
             mutate_close_pane(state, state.active_pane);
             true
+        }
+        other if other.starts_with("pane.extract_to_tab:") => {
+            dispatch_pane_extract_to_tab(state, other)
+        }
+        other if other.starts_with("drag.start_pane:") => dispatch_drag_start_pane(state, other),
+        other if other.starts_with("drag.update:") => dispatch_drag_update(state, other),
+        "drag.end" => {
+            if state.drag.is_active() {
+                state.drag = crate::drag::DragState::Idle;
+                true
+            } else {
+                false
+            }
         }
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
@@ -1290,6 +1393,76 @@ fn dispatch_keybind_set(state: &mut AppState, cmd: &str) -> bool {
         }
         Err(_) => true,
     }
+}
+
+/// Parse `drag.start_pane:<pane_id>:<x>:<y>` and enter the
+/// `DraggingPane` state. Returns `false` on malformed input or if
+/// the pane id is not present in the current tab.
+fn dispatch_drag_start_pane(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["drag.start_pane:".len()..];
+    let mut parts = rest.splitn(3, ':');
+    let (Some(pane_str), Some(x_str), Some(y_str)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (Ok(pane_num), Ok(x), Ok(y)) = (
+        pane_str.parse::<u32>(),
+        x_str.parse::<f32>(),
+        y_str.parse::<f32>(),
+    ) else {
+        return false;
+    };
+    let pane = PaneId(pane_num);
+    if find_pane_coord(state, pane).is_none() {
+        return false;
+    }
+    state.drag = crate::drag::DragState::DraggingPane {
+        pane,
+        cursor_x: x,
+        cursor_y: y,
+    };
+    true
+}
+
+/// Parse `drag.update:<x>:<y>` and update cursor position on the
+/// active drag. Returns `false` when not currently dragging or when
+/// the coordinates don't parse.
+fn dispatch_drag_update(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["drag.update:".len()..];
+    let Some((x_str, y_str)) = rest.split_once(':') else {
+        return false;
+    };
+    let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) else {
+        return false;
+    };
+    match &mut state.drag {
+        crate::drag::DragState::DraggingPane {
+            cursor_x, cursor_y, ..
+        } => {
+            *cursor_x = x;
+            *cursor_y = y;
+            true
+        }
+        crate::drag::DragState::Idle => false,
+    }
+}
+
+/// Parse `pane.extract_to_tab:<pane_id>:<tab_index>` and apply.
+/// Returns `false` when the parts are malformed so the framework can
+/// ignore a stale UI command without mutating state.
+fn dispatch_pane_extract_to_tab(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["pane.extract_to_tab:".len()..];
+    let Some((pane_str, index_str)) = rest.split_once(':') else {
+        return false;
+    };
+    let Ok(pane_num) = pane_str.parse::<u32>() else {
+        return false;
+    };
+    let Ok(index) = index_str.parse::<usize>() else {
+        return false;
+    };
+    mutate_extract_pane_to_tab(state, PaneId(pane_num), index);
+    true
 }
 
 fn dispatch_keybind_reset(state: &mut AppState, cmd: &str) -> bool {
@@ -1513,6 +1686,7 @@ mod tests {
             resize_drag: None,
             ctx_menu: None,
             keybinds: crate::keybinds::KeybindsState::default(),
+            drag: crate::drag::DragState::default(),
         }
     }
 
@@ -2305,6 +2479,238 @@ mod tests {
             original_tab_count - 1,
             "closing the last pane must close the tab"
         );
+    }
+
+    // -- mutate_extract_pane_to_tab -----------------------------------------
+
+    #[test]
+    fn extract_pane_from_two_pane_tab_leaves_one_pane_in_source() {
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        assert_eq!(state.panes[0].len(), 2);
+        let target = state.panes[0][1].id;
+
+        mutate_extract_pane_to_tab(&mut state, target, 1);
+
+        assert_eq!(state.tabs.len(), 2, "new tab created");
+        // Source tab (t1) retains its original pane.
+        let source_tab = &state.tabs[0];
+        assert_eq!(source_tab.panes.iter().flatten().count(), 1);
+        // New tab holds the extracted pane.
+        let new_tab = &state.tabs[1];
+        assert_eq!(new_tab.panes.iter().flatten().count(), 1);
+        assert_eq!(new_tab.panes[0][0].id, target);
+    }
+
+    #[test]
+    fn extract_pane_reflows_ratios_in_source() {
+        // After the split the row is 0.5/0.5. Extracting one pane must hand
+        // its column ratio to the remaining pane so the source fills 1.0.
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+
+        mutate_extract_pane_to_tab(&mut state, target, 1);
+
+        let source_col_ratios = &state.tabs[0].col_ratios;
+        assert_eq!(source_col_ratios[0].len(), 1);
+        assert!(
+            (source_col_ratios[0][0] - 1.0).abs() < 1e-6,
+            "surviving pane must absorb ratio, got {}",
+            source_col_ratios[0][0]
+        );
+    }
+
+    #[test]
+    fn extract_only_pane_closes_source_tab() {
+        // Single-pane tab extracted: the source tab disappears entirely so
+        // we never leave an empty tab behind. The pane must survive in the
+        // newly created tab.
+        let mut state = seed_state();
+        mutate_add_tab(&mut state); // now 2 tabs
+        mutate_switch_tab(&mut state, 0);
+        let target = state.active_pane;
+        let tab_count_before = state.tabs.len();
+
+        mutate_extract_pane_to_tab(&mut state, target, tab_count_before);
+
+        assert_eq!(
+            state.tabs.len(),
+            tab_count_before,
+            "source tab removed, new tab inserted = same count"
+        );
+        // Extracted pane still exists in some tab.
+        let found = state
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.iter().flatten())
+            .any(|p| p.id == target);
+        assert!(found, "extracted pane must live on in the new tab");
+    }
+
+    #[test]
+    fn extract_preserves_pty_entry_in_terminals_map() {
+        // The whole point of extract-to-tab: the running process must not
+        // respawn. We approximate that by checking the `terminals` HashMap
+        // entry is the same Arc (same strong count before/after).
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+        // split_right already inserted a SharedTerminal for this pane.
+        let before = state
+            .terminals
+            .get(&target.0)
+            .map(Arc::strong_count)
+            .expect("pty spawned by split_right");
+
+        mutate_extract_pane_to_tab(&mut state, target, 1);
+
+        let after = state
+            .terminals
+            .get(&target.0)
+            .map(Arc::strong_count)
+            .expect("pty handle must survive extraction");
+        assert_eq!(before, after, "Arc count must match: no respawn occurred");
+    }
+
+    #[test]
+    fn extract_activates_new_tab() {
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+
+        mutate_extract_pane_to_tab(&mut state, target, 1);
+
+        assert_eq!(state.active_tab, 1, "new tab becomes active");
+        assert_eq!(state.active_pane, target);
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 1);
+        assert_eq!(state.panes[0][0].id, target);
+    }
+
+    #[test]
+    fn extract_out_of_range_index_clamps_to_end() {
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+
+        mutate_extract_pane_to_tab(&mut state, target, 99);
+
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.tabs[1].panes[0][0].id, target);
+    }
+
+    #[test]
+    fn extract_unknown_pane_is_noop() {
+        let mut state = seed_state();
+        let tabs_before = state.tabs.len();
+
+        mutate_extract_pane_to_tab(&mut state, PaneId(9999), 0);
+
+        assert_eq!(state.tabs.len(), tabs_before);
+    }
+
+    #[test]
+    fn dispatch_pane_extract_to_tab_parses_and_applies() {
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+        let cmd = format!("pane.extract_to_tab:{}:1", target.0);
+
+        assert!(dispatch(&mut state, &cmd));
+        assert_eq!(state.tabs.len(), 2);
+    }
+
+    #[test]
+    fn dispatch_pane_extract_to_tab_malformed_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "pane.extract_to_tab:"));
+        assert!(!dispatch(&mut state, "pane.extract_to_tab:abc:1"));
+        assert!(!dispatch(&mut state, "pane.extract_to_tab:1:xyz"));
+    }
+
+    // -- drag.* dispatch arms -------------------------------------------------
+
+    #[test]
+    fn dispatch_drag_start_pane_sets_dragging_state() {
+        let mut state = seed_state();
+        let id = state.active_pane.0;
+        let cmd = format!("drag.start_pane:{}:40:60", id);
+
+        assert!(dispatch(&mut state, &cmd));
+
+        assert_eq!(state.drag.dragged_pane(), Some(PaneId(id)));
+    }
+
+    #[test]
+    fn dispatch_drag_start_pane_rejects_unknown_pane() {
+        let mut state = seed_state();
+        let cmd = "drag.start_pane:9999:0:0";
+
+        assert!(!dispatch(&mut state, cmd));
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn dispatch_drag_update_while_dragging_updates_cursor() {
+        let mut state = seed_state();
+        let id = state.active_pane.0;
+        dispatch(&mut state, &format!("drag.start_pane:{}:0:0", id));
+
+        assert!(dispatch(&mut state, "drag.update:123:456"));
+
+        match state.drag {
+            crate::drag::DragState::DraggingPane {
+                cursor_x, cursor_y, ..
+            } => {
+                assert_eq!(cursor_x, 123.0);
+                assert_eq!(cursor_y, 456.0);
+            }
+            _ => panic!("drag state must remain DraggingPane"),
+        }
+    }
+
+    #[test]
+    fn dispatch_drag_update_when_idle_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "drag.update:10:20"));
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn dispatch_drag_end_resets_to_idle() {
+        let mut state = seed_state();
+        let id = state.active_pane.0;
+        dispatch(&mut state, &format!("drag.start_pane:{}:0:0", id));
+        assert!(state.drag.is_active());
+
+        assert!(dispatch(&mut state, "drag.end"));
+
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn dispatch_drag_end_when_idle_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "drag.end"));
+    }
+
+    #[test]
+    fn dispatch_drag_malformed_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "drag.start_pane:"));
+        assert!(!dispatch(&mut state, "drag.start_pane:1"));
+        assert!(!dispatch(&mut state, "drag.start_pane:1:2"));
+        assert!(!dispatch(&mut state, "drag.start_pane:abc:1:2"));
+        assert!(!dispatch(&mut state, "drag.update:"));
+        assert!(!dispatch(&mut state, "drag.update:1"));
+        assert!(!dispatch(&mut state, "drag.update:x:y"));
     }
 
     #[test]
