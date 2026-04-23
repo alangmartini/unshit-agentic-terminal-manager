@@ -17,6 +17,7 @@ pub use frame::{FrameHeader, KIND_CONTROL, KIND_EVENT, KIND_OUTPUT, LEN_PREFIX_S
 pub use message::{
     decode_output_payload, read_request, read_response, read_server_event, write_output_frame,
     write_request, write_response, write_server_event, Request, Response, ServerEvent, SessionInfo,
+    SNAPSHOT_MAX_SCROLLBACK_LINES,
 };
 
 /// Wire protocol version advertised in `HelloAck`. Bump on any

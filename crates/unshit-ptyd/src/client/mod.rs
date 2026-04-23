@@ -17,6 +17,8 @@ use tokio::io::{AsyncRead, WriteHalf};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
+use unshit_terminal_core::Snapshot;
+
 use crate::protocol::{
     message::{decode_output_payload, write_request, Request, Response, ServerEvent, SessionInfo},
     read_frame, ProtocolError, KIND_CONTROL, KIND_EVENT, KIND_OUTPUT,
@@ -194,6 +196,43 @@ impl Client {
                 "unexpected response: {other:?}"
             )))),
         }
+    }
+
+    /// Fetches the daemon's current snapshot for `session_id`.
+    ///
+    /// `scrollback_lines` is clamped server-side at
+    /// [`crate::protocol::SNAPSHOT_MAX_SCROLLBACK_LINES`] so an
+    /// over-eager request simply returns that many lines rather than
+    /// erroring.
+    pub async fn attach_session(
+        &mut self,
+        session_id: u64,
+        scrollback_lines: u32,
+    ) -> Result<Snapshot, ProtocolError> {
+        let id = self.alloc_id();
+        let req = Request::AttachSession {
+            id,
+            session_id,
+            scrollback_lines,
+        };
+        let resp = self.roundtrip(req, id).await?;
+        match resp {
+            Response::SessionAttached { snapshot, .. } => Ok(snapshot),
+            Response::Error { code, message, .. } => Err(ProtocolError::Io(io::Error::other(
+                format!("attach_session failed: {code}: {message}"),
+            ))),
+            other => Err(ProtocolError::Io(io::Error::other(format!(
+                "unexpected response: {other:?}"
+            )))),
+        }
+    }
+
+    /// Slice 4 no-op that will mean "keep running" in slice 5. Exposed
+    /// now so the UI can start calling it today without churn later.
+    pub async fn detach_session(&mut self, session_id: u64) -> Result<Response, ProtocolError> {
+        let id = self.alloc_id();
+        self.roundtrip(Request::DetachSession { id, session_id }, id)
+            .await
     }
 
     async fn roundtrip(

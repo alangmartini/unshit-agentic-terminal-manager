@@ -9,6 +9,7 @@
 //! does not bump `PROTOCOL_VERSION`.
 
 use serde::{Deserialize, Serialize};
+use unshit_terminal_core::Snapshot;
 
 use super::error::ProtocolError;
 use super::frame::{KIND_CONTROL, KIND_EVENT, KIND_OUTPUT};
@@ -16,6 +17,14 @@ use super::{read_frame, write_frame};
 
 /// Size of the session id prefix on `KIND_OUTPUT` frames.
 pub const OUTPUT_SESSION_ID_SIZE: usize = 8;
+
+/// Maximum number of scrollback lines an attach-session response
+/// carries. The clamp is a v1 wire-format safety valve: with JSON
+/// encoding and default blank-cell payloads this keeps the control
+/// frame well under `MAX_FRAME_LEN` (1 MiB) for typical 80x24 grids.
+/// TODO(slice 5 / polish): swap JSON for a compact binary format and
+/// revisit this cap.
+pub const SNAPSHOT_MAX_SCROLLBACK_LINES: usize = 100;
 
 /// Client-to-daemon control requests.
 ///
@@ -60,6 +69,22 @@ pub enum Request {
     KillSession { id: u64, session_id: u64 },
     /// List every session on the daemon.
     ListSessions { id: u64 },
+    /// Attach to an existing session and retrieve its authoritative
+    /// snapshot (grid + scrollback tail).
+    ///
+    /// `scrollback_lines` is the requested number of most-recent
+    /// scrollback rows to include. The daemon silently clamps this at
+    /// [`SNAPSHOT_MAX_SCROLLBACK_LINES`] so an over-eager caller does
+    /// not push the control frame past `MAX_FRAME_LEN`.
+    AttachSession {
+        id: u64,
+        session_id: u64,
+        scrollback_lines: u32,
+    },
+    /// Detach from a session. Slice 4 treats this as a no-op ack;
+    /// slice 5 promotes it to "keep running" once cross-connection
+    /// persistence lands.
+    DetachSession { id: u64, session_id: u64 },
 }
 
 impl Request {
@@ -73,6 +98,8 @@ impl Request {
             Request::Resize { id, .. } => *id,
             Request::KillSession { id, .. } => *id,
             Request::ListSessions { id } => *id,
+            Request::AttachSession { id, .. } => *id,
+            Request::DetachSession { id, .. } => *id,
         }
     }
 }
@@ -89,7 +116,10 @@ pub struct SessionInfo {
 }
 
 /// Daemon-to-client control responses and errors.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is intentionally not derived: `SessionAttached` carries a
+/// [`Snapshot`] whose cells only implement `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
     HelloAck {
@@ -107,13 +137,18 @@ pub enum Response {
         id: u64,
         session_id: u64,
     },
-    /// Generic success ack used for write / resize / kill_session.
+    /// Generic success ack used for write / resize / kill_session /
+    /// detach_session.
     Ack {
         id: u64,
     },
     SessionList {
         id: u64,
         sessions: Vec<SessionInfo>,
+    },
+    SessionAttached {
+        id: u64,
+        snapshot: Snapshot,
     },
     Error {
         id: u64,
@@ -130,6 +165,7 @@ impl Response {
             Response::SessionSpawned { id, .. } => *id,
             Response::Ack { id } => *id,
             Response::SessionList { id, .. } => *id,
+            Response::SessionAttached { id, .. } => *id,
             Response::Error { id, .. } => *id,
         }
     }
@@ -356,7 +392,7 @@ mod tests {
     fn unknown_request_kind_is_rejected() {
         // Pick a variant name we have not defined yet so this test
         // stays meaningful as new request kinds are added.
-        let raw = br#"{"kind":"attach_session","id":1}"#;
+        let raw = br#"{"kind":"hibernate_session","id":1}"#;
         let err = serde_json::from_slice::<Request>(raw).unwrap_err();
         assert!(err.is_data(), "unknown kind should be a data error: {err}");
     }
@@ -651,6 +687,23 @@ mod tests {
             34
         );
         assert_eq!(Request::ListSessions { id: 35 }.id(), 35);
+        assert_eq!(
+            Request::AttachSession {
+                id: 36,
+                session_id: 1,
+                scrollback_lines: 0,
+            }
+            .id(),
+            36
+        );
+        assert_eq!(
+            Request::DetachSession {
+                id: 37,
+                session_id: 1,
+            }
+            .id(),
+            37
+        );
     }
 
     #[test]
@@ -672,5 +725,65 @@ mod tests {
             .id(),
             43
         );
+        let snap = unshit_terminal_core::Terminal::new(3, 5, 10).snapshot(0);
+        assert_eq!(
+            Response::SessionAttached {
+                id: 44,
+                snapshot: snap,
+            }
+            .id(),
+            44
+        );
+    }
+
+    #[test]
+    fn attach_session_request_round_trips() {
+        let req = Request::AttachSession {
+            id: 101,
+            session_id: 7,
+            scrollback_lines: 50,
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let back: Request = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn detach_session_request_round_trips() {
+        let req = Request::DetachSession {
+            id: 102,
+            session_id: 7,
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let back: Request = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn session_attached_response_round_trips() {
+        let snapshot = unshit_terminal_core::Terminal::new(3, 5, 10).snapshot(0);
+        let resp = Response::SessionAttached { id: 103, snapshot };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let back: Response = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn attach_session_request_serializes_scrollback_lines_field() {
+        let req = Request::AttachSession {
+            id: 1,
+            session_id: 2,
+            scrollback_lines: 7,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"kind\":\"attach_session\""), "{s}");
+        assert!(s.contains("\"scrollback_lines\":7"), "{s}");
+    }
+
+    #[test]
+    fn snapshot_max_scrollback_lines_is_one_hundred() {
+        // Pin the v1 wire cap so a future refactor has to revisit the
+        // deliberate choice documented in the constant's docstring.
+        assert_eq!(SNAPSHOT_MAX_SCROLLBACK_LINES, 100);
     }
 }

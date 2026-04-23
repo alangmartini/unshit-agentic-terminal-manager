@@ -20,7 +20,10 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
-    message::{read_request, write_output_frame, write_response, Request, Response},
+    message::{
+        read_request, write_output_frame, write_response, Request, Response,
+        SNAPSHOT_MAX_SCROLLBACK_LINES,
+    },
     ProtocolError, PROTOCOL_VERSION,
 };
 use crate::session::registry::SessionRegistry;
@@ -201,6 +204,37 @@ where
         Request::ListSessions { id } => {
             let sessions = registry.list().await;
             send_response(&writer, Response::SessionList { id, sessions }).await?;
+            Ok(PostRequest::Continue)
+        }
+        Request::AttachSession {
+            id,
+            session_id,
+            scrollback_lines,
+        } => {
+            let clamped = (scrollback_lines as usize).min(SNAPSHOT_MAX_SCROLLBACK_LINES);
+            match registry.snapshot(session_id, clamped).await {
+                Some(snapshot) => {
+                    send_response(&writer, Response::SessionAttached { id, snapshot }).await?;
+                }
+                None => {
+                    let err = io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no session for id {session_id}"),
+                    );
+                    send_err(&writer, id, error_code(&err), &err).await?;
+                }
+            }
+            Ok(PostRequest::Continue)
+        }
+        Request::DetachSession {
+            id,
+            session_id: _session_id,
+        } => {
+            // Slice 4 policy: detach is a no-op; sessions die on
+            // connection close (see slice 3a per-connection cleanup).
+            // Slice 5 promotes detach to "keep running" and wires the
+            // cross-connection persistence path.
+            send_response(&writer, Response::Ack { id }).await?;
             Ok(PostRequest::Continue)
         }
     }
