@@ -7,7 +7,7 @@ use futures_core::Stream;
 use unshit::app::{EventSink, ExternalEvent, Subscription};
 use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 
-use crate::state::SharedState;
+use crate::state::{MutexExt, SharedState};
 
 static PENDING_READERS: Mutex<Option<HashMap<u32, Box<dyn Read + Send>>>> = Mutex::new(None);
 
@@ -98,7 +98,7 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                 // concurrently on the state lock.
                 while let Some(data) = rx.recv().await {
                     let terminal_handle: Option<crate::state::SharedTerminal> = {
-                        let guard = shared.lock().expect("state mutex poisoned");
+                        let guard = shared.lock_recover();
                         guard.terminals.get(&pane_id).cloned()
                     };
                     let Some(terminal_handle) = terminal_handle else {
@@ -107,8 +107,7 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
 
                     let mut batched = 1u32;
                     {
-                        let mut terminal =
-                            terminal_handle.lock().expect("terminal mutex poisoned");
+                        let mut terminal = terminal_handle.lock_recover();
                         terminal.process_bytes(&data);
                         while let Ok(more) = rx.try_recv() {
                             terminal.process_bytes(&more);
@@ -158,7 +157,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     visible = !visible;
                     {
-                        let mut guard = shared.lock().expect("state mutex poisoned");
+                        let mut guard = shared.lock_recover();
 
                         // Cursor blink: active pane blinks when focused,
                         // shows steady cursor when window is unfocused.
@@ -166,9 +165,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                         let active_id = guard.active_pane.0;
                         let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
                         for (&id, terminal_handle) in guard.terminals.iter() {
-                            let mut terminal = terminal_handle
-                                .lock()
-                                .expect("terminal mutex poisoned");
+                            let mut terminal = terminal_handle.lock_recover();
                             if id == active_id {
                                 if win_focused {
                                     terminal.grid_mut().set_cursor_visible(visible);
@@ -301,9 +298,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                 for id in existing_ids {
                                     guard.pty_manager.resize(id, cols, rows);
                                     if let Some(t) = guard.terminals.get(&id) {
-                                        t.lock()
-                                            .expect("terminal mutex poisoned")
-                                            .resize(rows as usize, cols as usize);
+                                        t.lock_recover().resize(rows as usize, cols as usize);
                                     }
                                 }
                             }
@@ -331,14 +326,12 @@ fn resize_poll_subscription(shared: SharedState) -> Subscription {
                         unshit::core::cell_grid::CellGrid::take_pending_resize()
                     {
                         {
-                            let mut guard = shared.lock().expect("state mutex poisoned");
+                            let mut guard = shared.lock_recover();
                             let ids: Vec<u32> = guard.terminals.keys().copied().collect();
                             for id in ids {
                                 guard.pty_manager.resize(id, cols, rows);
                                 if let Some(t) = guard.terminals.get(&id) {
-                                    t.lock()
-                                        .expect("terminal mutex poisoned")
-                                        .resize(rows as usize, cols as usize);
+                                    t.lock_recover().resize(rows as usize, cols as usize);
                                 }
                             }
                         } // guard drops before yield
@@ -372,7 +365,7 @@ pub fn build_subscriptions(shared: &SharedState) -> Vec<Subscription> {
 
     // For existing terminals, emit identity-only subscriptions so the
     // framework keeps already-running streams alive.
-    let guard = shared.lock().expect("state mutex poisoned");
+    let guard = shared.lock_recover();
     for &pane_id in guard.terminals.keys() {
         subs.push(Subscription::new(
             format!("pty-{}", pane_id),

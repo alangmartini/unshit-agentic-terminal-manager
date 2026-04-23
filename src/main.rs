@@ -20,7 +20,7 @@ use unshit::core::trace::{
 };
 
 use crate::state::{
-    dispatch, mutate_with, new_workspace, resize_all_terminals, seed_state, SharedState,
+    dispatch, mutate_with, new_workspace, resize_all_terminals, seed_state, MutexExt, SharedState,
     UiSnapshot, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
 };
 use crate::ui::settings::build_settings_modal;
@@ -514,13 +514,13 @@ fn main() {
             ],
             user_shortcuts: user_shortcut_bindings(),
             on_command: Some(Arc::new(move |command: &str| -> bool {
-                let mut guard = command_shared.lock().expect("state mutex poisoned");
+                let mut guard = command_shared.lock_recover();
                 dispatch(&mut guard, command)
             })),
             // Approach 1: on_cell_metrics fires once after the first render
             // publishes valid cell dimensions. Resize all PTYs immediately.
             on_scale_factor: Some(Arc::new(move |scale: f32| {
-                let mut guard = scale_shared.lock().expect("state mutex poisoned");
+                let mut guard = scale_shared.lock_recover();
                 guard.scale_factor = scale;
             })),
             on_close: Some(Arc::new(move || {
@@ -552,7 +552,7 @@ fn main() {
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
-                let mut guard = metrics_shared.lock().expect("state mutex poisoned");
+                let mut guard = metrics_shared.lock_recover();
                 let (cols, rows) = CellGrid::take_pending_resize().unwrap_or_else(|| {
                     let w = guard.last_grid_width;
                     let h = guard.last_grid_height;
@@ -583,7 +583,7 @@ fn main() {
                 u32,
                 Vec<(u32, crate::state::SharedTerminal)>,
             ) = {
-                let guard = tree_shared.lock().expect("state mutex poisoned");
+                let guard = tree_shared.lock_recover();
                 let snap = guard.ui_snapshot();
                 let active_id = guard.active_pane.0;
                 let handles: Vec<_> = guard
@@ -603,7 +603,7 @@ fn main() {
             let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = handles
                 .into_iter()
                 .map(|(id, handle)| {
-                    let mut t = handle.lock().expect("terminal mutex poisoned");
+                    let mut t = handle.lock_recover();
                     let grid = snapshot_terminal_for_render(&mut t, id, id == active_id);
                     (id, grid)
                 })

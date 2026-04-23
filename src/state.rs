@@ -25,6 +25,21 @@ pub type SharedState = Arc<Mutex<AppState>>;
 /// own lock, not the global state lock).
 pub type SharedTerminal = Arc<Mutex<Terminal>>;
 
+/// Extension trait that tolerates poisoning by taking the inner guard
+/// on PoisonError. Used on paths reachable from any pane's byte stream
+/// (render closure, state mutex, per-terminal mutex) so a panic in one
+/// pane's parser cannot cascade into the others by poisoning a mutex
+/// every other pane also locks. See SPEC F4.3.
+pub trait MutexExt<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for Mutex<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CtxMenu {
     pub x: f32,
@@ -359,7 +374,7 @@ impl AppState {
     pub fn terminal_grid(&self, pane_id: PaneId) -> Option<unshit::core::cell_grid::CellGrid> {
         self.terminals
             .get(&pane_id.0)
-            .map(|t| t.lock().expect("terminal mutex poisoned").grid().clone())
+            .map(|t| t.lock_recover().grid().clone())
     }
 
     /// Clone the `Arc<Mutex<Terminal>>` handle for a pane without holding
@@ -567,7 +582,7 @@ pub fn mutate_with<F, R>(shared: &SharedState, f: F) -> R
 where
     F: FnOnce(&mut AppState) -> R,
 {
-    let mut guard = shared.lock().expect("state mutex poisoned");
+    let mut guard = shared.lock_recover();
     f(&mut guard)
 }
 
