@@ -1,14 +1,25 @@
-//! Daemon client used by the `--shutdown` flag and by tests.
+//! Daemon client used by the `--shutdown` flag, the UI bridge, and
+//! tests.
 //!
-//! One connection per instance. The monotonic correlation id starts at
-//! 1; we never reuse ids on the same connection.
+//! The client splits the transport into a write half owned by the
+//! [`Client`] and a read half owned by a background task. The reader
+//! classifies frames: control frames become [`Response`]s routed back
+//! to the matching request via a pending-map; event frames become
+//! [`ServerEvent`]s pushed onto an mpsc the caller drains in its own
+//! task.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
+
+use tokio::io::{AsyncRead, ReadHalf, WriteHalf};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::JoinHandle;
 
 use crate::protocol::{
-    message::{read_response, write_request, Request, Response},
-    ProtocolError,
+    message::{write_request, Request, Response, ServerEvent, SessionInfo},
+    read_frame, ProtocolError, KIND_CONTROL, KIND_EVENT,
 };
 use crate::transport::{connect, ClientConnection};
 
@@ -28,9 +39,7 @@ impl Default for RequestIds {
 impl RequestIds {
     pub fn next(&mut self) -> u64 {
         let id = self.next;
-        // Saturation avoids id reuse at u64::MAX. Reaching it takes
-        // billions of years of uptime so this is defensive, not a real
-        // concern.
+        // Saturation avoids id reuse at u64::MAX.
         self.next = self.next.saturating_add(1);
         id
     }
@@ -40,20 +49,52 @@ impl RequestIds {
     }
 }
 
-/// Sequentially issues requests over one transport connection.
+type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Response>>>>;
+
+/// Sequentially issues requests over one transport connection and
+/// exposes a stream of server-pushed events.
 pub struct Client {
-    stream: ClientConnection,
+    writer: WriteHalf<ClientConnection>,
     ids: RequestIds,
+    pending: PendingMap,
+    reader_task: Option<JoinHandle<()>>,
 }
 
 impl Client {
     /// Opens a connection to the daemon listening on `path`.
+    ///
+    /// A background reader task is spawned to dispatch inbound frames.
+    /// When the connection dies the task exits and any pending request
+    /// yields an IO error.
     pub async fn connect(path: &Path) -> io::Result<Self> {
+        let (client, _events) = Self::connect_with_events(path).await?;
+        Ok(client)
+    }
+
+    /// Variant of [`Client::connect`] that also hands back the
+    /// receiver end of the server-event stream.
+    pub async fn connect_with_events(
+        path: &Path,
+    ) -> io::Result<(Self, mpsc::Receiver<ServerEvent>)> {
         let stream = connect(path).await?;
-        Ok(Self {
-            stream,
-            ids: RequestIds::default(),
-        })
+        let (reader, writer) = tokio::io::split(stream);
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, event_rx) = mpsc::channel::<ServerEvent>(64);
+
+        let pending_for_reader = pending.clone();
+        let reader_task = tokio::spawn(async move {
+            reader_loop(reader, pending_for_reader, event_tx).await;
+        });
+
+        Ok((
+            Self {
+                writer,
+                ids: RequestIds::default(),
+                pending,
+                reader_task: Some(reader_task),
+            },
+            event_rx,
+        ))
     }
 
     /// Returns the next correlation id without consuming it; exposed
@@ -82,31 +123,154 @@ impl Client {
         self.roundtrip(Request::Shutdown { id }, id).await
     }
 
+    /// Spawns a session on the daemon.
+    pub async fn spawn_session(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        shell: Option<String>,
+    ) -> Result<Response, ProtocolError> {
+        let id = self.alloc_id();
+        let req = Request::SpawnSession {
+            id,
+            cols,
+            rows,
+            cwd,
+            shell,
+        };
+        self.roundtrip(req, id).await
+    }
+
+    /// Writes `bytes` to the PTY stdin of `session_id`.
+    pub async fn write(
+        &mut self,
+        session_id: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Response, ProtocolError> {
+        let id = self.alloc_id();
+        let req = Request::Write {
+            id,
+            session_id,
+            bytes,
+        };
+        self.roundtrip(req, id).await
+    }
+
+    /// Resizes the PTY of `session_id`.
+    pub async fn resize(
+        &mut self,
+        session_id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Response, ProtocolError> {
+        let id = self.alloc_id();
+        let req = Request::Resize {
+            id,
+            session_id,
+            cols,
+            rows,
+        };
+        self.roundtrip(req, id).await
+    }
+
+    /// Kills the session with the given id.
+    pub async fn kill_session(&mut self, session_id: u64) -> Result<Response, ProtocolError> {
+        let id = self.alloc_id();
+        self.roundtrip(Request::KillSession { id, session_id }, id)
+            .await
+    }
+
+    /// Returns the current list of sessions.
+    pub async fn list_sessions(&mut self) -> Result<Vec<SessionInfo>, ProtocolError> {
+        let id = self.alloc_id();
+        let resp = self.roundtrip(Request::ListSessions { id }, id).await?;
+        match resp {
+            Response::SessionList { sessions, .. } => Ok(sessions),
+            Response::Error { code, message, .. } => Err(ProtocolError::Io(io::Error::other(
+                format!("list_sessions failed: {code}: {message}"),
+            ))),
+            other => Err(ProtocolError::Io(io::Error::other(format!(
+                "unexpected response: {other:?}"
+            )))),
+        }
+    }
+
     async fn roundtrip(
         &mut self,
         req: Request,
         expected_id: u64,
     ) -> Result<Response, ProtocolError> {
-        write_request(&mut self.stream, &req).await?;
-        let resp = read_response(&mut self.stream).await?.ok_or_else(|| {
-            ProtocolError::Io(io::Error::new(
+        let (tx, rx) = oneshot::channel::<Response>();
+        {
+            let mut guard = self.pending.lock().await;
+            guard.insert(expected_id, tx);
+        }
+        if let Err(e) = write_request(&mut self.writer, &req).await {
+            // Clean up the pending slot so we never leak a oneshot.
+            let mut guard = self.pending.lock().await;
+            guard.remove(&expected_id);
+            return Err(e);
+        }
+        match rx.await {
+            Ok(resp) => Ok(resp),
+            Err(_) => Err(ProtocolError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "daemon closed connection before responding",
-            ))
-        })?;
-        if resp.id() != expected_id {
-            return Err(ProtocolError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "response id {} does not match request id {}",
-                    resp.id(),
-                    expected_id
-                ),
-            )));
+            ))),
         }
-        Ok(resp)
     }
 }
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(handle) = self.reader_task.take() {
+            handle.abort();
+        }
+    }
+}
+
+async fn reader_loop<R>(mut reader: R, pending: PendingMap, events: mpsc::Sender<ServerEvent>)
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let frame = match read_frame(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return,
+            Err(_) => return,
+        };
+        match frame.kind {
+            KIND_CONTROL => {
+                let resp: Response = match serde_json::from_slice(&frame.payload) {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                let id = resp.id();
+                let mut guard = pending.lock().await;
+                if let Some(tx) = guard.remove(&id) {
+                    let _ = tx.send(resp);
+                }
+            }
+            KIND_EVENT => {
+                let event: ServerEvent = match serde_json::from_slice(&frame.payload) {
+                    Ok(ev) => ev,
+                    Err(_) => return,
+                };
+                if events.send(event).await.is_err() {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
+// `ReadHalf` is only named so the compiler can see the concrete type
+// bound; rustc still infers it from the split() call sites. Keep the
+// import alive to document intent.
+#[allow(dead_code)]
+type _ReadHalfAlias = ReadHalf<ClientConnection>;
 
 #[cfg(test)]
 mod tests {

@@ -1,22 +1,31 @@
 //! Per-connection request handler.
 //!
-//! Reads requests, dispatches them, writes responses. For slice 2 the
-//! vocabulary is just hello and shutdown; additional request kinds slot
-//! in without touching the outer loop.
+//! Each connection gets its own [`SessionRegistry`]. A session spawned
+//! from a connection is implicitly cleaned up when that connection
+//! closes, matching the current in-process UI behavior (close UI,
+//! shells die). Slice 5 will introduce cross-connection persistence.
 //!
-//! A panic or error inside a handler must not bring the daemon down.
-//! The outer `Daemon::run` wraps every connection task in
-//! `catch_unwind` and logs.
+//! The handler holds the write half of the connection behind a tokio
+//! mutex because both the request-reply loop and the per-session output
+//! forwarders need to write frames. Serializing them on a mutex keeps
+//! frame bytes from interleaving on the wire.
 
 use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 use crate::protocol::{
-    message::{read_request, write_response, Request, Response},
+    message::{
+        read_request, write_response, write_server_event, Request, Response, ServerEvent,
+        SessionInfo,
+    },
     ProtocolError, PROTOCOL_VERSION,
 };
+use crate::session::registry::SessionRegistry;
 use crate::DAEMON_VERSION;
 
 /// Outcome the outer loop uses to decide whether to keep serving.
@@ -38,69 +47,237 @@ pub async fn serve_connection<S>(
     shutdown: broadcast::Sender<()>,
 ) -> Result<(), ProtocolError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = read_half;
-    let mut writer = write_half;
+    let writer = Arc::new(Mutex::new(write_half));
     let mut shutdown_rx = shutdown.subscribe();
 
-    loop {
+    let registry = Arc::new(SessionRegistry::new());
+    let mut forwarders: Vec<JoinHandle<()>> = Vec::new();
+
+    let result = loop {
         tokio::select! {
-            // Another handler pulled the shutdown lever; finish gracefully.
-            _ = shutdown_rx.recv() => return Ok(()),
+            _ = shutdown_rx.recv() => break Ok(()),
             req = read_request(&mut reader) => {
                 let req = match req? {
                     Some(r) => r,
-                    None => return Ok(()),
+                    None => break Ok(()),
                 };
-                match handle(req, &mut writer).await? {
+                match handle(req, writer.clone(), registry.clone(), &mut forwarders).await? {
                     PostRequest::Continue => continue,
                     PostRequest::ShutdownRequested => {
-                        // Tell sibling connections to wrap up.
                         let _ = shutdown.send(());
-                        return Ok(());
+                        break Ok(());
                     }
                 }
             }
         }
+    };
+
+    // Clean up every session spawned on this connection, then await the
+    // per-session forwarder tasks so they exit before we drop the
+    // writer.
+    registry.kill_all().await;
+    for handle in forwarders {
+        handle.abort();
+        let _ = handle.await;
     }
+
+    result
 }
 
-async fn handle<W>(req: Request, writer: &mut W) -> Result<PostRequest, ProtocolError>
+type SharedWriter<W> = Arc<Mutex<W>>;
+
+async fn handle<W>(
+    req: Request,
+    writer: SharedWriter<W>,
+    registry: Arc<SessionRegistry>,
+    forwarders: &mut Vec<JoinHandle<()>>,
+) -> Result<PostRequest, ProtocolError>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     match req {
         Request::Hello { id, client_version } => {
             log::debug!("hello from client_version={client_version} id={id}");
-            let resp = Response::HelloAck {
-                id,
-                server_version: DAEMON_VERSION.to_string(),
-                protocol_version: PROTOCOL_VERSION,
-            };
-            write_response(writer, &resp).await?;
+            send_response(
+                &writer,
+                Response::HelloAck {
+                    id,
+                    server_version: DAEMON_VERSION.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .await?;
             Ok(PostRequest::Continue)
         }
         Request::Shutdown { id } => {
-            // Slice 2: no sessions exist yet, so shutdown always succeeds.
-            // Slice 3 will gate this on the session registry.
-            let resp = Response::ShutdownAck {
-                id,
-                ok: true,
-                reason: None,
-            };
-            write_response(writer, &resp).await?;
-            Ok(PostRequest::ShutdownRequested)
+            let alive = registry.len().await;
+            if alive > 0 {
+                // Slice 3 policy: refuse shutdown while this connection
+                // still owns live sessions. Slice 5 reworks this gate
+                // against the global registry instead of per-connection.
+                send_response(
+                    &writer,
+                    Response::ShutdownAck {
+                        id,
+                        ok: false,
+                        reason: Some(format!("{alive} sessions alive")),
+                    },
+                )
+                .await?;
+                Ok(PostRequest::Continue)
+            } else {
+                send_response(
+                    &writer,
+                    Response::ShutdownAck {
+                        id,
+                        ok: true,
+                        reason: None,
+                    },
+                )
+                .await?;
+                Ok(PostRequest::ShutdownRequested)
+            }
+        }
+        Request::SpawnSession {
+            id,
+            cols,
+            rows,
+            cwd,
+            shell,
+        } => {
+            let cwd_path = cwd.as_deref().map(PathBuf::from);
+            let shell_ref = shell.as_deref();
+            let spawn_res = registry
+                .spawn(cols, rows, cwd_path.as_deref(), shell_ref)
+                .await;
+            match spawn_res {
+                Ok((session_id, rx)) => {
+                    let writer_for_forward = writer.clone();
+                    let handle = tokio::spawn(forward_output(session_id, rx, writer_for_forward));
+                    forwarders.push(handle);
+                    send_response(&writer, Response::SessionSpawned { id, session_id }).await?;
+                }
+                Err(e) => {
+                    send_response(
+                        &writer,
+                        Response::Error {
+                            id,
+                            code: "spawn_failed".into(),
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+            Ok(PostRequest::Continue)
+        }
+        Request::Write {
+            id,
+            session_id,
+            bytes,
+        } => {
+            match registry.write(session_id, &bytes).await {
+                Ok(()) => send_response(&writer, Response::Ack { id }).await?,
+                Err(e) => {
+                    send_response(
+                        &writer,
+                        Response::Error {
+                            id,
+                            code: error_code(&e),
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+            Ok(PostRequest::Continue)
+        }
+        Request::Resize {
+            id,
+            session_id,
+            cols,
+            rows,
+        } => {
+            match registry.resize(session_id, cols, rows).await {
+                Ok(()) => send_response(&writer, Response::Ack { id }).await?,
+                Err(e) => {
+                    send_response(
+                        &writer,
+                        Response::Error {
+                            id,
+                            code: error_code(&e),
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+            Ok(PostRequest::Continue)
+        }
+        Request::KillSession { id, session_id } => {
+            registry.remove(session_id).await;
+            send_response(&writer, Response::Ack { id }).await?;
+            Ok(PostRequest::Continue)
+        }
+        Request::ListSessions { id } => {
+            let sessions: Vec<SessionInfo> = registry
+                .list()
+                .await
+                .into_iter()
+                .map(|s| SessionInfo {
+                    id: s.id,
+                    cols: s.cols,
+                    rows: s.rows,
+                    alive: s.alive,
+                    pid: s.pid,
+                })
+                .collect();
+            send_response(&writer, Response::SessionList { id, sessions }).await?;
+            Ok(PostRequest::Continue)
         }
     }
 }
 
+async fn send_response<W>(writer: &SharedWriter<W>, resp: Response) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut guard = writer.lock().await;
+    write_response(&mut *guard, &resp).await
+}
+
+/// Forwards every byte chunk from `rx` as a `ServerEvent::Output` frame
+/// on `writer`, tagging the chunk with `session_id`. Exits when the
+/// session drops its sender or the writer errors out.
+async fn forward_output<W>(
+    session_id: u64,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    writer: SharedWriter<W>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(bytes) = rx.recv().await {
+        let event = ServerEvent::Output { session_id, bytes };
+        let mut guard = writer.lock().await;
+        if write_server_event(&mut *guard, &event).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn error_code(e: &io::Error) -> String {
+    match e.kind() {
+        io::ErrorKind::NotFound => "session_not_found".into(),
+        io::ErrorKind::NotConnected => "session_dead".into(),
+        _ => "io_error".into(),
+    }
+}
+
 /// Converts a protocol error into an IO error for loop-level logging.
-///
-/// Callers that want the original variant should keep the
-/// `ProtocolError` instead; this helper exists so the outer supervisor
-/// can uniformly log with `io::Error`.
 pub fn protocol_to_io(err: ProtocolError) -> io::Error {
     match err {
         ProtocolError::Io(e) => e,
@@ -149,11 +326,7 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        // Close the duplex so the server sees EOF on its read side and
-        // exits the accept loop. `tokio::io::split` hands out two halves
-        // that jointly own the stream via a shared lock: dropping just
-        // `client_write` is not enough because `client_read` keeps the
-        // stream alive. Both halves must go.
+        // Closing the duplex: see note in slice 2. Both halves must go.
         drop(client_write);
         drop(client_read);
         server_task.await.unwrap();
@@ -199,5 +372,17 @@ mod tests {
         let e = ProtocolError::EmptyFrame;
         let io_err = protocol_to_io(e);
         assert_eq!(io_err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn error_code_maps_not_found_to_session_not_found() {
+        let e = io::Error::new(io::ErrorKind::NotFound, "missing");
+        assert_eq!(error_code(&e), "session_not_found");
+    }
+
+    #[test]
+    fn error_code_maps_not_connected_to_session_dead() {
+        let e = io::Error::new(io::ErrorKind::NotConnected, "gone");
+        assert_eq!(error_code(&e), "session_dead");
     }
 }

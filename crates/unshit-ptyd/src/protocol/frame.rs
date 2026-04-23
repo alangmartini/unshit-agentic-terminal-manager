@@ -17,6 +17,11 @@ pub const KIND_CONTROL: u8 = 0;
 /// the constant is pinned here so later slices cannot collide with it.
 pub const KIND_OUTPUT: u8 = 1;
 
+/// Kind byte for server-pushed, unsolicited events. Used in slice 3 for
+/// `ServerEvent::Output`; extends to `session_exited` and
+/// `session_crashed` in slice 4.
+pub const KIND_EVENT: u8 = 2;
+
 /// Size of the length prefix in bytes.
 pub const LEN_PREFIX_SIZE: usize = 4;
 
@@ -76,7 +81,7 @@ pub fn decode_length(prefix: [u8; LEN_PREFIX_SIZE]) -> Result<u32, ProtocolError
 pub fn split_header(body: &[u8]) -> Result<(FrameHeader, &[u8]), ProtocolError> {
     let (kind_byte, payload) = body.split_first().ok_or(ProtocolError::EmptyFrame)?;
     let kind = *kind_byte;
-    if kind != KIND_CONTROL && kind != KIND_OUTPUT {
+    if kind != KIND_CONTROL && kind != KIND_OUTPUT && kind != KIND_EVENT {
         return Err(ProtocolError::UnknownKind(kind));
     }
     let payload_len = u32::try_from(payload.len()).map_err(|_| ProtocolError::FrameTooLarge {
@@ -180,6 +185,23 @@ mod tests {
         assert_eq!(header.kind, KIND_OUTPUT);
         assert_eq!(header.payload_len, 3);
         assert_eq!(payload, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn split_header_accepts_event_kind() {
+        let (header, payload) = split_header(&[KIND_EVENT, 9, 8]).unwrap();
+        assert_eq!(header.kind, KIND_EVENT);
+        assert_eq!(header.payload_len, 2);
+        assert_eq!(payload, &[9, 8]);
+    }
+
+    #[test]
+    fn kind_constants_are_distinct() {
+        // Pin the three wire values so a future refactor cannot collide
+        // them silently. Deployed clients depend on these bytes.
+        assert_ne!(KIND_CONTROL, KIND_OUTPUT);
+        assert_ne!(KIND_CONTROL, KIND_EVENT);
+        assert_ne!(KIND_OUTPUT, KIND_EVENT);
     }
 
     #[test]
