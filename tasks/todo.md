@@ -88,13 +88,16 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 - [x] PTY handoff verified via Arc::strong_count — no respawn
 - [x] 607/607 tests green, clippy/fmt clean
 
-### C3: Header `on_drag` + tab bar drop target
-- [ ] Attach `on_drag` to the pane header element
-- [ ] Drag > 4px -> dispatch start + update events
-- [ ] Tab bar computes insertion index from cursor x; renders vertical placeholder
-- [ ] `DragPhase::End` over tab bar -> `pane.extract_to_tab`
-- [ ] Integration test: simulate full drag; assert new tab + reflow
-- [ ] Visual verify
+### C3: Header `on_drag` + tab bar drop target [DONE]
+- [x] `on_drag` attached to `.pane-grip` in `build_pane_header`; framework handles 4px threshold
+- [x] `DragPhase::Start/Update/End` dispatch to `drag.start_pane` / `drag.update` / `drag.end`
+- [x] Tab bar `on_resize` records absolute `tabbar_rect` (x = sidebar + resizer, y = titlebar height)
+- [x] `pane_drag_insertion_index` renders vertical `.tab-drop-placeholder` at computed slot
+- [x] `drag.end` dispatch extracts pane into new tab when cursor lies in `tabbar_rect`
+- [x] Pure hit-test helpers (`Rect::contains`, `resolve_tabbar_drop`) with 8 table-driven tests
+- [x] Grip handler end-to-end test: simulate Start/Update/End -> new tab appears, drag state clears
+- [x] 627/627 tests green, clippy clean, fmt clean
+- [ ] Visual verify: drag pane grip onto tab bar, placeholder appears, drop creates new tab (pending user)
 
 ### Checkpoint 3
 - [ ] PTY state survives extraction (history, cwd, running process intact)

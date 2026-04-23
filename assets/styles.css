@@ -924,6 +924,17 @@ body::after {
   color: var(--amber-50);
 }
 
+.tab-drop-placeholder {
+  align-self: stretch;
+  width: 3px;
+  margin: 4px 2px;
+  background: var(--amber-400);
+  border-radius: 1px;
+  box-shadow: 0 0 6px var(--amber-500);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
 .tab-add {
   align-self: center;
   margin-left: var(--sp-3);

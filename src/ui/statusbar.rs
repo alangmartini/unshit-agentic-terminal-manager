@@ -163,6 +163,7 @@ mod tests {
             clock_hhmm: "00:00".into(),
             keybinds: crate::keybinds::KeybindsState::default(),
             drag: crate::drag::DragState::default(),
+            tabbar_rect: crate::drag::Rect::default(),
         }
     }
 

@@ -7,8 +7,15 @@ use crate::ui::icons::*;
 
 pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let mut tabs = ElementDef::new(Tag::Div).with_class("tabs").with_id("tabs");
+    let placeholder_index = pane_drag_insertion_index(state);
     for (index, tab) in state.tabs.iter().enumerate() {
+        if Some(index) == placeholder_index {
+            tabs = tabs.with_child(build_tab_drop_placeholder());
+        }
         tabs = tabs.with_child(build_tab(index, tab, index == state.active_tab, shared));
+    }
+    if placeholder_index == Some(state.tabs.len()) {
+        tabs = tabs.with_child(build_tab_drop_placeholder());
     }
     let add_state = shared.clone();
     tabs = tabs.with_child(
@@ -66,10 +73,40 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                 .with_child(svg_icon(icon_settings())),
         );
 
+    let resize_state = shared.clone();
     ElementDef::new(Tag::Div)
         .with_class("tabbar")
         .with_child(tabs)
         .with_child(actions)
+        .on_resize(move |w, h| {
+            mutate_with(&resize_state, |st| {
+                // The tabbar lives immediately to the right of the
+                // sidebar and its 6px resizer, below the titlebar. The
+                // framework's on_resize only reports w/h, so we
+                // reconstruct the absolute origin from the sidebar
+                // width we already track plus CSS constants.
+                const TITLEBAR_HEIGHT: f32 = 34.0;
+                const SIDEBAR_RESIZER_WIDTH: f32 = 6.0;
+                st.tabbar_rect = crate::drag::Rect {
+                    x: st.sidebar_width + SIDEBAR_RESIZER_WIDTH,
+                    y: TITLEBAR_HEIGHT,
+                    width: w,
+                    height: h,
+                };
+            });
+        })
+}
+
+/// When a pane drag is active and the cursor is over the tab bar,
+/// returns the slot at which a dropped tab would be inserted so the
+/// renderer can place a visual placeholder there. `None` otherwise.
+fn pane_drag_insertion_index(state: &UiSnapshot) -> Option<usize> {
+    let (cursor_x, cursor_y) = state.drag.cursor()?;
+    crate::drag::resolve_tabbar_drop(cursor_x, cursor_y, state.tabbar_rect, state.tabs.len())
+}
+
+fn build_tab_drop_placeholder() -> ElementDef {
+    ElementDef::new(Tag::Div).with_class("tab-drop-placeholder")
 }
 
 fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedState) -> ElementDef {
@@ -483,5 +520,131 @@ mod tests {
         let el = build_tab(0, &tab, false, &shared);
         let close = find_by_class(&el, "tab-close").unwrap();
         assert!(close.on_click.is_some());
+    }
+
+    // -- tabbar drop-target geometry tracking --------------------------------
+
+    /// The tabbar root must carry an `on_resize` handler that keeps
+    /// `tabbar_rect.width` / `tabbar_rect.height` in sync with its real
+    /// size. Without this, the pane-drag drop hit-test has no target.
+    #[test]
+    fn tabbar_on_resize_updates_tabbar_rect() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_tabbar(&snap, &shared);
+
+        let resize = el
+            .on_resize
+            .as_ref()
+            .expect("tabbar must have on_resize for drop-zone tracking")
+            .clone();
+        resize(720.0, 38.0);
+
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.tabbar_rect.width, 720.0);
+        assert_eq!(guard.tabbar_rect.height, 38.0);
+    }
+
+    /// The tabbar lives to the right of the sidebar + its resizer. When
+    /// on_resize fires, the stored rect must reflect that absolute x/y
+    /// offset so cursor_x (in window coordinates) hit-tests correctly.
+    #[test]
+    fn tabbar_on_resize_records_absolute_origin() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.sidebar_width = 252.0;
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_tabbar(&snap, &shared);
+        let resize = el.on_resize.as_ref().unwrap().clone();
+        resize(548.0, 38.0);
+
+        let guard = shared.lock().unwrap();
+        assert!(
+            (guard.tabbar_rect.x - 258.0).abs() < 0.5,
+            "tabbar_rect.x should sit after sidebar + resizer (~258), got {}",
+            guard.tabbar_rect.x
+        );
+        assert!(
+            (guard.tabbar_rect.y - 34.0).abs() < 0.5,
+            "tabbar_rect.y should be titlebar height (~34), got {}",
+            guard.tabbar_rect.y
+        );
+    }
+
+    /// While a pane drag is in progress and the cursor is within the
+    /// tabbar, an insertion placeholder element must be rendered at the
+    /// computed slot so the user sees where the new tab will land.
+    #[test]
+    fn tabbar_renders_insertion_placeholder_during_pane_drag() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.tabs = vec![
+                make_tab("a", TabStatus::Running),
+                make_tab("b", TabStatus::Running),
+                make_tab("c", TabStatus::Running),
+            ];
+            guard.active_tab = 0;
+            guard.tabbar_rect = crate::drag::Rect {
+                x: 0.0,
+                y: 34.0,
+                width: 600.0,
+                height: 38.0,
+            };
+            guard.drag = crate::drag::DragState::DraggingPane {
+                pane: PaneId(1),
+                cursor_x: 400.0,
+                cursor_y: 50.0,
+            };
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_tabbar(&snap, &shared);
+        let tabs = &el.children[0];
+        assert!(
+            find_by_class(tabs, "tab-drop-placeholder").is_some(),
+            "insertion placeholder must appear during a pane drag over the tab bar"
+        );
+    }
+
+    /// When no drag is in progress, the placeholder is absent so it
+    /// doesn't take up space or interfere with click targets.
+    #[test]
+    fn tabbar_has_no_placeholder_when_idle() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_tabbar(&snap, &shared);
+        assert!(
+            find_by_class(&el, "tab-drop-placeholder").is_none(),
+            "placeholder must only appear during an active pane drag"
+        );
+    }
+
+    /// A pane drag whose cursor sits outside the tab bar (e.g. still
+    /// hovering the pane body) should not render the placeholder.
+    #[test]
+    fn tabbar_has_no_placeholder_when_drag_outside_tabbar() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.tabbar_rect = crate::drag::Rect {
+                x: 0.0,
+                y: 34.0,
+                width: 600.0,
+                height: 38.0,
+            };
+            guard.drag = crate::drag::DragState::DraggingPane {
+                pane: PaneId(1),
+                cursor_x: 300.0,
+                cursor_y: 400.0,
+            };
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_tabbar(&snap, &shared);
+        assert!(
+            find_by_class(&el, "tab-drop-placeholder").is_none(),
+            "placeholder must not render when cursor is outside the tab bar"
+        );
     }
 }

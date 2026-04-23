@@ -277,6 +277,10 @@ pub struct AppState {
     /// Transient drag state for pane-header / tab drags. `Idle` at rest,
     /// `DraggingPane { .. }` once the cursor exceeds the 4px threshold.
     pub drag: crate::drag::DragState,
+    /// Last measured tab bar rectangle in window coordinates. Populated
+    /// by `on_resize` on the `.tabbar` element and the sidebar width
+    /// tracking. Used by the pane-extract drag flow to hit-test drops.
+    pub tabbar_rect: crate::drag::Rect,
 }
 
 impl AppState {
@@ -359,6 +363,7 @@ impl AppState {
             ctx_menu: self.ctx_menu.clone(),
             keybinds: self.keybinds.clone(),
             drag: self.drag,
+            tabbar_rect: self.tabbar_rect,
         }
     }
 
@@ -405,6 +410,7 @@ pub struct UiSnapshot {
     pub ctx_menu: Option<CtxMenu>,
     pub keybinds: crate::keybinds::KeybindsState,
     pub drag: crate::drag::DragState,
+    pub tabbar_rect: crate::drag::Rect,
 }
 
 fn current_folder_name() -> String {
@@ -571,6 +577,7 @@ pub fn seed_state() -> AppState {
             crate::keybinds::loader::load_if_installed(),
         ),
         drag: crate::drag::DragState::default(),
+        tabbar_rect: crate::drag::Rect::default(),
     }
 }
 
@@ -1214,14 +1221,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         other if other.starts_with("drag.start_pane:") => dispatch_drag_start_pane(state, other),
         other if other.starts_with("drag.update:") => dispatch_drag_update(state, other),
-        "drag.end" => {
-            if state.drag.is_active() {
-                state.drag = crate::drag::DragState::Idle;
-                true
-            } else {
-                false
-            }
-        }
+        "drag.end" => dispatch_drag_end(state),
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
             true
@@ -1421,6 +1421,28 @@ fn dispatch_drag_start_pane(state: &mut AppState, cmd: &str) -> bool {
         cursor_x: x,
         cursor_y: y,
     };
+    true
+}
+
+/// Handle `drag.end`. When a pane drag was in progress and the cursor
+/// lies within the last-known tab-bar rect, extract the dragged pane
+/// into a new tab at the computed insertion index before clearing the
+/// drag state. Returns `true` iff a drag was actually in progress.
+fn dispatch_drag_end(state: &mut AppState) -> bool {
+    let crate::drag::DragState::DraggingPane {
+        pane,
+        cursor_x,
+        cursor_y,
+    } = state.drag
+    else {
+        return false;
+    };
+    if let Some(index) =
+        crate::drag::resolve_tabbar_drop(cursor_x, cursor_y, state.tabbar_rect, state.tabs.len())
+    {
+        mutate_extract_pane_to_tab(state, pane, index);
+    }
+    state.drag = crate::drag::DragState::Idle;
     true
 }
 
@@ -1687,6 +1709,7 @@ mod tests {
             ctx_menu: None,
             keybinds: crate::keybinds::KeybindsState::default(),
             drag: crate::drag::DragState::default(),
+            tabbar_rect: crate::drag::Rect::default(),
         }
     }
 
@@ -2711,6 +2734,98 @@ mod tests {
         assert!(!dispatch(&mut state, "drag.update:"));
         assert!(!dispatch(&mut state, "drag.update:1"));
         assert!(!dispatch(&mut state, "drag.update:x:y"));
+    }
+
+    #[test]
+    fn drag_end_over_tabbar_extracts_pane_to_new_tab() {
+        // A multi-pane tab with the cursor released over the tab bar
+        // should extract the dragged pane into its own tab at the
+        // computed insertion index.
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let extracted = state.active_pane;
+        let tabs_before = state.tabs.len();
+
+        state.tabbar_rect = crate::drag::Rect {
+            x: 0.0,
+            y: 34.0,
+            width: 800.0,
+            height: 38.0,
+        };
+
+        dispatch(
+            &mut state,
+            &format!("drag.start_pane:{}:400:300", extracted.0),
+        );
+        dispatch(&mut state, "drag.update:600:50");
+        assert!(dispatch(&mut state, "drag.end"));
+
+        assert_eq!(state.tabs.len(), tabs_before + 1, "new tab should be added");
+        assert_eq!(
+            state.drag,
+            crate::drag::DragState::Idle,
+            "drag state cleared"
+        );
+    }
+
+    #[test]
+    fn drag_end_outside_tabbar_does_not_extract() {
+        // A release with the cursor below the tab bar must not touch
+        // the tab list; drag state still clears.
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let extracted = state.active_pane;
+        let tabs_before = state.tabs.len();
+
+        state.tabbar_rect = crate::drag::Rect {
+            x: 0.0,
+            y: 34.0,
+            width: 800.0,
+            height: 38.0,
+        };
+
+        dispatch(
+            &mut state,
+            &format!("drag.start_pane:{}:400:300", extracted.0),
+        );
+        dispatch(&mut state, "drag.update:400:500");
+        assert!(dispatch(&mut state, "drag.end"));
+
+        assert_eq!(state.tabs.len(), tabs_before, "no extraction below tab bar");
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn drag_end_over_tabbar_inserts_at_cursor_position() {
+        // Dropping near the right edge of the tab bar should insert the
+        // new tab at the end; dropping near the left should insert near
+        // the beginning.
+        let mut state = seed_state();
+        mutate_add_tab(&mut state);
+        mutate_add_tab(&mut state);
+        state.active_tab = 1;
+        load_tab_state(&mut state);
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let extracted = state.active_pane;
+
+        state.tabbar_rect = crate::drag::Rect {
+            x: 0.0,
+            y: 34.0,
+            width: 900.0,
+            height: 38.0,
+        };
+
+        dispatch(
+            &mut state,
+            &format!("drag.start_pane:{}:400:300", extracted.0),
+        );
+        dispatch(&mut state, "drag.update:890:50");
+        dispatch(&mut state, "drag.end");
+
+        assert_eq!(state.active_tab, state.tabs.len() - 1, "inserted at end");
     }
 
     #[test]

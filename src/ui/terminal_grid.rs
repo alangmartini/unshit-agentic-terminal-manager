@@ -209,6 +209,7 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
     let split_h_state = shared.clone();
     let split_v_state = shared.clone();
     let close_state = shared.clone();
+    let grip_state = shared.clone();
     let header = ElementDef::new(Tag::Div)
         .with_class("pane-header")
         .with_child(
@@ -221,7 +222,34 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
                         // chars). Avoids an SVG allocation per pane
                         // which would blow the framework renderer's
                         // instance buffer past 4 panes.
-                        .with_text("\u{22EE}\u{22EE}"),
+                        .with_text("\u{22EE}\u{22EE}")
+                        .on_drag(move |ev| match ev.phase {
+                            DragPhase::Start => {
+                                mutate_with(&grip_state, |st| {
+                                    crate::state::dispatch(
+                                        st,
+                                        &format!("drag.start_pane:{}:{}:{}", pane_id.0, ev.x, ev.y),
+                                    );
+                                });
+                            }
+                            DragPhase::Update => {
+                                mutate_with(&grip_state, |st| {
+                                    crate::state::dispatch(
+                                        st,
+                                        &format!("drag.update:{}:{}", ev.x, ev.y),
+                                    );
+                                });
+                            }
+                            DragPhase::End => {
+                                mutate_with(&grip_state, |st| {
+                                    crate::state::dispatch(
+                                        st,
+                                        &format!("drag.update:{}:{}", ev.x, ev.y),
+                                    );
+                                    crate::state::dispatch(st, "drag.end");
+                                });
+                            }
+                        }),
                 )
                 .with_child(ElementDef::new(Tag::Span).with_class("pane-status-dot"))
                 .with_child(
@@ -1072,6 +1100,166 @@ mod tests {
         assert!(
             tree_has_text(&el, "shell"),
             "multi-pane header must display the pane title text"
+        );
+    }
+
+    /// The grip on the pane header is the drag source for the
+    /// pane-extract-to-tab flow (F4). It must carry an `on_drag`
+    /// handler so the framework tracks the pointer.
+    #[test]
+    fn pane_grip_has_on_drag_handler() {
+        let shared = test_shared();
+        let pane = make_pane(1);
+        let header = build_pane_header(&pane, &shared);
+        let left = &header.children[0];
+        let grip = &left.children[0];
+        assert!(grip.classes.contains(&"pane-grip".to_string()));
+        assert!(
+            grip.on_drag.is_some(),
+            "pane grip must have on_drag handler for extract-to-tab"
+        );
+    }
+
+    /// Invoking the grip's `on_drag` with a `Start` phase must transition
+    /// the app's drag state to `DraggingPane` for the owning pane id.
+    #[test]
+    fn pane_grip_on_drag_start_enters_dragging_state() {
+        use unshit::core::event::MouseButton;
+        use unshit::core::event::{DragEvent, DragPhase};
+        let shared = test_shared();
+        let pane = make_pane(42);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.panes = vec![vec![pane.clone()]];
+            guard.active_pane = pane.id;
+        }
+        let header = build_pane_header(&pane, &shared);
+        let grip = &header.children[0].children[0];
+        let handler = grip.on_drag.as_ref().unwrap().clone();
+        let start = DragEvent {
+            phase: DragPhase::Start,
+            x: 100.0,
+            y: 200.0,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            total_delta_x: 0.0,
+            total_delta_y: 0.0,
+            button: MouseButton::Left,
+        };
+        handler(&start);
+
+        let guard = shared.lock().unwrap();
+        match guard.drag {
+            crate::drag::DragState::DraggingPane { pane: p, .. } => {
+                assert_eq!(p, PaneId(42));
+            }
+            _ => panic!("expected DraggingPane state after DragPhase::Start"),
+        }
+    }
+
+    /// A `DragPhase::Update` event must refresh `cursor_x`/`cursor_y` on
+    /// the active drag so the extract-to-tab end handler can hit-test.
+    #[test]
+    fn pane_grip_on_drag_update_refreshes_cursor() {
+        use unshit::core::event::{DragEvent, DragPhase, MouseButton};
+        let shared = test_shared();
+        let pane = make_pane(7);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.panes = vec![vec![pane.clone()]];
+            guard.active_pane = pane.id;
+        }
+        let header = build_pane_header(&pane, &shared);
+        let grip = &header.children[0].children[0];
+        let handler = grip.on_drag.as_ref().unwrap().clone();
+        let start = DragEvent {
+            phase: DragPhase::Start,
+            x: 0.0,
+            y: 0.0,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            total_delta_x: 0.0,
+            total_delta_y: 0.0,
+            button: MouseButton::Left,
+        };
+        handler(&start);
+        let update = DragEvent {
+            phase: DragPhase::Update,
+            x: 321.0,
+            y: 54.0,
+            delta_x: 5.0,
+            delta_y: 2.0,
+            total_delta_x: 321.0,
+            total_delta_y: 54.0,
+            button: MouseButton::Left,
+        };
+        handler(&update);
+
+        assert_eq!(
+            shared.lock().unwrap().drag.cursor(),
+            Some((321.0, 54.0)),
+            "drag cursor must reflect the latest update event"
+        );
+    }
+
+    /// `DragPhase::End` over the tab bar must extract the pane into a
+    /// new tab. This exercises the full callback path from framework
+    /// event to dispatch to mutate_extract_pane_to_tab.
+    #[test]
+    fn pane_grip_on_drag_end_over_tabbar_extracts() {
+        use crate::state::mutate_split_right;
+        use unshit::core::event::{DragEvent, DragPhase, MouseButton};
+        let shared = test_shared();
+        let original;
+        let extracted;
+        {
+            let mut guard = shared.lock().unwrap();
+            original = guard.active_pane;
+            mutate_split_right(&mut guard, original);
+            extracted = guard.active_pane;
+            guard.tabbar_rect = crate::drag::Rect {
+                x: 0.0,
+                y: 34.0,
+                width: 800.0,
+                height: 38.0,
+            };
+        }
+        let tabs_before = shared.lock().unwrap().tabs.len();
+
+        let pane = Pane {
+            id: extracted,
+            title: "shell".into(),
+            subtitle: "bash".into(),
+            pid: 0,
+            cpu: 0.0,
+        };
+        let header = build_pane_header(&pane, &shared);
+        let grip = &header.children[0].children[0];
+        let handler = grip.on_drag.as_ref().unwrap().clone();
+
+        let mk = |phase, x, y| DragEvent {
+            phase,
+            x,
+            y,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            total_delta_x: 0.0,
+            total_delta_y: 0.0,
+            button: MouseButton::Left,
+        };
+        handler(&mk(DragPhase::Start, 400.0, 300.0));
+        handler(&mk(DragPhase::Update, 600.0, 50.0));
+        handler(&mk(DragPhase::End, 600.0, 50.0));
+
+        assert_eq!(
+            shared.lock().unwrap().tabs.len(),
+            tabs_before + 1,
+            "dropping on the tab bar must spawn a new tab"
+        );
+        assert_eq!(
+            shared.lock().unwrap().drag,
+            crate::drag::DragState::Idle,
+            "drag state must reset after end"
         );
     }
 
