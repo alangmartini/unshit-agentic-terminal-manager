@@ -6,6 +6,7 @@
 //! - a default key combo, and
 //! - a human label for the Settings UI.
 
+pub mod loader;
 pub mod registry;
 
 use unshit::core::shortcut::KeyCombo;

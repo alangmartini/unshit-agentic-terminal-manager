@@ -33,12 +33,12 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase B: Editable keybinds (F5)
 
-### B1: JSON persistence
-- [ ] Create `src/keybinds/loader.rs`
-- [ ] `load_user_keybinds` with missing-file and malformed-file fallbacks
-- [ ] `save_user_keybinds` with atomic write (`.tmp` + rename)
-- [ ] Confirm config dir resolver matches existing app usage
-- [ ] Unit tests: round-trip, missing, malformed, atomic
+### B1: JSON persistence [DONE]
+- [x] Create `src/keybinds/loader.rs`
+- [x] `load_user_keybinds` with missing-file and malformed-file fallbacks + unknown-id/bad-combo skip
+- [x] `save_user_keybinds` with atomic write (`.tmp` + rename)
+- [x] Config dir matches existing app usage (`com.godly.terminal` namespace under `dirs::config_dir()`)
+- [x] 10/10 unit tests green (round-trip, missing, malformed, atomic, overwrite, parent-dir, empty, namespace)
 
 ### B2: `AppState.keybinds` + dispatch arms
 - [ ] Add `keybinds: HashMap<KeybindAction, KeyCombo>` to `AppState`
