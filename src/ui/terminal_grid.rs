@@ -217,7 +217,11 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
                 .with_child(
                     ElementDef::new(Tag::Div)
                         .with_class("pane-grip")
-                        .with_svg(icon_grip()),
+                        // Text-based 6-dot grip (two VERTICAL ELLIPSIS
+                        // chars). Avoids an SVG allocation per pane
+                        // which would blow the framework renderer's
+                        // instance buffer past 4 panes.
+                        .with_text("\u{22EE}\u{22EE}"),
                 )
                 .with_child(ElementDef::new(Tag::Span).with_class("pane-status-dot"))
                 .with_child(

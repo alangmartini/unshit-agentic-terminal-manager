@@ -1087,16 +1087,15 @@ body::after {
   width: 14px;
   height: 20px;
   color: var(--fg-muted);
+  font-size: 14px;
+  line-height: 1;
+  letter-spacing: -3px;
   flex-shrink: 0;
   cursor: grab;
   opacity: 0.4;
+  user-select: none;
   transition: opacity var(--dur-fast) var(--ease-std),
               color var(--dur-fast) var(--ease-std);
-}
-
-.pane-grip svg {
-  width: 12px;
-  height: 14px;
 }
 
 .pane:hover .pane-grip,

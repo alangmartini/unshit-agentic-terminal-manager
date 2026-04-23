@@ -43,15 +43,21 @@ pub fn default_shortcut_bindings() -> Vec<(String, String)> {
 
 /// Convenience aliases that map a second combo to an existing action's
 /// dispatch command.
+///
+/// `Ctrl+Shift+V` and `Ctrl+Shift+H` follow the tmux convention where V
+/// means "stack panes vertically" (so the new pane lands below) and H
+/// means "stack panes horizontally" (so the new pane lands beside the
+/// current one). This way V and H are complements, not duplicates of
+/// the primary Ctrl+D / Ctrl+Shift+D bindings.
 fn alias_bindings() -> Vec<(String, String)> {
     vec![
         (
             "Ctrl+Shift+V".to_string(),
-            KeybindAction::SplitRight.dispatch_command().to_string(),
+            KeybindAction::SplitDown.dispatch_command().to_string(),
         ),
         (
             "Ctrl+Shift+H".to_string(),
-            KeybindAction::SplitDown.dispatch_command().to_string(),
+            KeybindAction::SplitRight.dispatch_command().to_string(),
         ),
         (
             "Ctrl+Shift+P".to_string(),
@@ -113,13 +119,15 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_v_aliases_split_right() {
-        assert_eq!(find("Ctrl+Shift+V").as_deref(), Some("pane.split_right"));
+    fn ctrl_shift_v_aliases_split_down() {
+        // tmux convention: V stacks panes vertically -> new pane below.
+        assert_eq!(find("Ctrl+Shift+V").as_deref(), Some("pane.split_down"));
     }
 
     #[test]
-    fn ctrl_shift_h_aliases_split_down() {
-        assert_eq!(find("Ctrl+Shift+H").as_deref(), Some("pane.split_down"));
+    fn ctrl_shift_h_aliases_split_right() {
+        // tmux convention: H stacks panes horizontally -> new pane beside.
+        assert_eq!(find("Ctrl+Shift+H").as_deref(), Some("pane.split_right"));
     }
 
     #[test]
