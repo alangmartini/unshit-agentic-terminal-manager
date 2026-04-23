@@ -9,11 +9,19 @@ use crate::ui::icons::*;
 pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let mut tabs = ElementDef::new(Tag::Div).with_class("tabs").with_id("tabs");
     let placeholder_index = pane_drag_insertion_index(state);
+    let dragging_source_id = state.drag.dragged_tab().map(|s| s.to_string());
     for (index, tab) in state.tabs.iter().enumerate() {
         if Some(index) == placeholder_index {
             tabs = tabs.with_child(build_tab_drop_placeholder());
         }
-        tabs = tabs.with_child(build_tab(index, tab, index == state.active_tab, shared));
+        let is_dragging = dragging_source_id.as_deref() == Some(tab.id.as_str());
+        tabs = tabs.with_child(build_tab(
+            index,
+            tab,
+            index == state.active_tab,
+            is_dragging,
+            shared,
+        ));
     }
     if placeholder_index == Some(state.tabs.len()) {
         tabs = tabs.with_child(build_tab_drop_placeholder());
@@ -115,7 +123,13 @@ fn build_tab_drop_placeholder() -> ElementDef {
         .with_key("tab-drop-placeholder")
 }
 
-fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedState) -> ElementDef {
+fn build_tab(
+    index: usize,
+    tab: &TerminalTab,
+    is_active: bool,
+    is_dragging_source: bool,
+    shared: &SharedState,
+) -> ElementDef {
     let status_class = match tab.status {
         TabStatus::Running => "running",
         TabStatus::Idle => "idle",
@@ -130,6 +144,9 @@ fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedSt
         .with_key(format!("tab:{}", tab.id));
     if is_active {
         btn = btn.with_class("active");
+    }
+    if is_dragging_source {
+        btn = btn.with_class("dragging");
     }
     let activate_state = shared.clone();
     btn = btn.on_click(move || {
@@ -339,7 +356,7 @@ mod tests {
     fn tab_active() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, true, &shared);
+        let el = build_tab(0, &tab, true, false, &shared);
 
         assert_eq!(el.tag, Tag::Button);
         assert!(has_class(&el, "tab"));
@@ -350,7 +367,7 @@ mod tests {
     fn tab_inactive() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, &shared);
+        let el = build_tab(0, &tab, false, false, &shared);
 
         assert!(has_class(&el, "tab"));
         assert!(!has_class(&el, "active"));
@@ -360,7 +377,7 @@ mod tests {
     fn tab_status_running() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, &shared);
+        let el = build_tab(0, &tab, false, false, &shared);
         let status = find_by_class(&el, "tab-status").unwrap();
         assert!(has_class(status, "running"));
     }
@@ -369,7 +386,7 @@ mod tests {
     fn tab_status_idle() {
         let shared = make_shared();
         let tab = make_tab("vim", TabStatus::Idle);
-        let el = build_tab(0, &tab, false, &shared);
+        let el = build_tab(0, &tab, false, false, &shared);
         let status = find_by_class(&el, "tab-status").unwrap();
         assert!(has_class(status, "idle"));
     }
@@ -378,7 +395,7 @@ mod tests {
     fn tab_status_stopped() {
         let shared = make_shared();
         let tab = make_tab("done", TabStatus::Stopped);
-        let el = build_tab(0, &tab, false, &shared);
+        let el = build_tab(0, &tab, false, false, &shared);
         let status = find_by_class(&el, "tab-status").unwrap();
         assert!(has_class(status, "stopped"));
     }
@@ -387,7 +404,7 @@ mod tests {
     fn tab_shows_name_and_subtitle() {
         let shared = make_shared();
         let tab = make_tab("myshell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, &shared);
+        let el = build_tab(0, &tab, false, false, &shared);
 
         let name_el = find_by_class(&el, "tab-name").unwrap();
         assert_eq!(text_of(name_el), Some("myshell"));
@@ -400,7 +417,7 @@ mod tests {
     fn tab_has_close_button() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, &shared);
+        let el = build_tab(0, &tab, false, false, &shared);
 
         let close = find_by_class(&el, "tab-close").unwrap();
         assert_eq!(text_of(close), Some("\u{00D7}"));
@@ -410,7 +427,7 @@ mod tests {
     fn tab_children_order() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, &shared);
+        let el = build_tab(0, &tab, false, false, &shared);
 
         // Expected order: status, name, subtitle, close
         assert_eq!(el.children.len(), 4);
@@ -547,7 +564,7 @@ mod tests {
     fn tab_has_click_handler_for_activation() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, &shared);
+        let el = build_tab(0, &tab, false, false, &shared);
         assert!(el.on_click.is_some());
     }
 
@@ -555,9 +572,64 @@ mod tests {
     fn tab_close_has_click_handler() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, &shared);
+        let el = build_tab(0, &tab, false, false, &shared);
         let close = find_by_class(&el, "tab-close").unwrap();
         assert!(close.on_click.is_some());
+    }
+
+    #[test]
+    fn tab_has_dragging_class_when_source_of_drag() {
+        let shared = make_shared();
+        let tab = make_tab("shell", TabStatus::Running);
+        let el = build_tab(0, &tab, false, true, &shared);
+        assert!(has_class(&el, "dragging"));
+    }
+
+    #[test]
+    fn tabbar_marks_only_source_tab_as_dragging() {
+        // Prepare a snapshot with two tabs and a DraggingTab state
+        // pointing at the second one; only that tab should carry the
+        // .dragging class so CSS can fade the source while the ghost
+        // follows the cursor.
+        use crate::state::{AppState, Pane, PaneId, TabStatus, TerminalTab};
+        let shared: SharedState = Arc::new(Mutex::new(seed_state()));
+        let mut state = seed_state();
+        let second_pane = Pane {
+            id: PaneId(999),
+            title: "second".into(),
+            subtitle: "bash".into(),
+            pid: 0,
+            cpu: 0.0,
+        };
+        let second_tab = TerminalTab {
+            id: "t-other".into(),
+            name: "other".into(),
+            subtitle: "bash".into(),
+            status: TabStatus::Running,
+            panes: vec![vec![second_pane]],
+            active_pane: PaneId(999),
+            row_ratios: vec![1.0],
+            col_ratios: vec![vec![1.0]],
+        };
+        state.tabs.push(second_tab);
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: "t-other".into(),
+            cursor_x: 0.0,
+            cursor_y: 0.0,
+        };
+        let snap = state.ui_snapshot();
+        let bar = build_tabbar(&snap, &shared);
+        let tabs_row = find_by_id(&bar, "tabs").unwrap();
+        let tab_buttons: Vec<&ElementDef> = tabs_row
+            .children
+            .iter()
+            .filter(|c| has_class(c, "tab"))
+            .collect();
+        assert_eq!(tab_buttons.len(), 2);
+        assert!(!has_class(tab_buttons[0], "dragging"));
+        assert!(has_class(tab_buttons[1], "dragging"));
+        // Silence unused warning on AppState alias import.
+        let _: fn() -> AppState = seed_state;
     }
 
     // -- tabbar drop-target geometry tracking --------------------------------

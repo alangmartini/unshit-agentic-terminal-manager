@@ -135,11 +135,13 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 - [x] Replaced stored `pane_rects` with pure `compute_pane_rects` + `grid_rect_from_state` used by both overlay and drag-end hit-test
 - [x] 20 new tests (reorder, drop_split per edge, dispatch arms, drag.end variants); 697/697 suite green, clippy/fmt clean
 
-### D4: Wire overlay + ghost placeholder
-- [ ] Mount overlay conditionally in `build_terminal_grid`
-- [ ] Source tab shows faded ghost; dragged label follows cursor
-- [ ] Drop outside window cancels
-- [ ] Visual verify:
+### D4: Wire overlay + ghost placeholder [DONE]
+- [x] `build_drop_zone_overlay` mounted at root in `main.rs` (same layer as drag ghost, Position::Fixed)
+- [x] Source tab gets `.tab.dragging` class (CSS fades it to 0.4 opacity); ghost extended to show tab label + subtitle
+- [x] Drop outside window falls through `dispatch_drag_end` tab branch with no hit and clears drag state
+- [x] 4 new tests (dragging-class on source tab only, ghost renders for tab drag with correct label, ghost `None` when dragged tab id missing)
+- [x] 701/701 suite green, clippy clean, fmt clean
+- [ ] Visual verify (pending user):
   - [ ] Drag B onto A's right edge -> B becomes right split of A
   - [ ] Drag B onto A's center -> B moves adjacent to A
   - [ ] Drag B outside window -> cancel

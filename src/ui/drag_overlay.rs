@@ -13,16 +13,25 @@ use unshit::core::style::types::{CssPosition, Dimension};
 use crate::state::UiSnapshot;
 
 /// Return the drag ghost element for the current snapshot, or `None`
-/// when no drag is in progress (or the dragged pane can't be resolved,
-/// which should not normally happen).
+/// when no drag is in progress. Resolves the label (title + subtitle)
+/// from either the dragged pane or the dragged tab, depending on the
+/// drag variant. Missing ids fall through to `None` rather than
+/// panicking so a torn-down pane/tab doesn't blow up rendering.
 pub fn build_drag_overlay(state: &UiSnapshot) -> Option<ElementDef> {
-    let pane_id = state.drag.dragged_pane()?;
     let (cursor_x, cursor_y) = state.drag.cursor()?;
-    let pane = state
-        .panes
-        .iter()
-        .flat_map(|row| row.iter())
-        .find(|p| p.id == pane_id)?;
+    let (title, subtitle) = if let Some(pane_id) = state.drag.dragged_pane() {
+        let pane = state
+            .panes
+            .iter()
+            .flat_map(|row| row.iter())
+            .find(|p| p.id == pane_id)?;
+        (pane.title.clone(), pane.subtitle.clone())
+    } else if let Some(tab_id) = state.drag.dragged_tab() {
+        let tab = state.tabs.iter().find(|t| t.id == tab_id)?;
+        (tab.name.clone(), tab.subtitle.clone())
+    } else {
+        return None;
+    };
 
     // Offset so the ghost hangs down/right of the cursor instead of
     // covering the arrow tip. The 12/8 offset mirrors common OS drag
@@ -39,12 +48,12 @@ pub fn build_drag_overlay(state: &UiSnapshot) -> Option<ElementDef> {
             .with_child(
                 ElementDef::new(Tag::Span)
                     .with_class("drag-ghost-title")
-                    .with_text(pane.title.clone()),
+                    .with_text(title),
             )
             .with_child(
                 ElementDef::new(Tag::Span)
                     .with_class("drag-ghost-subtitle")
-                    .with_text(format!("\u{00B7} {}", pane.subtitle)),
+                    .with_text(format!("\u{00B7} {}", subtitle)),
             ),
     )
 }
@@ -164,6 +173,37 @@ mod tests {
             pane: PaneId(9999),
             cursor_x: 100.0,
             cursor_y: 100.0,
+        };
+        let snap = state.ui_snapshot();
+        assert!(build_drag_overlay(&snap).is_none());
+    }
+
+    #[test]
+    fn overlay_renders_for_tab_drag_with_tab_label() {
+        let mut state = seed_state();
+        let tab_id = state.tabs[0].id.clone();
+        state.tabs[0].name = "alpha".into();
+        state.tabs[0].subtitle = "zsh".into();
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: tab_id,
+            cursor_x: 300.0,
+            cursor_y: 100.0,
+        };
+        let snap = state.ui_snapshot();
+        let el = build_drag_overlay(&snap).expect("tab drag must render a ghost");
+        let title = find_by_class(&el, "drag-ghost-title").unwrap();
+        assert_eq!(text_of(title), Some("alpha"));
+        let subtitle = find_by_class(&el, "drag-ghost-subtitle").unwrap();
+        assert_eq!(text_of(subtitle), Some("\u{00B7} zsh"));
+    }
+
+    #[test]
+    fn overlay_is_none_when_dragged_tab_not_in_state() {
+        let mut state = seed_state();
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: "does-not-exist".into(),
+            cursor_x: 50.0,
+            cursor_y: 50.0,
         };
         let snap = state.ui_snapshot();
         assert!(build_drag_overlay(&snap).is_none());
