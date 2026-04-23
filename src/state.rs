@@ -657,7 +657,8 @@ pub fn mutate_add_tab(state: &mut AppState) {
 
     // Spawn PTY eagerly so the terminal is live immediately.
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
-    match state.pty_manager.spawn(id_num, cols, rows) {
+    let workspace_id = active_workspace_num(state);
+    match state.pty_manager.spawn(id_num, workspace_id, cols, rows) {
         Ok(reader) => {
             state
                 .terminals
@@ -857,10 +858,11 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
     );
 
     let cwd = active_workspace_cwd(state);
+    let workspace_id = active_workspace_num(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
     match state
         .pty_manager
-        .spawn_in(id_num, cols, rows, cwd.as_deref())
+        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
     {
         Ok(reader) => {
             state
@@ -915,10 +917,11 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
     );
 
     let cwd = active_workspace_cwd(state);
+    let workspace_id = active_workspace_num(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
     match state
         .pty_manager
-        .spawn_in(id_num, cols, rows, cwd.as_deref())
+        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
     {
         Ok(reader) => {
             state
@@ -1233,6 +1236,18 @@ pub fn active_workspace_cwd(state: &AppState) -> Option<PathBuf> {
         .workspaces
         .get(state.active_workspace)
         .and_then(|ws| ws.path.clone())
+}
+
+/// Stable identifier of the active workspace on the wire. Threaded into
+/// `DaemonPty::spawn*` / `attach_or_spawn` so daemon-side `SessionInfo`
+/// records carry the workspace the pane belongs to, enabling
+/// cross-UI-run session reconciliation.
+pub fn active_workspace_num(state: &AppState) -> u32 {
+    state
+        .workspaces
+        .get(state.active_workspace)
+        .map(|ws| ws.num)
+        .unwrap_or(0)
 }
 
 pub fn find_active_pane(state: &UiSnapshot) -> &Pane {

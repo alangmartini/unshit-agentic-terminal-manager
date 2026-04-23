@@ -12,6 +12,14 @@
 //! through per-session std channels wrapped in `ChannelReader`, which
 //! fits the blocking reader loop `bridge.rs` runs under
 //! `spawn_blocking`.
+//!
+//! Slice 5 adds cross-UI-run session survival: sessions live on the
+//! daemon beyond a single shim's lifetime. On `connect_to`, the shim
+//! snapshots the daemon's session list and caches the mapping
+//! `(workspace_id, pane_id) -> session_id` so a subsequent
+//! `attach_or_spawn` for a surviving pane reattaches instead of
+//! spawning a second shell. The `Drop` impl no longer tears down
+//! sessions; only an explicit `destroy` / `destroy_all` does.
 
 use std::collections::HashMap;
 use std::io;
@@ -19,10 +27,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use tokio::sync::mpsc as tokio_mpsc;
 
 use unshit_ptyd::client::Client;
+use unshit_ptyd::protocol::message::{SessionInfo, SNAPSHOT_MAX_SCROLLBACK_LINES};
 use unshit_ptyd::protocol::{ProtocolError, Response, ServerEvent};
 use unshit_terminal_core::Snapshot;
 
@@ -34,6 +44,11 @@ pub struct DaemonPty {
 struct Inner {
     cmd_tx: tokio_mpsc::UnboundedSender<Command>,
     sessions: HashMap<u32, u64>,
+    /// Reconciliation cache populated on `connect_to` from the
+    /// daemon's current session list. Entries are consumed by
+    /// `attach_or_spawn` on cache hits so a second pane with the same
+    /// `(workspace_id, pane_id)` tuple still gets a fresh spawn.
+    reattach_cache: HashMap<(u32, u32), u64>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -42,6 +57,9 @@ enum Command {
         cols: u16,
         rows: u16,
         cwd: Option<PathBuf>,
+        workspace_id: u32,
+        pane_id: u32,
+        name: Option<String>,
         byte_tx: std_mpsc::Sender<Vec<u8>>,
         reply: std_mpsc::SyncSender<io::Result<u64>>,
     },
@@ -63,6 +81,9 @@ enum Command {
     },
     Kill {
         session_id: u64,
+    },
+    List {
+        reply: std_mpsc::SyncSender<io::Result<Vec<SessionInfo>>>,
     },
 }
 
@@ -95,8 +116,32 @@ impl DaemonPty {
                 self.inner = Some(Inner {
                     cmd_tx,
                     sessions: HashMap::new(),
+                    reattach_cache: HashMap::new(),
                     worker: Some(worker),
                 });
+                // Populate the reattach cache from the daemon. A failure
+                // here (fresh-daemon case, slow daemon, transient IO)
+                // only costs a cold start on the first pane; it must not
+                // make `connect_to` itself fail.
+                match self.list_sessions() {
+                    Ok(sessions) => {
+                        if let Some(inner) = self.inner.as_mut() {
+                            for info in sessions {
+                                if info.alive {
+                                    inner
+                                        .reattach_cache
+                                        .insert((info.workspace_id, info.pane_id), info.id);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "DaemonPty::connect_to: initial list_sessions failed, \
+                             starting with empty reattach cache: {e}"
+                        );
+                    }
+                }
                 Ok(())
             }
             Ok(Err(e)) => Err(e),
@@ -110,15 +155,17 @@ impl DaemonPty {
     pub fn spawn(
         &mut self,
         pane_id: u32,
+        workspace_id: u32,
         cols: u16,
         rows: u16,
     ) -> io::Result<Box<dyn io::Read + Send>> {
-        self.spawn_in(pane_id, cols, rows, None)
+        self.spawn_in(pane_id, workspace_id, cols, rows, None)
     }
 
     pub fn spawn_in(
         &mut self,
         pane_id: u32,
+        workspace_id: u32,
         cols: u16,
         rows: u16,
         cwd: Option<&Path>,
@@ -130,6 +177,9 @@ impl DaemonPty {
             cols,
             rows,
             cwd: cwd.map(Path::to_path_buf),
+            workspace_id,
+            pane_id,
+            name: None,
             byte_tx,
             reply: reply_tx,
         };
@@ -158,6 +208,44 @@ impl DaemonPty {
         let snapshot = reply_rx.recv().map_err(|_| worker_gone())??;
         inner.sessions.insert(pane_id, session_id);
         Ok((snapshot, Box::new(ChannelReader::new(byte_rx))))
+    }
+
+    /// Reconcile a pane against the daemon's surviving sessions: attach
+    /// to an existing session if one matches `(workspace_id, pane_id)`,
+    /// otherwise spawn a fresh one. Returns the snapshot (on attach) or
+    /// `None` (on fresh spawn) together with the live byte reader.
+    ///
+    /// Cache entries are consumed by hits so a second call with the
+    /// same `(workspace_id, pane_id)` tuple will spawn a fresh session
+    /// rather than double-attach.
+    pub fn attach_or_spawn(
+        &mut self,
+        pane_id: u32,
+        workspace_id: u32,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
+    ) -> io::Result<(Option<Snapshot>, Box<dyn io::Read + Send>)> {
+        let cache_hit = self
+            .inner
+            .as_mut()
+            .ok_or_else(not_connected)?
+            .reattach_cache
+            .remove(&(workspace_id, pane_id));
+        if let Some(session_id) = cache_hit {
+            match self.attach_to(pane_id, session_id, SNAPSHOT_MAX_SCROLLBACK_LINES as u32) {
+                Ok((snapshot, reader)) => return Ok((Some(snapshot), reader)),
+                Err(e) => {
+                    log::warn!(
+                        "attach_or_spawn: cached session {session_id} for pane {pane_id} \
+                         in workspace {workspace_id} failed to reattach ({e}); \
+                         falling back to fresh spawn"
+                    );
+                }
+            }
+        }
+        let reader = self.spawn_in(pane_id, workspace_id, cols, rows, cwd)?;
+        Ok((None, reader))
     }
 
     pub fn write(&mut self, pane_id: u32, data: &[u8]) -> io::Result<()> {
@@ -219,11 +307,35 @@ impl DaemonPty {
             .unwrap_or(false)
     }
 
+    pub fn list_sessions(&mut self) -> io::Result<Vec<SessionInfo>> {
+        let inner = self.inner.as_mut().ok_or_else(not_connected)?;
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<Vec<SessionInfo>>>(1);
+        inner
+            .cmd_tx
+            .send(Command::List { reply: reply_tx })
+            .map_err(|_| worker_gone())?;
+        // A short timeout keeps connect_to from hanging indefinitely if
+        // the daemon is unresponsive. Two seconds is long enough for
+        // any normal local IPC and short enough that a stuck daemon
+        // does not stall UI startup forever.
+        reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| worker_gone())?
+    }
+
     #[cfg(test)]
     fn session_id_for_pane(&self, pane_id: u32) -> Option<u64> {
         self.inner
             .as_ref()
             .and_then(|i| i.sessions.get(&pane_id).copied())
+    }
+
+    #[cfg(test)]
+    fn reattach_cache_len(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map(|i| i.reattach_cache.len())
+            .unwrap_or(0)
     }
 }
 
@@ -235,7 +347,10 @@ impl Default for DaemonPty {
 
 impl Drop for DaemonPty {
     fn drop(&mut self) {
-        self.destroy_all();
+        // Slice 5: sessions survive the shim. We no longer call
+        // `destroy_all` here; only explicit user-driven close paths
+        // (pane close, "kill all terminals") tear sessions down. The
+        // worker is still joined so the IPC thread exits cleanly.
         if let Some(mut inner) = self.inner.take() {
             // Dropping the sender lets the worker break out of cmd_rx.recv().
             drop(inner.cmd_tx);
@@ -353,11 +468,17 @@ fn worker_main(
                     cols,
                     rows,
                     cwd,
+                    workspace_id,
+                    pane_id,
+                    name,
                     byte_tx,
                     reply,
                 } => {
                     let cwd_string = cwd.map(|p| p.display().to_string());
-                    let result = match client.spawn_session(cols, rows, cwd_string, None).await {
+                    let result = match client
+                        .spawn_session(cols, rows, cwd_string, None, workspace_id, pane_id, name)
+                        .await
+                    {
                         Ok(Response::SessionSpawned { session_id, .. }) => {
                             if let Ok(mut guard) = sinks.lock() {
                                 guard.insert(session_id, byte_tx);
@@ -432,6 +553,14 @@ fn worker_main(
                     }
                     let _ = client.kill_session(session_id).await;
                 }
+                Command::List { reply } => {
+                    let result = match client.list_sessions().await {
+                        Ok(list) => Ok(list),
+                        Err(ProtocolError::Io(e)) => Err(e),
+                        Err(other) => Err(io::Error::other(other.to_string())),
+                    };
+                    let _ = reply.send(result);
+                }
             }
         }
 
@@ -466,7 +595,6 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -519,18 +647,25 @@ mod tests {
         let mut shim = DaemonPty::new();
         assert!(!shim.has(1));
 
-        let spawn_err = match shim.spawn(1, 80, 24) {
+        let spawn_err = match shim.spawn(1, 1, 80, 24) {
             Err(e) => e,
             Ok(_) => panic!("spawn on unconnected shim must fail"),
         };
         assert_eq!(spawn_err.kind(), io::ErrorKind::NotConnected);
-        let spawn_in_err = match shim.spawn_in(2, 80, 24, None) {
+        let spawn_in_err = match shim.spawn_in(2, 1, 80, 24, None) {
             Err(e) => e,
             Ok(_) => panic!("spawn_in on unconnected shim must fail"),
         };
         assert_eq!(spawn_in_err.kind(), io::ErrorKind::NotConnected);
         let write_err = shim.write(1, b"hi").unwrap_err();
         assert_eq!(write_err.kind(), io::ErrorKind::NotConnected);
+        let list_err = shim.list_sessions().unwrap_err();
+        assert_eq!(list_err.kind(), io::ErrorKind::NotConnected);
+        let attach_or_spawn_err = match shim.attach_or_spawn(1, 1, 80, 24, None) {
+            Err(e) => e,
+            Ok(_) => panic!("attach_or_spawn on unconnected shim must fail"),
+        };
+        assert_eq!(attach_or_spawn_err.kind(), io::ErrorKind::NotConnected);
 
         // resize / destroy / destroy_all must not panic when unconnected.
         shim.resize(1, 80, 24);
@@ -574,7 +709,7 @@ mod tests {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path);
             let pane_id = 7u32;
-            let mut reader = shim.spawn_in(pane_id, 80, 24, None).expect("spawn_in");
+            let mut reader = shim.spawn_in(pane_id, 1, 80, 24, None).expect("spawn_in");
             assert!(shim.has(pane_id));
 
             shim.write(pane_id, ECHO_CMD).expect("write");
@@ -639,7 +774,7 @@ mod tests {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path);
             let pane_id = 3u32;
-            let _reader = shim.spawn_in(pane_id, 80, 24, None).expect("spawn_in");
+            let _reader = shim.spawn_in(pane_id, 1, 80, 24, None).expect("spawn_in");
             assert!(shim.has(pane_id));
             shim.destroy(pane_id);
             assert!(!shim.has(pane_id));
@@ -661,8 +796,8 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path);
-            let _r1 = shim.spawn_in(1, 80, 24, None).expect("spawn 1");
-            let _r2 = shim.spawn_in(2, 80, 24, None).expect("spawn 2");
+            let _r1 = shim.spawn_in(1, 1, 80, 24, None).expect("spawn 1");
+            let _r2 = shim.spawn_in(2, 1, 80, 24, None).expect("spawn 2");
             assert!(shim.has(1));
             assert!(shim.has(2));
             shim.destroy_all();
@@ -700,7 +835,7 @@ mod tests {
             // connection registries in the daemon mean only this shim
             // can reach the session; attach_to via a fresh pane id
             // still works because both panes live on the same shim.
-            let _reader = shim.spawn_in(100, 80, 24, None).expect("spawn_in");
+            let _reader = shim.spawn_in(100, 1, 80, 24, None).expect("spawn_in");
             let session_id = shim
                 .session_id_for_pane(100)
                 .expect("spawn_in must register pane");
@@ -752,7 +887,7 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path);
-            let _reader_a = shim.spawn_in(10, 80, 24, None).expect("spawn_in");
+            let _reader_a = shim.spawn_in(10, 1, 80, 24, None).expect("spawn_in");
             let session_id = shim
                 .session_id_for_pane(10)
                 .expect("spawn_in must register pane");
@@ -823,39 +958,140 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn drop_shim_destroys_all_and_exits_worker() {
-        std::env::set_var("SHELL", TEST_SHELL);
+    async fn list_sessions_returns_empty_on_fresh_daemon() {
         let path = unique_socket_path();
         let daemon = start_daemon(&path).await;
 
-        let shim_path_for_spawn = path.clone();
+        let shim_path = path.clone();
         tokio::task::spawn_blocking(move || {
             let mut shim = DaemonPty::new();
-            connect_with_retry(&mut shim, &shim_path_for_spawn);
-            let _reader = shim.spawn_in(11, 80, 24, None).expect("spawn");
-            assert!(shim.has(11));
-            // Drop at end of scope sends Kill, then closes cmd_tx which
-            // exits the worker loop.
+            connect_with_retry(&mut shim, &shim_path);
+            let list = shim.list_sessions().expect("list_sessions");
+            assert!(
+                list.is_empty(),
+                "fresh daemon must have no sessions, got {list:?}"
+            );
+            assert_eq!(shim.reattach_cache_len(), 0);
         })
         .await
         .unwrap();
 
-        // Poll a fresh client: the prior client's session must have been
-        // reaped (either by our Kill, or by the connection drop from
-        // the worker going away).
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let (mut client, _events) = Client::connect_with_events(&path).await.unwrap();
-            let list = client.list_sessions().await.unwrap();
-            drop(client);
-            if list.is_empty() {
-                break;
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_or_spawn_cache_miss_spawns_fresh_session() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let (snapshot, _reader) = shim
+                .attach_or_spawn(1, 1, 80, 24, None)
+                .expect("attach_or_spawn");
+            assert!(snapshot.is_none(), "cache miss must spawn fresh");
+            assert!(shim.has(1));
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_or_spawn_cache_hit_attaches_to_existing_session() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let pane_id = 42u32;
+        let workspace_id = 7u32;
+
+        // Phase A: create a session via shim A, then drop shim A. The
+        // session must survive (slice 5 policy) so a fresh shim can
+        // reattach.
+        let shim_path_a = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path_a);
+            let _reader = shim
+                .spawn_in(pane_id, workspace_id, 80, 24, None)
+                .expect("spawn_in");
+        })
+        .await
+        .unwrap();
+
+        // Phase B: open a fresh shim against the same daemon and call
+        // attach_or_spawn with the same `(workspace_id, pane_id)`. It
+        // must hit the cache populated during connect_to and return a
+        // snapshot.
+        let shim_path_b = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path_b);
+            let (snapshot, mut reader) = shim
+                .attach_or_spawn(pane_id, workspace_id, 80, 24, None)
+                .expect("attach_or_spawn on survivor");
+            assert!(
+                snapshot.is_some(),
+                "attach_or_spawn must reattach when a matching session survives"
+            );
+            assert!(shim.has(pane_id));
+
+            // And a read does not immediately error. The reader may
+            // not have any immediate bytes to deliver (no writes since
+            // the first shell prompt) but it must not crash.
+            let mut buf = [0u8; 64];
+            match reader.read(&mut buf) {
+                Ok(_) => {}
+                Err(e) => panic!("reader erroring on attach survivor: {e}"),
             }
-            if std::time::Instant::now() >= deadline {
-                panic!("session was not reaped after shim drop: {list:?}");
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+            shim.destroy(pane_id);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_shim_no_longer_kills_daemon_sessions() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path_a = path.clone();
+        let spawned_session = tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path_a);
+            let _reader = shim.spawn_in(55, 9, 80, 24, None).expect("spawn");
+            // Drop shim at end of scope. Slice 5: this does NOT kill
+            // the daemon-side session.
+            shim.session_id_for_pane(55)
+                .expect("pane must be registered")
+        })
+        .await
+        .unwrap();
+
+        // Shim B: confirm the session survived shim A's drop.
+        let shim_path_b = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path_b);
+            let list = shim.list_sessions().expect("list_sessions");
+            assert!(
+                list.iter().any(|s| s.id == spawned_session && s.alive),
+                "session {spawned_session} should survive shim drop; got {list:?}"
+            );
+        })
+        .await
+        .unwrap();
 
         daemon.abort();
         let _ = daemon.await;

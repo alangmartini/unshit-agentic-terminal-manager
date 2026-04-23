@@ -411,12 +411,16 @@ fn main() {
         guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
     }
 
-    // Spawn initial PTY eagerly. This is load-bearing: without a terminal
-    // the CellGrid doesn't exist, the renderer can't publish metrics, and
-    // the PTY never gets spawned (deadlock). Estimate dimensions from the
-    // window size minus CSS chrome so the shell greeting is formatted for
-    // roughly the right width. on_cell_metrics corrects to exact values on
-    // the first frame.
+    // Reconcile the initial pane against any surviving daemon session
+    // (slice 5): if a prior UI run left a session with a matching
+    // `(workspace_id, pane_id)` on the daemon, reattach and replay its
+    // snapshot so the user sees their shell exactly as they left it;
+    // otherwise spawn a fresh one. This is load-bearing: without a live
+    // terminal the CellGrid doesn't exist, the renderer can't publish
+    // metrics, and the PTY never gets spawned (deadlock). Estimate
+    // dimensions from the window size minus CSS chrome so the shell
+    // greeting is formatted for roughly the right width; on_cell_metrics
+    // corrects to exact values on the first frame.
     {
         let mut guard = shared.lock().unwrap();
         // CSS chrome in logical pixels (scale cancels: grid and cells both
@@ -436,26 +440,50 @@ fn main() {
             cell_h_est,
         );
         let pane_id = guard.active_pane.0;
+        let workspace_id = crate::state::active_workspace_num(&guard);
         let cwd = crate::state::active_workspace_cwd(&guard);
-        let terminal = crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
-        guard.terminals.insert(
+        match guard.pty_manager.attach_or_spawn(
             pane_id,
-            std::sync::Arc::new(std::sync::Mutex::new(terminal)),
-        );
-        match guard
-            .pty_manager
-            .spawn_in(pane_id, init_cols, init_rows, cwd.as_deref())
-        {
-            Ok(reader) => {
+            workspace_id,
+            init_cols,
+            init_rows,
+            cwd.as_deref(),
+        ) {
+            Ok((Some(snapshot), reader)) => {
+                let rows = snapshot.grid.rows();
+                let cols = snapshot.grid.cols();
+                let mut terminal = crate::terminal::Terminal::new(rows, cols);
+                terminal.apply_snapshot(&snapshot);
+                guard.terminals.insert(
+                    pane_id,
+                    std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+                );
+                crate::bridge::register_reader(pane_id, reader);
+                log::info!(
+                    "reattached pane {} to surviving daemon session ({}x{})",
+                    pane_id,
+                    cols,
+                    rows
+                );
+            }
+            Ok((None, reader)) => {
+                let terminal =
+                    crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
+                guard.terminals.insert(
+                    pane_id,
+                    std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+                );
                 crate::bridge::register_reader(pane_id, reader);
             }
             Err(e) => {
                 log::error!("failed to spawn initial PTY: {}", e);
-                if let Some(t) = guard.terminals.get(&pane_id) {
-                    t.lock()
-                        .expect("terminal mutex poisoned")
-                        .process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
-                }
+                let mut terminal =
+                    crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
+                terminal.process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
+                guard.terminals.insert(
+                    pane_id,
+                    std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+                );
             }
         }
     }
@@ -496,11 +524,20 @@ fn main() {
                 guard.scale_factor = scale;
             })),
             on_close: Some(Arc::new(move || {
+                // Slice 5 session-survival policy: closing the window
+                // does NOT kill daemon-side sessions. Local UI state
+                // (terminals map, readers) is still cleared so the
+                // current process can exit cleanly, but the shells
+                // keep running on the daemon and the next UI launch
+                // reconciles them via `DaemonPty::attach_or_spawn`.
+                // Explicit user-driven teardown (pane close, tab close,
+                // "kill all terminals") continues to route through
+                // `DaemonPty::destroy` / `destroy_all`.
+                //
                 // Use .lock().ok() instead of .expect() so a poisoned mutex
                 // (from a panic on another thread) does not prevent us from
                 // reaching process::exit below.
                 if let Ok(mut guard) = close_shared.lock() {
-                    guard.pty_manager.destroy_all();
                     guard.terminals.clear();
                 }
                 // Flush heap profile (no-op without --features profiling) so

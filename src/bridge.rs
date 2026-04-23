@@ -209,27 +209,59 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                     cols, rows, cell_w, cell_h, w, h
                                 );
 
-                                // Spawn deferred PTYs for panes that have no
-                                // terminal yet. Issue #5: PTYs get correct
-                                // dimensions from the start.
+                                // Reconcile deferred panes against the daemon's
+                                // surviving sessions (slice 5). If a prior UI
+                                // run left a matching `(workspace_id, pane_id)`
+                                // session alive, attach to it and replay its
+                                // snapshot; otherwise spawn a fresh shell.
+                                // Issue #5: PTYs get correct dimensions from
+                                // the start.
                                 let all_pane_ids: Vec<u32> = guard
                                     .panes
                                     .iter()
                                     .flat_map(|row| row.iter().map(|p| p.id.0))
                                     .collect();
                                 let cwd = crate::state::active_workspace_cwd(&guard);
+                                let workspace_id = crate::state::active_workspace_num(&guard);
                                 for id in &all_pane_ids {
                                     if !guard.terminals.contains_key(id) {
-                                        let terminal = crate::terminal::Terminal::new(
-                                            rows as usize,
-                                            cols as usize,
-                                        );
-                                        guard.terminals.insert(
+                                        match guard.pty_manager.attach_or_spawn(
                                             *id,
-                                            std::sync::Arc::new(std::sync::Mutex::new(terminal)),
-                                        );
-                                        match guard.pty_manager.spawn_in(*id, cols, rows, cwd.as_deref()) {
-                                            Ok(reader) => {
+                                            workspace_id,
+                                            cols,
+                                            rows,
+                                            cwd.as_deref(),
+                                        ) {
+                                            Ok((Some(snapshot), reader)) => {
+                                                let snap_rows = snapshot.grid.rows();
+                                                let snap_cols = snapshot.grid.cols();
+                                                let mut terminal = crate::terminal::Terminal::new(
+                                                    snap_rows, snap_cols,
+                                                );
+                                                terminal.apply_snapshot(&snapshot);
+                                                guard.terminals.insert(
+                                                    *id,
+                                                    std::sync::Arc::new(std::sync::Mutex::new(
+                                                        terminal,
+                                                    )),
+                                                );
+                                                crate::bridge::register_reader(*id, reader);
+                                                log::info!(
+                                                    "deferred reattach for pane {}: {}x{}",
+                                                    id, snap_cols, snap_rows
+                                                );
+                                            }
+                                            Ok((None, reader)) => {
+                                                let terminal = crate::terminal::Terminal::new(
+                                                    rows as usize,
+                                                    cols as usize,
+                                                );
+                                                guard.terminals.insert(
+                                                    *id,
+                                                    std::sync::Arc::new(std::sync::Mutex::new(
+                                                        terminal,
+                                                    )),
+                                                );
                                                 crate::bridge::register_reader(*id, reader);
                                                 log::info!(
                                                     "deferred PTY spawn for pane {}: {}x{}",
@@ -241,17 +273,23 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                     "failed to spawn deferred PTY for pane {}: {}",
                                                     id, e
                                                 );
-                                                if let Some(t) = guard.terminals.get(id) {
-                                                    t.lock()
-                                                        .expect("terminal mutex poisoned")
-                                                        .process_bytes(
-                                                            format!(
-                                                                "Failed to spawn shell: {}\r\n",
-                                                                e
-                                                            )
-                                                            .as_bytes(),
-                                                        );
-                                                }
+                                                let mut terminal = crate::terminal::Terminal::new(
+                                                    rows as usize,
+                                                    cols as usize,
+                                                );
+                                                terminal.process_bytes(
+                                                    format!(
+                                                        "Failed to spawn shell: {}\r\n",
+                                                        e
+                                                    )
+                                                    .as_bytes(),
+                                                );
+                                                guard.terminals.insert(
+                                                    *id,
+                                                    std::sync::Arc::new(std::sync::Mutex::new(
+                                                        terminal,
+                                                    )),
+                                                );
                                             }
                                         }
                                     }
