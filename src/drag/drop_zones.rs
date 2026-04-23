@@ -31,6 +31,33 @@ pub enum DropZone {
     Center,
 }
 
+impl DropZone {
+    /// Lowercase command token used when encoding the zone in a
+    /// dispatch string (e.g. `pane.drop_split:7:left`).
+    pub fn id(self) -> &'static str {
+        match self {
+            DropZone::Left => "left",
+            DropZone::Right => "right",
+            DropZone::Top => "top",
+            DropZone::Bottom => "bottom",
+            DropZone::Center => "center",
+        }
+    }
+
+    /// Parse the token emitted by `id`. Returns `None` on any other
+    /// value so malformed commands can be rejected safely.
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(DropZone::Left),
+            "right" => Some(DropZone::Right),
+            "top" => Some(DropZone::Top),
+            "bottom" => Some(DropZone::Bottom),
+            "center" => Some(DropZone::Center),
+            _ => None,
+        }
+    }
+}
+
 /// Classify a cursor position relative to a pane rectangle.
 /// Returns `None` when the cursor is outside `rect`.
 pub fn hit_test(rect: Rect, cursor_x: f32, cursor_y: f32) -> Option<DropZone> {
@@ -255,6 +282,22 @@ mod tests {
             height: 0.0,
         };
         assert_eq!(hit_test(r, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn drop_zone_id_round_trip() {
+        for z in [
+            DropZone::Left,
+            DropZone::Right,
+            DropZone::Top,
+            DropZone::Bottom,
+            DropZone::Center,
+        ] {
+            assert_eq!(DropZone::from_id(z.id()), Some(z));
+        }
+        assert_eq!(DropZone::from_id("nonsense"), None);
+        assert_eq!(DropZone::from_id(""), None);
+        assert_eq!(DropZone::from_id("LEFT"), None, "casing is strict");
     }
 
     #[test]

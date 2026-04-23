@@ -124,15 +124,16 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 - [x] `DragState::DraggingTab { source_tab, cursor_x, cursor_y }` variant added; `drag.update` now refreshes cursor for both pane and tab drags
 - [x] `AppState.pane_rects` and `pane.rect:<pane>:<x>:<y>:<w>:<h>` dispatch arm (6 new tests); overlay module has 14 unit tests; 678/678 suite green, clippy/fmt clean
 
-### D3: Tab drag source + `pane.drop_split` + `tab.reorder`
-- [ ] Attach `on_drag` to each tab
-- [ ] Extend `DragState` with `DraggingTab { source_tab, cursor }`
-- [ ] Implement `drag.start_tab`, update, end
-- [ ] End resolution: edge zone -> `pane.drop_split`; center/tab bar -> `tab.reorder`
-- [ ] Implement `pane.drop_split:<target>:<edge>` (left|right splits column, top|bottom splits row)
-- [ ] Implement `tab.reorder:<source>:<index>`
-- [ ] Source tab removed (or closed if empty) after successful edge drop
-- [ ] Unit tests per edge + reorder
+### D3: Tab drag source + `pane.drop_split` + `tab.reorder` [DONE]
+- [x] `on_drag` on each tab button dispatches `drag.start_tab:<id>:<x>:<y>` / `drag.update` / `drag.end`
+- [x] `DragState::DraggingTab { source_tab, cursor }` (added in D2)
+- [x] `drag.start_tab` / `drag.update` / `drag.end` dispatch arms
+- [x] `drag.end` (tab variant): tab-bar -> `mutate_tab_reorder`; edge zone -> `mutate_pane_drop_split`; center zone -> reorder next to active tab
+- [x] `pane.drop_split:<target>:<edge>` dispatch arm (reads source from drag state; rejects center and no-drag states)
+- [x] `tab.reorder:<source>:<index>` dispatch arm (preserves active tab by id)
+- [x] Source tab removed after edge drop (single-pane-source restriction for safety)
+- [x] Replaced stored `pane_rects` with pure `compute_pane_rects` + `grid_rect_from_state` used by both overlay and drag-end hit-test
+- [x] 20 new tests (reorder, drop_split per edge, dispatch arms, drag.end variants); 697/697 suite green, clippy/fmt clean
 
 ### D4: Wire overlay + ghost placeholder
 - [ ] Mount overlay conditionally in `build_terminal_grid`

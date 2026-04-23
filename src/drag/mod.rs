@@ -99,6 +99,81 @@ impl Rect {
 /// tab's live rect.
 pub const TAB_WIDTH_ESTIMATE: f32 = 200.0;
 
+/// Width of the sidebar-to-tabbar resizer strip in CSS pixels. Keep
+/// in sync with `.sidebar-resizer` in the stylesheet; used when
+/// deriving the grid's left edge from sidebar_width.
+pub const SIDEBAR_RESIZER_WIDTH: f32 = 6.0;
+
+/// Compute the window-coordinate (CSS-pixel) rectangle of every pane
+/// in a row-major pane grid, given the grid's own rect. Pure and
+/// layout-free so the same logic drives both the visual overlay and
+/// the drag-end hit-test. Returns an empty vec when the grid has no
+/// area (no sensible rects to emit).
+pub fn compute_pane_rects(
+    panes: &[Vec<crate::state::Pane>],
+    row_ratios: &[f32],
+    col_ratios: &[Vec<f32>],
+    grid: Rect,
+) -> Vec<(crate::state::PaneId, Rect)> {
+    if grid.width <= 0.0 || grid.height <= 0.0 {
+        return Vec::new();
+    }
+    let total_row: f32 = row_ratios.iter().sum();
+    if total_row <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut y = grid.y;
+    for (row_idx, row) in panes.iter().enumerate() {
+        let row_ratio = *row_ratios.get(row_idx).unwrap_or(&0.0);
+        let row_h = grid.height * row_ratio / total_row;
+        let cols = col_ratios.get(row_idx).map(|c| c.as_slice()).unwrap_or(&[]);
+        let total_col: f32 = cols.iter().sum();
+        if total_col <= 0.0 {
+            y += row_h;
+            continue;
+        }
+        let mut x = grid.x;
+        for (col_idx, pane) in row.iter().enumerate() {
+            let col_ratio = *cols.get(col_idx).unwrap_or(&0.0);
+            let col_w = grid.width * col_ratio / total_col;
+            out.push((
+                pane.id,
+                Rect {
+                    x,
+                    y,
+                    width: col_w,
+                    height: row_h,
+                },
+            ));
+            x += col_w;
+        }
+        y += row_h;
+    }
+    out
+}
+
+/// Derive the terminal-grid rect from the standard layout fields the
+/// main UI tracks in state. Returns a zero-size rect until `on_resize`
+/// on the grid has run at least once (so the caller should treat the
+/// result as invalid when width or height is zero).
+pub fn grid_rect_from_state(
+    sidebar_width: f32,
+    tabbar_rect: Rect,
+    last_grid_width: f32,
+    last_grid_height: f32,
+    scale_factor: f32,
+) -> Rect {
+    let sf = scale_factor.max(1e-3);
+    Rect {
+        x: sidebar_width + SIDEBAR_RESIZER_WIDTH,
+        y: tabbar_rect.y + tabbar_rect.height,
+        width: last_grid_width / sf,
+        height: last_grid_height / sf,
+    }
+}
+
 /// Resolve the drop target for a dragged pane at the given cursor
 /// position. Returns the insertion index in the tab bar when the cursor
 /// is within `tabbar`, or `None` otherwise.

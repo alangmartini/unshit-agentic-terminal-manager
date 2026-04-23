@@ -1,4 +1,5 @@
 use unshit::core::element::*;
+use unshit::core::event::DragPhase;
 
 use crate::state::{
     dispatch, mutate_close_tab, mutate_with, SharedState, TabStatus, TerminalTab, UiSnapshot,
@@ -135,6 +136,33 @@ fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedSt
         mutate_with(&activate_state, |st| {
             dispatch(st, &format!("tab.switch:{}", index));
         });
+    });
+
+    // Drag source for F1: the user grabs a tab label and drops it on
+    // a pane zone (split) or the tab bar (reorder). The framework's
+    // 4px threshold keeps a regular click firing on_click instead.
+    let drag_state = shared.clone();
+    let drag_tab_id = tab.id.clone();
+    btn = btn.on_drag(move |ev| match ev.phase {
+        DragPhase::Start => {
+            mutate_with(&drag_state, |st| {
+                dispatch(
+                    st,
+                    &format!("drag.start_tab:{}:{}:{}", drag_tab_id, ev.x, ev.y),
+                );
+            });
+        }
+        DragPhase::Update => {
+            mutate_with(&drag_state, |st| {
+                dispatch(st, &format!("drag.update:{}:{}", ev.x, ev.y));
+            });
+        }
+        DragPhase::End => {
+            mutate_with(&drag_state, |st| {
+                dispatch(st, &format!("drag.update:{}:{}", ev.x, ev.y));
+                dispatch(st, "drag.end");
+            });
+        }
     });
 
     let close_state = shared.clone();
