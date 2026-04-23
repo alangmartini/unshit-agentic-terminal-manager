@@ -6,6 +6,7 @@
 //! arrive in slice 3.
 
 pub mod protocol;
+pub mod transport;
 
 /// Daemon version pulled from the crate manifest. Reported on the wire
 /// in `HelloAck` so clients can version-gate behavior.
