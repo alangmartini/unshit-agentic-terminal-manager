@@ -9,6 +9,7 @@ pub mod client;
 pub mod daemon;
 pub mod protocol;
 pub mod pty;
+pub mod session;
 pub mod transport;
 
 use std::path::PathBuf;
