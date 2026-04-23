@@ -105,6 +105,7 @@ workspace = true
 [dependencies]
 unshit = { path = "crates/unshit-framework/crates/unshit", features = ["async", "clipboard"] }
 unshit-ptyd = { path = "crates/unshit-ptyd" }
+unshit-terminal-core = { path = "crates/unshit-terminal-core" }
 cosmic-text = "0.12"
 portable-pty = "0.8"
 vte = "0.13"

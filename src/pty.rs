@@ -24,6 +24,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use unshit_ptyd::client::Client;
 use unshit_ptyd::protocol::{ProtocolError, Response, ServerEvent};
+use unshit_terminal_core::Snapshot;
 
 /// Shim around the daemon client that keeps the old `PtyManager` API.
 pub struct DaemonPty {
@@ -43,6 +44,12 @@ enum Command {
         cwd: Option<PathBuf>,
         byte_tx: std_mpsc::Sender<Vec<u8>>,
         reply: std_mpsc::SyncSender<io::Result<u64>>,
+    },
+    Attach {
+        session_id: u64,
+        scrollback_lines: u32,
+        byte_tx: std_mpsc::Sender<Vec<u8>>,
+        reply: std_mpsc::SyncSender<io::Result<Snapshot>>,
     },
     Write {
         session_id: u64,
@@ -132,6 +139,27 @@ impl DaemonPty {
         Ok(Box::new(ChannelReader::new(byte_rx)))
     }
 
+    pub fn attach_to(
+        &mut self,
+        pane_id: u32,
+        session_id: u64,
+        scrollback_lines: u32,
+    ) -> io::Result<(Snapshot, Box<dyn io::Read + Send>)> {
+        let inner = self.inner.as_mut().ok_or_else(not_connected)?;
+        let (byte_tx, byte_rx) = std_mpsc::channel::<Vec<u8>>();
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<Snapshot>>(1);
+        let cmd = Command::Attach {
+            session_id,
+            scrollback_lines,
+            byte_tx,
+            reply: reply_tx,
+        };
+        inner.cmd_tx.send(cmd).map_err(|_| worker_gone())?;
+        let snapshot = reply_rx.recv().map_err(|_| worker_gone())??;
+        inner.sessions.insert(pane_id, session_id);
+        Ok((snapshot, Box::new(ChannelReader::new(byte_rx))))
+    }
+
     pub fn write(&mut self, pane_id: u32, data: &[u8]) -> io::Result<()> {
         let inner = self.inner.as_mut().ok_or_else(not_connected)?;
         let session_id = *inner.sessions.get(&pane_id).ok_or_else(|| {
@@ -189,6 +217,13 @@ impl DaemonPty {
             .as_ref()
             .map(|i| i.sessions.contains_key(&pane_id))
             .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn session_id_for_pane(&self, pane_id: u32) -> Option<u64> {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.sessions.get(&pane_id).copied())
     }
 }
 
@@ -335,6 +370,36 @@ fn worker_main(
                         Ok(other) => Err(io::Error::other(format!("unexpected: {other:?}"))),
                         Err(ProtocolError::Io(e)) => Err(e),
                         Err(other) => Err(io::Error::other(other.to_string())),
+                    };
+                    let _ = reply.send(result);
+                }
+                Command::Attach {
+                    session_id,
+                    scrollback_lines,
+                    byte_tx,
+                    reply,
+                } => {
+                    // Register the sink before the RPC so live Output
+                    // events that arrive between the daemon accepting
+                    // the attach and us wiring up the route are not
+                    // dropped.
+                    if let Ok(mut guard) = sinks.lock() {
+                        guard.insert(session_id, byte_tx);
+                    }
+                    let result = match client.attach_session(session_id, scrollback_lines).await {
+                        Ok(snapshot) => Ok(snapshot),
+                        Err(ProtocolError::Io(e)) => {
+                            if let Ok(mut guard) = sinks.lock() {
+                                guard.remove(&session_id);
+                            }
+                            Err(e)
+                        }
+                        Err(other) => {
+                            if let Ok(mut guard) = sinks.lock() {
+                                guard.remove(&session_id);
+                            }
+                            Err(io::Error::other(other.to_string()))
+                        }
                     };
                     let _ = reply.send(result);
                 }
@@ -603,6 +668,152 @@ mod tests {
             shim.destroy_all();
             assert!(!shim.has(1));
             assert!(!shim.has(2));
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[test]
+    fn attach_to_on_unconnected_shim_returns_not_connected() {
+        let mut shim = DaemonPty::new();
+        let err = match shim.attach_to(1, 42, 0) {
+            Err(e) => e,
+            Ok(_) => panic!("attach_to on unconnected shim must fail"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_to_returns_snapshot_and_reader_for_live_session() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            // Spawn a session owned by this shim's connection. Per-
+            // connection registries in the daemon mean only this shim
+            // can reach the session; attach_to via a fresh pane id
+            // still works because both panes live on the same shim.
+            let _reader = shim.spawn_in(100, 80, 24, None).expect("spawn_in");
+            let session_id = shim
+                .session_id_for_pane(100)
+                .expect("spawn_in must register pane");
+
+            let (snapshot, mut reader) = shim
+                .attach_to(200, session_id, 0)
+                .expect("attach_to live session");
+            assert_eq!(snapshot.grid.rows(), 24);
+            assert_eq!(snapshot.grid.cols(), 80);
+
+            // Writing through the attached pane must reach the same
+            // session and the live reader must see SOMETHING back.
+            shim.write(200, ECHO_CMD).expect("write via attached pane");
+            let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+            let mut collected: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            while std::time::Instant::now() < deadline {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        if !collected.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            assert!(
+                !collected.is_empty(),
+                "attached reader should receive live output"
+            );
+            shim.destroy(200);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_to_registers_pane_mapping_so_write_targets_matching_session() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let _reader_a = shim.spawn_in(10, 80, 24, None).expect("spawn_in");
+            let session_id = shim
+                .session_id_for_pane(10)
+                .expect("spawn_in must register pane");
+
+            let (_snap, mut reader_b) = shim
+                .attach_to(300, session_id, 0)
+                .expect("attach_to live session");
+            assert!(shim.has(300));
+
+            // write + resize on the attached pane must not error.
+            shim.write(300, ECHO_CMD).expect("write via attached pane");
+            shim.resize(300, 120, 40);
+
+            // And the route is live: drain briefly, assert bytes flow.
+            let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+            let mut collected: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            while std::time::Instant::now() < deadline {
+                match reader_b.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        if !collected.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            assert!(
+                !collected.is_empty(),
+                "mapped pane should feed the attached reader"
+            );
+            shim.destroy(300);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_to_unknown_session_returns_error() {
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let err = match shim.attach_to(5, 9999, 0) {
+                Err(e) => e,
+                Ok(_) => panic!("attach_to on unknown session must fail"),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("session_not_found"),
+                "expected session_not_found in error, got: {msg}"
+            );
+            assert!(!shim.has(5));
         })
         .await
         .unwrap();
