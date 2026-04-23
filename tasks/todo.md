@@ -109,11 +109,11 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase D: Tab drag with 5-zone drop (F1)
 
-### D1: Drop-zone hit-testing
-- [ ] Create `src/drag/drop_zones.rs`
-- [ ] `DropZone` enum + `hit_test(rect, cursor) -> Option<DropZone>`
-- [ ] Edge zones = outer 25%; center = inner 50%; corner disambiguation
-- [ ] 20+ table-driven unit tests
+### D1: Drop-zone hit-testing [DONE]
+- [x] Create `src/drag/drop_zones.rs`
+- [x] `DropZone` enum + `hit_test(rect, cursor) -> Option<DropZone>`
+- [x] Edge zones = outer 25%; center = inner 50%; corner disambiguation (closer edge wins, tie -> vertical)
+- [x] 21 table-driven unit tests green; 659/659 suite, clippy/fmt clean
 
 ### D2: Overlay rendering
 - [ ] Create `src/drag/overlay.rs`

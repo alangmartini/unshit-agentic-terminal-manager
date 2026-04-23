@@ -7,6 +7,8 @@
 //! bar can react to cursor movement regardless of which element the
 //! pointer is currently over.
 
+pub mod drop_zones;
+
 use crate::state::PaneId;
 
 /// Global cursor tracking for in-progress drags.
