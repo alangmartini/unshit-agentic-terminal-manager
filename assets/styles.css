@@ -964,6 +964,24 @@ body::after {
   font-size: var(--t-xs);
 }
 
+.drop-zone-overlay {
+  pointer-events: none;
+  z-index: 900;
+}
+
+.drop-zone {
+  pointer-events: none;
+  border: 1px dashed rgba(212, 163, 72, 0.35);
+  background: rgba(212, 163, 72, 0.06);
+  transition: background var(--dur-fast), border-color var(--dur-fast), box-shadow var(--dur-fast);
+}
+
+.drop-zone.hovered {
+  background: rgba(212, 163, 72, 0.22);
+  border-color: var(--amber-400);
+  box-shadow: inset 0 0 12px rgba(212, 163, 72, 0.45);
+}
+
 .tab-add {
   align-self: center;
   margin-left: var(--sp-3);

@@ -115,12 +115,14 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 - [x] Edge zones = outer 25%; center = inner 50%; corner disambiguation (closer edge wins, tie -> vertical)
 - [x] 21 table-driven unit tests green; 659/659 suite, clippy/fmt clean
 
-### D2: Overlay rendering
-- [ ] Create `src/drag/overlay.rs`
-- [ ] Render 5-zone overlay per pane when `DragState::DraggingTab`
-- [ ] Highlight hovered zone; others outlined
-- [ ] `pointer-events: none` on overlay; hit-test uses `DragEvent.x/y`
-- [ ] CSS additions
+### D2: Overlay rendering [DONE]
+- [x] Create `src/drag/overlay.rs`
+- [x] Render 5-zone overlay per pane when `DragState::DraggingTab`
+- [x] Highlight hovered zone; others outlined
+- [x] `pointer-events: none` on overlay; hit-test driven by `DragState` cursor + `pane_rects`
+- [x] CSS additions (`.drop-zone-overlay`, `.drop-zone`, `.drop-zone.hovered`)
+- [x] `DragState::DraggingTab { source_tab, cursor_x, cursor_y }` variant added; `drag.update` now refreshes cursor for both pane and tab drags
+- [x] `AppState.pane_rects` and `pane.rect:<pane>:<x>:<y>:<w>:<h>` dispatch arm (6 new tests); overlay module has 14 unit tests; 678/678 suite green, clippy/fmt clean
 
 ### D3: Tab drag source + `pane.drop_split` + `tab.reorder`
 - [ ] Attach `on_drag` to each tab

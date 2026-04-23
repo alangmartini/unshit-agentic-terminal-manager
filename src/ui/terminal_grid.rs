@@ -1149,9 +1149,9 @@ mod tests {
         handler(&start);
 
         let guard = shared.lock().unwrap();
-        match guard.drag {
+        match &guard.drag {
             crate::drag::DragState::DraggingPane { pane: p, .. } => {
-                assert_eq!(p, PaneId(42));
+                assert_eq!(*p, PaneId(42));
             }
             _ => panic!("expected DraggingPane state after DragPhase::Start"),
         }
@@ -1256,9 +1256,8 @@ mod tests {
             tabs_before + 1,
             "dropping on the tab bar must spawn a new tab"
         );
-        assert_eq!(
-            shared.lock().unwrap().drag,
-            crate::drag::DragState::Idle,
+        assert!(
+            matches!(shared.lock().unwrap().drag, crate::drag::DragState::Idle),
             "drag state must reset after end"
         );
     }

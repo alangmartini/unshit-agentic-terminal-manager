@@ -8,6 +8,7 @@
 //! pointer is currently over.
 
 pub mod drop_zones;
+pub mod overlay;
 
 use crate::state::PaneId;
 
@@ -15,14 +16,23 @@ use crate::state::PaneId;
 ///
 /// `Idle` is the resting state; `DraggingPane` is entered when the
 /// user presses the pane header grip and exceeds the 4px threshold.
-/// The cursor fields are updated on each `drag.update` so overlays
-/// can render feedback at the current pointer position.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// `DraggingTab` is entered when a tab label is dragged and the
+/// framework fires a `DragPhase::Start`. The cursor fields are
+/// updated on each `drag.update` so overlays can render feedback at
+/// the current pointer position.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum DragState {
     #[default]
     Idle,
     DraggingPane {
         pane: PaneId,
+        cursor_x: f32,
+        cursor_y: f32,
+    },
+    /// `source_tab` is the stable tab id (matches `TerminalTab::id`)
+    /// so index shifts during the drag don't break the handoff.
+    DraggingTab {
+        source_tab: String,
         cursor_x: f32,
         cursor_y: f32,
     },
@@ -33,7 +43,15 @@ impl DragState {
     pub fn dragged_pane(&self) -> Option<PaneId> {
         match self {
             DragState::DraggingPane { pane, .. } => Some(*pane),
-            DragState::Idle => None,
+            _ => None,
+        }
+    }
+
+    /// `Some(tab_id)` while a tab drag is active, `None` otherwise.
+    pub fn dragged_tab(&self) -> Option<&str> {
+        match self {
+            DragState::DraggingTab { source_tab, .. } => Some(source_tab.as_str()),
+            _ => None,
         }
     }
 
@@ -46,6 +64,9 @@ impl DragState {
     pub fn cursor(&self) -> Option<(f32, f32)> {
         match self {
             DragState::DraggingPane {
+                cursor_x, cursor_y, ..
+            }
+            | DragState::DraggingTab {
                 cursor_x, cursor_y, ..
             } => Some((*cursor_x, *cursor_y)),
             DragState::Idle => None,
@@ -131,8 +152,22 @@ mod tests {
             cursor_y: 20.0,
         };
         assert_eq!(s.dragged_pane(), Some(PaneId(7)));
+        assert_eq!(s.dragged_tab(), None);
         assert!(s.is_active());
         assert_eq!(s.cursor(), Some((10.0, 20.0)));
+    }
+
+    #[test]
+    fn dragging_tab_reports_tab_and_is_active() {
+        let s = DragState::DraggingTab {
+            source_tab: "abc".into(),
+            cursor_x: 30.0,
+            cursor_y: 40.0,
+        };
+        assert_eq!(s.dragged_pane(), None);
+        assert_eq!(s.dragged_tab(), Some("abc"));
+        assert!(s.is_active());
+        assert_eq!(s.cursor(), Some((30.0, 40.0)));
     }
 
     fn tabbar(x: f32, y: f32, w: f32, h: f32) -> Rect {

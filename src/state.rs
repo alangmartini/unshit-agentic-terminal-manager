@@ -281,6 +281,11 @@ pub struct AppState {
     /// by `on_resize` on the `.tabbar` element and the sidebar width
     /// tracking. Used by the pane-extract drag flow to hit-test drops.
     pub tabbar_rect: crate::drag::Rect,
+    /// Last measured rectangle for each pane in window coordinates.
+    /// Populated by `on_resize` on the `.pane` element. Used by the
+    /// tab-drop flow to hit-test which pane (and which zone within it)
+    /// is under the cursor.
+    pub pane_rects: std::collections::HashMap<PaneId, crate::drag::Rect>,
 }
 
 impl AppState {
@@ -362,8 +367,9 @@ impl AppState {
             col_ratios: self.col_ratios.clone(),
             ctx_menu: self.ctx_menu.clone(),
             keybinds: self.keybinds.clone(),
-            drag: self.drag,
+            drag: self.drag.clone(),
             tabbar_rect: self.tabbar_rect,
+            pane_rects: self.pane_rects.clone(),
         }
     }
 
@@ -411,6 +417,7 @@ pub struct UiSnapshot {
     pub keybinds: crate::keybinds::KeybindsState,
     pub drag: crate::drag::DragState,
     pub tabbar_rect: crate::drag::Rect,
+    pub pane_rects: std::collections::HashMap<PaneId, crate::drag::Rect>,
 }
 
 fn current_folder_name() -> String {
@@ -578,6 +585,7 @@ pub fn seed_state() -> AppState {
         ),
         drag: crate::drag::DragState::default(),
         tabbar_rect: crate::drag::Rect::default(),
+        pane_rects: std::collections::HashMap::new(),
     }
 }
 
@@ -1222,6 +1230,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if other.starts_with("drag.start_pane:") => dispatch_drag_start_pane(state, other),
         other if other.starts_with("drag.update:") => dispatch_drag_update(state, other),
         "drag.end" => dispatch_drag_end(state),
+        other if other.starts_with("pane.rect:") => dispatch_pane_rect(state, other),
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
             true
@@ -1433,13 +1442,13 @@ fn dispatch_drag_start_pane(state: &mut AppState, cmd: &str) -> bool {
 /// into a new tab at the computed insertion index before clearing the
 /// drag state. Returns `true` iff a drag was actually in progress.
 fn dispatch_drag_end(state: &mut AppState) -> bool {
-    let crate::drag::DragState::DraggingPane {
-        pane,
-        cursor_x,
-        cursor_y,
-    } = state.drag
-    else {
-        return false;
+    let (pane, cursor_x, cursor_y) = match &state.drag {
+        crate::drag::DragState::DraggingPane {
+            pane,
+            cursor_x,
+            cursor_y,
+        } => (*pane, *cursor_x, *cursor_y),
+        _ => return false,
     };
     if let Some(index) =
         crate::drag::resolve_tabbar_drop(cursor_x, cursor_y, state.tabbar_rect, state.tabs.len())
@@ -1465,6 +1474,9 @@ fn dispatch_drag_update(state: &mut AppState, cmd: &str) -> bool {
     match &mut state.drag {
         crate::drag::DragState::DraggingPane {
             cursor_x, cursor_y, ..
+        }
+        | crate::drag::DragState::DraggingTab {
+            cursor_x, cursor_y, ..
         } => {
             *cursor_x = x / sf;
             *cursor_y = y / sf;
@@ -1472,6 +1484,46 @@ fn dispatch_drag_update(state: &mut AppState, cmd: &str) -> bool {
         }
         crate::drag::DragState::Idle => false,
     }
+}
+
+/// Parse `pane.rect:<pane_id>:<x>:<y>:<w>:<h>` and record the pane's
+/// measured rectangle in window (CSS) coordinates. Called from
+/// `on_resize` on each pane container so the tab-drop overlay can
+/// hit-test the cursor against the live layout. Returns `false` when
+/// the parts are malformed; unknown pane ids are still stored (the
+/// pane was there at some point and may be hit-tested again later if
+/// it returns).
+fn dispatch_pane_rect(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["pane.rect:".len()..];
+    let mut parts = rest.splitn(5, ':');
+    let (Some(pane_str), Some(x_str), Some(y_str), Some(w_str), Some(h_str)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return false;
+    };
+    let (Ok(pane_num), Ok(x), Ok(y), Ok(w), Ok(h)) = (
+        pane_str.parse::<u32>(),
+        x_str.parse::<f32>(),
+        y_str.parse::<f32>(),
+        w_str.parse::<f32>(),
+        h_str.parse::<f32>(),
+    ) else {
+        return false;
+    };
+    state.pane_rects.insert(
+        PaneId(pane_num),
+        crate::drag::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        },
+    );
+    true
 }
 
 /// Parse `pane.extract_to_tab:<pane_id>:<tab_index>` and apply.
@@ -1715,6 +1767,7 @@ mod tests {
             keybinds: crate::keybinds::KeybindsState::default(),
             drag: crate::drag::DragState::default(),
             tabbar_rect: crate::drag::Rect::default(),
+            pane_rects: std::collections::HashMap::new(),
         }
     }
 
@@ -2693,12 +2746,12 @@ mod tests {
 
         assert!(dispatch(&mut state, "drag.update:123:456"));
 
-        match state.drag {
+        match &state.drag {
             crate::drag::DragState::DraggingPane {
                 cursor_x, cursor_y, ..
             } => {
-                assert_eq!(cursor_x, 123.0);
-                assert_eq!(cursor_y, 456.0);
+                assert_eq!(*cursor_x, 123.0);
+                assert_eq!(*cursor_y, 456.0);
             }
             _ => panic!("drag state must remain DraggingPane"),
         }
@@ -2739,6 +2792,55 @@ mod tests {
         assert!(!dispatch(&mut state, "drag.update:"));
         assert!(!dispatch(&mut state, "drag.update:1"));
         assert!(!dispatch(&mut state, "drag.update:x:y"));
+    }
+
+    #[test]
+    fn dispatch_pane_rect_records_rectangle() {
+        let mut state = seed_state();
+        let pane = state.active_pane;
+        assert!(dispatch(
+            &mut state,
+            &format!("pane.rect:{}:100:200:300:400", pane.0),
+        ));
+        let rect = state.pane_rects.get(&pane).copied().unwrap();
+        assert_eq!(rect.x, 100.0);
+        assert_eq!(rect.y, 200.0);
+        assert_eq!(rect.width, 300.0);
+        assert_eq!(rect.height, 400.0);
+    }
+
+    #[test]
+    fn dispatch_pane_rect_overwrites_previous_value() {
+        let mut state = seed_state();
+        let pane = state.active_pane;
+        dispatch(&mut state, &format!("pane.rect:{}:0:0:50:50", pane.0));
+        dispatch(&mut state, &format!("pane.rect:{}:10:20:30:40", pane.0));
+        let rect = state.pane_rects.get(&pane).copied().unwrap();
+        assert_eq!(rect.x, 10.0);
+        assert_eq!(rect.width, 30.0);
+    }
+
+    #[test]
+    fn dispatch_pane_rect_rejects_malformed() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "pane.rect:"));
+        assert!(!dispatch(&mut state, "pane.rect:1"));
+        assert!(!dispatch(&mut state, "pane.rect:1:2:3:4"));
+        assert!(!dispatch(&mut state, "pane.rect:abc:1:2:3:4"));
+        assert!(!dispatch(&mut state, "pane.rect:1:x:2:3:4"));
+    }
+
+    #[test]
+    fn drag_update_refreshes_cursor_while_tab_dragging() {
+        let mut state = seed_state();
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: "tab-7".into(),
+            cursor_x: 0.0,
+            cursor_y: 0.0,
+        };
+        assert!(dispatch(&mut state, "drag.update:321:54"));
+        assert_eq!(state.drag.cursor(), Some((321.0, 54.0)));
+        assert_eq!(state.drag.dragged_tab(), Some("tab-7"));
     }
 
     #[test]

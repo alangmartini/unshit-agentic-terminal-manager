@@ -164,6 +164,7 @@ mod tests {
             keybinds: crate::keybinds::KeybindsState::default(),
             drag: crate::drag::DragState::default(),
             tabbar_rect: crate::drag::Rect::default(),
+            pane_rects: std::collections::HashMap::new(),
         }
     }
 
