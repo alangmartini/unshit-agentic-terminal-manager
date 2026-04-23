@@ -378,6 +378,23 @@ fn main() {
     }
     let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
 
+    // Bring the unshit-ptyd daemon up and wire the UI's DaemonPty shim
+    // to it. Uses a short-lived tokio runtime because connect_or_spawn
+    // is async; the shim's own worker thread drives every subsequent
+    // IPC call, so this runtime dies once the probe completes.
+    {
+        let socket_path = unshit_ptyd::transport::default_socket_path();
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime for daemon probe");
+        rt.block_on(daemon::connect_or_spawn(&socket_path))
+            .expect("connect or spawn unshit-ptyd daemon");
+        drop(rt);
+        let mut guard = shared.lock().unwrap();
+        guard
+            .pty_manager
+            .connect_to(&socket_path)
+            .expect("DaemonPty shim connect_to");
+    }
+
     // Measure the actual monospace cell width ratio for later use (split
     // pane spawns, etc.). Do NOT pre-publish cell metrics to the global
     // atomics: the pre-published values differ slightly from what the

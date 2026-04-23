@@ -12,14 +12,6 @@
 //! through per-session std channels wrapped in `ChannelReader`, which
 //! fits the blocking reader loop `bridge.rs` runs under
 //! `spawn_blocking`.
-//!
-//! The old `PtyManager` re-export is preserved so existing UI call
-//! sites keep compiling until the follow-up slice flips the field type
-//! in `AppState` over to `DaemonPty`.
-
-pub use unshit_ptyd::pty::{
-    build_powershell_cwd_args, default_shell, is_powershell_shell, PtyManager, PtyPair,
-};
 
 use std::collections::HashMap;
 use std::io;
