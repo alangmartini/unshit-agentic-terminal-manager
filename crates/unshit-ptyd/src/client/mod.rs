@@ -284,14 +284,14 @@ where
     loop {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(frame)) => frame,
-            Ok(None) => return,
-            Err(_) => return,
+            Ok(None) => break,
+            Err(_) => break,
         };
         match frame.kind {
             KIND_CONTROL => {
                 let resp: Response = match serde_json::from_slice(&frame.payload) {
                     Ok(r) => r,
-                    Err(_) => return,
+                    Err(_) => break,
                 };
                 let id = resp.id();
                 let mut guard = pending.lock().await;
@@ -302,28 +302,35 @@ where
             KIND_OUTPUT => {
                 let (session_id, bytes) = match decode_output_payload(&frame.payload) {
                     Ok(pair) => pair,
-                    Err(_) => return,
+                    Err(_) => break,
                 };
                 let event = ServerEvent::Output {
                     session_id,
                     bytes: bytes.to_vec(),
                 };
                 if events.send(event).await.is_err() {
-                    return;
+                    break;
                 }
             }
             KIND_EVENT => {
                 let event: ServerEvent = match serde_json::from_slice(&frame.payload) {
                     Ok(ev) => ev,
-                    Err(_) => return,
+                    Err(_) => break,
                 };
                 if events.send(event).await.is_err() {
-                    return;
+                    break;
                 }
             }
-            _ => return,
+            _ => break,
         }
     }
+    // Connection closed. Drop every pending oneshot Sender so in-flight
+    // roundtrips unblock with Err(UnexpectedEof) instead of deadlocking
+    // on rx.await. Without this, a daemon-side error that kills the
+    // socket mid-response (for example `FrameTooLarge` on an oversized
+    // `SessionAttached` payload) leaves waiting callers blocked forever.
+    let mut guard = pending.lock().await;
+    guard.clear();
 }
 
 #[cfg(test)]
