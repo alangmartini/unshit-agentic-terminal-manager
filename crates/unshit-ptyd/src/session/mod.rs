@@ -6,9 +6,10 @@
 //! [`tokio::sync::mpsc::Sender`] so the handler can forward them as
 //! `ServerEvent::Output` frames.
 //!
-//! Scope note: this module does NOT parse the byte stream with VTE yet,
-//! does NOT keep scrollback, and does NOT persist session identity. All
-//! three arrive in slices 4 and 5 (see SPEC.md section 11).
+//! Slice 4b: the session also owns an `unshit_terminal_core::Terminal`
+//! and feeds every PTY chunk through it in the reader task, so the
+//! daemon maintains authoritative grid plus scrollback state. Scrollback
+//! persistence and the attach RPC arrive in slice 4c.
 
 pub mod registry;
 
@@ -19,6 +20,10 @@ use std::sync::{Arc, Mutex};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use unshit_terminal_core::{Snapshot, Terminal};
+
+/// Default scrollback cap per session. Matches SPEC.md section 3 F3.
+const DEFAULT_SCROLLBACK: usize = 10_000;
 
 /// Size of the read buffer fed into the mpsc. Matches the value used
 /// elsewhere in the UI bridge so throughput characteristics do not drift
@@ -41,6 +46,10 @@ pub struct Session {
     /// Reader task handle; aborted on drop so the blocking read does not
     /// keep the child's master alive.
     reader_task: Option<JoinHandle<()>>,
+    /// Daemon-side terminal emulator. Every PTY chunk is parsed into
+    /// this in the reader task before being forwarded to the mpsc, so
+    /// `snapshot()` always reflects bytes already observed by clients.
+    terminal: Arc<Mutex<Terminal>>,
 }
 
 /// Internal representation of one PTY child, mirrored after the
@@ -105,8 +114,15 @@ impl Session {
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
 
+        let terminal = Arc::new(Mutex::new(Terminal::new(
+            rows as usize,
+            cols as usize,
+            DEFAULT_SCROLLBACK,
+        )));
+        let reader_terminal = Arc::clone(&terminal);
+
         let reader_task = tokio::task::spawn_blocking(move || {
-            run_reader(reader, tx);
+            run_reader(reader, tx, reader_terminal);
         });
 
         let session = Self {
@@ -120,6 +136,7 @@ impl Session {
             rows,
             pid,
             reader_task: Some(reader_task),
+            terminal,
         };
 
         Ok((session, rx))
@@ -136,8 +153,10 @@ impl Session {
         pty.writer.flush()
     }
 
-    /// Resizes the PTY. Best-effort: if the resize call fails we keep
-    /// the old dimensions so later accessors do not lie about reality.
+    /// Resizes the PTY and the daemon-side terminal. Best-effort: if
+    /// the PTY resize call fails we keep the old dimensions so later
+    /// accessors do not lie about reality, and we do not touch the
+    /// terminal either.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if let Some(pty) = self.pty.as_mut() {
             let new_size = PtySize {
@@ -149,7 +168,21 @@ impl Session {
             if pty.master.resize(new_size).is_ok() {
                 self.cols = cols;
                 self.rows = rows;
+                if let Ok(mut term) = self.terminal.lock() {
+                    term.resize(rows as usize, cols as usize);
+                }
             }
+        }
+    }
+
+    /// Returns a snapshot of the current grid plus up to
+    /// `scrollback_lines` most-recent scrollback rows. Never panics on a
+    /// poisoned mutex; returns a fresh snapshot sized to the current
+    /// dimensions in that case.
+    pub fn snapshot(&self, scrollback_lines: usize) -> Snapshot {
+        match self.terminal.lock() {
+            Ok(term) => term.snapshot(scrollback_lines),
+            Err(_) => Terminal::new(self.rows as usize, self.cols as usize, 0).snapshot(0),
         }
     }
 
@@ -201,12 +234,19 @@ impl Drop for Session {
     }
 }
 
-fn run_reader(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
+fn run_reader(
+    mut reader: Box<dyn Read + Send>,
+    tx: mpsc::Sender<Vec<u8>>,
+    terminal: Arc<Mutex<Terminal>>,
+) {
     let mut buf = vec![0u8; READ_BUF_LEN];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => {
+                if let Ok(mut term) = terminal.lock() {
+                    term.process_bytes(&buf[..n]);
+                }
                 let chunk = buf[..n].to_vec();
                 if tx.blocking_send(chunk).is_err() {
                     return;
@@ -310,5 +350,80 @@ mod tests {
         })
         .await;
         assert!(closed.is_ok(), "receiver should close once session dropped");
+    }
+
+    fn grid_text(snap: &Snapshot) -> String {
+        let grid = &snap.grid;
+        let mut s = String::new();
+        for r in 0..grid.rows() {
+            if let Some(row) = grid.row(r) {
+                for cell in row {
+                    s.push(cell.ch);
+                }
+                s.push('\n');
+            }
+        }
+        s
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_reflects_bytes_written_to_pty() {
+        let (mut session, mut rx) =
+            Session::spawn(10, 80, 24, None, Some(test_shell())).expect("spawn session");
+
+        #[cfg(windows)]
+        let payload = b"echo snapmarker\r\n";
+        #[cfg(unix)]
+        let payload = b"echo snapmarker\n";
+        session.write(payload).await.expect("write");
+
+        let _ = drain_for(&mut rx, Duration::from_millis(1500)).await;
+        let snap = session.snapshot(0);
+        let rendered = grid_text(&snap);
+        assert!(
+            rendered.contains("snapmarker"),
+            "expected snapshot to contain marker, got: {rendered:?}"
+        );
+
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_is_empty_for_fresh_session() {
+        let (mut session, _rx) =
+            Session::spawn(11, 80, 24, None, Some(test_shell())).expect("spawn session");
+        let snap = session.snapshot(0);
+        assert_eq!(snap.grid.rows(), 24);
+        assert_eq!(snap.grid.cols(), 80);
+        assert_eq!(snap.grid.cursor(), (0, 0));
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resize_propagates_to_terminal() {
+        let (mut session, _rx) =
+            Session::spawn(12, 80, 24, None, Some(test_shell())).expect("spawn session");
+        let snap = session.snapshot(0);
+        assert_eq!(snap.grid.rows(), 24);
+        assert_eq!(snap.grid.cols(), 80);
+
+        session.resize(120, 40);
+        let snap = session.snapshot(0);
+        assert_eq!(snap.grid.rows(), 40);
+        assert_eq!(snap.grid.cols(), 120);
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_on_dead_session_returns_empty_grid() {
+        let (mut session, _rx) =
+            Session::spawn(13, 80, 24, None, Some(test_shell())).expect("spawn session");
+        session.kill();
+        let snap = session.snapshot(0);
+        assert_eq!(snap.grid.rows(), 24);
+        assert_eq!(snap.grid.cols(), 80);
+        let (cr, cc) = snap.grid.cursor();
+        assert!(cr < snap.grid.rows(), "cursor row out of grid: {cr}");
+        assert!(cc < snap.grid.cols(), "cursor col out of grid: {cc}");
     }
 }

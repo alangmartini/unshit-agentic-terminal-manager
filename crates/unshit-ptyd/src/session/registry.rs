@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{mpsc, Mutex};
 
+use unshit_terminal_core::Snapshot;
+
 use super::Session;
 use crate::protocol::message::SessionInfo;
 
@@ -122,6 +124,14 @@ impl SessionRegistry {
         out
     }
 
+    /// Returns a snapshot of the session identified by `id`, or `None`
+    /// if the id is unknown. `scrollback_lines` bounds how many
+    /// most-recent scrollback rows ride along in the snapshot.
+    pub async fn snapshot(&self, id: u64, scrollback_lines: usize) -> Option<Snapshot> {
+        let guard = self.sessions.lock().await;
+        guard.get(&id).map(|s| s.snapshot(scrollback_lines))
+    }
+
     /// Returns how many sessions the registry currently holds.
     pub async fn len(&self) -> usize {
         self.sessions.lock().await.len()
@@ -196,5 +206,46 @@ mod tests {
         let reg = SessionRegistry::new();
         let err = reg.resize(99, 80, 24).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_none_for_unknown_id() {
+        let reg = SessionRegistry::new();
+        assert!(reg.snapshot(99, 0).await.is_none());
+    }
+
+    fn test_shell() -> &'static str {
+        #[cfg(windows)]
+        {
+            "cmd.exe"
+        }
+        #[cfg(unix)]
+        {
+            "/bin/sh"
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_round_trips_through_registry() {
+        let reg = SessionRegistry::new();
+        let (id, mut rx) = reg
+            .spawn(100, 30, None, Some(test_shell()))
+            .await
+            .expect("spawn");
+
+        #[cfg(windows)]
+        let payload = b"echo regmarker\r\n";
+        #[cfg(unix)]
+        let payload = b"echo regmarker\n";
+        reg.write(id, payload).await.expect("write");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::timeout_at(deadline, rx.recv()).await.is_ok() {}
+
+        let snap = reg.snapshot(id, 0).await.expect("snapshot");
+        assert_eq!(snap.grid.rows(), 30);
+        assert_eq!(snap.grid.cols(), 100);
+
+        reg.remove(id).await;
     }
 }
