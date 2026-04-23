@@ -32,14 +32,14 @@ async fn two_sessions_work_independently_on_one_connection() {
     let (mut client, mut events) = common::connect_with_events_retry(&path).await;
 
     let Response::SessionSpawned { session_id: a, .. } = client
-        .spawn_session(80, 24, None, Some(TEST_SHELL.into()))
+        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 0, None)
         .await
         .unwrap()
     else {
         panic!("expected SessionSpawned");
     };
     let Response::SessionSpawned { session_id: b, .. } = client
-        .spawn_session(80, 24, None, Some(TEST_SHELL.into()))
+        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 1, None)
         .await
         .unwrap()
     else {

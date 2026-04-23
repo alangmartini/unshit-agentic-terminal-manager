@@ -132,6 +132,9 @@ impl Client {
         rows: u16,
         cwd: Option<String>,
         shell: Option<String>,
+        workspace_id: u32,
+        pane_id: u32,
+        name: Option<String>,
     ) -> Result<Response, ProtocolError> {
         let id = self.alloc_id();
         let req = Request::SpawnSession {
@@ -140,6 +143,9 @@ impl Client {
             rows,
             cwd,
             shell,
+            workspace_id,
+            pane_id,
+            name,
         };
         self.roundtrip(req, id).await
     }
@@ -227,8 +233,10 @@ impl Client {
         }
     }
 
-    /// Slice 4 no-op that will mean "keep running" in slice 5. Exposed
-    /// now so the UI can start calling it today without churn later.
+    /// Detaches the current connection from `session_id`. The session
+    /// keeps running on the daemon; only this connection's forwarder is
+    /// torn down. A later `attach_session` on the same or a different
+    /// connection resumes streaming.
     pub async fn detach_session(&mut self, session_id: u64) -> Result<Response, ProtocolError> {
         let id = self.alloc_id();
         self.roundtrip(Request::DetachSession { id, session_id }, id)

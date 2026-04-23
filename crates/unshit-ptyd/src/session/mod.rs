@@ -50,6 +50,18 @@ pub struct Session {
     /// this in the reader task before being forwarded to the mpsc, so
     /// `snapshot()` always reflects bytes already observed by clients.
     terminal: Arc<Mutex<Terminal>>,
+    /// Swappable output sink. `None` when no client is attached; the
+    /// reader task still parses bytes into `terminal`, but nothing is
+    /// forwarded. `attach()` swaps in a fresh sender and returns the
+    /// matching receiver; `detach()` sets this back to `None`.
+    output_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    /// Workspace id tag used by the UI to match sessions back to panes
+    /// after a restart. Opaque to the daemon.
+    workspace_id: u32,
+    /// Pane id tag within the workspace. Opaque to the daemon.
+    pane_id: u32,
+    /// Optional human-friendly name for the session.
+    name: Option<String>,
 }
 
 /// Internal representation of one PTY child, mirrored after the
@@ -74,6 +86,9 @@ impl Session {
         rows: u16,
         cwd: Option<&Path>,
         shell: Option<&str>,
+        workspace_id: u32,
+        pane_id: u32,
+        name: Option<String>,
     ) -> std::io::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let pty_system = native_pty_system();
         let size = PtySize {
@@ -121,8 +136,11 @@ impl Session {
         )));
         let reader_terminal = Arc::clone(&terminal);
 
+        let output_tx = Arc::new(Mutex::new(Some(tx)));
+        let reader_output_tx = Arc::clone(&output_tx);
+
         let reader_task = tokio::task::spawn_blocking(move || {
-            run_reader(reader, tx, reader_terminal);
+            run_reader(reader, reader_output_tx, reader_terminal);
         });
 
         let session = Self {
@@ -137,9 +155,32 @@ impl Session {
             pid,
             reader_task: Some(reader_task),
             terminal,
+            output_tx,
+            workspace_id,
+            pane_id,
+            name,
         };
 
         Ok((session, rx))
+    }
+
+    /// Replaces the current output sender with a fresh channel and
+    /// returns the matching receiver. Any prior receiver is dropped;
+    /// the reader stops forwarding to it on the next chunk.
+    pub fn attach(&self) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        if let Ok(mut guard) = self.output_tx.lock() {
+            *guard = Some(tx);
+        }
+        rx
+    }
+
+    /// Clears the output sender. Future PTY output still lands in the
+    /// terminal but is not forwarded anywhere. No-op if already detached.
+    pub fn detach(&self) {
+        if let Ok(mut guard) = self.output_tx.lock() {
+            *guard = None;
+        }
     }
 
     /// Writes `bytes` to the PTY stdin. Uses `spawn_blocking` because
@@ -226,6 +267,18 @@ impl Session {
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
+
+    pub fn workspace_id(&self) -> u32 {
+        self.workspace_id
+    }
+
+    pub fn pane_id(&self) -> u32 {
+        self.pane_id
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
 }
 
 impl Drop for Session {
@@ -236,7 +289,7 @@ impl Drop for Session {
 
 fn run_reader(
     mut reader: Box<dyn Read + Send>,
-    tx: mpsc::Sender<Vec<u8>>,
+    output_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
     terminal: Arc<Mutex<Terminal>>,
 ) {
     let mut buf = vec![0u8; READ_BUF_LEN];
@@ -247,9 +300,14 @@ fn run_reader(
                 if let Ok(mut term) = terminal.lock() {
                     term.process_bytes(&buf[..n]);
                 }
-                let chunk = buf[..n].to_vec();
-                if tx.blocking_send(chunk).is_err() {
-                    return;
+                let tx_opt = output_tx.lock().ok().and_then(|g| g.clone());
+                if let Some(tx) = tx_opt {
+                    // Non-blocking: if the current client is slow or gone
+                    // we drop the chunk and rely on the terminal plus
+                    // scrollback as the source of truth. Never exit the
+                    // reader when the receiver is gone; a later attach
+                    // should still observe live output.
+                    let _ = tx.try_send(buf[..n].to_vec());
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -291,7 +349,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_emits_output_from_echo() {
         let (mut session, mut rx) =
-            Session::spawn(1, 80, 24, None, Some(test_shell())).expect("spawn session");
+            Session::spawn(1, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn session");
 
         #[cfg(windows)]
         let payload = b"echo session-hi\r\n";
@@ -312,7 +370,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resize_updates_recorded_dimensions() {
         let (mut session, _rx) =
-            Session::spawn(2, 80, 24, None, Some(test_shell())).expect("spawn session");
+            Session::spawn(2, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn session");
         assert_eq!(session.cols(), 80);
         assert_eq!(session.rows(), 24);
 
@@ -326,7 +384,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kill_is_idempotent_and_marks_session_dead() {
         let (mut session, _rx) =
-            Session::spawn(3, 80, 24, None, Some(test_shell())).expect("spawn session");
+            Session::spawn(3, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn session");
         assert!(
             session.alive(),
             "session must be alive immediately after spawn"
@@ -340,7 +398,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drop_kills_child_and_closes_receiver() {
         let (session, mut rx) =
-            Session::spawn(4, 80, 24, None, Some(test_shell())).expect("spawn session");
+            Session::spawn(4, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn session");
         drop(session);
 
         // With the session gone the reader task should stop and the
@@ -369,7 +427,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_reflects_bytes_written_to_pty() {
         let (mut session, mut rx) =
-            Session::spawn(10, 80, 24, None, Some(test_shell())).expect("spawn session");
+            Session::spawn(10, 80, 24, None, Some(test_shell()), 0, 0, None)
+                .expect("spawn session");
 
         #[cfg(windows)]
         let payload = b"echo snapmarker\r\n";
@@ -390,8 +449,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_is_empty_for_fresh_session() {
-        let (mut session, _rx) =
-            Session::spawn(11, 80, 24, None, Some(test_shell())).expect("spawn session");
+        let (mut session, _rx) = Session::spawn(11, 80, 24, None, Some(test_shell()), 0, 0, None)
+            .expect("spawn session");
         let snap = session.snapshot(0);
         assert_eq!(snap.grid.rows(), 24);
         assert_eq!(snap.grid.cols(), 80);
@@ -401,8 +460,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resize_propagates_to_terminal() {
-        let (mut session, _rx) =
-            Session::spawn(12, 80, 24, None, Some(test_shell())).expect("spawn session");
+        let (mut session, _rx) = Session::spawn(12, 80, 24, None, Some(test_shell()), 0, 0, None)
+            .expect("spawn session");
         let snap = session.snapshot(0);
         assert_eq!(snap.grid.rows(), 24);
         assert_eq!(snap.grid.cols(), 80);
@@ -416,8 +475,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_on_dead_session_returns_empty_grid() {
-        let (mut session, _rx) =
-            Session::spawn(13, 80, 24, None, Some(test_shell())).expect("spawn session");
+        let (mut session, _rx) = Session::spawn(13, 80, 24, None, Some(test_shell()), 0, 0, None)
+            .expect("spawn session");
         session.kill();
         let snap = session.snapshot(0);
         assert_eq!(snap.grid.rows(), 24);
@@ -425,5 +484,98 @@ mod tests {
         let (cr, cc) = snap.grid.cursor();
         assert!(cr < snap.grid.rows(), "cursor row out of grid: {cr}");
         assert!(cc < snap.grid.cols(), "cursor col out of grid: {cc}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_records_workspace_and_pane_metadata() {
+        let (session, _rx) = Session::spawn(
+            20,
+            80,
+            24,
+            None,
+            Some(test_shell()),
+            7,
+            3,
+            Some("scratch".into()),
+        )
+        .expect("spawn session");
+        assert_eq!(session.workspace_id(), 7);
+        assert_eq!(session.pane_id(), 3);
+        assert_eq!(session.name(), Some("scratch"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_replaces_prior_receiver_and_drops_it() {
+        let (mut session, original_rx) =
+            Session::spawn(21, 80, 24, None, Some(test_shell()), 0, 0, None)
+                .expect("spawn session");
+
+        let mut new_rx = session.attach();
+
+        #[cfg(windows)]
+        let payload = b"echo reattach-marker\r\n";
+        #[cfg(unix)]
+        let payload = b"echo reattach-marker\n";
+        session.write(payload).await.expect("write");
+
+        let got = drain_for(&mut new_rx, Duration::from_millis(1500)).await;
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.contains("reattach-marker"),
+            "new receiver should observe live bytes, got: {text:?}"
+        );
+
+        // Original receiver was dropped and replaced on attach; any bytes
+        // that slipped through before the swap cannot include the marker.
+        drop(original_rx);
+
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detach_clears_tx_but_keeps_terminal_parsing() {
+        let (mut session, rx) = Session::spawn(22, 80, 24, None, Some(test_shell()), 0, 0, None)
+            .expect("spawn session");
+        drop(rx);
+        session.detach();
+
+        #[cfg(windows)]
+        let payload = b"echo detachmarker\r\n";
+        #[cfg(unix)]
+        let payload = b"echo detachmarker\n";
+        session.write(payload).await.expect("write");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let snap = session.snapshot(0);
+        let rendered = grid_text(&snap);
+        assert!(
+            rendered.contains("detachmarker"),
+            "terminal must keep parsing while detached, got: {rendered:?}"
+        );
+
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reader_does_not_exit_when_output_receiver_dropped() {
+        let (mut session, rx) = Session::spawn(23, 80, 24, None, Some(test_shell()), 0, 0, None)
+            .expect("spawn session");
+        drop(rx);
+
+        #[cfg(windows)]
+        let payload = b"echo livemarker\r\n";
+        #[cfg(unix)]
+        let payload = b"echo livemarker\n";
+        session.write(payload).await.expect("write");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let snap = session.snapshot(0);
+        let rendered = grid_text(&snap);
+        assert!(
+            rendered.contains("livemarker"),
+            "reader must not exit because the client went away, got: {rendered:?}"
+        );
+
+        session.kill();
     }
 }

@@ -62,12 +62,36 @@ impl SessionRegistry {
         rows: u16,
         cwd: Option<&Path>,
         shell: Option<&str>,
+        workspace_id: u32,
+        pane_id: u32,
+        name: Option<String>,
     ) -> std::io::Result<(u64, mpsc::Receiver<Vec<u8>>)> {
         let id = self.next_id();
-        let (session, rx) = Session::spawn(id, cols, rows, cwd, shell)?;
+        let (session, rx) =
+            Session::spawn(id, cols, rows, cwd, shell, workspace_id, pane_id, name)?;
         let mut guard = self.sessions.lock().await;
         guard.insert(id, session);
         Ok((id, rx))
+    }
+
+    /// Swaps the session's output sender for a fresh one and returns the
+    /// matching receiver. Returns `None` if no session matches `id`.
+    pub async fn attach(&self, id: u64) -> Option<mpsc::Receiver<Vec<u8>>> {
+        let guard = self.sessions.lock().await;
+        guard.get(&id).map(|s| s.attach())
+    }
+
+    /// Clears the session's output sender. Returns `true` if a session
+    /// matched `id`, `false` otherwise.
+    pub async fn detach(&self, id: u64) -> bool {
+        let guard = self.sessions.lock().await;
+        match guard.get(&id) {
+            Some(s) => {
+                s.detach();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Writes `bytes` to the session with the given id.
@@ -118,6 +142,9 @@ impl SessionRegistry {
                 rows: s.rows(),
                 alive: s.alive(),
                 pid: s.pid(),
+                workspace_id: s.workspace_id(),
+                pane_id: s.pane_id(),
+                name: s.name().map(|n| n.to_string()),
             })
             .collect();
         out.sort_by_key(|info| info.id);
@@ -229,7 +256,7 @@ mod tests {
     async fn snapshot_round_trips_through_registry() {
         let reg = SessionRegistry::new();
         let (id, mut rx) = reg
-            .spawn(100, 30, None, Some(test_shell()))
+            .spawn(100, 30, None, Some(test_shell()), 0, 0, None)
             .await
             .expect("spawn");
 
@@ -245,6 +272,89 @@ mod tests {
         let snap = reg.snapshot(id, 0).await.expect("snapshot");
         assert_eq!(snap.grid.rows(), 30);
         assert_eq!(snap.grid.cols(), 100);
+
+        reg.remove(id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_stores_workspace_and_pane_metadata() {
+        let reg = SessionRegistry::new();
+        let (id, _rx) = reg
+            .spawn(80, 24, None, Some(test_shell()), 4, 2, Some("alpha".into()))
+            .await
+            .expect("spawn");
+
+        let list = reg.list().await;
+        let info = list.iter().find(|s| s.id == id).expect("listed");
+        assert_eq!(info.workspace_id, 4);
+        assert_eq!(info.pane_id, 2);
+        assert_eq!(info.name.as_deref(), Some("alpha"));
+
+        reg.remove(id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_returns_full_metadata_for_every_session() {
+        let reg = SessionRegistry::new();
+        let (a, _rx_a) = reg
+            .spawn(80, 24, None, Some(test_shell()), 1, 0, Some("a".into()))
+            .await
+            .expect("spawn a");
+        let (b, _rx_b) = reg
+            .spawn(90, 30, None, Some(test_shell()), 2, 1, None)
+            .await
+            .expect("spawn b");
+
+        let list = reg.list().await;
+        assert_eq!(list.len(), 2);
+        let info_a = list.iter().find(|s| s.id == a).expect("a listed");
+        let info_b = list.iter().find(|s| s.id == b).expect("b listed");
+        assert_eq!(info_a.workspace_id, 1);
+        assert_eq!(info_a.pane_id, 0);
+        assert_eq!(info_a.name.as_deref(), Some("a"));
+        assert_eq!(info_b.workspace_id, 2);
+        assert_eq!(info_b.pane_id, 1);
+        assert_eq!(info_b.name, None);
+
+        reg.remove(a).await;
+        reg.remove(b).await;
+    }
+
+    #[tokio::test]
+    async fn attach_returns_none_for_unknown_id() {
+        let reg = SessionRegistry::new();
+        assert!(reg.attach(999).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn detach_is_noop_on_unknown_id() {
+        let reg = SessionRegistry::new();
+        assert!(!reg.detach(999).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_returns_receiver_for_known_session() {
+        let reg = SessionRegistry::new();
+        let (id, _original_rx) = reg
+            .spawn(80, 24, None, Some(test_shell()), 0, 0, None)
+            .await
+            .expect("spawn");
+
+        let new_rx = reg.attach(id).await.expect("attach");
+        drop(new_rx);
+
+        reg.remove(id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detach_returns_true_for_known_session() {
+        let reg = SessionRegistry::new();
+        let (id, _rx) = reg
+            .spawn(80, 24, None, Some(test_shell()), 0, 0, None)
+            .await
+            .expect("spawn");
+
+        assert!(reg.detach(id).await);
 
         reg.remove(id).await;
     }

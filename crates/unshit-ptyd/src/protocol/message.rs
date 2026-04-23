@@ -51,6 +51,10 @@ pub enum Request {
         cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shell: Option<String>,
+        workspace_id: u32,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     /// Write `bytes` to the PTY stdin of `session_id`.
     Write {
@@ -113,6 +117,10 @@ pub struct SessionInfo {
     pub alive: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    pub workspace_id: u32,
+    pub pane_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Daemon-to-client control responses and errors.
@@ -490,6 +498,9 @@ mod tests {
             rows: 40,
             cwd: Some("/tmp".into()),
             shell: None,
+            workspace_id: 2,
+            pane_id: 5,
+            name: Some("scratch".into()),
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(
@@ -498,6 +509,50 @@ mod tests {
         );
         let back: Request = serde_json::from_str(&s).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn spawn_session_omits_name_when_none() {
+        let req = Request::SpawnSession {
+            id: 12,
+            cols: 80,
+            rows: 24,
+            cwd: None,
+            shell: None,
+            workspace_id: 0,
+            pane_id: 0,
+            name: None,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(
+            !s.contains("\"name\""),
+            "None name must be omitted on the wire: {s}"
+        );
+        assert!(s.contains("\"workspace_id\":0"), "{s}");
+        assert!(s.contains("\"pane_id\":0"), "{s}");
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn session_info_omits_name_when_none() {
+        let info = SessionInfo {
+            id: 1,
+            cols: 80,
+            rows: 24,
+            alive: true,
+            pid: None,
+            workspace_id: 7,
+            pane_id: 3,
+            name: None,
+        };
+        let s = serde_json::to_string(&info).unwrap();
+        assert!(
+            !s.contains("\"name\""),
+            "None name must be omitted on the wire: {s}"
+        );
+        let back: SessionInfo = serde_json::from_str(&s).unwrap();
+        assert_eq!(info, back);
     }
 
     #[test]
@@ -546,6 +601,9 @@ mod tests {
                     rows: 24,
                     alive: true,
                     pid: Some(1234),
+                    workspace_id: 0,
+                    pane_id: 1,
+                    name: Some("shell".into()),
                 },
                 SessionInfo {
                     id: 2,
@@ -553,6 +611,9 @@ mod tests {
                     rows: 30,
                     alive: false,
                     pid: None,
+                    workspace_id: 1,
+                    pane_id: 0,
+                    name: None,
                 },
             ],
         };
@@ -654,7 +715,10 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 cwd: None,
-                shell: None
+                shell: None,
+                workspace_id: 0,
+                pane_id: 0,
+                name: None,
             }
             .id(),
             31

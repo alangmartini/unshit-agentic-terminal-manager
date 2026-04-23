@@ -1,9 +1,10 @@
 //! Per-connection request handler.
 //!
-//! Each connection gets its own [`SessionRegistry`]. A session spawned
-//! from a connection is implicitly cleaned up when that connection
-//! closes, matching the current in-process UI behavior (close UI,
-//! shells die). Slice 5 will introduce cross-connection persistence.
+//! Each connection gets its own [`SessionRegistry`]. Slice 5 promotes
+//! sessions to survive the client that spawned them: a disconnect drains
+//! forwarders and detaches every session, but the children keep running
+//! and their terminals keep parsing. Sessions only die on explicit
+//! `KillSession` or when the daemon itself exits.
 //!
 //! The handler holds the write half of the connection behind a tokio
 //! mutex because both the request-reply loop and the per-session output
@@ -42,10 +43,13 @@ pub enum PostRequest {
 /// Drives the request loop on a single connection.
 ///
 /// The `shutdown` broadcast is used to notify other in-flight handlers
-/// that the daemon is stopping, so they can close out cleanly.
+/// that the daemon is stopping, so they can close out cleanly. The
+/// `registry` is shared across every connection so sessions survive
+/// individual client disconnects.
 pub async fn serve_connection<S>(
     stream: S,
     shutdown: broadcast::Sender<()>,
+    registry: Arc<SessionRegistry>,
 ) -> Result<(), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -55,7 +59,6 @@ where
     let writer = Arc::new(Mutex::new(write_half));
     let mut shutdown_rx = shutdown.subscribe();
 
-    let registry = Arc::new(SessionRegistry::new());
     // Keyed by session_id so KillSession can abort the matching
     // forwarder without a linear scan, and per-connection cleanup
     // can drain them all on close.
@@ -80,13 +83,15 @@ where
         }
     };
 
-    // Clean up every session spawned on this connection, then await the
-    // per-session forwarder tasks so they exit before we drop the
-    // writer.
-    registry.kill_all().await;
-    for (_id, handle) in forwarders.drain() {
+    // Sessions survive client disconnect (slice 5). Abort the per-session
+    // forwarder tasks so they release the writer, then detach each
+    // session so a later attach sees a fresh channel. The `Terminal`
+    // inside each session keeps parsing PTY output so reattaches observe
+    // the authoritative grid plus scrollback.
+    for (id, handle) in forwarders.drain() {
         handle.abort();
         let _ = handle.await;
+        registry.detach(id).await;
     }
 
     result
@@ -152,11 +157,22 @@ where
             rows,
             cwd,
             shell,
+            workspace_id,
+            pane_id,
+            name,
         } => {
             let cwd_path = cwd.as_deref().map(PathBuf::from);
             let shell_ref = shell.as_deref();
             let spawn_res = registry
-                .spawn(cols, rows, cwd_path.as_deref(), shell_ref)
+                .spawn(
+                    cols,
+                    rows,
+                    cwd_path.as_deref(),
+                    shell_ref,
+                    workspace_id,
+                    pane_id,
+                    name,
+                )
                 .await;
             match spawn_res {
                 Ok((session_id, rx)) => {
@@ -212,8 +228,19 @@ where
             scrollback_lines,
         } => {
             let clamped = (scrollback_lines as usize).min(SNAPSHOT_MAX_SCROLLBACK_LINES);
-            match registry.snapshot(session_id, clamped).await {
-                Some(snapshot) => {
+            let rx = registry.attach(session_id).await;
+            match rx {
+                Some(rx) => {
+                    if let Some(old) = forwarders.remove(&session_id) {
+                        old.abort();
+                        let _ = old.await;
+                    }
+                    let handle = tokio::spawn(forward_output(session_id, rx, writer.clone()));
+                    forwarders.insert(session_id, handle);
+                    let snapshot = registry
+                        .snapshot(session_id, clamped)
+                        .await
+                        .expect("session existed for attach but not snapshot");
                     send_response(&writer, Response::SessionAttached { id, snapshot }).await?;
                 }
                 None => {
@@ -226,14 +253,12 @@ where
             }
             Ok(PostRequest::Continue)
         }
-        Request::DetachSession {
-            id,
-            session_id: _session_id,
-        } => {
-            // Slice 4 policy: detach is a no-op; sessions die on
-            // connection close (see slice 3a per-connection cleanup).
-            // Slice 5 promotes detach to "keep running" and wires the
-            // cross-connection persistence path.
+        Request::DetachSession { id, session_id } => {
+            if let Some(h) = forwarders.remove(&session_id) {
+                h.abort();
+                let _ = h.await;
+            }
+            registry.detach(session_id).await;
             send_response(&writer, Response::Ack { id }).await?;
             Ok(PostRequest::Continue)
         }
@@ -315,9 +340,12 @@ mod tests {
     async fn hello_elicits_hello_ack_with_echoed_id() {
         let (client, server) = duplex(4096);
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
+        let registry = Arc::new(SessionRegistry::new());
 
         let server_task = tokio::spawn(async move {
-            serve_connection(server, shutdown_tx).await.unwrap();
+            serve_connection(server, shutdown_tx, registry)
+                .await
+                .unwrap();
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -356,9 +384,12 @@ mod tests {
     async fn shutdown_returns_shutdown_ack_and_drops_connection() {
         let (client, server) = duplex(4096);
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
+        let registry = Arc::new(SessionRegistry::new());
 
         let server_task = tokio::spawn(async move {
-            serve_connection(server, shutdown_tx).await.unwrap();
+            serve_connection(server, shutdown_tx, registry)
+                .await
+                .unwrap();
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);

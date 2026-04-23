@@ -1,5 +1,7 @@
 //! Client spawns a session, receives the echoed output via a
-//! `ServerEvent::Output`, then disconnects and confirms cleanup.
+//! `ServerEvent::Output`, then kills the session explicitly and
+//! confirms it is gone. Slice 5 moves session-lifetime ownership off
+//! the connection, so cleanup now requires an explicit kill.
 
 use std::time::Duration;
 
@@ -28,7 +30,7 @@ async fn spawn_session_yields_output_event_containing_payload() {
 
     let (mut client, mut events) = common::connect_with_events_retry(&path).await;
     let resp = client
-        .spawn_session(80, 24, None, Some(TEST_SHELL.into()))
+        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 0, None)
         .await
         .unwrap();
     let session_id = match resp {
@@ -51,8 +53,8 @@ async fn spawn_session_yields_output_event_containing_payload() {
         "expected echo output to contain marker, got: {text:?}"
     );
 
-    // Drop the client. That connection's session should die so list
-    // reports nothing on a fresh client.
+    // Explicit kill drops the session from the shared registry.
+    client.kill_session(session_id).await.unwrap();
     drop(client);
     drop(events);
 
@@ -60,7 +62,7 @@ async fn spawn_session_yields_output_event_containing_payload() {
     let list = follow_up.list_sessions().await.unwrap();
     assert!(
         list.is_empty(),
-        "dropped client's session should be reaped, got {list:?}"
+        "killed session must not appear on follow-up list, got {list:?}"
     );
 
     follow_up.shutdown().await.unwrap();
