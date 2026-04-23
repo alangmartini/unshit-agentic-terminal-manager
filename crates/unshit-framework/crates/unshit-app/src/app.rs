@@ -61,6 +61,19 @@ pub struct AppConfig {
     /// returns `true` if the application should rebuild its tree.
     #[allow(clippy::type_complexity)]
     pub on_command: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    /// Callback invoked before the shortcut resolver runs, receiving the
+    /// parsed [`KeyCombo`] for every key press. Returning `true` consumes
+    /// the event: the resolver is skipped, no command fires, and the
+    /// framework requests a rebuild. Returning `false` passes through to
+    /// normal shortcut resolution.
+    ///
+    /// Intended for features that need to capture arbitrary key combos
+    /// (settings UIs recording a new binding, text-entry modes that
+    /// temporarily suppress hotkeys). The hook runs in both normal and
+    /// capture-mode key flows so it behaves the same whether a terminal
+    /// pane holds keyboard focus or not.
+    #[allow(clippy::type_complexity)]
+    pub on_raw_key: Option<Arc<dyn Fn(&unshit_core::shortcut::KeyCombo) -> bool + Send + Sync>>,
     /// Additional fonts registered exactly once at startup.
     ///
     /// Entries are loaded into the cosmic-text `FontSystem` inside
@@ -148,6 +161,7 @@ impl Default for AppConfig {
             on_bytes: None,
             user_shortcuts: Vec::new(),
             on_command: None,
+            on_raw_key: None,
             fonts: Vec::new(),
             fallback_chain: crate::font::FallbackChain::default_chain(),
             theme: Theme::dark(),
@@ -1621,10 +1635,24 @@ impl ApplicationHandler for AppHandler {
                             if let Some(combo) =
                                 key_combo_from_winit(&event.logical_key, &state.modifiers_state)
                             {
-                                // Cancel chord on Escape
-                                if combo.key == Key::Escape
+                                // Raw-key hook: app can consume the event
+                                // before it reaches the shortcut resolver
+                                // (used by Settings' "record a new binding"
+                                // flow).
+                                let consumed_by_raw = self
+                                    .app
+                                    .config
+                                    .on_raw_key
+                                    .as_ref()
+                                    .map(|f| f(&combo))
+                                    .unwrap_or(false);
+                                if consumed_by_raw {
+                                    state.needs_rebuild = true;
+                                    state.window.request_redraw();
+                                } else if combo.key == Key::Escape
                                     && state.shortcut_resolver.is_chord_pending()
                                 {
+                                    // Cancel chord on Escape
                                     state.shortcut_resolver.cancel_chord();
                                     state.window.request_redraw();
                                 } else {
