@@ -111,6 +111,7 @@ pub fn protocol_to_io(err: ProtocolError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::message::{read_response, write_request};
     use tokio::io::duplex;
 
     #[tokio::test]
@@ -123,7 +124,6 @@ mod tests {
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
-        use crate::protocol::message::{read_response, write_request};
         write_request(
             &mut client_write,
             &Request::Hello {
@@ -169,7 +169,6 @@ mod tests {
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
-        use crate::protocol::message::{read_response, write_request};
         write_request(&mut client_write, &Request::Shutdown { id: 3 })
             .await
             .unwrap();
