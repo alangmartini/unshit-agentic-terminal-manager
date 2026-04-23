@@ -818,6 +818,7 @@ body::after {
   padding: 0 var(--sp-5) 0 var(--sp-5);
   min-width: 150px;
   max-width: 240px;
+  flex-shrink: 0;
   background: transparent;
   color: var(--fg-secondary);
   font-size: var(--t-sm);
@@ -927,12 +928,40 @@ body::after {
 .tab-drop-placeholder {
   align-self: stretch;
   width: 3px;
+  min-width: 3px;
   margin: 4px 2px;
+  flex-shrink: 0;
   background: var(--amber-400);
   border-radius: 1px;
   box-shadow: 0 0 6px var(--amber-500);
   opacity: 0.85;
   pointer-events: none;
+}
+
+.drag-ghost {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 4px 10px;
+  background: var(--bg-subtle);
+  color: var(--amber-50);
+  border: 1px solid var(--amber-500);
+  border-radius: var(--r-md);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45), 0 0 12px rgba(212, 163, 72, 0.35);
+  font-size: var(--t-sm);
+  opacity: 0.92;
+  pointer-events: none;
+  z-index: 1000;
+  user-select: none;
+}
+
+.drag-ghost-title {
+  font-weight: 500;
+}
+
+.drag-ghost-subtitle {
+  color: var(--amber-400);
+  font-size: var(--t-xs);
 }
 
 .tab-add {

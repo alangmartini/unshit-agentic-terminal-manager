@@ -1,3 +1,4 @@
+pub mod drag_overlay;
 pub mod icons;
 pub mod settings;
 pub mod sidebar;

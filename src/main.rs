@@ -235,6 +235,10 @@ fn build_tree(
         );
     }
 
+    if let Some(ghost) = crate::ui::drag_overlay::build_drag_overlay(snap) {
+        root = root.with_child(ghost);
+    }
+
     ElementTree {
         root: root.with_child(build_ctx_menu_overlay(snap, shared)),
     }
