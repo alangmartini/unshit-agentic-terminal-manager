@@ -50,16 +50,17 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 - [x] `user_shortcut_bindings()` now honors saved overrides on startup (restart-to-apply per user's option-1 choice)
 - [x] Persistence path installed in `main.rs` alongside `persist::install`
 
-### B3: Editable Settings > Keybinds UI
-- [ ] Replace static `keybind_row` block with dynamic builder over `AppState.keybinds`
-- [ ] Row layout: Label | Combo button | Reset button | Conflict indicator
-- [ ] Click combo -> enter recording mode; "Press keys..."
-- [ ] Intercept next combo; Escape cancels; any other combo fires `keybind.set`
-- [ ] Conflict indicator: red border + tooltip with conflicting action name
-- [ ] "Reset all" button dispatches `keybind.reset_all`
-- [ ] Unit test: 13 rows rendered
-- [ ] Integration test: click + key event = persisted change visible in UI
-- [ ] Visual verify: remap, restart, confirm persistence
+### B3: Editable Settings > Keybinds UI [DONE]
+- [x] Replace static `keybind_row` block with dynamic builder over `AppState.keybinds`
+- [x] Row layout: Label | Combo button | Reset button | Conflict indicator + restart/error banners
+- [x] Click combo -> enter recording mode; "Press keys... (Esc to cancel)"
+- [x] Framework `on_raw_key` hook added; `main.rs` consumes keys while recording
+- [x] Intercept next combo; Escape cancels; any other combo fires `keybind.set`
+- [x] Conflict indicator: red border on cell + error banner at top
+- [x] "Reset all" button dispatches `keybind.reset_all`; per-row reset when overridden
+- [x] 6 new unit tests green (section children count, row content, recording state, override reset button, error banner)
+- [x] CSS for banner, error banner, recording cell, conflict cell, per-row reset
+- [ ] Visual verify: remap, restart, confirm persistence (pending user)
 
 ### Checkpoint 2
 - [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green

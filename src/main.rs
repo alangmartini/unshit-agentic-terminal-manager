@@ -434,6 +434,7 @@ fn main() {
     let scale_shared = shared.clone();
     let close_shared = shared.clone();
     let sub_shared = shared.clone();
+    let raw_key_shared = shared.clone();
 
     let mut app = App::new(
         AppConfig {
@@ -453,6 +454,24 @@ fn main() {
                 let mut guard = command_shared.lock().expect("state mutex poisoned");
                 dispatch(&mut guard, command)
             })),
+            on_raw_key: Some(Arc::new(
+                move |combo: &unshit::core::shortcut::KeyCombo| -> bool {
+                    use unshit::core::event::Key;
+                    let mut guard = raw_key_shared.lock().expect("state mutex poisoned");
+                    // Only intercept while a keybind is being recorded. Escape
+                    // cancels; any other combo commits via keybind.set.
+                    let Some(action) = guard.keybinds.recording else {
+                        return false;
+                    };
+                    if combo.key == Key::Escape && combo.modifiers.is_empty() {
+                        dispatch(&mut guard, "keybind.cancel_record");
+                    } else {
+                        let cmd = format!("keybind.set:{}:{}", action.id(), combo);
+                        dispatch(&mut guard, &cmd);
+                    }
+                    true
+                },
+            )),
             // Approach 1: on_cell_metrics fires once after the first render
             // publishes valid cell dimensions. Resize all PTYs immediately.
             on_scale_factor: Some(Arc::new(move |scale: f32| {

@@ -354,6 +354,7 @@ impl AppState {
             row_ratios: self.row_ratios.clone(),
             col_ratios: self.col_ratios.clone(),
             ctx_menu: self.ctx_menu.clone(),
+            keybinds: self.keybinds.clone(),
         }
     }
 
@@ -398,6 +399,7 @@ pub struct UiSnapshot {
     pub row_ratios: Vec<f32>,
     pub col_ratios: Vec<Vec<f32>>,
     pub ctx_menu: Option<CtxMenu>,
+    pub keybinds: crate::keybinds::KeybindsState,
 }
 
 fn current_folder_name() -> String {

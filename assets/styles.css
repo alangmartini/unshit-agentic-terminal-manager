@@ -2052,6 +2052,68 @@ body.dragging-pane {
   border-top: 1px solid var(--border-hair);
 }
 
+.keybind-banner {
+  padding: var(--sp-2) var(--sp-3);
+  margin-bottom: var(--sp-3);
+  background: var(--bg-elevated);
+  border-left: 2px solid var(--amber-100);
+  border-radius: var(--r-sm);
+  color: var(--fg-secondary);
+  font-size: var(--t-xs);
+}
+
+.keybind-banner-error {
+  padding: var(--sp-2) var(--sp-3);
+  margin-bottom: var(--sp-3);
+  background: rgba(220, 80, 80, 0.12);
+  border-left: 2px solid rgb(220, 80, 80);
+  border-radius: var(--r-sm);
+  color: rgb(250, 180, 180);
+  font-size: var(--t-xs);
+}
+
+.keybind-banner-error.hidden {
+  display: none;
+}
+
+.keybind-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: var(--sp-1) var(--sp-2);
+  background: transparent;
+  border: 1px dashed transparent;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+.keybind-row:hover .keybind-cell {
+  border-color: var(--border-soft);
+}
+
+.keybind-cell.recording {
+  border-style: solid;
+  border-color: var(--amber-100);
+  background: rgba(212, 163, 72, 0.08);
+}
+
+.keybind-cell.conflict {
+  border-style: solid;
+  border-color: rgb(220, 80, 80);
+}
+
+.keybind-recording-label {
+  color: var(--amber-100);
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  font-style: italic;
+}
+
+.keybind-reset {
+  margin-left: var(--sp-2);
+  font-size: var(--t-xs);
+}
+
 
 /* ============================================================ */
 /* AGENT LIST                                                   */

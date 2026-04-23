@@ -3,6 +3,10 @@ use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{Dimension, FlexDirection, Overflow};
 use unshit::prelude::SvgNode;
 
+use unshit::core::event::Modifiers;
+use unshit::core::shortcut::KeyCombo;
+
+use crate::keybinds::{KeybindAction, KeybindError, KeybindErrorKind};
 use crate::state::{
     agent_enabled, dispatch, is_on, mutate_toggle_agent, mutate_with, AgentKey, SettingsSection,
     SharedState, ToggleKey, UiSnapshot,
@@ -76,7 +80,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         SettingsSection::General => build_general_section(state, shared),
         SettingsSection::Appearance => build_appearance_section(state, shared),
         SettingsSection::Shell => build_shell_section(state, shared),
-        SettingsSection::Keybinds => build_keybinds_section(),
+        SettingsSection::Keybinds => build_keybinds_section(state, shared),
         SettingsSection::Agents => build_agents_section(state, shared),
     };
     ElementDef::new(Tag::Div)
@@ -218,31 +222,144 @@ fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         ))
 }
 
-/// Memo key for the keybinds section.
-///
-/// The keybinds section is a pure function of compile-time constants (no
-/// `&state`, no `&shared`). Tagging it with a stable memo key lets the
-/// reconciler skip the entire subtree on every rebuild once it has been
-/// mounted, which matters because the section is rebuilt on every tab
-/// switch even when nothing about it has changed.
-const KEYBINDS_MEMO_KEY: u64 = 0xBEEF_0001_CAFE_0002_u64;
+fn build_keybinds_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let mut section = section_shell("keybinds")
+        .with_child(keybind_restart_banner())
+        .with_child(keybind_error_banner(state.keybinds.error.as_ref()));
 
-fn build_keybinds_section() -> ElementDef {
-    section_shell("keybinds")
-        .with_memo_key(KEYBINDS_MEMO_KEY)
-        .with_child(keybind_row("New terminal", &["Ctrl", "T"]))
-        .with_child(keybind_row("Close tab", &["Ctrl", "W"]))
-        .with_child(keybind_row("Split right", &["Ctrl", "D"]))
-        .with_child(keybind_row("Split down", &["Ctrl", "Shift", "D"]))
-        .with_child(keybind_row("Next tab", &["Ctrl", "Tab"]))
-        .with_child(keybind_row("Previous tab", &["Ctrl", "Shift", "Tab"]))
-        .with_child(keybind_row("Command palette", &["Ctrl", "K"]))
-        .with_child(keybind_row("Toggle sidebar", &["Ctrl", "B"]))
-        .with_child(keybind_row("Settings", &["Ctrl", ","]))
-        .with_child(keybind_row("Zoom in", &["Ctrl", "="]))
-        .with_child(keybind_row("Zoom out", &["Ctrl", "-"]))
-        .with_child(keybind_row("Fullscreen", &["F11"]))
-        .with_child(keybind_footer())
+    for action in KeybindAction::ALL {
+        section = section.with_child(editable_keybind_row(*action, state, shared));
+    }
+
+    section.with_child(keybind_footer(shared))
+}
+
+fn keybind_restart_banner() -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("keybind-banner")
+        .with_text("Keybind changes take effect after restarting the app.")
+}
+
+fn keybind_error_banner(err: Option<&KeybindError>) -> ElementDef {
+    let mut banner = ElementDef::new(Tag::Div).with_class("keybind-banner-error");
+    match err {
+        None => banner.with_class("hidden"),
+        Some(e) => {
+            let msg = match &e.kind {
+                KeybindErrorKind::Conflict { other, combo } => {
+                    format!(
+                        "{} is already bound to \"{}\"; pick another combo.",
+                        combo,
+                        other.label()
+                    )
+                }
+                KeybindErrorKind::InvalidCombo { combo, message } => {
+                    format!("\"{}\" is not a valid combo: {}", combo, message)
+                }
+            };
+            banner = banner.with_text(msg.as_str());
+            banner
+        }
+    }
+}
+
+fn editable_keybind_row(
+    action: KeybindAction,
+    state: &UiSnapshot,
+    shared: &SharedState,
+) -> ElementDef {
+    let is_recording = state.keybinds.recording == Some(action);
+    let is_overridden = state.keybinds.overrides.contains_key(&action);
+    let has_error = state
+        .keybinds
+        .error
+        .as_ref()
+        .map(|e| e.action == action)
+        .unwrap_or(false);
+    let combo = state.keybinds.effective(action);
+
+    let mut row = ElementDef::new(Tag::Div)
+        .with_class("keybind-row")
+        .with_child(setting_meta(action.label(), None))
+        .with_child(combo_cell(action, combo, is_recording, has_error, shared));
+
+    if is_overridden {
+        row = row.with_child(reset_row_button(action, shared));
+    }
+
+    row
+}
+
+fn combo_cell(
+    action: KeybindAction,
+    combo: KeyCombo,
+    is_recording: bool,
+    has_error: bool,
+    shared: &SharedState,
+) -> ElementDef {
+    let mut btn = ElementDef::new(Tag::Button).with_class("keybind-cell");
+    if is_recording {
+        btn = btn.with_class("recording");
+    }
+    if has_error {
+        btn = btn.with_class("conflict");
+    }
+
+    if is_recording {
+        btn = btn.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("keybind-recording-label")
+                .with_text("Press keys... (Esc to cancel)"),
+        );
+    } else {
+        for part in combo_parts(combo) {
+            btn = btn.with_child(pill("keybind-key", None, &part));
+        }
+    }
+
+    let s = shared.clone();
+    let command = if is_recording {
+        "keybind.cancel_record".to_string()
+    } else {
+        format!("keybind.record:{}", action.id())
+    };
+    btn.on_click(move || {
+        mutate_with(&s, |st| dispatch(st, &command));
+    })
+}
+
+fn reset_row_button(action: KeybindAction, shared: &SharedState) -> ElementDef {
+    let s = shared.clone();
+    let cmd = format!("keybind.reset:{}", action.id());
+    ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("ghost")
+        .with_class("keybind-reset")
+        .with_text("reset")
+        .on_click(move || {
+            mutate_with(&s, |st| dispatch(st, &cmd));
+        })
+}
+
+/// Split a combo into the parts shown as individual key pills. Modifiers
+/// are pushed in the canonical Ctrl, Shift, Alt, Meta order; then the key
+/// name comes last.
+fn combo_parts(combo: KeyCombo) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if combo.modifiers.contains(Modifiers::CTRL) {
+        parts.push("Ctrl".to_string());
+    }
+    if combo.modifiers.contains(Modifiers::SHIFT) {
+        parts.push("Shift".to_string());
+    }
+    if combo.modifiers.contains(Modifiers::ALT) {
+        parts.push("Alt".to_string());
+    }
+    if combo.modifiers.contains(Modifiers::META) {
+        parts.push("Meta".to_string());
+    }
+    parts.push(combo.key.to_string());
+    parts
 }
 
 fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -501,17 +618,6 @@ fn slider_control(value_label: &str) -> ElementDef {
         )
 }
 
-fn keybind_row(label: &str, keys: &[&str]) -> ElementDef {
-    let mut keys_wrap = ElementDef::new(Tag::Div).with_class("keybind-keys");
-    for key in keys {
-        keys_wrap = keys_wrap.with_child(pill("keybind-key", None, key));
-    }
-    ElementDef::new(Tag::Div)
-        .with_class("keybind-row")
-        .with_child(setting_meta(label, None))
-        .with_child(keys_wrap)
-}
-
 fn pill(base: &str, modifier: Option<&str>, text: &str) -> ElementDef {
     let mut el = ElementDef::new(Tag::Span).with_class(base).with_text(text);
     if let Some(m) = modifier {
@@ -524,14 +630,18 @@ fn svg_icon(svg: SvgNode) -> ElementDef {
     ElementDef::new(Tag::Div).with_svg(svg)
 }
 
-fn keybind_footer() -> ElementDef {
+fn keybind_footer(shared: &SharedState) -> ElementDef {
+    let s = shared.clone();
     ElementDef::new(Tag::Div)
         .with_class("keybind-footer")
         .with_child(
             ElementDef::new(Tag::Button)
                 .with_class("btn")
                 .with_class("ghost")
-                .with_text("reset to defaults"),
+                .with_text("reset to defaults")
+                .on_click(move || {
+                    mutate_with(&s, |st| dispatch(st, "keybind.reset_all"));
+                }),
         )
 }
 
@@ -947,49 +1057,96 @@ mod tests {
     // -- build_keybinds_section -------------------------------------------------
 
     #[test]
-    fn keybinds_section_has_title_twelve_rows_and_footer() {
-        let el = build_keybinds_section();
-        // title + 12 keybind rows + footer
-        assert_eq!(el.children.len(), 14);
+    fn keybinds_section_has_banner_thirteen_rows_and_footer() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_keybinds_section(&snap, &shared);
+        // title + restart banner + error banner + 13 rows + footer
+        assert_eq!(el.children.len(), 17);
     }
 
     #[test]
-    fn keybinds_section_first_row_has_correct_keys() {
-        let el = build_keybinds_section();
-        let first_row = &el.children[1];
+    fn keybinds_row_shows_effective_combo_parts() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_keybinds_section(&snap, &shared);
+        // children: [title, restart_banner, error_banner, row0, row1, ..., footer]
+        let first_row = &el.children[3];
         assert!(first_row.classes.contains(&"keybind-row".to_string()));
-        let keys_wrap = &first_row.children[1];
-        assert!(keys_wrap.classes.contains(&"keybind-keys".to_string()));
-        // Separator lives in CSS (::before), so only the key pills render.
-        assert_eq!(keys_wrap.children.len(), 2);
+        // cell: [setting_meta, combo_cell, (maybe reset)]
+        let combo_cell = &first_row.children[1];
+        assert!(combo_cell.classes.contains(&"keybind-cell".to_string()));
+        // Default NewTerminal is Ctrl+T so we expect 2 pills.
+        assert_eq!(combo_cell.children.len(), 2);
     }
 
     #[test]
-    fn keybinds_section_footer_has_reset_button() {
-        let el = build_keybinds_section();
+    fn keybinds_footer_has_reset_to_defaults() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_keybinds_section(&snap, &shared);
         let footer = el.children.last().unwrap();
         assert!(footer.classes.contains(&"keybind-footer".to_string()));
         let btn = &footer.children[0];
-        assert!(btn.classes.contains(&"btn".to_string()));
         assert_eq!(text_of(btn), Some("reset to defaults"));
     }
 
     #[test]
-    fn keybinds_section_has_stable_memo_key() {
-        // The keybinds section is a pure function of compile-time constants.
-        // It must carry a stable memo key so the reconciler can skip its
-        // subtree on every rebuild triggered by tab switches.
-        let first = build_keybinds_section();
-        let second = build_keybinds_section();
-        assert_eq!(first.memo_key, Some(KEYBINDS_MEMO_KEY));
-        assert_eq!(first.memo_key, second.memo_key);
+    fn keybinds_row_with_override_includes_reset_button() {
+        let mut state = seed_state();
+        state
+            .keybinds
+            .set(
+                crate::keybinds::KeybindAction::NewTerminal,
+                unshit::core::shortcut::KeyCombo::parse("Alt+N").unwrap(),
+            )
+            .unwrap();
+        let snap = state.ui_snapshot();
+        let shared = Arc::new(Mutex::new(state));
+        let el = build_keybinds_section(&snap, &shared);
+        // NewTerminal is the first row (index 3 after title + 2 banners).
+        let first_row = &el.children[3];
+        // With override: [meta, combo_cell, reset_btn] -> 3 children.
+        assert_eq!(first_row.children.len(), 3);
+        let reset = &first_row.children[2];
+        assert!(reset.classes.contains(&"keybind-reset".to_string()));
     }
 
     #[test]
-    fn keybinds_section_memo_key_is_nonzero() {
-        // A key of 0 would still work, but a nonzero key makes it obvious in
-        // debug output that memoization was deliberately configured.
-        assert_ne!(KEYBINDS_MEMO_KEY, 0);
+    fn keybinds_row_in_recording_state_shows_placeholder() {
+        let mut state = seed_state();
+        state
+            .keybinds
+            .start_recording(crate::keybinds::KeybindAction::NewTerminal);
+        let snap = state.ui_snapshot();
+        let shared = Arc::new(Mutex::new(state));
+        let el = build_keybinds_section(&snap, &shared);
+        let first_row = &el.children[3];
+        let combo_cell = &first_row.children[1];
+        assert!(combo_cell.classes.contains(&"recording".to_string()));
+        assert_eq!(combo_cell.children.len(), 1);
+        assert_eq!(
+            text_of(&combo_cell.children[0]),
+            Some("Press keys... (Esc to cancel)")
+        );
+    }
+
+    #[test]
+    fn keybinds_error_banner_visible_on_conflict() {
+        let mut state = seed_state();
+        // Provoke a conflict: set NewTerminal to CloseTab's default.
+        let _ = state.keybinds.set(
+            crate::keybinds::KeybindAction::NewTerminal,
+            unshit::core::shortcut::KeyCombo::parse("Ctrl+W").unwrap(),
+        );
+        let snap = state.ui_snapshot();
+        let shared = Arc::new(Mutex::new(state));
+        let el = build_keybinds_section(&snap, &shared);
+        let error_banner = &el.children[2];
+        assert!(error_banner
+            .classes
+            .contains(&"keybind-banner-error".to_string()));
+        assert!(!error_banner.classes.contains(&"hidden".to_string()));
     }
 
     // -- build_agents_section ---------------------------------------------------
@@ -1389,30 +1546,6 @@ mod tests {
         assert_eq!(el.children.len(), 2);
         assert!(el.children[0].classes.contains(&"slider".to_string()));
         assert_eq!(text_of(&el.children[1]), Some("75%"));
-    }
-
-    #[test]
-    fn keybind_row_has_meta_and_keys() {
-        let el = keybind_row("Test", &["Ctrl", "A"]);
-        assert!(el.classes.contains(&"keybind-row".to_string()));
-        assert_eq!(el.children.len(), 2);
-        let keys = &el.children[1];
-        assert!(keys.classes.contains(&"keybind-keys".to_string()));
-        // Separator is now CSS ::before, so only two key pills render.
-        assert_eq!(keys.children.len(), 2);
-        assert!(keys
-            .children
-            .iter()
-            .all(|c| c.classes.contains(&"keybind-key".to_string())));
-        assert_eq!(text_of(&keys.children[0]), Some("Ctrl"));
-        assert_eq!(text_of(&keys.children[1]), Some("A"));
-    }
-
-    #[test]
-    fn keybind_row_single_key_no_separator() {
-        let el = keybind_row("Fullscreen", &["F11"]);
-        let keys = &el.children[1];
-        assert_eq!(keys.children.len(), 1);
     }
 
     #[test]
