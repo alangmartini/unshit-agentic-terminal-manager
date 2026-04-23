@@ -1053,3 +1053,314 @@ fn grid_auto_rows_sets_implicit_row_size() {
         c.layout_rect.height
     );
 }
+
+// ---------------------------------------------------------------------------
+// F2 regression: 1fr in non-fixed containers (flex child, percent, nested)
+//
+// These cases are the ones the framework historically warned about under
+// "grid 1fr expansion is unreliable". They probe how `1fr` resolves when the
+// grid container's main axis size is derived from the parent (flex, percent,
+// inherited 100%) or when grids nest.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grid_as_flex_child_1fr_resolves_against_flex_size() {
+    // A flex parent hands the grid child its width via `flex: 1`. The grid's
+    // `1fr 1fr` should split that derived width in half, not fall back to 0
+    // or to content size.
+    let css = r#"
+        .flex-parent {
+            display: flex;
+            flex-direction: row;
+            width: 800px;
+            height: 200px;
+        }
+        .sidebar { width: 200px; }
+        .grid-child {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            flex: 1;
+            height: 200px;
+        }
+        .item { height: 50px; }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("flex-parent")
+                .with_child(ElementDef::new(Tag::Div).with_class("sidebar").with_id("s"))
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("grid-child")
+                        .with_id("g")
+                        .with_child(ElementDef::new(Tag::Div).with_class("item").with_id("a"))
+                        .with_child(ElementDef::new(Tag::Div).with_class("item").with_id("b")),
+                ),
+        },
+        800.0,
+        600.0,
+    );
+
+    let g = h.query("#g").unwrap();
+    let a = h.query("#a").unwrap();
+    let b = h.query("#b").unwrap();
+
+    // Grid takes flex remainder: 800 - 200 = 600px
+    assert!(
+        (g.layout_rect.width - 600.0).abs() < 1.0,
+        "grid-child should be 600px wide (flex remainder), got {}",
+        g.layout_rect.width
+    );
+    // Each 1fr track gets half of 600 = 300px
+    assert!(
+        (a.layout_rect.width - 300.0).abs() < 1.0,
+        "first 1fr track should be 300px, got {}",
+        a.layout_rect.width
+    );
+    assert!(
+        (b.layout_rect.width - 300.0).abs() < 1.0,
+        "second 1fr track should be 300px, got {}",
+        b.layout_rect.width
+    );
+}
+
+#[test]
+fn grid_with_percent_width_splits_1fr_against_resolved_percent() {
+    let css = r#"
+        .outer { width: 600px; height: 200px; }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            width: 50%;
+            height: 200px;
+        }
+        .item { height: 50px; }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div).with_class("outer").with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("grid")
+                    .with_id("g")
+                    .with_child(ElementDef::new(Tag::Div).with_class("item").with_id("a"))
+                    .with_child(ElementDef::new(Tag::Div).with_class("item").with_id("b")),
+            ),
+        },
+        800.0,
+        600.0,
+    );
+
+    let g = h.query("#g").unwrap();
+    let a = h.query("#a").unwrap();
+    let b = h.query("#b").unwrap();
+
+    // 50% of 600 = 300px
+    assert!(
+        (g.layout_rect.width - 300.0).abs() < 1.0,
+        "grid should resolve to 300px (50% of 600), got {}",
+        g.layout_rect.width
+    );
+    assert!(
+        (a.layout_rect.width - 150.0).abs() < 1.0,
+        "1fr of 300 should be 150px, got {}",
+        a.layout_rect.width
+    );
+    assert!(
+        (b.layout_rect.width - 150.0).abs() < 1.0,
+        "1fr of 300 should be 150px, got {}",
+        b.layout_rect.width
+    );
+}
+
+#[test]
+fn nested_grid_1fr_resolves_against_inner_not_outer() {
+    // Outer grid gives the inner grid a 300px cell. The inner grid then
+    // splits that 300px with 1fr 1fr into two 150px tracks, independent
+    // of the outer grid's size.
+    let css = r#"
+        .outer {
+            display: grid;
+            grid-template-columns: 200px 300px;
+            width: 500px;
+            height: 200px;
+        }
+        .inner {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            height: 100px;
+        }
+        .leaf { height: 50px; }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("outer")
+                .with_child(ElementDef::new(Tag::Div).with_class("inner").with_id("side"))
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("inner")
+                        .with_id("main")
+                        .with_child(ElementDef::new(Tag::Div).with_class("leaf").with_id("a"))
+                        .with_child(ElementDef::new(Tag::Div).with_class("leaf").with_id("b")),
+                ),
+        },
+        800.0,
+        600.0,
+    );
+
+    let main = h.query("#main").unwrap();
+    let a = h.query("#a").unwrap();
+    let b = h.query("#b").unwrap();
+
+    assert!(
+        (main.layout_rect.width - 300.0).abs() < 1.0,
+        "inner grid cell should be 300px, got {}",
+        main.layout_rect.width
+    );
+    assert!(
+        (a.layout_rect.width - 150.0).abs() < 1.0,
+        "inner 1fr track should be 150px (half of 300), not 250 (half of outer 500), got {}",
+        a.layout_rect.width
+    );
+    assert!(
+        (b.layout_rect.width - 150.0).abs() < 1.0,
+        "inner 1fr track should be 150px, got {}",
+        b.layout_rect.width
+    );
+}
+
+#[test]
+fn grid_rows_1fr_inside_fixed_height_parent() {
+    // Definite height on the grid container must let `grid-template-rows:
+    // 1fr 2fr` distribute the height by weight.
+    let css = r#"
+        .grid {
+            display: grid;
+            grid-template-rows: 1fr 2fr;
+            width: 400px;
+            height: 300px;
+        }
+        .item { width: 400px; }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("grid")
+                .with_child(ElementDef::new(Tag::Div).with_class("item").with_id("a"))
+                .with_child(ElementDef::new(Tag::Div).with_class("item").with_id("b")),
+        },
+        800.0,
+        600.0,
+    );
+
+    let a = h.query("#a").unwrap();
+    let b = h.query("#b").unwrap();
+
+    // 1fr + 2fr = 3fr. Container height 300. Each fr = 100.
+    assert!(
+        (a.layout_rect.height - 100.0).abs() < 1.0,
+        "1fr row should be 100px, got {}",
+        a.layout_rect.height
+    );
+    assert!(
+        (b.layout_rect.height - 200.0).abs() < 1.0,
+        "2fr row should be 200px, got {}",
+        b.layout_rect.height
+    );
+}
+
+#[test]
+fn grid_with_height_100_percent_resolves_1fr_rows() {
+    // Grid has height: 100% inside a fixed-height parent, and uses
+    // grid-template-rows with 1fr. The 100% should resolve first against
+    // the parent, then 1fr splits against the resolved height.
+    let css = r#"
+        .parent { width: 400px; height: 400px; }
+        .grid {
+            display: grid;
+            grid-template-rows: 1fr 1fr;
+            width: 400px;
+            height: 100%;
+        }
+        .item { width: 400px; }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div).with_class("parent").with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("grid")
+                    .with_id("g")
+                    .with_child(ElementDef::new(Tag::Div).with_class("item").with_id("a"))
+                    .with_child(ElementDef::new(Tag::Div).with_class("item").with_id("b")),
+            ),
+        },
+        800.0,
+        600.0,
+    );
+
+    let g = h.query("#g").unwrap();
+    let a = h.query("#a").unwrap();
+    let b = h.query("#b").unwrap();
+
+    assert!(
+        (g.layout_rect.height - 400.0).abs() < 1.0,
+        "grid height 100% should resolve to parent 400, got {}",
+        g.layout_rect.height
+    );
+    assert!(
+        (a.layout_rect.height - 200.0).abs() < 1.0,
+        "first 1fr row should be 200px, got {}",
+        a.layout_rect.height
+    );
+    assert!(
+        (b.layout_rect.height - 200.0).abs() < 1.0,
+        "second 1fr row should be 200px, got {}",
+        b.layout_rect.height
+    );
+}
+
+#[test]
+fn grid_1fr_mixed_with_auto_track() {
+    // `grid-template-columns: auto 1fr` should size the auto track to its
+    // content, then give all remaining space to the 1fr track.
+    let css = r#"
+        .grid {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            width: 500px;
+            height: 100px;
+        }
+        .fixed { width: 120px; height: 80px; }
+        .fill { height: 80px; }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("grid")
+                .with_child(ElementDef::new(Tag::Div).with_class("fixed").with_id("a"))
+                .with_child(ElementDef::new(Tag::Div).with_class("fill").with_id("b")),
+        },
+        800.0,
+        600.0,
+    );
+
+    let a = h.query("#a").unwrap();
+    let b = h.query("#b").unwrap();
+
+    assert!(
+        (a.layout_rect.width - 120.0).abs() < 1.0,
+        "auto track should fit its 120px child, got {}",
+        a.layout_rect.width
+    );
+    assert!(
+        (b.layout_rect.width - 380.0).abs() < 1.0,
+        "1fr track should take the remaining 380px, got {}",
+        b.layout_rect.width
+    );
+}

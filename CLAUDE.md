@@ -40,11 +40,9 @@ Rules:
 
 Issues in `crates/unshit-framework/` that currently require care in the app. Prefer fixing these upstream when touched. The workarounds listed are temporary.
 
-1. **CSS grid `1fr` expansion is unreliable.** Flexbox (`display: flex` + `flex: 1`) currently works where `display: grid` with `grid-template-*` does not. **Fix upstream:** repair grid track expansion in the framework layout engine.
+1. **Cell metrics timing (not a bug, behavior to know).** The renderer publishes `cell_w`/`cell_h` via `CellGrid::publish_cell_metrics()` during the render pass. The `on_resize` handler fires during the layout pass BEFORE the renderer, so `global_cell_w()` is 0.0 on the first frame. The `on_cell_metrics` callback and blink subscription handle the correction.
 
-2. **Cell metrics timing (not a bug, behavior to know).** The renderer publishes `cell_w`/`cell_h` via `CellGrid::publish_cell_metrics()` during the render pass. The `on_resize` handler fires during the layout pass BEFORE the renderer, so `global_cell_w()` is 0.0 on the first frame. The `on_cell_metrics` callback and blink subscription handle the correction.
-
-3. **PTY must be spawned eagerly (app-level concern, keep as is).** Do NOT defer PTY spawning until cell metrics are available. This creates a deadlock: no terminal, no CellGrid rendered, no metrics published, PTY never spawns. Always spawn at 80x24, then correct dimensions once metrics arrive.
+2. **PTY must be spawned eagerly (app-level concern, keep as is).** Do NOT defer PTY spawning until cell metrics are available. This creates a deadlock: no terminal, no CellGrid rendered, no metrics published, PTY never spawns. Always spawn at 80x24, then correct dimensions once metrics arrive.
 
 ## Agent/Worktree Guidelines
 
