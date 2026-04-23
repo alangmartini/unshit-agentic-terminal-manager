@@ -46,15 +46,21 @@ async fn session_from_disconnected_client_is_reaped() {
         // kill every session spawned on that connection.
     }
 
-    // Give the daemon a moment to observe the disconnect and reap.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
+    // Poll instead of sleeping. Reap happens after the daemon's read
+    // half observes EOF, which can race with forwarder drain on a loaded
+    // CI box; any fixed sleep is either flaky or wasteful.
     let (mut follow_up, _ev) = common::connect_with_events_retry(&path).await;
-    let list = follow_up.list_sessions().await.unwrap();
-    assert!(
-        list.is_empty(),
-        "session from prior connection must have been reaped: {list:?}"
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let list = follow_up.list_sessions().await.unwrap();
+        if list.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("session from prior connection was not reaped: {list:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 
     follow_up.shutdown().await.unwrap();
     common::await_daemon(server_handle).await;

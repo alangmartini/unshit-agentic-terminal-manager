@@ -10,6 +10,7 @@
 //! forwarders need to write frames. Serializing them on a mutex keeps
 //! frame bytes from interleaving on the wire.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,10 +20,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
-    message::{
-        read_request, write_response, write_server_event, Request, Response, ServerEvent,
-        SessionInfo,
-    },
+    message::{read_request, write_output_frame, write_response, Request, Response},
     ProtocolError, PROTOCOL_VERSION,
 };
 use crate::session::registry::SessionRegistry;
@@ -55,7 +53,10 @@ where
     let mut shutdown_rx = shutdown.subscribe();
 
     let registry = Arc::new(SessionRegistry::new());
-    let mut forwarders: Vec<JoinHandle<()>> = Vec::new();
+    // Keyed by session_id so KillSession can abort the matching
+    // forwarder without a linear scan, and per-connection cleanup
+    // can drain them all on close.
+    let mut forwarders: HashMap<u64, JoinHandle<()>> = HashMap::new();
 
     let result = loop {
         tokio::select! {
@@ -80,7 +81,7 @@ where
     // per-session forwarder tasks so they exit before we drop the
     // writer.
     registry.kill_all().await;
-    for handle in forwarders {
+    for (_id, handle) in forwarders.drain() {
         handle.abort();
         let _ = handle.await;
     }
@@ -94,7 +95,7 @@ async fn handle<W>(
     req: Request,
     writer: SharedWriter<W>,
     registry: Arc<SessionRegistry>,
-    forwarders: &mut Vec<JoinHandle<()>>,
+    forwarders: &mut HashMap<u64, JoinHandle<()>>,
 ) -> Result<PostRequest, ProtocolError>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -156,21 +157,12 @@ where
                 .await;
             match spawn_res {
                 Ok((session_id, rx)) => {
-                    let writer_for_forward = writer.clone();
-                    let handle = tokio::spawn(forward_output(session_id, rx, writer_for_forward));
-                    forwarders.push(handle);
+                    let handle = tokio::spawn(forward_output(session_id, rx, writer.clone()));
+                    forwarders.insert(session_id, handle);
                     send_response(&writer, Response::SessionSpawned { id, session_id }).await?;
                 }
                 Err(e) => {
-                    send_response(
-                        &writer,
-                        Response::Error {
-                            id,
-                            code: "spawn_failed".into(),
-                            message: e.to_string(),
-                        },
-                    )
-                    .await?;
+                    send_err(&writer, id, "spawn_failed", &e).await?;
                 }
             }
             Ok(PostRequest::Continue)
@@ -182,17 +174,7 @@ where
         } => {
             match registry.write(session_id, &bytes).await {
                 Ok(()) => send_response(&writer, Response::Ack { id }).await?,
-                Err(e) => {
-                    send_response(
-                        &writer,
-                        Response::Error {
-                            id,
-                            code: error_code(&e),
-                            message: e.to_string(),
-                        },
-                    )
-                    .await?
-                }
+                Err(e) => send_err(&writer, id, error_code(&e), &e).await?,
             }
             Ok(PostRequest::Continue)
         }
@@ -204,38 +186,20 @@ where
         } => {
             match registry.resize(session_id, cols, rows).await {
                 Ok(()) => send_response(&writer, Response::Ack { id }).await?,
-                Err(e) => {
-                    send_response(
-                        &writer,
-                        Response::Error {
-                            id,
-                            code: error_code(&e),
-                            message: e.to_string(),
-                        },
-                    )
-                    .await?
-                }
+                Err(e) => send_err(&writer, id, error_code(&e), &e).await?,
             }
             Ok(PostRequest::Continue)
         }
         Request::KillSession { id, session_id } => {
             registry.remove(session_id).await;
+            if let Some(h) = forwarders.remove(&session_id) {
+                h.abort();
+            }
             send_response(&writer, Response::Ack { id }).await?;
             Ok(PostRequest::Continue)
         }
         Request::ListSessions { id } => {
-            let sessions: Vec<SessionInfo> = registry
-                .list()
-                .await
-                .into_iter()
-                .map(|s| SessionInfo {
-                    id: s.id,
-                    cols: s.cols,
-                    rows: s.rows,
-                    alive: s.alive,
-                    pid: s.pid,
-                })
-                .collect();
+            let sessions = registry.list().await;
             send_response(&writer, Response::SessionList { id, sessions }).await?;
             Ok(PostRequest::Continue)
         }
@@ -250,8 +214,28 @@ where
     write_response(&mut *guard, &resp).await
 }
 
-/// Forwards every byte chunk from `rx` as a `ServerEvent::Output` frame
-/// on `writer`, tagging the chunk with `session_id`. Exits when the
+async fn send_err<W>(
+    writer: &SharedWriter<W>,
+    id: u64,
+    code: impl Into<String>,
+    e: &io::Error,
+) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    send_response(
+        writer,
+        Response::Error {
+            id,
+            code: code.into(),
+            message: e.to_string(),
+        },
+    )
+    .await
+}
+
+/// Forwards every byte chunk from `rx` as a `KIND_OUTPUT` frame on
+/// `writer`, tagging the chunk with `session_id`. Exits when the
 /// session drops its sender or the writer errors out.
 async fn forward_output<W>(
     session_id: u64,
@@ -261,19 +245,21 @@ async fn forward_output<W>(
     W: AsyncWrite + Unpin,
 {
     while let Some(bytes) = rx.recv().await {
-        let event = ServerEvent::Output { session_id, bytes };
         let mut guard = writer.lock().await;
-        if write_server_event(&mut *guard, &event).await.is_err() {
+        if write_output_frame(&mut *guard, session_id, &bytes)
+            .await
+            .is_err()
+        {
             return;
         }
     }
 }
 
-fn error_code(e: &io::Error) -> String {
+fn error_code(e: &io::Error) -> &'static str {
     match e.kind() {
-        io::ErrorKind::NotFound => "session_not_found".into(),
-        io::ErrorKind::NotConnected => "session_dead".into(),
-        _ => "io_error".into(),
+        io::ErrorKind::NotFound => "session_not_found",
+        io::ErrorKind::NotConnected => "session_dead",
+        _ => "io_error",
     }
 }
 
@@ -376,13 +362,13 @@ mod tests {
 
     #[test]
     fn error_code_maps_not_found_to_session_not_found() {
-        let e = io::Error::new(io::ErrorKind::NotFound, "missing");
+        let e = io::Error::new(io::ErrorKind::NotFound, "x");
         assert_eq!(error_code(&e), "session_not_found");
     }
 
     #[test]
-    fn error_code_maps_not_connected_to_session_dead() {
-        let e = io::Error::new(io::ErrorKind::NotConnected, "gone");
-        assert_eq!(error_code(&e), "session_dead");
+    fn error_code_falls_back_to_io_error() {
+        let e = io::Error::other("x");
+        assert_eq!(error_code(&e), "io_error");
     }
 }

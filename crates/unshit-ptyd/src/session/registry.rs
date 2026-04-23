@@ -11,16 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, Mutex};
 
 use super::Session;
-
-/// Lightweight snapshot of session state, safe to copy across the wire.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionInfo {
-    pub id: u64,
-    pub cols: u16,
-    pub rows: u16,
-    pub alive: bool,
-    pub pid: Option<u32>,
-}
+use crate::protocol::message::SessionInfo;
 
 /// Thread-safe, mutex-guarded map of live sessions.
 #[derive(Default)]
