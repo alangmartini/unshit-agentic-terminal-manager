@@ -70,14 +70,23 @@ impl Rect {
     }
 }
 
+/// Estimated rendered width of one tab in CSS pixels. Tabs clamp to
+/// [150, 240] in the stylesheet; 200 splits the middle and gives us a
+/// reasonable boundary for drop-index hit-testing without tracking each
+/// tab's live rect.
+pub const TAB_WIDTH_ESTIMATE: f32 = 200.0;
+
 /// Resolve the drop target for a dragged pane at the given cursor
 /// position. Returns the insertion index in the tab bar when the cursor
 /// is within `tabbar`, or `None` otherwise.
 ///
-/// The insertion index is computed by splitting the tab-strip width
-/// into `tab_count + 1` equal slots (one boundary before each tab plus
-/// one after the last). A cursor past the rightmost tab inserts at
-/// `tab_count`, placing the new tab at the end.
+/// Each existing tab is treated as `TAB_WIDTH_ESTIMATE` CSS pixels wide
+/// starting at `tabbar.x`; the insertion slot falls on the nearest tab
+/// boundary. A cursor past the rightmost tab (i.e. over the empty right
+/// half of the tab strip) inserts at `tab_count`, placing the new tab
+/// at the end. This matches what a flex-row tab strip renders: tabs are
+/// left-aligned with a fixed width, so the midpoint of each tab is
+/// `(i + 0.5) * TAB_WIDTH_ESTIMATE` from the strip's start.
 pub fn resolve_tabbar_drop(
     cursor_x: f32,
     cursor_y: f32,
@@ -87,12 +96,11 @@ pub fn resolve_tabbar_drop(
     if !tabbar.contains(cursor_x, cursor_y) {
         return None;
     }
-    if tab_count == 0 || tabbar.width <= 0.0 {
+    if tab_count == 0 {
         return Some(0);
     }
     let local_x = (cursor_x - tabbar.x).max(0.0);
-    let slot = tabbar.width / tab_count as f32;
-    let raw = (local_x / slot).round() as isize;
+    let raw = (local_x / TAB_WIDTH_ESTIMATE).round() as isize;
     Some(raw.clamp(0, tab_count as isize) as usize)
 }
 
@@ -188,7 +196,35 @@ mod tests {
     fn drop_respects_offset_origin() {
         let bar = tabbar(252.0, 34.0, 548.0, 38.0);
         assert_eq!(resolve_tabbar_drop(252.0, 50.0, bar, 2), Some(0));
-        assert_eq!(resolve_tabbar_drop(525.0, 50.0, bar, 2), Some(1));
-        assert_eq!(resolve_tabbar_drop(799.0, 50.0, bar, 2), Some(2));
+        // Middle of tab 0 at x=352, boundary at x=452, middle of tab 1 at x=552.
+        assert_eq!(resolve_tabbar_drop(460.0, 50.0, bar, 2), Some(1));
+        assert_eq!(resolve_tabbar_drop(700.0, 50.0, bar, 2), Some(2));
+    }
+
+    /// The tab bar is typically much wider than `tab_count * TAB_WIDTH`;
+    /// a cursor released over the empty right half must still insert at
+    /// the end of the strip rather than snapping back to the middle.
+    #[test]
+    fn drop_in_empty_right_area_still_inserts_at_end() {
+        let bar = tabbar(258.0, 34.0, 2000.0, 38.0);
+        assert_eq!(resolve_tabbar_drop(1800.0, 50.0, bar, 1), Some(1));
+        assert_eq!(resolve_tabbar_drop(1800.0, 50.0, bar, 2), Some(2));
+    }
+
+    /// A cursor just past a tab's right edge must insert after that
+    /// tab, even when the tab bar has generous empty space.
+    #[test]
+    fn drop_right_of_only_tab_inserts_after_it() {
+        let bar = tabbar(258.0, 34.0, 2000.0, 38.0);
+        // With 1 tab at [258, 458] (width 200 estimate) the midpoint is
+        // 358. A drop at x=500 is clearly past it and should insert at 1.
+        assert_eq!(resolve_tabbar_drop(500.0, 50.0, bar, 1), Some(1));
+    }
+
+    /// A cursor to the left of the only tab's midpoint must insert at 0.
+    #[test]
+    fn drop_left_of_only_tab_inserts_before_it() {
+        let bar = tabbar(258.0, 34.0, 2000.0, 38.0);
+        assert_eq!(resolve_tabbar_drop(300.0, 50.0, bar, 1), Some(0));
     }
 }

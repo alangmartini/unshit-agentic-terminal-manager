@@ -21,6 +21,7 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     tabs = tabs.with_child(
         ElementDef::new(Tag::Button)
             .with_class("tab-add")
+            .with_key("tab-add")
             .on_click(move || {
                 mutate_with(&add_state, |st| dispatch(st, "tab.new"));
             })
@@ -84,7 +85,7 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                 // sidebar and its 6px resizer, below the titlebar. The
                 // framework's on_resize reports w/h in *physical*
                 // pixels, but sidebar_width and the CSS constants are
-                // in logical pixels — divide w/h so the rect composes
+                // in logical pixels, so divide w/h to make the rect compose
                 // with cursor coords that are also normalised to CSS.
                 const TITLEBAR_HEIGHT: f32 = 34.0;
                 const SIDEBAR_RESIZER_WIDTH: f32 = 6.0;
@@ -108,7 +109,9 @@ fn pane_drag_insertion_index(state: &UiSnapshot) -> Option<usize> {
 }
 
 fn build_tab_drop_placeholder() -> ElementDef {
-    ElementDef::new(Tag::Div).with_class("tab-drop-placeholder")
+    ElementDef::new(Tag::Div)
+        .with_class("tab-drop-placeholder")
+        .with_key("tab-drop-placeholder")
 }
 
 fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedState) -> ElementDef {
@@ -118,7 +121,12 @@ fn build_tab(index: usize, tab: &TerminalTab, is_active: bool, shared: &SharedSt
         TabStatus::Stopped => "stopped",
     };
 
-    let mut btn = ElementDef::new(Tag::Button).with_class("tab");
+    // Stable reconcile key derived from the tab's persistent id. Without
+    // this the framework's positional match shuffles every tab + the
+    // add button when a tab is inserted or removed mid-strip.
+    let mut btn = ElementDef::new(Tag::Button)
+        .with_class("tab")
+        .with_key(format!("tab:{}", tab.id));
     if is_active {
         btn = btn.with_class("active");
     }
@@ -621,6 +629,40 @@ mod tests {
             find_by_class(&el, "tab-drop-placeholder").is_none(),
             "placeholder must only appear during an active pane drag"
         );
+    }
+
+    /// Without stable keys the framework's reconciler matches tab-bar
+    /// children by position. Inserting a new tab then shuffles every
+    /// subsequent element (tabs, placeholder, add button) into the
+    /// wrong slot on the next render, causing the squished/misaligned
+    /// rendering we saw after pane extraction. Each tab needs a key
+    /// tied to its stable `id`, and the add button needs its own.
+    #[test]
+    fn tabs_have_unique_keys_for_reconcile_stability() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.tabs = vec![
+                make_tab("shell", TabStatus::Running),
+                make_tab("vim", TabStatus::Idle),
+                make_tab("build", TabStatus::Stopped),
+            ];
+        }
+        // Override the tab ids so collisions aren't hidden by
+        // coincidence; make_tab uses a formatted label so "t-shell"
+        // etc. are naturally unique, but we want the assertion explicit.
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_tabbar(&snap, &shared);
+        let tabs_el = &el.children[0];
+
+        let mut seen = std::collections::HashSet::new();
+        for (i, child) in tabs_el.children.iter().enumerate() {
+            let key = child
+                .key
+                .clone()
+                .unwrap_or_else(|| panic!("child {i} missing reconcile key"));
+            assert!(seen.insert(key.clone()), "duplicate reconcile key: {}", key);
+        }
     }
 
     /// A pane drag whose cursor sits outside the tab bar (e.g. still
