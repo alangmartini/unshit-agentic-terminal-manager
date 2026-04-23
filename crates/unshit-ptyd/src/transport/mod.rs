@@ -10,12 +10,12 @@ use std::path::PathBuf;
 #[cfg(windows)]
 pub mod pipe_windows;
 #[cfg(windows)]
-pub use pipe_windows::{connect, Connection, Server};
+pub use pipe_windows::{connect, ClientConnection, Connection, Server};
 
 #[cfg(unix)]
 pub mod socket_unix;
 #[cfg(unix)]
-pub use socket_unix::{connect, Connection, Server};
+pub use socket_unix::{connect, ClientConnection, Connection, Server};
 
 /// Default path the daemon binds when the caller does not override it.
 ///

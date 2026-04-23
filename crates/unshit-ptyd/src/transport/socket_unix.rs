@@ -12,6 +12,11 @@ use tokio::net::{UnixListener, UnixStream};
 
 pub type Connection = UnixStream;
 
+/// Client-side connection returned by [`connect`]. On Unix the same
+/// `UnixStream` type serves both ends; the alias exists to match the
+/// Windows API shape.
+pub type ClientConnection = UnixStream;
+
 pub struct Server {
     listener: UnixListener,
     path: PathBuf,

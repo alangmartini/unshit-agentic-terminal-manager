@@ -5,20 +5,28 @@
 //! event loop for hello / shutdown. Session lifecycle and PTY ownership
 //! arrive in slice 3.
 
+pub mod client;
+pub mod daemon;
 pub mod protocol;
 pub mod transport;
+
+use std::path::PathBuf;
 
 /// Daemon version pulled from the crate manifest. Reported on the wire
 /// in `HelloAck` so clients can version-gate behavior.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Parsed CLI invocation.
-///
-/// `Run` is a loud-failing stub in slice 1 so accidental callers fail
-/// instead of silently hanging; the real daemon loop lands in slice 2.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParsedArgs {
-    Run,
+    /// Run the daemon event loop on `socket` (or the default path).
+    Run {
+        socket: Option<PathBuf>,
+    },
+    /// Connect to an existing daemon and ask it to shut down.
+    Shutdown {
+        socket: Option<PathBuf>,
+    },
     Status,
     Help,
     Version,
@@ -29,6 +37,18 @@ pub enum ParsedArgs {
 pub enum ArgError {
     UnknownFlag(String),
     UnexpectedPositional(String),
+    /// `--socket` was the last token, or a flag that requires a value
+    /// was followed by nothing.
+    MissingValue(String),
+    /// Two mode-selecting flags were passed together (e.g. `--status
+    /// --shutdown`). Exactly one mode flag is allowed.
+    ConflictingModes(String, String),
+    /// A flag was accepted in isolation but is not valid in the chosen
+    /// mode (e.g. `--socket` with `--status`).
+    IncompatibleFlag {
+        mode: String,
+        flag: String,
+    },
 }
 
 impl std::fmt::Display for ArgError {
@@ -36,11 +56,43 @@ impl std::fmt::Display for ArgError {
         match self {
             ArgError::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
             ArgError::UnexpectedPositional(v) => write!(f, "unexpected positional argument: {v}"),
+            ArgError::MissingValue(flag) => write!(f, "missing value for flag: {flag}"),
+            ArgError::ConflictingModes(a, b) => {
+                write!(f, "conflicting mode flags: {a} and {b}")
+            }
+            ArgError::IncompatibleFlag { mode, flag } => {
+                write!(f, "flag {flag} is not valid with {mode}")
+            }
         }
     }
 }
 
 impl std::error::Error for ArgError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Run,
+    Shutdown,
+    Status,
+    Help,
+    Version,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Run => "(default run)",
+            Mode::Shutdown => "--shutdown",
+            Mode::Status => "--status",
+            Mode::Help => "--help",
+            Mode::Version => "--version",
+        }
+    }
+
+    fn accepts_socket(self) -> bool {
+        matches!(self, Mode::Run | Mode::Shutdown)
+    }
+}
 
 /// Parse CLI arguments.
 ///
@@ -52,29 +104,55 @@ where
     S: AsRef<str>,
 {
     let mut iter = args.into_iter();
-    let Some(first) = iter.next() else {
-        return Ok(ParsedArgs::Run);
-    };
-    let parsed = match first.as_ref() {
-        "--status" => ParsedArgs::Status,
-        "--help" | "-h" => ParsedArgs::Help,
-        "--version" | "-V" => ParsedArgs::Version,
-        other if other.starts_with('-') => {
-            return Err(ArgError::UnknownFlag(other.to_string()));
+    let mut mode: Option<Mode> = None;
+    let mut socket: Option<PathBuf> = None;
+
+    while let Some(arg) = iter.next() {
+        let s = arg.as_ref();
+        let next_mode = match s {
+            "--status" => Some(Mode::Status),
+            "--help" | "-h" => Some(Mode::Help),
+            "--version" | "-V" => Some(Mode::Version),
+            "--shutdown" => Some(Mode::Shutdown),
+            "--socket" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| ArgError::MissingValue("--socket".to_string()))?;
+                socket = Some(PathBuf::from(value.as_ref()));
+                None
+            }
+            other if other.starts_with('-') => {
+                return Err(ArgError::UnknownFlag(other.to_string()));
+            }
+            other => {
+                return Err(ArgError::UnexpectedPositional(other.to_string()));
+            }
+        };
+        if let Some(m) = next_mode {
+            if let Some(prev) = mode {
+                return Err(ArgError::ConflictingModes(
+                    prev.label().to_string(),
+                    m.label().to_string(),
+                ));
+            }
+            mode = Some(m);
         }
-        other => {
-            return Err(ArgError::UnexpectedPositional(other.to_string()));
-        }
-    };
-    if let Some(extra) = iter.next() {
-        let s = extra.as_ref();
-        return Err(if s.starts_with('-') {
-            ArgError::UnknownFlag(s.to_string())
-        } else {
-            ArgError::UnexpectedPositional(s.to_string())
+    }
+
+    let resolved = mode.unwrap_or(Mode::Run);
+    if socket.is_some() && !resolved.accepts_socket() {
+        return Err(ArgError::IncompatibleFlag {
+            mode: resolved.label().to_string(),
+            flag: "--socket".to_string(),
         });
     }
-    Ok(parsed)
+    Ok(match resolved {
+        Mode::Run => ParsedArgs::Run { socket },
+        Mode::Shutdown => ParsedArgs::Shutdown { socket },
+        Mode::Status => ParsedArgs::Status,
+        Mode::Help => ParsedArgs::Help,
+        Mode::Version => ParsedArgs::Version,
+    })
 }
 
 /// One-line health banner printed for `--status`.
@@ -93,11 +171,13 @@ USAGE:
     unshit-ptyd [FLAGS]
 
 FLAGS:
-    --status       Print a one-line health banner and exit
-    --help, -h     Print this help and exit
-    --version, -V  Print version and exit
+    --status           Print a one-line health banner and exit
+    --help, -h         Print this help and exit
+    --version, -V      Print version and exit
+    --shutdown         Connect to a running daemon and ask it to shut down
+    --socket <path>    Override the default pipe / socket path
 
-With no flags, runs the daemon event loop (not implemented in slice 1).
+With no flags, runs the daemon event loop on the default socket path.
 ";
 
 #[cfg(test)]
@@ -109,8 +189,8 @@ mod tests {
     }
 
     #[test]
-    fn no_args_runs_daemon() {
-        assert_eq!(parse(&[]), Ok(ParsedArgs::Run));
+    fn no_args_runs_daemon_with_default_socket() {
+        assert_eq!(parse(&[]), Ok(ParsedArgs::Run { socket: None }));
     }
 
     #[test]
@@ -136,6 +216,67 @@ mod tests {
     #[test]
     fn version_flag_short_parsed() {
         assert_eq!(parse(&["-V"]), Ok(ParsedArgs::Version));
+    }
+
+    #[test]
+    fn shutdown_flag_parsed() {
+        assert_eq!(
+            parse(&["--shutdown"]),
+            Ok(ParsedArgs::Shutdown { socket: None })
+        );
+    }
+
+    #[test]
+    fn socket_overrides_default_on_run() {
+        assert_eq!(
+            parse(&["--socket", r"\\.\pipe\custom"]),
+            Ok(ParsedArgs::Run {
+                socket: Some(PathBuf::from(r"\\.\pipe\custom"))
+            })
+        );
+    }
+
+    #[test]
+    fn shutdown_with_socket_pairs_correctly() {
+        assert_eq!(
+            parse(&["--shutdown", "--socket", "/tmp/x.sock"]),
+            Ok(ParsedArgs::Shutdown {
+                socket: Some(PathBuf::from("/tmp/x.sock"))
+            })
+        );
+    }
+
+    #[test]
+    fn socket_before_shutdown_pairs_correctly() {
+        assert_eq!(
+            parse(&["--socket", "/tmp/x.sock", "--shutdown"]),
+            Ok(ParsedArgs::Shutdown {
+                socket: Some(PathBuf::from("/tmp/x.sock"))
+            })
+        );
+    }
+
+    #[test]
+    fn socket_without_value_errors() {
+        assert_eq!(
+            parse(&["--socket"]),
+            Err(ArgError::MissingValue("--socket".to_string()))
+        );
+    }
+
+    #[test]
+    fn socket_with_status_is_incompatible() {
+        let err = parse(&["--status", "--socket", "/tmp/x"]).unwrap_err();
+        assert!(
+            matches!(err, ArgError::IncompatibleFlag { ref flag, .. } if flag == "--socket"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn two_mode_flags_conflict() {
+        let err = parse(&["--status", "--shutdown"]).unwrap_err();
+        assert!(matches!(err, ArgError::ConflictingModes(_, _)), "{err:?}");
     }
 
     #[test]
@@ -168,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_flag_after_flag_rejected() {
+    fn unknown_trailing_flag_after_mode_rejected() {
         assert_eq!(
             parse(&["--status", "--also"]),
             Err(ArgError::UnknownFlag("--also".to_string()))

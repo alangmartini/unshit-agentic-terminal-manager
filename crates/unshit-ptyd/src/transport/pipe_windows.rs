@@ -13,10 +13,11 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 
-/// Connection handed out by `Server::accept`. On Windows this is a
-/// single concrete tokio type; the alias exists so Unix callers can
-/// name the same thing portably.
+/// Server-side connection handed out by `Server::accept`.
 pub type Connection = NamedPipeServer;
+
+/// Client-side connection returned by [`connect`].
+pub type ClientConnection = NamedPipeClient;
 
 /// Listens on a named pipe and yields connections one at a time.
 ///
@@ -72,7 +73,7 @@ fn create_instance(path: &Path, first: bool) -> io::Result<NamedPipeServer> {
 }
 
 /// Connects to a daemon already listening on `path`.
-pub async fn connect(path: impl AsRef<Path>) -> io::Result<NamedPipeClient> {
+pub async fn connect(path: impl AsRef<Path>) -> io::Result<ClientConnection> {
     ClientOptions::new().open(path.as_ref())
 }
 
