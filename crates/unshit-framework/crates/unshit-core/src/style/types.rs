@@ -453,8 +453,8 @@ pub enum Dimension {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Display {
     #[default]
-    Flex,
     Block,
+    Flex,
     InlineFlex,
     InlineBlock,
     Grid,
@@ -1119,7 +1119,7 @@ impl Default for ComputedStyle {
             content: ContentValue::Normal,
             transitions: SmallVec::new(),
             animations: SmallVec::new(),
-            display: Display::Flex,
+            display: Display::Block,
             flex_direction: FlexDirection::Row,
             flex_grow: 0.0,
             flex_shrink: 1.0,

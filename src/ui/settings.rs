@@ -1,6 +1,6 @@
 use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::{Dimension, FlexDirection, Overflow};
+use unshit::core::style::types::{Dimension, Display, FlexDirection, Overflow};
 use unshit::prelude::SvgNode;
 
 use crate::state::{
@@ -12,6 +12,7 @@ use crate::ui::icons::*;
 pub fn build_settings_modal(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal")
+        .with_style(StyleDeclaration::Display(Display::Flex))
         .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_style(StyleDeclaration::Width(Dimension::Px(680.0)))
         .with_style(StyleDeclaration::Height(Dimension::Percent(80.0)))
@@ -81,6 +82,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     };
     ElementDef::new(Tag::Div)
         .with_class("modal-body")
+        .with_style(StyleDeclaration::Display(Display::Flex))
         .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_style(StyleDeclaration::FlexGrow(1.0))
         .with_style(StyleDeclaration::FlexBasis(Dimension::Auto))
@@ -315,6 +317,7 @@ fn build_modal_footer(shared: &SharedState) -> ElementDef {
 fn section_shell(title: &str) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal-section")
+        .with_style(StyleDeclaration::Display(Display::Flex))
         .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_child(
             ElementDef::new(Tag::Div)
@@ -326,6 +329,7 @@ fn section_shell(title: &str) -> ElementDef {
 fn setting_meta(label: &str, desc: Option<&str>) -> ElementDef {
     let mut meta = ElementDef::new(Tag::Div)
         .with_class("setting-meta")
+        .with_style(StyleDeclaration::Display(Display::Flex))
         .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_child(
             ElementDef::new(Tag::Span)
@@ -607,6 +611,7 @@ fn agent_row(spec: &AgentSpec, enabled: bool, shared: &SharedState) -> ElementDe
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("agent-info")
+                .with_style(StyleDeclaration::Display(Display::Flex))
                 .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
                 .with_child(
                     ElementDef::new(Tag::Span)

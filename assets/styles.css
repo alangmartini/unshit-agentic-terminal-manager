@@ -375,6 +375,7 @@ body::after {
 }
 
 .sidebar-scroll {
+  display: flex;
   flex: 1;
   flex-direction: column;
   overflow-y: auto;
@@ -398,6 +399,7 @@ body::after {
 
 
 .workspace {
+  display: flex;
   flex-direction: column;
   padding-bottom: var(--sp-1);
   margin-bottom: var(--sp-2);
@@ -513,6 +515,7 @@ body::after {
 }
 
 .workspace-body {
+  display: flex;
   flex-direction: column;
   padding: var(--sp-1) 0 var(--sp-2);
   overflow: hidden;
@@ -645,11 +648,13 @@ body::after {
 }
 
 .terminal-entries {
+  display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
 .terminal-entry {
+  display: flex;
   align-items: center;
   gap: var(--sp-3);
   padding: var(--sp-1) var(--sp-6) var(--sp-1) calc(var(--sp-6) + 32px);
@@ -673,6 +678,7 @@ body::after {
 }
 
 .sidebar-footer {
+  display: flex;
   flex-direction: column;
   border-top: 1px solid var(--border-hair);
   padding: var(--sp-5) var(--sp-6) var(--sp-4);
@@ -697,6 +703,7 @@ body::after {
 }
 
 .activity-item {
+  display: flex;
   flex-direction: column;
   margin-bottom: var(--sp-4);
   padding-left: var(--sp-4);
@@ -976,6 +983,7 @@ body::after {
 }
 
 .terminal-grid.empty {
+  display: flex;
   align-items: center;
   justify-content: center;
 }
@@ -1405,6 +1413,8 @@ body.dragging-pane {
 
 .ctx-menu {
   position: fixed;
+  display: flex;
+  flex-direction: column;
   min-width: 180px;
   background: var(--bg-elevated);
   border: 1px solid var(--border-soft);
@@ -1412,7 +1422,6 @@ body.dragging-pane {
   padding: 4px 0;
   box-shadow: var(--shadow-lg);
   z-index: 201;
-  flex-direction: column;
 }
 
 .ctx-menu-header {
