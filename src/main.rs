@@ -1,5 +1,6 @@
 pub mod bench;
 pub mod bridge;
+pub mod daemon;
 pub mod git;
 pub mod persist;
 pub mod pty;
