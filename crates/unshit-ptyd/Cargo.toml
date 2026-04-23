@@ -22,6 +22,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+portable-pty = "0.8"
+dirs = "5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
