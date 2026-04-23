@@ -9,26 +9,36 @@
 //! 3. Non-editable system shortcuts: `Escape` to close modals and
 //!    `Ctrl+1` through `Ctrl+9` to jump to a tab.
 
+use super::loader::UserKeybinds;
 use super::KeybindAction;
 
 /// Number of `Ctrl+N` tab-switch bindings (one per numeric key 1..=9).
 const TAB_SWITCH_COUNT: usize = 9;
 
 /// Build the full list of `(combo, dispatch_command)` pairs to register
-/// with the framework on startup.
-pub fn default_shortcut_bindings() -> Vec<(String, String)> {
+/// with the framework on startup, with user overrides applied.
+///
+/// The framework snapshots these at build time, so changes to
+/// `overrides` after startup do not propagate until the next run.
+pub fn shortcut_bindings_with_overrides(overrides: &UserKeybinds) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
 
     for action in KeybindAction::ALL {
-        out.push((
-            action.default_combo_str().to_string(),
-            action.dispatch_command().to_string(),
-        ));
+        let combo = overrides
+            .get(action)
+            .copied()
+            .unwrap_or_else(|| action.default_combo());
+        out.push((combo.to_string(), action.dispatch_command().to_string()));
     }
 
     out.extend(alias_bindings());
     out.extend(system_bindings());
     out
+}
+
+/// Build the bindings list with defaults only (no user overrides).
+pub fn default_shortcut_bindings() -> Vec<(String, String)> {
+    shortcut_bindings_with_overrides(&UserKeybinds::new())
 }
 
 /// Convenience aliases that map a second combo to an existing action's

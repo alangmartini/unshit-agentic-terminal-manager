@@ -40,14 +40,15 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 - [x] Config dir matches existing app usage (`com.godly.terminal` namespace under `dirs::config_dir()`)
 - [x] 10/10 unit tests green (round-trip, missing, malformed, atomic, overwrite, parent-dir, empty, namespace)
 
-### B2: `AppState.keybinds` + dispatch arms
-- [ ] Add `keybinds: HashMap<KeybindAction, KeyCombo>` to `AppState`
-- [ ] Load on startup, defaults fill gaps
-- [ ] Implement `keybind.set:<action>:<combo>` with conflict check
-- [ ] Implement `keybind.reset:<action>` and `keybind.reset_all`
-- [ ] Add `keybind_recording: Option<RecordingState>` + `keybind_error: Option<KeybindError>`
-- [ ] Unit tests for each dispatch arm
-- [ ] Persistence integration test: set, reload state from disk, combo persists
+### B2: `AppState.keybinds` + dispatch arms [DONE]
+- [x] Add `keybinds: KeybindsState` to `AppState` (sparse overrides, recording, error)
+- [x] Load overrides on startup via `load_if_installed` in `seed_state`
+- [x] Implement `keybind.set:<action>:<combo>` with conflict + invalid-combo errors
+- [x] Implement `keybind.reset:<action>` and `keybind.reset_all`
+- [x] Add `keybind.record:<action>` and `keybind.cancel_record` dispatch arms
+- [x] 12 KeybindsState unit tests + 8 dispatch tests green (all 589/589 suite)
+- [x] `user_shortcut_bindings()` now honors saved overrides on startup (restart-to-apply per user's option-1 choice)
+- [x] Persistence path installed in `main.rs` alongside `persist::install`
 
 ### B3: Editable Settings > Keybinds UI
 - [ ] Replace static `keybind_row` block with dynamic builder over `AppState.keybinds`

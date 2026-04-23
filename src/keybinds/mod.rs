@@ -8,6 +8,9 @@
 
 pub mod loader;
 pub mod registry;
+pub mod state;
+
+pub use state::{KeybindError, KeybindErrorKind, KeybindsState};
 
 use unshit::core::shortcut::KeyCombo;
 

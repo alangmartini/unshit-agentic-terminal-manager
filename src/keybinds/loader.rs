@@ -9,12 +9,47 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use unshit::core::shortcut::KeyCombo;
 
 use super::KeybindAction;
 
 pub type UserKeybinds = HashMap<KeybindAction, KeyCombo>;
+
+/// Path installed at app startup. Dispatch-initiated saves read this
+/// via `save_if_installed`. Tests that don't install skip file I/O.
+static KEYBINDS_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the user-config path for dispatch-initiated saves. Safe to
+/// call once at app startup. Subsequent calls are ignored.
+pub fn install(path: PathBuf) {
+    let _ = KEYBINDS_PATH.set(path);
+}
+
+fn configured_path() -> Option<&'static Path> {
+    KEYBINDS_PATH.get().map(|p| p.as_path())
+}
+
+/// Load overrides from the installed path. Returns an empty map if no
+/// path has been installed or the file is missing/malformed.
+pub fn load_if_installed() -> UserKeybinds {
+    configured_path()
+        .map(load_user_keybinds)
+        .unwrap_or_default()
+}
+
+/// Save overrides to the installed path. Silently skipped when no path
+/// is installed (e.g. in unit tests). Errors are logged, not returned:
+/// a failed write must never block a dispatch.
+pub fn save_if_installed(map: &UserKeybinds) {
+    let Some(path) = configured_path() else {
+        return;
+    };
+    if let Err(e) = save_user_keybinds(path, map) {
+        log::warn!("failed to save keybinds to {}: {}", path.display(), e);
+    }
+}
 
 /// Default location of the user keybindings file. `None` if we cannot
 /// determine a config dir (rare; happens on stripped-down systems).

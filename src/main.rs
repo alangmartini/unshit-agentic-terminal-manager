@@ -240,7 +240,8 @@ fn build_tree(
 }
 
 fn user_shortcut_bindings() -> Vec<(String, String)> {
-    crate::keybinds::registry::default_shortcut_bindings()
+    let overrides = crate::keybinds::loader::load_if_installed();
+    crate::keybinds::registry::shortcut_bindings_with_overrides(&overrides)
 }
 
 fn parse_bench_args() -> Option<crate::bench::BenchConfig> {
@@ -333,6 +334,10 @@ fn main() {
 
     if let Some(path) = persist::default_config_path() {
         persist::install(path);
+    }
+
+    if let Some(path) = crate::keybinds::loader::keybinds_config_path() {
+        crate::keybinds::loader::install(path);
     }
 
     let mut initial_state = seed_state();

@@ -270,6 +270,10 @@ pub struct AppState {
     pub resize_drag: Option<ResizeDragSnapshot>,
     /// Context menu state: Some when open, None when closed.
     pub ctx_menu: Option<CtxMenu>,
+    /// User keybind overrides, recording mode, and last validation error.
+    /// Changes here persist to disk but only take effect on next restart
+    /// (the framework's shortcut resolver snapshots the bindings at build).
+    pub keybinds: crate::keybinds::KeybindsState,
 }
 
 impl AppState {
@@ -556,6 +560,9 @@ pub fn seed_state() -> AppState {
         col_ratios: vec![vec![1.0]],
         resize_drag: None,
         ctx_menu: None,
+        keybinds: crate::keybinds::KeybindsState::with_overrides(
+            crate::keybinds::loader::load_if_installed(),
+        ),
     }
 }
 
@@ -1223,8 +1230,74 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             true
         }
+        other if other.starts_with("keybind.set:") => dispatch_keybind_set(state, other),
+        other if other.starts_with("keybind.reset:") => dispatch_keybind_reset(state, other),
+        "keybind.reset_all" => {
+            state.keybinds.reset_all();
+            crate::keybinds::loader::save_if_installed(&state.keybinds.overrides);
+            true
+        }
+        other if other.starts_with("keybind.record:") => {
+            let id = &other["keybind.record:".len()..];
+            let Some(action) = crate::keybinds::KeybindAction::from_id(id) else {
+                return false;
+            };
+            state.keybinds.start_recording(action);
+            true
+        }
+        "keybind.cancel_record" => {
+            let had_state = state.keybinds.recording.is_some() || state.keybinds.error.is_some();
+            state.keybinds.cancel_recording();
+            state.keybinds.error = None;
+            had_state
+        }
         _ => false,
     }
+}
+
+/// Parse `keybind.set:<action_id>:<combo>` and apply. The combo can
+/// itself contain `+` and the separator is only the *first* colon after
+/// the prefix, since combos like `Ctrl+,` do not contain colons but
+/// ids never do either. Falls back to `false` when the action id is
+/// unknown so a stale settings UI doesn't silently corrupt state.
+fn dispatch_keybind_set(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["keybind.set:".len()..];
+    let Some((id, combo_str)) = rest.split_once(':') else {
+        return false;
+    };
+    let Some(action) = crate::keybinds::KeybindAction::from_id(id) else {
+        return false;
+    };
+    let combo = match unshit::core::shortcut::KeyCombo::parse(combo_str) {
+        Ok(c) => c,
+        Err(e) => {
+            state.keybinds.error = Some(crate::keybinds::KeybindError {
+                action,
+                kind: crate::keybinds::KeybindErrorKind::InvalidCombo {
+                    combo: combo_str.to_string(),
+                    message: e,
+                },
+            });
+            return true;
+        }
+    };
+    match state.keybinds.set(action, combo) {
+        Ok(()) => {
+            crate::keybinds::loader::save_if_installed(&state.keybinds.overrides);
+            true
+        }
+        Err(_) => true,
+    }
+}
+
+fn dispatch_keybind_reset(state: &mut AppState, cmd: &str) -> bool {
+    let id = &cmd["keybind.reset:".len()..];
+    let Some(action) = crate::keybinds::KeybindAction::from_id(id) else {
+        return false;
+    };
+    state.keybinds.reset(action);
+    crate::keybinds::loader::save_if_installed(&state.keybinds.overrides);
+    true
 }
 
 /// Return the working directory for the active workspace, falling back to home.
@@ -1437,6 +1510,7 @@ mod tests {
             col_ratios: vec![vec![1.0]],
             resize_drag: None,
             ctx_menu: None,
+            keybinds: crate::keybinds::KeybindsState::default(),
         }
     }
 
@@ -2250,6 +2324,109 @@ mod tests {
             "surviving pane must absorb closed pane's ratio, got {}",
             state.col_ratios[0][0]
         );
+    }
+
+    // -- dispatch keybind.* ---------------------------------------------------
+
+    #[test]
+    fn dispatch_keybind_set_non_conflicting_updates_override() {
+        let mut state = test_state();
+        assert!(dispatch(
+            &mut state,
+            "keybind.set:new_terminal:Ctrl+Shift+T"
+        ));
+        assert_eq!(
+            state
+                .keybinds
+                .effective(crate::keybinds::KeybindAction::NewTerminal)
+                .to_string(),
+            "Ctrl+Shift+T".to_string()
+        );
+        assert!(state.keybinds.error.is_none());
+    }
+
+    #[test]
+    fn dispatch_keybind_set_conflict_leaves_override_unchanged() {
+        // Ctrl+W is CloseTab's default. Setting NewTerminal to Ctrl+W
+        // must conflict and leave NewTerminal at its default.
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "keybind.set:new_terminal:Ctrl+W"));
+        assert!(
+            state.keybinds.error.is_some(),
+            "conflict should populate error"
+        );
+        assert!(
+            !state
+                .keybinds
+                .overrides
+                .contains_key(&crate::keybinds::KeybindAction::NewTerminal),
+            "conflicting set must not mutate overrides"
+        );
+    }
+
+    #[test]
+    fn dispatch_keybind_set_invalid_combo_sets_error() {
+        let mut state = test_state();
+        assert!(dispatch(
+            &mut state,
+            "keybind.set:new_terminal:NotARealCombo"
+        ));
+        match state.keybinds.error.as_ref().map(|e| &e.kind) {
+            Some(crate::keybinds::KeybindErrorKind::InvalidCombo { .. }) => {}
+            other => panic!("expected InvalidCombo error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dispatch_keybind_set_unknown_action_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "keybind.set:bogus_action:Ctrl+T"));
+    }
+
+    #[test]
+    fn dispatch_keybind_reset_drops_override() {
+        let mut state = test_state();
+        dispatch(&mut state, "keybind.set:new_terminal:Ctrl+Shift+T");
+        assert!(state
+            .keybinds
+            .overrides
+            .contains_key(&crate::keybinds::KeybindAction::NewTerminal));
+
+        assert!(dispatch(&mut state, "keybind.reset:new_terminal"));
+        assert!(!state
+            .keybinds
+            .overrides
+            .contains_key(&crate::keybinds::KeybindAction::NewTerminal));
+    }
+
+    #[test]
+    fn dispatch_keybind_reset_all_clears_every_override() {
+        let mut state = test_state();
+        dispatch(&mut state, "keybind.set:new_terminal:Ctrl+Shift+T");
+        dispatch(&mut state, "keybind.set:close_tab:Ctrl+Shift+F4");
+        assert_eq!(state.keybinds.overrides.len(), 2);
+
+        assert!(dispatch(&mut state, "keybind.reset_all"));
+        assert!(state.keybinds.overrides.is_empty());
+    }
+
+    #[test]
+    fn dispatch_keybind_record_and_cancel() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "keybind.record:new_terminal"));
+        assert_eq!(
+            state.keybinds.recording,
+            Some(crate::keybinds::KeybindAction::NewTerminal)
+        );
+
+        assert!(dispatch(&mut state, "keybind.cancel_record"));
+        assert!(state.keybinds.recording.is_none());
+    }
+
+    #[test]
+    fn dispatch_keybind_record_unknown_action_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "keybind.record:bogus"));
     }
 
     // -- dispatch tab.next / tab.prev with empty tabs -------------------------
