@@ -82,16 +82,18 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             mutate_with(&resize_state, |st| {
                 // The tabbar lives immediately to the right of the
                 // sidebar and its 6px resizer, below the titlebar. The
-                // framework's on_resize only reports w/h, so we
-                // reconstruct the absolute origin from the sidebar
-                // width we already track plus CSS constants.
+                // framework's on_resize reports w/h in *physical*
+                // pixels, but sidebar_width and the CSS constants are
+                // in logical pixels — divide w/h so the rect composes
+                // with cursor coords that are also normalised to CSS.
                 const TITLEBAR_HEIGHT: f32 = 34.0;
                 const SIDEBAR_RESIZER_WIDTH: f32 = 6.0;
+                let sf = st.scale_factor.max(1e-3);
                 st.tabbar_rect = crate::drag::Rect {
                     x: st.sidebar_width + SIDEBAR_RESIZER_WIDTH,
                     y: TITLEBAR_HEIGHT,
-                    width: w,
-                    height: h,
+                    width: w / sf,
+                    height: h / sf,
                 };
             });
         })

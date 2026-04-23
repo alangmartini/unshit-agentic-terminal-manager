@@ -1416,10 +1416,14 @@ fn dispatch_drag_start_pane(state: &mut AppState, cmd: &str) -> bool {
     if find_pane_coord(state, pane).is_none() {
         return false;
     }
+    // Cursor events arrive in physical pixels. Store them in CSS
+    // pixels so they compose correctly with `Dimension::Px` in the
+    // overlay builder (the framework re-applies scale_factor there).
+    let sf = state.scale_factor.max(1e-3);
     state.drag = crate::drag::DragState::DraggingPane {
         pane,
-        cursor_x: x,
-        cursor_y: y,
+        cursor_x: x / sf,
+        cursor_y: y / sf,
     };
     true
 }
@@ -1457,12 +1461,13 @@ fn dispatch_drag_update(state: &mut AppState, cmd: &str) -> bool {
     let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) else {
         return false;
     };
+    let sf = state.scale_factor.max(1e-3);
     match &mut state.drag {
         crate::drag::DragState::DraggingPane {
             cursor_x, cursor_y, ..
         } => {
-            *cursor_x = x;
-            *cursor_y = y;
+            *cursor_x = x / sf;
+            *cursor_y = y / sf;
             true
         }
         crate::drag::DragState::Idle => false,
@@ -2795,6 +2800,29 @@ mod tests {
 
         assert_eq!(state.tabs.len(), tabs_before, "no extraction below tab bar");
         assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn dispatch_drag_start_converts_physical_cursor_to_css() {
+        // Cursor events arrive in physical pixels; storing them as-is
+        // and then feeding them to `Dimension::Px` would make the ghost
+        // overlay render scale_factor^2 pixels away from the real
+        // cursor. Divide by scale_factor at the dispatch boundary.
+        let mut state = seed_state();
+        state.scale_factor = 2.0;
+        let id = state.active_pane.0;
+        dispatch(&mut state, &format!("drag.start_pane:{}:200:100", id));
+        assert_eq!(state.drag.cursor(), Some((100.0, 50.0)));
+    }
+
+    #[test]
+    fn dispatch_drag_update_converts_physical_cursor_to_css() {
+        let mut state = seed_state();
+        state.scale_factor = 2.0;
+        let id = state.active_pane.0;
+        dispatch(&mut state, &format!("drag.start_pane:{}:0:0", id));
+        dispatch(&mut state, "drag.update:400:200");
+        assert_eq!(state.drag.cursor(), Some((200.0, 100.0)));
     }
 
     #[test]
