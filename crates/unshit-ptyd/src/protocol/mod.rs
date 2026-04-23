@@ -6,9 +6,11 @@
 //! - [`message`] defines the JSON control vocabulary.
 //! - [`error`] is the shared error type across the three.
 
+pub mod codec;
 pub mod error;
 pub mod frame;
 
+pub use codec::{read_frame, write_frame, Frame};
 pub use error::{ProtocolError, MAX_FRAME_LEN};
 pub use frame::{FrameHeader, KIND_CONTROL, KIND_OUTPUT, LEN_PREFIX_SIZE};
 
