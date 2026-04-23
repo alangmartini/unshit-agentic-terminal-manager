@@ -1,11 +1,14 @@
 //! `unshit-ptyd` daemon crate.
 //!
-//! This is slice 1 of the tmux-style persistence work (see `SPEC.md`).
-//! Only arg parsing and the status banner are implemented here. Later
-//! slices add IPC, session management, PTY ownership, and scrollback.
+//! Slice 2 of the tmux-style persistence work (see `SPEC.md`). This
+//! crate owns the IPC transport, the wire protocol, and the daemon
+//! event loop for hello / shutdown. Session lifecycle and PTY ownership
+//! arrive in slice 3.
+
+pub mod protocol;
 
 /// Daemon version pulled from the crate manifest. Reported on the wire
-/// once the IPC layer lands so clients can version-gate behavior.
+/// in `HelloAck` so clients can version-gate behavior.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Parsed CLI invocation.
