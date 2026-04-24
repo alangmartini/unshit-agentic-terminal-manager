@@ -57,6 +57,10 @@ pub enum ConfirmDialog {
     /// modal can caption correctly even if the workspace is renamed
     /// mid-flight.
     KillWorkspace { workspace_idx: usize, name: String },
+    /// Kill every terminal across every workspace. `count` is the number
+    /// of live terminals sampled at open time and is only used for the
+    /// modal body text.
+    KillAll { count: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +70,7 @@ pub enum SettingsSection {
     Shell,
     Keybinds,
     Agents,
+    DangerZone,
 }
 
 impl SettingsSection {
@@ -76,16 +81,18 @@ impl SettingsSection {
             SettingsSection::Shell => "shell",
             SettingsSection::Keybinds => "keybinds",
             SettingsSection::Agents => "agents",
+            SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 5] {
+    pub fn all() -> [SettingsSection; 6] {
         [
             SettingsSection::General,
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
             SettingsSection::Agents,
+            SettingsSection::DangerZone,
         ]
     }
 }
@@ -381,6 +388,7 @@ impl AppState {
             col_ratios: self.col_ratios.clone(),
             ctx_menu: self.ctx_menu.clone(),
             confirm_dialog: self.confirm_dialog.clone(),
+            terminal_count: self.terminals.len(),
         }
     }
 
@@ -426,6 +434,10 @@ pub struct UiSnapshot {
     pub col_ratios: Vec<Vec<f32>>,
     pub ctx_menu: Option<CtxMenu>,
     pub confirm_dialog: Option<ConfirmDialog>,
+    /// Total number of live terminals across every workspace. Read from
+    /// `state.terminals.len()` so the danger-zone button can show an
+    /// accurate count without the UI having to reach into the map.
+    pub terminal_count: usize,
 }
 
 fn current_folder_name() -> String {
@@ -1133,6 +1145,29 @@ pub fn mutate_kill_workspace_terminals(state: &mut AppState, ws_idx: usize) {
     state.workspaces[ws_idx].active_tab = 0;
 }
 
+/// Kill every terminal across every workspace and empty every workspace.
+/// All pane ids currently tracked in `state.terminals` are destroyed on
+/// the daemon, then every workspace's saved tabs and the live active
+/// pane/tab state are cleared. Workspaces themselves are not removed
+/// (per SPEC F6: the app-wide nuke empties but does not delete).
+pub fn mutate_kill_all_terminals(state: &mut AppState) {
+    let ids: Vec<u32> = state.terminals.keys().copied().collect();
+    for id in &ids {
+        state.pty_manager.destroy(*id);
+        state.terminals.remove(id);
+    }
+    for ws in state.workspaces.iter_mut() {
+        ws.tabs.clear();
+        ws.active_tab = 0;
+    }
+    state.tabs.clear();
+    state.active_tab = 0;
+    state.panes.clear();
+    state.active_pane = PaneId(0);
+    state.row_ratios.clear();
+    state.col_ratios.clear();
+}
+
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
     match command {
         "modal.close" => {
@@ -1156,6 +1191,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 match dlg {
                     ConfirmDialog::KillWorkspace { workspace_idx, .. } => {
                         mutate_kill_workspace_terminals(state, workspace_idx);
+                    }
+                    ConfirmDialog::KillAll { .. } => {
+                        mutate_kill_all_terminals(state);
                     }
                 }
                 true
@@ -1312,6 +1350,12 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 }
             }
             false
+        }
+        "app.request_kill_all_terminals" => {
+            state.confirm_dialog = Some(ConfirmDialog::KillAll {
+                count: state.terminals.len(),
+            });
+            true
         }
         other if other.starts_with("terminal.focus:") => {
             let rest = &other["terminal.focus:".len()..];
@@ -1593,14 +1637,16 @@ mod tests {
         assert_eq!(SettingsSection::Shell.label(), "shell");
         assert_eq!(SettingsSection::Keybinds.label(), "keybinds");
         assert_eq!(SettingsSection::Agents.label(), "agents");
+        assert_eq!(SettingsSection::DangerZone.label(), "danger zone");
     }
 
     #[test]
-    fn settings_section_all_returns_five() {
+    fn settings_section_all_returns_six() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         assert_eq!(all[0], SettingsSection::General);
         assert_eq!(all[4], SettingsSection::Agents);
+        assert_eq!(all[5], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -1947,7 +1993,7 @@ mod tests {
                 assert_eq!(*workspace_idx, 0);
                 assert_eq!(name, &state.workspaces[0].name);
             }
-            None => panic!("confirm dialog should be set"),
+            other => panic!("expected KillWorkspace dialog, got {other:?}"),
         }
     }
 
@@ -2065,6 +2111,71 @@ mod tests {
         });
         assert!(dispatch(&mut state, "modal.close"));
         assert!(state.confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn request_kill_all_terminals_opens_kill_all_confirm_dialog_with_count() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "app.request_kill_all_terminals"));
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::KillAll { count }) => {
+                assert_eq!(*count, state.terminals.len());
+            }
+            other => panic!("expected KillAll dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dialog_confirm_on_kill_all_empties_every_workspace() {
+        let mut state = seed_state();
+        mutate_add_workspace(&mut state);
+        // Seed saved tabs on the second (now inactive) workspace so the
+        // test asserts the mutator reaches into every workspace, not
+        // just the active one.
+        state.workspaces[1].tabs = vec![TerminalTab {
+            id: "ws2-t1".into(),
+            name: "n".into(),
+            subtitle: "".into(),
+            status: TabStatus::Running,
+            panes: vec![vec![Pane {
+                id: PaneId(77),
+                title: "p".into(),
+                subtitle: "".into(),
+                pid: 0,
+                cpu: 0.0,
+            }]],
+            active_pane: PaneId(77),
+            row_ratios: vec![1.0],
+            col_ratios: vec![vec![1.0]],
+        }];
+
+        state.confirm_dialog = Some(ConfirmDialog::KillAll { count: 0 });
+        assert!(dispatch(&mut state, "dialog.confirm"));
+
+        assert!(state.confirm_dialog.is_none());
+        assert!(state.tabs.is_empty(), "active tabs must be emptied");
+        assert!(state.panes.is_empty(), "active panes must be emptied");
+        assert!(
+            state.terminals.is_empty(),
+            "every terminal handle must be dropped"
+        );
+        for (idx, ws) in state.workspaces.iter().enumerate() {
+            assert!(
+                ws.tabs.is_empty(),
+                "workspace {idx} must have no saved tabs"
+            );
+        }
+    }
+
+    #[test]
+    fn mutate_kill_all_terminals_on_empty_state_is_noop() {
+        let mut state = seed_state();
+        // seed_state produces a workspace with no tabs, so everything is
+        // already empty; the mutator must not panic or corrupt invariants.
+        mutate_kill_all_terminals(&mut state);
+        assert!(state.tabs.is_empty());
+        assert!(state.terminals.is_empty());
+        assert_eq!(state.active_pane, PaneId(0));
     }
 
     #[test]

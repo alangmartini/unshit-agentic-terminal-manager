@@ -78,6 +78,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         SettingsSection::Shell => build_shell_section(state, shared),
         SettingsSection::Keybinds => build_keybinds_section(),
         SettingsSection::Agents => build_agents_section(state, shared),
+        SettingsSection::DangerZone => build_danger_zone_section(state, shared),
     };
     ElementDef::new(Tag::Div)
         .with_class("modal-body")
@@ -264,6 +265,34 @@ fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef 
         section = section.with_child(agent_row(spec, agent_enabled(state, spec.key), shared));
     }
     section
+}
+
+fn build_danger_zone_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let live_count = state.terminal_count;
+    let button_shared = shared.clone();
+    let kill_all = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("danger")
+        .with_id("settings-kill-all-terminals")
+        .on_click(move || {
+            mutate_with(&button_shared, |st| {
+                dispatch(st, "modal.close");
+                dispatch(st, "app.request_kill_all_terminals");
+            });
+        })
+        .with_text(if live_count == 0 {
+            "kill all terminals".to_string()
+        } else if live_count == 1 {
+            "kill 1 terminal".to_string()
+        } else {
+            format!("kill {live_count} terminals")
+        });
+
+    section_shell("danger zone").with_child(setting_row(
+        "Kill all terminals",
+        "Destroys every running shell across every workspace. Workspaces are kept but emptied.",
+        kill_all,
+    ))
 }
 
 fn build_modal_footer(shared: &SharedState) -> ElementDef {
@@ -721,10 +750,10 @@ mod tests {
     }
 
     #[test]
-    fn modal_nav_has_five_items() {
+    fn modal_nav_has_six_items() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::General, &shared);
-        assert_eq!(el.children.len(), 5);
+        assert_eq!(el.children.len(), 6);
     }
 
     #[test]

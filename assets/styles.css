@@ -1902,6 +1902,17 @@ body.dragging-pane {
   box-shadow: 0 0 18px rgba(212, 163, 72, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2);
 }
 
+.btn.danger {
+  background: var(--rust);
+  color: var(--bg-base);
+  border-color: var(--rust);
+}
+
+.btn.danger:hover {
+  background: var(--rust);
+  filter: brightness(1.1);
+}
+
 .btn:active {
   transform: translateY(1px);
 }

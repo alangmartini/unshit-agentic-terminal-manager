@@ -28,6 +28,15 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
             ),
             "Kill all".to_string(),
         ),
+        ConfirmDialog::KillAll { count } => (
+            "Kill all terminals".to_string(),
+            format!(
+                "{} running shell{} across every workspace will be killed. All workspaces will be emptied. This cannot be undone.",
+                count,
+                if *count == 1 { "" } else { "s" }
+            ),
+            "Kill everything".to_string(),
+        ),
     };
 
     let cancel_shared = shared.clone();
