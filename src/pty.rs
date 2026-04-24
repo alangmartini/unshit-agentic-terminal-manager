@@ -90,6 +90,11 @@ enum Command {
     List {
         reply: std_mpsc::SyncSender<io::Result<Vec<SessionInfo>>>,
     },
+    Rename {
+        session_id: u64,
+        name: Option<String>,
+        reply: std_mpsc::SyncSender<io::Result<()>>,
+    },
 }
 
 impl DaemonPty {
@@ -314,6 +319,27 @@ impl DaemonPty {
         }
     }
 
+    /// Kill a session by its daemon id without touching the local
+    /// pane map. Used by the sessions panel where orphan sessions
+    /// (not mirrored into any pane) still need a kill button.
+    pub fn kill_session_id(&mut self, session_id: u64) {
+        let Some(inner) = self.inner.as_mut() else {
+            log::warn!("DaemonPty::kill_session_id called before connect");
+            return;
+        };
+        inner.sessions.retain(|_pane, sid| *sid != session_id);
+        let _ = inner.cmd_tx.send(Command::Kill { session_id });
+    }
+
+    /// Iterate over every `(pane_id, session_id)` mapping the shim
+    /// currently tracks. Returns an empty iterator when disconnected.
+    pub fn sessions_iter(&self) -> Box<dyn Iterator<Item = (u32, u64)> + '_> {
+        match self.inner.as_ref() {
+            Some(i) => Box::new(i.sessions.iter().map(|(&p, &s)| (p, s))),
+            None => Box::new(std::iter::empty()),
+        }
+    }
+
     pub fn destroy_all(&mut self) {
         self.spawn_cwds.clear();
         let Some(inner) = self.inner.as_mut() else {
@@ -346,6 +372,33 @@ impl DaemonPty {
         reply_rx
             .recv_timeout(Duration::from_secs(2))
             .map_err(|_| worker_gone())?
+    }
+
+    /// Set or clear the display name of a session. An empty `name`
+    /// or `None` clears it.
+    pub fn rename_session(&mut self, session_id: u64, name: Option<String>) -> io::Result<()> {
+        let inner = self.inner.as_mut().ok_or_else(not_connected)?;
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<()>>(1);
+        inner
+            .cmd_tx
+            .send(Command::Rename {
+                session_id,
+                name: name.filter(|s| !s.is_empty()),
+                reply: reply_tx,
+            })
+            .map_err(|_| worker_gone())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| worker_gone())?
+    }
+
+    /// Resolve the session id for a pane, if this shim spawned or
+    /// reattached one for it. Used by the UI so rename / kill actions
+    /// keyed on a pane_id can reach the daemon.
+    pub fn session_id(&self, pane_id: u32) -> Option<u64> {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.sessions.get(&pane_id).copied())
     }
 
     #[cfg(test)]
@@ -581,6 +634,18 @@ fn worker_main(
                 Command::List { reply } => {
                     let result = match client.list_sessions().await {
                         Ok(list) => Ok(list),
+                        Err(ProtocolError::Io(e)) => Err(e),
+                        Err(other) => Err(io::Error::other(other.to_string())),
+                    };
+                    let _ = reply.send(result);
+                }
+                Command::Rename {
+                    session_id,
+                    name,
+                    reply,
+                } => {
+                    let result = match client.rename_session(session_id, name).await {
+                        Ok(()) => Ok(()),
                         Err(ProtocolError::Io(e)) => Err(e),
                         Err(other) => Err(io::Error::other(other.to_string())),
                     };

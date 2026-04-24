@@ -159,6 +159,7 @@ mod tests {
             ctx_menu: None,
             confirm_dialog: None,
             terminal_count: 0,
+            sessions: Vec::new(),
             cpu_pct: 0.0,
             mem_gb: 0.0,
             net_kbps: 0.0,

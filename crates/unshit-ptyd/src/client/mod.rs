@@ -243,6 +243,31 @@ impl Client {
             .await
     }
 
+    /// Sets or clears the display name of `session_id`. Passing `None`
+    /// (or an empty string) clears the name server-side.
+    pub async fn rename_session(
+        &mut self,
+        session_id: u64,
+        name: Option<String>,
+    ) -> Result<(), ProtocolError> {
+        let id = self.alloc_id();
+        let req = Request::RenameSession {
+            id,
+            session_id,
+            name,
+        };
+        let resp = self.roundtrip(req, id).await?;
+        match resp {
+            Response::Ack { .. } => Ok(()),
+            Response::Error { code, message, .. } => Err(ProtocolError::Io(io::Error::other(
+                format!("rename_session failed: {code}: {message}"),
+            ))),
+            other => Err(ProtocolError::Io(io::Error::other(format!(
+                "unexpected response: {other:?}"
+            )))),
+        }
+    }
+
     async fn roundtrip(
         &mut self,
         req: Request,

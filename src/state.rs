@@ -44,7 +44,19 @@ impl<T> MutexExt<T> for Mutex<T> {
 pub struct CtxMenu {
     pub x: f32,
     pub y: f32,
-    pub workspace_idx: usize,
+    pub target: CtxMenuTarget,
+}
+
+/// What the context menu was opened against. Decides which action
+/// set the overlay renders and which dispatch commands it emits.
+#[derive(Clone, Debug)]
+pub enum CtxMenuTarget {
+    /// Menu opened on a workspace row in the sidebar.
+    Workspace { idx: usize },
+    /// Menu opened on a tab in the tabbar. Carries the active pane id
+    /// at the moment the menu opened so rename / kill actions reach a
+    /// specific session even after the active pane changes.
+    Tab { pane_id: u32 },
 }
 
 /// Pending destructive action awaiting user confirmation via the confirm
@@ -66,6 +78,10 @@ pub enum ConfirmDialog {
     /// true, the clicked action is also persisted via the close toggles
     /// so the next close can skip the prompt.
     CloseApp { count: usize, remember: bool },
+    /// Rename dialog for the session backing `pane_id`. `buffer` is
+    /// the live text in the input, updated on every keystroke so the
+    /// commit handler can read it without pulling values out of the UI.
+    RenameSession { pane_id: u32, buffer: String },
 }
 
 /// Outcome of resolving the user's persisted close preference when the
@@ -91,6 +107,7 @@ pub enum SettingsSection {
     Shell,
     Keybinds,
     Agents,
+    Sessions,
     DangerZone,
 }
 
@@ -102,20 +119,37 @@ impl SettingsSection {
             SettingsSection::Shell => "shell",
             SettingsSection::Keybinds => "keybinds",
             SettingsSection::Agents => "agents",
+            SettingsSection::Sessions => "sessions",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 6] {
+    pub fn all() -> [SettingsSection; 7] {
         [
             SettingsSection::General,
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
             SettingsSection::Agents,
+            SettingsSection::Sessions,
             SettingsSection::DangerZone,
         ]
     }
+}
+
+/// Lightweight mirror of `unshit_ptyd::protocol::message::SessionInfo`
+/// kept in app state so the UI can render a sessions list without
+/// reaching across the crate boundary. Refreshed synchronously via
+/// [`refresh_sessions`] when the user opens the Sessions panel or
+/// presses Refresh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub session_id: u64,
+    pub pane_id: u32,
+    pub workspace_id: u32,
+    pub name: Option<String>,
+    pub pid: Option<u32>,
+    pub alive: bool,
 }
 
 /// Typed keys for the `AppState::toggles` map. Previously string literals
@@ -339,6 +373,10 @@ pub struct AppState {
     /// Pending destructive action awaiting confirmation. `None` when no
     /// confirm modal is showing.
     pub confirm_dialog: Option<ConfirmDialog>,
+    /// Daemon-known sessions, refreshed on demand via
+    /// [`refresh_sessions`]. Empty when the daemon has never been
+    /// polled or when the last poll returned no sessions.
+    pub sessions: Vec<SessionSnapshot>,
 }
 
 impl AppState {
@@ -421,6 +459,7 @@ impl AppState {
             ctx_menu: self.ctx_menu.clone(),
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
+            sessions: self.sessions.clone(),
         }
     }
 
@@ -470,6 +509,7 @@ pub struct UiSnapshot {
     /// `state.terminals.len()` so the danger-zone button can show an
     /// accurate count without the UI having to reach into the map.
     pub terminal_count: usize,
+    pub sessions: Vec<SessionSnapshot>,
 }
 
 fn current_folder_name() -> String {
@@ -635,6 +675,7 @@ pub fn seed_state() -> AppState {
         resize_drag: None,
         ctx_menu: None,
         confirm_dialog: None,
+        sessions: Vec::new(),
     }
 }
 
@@ -1233,6 +1274,112 @@ pub fn mutate_kill_all_terminals(state: &mut AppState) {
     state.col_ratios.clear();
 }
 
+/// Poll the daemon for its live session list and cache the result in
+/// `state.sessions`. Called when the user opens the Sessions panel or
+/// presses the Refresh button; safe to call when disconnected (logs a
+/// warning and leaves the existing cache untouched).
+pub fn refresh_sessions(state: &mut AppState) {
+    match state.pty_manager.list_sessions() {
+        Ok(list) => {
+            state.sessions = list
+                .into_iter()
+                .map(|info| SessionSnapshot {
+                    session_id: info.id,
+                    pane_id: info.pane_id,
+                    workspace_id: info.workspace_id,
+                    name: info.name,
+                    pid: info.pid,
+                    alive: info.alive,
+                })
+                .collect();
+        }
+        Err(e) => {
+            log::warn!("refresh_sessions: list_sessions failed: {e}");
+        }
+    }
+}
+
+/// Kill a session directly by session id without requiring a local
+/// pane mapping. Used by the sessions panel where orphan sessions (no
+/// attached pane) still need a kill button.
+pub fn mutate_kill_session_id(state: &mut AppState, session_id: u64) {
+    let pane_id = state
+        .pty_manager
+        .sessions_iter()
+        .find_map(|(pid, sid)| (sid == session_id).then_some(pid));
+
+    if let Some(pid) = pane_id {
+        state.pty_manager.destroy(pid);
+        state.terminals.remove(&pid);
+        prune_pane_from_layouts(state, pid);
+    } else {
+        state.pty_manager.kill_session_id(session_id);
+    }
+    state.sessions.retain(|s| s.session_id != session_id);
+}
+
+fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
+    state.panes.retain_mut(|row| {
+        row.retain(|p| p.id.0 != pane_id);
+        !row.is_empty()
+    });
+    if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+        tab.panes.retain_mut(|row| {
+            row.retain(|p| p.id.0 != pane_id);
+            !row.is_empty()
+        });
+    }
+    for ws in state.workspaces.iter_mut() {
+        for tab in ws.tabs.iter_mut() {
+            tab.panes.retain_mut(|row| {
+                row.retain(|p| p.id.0 != pane_id);
+                !row.is_empty()
+            });
+        }
+    }
+}
+
+/// Update the display title of a pane. Writes through to both the
+/// active `state.panes` layout and every saved workspace/tab so the
+/// rename survives workspace switches. An empty `name` is treated as
+/// "clear the custom name" and falls back to a generic "shell" label.
+pub fn mutate_rename_pane(state: &mut AppState, pane_id: u32, name: &str) {
+    let trimmed = name.trim();
+    let new_title = if trimmed.is_empty() {
+        "shell".to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    for row in state.panes.iter_mut() {
+        for pane in row.iter_mut() {
+            if pane.id.0 == pane_id {
+                pane.title = new_title.clone();
+            }
+        }
+    }
+    if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+        for row in tab.panes.iter_mut() {
+            for pane in row.iter_mut() {
+                if pane.id.0 == pane_id {
+                    pane.title = new_title.clone();
+                }
+            }
+        }
+    }
+    for ws in state.workspaces.iter_mut() {
+        for tab in ws.tabs.iter_mut() {
+            for row in tab.panes.iter_mut() {
+                for pane in row.iter_mut() {
+                    if pane.id.0 == pane_id {
+                        pane.title = new_title.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
     match command {
         "modal.close" => {
@@ -1257,7 +1404,12 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             // CloseApp has three explicit actions and is driven by
             // `app.close.*` dispatches, not the generic yes/no confirm.
-            if matches!(dlg, ConfirmDialog::CloseApp { .. }) {
+            // RenameSession commits via `dialog.rename_commit` so the
+            // handler can read the buffer before clearing.
+            if matches!(
+                dlg,
+                ConfirmDialog::CloseApp { .. } | ConfirmDialog::RenameSession { .. }
+            ) {
                 return false;
             }
             match state.confirm_dialog.take().unwrap() {
@@ -1267,7 +1419,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 ConfirmDialog::KillAll { .. } => {
                     mutate_kill_all_terminals(state);
                 }
-                ConfirmDialog::CloseApp { .. } => unreachable!("filtered above"),
+                ConfirmDialog::CloseApp { .. } | ConfirmDialog::RenameSession { .. } => {
+                    unreachable!("filtered above")
+                }
             }
             true
         }
@@ -1478,6 +1632,55 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 count: state.terminals.len(),
             });
             true
+        }
+        "sessions.refresh" => {
+            refresh_sessions(state);
+            true
+        }
+        other if other.starts_with("session.kill:") => {
+            if let Ok(sid) = other["session.kill:".len()..].parse::<u64>() {
+                mutate_kill_session_id(state, sid);
+                return true;
+            }
+            false
+        }
+        "dialog.rename_commit" => {
+            let Some(ConfirmDialog::RenameSession { pane_id, buffer }) =
+                state.confirm_dialog.take()
+            else {
+                return false;
+            };
+            if let Some(sid) = state.pty_manager.session_id(pane_id) {
+                let wire_name = if buffer.trim().is_empty() {
+                    None
+                } else {
+                    Some(buffer.trim().to_string())
+                };
+                if let Err(e) = state.pty_manager.rename_session(sid, wire_name) {
+                    log::warn!("rename_session({}): {}", sid, e);
+                }
+            }
+            mutate_rename_pane(state, pane_id, &buffer);
+            crate::persist::save_workspaces(state);
+            true
+        }
+        other if other.starts_with("tab.request_rename:") => {
+            if let Ok(pane_num) = other["tab.request_rename:".len()..].parse::<u32>() {
+                state.ctx_menu = None;
+                let current = state
+                    .panes
+                    .iter()
+                    .flat_map(|row| row.iter())
+                    .find(|p| p.id.0 == pane_num)
+                    .map(|p| p.title.clone())
+                    .unwrap_or_default();
+                state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                    pane_id: pane_num,
+                    buffer: current,
+                });
+                return true;
+            }
+            false
         }
         other if other.starts_with("terminal.focus:") => {
             let rest = &other["terminal.focus:".len()..];
@@ -1747,6 +1950,7 @@ mod tests {
             resize_drag: None,
             ctx_menu: None,
             confirm_dialog: None,
+            sessions: Vec::new(),
         }
     }
 
@@ -1763,12 +1967,13 @@ mod tests {
     }
 
     #[test]
-    fn settings_section_all_returns_six() {
+    fn settings_section_all_returns_seven() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         assert_eq!(all[0], SettingsSection::General);
         assert_eq!(all[4], SettingsSection::Agents);
-        assert_eq!(all[5], SettingsSection::DangerZone);
+        assert_eq!(all[5], SettingsSection::Sessions);
+        assert_eq!(all[6], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -2083,7 +2288,7 @@ mod tests {
         state.ctx_menu = Some(CtxMenu {
             x: 100.0,
             y: 200.0,
-            workspace_idx: 0,
+            target: CtxMenuTarget::Workspace { idx: 0 },
         });
         assert!(dispatch(&mut state, "ctx_menu.close"));
         assert!(state.ctx_menu.is_none());
@@ -2101,7 +2306,7 @@ mod tests {
         state.ctx_menu = Some(CtxMenu {
             x: 10.0,
             y: 20.0,
-            workspace_idx: 0,
+            target: CtxMenuTarget::Workspace { idx: 0 },
         });
         assert!(dispatch(&mut state, "modal.close"));
         assert!(state.ctx_menu.is_none());
@@ -2113,7 +2318,7 @@ mod tests {
         state.ctx_menu = Some(CtxMenu {
             x: 0.0,
             y: 0.0,
-            workspace_idx: 0,
+            target: CtxMenuTarget::Workspace { idx: 0 },
         });
         assert!(dispatch(&mut state, "workspace.remove:1"));
         assert!(state.ctx_menu.is_none());
@@ -2127,7 +2332,7 @@ mod tests {
         state.ctx_menu = Some(CtxMenu {
             x: 1.0,
             y: 2.0,
-            workspace_idx: 0,
+            target: CtxMenuTarget::Workspace { idx: 0 },
         });
         assert!(dispatch(&mut state, "workspace.request_kill_all:0"));
         assert!(state.ctx_menu.is_none());
@@ -2464,6 +2669,190 @@ mod tests {
             state.confirm_dialog.is_some(),
             "CloseApp must not be consumed by the generic confirm handler"
         );
+    }
+
+    // -- F8 named sessions ----------------------------------------------------
+
+    #[test]
+    fn tab_request_rename_opens_rename_dialog_with_current_title() {
+        let mut state = seed_state();
+        state.panes = vec![vec![Pane {
+            id: PaneId(42),
+            title: "api-server".into(),
+            subtitle: "".into(),
+            pid: 0,
+            cpu: 0.0,
+        }]];
+        assert!(dispatch(&mut state, "tab.request_rename:42"));
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::RenameSession { pane_id, buffer }) => {
+                assert_eq!(*pane_id, 42);
+                assert_eq!(buffer, "api-server");
+            }
+            other => panic!("expected RenameSession dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_request_rename_closes_ctx_menu() {
+        let mut state = seed_state();
+        state.ctx_menu = Some(CtxMenu {
+            x: 1.0,
+            y: 2.0,
+            target: CtxMenuTarget::Tab { pane_id: 1 },
+        });
+        assert!(dispatch(&mut state, "tab.request_rename:1"));
+        assert!(state.ctx_menu.is_none());
+    }
+
+    #[test]
+    fn tab_request_rename_with_unknown_pane_opens_dialog_with_empty_buffer() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "tab.request_rename:9999"));
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::RenameSession { pane_id, buffer }) => {
+                assert_eq!(*pane_id, 9999);
+                assert!(buffer.is_empty());
+            }
+            other => panic!("expected RenameSession dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dialog_confirm_on_rename_session_is_noop_and_keeps_dialog_open() {
+        let mut state = seed_state();
+        state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+            pane_id: 1,
+            buffer: "x".into(),
+        });
+        assert!(!dispatch(&mut state, "dialog.confirm"));
+        assert!(state.confirm_dialog.is_some());
+    }
+
+    #[test]
+    fn dialog_rename_commit_updates_pane_title_and_clears_dialog() {
+        let mut state = seed_state();
+        state.panes = vec![vec![Pane {
+            id: PaneId(7),
+            title: "shell".into(),
+            subtitle: "".into(),
+            pid: 0,
+            cpu: 0.0,
+        }]];
+        state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+            pane_id: 7,
+            buffer: "build".into(),
+        });
+        assert!(dispatch(&mut state, "dialog.rename_commit"));
+        assert!(state.confirm_dialog.is_none());
+        assert_eq!(state.panes[0][0].title, "build");
+    }
+
+    #[test]
+    fn dialog_rename_commit_empty_buffer_clears_to_fallback_title() {
+        let mut state = seed_state();
+        state.panes = vec![vec![Pane {
+            id: PaneId(7),
+            title: "custom".into(),
+            subtitle: "".into(),
+            pid: 0,
+            cpu: 0.0,
+        }]];
+        state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+            pane_id: 7,
+            buffer: "   ".into(),
+        });
+        assert!(dispatch(&mut state, "dialog.rename_commit"));
+        assert_eq!(state.panes[0][0].title, "shell");
+    }
+
+    #[test]
+    fn dialog_rename_commit_without_dialog_is_noop() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "dialog.rename_commit"));
+    }
+
+    #[test]
+    fn refresh_sessions_leaves_cache_untouched_when_disconnected() {
+        let mut state = seed_state();
+        state.sessions = vec![SessionSnapshot {
+            session_id: 1,
+            pane_id: 1,
+            workspace_id: 1,
+            name: None,
+            pid: None,
+            alive: true,
+        }];
+        // No daemon connected in tests; refresh must log and not panic.
+        refresh_sessions(&mut state);
+        assert_eq!(state.sessions.len(), 1);
+    }
+
+    #[test]
+    fn session_kill_without_pane_mapping_drops_from_sessions_cache() {
+        let mut state = seed_state();
+        state.sessions = vec![
+            SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 1,
+                name: None,
+                pid: None,
+                alive: true,
+            },
+            SessionSnapshot {
+                session_id: 2,
+                pane_id: 2,
+                workspace_id: 1,
+                name: None,
+                pid: None,
+                alive: true,
+            },
+        ];
+        assert!(dispatch(&mut state, "session.kill:1"));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].session_id, 2);
+    }
+
+    #[test]
+    fn session_kill_bad_id_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "session.kill:not-a-number"));
+    }
+
+    #[test]
+    fn sessions_refresh_dispatch_returns_true() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "sessions.refresh"));
+    }
+
+    #[test]
+    fn settings_section_sessions_labels_and_included_in_all() {
+        assert_eq!(SettingsSection::Sessions.label(), "sessions");
+        assert!(SettingsSection::all().contains(&SettingsSection::Sessions));
+    }
+
+    #[test]
+    fn mutate_rename_pane_updates_saved_workspace_tabs() {
+        let mut state = seed_state();
+        state.workspaces[1].tabs = vec![TerminalTab {
+            id: "ws2-t1".into(),
+            name: "n".into(),
+            subtitle: "".into(),
+            status: TabStatus::Running,
+            panes: vec![vec![Pane {
+                id: PaneId(9),
+                title: "old".into(),
+                subtitle: "".into(),
+                pid: 0,
+                cpu: 0.0,
+            }]],
+            active_pane: PaneId(9),
+            row_ratios: vec![1.0],
+            col_ratios: vec![vec![1.0]],
+        }];
+        mutate_rename_pane(&mut state, 9, "new-name");
+        assert_eq!(state.workspaces[1].tabs[0].panes[0][0].title, "new-name");
     }
 
     #[test]

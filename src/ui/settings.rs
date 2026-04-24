@@ -65,7 +65,12 @@ fn build_modal_nav(active: SettingsSection, shared: &SharedState) -> ElementDef 
         let s = shared.clone();
         let target = section;
         item = item.on_click(move || {
-            mutate_with(&s, |st| st.settings_section = target);
+            mutate_with(&s, |st| {
+                st.settings_section = target;
+                if target == SettingsSection::Sessions {
+                    crate::state::refresh_sessions(st);
+                }
+            });
         });
         nav = nav.with_child(item);
     }
@@ -79,6 +84,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         SettingsSection::Shell => build_shell_section(state, shared),
         SettingsSection::Keybinds => build_keybinds_section(),
         SettingsSection::Agents => build_agents_section(state, shared),
+        SettingsSection::Sessions => build_sessions_section(state, shared),
         SettingsSection::DangerZone => build_danger_zone_section(state, shared),
     };
     ElementDef::new(Tag::Div)
@@ -267,6 +273,106 @@ fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef 
         section = section.with_child(agent_row(spec, agent_enabled(state, spec.key), shared));
     }
     section
+}
+
+fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let refresh_shared = shared.clone();
+    let refresh = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("ghost")
+        .with_id("settings-sessions-refresh")
+        .with_text("refresh")
+        .on_click(move || {
+            mutate_with(&refresh_shared, |st| {
+                dispatch(st, "sessions.refresh");
+            });
+        });
+
+    let mut section = section_shell("sessions").with_child(setting_row(
+        "Daemon sessions",
+        "Sessions currently tracked by the session daemon. Refresh to re-poll.",
+        refresh,
+    ));
+
+    if state.sessions.is_empty() {
+        section = section.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("sessions-empty")
+                .with_text("No sessions. Press refresh to poll the daemon."),
+        );
+        return section;
+    }
+
+    for s in &state.sessions {
+        section = section.with_child(session_row(s, shared));
+    }
+    section
+}
+
+fn session_row(s: &crate::state::SessionSnapshot, shared: &SharedState) -> ElementDef {
+    let label = s.name.clone().unwrap_or_else(|| match s.pid {
+        Some(p) => format!("shell ({p})"),
+        None => format!("shell (session {})", s.session_id),
+    });
+    let meta = ElementDef::new(Tag::Span)
+        .with_class("setting-desc")
+        .with_child(ElementDef::new(Tag::Span).with_text(format!(
+            "workspace {} · pane {} · ",
+            s.workspace_id, s.pane_id
+        )))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class(if s.alive {
+                    "session-status-alive"
+                } else {
+                    "session-status-dead"
+                })
+                .with_text(if s.alive { "alive" } else { "dead" }),
+        );
+
+    let kill_shared = shared.clone();
+    let session_id = s.session_id;
+    let kill = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("danger")
+        .with_text("kill")
+        .on_click(move || {
+            mutate_with(&kill_shared, |st| {
+                dispatch(st, &format!("session.kill:{session_id}"));
+            });
+        });
+
+    let rename_shared = shared.clone();
+    let pane_id = s.pane_id;
+    let rename = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("ghost")
+        .with_text("rename")
+        .on_click(move || {
+            mutate_with(&rename_shared, |st| {
+                dispatch(st, "modal.close");
+                dispatch(st, &format!("tab.request_rename:{pane_id}"));
+            });
+        });
+
+    ElementDef::new(Tag::Div)
+        .with_class("setting-row")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("setting-meta")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("setting-label")
+                        .with_text(label),
+                )
+                .with_child(meta),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("session-row-actions")
+                .with_child(rename)
+                .with_child(kill),
+        )
 }
 
 fn build_danger_zone_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -778,10 +884,10 @@ mod tests {
     }
 
     #[test]
-    fn modal_nav_has_six_items() {
+    fn modal_nav_has_seven_items() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::General, &shared);
-        assert_eq!(el.children.len(), 6);
+        assert_eq!(el.children.len(), 7);
     }
 
     #[test]
@@ -1497,5 +1603,172 @@ mod tests {
         assert!(el.children[2]
             .classes
             .contains(&"agent-controls".to_string()));
+    }
+
+    // -- build_sessions_section -------------------------------------------------
+
+    #[test]
+    fn sessions_section_empty_state_shows_placeholder() {
+        let snap = make_snapshot_section(SettingsSection::Sessions);
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        assert!(el
+            .children
+            .iter()
+            .any(|c| c.classes.contains(&"sessions-empty".to_string())));
+    }
+
+    #[test]
+    fn sessions_section_renders_row_per_session() {
+        let mut state = seed_state();
+        state.settings_section = SettingsSection::Sessions;
+        state.sessions = vec![
+            crate::state::SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 1,
+                name: Some("build".into()),
+                pid: Some(1234),
+                alive: true,
+            },
+            crate::state::SessionSnapshot {
+                session_id: 2,
+                pane_id: 2,
+                workspace_id: 1,
+                name: None,
+                pid: Some(5678),
+                alive: false,
+            },
+        ];
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let rows: Vec<_> = el
+            .children
+            .iter()
+            .filter(|c| c.classes.contains(&"setting-row".to_string()))
+            .collect();
+        // First row is the "Daemon sessions / Refresh" header row, then
+        // one row per session.
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn sessions_section_named_session_shows_custom_label() {
+        let snap = crate::state::UiSnapshot {
+            sessions: vec![crate::state::SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 42,
+                name: Some("api-server".into()),
+                pid: Some(1234),
+                alive: true,
+            }],
+            ..seed_state().ui_snapshot()
+        };
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let labels: Vec<&str> = el
+            .children
+            .iter()
+            .filter_map(|c| {
+                c.children
+                    .iter()
+                    .find(|m| m.classes.contains(&"setting-meta".to_string()))
+                    .and_then(|m| m.children.first())
+                    .and_then(text_of)
+            })
+            .collect();
+        assert!(labels.contains(&"api-server"));
+    }
+
+    #[test]
+    fn sessions_section_unnamed_session_shows_pid_fallback() {
+        let snap = crate::state::UiSnapshot {
+            sessions: vec![crate::state::SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 1,
+                name: None,
+                pid: Some(9999),
+                alive: true,
+            }],
+            ..seed_state().ui_snapshot()
+        };
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let labels: Vec<String> = el
+            .children
+            .iter()
+            .filter_map(|c| {
+                c.children
+                    .iter()
+                    .find(|m| m.classes.contains(&"setting-meta".to_string()))
+                    .and_then(|m| m.children.first())
+                    .and_then(text_of)
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert!(labels.iter().any(|l| l == "shell (9999)"));
+    }
+
+    #[test]
+    fn sessions_section_alive_session_has_alive_status_class() {
+        let snap = crate::state::UiSnapshot {
+            sessions: vec![
+                crate::state::SessionSnapshot {
+                    session_id: 1,
+                    pane_id: 1,
+                    workspace_id: 1,
+                    name: Some("a".into()),
+                    pid: None,
+                    alive: true,
+                },
+                crate::state::SessionSnapshot {
+                    session_id: 2,
+                    pane_id: 2,
+                    workspace_id: 1,
+                    name: Some("b".into()),
+                    pid: None,
+                    alive: false,
+                },
+            ],
+            ..seed_state().ui_snapshot()
+        };
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let rows: Vec<_> = el
+            .children
+            .iter()
+            .filter(|c| c.classes.contains(&"setting-row".to_string()))
+            .collect();
+        // rows[0] is header; rows[1] alive, rows[2] dead
+        let alive_meta = &rows[1].children[0];
+        let dead_meta = &rows[2].children[0];
+        let has_status_class = |meta: &ElementDef, cls: &str| {
+            meta.children.iter().any(|c| {
+                c.children
+                    .iter()
+                    .any(|span| span.classes.iter().any(|k| k == cls))
+            })
+        };
+        assert!(has_status_class(alive_meta, "session-status-alive"));
+        assert!(has_status_class(dead_meta, "session-status-dead"));
+    }
+
+    #[test]
+    fn sessions_section_refresh_button_click_dispatches_refresh() {
+        let snap = make_snapshot_section(SettingsSection::Sessions);
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let refresh_row = &el.children[1]; // first is section title, second is header setting-row
+        let refresh_btn = refresh_row
+            .children
+            .iter()
+            .find(|c| c.id.as_deref() == Some("settings-sessions-refresh"))
+            .expect("refresh button");
+        // Invoking succeeds without panic; actual daemon call is a no-op
+        // because no daemon is connected in unit tests.
+        (refresh_btn.on_click.as_ref().unwrap())();
     }
 }

@@ -89,6 +89,15 @@ pub enum Request {
     /// slice 5 promotes it to "keep running" once cross-connection
     /// persistence lands.
     DetachSession { id: u64, session_id: u64 },
+    /// Set or clear the display name of a session. Clearing uses
+    /// `name: None`; the daemon treats an empty string the same as
+    /// `None`. Responds with a generic `Ack`.
+    RenameSession {
+        id: u64,
+        session_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 impl Request {
@@ -104,6 +113,7 @@ impl Request {
             Request::ListSessions { id } => *id,
             Request::AttachSession { id, .. } => *id,
             Request::DetachSession { id, .. } => *id,
+            Request::RenameSession { id, .. } => *id,
         }
     }
 }

@@ -98,7 +98,11 @@ fn build_workspace(
         .on_context_menu(move |x, y| {
             mutate_with(&ctx_state, |st| {
                 // Toggle: if the menu is already open for this workspace, close it.
-                if st.ctx_menu.as_ref().is_some_and(|m| m.workspace_idx == idx) {
+                let same_ws = matches!(
+                    st.ctx_menu.as_ref().map(|m| &m.target),
+                    Some(crate::state::CtxMenuTarget::Workspace { idx: i }) if *i == idx
+                );
+                if same_ws {
                     st.ctx_menu = None;
                 } else {
                     // Divide by scale_factor: cursor coords are physical pixels,
@@ -107,7 +111,7 @@ fn build_workspace(
                     st.ctx_menu = Some(CtxMenu {
                         x: x / sf,
                         y: y / sf,
-                        workspace_idx: idx,
+                        target: crate::state::CtxMenuTarget::Workspace { idx },
                     });
                 }
             });
@@ -371,26 +375,10 @@ fn hint_item(key: &str, label: &str) -> ElementDef {
 }
 
 pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    use unshit::core::style::parse::StyleDeclaration;
-    use unshit::core::style::types::Dimension;
-
     let ctx = match &snap.ctx_menu {
         Some(c) => c,
         None => return ElementDef::new(Tag::Div).with_class("ctx-menu-hidden"),
     };
-
-    let ws_idx = ctx.workspace_idx;
-    let ws_name = snap
-        .workspaces
-        .get(ws_idx)
-        .map(|w| w.name.clone())
-        .unwrap_or_default();
-    let is_collapsed = snap
-        .workspaces
-        .get(ws_idx)
-        .map(|w| w.collapsed)
-        .unwrap_or(false);
-    let can_remove = snap.workspaces.len() > 1;
 
     // Backdrop: clicking (left or right) outside the menu closes it.
     let backdrop_shared = shared.clone();
@@ -408,57 +396,89 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
             });
         });
 
-    // Menu items.
-    fn menu_item(label: &str, shared: &SharedState, command: String) -> ElementDef {
-        let s = shared.clone();
-        ElementDef::new(Tag::Div)
-            .with_class("ctx-menu-item")
-            .on_click(move || {
-                mutate_with(&s, |st| {
-                    crate::state::dispatch(st, &command);
-                });
-            })
-            .with_child(
-                ElementDef::new(Tag::Span)
-                    .with_class("ctx-menu-item-label")
-                    .with_text(label.to_string()),
-            )
-    }
+    let menu = match &ctx.target {
+        crate::state::CtxMenuTarget::Workspace { idx } => {
+            build_workspace_ctx_menu(snap, shared, ctx.x, ctx.y, *idx)
+        }
+        crate::state::CtxMenuTarget::Tab { pane_id } => {
+            build_tab_ctx_menu(snap, shared, ctx.x, ctx.y, *pane_id)
+        }
+    };
 
-    fn menu_separator() -> ElementDef {
-        ElementDef::new(Tag::Div).with_class("ctx-menu-separator")
-    }
+    backdrop.with_child(menu)
+}
 
+fn ctx_menu_item(label: &str, shared: &SharedState, command: String) -> ElementDef {
+    let s = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-item")
+        .on_click(move || {
+            mutate_with(&s, |st| {
+                crate::state::dispatch(st, &command);
+            });
+        })
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("ctx-menu-item-label")
+                .with_text(label.to_string()),
+        )
+}
+
+fn ctx_menu_separator() -> ElementDef {
+    ElementDef::new(Tag::Div).with_class("ctx-menu-separator")
+}
+
+fn build_workspace_ctx_menu(
+    snap: &UiSnapshot,
+    shared: &SharedState,
+    x: f32,
+    y: f32,
+    ws_idx: usize,
+) -> ElementDef {
+    use unshit::core::style::parse::StyleDeclaration;
+    use unshit::core::style::types::Dimension;
+
+    let ws_name = snap
+        .workspaces
+        .get(ws_idx)
+        .map(|w| w.name.clone())
+        .unwrap_or_default();
+    let is_collapsed = snap
+        .workspaces
+        .get(ws_idx)
+        .map(|w| w.collapsed)
+        .unwrap_or(false);
+    let can_remove = snap.workspaces.len() > 1;
     let collapse_label = if is_collapsed { "Expand" } else { "Collapse" };
 
     let mut menu = ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
-        .with_style(StyleDeclaration::Left(Dimension::Px(ctx.x)))
-        .with_style(StyleDeclaration::Top(Dimension::Px(ctx.y)))
+        .with_style(StyleDeclaration::Left(Dimension::Px(x)))
+        .with_style(StyleDeclaration::Top(Dimension::Px(y)))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("ctx-menu-header")
                 .with_text(ws_name),
         )
-        .with_child(menu_separator())
-        .with_child(menu_item(
+        .with_child(ctx_menu_separator())
+        .with_child(ctx_menu_item(
             "Set active",
             shared,
             format!("workspace.switch:{}", ws_idx),
         ))
-        .with_child(menu_item(
+        .with_child(ctx_menu_item(
             "New terminal",
             shared,
             format!("workspace.new_terminal:{}", ws_idx),
         ))
-        .with_child(menu_item(
+        .with_child(ctx_menu_item(
             collapse_label,
             shared,
             format!("workspace.collapse:{}", ws_idx),
         ));
 
-    menu = menu.with_child(menu_separator()).with_child(
-        menu_item(
+    menu = menu.with_child(ctx_menu_separator()).with_child(
+        ctx_menu_item(
             "Kill all terminals in workspace",
             shared,
             format!("workspace.request_kill_all:{}", ws_idx),
@@ -467,8 +487,8 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
     );
 
     if can_remove {
-        menu = menu.with_child(menu_separator()).with_child(
-            menu_item(
+        menu = menu.with_child(ctx_menu_separator()).with_child(
+            ctx_menu_item(
                 "Remove workspace",
                 shared,
                 format!("workspace.remove:{}", ws_idx),
@@ -477,7 +497,46 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
         );
     }
 
-    backdrop.with_child(menu)
+    menu
+}
+
+fn build_tab_ctx_menu(
+    snap: &UiSnapshot,
+    shared: &SharedState,
+    x: f32,
+    y: f32,
+    pane_id: u32,
+) -> ElementDef {
+    use unshit::core::style::parse::StyleDeclaration;
+    use unshit::core::style::types::Dimension;
+
+    // Header shows the current pane title so the user can tell which
+    // session they are about to rename / kill. Fall back to the pane
+    // id if no matching pane is found, which only happens if the menu
+    // races a tab close.
+    let header = snap
+        .panes
+        .iter()
+        .flat_map(|row| row.iter())
+        .find(|p| p.id.0 == pane_id)
+        .map(|p| p.title.clone())
+        .unwrap_or_else(|| format!("pane {pane_id}"));
+
+    ElementDef::new(Tag::Div)
+        .with_class("ctx-menu")
+        .with_style(StyleDeclaration::Left(Dimension::Px(x)))
+        .with_style(StyleDeclaration::Top(Dimension::Px(y)))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("ctx-menu-header")
+                .with_text(header),
+        )
+        .with_child(ctx_menu_separator())
+        .with_child(ctx_menu_item(
+            "Rename session",
+            shared,
+            format!("tab.request_rename:{}", pane_id),
+        ))
 }
 
 #[cfg(test)]
