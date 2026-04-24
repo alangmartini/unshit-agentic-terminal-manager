@@ -288,11 +288,34 @@ fn build_danger_zone_section(state: &UiSnapshot, shared: &SharedState) -> Elemen
             format!("kill {live_count} terminals")
         });
 
-    section_shell("danger zone").with_child(setting_row(
+    let mut section = section_shell("danger zone").with_child(setting_row(
         "Kill all terminals",
         "Destroys every running shell across every workspace. Workspaces are kept but emptied.",
         kill_all,
-    ))
+    ));
+
+    if is_on(state, ToggleKey::RememberCloseChoice) {
+        let kill_on_close = is_on(state, ToggleKey::KillAllOnClose);
+        let desc = if kill_on_close {
+            "Close currently kills every terminal and quits without asking. Reset to show the confirm prompt again."
+        } else {
+            "Close currently quits while leaving terminals running on the daemon. Reset to show the confirm prompt again."
+        };
+        let reset_shared = shared.clone();
+        let reset = ElementDef::new(Tag::Button)
+            .with_class("btn")
+            .with_class("ghost")
+            .with_id("settings-close-prompt-reset")
+            .on_click(move || {
+                mutate_with(&reset_shared, |st| {
+                    dispatch(st, "app.close.reset_preference");
+                });
+            })
+            .with_text("reset".to_string());
+        section = section.with_child(setting_row("Close behavior", desc, reset));
+    }
+
+    section
 }
 
 fn build_modal_footer(shared: &SharedState) -> ElementDef {

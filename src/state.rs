@@ -61,6 +61,27 @@ pub enum ConfirmDialog {
     /// of live terminals sampled at open time and is only used for the
     /// modal body text.
     KillAll { count: usize },
+    /// Window close intent awaiting a decision between keep-running,
+    /// kill-all, or cancel. `remember` is the live checkbox value: when
+    /// true, the clicked action is also persisted via the close toggles
+    /// so the next close can skip the prompt.
+    CloseApp { count: usize, remember: bool },
+}
+
+/// Outcome of resolving the user's persisted close preference when the
+/// window's close button is clicked. Returned by `resolve_close_action`
+/// so the `on_close` callback does not need to read the toggle map
+/// itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseAction {
+    /// No preference persisted. Caller vetoes the framework close and
+    /// opens the `CloseApp` confirm dialog.
+    Prompt,
+    /// Persisted preference: exit without touching daemon sessions.
+    /// Local UI state is dropped, shells keep running on the daemon.
+    KeepRunning,
+    /// Persisted preference: destroy every session, then exit.
+    KillAll,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +138,15 @@ pub enum ToggleKey {
     ScrollOnOutput,
     BellNotification,
     AutoDiscovery,
+    /// When true, the close-app prompt is skipped and the action stored
+    /// in `KillAllOnClose` runs silently. Toggled on by the "remember my
+    /// choice" checkbox in the close-app confirm dialog and cleared by
+    /// the danger-zone reset control.
+    RememberCloseChoice,
+    /// When `RememberCloseChoice` is true, selects between the two
+    /// silent close actions: false = keep running (leave daemon
+    /// sessions alive), true = kill all and quit.
+    KillAllOnClose,
 }
 
 impl ToggleKey {
@@ -133,6 +163,8 @@ impl ToggleKey {
             ToggleKey::ScrollOnOutput => "scroll-on-output",
             ToggleKey::BellNotification => "bell-notification",
             ToggleKey::AutoDiscovery => "auto-discovery",
+            ToggleKey::RememberCloseChoice => "remember-close-choice",
+            ToggleKey::KillAllOnClose => "kill-all-on-close",
         }
     }
 }
@@ -565,6 +597,8 @@ pub fn seed_state() -> AppState {
     toggles.insert(ToggleKey::ScrollOnOutput, true);
     toggles.insert(ToggleKey::BellNotification, false);
     toggles.insert(ToggleKey::AutoDiscovery, true);
+    toggles.insert(ToggleKey::RememberCloseChoice, false);
+    toggles.insert(ToggleKey::KillAllOnClose, false);
 
     let agents = default_agents();
 
@@ -1145,6 +1179,33 @@ pub fn mutate_kill_workspace_terminals(state: &mut AppState, ws_idx: usize) {
     state.workspaces[ws_idx].active_tab = 0;
 }
 
+fn toggle_on(state: &AppState, key: ToggleKey) -> bool {
+    state.toggles.get(&key).copied().unwrap_or(false)
+}
+
+/// Resolve the close-button click against the persisted preference
+/// toggles. If no preference has been remembered, populate
+/// `state.confirm_dialog` with a `CloseApp` dialog and return
+/// `CloseAction::Prompt` so the caller knows to veto the framework's
+/// exit. Otherwise returns the remembered action without mutating
+/// state. Helper instead of inline logic so `main::on_close` does not
+/// have to know the toggle keys.
+pub fn resolve_close_action(state: &mut AppState) -> CloseAction {
+    if toggle_on(state, ToggleKey::RememberCloseChoice) {
+        if toggle_on(state, ToggleKey::KillAllOnClose) {
+            CloseAction::KillAll
+        } else {
+            CloseAction::KeepRunning
+        }
+    } else {
+        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
+            count: state.terminals.len(),
+            remember: false,
+        });
+        CloseAction::Prompt
+    }
+}
+
 /// Kill every terminal across every workspace and empty every workspace.
 /// All pane ids currently tracked in `state.terminals` are destroyed on
 /// the daemon, then every workspace's saved tabs and the live active
@@ -1187,19 +1248,24 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             changed
         }
         "dialog.confirm" => {
-            if let Some(dlg) = state.confirm_dialog.take() {
-                match dlg {
-                    ConfirmDialog::KillWorkspace { workspace_idx, .. } => {
-                        mutate_kill_workspace_terminals(state, workspace_idx);
-                    }
-                    ConfirmDialog::KillAll { .. } => {
-                        mutate_kill_all_terminals(state);
-                    }
-                }
-                true
-            } else {
-                false
+            let Some(dlg) = state.confirm_dialog.as_ref() else {
+                return false;
+            };
+            // CloseApp has three explicit actions and is driven by
+            // `app.close.*` dispatches, not the generic yes/no confirm.
+            if matches!(dlg, ConfirmDialog::CloseApp { .. }) {
+                return false;
             }
+            match state.confirm_dialog.take().unwrap() {
+                ConfirmDialog::KillWorkspace { workspace_idx, .. } => {
+                    mutate_kill_workspace_terminals(state, workspace_idx);
+                }
+                ConfirmDialog::KillAll { .. } => {
+                    mutate_kill_all_terminals(state);
+                }
+                ConfirmDialog::CloseApp { .. } => unreachable!("filtered above"),
+            }
+            true
         }
         "dialog.cancel" => {
             if state.confirm_dialog.is_some() {
@@ -1208,6 +1274,58 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             } else {
                 false
             }
+        }
+        "dialog.toggle_remember" => {
+            // Only applies while a CloseApp dialog is active. Flips the
+            // checkbox; the persisted toggle is only written when the user
+            // actually picks an action.
+            if let Some(ConfirmDialog::CloseApp { remember, .. }) = state.confirm_dialog.as_mut() {
+                *remember = !*remember;
+                true
+            } else {
+                false
+            }
+        }
+        "app.close.keep_running" => {
+            let remember = matches!(
+                state.confirm_dialog,
+                Some(ConfirmDialog::CloseApp { remember: true, .. })
+            );
+            state.confirm_dialog = None;
+            if remember {
+                state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+                state.toggles.insert(ToggleKey::KillAllOnClose, false);
+                crate::persist::save_workspaces(state);
+            }
+            // Drop local readers; daemon sessions remain alive. The UI
+            // callback follows up with `process::exit(0)`.
+            state.terminals.clear();
+            true
+        }
+        "app.close.kill_and_quit" => {
+            let remember = matches!(
+                state.confirm_dialog,
+                Some(ConfirmDialog::CloseApp { remember: true, .. })
+            );
+            state.confirm_dialog = None;
+            if remember {
+                state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+                state.toggles.insert(ToggleKey::KillAllOnClose, true);
+                crate::persist::save_workspaces(state);
+            }
+            mutate_kill_all_terminals(state);
+            true
+        }
+        "app.close.reset_preference" => {
+            let had_pref = toggle_on(state, ToggleKey::RememberCloseChoice);
+            state.toggles.insert(ToggleKey::RememberCloseChoice, false);
+            // KillAllOnClose is left at whatever it was; it is inert while
+            // RememberCloseChoice is false and the reset UI description
+            // only promises to re-enable the prompt.
+            if had_pref {
+                crate::persist::save_workspaces(state);
+            }
+            had_pref
         }
         "ctx_menu.close" => {
             if state.ctx_menu.is_some() {
@@ -2176,6 +2294,148 @@ mod tests {
         assert!(state.tabs.is_empty());
         assert!(state.terminals.is_empty());
         assert_eq!(state.active_pane, PaneId(0));
+    }
+
+    // -- F7 close-app prompt --------------------------------------------------
+
+    #[test]
+    fn resolve_close_action_with_no_preference_opens_prompt_and_vetoes() {
+        let mut state = seed_state();
+        assert!(!toggle_on(&state, ToggleKey::RememberCloseChoice));
+        let action = resolve_close_action(&mut state);
+        assert_eq!(action, CloseAction::Prompt);
+        assert!(matches!(
+            state.confirm_dialog,
+            Some(ConfirmDialog::CloseApp {
+                remember: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_close_action_with_kill_preference_returns_kill_all() {
+        let mut state = seed_state();
+        state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+        state.toggles.insert(ToggleKey::KillAllOnClose, true);
+        let action = resolve_close_action(&mut state);
+        assert_eq!(action, CloseAction::KillAll);
+        assert!(
+            state.confirm_dialog.is_none(),
+            "remembered preference must not open the dialog"
+        );
+    }
+
+    #[test]
+    fn resolve_close_action_with_keep_preference_returns_keep_running() {
+        let mut state = seed_state();
+        state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+        state.toggles.insert(ToggleKey::KillAllOnClose, false);
+        let action = resolve_close_action(&mut state);
+        assert_eq!(action, CloseAction::KeepRunning);
+        assert!(state.confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn dialog_toggle_remember_flips_checkbox_on_close_app_dialog() {
+        let mut state = seed_state();
+        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
+            count: 2,
+            remember: false,
+        });
+        assert!(dispatch(&mut state, "dialog.toggle_remember"));
+        assert!(matches!(
+            state.confirm_dialog,
+            Some(ConfirmDialog::CloseApp { remember: true, .. })
+        ));
+        assert!(dispatch(&mut state, "dialog.toggle_remember"));
+        assert!(matches!(
+            state.confirm_dialog,
+            Some(ConfirmDialog::CloseApp {
+                remember: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn dialog_toggle_remember_without_close_app_is_noop() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "dialog.toggle_remember"));
+        state.confirm_dialog = Some(ConfirmDialog::KillAll { count: 1 });
+        assert!(!dispatch(&mut state, "dialog.toggle_remember"));
+    }
+
+    #[test]
+    fn close_keep_running_without_remember_clears_dialog_and_terminals_only() {
+        let mut state = seed_state();
+        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
+            count: 0,
+            remember: false,
+        });
+        assert!(dispatch(&mut state, "app.close.keep_running"));
+        assert!(state.confirm_dialog.is_none());
+        assert!(state.terminals.is_empty());
+        assert!(
+            !toggle_on(&state, ToggleKey::RememberCloseChoice),
+            "preference must not be written when remember is off"
+        );
+    }
+
+    #[test]
+    fn close_keep_running_with_remember_persists_preference() {
+        let mut state = seed_state();
+        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
+            count: 0,
+            remember: true,
+        });
+        assert!(dispatch(&mut state, "app.close.keep_running"));
+        assert!(toggle_on(&state, ToggleKey::RememberCloseChoice));
+        assert!(!toggle_on(&state, ToggleKey::KillAllOnClose));
+    }
+
+    #[test]
+    fn close_kill_and_quit_with_remember_persists_preference_and_empties() {
+        let mut state = seed_state();
+        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
+            count: 0,
+            remember: true,
+        });
+        assert!(dispatch(&mut state, "app.close.kill_and_quit"));
+        assert!(toggle_on(&state, ToggleKey::RememberCloseChoice));
+        assert!(toggle_on(&state, ToggleKey::KillAllOnClose));
+        assert!(state.tabs.is_empty());
+        assert!(state.terminals.is_empty());
+    }
+
+    #[test]
+    fn close_reset_preference_clears_remember_flag() {
+        let mut state = seed_state();
+        state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+        state.toggles.insert(ToggleKey::KillAllOnClose, true);
+        assert!(dispatch(&mut state, "app.close.reset_preference"));
+        assert!(!toggle_on(&state, ToggleKey::RememberCloseChoice));
+    }
+
+    #[test]
+    fn close_reset_preference_when_not_set_is_noop() {
+        let mut state = seed_state();
+        assert!(!toggle_on(&state, ToggleKey::RememberCloseChoice));
+        assert!(!dispatch(&mut state, "app.close.reset_preference"));
+    }
+
+    #[test]
+    fn dialog_confirm_on_close_app_is_noop_and_keeps_dialog_open() {
+        let mut state = seed_state();
+        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
+            count: 0,
+            remember: false,
+        });
+        assert!(!dispatch(&mut state, "dialog.confirm"));
+        assert!(
+            state.confirm_dialog.is_some(),
+            "CloseApp must not be consumed by the generic confirm handler"
+        );
     }
 
     #[test]

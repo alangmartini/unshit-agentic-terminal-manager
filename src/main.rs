@@ -100,7 +100,7 @@ mod profiler_tests {
 }
 
 #[cfg(feature = "profiling")]
-fn finalize_profiler() {
+pub(crate) fn finalize_profiler() {
     // Recover through poison: if we crash mid-flush we still want the JSON on disk.
     let mut guard = PROFILER
         .lock()
@@ -113,7 +113,16 @@ fn finalize_profiler() {
 
 #[cfg(not(feature = "profiling"))]
 #[inline]
-fn finalize_profiler() {}
+pub(crate) fn finalize_profiler() {}
+
+/// Flush the heap profile (if the `profiling` feature is on) and exit
+/// the process with status 0. Used by the close-app dialog buttons to
+/// drive their own exit after routing through dispatch, since the
+/// framework's `event_loop.exit()` path was vetoed by `on_close`.
+pub(crate) fn shutdown_now() -> ! {
+    finalize_profiler();
+    std::process::exit(0);
+}
 
 /// Snapshot a terminal's display grid for the current render frame.
 ///
@@ -379,6 +388,14 @@ fn main() {
             let last = initial_state.workspaces.len() - 1;
             initial_state.active_workspace = persisted.active_workspace.min(last);
         }
+        initial_state.toggles.insert(
+            crate::state::ToggleKey::RememberCloseChoice,
+            persisted.remember_close_choice,
+        );
+        initial_state.toggles.insert(
+            crate::state::ToggleKey::KillAllOnClose,
+            persisted.kill_all_on_close,
+        );
     }
     let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
 
@@ -527,32 +544,53 @@ fn main() {
                 let mut guard = scale_shared.lock_recover();
                 guard.scale_factor = scale;
             })),
-            on_close: Some(Arc::new(move || {
-                // Slice 5 session-survival policy: closing the window
-                // does NOT kill daemon-side sessions. Local UI state
-                // (terminals map, readers) is still cleared so the
-                // current process can exit cleanly, but the shells
-                // keep running on the daemon and the next UI launch
-                // reconciles them via `DaemonPty::attach_or_spawn`.
-                // Explicit user-driven teardown (pane close, tab close,
-                // "kill all terminals") continues to route through
-                // `DaemonPty::destroy` / `destroy_all`.
+            on_close: Some(Arc::new(move || -> bool {
+                // F7: when the user has not yet remembered a choice, veto
+                // the framework's close and route through the confirm
+                // dialog so they can pick "keep running" / "kill all" /
+                // "cancel". Once a choice has been persisted it is applied
+                // silently on close.
+                //
+                // Slice 5 session-survival policy still applies: keep-running
+                // just drops local UI state (terminals map, readers) so the
+                // current process can exit cleanly while the shells keep
+                // running on the daemon. Kill-all routes through
+                // `DaemonPty::destroy_all` before exit.
                 //
                 // Use .lock().ok() instead of .expect() so a poisoned mutex
                 // (from a panic on another thread) does not prevent us from
                 // reaching process::exit below.
-                if let Ok(mut guard) = close_shared.lock() {
-                    guard.terminals.clear();
+                let action = {
+                    let Ok(mut guard) = close_shared.lock() else {
+                        // Mutex poisoned: skip the prompt path, fall back
+                        // to the legacy "just exit" behaviour so we do not
+                        // wedge the user holding an undismissable dialog.
+                        finalize_profiler();
+                        return true;
+                    };
+                    crate::state::resolve_close_action(&mut guard)
+                };
+                match action {
+                    crate::state::CloseAction::Prompt => {
+                        // Veto. The confirm dialog is now visible; the UI
+                        // click handlers drive the real exit.
+                        false
+                    }
+                    crate::state::CloseAction::KeepRunning => {
+                        if let Ok(mut guard) = close_shared.lock() {
+                            guard.terminals.clear();
+                        }
+                        finalize_profiler();
+                        std::process::exit(0);
+                    }
+                    crate::state::CloseAction::KillAll => {
+                        if let Ok(mut guard) = close_shared.lock() {
+                            crate::state::mutate_kill_all_terminals(&mut guard);
+                        }
+                        finalize_profiler();
+                        std::process::exit(0);
+                    }
                 }
-                // Flush heap profile (no-op without --features profiling) so
-                // dhat writes its JSON before we bypass Drop via exit() below.
-                finalize_profiler();
-                // Force-exit the process. Without this, tokio's Runtime::drop
-                // blocks indefinitely waiting for spawn_blocking reader tasks
-                // (bridge.rs) that are stuck on pipe reads. The readers hold
-                // cloned PTY pipe handles that keep the .exe locked on Windows
-                // (os error 32), preventing cargo from rebuilding.
-                std::process::exit(0);
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;

@@ -20,6 +20,14 @@ pub struct PersistedState {
     pub workspaces: Vec<PersistedWorkspace>,
     #[serde(default)]
     pub active_workspace: usize,
+    /// F7: the user's remembered close-app choice. Both default to false
+    /// (prompt on every close) so upgrading an existing config without
+    /// these keys restores the prompt rather than silently applying a
+    /// destructive action.
+    #[serde(default)]
+    pub remember_close_choice: bool,
+    #[serde(default)]
+    pub kill_all_on_close: bool,
 }
 
 impl PersistedState {
@@ -35,6 +43,16 @@ impl PersistedState {
                 })
                 .collect(),
             active_workspace: state.active_workspace,
+            remember_close_choice: state
+                .toggles
+                .get(&crate::state::ToggleKey::RememberCloseChoice)
+                .copied()
+                .unwrap_or(false),
+            kill_all_on_close: state
+                .toggles
+                .get(&crate::state::ToggleKey::KillAllOnClose)
+                .copied()
+                .unwrap_or(false),
         }
     }
 
@@ -137,6 +155,8 @@ mod tests {
                 collapsed: true,
             }],
             active_workspace: 0,
+            remember_close_choice: false,
+            kill_all_on_close: false,
         };
         persisted.write_to(&path).unwrap();
         let loaded = PersistedState::read_from(&path).unwrap();
