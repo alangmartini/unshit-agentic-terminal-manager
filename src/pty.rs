@@ -90,6 +90,11 @@ enum Command {
     List {
         reply: std_mpsc::SyncSender<io::Result<Vec<SessionInfo>>>,
     },
+    Rename {
+        session_id: u64,
+        name: Option<String>,
+        reply: std_mpsc::SyncSender<io::Result<()>>,
+    },
 }
 
 impl DaemonPty {
@@ -348,6 +353,33 @@ impl DaemonPty {
             .map_err(|_| worker_gone())?
     }
 
+    /// Set or clear the display name of a session. An empty `name`
+    /// or `None` clears it.
+    pub fn rename_session(&mut self, session_id: u64, name: Option<String>) -> io::Result<()> {
+        let inner = self.inner.as_mut().ok_or_else(not_connected)?;
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<()>>(1);
+        inner
+            .cmd_tx
+            .send(Command::Rename {
+                session_id,
+                name: name.filter(|s| !s.is_empty()),
+                reply: reply_tx,
+            })
+            .map_err(|_| worker_gone())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| worker_gone())?
+    }
+
+    /// Resolve the session id for a pane, if this shim spawned or
+    /// reattached one for it. Used by the UI so rename / kill actions
+    /// keyed on a pane_id can reach the daemon.
+    pub fn session_id(&self, pane_id: u32) -> Option<u64> {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.sessions.get(&pane_id).copied())
+    }
+
     #[cfg(test)]
     fn session_id_for_pane(&self, pane_id: u32) -> Option<u64> {
         self.inner
@@ -581,6 +613,18 @@ fn worker_main(
                 Command::List { reply } => {
                     let result = match client.list_sessions().await {
                         Ok(list) => Ok(list),
+                        Err(ProtocolError::Io(e)) => Err(e),
+                        Err(other) => Err(io::Error::other(other.to_string())),
+                    };
+                    let _ = reply.send(result);
+                }
+                Command::Rename {
+                    session_id,
+                    name,
+                    reply,
+                } => {
+                    let result = match client.rename_session(session_id, name).await {
+                        Ok(()) => Ok(()),
                         Err(ProtocolError::Io(e)) => Err(e),
                         Err(other) => Err(io::Error::other(other.to_string())),
                     };

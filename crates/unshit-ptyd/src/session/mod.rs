@@ -279,6 +279,12 @@ impl Session {
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+
+    /// Set or clear the display name. An empty string is treated the
+    /// same as `None` so the UI does not have to care which it sends.
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name.filter(|s| !s.is_empty());
+    }
 }
 
 impl Drop for Session {
@@ -409,6 +415,27 @@ mod tests {
         session.resize(120, 40);
         assert_eq!(session.cols(), 120);
         assert_eq!(session.rows(), 40);
+
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_name_stores_and_clears_display_name() {
+        let (mut session, _rx) =
+            Session::spawn(10, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn");
+        assert_eq!(session.name(), None);
+
+        session.set_name(Some("build".to_string()));
+        assert_eq!(session.name(), Some("build"));
+
+        // Empty string must behave the same as clearing so the UI can
+        // send whatever the input field contains without branching.
+        session.set_name(Some(String::new()));
+        assert_eq!(session.name(), None);
+
+        session.set_name(Some("again".to_string()));
+        session.set_name(None);
+        assert_eq!(session.name(), None);
 
         session.kill();
     }

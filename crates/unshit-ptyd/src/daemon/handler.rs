@@ -262,6 +262,22 @@ where
             send_response(&writer, Response::Ack { id }).await?;
             Ok(PostRequest::Continue)
         }
+        Request::RenameSession {
+            id,
+            session_id,
+            name,
+        } => {
+            if registry.rename(session_id, name).await {
+                send_response(&writer, Response::Ack { id }).await?;
+            } else {
+                let err = io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no session for id {session_id}"),
+                );
+                send_err(&writer, id, error_code(&err), &err).await?;
+            }
+            Ok(PostRequest::Continue)
+        }
     }
 }
 

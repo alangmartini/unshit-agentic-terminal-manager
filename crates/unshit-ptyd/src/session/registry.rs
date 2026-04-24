@@ -119,6 +119,19 @@ impl SessionRegistry {
         Ok(())
     }
 
+    /// Set or clear the display name of a session. Returns `false` if
+    /// no session matches `id`.
+    pub async fn rename(&self, id: u64, name: Option<String>) -> bool {
+        let mut guard = self.sessions.lock().await;
+        match guard.get_mut(&id) {
+            Some(session) => {
+                session.set_name(name);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Removes a session from the registry and kills its child.
     pub async fn remove(&self, id: u64) -> bool {
         let mut guard = self.sessions.lock().await;
