@@ -45,25 +45,68 @@ fn trace_text_draw_ranges() -> bool {
 /// MSAA sample count for the main content pipelines. Set to 1 to disable.
 const MSAA_SAMPLE_COUNT: u32 = 4;
 
+/// Base surface usages always needed for presentation: render to and read
+/// back from the swapchain.
+const BASE_SURFACE_USAGES: wgpu::TextureUsages =
+    wgpu::TextureUsages::RENDER_ATTACHMENT.union(wgpu::TextureUsages::COPY_SRC);
+
+/// Compute the usage flags for the window `SurfaceConfiguration`. When the
+/// surface allows `COPY_DST` the backdrop-filter path needs that flag so it
+/// can `copy_texture_to_texture` the blurred offscreen result onto the
+/// presented frame (see the copy around `backdrop_source.as_image_copy()`
+/// in `render`). If the surface does not expose `COPY_DST` we fall back to
+/// the base usages and `probe_backdrop_filter_support` disables the effect.
+fn surface_config_usages(surface_usages: wgpu::TextureUsages) -> wgpu::TextureUsages {
+    let mut usages = BASE_SURFACE_USAGES;
+    if surface_usages.contains(wgpu::TextureUsages::COPY_DST) {
+        usages |= wgpu::TextureUsages::COPY_DST;
+    }
+    usages
+}
+
+/// Texture usages the backdrop-filter path needs on both the swapchain
+/// format AND the configured target. `TEXTURE_BINDING` so the blur shader
+/// can sample the framebuffer, `RENDER_ATTACHMENT` so the renderer can
+/// draw into the offscreen texture, and `COPY_SRC` / `COPY_DST` so the
+/// final pass can `copy_texture_to_texture` the blurred result onto the
+/// presented texture.
+const BACKDROP_REQUIRED_USAGES: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
+    .union(wgpu::TextureUsages::RENDER_ATTACHMENT)
+    .union(wgpu::TextureUsages::COPY_SRC)
+    .union(wgpu::TextureUsages::COPY_DST);
+
+/// Pure decision function: backdrop-filter is available iff both the format
+/// features and the target's actual configured usages contain every flag
+/// the backdrop path needs. Split out from `probe_backdrop_filter_support`
+/// so the AND-of-two-bitsets logic is unit-testable without a real adapter.
+fn probe_backdrop_filter_support_inner(
+    format_usages: wgpu::TextureUsages,
+    surface_usages: wgpu::TextureUsages,
+) -> bool {
+    format_usages.contains(BACKDROP_REQUIRED_USAGES)
+        && surface_usages.contains(BACKDROP_REQUIRED_USAGES)
+}
+
 /// Cached probe that decides whether the renderer can support
-/// `backdrop-filter`. The check is extremely conservative: the swapchain
-/// format must allow both `TEXTURE_BINDING` (so the blur shader can sample
-/// the framebuffer) and `RENDER_ATTACHMENT` (so the renderer can draw
-/// directly into the offscreen texture). Both usages are available on every
-/// wgpu backend the framework currently targets, but we probe anyway to
-/// keep the fallback path clean.
-fn probe_backdrop_filter_support(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> bool {
-    let features = adapter.get_texture_format_features(format);
-    let needed = wgpu::TextureUsages::TEXTURE_BINDING
-        | wgpu::TextureUsages::RENDER_ATTACHMENT
-        | wgpu::TextureUsages::COPY_SRC
-        | wgpu::TextureUsages::COPY_DST;
-    let available = features.allowed_usages.contains(needed);
+/// `backdrop-filter`. `surface_usages` carries the configured target's
+/// allowed usages (the window swapchain's `SurfaceConfiguration::usage`
+/// for window targets, the headless texture's descriptor flags for
+/// headless targets). The path is disabled when either the format or the
+/// target cannot supply every flag in [`BACKDROP_REQUIRED_USAGES`].
+fn probe_backdrop_filter_support(
+    adapter: &wgpu::Adapter,
+    format: wgpu::TextureFormat,
+    surface_usages: wgpu::TextureUsages,
+) -> bool {
+    let format_usages = adapter.get_texture_format_features(format).allowed_usages;
+    let available = probe_backdrop_filter_support_inner(format_usages, surface_usages);
     if !available {
         BACKDROP_FALLBACK_LOG.call_once(|| {
             log::info!(
-                "backdrop-filter unavailable: surface format {:?} does not expose the required usages",
-                format
+                "backdrop-filter unavailable: format {:?} or configured target does not expose the required usages (format={:?}, target={:?})",
+                format,
+                format_usages,
+                surface_usages,
             );
         });
     }
@@ -216,7 +259,7 @@ impl GpuContext {
         };
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: surface_config_usages(surface_caps.usages),
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -263,7 +306,8 @@ impl GpuContext {
             (None, None)
         };
 
-        let backdrop_filter_available = probe_backdrop_filter_support(&adapter, surface_format);
+        let backdrop_filter_available =
+            probe_backdrop_filter_support(&adapter, surface_format, surface_config.usage);
 
         Self {
             device,
@@ -531,7 +575,20 @@ impl GpuContext {
             (None, None)
         };
 
-        let backdrop_filter_available = probe_backdrop_filter_support(adapter, format);
+        // Pass the headless texture's actual usages (matching the
+        // descriptor above) so a future tightening of those flags is
+        // reflected in availability instead of being hidden behind
+        // `TextureUsages::all()`. `TEXTURE_BINDING` is added because the
+        // backdrop blur path samples the offscreen target, even though it
+        // is not in the descriptor today (the path uses ping-pong
+        // textures). The probe still requires both format features and
+        // these target usages to contain every backdrop flag.
+        let headless_target_usages = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::TEXTURE_BINDING;
+        let backdrop_filter_available =
+            probe_backdrop_filter_support(adapter, format, headless_target_usages);
 
         Self {
             device,
@@ -1882,4 +1939,105 @@ fn apply_object_fit(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: clicking the window close button raised
+    /// `Texture with '<Surface Texture>' label do not contain required usage
+    /// flags TextureUsages(COPY_DST)` because the swapchain was configured
+    /// without `COPY_DST` and the backdrop-filter path on the close-confirm
+    /// dialog overlay (`backdrop-filter: blur(4px)` in `assets/styles.css`)
+    /// then issued `copy_texture_to_texture` onto the surface texture.
+    #[test]
+    fn surface_config_usages_adds_copy_dst_when_supported() {
+        let caps = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST;
+        let usages = surface_config_usages(caps);
+        assert!(usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
+        assert!(usages.contains(wgpu::TextureUsages::COPY_SRC));
+        assert!(usages.contains(wgpu::TextureUsages::COPY_DST));
+    }
+
+    /// On platforms whose surface refuses `COPY_DST` we must NOT request
+    /// it; `surface.configure()` would error and the renderer relies on
+    /// `probe_backdrop_filter_support` to disable the effect cleanly.
+    #[test]
+    fn surface_config_usages_omits_copy_dst_when_unsupported() {
+        let caps = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+        let usages = surface_config_usages(caps);
+        assert!(usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
+        assert!(usages.contains(wgpu::TextureUsages::COPY_SRC));
+        assert!(!usages.contains(wgpu::TextureUsages::COPY_DST));
+    }
+
+    #[test]
+    fn surface_config_usages_always_includes_base_usages() {
+        let usages = surface_config_usages(wgpu::TextureUsages::empty());
+        assert!(usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
+        assert!(usages.contains(wgpu::TextureUsages::COPY_SRC));
+    }
+
+    /// Pins the additive-only contract: even when the input caps include
+    /// usages outside the swapchain's needs (e.g. `STORAGE_BINDING`,
+    /// `TEXTURE_BINDING`), the helper must only enable `COPY_DST` from the
+    /// extra-flag set.
+    #[test]
+    fn surface_config_usages_does_not_pass_through_unrelated_flags() {
+        let usages = surface_config_usages(wgpu::TextureUsages::all());
+        let allowed = BASE_SURFACE_USAGES | wgpu::TextureUsages::COPY_DST;
+        assert_eq!(
+            usages, allowed,
+            "surface_config_usages must be additive on COPY_DST only; \
+             unrelated flags from caps must not leak into the swapchain config"
+        );
+    }
+
+    #[test]
+    fn probe_inner_true_when_both_format_and_surface_supply_every_flag() {
+        assert!(probe_backdrop_filter_support_inner(
+            BACKDROP_REQUIRED_USAGES,
+            BACKDROP_REQUIRED_USAGES
+        ));
+    }
+
+    #[test]
+    fn probe_inner_false_when_format_is_missing_a_flag() {
+        // Surface has everything, format is missing COPY_DST.
+        let format = BACKDROP_REQUIRED_USAGES - wgpu::TextureUsages::COPY_DST;
+        assert!(!probe_backdrop_filter_support_inner(format, BACKDROP_REQUIRED_USAGES));
+    }
+
+    /// Direct regression: the original bug was a surface configured
+    /// without `COPY_DST` while the format advertised it. The probe must
+    /// return false in that case so the renderer disables the backdrop
+    /// path instead of panicking when it tries to copy onto the swapchain.
+    #[test]
+    fn probe_inner_false_when_surface_is_missing_copy_dst() {
+        let surface = BACKDROP_REQUIRED_USAGES - wgpu::TextureUsages::COPY_DST;
+        assert!(!probe_backdrop_filter_support_inner(BACKDROP_REQUIRED_USAGES, surface));
+    }
+
+    #[test]
+    fn probe_inner_false_when_neither_supplies_any_flag() {
+        assert!(!probe_backdrop_filter_support_inner(
+            wgpu::TextureUsages::empty(),
+            wgpu::TextureUsages::empty()
+        ));
+    }
+
+    /// Extra superset bits on either side must not change the decision:
+    /// the probe asks "do you contain everything I need", not "are you
+    /// exactly this set".
+    #[test]
+    fn probe_inner_ignores_unrelated_extra_flags() {
+        let extra = wgpu::TextureUsages::STORAGE_BINDING;
+        assert!(probe_backdrop_filter_support_inner(
+            BACKDROP_REQUIRED_USAGES | extra,
+            BACKDROP_REQUIRED_USAGES | extra
+        ));
+    }
 }
