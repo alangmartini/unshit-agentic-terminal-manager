@@ -157,6 +157,8 @@ mod tests {
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
             ctx_menu: None,
+            confirm_dialog: None,
+            terminal_count: 0,
             cpu_pct: 0.0,
             mem_gb: 0.0,
             net_kbps: 0.0,

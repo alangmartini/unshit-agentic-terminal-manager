@@ -7,7 +7,7 @@ use futures_core::Stream;
 use unshit::app::{EventSink, ExternalEvent, Subscription};
 use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 
-use crate::state::SharedState;
+use crate::state::{MutexExt, SharedState};
 
 static PENDING_READERS: Mutex<Option<HashMap<u32, Box<dyn Read + Send>>>> = Mutex::new(None);
 
@@ -98,7 +98,7 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                 // concurrently on the state lock.
                 while let Some(data) = rx.recv().await {
                     let terminal_handle: Option<crate::state::SharedTerminal> = {
-                        let guard = shared.lock().expect("state mutex poisoned");
+                        let guard = shared.lock_recover();
                         guard.terminals.get(&pane_id).cloned()
                     };
                     let Some(terminal_handle) = terminal_handle else {
@@ -107,8 +107,7 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
 
                     let mut batched = 1u32;
                     {
-                        let mut terminal =
-                            terminal_handle.lock().expect("terminal mutex poisoned");
+                        let mut terminal = terminal_handle.lock_recover();
                         terminal.process_bytes(&data);
                         while let Ok(more) = rx.try_recv() {
                             terminal.process_bytes(&more);
@@ -158,7 +157,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     visible = !visible;
                     {
-                        let mut guard = shared.lock().expect("state mutex poisoned");
+                        let mut guard = shared.lock_recover();
 
                         // Cursor blink: active pane blinks when focused,
                         // shows steady cursor when window is unfocused.
@@ -166,9 +165,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                         let active_id = guard.active_pane.0;
                         let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
                         for (&id, terminal_handle) in guard.terminals.iter() {
-                            let mut terminal = terminal_handle
-                                .lock()
-                                .expect("terminal mutex poisoned");
+                            let mut terminal = terminal_handle.lock_recover();
                             if id == active_id {
                                 if win_focused {
                                     terminal.grid_mut().set_cursor_visible(visible);
@@ -209,27 +206,59 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                     cols, rows, cell_w, cell_h, w, h
                                 );
 
-                                // Spawn deferred PTYs for panes that have no
-                                // terminal yet. Issue #5: PTYs get correct
-                                // dimensions from the start.
+                                // Reconcile deferred panes against the daemon's
+                                // surviving sessions (slice 5). If a prior UI
+                                // run left a matching `(workspace_id, pane_id)`
+                                // session alive, attach to it and replay its
+                                // snapshot; otherwise spawn a fresh shell.
+                                // Issue #5: PTYs get correct dimensions from
+                                // the start.
                                 let all_pane_ids: Vec<u32> = guard
                                     .panes
                                     .iter()
                                     .flat_map(|row| row.iter().map(|p| p.id.0))
                                     .collect();
                                 let cwd = crate::state::active_workspace_cwd(&guard);
+                                let workspace_id = crate::state::active_workspace_num(&guard);
                                 for id in &all_pane_ids {
                                     if !guard.terminals.contains_key(id) {
-                                        let terminal = crate::terminal::Terminal::new(
-                                            rows as usize,
-                                            cols as usize,
-                                        );
-                                        guard.terminals.insert(
+                                        match guard.pty_manager.attach_or_spawn(
                                             *id,
-                                            std::sync::Arc::new(std::sync::Mutex::new(terminal)),
-                                        );
-                                        match guard.pty_manager.spawn_in(*id, cols, rows, cwd.as_deref()) {
-                                            Ok(reader) => {
+                                            workspace_id,
+                                            cols,
+                                            rows,
+                                            cwd.as_deref(),
+                                        ) {
+                                            Ok((Some(snapshot), reader)) => {
+                                                let snap_rows = snapshot.grid.rows();
+                                                let snap_cols = snapshot.grid.cols();
+                                                let mut terminal = crate::terminal::Terminal::new(
+                                                    snap_rows, snap_cols,
+                                                );
+                                                terminal.apply_snapshot(&snapshot);
+                                                guard.terminals.insert(
+                                                    *id,
+                                                    std::sync::Arc::new(std::sync::Mutex::new(
+                                                        terminal,
+                                                    )),
+                                                );
+                                                crate::bridge::register_reader(*id, reader);
+                                                log::info!(
+                                                    "deferred reattach for pane {}: {}x{}",
+                                                    id, snap_cols, snap_rows
+                                                );
+                                            }
+                                            Ok((None, reader)) => {
+                                                let terminal = crate::terminal::Terminal::new(
+                                                    rows as usize,
+                                                    cols as usize,
+                                                );
+                                                guard.terminals.insert(
+                                                    *id,
+                                                    std::sync::Arc::new(std::sync::Mutex::new(
+                                                        terminal,
+                                                    )),
+                                                );
                                                 crate::bridge::register_reader(*id, reader);
                                                 log::info!(
                                                     "deferred PTY spawn for pane {}: {}x{}",
@@ -241,17 +270,23 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                     "failed to spawn deferred PTY for pane {}: {}",
                                                     id, e
                                                 );
-                                                if let Some(t) = guard.terminals.get(id) {
-                                                    t.lock()
-                                                        .expect("terminal mutex poisoned")
-                                                        .process_bytes(
-                                                            format!(
-                                                                "Failed to spawn shell: {}\r\n",
-                                                                e
-                                                            )
-                                                            .as_bytes(),
-                                                        );
-                                                }
+                                                let mut terminal = crate::terminal::Terminal::new(
+                                                    rows as usize,
+                                                    cols as usize,
+                                                );
+                                                terminal.process_bytes(
+                                                    format!(
+                                                        "Failed to spawn shell: {}\r\n",
+                                                        e
+                                                    )
+                                                    .as_bytes(),
+                                                );
+                                                guard.terminals.insert(
+                                                    *id,
+                                                    std::sync::Arc::new(std::sync::Mutex::new(
+                                                        terminal,
+                                                    )),
+                                                );
                                             }
                                         }
                                     }
@@ -263,9 +298,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                 for id in existing_ids {
                                     guard.pty_manager.resize(id, cols, rows);
                                     if let Some(t) = guard.terminals.get(&id) {
-                                        t.lock()
-                                            .expect("terminal mutex poisoned")
-                                            .resize(rows as usize, cols as usize);
+                                        t.lock_recover().resize(rows as usize, cols as usize);
                                     }
                                 }
                             }
@@ -293,14 +326,12 @@ fn resize_poll_subscription(shared: SharedState) -> Subscription {
                         unshit::core::cell_grid::CellGrid::take_pending_resize()
                     {
                         {
-                            let mut guard = shared.lock().expect("state mutex poisoned");
+                            let mut guard = shared.lock_recover();
                             let ids: Vec<u32> = guard.terminals.keys().copied().collect();
                             for id in ids {
                                 guard.pty_manager.resize(id, cols, rows);
                                 if let Some(t) = guard.terminals.get(&id) {
-                                    t.lock()
-                                        .expect("terminal mutex poisoned")
-                                        .resize(rows as usize, cols as usize);
+                                    t.lock_recover().resize(rows as usize, cols as usize);
                                 }
                             }
                         } // guard drops before yield
@@ -334,7 +365,7 @@ pub fn build_subscriptions(shared: &SharedState) -> Vec<Subscription> {
 
     // For existing terminals, emit identity-only subscriptions so the
     // framework keeps already-running streams alive.
-    let guard = shared.lock().expect("state mutex poisoned");
+    let guard = shared.lock_recover();
     for &pane_id in guard.terminals.keys() {
         subs.push(Subscription::new(
             format!("pty-{}", pane_id),

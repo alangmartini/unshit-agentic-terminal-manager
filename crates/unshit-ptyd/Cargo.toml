@@ -1,0 +1,30 @@
+[package]
+name = "unshit-ptyd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Background PTY daemon for the terminal-manager UI. Owns PTYs, parsers, and scrollback so terminals outlive the UI."
+
+[lints]
+workspace = true
+
+[lib]
+name = "unshit_ptyd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "unshit-ptyd"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "io-util", "net"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+portable-pty = "0.8"
+dirs = "5"
+unshit-terminal-core = { path = "../unshit-terminal-core" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

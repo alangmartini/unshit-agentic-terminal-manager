@@ -3,8 +3,8 @@ use unshit::core::event::{DragPhase, Event, EventType, Key, KeyEventKind, Modifi
 use unshit::core::style::parse::StyleDeclaration;
 
 use crate::state::{
-    apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with, Pane,
-    PaneId, ResizeDragSnapshot, SharedState, UiSnapshot,
+    apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with,
+    MutexExt, Pane, PaneId, ResizeDragSnapshot, SharedState, UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -311,8 +311,7 @@ fn build_pane_body(
                         if has_shift && no_ctrl && no_alt && kb.key == Key::PageUp {
                             mutate_with(&kbd_shared, |st| {
                                 if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
-                                    let mut terminal =
-                                        handle.lock().expect("terminal mutex poisoned");
+                                    let mut terminal = handle.lock_recover();
                                     let half = (terminal.grid().rows() / 2).max(1);
                                     terminal.scroll_view_up(half);
                                 }
@@ -324,8 +323,7 @@ fn build_pane_body(
                         if has_shift && no_ctrl && no_alt && kb.key == Key::PageDown {
                             mutate_with(&kbd_shared, |st| {
                                 if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
-                                    let mut terminal =
-                                        handle.lock().expect("terminal mutex poisoned");
+                                    let mut terminal = handle.lock_recover();
                                     let half = (terminal.grid().rows() / 2).max(1);
                                     terminal.scroll_view_down(half);
                                 }
@@ -336,7 +334,7 @@ fn build_pane_body(
                         // Any other key while scrolled back snaps to live view.
                         mutate_with(&kbd_shared, |st| {
                             if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
-                                let mut terminal = handle.lock().expect("terminal mutex poisoned");
+                                let mut terminal = handle.lock_recover();
                                 if terminal.scroll_offset() > 0 {
                                     terminal.reset_scroll();
                                 }
@@ -377,8 +375,7 @@ fn build_pane_body(
                         if lines != 0 {
                             mutate_with(&scroll_shared, |st| {
                                 if let Some(handle) = st.terminals.get(&scroll_pane_id.0) {
-                                    let mut terminal =
-                                        handle.lock().expect("terminal mutex poisoned");
+                                    let mut terminal = handle.lock_recover();
                                     if lines > 0 {
                                         terminal.scroll_view_up(lines as usize);
                                     } else {

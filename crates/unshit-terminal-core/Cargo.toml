@@ -1,0 +1,22 @@
+[package]
+name = "unshit-terminal-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Headless terminal core: cell grid, bounded scrollback, and VTE-driven emulation. Shared by the unshit-ptyd daemon and the terminal-manager UI."
+
+[lints]
+workspace = true
+
+[lib]
+name = "unshit_terminal_core"
+path = "src/lib.rs"
+
+[dependencies]
+vte = "0.13"
+bitflags = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+bincode = "1"

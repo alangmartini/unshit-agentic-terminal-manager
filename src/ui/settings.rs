@@ -79,6 +79,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         SettingsSection::Shell => build_shell_section(state, shared),
         SettingsSection::Keybinds => build_keybinds_section(),
         SettingsSection::Agents => build_agents_section(state, shared),
+        SettingsSection::DangerZone => build_danger_zone_section(state, shared),
     };
     ElementDef::new(Tag::Div)
         .with_class("modal-body")
@@ -265,6 +266,57 @@ fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef 
     for spec in AGENT_SPECS {
         section = section.with_child(agent_row(spec, agent_enabled(state, spec.key), shared));
     }
+    section
+}
+
+fn build_danger_zone_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let live_count = state.terminal_count;
+    let button_shared = shared.clone();
+    let kill_all = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("danger")
+        .with_id("settings-kill-all-terminals")
+        .on_click(move || {
+            mutate_with(&button_shared, |st| {
+                dispatch(st, "modal.close");
+                dispatch(st, "app.request_kill_all_terminals");
+            });
+        })
+        .with_text(if live_count == 0 {
+            "kill all terminals".to_string()
+        } else if live_count == 1 {
+            "kill 1 terminal".to_string()
+        } else {
+            format!("kill {live_count} terminals")
+        });
+
+    let mut section = section_shell("danger zone").with_child(setting_row(
+        "Kill all terminals",
+        "Destroys every running shell across every workspace. Workspaces are kept but emptied.",
+        kill_all,
+    ));
+
+    if is_on(state, ToggleKey::RememberCloseChoice) {
+        let kill_on_close = is_on(state, ToggleKey::KillAllOnClose);
+        let desc = if kill_on_close {
+            "Close currently kills every terminal and quits without asking. Reset to show the confirm prompt again."
+        } else {
+            "Close currently quits while leaving terminals running on the daemon. Reset to show the confirm prompt again."
+        };
+        let reset_shared = shared.clone();
+        let reset = ElementDef::new(Tag::Button)
+            .with_class("btn")
+            .with_class("ghost")
+            .with_id("settings-close-prompt-reset")
+            .on_click(move || {
+                mutate_with(&reset_shared, |st| {
+                    dispatch(st, "app.close.reset_preference");
+                });
+            })
+            .with_text("reset".to_string());
+        section = section.with_child(setting_row("Close behavior", desc, reset));
+    }
+
     section
 }
 
@@ -726,10 +778,10 @@ mod tests {
     }
 
     #[test]
-    fn modal_nav_has_five_items() {
+    fn modal_nav_has_six_items() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::General, &shared);
-        assert_eq!(el.children.len(), 5);
+        assert_eq!(el.children.len(), 6);
     }
 
     #[test]

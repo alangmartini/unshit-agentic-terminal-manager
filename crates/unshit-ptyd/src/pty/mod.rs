@@ -206,7 +206,7 @@ impl Drop for PtyPair {
 ///
 /// Reads the `SHELL` environment variable first. If unset, falls back to
 /// `bash` on Unix-like systems and `powershell.exe` on Windows.
-fn default_shell() -> String {
+pub fn default_shell() -> String {
     if let Ok(shell) = std::env::var("SHELL") {
         return shell;
     }
@@ -220,7 +220,7 @@ fn default_shell() -> String {
 
 /// Returns true when `shell` points at `powershell` or `pwsh` (with or
 /// without a `.exe` suffix, any path prefix, case-insensitive stem).
-fn is_powershell_shell(shell: &str) -> bool {
+pub fn is_powershell_shell(shell: &str) -> bool {
     Path::new(shell)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -231,7 +231,7 @@ fn is_powershell_shell(shell: &str) -> bool {
 /// Build the `-NoExit -Command "Set-Location ..."` args that force PowerShell
 /// into `dir` *after* the user profile has run. Single quotes in the path are
 /// doubled to keep the PowerShell single-quoted string well-formed.
-fn build_powershell_cwd_args(dir: &Path) -> Vec<String> {
+pub fn build_powershell_cwd_args(dir: &Path) -> Vec<String> {
     let escaped = dir.to_string_lossy().replace('\'', "''");
     vec![
         "-NoExit".to_string(),
