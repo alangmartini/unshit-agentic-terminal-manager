@@ -152,6 +152,22 @@ pub struct SessionSnapshot {
     pub alive: bool,
 }
 
+/// Render-side projection of a `unshit::core::toast::Toast`. The live
+/// store stays in `AppState`; the snapshot path clones a flat list
+/// here so the UI builder layer never reaches back into the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToastView {
+    pub id: unshit::core::toast::ToastId,
+    pub kind: unshit::core::toast::ToastKind,
+    pub message: String,
+}
+
+/// Push an error-level toast onto `state.toasts`. Single entry point
+/// so dispatch handlers do not format user-facing strings inline.
+pub fn push_error_toast(state: &mut AppState, message: impl Into<String>) {
+    state.toasts.push(message);
+}
+
 /// Typed keys for the `AppState::toggles` map. Previously string literals
 /// like "confirm-close" were spread across the UI, with the type system
 /// no help against typos (e.g. "confirm-clsoe" silently read as `false`).
@@ -388,6 +404,15 @@ pub struct AppState {
     /// [`refresh_sessions`]. Empty when the daemon has never been
     /// polled or when the last poll returned no sessions.
     pub sessions: Vec<SessionSnapshot>,
+    /// Set when the most recent `list_sessions` RPC failed. Drives
+    /// the "stale" chip next to the Sessions panel refresh button so
+    /// the user sees that the cached rows may not match the daemon.
+    /// Cleared on the next successful refresh.
+    pub sessions_stale: bool,
+    /// Ephemeral notification queue. Populated by
+    /// [`push_error_toast`]; ticked down by the cursor-blink
+    /// subscription so dismissal stays deterministic in tests.
+    pub toasts: unshit::core::toast::ToastStore,
 }
 
 impl AppState {
@@ -477,6 +502,16 @@ impl AppState {
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
             sessions: self.sessions.clone(),
+            sessions_stale: self.sessions_stale,
+            toasts: self
+                .toasts
+                .iter()
+                .map(|t| ToastView {
+                    id: t.id,
+                    kind: t.kind,
+                    message: t.message.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -539,6 +574,11 @@ pub struct UiSnapshot {
     /// accurate count without the UI having to reach into the map.
     pub terminal_count: usize,
     pub sessions: Vec<SessionSnapshot>,
+    /// Mirrors `AppState::sessions_stale`. `true` when the most recent
+    /// `list_sessions` RPC failed and the cached rows may be stale.
+    pub sessions_stale: bool,
+    /// Flat projection of the live `ToastStore`. Push order preserved.
+    pub toasts: Vec<ToastView>,
 }
 
 fn current_folder_name() -> String {
@@ -710,6 +750,8 @@ pub fn seed_state() -> AppState {
         tabbar_rect: crate::drag::Rect::default(),
         confirm_dialog: None,
         sessions: Vec::new(),
+        sessions_stale: false,
+        toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
     }
 }
 
@@ -2135,6 +2177,12 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             false
         }
+        other if other.starts_with("toast.dismiss:") => {
+            if let Ok(id) = other["toast.dismiss:".len()..].parse::<u64>() {
+                return state.toasts.dismiss(id);
+            }
+            false
+        }
         "dialog.rename_commit" => {
             let Some(ConfirmDialog::RenameSession { pane_id, buffer }) =
                 state.confirm_dialog.take()
@@ -2802,6 +2850,8 @@ mod tests {
             tabbar_rect: crate::drag::Rect::default(),
             confirm_dialog: None,
             sessions: Vec::new(),
+            sessions_stale: false,
+            toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
         }
     }
 
@@ -3637,6 +3687,39 @@ mod tests {
         // No daemon connected in tests; refresh must log and not panic.
         refresh_sessions(&mut state);
         assert_eq!(state.sessions.len(), 1);
+    }
+
+    #[test]
+    fn push_error_toast_caps_at_three() {
+        let mut state = seed_state();
+        for i in 0..5 {
+            push_error_toast(&mut state, format!("err {i}"));
+        }
+        assert_eq!(state.toasts.len(), 3);
+        let messages: Vec<String> = state.toasts.iter().map(|t| t.message.clone()).collect();
+        assert_eq!(messages, vec!["err 2", "err 3", "err 4"]);
+    }
+
+    #[test]
+    fn dispatch_toast_dismiss_removes_toast() {
+        let mut state = seed_state();
+        push_error_toast(&mut state, "boom");
+        let id = state.toasts.iter().next().expect("toast").id;
+        assert!(dispatch(&mut state, &format!("toast.dismiss:{id}")));
+        assert!(state.toasts.is_empty());
+        // Idempotent: a second dismiss returns false but does not panic.
+        assert!(!dispatch(&mut state, &format!("toast.dismiss:{id}")));
+    }
+
+    #[test]
+    fn ui_snapshot_includes_toast_view_in_push_order() {
+        let mut state = seed_state();
+        push_error_toast(&mut state, "first");
+        push_error_toast(&mut state, "second");
+        let snap = state.ui_snapshot();
+        let messages: Vec<&str> = snap.toasts.iter().map(|t| t.message.as_str()).collect();
+        assert_eq!(messages, vec!["first", "second"]);
+        assert!(!snap.sessions_stale);
     }
 
     #[test]
