@@ -1560,6 +1560,19 @@ body.dragging-pane {
   outline: none;
 }
 
+.session-row-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.sessions-empty {
+  padding: 12px 14px;
+  font-size: 12px;
+  color: var(--fg-secondary);
+  font-style: italic;
+}
+
 .confirm-dialog-checkbox {
   display: flex;
   align-items: center;

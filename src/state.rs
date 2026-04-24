@@ -107,6 +107,7 @@ pub enum SettingsSection {
     Shell,
     Keybinds,
     Agents,
+    Sessions,
     DangerZone,
 }
 
@@ -118,20 +119,37 @@ impl SettingsSection {
             SettingsSection::Shell => "shell",
             SettingsSection::Keybinds => "keybinds",
             SettingsSection::Agents => "agents",
+            SettingsSection::Sessions => "sessions",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 6] {
+    pub fn all() -> [SettingsSection; 7] {
         [
             SettingsSection::General,
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
             SettingsSection::Agents,
+            SettingsSection::Sessions,
             SettingsSection::DangerZone,
         ]
     }
+}
+
+/// Lightweight mirror of `unshit_ptyd::protocol::message::SessionInfo`
+/// kept in app state so the UI can render a sessions list without
+/// reaching across the crate boundary. Refreshed synchronously via
+/// [`refresh_sessions`] when the user opens the Sessions panel or
+/// presses Refresh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub session_id: u64,
+    pub pane_id: u32,
+    pub workspace_id: u32,
+    pub name: Option<String>,
+    pub pid: Option<u32>,
+    pub alive: bool,
 }
 
 /// Typed keys for the `AppState::toggles` map. Previously string literals
@@ -355,6 +373,10 @@ pub struct AppState {
     /// Pending destructive action awaiting confirmation. `None` when no
     /// confirm modal is showing.
     pub confirm_dialog: Option<ConfirmDialog>,
+    /// Daemon-known sessions, refreshed on demand via
+    /// [`refresh_sessions`]. Empty when the daemon has never been
+    /// polled or when the last poll returned no sessions.
+    pub sessions: Vec<SessionSnapshot>,
 }
 
 impl AppState {
@@ -437,6 +459,7 @@ impl AppState {
             ctx_menu: self.ctx_menu.clone(),
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
+            sessions: self.sessions.clone(),
         }
     }
 
@@ -486,6 +509,7 @@ pub struct UiSnapshot {
     /// `state.terminals.len()` so the danger-zone button can show an
     /// accurate count without the UI having to reach into the map.
     pub terminal_count: usize,
+    pub sessions: Vec<SessionSnapshot>,
 }
 
 fn current_folder_name() -> String {
@@ -651,6 +675,7 @@ pub fn seed_state() -> AppState {
         resize_drag: None,
         ctx_menu: None,
         confirm_dialog: None,
+        sessions: Vec::new(),
     }
 }
 
@@ -1249,6 +1274,71 @@ pub fn mutate_kill_all_terminals(state: &mut AppState) {
     state.col_ratios.clear();
 }
 
+/// Poll the daemon for its live session list and cache the result in
+/// `state.sessions`. Called when the user opens the Sessions panel or
+/// presses the Refresh button; safe to call when disconnected (logs a
+/// warning and leaves the existing cache untouched).
+pub fn refresh_sessions(state: &mut AppState) {
+    match state.pty_manager.list_sessions() {
+        Ok(list) => {
+            state.sessions = list
+                .into_iter()
+                .map(|info| SessionSnapshot {
+                    session_id: info.id,
+                    pane_id: info.pane_id,
+                    workspace_id: info.workspace_id,
+                    name: info.name,
+                    pid: info.pid,
+                    alive: info.alive,
+                })
+                .collect();
+        }
+        Err(e) => {
+            log::warn!("refresh_sessions: list_sessions failed: {e}");
+        }
+    }
+}
+
+/// Kill a session directly by session id without requiring a local
+/// pane mapping. Used by the sessions panel where orphan sessions (no
+/// attached pane) still need a kill button.
+pub fn mutate_kill_session_id(state: &mut AppState, session_id: u64) {
+    let pane_id = state
+        .pty_manager
+        .sessions_iter()
+        .find_map(|(pid, sid)| (sid == session_id).then_some(pid));
+
+    if let Some(pid) = pane_id {
+        state.pty_manager.destroy(pid);
+        state.terminals.remove(&pid);
+        prune_pane_from_layouts(state, pid);
+    } else {
+        state.pty_manager.kill_session_id(session_id);
+    }
+    state.sessions.retain(|s| s.session_id != session_id);
+}
+
+fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
+    state.panes.retain_mut(|row| {
+        row.retain(|p| p.id.0 != pane_id);
+        !row.is_empty()
+    });
+    if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+        tab.panes.retain_mut(|row| {
+            row.retain(|p| p.id.0 != pane_id);
+            !row.is_empty()
+        });
+    }
+    for ws in state.workspaces.iter_mut() {
+        for tab in ws.tabs.iter_mut() {
+            tab.panes.retain_mut(|row| {
+                row.retain(|p| p.id.0 != pane_id);
+                !row.is_empty()
+            });
+        }
+    }
+}
+
 /// Update the display title of a pane. Writes through to both the
 /// active `state.panes` layout and every saved workspace/tab so the
 /// rename survives workspace switches. An empty `name` is treated as
@@ -1542,6 +1632,17 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 count: state.terminals.len(),
             });
             true
+        }
+        "sessions.refresh" => {
+            refresh_sessions(state);
+            true
+        }
+        other if other.starts_with("session.kill:") => {
+            if let Ok(sid) = other["session.kill:".len()..].parse::<u64>() {
+                mutate_kill_session_id(state, sid);
+                return true;
+            }
+            false
         }
         "dialog.rename_commit" => {
             let Some(ConfirmDialog::RenameSession { pane_id, buffer }) =
@@ -1849,6 +1950,7 @@ mod tests {
             resize_drag: None,
             ctx_menu: None,
             confirm_dialog: None,
+            sessions: Vec::new(),
         }
     }
 
@@ -1865,12 +1967,13 @@ mod tests {
     }
 
     #[test]
-    fn settings_section_all_returns_six() {
+    fn settings_section_all_returns_seven() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         assert_eq!(all[0], SettingsSection::General);
         assert_eq!(all[4], SettingsSection::Agents);
-        assert_eq!(all[5], SettingsSection::DangerZone);
+        assert_eq!(all[5], SettingsSection::Sessions);
+        assert_eq!(all[6], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -2667,6 +2770,66 @@ mod tests {
     fn dialog_rename_commit_without_dialog_is_noop() {
         let mut state = seed_state();
         assert!(!dispatch(&mut state, "dialog.rename_commit"));
+    }
+
+    #[test]
+    fn refresh_sessions_leaves_cache_untouched_when_disconnected() {
+        let mut state = seed_state();
+        state.sessions = vec![SessionSnapshot {
+            session_id: 1,
+            pane_id: 1,
+            workspace_id: 1,
+            name: None,
+            pid: None,
+            alive: true,
+        }];
+        // No daemon connected in tests; refresh must log and not panic.
+        refresh_sessions(&mut state);
+        assert_eq!(state.sessions.len(), 1);
+    }
+
+    #[test]
+    fn session_kill_without_pane_mapping_drops_from_sessions_cache() {
+        let mut state = seed_state();
+        state.sessions = vec![
+            SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 1,
+                name: None,
+                pid: None,
+                alive: true,
+            },
+            SessionSnapshot {
+                session_id: 2,
+                pane_id: 2,
+                workspace_id: 1,
+                name: None,
+                pid: None,
+                alive: true,
+            },
+        ];
+        assert!(dispatch(&mut state, "session.kill:1"));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].session_id, 2);
+    }
+
+    #[test]
+    fn session_kill_bad_id_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "session.kill:not-a-number"));
+    }
+
+    #[test]
+    fn sessions_refresh_dispatch_returns_true() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "sessions.refresh"));
+    }
+
+    #[test]
+    fn settings_section_sessions_labels_and_included_in_all() {
+        assert_eq!(SettingsSection::Sessions.label(), "sessions");
+        assert!(SettingsSection::all().contains(&SettingsSection::Sessions));
     }
 
     #[test]
