@@ -34,10 +34,7 @@ fn log_backdrop_fallback_once(
     target_usages: wgpu::TextureUsages,
 ) {
     let seen = BACKDROP_FALLBACK_LOG.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut guard = match seen.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut guard = seen.lock().unwrap_or_else(|p| p.into_inner());
     if guard.insert((format, target_usages)) {
         log::info!(
             "backdrop-filter unavailable: required usages missing (format={:?}, format_usages={:?}, target_usages={:?})",
@@ -548,6 +545,17 @@ impl GpuContext {
     ) -> Self {
         let format = wgpu::TextureFormat::Rgba8Unorm;
 
+        // `COPY_DST` is required when the backdrop filter path copies the
+        // `backdrop_source` texture onto the offscreen target at the end of
+        // the render pass (see the branches in `render` around
+        // `backdrop_source.as_ref().unwrap().as_image_copy()`). Kept in a
+        // local so the same value is fed to the texture descriptor and to
+        // `probe_backdrop_filter_support` below; declaring them separately
+        // would let the two drift.
+        let headless_target_usages = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST;
+
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen target"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -555,13 +563,7 @@ impl GpuContext {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            // `COPY_DST` is required when the backdrop filter path copies
-            // the `backdrop_source` texture onto the offscreen target at
-            // the end of the render pass (see the branches in `render`
-            // around `backdrop_source.as_ref().unwrap().as_image_copy()`).
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
+            usage: headless_target_usages,
             view_formats: &[],
         });
         let quad_pipeline = QuadPipeline::new(&device, format, MSAA_SAMPLE_COUNT);
@@ -595,12 +597,6 @@ impl GpuContext {
             (None, None)
         };
 
-        // Pass the headless texture's actual descriptor usages so a future
-        // tightening (or loosening) is reflected in probe availability
-        // instead of being hidden behind a wildcard.
-        let headless_target_usages = wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::COPY_DST;
         let backdrop_filter_available =
             probe_backdrop_filter_support(adapter, format, headless_target_usages);
 
