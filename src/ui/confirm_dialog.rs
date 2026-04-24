@@ -220,6 +220,7 @@ fn build_close_app_card(count: usize, remember: bool, shared: &SharedState) -> E
 /// text; submitting an empty field clears the custom name.
 fn build_rename_session_card(pane_id: u32, _buffer: &str, shared: &SharedState) -> ElementDef {
     let input_shared = shared.clone();
+    let submit_shared = shared.clone();
     let input = ElementDef::new(Tag::Input)
         .with_class("confirm-dialog-input")
         .with_placeholder("New session name")
@@ -231,6 +232,17 @@ fn build_rename_session_card(pane_id: u32, _buffer: &str, shared: &SharedState) 
                 {
                     *buffer = typed;
                 }
+            });
+        })
+        .on_submit(move |text| {
+            let typed = text.to_string();
+            mutate_with(&submit_shared, |st| {
+                if let Some(ConfirmDialog::RenameSession { buffer, .. }) =
+                    st.confirm_dialog.as_mut()
+                {
+                    *buffer = typed;
+                }
+                dispatch(st, "dialog.rename_commit");
             });
         });
 
@@ -515,6 +527,37 @@ mod tests {
             s.lock().unwrap().confirm_dialog,
             Some(ConfirmDialog::CloseApp { remember: true, .. })
         ));
+    }
+
+    #[test]
+    fn rename_dialog_input_submit_commits_with_typed_value() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.panes = vec![vec![crate::state::Pane {
+                id: crate::state::PaneId(5),
+                title: "old".into(),
+                subtitle: "".into(),
+                pid: 0,
+                cpu: 0.0,
+            }]];
+            guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                pane_id: 5,
+                buffer: "partial".into(),
+            });
+        }
+        let snap = s.lock().unwrap().ui_snapshot();
+        let el = build_confirm_dialog_overlay(&snap, &s);
+        let card = &el.children[0];
+        let input = card
+            .children
+            .iter()
+            .find(|c| c.classes.iter().any(|cls| cls == "confirm-dialog-input"))
+            .expect("input");
+        (input.on_submit.as_ref().unwrap())("enter-to-commit");
+        let guard = s.lock().unwrap();
+        assert!(guard.confirm_dialog.is_none());
+        assert_eq!(guard.panes[0][0].title, "enter-to-commit");
     }
 
     #[test]

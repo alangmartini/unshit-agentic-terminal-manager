@@ -1573,6 +1573,14 @@ body.dragging-pane {
   font-style: italic;
 }
 
+.session-status-alive {
+  color: var(--amber-400);
+}
+
+.session-status-dead {
+  color: var(--rust);
+}
+
 .confirm-dialog-checkbox {
   display: flex;
   align-items: center;

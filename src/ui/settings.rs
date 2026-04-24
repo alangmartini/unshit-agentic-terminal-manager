@@ -314,11 +314,21 @@ fn session_row(s: &crate::state::SessionSnapshot, shared: &SharedState) -> Eleme
         Some(p) => format!("shell ({p})"),
         None => format!("shell (session {})", s.session_id),
     });
-    let status = if s.alive { "alive" } else { "dead" };
-    let meta = format!(
-        "workspace {} · pane {} · {}",
-        s.workspace_id, s.pane_id, status
-    );
+    let meta = ElementDef::new(Tag::Span)
+        .with_class("setting-desc")
+        .with_child(ElementDef::new(Tag::Span).with_text(format!(
+            "workspace {} · pane {} · ",
+            s.workspace_id, s.pane_id
+        )))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class(if s.alive {
+                    "session-status-alive"
+                } else {
+                    "session-status-dead"
+                })
+                .with_text(if s.alive { "alive" } else { "dead" }),
+        );
 
     let kill_shared = shared.clone();
     let session_id = s.session_id;
@@ -355,11 +365,7 @@ fn session_row(s: &crate::state::SessionSnapshot, shared: &SharedState) -> Eleme
                         .with_class("setting-label")
                         .with_text(label),
                 )
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("setting-desc")
-                        .with_text(meta),
-                ),
+                .with_child(meta),
         )
         .with_child(
             ElementDef::new(Tag::Div)
@@ -1704,6 +1710,50 @@ mod tests {
             })
             .collect();
         assert!(labels.iter().any(|l| l == "shell (9999)"));
+    }
+
+    #[test]
+    fn sessions_section_alive_session_has_alive_status_class() {
+        let snap = crate::state::UiSnapshot {
+            sessions: vec![
+                crate::state::SessionSnapshot {
+                    session_id: 1,
+                    pane_id: 1,
+                    workspace_id: 1,
+                    name: Some("a".into()),
+                    pid: None,
+                    alive: true,
+                },
+                crate::state::SessionSnapshot {
+                    session_id: 2,
+                    pane_id: 2,
+                    workspace_id: 1,
+                    name: Some("b".into()),
+                    pid: None,
+                    alive: false,
+                },
+            ],
+            ..seed_state().ui_snapshot()
+        };
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let rows: Vec<_> = el
+            .children
+            .iter()
+            .filter(|c| c.classes.contains(&"setting-row".to_string()))
+            .collect();
+        // rows[0] is header; rows[1] alive, rows[2] dead
+        let alive_meta = &rows[1].children[0];
+        let dead_meta = &rows[2].children[0];
+        let has_status_class = |meta: &ElementDef, cls: &str| {
+            meta.children.iter().any(|c| {
+                c.children
+                    .iter()
+                    .any(|span| span.classes.iter().any(|k| k == cls))
+            })
+        };
+        assert!(has_status_class(alive_meta, "session-status-alive"));
+        assert!(has_status_class(dead_meta, "session-status-dead"));
     }
 
     #[test]
