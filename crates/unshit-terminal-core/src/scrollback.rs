@@ -59,18 +59,9 @@ impl Scrollback {
     /// empty. Used by `Terminal::resize` to lift scrollback into newly
     /// available rows on grow.
     pub fn pop_back_n(&mut self, n: usize) -> Vec<Vec<Cell>> {
-        if n == 0 {
-            return Vec::new();
-        }
         let take = n.min(self.lines.len());
-        let mut popped: Vec<Vec<Cell>> = Vec::with_capacity(take);
-        for _ in 0..take {
-            if let Some(line) = self.lines.pop_back() {
-                popped.push(line);
-            }
-        }
-        popped.reverse();
-        popped
+        let split_at = self.lines.len() - take;
+        self.lines.split_off(split_at).into()
     }
 }
 

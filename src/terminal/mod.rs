@@ -149,17 +149,16 @@ impl Terminal {
     /// round-trip. Column-only resizes do not touch scrollback.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let old_rows = self.rows;
-        let old_cols = self.cols;
 
         if rows > old_rows {
             let k = rows - old_rows;
-            self.grow_rows_lifting_scrollback(k, old_rows, old_cols);
+            self.grow_rows_lifting_scrollback(k);
             self.cursor_row += k;
         } else if rows < old_rows {
             let k = old_rows - rows;
             let evict_above = k.min(self.cursor_row);
             if evict_above > 0 {
-                self.shrink_rows_evicting_to_scrollback(evict_above, old_cols);
+                self.shrink_rows_evicting_to_scrollback(evict_above);
                 self.cursor_row -= evict_above;
             }
         }
@@ -168,49 +167,32 @@ impl Terminal {
         self.rows = rows;
         self.cols = cols;
 
-        if rows == 0 {
-            self.cursor_row = 0;
-        } else if self.cursor_row >= rows {
-            self.cursor_row = rows - 1;
-        }
-        if cols == 0 {
-            self.cursor_col = 0;
-        } else if self.cursor_col >= cols {
-            self.cursor_col = cols - 1;
-        }
+        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
     /// Lift up to `k` newest scrollback rows into the top of the grid
     /// after extending the row count by `k`. Existing rows shift down
     /// so the bottom of the grid stays anchored to its previous content.
-    fn grow_rows_lifting_scrollback(&mut self, k: usize, old_rows: usize, cols: usize) {
-        let take = k.min(self.scrollback.len());
-        let mut lifted: Vec<Vec<Cell>> = Vec::with_capacity(take);
-        for _ in 0..take {
-            if let Some(line) = self.scrollback.pop_back() {
-                lifted.push(line);
-            }
-        }
-        lifted.reverse();
+    fn grow_rows_lifting_scrollback(&mut self, k: usize) {
+        let cols = self.cols;
+        let old_rows = self.rows;
+        let split_at = self.scrollback.len().saturating_sub(k);
+        let lifted: Vec<Vec<Cell>> = self.scrollback.split_off(split_at).into();
 
-        let new_rows = old_rows + k;
-        self.grid.resize(new_rows, cols);
-        if old_rows > 0 {
-            self.grid.shift_rows(k, 0, old_rows);
-        }
-        let blank = Cell::default();
+        self.grid.resize(old_rows + k, cols);
+        self.grid.shift_rows(k, 0, old_rows);
         for r in 0..k {
             for c in 0..cols {
-                self.grid.set_cell(r, c, blank);
+                self.grid.set_cell(r, c, Cell::default());
             }
         }
         let blank_top = k - lifted.len();
         for (i, row) in lifted.iter().enumerate() {
-            let dst = blank_top + i;
             let copy = row.len().min(cols);
             for (c, cell) in row.iter().take(copy).enumerate() {
-                self.grid.set_cell(dst, c, *cell);
+                self.grid.set_cell(blank_top + i, c, *cell);
             }
         }
     }
@@ -219,21 +201,18 @@ impl Terminal {
     /// shift the remaining rows up so the bottom of the grid keeps its
     /// content. The vacated rows at the bottom are left blank by
     /// `shift_rows` and trimmed by the subsequent `grid.resize` call.
-    fn shrink_rows_evicting_to_scrollback(&mut self, n: usize, cols: usize) {
+    fn shrink_rows_evicting_to_scrollback(&mut self, n: usize) {
+        let cols = self.cols;
         for r in 0..n {
-            let mut row: Vec<Cell> = Vec::with_capacity(cols);
-            for c in 0..cols {
-                row.push(self.grid.get_cell(r, c).copied().unwrap_or_default());
-            }
+            let row: Vec<Cell> = (0..cols)
+                .map(|c| self.grid.get_cell(r, c).copied().unwrap_or_default())
+                .collect();
             self.scrollback.push_back(row);
             if self.scrollback.len() > MAX_SCROLLBACK {
                 self.scrollback.pop_front();
             }
         }
-        let move_count = self.rows.saturating_sub(n);
-        if move_count > 0 {
-            self.grid.shift_rows(0, n, move_count);
-        }
+        self.grid.shift_rows(0, n, self.rows.saturating_sub(n));
     }
 
     /// Overwrite this terminal's rendered state with `snapshot`.

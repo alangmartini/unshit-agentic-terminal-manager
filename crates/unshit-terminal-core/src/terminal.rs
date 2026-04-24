@@ -86,16 +86,8 @@ impl Terminal {
         self.rows = rows;
         self.cols = cols;
 
-        if rows == 0 {
-            self.cursor_row = 0;
-        } else if self.cursor_row >= rows {
-            self.cursor_row = rows - 1;
-        }
-        if cols == 0 {
-            self.cursor_col = 0;
-        } else if self.cursor_col >= cols {
-            self.cursor_col = cols - 1;
-        }
+        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
