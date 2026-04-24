@@ -7,6 +7,9 @@
 //! dispatches `app.close.keep_running` / `app.close.kill_and_quit`
 //! instead of going through `dialog.confirm`; the close-app UI
 //! handlers follow up with `process::exit(0)` to drive the real exit.
+//! The `RenameSession` variant shows a text input and commits via
+//! `dialog.rename_commit` so the commit handler can pull the typed
+//! buffer before clearing the dialog.
 //! The modal overlay itself blocks clicks to everything behind it.
 
 use unshit::core::element::*;
@@ -45,6 +48,9 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
         ),
         ConfirmDialog::CloseApp { count, remember } => {
             build_close_app_card(*count, *remember, shared)
+        }
+        ConfirmDialog::RenameSession { pane_id, buffer } => {
+            build_rename_session_card(*pane_id, buffer, shared)
         }
     };
 
@@ -207,6 +213,74 @@ fn build_close_app_card(count: usize, remember: bool, shared: &SharedState) -> E
         )
 }
 
+/// Card body for the `RenameSession` dialog. The input's on_change
+/// keeps the dialog buffer in sync so the commit handler can read the
+/// typed value. The framework does not seed an input's initial value
+/// from the ElementDef, so the current name is shown as placeholder
+/// text; submitting an empty field clears the custom name.
+fn build_rename_session_card(pane_id: u32, _buffer: &str, shared: &SharedState) -> ElementDef {
+    let input_shared = shared.clone();
+    let input = ElementDef::new(Tag::Input)
+        .with_class("confirm-dialog-input")
+        .with_placeholder("New session name")
+        .on_change(move |text| {
+            let typed = text.to_string();
+            mutate_with(&input_shared, |st| {
+                if let Some(ConfirmDialog::RenameSession { buffer, .. }) =
+                    st.confirm_dialog.as_mut()
+                {
+                    *buffer = typed;
+                }
+            });
+        });
+
+    let cancel_shared = shared.clone();
+    let cancel = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-button")
+        .with_class("cancel")
+        .on_click(move || {
+            mutate_with(&cancel_shared, |st| {
+                dispatch(st, "dialog.cancel");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Cancel".to_string()));
+
+    let save_shared = shared.clone();
+    let save = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-button")
+        .with_class("primary")
+        .on_click(move || {
+            mutate_with(&save_shared, |st| {
+                dispatch(st, "dialog.rename_commit");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Save".to_string()));
+
+    ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-card")
+        .with_id(format!("confirm-dialog-rename-{pane_id}"))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-title")
+                .with_text("Rename session".to_string()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-body")
+                .with_text(
+                    "Type a new name for this session. Leave empty to clear the custom name."
+                        .to_string(),
+                ),
+        )
+        .with_child(input)
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-buttons")
+                .with_child(cancel)
+                .with_child(save),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +354,36 @@ mod tests {
             .find(|c| c.classes.iter().any(|cls| cls == "confirm-dialog-checkbox"))
             .expect("checkbox element");
         assert!(checkbox.classes.iter().any(|c| c == "checked"));
+    }
+
+    #[test]
+    fn rename_session_dialog_renders_input_and_save_cancel_buttons() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                pane_id: 3,
+                buffer: "old".into(),
+            });
+        }
+        let snap = s.lock().unwrap().ui_snapshot();
+        let el = build_confirm_dialog_overlay(&snap, &s);
+        let card = &el.children[0];
+        assert_eq!(card.id.as_deref(), Some("confirm-dialog-rename-3"));
+
+        let input = card
+            .children
+            .iter()
+            .find(|c| c.classes.iter().any(|cls| cls == "confirm-dialog-input"))
+            .expect("input element");
+        assert!(input.on_change.is_some());
+
+        let buttons = card
+            .children
+            .iter()
+            .find(|c| c.classes.iter().any(|cls| cls == "confirm-dialog-buttons"))
+            .expect("buttons row");
+        assert_eq!(buttons.children.len(), 2);
+        assert!(buttons.children[1].classes.iter().any(|c| c == "primary"));
     }
 }
