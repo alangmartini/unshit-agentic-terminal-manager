@@ -42,7 +42,7 @@ Both emulators are fixed identically so the UI mirror and the daemon stay in syn
 
 Acceptance:
 - If scrollback has >= K lines, the top K rows of the new grid equal the last K scrollback lines (in the same order they scrolled off), and scrollback length decreases by K.
-- If scrollback has fewer than K lines (say M), the top M rows come from scrollback, the next K-M rows are blank, and scrollback is empty afterward. Cursor row advances by M (not by K).
+- If scrollback has fewer than K lines (say M), the M lifted rows sit immediately above the existing content (rows `K-M..K`), the top `K-M` rows are blank, and scrollback is empty afterward. Cursor row always advances by K so it stays anchored to its distance-from-bottom regardless of how many rows were lifted.
 - No visible blank gap between scrolled-back content and the live prompt when scrollback has content.
 
 ### F2. Shrink evicts top rows into scrollback
@@ -75,16 +75,14 @@ Acceptance:
 Files to touch (small, focused):
 
 - `crates/unshit-terminal-core/src/grid.rs`
-  - Add `shrink_rows_from_top(&mut self, n: usize) -> Vec<Vec<Cell>>` that removes the top `n` rows and returns them as owned vecs. The remaining rows shift up; the bottom gains `n` blank rows.
-  - Add `grow_rows_with_lift(&mut self, n: usize, lifted: impl Iterator<Item = Vec<Cell>>)` that prepends lifted rows at the top (padding with blanks if iterator yields fewer than `n`), shifting existing rows down.
-  - Or: factor the primitives differently. Open to refactoring.
+  - Add `shrink_rows_from_top(&mut self, n: usize) -> Vec<Vec<Cell>>` that removes the top `n` rows and returns them as owned vecs. The remaining rows shift up; the bottom gains `n` blank rows so the row count is preserved (the caller's subsequent `resize` truncates the blank tail to the final row count).
+  - Add `grow_rows_at_top(&mut self, n: usize, lifted: impl IntoIterator<Item = Vec<Cell>>)` that grows the grid by `n` rows added at the top, painted with the lifted rows. Lifted rows shorter than `cols` are padded; longer ones are clipped. If fewer than `n` rows are lifted, they sit at the bottom of the new top section so they're adjacent to the existing content.
 - `crates/unshit-terminal-core/src/terminal.rs::resize`
-  - Compute `delta_rows = new_rows as isize - old_rows as isize`.
-  - On grow: lift up to `delta_rows` lines from the tail of `scrollback` and call `grid.grow_rows_with_lift`; advance cursor_row by the number of lines actually lifted (clamped to new_rows - 1).
-  - On shrink: determine eviction count `k = old_rows - new_rows`. Call `grid.shrink_rows_from_top(k)` and push each evicted row into `scrollback`, respecting the max. Update cursor_row = `old_cursor_row.saturating_sub(k)`.
-  - Then delegate column handling to the existing clamp + grid.resize for the column-only path.
+  - On grow: lift up to `K = new_rows - old_rows` lines from the tail of `scrollback` and call `grid.grow_rows_at_top`. Advance cursor_row by the full K so the bottom of the grid stays anchored.
+  - On shrink: `K = old_rows - new_rows`. Evict up to `min(K, cursor_row)` top rows into scrollback (so the live prompt row is never pushed). Decrement cursor_row by the evicted count. Any remaining shrink trims the blank tail below the cursor via the subsequent `grid.resize`.
+  - Column-only resize delegates to `grid.resize` with no scrollback side effects.
 - `crates/unshit-terminal-core/src/scrollback.rs`
-  - Expose `pop_back(&mut self, n: usize) -> Vec<Vec<Cell>>` or equivalent so `terminal.rs` can lift newest-first on grow.
+  - Add `pop_back_n(&mut self, n: usize) -> Vec<Vec<Cell>>` that pops up to `n` newest lines off the back, returned in oldest-first order so callers can place them top-to-bottom in a grid.
 - `src/terminal/mod.rs::resize`
   - Mirror the daemon logic. Reuse the existing `scrollback: VecDeque<Vec<Cell>>` and `MAX_SCROLLBACK` constant.
   - On grow: lift from the back of `scrollback` into new top rows of `self.grid`. Advance `self.cursor_row`.

@@ -199,8 +199,9 @@ impl Terminal {
 
     /// Push the top `n` grid rows into scrollback (oldest first) and
     /// shift the remaining rows up so the bottom of the grid keeps its
-    /// content. The vacated rows at the bottom are left blank by
-    /// `shift_rows` and trimmed by the subsequent `grid.resize` call.
+    /// content. `CellGrid::shift_rows` is a `copy_within` and does not
+    /// blank the source range, so the duplicated tail rows are clipped
+    /// by the subsequent `grid.resize` call in `resize`.
     fn shrink_rows_evicting_to_scrollback(&mut self, n: usize) {
         let cols = self.cols;
         for r in 0..n {
@@ -1336,6 +1337,43 @@ mod tests {
 
         assert_eq!(t.scrollback_len(), scrollback_before);
         assert_eq!(t.cols, 5);
+    }
+
+    #[test]
+    fn resize_shrink_respects_max_scrollback_ui() {
+        // The UI mirror's eviction loop uses its own VecDeque cap check
+        // (MAX_SCROLLBACK = 10_000) instead of the daemon's `Scrollback`
+        // type. We can't shrink that cap from the test, so just verify
+        // overflow handling does the right thing on a small synthetic
+        // case by pre-filling scrollback up to the cap and then evicting
+        // one more row via resize.
+        let mut t = Terminal::new(2, 4);
+        // Pre-load scrollback to MAX_SCROLLBACK by directly pushing.
+        for _ in 0..MAX_SCROLLBACK {
+            t.scrollback.push_back(vec![Cell::default(); 4]);
+        }
+        // Now write a real row so the grid has identifiable content.
+        t.process_bytes(b"AB\r\nCD");
+        assert_eq!(t.scrollback_len(), MAX_SCROLLBACK);
+
+        t.resize(1, 4);
+
+        // The shrink evicted one row to scrollback; cap forces an
+        // equivalent pop_front so length stays at MAX_SCROLLBACK.
+        assert_eq!(t.scrollback_len(), MAX_SCROLLBACK);
+        // The newest scrollback entry is the row we just evicted ("AB").
+        let newest = t.scrollback.back().unwrap();
+        assert_eq!(newest[0].ch, 'A');
+        assert_eq!(newest[1].ch, 'B');
+    }
+
+    #[test]
+    fn resize_to_zero_rows_does_not_panic_ui() {
+        let mut t = Terminal::new(2, 3);
+        t.process_bytes(b"aa\r\nbb");
+        t.resize(0, 3);
+        assert_eq!(t.rows, 0);
+        assert_eq!(t.cursor_position().0, 0);
     }
 
     #[test]
