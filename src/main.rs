@@ -235,7 +235,11 @@ fn build_tree(
     }
 
     ElementTree {
-        root: root.with_child(build_ctx_menu_overlay(snap, shared)),
+        root: root
+            .with_child(build_ctx_menu_overlay(snap, shared))
+            .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
+                snap, shared,
+            )),
     }
 }
 

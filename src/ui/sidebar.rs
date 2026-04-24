@@ -457,6 +457,15 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
             format!("workspace.collapse:{}", ws_idx),
         ));
 
+    menu = menu.with_child(menu_separator()).with_child(
+        menu_item(
+            "Kill all terminals in workspace",
+            shared,
+            format!("workspace.request_kill_all:{}", ws_idx),
+        )
+        .with_class("danger"),
+    );
+
     if can_remove {
         menu = menu.with_child(menu_separator()).with_child(
             menu_item(

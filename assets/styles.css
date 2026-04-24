@@ -1446,6 +1446,78 @@ body.dragging-pane {
   /* inherits font size and color from parent */
 }
 
+/* ---- Confirm Dialog ---- */
+
+.confirm-dialog-hidden {
+  display: none;
+}
+
+.confirm-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-overlay);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 300;
+}
+
+.confirm-dialog-card {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  padding: 20px 24px;
+  min-width: 360px;
+  max-width: 480px;
+  box-shadow: var(--shadow-lg);
+  flex-direction: column;
+}
+
+.confirm-dialog-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg-primary);
+  margin-bottom: 10px;
+}
+
+.confirm-dialog-body {
+  font-size: 12px;
+  color: var(--fg-secondary);
+  margin-bottom: 18px;
+  line-height: 1.5;
+}
+
+.confirm-dialog-buttons {
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.confirm-dialog-button {
+  padding: 6px 14px;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--fg-primary);
+}
+
+.confirm-dialog-button:hover {
+  background: var(--bg-hover);
+}
+
+.confirm-dialog-button.danger {
+  background: var(--rust);
+  color: var(--bg-base);
+  border-color: var(--rust);
+}
+
+.confirm-dialog-button.danger:hover {
+  background: var(--rust);
+  filter: brightness(1.1);
+}
+
 /* ---- Settings Modal ---- */
 
 .modal-overlay {

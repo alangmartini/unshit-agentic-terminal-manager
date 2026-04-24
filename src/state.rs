@@ -47,6 +47,18 @@ pub struct CtxMenu {
     pub workspace_idx: usize,
 }
 
+/// Pending destructive action awaiting user confirmation via the confirm
+/// modal. Populating `AppState.confirm_dialog` opens the modal; the
+/// modal dispatches `dialog.confirm` or `dialog.cancel`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmDialog {
+    /// Kill every terminal inside the workspace at `workspace_idx` and
+    /// empty the workspace's tabs. Name is copied at open time so the
+    /// modal can caption correctly even if the workspace is renamed
+    /// mid-flight.
+    KillWorkspace { workspace_idx: usize, name: String },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSection {
     General,
@@ -285,6 +297,9 @@ pub struct AppState {
     pub resize_drag: Option<ResizeDragSnapshot>,
     /// Context menu state: Some when open, None when closed.
     pub ctx_menu: Option<CtxMenu>,
+    /// Pending destructive action awaiting confirmation. `None` when no
+    /// confirm modal is showing.
+    pub confirm_dialog: Option<ConfirmDialog>,
 }
 
 impl AppState {
@@ -365,6 +380,7 @@ impl AppState {
             row_ratios: self.row_ratios.clone(),
             col_ratios: self.col_ratios.clone(),
             ctx_menu: self.ctx_menu.clone(),
+            confirm_dialog: self.confirm_dialog.clone(),
         }
     }
 
@@ -409,6 +425,7 @@ pub struct UiSnapshot {
     pub row_ratios: Vec<f32>,
     pub col_ratios: Vec<Vec<f32>>,
     pub ctx_menu: Option<CtxMenu>,
+    pub confirm_dialog: Option<ConfirmDialog>,
 }
 
 fn current_folder_name() -> String {
@@ -571,6 +588,7 @@ pub fn seed_state() -> AppState {
         col_ratios: vec![vec![1.0]],
         resize_drag: None,
         ctx_menu: None,
+        confirm_dialog: None,
     }
 }
 
@@ -1057,6 +1075,64 @@ pub fn mutate_font_size_delta(state: &mut AppState, delta: i32) {
     state.font_size_pt = (next.clamp(MIN_FONT_SIZE as i32, MAX_FONT_SIZE as i32)) as u32;
 }
 
+/// Kill every daemon session tagged with the workspace at `ws_idx` and
+/// empty that workspace's tabs/panes in the UI. The workspace itself is
+/// kept (per SPEC F5: "Workspace itself is not deleted, just emptied").
+///
+/// Pane ids come from the live `state.panes` + `state.tabs` snapshot
+/// when `ws_idx` is the active workspace, otherwise from the saved
+/// `workspaces[ws_idx].tabs`. Each id is destroyed on the daemon and
+/// dropped from `state.terminals`; state.pty_manager.destroy is a
+/// no-op for unknown ids so double-destroy is safe.
+pub fn mutate_kill_workspace_terminals(state: &mut AppState, ws_idx: usize) {
+    if ws_idx >= state.workspaces.len() {
+        return;
+    }
+
+    let mut pane_ids: Vec<u32> = Vec::new();
+    if ws_idx == state.active_workspace {
+        for row in &state.panes {
+            for p in row {
+                pane_ids.push(p.id.0);
+            }
+        }
+        for (tab_idx, tab) in state.tabs.iter().enumerate() {
+            if tab_idx == state.active_tab {
+                continue;
+            }
+            for row in &tab.panes {
+                for p in row {
+                    pane_ids.push(p.id.0);
+                }
+            }
+        }
+    } else {
+        for tab in &state.workspaces[ws_idx].tabs {
+            for row in &tab.panes {
+                for p in row {
+                    pane_ids.push(p.id.0);
+                }
+            }
+        }
+    }
+
+    for id in &pane_ids {
+        state.pty_manager.destroy(*id);
+        state.terminals.remove(id);
+    }
+
+    if ws_idx == state.active_workspace {
+        state.tabs.clear();
+        state.active_tab = 0;
+        state.panes.clear();
+        state.active_pane = PaneId(0);
+        state.row_ratios.clear();
+        state.col_ratios.clear();
+    }
+    state.workspaces[ws_idx].tabs.clear();
+    state.workspaces[ws_idx].active_tab = 0;
+}
+
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
     match command {
         "modal.close" => {
@@ -1069,7 +1145,31 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.settings_open = false;
                 changed = true;
             }
+            if state.confirm_dialog.is_some() {
+                state.confirm_dialog = None;
+                changed = true;
+            }
             changed
+        }
+        "dialog.confirm" => {
+            if let Some(dlg) = state.confirm_dialog.take() {
+                match dlg {
+                    ConfirmDialog::KillWorkspace { workspace_idx, .. } => {
+                        mutate_kill_workspace_terminals(state, workspace_idx);
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+        "dialog.cancel" => {
+            if state.confirm_dialog.is_some() {
+                state.confirm_dialog = None;
+                true
+            } else {
+                false
+            }
         }
         "ctx_menu.close" => {
             if state.ctx_menu.is_some() {
@@ -1195,6 +1295,19 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 if idx < state.workspaces.len() {
                     mutate_switch_workspace(state, idx);
                     mutate_add_tab(state);
+                    return true;
+                }
+            }
+            false
+        }
+        other if other.starts_with("workspace.request_kill_all:") => {
+            if let Ok(idx) = other["workspace.request_kill_all:".len()..].parse::<usize>() {
+                state.ctx_menu = None;
+                if let Some(ws) = state.workspaces.get(idx) {
+                    state.confirm_dialog = Some(ConfirmDialog::KillWorkspace {
+                        workspace_idx: idx,
+                        name: ws.name.clone(),
+                    });
                     return true;
                 }
             }
@@ -1467,6 +1580,7 @@ mod tests {
             col_ratios: vec![vec![1.0]],
             resize_drag: None,
             ctx_menu: None,
+            confirm_dialog: None,
         }
     }
 
@@ -1811,6 +1925,146 @@ mod tests {
         });
         assert!(dispatch(&mut state, "workspace.remove:1"));
         assert!(state.ctx_menu.is_none());
+    }
+
+    // -- F5: per-workspace kill ----------------------------------------------
+
+    #[test]
+    fn request_kill_all_opens_confirm_dialog_and_closes_ctx_menu() {
+        let mut state = seed_state();
+        state.ctx_menu = Some(CtxMenu {
+            x: 1.0,
+            y: 2.0,
+            workspace_idx: 0,
+        });
+        assert!(dispatch(&mut state, "workspace.request_kill_all:0"));
+        assert!(state.ctx_menu.is_none());
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::KillWorkspace {
+                workspace_idx,
+                name,
+            }) => {
+                assert_eq!(*workspace_idx, 0);
+                assert_eq!(name, &state.workspaces[0].name);
+            }
+            None => panic!("confirm dialog should be set"),
+        }
+    }
+
+    #[test]
+    fn request_kill_all_for_unknown_workspace_is_noop() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "workspace.request_kill_all:99"));
+        assert!(state.confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn dialog_cancel_clears_dialog_without_side_effects() {
+        let mut state = seed_state();
+        state.confirm_dialog = Some(ConfirmDialog::KillWorkspace {
+            workspace_idx: 0,
+            name: "ws".into(),
+        });
+        let tabs_before = state.tabs.len();
+        assert!(dispatch(&mut state, "dialog.cancel"));
+        assert!(state.confirm_dialog.is_none());
+        assert_eq!(state.tabs.len(), tabs_before, "cancel must not kill tabs");
+    }
+
+    #[test]
+    fn dialog_confirm_on_kill_workspace_empties_active_workspace() {
+        let mut state = seed_state();
+        let ws_idx = state.active_workspace;
+        assert!(!state.panes.is_empty(), "seed must have at least one pane");
+        state.confirm_dialog = Some(ConfirmDialog::KillWorkspace {
+            workspace_idx: ws_idx,
+            name: state.workspaces[ws_idx].name.clone(),
+        });
+        assert!(dispatch(&mut state, "dialog.confirm"));
+        assert!(state.confirm_dialog.is_none());
+        assert!(
+            state.tabs.is_empty(),
+            "active workspace tabs must be emptied"
+        );
+        assert!(
+            state.panes.is_empty(),
+            "active workspace panes must be emptied"
+        );
+        assert!(
+            state.terminals.is_empty(),
+            "terminal handles must be dropped"
+        );
+        assert!(
+            state.workspaces[ws_idx].tabs.is_empty(),
+            "saved tab list must also be cleared"
+        );
+    }
+
+    #[test]
+    fn mutate_kill_workspace_terminals_on_inactive_workspace_leaves_active_intact() {
+        let mut state = seed_state();
+        mutate_add_workspace(&mut state);
+        assert!(state.workspaces.len() >= 2);
+        let inactive_idx = 1;
+        assert_ne!(state.active_workspace, inactive_idx);
+
+        // Seed the inactive workspace with a saved tab so there's
+        // something to kill.
+        state.workspaces[inactive_idx].tabs = vec![TerminalTab {
+            id: "t-inactive".into(),
+            name: "old".into(),
+            subtitle: "".into(),
+            status: TabStatus::Running,
+            panes: vec![vec![Pane {
+                id: PaneId(42),
+                title: "p".into(),
+                subtitle: "".into(),
+                pid: 0,
+                cpu: 0.0,
+            }]],
+            active_pane: PaneId(42),
+            row_ratios: vec![1.0],
+            col_ratios: vec![vec![1.0]],
+        }];
+
+        let active_tabs_before = state.tabs.len();
+        let active_panes_before = state.panes.len();
+
+        mutate_kill_workspace_terminals(&mut state, inactive_idx);
+
+        assert!(
+            state.workspaces[inactive_idx].tabs.is_empty(),
+            "target workspace must be emptied"
+        );
+        assert_eq!(
+            state.tabs.len(),
+            active_tabs_before,
+            "active workspace tabs must be untouched"
+        );
+        assert_eq!(
+            state.panes.len(),
+            active_panes_before,
+            "active workspace panes must be untouched"
+        );
+    }
+
+    #[test]
+    fn mutate_kill_workspace_terminals_unknown_index_is_noop() {
+        let mut state = test_state();
+        let tabs_before = state.tabs.len();
+        mutate_kill_workspace_terminals(&mut state, 999);
+        assert_eq!(state.tabs.len(), tabs_before);
+    }
+
+    #[test]
+    fn modal_close_also_closes_confirm_dialog() {
+        let mut state = test_state();
+        state.confirm_dialog = Some(ConfirmDialog::KillWorkspace {
+            workspace_idx: 0,
+            name: "ws".into(),
+        });
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.confirm_dialog.is_none());
     }
 
     #[test]
