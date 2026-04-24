@@ -1646,4 +1646,79 @@ mod tests {
         // one row per session.
         assert_eq!(rows.len(), 3);
     }
+
+    #[test]
+    fn sessions_section_named_session_shows_custom_label() {
+        let snap = crate::state::UiSnapshot {
+            sessions: vec![crate::state::SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 42,
+                name: Some("api-server".into()),
+                pid: Some(1234),
+                alive: true,
+            }],
+            ..seed_state().ui_snapshot()
+        };
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let labels: Vec<&str> = el
+            .children
+            .iter()
+            .filter_map(|c| {
+                c.children
+                    .iter()
+                    .find(|m| m.classes.contains(&"setting-meta".to_string()))
+                    .and_then(|m| m.children.first())
+                    .and_then(text_of)
+            })
+            .collect();
+        assert!(labels.contains(&"api-server"));
+    }
+
+    #[test]
+    fn sessions_section_unnamed_session_shows_pid_fallback() {
+        let snap = crate::state::UiSnapshot {
+            sessions: vec![crate::state::SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 1,
+                name: None,
+                pid: Some(9999),
+                alive: true,
+            }],
+            ..seed_state().ui_snapshot()
+        };
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let labels: Vec<String> = el
+            .children
+            .iter()
+            .filter_map(|c| {
+                c.children
+                    .iter()
+                    .find(|m| m.classes.contains(&"setting-meta".to_string()))
+                    .and_then(|m| m.children.first())
+                    .and_then(text_of)
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert!(labels.iter().any(|l| l == "shell (9999)"));
+    }
+
+    #[test]
+    fn sessions_section_refresh_button_click_dispatches_refresh() {
+        let snap = make_snapshot_section(SettingsSection::Sessions);
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let refresh_row = &el.children[1]; // first is section title, second is header setting-row
+        let refresh_btn = refresh_row
+            .children
+            .iter()
+            .find(|c| c.id.as_deref() == Some("settings-sessions-refresh"))
+            .expect("refresh button");
+        // Invoking succeeds without panic; actual daemon call is a no-op
+        // because no daemon is connected in unit tests.
+        (refresh_btn.on_click.as_ref().unwrap())();
+    }
 }
