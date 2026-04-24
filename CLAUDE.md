@@ -17,14 +17,24 @@ cargo llvm-cov --html # coverage report in target/llvm-cov/html/
 
 ## Architecture
 
-- `src/` - Rust backend: PTY management, terminal emulation, state, UI bridge
-- `src/pty/` - Pseudo-terminal handling via `portable-pty`
-- `src/terminal/` - Terminal emulation via `vte`
+- `src/` - Rust backend: daemon shim, terminal emulation, state, UI bridge
+- `src/pty.rs` - `DaemonPty` shim: connects the UI to the `unshit-ptyd` session daemon over IPC. Sync wrappers around async client calls.
+- `src/terminal/` - Local `vte`-based terminal emulator that consumes daemon `output` events and renders into a `CellGrid`.
 - `src/bridge.rs` - Frontend-backend bridge (PTY subscriptions, cursor blink, resize polling)
-- `src/state.rs` - Application state, PTY dimension helpers, cell metrics
-- `src/ui/` - UI components (split panes, settings, keyboard nav)
+- `src/state.rs` - Application state, dialog + context menu routing, session cache, PTY dimension helpers
+- `src/ui/` - UI components (split panes, settings, keyboard nav, confirm dialogs)
 - `assets/styles.css` - All CSS styling
 - `crates/unshit-framework/` - The unshit framework (git subtree from `unshit-rust-framework` repo)
+- `crates/unshit-ptyd/` - The session daemon. Owns PTYs, VTE parsing, scrollback, and `sessions.json`. Speaks length-prefixed JSON + binary over a Windows named pipe / Unix socket.
+
+## Session daemon
+
+Sessions live in `unshit-ptyd`, not the UI. When the UI window closes, the daemon keeps every PTY alive. On next launch the UI reattaches via `list_sessions` + `attach_session`, gets a cell grid snapshot, and resubscribes to `output` events.
+
+- Close survival: graceful close detaches clients; an explicit "Kill all and quit" path tears sessions down.
+- Crash isolation: per-session workers are wrapped in `catch_unwind` so one broken VTE stream cannot poison the daemon or other sessions.
+- Named sessions: `rename_session` RPC stores a display name on the daemon. The UI exposes this through a right-click "Rename session" action on tabs and a Sessions panel in the settings modal (attach / rename / kill per row).
+- Manifest: `sessions.json` is written atomically on change so a daemon crash cannot leave a partial manifest.
 
 ## Framework-First Development
 
