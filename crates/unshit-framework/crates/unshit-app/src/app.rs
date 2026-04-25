@@ -292,10 +292,12 @@ struct AppState {
     /// on the very next frame. After [`ACTIVITY_WINDOW`] of silence the loop
     /// falls back to `ControlFlow::Wait` and idle CPU returns to ~zero.
     last_activity: Instant,
-    /// Rolling window of per-frame durations. Debug-only; emits p50/p95/
-    /// p99 quantiles once per second via `log::info!`. See
-    /// [`crate::frame_probe`].
-    #[cfg(debug_assertions)]
+    /// Rolling window of per-frame durations. Always present. Emits
+    /// p50/p95/p99 quantiles once per second via `log::info!` only while
+    /// the runtime enable flag is set; debug builds default to enabled
+    /// to preserve the previous behavior, release builds default to
+    /// disabled and rely on the in-app FPS overlay (or other callers)
+    /// flipping the flag on. See [`crate::frame_probe`].
     frame_probe: crate::frame_probe::FrameProbe,
     /// Nanosecond-grained input latency histograms. See
     /// [`crate::input_latency`]. Only present when the
@@ -844,7 +846,6 @@ impl ApplicationHandler for AppHandler {
             // smooths over the initial PTY-spawn / cell-metrics dance on
             // the app side before any user input arrives.
             last_activity: Instant::now(),
-            #[cfg(debug_assertions)]
             frame_probe: crate::frame_probe::FrameProbe::new(),
             #[cfg(feature = "input-latency-histogram")]
             input_latency: crate::input_latency::InputLatencyTracker::new()
@@ -2259,18 +2260,15 @@ impl ApplicationHandler for AppHandler {
                 metrics.rss_bytes = get_rss_bytes();
                 metrics.pacer_min_interval_ns = state.frame_pacer.min_interval().as_nanos() as u64;
 
-                // Debug-only per-second frame-time probe. Feeds this frame's
-                // duration into a rolling window and emits p50/p95/p99
-                // quantiles once per second. Release builds skip the whole
-                // block via cfg(debug_assertions); see crate::frame_probe.
-                #[cfg(debug_assertions)]
-                {
-                    state
-                        .frame_probe
-                        .record_frame(std::time::Duration::from_micros(metrics.total_us));
-                    if let Some(snap) = state.frame_probe.maybe_emit(Instant::now()) {
-                        log::info!("[FRAME] {}", snap);
-                    }
+                // Per-second frame-time probe. Always records this
+                // frame's duration into a rolling window so the in-app
+                // FPS overlay can read live quantiles without rebuilding;
+                // [`FrameProbe::maybe_emit`] only returns a summary when
+                // the runtime enable flag is set (default on in debug,
+                // off in release). See crate::frame_probe.
+                state.frame_probe.record_frame(std::time::Duration::from_micros(metrics.total_us));
+                if let Some(snap) = state.frame_probe.maybe_emit(Instant::now()) {
+                    log::info!("[FRAME] {}", snap);
                 }
 
                 // Log slow frames

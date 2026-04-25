@@ -3,7 +3,6 @@ pub mod clipboard;
 pub mod event_sink;
 pub mod font;
 pub mod frame_pacer;
-#[cfg(debug_assertions)]
 pub mod frame_probe;
 #[cfg(feature = "input-latency-histogram")]
 pub mod input_latency;
@@ -22,6 +21,7 @@ pub use font::{
     check_fallback_chain, load_custom_fonts, FallbackChain, FontLoadReport, FontSource,
 };
 pub use frame_pacer::{FramePacer, PaceDecision};
+pub use frame_probe::{FrameProbe, FrameQuantiles};
 #[cfg(feature = "input-latency-histogram")]
 pub use input_latency::{InputLatencySnapshot, InputLatencyTracker};
 pub use notification::{AttentionUrgency, BellConfig, BellState, BellStyle};
