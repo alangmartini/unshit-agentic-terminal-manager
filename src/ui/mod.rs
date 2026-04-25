@@ -1,4 +1,5 @@
 pub mod confirm_dialog;
+pub mod fps_overlay;
 pub mod icons;
 pub mod settings;
 pub mod sidebar;

@@ -248,7 +248,8 @@ fn build_tree(
             .with_child(build_ctx_menu_overlay(snap, shared))
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
                 snap, shared,
-            )),
+            ))
+            .with_child(crate::ui::fps_overlay::build_fps_overlay()),
     }
 }
 
@@ -609,7 +610,10 @@ fn main() {
                 );
                 resize_all_terminals(&mut guard, cols, rows);
             })),
-            on_frame_metrics: Some(Box::new(|m| crate::bench::record_frame(m))),
+            on_frame_metrics: Some(Box::new(|m| {
+                crate::bench::record_frame(m);
+                crate::ui::fps_overlay::record_frame(m);
+            })),
             #[cfg(feature = "input-latency-histogram")]
             on_input_latency: Some(Box::new(|snap| crate::bench::record_input_latency(snap))),
             ..Default::default()
