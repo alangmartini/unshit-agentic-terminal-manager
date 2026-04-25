@@ -278,6 +278,7 @@ fn user_shortcut_bindings() -> Vec<(String, String)> {
         ("Ctrl+-".to_string(), "font.dec".to_string()),
         ("Ctrl+Tab".to_string(), "tab.next".to_string()),
         ("Ctrl+Shift+Tab".to_string(), "tab.prev".to_string()),
+        ("Ctrl+Shift+F".to_string(), "fps_overlay.toggle".to_string()),
     ]
 }
 
@@ -668,6 +669,20 @@ fn main() {
 mod tests {
     use super::*;
     use crate::terminal::Terminal;
+
+    #[test]
+    fn user_shortcut_bindings_includes_fps_overlay_toggle() {
+        // Phase 0 of the 120fps perf work (refs #135) ships an in-app
+        // FPS overlay toggled by Ctrl+Shift+F. Without this binding the
+        // overlay is unreachable from the keyboard.
+        let bindings = user_shortcut_bindings();
+        assert!(
+            bindings
+                .iter()
+                .any(|(s, c)| s == "Ctrl+Shift+F" && c == "fps_overlay.toggle"),
+            "Ctrl+Shift+F must dispatch fps_overlay.toggle"
+        );
+    }
 
     /// Regression test for issue #63.
     ///

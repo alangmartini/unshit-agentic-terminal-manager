@@ -1565,6 +1565,16 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             state.palette_open = !state.palette_open;
             true
         }
+        "fps_overlay.toggle" => {
+            // Flip the in-app FPS overlay (Phase 0 of the 120fps perf
+            // work, refs #135). The overlay also drives the
+            // FrameProbe's emit gate so release builds start writing
+            // [FRAME] log lines while the overlay is up. Returns true
+            // so the framework rebuilds the tree to show or hide the
+            // widget.
+            crate::ui::fps_overlay::toggle_visible();
+            true
+        }
         other if other.starts_with("tab.switch:") => {
             if let Ok(index) = other["tab.switch:".len()..].parse::<usize>() {
                 if index < state.tabs.len() && state.active_tab != index {
@@ -2272,6 +2282,27 @@ mod tests {
 
         assert!(dispatch(&mut state, "palette.toggle"));
         assert!(!state.palette_open);
+    }
+
+    #[test]
+    fn dispatch_fps_overlay_toggle_flips_visibility_and_emit_flag() {
+        // Reset to a known starting state since the overlay lives in
+        // a process global. Both the visible flag and the FrameProbe
+        // emit flag must move in lock step on every dispatch.
+        crate::ui::fps_overlay::reset_for_test();
+        let mut state = test_state();
+
+        assert!(dispatch(&mut state, "fps_overlay.toggle"));
+        let snap = crate::ui::fps_overlay::snapshot();
+        assert!(snap.visible);
+        assert!(unshit::app::frame_probe::is_emit_enabled());
+
+        assert!(dispatch(&mut state, "fps_overlay.toggle"));
+        let snap = crate::ui::fps_overlay::snapshot();
+        assert!(!snap.visible);
+        assert!(!unshit::app::frame_probe::is_emit_enabled());
+
+        crate::ui::fps_overlay::reset_for_test();
     }
 
     #[test]
