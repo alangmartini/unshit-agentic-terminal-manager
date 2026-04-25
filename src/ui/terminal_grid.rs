@@ -24,9 +24,20 @@ pub fn build_terminal_grid(
         return build_empty_workspace(shared);
     }
 
+    let resize_shared = shared.clone();
     let mut grid_el = ElementDef::new(Tag::Div)
         .with_class("terminal-grid")
-        .with_id("terminal-grid");
+        .with_id("terminal-grid")
+        // The full grid's dimensions drive hit-testing for pane-edge drops
+        // and the container_size used by column/row resizers. Per-pane
+        // `terminal-content` on_resize only sees its own subrect, so we
+        // capture the true grid size here.
+        .on_resize(move |w, h| {
+            mutate_with(&resize_shared, |st| {
+                st.last_grid_width = w;
+                st.last_grid_height = h;
+            });
+        });
 
     let single_pane = is_single_pane(&state.panes);
 
@@ -46,7 +57,7 @@ pub fn build_terminal_grid(
                 .and_then(|r| r.get(col_idx))
                 .copied()
                 .unwrap_or(1.0);
-            let pane_el = build_pane(pane, is_active, single_pane, shared, grids)
+            let pane_el = build_pane(pane, is_active, single_pane, state, shared, grids)
                 .with_style(StyleDeclaration::FlexGrow(col_ratio));
             row_el = row_el.with_child(pane_el);
         }
@@ -176,10 +187,17 @@ fn build_pane(
     pane: &Pane,
     is_active: bool,
     single_pane: bool,
+    state: &UiSnapshot,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
-    let mut container = ElementDef::new(Tag::Div).with_class("pane");
+    // Stable keys on both the pane container and its children keep the
+    // reconciler from positionally shuffling DOM nodes when optional
+    // children (header, drop-zone overlay) appear/disappear during
+    // drags or split/unsplit operations.
+    let mut container = ElementDef::new(Tag::Div)
+        .with_class("pane")
+        .with_key(format!("pane:{}", pane.id.0));
     if is_active {
         container = container.with_class("active");
     }
@@ -192,15 +210,23 @@ fn build_pane(
         });
     });
 
-    let body = build_pane_body(pane.id, is_active, shared, grids);
     // Header is only meaningful in multi-pane tabs: the tab bar already
     // shows title/subtitle for the single-pane case, and the pane's drag
     // grip (used by the extract-to-tab flow) would have nothing to act on
     // when there is only one pane in the tab.
     if !single_pane {
-        container = container.with_child(build_pane_header(pane, shared));
+        let header = build_pane_header(pane, shared).with_key("pane-header");
+        container = container.with_child(header);
     }
-    container.with_child(body)
+    let body = build_pane_body(pane.id, is_active, shared, grids).with_key("pane-body");
+    container = container.with_child(body);
+    // During a tab drag, layer the 4-edge drop overlay inside the pane
+    // so it tracks the pane's real layout rather than a recomputed
+    // window rect that would drift under border/padding changes.
+    if let Some(overlay) = crate::drag::overlay::build_pane_drop_zone_overlay(state, pane.id) {
+        container = container.with_child(overlay.with_key("drop-overlay"));
+    }
+    container
 }
 
 fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
@@ -433,15 +459,16 @@ fn build_pane_body(
             // Register resize handler to update PTY dimensions.
             // Prefer the renderer-computed pending resize (exact), fall
             // back to global cell metrics, then to hardcoded estimates.
+            // Note: this fires with THIS pane's terminal-content size, not
+            // the whole grid. The full-grid dimensions used for hit-testing
+            // are captured by `.terminal-grid`'s own on_resize (see
+            // `build_terminal_grid`).
             let resize_shared = shared.clone();
             let resize_pane_id = pane_id;
             grid_el = grid_el.on_resize(move |w, h| {
                 use unshit::core::cell_grid::CellGrid;
 
                 mutate_with(&resize_shared, |st| {
-                    st.last_grid_width = w;
-                    st.last_grid_height = h;
-
                     // Use the renderer's published cell metrics when available.
                     // On the first frame, metrics may be 0 because on_resize
                     // fires before the render pass. The on_cell_metrics callback
@@ -659,7 +686,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &shared, &grids);
+        let el = build_pane(&pane, true, false, &make_snapshot(), &shared, &grids);
         assert!(el.classes.contains(&"pane".to_string()));
         assert!(el.classes.contains(&"active".to_string()));
     }
@@ -669,7 +696,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &shared, &grids);
+        let el = build_pane(&pane, false, false, &make_snapshot(), &shared, &grids);
         assert!(el.classes.contains(&"pane".to_string()));
         assert!(!el.classes.contains(&"active".to_string()));
     }
@@ -679,7 +706,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &shared, &grids);
+        let el = build_pane(&pane, true, false, &make_snapshot(), &shared, &grids);
         assert_eq!(el.children.len(), 2);
         assert!(el.children[0].classes.contains(&"pane-header".to_string()));
         assert!(el.children[1].classes.contains(&"pane-body".to_string()));
@@ -690,7 +717,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &shared, &grids);
+        let el = build_pane(&pane, false, false, &make_snapshot(), &shared, &grids);
         assert!(el.on_click.is_some());
     }
 
@@ -824,7 +851,7 @@ mod tests {
             guard.col_ratios[0].push(1.0);
         }
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &shared, &grids);
+        let el = build_pane(&pane, false, false, &make_snapshot(), &shared, &grids);
         (el.on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().active_pane, PaneId(42));
     }
@@ -1067,7 +1094,7 @@ mod tests {
         let shared = test_shared();
         let pane = make_pane(1);
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, true, &shared, &grids);
+        let el = build_pane(&pane, true, true, &make_snapshot(), &shared, &grids);
 
         assert!(
             !tree_has_class(&el, "pane-header"),
@@ -1083,7 +1110,7 @@ mod tests {
         let shared = test_shared();
         let pane = make_pane(1);
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &shared, &grids);
+        let el = build_pane(&pane, true, false, &make_snapshot(), &shared, &grids);
 
         assert!(
             tree_has_class(&el, "pane-header"),

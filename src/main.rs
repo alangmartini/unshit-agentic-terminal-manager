@@ -235,9 +235,8 @@ fn build_tree(
         );
     }
 
-    for zone_overlay in crate::drag::overlay::build_drop_zone_overlay(snap) {
-        root = root.with_child(zone_overlay);
-    }
+    // The drop-zone overlay is rendered as a child inside each pane
+    // (see `build_pane`); no root-level overlay is needed.
     if let Some(ghost) = crate::ui::drag_overlay::build_drag_overlay(snap) {
         root = root.with_child(ghost);
     }
