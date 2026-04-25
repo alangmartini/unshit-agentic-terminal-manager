@@ -87,6 +87,15 @@ enum Command {
     Kill {
         session_id: u64,
     },
+    /// Blocking kill: like `Kill`, but the daemon's response is mapped
+    /// back through `reply` so the caller can tell whether the daemon
+    /// actually saw the request. Used by the orphan-session kill path
+    /// in `mutate_kill_session_id` so the user gets a toast on RPC
+    /// failure instead of an optimistically-removed row.
+    KillAck {
+        session_id: u64,
+        reply: std_mpsc::SyncSender<io::Result<()>>,
+    },
     List {
         reply: std_mpsc::SyncSender<io::Result<Vec<SessionInfo>>>,
     },
@@ -329,6 +338,32 @@ impl DaemonPty {
         };
         inner.sessions.retain(|_pane, sid| *sid != session_id);
         let _ = inner.cmd_tx.send(Command::Kill { session_id });
+    }
+
+    /// Blocking variant of [`kill_session_id`] that waits up to two
+    /// seconds for the daemon's ack and surfaces the failure as an
+    /// `io::Result`. Mirrors the contract of [`list_sessions`] and
+    /// [`rename_session`]: callers in the orphan kill path use this
+    /// so a disconnected or slow daemon shows up as a user-visible
+    /// error instead of a silently-dropped row. Local pane bookkeeping
+    /// is left to the caller to keep the success/failure split clean.
+    pub fn kill_session_id_blocking(&mut self, session_id: u64) -> io::Result<()> {
+        let inner = self.inner.as_mut().ok_or_else(not_connected)?;
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<()>>(1);
+        inner
+            .cmd_tx
+            .send(Command::KillAck {
+                session_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| worker_gone())?;
+        let result = reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| worker_gone())?;
+        if result.is_ok() {
+            inner.sessions.retain(|_pane, sid| *sid != session_id);
+        }
+        result
     }
 
     /// Iterate over every `(pane_id, session_id)` mapping the shim
@@ -631,6 +666,21 @@ fn worker_main(
                     }
                     let _ = client.kill_session(session_id).await;
                 }
+                Command::KillAck { session_id, reply } => {
+                    if let Ok(mut guard) = sinks.lock() {
+                        guard.remove(&session_id);
+                    }
+                    let result: io::Result<()> = match client.kill_session(session_id).await {
+                        Ok(Response::Ack { .. }) => Ok(()),
+                        Ok(Response::Error { code, message, .. }) => Err(io::Error::other(
+                            format!("kill_session failed: {code}: {message}"),
+                        )),
+                        Ok(other) => Err(io::Error::other(format!("unexpected: {other:?}"))),
+                        Err(ProtocolError::Io(e)) => Err(e),
+                        Err(other) => Err(io::Error::other(other.to_string())),
+                    };
+                    let _ = reply.send(result);
+                }
                 Command::List { reply } => {
                     let result = match client.list_sessions().await {
                         Ok(list) => Ok(list),
@@ -730,6 +780,17 @@ mod tests {
                 Err(e) => panic!("shim failed to connect: {e}"),
             }
         }
+    }
+
+    // refs #130: blocking kill variant must follow list_sessions /
+    // rename_session contract: NotConnected when no daemon attached.
+    #[test]
+    fn kill_session_id_blocking_returns_not_connected_when_disconnected() {
+        let mut shim = DaemonPty::new();
+        let err = shim
+            .kill_session_id_blocking(42)
+            .expect_err("blocking kill on unconnected shim must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
     }
 
     #[test]
