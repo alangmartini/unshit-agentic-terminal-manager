@@ -20,8 +20,6 @@ use std::time::Instant;
 
 use unshit::app::FrameMetrics;
 use unshit::core::element::*;
-use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::{CssPosition, Dimension};
 
 /// Capacity of the rolling frame-time window used by the overlay.
 /// Sized to cover roughly one second at 240fps, matching the
@@ -173,10 +171,7 @@ pub fn build_fps_overlay() -> ElementDef {
 
     let mut card = ElementDef::new(Tag::Div)
         .with_class("fps-overlay")
-        .with_id("fps-overlay")
-        .with_style(StyleDeclaration::Position(CssPosition::Fixed))
-        .with_style(StyleDeclaration::Top(Dimension::Px(48.0)))
-        .with_style(StyleDeclaration::Right(Dimension::Px(12.0)));
+        .with_id("fps-overlay");
 
     card = card
         .with_child(metric_row("fps", &format!("{:.1}", fps)))
