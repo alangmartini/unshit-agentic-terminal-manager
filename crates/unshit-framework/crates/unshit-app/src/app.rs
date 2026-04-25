@@ -1494,6 +1494,41 @@ impl ApplicationHandler for AppHandler {
                 state.modifiers_state = modifiers.state();
             }
 
+            WindowEvent::Focused(focused) => {
+                // Losing focus mid-drag (e.g. Alt-Tab) means the mouse-up
+                // will never be delivered to our window. Synthesize a
+                // DragPhase::End so the app's on_drag handler can clean up
+                // instead of leaving ghost overlays stuck on screen.
+                if !focused && state.interaction.dragging {
+                    let pos = state.interaction.last_cursor_pos;
+                    if let Some(handler_node) = state.interaction.drag_target {
+                        let origin = state.interaction.drag_origin.unwrap_or(pos);
+                        let last = state.interaction.drag_last_pos;
+                        let event = DragEvent {
+                            phase: DragPhase::End,
+                            x: pos.0,
+                            y: pos.1,
+                            delta_x: pos.0 - last.0,
+                            delta_y: pos.1 - last.1,
+                            total_delta_x: pos.0 - origin.0,
+                            total_delta_y: pos.1 - origin.1,
+                            button: state.interaction.drag_button,
+                        };
+                        if let Some(element) = state.arena.get(handler_node) {
+                            if let Some(ref on_drag) = element.on_drag {
+                                on_drag(&event);
+                            }
+                        }
+                    }
+                    state.interaction.drag_origin = None;
+                    state.interaction.drag_target = None;
+                    state.interaction.dragging = false;
+                    state.interaction.mousedown_target = None;
+                    state.needs_rebuild = true;
+                    state.window.request_redraw();
+                }
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
                     // FIRST: check if focused element captures keyboard input
