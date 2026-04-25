@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn set_rejects_conflict_with_other_default() {
-        // Ctrl+W is CloseTab's default. Trying to bind NewTerminal to
+        // Ctrl+W is Unsplit's default. Trying to bind NewTerminal to
         // Ctrl+W must be rejected.
         let mut state = KeybindsState::default();
         let result = state.set(KeybindAction::NewTerminal, combo("Ctrl+W"));

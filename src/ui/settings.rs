@@ -1134,7 +1134,7 @@ mod tests {
     #[test]
     fn keybinds_error_banner_visible_on_conflict() {
         let mut state = seed_state();
-        // Provoke a conflict: set NewTerminal to CloseTab's default.
+        // Provoke a conflict: set NewTerminal to Unsplit's default.
         let _ = state.keybinds.set(
             crate::keybinds::KeybindAction::NewTerminal,
             unshit::core::shortcut::KeyCombo::parse("Ctrl+W").unwrap(),

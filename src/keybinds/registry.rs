@@ -131,15 +131,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_w_triggers_unsplit() {
-        assert_eq!(find("Ctrl+Shift+W").as_deref(), Some("pane.close"));
+    fn ctrl_w_closes_focused_pane() {
+        // In a split tab, Ctrl+W should close just the focused pane and
+        // only fall through to closing the tab when that pane was the
+        // last one (pane.close has the cascade built in).
+        assert_eq!(find("Ctrl+W").as_deref(), Some("pane.close"));
     }
 
     #[test]
-    fn ctrl_w_closes_active_tab() {
-        // Behavior change confirmed with user: Ctrl+W -> tab.close.active
-        // (was pane.close). Ctrl+Shift+W is the new pane-only close.
-        assert_eq!(find("Ctrl+W").as_deref(), Some("tab.close.active"));
+    fn ctrl_shift_w_closes_active_tab() {
+        // Ctrl+Shift+W forcibly closes the whole tab regardless of how
+        // many panes it holds.
+        assert_eq!(find("Ctrl+Shift+W").as_deref(), Some("tab.close.active"));
     }
 
     #[test]

@@ -121,10 +121,10 @@ impl KeybindAction {
     pub fn default_combo_str(self) -> &'static str {
         match self {
             Self::NewTerminal => "Ctrl+T",
-            Self::CloseTab => "Ctrl+W",
+            Self::CloseTab => "Ctrl+Shift+W",
             Self::SplitRight => "Ctrl+D",
             Self::SplitDown => "Ctrl+Shift+D",
-            Self::Unsplit => "Ctrl+Shift+W",
+            Self::Unsplit => "Ctrl+W",
             Self::NextTab => "Ctrl+Tab",
             Self::PrevTab => "Ctrl+Shift+Tab",
             Self::CommandPalette => "Ctrl+K",
