@@ -2638,7 +2638,7 @@ body.dragging-pane {
 
 .fps-overlay {
   position: fixed;
-  top: 96px;
+  bottom: 56px;
   right: 12px;
   z-index: 9000;
   display: flex;
