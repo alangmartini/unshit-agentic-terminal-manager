@@ -2608,3 +2608,16 @@ body.dragging-pane {
 .toast:hover {
   background: var(--bg-elevated, var(--bg-subtle));
 }
+
+.sessions-refresh-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sessions-refresh-stale {
+  font-size: 11px;
+  color: var(--accent-danger, #d75f5f);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}

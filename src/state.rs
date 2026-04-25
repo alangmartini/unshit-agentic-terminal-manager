@@ -1800,8 +1800,10 @@ pub fn mutate_kill_all_terminals(state: &mut AppState) {
 
 /// Poll the daemon for its live session list and cache the result in
 /// `state.sessions`. Called when the user opens the Sessions panel or
-/// presses the Refresh button; safe to call when disconnected (logs a
-/// warning and leaves the existing cache untouched).
+/// presses the Refresh button; safe to call when disconnected (the
+/// existing cache is left in place and `sessions_stale` is set so the
+/// Sessions panel can show the user that the rows may not match the
+/// daemon).
 pub fn refresh_sessions(state: &mut AppState) {
     match state.pty_manager.list_sessions() {
         Ok(list) => {
@@ -1816,9 +1818,12 @@ pub fn refresh_sessions(state: &mut AppState) {
                     alive: info.alive,
                 })
                 .collect();
+            state.sessions_stale = false;
         }
         Err(e) => {
             log::warn!("refresh_sessions: list_sessions failed: {e}");
+            state.sessions_stale = true;
+            push_error_toast(state, format!("refresh failed: {e}"));
         }
     }
 }
@@ -3687,6 +3692,28 @@ mod tests {
         // No daemon connected in tests; refresh must log and not panic.
         refresh_sessions(&mut state);
         assert_eq!(state.sessions.len(), 1);
+    }
+
+    // refs #130: refresh failure must surface to the user, not just to stderr.
+    #[test]
+    fn refresh_sessions_failure_sets_stale_and_pushes_toast() {
+        let mut state = seed_state();
+        assert!(!state.sessions_stale);
+        assert!(state.toasts.is_empty());
+        // No daemon connected in tests, so list_sessions returns Err.
+        refresh_sessions(&mut state);
+        assert!(state.sessions_stale);
+        assert_eq!(state.toasts.len(), 1);
+        let msg = state
+            .toasts
+            .iter()
+            .next()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.starts_with("refresh failed:"),
+            "expected refresh-failure toast, got {msg:?}"
+        );
     }
 
     #[test]
