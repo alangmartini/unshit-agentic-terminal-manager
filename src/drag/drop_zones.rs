@@ -1,27 +1,28 @@
-//! Five-zone hit-testing for tab-onto-pane drops (F1).
+//! Five-zone hit-testing for drag drops (F1).
 //!
-//! Each pane rectangle is divided into five regions:
+//! Each pane rectangle is divided into four edge strips plus a center
+//! block. The inner 50%x50% block is the `Center` zone, which maps to
+//! the "replace target pane with source" action:
 //!
 //! ```text
 //!   +----+------+----+
 //!   | TL | Top  | TR |
 //!   +----+------+----+
-//!   | L  |Center| R  |
+//!   | L  |Center|  R |
 //!   +----+------+----+
 //!   | BL |Bottom| BR |
 //!   +----+------+----+
 //! ```
 //!
-//! The center is the inner 50% of the rect on both axes. The four
-//! straight-edge zones (Left/Right/Top/Bottom) are the 25% strips
-//! that flank the center band. The corner cells go to whichever edge
-//! the cursor is closer to, so a drop near the top-left corner snaps
-//! to `Top` or `Left` based on which edge is nearest.
+//! The four straight-edge zones (Left/Right/Top/Bottom) are the 25%
+//! strips that flank the center block. The corner cells go to whichever
+//! edge the cursor is closer to, so a drop near the top-left corner
+//! snaps to `Top` or `Left` based on which edge is nearest.
 
 use super::Rect;
 
-/// Which edge of a pane a tab drop would target, or `Center` to move
-/// the source tab next to the target without splitting.
+/// Which region of a pane a drop would target. `Center` maps to the
+/// "replace" action (destroy target, put source in its slot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropZone {
     Left,
@@ -58,8 +59,9 @@ impl DropZone {
     }
 }
 
-/// Classify a cursor position relative to a pane rectangle.
-/// Returns `None` when the cursor is outside `rect`.
+/// Classify a cursor position relative to a pane rectangle. Returns
+/// `None` only when the cursor is outside `rect`. The inner 50%x50%
+/// maps to `Center` (the "replace target pane" action).
 pub fn hit_test(rect: Rect, cursor_x: f32, cursor_y: f32) -> Option<DropZone> {
     if !rect.contains(cursor_x, cursor_y) {
         return None;
@@ -138,13 +140,14 @@ mod tests {
     }
 
     #[test]
-    fn dead_center_is_center() {
+    fn dead_center_is_center_zone() {
+        // Inner center maps to the "replace" action.
         assert_eq!(hit_test(rect(), 50.0, 50.0), Some(DropZone::Center));
     }
 
     #[test]
-    fn center_band_edges_inclusive() {
-        // Boundary of the inner 50% square: still center.
+    fn center_band_edges_are_center_zone() {
+        // Boundary of the inner 50% square is inside the Center band.
         assert_eq!(hit_test(rect(), 25.0, 50.0), Some(DropZone::Center));
         assert_eq!(hit_test(rect(), 75.0, 50.0), Some(DropZone::Center));
         assert_eq!(hit_test(rect(), 50.0, 25.0), Some(DropZone::Center));
@@ -258,12 +261,12 @@ mod tests {
         };
         // 60px from the left is 15% of width, so still in the Left strip.
         assert_eq!(hit_test(r, 60.0, 50.0), Some(DropZone::Left));
-        // 120px is 30% of width, out of the left strip, into the center band.
+        // 120px is 30% of width, out of the left strip, inside the center block.
         assert_eq!(hit_test(r, 120.0, 50.0), Some(DropZone::Center));
     }
 
     #[test]
-    fn center_of_offset_rect_still_center() {
+    fn center_of_offset_rect_is_center_zone() {
         let r = Rect {
             x: 250.0,
             y: 100.0,
@@ -302,8 +305,8 @@ mod tests {
 
     #[test]
     fn hit_test_is_deterministic_at_all_25_percent_lines() {
-        // The four boundary lines of the center band resolve to Center
-        // rather than flipping to an edge zone.
+        // The four corners of the center band resolve to Center
+        // rather than flipping to an edge.
         assert_eq!(hit_test(rect(), 25.0, 25.0), Some(DropZone::Center));
         assert_eq!(hit_test(rect(), 75.0, 75.0), Some(DropZone::Center));
         assert_eq!(hit_test(rect(), 25.0, 75.0), Some(DropZone::Center));

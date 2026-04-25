@@ -33,11 +33,11 @@ pub fn build_drag_overlay(state: &UiSnapshot) -> Option<ElementDef> {
         return None;
     };
 
-    // Offset so the ghost hangs down/right of the cursor instead of
-    // covering the arrow tip. The 12/8 offset mirrors common OS drag
-    // cursor conventions.
-    let ghost_x = cursor_x + 12.0;
-    let ghost_y = cursor_y + 8.0;
+    // Small down/right offset keeps the ghost next to the cursor
+    // without visually detaching from it. A larger offset reads as a
+    // lag between the pointer and the label being carried.
+    let ghost_x = cursor_x + 4.0;
+    let ghost_y = cursor_y + 4.0;
 
     Some(
         ElementDef::new(Tag::Div)
@@ -155,12 +155,12 @@ mod tests {
             })
             .expect("top style must be set");
         assert!(
-            (left - 412.0).abs() < 1e-3,
+            (left - 404.0).abs() < 1e-3,
             "left should track cursor + offset, got {}",
             left
         );
         assert!(
-            (top - 258.0).abs() < 1e-3,
+            (top - 254.0).abs() < 1e-3,
             "top should track cursor + offset, got {}",
             top
         );
