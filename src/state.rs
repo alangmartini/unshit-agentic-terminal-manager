@@ -1831,6 +1831,12 @@ pub fn refresh_sessions(state: &mut AppState) {
 /// Kill a session directly by session id without requiring a local
 /// pane mapping. Used by the sessions panel where orphan sessions (no
 /// attached pane) still need a kill button.
+///
+/// Mapped-pane branch is fire-and-forget through `destroy(pane_id)`;
+/// orphan branch waits on the daemon's ack via
+/// `kill_session_id_blocking` so a disconnected or unresponsive
+/// daemon shows up as a user-visible toast instead of an
+/// optimistically-removed row. Issue #130.
 pub fn mutate_kill_session_id(state: &mut AppState, session_id: u64) {
     let pane_id = state
         .pty_manager
@@ -1841,10 +1847,19 @@ pub fn mutate_kill_session_id(state: &mut AppState, session_id: u64) {
         state.pty_manager.destroy(pid);
         state.terminals.remove(&pid);
         prune_pane_from_layouts(state, pid);
-    } else {
-        state.pty_manager.kill_session_id(session_id);
+        state.sessions.retain(|s| s.session_id != session_id);
+        return;
     }
-    state.sessions.retain(|s| s.session_id != session_id);
+
+    match state.pty_manager.kill_session_id_blocking(session_id) {
+        Ok(()) => {
+            state.sessions.retain(|s| s.session_id != session_id);
+        }
+        Err(e) => {
+            log::warn!("kill_session_id_blocking({session_id}): {e}");
+            push_error_toast(state, format!("kill failed: {e}"));
+        }
+    }
 }
 
 fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
@@ -3749,8 +3764,12 @@ mod tests {
         assert!(!snap.sessions_stale);
     }
 
+    // refs #130: with the orphan-branch kill now blocking on a daemon
+    // ack, a disconnected daemon must NOT drop the row optimistically.
+    // The user gets a toast instead and the cached row stays so the
+    // panel does not lie about what the daemon knows.
     #[test]
-    fn session_kill_without_pane_mapping_drops_from_sessions_cache() {
+    fn session_kill_without_pane_mapping_keeps_row_when_disconnected() {
         let mut state = seed_state();
         state.sessions = vec![
             SessionSnapshot {
@@ -3771,8 +3790,18 @@ mod tests {
             },
         ];
         assert!(dispatch(&mut state, "session.kill:1"));
-        assert_eq!(state.sessions.len(), 1);
-        assert_eq!(state.sessions[0].session_id, 2);
+        assert_eq!(state.sessions.len(), 2, "row stays under failed RPC");
+        assert_eq!(state.toasts.len(), 1, "user sees a kill-failed toast");
+        let msg = state
+            .toasts
+            .iter()
+            .next()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.starts_with("kill failed:"),
+            "expected kill-failure toast, got {msg:?}"
+        );
     }
 
     #[test]
