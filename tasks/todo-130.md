@@ -16,7 +16,7 @@ Mark tasks done in order. Do not skip a checkpoint.
 - [ ] Commit: `feat(framework): toast notification primitive`
 
 ### A2. App state plumbing
-- [ ] Verify `ElementDef` supports `role` / `aria-*` attributes (framework probe)
+- [x] ~~Verify `ElementDef` supports `role` / `aria-*` attributes (framework probe)~~ Done: not supported; deferred to unshit-rust-framework#228
 - [ ] Red: 3 new tests in `src/state.rs::tests`
 - [ ] Add `AppState.toasts: ToastStore`, init via `with_capacity(3, 8)` at every construction site
 - [ ] Add `AppState.sessions_stale: bool`
@@ -28,8 +28,8 @@ Mark tasks done in order. Do not skip a checkpoint.
 - [ ] Commit: `feat(state): toast store, dismiss dispatch, sessions_stale flag`
 
 ### A3. UI overlay, root wiring, CSS, bridge tick
-- [ ] Red: 4 builder tests in new `src/ui/toasts.rs`
-- [ ] Implement `build_toast_overlay(snap, shared)` with `role=status`, `aria-live=polite`, `aria-atomic=false`
+- [ ] Red: 3 builder tests in new `src/ui/toasts.rs` (aria test dropped, see unshit-rust-framework#228)
+- [ ] Implement `build_toast_overlay(snap, shared)` (no aria; deferred to unshit-rust-framework#228)
 - [ ] Add `pub mod toasts;` to `src/ui/mod.rs`
 - [ ] Wire into root tree in `src/main.rs` after `build_confirm_dialog_overlay`
 - [ ] Add CSS rules: `.toast-overlay`, `.toast`, `.toast-error`, `.toast-overlay-hidden`

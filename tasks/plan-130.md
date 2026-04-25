@@ -514,7 +514,7 @@ before continuing.
 |------|------------|
 | Slice D fan-out (17 sites) drifts the build red across multiple commits | Update all sites in a single commit (`feat(state,ui): rename inline error`). Run `cargo check` continuously while editing. |
 | `kill_session_id_blocking` behavior change drops a previously-passing test (`session_kill_without_pane_mapping_drops_from_sessions_cache`) | Acknowledge in slice C commit message; update the test to reflect the new contract (orphan + disconnected = row stays). |
-| Framework `ElementDef` lacks `aria-*` / `role` attribute support | Verify before slice A3 starts. If missing, add to framework first (separate commit), then continue. Do not stub or fake the attributes. |
+| Framework `ElementDef` lacks `aria-*` / `role` attribute support | Verified: framework has no DOM, no AT bridge. Dropped from A5 scope; deferred to [`unshit-rust-framework#228`](https://github.com/alangmartini/unshit-rust-framework/issues/228). Visual toast still ships; announcement path picks up once #228 lands. |
 | Bridge subscription advances toast lifetimes during a window where the user is staring at a toast and types into a slow shell, dropping the toast under their cursor | 4s lifetime is conservative; user can click to dismiss anyway. Out of scope to extend on hover. |
 | Coverage gate fails on 100% line coverage of `push_error_toast` | The helper is one line plus a `push` call. If `cargo llvm-cov` shows a missed branch, write a one-liner test that calls it directly. |
 

@@ -58,8 +58,13 @@ clarification.
 - [ ] **A4.** Toasts auto-dismiss after roughly 4 seconds, stack upward
       from the bottom-right corner above the status bar, cap at 3
       visible, and dismiss on click.
-- [ ] **A5.** The toast container carries `role="status"` and
-      `aria-live="polite"`. Auto-dismissed toasts do not re-announce.
+- [ ] ~~**A5.** The toast container carries `role="status"` and
+      `aria-live="polite"`. Auto-dismissed toasts do not re-announce.~~
+      Dropped: framework has no DOM, no AT bridge, and no
+      `with_attribute` API. Tracked as
+      [`unshit-rust-framework#228`](https://github.com/alangmartini/unshit-rust-framework/issues/228).
+      Visual toast still ships; the announcement path is deferred to
+      that issue.
 - [ ] **A6.** Unit tests cover the error path for each of the three
       dispatches, plus a builder-level render test for the toast overlay
       and the stale marker.
@@ -229,9 +234,10 @@ constraints that apply here:
 - Strings rendered to the user follow existing tone: lowercase, terse.
   Examples: `"rename failed: not connected"`, `"kill failed: timeout"`,
   `"refresh failed: not connected"`.
-- Accessibility attributes: the toast container gets `role="status"`,
-  `aria-live="polite"`, `aria-atomic="false"`. Auto-dismiss does not
-  trigger a re-announce; the toast is removed from the DOM in place.
+- Accessibility attributes: deferred to
+  [`unshit-rust-framework#228`](https://github.com/alangmartini/unshit-rust-framework/issues/228).
+  The framework has no AT bridge today, so adding `role` / `aria-*`
+  here would be theater. Revisit once that issue lands.
 - CSS lives in `assets/styles.css`. No inline styles in the toast
   builder except positioning that depends on framework Dimension types
   (matches the pattern in `confirm_dialog.rs`).
@@ -273,7 +279,7 @@ test surface honest and avoids a test-only branch in production code.
 
 - `toast_overlay_empty_returns_hidden_div`
 - `toast_overlay_renders_one_card_per_toast`
-- `toast_card_carries_role_status_and_aria_live`
+<!-- toast_card_carries_role_status_and_aria_live: dropped, see unshit-rust-framework#228 -->
 - `rename_dialog_renders_inline_error_when_present`
 - `sessions_panel_renders_stale_chip_when_flag_set`
 
