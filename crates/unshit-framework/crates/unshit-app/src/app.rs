@@ -61,6 +61,19 @@ pub struct AppConfig {
     /// returns `true` if the application should rebuild its tree.
     #[allow(clippy::type_complexity)]
     pub on_command: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    /// Callback invoked before the shortcut resolver runs, receiving the
+    /// parsed [`KeyCombo`] for every key press. Returning `true` consumes
+    /// the event: the resolver is skipped, no command fires, and the
+    /// framework requests a rebuild. Returning `false` passes through to
+    /// normal shortcut resolution.
+    ///
+    /// Intended for features that need to capture arbitrary key combos
+    /// (settings UIs recording a new binding, text-entry modes that
+    /// temporarily suppress hotkeys). The hook runs in both normal and
+    /// capture-mode key flows so it behaves the same whether a terminal
+    /// pane holds keyboard focus or not.
+    #[allow(clippy::type_complexity)]
+    pub on_raw_key: Option<Arc<dyn Fn(&unshit_core::shortcut::KeyCombo) -> bool + Send + Sync>>,
     /// Additional fonts registered exactly once at startup.
     ///
     /// Entries are loaded into the cosmic-text `FontSystem` inside
@@ -153,6 +166,7 @@ impl Default for AppConfig {
             on_bytes: None,
             user_shortcuts: Vec::new(),
             on_command: None,
+            on_raw_key: None,
             fonts: Vec::new(),
             fallback_chain: crate::font::FallbackChain::default_chain(),
             theme: Theme::dark(),
@@ -1496,6 +1510,41 @@ impl ApplicationHandler for AppHandler {
                 state.modifiers_state = modifiers.state();
             }
 
+            WindowEvent::Focused(focused) => {
+                // Losing focus mid-drag (e.g. Alt-Tab) means the mouse-up
+                // will never be delivered to our window. Synthesize a
+                // DragPhase::End so the app's on_drag handler can clean up
+                // instead of leaving ghost overlays stuck on screen.
+                if !focused && state.interaction.dragging {
+                    let pos = state.interaction.last_cursor_pos;
+                    if let Some(handler_node) = state.interaction.drag_target {
+                        let origin = state.interaction.drag_origin.unwrap_or(pos);
+                        let last = state.interaction.drag_last_pos;
+                        let event = DragEvent {
+                            phase: DragPhase::End,
+                            x: pos.0,
+                            y: pos.1,
+                            delta_x: pos.0 - last.0,
+                            delta_y: pos.1 - last.1,
+                            total_delta_x: pos.0 - origin.0,
+                            total_delta_y: pos.1 - origin.1,
+                            button: state.interaction.drag_button,
+                        };
+                        if let Some(element) = state.arena.get(handler_node) {
+                            if let Some(ref on_drag) = element.on_drag {
+                                on_drag(&event);
+                            }
+                        }
+                    }
+                    state.interaction.drag_origin = None;
+                    state.interaction.drag_target = None;
+                    state.interaction.dragging = false;
+                    state.interaction.mousedown_target = None;
+                    state.needs_rebuild = true;
+                    state.window.request_redraw();
+                }
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
                     // FIRST: check if focused element captures keyboard input
@@ -1637,10 +1686,24 @@ impl ApplicationHandler for AppHandler {
                             if let Some(combo) =
                                 key_combo_from_winit(&event.logical_key, &state.modifiers_state)
                             {
-                                // Cancel chord on Escape
-                                if combo.key == Key::Escape
+                                // Raw-key hook: app can consume the event
+                                // before it reaches the shortcut resolver
+                                // (used by Settings' "record a new binding"
+                                // flow).
+                                let consumed_by_raw = self
+                                    .app
+                                    .config
+                                    .on_raw_key
+                                    .as_ref()
+                                    .map(|f| f(&combo))
+                                    .unwrap_or(false);
+                                if consumed_by_raw {
+                                    state.needs_rebuild = true;
+                                    state.window.request_redraw();
+                                } else if combo.key == Key::Escape
                                     && state.shortcut_resolver.is_chord_pending()
                                 {
+                                    // Cancel chord on Escape
                                     state.shortcut_resolver.cancel_chord();
                                     state.window.request_redraw();
                                 } else {

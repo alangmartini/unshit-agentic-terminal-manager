@@ -1,7 +1,9 @@
 pub mod bench;
 pub mod bridge;
 pub mod daemon;
+pub mod drag;
 pub mod git;
+pub mod keybinds;
 pub mod persist;
 pub mod pty;
 pub mod state;
@@ -29,6 +31,7 @@ use crate::ui::statusbar::build_statusbar;
 use crate::ui::tabbar::build_tabbar;
 use crate::ui::terminal_grid::build_terminal_grid;
 use crate::ui::titlebar::build_titlebar;
+use crate::ui::toasts::build_toast_overlay;
 
 const STYLES: &str = include_str!("../assets/styles.css");
 
@@ -243,43 +246,26 @@ fn build_tree(
         );
     }
 
+    // The drop-zone overlay is rendered as a child inside each pane
+    // (see `build_pane`); no root-level overlay is needed.
+    if let Some(ghost) = crate::ui::drag_overlay::build_drag_overlay(snap) {
+        root = root.with_child(ghost);
+    }
+
     ElementTree {
         root: root
             .with_child(build_ctx_menu_overlay(snap, shared))
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
                 snap, shared,
             ))
+            .with_child(build_toast_overlay(snap, shared))
             .with_child(crate::ui::fps_overlay::build_fps_overlay()),
     }
 }
 
 fn user_shortcut_bindings() -> Vec<(String, String)> {
-    vec![
-        ("Ctrl+T".to_string(), "tab.new".to_string()),
-        ("Ctrl+W".to_string(), "pane.close".to_string()),
-        ("Ctrl+D".to_string(), "pane.split_right".to_string()),
-        ("Ctrl+Shift+D".to_string(), "pane.split_down".to_string()),
-        ("Ctrl+B".to_string(), "sidebar.toggle".to_string()),
-        ("Ctrl+,".to_string(), "modal.open".to_string()),
-        ("Ctrl+K".to_string(), "palette.toggle".to_string()),
-        ("Ctrl+Shift+P".to_string(), "palette.toggle".to_string()),
-        ("Escape".to_string(), "modal.close".to_string()),
-        ("Ctrl+1".to_string(), "tab.switch:0".to_string()),
-        ("Ctrl+2".to_string(), "tab.switch:1".to_string()),
-        ("Ctrl+3".to_string(), "tab.switch:2".to_string()),
-        ("Ctrl+4".to_string(), "tab.switch:3".to_string()),
-        ("Ctrl+5".to_string(), "tab.switch:4".to_string()),
-        ("Ctrl+6".to_string(), "tab.switch:5".to_string()),
-        ("Ctrl+7".to_string(), "tab.switch:6".to_string()),
-        ("Ctrl+8".to_string(), "tab.switch:7".to_string()),
-        ("Ctrl+9".to_string(), "tab.switch:8".to_string()),
-        ("Ctrl+=".to_string(), "font.inc".to_string()),
-        ("Ctrl+Shift+=".to_string(), "font.inc".to_string()),
-        ("Ctrl+-".to_string(), "font.dec".to_string()),
-        ("Ctrl+Tab".to_string(), "tab.next".to_string()),
-        ("Ctrl+Shift+Tab".to_string(), "tab.prev".to_string()),
-        ("Ctrl+Shift+F".to_string(), "fps_overlay.toggle".to_string()),
-    ]
+    let overrides = crate::keybinds::loader::load_if_installed();
+    crate::keybinds::registry::shortcut_bindings_with_overrides(&overrides)
 }
 
 fn parse_bench_args() -> Option<crate::bench::BenchConfig> {
@@ -372,6 +358,10 @@ fn main() {
 
     if let Some(path) = persist::default_config_path() {
         persist::install(path);
+    }
+
+    if let Some(path) = crate::keybinds::loader::keybinds_config_path() {
+        crate::keybinds::loader::install(path);
     }
 
     let mut initial_state = seed_state();
@@ -521,6 +511,7 @@ fn main() {
     let scale_shared = shared.clone();
     let close_shared = shared.clone();
     let sub_shared = shared.clone();
+    let raw_key_shared = shared.clone();
 
     let mut app = App::new(
         AppConfig {
@@ -540,6 +531,24 @@ fn main() {
                 let mut guard = command_shared.lock_recover();
                 dispatch(&mut guard, command)
             })),
+            on_raw_key: Some(Arc::new(
+                move |combo: &unshit::core::shortcut::KeyCombo| -> bool {
+                    use unshit::core::event::Key;
+                    let mut guard = raw_key_shared.lock().expect("state mutex poisoned");
+                    // Only intercept while a keybind is being recorded. Escape
+                    // cancels; any other combo commits via keybind.set.
+                    let Some(action) = guard.keybinds.recording else {
+                        return false;
+                    };
+                    if combo.key == Key::Escape && combo.modifiers.is_empty() {
+                        dispatch(&mut guard, "keybind.cancel_record");
+                    } else {
+                        let cmd = format!("keybind.set:{}:{}", action.id(), combo);
+                        dispatch(&mut guard, &cmd);
+                    }
+                    true
+                },
+            )),
             // Approach 1: on_cell_metrics fires once after the first render
             // publishes valid cell dimensions. Resize all PTYs immediately.
             on_scale_factor: Some(Arc::new(move |scale: f32| {

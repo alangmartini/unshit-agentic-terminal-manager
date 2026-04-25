@@ -830,6 +830,7 @@ body::after {
   padding: 0 var(--sp-5) 0 var(--sp-5);
   min-width: 150px;
   max-width: 240px;
+  flex-shrink: 0;
   background: transparent;
   color: var(--fg-secondary);
   font-size: var(--t-sm);
@@ -934,6 +935,69 @@ body::after {
   opacity: 1 !important;
   background: var(--rust);
   color: var(--amber-50);
+}
+
+.tab-drop-placeholder {
+  align-self: stretch;
+  width: 3px;
+  min-width: 3px;
+  max-width: 3px;
+  flex: 0 0 3px;
+  margin: 4px 2px;
+  flex-shrink: 0;
+  background: var(--amber-400);
+  border-radius: 1px;
+  box-shadow: 0 0 6px var(--amber-500);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+.drag-ghost {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 4px 10px;
+  background: var(--bg-subtle);
+  color: var(--amber-50);
+  border: 1px solid var(--amber-500);
+  border-radius: var(--r-md);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45), 0 0 12px rgba(212, 163, 72, 0.35);
+  font-size: var(--t-sm);
+  opacity: 0.92;
+  pointer-events: none;
+  z-index: 1000;
+  user-select: none;
+}
+
+.drag-ghost-title {
+  font-weight: 500;
+}
+
+.drag-ghost-subtitle {
+  color: var(--amber-400);
+  font-size: var(--t-xs);
+}
+
+.drop-zone-overlay {
+  pointer-events: none;
+  z-index: 900;
+}
+
+.drop-zone-preview {
+  pointer-events: none;
+  background: rgba(212, 163, 72, 0.16);
+  border-width: 2px;
+  border-color: var(--amber-300);
+  border-radius: var(--r-md);
+  box-shadow:
+    inset 0 0 0 1px rgba(212, 163, 72, 0.4),
+    0 0 24px rgba(212, 163, 72, 0.25);
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+
+.tab.dragging {
+  opacity: 0.4;
 }
 
 .tab-add {
@@ -1091,6 +1155,36 @@ body::after {
   min-width: 0;
   overflow: hidden;
   flex: 1;
+}
+
+.pane-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 20px;
+  color: var(--fg-muted);
+  font-size: 14px;
+  line-height: 1;
+  letter-spacing: -3px;
+  flex-shrink: 0;
+  cursor: grab;
+  opacity: 0.4;
+  user-select: none;
+  transition: opacity var(--dur-fast) var(--ease-std),
+              color var(--dur-fast) var(--ease-std);
+}
+
+.pane:hover .pane-grip,
+.pane.active .pane-grip {
+  opacity: 1;
+  color: var(--fg-secondary);
+}
+
+.pane-grip.dragging,
+.pane-grip:active {
+  cursor: grabbing;
+  color: var(--amber-100);
 }
 
 .pane-status-dot {
@@ -2224,6 +2318,68 @@ body.dragging-pane {
   border-top: 1px solid var(--border-hair);
 }
 
+.keybind-banner {
+  padding: var(--sp-2) var(--sp-3);
+  margin-bottom: var(--sp-3);
+  background: var(--bg-elevated);
+  border-left: 2px solid var(--amber-100);
+  border-radius: var(--r-sm);
+  color: var(--fg-secondary);
+  font-size: var(--t-xs);
+}
+
+.keybind-banner-error {
+  padding: var(--sp-2) var(--sp-3);
+  margin-bottom: var(--sp-3);
+  background: rgba(220, 80, 80, 0.12);
+  border-left: 2px solid rgb(220, 80, 80);
+  border-radius: var(--r-sm);
+  color: rgb(250, 180, 180);
+  font-size: var(--t-xs);
+}
+
+.keybind-banner-error.hidden {
+  display: none;
+}
+
+.keybind-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: var(--sp-1) var(--sp-2);
+  background: transparent;
+  border: 1px dashed transparent;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+.keybind-row:hover .keybind-cell {
+  border-color: var(--border-soft);
+}
+
+.keybind-cell.recording {
+  border-style: solid;
+  border-color: var(--amber-100);
+  background: rgba(212, 163, 72, 0.08);
+}
+
+.keybind-cell.conflict {
+  border-style: solid;
+  border-color: rgb(220, 80, 80);
+}
+
+.keybind-recording-label {
+  color: var(--amber-100);
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  font-style: italic;
+}
+
+.keybind-reset {
+  margin-left: var(--sp-2);
+  font-size: var(--t-xs);
+}
+
 
 /* ============================================================ */
 /* AGENT LIST                                                   */
@@ -2410,6 +2566,67 @@ body.dragging-pane {
   .pill-btn span { display: none; }
 }
 
+/* ============================================================
+   TOAST OVERLAY
+   Fixed bottom-right, stacks above the status bar. Each toast is
+   click-to-dismiss; auto-dismiss is driven by the blink subscription.
+   ============================================================ */
+
+.toast-overlay-hidden {
+  display: none;
+}
+
+.toast-overlay {
+  position: fixed;
+  right: 16px;
+  bottom: 40px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  z-index: 400;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  padding: 8px 12px;
+  min-width: 240px;
+  max-width: 360px;
+  box-shadow: var(--shadow-lg);
+  font-size: 12px;
+  color: var(--fg-primary);
+  cursor: pointer;
+}
+
+.toast-error {
+  border-left: 3px solid var(--accent-danger, #d75f5f);
+}
+
+.toast:hover {
+  background: var(--bg-elevated, var(--bg-subtle));
+}
+
+.sessions-refresh-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sessions-refresh-stale {
+  font-size: 11px;
+  color: var(--accent-danger, #d75f5f);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.rename-session-error {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--accent-danger, #d75f5f);
+}
 
 /* ============================================================ */
 /* FPS OVERLAY (Phase 0 of 120fps perf work, toggle Ctrl+Shift+F)*/
@@ -2421,9 +2638,9 @@ body.dragging-pane {
 
 .fps-overlay {
   position: fixed;
-  top: 48px;
+  top: 96px;
   right: 12px;
-  z-index: 400;
+  z-index: 9000;
   display: flex;
   flex-direction: column;
   gap: 2px;

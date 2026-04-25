@@ -140,21 +140,80 @@ impl Terminal {
         &mut self.grid
     }
 
-    /// Resize the terminal and its grid to new dimensions.
-    ///
-    /// The cursor is clamped to stay within the new bounds.
+    /// Bottom-anchored reflow on row resize (issue #129). Growing rows
+    /// lifts scrollback lines into the new top rows so the live prompt
+    /// stays anchored at the bottom; shrinking rows evicts the rows
+    /// above the cursor into scrollback so they survive the resize.
+    /// Mirrors `unshit_terminal_core::Terminal::resize` so the UI's local
+    /// emulator stays consistent with the daemon during a resize
+    /// round-trip. Column-only resizes do not touch scrollback.
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        let old_rows = self.rows;
+
+        if rows > old_rows {
+            let k = rows - old_rows;
+            self.grow_rows_lifting_scrollback(k);
+            self.cursor_row += k;
+        } else if rows < old_rows {
+            let k = old_rows - rows;
+            let evict_above = k.min(self.cursor_row);
+            if evict_above > 0 {
+                self.shrink_rows_evicting_to_scrollback(evict_above);
+                self.cursor_row -= evict_above;
+            }
+        }
+
+        self.grid.resize(rows, cols);
         self.rows = rows;
         self.cols = cols;
-        self.grid.resize(rows, cols);
-        // Clamp cursor to new bounds.
-        if self.cursor_row >= rows {
-            self.cursor_row = rows.saturating_sub(1);
-        }
-        if self.cursor_col >= cols {
-            self.cursor_col = cols.saturating_sub(1);
-        }
+
+        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
+    }
+
+    /// Lift up to `k` newest scrollback rows into the top of the grid
+    /// after extending the row count by `k`. Existing rows shift down
+    /// so the bottom of the grid stays anchored to its previous content.
+    fn grow_rows_lifting_scrollback(&mut self, k: usize) {
+        let cols = self.cols;
+        let old_rows = self.rows;
+        let split_at = self.scrollback.len().saturating_sub(k);
+        let lifted: Vec<Vec<Cell>> = self.scrollback.split_off(split_at).into();
+
+        self.grid.resize(old_rows + k, cols);
+        self.grid.shift_rows(k, 0, old_rows);
+        for r in 0..k {
+            for c in 0..cols {
+                self.grid.set_cell(r, c, Cell::default());
+            }
+        }
+        let blank_top = k - lifted.len();
+        for (i, row) in lifted.iter().enumerate() {
+            let copy = row.len().min(cols);
+            for (c, cell) in row.iter().take(copy).enumerate() {
+                self.grid.set_cell(blank_top + i, c, *cell);
+            }
+        }
+    }
+
+    /// Push the top `n` grid rows into scrollback (oldest first) and
+    /// shift the remaining rows up so the bottom of the grid keeps its
+    /// content. `CellGrid::shift_rows` is a `copy_within` and does not
+    /// blank the source range, so the duplicated tail rows are clipped
+    /// by the subsequent `grid.resize` call in `resize`.
+    fn shrink_rows_evicting_to_scrollback(&mut self, n: usize) {
+        let cols = self.cols;
+        for r in 0..n {
+            let row: Vec<Cell> = (0..cols)
+                .map(|c| self.grid.get_cell(r, c).copied().unwrap_or_default())
+                .collect();
+            self.scrollback.push_back(row);
+            if self.scrollback.len() > MAX_SCROLLBACK {
+                self.scrollback.pop_front();
+            }
+        }
+        self.grid.shift_rows(0, n, self.rows.saturating_sub(n));
     }
 
     /// Overwrite this terminal's rendered state with `snapshot`.
@@ -1169,7 +1228,175 @@ mod tests {
         t.resize(5, 10);
         assert_eq!(t.rows, 5);
         assert_eq!(t.cols, 10);
-        assert_eq!(t.cursor_position(), (4, 9)); // clamped
+        // Bottom-anchored (issue #129): the cursor's distance from the
+        // bottom is preserved across shrink, so row 7 of 10 (distance 2)
+        // becomes row 2 of 5 (distance 2). Col is clamped to new bounds.
+        assert_eq!(t.cursor_position(), (2, 9));
+    }
+
+    // -- Resize reflow (issue #129) -------------------------------------------
+    //
+    // Bottom-anchored: grow lifts scrollback into the new top rows; shrink
+    // evicts top rows into scrollback. Mirrors the daemon-side behavior so
+    // the local UI replay stays consistent with the authoritative grid.
+
+    #[test]
+    fn resize_grow_lifts_scrollback_into_new_top_rows_ui() {
+        // Issue #129 regression. Short content (2 chars in 4-col grid) so
+        // we don't trigger the eager wrap-scroll path.
+        let mut t = Terminal::new(2, 4);
+        t.process_bytes(b"L1\r\nL2\r\nL3\r\nL4\r\n>>");
+        assert_eq!(t.scrollback_len(), 3);
+        assert_eq!(row_text(&t, 0), "L4");
+        assert_eq!(row_text(&t, 1), ">>");
+        let cursor_before = t.cursor_position();
+
+        t.resize(4, 4);
+
+        assert_eq!(t.rows, 4);
+        assert_eq!(row_text(&t, 0), "L2");
+        assert_eq!(row_text(&t, 1), "L3");
+        assert_eq!(row_text(&t, 2), "L4");
+        assert_eq!(row_text(&t, 3), ">>");
+        assert_eq!(t.scrollback_len(), 1);
+        assert_eq!(t.cursor_position().0, cursor_before.0 + 2);
+    }
+
+    #[test]
+    fn resize_grow_with_empty_scrollback_blanks_top_and_advances_cursor_ui() {
+        let mut t = Terminal::new(2, 3);
+        t.process_bytes(b"aa\r\nbb");
+        assert_eq!(t.cursor_position().0, 1);
+        assert_eq!(t.scrollback_len(), 0);
+
+        t.resize(4, 3);
+
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "");
+        assert_eq!(row_text(&t, 2), "aa");
+        assert_eq!(row_text(&t, 3), "bb");
+        assert_eq!(t.cursor_position().0, 3);
+    }
+
+    #[test]
+    fn resize_shrink_pushes_top_rows_to_scrollback_ui() {
+        let mut t = Terminal::new(4, 3);
+        t.process_bytes(b"aa\r\nbb\r\ncc\r\ndd");
+        assert_eq!(t.cursor_position().0, 3);
+        assert_eq!(t.scrollback_len(), 0);
+
+        t.resize(2, 3);
+
+        assert_eq!(t.rows, 2);
+        assert_eq!(row_text(&t, 0), "cc");
+        assert_eq!(row_text(&t, 1), "dd");
+        assert_eq!(t.cursor_position().0, 1);
+        assert_eq!(t.scrollback_len(), 2);
+        assert_eq!(t.scrollback[0][0].ch, 'a');
+        assert_eq!(t.scrollback[1][0].ch, 'b');
+    }
+
+    #[test]
+    fn resize_shrink_when_k_exceeds_cursor_row_evicts_only_above_cursor_ui() {
+        let mut t = Terminal::new(5, 3);
+        t.process_bytes(b"aa\r\nXX");
+        assert_eq!(t.cursor_position().0, 1);
+
+        t.resize(1, 3);
+
+        assert_eq!(t.rows, 1);
+        assert_eq!(row_text(&t, 0), "XX");
+        assert_eq!(t.cursor_position().0, 0);
+        assert_eq!(t.scrollback_len(), 1);
+        assert_eq!(t.scrollback[0][0].ch, 'a');
+    }
+
+    #[test]
+    fn resize_round_trip_is_stable_ui() {
+        let mut t = Terminal::new(4, 3);
+        t.process_bytes(b"aa\r\nbb\r\ncc\r\ndd");
+        let cursor_before = t.cursor_position();
+
+        t.resize(2, 3);
+        t.resize(4, 3);
+
+        assert_eq!(row_text(&t, 0), "aa");
+        assert_eq!(row_text(&t, 1), "bb");
+        assert_eq!(row_text(&t, 2), "cc");
+        assert_eq!(row_text(&t, 3), "dd");
+        assert_eq!(t.cursor_position(), cursor_before);
+    }
+
+    #[test]
+    fn resize_column_only_does_not_touch_scrollback_ui() {
+        let mut t = Terminal::new(2, 3);
+        t.process_bytes(b"aa\r\nbb\r\ncc");
+        let scrollback_before = t.scrollback_len();
+
+        t.resize(2, 5);
+
+        assert_eq!(t.scrollback_len(), scrollback_before);
+        assert_eq!(t.cols, 5);
+    }
+
+    #[test]
+    fn resize_shrink_respects_max_scrollback_ui() {
+        // The UI mirror's eviction loop uses its own VecDeque cap check
+        // (MAX_SCROLLBACK = 10_000) instead of the daemon's `Scrollback`
+        // type. We can't shrink that cap from the test, so just verify
+        // overflow handling does the right thing on a small synthetic
+        // case by pre-filling scrollback up to the cap and then evicting
+        // one more row via resize.
+        let mut t = Terminal::new(2, 4);
+        // Pre-load scrollback to MAX_SCROLLBACK by directly pushing.
+        for _ in 0..MAX_SCROLLBACK {
+            t.scrollback.push_back(vec![Cell::default(); 4]);
+        }
+        // Now write a real row so the grid has identifiable content.
+        t.process_bytes(b"AB\r\nCD");
+        assert_eq!(t.scrollback_len(), MAX_SCROLLBACK);
+
+        t.resize(1, 4);
+
+        // The shrink evicted one row to scrollback; cap forces an
+        // equivalent pop_front so length stays at MAX_SCROLLBACK.
+        assert_eq!(t.scrollback_len(), MAX_SCROLLBACK);
+        // The newest scrollback entry is the row we just evicted ("AB").
+        let newest = t.scrollback.back().unwrap();
+        assert_eq!(newest[0].ch, 'A');
+        assert_eq!(newest[1].ch, 'B');
+    }
+
+    #[test]
+    fn resize_to_zero_rows_does_not_panic_ui() {
+        let mut t = Terminal::new(2, 3);
+        t.process_bytes(b"aa\r\nbb");
+        t.resize(0, 3);
+        assert_eq!(t.rows, 0);
+        assert_eq!(t.cursor_position().0, 0);
+    }
+
+    #[test]
+    fn resize_no_blank_gap_after_split_unsplit_round_trip_ui() {
+        let mut t = Terminal::new(6, 8);
+        t.process_bytes(b"row1__\r\nrow2__\r\nrow3__\r\nrow4__\r\nrow5__\r\n>>>>>");
+        let cursor_before = t.cursor_position();
+
+        t.resize(4, 8);
+        assert_eq!(row_text(&t, 3), ">>>>>");
+
+        t.resize(6, 8);
+
+        assert_eq!(row_text(&t, 0), "row1__");
+        assert_eq!(row_text(&t, 1), "row2__");
+        assert_eq!(row_text(&t, 2), "row3__");
+        assert_eq!(row_text(&t, 3), "row4__");
+        assert_eq!(row_text(&t, 4), "row5__");
+        assert_eq!(row_text(&t, 5), ">>>>>");
+        assert_eq!(t.cursor_position(), cursor_before);
+        for r in 0..5 {
+            assert_ne!(row_text(&t, r), "", "row {r} unexpectedly blank");
+        }
     }
 
     // -- SGR (text attributes) ------------------------------------------------
@@ -1600,7 +1827,9 @@ mod tests {
         term.process_bytes(b"\x1b[20;70H"); // move cursor to row 19, col 69
         assert_eq!(term.cursor_position(), (19, 69));
         term.resize(10, 40);
-        assert_eq!(term.cursor_position(), (9, 39));
+        // Bottom-anchored (issue #129): row 19 of 24 (distance 4 from
+        // bottom) becomes row 5 of 10 (distance 4). Col is clamped.
+        assert_eq!(term.cursor_position(), (5, 39));
     }
 
     // -- Character spacing regression tests (PR #13) --------------------------

@@ -16,8 +16,11 @@ pub mod scroll;
 pub mod shortcut;
 pub mod style;
 pub mod svg;
+pub mod toast;
 pub mod trace;
 pub mod tree;
+
+pub use toast::{Toast, ToastId, ToastKind, ToastStore};
 
 pub mod prelude {
     pub use crate::cell_grid::{Cell, CellAttrs, CellGrid};

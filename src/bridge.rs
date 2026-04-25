@@ -177,6 +177,14 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                             }
                         }
 
+                        // Toast lifetimes are tick-driven from this same
+                        // 500 ms cadence. ToastStore::with_capacity(_, 8)
+                        // gives ~4 s before auto-dismiss. The ids of any
+                        // dismissed toasts are intentionally ignored; the
+                        // snapshot path picks up the new state on the
+                        // next render.
+                        let _ = guard.toasts.advance_ticks(1);
+
                         // Deferred PTY spawn and dimension sync.
                         // Wait until the renderer has published real cell
                         // metrics (cell_w > 0), then spawn PTYs for any

@@ -24,9 +24,20 @@ pub fn build_terminal_grid(
         return build_empty_workspace(shared);
     }
 
+    let resize_shared = shared.clone();
     let mut grid_el = ElementDef::new(Tag::Div)
         .with_class("terminal-grid")
-        .with_id("terminal-grid");
+        .with_id("terminal-grid")
+        // The full grid's dimensions drive hit-testing for pane-edge drops
+        // and the container_size used by column/row resizers. Per-pane
+        // `terminal-content` on_resize only sees its own subrect, so we
+        // capture the true grid size here.
+        .on_resize(move |w, h| {
+            mutate_with(&resize_shared, |st| {
+                st.last_grid_width = w;
+                st.last_grid_height = h;
+            });
+        });
 
     let single_pane = is_single_pane(&state.panes);
 
@@ -46,7 +57,7 @@ pub fn build_terminal_grid(
                 .and_then(|r| r.get(col_idx))
                 .copied()
                 .unwrap_or(1.0);
-            let pane_el = build_pane(pane, is_active, single_pane, shared, grids)
+            let pane_el = build_pane(pane, is_active, single_pane, state, shared, grids)
                 .with_style(StyleDeclaration::FlexGrow(col_ratio));
             row_el = row_el.with_child(pane_el);
         }
@@ -176,10 +187,17 @@ fn build_pane(
     pane: &Pane,
     is_active: bool,
     single_pane: bool,
+    state: &UiSnapshot,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
-    let mut container = ElementDef::new(Tag::Div).with_class("pane");
+    // Stable keys on both the pane container and its children keep the
+    // reconciler from positionally shuffling DOM nodes when optional
+    // children (header, drop-zone overlay) appear/disappear during
+    // drags or split/unsplit operations.
+    let mut container = ElementDef::new(Tag::Div)
+        .with_class("pane")
+        .with_key(format!("pane:{}", pane.id.0));
     if is_active {
         container = container.with_class("active");
     }
@@ -192,26 +210,73 @@ fn build_pane(
         });
     });
 
-    let body = build_pane_body(pane.id, is_active, shared, grids);
+    // Header is only meaningful in multi-pane tabs: the tab bar already
+    // shows title/subtitle for the single-pane case, and the pane's drag
+    // grip (used by the extract-to-tab flow) would have nothing to act on
+    // when there is only one pane in the tab.
+    if !single_pane {
+        let header = build_pane_header(pane, shared).with_key("pane-header");
+        container = container.with_child(header);
+    }
+    let body = build_pane_body(pane.id, is_active, shared, grids).with_key("pane-body");
+    container = container.with_child(body);
+    // During a tab drag, layer the 4-edge drop overlay inside the pane
+    // so it tracks the pane's real layout rather than a recomputed
+    // window rect that would drift under border/padding changes.
+    if let Some(overlay) = crate::drag::overlay::build_pane_drop_zone_overlay(state, pane.id) {
+        container = container.with_child(overlay.with_key("drop-overlay"));
+    }
     container
-        .with_child(build_pane_header(pane, single_pane, shared))
-        .with_child(body)
 }
 
-fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> ElementDef {
+fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
     let meta = format!("pid {} \u{00B7} {:.1}%", pane.pid, pane.cpu);
     let pane_id = pane.id;
     let split_h_state = shared.clone();
     let split_v_state = shared.clone();
     let close_state = shared.clone();
-    let mut header = ElementDef::new(Tag::Div).with_class("pane-header");
-
-    // When there is only a single pane the tab bar already shows the title and
-    // subtitle, so we omit the left section to avoid visual duplication.
-    if !single_pane {
-        header = header.with_child(
+    let grip_state = shared.clone();
+    let header = ElementDef::new(Tag::Div)
+        .with_class("pane-header")
+        .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("pane-header-left")
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("pane-grip")
+                        // Text-based 6-dot grip (two VERTICAL ELLIPSIS
+                        // chars). Avoids an SVG allocation per pane
+                        // which would blow the framework renderer's
+                        // instance buffer past 4 panes.
+                        .with_text("\u{22EE}\u{22EE}")
+                        .on_drag(move |ev| match ev.phase {
+                            DragPhase::Start => {
+                                mutate_with(&grip_state, |st| {
+                                    crate::state::dispatch(
+                                        st,
+                                        &format!("drag.start_pane:{}:{}:{}", pane_id.0, ev.x, ev.y),
+                                    );
+                                });
+                            }
+                            DragPhase::Update => {
+                                mutate_with(&grip_state, |st| {
+                                    crate::state::dispatch(
+                                        st,
+                                        &format!("drag.update:{}:{}", ev.x, ev.y),
+                                    );
+                                });
+                            }
+                            DragPhase::End => {
+                                mutate_with(&grip_state, |st| {
+                                    crate::state::dispatch(
+                                        st,
+                                        &format!("drag.update:{}:{}", ev.x, ev.y),
+                                    );
+                                    crate::state::dispatch(st, "drag.end");
+                                });
+                            }
+                        }),
+                )
                 .with_child(ElementDef::new(Tag::Span).with_class("pane-status-dot"))
                 .with_child(
                     ElementDef::new(Tag::Span)
@@ -224,7 +289,6 @@ fn build_pane_header(pane: &Pane, single_pane: bool, shared: &SharedState) -> El
                         .with_text(format!("\u{00B7} {}", pane.subtitle)),
                 ),
         );
-    }
 
     header
         .with_child(
@@ -392,15 +456,16 @@ fn build_pane_body(
             // Register resize handler to update PTY dimensions.
             // Prefer the renderer-computed pending resize (exact), fall
             // back to global cell metrics, then to hardcoded estimates.
+            // Note: this fires with THIS pane's terminal-content size, not
+            // the whole grid. The full-grid dimensions used for hit-testing
+            // are captured by `.terminal-grid`'s own on_resize (see
+            // `build_terminal_grid`).
             let resize_shared = shared.clone();
             let resize_pane_id = pane_id;
             grid_el = grid_el.on_resize(move |w, h| {
                 use unshit::core::cell_grid::CellGrid;
 
                 mutate_with(&resize_shared, |st| {
-                    st.last_grid_width = w;
-                    st.last_grid_height = h;
-
                     // Use the renderer's published cell metrics when available.
                     // On the first frame, metrics may be 0 because on_resize
                     // fires before the render pass. The on_cell_metrics callback
@@ -618,7 +683,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &shared, &grids);
+        let el = build_pane(&pane, true, false, &make_snapshot(), &shared, &grids);
         assert!(el.classes.contains(&"pane".to_string()));
         assert!(el.classes.contains(&"active".to_string()));
     }
@@ -628,7 +693,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &shared, &grids);
+        let el = build_pane(&pane, false, false, &make_snapshot(), &shared, &grids);
         assert!(el.classes.contains(&"pane".to_string()));
         assert!(!el.classes.contains(&"active".to_string()));
     }
@@ -638,7 +703,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &shared, &grids);
+        let el = build_pane(&pane, true, false, &make_snapshot(), &shared, &grids);
         assert_eq!(el.children.len(), 2);
         assert!(el.children[0].classes.contains(&"pane-header".to_string()));
         assert!(el.children[1].classes.contains(&"pane-body".to_string()));
@@ -649,7 +714,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &shared, &grids);
+        let el = build_pane(&pane, false, false, &make_snapshot(), &shared, &grids);
         assert!(el.on_click.is_some());
     }
 
@@ -659,7 +724,7 @@ mod tests {
     fn pane_header_has_correct_class() {
         let pane = make_pane_titled(42, "zsh");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         assert!(el.classes.contains(&"pane-header".to_string()));
     }
 
@@ -667,7 +732,7 @@ mod tests {
     fn pane_header_has_three_sections() {
         let pane = make_pane_titled(42, "zsh");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         // left, meta, right
         assert_eq!(el.children.len(), 3);
         assert!(el.children[0]
@@ -683,7 +748,7 @@ mod tests {
     fn pane_header_meta_shows_pid_and_cpu() {
         let pane = make_pane_titled(42, "zsh");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let meta = &el.children[1];
         // meta text should contain "pid 1234" and "5.3%"
         if let unshit::core::element::ElementContent::Text(ref text) = meta.content {
@@ -698,7 +763,7 @@ mod tests {
     fn pane_header_right_has_action_buttons() {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let right = &el.children[2];
         // search, split_h, split_v, close = 4 buttons
         assert_eq!(right.children.len(), 4);
@@ -783,7 +848,7 @@ mod tests {
             guard.col_ratios[0].push(1.0);
         }
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &shared, &grids);
+        let el = build_pane(&pane, false, false, &make_snapshot(), &shared, &grids);
         (el.on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().active_pane, PaneId(42));
     }
@@ -792,7 +857,7 @@ mod tests {
     fn pane_header_split_h_has_click_handler() {
         let shared = make_shared();
         let pane = make_pane_titled(1, "shell");
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let right = &el.children[2];
         // split_h is the second action button (index 1)
         let split_h = &right.children[1];
@@ -804,7 +869,7 @@ mod tests {
     fn pane_header_split_v_has_click_handler() {
         let shared = make_shared();
         let pane = make_pane_titled(1, "shell");
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let right = &el.children[2];
         // split_v is the third action button (index 2)
         let split_v = &right.children[2];
@@ -816,7 +881,7 @@ mod tests {
     fn pane_header_close_has_click_handler_and_danger_class() {
         let shared = make_shared();
         let pane = make_pane_titled(1, "shell");
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let right = &el.children[2];
         // close is the last action button (index 3)
         let close_btn = &right.children[3];
@@ -871,18 +936,19 @@ mod tests {
     }
 
     #[test]
-    fn pane_header_left_has_status_dot_title_subtitle() {
+    fn pane_header_left_has_grip_dot_title_subtitle() {
         let pane = make_pane_titled(1, "zsh");
         let shared = make_shared();
-        let el = build_pane_header(&pane, false, &shared);
+        let el = build_pane_header(&pane, &shared);
         let left = &el.children[0];
         assert!(left.classes.contains(&"pane-header-left".to_string()));
-        assert_eq!(left.children.len(), 3);
-        assert!(left.children[0]
+        assert_eq!(left.children.len(), 4);
+        assert!(left.children[0].classes.contains(&"pane-grip".to_string()));
+        assert!(left.children[1]
             .classes
             .contains(&"pane-status-dot".to_string()));
-        assert!(left.children[1].classes.contains(&"pane-title".to_string()));
-        assert!(left.children[2]
+        assert!(left.children[2].classes.contains(&"pane-title".to_string()));
+        assert!(left.children[3]
             .classes
             .contains(&"pane-subtitle".to_string()));
     }
@@ -1014,63 +1080,209 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pane header deduplication: single pane hides title/subtitle
+    // Pane header visibility: single-pane tabs omit the header entirely
     // -----------------------------------------------------------------------
 
-    /// When there is only one pane the tab bar already shows "shell  bash", so
-    /// the pane header must NOT duplicate the title and subtitle.
+    /// Single-pane tabs have no pane header at all. The tab bar already
+    /// shows title/subtitle and a single pane cannot be extracted, so
+    /// the grip and action buttons would be clutter.
     #[test]
-    fn single_pane_header_omits_title_and_subtitle() {
+    fn single_pane_tab_omits_pane_header() {
         let shared = test_shared();
         let pane = make_pane(1);
-        let header = build_pane_header(&pane, true, &shared);
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, true, true, &make_snapshot(), &shared, &grids);
 
         assert!(
-            !tree_has_class(&header, "pane-header-left"),
-            "single-pane header must not contain .pane-header-left"
-        );
-        assert!(
-            !tree_has_class(&header, "pane-title"),
-            "single-pane header must not contain .pane-title"
-        );
-        assert!(
-            !tree_has_class(&header, "pane-subtitle"),
-            "single-pane header must not contain .pane-subtitle"
-        );
-        // Meta and action buttons must still be present.
-        assert!(
-            tree_has_class(&header, "pane-meta"),
-            "single-pane header must still contain .pane-meta"
-        );
-        assert!(
-            tree_has_class(&header, "pane-header-right"),
-            "single-pane header must still contain .pane-header-right"
+            !tree_has_class(&el, "pane-header"),
+            "single-pane tab must not render a pane-header"
         );
     }
 
-    /// When there are multiple panes (split layout) every pane header must
-    /// show its title and subtitle so the user can tell them apart.
+    /// Multi-pane tabs include a header with a grip on the left so each
+    /// pane can be dragged. The header also carries title/subtitle and
+    /// action buttons so the user can distinguish panes and manage them.
     #[test]
-    fn multi_pane_header_shows_title_and_subtitle() {
+    fn multi_pane_tab_renders_header_with_grip() {
         let shared = test_shared();
         let pane = make_pane(1);
-        let header = build_pane_header(&pane, false, &shared);
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, true, false, &make_snapshot(), &shared, &grids);
 
         assert!(
-            tree_has_class(&header, "pane-header-left"),
-            "multi-pane header must contain .pane-header-left"
+            tree_has_class(&el, "pane-header"),
+            "multi-pane tab must render a pane-header"
         );
         assert!(
-            tree_has_class(&header, "pane-title"),
-            "multi-pane header must contain .pane-title"
+            tree_has_class(&el, "pane-grip"),
+            "multi-pane header must include a pane-grip for drag"
         );
         assert!(
-            tree_has_text(&header, "shell"),
+            tree_has_class(&el, "pane-title"),
+            "multi-pane header must show the pane title"
+        );
+        assert!(
+            tree_has_text(&el, "shell"),
             "multi-pane header must display the pane title text"
         );
+    }
+
+    /// The grip on the pane header is the drag source for the
+    /// pane-extract-to-tab flow (F4). It must carry an `on_drag`
+    /// handler so the framework tracks the pointer.
+    #[test]
+    fn pane_grip_has_on_drag_handler() {
+        let shared = test_shared();
+        let pane = make_pane(1);
+        let header = build_pane_header(&pane, &shared);
+        let left = &header.children[0];
+        let grip = &left.children[0];
+        assert!(grip.classes.contains(&"pane-grip".to_string()));
         assert!(
-            tree_has_text(&header, "bash"),
-            "multi-pane header must display the pane subtitle text"
+            grip.on_drag.is_some(),
+            "pane grip must have on_drag handler for extract-to-tab"
+        );
+    }
+
+    /// Invoking the grip's `on_drag` with a `Start` phase must transition
+    /// the app's drag state to `DraggingPane` for the owning pane id.
+    #[test]
+    fn pane_grip_on_drag_start_enters_dragging_state() {
+        use unshit::core::event::MouseButton;
+        use unshit::core::event::{DragEvent, DragPhase};
+        let shared = test_shared();
+        let pane = make_pane(42);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.panes = vec![vec![pane.clone()]];
+            guard.active_pane = pane.id;
+        }
+        let header = build_pane_header(&pane, &shared);
+        let grip = &header.children[0].children[0];
+        let handler = grip.on_drag.as_ref().unwrap().clone();
+        let start = DragEvent {
+            phase: DragPhase::Start,
+            x: 100.0,
+            y: 200.0,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            total_delta_x: 0.0,
+            total_delta_y: 0.0,
+            button: MouseButton::Left,
+        };
+        handler(&start);
+
+        let guard = shared.lock().unwrap();
+        match &guard.drag {
+            crate::drag::DragState::DraggingPane { pane: p, .. } => {
+                assert_eq!(*p, PaneId(42));
+            }
+            _ => panic!("expected DraggingPane state after DragPhase::Start"),
+        }
+    }
+
+    /// A `DragPhase::Update` event must refresh `cursor_x`/`cursor_y` on
+    /// the active drag so the extract-to-tab end handler can hit-test.
+    #[test]
+    fn pane_grip_on_drag_update_refreshes_cursor() {
+        use unshit::core::event::{DragEvent, DragPhase, MouseButton};
+        let shared = test_shared();
+        let pane = make_pane(7);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.panes = vec![vec![pane.clone()]];
+            guard.active_pane = pane.id;
+        }
+        let header = build_pane_header(&pane, &shared);
+        let grip = &header.children[0].children[0];
+        let handler = grip.on_drag.as_ref().unwrap().clone();
+        let start = DragEvent {
+            phase: DragPhase::Start,
+            x: 0.0,
+            y: 0.0,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            total_delta_x: 0.0,
+            total_delta_y: 0.0,
+            button: MouseButton::Left,
+        };
+        handler(&start);
+        let update = DragEvent {
+            phase: DragPhase::Update,
+            x: 321.0,
+            y: 54.0,
+            delta_x: 5.0,
+            delta_y: 2.0,
+            total_delta_x: 321.0,
+            total_delta_y: 54.0,
+            button: MouseButton::Left,
+        };
+        handler(&update);
+
+        assert_eq!(
+            shared.lock().unwrap().drag.cursor(),
+            Some((321.0, 54.0)),
+            "drag cursor must reflect the latest update event"
+        );
+    }
+
+    /// `DragPhase::End` over the tab bar must extract the pane into a
+    /// new tab. This exercises the full callback path from framework
+    /// event to dispatch to mutate_extract_pane_to_tab.
+    #[test]
+    fn pane_grip_on_drag_end_over_tabbar_extracts() {
+        use crate::state::mutate_split_right;
+        use unshit::core::event::{DragEvent, DragPhase, MouseButton};
+        let shared = test_shared();
+        let original;
+        let extracted;
+        {
+            let mut guard = shared.lock().unwrap();
+            original = guard.active_pane;
+            mutate_split_right(&mut guard, original);
+            extracted = guard.active_pane;
+            guard.tabbar_rect = crate::drag::Rect {
+                x: 0.0,
+                y: 34.0,
+                width: 800.0,
+                height: 38.0,
+            };
+        }
+        let tabs_before = shared.lock().unwrap().tabs.len();
+
+        let pane = Pane {
+            id: extracted,
+            title: "shell".into(),
+            subtitle: "bash".into(),
+            pid: 0,
+            cpu: 0.0,
+        };
+        let header = build_pane_header(&pane, &shared);
+        let grip = &header.children[0].children[0];
+        let handler = grip.on_drag.as_ref().unwrap().clone();
+
+        let mk = |phase, x, y| DragEvent {
+            phase,
+            x,
+            y,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            total_delta_x: 0.0,
+            total_delta_y: 0.0,
+            button: MouseButton::Left,
+        };
+        handler(&mk(DragPhase::Start, 400.0, 300.0));
+        handler(&mk(DragPhase::Update, 600.0, 50.0));
+        handler(&mk(DragPhase::End, 600.0, 50.0));
+
+        assert_eq!(
+            shared.lock().unwrap().tabs.len(),
+            tabs_before + 1,
+            "dropping on the tab bar must spawn a new tab"
+        );
+        assert!(
+            matches!(shared.lock().unwrap().drag, crate::drag::DragState::Idle),
+            "drag state must reset after end"
         );
     }
 
