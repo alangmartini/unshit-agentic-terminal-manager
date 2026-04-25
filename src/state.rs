@@ -370,6 +370,17 @@ pub struct AppState {
     pub resize_drag: Option<ResizeDragSnapshot>,
     /// Context menu state: Some when open, None when closed.
     pub ctx_menu: Option<CtxMenu>,
+    /// User keybind overrides, recording mode, and last validation error.
+    /// Changes here persist to disk but only take effect on next restart
+    /// (the framework's shortcut resolver snapshots the bindings at build).
+    pub keybinds: crate::keybinds::KeybindsState,
+    /// Transient drag state for pane-header / tab drags. `Idle` at rest,
+    /// `DraggingPane { .. }` once the cursor exceeds the 4px threshold.
+    pub drag: crate::drag::DragState,
+    /// Last measured tab bar rectangle in window coordinates. Populated
+    /// by `on_resize` on the `.tabbar` element and the sidebar width
+    /// tracking. Used by the pane-extract drag flow to hit-test drops.
+    pub tabbar_rect: crate::drag::Rect,
     /// Pending destructive action awaiting confirmation. `None` when no
     /// confirm modal is showing.
     pub confirm_dialog: Option<ConfirmDialog>,
@@ -457,6 +468,12 @@ impl AppState {
             row_ratios: self.row_ratios.clone(),
             col_ratios: self.col_ratios.clone(),
             ctx_menu: self.ctx_menu.clone(),
+            keybinds: self.keybinds.clone(),
+            drag: self.drag.clone(),
+            tabbar_rect: self.tabbar_rect,
+            last_grid_width: self.last_grid_width,
+            last_grid_height: self.last_grid_height,
+            scale_factor: self.scale_factor,
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
             sessions: self.sessions.clone(),
@@ -504,6 +521,18 @@ pub struct UiSnapshot {
     pub row_ratios: Vec<f32>,
     pub col_ratios: Vec<Vec<f32>>,
     pub ctx_menu: Option<CtxMenu>,
+    pub keybinds: crate::keybinds::KeybindsState,
+    pub drag: crate::drag::DragState,
+    pub tabbar_rect: crate::drag::Rect,
+    /// Last measured physical width of the terminal-grid container.
+    /// Consumers must divide by `scale_factor` to get CSS pixels.
+    pub last_grid_width: f32,
+    /// Last measured physical height of the terminal-grid container.
+    pub last_grid_height: f32,
+    /// Display scale factor so callers can convert physical pixels
+    /// (stored for last_grid_*) back to CSS coordinates that compose
+    /// with tabbar_rect and DragState cursor.
+    pub scale_factor: f32,
     pub confirm_dialog: Option<ConfirmDialog>,
     /// Total number of live terminals across every workspace. Read from
     /// `state.terminals.len()` so the danger-zone button can show an
@@ -674,6 +703,11 @@ pub fn seed_state() -> AppState {
         col_ratios: vec![vec![1.0]],
         resize_drag: None,
         ctx_menu: None,
+        keybinds: crate::keybinds::KeybindsState::with_overrides(
+            crate::keybinds::loader::load_if_installed(),
+        ),
+        drag: crate::drag::DragState::default(),
+        tabbar_rect: crate::drag::Rect::default(),
         confirm_dialog: None,
         sessions: Vec::new(),
     }
@@ -1124,6 +1158,454 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
     sync_live_tab_from_panes(state);
 }
 
+/// Move `target` out of the active tab into a new tab inserted at
+/// `new_tab_index`. The PTY handle and terminal emulator state are
+/// kept untouched so the running process, scrollback and cwd survive
+/// the move.
+///
+/// - When the active tab holds multiple panes, the pane is removed from
+///   its row and the freed column ratio is absorbed by a neighbor, then
+///   a fresh `TerminalTab` holding the extracted pane is inserted at
+///   `new_tab_index`.
+/// - When the active tab holds only `target`, the source tab is removed
+///   (without destroying the PTY) and the new tab takes its place. The
+///   tab count stays the same.
+///
+/// After extraction the newly inserted tab becomes active. A bad
+/// `target` id or a call that would leave no tabs at all is a no-op.
+pub fn mutate_extract_pane_to_tab(state: &mut AppState, target: PaneId, new_tab_index: usize) {
+    let Some((row_idx, col_idx)) = find_pane_coord(state, target) else {
+        log::warn!(
+            "extract_to_tab: pane {:?} not found in active layout",
+            target
+        );
+        return;
+    };
+
+    let extracted_pane = state.panes[row_idx][col_idx].clone();
+    let extracted_id = extracted_pane.id.0;
+    let source_tab_idx = state.active_tab;
+    let live_pane_count: usize = state.panes.iter().map(|r| r.len()).sum();
+    log::info!(
+        "extract_to_tab: pane={:?} ({}, {}) source_tab={} live_panes={} new_idx={}",
+        target,
+        row_idx,
+        col_idx,
+        source_tab_idx,
+        live_pane_count,
+        new_tab_index
+    );
+
+    if live_pane_count == 1 {
+        // Source tab becomes empty after extraction. Drop it from `tabs`
+        // without going through `mutate_close_tab` (which would destroy
+        // the PTY we want to migrate). Clear live layout fields so the
+        // new tab can re-seed them via `load_tab_state`.
+        state.tabs.remove(source_tab_idx);
+        state.panes.clear();
+        state.row_ratios.clear();
+        state.col_ratios.clear();
+    } else {
+        let closed_ratio = state.col_ratios[row_idx][col_idx];
+        state.col_ratios[row_idx].remove(col_idx);
+        if !state.col_ratios[row_idx].is_empty() {
+            let absorb_idx = if col_idx > 0 { col_idx - 1 } else { 0 };
+            state.col_ratios[row_idx][absorb_idx] += closed_ratio;
+        }
+        state.panes[row_idx].remove(col_idx);
+        if state.panes[row_idx].is_empty() {
+            let closed_row_ratio = state.row_ratios[row_idx];
+            state.row_ratios.remove(row_idx);
+            state.col_ratios.remove(row_idx);
+            if !state.row_ratios.is_empty() {
+                let absorb_idx = if row_idx > 0 { row_idx - 1 } else { 0 };
+                state.row_ratios[absorb_idx] += closed_row_ratio;
+            }
+            state.panes.remove(row_idx);
+        }
+        if state.active_pane == target {
+            let new_row = row_idx.min(state.panes.len() - 1);
+            let new_col = col_idx.min(state.panes[new_row].len() - 1);
+            state.active_pane = state.panes[new_row][new_col].id;
+        }
+        sync_live_tab_from_panes(state);
+    }
+
+    let new_tab = TerminalTab {
+        id: format!("t{}", extracted_id),
+        name: extracted_pane.title.clone(),
+        subtitle: extracted_pane.subtitle.clone(),
+        status: TabStatus::Running,
+        panes: vec![vec![extracted_pane]],
+        active_pane: PaneId(extracted_id),
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+
+    // When the source tab was removed above, any `new_tab_index` past
+    // the removed slot shifts left by one.
+    let adjusted_index = if live_pane_count == 1 && new_tab_index > source_tab_idx {
+        new_tab_index - 1
+    } else {
+        new_tab_index
+    };
+    let insertion_index = adjusted_index.min(state.tabs.len());
+    state.tabs.insert(insertion_index, new_tab);
+    state.active_tab = insertion_index;
+    load_tab_state(state);
+}
+
+/// Move tab `source_tab_id` to the requested `new_index` in the tab
+/// strip. Active-tab pointer follows the moved tab by id so selection
+/// is preserved regardless of which tabs shift. Unknown ids and a
+/// no-op reorder (already at target index) are silently ignored.
+pub fn mutate_tab_reorder(state: &mut AppState, source_tab_id: &str, new_index: usize) {
+    let Some(old_idx) = state.tabs.iter().position(|t| t.id == source_tab_id) else {
+        return;
+    };
+    let clamped_target = new_index.min(state.tabs.len());
+    // Removing first, then inserting at the caller's index, requires a
+    // shift when the target lies past the removed slot; otherwise the
+    // item lands one position too far right.
+    let adjusted = if clamped_target > old_idx {
+        clamped_target - 1
+    } else {
+        clamped_target
+    };
+    if adjusted == old_idx {
+        return;
+    }
+    let active_id = state.tabs[state.active_tab].id.clone();
+    let tab = state.tabs.remove(old_idx);
+    let insertion = adjusted.min(state.tabs.len());
+    state.tabs.insert(insertion, tab);
+    state.active_tab = state
+        .tabs
+        .iter()
+        .position(|t| t.id == active_id)
+        .unwrap_or(0);
+}
+
+/// Insert `source_tab`'s single pane as a split of `target` along the
+/// given `edge`. This is the edge-drop half of the tab-drag flow; the
+/// center zone uses `mutate_tab_reorder` instead.
+///
+/// Constraints:
+/// - Source tab must exist and have exactly one pane. Multi-pane tabs
+///   would require recursive nested grids, which the layout doesn't
+///   model, so the drop is a no-op instead of a partial move.
+/// - Source tab must not be the currently active tab (a self-split
+///   would try to place the pane next to itself). No-op in that case.
+/// - The target pane must exist in the active tab's live layout.
+///
+/// The source tab's PTY handle is preserved (we never destroy the
+/// `state.terminals` entry), so the process, scrollback, and cwd
+/// survive the move. The source tab is then removed from the tab
+/// strip because it became empty.
+pub fn mutate_pane_drop_split(
+    state: &mut AppState,
+    source_tab_id: &str,
+    target: PaneId,
+    edge: crate::drag::drop_zones::DropZone,
+) {
+    use crate::drag::drop_zones::DropZone;
+
+    let Some(source_idx) = state.tabs.iter().position(|t| t.id == source_tab_id) else {
+        log::warn!("drop_split: unknown source tab {}", source_tab_id);
+        return;
+    };
+    if source_idx == state.active_tab {
+        log::warn!("drop_split: source tab {} is active; no-op", source_tab_id);
+        return;
+    }
+    let saved_count: usize = state.tabs[source_idx].panes.iter().map(|r| r.len()).sum();
+    if saved_count != 1 {
+        log::warn!(
+            "drop_split: source tab {} has {} panes, only single-pane supported",
+            source_tab_id,
+            saved_count
+        );
+        return;
+    }
+    let source_pane = state.tabs[source_idx].panes[0][0].clone();
+    let source_pane_id = source_pane.id;
+
+    if source_pane_id == target {
+        log::warn!(
+            "drop_split: source pane {:?} equals target; no-op",
+            source_pane_id
+        );
+        return;
+    }
+
+    let Some((row_idx, col_idx)) = find_pane_coord(state, target) else {
+        log::warn!("drop_split: target pane {:?} not in active layout", target);
+        return;
+    };
+
+    log::info!(
+        "drop_split: src_tab={} src_pane={:?} target={:?} edge={:?}",
+        source_tab_id,
+        source_pane_id,
+        target,
+        edge
+    );
+
+    state.tabs.remove(source_idx);
+    if state.active_tab > source_idx {
+        state.active_tab -= 1;
+    }
+
+    match edge {
+        DropZone::Left => {
+            let existing = state.col_ratios[row_idx][col_idx];
+            let half = existing / 2.0;
+            state.col_ratios[row_idx][col_idx] = half;
+            state.col_ratios[row_idx].insert(col_idx, half);
+            state.panes[row_idx].insert(col_idx, source_pane);
+        }
+        DropZone::Right => {
+            let existing = state.col_ratios[row_idx][col_idx];
+            let half = existing / 2.0;
+            state.col_ratios[row_idx][col_idx] = half;
+            state.col_ratios[row_idx].insert(col_idx + 1, half);
+            state.panes[row_idx].insert(col_idx + 1, source_pane);
+        }
+        DropZone::Top => {
+            let existing = state.row_ratios[row_idx];
+            let half = existing / 2.0;
+            state.row_ratios[row_idx] = half;
+            state.row_ratios.insert(row_idx, half);
+            state.col_ratios.insert(row_idx, vec![1.0]);
+            state.panes.insert(row_idx, vec![source_pane]);
+        }
+        DropZone::Bottom => {
+            let existing = state.row_ratios[row_idx];
+            let half = existing / 2.0;
+            state.row_ratios[row_idx] = half;
+            state.row_ratios.insert(row_idx + 1, half);
+            state.col_ratios.insert(row_idx + 1, vec![1.0]);
+            state.panes.insert(row_idx + 1, vec![source_pane]);
+        }
+        DropZone::Center => return,
+    }
+
+    state.active_pane = source_pane_id;
+    sync_live_tab_from_panes(state);
+}
+
+/// Move `source` out of its current slot in the active tab and re-insert
+/// it at `target`'s `edge`. Used when the user drags a pane grip onto
+/// another pane's edge inside the same tab (the intra-tab analogue of
+/// `mutate_pane_drop_split`).
+///
+/// The PTY handle and terminal emulator are untouched: only the layout
+/// vectors move. Ratio absorption mirrors `mutate_close_pane` on removal
+/// and `mutate_pane_drop_split` on insertion, so the rest of the tab's
+/// layout keeps its relative proportions.
+///
+/// Constraints:
+/// - `source` and `target` must both live in the active tab.
+/// - `source != target`: dropping a pane on its own edge is a no-op.
+/// - `edge` must be a proper edge; `Center` is rejected (it's a dead
+///   zone in `hit_test`, so any stale Center value is a cancel).
+pub fn mutate_pane_move_to_edge(
+    state: &mut AppState,
+    source: PaneId,
+    target: PaneId,
+    edge: crate::drag::drop_zones::DropZone,
+) {
+    use crate::drag::drop_zones::DropZone;
+
+    if source == target {
+        log::warn!("pane_move_to_edge: source == target; no-op");
+        return;
+    }
+    if matches!(edge, DropZone::Center) {
+        log::warn!("pane_move_to_edge: edge is Center; no-op");
+        return;
+    }
+    let Some((src_row, src_col)) = find_pane_coord(state, source) else {
+        log::warn!(
+            "pane_move_to_edge: source {:?} not in active layout",
+            source
+        );
+        return;
+    };
+    if find_pane_coord(state, target).is_none() {
+        log::warn!(
+            "pane_move_to_edge: target {:?} not in active layout",
+            target
+        );
+        return;
+    }
+
+    log::info!(
+        "pane_move_to_edge: src={:?} ({},{}) tgt={:?} edge={:?}",
+        source,
+        src_row,
+        src_col,
+        target,
+        edge
+    );
+
+    // Detach source from its current slot (same ratio-absorb logic as
+    // `mutate_close_pane`, but we keep the Pane value to re-insert).
+    let source_pane = state.panes[src_row][src_col].clone();
+    let freed_col_ratio = state.col_ratios[src_row][src_col];
+    state.col_ratios[src_row].remove(src_col);
+    if !state.col_ratios[src_row].is_empty() {
+        let absorb_idx = if src_col > 0 { src_col - 1 } else { 0 };
+        state.col_ratios[src_row][absorb_idx] += freed_col_ratio;
+    }
+    state.panes[src_row].remove(src_col);
+    if state.panes[src_row].is_empty() {
+        let freed_row_ratio = state.row_ratios[src_row];
+        state.row_ratios.remove(src_row);
+        state.col_ratios.remove(src_row);
+        if !state.row_ratios.is_empty() {
+            let absorb_idx = if src_row > 0 { src_row - 1 } else { 0 };
+            state.row_ratios[absorb_idx] += freed_row_ratio;
+        }
+        state.panes.remove(src_row);
+    }
+
+    // After removal, target's coordinates may have shifted (e.g. source
+    // was earlier in the same row or on a now-deleted row). Re-query.
+    let Some((row_idx, col_idx)) = find_pane_coord(state, target) else {
+        log::warn!(
+            "pane_move_to_edge: target {:?} disappeared after detach",
+            target
+        );
+        return;
+    };
+
+    match edge {
+        DropZone::Left => {
+            let existing = state.col_ratios[row_idx][col_idx];
+            let half = existing / 2.0;
+            state.col_ratios[row_idx][col_idx] = half;
+            state.col_ratios[row_idx].insert(col_idx, half);
+            state.panes[row_idx].insert(col_idx, source_pane);
+        }
+        DropZone::Right => {
+            let existing = state.col_ratios[row_idx][col_idx];
+            let half = existing / 2.0;
+            state.col_ratios[row_idx][col_idx] = half;
+            state.col_ratios[row_idx].insert(col_idx + 1, half);
+            state.panes[row_idx].insert(col_idx + 1, source_pane);
+        }
+        DropZone::Top => {
+            let existing = state.row_ratios[row_idx];
+            let half = existing / 2.0;
+            state.row_ratios[row_idx] = half;
+            state.row_ratios.insert(row_idx, half);
+            state.col_ratios.insert(row_idx, vec![1.0]);
+            state.panes.insert(row_idx, vec![source_pane]);
+        }
+        DropZone::Bottom => {
+            let existing = state.row_ratios[row_idx];
+            let half = existing / 2.0;
+            state.row_ratios[row_idx] = half;
+            state.row_ratios.insert(row_idx + 1, half);
+            state.col_ratios.insert(row_idx + 1, vec![1.0]);
+            state.panes.insert(row_idx + 1, vec![source_pane]);
+        }
+        DropZone::Center => return,
+    }
+
+    state.active_pane = source;
+    sync_live_tab_from_panes(state);
+}
+
+/// Swap two panes in the active tab. Both PTYs and terminals stay
+/// alive; only the PaneId references in the layout grid trade places.
+/// Used by Center drops in pane drags so the gesture rearranges
+/// content without destroying anything.
+pub fn mutate_pane_swap(state: &mut AppState, a: PaneId, b: PaneId) {
+    if a == b {
+        return;
+    }
+    let Some((ar, ac)) = find_pane_coord(state, a) else {
+        log::warn!("pane_swap: source {:?} not in active layout", a);
+        return;
+    };
+    let Some((br, bc)) = find_pane_coord(state, b) else {
+        log::warn!("pane_swap: target {:?} not in active layout", b);
+        return;
+    };
+    log::info!(
+        "pane_swap: a={:?} ({},{}) b={:?} ({},{})",
+        a,
+        ar,
+        ac,
+        b,
+        br,
+        bc
+    );
+    let tmp = state.panes[ar][ac].clone();
+    state.panes[ar][ac] = state.panes[br][bc].clone();
+    state.panes[br][bc] = tmp;
+    state.active_pane = a;
+    sync_live_tab_from_panes(state);
+}
+
+/// Swap the single pane in `source_tab_id` with `target` in the
+/// active tab. Both PTYs survive, both tabs survive — the source tab
+/// inherits the target's pane and the active tab now holds the
+/// source pane in target's old slot. Used by Center drops in tab
+/// drags so a tab→pane drop rearranges content without deleting
+/// anything.
+pub fn mutate_pane_swap_from_tab(state: &mut AppState, source_tab_id: &str, target: PaneId) {
+    let Some(source_idx) = state.tabs.iter().position(|t| t.id == source_tab_id) else {
+        log::warn!("pane_swap_from_tab: unknown source tab {}", source_tab_id);
+        return;
+    };
+    if source_idx == state.active_tab {
+        log::warn!(
+            "pane_swap_from_tab: source tab {} is active; no-op",
+            source_tab_id
+        );
+        return;
+    }
+    let saved_count: usize = state.tabs[source_idx].panes.iter().map(|r| r.len()).sum();
+    if saved_count != 1 {
+        log::warn!(
+            "pane_swap_from_tab: source tab {} has {} panes, single-pane only",
+            source_tab_id,
+            saved_count
+        );
+        return;
+    }
+    let source_pane = state.tabs[source_idx].panes[0][0].clone();
+    let source_pane_id = source_pane.id;
+    if source_pane_id == target {
+        return;
+    }
+    let Some((tgt_row, tgt_col)) = find_pane_coord(state, target) else {
+        log::warn!(
+            "pane_swap_from_tab: target {:?} not in active layout",
+            target
+        );
+        return;
+    };
+
+    log::info!(
+        "pane_swap_from_tab: src_tab={} src_pane={:?} target={:?}",
+        source_tab_id,
+        source_pane_id,
+        target
+    );
+
+    let target_pane = state.panes[tgt_row][tgt_col].clone();
+    state.panes[tgt_row][tgt_col] = source_pane;
+    state.tabs[source_idx].panes[0][0] = target_pane;
+    state.tabs[source_idx].active_pane = target;
+
+    state.active_pane = source_pane_id;
+    sync_live_tab_from_panes(state);
+}
+
 /// Copy the live pane layout back into `tabs[active_tab]` so the per-tab
 /// saved view stays in sync without waiting for a tab or workspace switch.
 fn sync_live_tab_from_panes(state: &mut AppState) {
@@ -1542,6 +2024,15 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             mutate_close_pane(state, state.active_pane);
             true
         }
+        other if other.starts_with("pane.extract_to_tab:") => {
+            dispatch_pane_extract_to_tab(state, other)
+        }
+        other if other.starts_with("drag.start_pane:") => dispatch_drag_start_pane(state, other),
+        other if other.starts_with("drag.start_tab:") => dispatch_drag_start_tab(state, other),
+        other if other.starts_with("drag.update:") => dispatch_drag_update(state, other),
+        "drag.end" => dispatch_drag_end(state),
+        other if other.starts_with("pane.drop_split:") => dispatch_pane_drop_split(state, other),
+        other if other.starts_with("tab.reorder:") => dispatch_tab_reorder(state, other),
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
             true
@@ -1723,8 +2214,365 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             true
         }
+        other if other.starts_with("keybind.set:") => dispatch_keybind_set(state, other),
+        other if other.starts_with("keybind.reset:") => dispatch_keybind_reset(state, other),
+        "keybind.reset_all" => {
+            state.keybinds.reset_all();
+            crate::keybinds::loader::save_if_installed(&state.keybinds.overrides);
+            true
+        }
+        other if other.starts_with("keybind.record:") => {
+            let id = &other["keybind.record:".len()..];
+            let Some(action) = crate::keybinds::KeybindAction::from_id(id) else {
+                return false;
+            };
+            state.keybinds.start_recording(action);
+            true
+        }
+        "keybind.cancel_record" => {
+            let had_state = state.keybinds.recording.is_some() || state.keybinds.error.is_some();
+            state.keybinds.cancel_recording();
+            state.keybinds.error = None;
+            had_state
+        }
         _ => false,
     }
+}
+
+/// Parse `keybind.set:<action_id>:<combo>` and apply. The combo can
+/// itself contain `+` and the separator is only the *first* colon after
+/// the prefix, since combos like `Ctrl+,` do not contain colons but
+/// ids never do either. Falls back to `false` when the action id is
+/// unknown so a stale settings UI doesn't silently corrupt state.
+fn dispatch_keybind_set(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["keybind.set:".len()..];
+    let Some((id, combo_str)) = rest.split_once(':') else {
+        return false;
+    };
+    let Some(action) = crate::keybinds::KeybindAction::from_id(id) else {
+        return false;
+    };
+    let combo = match unshit::core::shortcut::KeyCombo::parse(combo_str) {
+        Ok(c) => c,
+        Err(e) => {
+            state.keybinds.error = Some(crate::keybinds::KeybindError {
+                action,
+                kind: crate::keybinds::KeybindErrorKind::InvalidCombo {
+                    combo: combo_str.to_string(),
+                    message: e,
+                },
+            });
+            return true;
+        }
+    };
+    match state.keybinds.set(action, combo) {
+        Ok(()) => {
+            crate::keybinds::loader::save_if_installed(&state.keybinds.overrides);
+            true
+        }
+        Err(_) => true,
+    }
+}
+
+/// Parse `drag.start_pane:<pane_id>:<x>:<y>` and enter the
+/// `DraggingPane` state. Returns `false` on malformed input or if
+/// the pane id is not present in the current tab.
+fn dispatch_drag_start_pane(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["drag.start_pane:".len()..];
+    let mut parts = rest.splitn(3, ':');
+    let (Some(pane_str), Some(x_str), Some(y_str)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (Ok(pane_num), Ok(x), Ok(y)) = (
+        pane_str.parse::<u32>(),
+        x_str.parse::<f32>(),
+        y_str.parse::<f32>(),
+    ) else {
+        return false;
+    };
+    let pane = PaneId(pane_num);
+    if find_pane_coord(state, pane).is_none() {
+        return false;
+    }
+    // Cursor events arrive in physical pixels. Store them in CSS
+    // pixels so they compose correctly with `Dimension::Px` in the
+    // overlay builder (the framework re-applies scale_factor there).
+    let sf = state.scale_factor.max(1e-3);
+    state.drag = crate::drag::DragState::DraggingPane {
+        pane,
+        cursor_x: x / sf,
+        cursor_y: y / sf,
+    };
+    true
+}
+
+/// Parse `drag.start_tab:<tab_id>:<x>:<y>` and enter the `DraggingTab`
+/// state. Returns `false` on malformed input or if the tab id is not
+/// present. The cursor is normalised to CSS pixels (winit events are
+/// physical) to match how pane rects and the tab-bar rect are stored.
+fn dispatch_drag_start_tab(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["drag.start_tab:".len()..];
+    let mut parts = rest.splitn(3, ':');
+    let (Some(id), Some(x_str), Some(y_str)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) else {
+        return false;
+    };
+    if !state.tabs.iter().any(|t| t.id == id) {
+        return false;
+    }
+    let sf = state.scale_factor.max(1e-3);
+    state.drag = crate::drag::DragState::DraggingTab {
+        source_tab: id.to_string(),
+        cursor_x: x / sf,
+        cursor_y: y / sf,
+    };
+    true
+}
+
+/// Handle `drag.end`. Resolves the drop based on the variant in flight:
+/// - `DraggingPane`: tab-bar hit -> extract to new tab.
+/// - `DraggingTab`: tab-bar hit -> `tab.reorder`; edge zone on a pane ->
+///   `pane.drop_split`; center zone on a pane -> `tab.reorder` next to
+///   the target's tab.
+///
+/// Returns `true` iff a drag was actually in progress. Drops that hit
+/// nothing still clear the drag state and return `true`.
+fn dispatch_drag_end(state: &mut AppState) -> bool {
+    match state.drag.clone() {
+        crate::drag::DragState::DraggingPane {
+            pane,
+            cursor_x,
+            cursor_y,
+        } => {
+            log::info!(
+                "drag.end: pane={:?} cursor=({:.1},{:.1}) tabs={} active_tab={}",
+                pane,
+                cursor_x,
+                cursor_y,
+                state.tabs.len(),
+                state.active_tab
+            );
+            if let Some(index) = crate::drag::resolve_tabbar_drop(
+                cursor_x,
+                cursor_y,
+                state.tabbar_rect,
+                state.tabs.len(),
+            ) {
+                log::info!(
+                    "drag.end: extracting pane {:?} to tab index {}",
+                    pane,
+                    index
+                );
+                mutate_extract_pane_to_tab(state, pane, index);
+            } else {
+                // Missed the tab bar: look for a pane-edge drop inside the
+                // active tab. The dragged pane itself is skipped so a drop
+                // on its own rect cancels instead of splitting against self.
+                let grid = crate::drag::grid_rect_from_state(
+                    state.sidebar_width,
+                    state.tabbar_rect,
+                    state.last_grid_width,
+                    state.last_grid_height,
+                    state.scale_factor,
+                );
+                let rects = crate::drag::compute_pane_rects(
+                    &state.panes,
+                    &state.row_ratios,
+                    &state.col_ratios,
+                    grid,
+                );
+                let hit = rects
+                    .into_iter()
+                    .filter(|(id, _)| *id != pane)
+                    .find_map(|(id, r)| {
+                        crate::drag::drop_zones::hit_test(r, cursor_x, cursor_y).map(|z| (id, z))
+                    });
+                if let Some((target, zone)) = hit {
+                    use crate::drag::drop_zones::DropZone;
+                    log::info!(
+                        "drag.end: pane {:?} hit target {:?} zone {:?}",
+                        pane,
+                        target,
+                        zone
+                    );
+                    match zone {
+                        DropZone::Left | DropZone::Right | DropZone::Top | DropZone::Bottom => {
+                            mutate_pane_move_to_edge(state, pane, target, zone);
+                        }
+                        DropZone::Center => {
+                            mutate_pane_swap(state, pane, target);
+                        }
+                    }
+                } else {
+                    log::info!("drag.end: pane {:?} no target", pane);
+                }
+            }
+            state.drag = crate::drag::DragState::Idle;
+            true
+        }
+        crate::drag::DragState::DraggingTab {
+            source_tab,
+            cursor_x,
+            cursor_y,
+        } => {
+            log::info!(
+                "drag.end: tab={} cursor=({:.1},{:.1}) tabs={} active_tab={}",
+                source_tab,
+                cursor_x,
+                cursor_y,
+                state.tabs.len(),
+                state.active_tab
+            );
+            if let Some(index) = crate::drag::resolve_tabbar_drop(
+                cursor_x,
+                cursor_y,
+                state.tabbar_rect,
+                state.tabs.len(),
+            ) {
+                log::info!("drag.end: reordering tab {} to {}", source_tab, index);
+                mutate_tab_reorder(state, &source_tab, index);
+            } else {
+                let grid = crate::drag::grid_rect_from_state(
+                    state.sidebar_width,
+                    state.tabbar_rect,
+                    state.last_grid_width,
+                    state.last_grid_height,
+                    state.scale_factor,
+                );
+                let rects = crate::drag::compute_pane_rects(
+                    &state.panes,
+                    &state.row_ratios,
+                    &state.col_ratios,
+                    grid,
+                );
+                let hit = rects.into_iter().find_map(|(id, r)| {
+                    crate::drag::drop_zones::hit_test(r, cursor_x, cursor_y).map(|z| (id, z))
+                });
+                if let Some((target, zone)) = hit {
+                    use crate::drag::drop_zones::DropZone;
+                    log::info!(
+                        "drag.end: tab {} hit pane {:?} zone {:?}",
+                        source_tab,
+                        target,
+                        zone
+                    );
+                    match zone {
+                        DropZone::Left | DropZone::Right | DropZone::Top | DropZone::Bottom => {
+                            mutate_pane_drop_split(state, &source_tab, target, zone);
+                        }
+                        DropZone::Center => {
+                            mutate_pane_swap_from_tab(state, &source_tab, target);
+                        }
+                    }
+                } else {
+                    log::info!("drag.end: tab {} no pane hit", source_tab);
+                }
+            }
+            state.drag = crate::drag::DragState::Idle;
+            true
+        }
+        crate::drag::DragState::Idle => false,
+    }
+}
+
+/// Parse `pane.drop_split:<target_pane_id>:<edge>`. Requires an active
+/// `DraggingTab` so the source tab id can be read from `state.drag`;
+/// returns `false` otherwise. The edge is one of `left|right|top|bottom`
+/// (center is not valid here — use `tab.reorder`).
+fn dispatch_pane_drop_split(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["pane.drop_split:".len()..];
+    let Some((target_str, edge_str)) = rest.split_once(':') else {
+        return false;
+    };
+    let Ok(target_num) = target_str.parse::<u32>() else {
+        return false;
+    };
+    let Some(edge) = crate::drag::drop_zones::DropZone::from_id(edge_str) else {
+        return false;
+    };
+    if matches!(edge, crate::drag::drop_zones::DropZone::Center) {
+        return false;
+    }
+    let source = match &state.drag {
+        crate::drag::DragState::DraggingTab { source_tab, .. } => source_tab.clone(),
+        _ => return false,
+    };
+    mutate_pane_drop_split(state, &source, PaneId(target_num), edge);
+    true
+}
+
+/// Parse `tab.reorder:<source_tab_id>:<index>`. Unlike drop_split,
+/// this does not require an active drag — it's also used by
+/// keyboard-driven reordering in the future. Unknown ids silently
+/// no-op inside `mutate_tab_reorder`.
+fn dispatch_tab_reorder(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["tab.reorder:".len()..];
+    let Some((id, idx_str)) = rest.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(new_index) = idx_str.parse::<usize>() else {
+        return false;
+    };
+    mutate_tab_reorder(state, id, new_index);
+    true
+}
+
+/// Parse `drag.update:<x>:<y>` and update cursor position on the
+/// active drag. Returns `false` when not currently dragging or when
+/// the coordinates don't parse.
+fn dispatch_drag_update(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["drag.update:".len()..];
+    let Some((x_str, y_str)) = rest.split_once(':') else {
+        return false;
+    };
+    let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) else {
+        return false;
+    };
+    let sf = state.scale_factor.max(1e-3);
+    match &mut state.drag {
+        crate::drag::DragState::DraggingPane {
+            cursor_x, cursor_y, ..
+        }
+        | crate::drag::DragState::DraggingTab {
+            cursor_x, cursor_y, ..
+        } => {
+            *cursor_x = x / sf;
+            *cursor_y = y / sf;
+            true
+        }
+        crate::drag::DragState::Idle => false,
+    }
+}
+
+/// Parse `pane.extract_to_tab:<pane_id>:<tab_index>` and apply.
+/// Returns `false` when the parts are malformed so the framework can
+/// ignore a stale UI command without mutating state.
+fn dispatch_pane_extract_to_tab(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["pane.extract_to_tab:".len()..];
+    let Some((pane_str, index_str)) = rest.split_once(':') else {
+        return false;
+    };
+    let Ok(pane_num) = pane_str.parse::<u32>() else {
+        return false;
+    };
+    let Ok(index) = index_str.parse::<usize>() else {
+        return false;
+    };
+    mutate_extract_pane_to_tab(state, PaneId(pane_num), index);
+    true
+}
+
+fn dispatch_keybind_reset(state: &mut AppState, cmd: &str) -> bool {
+    let id = &cmd["keybind.reset:".len()..];
+    let Some(action) = crate::keybinds::KeybindAction::from_id(id) else {
+        return false;
+    };
+    state.keybinds.reset(action);
+    crate::keybinds::loader::save_if_installed(&state.keybinds.overrides);
+    true
 }
 
 /// Return the working directory for the active workspace, falling back to home.
@@ -1949,6 +2797,9 @@ mod tests {
             col_ratios: vec![vec![1.0]],
             resize_drag: None,
             ctx_menu: None,
+            keybinds: crate::keybinds::KeybindsState::default(),
+            drag: crate::drag::DragState::default(),
+            tabbar_rect: crate::drag::Rect::default(),
             confirm_dialog: None,
             sessions: Vec::new(),
         }
@@ -3280,6 +4131,1239 @@ mod tests {
 
         assert!(dispatch(&mut state, "pane.close"));
         assert_eq!(state.panes[0].len(), pane_count - 1);
+    }
+
+    #[test]
+    fn dispatch_pane_close_on_last_pane_closes_tab() {
+        // Unsplit (Ctrl+Shift+W) is dispatched as `pane.close`. When the
+        // focused pane is the tab's only pane, closing it must close the
+        // whole tab. Locks down the A3 semantics so future refactors
+        // cannot silently regress to "leave empty tab behind".
+        let mut state = seed_state();
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 1);
+        let original_tab_count = state.tabs.len();
+
+        assert!(dispatch(&mut state, "pane.close"));
+
+        assert!(state.panes.is_empty(), "last pane must be gone");
+        assert_eq!(
+            state.tabs.len(),
+            original_tab_count - 1,
+            "closing the last pane must close the tab"
+        );
+    }
+
+    // -- mutate_extract_pane_to_tab -----------------------------------------
+
+    #[test]
+    fn extract_pane_from_two_pane_tab_leaves_one_pane_in_source() {
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        assert_eq!(state.panes[0].len(), 2);
+        let target = state.panes[0][1].id;
+
+        mutate_extract_pane_to_tab(&mut state, target, 1);
+
+        assert_eq!(state.tabs.len(), 2, "new tab created");
+        // Source tab (t1) retains its original pane.
+        let source_tab = &state.tabs[0];
+        assert_eq!(source_tab.panes.iter().flatten().count(), 1);
+        // New tab holds the extracted pane.
+        let new_tab = &state.tabs[1];
+        assert_eq!(new_tab.panes.iter().flatten().count(), 1);
+        assert_eq!(new_tab.panes[0][0].id, target);
+    }
+
+    #[test]
+    fn extract_pane_reflows_ratios_in_source() {
+        // After the split the row is 0.5/0.5. Extracting one pane must hand
+        // its column ratio to the remaining pane so the source fills 1.0.
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+
+        mutate_extract_pane_to_tab(&mut state, target, 1);
+
+        let source_col_ratios = &state.tabs[0].col_ratios;
+        assert_eq!(source_col_ratios[0].len(), 1);
+        assert!(
+            (source_col_ratios[0][0] - 1.0).abs() < 1e-6,
+            "surviving pane must absorb ratio, got {}",
+            source_col_ratios[0][0]
+        );
+    }
+
+    #[test]
+    fn extract_only_pane_closes_source_tab() {
+        // Single-pane tab extracted: the source tab disappears entirely so
+        // we never leave an empty tab behind. The pane must survive in the
+        // newly created tab.
+        let mut state = seed_state();
+        mutate_add_tab(&mut state); // now 2 tabs
+        mutate_switch_tab(&mut state, 0);
+        let target = state.active_pane;
+        let tab_count_before = state.tabs.len();
+
+        mutate_extract_pane_to_tab(&mut state, target, tab_count_before);
+
+        assert_eq!(
+            state.tabs.len(),
+            tab_count_before,
+            "source tab removed, new tab inserted = same count"
+        );
+        // Extracted pane still exists in some tab.
+        let found = state
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.iter().flatten())
+            .any(|p| p.id == target);
+        assert!(found, "extracted pane must live on in the new tab");
+    }
+
+    #[test]
+    fn extract_preserves_pty_entry_in_terminals_map() {
+        // The whole point of extract-to-tab: the running process must not
+        // respawn. We approximate that by checking the `terminals` HashMap
+        // entry is the same Arc (same strong count before/after).
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+        // split_right already inserted a SharedTerminal for this pane.
+        let before = state
+            .terminals
+            .get(&target.0)
+            .map(Arc::strong_count)
+            .expect("pty spawned by split_right");
+
+        mutate_extract_pane_to_tab(&mut state, target, 1);
+
+        let after = state
+            .terminals
+            .get(&target.0)
+            .map(Arc::strong_count)
+            .expect("pty handle must survive extraction");
+        assert_eq!(before, after, "Arc count must match: no respawn occurred");
+    }
+
+    #[test]
+    fn extract_activates_new_tab() {
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+
+        mutate_extract_pane_to_tab(&mut state, target, 1);
+
+        assert_eq!(state.active_tab, 1, "new tab becomes active");
+        assert_eq!(state.active_pane, target);
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 1);
+        assert_eq!(state.panes[0][0].id, target);
+    }
+
+    #[test]
+    fn extract_out_of_range_index_clamps_to_end() {
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+
+        mutate_extract_pane_to_tab(&mut state, target, 99);
+
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.tabs[1].panes[0][0].id, target);
+    }
+
+    #[test]
+    fn extract_unknown_pane_is_noop() {
+        let mut state = seed_state();
+        let tabs_before = state.tabs.len();
+
+        mutate_extract_pane_to_tab(&mut state, PaneId(9999), 0);
+
+        assert_eq!(state.tabs.len(), tabs_before);
+    }
+
+    #[test]
+    fn dispatch_pane_extract_to_tab_parses_and_applies() {
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let target = state.panes[0][1].id;
+        let cmd = format!("pane.extract_to_tab:{}:1", target.0);
+
+        assert!(dispatch(&mut state, &cmd));
+        assert_eq!(state.tabs.len(), 2);
+    }
+
+    #[test]
+    fn dispatch_pane_extract_to_tab_malformed_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "pane.extract_to_tab:"));
+        assert!(!dispatch(&mut state, "pane.extract_to_tab:abc:1"));
+        assert!(!dispatch(&mut state, "pane.extract_to_tab:1:xyz"));
+    }
+
+    // -- drag.* dispatch arms -------------------------------------------------
+
+    #[test]
+    fn dispatch_drag_start_pane_sets_dragging_state() {
+        let mut state = seed_state();
+        let id = state.active_pane.0;
+        let cmd = format!("drag.start_pane:{}:40:60", id);
+
+        assert!(dispatch(&mut state, &cmd));
+
+        assert_eq!(state.drag.dragged_pane(), Some(PaneId(id)));
+    }
+
+    #[test]
+    fn dispatch_drag_start_pane_rejects_unknown_pane() {
+        let mut state = seed_state();
+        let cmd = "drag.start_pane:9999:0:0";
+
+        assert!(!dispatch(&mut state, cmd));
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn dispatch_drag_update_while_dragging_updates_cursor() {
+        let mut state = seed_state();
+        let id = state.active_pane.0;
+        dispatch(&mut state, &format!("drag.start_pane:{}:0:0", id));
+
+        assert!(dispatch(&mut state, "drag.update:123:456"));
+
+        match &state.drag {
+            crate::drag::DragState::DraggingPane {
+                cursor_x, cursor_y, ..
+            } => {
+                assert_eq!(*cursor_x, 123.0);
+                assert_eq!(*cursor_y, 456.0);
+            }
+            _ => panic!("drag state must remain DraggingPane"),
+        }
+    }
+
+    #[test]
+    fn dispatch_drag_update_when_idle_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "drag.update:10:20"));
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn dispatch_drag_end_resets_to_idle() {
+        let mut state = seed_state();
+        let id = state.active_pane.0;
+        dispatch(&mut state, &format!("drag.start_pane:{}:0:0", id));
+        assert!(state.drag.is_active());
+
+        assert!(dispatch(&mut state, "drag.end"));
+
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn dispatch_drag_end_when_idle_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "drag.end"));
+    }
+
+    #[test]
+    fn dispatch_drag_malformed_returns_false() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "drag.start_pane:"));
+        assert!(!dispatch(&mut state, "drag.start_pane:1"));
+        assert!(!dispatch(&mut state, "drag.start_pane:1:2"));
+        assert!(!dispatch(&mut state, "drag.start_pane:abc:1:2"));
+        assert!(!dispatch(&mut state, "drag.update:"));
+        assert!(!dispatch(&mut state, "drag.update:1"));
+        assert!(!dispatch(&mut state, "drag.update:x:y"));
+    }
+
+    #[test]
+    fn drag_update_refreshes_cursor_while_tab_dragging() {
+        let mut state = seed_state();
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: "tab-7".into(),
+            cursor_x: 0.0,
+            cursor_y: 0.0,
+        };
+        assert!(dispatch(&mut state, "drag.update:321:54"));
+        assert_eq!(state.drag.cursor(), Some((321.0, 54.0)));
+        assert_eq!(state.drag.dragged_tab(), Some("tab-7"));
+    }
+
+    fn seed_state_with_two_tabs() -> AppState {
+        // Start from seed_state (one tab, one pane), then add a
+        // second tab whose single pane has a fresh id so drop_split
+        // has a non-self source.
+        let mut state = seed_state();
+        let pane_id = PaneId(state.next_id);
+        state.next_id += 1;
+        let second_tab = TerminalTab {
+            id: "t-second".into(),
+            name: "second".into(),
+            subtitle: "bash".into(),
+            status: TabStatus::Running,
+            panes: vec![vec![Pane {
+                id: pane_id,
+                title: "second".into(),
+                subtitle: "bash".into(),
+                pid: 0,
+                cpu: 0.0,
+            }]],
+            active_pane: pane_id,
+            row_ratios: vec![1.0],
+            col_ratios: vec![vec![1.0]],
+        };
+        state.tabs.push(second_tab);
+        state
+    }
+
+    #[test]
+    fn tab_reorder_moves_tab_to_new_index() {
+        let mut state = seed_state_with_two_tabs();
+        let first_id = state.tabs[0].id.clone();
+        mutate_tab_reorder(&mut state, &first_id, 2);
+        assert_eq!(state.tabs[1].id, first_id);
+    }
+
+    #[test]
+    fn tab_reorder_preserves_active_tab_by_id() {
+        let mut state = seed_state_with_two_tabs();
+        state.active_tab = 0;
+        let active_id = state.tabs[0].id.clone();
+        // Move the active tab to the end.
+        mutate_tab_reorder(&mut state, &active_id, 2);
+        assert_eq!(state.tabs[state.active_tab].id, active_id);
+    }
+
+    #[test]
+    fn tab_reorder_unknown_id_is_noop() {
+        let mut state = seed_state_with_two_tabs();
+        let snapshot: Vec<String> = state.tabs.iter().map(|t| t.id.clone()).collect();
+        mutate_tab_reorder(&mut state, "does-not-exist", 0);
+        let after: Vec<String> = state.tabs.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(snapshot, after);
+    }
+
+    #[test]
+    fn tab_reorder_same_position_is_noop() {
+        let mut state = seed_state_with_two_tabs();
+        let id = state.tabs[0].id.clone();
+        let before: Vec<String> = state.tabs.iter().map(|t| t.id.clone()).collect();
+        mutate_tab_reorder(&mut state, &id, 0);
+        let after: Vec<String> = state.tabs.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn pane_drop_split_right_adds_new_column() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        let target_pane = state.panes[0][0].id;
+        let tabs_before = state.tabs.len();
+
+        mutate_pane_drop_split(&mut state, &source_id, target_pane, DropZone::Right);
+
+        assert_eq!(
+            state.tabs.len(),
+            tabs_before - 1,
+            "source tab should be removed"
+        );
+        assert_eq!(state.panes[0].len(), 2, "target row should have two panes");
+        assert_eq!(
+            state.panes[0][0].id, target_pane,
+            "target stays in its column"
+        );
+        // The inserted pane is in position 1 and becomes active.
+        assert_eq!(state.active_pane, state.panes[0][1].id);
+    }
+
+    #[test]
+    fn pane_drop_split_left_inserts_before_target() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        let source_pane_id = state.tabs[1].panes[0][0].id;
+        let target_pane = state.panes[0][0].id;
+
+        mutate_pane_drop_split(&mut state, &source_id, target_pane, DropZone::Left);
+
+        assert_eq!(
+            state.panes[0][0].id, source_pane_id,
+            "source lands before target"
+        );
+        assert_eq!(state.panes[0][1].id, target_pane);
+    }
+
+    #[test]
+    fn pane_drop_split_bottom_adds_new_row() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        let source_pane_id = state.tabs[1].panes[0][0].id;
+        let target_pane = state.panes[0][0].id;
+
+        mutate_pane_drop_split(&mut state, &source_id, target_pane, DropZone::Bottom);
+
+        assert_eq!(state.panes.len(), 2, "should have two rows");
+        assert_eq!(state.panes[0][0].id, target_pane);
+        assert_eq!(state.panes[1][0].id, source_pane_id);
+    }
+
+    #[test]
+    fn pane_drop_split_top_inserts_row_before_target() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        let source_pane_id = state.tabs[1].panes[0][0].id;
+        let target_pane = state.panes[0][0].id;
+
+        mutate_pane_drop_split(&mut state, &source_id, target_pane, DropZone::Top);
+
+        assert_eq!(state.panes.len(), 2);
+        assert_eq!(state.panes[0][0].id, source_pane_id);
+        assert_eq!(state.panes[1][0].id, target_pane);
+    }
+
+    #[test]
+    fn pane_drop_split_halves_the_split_ratio() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        let target_pane = state.panes[0][0].id;
+        state.col_ratios[0][0] = 1.0;
+
+        mutate_pane_drop_split(&mut state, &source_id, target_pane, DropZone::Right);
+
+        assert_eq!(state.col_ratios[0].len(), 2);
+        assert!((state.col_ratios[0][0] - 0.5).abs() < 1e-6);
+        assert!((state.col_ratios[0][1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pane_drop_split_rejects_same_tab_source() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state();
+        let source_id = state.tabs[0].id.clone();
+        let target_pane = state.panes[0][0].id;
+        let before: Vec<Vec<PaneId>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id).collect())
+            .collect();
+        // Source is the active tab: must be a no-op.
+        mutate_pane_drop_split(&mut state, &source_id, target_pane, DropZone::Right);
+        let after: Vec<Vec<PaneId>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id).collect())
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn pane_drop_split_rejects_multi_pane_source() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        // Give the source tab a second pane.
+        state.tabs[1].panes[0].push(Pane {
+            id: PaneId(9999),
+            title: "extra".into(),
+            subtitle: "bash".into(),
+            pid: 0,
+            cpu: 0.0,
+        });
+        state.tabs[1].col_ratios[0].push(1.0);
+
+        let tabs_before = state.tabs.len();
+        let target_pane = state.panes[0][0].id;
+        mutate_pane_drop_split(&mut state, &source_id, target_pane, DropZone::Right);
+        assert_eq!(
+            state.tabs.len(),
+            tabs_before,
+            "multi-pane source should be rejected"
+        );
+        assert_eq!(state.panes[0].len(), 1, "target row unchanged");
+    }
+
+    // -- mutate_pane_move_to_edge -------------------------------------------
+
+    #[test]
+    fn pane_move_to_edge_right_same_row_reorders() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        // Row is [a, b]. Move a to b's Right edge → [b, a].
+        mutate_pane_move_to_edge(&mut state, a, b, DropZone::Right);
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 2);
+        assert_eq!(state.panes[0][0].id, b);
+        assert_eq!(state.panes[0][1].id, a);
+        assert_eq!(state.active_pane, a);
+    }
+
+    #[test]
+    fn pane_move_to_edge_left_same_row_reorders() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        // Row is [a, b]. Move b to a's Left edge → [b, a].
+        mutate_pane_move_to_edge(&mut state, b, a, DropZone::Left);
+        assert_eq!(state.panes[0][0].id, b);
+        assert_eq!(state.panes[0][1].id, a);
+    }
+
+    #[test]
+    fn pane_move_to_edge_bottom_same_row_creates_row_below() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        // [a, b] → move a below b → [[b], [a]].
+        mutate_pane_move_to_edge(&mut state, a, b, DropZone::Bottom);
+        assert_eq!(state.panes.len(), 2);
+        assert_eq!(state.panes[0].len(), 1);
+        assert_eq!(state.panes[0][0].id, b);
+        assert_eq!(state.panes[1][0].id, a);
+    }
+
+    #[test]
+    fn pane_move_to_edge_top_same_row_inserts_row_above() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        // [a, b] → move b above a → [[b], [a]].
+        mutate_pane_move_to_edge(&mut state, b, a, DropZone::Top);
+        assert_eq!(state.panes.len(), 2);
+        assert_eq!(state.panes[0][0].id, b);
+        assert_eq!(state.panes[1][0].id, a);
+    }
+
+    #[test]
+    fn pane_move_to_edge_cross_row_handles_row_deletion() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_down(&mut state, a);
+        let b = state.active_pane;
+        // Layout is [[a], [b]]. Moving a to b's Right should delete row 0
+        // (source was the only pane there), shifting b up to row 0, then
+        // insert a to b's right → single row [b, a].
+        mutate_pane_move_to_edge(&mut state, a, b, DropZone::Right);
+        assert_eq!(state.panes.len(), 1, "empty source row must be removed");
+        assert_eq!(state.panes[0].len(), 2);
+        assert_eq!(state.panes[0][0].id, b);
+        assert_eq!(state.panes[0][1].id, a);
+    }
+
+    #[test]
+    fn pane_move_to_edge_source_equals_target_is_noop() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        let before: Vec<Vec<PaneId>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id).collect())
+            .collect();
+        mutate_pane_move_to_edge(&mut state, b, b, DropZone::Right);
+        let after: Vec<Vec<PaneId>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id).collect())
+            .collect();
+        assert_eq!(before, after, "self-drop must not alter the layout");
+    }
+
+    #[test]
+    fn pane_move_to_edge_center_is_noop() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        let before: Vec<Vec<PaneId>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id).collect())
+            .collect();
+        mutate_pane_move_to_edge(&mut state, a, b, DropZone::Center);
+        let after: Vec<Vec<PaneId>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id).collect())
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn pane_move_to_edge_right_halves_target_ratio() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_down(&mut state, a);
+        let b = state.active_pane;
+        // Detach a (its row dies), target b is now at row 0 with col_ratio [1.0].
+        mutate_pane_move_to_edge(&mut state, a, b, DropZone::Right);
+        assert_eq!(state.col_ratios[0].len(), 2);
+        assert!((state.col_ratios[0][0] - 0.5).abs() < 1e-6);
+        assert!((state.col_ratios[0][1] - 0.5).abs() < 1e-6);
+    }
+
+    // -- mutate_pane_swap ----------------------------------------------------
+
+    fn install_dummy_terminal(state: &mut AppState, pane_id: PaneId) {
+        use crate::terminal::Terminal;
+        use std::sync::{Arc, Mutex};
+        state
+            .terminals
+            .insert(pane_id.0, Arc::new(Mutex::new(Terminal::new(24, 80))));
+    }
+
+    #[test]
+    fn pane_swap_exchanges_slots_and_keeps_both_terminals() {
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        install_dummy_terminal(&mut state, a);
+        install_dummy_terminal(&mut state, b);
+        // Layout is [[a, b]]. Swap a and b: layout becomes [[b, a]],
+        // both PTYs preserved.
+        mutate_pane_swap(&mut state, a, b);
+        assert_eq!(state.panes[0][0].id, b);
+        assert_eq!(state.panes[0][1].id, a);
+        assert!(state.terminals.contains_key(&a.0));
+        assert!(state.terminals.contains_key(&b.0));
+        assert_eq!(state.active_pane, a);
+    }
+
+    #[test]
+    fn pane_swap_self_is_noop() {
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        let before: Vec<Vec<PaneId>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id).collect())
+            .collect();
+        mutate_pane_swap(&mut state, b, b);
+        let after: Vec<Vec<PaneId>> = state
+            .panes
+            .iter()
+            .map(|row| row.iter().map(|p| p.id).collect())
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn pane_swap_across_rows() {
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_down(&mut state, a);
+        let b = state.active_pane;
+        install_dummy_terminal(&mut state, a);
+        install_dummy_terminal(&mut state, b);
+        // Layout [[a], [b]] → [[b], [a]].
+        mutate_pane_swap(&mut state, a, b);
+        assert_eq!(state.panes[0][0].id, b);
+        assert_eq!(state.panes[1][0].id, a);
+        assert!(state.terminals.contains_key(&a.0));
+        assert!(state.terminals.contains_key(&b.0));
+    }
+
+    // -- mutate_pane_swap_from_tab -------------------------------------------
+
+    #[test]
+    fn pane_swap_from_tab_preserves_both_tabs_and_terminals() {
+        let mut state = seed_state_with_two_tabs();
+        let source_tab_id = state.tabs[1].id.clone();
+        let source_pane_id = state.tabs[1].panes[0][0].id;
+        let target = state.panes[0][0].id;
+        install_dummy_terminal(&mut state, target);
+        install_dummy_terminal(&mut state, source_pane_id);
+        let tabs_before = state.tabs.len();
+
+        mutate_pane_swap_from_tab(&mut state, &source_tab_id, target);
+
+        // Both tabs survive, both terminals survive, source pane now in
+        // active tab and target pane now lives in the source tab.
+        assert_eq!(state.tabs.len(), tabs_before);
+        assert_eq!(state.panes[0][0].id, source_pane_id);
+        assert_eq!(state.tabs[1].panes[0][0].id, target);
+        assert!(state.terminals.contains_key(&target.0));
+        assert!(state.terminals.contains_key(&source_pane_id.0));
+        assert_eq!(state.active_pane, source_pane_id);
+    }
+
+    #[test]
+    fn pane_swap_from_tab_rejects_same_tab_source() {
+        let mut state = seed_state();
+        let source_tab_id = state.tabs[0].id.clone();
+        let target = state.panes[0][0].id;
+        install_dummy_terminal(&mut state, target);
+        let panes_before = state.panes.clone();
+        mutate_pane_swap_from_tab(&mut state, &source_tab_id, target);
+        let ids_before: Vec<Vec<PaneId>> = panes_before
+            .iter()
+            .map(|r| r.iter().map(|p| p.id).collect())
+            .collect();
+        let ids_after: Vec<Vec<PaneId>> = state
+            .panes
+            .iter()
+            .map(|r| r.iter().map(|p| p.id).collect())
+            .collect();
+        assert_eq!(ids_before, ids_after);
+    }
+
+    #[test]
+    fn pane_swap_from_tab_rejects_multi_pane_source() {
+        let mut state = seed_state_with_two_tabs();
+        let source_tab_id = state.tabs[1].id.clone();
+        state.tabs[1].panes[0].push(Pane {
+            id: PaneId(9999),
+            title: "extra".into(),
+            subtitle: "bash".into(),
+            pid: 0,
+            cpu: 0.0,
+        });
+        state.tabs[1].col_ratios[0].push(1.0);
+        let target = state.panes[0][0].id;
+        install_dummy_terminal(&mut state, target);
+        let target_pane_before = state.panes[0][0].id;
+
+        mutate_pane_swap_from_tab(&mut state, &source_tab_id, target);
+
+        assert_eq!(state.panes[0][0].id, target_pane_before);
+    }
+
+    #[test]
+    fn drag_end_pane_over_pane_center_swaps() {
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        install_dummy_terminal(&mut state, a);
+        install_dummy_terminal(&mut state, b);
+        set_active_pane_rect_for_test(&mut state);
+        // Target b is at (106, 100, 100, 200). Center: nx in [0.25, 0.75],
+        // ny in [0.25, 0.75]. Cursor (156, 200) → nx=0.5, ny=0.5.
+        state.drag = crate::drag::DragState::DraggingPane {
+            pane: a,
+            cursor_x: 156.0,
+            cursor_y: 200.0,
+        };
+        assert!(dispatch(&mut state, "drag.end"));
+        // Center drop on another pane swaps slots — both PTYs survive.
+        assert_eq!(state.panes[0].len(), 2);
+        assert_eq!(state.panes[0][0].id, b);
+        assert_eq!(state.panes[0][1].id, a);
+        assert!(state.terminals.contains_key(&a.0));
+        assert!(state.terminals.contains_key(&b.0));
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn drag_end_pane_over_pane_edge_moves_pane() {
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        set_active_pane_rect_for_test(&mut state);
+        // After split_right the grid has two columns sharing (6, 100, 200, 200).
+        // Col 0: a at (6, 100, 100, 200). Col 1: b at (106, 100, 100, 200).
+        // Target b's right edge strip runs x ∈ [181, 206) — cursor (195, 200).
+        state.drag = crate::drag::DragState::DraggingPane {
+            pane: a,
+            cursor_x: 195.0,
+            cursor_y: 200.0,
+        };
+        assert!(dispatch(&mut state, "drag.end"));
+        assert_eq!(state.panes[0].len(), 2);
+        assert_eq!(
+            state.panes[0][0].id, b,
+            "a detached and re-inserted right of b"
+        );
+        assert_eq!(state.panes[0][1].id, a);
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn drag_end_pane_over_own_rect_is_noop() {
+        // Dropping a pane onto its own rect must not match any target,
+        // so the layout stays intact and drag state clears.
+        let mut state = seed_state();
+        let a = state.active_pane;
+        mutate_split_right(&mut state, a);
+        let b = state.active_pane;
+        set_active_pane_rect_for_test(&mut state);
+        // Pane a occupies (6, 100, 100, 200). Drop deep inside its own rect.
+        let before_panes: Vec<PaneId> = state.panes[0].iter().map(|p| p.id).collect();
+        state.drag = crate::drag::DragState::DraggingPane {
+            pane: a,
+            cursor_x: 30.0,
+            cursor_y: 150.0,
+        };
+        assert!(dispatch(&mut state, "drag.end"));
+        let after: Vec<PaneId> = state.panes[0].iter().map(|p| p.id).collect();
+        assert_eq!(before_panes, after, "self-drop must not move the pane");
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+        let _ = b;
+    }
+
+    /// Relied on by the framework's window-blur drag-cancel path: a
+    /// synthesized `drag.end` with whatever last cursor position must
+    /// always clear the drag state, even when the coordinates don't
+    /// hit any drop target. Without this, alt-tabbing mid-drag leaves
+    /// ghost overlays and drop zones stuck on screen.
+    #[test]
+    fn drag_end_always_clears_state_from_dragging_pane() {
+        let mut state = seed_state();
+        state.drag = crate::drag::DragState::DraggingPane {
+            pane: state.active_pane,
+            cursor_x: -999.0,
+            cursor_y: -999.0,
+        };
+        assert!(dispatch(&mut state, "drag.end"));
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn drag_end_always_clears_state_from_dragging_tab() {
+        let mut state = seed_state_with_two_tabs();
+        let id = state.tabs[1].id.clone();
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: id,
+            cursor_x: -999.0,
+            cursor_y: -999.0,
+        };
+        assert!(dispatch(&mut state, "drag.end"));
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn drag_end_from_idle_is_false_no_op() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "drag.end"));
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn dispatch_drag_start_tab_enters_state() {
+        let mut state = seed_state_with_two_tabs();
+        let id = state.tabs[1].id.clone();
+        assert!(dispatch(&mut state, &format!("drag.start_tab:{}:0:0", id)));
+        assert_eq!(state.drag.dragged_tab(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn dispatch_drag_start_tab_rejects_unknown() {
+        let mut state = seed_state_with_two_tabs();
+        assert!(!dispatch(&mut state, "drag.start_tab:nonexistent:0:0"));
+        assert!(matches!(state.drag, crate::drag::DragState::Idle));
+    }
+
+    #[test]
+    fn dispatch_pane_drop_split_reads_source_from_drag_state() {
+        use crate::drag::drop_zones::DropZone;
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: source_id.clone(),
+            cursor_x: 0.0,
+            cursor_y: 0.0,
+        };
+        let target = state.panes[0][0].id;
+        assert!(dispatch(
+            &mut state,
+            &format!("pane.drop_split:{}:{}", target.0, DropZone::Right.id())
+        ));
+        assert_eq!(state.panes[0].len(), 2);
+    }
+
+    #[test]
+    fn dispatch_pane_drop_split_requires_tab_drag() {
+        let mut state = seed_state_with_two_tabs();
+        // No drag in progress.
+        let target = state.panes[0][0].id;
+        assert!(!dispatch(
+            &mut state,
+            &format!("pane.drop_split:{}:right", target.0)
+        ));
+    }
+
+    #[test]
+    fn dispatch_pane_drop_split_rejects_center() {
+        let mut state = seed_state_with_two_tabs();
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: state.tabs[1].id.clone(),
+            cursor_x: 0.0,
+            cursor_y: 0.0,
+        };
+        let target = state.panes[0][0].id;
+        assert!(!dispatch(
+            &mut state,
+            &format!("pane.drop_split:{}:center", target.0)
+        ));
+    }
+
+    #[test]
+    fn dispatch_tab_reorder_moves_tab() {
+        let mut state = seed_state_with_two_tabs();
+        let id = state.tabs[0].id.clone();
+        assert!(dispatch(&mut state, &format!("tab.reorder:{}:2", id)));
+        assert_eq!(state.tabs[1].id, id);
+    }
+
+    #[test]
+    fn dispatch_tab_reorder_rejects_malformed() {
+        let mut state = seed_state_with_two_tabs();
+        assert!(!dispatch(&mut state, "tab.reorder:"));
+        assert!(!dispatch(&mut state, "tab.reorder:only-id"));
+        assert!(!dispatch(&mut state, "tab.reorder:id:notanumber"));
+    }
+
+    #[test]
+    fn drag_end_tab_over_tabbar_reorders() {
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        state.tabbar_rect = crate::drag::Rect {
+            x: 0.0,
+            y: 34.0,
+            width: 800.0,
+            height: 38.0,
+        };
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: source_id.clone(),
+            cursor_x: 10.0, // near the start of the tab bar, insert at 0
+            cursor_y: 50.0,
+        };
+        assert!(dispatch(&mut state, "drag.end"));
+        assert_eq!(state.tabs[0].id, source_id, "source moved to index 0");
+        assert!(matches!(state.drag, crate::drag::DragState::Idle));
+    }
+
+    /// Configure an AppState so its single active pane lives at a known
+    /// CSS rect. Grid x is sidebar_width + SIDEBAR_RESIZER_WIDTH (6), y
+    /// is tabbar.y + tabbar.height, and grid w/h come from last_grid_*
+    /// divided by scale_factor. We use sidebar=0 and scale_factor=1 so
+    /// the target rect becomes (6, 100, 200, 200).
+    fn set_active_pane_rect_for_test(state: &mut AppState) {
+        state.sidebar_width = 0.0;
+        state.scale_factor = 1.0;
+        state.last_grid_width = 200.0;
+        state.last_grid_height = 200.0;
+        state.tabbar_rect = crate::drag::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 100.0,
+        };
+    }
+
+    #[test]
+    fn drag_end_tab_over_pane_edge_splits() {
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        set_active_pane_rect_for_test(&mut state);
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: source_id,
+            // Target pane occupies (6, 100, 200, 200). Cursor at the
+            // right edge middle band: nx > 0.75, ny in [0.25, 0.75].
+            cursor_x: 200.0,
+            cursor_y: 200.0,
+        };
+        assert!(dispatch(&mut state, "drag.end"));
+        assert_eq!(state.panes[0].len(), 2, "target row should have split");
+    }
+
+    #[test]
+    fn drag_end_tab_over_pane_center_swaps() {
+        let mut state = seed_state_with_two_tabs();
+        let source_id = state.tabs[1].id.clone();
+        let source_pane_id = state.tabs[1].panes[0][0].id;
+        state.active_tab = 0;
+        let target_pane_id = state.panes[0][0].id;
+        install_dummy_terminal(&mut state, target_pane_id);
+        install_dummy_terminal(&mut state, source_pane_id);
+        let tabs_before = state.tabs.len();
+        set_active_pane_rect_for_test(&mut state);
+        state.drag = crate::drag::DragState::DraggingTab {
+            source_tab: source_id.clone(),
+            // Center of the target: nx,ny in [0.25, 0.75].
+            cursor_x: 106.0,
+            cursor_y: 200.0,
+        };
+        assert!(dispatch(&mut state, "drag.end"));
+        // Both tabs survive; panes swap places (source pane in active tab,
+        // target pane in the source tab). Both PTYs preserved.
+        assert_eq!(state.tabs.len(), tabs_before);
+        assert!(state.tabs.iter().any(|t| t.id == source_id));
+        assert_eq!(state.panes[0][0].id, source_pane_id);
+        assert_eq!(state.tabs[1].panes[0][0].id, target_pane_id);
+        assert!(state.terminals.contains_key(&target_pane_id.0));
+        assert!(state.terminals.contains_key(&source_pane_id.0));
+        assert_eq!(state.active_pane, source_pane_id);
+    }
+
+    #[test]
+    fn drag_end_over_tabbar_extracts_pane_to_new_tab() {
+        // A multi-pane tab with the cursor released over the tab bar
+        // should extract the dragged pane into its own tab at the
+        // computed insertion index.
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let extracted = state.active_pane;
+        let tabs_before = state.tabs.len();
+
+        state.tabbar_rect = crate::drag::Rect {
+            x: 0.0,
+            y: 34.0,
+            width: 800.0,
+            height: 38.0,
+        };
+
+        dispatch(
+            &mut state,
+            &format!("drag.start_pane:{}:400:300", extracted.0),
+        );
+        dispatch(&mut state, "drag.update:600:50");
+        assert!(dispatch(&mut state, "drag.end"));
+
+        assert_eq!(state.tabs.len(), tabs_before + 1, "new tab should be added");
+        assert_eq!(
+            state.drag,
+            crate::drag::DragState::Idle,
+            "drag state cleared"
+        );
+    }
+
+    #[test]
+    fn drag_end_outside_tabbar_does_not_extract() {
+        // A release with the cursor below the tab bar must not touch
+        // the tab list; drag state still clears.
+        let mut state = seed_state();
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let extracted = state.active_pane;
+        let tabs_before = state.tabs.len();
+
+        state.tabbar_rect = crate::drag::Rect {
+            x: 0.0,
+            y: 34.0,
+            width: 800.0,
+            height: 38.0,
+        };
+
+        dispatch(
+            &mut state,
+            &format!("drag.start_pane:{}:400:300", extracted.0),
+        );
+        dispatch(&mut state, "drag.update:400:500");
+        assert!(dispatch(&mut state, "drag.end"));
+
+        assert_eq!(state.tabs.len(), tabs_before, "no extraction below tab bar");
+        assert_eq!(state.drag, crate::drag::DragState::Idle);
+    }
+
+    #[test]
+    fn dispatch_drag_start_converts_physical_cursor_to_css() {
+        // Cursor events arrive in physical pixels; storing them as-is
+        // and then feeding them to `Dimension::Px` would make the ghost
+        // overlay render scale_factor^2 pixels away from the real
+        // cursor. Divide by scale_factor at the dispatch boundary.
+        let mut state = seed_state();
+        state.scale_factor = 2.0;
+        let id = state.active_pane.0;
+        dispatch(&mut state, &format!("drag.start_pane:{}:200:100", id));
+        assert_eq!(state.drag.cursor(), Some((100.0, 50.0)));
+    }
+
+    #[test]
+    fn dispatch_drag_update_converts_physical_cursor_to_css() {
+        let mut state = seed_state();
+        state.scale_factor = 2.0;
+        let id = state.active_pane.0;
+        dispatch(&mut state, &format!("drag.start_pane:{}:0:0", id));
+        dispatch(&mut state, "drag.update:400:200");
+        assert_eq!(state.drag.cursor(), Some((200.0, 100.0)));
+    }
+
+    #[test]
+    fn drag_end_over_tabbar_inserts_at_cursor_position() {
+        // Dropping near the right edge of the tab bar should insert the
+        // new tab at the end; dropping near the left should insert near
+        // the beginning.
+        let mut state = seed_state();
+        mutate_add_tab(&mut state);
+        mutate_add_tab(&mut state);
+        state.active_tab = 1;
+        load_tab_state(&mut state);
+        let original = state.active_pane;
+        mutate_split_right(&mut state, original);
+        let extracted = state.active_pane;
+
+        state.tabbar_rect = crate::drag::Rect {
+            x: 0.0,
+            y: 34.0,
+            width: 900.0,
+            height: 38.0,
+        };
+
+        dispatch(
+            &mut state,
+            &format!("drag.start_pane:{}:400:300", extracted.0),
+        );
+        dispatch(&mut state, "drag.update:890:50");
+        dispatch(&mut state, "drag.end");
+
+        assert_eq!(state.active_tab, state.tabs.len() - 1, "inserted at end");
+    }
+
+    #[test]
+    fn close_pane_absorbs_ratio_into_neighbor() {
+        // After a split, the two panes share 0.5/0.5 of the row. Closing
+        // one must hand its ratio to the neighbor so the surviving pane
+        // fills the row (1.0 total) rather than leaving a visual gap.
+        let mut state = seed_state();
+        let first = state.active_pane;
+        mutate_split_right(&mut state, first);
+        let second = state.active_pane;
+        assert_eq!(state.col_ratios[0], vec![0.5, 0.5]);
+
+        mutate_close_pane(&mut state, second);
+
+        assert_eq!(state.col_ratios[0].len(), 1);
+        assert!(
+            (state.col_ratios[0][0] - 1.0).abs() < 1e-6,
+            "surviving pane must absorb closed pane's ratio, got {}",
+            state.col_ratios[0][0]
+        );
+    }
+
+    // -- dispatch keybind.* ---------------------------------------------------
+
+    #[test]
+    fn dispatch_keybind_set_non_conflicting_updates_override() {
+        let mut state = test_state();
+        assert!(dispatch(
+            &mut state,
+            "keybind.set:new_terminal:Ctrl+Shift+T"
+        ));
+        assert_eq!(
+            state
+                .keybinds
+                .effective(crate::keybinds::KeybindAction::NewTerminal)
+                .to_string(),
+            "Ctrl+Shift+T".to_string()
+        );
+        assert!(state.keybinds.error.is_none());
+    }
+
+    #[test]
+    fn dispatch_keybind_set_conflict_leaves_override_unchanged() {
+        // Ctrl+W is Unsplit's default. Setting NewTerminal to Ctrl+W
+        // must conflict and leave NewTerminal at its default.
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "keybind.set:new_terminal:Ctrl+W"));
+        assert!(
+            state.keybinds.error.is_some(),
+            "conflict should populate error"
+        );
+        assert!(
+            !state
+                .keybinds
+                .overrides
+                .contains_key(&crate::keybinds::KeybindAction::NewTerminal),
+            "conflicting set must not mutate overrides"
+        );
+    }
+
+    #[test]
+    fn dispatch_keybind_set_invalid_combo_sets_error() {
+        let mut state = test_state();
+        assert!(dispatch(
+            &mut state,
+            "keybind.set:new_terminal:NotARealCombo"
+        ));
+        match state.keybinds.error.as_ref().map(|e| &e.kind) {
+            Some(crate::keybinds::KeybindErrorKind::InvalidCombo { .. }) => {}
+            other => panic!("expected InvalidCombo error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dispatch_keybind_set_unknown_action_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "keybind.set:bogus_action:Ctrl+T"));
+    }
+
+    #[test]
+    fn dispatch_keybind_reset_drops_override() {
+        let mut state = test_state();
+        dispatch(&mut state, "keybind.set:new_terminal:Ctrl+Shift+T");
+        assert!(state
+            .keybinds
+            .overrides
+            .contains_key(&crate::keybinds::KeybindAction::NewTerminal));
+
+        assert!(dispatch(&mut state, "keybind.reset:new_terminal"));
+        assert!(!state
+            .keybinds
+            .overrides
+            .contains_key(&crate::keybinds::KeybindAction::NewTerminal));
+    }
+
+    #[test]
+    fn dispatch_keybind_reset_all_clears_every_override() {
+        let mut state = test_state();
+        dispatch(&mut state, "keybind.set:new_terminal:Ctrl+Shift+T");
+        dispatch(&mut state, "keybind.set:close_tab:Ctrl+Shift+F4");
+        assert_eq!(state.keybinds.overrides.len(), 2);
+
+        assert!(dispatch(&mut state, "keybind.reset_all"));
+        assert!(state.keybinds.overrides.is_empty());
+    }
+
+    #[test]
+    fn dispatch_keybind_record_and_cancel() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "keybind.record:new_terminal"));
+        assert_eq!(
+            state.keybinds.recording,
+            Some(crate::keybinds::KeybindAction::NewTerminal)
+        );
+
+        assert!(dispatch(&mut state, "keybind.cancel_record"));
+        assert!(state.keybinds.recording.is_none());
+    }
+
+    #[test]
+    fn dispatch_keybind_record_unknown_action_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "keybind.record:bogus"));
     }
 
     // -- dispatch tab.next / tab.prev with empty tabs -------------------------

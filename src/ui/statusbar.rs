@@ -164,6 +164,12 @@ mod tests {
             mem_gb: 0.0,
             net_kbps: 0.0,
             clock_hhmm: "00:00".into(),
+            keybinds: crate::keybinds::KeybindsState::default(),
+            drag: crate::drag::DragState::default(),
+            tabbar_rect: crate::drag::Rect::default(),
+            last_grid_width: 0.0,
+            last_grid_height: 0.0,
+            scale_factor: 1.0,
         }
     }
 
