@@ -384,6 +384,37 @@ impl RadialGradient {
     }
 }
 
+/// Value of `transform: translateX(...)` as stored on a computed style.
+///
+/// CSS `translateX` accepts either an absolute length in pixels or a
+/// percentage of the element's own width. Other transform functions (
+/// `scale`, `rotate`, `translate`, `matrix`) are not yet supported and
+/// parse to an error so callers can log and continue.
+///
+/// The translation is applied at paint time as a post layout render offset:
+/// siblings do not shift, only the translated element (and its subtree)
+/// appear offset. This mirrors CSS's `transform` semantics where transforms
+/// do not participate in flow layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransformX {
+    Px(f32),
+    /// Percentage of the element's own width, stored as a unit fraction
+    /// (e.g. `50%` becomes `0.5`).
+    Percent(f32),
+}
+
+impl TransformX {
+    /// Resolve the translation to an absolute pixel offset given the
+    /// element's own width. Pixel values pass through; percentages multiply
+    /// the width.
+    pub fn resolve(self, own_width: f32) -> f32 {
+        match self {
+            TransformX::Px(v) => v,
+            TransformX::Percent(p) => p * own_width,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Background {
     Color(Color),
@@ -422,8 +453,8 @@ pub enum Dimension {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Display {
     #[default]
-    Flex,
     Block,
+    Flex,
     InlineFlex,
     InlineBlock,
     Grid,
@@ -1064,6 +1095,22 @@ pub struct ComputedStyle {
 
     // Bell / notification
     pub bell_style: BellStyle,
+
+    /// Parsed `transform: translateX(...)` offset.
+    ///
+    /// `None` means no transform on this element and keeps the renderer on
+    /// its fast path. The value, when present, is applied at paint time as
+    /// a render space translation that does not disturb layout flow.
+    pub transform_translate_x: Option<TransformX>,
+
+    /// Parsed `mask-image: linear-gradient(...)` mask.
+    ///
+    /// `None` means no mask is attached to this element and the renderer
+    /// emits its background quad through the normal solid / gradient path.
+    /// When set, the gradient is baked into the quad instance as an
+    /// auxiliary stop list and the fragment shader multiplies the final
+    /// output alpha by the mask's alpha channel.
+    pub mask_image: Option<LinearGradient>,
 }
 
 impl Default for ComputedStyle {
@@ -1072,7 +1119,7 @@ impl Default for ComputedStyle {
             content: ContentValue::Normal,
             transitions: SmallVec::new(),
             animations: SmallVec::new(),
-            display: Display::Flex,
+            display: Display::Block,
             flex_direction: FlexDirection::Row,
             flex_grow: 0.0,
             flex_shrink: 1.0,
@@ -1146,6 +1193,8 @@ impl Default for ComputedStyle {
             resize: CssResize::None,
             resize_axis: None,
             bell_style: BellStyle::Both,
+            transform_translate_x: None,
+            mask_image: None,
         }
     }
 }

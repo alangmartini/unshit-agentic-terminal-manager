@@ -260,6 +260,14 @@ fn lerp_corners(a: &Corners, b: &Corners, t: f32) -> Corners {
     }
 }
 
+/// Interpolate between two `Dimension` values for CSS transitions.
+///
+/// Same-unit pairs (`Px-Px`, `Percent-Percent`, `Vh-Vh`, `Vw-Vw`) lerp
+/// linearly in their own unit space. Mixed-unit pairs (e.g. `Px-Vh`,
+/// `Percent-Vw`, `Vh-Vw`) and any pair involving `Auto` snap to `a` for
+/// `t < 0.5` and to `b` otherwise. Continuous mixed-unit interpolation
+/// would require a viewport-aware resolve step that this sampler does
+/// not have access to; tracked as `TODO(viewport-lerp)`.
 fn lerp_dimension(a: &Dimension, b: &Dimension, t: f32) -> Dimension {
     match (a, b) {
         (Dimension::Px(a_v), Dimension::Px(b_v)) => Dimension::Px(lerp_f32(*a_v, *b_v, t)),
@@ -268,7 +276,6 @@ fn lerp_dimension(a: &Dimension, b: &Dimension, t: f32) -> Dimension {
         }
         (Dimension::Vh(a_v), Dimension::Vh(b_v)) => Dimension::Vh(lerp_f32(*a_v, *b_v, t)),
         (Dimension::Vw(a_v), Dimension::Vw(b_v)) => Dimension::Vw(lerp_f32(*a_v, *b_v, t)),
-        // Different units or Auto: snap.
         _ => {
             if t >= 0.5 {
                 *b
@@ -384,7 +391,7 @@ fn srgb_to_oklab(c: Color) -> [f32; 3] {
 }
 
 /// Convert Oklab [L, a, b] + alpha back to sRGB u8 Color.
-fn oklab_to_srgb(l: f32, a: f32, b: f32, alpha: f32) -> Color {
+pub(crate) fn oklab_to_srgb(l: f32, a: f32, b: f32, alpha: f32) -> Color {
     // Oklab to LMS (inverse M2)
     let l_ = l + 0.3963377774 * a + 0.2158037573 * b;
     let m_ = l - 0.1055613458 * a - 0.0638541728 * b;

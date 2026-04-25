@@ -375,6 +375,7 @@ body::after {
 }
 
 .sidebar-scroll {
+  display: flex;
   flex: 1;
   flex-direction: column;
   overflow-y: auto;
@@ -398,6 +399,7 @@ body::after {
 
 
 .workspace {
+  display: flex;
   flex-direction: column;
   padding-bottom: var(--sp-1);
   margin-bottom: var(--sp-2);
@@ -483,16 +485,21 @@ body::after {
 }
 
 .branch-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font-size: var(--t-xs);
+  line-height: 1.4;
   color: var(--sage);
-  padding: 0 var(--sp-2);
-  border-radius: var(--r-sm);
+  padding: 2px var(--sp-3);
+  border-radius: var(--r-md);
   background: rgba(139, 168, 92, 0.08);
   border: 1px solid rgba(139, 168, 92, 0.2);
-  max-width: 100px;
+  max-width: 140px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: center;
 }
 
 .branch-tag.muted {
@@ -508,6 +515,7 @@ body::after {
 }
 
 .workspace-body {
+  display: flex;
   flex-direction: column;
   padding: var(--sp-1) 0 var(--sp-2);
   overflow: hidden;
@@ -640,11 +648,13 @@ body::after {
 }
 
 .terminal-entries {
+  display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
 .terminal-entry {
+  display: flex;
   align-items: center;
   gap: var(--sp-3);
   padding: var(--sp-1) var(--sp-6) var(--sp-1) calc(var(--sp-6) + 32px);
@@ -668,6 +678,7 @@ body::after {
 }
 
 .sidebar-footer {
+  display: flex;
   flex-direction: column;
   border-top: 1px solid var(--border-hair);
   padding: var(--sp-5) var(--sp-6) var(--sp-4);
@@ -692,6 +703,7 @@ body::after {
 }
 
 .activity-item {
+  display: flex;
   flex-direction: column;
   margin-bottom: var(--sp-4);
   padding-left: var(--sp-4);
@@ -1035,6 +1047,7 @@ body::after {
 }
 
 .terminal-grid.empty {
+  display: flex;
   align-items: center;
   justify-content: center;
 }
@@ -1494,6 +1507,8 @@ body.dragging-pane {
 
 .ctx-menu {
   position: fixed;
+  display: flex;
+  flex-direction: column;
   min-width: 180px;
   background: var(--bg-elevated);
   border: 1px solid var(--border-soft);
@@ -1501,7 +1516,6 @@ body.dragging-pane {
   padding: 4px 0;
   box-shadow: var(--shadow-lg);
   z-index: 201;
-  flex-direction: column;
 }
 
 .ctx-menu-header {
@@ -1538,6 +1552,153 @@ body.dragging-pane {
 
 .ctx-menu-item-label {
   /* inherits font size and color from parent */
+}
+
+/* ---- Confirm Dialog ---- */
+
+.confirm-dialog-hidden {
+  display: none;
+}
+
+.confirm-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-overlay);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 300;
+}
+
+.confirm-dialog-card {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  padding: 20px 24px;
+  min-width: 360px;
+  max-width: 480px;
+  box-shadow: var(--shadow-lg);
+  flex-direction: column;
+}
+
+.confirm-dialog-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg-primary);
+  margin-bottom: 10px;
+}
+
+.confirm-dialog-body {
+  font-size: 12px;
+  color: var(--fg-secondary);
+  margin-bottom: 18px;
+  line-height: 1.5;
+}
+
+.confirm-dialog-buttons {
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.confirm-dialog-button {
+  padding: 6px 14px;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--fg-primary);
+}
+
+.confirm-dialog-button:hover {
+  background: var(--bg-hover);
+}
+
+.confirm-dialog-button.danger {
+  background: var(--rust);
+  color: var(--bg-base);
+  border-color: var(--rust);
+}
+
+.confirm-dialog-button.danger:hover {
+  background: var(--rust);
+  filter: brightness(1.1);
+}
+
+.confirm-dialog-button.primary {
+  background: var(--amber-400);
+  color: var(--bg-base);
+  border-color: var(--amber-400);
+}
+
+.confirm-dialog-button.primary:hover {
+  background: var(--amber-400);
+  filter: brightness(1.1);
+}
+
+.confirm-dialog-input {
+  width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  font-family: var(--font-mono, monospace);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  color: var(--fg-primary);
+}
+
+.confirm-dialog-input:focus {
+  border-color: var(--amber-400);
+  outline: none;
+}
+
+.session-row-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.sessions-empty {
+  padding: 12px 14px;
+  font-size: 12px;
+  color: var(--fg-secondary);
+  font-style: italic;
+}
+
+.session-status-alive {
+  color: var(--amber-400);
+}
+
+.session-status-dead {
+  color: var(--rust);
+}
+
+.confirm-dialog-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--fg-secondary);
+  font-size: 12px;
+}
+
+.confirm-dialog-checkbox:hover {
+  background: var(--bg-hover);
+}
+
+.confirm-dialog-checkbox.checked .confirm-dialog-checkbox-box {
+  color: var(--amber-400);
+}
+
+.confirm-dialog-checkbox-box {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--fg-secondary);
 }
 
 /* ---- Settings Modal ---- */
@@ -1922,6 +2083,17 @@ body.dragging-pane {
 .btn.primary:hover {
   background: linear-gradient(180deg, var(--amber-300) 0%, var(--amber-400) 100%);
   box-shadow: 0 0 18px rgba(212, 163, 72, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.btn.danger {
+  background: var(--rust);
+  color: var(--bg-base);
+  border-color: var(--rust);
+}
+
+.btn.danger:hover {
+  background: var(--rust);
+  filter: brightness(1.1);
 }
 
 .btn:active {

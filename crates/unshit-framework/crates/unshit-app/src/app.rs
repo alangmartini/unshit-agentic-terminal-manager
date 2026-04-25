@@ -116,8 +116,13 @@ pub struct AppConfig {
     /// Fires once at startup and again whenever the window moves between
     /// monitors with different scale factors.
     pub on_scale_factor: Option<Arc<dyn Fn(f32) + Send + Sync>>,
-    /// Callback invoked just before the application window closes.
-    pub on_close: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Callback invoked when the window's close button is clicked.
+    /// Returning `true` lets the framework proceed with exit; returning
+    /// `false` vetoes the close so the application can show a confirm
+    /// prompt and either issue its own `process::exit` once the user
+    /// confirms, or leave the window alive if the user cancels. When the
+    /// callback is unset the framework exits unconditionally.
+    pub on_close: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// One-shot callback invoked once the renderer publishes valid cell
     /// metrics (cell width and height in pixels). Fires after the first
     /// render pass that produces non-zero values, giving the application a
@@ -965,8 +970,18 @@ impl ApplicationHandler for AppHandler {
 
         match event {
             WindowEvent::CloseRequested => {
-                if let Some(ref cb) = self.app.config.on_close {
-                    cb();
+                let should_exit = self
+                    .app
+                    .config
+                    .on_close
+                    .as_ref()
+                    .map(|cb| cb())
+                    .unwrap_or(true);
+                if !should_exit {
+                    // Application vetoed the close (e.g. to show a confirm
+                    // prompt). The app is expected to drive its own exit
+                    // via `process::exit` once the user decides.
+                    return;
                 }
                 if let Some(log) = state.event_log.take() {
                     let json = format!("[{}]", log.join(",\n"));
@@ -2238,6 +2253,9 @@ impl ApplicationHandler for AppHandler {
                                 unshit_renderer::pipeline::quad::MAX_GRADIENT_STOPS],
                             gradient_params: [0.0, 0.0, 0.0, 0.0],
                             gradient_extra: [0.0, 0.0, 0.0, 0.0],
+                            mask_stops_01: [0.0, 0.0, 0.0, 0.0],
+                            mask_stops_23: [0.0, 0.0, 0.0, 0.0],
+                            mask_params: [0.0, 0.0, 0.0, 0.0],
                         },
                     );
                 }

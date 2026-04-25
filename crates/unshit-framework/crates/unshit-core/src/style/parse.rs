@@ -123,6 +123,17 @@ pub struct ParsedBoxShadow {
     pub inset: bool,
 }
 
+/// Identifies one edge of a box for per-side longhand CSS properties
+/// (e.g. `border-top-width`). Kept separate from the geometric `Edges`
+/// struct so the parser can carry the side tag in a declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
 #[derive(Debug, Clone)]
 pub enum StyleDeclaration {
     Content(ContentValue),
@@ -159,6 +170,11 @@ pub enum StyleDeclaration {
     Background(types::Background),
     BorderColor(Color),
     BorderWidth(Edges),
+    /// Per-side `border-<side>-width` longhand. CSS lets an author set
+    /// just one or two sides (`border-left-width`, `border-top-width`)
+    /// which is lossy through the shorthand `border-width` value, so
+    /// each side has its own declaration slot.
+    BorderSideWidth(BorderSide, f32),
     BorderRadius(Corners),
     Opacity(f32),
     BoxShadowList(SmallVec<[ParsedBoxShadow; 2]>),
@@ -240,6 +256,17 @@ pub enum StyleDeclaration {
 
     // Bell / notification
     BellStyle(types::BellStyle),
+
+    /// `transform: translateX(<length-percentage>)`. Other transform
+    /// functions are parsed as an error today; see
+    /// `parse_transform_translate_x` for the shortlist of accepted forms.
+    TransformTranslateX(types::TransformX),
+
+    /// `mask-image: linear-gradient(...)`. Any non gradient mask source
+    /// (url, image(), none) parses to an error today. The linear gradient
+    /// branch is reused verbatim from `parse_linear_gradient` so the stop
+    /// list and fixup pass behave identically to a background gradient.
+    MaskImage(types::LinearGradient),
 }
 
 impl CompiledStylesheet {
@@ -300,10 +327,13 @@ impl CompiledStylesheet {
             }
 
             // parse_rule always drains its block on failure, so no
-            // extra token skip is needed on the error path.
-            if let Ok(rule) = parse_rule(&mut parser, source_order) {
-                rules.push(rule);
-                source_order += 1;
+            // extra token skip is needed on the error path. A grouped
+            // selector like `.a, .b { ... }` returns one rule per sub
+            // selector; each gets its own source_order so cascade order
+            // matches the declaration order browsers use.
+            if let Ok(mut new_rules) = parse_rule(&mut parser, source_order) {
+                source_order += new_rules.len() as u32;
+                rules.append(&mut new_rules);
             }
         }
 
@@ -654,18 +684,35 @@ fn find_top_level_comma(s: &str) -> Option<usize> {
     None
 }
 
-fn parse_rule(parser: &mut Parser, source_order: u32) -> Result<CompiledRule, ()> {
+fn parse_rule(parser: &mut Parser, source_order: u32) -> Result<Vec<CompiledRule>, ()> {
     let selector_str = collect_selector_text(parser)?;
-    let selector = match parse_selector_string(&selector_str) {
-        Ok(s) => s,
-        Err(()) => {
-            // collect_selector_text already consumed the CurlyBracketBlock
-            // token; drain its contents to keep the parser consistent.
-            drain_nested_block(parser);
-            return Err(());
+    // Split comma-separated selector groups (`.a, .b, .c`) into individual
+    // selectors. Each becomes its own compiled rule with a shared copy of
+    // the declarations, matching CSS grouped selector semantics.
+    let selector_parts: Vec<&str> = split_top_level_commas(&selector_str);
+    let mut selectors: Vec<(SelectorChain, (u16, u16, u16))> =
+        Vec::with_capacity(selector_parts.len());
+    for part in selector_parts {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
         }
-    };
-    let specificity = compute_specificity(&selector);
+        match parse_selector_string(trimmed) {
+            Ok(s) => {
+                let spec = compute_specificity(&s);
+                selectors.push((s, spec));
+            }
+            // A single bad branch in a group should not poison the rest,
+            // but the parser already consumed the selector slice before the
+            // block so we fall through to drain and return Err only if we
+            // end up with no valid selectors at all.
+            Err(()) => continue,
+        }
+    }
+    if selectors.is_empty() {
+        drain_nested_block(parser);
+        return Err(());
+    }
 
     let declarations = parser
         .parse_nested_block(|parser| {
@@ -685,7 +732,35 @@ fn parse_rule(parser: &mut Parser, source_order: u32) -> Result<CompiledRule, ()
         })
         .map_err(|_: cssparser::ParseError<'_, ()>| ())?;
 
-    Ok(CompiledRule { selector, specificity, declarations, source_order })
+    Ok(selectors
+        .into_iter()
+        .enumerate()
+        .map(|(i, (selector, specificity))| CompiledRule {
+            selector,
+            specificity,
+            declarations: declarations.clone(),
+            source_order: source_order + i as u32,
+        })
+        .collect())
+}
+
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 fn collect_selector_text(parser: &mut Parser) -> Result<String, ()> {
@@ -694,13 +769,54 @@ fn collect_selector_text(parser: &mut Parser) -> Result<String, ()> {
         match parser.next() {
             Ok(Token::CurlyBracketBlock) => {
                 let slice = parser.slice_from(start);
-                let selector_text = slice.trim().trim_end_matches('{').trim();
-                return Ok(selector_text.to_string());
+                // cssparser's `Parser::next` skips whitespace and `/* ... */`
+                // comments between tokens, so `position()` may be captured
+                // before leading trivia. Strip comments from the raw slice
+                // before passing it to the selector parser; otherwise a rule
+                // like `/* nav */ .nav { ... }` ends up with a selector that
+                // still contains the comment tokens (e.g. `* / nav / .nav`)
+                // and never matches any element.
+                let without_comments = strip_block_comments(slice);
+                let selector_text =
+                    without_comments.trim().trim_end_matches('{').trim().to_string();
+                return Ok(selector_text);
             }
             Ok(_) => continue,
             Err(_) => return Err(()),
         }
     }
+}
+
+/// Strip `/* ... */` block comments from a CSS source fragment.
+///
+/// Keeps everything outside the comment markers verbatim, including
+/// whitespace. Used on raw selector slices before tokenisation so that
+/// `/* nav */ .nav` collapses to ` .nav`, avoiding spurious selector
+/// parts. An unterminated `/*` drops everything from that point on, which
+/// matches the cssparser tokenizer's tolerant behavior. Works at the char
+/// level so it is safe for non-ASCII content inside comments.
+fn strip_block_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut terminated = false;
+            while let Some(inner) = chars.next() {
+                if inner == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    terminated = true;
+                    break;
+                }
+            }
+            if !terminated {
+                break;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_selector_string(s: &str) -> Result<SelectorChain, ()> {
@@ -1172,6 +1288,18 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         }
         "border-color" => StyleDeclaration::BorderColor(parse_color(parser)?),
         "border-width" => StyleDeclaration::BorderWidth(parse_edges(parser)?),
+        "border-top-width" => {
+            StyleDeclaration::BorderSideWidth(BorderSide::Top, parse_px(parser)?)
+        }
+        "border-right-width" => {
+            StyleDeclaration::BorderSideWidth(BorderSide::Right, parse_px(parser)?)
+        }
+        "border-bottom-width" => {
+            StyleDeclaration::BorderSideWidth(BorderSide::Bottom, parse_px(parser)?)
+        }
+        "border-left-width" => {
+            StyleDeclaration::BorderSideWidth(BorderSide::Left, parse_px(parser)?)
+        }
         "border-radius" => StyleDeclaration::BorderRadius(parse_corners(parser)?),
         "opacity" => StyleDeclaration::Opacity(parse_number(parser)?),
         "color" => StyleDeclaration::Color(parse_color(parser)?),
@@ -1607,6 +1735,26 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             })
         }
 
+        // CSS `transform`. Today the parser recognises only a single
+        // `translateX(<length-percentage>)` entry. Every other transform
+        // function (`translate`, `translateY`, `scale`, `rotate`,
+        // `matrix`, ...) returns an error so the cascade drops the
+        // declaration while other, supported declarations on the same
+        // selector continue to apply. See `parse_transform_translate_x`.
+        "transform" => match parse_transform_translate_x(parser) {
+            Some(tx) => StyleDeclaration::TransformTranslateX(tx),
+            None => return Err(()),
+        },
+
+        // CSS `mask-image`. Only the `linear-gradient(...)` branch is
+        // supported. `none`, `url()`, and other image sources parse to an
+        // error today. The underlying gradient parser is the same one
+        // used by `background: linear-gradient(...)`.
+        "mask-image" => {
+            let gradient = parse_mask_image(parser)?;
+            StyleDeclaration::MaskImage(gradient)
+        }
+
         _ => return Err(()),
     };
 
@@ -1665,7 +1813,17 @@ fn parse_content_value(parser: &mut Parser) -> Result<ContentValue, ()> {
 
 fn parse_px(parser: &mut Parser) -> Result<f32, ()> {
     match parser.next().map_err(|_| ())? {
-        Token::Dimension { value, .. } => Ok(*value),
+        Token::Dimension { value, unit, .. } => {
+            // Viewport relative units cannot resolve without layout context.
+            // Reject `vh`/`vw` here so properties that use the px pathway
+            // (padding, border-width, gap, etc.) error loudly instead of
+            // silently treating `5vh` as `5px`. Broadening the pathway to
+            // accept viewport units is tracked as a framework gap.
+            if unit.as_ref() == "vh" || unit.as_ref() == "vw" {
+                return Err(());
+            }
+            Ok(*value)
+        }
         Token::Number { value, .. } => Ok(*value),
         _ => Err(()),
     }
@@ -1956,20 +2114,35 @@ fn parse_linear_gradient(parser: &mut Parser) -> Result<types::LinearGradient, (
 
     parser
         .parse_nested_block(|p| {
-            // Optional leading `<angle>,`. If absent, CSS defaults to 180deg
-            // (gradient flows from top to bottom, first stop at the top).
+            // Optional leading `<angle>,` or `to <side>[ <side>],`. If both
+            // are absent, CSS defaults to 180deg (gradient flows top to
+            // bottom, first stop at the top). `to <side>` is the CSS Images
+            // Level 3 side based form that is commonly used for
+            // `mask-image: linear-gradient(to right, ...)`.
             let angle_deg = p
-                .try_parse(|p| match p.next() {
-                    Ok(Token::Dimension { value, unit, .. })
-                        if unit.as_ref().eq_ignore_ascii_case("deg") =>
-                    {
-                        let v = *value;
-                        match p.expect_comma() {
-                            Ok(_) => Ok(v),
-                            Err(_) => Err(()),
+                .try_parse(|p| -> Result<f32, ()> {
+                    match p.next() {
+                        Ok(Token::Dimension { value, unit, .. })
+                            if unit.as_ref().eq_ignore_ascii_case("deg") =>
+                        {
+                            let v = *value;
+                            p.expect_comma().map_err(|_| ())?;
+                            Ok(v)
                         }
+                        Ok(Token::Ident(name)) if name.as_ref().eq_ignore_ascii_case("to") => {
+                            // Consume one or two side keywords.
+                            let a = p.expect_ident_cloned().map_err(|_| ())?;
+                            let b = p.try_parse(|p| p.expect_ident_cloned()).ok();
+                            let degrees = sides_to_angle_deg(
+                                a.as_ref(),
+                                b.as_ref().map(|s| s.as_ref()),
+                            )
+                            .ok_or(())?;
+                            p.expect_comma().map_err(|_| ())?;
+                            Ok(degrees)
+                        }
+                        _ => Err(()),
                     }
-                    _ => Err(()),
                 })
                 .unwrap_or(180.0);
 
@@ -1989,6 +2162,133 @@ fn parse_linear_gradient(parser: &mut Parser) -> Result<types::LinearGradient, (
             Ok(types::LinearGradient { angle_deg, stops, repeating })
         })
         .map_err(|_: cssparser::ParseError<'_, ()>| ())
+}
+
+/// Translate CSS `to <side>[ <side>]` into a gradient angle in degrees.
+///
+/// The mapping follows CSS Images Level 3: `to top` is 0deg, `to right` is
+/// 90deg, `to bottom` is 180deg, `to left` is 270deg. Corners average the
+/// two adjacent side angles: `to top right` is 45deg, `to bottom right`
+/// 135deg, etc. Returns `None` on unknown or conflicting keywords.
+fn sides_to_angle_deg(a: &str, b: Option<&str>) -> Option<f32> {
+    fn side_deg(s: &str) -> Option<f32> {
+        match s.to_ascii_lowercase().as_str() {
+            "top" => Some(0.0),
+            "right" => Some(90.0),
+            "bottom" => Some(180.0),
+            "left" => Some(270.0),
+            _ => None,
+        }
+    }
+    match b {
+        None => side_deg(a),
+        Some(b_str) => {
+            // Accept vertical + horizontal in either order.
+            let vertical = matches!(
+                a.to_ascii_lowercase().as_str(),
+                "top" | "bottom"
+            ) || matches!(
+                b_str.to_ascii_lowercase().as_str(),
+                "top" | "bottom"
+            );
+            let horizontal = matches!(
+                a.to_ascii_lowercase().as_str(),
+                "left" | "right"
+            ) || matches!(
+                b_str.to_ascii_lowercase().as_str(),
+                "left" | "right"
+            );
+            if !(vertical && horizontal) {
+                return None;
+            }
+            // Corner angles: top right=45, bottom right=135, bottom left=225,
+            // top left=315.
+            let is_top = matches!(
+                a.to_ascii_lowercase().as_str(),
+                "top"
+            ) || matches!(
+                b_str.to_ascii_lowercase().as_str(),
+                "top"
+            );
+            let is_right = matches!(
+                a.to_ascii_lowercase().as_str(),
+                "right"
+            ) || matches!(
+                b_str.to_ascii_lowercase().as_str(),
+                "right"
+            );
+            match (is_top, is_right) {
+                (true, true) => Some(45.0),
+                (false, true) => Some(135.0),
+                (false, false) => Some(225.0),
+                (true, false) => Some(315.0),
+            }
+        }
+    }
+}
+
+/// Parse a `mask-image: <linear-gradient>` declaration. Accepts
+/// `linear-gradient(...)` and `repeating-linear-gradient(...)`. Other mask
+/// sources (`url(...)`, `image(...)`, `none`) are rejected so callers can
+/// cascade in the fallback.
+fn parse_mask_image(parser: &mut Parser) -> Result<types::LinearGradient, ()> {
+    // Reuse the existing gradient parser verbatim. The gradient grammar is
+    // identical in `background-image` and `mask-image` contexts.
+    parse_linear_gradient(parser)
+}
+
+/// Parse `transform: translateX(<length-percentage>)` and return the
+/// resolved `TransformX` value. Other transform functions (including
+/// `translate`, `translateY`, `scale`, `rotate`, `matrix`, and the plain
+/// `none` keyword) return `None` today so the declaration is dropped from
+/// the cascade and logged via the caller's error path.
+fn parse_transform_translate_x(parser: &mut Parser) -> Option<types::TransformX> {
+    // The input is a single function token like `translateX(50px)`. Peek
+    // the function name first.
+    let fn_name = match parser.next() {
+        Ok(Token::Function(name)) => name.clone(),
+        Ok(Token::Ident(id)) if id.as_ref().eq_ignore_ascii_case("none") => {
+            // `transform: none` is the CSS default. Returning `None` drops
+            // the declaration entirely, which leaves `transform_translate_x`
+            // at its default of `None` in the cascade. That matches the
+            // semantics of `none`.
+            return None;
+        }
+        _ => return None,
+    };
+
+    // TODO: accept scale(), rotate(), translate(), translateY(), matrix()
+    // here as real transforms instead of dropping them silently.
+    if !fn_name.as_ref().eq_ignore_ascii_case("translateX") {
+        // Drain the block so the outer parser stays consistent with the
+        // cssparser block invariant: once we see a Function token we must
+        // consume the matching close paren via parse_nested_block.
+        let _ = parser.parse_nested_block(|p| -> Result<(), cssparser::ParseError<'_, ()>> {
+            drain_tokens(p);
+            Ok(())
+        });
+        return None;
+    }
+
+    // Parse the inner `<length-percentage>` argument.
+    parser
+        .parse_nested_block(|p| -> Result<types::TransformX, cssparser::ParseError<'_, ()>> {
+            match p.next() {
+                Ok(Token::Percentage { unit_value, .. }) => {
+                    Ok(types::TransformX::Percent(*unit_value))
+                }
+                Ok(Token::Dimension { value, unit, .. })
+                    if unit.as_ref().eq_ignore_ascii_case("px") =>
+                {
+                    Ok(types::TransformX::Px(*value))
+                }
+                Ok(Token::Number { value, .. }) if *value == 0.0 => {
+                    Ok(types::TransformX::Px(0.0))
+                }
+                _ => Err(p.new_custom_error(())),
+            }
+        })
+        .ok()
 }
 
 /// Parse a single `<length-percentage>` token for the radial gradient grammar.
@@ -2296,6 +2596,73 @@ fn parse_color(parser: &mut Parser) -> Result<Color, ()> {
                 Ok(Color::rgba(r, g, b, a))
             })
             .map_err(|_: cssparser::ParseError<'_, ()>| ()),
+        Token::Function(ref name) if name.as_ref() == "oklch" => parser
+            .parse_nested_block(|p| parse_oklch_body(p).map_err(|_| p.new_custom_error(())))
+            .map_err(|_: cssparser::ParseError<'_, ()>| ()),
+        _ => Err(()),
+    }
+}
+
+/// Parse the body of an `oklch(L C H)` or `oklch(L C H / A)` function.
+///
+/// Grammar (CSS Color Level 4):
+/// * L: number `0.0..=1.0` or percentage `0%..=100%` (percentage of 1.0)
+/// * C: number (clamped to `>= 0.0`) or percentage (percentage of `0.4`)
+/// * H: number in degrees, or `<angle>` (deg/grad/rad/turn)
+/// * A: optional, separated by `/`; number `0.0..=1.0` or percentage
+fn parse_oklch_body(parser: &mut Parser) -> Result<Color, ()> {
+    let lightness = parse_oklch_lightness(parser)?;
+    let chroma = parse_oklch_chroma(parser)?;
+    let hue_rad = parse_oklch_hue(parser)?;
+    let alpha = if parser.try_parse(|p| p.expect_delim('/')).is_ok() {
+        parse_alpha_unit(parser)?
+    } else {
+        1.0
+    };
+
+    let a = chroma * hue_rad.cos();
+    let b = chroma * hue_rad.sin();
+    Ok(crate::style::transition::oklab_to_srgb(lightness, a, b, alpha))
+}
+
+fn parse_oklch_lightness(parser: &mut Parser) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        Token::Number { value, .. } => Ok(value.clamp(0.0, 1.0)),
+        Token::Percentage { unit_value, .. } => Ok(unit_value.clamp(0.0, 1.0)),
+        _ => Err(()),
+    }
+}
+
+fn parse_oklch_chroma(parser: &mut Parser) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        Token::Number { value, .. } => Ok(value.max(0.0)),
+        // CSS Color 4: 100% chroma in oklch equals 0.4 numeric.
+        Token::Percentage { unit_value, .. } => Ok((unit_value * 0.4).max(0.0)),
+        _ => Err(()),
+    }
+}
+
+/// Parse the hue component and return it in radians.
+fn parse_oklch_hue(parser: &mut Parser) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        // Bare number is degrees per CSS Color 4.
+        Token::Number { value, .. } => Ok(value.to_radians()),
+        Token::Dimension { value, unit, .. } => match unit.as_ref() {
+            "deg" => Ok(value.to_radians()),
+            "rad" => Ok(*value),
+            "grad" => Ok(value * std::f32::consts::PI / 200.0),
+            "turn" => Ok(value * std::f32::consts::TAU),
+            _ => Err(()),
+        },
+        _ => Err(()),
+    }
+}
+
+/// Alpha as a `0.0..=1.0` float. Accepts a number or a percentage.
+fn parse_alpha_unit(parser: &mut Parser) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        Token::Number { value, .. } => Ok(value.clamp(0.0, 1.0)),
+        Token::Percentage { unit_value, .. } => Ok(unit_value.clamp(0.0, 1.0)),
         _ => Err(()),
     }
 }
@@ -3039,6 +3406,11 @@ fn parse_grid_track_size_single(parser: &mut Parser) -> Result<types::GridTrackS
                 Ok(types::GridTrackSize::fr(*value))
             } else if unit_str == "%" {
                 Ok(types::GridTrackSize::fixed_percent(*value))
+            } else if unit_str == "vh" || unit_str == "vw" {
+                // Grid track sizes have no viewport context at parse time,
+                // so vh/vw must fail rather than silently becoming px.
+                // Mirrors the rejection in `parse_px`.
+                Err(())
             } else {
                 Ok(types::GridTrackSize::fixed_px(*value))
             }
@@ -3071,10 +3443,17 @@ fn parse_grid_function_track(parser: &mut Parser) -> Result<types::GridTrackSize
             .parse_nested_block(|p| {
                 let tok = p.next().cloned().map_err(|_| p.new_custom_error(()))?;
                 match tok {
-                    Token::Dimension { value, .. } => Ok(types::GridTrackSize {
-                        min: types::GridMinTrackSize::Auto,
-                        max: types::GridMaxTrackSize::FitContent(value),
-                    }),
+                    Token::Dimension { value, unit, .. } => {
+                        if unit.as_ref() == "vh" || unit.as_ref() == "vw" {
+                            // Viewport units cannot resolve at parse time.
+                            Err(p.new_custom_error(()))
+                        } else {
+                            Ok(types::GridTrackSize {
+                                min: types::GridMinTrackSize::Auto,
+                                max: types::GridMaxTrackSize::FitContent(value),
+                            })
+                        }
+                    }
                     Token::Percentage { unit_value, .. } => Ok(types::GridTrackSize {
                         min: types::GridMinTrackSize::Auto,
                         max: types::GridMaxTrackSize::FitContentPercent(unit_value * 100.0),
@@ -3104,8 +3483,11 @@ fn parse_grid_min_track_size(parser: &mut Parser) -> Result<types::GridMinTrackS
 
     match parser.next().map_err(|_| ())? {
         Token::Dimension { value, unit, .. } => {
-            if unit.as_ref() == "%" {
+            let unit_str = unit.as_ref();
+            if unit_str == "%" {
                 Ok(types::GridMinTrackSize::Percent(*value))
+            } else if unit_str == "vh" || unit_str == "vw" {
+                Err(())
             } else {
                 Ok(types::GridMinTrackSize::Px(*value))
             }
@@ -3136,6 +3518,8 @@ fn parse_grid_max_track_size(parser: &mut Parser) -> Result<types::GridMaxTrackS
                 Ok(types::GridMaxTrackSize::Fr(*value))
             } else if unit_str == "%" {
                 Ok(types::GridMaxTrackSize::Percent(*value))
+            } else if unit_str == "vh" || unit_str == "vw" {
+                Err(())
             } else {
                 Ok(types::GridMaxTrackSize::Px(*value))
             }
@@ -3326,6 +3710,12 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::Background(v) => style.background = v.clone(),
         StyleDeclaration::BorderColor(v) => style.border_color = *v,
         StyleDeclaration::BorderWidth(v) => style.border_width = *v,
+        StyleDeclaration::BorderSideWidth(side, v) => match side {
+            BorderSide::Top => style.border_width.top = *v,
+            BorderSide::Right => style.border_width.right = *v,
+            BorderSide::Bottom => style.border_width.bottom = *v,
+            BorderSide::Left => style.border_width.left = *v,
+        },
         StyleDeclaration::BorderRadius(v) => style.border_radius = *v,
         StyleDeclaration::Opacity(v) => style.opacity = *v,
         StyleDeclaration::BoxShadowList(v) => {
@@ -3429,6 +3819,14 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
 
         // Bell / notification
         StyleDeclaration::BellStyle(v) => style.bell_style = *v,
+
+        // CSS `transform: translateX(...)`. Replaces any prior value on the
+        // same element so later declarations win (standard cascade rule).
+        StyleDeclaration::TransformTranslateX(v) => style.transform_translate_x = Some(*v),
+
+        // CSS `mask-image: linear-gradient(...)`. Only the linear gradient
+        // form is supported; see `parse_mask_image`.
+        StyleDeclaration::MaskImage(g) => style.mask_image = Some(g.clone()),
     }
 }
 
@@ -5752,6 +6150,289 @@ mod tests {
             taffy.position,
             taffy::Position::Absolute,
             "CssPosition::Fixed should map to taffy::Position::Absolute"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `oklch()` color function parsing.
+    //
+    // The Organiza Nota Wireframes v1 and v2 palettes are defined in
+    // oklch, e.g. `oklch(0.65 0.17 145)` for the stamp-green accent.
+    // Before support landed, these calls produced a parse error and the
+    // variables fell back to the default color, silently breaking the
+    // wireframe theme.
+    // -----------------------------------------------------------------
+
+    fn parse_single_color(css: &str) -> Option<Color> {
+        let mut input = ParserInput::new(css);
+        let mut parser = Parser::new(&mut input);
+        parse_color(&mut parser).ok()
+    }
+
+    #[test]
+    fn oklch_zero_chroma_at_full_lightness_is_white() {
+        let c = parse_single_color("oklch(1.0 0.0 0.0)").expect("oklch parse");
+        assert_eq!(
+            (c.r, c.g, c.b, c.a),
+            (255, 255, 255, 255),
+            "oklch(1.0 0.0 0.0) must round-trip to pure white"
+        );
+    }
+
+    #[test]
+    fn oklch_zero_lightness_is_black() {
+        let c = parse_single_color("oklch(0.0 0.0 0.0)").expect("oklch parse");
+        assert_eq!(
+            (c.r, c.g, c.b, c.a),
+            (0, 0, 0, 255),
+            "oklch(0.0 0.0 0.0) must round-trip to pure black"
+        );
+    }
+
+    #[test]
+    fn oklch_with_chroma_produces_hue_colored_output() {
+        // L=0.65, C=0.17, H=145deg is the wireframes v1 stamp green. The
+        // exact sRGB output depends on gamma conversion; assert the hue
+        // signature: green dominates over red and blue.
+        let c = parse_single_color("oklch(0.65 0.17 145)").expect("oklch parse");
+        assert!(
+            c.g > c.r && c.g > c.b,
+            "oklch(0.65 0.17 145) should have green dominance, got rgba({}, {}, {}, {})",
+            c.r,
+            c.g,
+            c.b,
+            c.a
+        );
+    }
+
+    #[test]
+    fn oklch_alpha_slash_syntax_populates_alpha_channel() {
+        let c = parse_single_color("oklch(0.65 0.17 40 / 0.5)").expect("oklch parse");
+        // 0.5 alpha rounds to 128 (0.5 * 255 = 127.5, banker's round to 128).
+        assert!(
+            (c.a as i32 - 128).abs() <= 1,
+            "oklch(... / 0.5) must set alpha near 128, got {}",
+            c.a
+        );
+    }
+
+    #[test]
+    fn oklch_lightness_percentage_equals_unit_number() {
+        let pct = parse_single_color("oklch(50% 0.0 0.0)").expect("percent parse");
+        let num = parse_single_color("oklch(0.5 0.0 0.0)").expect("number parse");
+        assert_eq!(
+            (pct.r, pct.g, pct.b),
+            (num.r, num.g, num.b),
+            "oklch(50% ...) must equal oklch(0.5 ...) modulo rounding"
+        );
+    }
+
+    #[test]
+    fn oklch_chroma_percentage_equals_number_scaled_by_0_4() {
+        // CSS Color Level 4 says C of 100% equals 0.4 numeric. So
+        // oklch(0.65 50% 145) must equal oklch(0.65 0.2 145).
+        let pct = parse_single_color("oklch(0.65 50% 145)").expect("percent parse");
+        let num = parse_single_color("oklch(0.65 0.2 145)").expect("number parse");
+        assert_eq!(
+            (pct.r, pct.g, pct.b),
+            (num.r, num.g, num.b),
+            "oklch chroma 50% must equal 0.2"
+        );
+    }
+
+    #[test]
+    fn oklch_hue_angle_deg_keyword_accepted() {
+        let no_unit = parse_single_color("oklch(0.65 0.17 145)").expect("bare hue parse");
+        let deg = parse_single_color("oklch(0.65 0.17 145deg)").expect("deg hue parse");
+        assert_eq!(
+            (no_unit.r, no_unit.g, no_unit.b),
+            (deg.r, deg.g, deg.b),
+            "bare hue number and deg angle must match"
+        );
+    }
+
+    #[test]
+    fn oklch_without_alpha_slash_is_opaque() {
+        let c = parse_single_color("oklch(0.5 0.1 60)").expect("oklch parse");
+        assert_eq!(c.a, 255, "oklch without alpha must be fully opaque");
+    }
+
+    #[test]
+    fn oklch_rejects_malformed_input() {
+        assert!(parse_single_color("oklch()").is_none(), "oklch() is invalid");
+        assert!(parse_single_color("oklch(0.5)").is_none(), "oklch missing C and H is invalid");
+        assert!(
+            parse_single_color("oklch(0.5 0.1)").is_none(),
+            "oklch missing H is invalid"
+        );
+    }
+
+    #[test]
+    fn oklch_clamps_lightness_above_one_to_white() {
+        let over = parse_single_color("oklch(2.0 0.0 0)").expect("over-range L parses");
+        let clamped = parse_single_color("oklch(1.0 0.0 0)").expect("boundary L parses");
+        assert_eq!(
+            (over.r, over.g, over.b),
+            (clamped.r, clamped.g, clamped.b),
+            "L above 1.0 must clamp to 1.0 (white)"
+        );
+    }
+
+    #[test]
+    fn oklch_clamps_negative_lightness_to_black() {
+        let neg = parse_single_color("oklch(-0.5 0.0 0)").expect("negative L parses");
+        let clamped = parse_single_color("oklch(0.0 0.0 0)").expect("boundary L parses");
+        assert_eq!(
+            (neg.r, neg.g, neg.b),
+            (clamped.r, clamped.g, clamped.b),
+            "L below 0.0 must clamp to 0.0 (black)"
+        );
+    }
+
+    #[test]
+    fn oklch_clamps_negative_chroma_to_zero() {
+        let neg = parse_single_color("oklch(0.5 -0.1 60)").expect("negative C parses");
+        let clamped = parse_single_color("oklch(0.5 0.0 60)").expect("zero C parses");
+        assert_eq!(
+            (neg.r, neg.g, neg.b),
+            (clamped.r, clamped.g, clamped.b),
+            "negative chroma must clamp to 0 (grayscale)"
+        );
+    }
+
+    #[test]
+    fn oklch_clamps_over_range_alpha() {
+        let over = parse_single_color("oklch(0.5 0.1 60 / 2.0)").expect("over-range alpha parses");
+        assert_eq!(over.a, 255, "alpha above 1.0 must clamp to fully opaque");
+
+        let neg = parse_single_color("oklch(0.5 0.1 60 / -0.5)").expect("negative alpha parses");
+        assert_eq!(neg.a, 0, "alpha below 0.0 must clamp to fully transparent");
+    }
+
+    #[test]
+    fn oklch_alpha_percentage_equals_unit_number() {
+        let pct = parse_single_color("oklch(0.5 0.1 60 / 50%)").expect("percent alpha parses");
+        let num = parse_single_color("oklch(0.5 0.1 60 / 0.5)").expect("number alpha parses");
+        assert_eq!(pct.a, num.a, "50% alpha must equal 0.5 numeric");
+    }
+
+    #[test]
+    fn oklch_hue_in_radians_matches_equivalent_degrees() {
+        // pi/4 rad = 45 deg.
+        let rad = parse_single_color("oklch(0.6 0.12 0.7853982rad)").expect("rad hue parses");
+        let deg = parse_single_color("oklch(0.6 0.12 45)").expect("deg hue parses");
+        assert!(
+            (rad.r as i32 - deg.r as i32).abs() <= 1
+                && (rad.g as i32 - deg.g as i32).abs() <= 1
+                && (rad.b as i32 - deg.b as i32).abs() <= 1,
+            "pi/4 rad and 45 deg must round to within 1 sRGB unit"
+        );
+    }
+
+    #[test]
+    fn oklch_hue_in_gradians_matches_equivalent_degrees() {
+        // 100 grad = 90 deg.
+        let grad = parse_single_color("oklch(0.6 0.12 100grad)").expect("grad hue parses");
+        let deg = parse_single_color("oklch(0.6 0.12 90)").expect("deg hue parses");
+        assert!(
+            (grad.r as i32 - deg.r as i32).abs() <= 1
+                && (grad.g as i32 - deg.g as i32).abs() <= 1
+                && (grad.b as i32 - deg.b as i32).abs() <= 1,
+            "100 grad and 90 deg must round to within 1 sRGB unit"
+        );
+    }
+
+    #[test]
+    fn oklch_hue_in_turns_matches_equivalent_degrees() {
+        // 0.25 turn = 90 deg.
+        let turn = parse_single_color("oklch(0.6 0.12 0.25turn)").expect("turn hue parses");
+        let deg = parse_single_color("oklch(0.6 0.12 90)").expect("deg hue parses");
+        assert!(
+            (turn.r as i32 - deg.r as i32).abs() <= 1
+                && (turn.g as i32 - deg.g as i32).abs() <= 1
+                && (turn.b as i32 - deg.b as i32).abs() <= 1,
+            "0.25 turn and 90 deg must round to within 1 sRGB unit"
+        );
+    }
+
+    #[test]
+    fn oklch_rejects_unknown_hue_angle_unit() {
+        assert!(
+            parse_single_color("oklch(0.5 0.1 60foo)").is_none(),
+            "unknown hue angle unit must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_px_rejects_vh_and_vw() {
+        // The px pathway is used for padding, border-width, gap, etc. It
+        // has no viewport context and cannot resolve viewport units, so
+        // `padding: 5vh` must fail to parse rather than silently becoming
+        // `padding: 5px`. See `parse_px`.
+        let mut input = ParserInput::new("5vh");
+        let mut parser = Parser::new(&mut input);
+        assert!(parse_px(&mut parser).is_err(), "parse_px must reject 5vh");
+
+        let mut input = ParserInput::new("5vw");
+        let mut parser = Parser::new(&mut input);
+        assert!(parse_px(&mut parser).is_err(), "parse_px must reject 5vw");
+    }
+
+    #[test]
+    fn grid_track_parsers_reject_vh_and_vw() {
+        // Grid track sizes likewise have no viewport context at parse
+        // time. Letting `grid-template-rows: 50vh` silently degrade to
+        // `50px` would misposition rows at any non-100px viewport. Pin
+        // rejection across all four grid entry points.
+        for css in ["50vh", "50vw"] {
+            let mut input = ParserInput::new(css);
+            let mut parser = Parser::new(&mut input);
+            assert!(
+                parse_grid_track_size_single(&mut parser).is_err(),
+                "parse_grid_track_size_single must reject {}",
+                css
+            );
+
+            let mut input = ParserInput::new(css);
+            let mut parser = Parser::new(&mut input);
+            assert!(
+                parse_grid_min_track_size(&mut parser).is_err(),
+                "parse_grid_min_track_size must reject {}",
+                css
+            );
+
+            let mut input = ParserInput::new(css);
+            let mut parser = Parser::new(&mut input);
+            assert!(
+                parse_grid_max_track_size(&mut parser).is_err(),
+                "parse_grid_max_track_size must reject {}",
+                css
+            );
+        }
+
+        // fit-content(50vh) lives inside parse_grid_function_track, which
+        // is reached via parse_grid_track_size_single.
+        for css in ["fit-content(50vh)", "fit-content(50vw)"] {
+            let mut input = ParserInput::new(css);
+            let mut parser = Parser::new(&mut input);
+            assert!(
+                parse_grid_track_size_single(&mut parser).is_err(),
+                "fit-content must reject {}",
+                css
+            );
+        }
+    }
+
+    #[test]
+    fn oklch_leaves_trailing_tokens_for_caller() {
+        // parse_color consumes one color literal and stops. Trailing
+        // tokens past the closing `)` are the caller's responsibility to
+        // validate via expect_exhausted. Pin this contract so a future
+        // refactor that tightens parse_color doesn't silently break
+        // callers that compose a color with other productions.
+        assert!(
+            parse_single_color("oklch(0.5 0.1 60) garbage").is_some(),
+            "parse_color must stop at the oklch() call and leave trailing tokens untouched"
         );
     }
 }

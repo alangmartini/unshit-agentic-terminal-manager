@@ -2,7 +2,8 @@ use unshit::core::element::*;
 use unshit::core::event::DragPhase;
 
 use crate::state::{
-    dispatch, mutate_close_tab, mutate_with, SharedState, TabStatus, TerminalTab, UiSnapshot,
+    dispatch, mutate_close_tab, mutate_with, CtxMenu, CtxMenuTarget, SharedState, TabStatus,
+    TerminalTab, UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -180,6 +181,29 @@ fn build_tab(
                 dispatch(st, "drag.end");
             });
         }
+    });
+
+    let tab_pane_id = tab.active_pane.0;
+    let ctx_state = shared.clone();
+    btn = btn.on_context_menu(move |x, y| {
+        mutate_with(&ctx_state, |st| {
+            let same_tab = matches!(
+                st.ctx_menu.as_ref().map(|m| &m.target),
+                Some(CtxMenuTarget::Tab { pane_id }) if *pane_id == tab_pane_id
+            );
+            if same_tab {
+                st.ctx_menu = None;
+            } else {
+                let sf = st.scale_factor;
+                st.ctx_menu = Some(CtxMenu {
+                    x: x / sf,
+                    y: y / sf,
+                    target: CtxMenuTarget::Tab {
+                        pane_id: tab_pane_id,
+                    },
+                });
+            }
+        });
     });
 
     let close_state = shared.clone();

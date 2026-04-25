@@ -1,5 +1,6 @@
 pub mod bench;
 pub mod bridge;
+pub mod daemon;
 pub mod drag;
 pub mod git;
 pub mod keybinds;
@@ -21,7 +22,7 @@ use unshit::core::trace::{
 };
 
 use crate::state::{
-    dispatch, mutate_with, new_workspace, resize_all_terminals, seed_state, SharedState,
+    dispatch, mutate_with, new_workspace, resize_all_terminals, seed_state, MutexExt, SharedState,
     UiSnapshot, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
 };
 use crate::ui::settings::build_settings_modal;
@@ -101,7 +102,7 @@ mod profiler_tests {
 }
 
 #[cfg(feature = "profiling")]
-fn finalize_profiler() {
+pub(crate) fn finalize_profiler() {
     // Recover through poison: if we crash mid-flush we still want the JSON on disk.
     let mut guard = PROFILER
         .lock()
@@ -114,7 +115,16 @@ fn finalize_profiler() {
 
 #[cfg(not(feature = "profiling"))]
 #[inline]
-fn finalize_profiler() {}
+pub(crate) fn finalize_profiler() {}
+
+/// Flush the heap profile (if the `profiling` feature is on) and exit
+/// the process with status 0. Used by the close-app dialog buttons to
+/// drive their own exit after routing through dispatch, since the
+/// framework's `event_loop.exit()` path was vetoed by `on_close`.
+pub(crate) fn shutdown_now() -> ! {
+    finalize_profiler();
+    std::process::exit(0);
+}
 
 /// Snapshot a terminal's display grid for the current render frame.
 ///
@@ -242,7 +252,11 @@ fn build_tree(
     }
 
     ElementTree {
-        root: root.with_child(build_ctx_menu_overlay(snap, shared)),
+        root: root
+            .with_child(build_ctx_menu_overlay(snap, shared))
+            .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
+                snap, shared,
+            )),
     }
 }
 
@@ -363,8 +377,33 @@ fn main() {
             let last = initial_state.workspaces.len() - 1;
             initial_state.active_workspace = persisted.active_workspace.min(last);
         }
+        initial_state.toggles.insert(
+            crate::state::ToggleKey::RememberCloseChoice,
+            persisted.remember_close_choice,
+        );
+        initial_state.toggles.insert(
+            crate::state::ToggleKey::KillAllOnClose,
+            persisted.kill_all_on_close,
+        );
     }
     let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
+
+    // Bring the unshit-ptyd daemon up and wire the UI's DaemonPty shim
+    // to it. Uses a short-lived tokio runtime because connect_or_spawn
+    // is async; the shim's own worker thread drives every subsequent
+    // IPC call, so this runtime dies once the probe completes.
+    {
+        let socket_path = unshit_ptyd::transport::default_socket_path();
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime for daemon probe");
+        rt.block_on(daemon::connect_or_spawn(&socket_path))
+            .expect("connect or spawn unshit-ptyd daemon");
+        drop(rt);
+        let mut guard = shared.lock().unwrap();
+        guard
+            .pty_manager
+            .connect_to(&socket_path)
+            .expect("DaemonPty shim connect_to");
+    }
 
     // Measure the actual monospace cell width ratio for later use (split
     // pane spawns, etc.). Do NOT pre-publish cell metrics to the global
@@ -382,12 +421,16 @@ fn main() {
         guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
     }
 
-    // Spawn initial PTY eagerly. This is load-bearing: without a terminal
-    // the CellGrid doesn't exist, the renderer can't publish metrics, and
-    // the PTY never gets spawned (deadlock). Estimate dimensions from the
-    // window size minus CSS chrome so the shell greeting is formatted for
-    // roughly the right width. on_cell_metrics corrects to exact values on
-    // the first frame.
+    // Reconcile the initial pane against any surviving daemon session
+    // (slice 5): if a prior UI run left a session with a matching
+    // `(workspace_id, pane_id)` on the daemon, reattach and replay its
+    // snapshot so the user sees their shell exactly as they left it;
+    // otherwise spawn a fresh one. This is load-bearing: without a live
+    // terminal the CellGrid doesn't exist, the renderer can't publish
+    // metrics, and the PTY never gets spawned (deadlock). Estimate
+    // dimensions from the window size minus CSS chrome so the shell
+    // greeting is formatted for roughly the right width; on_cell_metrics
+    // corrects to exact values on the first frame.
     {
         let mut guard = shared.lock().unwrap();
         // CSS chrome in logical pixels (scale cancels: grid and cells both
@@ -407,26 +450,50 @@ fn main() {
             cell_h_est,
         );
         let pane_id = guard.active_pane.0;
+        let workspace_id = crate::state::active_workspace_num(&guard);
         let cwd = crate::state::active_workspace_cwd(&guard);
-        let terminal = crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
-        guard.terminals.insert(
+        match guard.pty_manager.attach_or_spawn(
             pane_id,
-            std::sync::Arc::new(std::sync::Mutex::new(terminal)),
-        );
-        match guard
-            .pty_manager
-            .spawn_in(pane_id, init_cols, init_rows, cwd.as_deref())
-        {
-            Ok(reader) => {
+            workspace_id,
+            init_cols,
+            init_rows,
+            cwd.as_deref(),
+        ) {
+            Ok((Some(snapshot), reader)) => {
+                let rows = snapshot.grid.rows();
+                let cols = snapshot.grid.cols();
+                let mut terminal = crate::terminal::Terminal::new(rows, cols);
+                terminal.apply_snapshot(&snapshot);
+                guard.terminals.insert(
+                    pane_id,
+                    std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+                );
+                crate::bridge::register_reader(pane_id, reader);
+                log::info!(
+                    "reattached pane {} to surviving daemon session ({}x{})",
+                    pane_id,
+                    cols,
+                    rows
+                );
+            }
+            Ok((None, reader)) => {
+                let terminal =
+                    crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
+                guard.terminals.insert(
+                    pane_id,
+                    std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+                );
                 crate::bridge::register_reader(pane_id, reader);
             }
             Err(e) => {
                 log::error!("failed to spawn initial PTY: {}", e);
-                if let Some(t) = guard.terminals.get(&pane_id) {
-                    t.lock()
-                        .expect("terminal mutex poisoned")
-                        .process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
-                }
+                let mut terminal =
+                    crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
+                terminal.process_bytes(format!("Failed to spawn shell: {}\r\n", e).as_bytes());
+                guard.terminals.insert(
+                    pane_id,
+                    std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+                );
             }
         }
     }
@@ -458,7 +525,7 @@ fn main() {
             ],
             user_shortcuts: user_shortcut_bindings(),
             on_command: Some(Arc::new(move |command: &str| -> bool {
-                let mut guard = command_shared.lock().expect("state mutex poisoned");
+                let mut guard = command_shared.lock_recover();
                 dispatch(&mut guard, command)
             })),
             on_raw_key: Some(Arc::new(
@@ -482,30 +549,60 @@ fn main() {
             // Approach 1: on_cell_metrics fires once after the first render
             // publishes valid cell dimensions. Resize all PTYs immediately.
             on_scale_factor: Some(Arc::new(move |scale: f32| {
-                let mut guard = scale_shared.lock().expect("state mutex poisoned");
+                let mut guard = scale_shared.lock_recover();
                 guard.scale_factor = scale;
             })),
-            on_close: Some(Arc::new(move || {
+            on_close: Some(Arc::new(move || -> bool {
+                // F7: when the user has not yet remembered a choice, veto
+                // the framework's close and route through the confirm
+                // dialog so they can pick "keep running" / "kill all" /
+                // "cancel". Once a choice has been persisted it is applied
+                // silently on close.
+                //
+                // Slice 5 session-survival policy still applies: keep-running
+                // just drops local UI state (terminals map, readers) so the
+                // current process can exit cleanly while the shells keep
+                // running on the daemon. Kill-all routes through
+                // `DaemonPty::destroy_all` before exit.
+                //
                 // Use .lock().ok() instead of .expect() so a poisoned mutex
                 // (from a panic on another thread) does not prevent us from
                 // reaching process::exit below.
-                if let Ok(mut guard) = close_shared.lock() {
-                    guard.pty_manager.destroy_all();
-                    guard.terminals.clear();
+                let action = {
+                    let Ok(mut guard) = close_shared.lock() else {
+                        // Mutex poisoned: skip the prompt path, fall back
+                        // to the legacy "just exit" behaviour so we do not
+                        // wedge the user holding an undismissable dialog.
+                        finalize_profiler();
+                        return true;
+                    };
+                    crate::state::resolve_close_action(&mut guard)
+                };
+                match action {
+                    crate::state::CloseAction::Prompt => {
+                        // Veto. The confirm dialog is now visible; the UI
+                        // click handlers drive the real exit.
+                        false
+                    }
+                    crate::state::CloseAction::KeepRunning => {
+                        if let Ok(mut guard) = close_shared.lock() {
+                            guard.terminals.clear();
+                        }
+                        finalize_profiler();
+                        std::process::exit(0);
+                    }
+                    crate::state::CloseAction::KillAll => {
+                        if let Ok(mut guard) = close_shared.lock() {
+                            crate::state::mutate_kill_all_terminals(&mut guard);
+                        }
+                        finalize_profiler();
+                        std::process::exit(0);
+                    }
                 }
-                // Flush heap profile (no-op without --features profiling) so
-                // dhat writes its JSON before we bypass Drop via exit() below.
-                finalize_profiler();
-                // Force-exit the process. Without this, tokio's Runtime::drop
-                // blocks indefinitely waiting for spawn_blocking reader tasks
-                // (bridge.rs) that are stuck on pipe reads. The readers hold
-                // cloned PTY pipe handles that keep the .exe locked on Windows
-                // (os error 32), preventing cargo from rebuilding.
-                std::process::exit(0);
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
-                let mut guard = metrics_shared.lock().expect("state mutex poisoned");
+                let mut guard = metrics_shared.lock_recover();
                 let (cols, rows) = CellGrid::take_pending_resize().unwrap_or_else(|| {
                     let w = guard.last_grid_width;
                     let h = guard.last_grid_height;
@@ -536,7 +633,7 @@ fn main() {
                 u32,
                 Vec<(u32, crate::state::SharedTerminal)>,
             ) = {
-                let guard = tree_shared.lock().expect("state mutex poisoned");
+                let guard = tree_shared.lock_recover();
                 let snap = guard.ui_snapshot();
                 let active_id = guard.active_pane.0;
                 let handles: Vec<_> = guard
@@ -556,7 +653,7 @@ fn main() {
             let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = handles
                 .into_iter()
                 .map(|(id, handle)| {
-                    let mut t = handle.lock().expect("terminal mutex poisoned");
+                    let mut t = handle.lock_recover();
                     let grid = snapshot_terminal_for_render(&mut t, id, id == active_id);
                     (id, grid)
                 })

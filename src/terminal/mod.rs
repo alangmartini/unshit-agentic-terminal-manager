@@ -157,6 +157,43 @@ impl Terminal {
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
+    /// Overwrite this terminal's rendered state with `snapshot`.
+    ///
+    /// Used by the daemon attach path: after pulling a snapshot from the
+    /// daemon the client rebuilds its local grid so the first frame it
+    /// renders matches the authoritative daemon view. The VTE parser,
+    /// current SGR state, saved cursor, and title are not touched since
+    /// the daemon does not hand those back in slice 4d.
+    pub fn apply_snapshot(&mut self, snapshot: &unshit_terminal_core::Snapshot) {
+        let rows = snapshot.grid.rows();
+        let cols = snapshot.grid.cols();
+        if rows != self.rows || cols != self.cols {
+            self.rows = rows;
+            self.cols = cols;
+            self.grid.resize(rows, cols);
+        }
+        for r in 0..rows {
+            for c in 0..cols {
+                if let Some(cell) = snapshot.grid.get(r, c) {
+                    self.grid.set_cell(r, c, core_cell_to_ui(*cell));
+                }
+            }
+        }
+        let (cur_row, cur_col) = snapshot.grid.cursor();
+        self.cursor_row = cur_row.min(rows.saturating_sub(1));
+        self.cursor_col = cur_col.min(cols.saturating_sub(1));
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
+        self.grid.set_cursor_visible(snapshot.grid.cursor_visible());
+
+        self.scrollback.clear();
+        self.scrollback.reserve(snapshot.scrollback.len());
+        for line in &snapshot.scrollback {
+            let converted: Vec<Cell> = line.iter().map(|c| core_cell_to_ui(*c)).collect();
+            self.scrollback.push_back(converted);
+        }
+        self.scroll_offset = 0;
+    }
+
     /// The current window title (set via OSC 0 or OSC 2).
     pub fn title(&self) -> &str {
         &self.title
@@ -856,6 +893,32 @@ fn reset_attrs(t: &mut Terminal) {
     t.fg = DEFAULT_FG;
     t.bg = DEFAULT_BG;
     t.attrs = CellAttrs::empty();
+}
+
+/// Convert a cell from the shared `unshit-terminal-core` shape to the
+/// UI framework's `cell_grid::Cell`. Both types carry identical
+/// per-channel color bytes and the same attribute bit layout, so this
+/// is a field-for-field copy. `wide_continuation` is always reset to
+/// `false` because the core snapshot does not carry that flag in slice
+/// 4d; a future slice may propagate it.
+fn core_cell_to_ui(core: unshit_terminal_core::Cell) -> Cell {
+    Cell {
+        ch: core.ch,
+        fg: Color {
+            r: core.fg.r,
+            g: core.fg.g,
+            b: core.fg.b,
+            a: core.fg.a,
+        },
+        bg: Color {
+            r: core.bg.r,
+            g: core.bg.g,
+            b: core.bg.b,
+            a: core.bg.a,
+        },
+        attrs: CellAttrs::from_bits_truncate(core.attrs.bits()),
+        wide_continuation: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2291,5 +2354,86 @@ mod tests {
             !ids_before.contains(&new_top),
             "new top row id {new_top} must not collide with pre-shift ids",
         );
+    }
+
+    // -- apply_snapshot -------------------------------------------------------
+
+    #[test]
+    fn apply_snapshot_replaces_grid_and_cursor() {
+        use unshit_terminal_core::Terminal as CoreTerminal;
+
+        let mut core = CoreTerminal::new(3, 5, 10);
+        core.process_bytes(b"hi\r\nyo");
+        let snap = core.snapshot(10);
+
+        let mut ui = Terminal::new(3, 5);
+        ui.apply_snapshot(&snap);
+
+        assert_eq!(cell_char(&ui, 0, 0), 'h');
+        assert_eq!(cell_char(&ui, 0, 1), 'i');
+        assert_eq!(cell_char(&ui, 1, 0), 'y');
+        assert_eq!(cell_char(&ui, 1, 1), 'o');
+        let (core_row, core_col) = snap.grid.cursor();
+        assert_eq!(ui.cursor_position(), (core_row, core_col));
+    }
+
+    #[test]
+    fn apply_snapshot_replaces_scrollback() {
+        use unshit_terminal_core::Terminal as CoreTerminal;
+
+        let mut core = CoreTerminal::new(2, 4, 100);
+        core.process_bytes(b"aaaa\r\nbbbb\r\ncccc\r\ndddd");
+        let snap = core.snapshot(100);
+        assert!(!snap.scrollback.is_empty(), "fixture should have scrolled");
+
+        let mut ui = Terminal::new(2, 4);
+        ui.apply_snapshot(&snap);
+
+        assert_eq!(ui.scrollback_len(), snap.scrollback.len());
+        let first_line = &snap.scrollback[0];
+        let first_ch = first_line[0].ch;
+        assert_eq!(ui.scrollback[0][0].ch, first_ch);
+    }
+
+    #[test]
+    fn apply_snapshot_translates_colors_and_attrs() {
+        use unshit_terminal_core::Terminal as CoreTerminal;
+
+        let mut core = CoreTerminal::new(1, 3, 10);
+        core.process_bytes(b"\x1b[31;1mA\x1b[0m");
+        let snap = core.snapshot(0);
+
+        let mut ui = Terminal::new(1, 3);
+        ui.apply_snapshot(&snap);
+
+        let cell = ui.grid().get_cell(0, 0).expect("cell (0,0) must exist");
+        assert!(
+            cell.attrs.contains(CellAttrs::BOLD),
+            "bold attribute must survive translation, got {:?}",
+            cell.attrs
+        );
+        assert_eq!(
+            cell.fg, ANSI_16[1],
+            "red (SGR 31) foreground must map to UI ANSI_16[1]"
+        );
+    }
+
+    #[test]
+    fn apply_snapshot_resizes_grid_if_dimensions_differ() {
+        use unshit_terminal_core::Terminal as CoreTerminal;
+
+        let core = CoreTerminal::new(3, 5, 10);
+        let snap = core.snapshot(0);
+
+        let mut ui = Terminal::new(5, 10);
+        assert_eq!(ui.rows, 5);
+        assert_eq!(ui.cols, 10);
+
+        ui.apply_snapshot(&snap);
+
+        assert_eq!(ui.rows, 3);
+        assert_eq!(ui.cols, 5);
+        assert_eq!(ui.grid().rows(), 3);
+        assert_eq!(ui.grid().cols(), 5);
     }
 }

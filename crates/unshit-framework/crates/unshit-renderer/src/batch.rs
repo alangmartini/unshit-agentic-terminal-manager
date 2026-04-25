@@ -58,6 +58,15 @@ pub(crate) const EMPTY_GRADIENT_STOP_POSITIONS: [f32; MAX_GRADIENT_STOPS] =
 /// real `(center, radii)` values into the slot.
 pub(crate) const EMPTY_GRADIENT_EXTRA: [f32; 4] = [0.0; 4];
 
+/// Zero value for the `mask-image` slots (alpha0 pos0 alpha1 pos1 etc.).
+/// A `mask_params.w` of zero (see `EMPTY_MASK_PARAMS`) selects the "no
+/// mask" branch in the shader, so these can stay zero at every emit site
+/// that does not attach a mask-image.
+pub(crate) const EMPTY_MASK_STOPS: [f32; 4] = [0.0; 4];
+/// Mask `params` default. `stop_count = 0` (the last component) disables
+/// mask alpha modulation in the shader.
+pub(crate) const EMPTY_MASK_PARAMS: [f32; 4] = [0.0; 4];
+
 /// One shot flag so the stop truncation warning does not spam logs.
 static GRADIENT_TRUNCATE_WARNED: AtomicBool = AtomicBool::new(false);
 static LAST_TERMINAL_RENDER_TRACE_HASH: AtomicU64 = AtomicU64::new(0);
@@ -241,6 +250,60 @@ fn pack_radial_gradient(
     let params = [0.0, shape_tag, 0.0, -(count as f32)];
     let extra = [resolved.center_x, resolved.center_y, resolved.rx, resolved.ry];
     (colors, positions, params, extra)
+}
+
+/// Pack a `mask-image: linear-gradient(...)` declaration into the four
+/// auxiliary slots on `QuadInstance` (`mask_stops_01`, `mask_stops_23`,
+/// `mask_params`).
+///
+/// The mask gradient carries only the alpha channel of each stop and its
+/// position along the projected axis. Two stops per `vec4` keeps the
+/// GPU instance size manageable; up to four stops are supported today.
+/// When the source gradient has more than four stops we truncate silently
+/// (same policy as background gradient truncation above) because the
+/// common edge fade pattern is always three or four stops.
+///
+/// `mask_params.w` is the stop count. The fragment shader selects the
+/// "no mask" fast path when this is zero, so the pre-normalization here is
+/// defensive: we emit `stop_count = 0` when the source list is empty.
+pub(crate) fn pack_mask_image(
+    mask: &LinearGradient,
+) -> ([f32; 4], [f32; 4], [f32; 4]) {
+    let mut stops_01 = [0.0_f32; 4];
+    let mut stops_23 = [0.0_f32; 4];
+    let axis_length = projected_axis_length(mask.angle_deg, 1.0, 1.0);
+    // Mask gradient stops resolve into [0, 1] along the projection axis,
+    // exactly like background gradient stops. We only need the alpha
+    // channel of each stop so we drop rgb and re pack positions inline.
+    let count = mask.stops.len().min(crate::pipeline::quad::MAX_MASK_STOPS);
+    for (i, stop) in mask.stops.iter().take(count).enumerate() {
+        let alpha = stop.color.a as f32 / 255.0;
+        // Pixel stops on a mask are unusual (the test fixture always uses
+        // percentages) but we honor them the same way the background
+        // pipeline does: resolve against the unit projected axis length so
+        // the value already sits in [0, 1].
+        let pos = match stop.position {
+            unshit_core::style::types::GradientStopPosition::Percent(v) => v,
+            unshit_core::style::types::GradientStopPosition::Px(v) => {
+                // Without the element's projected axis length available at
+                // this point we treat pixel stops as fractions. Callers
+                // that care about mixed unit masks can migrate to the full
+                // axis resolution in a follow up.
+                v / axis_length.max(1.0)
+            }
+        };
+        if i < 2 {
+            stops_01[i * 2] = alpha;
+            stops_01[i * 2 + 1] = pos.clamp(0.0, 1.0);
+        } else {
+            let j = i - 2;
+            stops_23[j * 2] = alpha;
+            stops_23[j * 2 + 1] = pos.clamp(0.0, 1.0);
+        }
+    }
+    let angle_rad = mask.angle_deg.to_radians();
+    let params = [angle_rad, 0.0, 0.0, count as f32];
+    (stops_01, stops_23, params)
 }
 
 pub struct ImageBatch {
@@ -1134,7 +1197,17 @@ fn walk_for_batch(
     let rect = element.layout_rect;
     let opacity = style.opacity;
 
-    let render_x = rect.x - scroll_offset_x;
+    // CSS `transform: translateX(...)` is applied here as a pure render
+    // space offset. The layout rect keeps its in flow position so siblings
+    // and hit testing are unaffected; only the painted position shifts.
+    // Transform offsets propagate down into child scroll offsets so the
+    // whole subtree translates together.
+    let transform_dx = style
+        .transform_translate_x
+        .map(|t| t.resolve(rect.width))
+        .unwrap_or(0.0);
+
+    let render_x = rect.x - scroll_offset_x + transform_dx;
     let render_y = rect.y - scroll_offset_y;
 
     let clips_children = style.overflow != Overflow::Visible;
@@ -1152,6 +1225,12 @@ fn walk_for_batch(
     } else {
         (scroll_offset_x, scroll_offset_y)
     };
+    // Propagate the transform offset to children so the whole subtree
+    // moves with the translated element. A child's render_x is computed as
+    // `rect.x - scroll_offset_x`, so subtracting `transform_dx` from the
+    // scroll offset effectively adds it to the child's render position,
+    // matching the shift we already applied to this element's own paint.
+    let child_scroll_x = child_scroll_x - transform_dx;
 
     if is_visible && style.outline_width > 0.0 && style.outline_color.a > 0 {
         let expand = style.outline_width + style.outline_offset;
@@ -1175,6 +1254,9 @@ fn walk_for_batch(
             gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
             gradient_params: [0.0; 4],
             gradient_extra: EMPTY_GRADIENT_EXTRA,
+            mask_stops_01: EMPTY_MASK_STOPS,
+            mask_stops_23: EMPTY_MASK_STOPS,
+            mask_params: EMPTY_MASK_PARAMS,
         });
     }
 
@@ -1253,6 +1335,9 @@ fn walk_for_batch(
                 gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                 gradient_params: [0.0; 4],
                 gradient_extra: EMPTY_GRADIENT_EXTRA,
+                mask_stops_01: EMPTY_MASK_STOPS,
+                mask_stops_23: EMPTY_MASK_STOPS,
+                mask_params: EMPTY_MASK_PARAMS,
             });
         }
 
@@ -1286,6 +1371,11 @@ fn walk_for_batch(
             };
 
         if style.background.is_visible() || style.border_width.any_nonzero() {
+            let (mask_stops_01, mask_stops_23, mask_params) = style
+                .mask_image
+                .as_ref()
+                .map(pack_mask_image)
+                .unwrap_or((EMPTY_MASK_STOPS, EMPTY_MASK_STOPS, EMPTY_MASK_PARAMS));
             batch.layer_mut(effective_layer).quad_instances.push(QuadInstance {
                 pos: [render_x, render_y],
                 size: [rect.width, rect.height],
@@ -1302,6 +1392,9 @@ fn walk_for_batch(
                 gradient_stop_positions: grad_stop_positions,
                 gradient_params: grad_params,
                 gradient_extra: grad_extra,
+                mask_stops_01,
+                mask_stops_23,
+                mask_params,
             });
         }
 
@@ -1332,6 +1425,9 @@ fn walk_for_batch(
                 gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                 gradient_params: [0.0; 4],
                 gradient_extra: EMPTY_GRADIENT_EXTRA,
+                mask_stops_01: EMPTY_MASK_STOPS,
+                mask_stops_23: EMPTY_MASK_STOPS,
+                mask_params: EMPTY_MASK_PARAMS,
             });
         }
     }
@@ -1427,6 +1523,9 @@ fn walk_for_batch(
                     gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                     gradient_params: [0.0; 4],
                     gradient_extra: EMPTY_GRADIENT_EXTRA,
+                    mask_stops_01: EMPTY_MASK_STOPS,
+                    mask_stops_23: EMPTY_MASK_STOPS,
+                    mask_params: EMPTY_MASK_PARAMS,
                 });
 
                 // Thumb position.
@@ -1457,6 +1556,9 @@ fn walk_for_batch(
                     gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                     gradient_params: [0.0; 4],
                     gradient_extra: EMPTY_GRADIENT_EXTRA,
+                    mask_stops_01: EMPTY_MASK_STOPS,
+                    mask_stops_23: EMPTY_MASK_STOPS,
+                    mask_params: EMPTY_MASK_PARAMS,
                 });
             }
             InputType::Text | InputType::Password | InputType::Number => {
@@ -1585,6 +1687,9 @@ fn walk_for_batch(
                         gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                         gradient_params: [0.0; 4],
                         gradient_extra: EMPTY_GRADIENT_EXTRA,
+                        mask_stops_01: EMPTY_MASK_STOPS,
+                        mask_stops_23: EMPTY_MASK_STOPS,
+                        mask_params: EMPTY_MASK_PARAMS,
                     });
                 }
             }
@@ -1682,6 +1787,9 @@ fn walk_for_batch(
                                         gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                                         gradient_params: [0.0; 4],
                                         gradient_extra: EMPTY_GRADIENT_EXTRA,
+                                        mask_stops_01: EMPTY_MASK_STOPS,
+                                        mask_stops_23: EMPTY_MASK_STOPS,
+                                        mask_params: EMPTY_MASK_PARAMS,
                                     },
                                 );
                             }
@@ -1739,6 +1847,9 @@ fn walk_for_batch(
                         gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                         gradient_params: [0.0; 4],
                         gradient_extra: EMPTY_GRADIENT_EXTRA,
+                        mask_stops_01: EMPTY_MASK_STOPS,
+                        mask_stops_23: EMPTY_MASK_STOPS,
+                        mask_params: EMPTY_MASK_PARAMS,
                     });
                 }
             }
@@ -2000,6 +2111,9 @@ fn walk_for_batch(
                 gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                 gradient_params: [0.0; 4],
                 gradient_extra: EMPTY_GRADIENT_EXTRA,
+                mask_stops_01: EMPTY_MASK_STOPS,
+                mask_stops_23: EMPTY_MASK_STOPS,
+                mask_params: EMPTY_MASK_PARAMS,
             });
         };
 
@@ -2055,6 +2169,9 @@ fn walk_for_batch(
                 gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                 gradient_params: [0.0; 4],
                 gradient_extra: EMPTY_GRADIENT_EXTRA,
+                mask_stops_01: EMPTY_MASK_STOPS,
+                mask_stops_23: EMPTY_MASK_STOPS,
+                mask_params: EMPTY_MASK_PARAMS,
             });
         }
     }
@@ -2404,6 +2521,9 @@ fn emit_grid_row_backgrounds(
             gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
             gradient_params: [0.0; 4],
             gradient_extra: EMPTY_GRADIENT_EXTRA,
+            mask_stops_01: EMPTY_MASK_STOPS,
+            mask_stops_23: EMPTY_MASK_STOPS,
+            mask_params: EMPTY_MASK_PARAMS,
         });
     }
 }
@@ -2756,6 +2876,9 @@ fn emit_grid_cells(
                 gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                 gradient_params: [0.0; 4],
                 gradient_extra: EMPTY_GRADIENT_EXTRA,
+                mask_stops_01: EMPTY_MASK_STOPS,
+                mask_stops_23: EMPTY_MASK_STOPS,
+                mask_params: EMPTY_MASK_PARAMS,
             });
         }
     }
@@ -3343,6 +3466,9 @@ fn emit_select_node(
         gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
         gradient_params: [0.0, 0.0, 0.0, 0.0],
         gradient_extra: EMPTY_GRADIENT_EXTRA,
+        mask_stops_01: EMPTY_MASK_STOPS,
+        mask_stops_23: EMPTY_MASK_STOPS,
+        mask_params: EMPTY_MASK_PARAMS,
     });
 
     // Per-option rows
@@ -3370,6 +3496,9 @@ fn emit_select_node(
                 gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
                 gradient_params: [0.0, 0.0, 0.0, 0.0],
                 gradient_extra: EMPTY_GRADIENT_EXTRA,
+                mask_stops_01: EMPTY_MASK_STOPS,
+                mask_stops_23: EMPTY_MASK_STOPS,
+                mask_params: EMPTY_MASK_PARAMS,
             });
         }
 
@@ -4013,6 +4142,9 @@ mod tests {
             gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
             gradient_params: [0.0; 4],
             gradient_extra: EMPTY_GRADIENT_EXTRA,
+            mask_stops_01: EMPTY_MASK_STOPS,
+            mask_stops_23: EMPTY_MASK_STOPS,
+            mask_params: EMPTY_MASK_PARAMS,
         };
         batch.quad_instances.push(dummy_quad);
 
