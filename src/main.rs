@@ -31,6 +31,7 @@ use crate::ui::statusbar::build_statusbar;
 use crate::ui::tabbar::build_tabbar;
 use crate::ui::terminal_grid::build_terminal_grid;
 use crate::ui::titlebar::build_titlebar;
+use crate::ui::toasts::build_toast_overlay;
 
 const STYLES: &str = include_str!("../assets/styles.css");
 
@@ -256,7 +257,8 @@ fn build_tree(
             .with_child(build_ctx_menu_overlay(snap, shared))
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
                 snap, shared,
-            )),
+            ))
+            .with_child(build_toast_overlay(snap, shared)),
     }
 }
 

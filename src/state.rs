@@ -81,7 +81,15 @@ pub enum ConfirmDialog {
     /// Rename dialog for the session backing `pane_id`. `buffer` is
     /// the live text in the input, updated on every keystroke so the
     /// commit handler can read it without pulling values out of the UI.
-    RenameSession { pane_id: u32, buffer: String },
+    /// `error` carries an inline failure message under the input
+    /// when the most recent commit attempt's RPC failed; cleared on
+    /// the next keystroke so retrying does not show stale text.
+    /// Issue #130.
+    RenameSession {
+        pane_id: u32,
+        buffer: String,
+        error: Option<String>,
+    },
 }
 
 /// Outcome of resolving the user's persisted close preference when the
@@ -150,6 +158,22 @@ pub struct SessionSnapshot {
     pub name: Option<String>,
     pub pid: Option<u32>,
     pub alive: bool,
+}
+
+/// Render-side projection of a `unshit::core::toast::Toast`. The live
+/// store stays in `AppState`; the snapshot path clones a flat list
+/// here so the UI builder layer never reaches back into the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToastView {
+    pub id: unshit::core::toast::ToastId,
+    pub kind: unshit::core::toast::ToastKind,
+    pub message: String,
+}
+
+/// Push an error-level toast onto `state.toasts`. Single entry point
+/// so dispatch handlers do not format user-facing strings inline.
+pub fn push_error_toast(state: &mut AppState, message: impl Into<String>) {
+    state.toasts.push(message);
 }
 
 /// Typed keys for the `AppState::toggles` map. Previously string literals
@@ -388,6 +412,15 @@ pub struct AppState {
     /// [`refresh_sessions`]. Empty when the daemon has never been
     /// polled or when the last poll returned no sessions.
     pub sessions: Vec<SessionSnapshot>,
+    /// Set when the most recent `list_sessions` RPC failed. Drives
+    /// the "stale" chip next to the Sessions panel refresh button so
+    /// the user sees that the cached rows may not match the daemon.
+    /// Cleared on the next successful refresh.
+    pub sessions_stale: bool,
+    /// Ephemeral notification queue. Populated by
+    /// [`push_error_toast`]; ticked down by the cursor-blink
+    /// subscription so dismissal stays deterministic in tests.
+    pub toasts: unshit::core::toast::ToastStore,
 }
 
 impl AppState {
@@ -477,6 +510,16 @@ impl AppState {
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
             sessions: self.sessions.clone(),
+            sessions_stale: self.sessions_stale,
+            toasts: self
+                .toasts
+                .iter()
+                .map(|t| ToastView {
+                    id: t.id,
+                    kind: t.kind,
+                    message: t.message.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -539,6 +582,11 @@ pub struct UiSnapshot {
     /// accurate count without the UI having to reach into the map.
     pub terminal_count: usize,
     pub sessions: Vec<SessionSnapshot>,
+    /// Mirrors `AppState::sessions_stale`. `true` when the most recent
+    /// `list_sessions` RPC failed and the cached rows may be stale.
+    pub sessions_stale: bool,
+    /// Flat projection of the live `ToastStore`. Push order preserved.
+    pub toasts: Vec<ToastView>,
 }
 
 fn current_folder_name() -> String {
@@ -710,6 +758,8 @@ pub fn seed_state() -> AppState {
         tabbar_rect: crate::drag::Rect::default(),
         confirm_dialog: None,
         sessions: Vec::new(),
+        sessions_stale: false,
+        toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
     }
 }
 
@@ -1758,8 +1808,10 @@ pub fn mutate_kill_all_terminals(state: &mut AppState) {
 
 /// Poll the daemon for its live session list and cache the result in
 /// `state.sessions`. Called when the user opens the Sessions panel or
-/// presses the Refresh button; safe to call when disconnected (logs a
-/// warning and leaves the existing cache untouched).
+/// presses the Refresh button; safe to call when disconnected (the
+/// existing cache is left in place and `sessions_stale` is set so the
+/// Sessions panel can show the user that the rows may not match the
+/// daemon).
 pub fn refresh_sessions(state: &mut AppState) {
     match state.pty_manager.list_sessions() {
         Ok(list) => {
@@ -1774,9 +1826,12 @@ pub fn refresh_sessions(state: &mut AppState) {
                     alive: info.alive,
                 })
                 .collect();
+            state.sessions_stale = false;
         }
         Err(e) => {
             log::warn!("refresh_sessions: list_sessions failed: {e}");
+            state.sessions_stale = true;
+            push_error_toast(state, format!("refresh failed: {e}"));
         }
     }
 }
@@ -1784,6 +1839,12 @@ pub fn refresh_sessions(state: &mut AppState) {
 /// Kill a session directly by session id without requiring a local
 /// pane mapping. Used by the sessions panel where orphan sessions (no
 /// attached pane) still need a kill button.
+///
+/// Mapped-pane branch is fire-and-forget through `destroy(pane_id)`;
+/// orphan branch waits on the daemon's ack via
+/// `kill_session_id_blocking` so a disconnected or unresponsive
+/// daemon shows up as a user-visible toast instead of an
+/// optimistically-removed row. Issue #130.
 pub fn mutate_kill_session_id(state: &mut AppState, session_id: u64) {
     let pane_id = state
         .pty_manager
@@ -1794,10 +1855,19 @@ pub fn mutate_kill_session_id(state: &mut AppState, session_id: u64) {
         state.pty_manager.destroy(pid);
         state.terminals.remove(&pid);
         prune_pane_from_layouts(state, pid);
-    } else {
-        state.pty_manager.kill_session_id(session_id);
+        state.sessions.retain(|s| s.session_id != session_id);
+        return;
     }
-    state.sessions.retain(|s| s.session_id != session_id);
+
+    match state.pty_manager.kill_session_id_blocking(session_id) {
+        Ok(()) => {
+            state.sessions.retain(|s| s.session_id != session_id);
+        }
+        Err(e) => {
+            log::warn!("kill_session_id_blocking({session_id}): {e}");
+            push_error_toast(state, format!("kill failed: {e}"));
+        }
+    }
 }
 
 fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
@@ -2135,9 +2205,18 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             false
         }
+        other if other.starts_with("toast.dismiss:") => {
+            if let Ok(id) = other["toast.dismiss:".len()..].parse::<u64>() {
+                return state.toasts.dismiss(id);
+            }
+            false
+        }
         "dialog.rename_commit" => {
-            let Some(ConfirmDialog::RenameSession { pane_id, buffer }) =
-                state.confirm_dialog.take()
+            let Some(ConfirmDialog::RenameSession {
+                pane_id,
+                buffer,
+                error: _,
+            }) = state.confirm_dialog.take()
             else {
                 return false;
             };
@@ -2148,7 +2227,16 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                     Some(buffer.trim().to_string())
                 };
                 if let Err(e) = state.pty_manager.rename_session(sid, wire_name) {
+                    // Issue #130: surface the failure inline in the
+                    // dialog and skip the local pane title update so
+                    // local state cannot diverge from the daemon.
                     log::warn!("rename_session({}): {}", sid, e);
+                    state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                        pane_id,
+                        buffer,
+                        error: Some(format!("rename failed: {e}")),
+                    });
+                    return true;
                 }
             }
             mutate_rename_pane(state, pane_id, &buffer);
@@ -2168,6 +2256,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.confirm_dialog = Some(ConfirmDialog::RenameSession {
                     pane_id: pane_num,
                     buffer: current,
+                    error: None,
                 });
                 return true;
             }
@@ -2802,6 +2891,8 @@ mod tests {
             tabbar_rect: crate::drag::Rect::default(),
             confirm_dialog: None,
             sessions: Vec::new(),
+            sessions_stale: false,
+            toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
         }
     }
 
@@ -3536,7 +3627,9 @@ mod tests {
         }]];
         assert!(dispatch(&mut state, "tab.request_rename:42"));
         match state.confirm_dialog.as_ref() {
-            Some(ConfirmDialog::RenameSession { pane_id, buffer }) => {
+            Some(ConfirmDialog::RenameSession {
+                pane_id, buffer, ..
+            }) => {
                 assert_eq!(*pane_id, 42);
                 assert_eq!(buffer, "api-server");
             }
@@ -3561,7 +3654,9 @@ mod tests {
         let mut state = seed_state();
         assert!(dispatch(&mut state, "tab.request_rename:9999"));
         match state.confirm_dialog.as_ref() {
-            Some(ConfirmDialog::RenameSession { pane_id, buffer }) => {
+            Some(ConfirmDialog::RenameSession {
+                pane_id, buffer, ..
+            }) => {
                 assert_eq!(*pane_id, 9999);
                 assert!(buffer.is_empty());
             }
@@ -3575,6 +3670,7 @@ mod tests {
         state.confirm_dialog = Some(ConfirmDialog::RenameSession {
             pane_id: 1,
             buffer: "x".into(),
+            error: None,
         });
         assert!(!dispatch(&mut state, "dialog.confirm"));
         assert!(state.confirm_dialog.is_some());
@@ -3593,6 +3689,7 @@ mod tests {
         state.confirm_dialog = Some(ConfirmDialog::RenameSession {
             pane_id: 7,
             buffer: "build".into(),
+            error: None,
         });
         assert!(dispatch(&mut state, "dialog.rename_commit"));
         assert!(state.confirm_dialog.is_none());
@@ -3612,6 +3709,7 @@ mod tests {
         state.confirm_dialog = Some(ConfirmDialog::RenameSession {
             pane_id: 7,
             buffer: "   ".into(),
+            error: None,
         });
         assert!(dispatch(&mut state, "dialog.rename_commit"));
         assert_eq!(state.panes[0][0].title, "shell");
@@ -3621,6 +3719,66 @@ mod tests {
     fn dialog_rename_commit_without_dialog_is_noop() {
         let mut state = seed_state();
         assert!(!dispatch(&mut state, "dialog.rename_commit"));
+    }
+
+    // refs #130: when the daemon RPC fails, the rename dialog must
+    // stay open with an inline error string so the user can retry,
+    // and the local pane title must NOT update (otherwise local and
+    // daemon state diverge until the next refresh).
+    #[test]
+    fn rename_commit_rpc_failure_keeps_dialog_open_with_error_string() {
+        let mut state = seed_state();
+        let pane_id = state.panes[0][0].id.0;
+        let original_title = state.panes[0][0].title.clone();
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(pane_id, 7);
+        state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+            pane_id,
+            buffer: "new-name".to_string(),
+            error: None,
+        });
+        let handled = dispatch(&mut state, "dialog.rename_commit");
+        assert!(handled);
+        match state.confirm_dialog {
+            Some(ConfirmDialog::RenameSession {
+                pane_id: pid,
+                buffer,
+                error,
+            }) => {
+                assert_eq!(pid, pane_id);
+                assert_eq!(buffer, "new-name");
+                let msg = error.expect("error string must be present");
+                assert!(
+                    msg.starts_with("rename failed:"),
+                    "expected rename-failure message, got {msg:?}"
+                );
+            }
+            other => panic!("expected dialog still open with error, got {other:?}"),
+        }
+        // Local title must not have moved.
+        assert_eq!(state.panes[0][0].title, original_title);
+        // No toast: the error is inline-only per spec decision 1a.
+        assert!(state.toasts.is_empty());
+    }
+
+    #[test]
+    fn rename_commit_rpc_failure_does_not_call_mutate_rename_pane() {
+        let mut state = seed_state();
+        let pane_id = state.panes[0][0].id.0;
+        let original = state.panes[0][0].title.clone();
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(pane_id, 11);
+        state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+            pane_id,
+            buffer: "should-not-stick".to_string(),
+            error: None,
+        });
+        dispatch(&mut state, "dialog.rename_commit");
+        // Original title preserved across every layout; mutate_rename_pane
+        // would have rewritten this, so its absence is the assertion.
+        assert_eq!(state.panes[0][0].title, original);
     }
 
     #[test]
@@ -3639,8 +3797,67 @@ mod tests {
         assert_eq!(state.sessions.len(), 1);
     }
 
+    // refs #130: refresh failure must surface to the user, not just to stderr.
     #[test]
-    fn session_kill_without_pane_mapping_drops_from_sessions_cache() {
+    fn refresh_sessions_failure_sets_stale_and_pushes_toast() {
+        let mut state = seed_state();
+        assert!(!state.sessions_stale);
+        assert!(state.toasts.is_empty());
+        // No daemon connected in tests, so list_sessions returns Err.
+        refresh_sessions(&mut state);
+        assert!(state.sessions_stale);
+        assert_eq!(state.toasts.len(), 1);
+        let msg = state
+            .toasts
+            .iter()
+            .next()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.starts_with("refresh failed:"),
+            "expected refresh-failure toast, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn push_error_toast_caps_at_three() {
+        let mut state = seed_state();
+        for i in 0..5 {
+            push_error_toast(&mut state, format!("err {i}"));
+        }
+        assert_eq!(state.toasts.len(), 3);
+        let messages: Vec<String> = state.toasts.iter().map(|t| t.message.clone()).collect();
+        assert_eq!(messages, vec!["err 2", "err 3", "err 4"]);
+    }
+
+    #[test]
+    fn dispatch_toast_dismiss_removes_toast() {
+        let mut state = seed_state();
+        push_error_toast(&mut state, "boom");
+        let id = state.toasts.iter().next().expect("toast").id;
+        assert!(dispatch(&mut state, &format!("toast.dismiss:{id}")));
+        assert!(state.toasts.is_empty());
+        // Idempotent: a second dismiss returns false but does not panic.
+        assert!(!dispatch(&mut state, &format!("toast.dismiss:{id}")));
+    }
+
+    #[test]
+    fn ui_snapshot_includes_toast_view_in_push_order() {
+        let mut state = seed_state();
+        push_error_toast(&mut state, "first");
+        push_error_toast(&mut state, "second");
+        let snap = state.ui_snapshot();
+        let messages: Vec<&str> = snap.toasts.iter().map(|t| t.message.as_str()).collect();
+        assert_eq!(messages, vec!["first", "second"]);
+        assert!(!snap.sessions_stale);
+    }
+
+    // refs #130: with the orphan-branch kill now blocking on a daemon
+    // ack, a disconnected daemon must NOT drop the row optimistically.
+    // The user gets a toast instead and the cached row stays so the
+    // panel does not lie about what the daemon knows.
+    #[test]
+    fn session_kill_without_pane_mapping_keeps_row_when_disconnected() {
         let mut state = seed_state();
         state.sessions = vec![
             SessionSnapshot {
@@ -3661,8 +3878,18 @@ mod tests {
             },
         ];
         assert!(dispatch(&mut state, "session.kill:1"));
-        assert_eq!(state.sessions.len(), 1);
-        assert_eq!(state.sessions[0].session_id, 2);
+        assert_eq!(state.sessions.len(), 2, "row stays under failed RPC");
+        assert_eq!(state.toasts.len(), 1, "user sees a kill-failed toast");
+        let msg = state
+            .toasts
+            .iter()
+            .next()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.starts_with("kill failed:"),
+            "expected kill-failure toast, got {msg:?}"
+        );
     }
 
     #[test]

@@ -405,10 +405,21 @@ fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
             });
         });
 
+    let mut control = ElementDef::new(Tag::Div)
+        .with_class("sessions-refresh-control")
+        .with_child(refresh);
+    if state.sessions_stale {
+        control = control.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("sessions-refresh-stale")
+                .with_text("stale"),
+        );
+    }
+
     let mut section = section_shell("sessions").with_child(setting_row(
         "Daemon sessions",
         "Sessions currently tracked by the session daemon. Refresh to re-poll.",
-        refresh,
+        control,
     ));
 
     if state.sessions.is_empty() {
@@ -1894,14 +1905,37 @@ mod tests {
         let snap = make_snapshot_section(SettingsSection::Sessions);
         let shared = make_shared();
         let el = build_sessions_section(&snap, &shared);
-        let refresh_row = &el.children[1]; // first is section title, second is header setting-row
-        let refresh_btn = refresh_row
-            .children
-            .iter()
-            .find(|c| c.id.as_deref() == Some("settings-sessions-refresh"))
-            .expect("refresh button");
+        let refresh_btn = find_by_id(&el, "settings-sessions-refresh").expect("refresh button");
         // Invoking succeeds without panic; actual daemon call is a no-op
         // because no daemon is connected in unit tests.
         (refresh_btn.on_click.as_ref().unwrap())();
+    }
+
+    fn find_by_id<'a>(el: &'a ElementDef, target: &str) -> Option<&'a ElementDef> {
+        if el.id.as_deref() == Some(target) {
+            return Some(el);
+        }
+        el.children.iter().find_map(|c| find_by_id(c, target))
+    }
+
+    // refs #130: stale chip surfaces failed refreshes next to the button.
+    #[test]
+    fn sessions_section_renders_stale_chip_when_flag_set() {
+        let mut snap = make_snapshot_section(SettingsSection::Sessions);
+        assert!(!snap.sessions_stale);
+        let shared = make_shared();
+        let clean = build_sessions_section(&snap, &shared);
+        assert!(!has_class_anywhere(&clean, "sessions-refresh-stale"));
+
+        snap.sessions_stale = true;
+        let stale = build_sessions_section(&snap, &shared);
+        assert!(has_class_anywhere(&stale, "sessions-refresh-stale"));
+    }
+
+    fn has_class_anywhere(el: &ElementDef, class: &str) -> bool {
+        if el.classes.iter().any(|c| c == class) {
+            return true;
+        }
+        el.children.iter().any(|c| has_class_anywhere(c, class))
     }
 }
