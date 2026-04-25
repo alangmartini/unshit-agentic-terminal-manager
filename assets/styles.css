@@ -2565,3 +2565,46 @@ body.dragging-pane {
   }
   .pill-btn span { display: none; }
 }
+
+/* ============================================================
+   TOAST OVERLAY
+   Fixed bottom-right, stacks above the status bar. Each toast is
+   click-to-dismiss; auto-dismiss is driven by the blink subscription.
+   ============================================================ */
+
+.toast-overlay-hidden {
+  display: none;
+}
+
+.toast-overlay {
+  position: fixed;
+  right: 16px;
+  bottom: 40px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  z-index: 400;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  padding: 8px 12px;
+  min-width: 240px;
+  max-width: 360px;
+  box-shadow: var(--shadow-lg);
+  font-size: 12px;
+  color: var(--fg-primary);
+  cursor: pointer;
+}
+
+.toast-error {
+  border-left: 3px solid var(--accent-danger, #d75f5f);
+}
+
+.toast:hover {
+  background: var(--bg-elevated, var(--bg-subtle));
+}

@@ -7,3 +7,4 @@ pub mod statusbar;
 pub mod tabbar;
 pub mod terminal_grid;
 pub mod titlebar;
+pub mod toasts;
