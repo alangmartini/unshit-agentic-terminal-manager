@@ -117,6 +117,59 @@ impl Grid {
         }
     }
 
+    /// Remove the top `n` rows and return them in top-first order. The
+    /// remaining rows shift up; `n` blank rows fill the bottom so the grid
+    /// keeps its row count. If `n >= rows`, every row is evicted and the
+    /// grid is fully blanked. Returns an empty vec when `n == 0`.
+    pub fn shrink_rows_from_top(&mut self, n: usize) -> Vec<Vec<Cell>> {
+        if n == 0 || self.rows == 0 || self.cols == 0 {
+            return Vec::new();
+        }
+        let take = n.min(self.rows);
+        let mut evicted: Vec<Vec<Cell>> = Vec::with_capacity(take);
+        for r in 0..take {
+            let start = r * self.cols;
+            evicted.push(self.cells[start..start + self.cols].to_vec());
+        }
+        self.cells.copy_within(take * self.cols.., 0);
+        let tail_start = (self.rows - take) * self.cols;
+        for slot in &mut self.cells[tail_start..] {
+            *slot = Cell::BLANK;
+        }
+        evicted
+    }
+
+    /// Grow the grid by `n` rows added at the top, filling them with the
+    /// rows from `lifted` (one per row, in iteration order). Existing rows
+    /// shift down. Lifted rows shorter than `cols` are padded with blanks;
+    /// longer rows are clipped. If `lifted` yields fewer than `n` rows,
+    /// the lifted rows occupy the bottom of the new top section so they
+    /// sit adjacent to the existing content; any missing rows above stay
+    /// blank. Cursor row is *not* adjusted; callers (`Terminal::resize`)
+    /// own the cursor policy.
+    pub fn grow_rows_at_top(&mut self, n: usize, lifted: impl IntoIterator<Item = Vec<Cell>>) {
+        if n == 0 {
+            return;
+        }
+        let new_rows = self.rows + n;
+        let mut next = vec![Cell::BLANK; new_rows * self.cols];
+        // Buffer the lifted rows so we know how many actually came in.
+        let lifted_rows: Vec<Vec<Cell>> = lifted.into_iter().take(n).collect();
+        let blank_top = n - lifted_rows.len();
+        for (i, row) in lifted_rows.into_iter().enumerate() {
+            let copy = row.len().min(self.cols);
+            let dst = (blank_top + i) * self.cols;
+            next[dst..dst + copy].copy_from_slice(&row[..copy]);
+        }
+        for r in 0..self.rows {
+            let src = r * self.cols;
+            let dst = (r + n) * self.cols;
+            next[dst..dst + self.cols].copy_from_slice(&self.cells[src..src + self.cols]);
+        }
+        self.cells = next;
+        self.rows = new_rows;
+    }
+
     pub fn scroll_up(&mut self) -> Vec<Cell> {
         if self.rows == 0 || self.cols == 0 {
             return Vec::new();
@@ -262,5 +315,121 @@ mod tests {
         assert!(!g.cursor_visible());
         g.set_cursor_visible(true);
         assert!(g.cursor_visible());
+    }
+
+    fn cell(ch: char) -> Cell {
+        Cell::new(ch, Color::WHITE, Color::BLACK, CellAttrs::empty())
+    }
+
+    fn fill_row(g: &mut Grid, row: usize, ch: char) {
+        for c in 0..g.cols() {
+            g.set(row, c, cell(ch));
+        }
+    }
+
+    #[test]
+    fn shrink_rows_from_top_returns_top_rows_and_shifts_remainder() {
+        let mut g = Grid::new(3, 2);
+        fill_row(&mut g, 0, 'a');
+        fill_row(&mut g, 1, 'b');
+        fill_row(&mut g, 2, 'c');
+
+        let evicted = g.shrink_rows_from_top(1);
+        assert_eq!(evicted, vec![vec![cell('a'), cell('a')]]);
+        assert_eq!(g.rows(), 3);
+        assert_eq!(g.row(0).unwrap(), &[cell('b'), cell('b')]);
+        assert_eq!(g.row(1).unwrap(), &[cell('c'), cell('c')]);
+        assert_eq!(g.row(2).unwrap(), &[Cell::BLANK, Cell::BLANK]);
+    }
+
+    #[test]
+    fn shrink_rows_from_top_returns_in_top_first_order() {
+        let mut g = Grid::new(3, 1);
+        fill_row(&mut g, 0, 'a');
+        fill_row(&mut g, 1, 'b');
+        fill_row(&mut g, 2, 'c');
+
+        let evicted = g.shrink_rows_from_top(2);
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(evicted[0][0].ch, 'a');
+        assert_eq!(evicted[1][0].ch, 'b');
+    }
+
+    #[test]
+    fn shrink_rows_from_top_zero_is_noop() {
+        let mut g = Grid::new(2, 2);
+        fill_row(&mut g, 0, 'x');
+        let evicted = g.shrink_rows_from_top(0);
+        assert!(evicted.is_empty());
+        assert_eq!(g.row(0).unwrap(), &[cell('x'), cell('x')]);
+    }
+
+    #[test]
+    fn shrink_rows_from_top_n_ge_rows_evicts_all_and_blanks_grid() {
+        let mut g = Grid::new(2, 2);
+        fill_row(&mut g, 0, 'a');
+        fill_row(&mut g, 1, 'b');
+        let evicted = g.shrink_rows_from_top(5);
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(g.row(0).unwrap(), &[Cell::BLANK, Cell::BLANK]);
+        assert_eq!(g.row(1).unwrap(), &[Cell::BLANK, Cell::BLANK]);
+    }
+
+    #[test]
+    fn grow_rows_at_top_prepends_lifted_rows() {
+        let mut g = Grid::new(2, 2);
+        fill_row(&mut g, 0, 'a');
+        fill_row(&mut g, 1, 'b');
+
+        let lifted = vec![vec![cell('x'), cell('x')]];
+        g.grow_rows_at_top(1, lifted);
+
+        assert_eq!(g.rows(), 3);
+        assert_eq!(g.row(0).unwrap(), &[cell('x'), cell('x')]);
+        assert_eq!(g.row(1).unwrap(), &[cell('a'), cell('a')]);
+        assert_eq!(g.row(2).unwrap(), &[cell('b'), cell('b')]);
+    }
+
+    #[test]
+    fn grow_rows_at_top_pads_missing_rows_with_blank() {
+        let mut g = Grid::new(1, 2);
+        fill_row(&mut g, 0, 'z');
+        // Iterator yields 1 row, but we asked for 2 new rows at the top.
+        g.grow_rows_at_top(2, vec![vec![cell('x'), cell('x')]]);
+        assert_eq!(g.rows(), 3);
+        assert_eq!(g.row(0).unwrap(), &[Cell::BLANK, Cell::BLANK]);
+        assert_eq!(g.row(1).unwrap(), &[cell('x'), cell('x')]);
+        assert_eq!(g.row(2).unwrap(), &[cell('z'), cell('z')]);
+    }
+
+    #[test]
+    fn grow_rows_at_top_clips_long_lifted_rows_to_cols() {
+        let mut g = Grid::new(1, 2);
+        fill_row(&mut g, 0, 'a');
+        let oversize = vec![vec![cell('1'), cell('2'), cell('3'), cell('4')]];
+        g.grow_rows_at_top(1, oversize);
+        assert_eq!(g.cols(), 2);
+        assert_eq!(g.row(0).unwrap(), &[cell('1'), cell('2')]);
+    }
+
+    #[test]
+    fn grow_rows_at_top_pads_short_lifted_rows_with_blank() {
+        let mut g = Grid::new(1, 4);
+        fill_row(&mut g, 0, 'a');
+        let short = vec![vec![cell('1'), cell('2')]];
+        g.grow_rows_at_top(1, short);
+        assert_eq!(
+            g.row(0).unwrap(),
+            &[cell('1'), cell('2'), Cell::BLANK, Cell::BLANK]
+        );
+    }
+
+    #[test]
+    fn grow_rows_at_top_zero_is_noop() {
+        let mut g = Grid::new(2, 2);
+        fill_row(&mut g, 0, 'a');
+        g.grow_rows_at_top(0, Vec::<Vec<Cell>>::new());
+        assert_eq!(g.rows(), 2);
+        assert_eq!(g.row(0).unwrap(), &[cell('a'), cell('a')]);
     }
 }

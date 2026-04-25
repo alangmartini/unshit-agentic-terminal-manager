@@ -52,20 +52,42 @@ impl Terminal {
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
+    /// Bottom-anchored reflow on row resize (issue #129). Growing rows
+    /// lifts scrollback into the new top so the cursor stays anchored to
+    /// its distance-from-bottom, rather than leaving a blank gap below
+    /// the live prompt. Shrinking rows pushes the rows above the cursor
+    /// into scrollback so they survive the resize. Column-only resizes
+    /// do not touch scrollback.
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        let old_rows = self.rows;
+
+        if rows > old_rows {
+            let k = rows - old_rows;
+            let lifted = self.scrollback.pop_back_n(k);
+            self.grid.grow_rows_at_top(k, lifted);
+            self.cursor_row += k;
+        } else if rows < old_rows {
+            let k = old_rows - rows;
+            // Only evict rows that sit above the cursor, so the live
+            // prompt row is never pushed into scrollback.
+            let evict_above = k.min(self.cursor_row);
+            if evict_above > 0 {
+                let evicted = self.grid.shrink_rows_from_top(evict_above);
+                for line in evicted {
+                    self.scrollback.push(line);
+                }
+                self.cursor_row -= evict_above;
+            }
+            // Any remaining shrink (k > cursor_row) trims the blank tail
+            // below the cursor; grid.resize handles it by clipping.
+        }
+
+        self.grid.resize(rows, cols);
         self.rows = rows;
         self.cols = cols;
-        self.grid.resize(rows, cols);
-        if rows == 0 {
-            self.cursor_row = 0;
-        } else if self.cursor_row >= rows {
-            self.cursor_row = rows - 1;
-        }
-        if cols == 0 {
-            self.cursor_col = 0;
-        } else if self.cursor_col >= cols {
-            self.cursor_col = cols - 1;
-        }
+
+        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
@@ -628,5 +650,231 @@ mod tests {
         let mut t = Terminal::new(1, 2, 10);
         t.process_bytes(b"\x1b[91ma");
         assert_eq!(t.grid().get(0, 0).unwrap().fg, ANSI_16[9]);
+    }
+
+    // -- Resize reflow (issue #129) ----------------------------------------
+    //
+    // Splitting a pane and unsplitting triggers two PTY resize calls. The
+    // old behavior was a naive top-left clip: shrink discarded top rows
+    // silently and grow appended blanks at the bottom, so the live prompt
+    // ended up mid-grid with a blank gap below it and old narrow-width
+    // prompts left behind in the visible rows. The new behavior is
+    // bottom-anchored: grow lifts scrollback into the new top rows, shrink
+    // evicts top rows into scrollback.
+
+    #[test]
+    fn resize_grow_lifts_scrollback_into_new_top_rows() {
+        // Issue #129 regression: when the grid grows, scrollback content
+        // must fill the new top rows so the live prompt stays at the
+        // bottom and there is no blank gap. Input is short (2 chars in
+        // 4-col terminal) so the eager wrap-scroll path is not exercised.
+        let mut t = Terminal::new(2, 4, 100);
+        // Five logical lines, last one is the "prompt".
+        t.process_bytes(b"L1\r\nL2\r\nL3\r\nL4\r\n>>");
+        assert_eq!(t.scrollback().len(), 3);
+        assert_eq!(row_text(&t, 0), "L4");
+        assert_eq!(row_text(&t, 1), ">>");
+        let cursor_before = t.grid().cursor();
+
+        t.resize(4, 4);
+
+        assert_eq!(t.grid().rows(), 4);
+        assert_eq!(row_text(&t, 0), "L2");
+        assert_eq!(row_text(&t, 1), "L3");
+        assert_eq!(row_text(&t, 2), "L4");
+        assert_eq!(row_text(&t, 3), ">>");
+        assert_eq!(t.scrollback().len(), 1);
+        // Cursor advanced by 2 (the row count delta) so it is still on
+        // the same logical line ">>".
+        assert_eq!(t.grid().cursor().0, cursor_before.0 + 2);
+    }
+
+    #[test]
+    fn resize_no_blank_gap_after_split_unsplit_round_trip() {
+        // Issue #129 reproduction: simulate a wide pane that gets split
+        // (shrink) and then unsplit (grow back). After the round-trip,
+        // every visible row should have content (no blank gap) and the
+        // bottom row should still be the live prompt.
+        let mut t = Terminal::new(6, 8, 100);
+        // Six logical lines of wide content (6 chars each, 8-col grid).
+        t.process_bytes(b"row1__\r\nrow2__\r\nrow3__\r\nrow4__\r\nrow5__\r\n>>>>>");
+        let cursor_before = t.grid().cursor();
+
+        t.resize(4, 8);
+        assert_eq!(row_text(&t, 3), ">>>>>");
+
+        t.resize(6, 8);
+
+        assert_eq!(row_text(&t, 0), "row1__");
+        assert_eq!(row_text(&t, 1), "row2__");
+        assert_eq!(row_text(&t, 2), "row3__");
+        assert_eq!(row_text(&t, 3), "row4__");
+        assert_eq!(row_text(&t, 4), "row5__");
+        assert_eq!(row_text(&t, 5), ">>>>>");
+        assert_eq!(t.grid().cursor(), cursor_before);
+        for r in 0..5 {
+            assert_ne!(row_text(&t, r), "", "row {r} unexpectedly blank");
+        }
+    }
+
+    #[test]
+    fn resize_grow_with_empty_scrollback_blanks_top_and_advances_cursor() {
+        let mut t = Terminal::new(2, 3, 100);
+        t.process_bytes(b"aa\r\nbb");
+        assert_eq!(t.grid().cursor().0, 1);
+        assert!(t.scrollback().is_empty());
+
+        t.resize(4, 3);
+
+        // No scrollback, so the new top rows are blank; existing content
+        // shifted down by 2.
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "");
+        assert_eq!(row_text(&t, 2), "aa");
+        assert_eq!(row_text(&t, 3), "bb");
+        assert_eq!(t.grid().cursor().0, 3);
+    }
+
+    #[test]
+    fn resize_grow_when_scrollback_smaller_than_delta() {
+        let mut t = Terminal::new(2, 3, 100);
+        t.process_bytes(b"aa\r\nbb\r\ncc");
+        assert_eq!(t.scrollback().len(), 1);
+
+        t.resize(5, 3);
+
+        // Only 1 line in scrollback to lift, but we grew by 3. The lifted
+        // row sits adjacent to the original top so the bottom stays
+        // anchored: top 2 rows blank, then "aa", then "bb", "cc".
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "");
+        assert_eq!(row_text(&t, 2), "aa");
+        assert_eq!(row_text(&t, 3), "bb");
+        assert_eq!(row_text(&t, 4), "cc");
+        assert!(t.scrollback().is_empty());
+        assert_eq!(t.grid().cursor().0, 4);
+    }
+
+    #[test]
+    fn resize_shrink_pushes_top_rows_to_scrollback_and_decreases_cursor() {
+        let mut t = Terminal::new(4, 3, 100);
+        t.process_bytes(b"aa\r\nbb\r\ncc\r\ndd");
+        assert_eq!(t.grid().cursor().0, 3);
+        assert!(t.scrollback().is_empty());
+
+        t.resize(2, 3);
+
+        assert_eq!(t.grid().rows(), 2);
+        assert_eq!(row_text(&t, 0), "cc");
+        assert_eq!(row_text(&t, 1), "dd");
+        assert_eq!(t.grid().cursor().0, 1);
+        let scrolled: Vec<String> = t
+            .scrollback()
+            .lines()
+            .map(|l| {
+                l.iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(scrolled, vec!["aa".to_string(), "bb".to_string()]);
+    }
+
+    #[test]
+    fn resize_shrink_when_k_exceeds_cursor_row_evicts_only_above_cursor() {
+        let mut t = Terminal::new(5, 3, 100);
+        // Cursor stays on row 1 ("XX") with three blank rows below it.
+        t.process_bytes(b"aa\r\nXX");
+        assert_eq!(t.grid().cursor().0, 1);
+
+        // Shrink by 4 rows. Only 1 row above the cursor (row 0 "aa") can
+        // be pushed to scrollback; remaining 3 rows of trim come from
+        // the blank tail below the cursor.
+        t.resize(1, 3);
+
+        assert_eq!(t.grid().rows(), 1);
+        assert_eq!(row_text(&t, 0), "XX");
+        assert_eq!(t.grid().cursor().0, 0);
+        let scrolled: Vec<String> = t
+            .scrollback()
+            .lines()
+            .map(|l| {
+                l.iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(scrolled, vec!["aa".to_string()]);
+    }
+
+    #[test]
+    fn resize_shrink_respects_max_scrollback() {
+        // Cap scrollback at 1; the second eviction pushes the first out.
+        let mut t = Terminal::new(3, 4, 1);
+        t.process_bytes(b"L1\r\nL2\r\nL3");
+        // Visible: ["L1", "L2", "L3"]; scrollback empty.
+        assert!(t.scrollback().is_empty());
+
+        t.resize(1, 4);
+
+        // Evict "L1" then "L2" in that order; cap is 1 so only "L2"
+        // survives.
+        assert_eq!(t.scrollback().len(), 1);
+        let last: String = t
+            .scrollback()
+            .lines()
+            .next()
+            .unwrap()
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        assert_eq!(last, "L2");
+    }
+
+    #[test]
+    fn resize_round_trip_is_stable() {
+        let mut t = Terminal::new(4, 3, 100);
+        t.process_bytes(b"aa\r\nbb\r\ncc\r\ndd");
+        let cursor_before = t.grid().cursor();
+
+        t.resize(2, 3);
+        t.resize(4, 3);
+
+        // After shrink-then-grow, the visible grid recovers and the
+        // cursor returns to its pre-resize row.
+        assert_eq!(row_text(&t, 0), "aa");
+        assert_eq!(row_text(&t, 1), "bb");
+        assert_eq!(row_text(&t, 2), "cc");
+        assert_eq!(row_text(&t, 3), "dd");
+        assert_eq!(t.grid().cursor(), cursor_before);
+    }
+
+    #[test]
+    fn resize_column_only_does_not_touch_scrollback() {
+        let mut t = Terminal::new(2, 3, 100);
+        t.process_bytes(b"aa\r\nbb\r\ncc");
+        let scrollback_before = t.scrollback().len();
+
+        t.resize(2, 5);
+
+        assert_eq!(t.scrollback().len(), scrollback_before);
+        assert_eq!(t.grid().cols(), 5);
+    }
+
+    #[test]
+    fn resize_to_zero_rows_does_not_panic() {
+        let mut t = Terminal::new(2, 3, 10);
+        t.process_bytes(b"aa\r\nbb");
+        t.resize(0, 3);
+        assert_eq!(t.grid().rows(), 0);
+        // Cursor row is forced to 0 when rows == 0; cursor col is left
+        // at whatever it was clamped to (the grid's own cursor clamp).
+        assert_eq!(t.grid().cursor().0, 0);
     }
 }
