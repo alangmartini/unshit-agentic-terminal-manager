@@ -443,6 +443,28 @@ impl DaemonPty {
             .and_then(|i| i.sessions.get(&pane_id).copied())
     }
 
+    /// Test-only: install an `Inner` whose worker channel is already
+    /// dead, with a single pane->session mapping pre-populated. Lets
+    /// state.rs unit tests exercise the "session known, RPC fails"
+    /// path that real disconnected mode does not reach (since
+    /// `inner` is `None` and `session_id` returns `None`).
+    #[cfg(test)]
+    pub(crate) fn test_install_broken_inner_with_session(&mut self, pane_id: u32, session_id: u64) {
+        let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
+        // Drop the receiver immediately so any send() returns an
+        // SendError, which the shim maps via `worker_gone()` to a
+        // BrokenPipe io::Error.
+        drop(cmd_rx);
+        let mut sessions = HashMap::new();
+        sessions.insert(pane_id, session_id);
+        self.inner = Some(Inner {
+            cmd_tx,
+            sessions,
+            reattach_cache: HashMap::new(),
+            worker: None,
+        });
+    }
+
     #[cfg(test)]
     fn reattach_cache_len(&self) -> usize {
         self.inner

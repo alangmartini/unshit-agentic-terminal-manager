@@ -49,9 +49,11 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
         ConfirmDialog::CloseApp { count, remember } => {
             build_close_app_card(*count, *remember, shared)
         }
-        ConfirmDialog::RenameSession { pane_id, buffer } => {
-            build_rename_session_card(*pane_id, buffer, shared)
-        }
+        ConfirmDialog::RenameSession {
+            pane_id,
+            buffer,
+            error,
+        } => build_rename_session_card(*pane_id, buffer, error.as_deref(), shared),
     };
 
     let backdrop_shared = shared.clone();
@@ -218,7 +220,16 @@ fn build_close_app_card(count: usize, remember: bool, shared: &SharedState) -> E
 /// typed value. The framework does not seed an input's initial value
 /// from the ElementDef, so the current name is shown as placeholder
 /// text; submitting an empty field clears the custom name.
-fn build_rename_session_card(pane_id: u32, _buffer: &str, shared: &SharedState) -> ElementDef {
+///
+/// `error` carries an inline failure message under the input when
+/// the most recent rename RPC came back Err. Typing into the input
+/// clears it so a retry does not show stale text.
+fn build_rename_session_card(
+    pane_id: u32,
+    _buffer: &str,
+    error: Option<&str>,
+    shared: &SharedState,
+) -> ElementDef {
     let input_shared = shared.clone();
     let submit_shared = shared.clone();
     let input = ElementDef::new(Tag::Input)
@@ -227,10 +238,11 @@ fn build_rename_session_card(pane_id: u32, _buffer: &str, shared: &SharedState) 
         .on_change(move |text| {
             let typed = text.to_string();
             mutate_with(&input_shared, |st| {
-                if let Some(ConfirmDialog::RenameSession { buffer, .. }) =
+                if let Some(ConfirmDialog::RenameSession { buffer, error, .. }) =
                     st.confirm_dialog.as_mut()
                 {
                     *buffer = typed;
+                    *error = None;
                 }
             });
         })
@@ -268,7 +280,7 @@ fn build_rename_session_card(pane_id: u32, _buffer: &str, shared: &SharedState) 
         })
         .with_child(ElementDef::new(Tag::Span).with_text("Save".to_string()));
 
-    ElementDef::new(Tag::Div)
+    let mut card = ElementDef::new(Tag::Div)
         .with_class("confirm-dialog-card")
         .with_id(format!("confirm-dialog-rename-{pane_id}"))
         .with_child(
@@ -284,13 +296,20 @@ fn build_rename_session_card(pane_id: u32, _buffer: &str, shared: &SharedState) 
                         .to_string(),
                 ),
         )
-        .with_child(input)
-        .with_child(
+        .with_child(input);
+    if let Some(msg) = error {
+        card = card.with_child(
             ElementDef::new(Tag::Div)
-                .with_class("confirm-dialog-buttons")
-                .with_child(cancel)
-                .with_child(save),
-        )
+                .with_class("rename-session-error")
+                .with_text(msg.to_string()),
+        );
+    }
+    card.with_child(
+        ElementDef::new(Tag::Div)
+            .with_class("confirm-dialog-buttons")
+            .with_child(cancel)
+            .with_child(save),
+    )
 }
 
 #[cfg(test)]
@@ -376,6 +395,7 @@ mod tests {
             guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
                 pane_id: 3,
                 buffer: "old".into(),
+                error: None,
             });
         }
         let snap = s.lock().unwrap().ui_snapshot();
@@ -407,6 +427,7 @@ mod tests {
             guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
                 pane_id: 3,
                 buffer: String::new(),
+                error: None,
             });
         }
         let snap = s.lock().unwrap().ui_snapshot();
@@ -435,6 +456,7 @@ mod tests {
             guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
                 pane_id: 3,
                 buffer: "x".into(),
+                error: None,
             });
         }
         let snap = s.lock().unwrap().ui_snapshot();
@@ -465,6 +487,7 @@ mod tests {
             guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
                 pane_id: 3,
                 buffer: "new-name".into(),
+                error: None,
             });
         }
         let snap = s.lock().unwrap().ui_snapshot();
@@ -544,6 +567,7 @@ mod tests {
             guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
                 pane_id: 5,
                 buffer: "partial".into(),
+                error: None,
             });
         }
         let snap = s.lock().unwrap().ui_snapshot();
@@ -571,5 +595,56 @@ mod tests {
         let el = build_confirm_dialog_overlay(&snap, &s);
         (el.on_click.as_ref().unwrap())();
         assert!(s.lock().unwrap().confirm_dialog.is_none());
+    }
+
+    // refs #130: rename dialog must render an inline error string
+    // under the input when ConfirmDialog::RenameSession.error is Some,
+    // and must omit it when None.
+    #[test]
+    fn rename_dialog_renders_inline_error_when_present() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                pane_id: 3,
+                buffer: "x".into(),
+                error: None,
+            });
+        }
+        let snap_clean = s.lock().unwrap().ui_snapshot();
+        let clean = build_confirm_dialog_overlay(&snap_clean, &s);
+        assert!(!has_class_anywhere(&clean, "rename-session-error"));
+
+        {
+            let mut guard = s.lock().unwrap();
+            guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                pane_id: 3,
+                buffer: "x".into(),
+                error: Some("rename failed: not connected".into()),
+            });
+        }
+        let snap_err = s.lock().unwrap().ui_snapshot();
+        let with_err = build_confirm_dialog_overlay(&snap_err, &s);
+        assert!(has_class_anywhere(&with_err, "rename-session-error"));
+        assert!(text_anywhere(&with_err).contains("rename failed: not connected"));
+    }
+
+    fn has_class_anywhere(el: &ElementDef, class: &str) -> bool {
+        if el.classes.iter().any(|c| c == class) {
+            return true;
+        }
+        el.children.iter().any(|c| has_class_anywhere(c, class))
+    }
+
+    fn text_anywhere(el: &ElementDef) -> String {
+        let mut out = String::new();
+        if let ElementContent::Text(s) = &el.content {
+            out.push_str(s);
+        }
+        for c in &el.children {
+            out.push(' ');
+            out.push_str(&text_anywhere(c));
+        }
+        out
     }
 }

@@ -2621,3 +2621,9 @@ body.dragging-pane {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+
+.rename-session-error {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--accent-danger, #d75f5f);
+}

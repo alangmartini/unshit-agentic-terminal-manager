@@ -81,7 +81,15 @@ pub enum ConfirmDialog {
     /// Rename dialog for the session backing `pane_id`. `buffer` is
     /// the live text in the input, updated on every keystroke so the
     /// commit handler can read it without pulling values out of the UI.
-    RenameSession { pane_id: u32, buffer: String },
+    /// `error` carries an inline failure message under the input
+    /// when the most recent commit attempt's RPC failed; cleared on
+    /// the next keystroke so retrying does not show stale text.
+    /// Issue #130.
+    RenameSession {
+        pane_id: u32,
+        buffer: String,
+        error: Option<String>,
+    },
 }
 
 /// Outcome of resolving the user's persisted close preference when the
@@ -2204,8 +2212,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             false
         }
         "dialog.rename_commit" => {
-            let Some(ConfirmDialog::RenameSession { pane_id, buffer }) =
-                state.confirm_dialog.take()
+            let Some(ConfirmDialog::RenameSession {
+                pane_id,
+                buffer,
+                error: _,
+            }) = state.confirm_dialog.take()
             else {
                 return false;
             };
@@ -2216,7 +2227,16 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                     Some(buffer.trim().to_string())
                 };
                 if let Err(e) = state.pty_manager.rename_session(sid, wire_name) {
+                    // Issue #130: surface the failure inline in the
+                    // dialog and skip the local pane title update so
+                    // local state cannot diverge from the daemon.
                     log::warn!("rename_session({}): {}", sid, e);
+                    state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                        pane_id,
+                        buffer,
+                        error: Some(format!("rename failed: {e}")),
+                    });
+                    return true;
                 }
             }
             mutate_rename_pane(state, pane_id, &buffer);
@@ -2236,6 +2256,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.confirm_dialog = Some(ConfirmDialog::RenameSession {
                     pane_id: pane_num,
                     buffer: current,
+                    error: None,
                 });
                 return true;
             }
@@ -3606,7 +3627,9 @@ mod tests {
         }]];
         assert!(dispatch(&mut state, "tab.request_rename:42"));
         match state.confirm_dialog.as_ref() {
-            Some(ConfirmDialog::RenameSession { pane_id, buffer }) => {
+            Some(ConfirmDialog::RenameSession {
+                pane_id, buffer, ..
+            }) => {
                 assert_eq!(*pane_id, 42);
                 assert_eq!(buffer, "api-server");
             }
@@ -3631,7 +3654,9 @@ mod tests {
         let mut state = seed_state();
         assert!(dispatch(&mut state, "tab.request_rename:9999"));
         match state.confirm_dialog.as_ref() {
-            Some(ConfirmDialog::RenameSession { pane_id, buffer }) => {
+            Some(ConfirmDialog::RenameSession {
+                pane_id, buffer, ..
+            }) => {
                 assert_eq!(*pane_id, 9999);
                 assert!(buffer.is_empty());
             }
@@ -3645,6 +3670,7 @@ mod tests {
         state.confirm_dialog = Some(ConfirmDialog::RenameSession {
             pane_id: 1,
             buffer: "x".into(),
+            error: None,
         });
         assert!(!dispatch(&mut state, "dialog.confirm"));
         assert!(state.confirm_dialog.is_some());
@@ -3663,6 +3689,7 @@ mod tests {
         state.confirm_dialog = Some(ConfirmDialog::RenameSession {
             pane_id: 7,
             buffer: "build".into(),
+            error: None,
         });
         assert!(dispatch(&mut state, "dialog.rename_commit"));
         assert!(state.confirm_dialog.is_none());
@@ -3682,6 +3709,7 @@ mod tests {
         state.confirm_dialog = Some(ConfirmDialog::RenameSession {
             pane_id: 7,
             buffer: "   ".into(),
+            error: None,
         });
         assert!(dispatch(&mut state, "dialog.rename_commit"));
         assert_eq!(state.panes[0][0].title, "shell");
@@ -3691,6 +3719,66 @@ mod tests {
     fn dialog_rename_commit_without_dialog_is_noop() {
         let mut state = seed_state();
         assert!(!dispatch(&mut state, "dialog.rename_commit"));
+    }
+
+    // refs #130: when the daemon RPC fails, the rename dialog must
+    // stay open with an inline error string so the user can retry,
+    // and the local pane title must NOT update (otherwise local and
+    // daemon state diverge until the next refresh).
+    #[test]
+    fn rename_commit_rpc_failure_keeps_dialog_open_with_error_string() {
+        let mut state = seed_state();
+        let pane_id = state.panes[0][0].id.0;
+        let original_title = state.panes[0][0].title.clone();
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(pane_id, 7);
+        state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+            pane_id,
+            buffer: "new-name".to_string(),
+            error: None,
+        });
+        let handled = dispatch(&mut state, "dialog.rename_commit");
+        assert!(handled);
+        match state.confirm_dialog {
+            Some(ConfirmDialog::RenameSession {
+                pane_id: pid,
+                buffer,
+                error,
+            }) => {
+                assert_eq!(pid, pane_id);
+                assert_eq!(buffer, "new-name");
+                let msg = error.expect("error string must be present");
+                assert!(
+                    msg.starts_with("rename failed:"),
+                    "expected rename-failure message, got {msg:?}"
+                );
+            }
+            other => panic!("expected dialog still open with error, got {other:?}"),
+        }
+        // Local title must not have moved.
+        assert_eq!(state.panes[0][0].title, original_title);
+        // No toast: the error is inline-only per spec decision 1a.
+        assert!(state.toasts.is_empty());
+    }
+
+    #[test]
+    fn rename_commit_rpc_failure_does_not_call_mutate_rename_pane() {
+        let mut state = seed_state();
+        let pane_id = state.panes[0][0].id.0;
+        let original = state.panes[0][0].title.clone();
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(pane_id, 11);
+        state.confirm_dialog = Some(ConfirmDialog::RenameSession {
+            pane_id,
+            buffer: "should-not-stick".to_string(),
+            error: None,
+        });
+        dispatch(&mut state, "dialog.rename_commit");
+        // Original title preserved across every layout; mutate_rename_pane
+        // would have rewritten this, so its absence is the assertion.
+        assert_eq!(state.panes[0][0].title, original);
     }
 
     #[test]
