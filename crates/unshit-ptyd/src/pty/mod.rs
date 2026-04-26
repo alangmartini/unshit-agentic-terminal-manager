@@ -204,14 +204,24 @@ impl Drop for PtyPair {
 
 /// Detect the default shell for the current platform.
 ///
-/// Reads the `SHELL` environment variable first. If unset, falls back to
-/// `bash` on Unix-like systems and `powershell.exe` on Windows.
+/// Reads the `SHELL` environment variable first. On Windows, ignores
+/// Unix-style values (paths starting with `/`) because Git Bash and
+/// WSL set `SHELL=/usr/bin/bash` which is a poor PTY experience under
+/// Windows ConPTY. Falls back to `bash` on Unix and `powershell.exe` on
+/// Windows.
 pub fn default_shell() -> String {
-    if let Ok(shell) = std::env::var("SHELL") {
-        return shell;
+    pick_default_shell(std::env::var("SHELL").ok().as_deref(), cfg!(windows))
+}
+
+fn pick_default_shell(shell_env: Option<&str>, is_windows: bool) -> String {
+    if let Some(shell) = shell_env {
+        let unix_style = shell.starts_with('/');
+        if !is_windows || !unix_style {
+            return shell.to_string();
+        }
     }
 
-    if cfg!(windows) {
+    if is_windows {
         "powershell.exe".to_string()
     } else {
         "bash".to_string()
@@ -367,6 +377,46 @@ mod tests {
     fn default_shell_returns_nonempty_string() {
         let shell = default_shell();
         assert!(!shell.is_empty());
+    }
+
+    #[test]
+    fn pick_default_shell_honors_shell_env_on_unix() {
+        assert_eq!(pick_default_shell(Some("/bin/zsh"), false), "/bin/zsh");
+    }
+
+    #[test]
+    fn pick_default_shell_falls_back_to_bash_on_unix_when_unset() {
+        assert_eq!(pick_default_shell(None, false), "bash");
+    }
+
+    #[test]
+    fn pick_default_shell_falls_back_to_powershell_on_windows_when_unset() {
+        assert_eq!(pick_default_shell(None, true), "powershell.exe");
+    }
+
+    #[test]
+    fn pick_default_shell_honors_windows_style_shell_on_windows() {
+        // A Windows-style executable name (or a path with backslashes) is
+        // honored verbatim. Tests still set SHELL=cmd.exe, this preserves
+        // that contract.
+        assert_eq!(pick_default_shell(Some("cmd.exe"), true), "cmd.exe");
+        assert_eq!(
+            pick_default_shell(Some("C:\\Windows\\System32\\cmd.exe"), true),
+            "C:\\Windows\\System32\\cmd.exe"
+        );
+        assert_eq!(pick_default_shell(Some("pwsh.exe"), true), "pwsh.exe");
+    }
+
+    #[test]
+    fn pick_default_shell_ignores_unix_style_shell_on_windows() {
+        // Git Bash and WSL set SHELL=/usr/bin/bash. Running bash inside
+        // a Windows ConPTY is a degraded experience. Fall back to
+        // PowerShell instead.
+        assert_eq!(
+            pick_default_shell(Some("/usr/bin/bash"), true),
+            "powershell.exe"
+        );
+        assert_eq!(pick_default_shell(Some("/bin/sh"), true), "powershell.exe");
     }
 
     #[test]
