@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::shell::ShellSpec;
 use crate::state::AppState;
 
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -28,6 +29,11 @@ pub struct PersistedState {
     pub remember_close_choice: bool,
     #[serde(default)]
     pub kill_all_on_close: bool,
+    /// App wide default shell. Empty for upgraders predating the
+    /// feature so the daemon's own `default_shell()` keeps the floor;
+    /// inference only runs in `seed_state` for true first runs.
+    #[serde(default)]
+    pub default_shell: ShellSpec,
 }
 
 impl PersistedState {
@@ -53,6 +59,7 @@ impl PersistedState {
                 .get(&crate::state::ToggleKey::KillAllOnClose)
                 .copied()
                 .unwrap_or(false),
+            default_shell: state.default_shell.clone(),
         }
     }
 
@@ -157,6 +164,7 @@ mod tests {
             active_workspace: 0,
             remember_close_choice: false,
             kill_all_on_close: false,
+            default_shell: ShellSpec::default(),
         };
         persisted.write_to(&path).unwrap();
         let loaded = PersistedState::read_from(&path).unwrap();
@@ -170,5 +178,41 @@ mod tests {
     fn read_from_missing_file_errors() {
         let path = unique_temp_path("missing");
         assert!(PersistedState::read_from(&path).is_err());
+    }
+
+    #[test]
+    fn round_trip_preserves_non_default_default_shell() {
+        let mut state = seed_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec!["--login".into()],
+        };
+        let persisted = PersistedState::from_state(&state);
+        let path = unique_temp_path("default-shell-round-trip");
+        persisted.write_to(&path).unwrap();
+        let loaded = PersistedState::read_from(&path).unwrap();
+        assert_eq!(loaded.default_shell.program, "/bin/bash");
+        assert_eq!(loaded.default_shell.args, vec!["--login".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deserializes_with_default_shell_when_field_is_missing() {
+        // An old workspaces.json predating the default shell feature
+        // omits the field entirely. Serde must hydrate it as the empty
+        // spec so the daemon's own `default_shell()` continues to win
+        // for upgraders. Inference only kicks in for true first runs.
+        let json = r#"{
+            "workspaces": [{"name":"alpha","path":null,"collapsed":false}],
+            "active_workspace": 0,
+            "remember_close_choice": false,
+            "kill_all_on_close": false
+        }"#;
+        let loaded: PersistedState = serde_json::from_str(json).unwrap();
+        assert!(
+            loaded.default_shell.is_empty(),
+            "missing default_shell must deserialize to an empty ShellSpec, got {:?}",
+            loaded.default_shell
+        );
     }
 }

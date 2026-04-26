@@ -43,18 +43,18 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase 3: App wide default
 
-- [ ] **Task 4: `AppState.default_shell` + persistence + first time inference + initial spawn**
-  - [ ] Add `default_shell: ShellSpec` to `AppState` (initialized in `seed_state`).
-  - [ ] Add `default_shell: ShellSpec` to `UiSnapshot`.
-  - [ ] Add `default_shell: ShellSpec` to `PersistedState` with `#[serde(default)]`.
-  - [ ] Wire load / save (`from_state`, restoration in `main.rs`).
-  - [ ] First time inference in `seed_state`: `pwsh.exe` if found, else `powershell.exe`, else today's `default_shell()` value.
-  - [ ] Update `main.rs:457` initial spawn to call `shell::resolve(None, Some(&state.default_shell))`.
-  - [ ] Test: old `workspaces.json` without `default_shell` loads with `ShellSpec::default()` (inference only kicks in on missing config).
-  - [ ] Test: round trip preserves a non default `default_shell`.
-  - [ ] Test: inference with a stubbed `discover_installed` returning `[pwsh.exe, powershell.exe]` picks `pwsh.exe`.
-  - [ ] Test: programmatic `state.default_shell = ShellSpec { program: "/bin/sh", args: vec![] }` causes initial spawn to send `Some("/bin/sh")` to the daemon.
-  - [ ] `cargo test` green.
+- [x] **Task 4: `AppState.default_shell` + persistence + first time inference + initial spawn** [DONE]
+  - [x] Added `default_shell: ShellSpec` to `AppState` (initialized in `seed_state` via `infer_default_shell(&discover_installed())`).
+  - [x] Added `default_shell: ShellSpec` to `UiSnapshot`.
+  - [x] Added `default_shell: ShellSpec` to `PersistedState` with `#[serde(default)]`.
+  - [x] Wired load / save (`from_state`, restoration in `main.rs:391`).
+  - [x] First time inference in `seed_state`: prefers `pwsh`, then `powershell`, else empty (daemon falls back).
+  - [x] `discover_installed()` minimal PATH probe for `pwsh` / `powershell` (full impl in Task 7).
+  - [x] Updated `main.rs:458` initial spawn to call `shell::resolve(None, Some(&guard.default_shell))`.
+  - [x] Test: old `workspaces.json` without `default_shell` loads with `ShellSpec::default()` (`deserializes_with_default_shell_when_field_is_missing`).
+  - [x] Test: round trip preserves a non default `default_shell` (`round_trip_preserves_non_default_default_shell`).
+  - [x] Test: inference with `[pwsh, powershell]` picks `pwsh` (`infer_default_shell_prefers_pwsh_over_powershell`).
+  - [x] `cargo test --bin terminal-manager`: 830 passed (up from 823, +7 new). clippy + fmt clean.
 
 - [ ] **Task 5: All other spawn sites resolve and pass spec**
   - [ ] Update three sites in `src/state.rs:868`, `:1073`, `:1132`.

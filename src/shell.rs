@@ -5,6 +5,8 @@
 //! wide default; both empty means "let the daemon's `default_shell()`
 //! decide", preserving the pre feature behavior.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// A shell program plus its launch args. Stored in `workspaces.json`
@@ -34,6 +36,55 @@ pub fn resolve(workspace: Option<&ShellSpec>, app: Option<&ShellSpec>) -> Option
         .filter(|s| !s.is_empty())
         .or(app.filter(|s| !s.is_empty()))
         .cloned()
+}
+
+/// Pick a sensible default shell from a list of discovered binaries.
+/// Prefers `pwsh` over `powershell` so users on a fresh machine land
+/// on the modern shell. Returns an empty spec when no preferred shell
+/// is present so the daemon's own `default_shell()` keeps the floor.
+pub fn infer_default_shell(installed: &[PathBuf]) -> ShellSpec {
+    for preferred in ["pwsh", "powershell"] {
+        if let Some(hit) = installed.iter().find(|p| stem_matches(p, preferred)) {
+            return ShellSpec {
+                program: hit.display().to_string(),
+                args: Vec::new(),
+            };
+        }
+    }
+    ShellSpec::default()
+}
+
+fn stem_matches(path: &std::path::Path, name: &str) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case(name))
+        .unwrap_or(false)
+}
+
+/// Probe PATH for a small set of preferred shell names so first run
+/// inference has something to choose from. The full discovery surface
+/// (Git Bash, WSL, dedup by canonical path, etc.) lands in Task 7.
+pub fn discover_installed() -> Vec<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["pwsh.exe", "powershell.exe"]
+    } else {
+        &["pwsh", "powershell"]
+    };
+
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in std::env::split_paths(&path_var) {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() && !out.iter().any(|p| p == &candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -127,5 +178,55 @@ mod tests {
             got.args.is_empty(),
             "missing args field must deserialize to an empty vector"
         );
+    }
+
+    #[test]
+    fn infer_default_shell_prefers_pwsh_over_powershell() {
+        let installed = vec![
+            PathBuf::from("/usr/bin/powershell.exe"),
+            PathBuf::from("/usr/bin/pwsh.exe"),
+        ];
+        let got = infer_default_shell(&installed);
+        assert_eq!(got.program, "/usr/bin/pwsh.exe");
+        assert!(got.args.is_empty());
+    }
+
+    #[test]
+    fn infer_default_shell_picks_powershell_when_pwsh_missing() {
+        let installed = vec![PathBuf::from("/usr/bin/powershell.exe")];
+        let got = infer_default_shell(&installed);
+        assert_eq!(got.program, "/usr/bin/powershell.exe");
+        assert!(got.args.is_empty());
+    }
+
+    #[test]
+    fn infer_default_shell_returns_empty_spec_when_no_preferred_shell_present() {
+        // Daemon should fall back to its own `default_shell()` when the
+        // UI hands back an empty spec.
+        let installed = vec![
+            PathBuf::from("/bin/cmd"),
+            PathBuf::from("/bin/zsh"),
+            PathBuf::from("/bin/fish"),
+        ];
+        let got = infer_default_shell(&installed);
+        assert!(
+            got.is_empty(),
+            "no preferred shell discovered must yield an empty spec, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn infer_default_shell_returns_empty_spec_for_empty_install_list() {
+        let got = infer_default_shell(&[]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn infer_default_shell_match_is_case_insensitive_on_stem() {
+        // discover_installed may return paths preserving on disk casing
+        // ("Pwsh.EXE" on Windows). The match must still pick it.
+        let installed = vec![PathBuf::from("/opt/Pwsh.EXE")];
+        let got = infer_default_shell(&installed);
+        assert_eq!(got.program, "/opt/Pwsh.EXE");
     }
 }

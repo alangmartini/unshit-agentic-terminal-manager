@@ -388,6 +388,11 @@ fn main() {
             crate::state::ToggleKey::KillAllOnClose,
             persisted.kill_all_on_close,
         );
+        // Override the seed_state inference with whatever the user
+        // last persisted. An upgrader without the field gets an
+        // empty spec here, which keeps the daemon's `default_shell()`
+        // floor exactly as before.
+        initial_state.default_shell = persisted.default_shell;
     }
     let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
 
@@ -455,13 +460,14 @@ fn main() {
         let pane_id = guard.active_pane.0;
         let workspace_id = crate::state::active_workspace_num(&guard);
         let cwd = crate::state::active_workspace_cwd(&guard);
+        let shell = crate::shell::resolve(None, Some(&guard.default_shell));
         match guard.pty_manager.attach_or_spawn(
             pane_id,
             workspace_id,
             init_cols,
             init_rows,
             cwd.as_deref(),
-            None,
+            shell.as_ref(),
         ) {
             Ok((Some(snapshot), reader)) => {
                 let rows = snapshot.grid.rows();

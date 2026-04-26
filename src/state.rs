@@ -421,6 +421,10 @@ pub struct AppState {
     /// [`push_error_toast`]; ticked down by the cursor-blink
     /// subscription so dismissal stays deterministic in tests.
     pub toasts: unshit::core::toast::ToastStore,
+    /// App wide default shell. Empty means "let the daemon's own
+    /// `default_shell()` decide". Per workspace overrides land in
+    /// Task 6 and take precedence via `shell::resolve`.
+    pub default_shell: crate::shell::ShellSpec,
 }
 
 impl AppState {
@@ -520,6 +524,7 @@ impl AppState {
                     message: t.message.clone(),
                 })
                 .collect(),
+            default_shell: self.default_shell.clone(),
         }
     }
 
@@ -587,6 +592,9 @@ pub struct UiSnapshot {
     pub sessions_stale: bool,
     /// Flat projection of the live `ToastStore`. Push order preserved.
     pub toasts: Vec<ToastView>,
+    /// Mirror of `AppState::default_shell` so settings UI can render
+    /// the current value without reaching into the live state.
+    pub default_shell: crate::shell::ShellSpec,
 }
 
 fn current_folder_name() -> String {
@@ -760,6 +768,7 @@ pub fn seed_state() -> AppState {
         sessions: Vec::new(),
         sessions_stale: false,
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
+        default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
     }
 }
 
@@ -2961,6 +2970,7 @@ mod tests {
             sessions: Vec::new(),
             sessions_stale: false,
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
+            default_shell: crate::shell::ShellSpec::default(),
         }
     }
 
