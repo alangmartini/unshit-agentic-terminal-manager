@@ -185,6 +185,26 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                         // next render.
                         let _ = guard.toasts.advance_ticks(1);
 
+                        // Drain any fire-and-forget PTY write failures
+                        // the worker has reported since the last tick
+                        // (Phase 2 of #135). The render thread never
+                        // waits for daemon acks anymore, so failures
+                        // surface here as user-visible toasts. 500 ms
+                        // latency is acceptable for an error message;
+                        // it matches the existing toast tick cadence.
+                        let write_errors = guard.pty_manager.take_write_errors();
+                        for err in write_errors {
+                            log::warn!(
+                                "pty write failed for pane {}: {}",
+                                err.pane_id,
+                                err.error
+                            );
+                            crate::state::push_error_toast(
+                                &mut guard,
+                                format!("write failed (pane {}): {}", err.pane_id, err.error),
+                            );
+                        }
+
                         // Deferred PTY spawn and dimension sync.
                         // Wait until the renderer has published real cell
                         // metrics (cell_w > 0), then spawn PTYs for any
