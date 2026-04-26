@@ -350,6 +350,58 @@ pub(crate) fn is_within_activity_window(
     now.saturating_duration_since(last_activity) < window
 }
 
+/// Coalesces external events that arrive between two paints into a
+/// single per-frame decision. The contract that callers depend on:
+/// any number of [`ExternalEvent::RequestRebuild`] events that land in
+/// one drain window collapse to exactly one tree rebuild on the next
+/// paint. The renderer reads `needs_rebuild` once per frame, runs the
+/// rebuild pipeline if set, then resets the flag, so additional events
+/// that arrive after the drain but before the redraw still piggyback on
+/// the same rebuild as long as they land in the same drain window.
+///
+/// Kept as a small explicit value type (rather than an inline boolean
+/// in `proxy_wake_up`) so the coalescing guarantee has a unit test that
+/// does not need a full winit [`AppState`]. See
+/// [`tests::request_rebuild_events_coalesce_to_single_rebuild`].
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct RebuildCoalescer {
+    /// Set to true the first time a rebuild-implying event lands. Stays
+    /// true regardless of how many further rebuild events arrive in the
+    /// same drain.
+    pub needs_rebuild: bool,
+    /// True if any event was observed during the current drain. Used
+    /// independently of `needs_rebuild` to mark UI activity for the
+    /// speculative-frame window.
+    pub saw_event: bool,
+    /// Telemetry: how many rebuild-implying events arrived during the
+    /// drain. Always >= 1 when `needs_rebuild` is set; saturates at
+    /// `u32::MAX` to avoid wrapping under pathological storms.
+    pub rebuild_request_count: u32,
+}
+
+impl RebuildCoalescer {
+    /// Reset to "no events yet for this drain". Called once per
+    /// `proxy_wake_up` entry so the same struct can be reused across
+    /// frames without per-frame allocation.
+    pub(crate) fn begin_drain(&mut self) {
+        self.needs_rebuild = false;
+        self.saw_event = false;
+        self.rebuild_request_count = 0;
+    }
+
+    /// Record one event. `request_rebuild` is true when the event
+    /// semantically implies a tree rebuild ([`ExternalEvent::RequestRebuild`],
+    /// [`ExternalEvent::Custom`], hot-reloaded stylesheet). All other
+    /// variants only mark activity.
+    pub(crate) fn observe(&mut self, request_rebuild: bool) {
+        self.saw_event = true;
+        if request_rebuild {
+            self.needs_rebuild = true;
+            self.rebuild_request_count = self.rebuild_request_count.saturating_add(1);
+        }
+    }
+}
+
 /// Adapter that exposes a winit [`Window`] as a
 /// [`crate::frame_pacer::MonitorRefreshSource`]. The adapter is the sole
 /// point in the framework that talks to winit's monitor APIs; the pacer
@@ -590,27 +642,28 @@ impl ApplicationHandler for AppHandler {
         let Some(state) = self.app.state.as_mut() else {
             return;
         };
-        let mut saw_event = false;
+        let mut coalescer = RebuildCoalescer::default();
+        coalescer.begin_drain();
         for event in self.event_rx.try_iter() {
-            saw_event = true;
             match event {
                 ExternalEvent::RequestRebuild => {
-                    state.needs_rebuild = true;
+                    coalescer.observe(true);
                 }
                 ExternalEvent::RequestRedraw => {
-                    // Redraw happens below via request_redraw.
+                    coalescer.observe(false);
                 }
                 ExternalEvent::Custom(payload) => {
                     if let Some(ref handler) = self.app.config.on_external_event {
                         handler(payload);
                     }
                     // Custom events typically change app state, so rebuild.
-                    state.needs_rebuild = true;
+                    coalescer.observe(true);
                 }
                 ExternalEvent::Bytes(data) => {
                     if let Some(ref handler) = self.app.config.on_bytes {
                         (handler)(data);
                     }
+                    coalescer.observe(false);
                 }
                 #[cfg(feature = "hot-reload")]
                 ExternalEvent::StylesheetReload(new_stylesheet) => {
@@ -627,11 +680,14 @@ impl ApplicationHandler for AppHandler {
                                 | unshit_core::dirty::DirtyFlags::SUBTREE_STYLE;
                         }
                     }
-                    state.needs_rebuild = true;
+                    coalescer.observe(true);
                 }
             }
         }
-        if saw_event {
+        if coalescer.needs_rebuild {
+            state.needs_rebuild = true;
+        }
+        if coalescer.saw_event {
             // An external source (PTY reader, subscription, bridge, hot
             // reload, etc.) produced work for the UI thread. Count this as
             // activity so `about_to_wait` schedules speculative frames
@@ -3574,5 +3630,109 @@ mod tests {
         let last = Instant::now() + Duration::from_millis(100);
         let now = last - Duration::from_millis(50);
         assert!(is_within_activity_window(last, now, ACTIVITY_WINDOW));
+    }
+
+    // === RebuildCoalescer (#135 Phase 1, item 1) ===
+
+    #[test]
+    fn rebuild_coalescer_default_is_idle() {
+        let c = RebuildCoalescer::default();
+        assert!(!c.needs_rebuild);
+        assert!(!c.saw_event);
+        assert_eq!(c.rebuild_request_count, 0);
+    }
+
+    #[test]
+    fn rebuild_coalescer_observe_redraw_only_marks_activity() {
+        let mut c = RebuildCoalescer::default();
+        c.observe(false);
+        assert!(c.saw_event, "redraw-only events still count as activity");
+        assert!(!c.needs_rebuild, "redraw-only events do not request a rebuild");
+        assert_eq!(c.rebuild_request_count, 0);
+    }
+
+    #[test]
+    fn rebuild_coalescer_observe_rebuild_sets_flag() {
+        let mut c = RebuildCoalescer::default();
+        c.observe(true);
+        assert!(c.saw_event);
+        assert!(c.needs_rebuild);
+        assert_eq!(c.rebuild_request_count, 1);
+    }
+
+    #[test]
+    fn one_hundred_rebuild_events_coalesce_to_single_rebuild_flag() {
+        // The Phase 1 cornerstone guarantee: any number of rebuild
+        // requests that arrive in one drain window collapse to exactly
+        // one tree rebuild on the next paint. The flag is idempotent;
+        // the counter records how many requests landed for telemetry,
+        // but `needs_rebuild` is unchanged after the first observation.
+        let mut c = RebuildCoalescer::default();
+        c.begin_drain();
+        for _ in 0..100 {
+            c.observe(true);
+        }
+        assert!(c.needs_rebuild, "100 rebuild events must set the flag exactly once");
+        assert!(c.saw_event);
+        assert_eq!(
+            c.rebuild_request_count, 100,
+            "telemetry counts every rebuild request even though they coalesce"
+        );
+    }
+
+    #[test]
+    fn begin_drain_resets_state_between_frames() {
+        let mut c = RebuildCoalescer::default();
+        for _ in 0..50 {
+            c.observe(true);
+        }
+        assert!(c.needs_rebuild);
+        assert_eq!(c.rebuild_request_count, 50);
+
+        c.begin_drain();
+        assert!(!c.needs_rebuild, "begin_drain clears the rebuild flag for the next frame");
+        assert!(!c.saw_event);
+        assert_eq!(c.rebuild_request_count, 0);
+
+        // The next drain stands on its own: a single redraw event does not
+        // resurrect a stale rebuild flag from the previous drain.
+        c.observe(false);
+        assert!(c.saw_event);
+        assert!(!c.needs_rebuild);
+        assert_eq!(c.rebuild_request_count, 0);
+    }
+
+    #[test]
+    fn rebuild_coalescer_mixed_events_collapse_to_single_rebuild() {
+        // A mix of redraw-only and rebuild-implying events lands in the
+        // same drain. We expect the flag set exactly once and the counter
+        // to track only the rebuild-implying events.
+        let mut c = RebuildCoalescer::default();
+        c.begin_drain();
+        c.observe(false); // RequestRedraw
+        c.observe(true); // RequestRebuild
+        c.observe(false); // Bytes
+        c.observe(true); // Custom (mutating)
+        c.observe(false); // RequestRedraw
+        c.observe(true); // RequestRebuild
+
+        assert!(c.needs_rebuild);
+        assert_eq!(c.rebuild_request_count, 3, "only rebuild-implying events count");
+    }
+
+    #[test]
+    fn rebuild_coalescer_counter_saturates_under_extreme_storm() {
+        // Pathological input must not wrap the telemetry counter. Pick
+        // a sentinel value just below u32::MAX and confirm `saturating_add`
+        // pins it at the ceiling rather than overflowing.
+        let mut c = RebuildCoalescer {
+            needs_rebuild: true,
+            saw_event: true,
+            rebuild_request_count: u32::MAX - 1,
+        };
+        c.observe(true);
+        c.observe(true);
+        c.observe(true);
+        assert_eq!(c.rebuild_request_count, u32::MAX);
     }
 }
