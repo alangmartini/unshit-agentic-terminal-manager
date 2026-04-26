@@ -6,6 +6,7 @@ pub mod git;
 pub mod keybinds;
 pub mod persist;
 pub mod pty;
+pub mod shell;
 pub mod state;
 pub mod terminal;
 pub mod ui;

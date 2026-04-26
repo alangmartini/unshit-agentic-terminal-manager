@@ -4,14 +4,14 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase 1: Foundation
 
-- [ ] **Task 1: `ShellSpec` type + `resolve()`**
-  - [ ] Create `src/shell.rs` with `ShellSpec { program, args }`, `is_empty()`, and `resolve(workspace, app)`.
-  - [ ] Add `pub mod shell;` to `src/main.rs`.
-  - [ ] Unit tests: `is_empty`, `resolve` (workspace wins, fallback, both empty), serde round trip with empty args defaulted in.
-  - [ ] `cargo test --lib shell::` green.
+- [x] **Task 1: `ShellSpec` type + `resolve()`** [DONE]
+  - [x] Create `src/shell.rs` with `ShellSpec { program, args }`, `is_empty()`, and `resolve(workspace, app)`.
+  - [x] Add `pub mod shell;` to `src/main.rs`.
+  - [x] Unit tests: `is_empty`, `resolve` (workspace wins, fallback, both empty), serde round trip with empty args defaulted in.
+  - [x] `cargo test --bin terminal-manager shell::` green (10/10).
 
 ### Checkpoint
-- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` clean. No behavior change.
+- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean (terminal-manager package). No behavior change.
 
 ## Phase 2: Daemon honors `shell_args`
 
