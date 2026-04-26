@@ -407,7 +407,7 @@ fn build_pane_body(
 
                         if let Some(bytes) = crate::terminal::keys::encode_key(kb) {
                             mutate_with(&kbd_shared, |st| {
-                                let _ = st.pty_manager.write_blocking(kbd_pane_id.0, &bytes);
+                                let _ = st.pty_manager.write(kbd_pane_id.0, &bytes);
                             });
                         }
                     }
