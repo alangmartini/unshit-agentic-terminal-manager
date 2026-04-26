@@ -734,8 +734,15 @@ fn worker_main(
                     reply,
                 } => {
                     let cwd_string = cwd.map(|p| p.display().to_string());
+                    // Pass the shell explicitly so the daemon does not fall
+                    // back to its own default. The UI binary is rebuilt on
+                    // every `cargo run`; the daemon survives across UI
+                    // restarts and may be on stale code. Passing the shell
+                    // from here keeps shell selection up to date with the
+                    // latest UI binary.
+                    let shell = Some(unshit_ptyd::pty::default_shell());
                     let result = match client
-                        .spawn_session(cols, rows, cwd_string, None, workspace_id, pane_id, name)
+                        .spawn_session(cols, rows, cwd_string, shell, workspace_id, pane_id, name)
                         .await
                     {
                         Ok(Response::SessionSpawned { session_id, .. }) => {
