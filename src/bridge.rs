@@ -236,6 +236,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                             cols,
                                             rows,
                                             cwd.as_deref(),
+                                            None,
                                         ) {
                                             Ok((Some(snapshot), reader)) => {
                                                 let snap_rows = snapshot.grid.rows();

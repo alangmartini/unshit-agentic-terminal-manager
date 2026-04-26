@@ -36,6 +36,8 @@ use unshit_ptyd::protocol::message::{SessionInfo, SNAPSHOT_MAX_SCROLLBACK_LINES}
 use unshit_ptyd::protocol::{ProtocolError, Response, ServerEvent};
 use unshit_terminal_core::Snapshot;
 
+use crate::shell::ShellSpec;
+
 /// Shim around the daemon client that keeps the old `PtyManager` API.
 pub struct DaemonPty {
     inner: Option<Inner>,
@@ -62,6 +64,8 @@ enum Command {
         cols: u16,
         rows: u16,
         cwd: Option<PathBuf>,
+        shell: Option<String>,
+        shell_args: Vec<String>,
         workspace_id: u32,
         pane_id: u32,
         name: Option<String>,
@@ -181,7 +185,7 @@ impl DaemonPty {
         cols: u16,
         rows: u16,
     ) -> io::Result<Box<dyn io::Read + Send>> {
-        self.spawn_in(pane_id, workspace_id, cols, rows, None)
+        self.spawn_in(pane_id, workspace_id, cols, rows, None, None)
     }
 
     pub fn spawn_in(
@@ -191,6 +195,7 @@ impl DaemonPty {
         cols: u16,
         rows: u16,
         cwd: Option<&Path>,
+        shell: Option<&ShellSpec>,
     ) -> io::Result<Box<dyn io::Read + Send>> {
         let cwd_owned = cwd.map(Path::to_path_buf);
         // Record the cwd before the IPC attempt so tests that never
@@ -199,6 +204,7 @@ impl DaemonPty {
         if let Some(path) = cwd_owned.as_ref() {
             self.spawn_cwds.insert(pane_id, path.clone());
         }
+        let (shell_program, shell_args) = shell_spec_to_wire(shell);
         let inner = self.inner.as_mut().ok_or_else(not_connected)?;
         let (byte_tx, byte_rx) = std_mpsc::channel::<Vec<u8>>();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<u64>>(1);
@@ -206,6 +212,8 @@ impl DaemonPty {
             cols,
             rows,
             cwd: cwd_owned,
+            shell: shell_program,
+            shell_args,
             workspace_id,
             pane_id,
             name: None,
@@ -262,6 +270,7 @@ impl DaemonPty {
         cols: u16,
         rows: u16,
         cwd: Option<&Path>,
+        shell: Option<&ShellSpec>,
     ) -> io::Result<(Option<Snapshot>, Box<dyn io::Read + Send>)> {
         let cache_hit = self
             .inner
@@ -281,7 +290,7 @@ impl DaemonPty {
                 }
             }
         }
-        let reader = self.spawn_in(pane_id, workspace_id, cols, rows, cwd)?;
+        let reader = self.spawn_in(pane_id, workspace_id, cols, rows, cwd, shell)?;
         Ok((None, reader))
     }
 
@@ -500,6 +509,17 @@ fn not_connected() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "daemon pty is not connected")
 }
 
+/// Normalize a [`ShellSpec`] for the daemon wire. An empty spec
+/// (no `program`) and `None` both map to `(None, vec![])` so the
+/// daemon falls back to its own default, matching the additive
+/// `shell_args` contract on `Request::SpawnSession`.
+fn shell_spec_to_wire(spec: Option<&ShellSpec>) -> (Option<String>, Vec<String>) {
+    match spec.filter(|s| !s.is_empty()) {
+        Some(s) => (Some(s.program.clone()), s.args.clone()),
+        None => (None, Vec::new()),
+    }
+}
+
 fn worker_gone() -> io::Error {
     io::Error::new(
         io::ErrorKind::BrokenPipe,
@@ -603,6 +623,8 @@ fn worker_main(
                     cols,
                     rows,
                     cwd,
+                    shell,
+                    shell_args,
                     workspace_id,
                     pane_id,
                     name,
@@ -615,8 +637,8 @@ fn worker_main(
                             cols,
                             rows,
                             cwd_string,
-                            None,
-                            vec![],
+                            shell,
+                            shell_args,
                             workspace_id,
                             pane_id,
                             name,
@@ -834,7 +856,7 @@ mod tests {
             Ok(_) => panic!("spawn on unconnected shim must fail"),
         };
         assert_eq!(spawn_err.kind(), io::ErrorKind::NotConnected);
-        let spawn_in_err = match shim.spawn_in(2, 1, 80, 24, None) {
+        let spawn_in_err = match shim.spawn_in(2, 1, 80, 24, None, None) {
             Err(e) => e,
             Ok(_) => panic!("spawn_in on unconnected shim must fail"),
         };
@@ -843,7 +865,7 @@ mod tests {
         assert_eq!(write_err.kind(), io::ErrorKind::NotConnected);
         let list_err = shim.list_sessions().unwrap_err();
         assert_eq!(list_err.kind(), io::ErrorKind::NotConnected);
-        let attach_or_spawn_err = match shim.attach_or_spawn(1, 1, 80, 24, None) {
+        let attach_or_spawn_err = match shim.attach_or_spawn(1, 1, 80, 24, None, None) {
             Err(e) => e,
             Ok(_) => panic!("attach_or_spawn on unconnected shim must fail"),
         };
@@ -891,7 +913,9 @@ mod tests {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path);
             let pane_id = 7u32;
-            let mut reader = shim.spawn_in(pane_id, 1, 80, 24, None).expect("spawn_in");
+            let mut reader = shim
+                .spawn_in(pane_id, 1, 80, 24, None, None)
+                .expect("spawn_in");
             assert!(shim.has(pane_id));
 
             shim.write(pane_id, ECHO_CMD).expect("write");
@@ -956,7 +980,9 @@ mod tests {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path);
             let pane_id = 3u32;
-            let _reader = shim.spawn_in(pane_id, 1, 80, 24, None).expect("spawn_in");
+            let _reader = shim
+                .spawn_in(pane_id, 1, 80, 24, None, None)
+                .expect("spawn_in");
             assert!(shim.has(pane_id));
             shim.destroy(pane_id);
             assert!(!shim.has(pane_id));
@@ -978,8 +1004,8 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path);
-            let _r1 = shim.spawn_in(1, 1, 80, 24, None).expect("spawn 1");
-            let _r2 = shim.spawn_in(2, 1, 80, 24, None).expect("spawn 2");
+            let _r1 = shim.spawn_in(1, 1, 80, 24, None, None).expect("spawn 1");
+            let _r2 = shim.spawn_in(2, 1, 80, 24, None, None).expect("spawn 2");
             assert!(shim.has(1));
             assert!(shim.has(2));
             shim.destroy_all();
@@ -1017,7 +1043,7 @@ mod tests {
             // connection registries in the daemon mean only this shim
             // can reach the session; attach_to via a fresh pane id
             // still works because both panes live on the same shim.
-            let _reader = shim.spawn_in(100, 1, 80, 24, None).expect("spawn_in");
+            let _reader = shim.spawn_in(100, 1, 80, 24, None, None).expect("spawn_in");
             let session_id = shim
                 .session_id_for_pane(100)
                 .expect("spawn_in must register pane");
@@ -1069,7 +1095,7 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path);
-            let _reader_a = shim.spawn_in(10, 1, 80, 24, None).expect("spawn_in");
+            let _reader_a = shim.spawn_in(10, 1, 80, 24, None, None).expect("spawn_in");
             let session_id = shim
                 .session_id_for_pane(10)
                 .expect("spawn_in must register pane");
@@ -1173,7 +1199,7 @@ mod tests {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path);
             let (snapshot, _reader) = shim
-                .attach_or_spawn(1, 1, 80, 24, None)
+                .attach_or_spawn(1, 1, 80, 24, None, None)
                 .expect("attach_or_spawn");
             assert!(snapshot.is_none(), "cache miss must spawn fresh");
             assert!(shim.has(1));
@@ -1202,7 +1228,7 @@ mod tests {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path_a);
             let _reader = shim
-                .spawn_in(pane_id, workspace_id, 80, 24, None)
+                .spawn_in(pane_id, workspace_id, 80, 24, None, None)
                 .expect("spawn_in");
         })
         .await
@@ -1217,7 +1243,7 @@ mod tests {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path_b);
             let (snapshot, mut reader) = shim
-                .attach_or_spawn(pane_id, workspace_id, 80, 24, None)
+                .attach_or_spawn(pane_id, workspace_id, 80, 24, None, None)
                 .expect("attach_or_spawn on survivor");
             assert!(
                 snapshot.is_some(),
@@ -1242,6 +1268,86 @@ mod tests {
         let _ = daemon.await;
     }
 
+    #[test]
+    fn shell_spec_to_wire_returns_none_for_no_spec() {
+        assert_eq!(shell_spec_to_wire(None), (None, Vec::new()));
+    }
+
+    #[test]
+    fn shell_spec_to_wire_treats_empty_program_as_none() {
+        let spec = crate::shell::ShellSpec::default();
+        assert_eq!(shell_spec_to_wire(Some(&spec)), (None, Vec::new()));
+    }
+
+    #[test]
+    fn shell_spec_to_wire_returns_program_and_args_for_filled_spec() {
+        let spec = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec!["--login".into(), "-i".into()],
+        };
+        assert_eq!(
+            shell_spec_to_wire(Some(&spec)),
+            (
+                Some("/bin/bash".to_string()),
+                vec!["--login".to_string(), "-i".to_string()],
+            ),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_in_with_shell_spec_routes_program_to_daemon() {
+        const MARKER: &str = "spawn-in-shell-spec-marker-140";
+        #[cfg(windows)]
+        let shell = crate::shell::ShellSpec {
+            program: "cmd.exe".into(),
+            args: vec!["/C".into(), format!("echo {MARKER}")],
+        };
+        #[cfg(unix)]
+        let shell = crate::shell::ShellSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), format!("echo {MARKER}")],
+        };
+
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let mut reader = shim
+                .spawn_in(11, 1, 80, 24, None, Some(&shell))
+                .expect("spawn_in with shell spec");
+
+            let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+            let mut collected: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            while std::time::Instant::now() < deadline {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        if String::from_utf8_lossy(&collected).contains(MARKER) {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let text = String::from_utf8_lossy(&collected).to_string();
+            assert!(
+                text.contains(MARKER),
+                "expected {MARKER} in output, got: {text:?}"
+            );
+            shim.destroy(11);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drop_shim_no_longer_kills_daemon_sessions() {
         std::env::set_var("SHELL", TEST_SHELL);
@@ -1252,7 +1358,7 @@ mod tests {
         let spawned_session = tokio::task::spawn_blocking(move || {
             let mut shim = DaemonPty::new();
             connect_with_retry(&mut shim, &shim_path_a);
-            let _reader = shim.spawn_in(55, 9, 80, 24, None).expect("spawn");
+            let _reader = shim.spawn_in(55, 9, 80, 24, None, None).expect("spawn");
             // Drop shim at end of scope. Slice 5: this does NOT kill
             // the daemon-side session.
             shim.session_id_for_pane(55)

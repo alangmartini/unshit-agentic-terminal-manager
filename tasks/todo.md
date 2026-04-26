@@ -27,17 +27,18 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
   - [x] Updated 12 test call sites + handler + registry + UI shim (`src/pty.rs`).
   - [x] `cargo test -p unshit-ptyd` green (141 unit + all integration tests).
 
-- [ ] **Task 3: `DaemonPty` shim carries `ShellSpec`**
-  - [ ] `DaemonPty::spawn_in` and `attach_or_spawn` accept `Option<&ShellSpec>`.
-  - [ ] `Command::Spawn` enum variant carries `(shell, shell_args)`.
-  - [ ] Worker forwards them to `client.spawn_session`.
-  - [ ] Update 4 call sites in `src/main.rs:457` and `src/state.rs:868`, `:1073`, `:1132` to pass `None` (Task 4 wires real values).
-  - [ ] Update 1 call site in `src/bridge.rs:233` to pass `None`.
-  - [ ] Test: `ShellSpec` with empty program is treated as `None` at the wire.
-  - [ ] `cargo test --lib pty::` green; `cargo build` succeeds.
+- [x] **Task 3: `DaemonPty` shim carries `ShellSpec`** [DONE]
+  - [x] `DaemonPty::spawn_in` and `attach_or_spawn` accept `Option<&ShellSpec>`.
+  - [x] `Command::Spawn` enum variant carries `(shell, shell_args)`.
+  - [x] Worker forwards them to `client.spawn_session`.
+  - [x] Updated 4 call sites in `src/main.rs:458` and `src/state.rs:868`, `:1073`, `:1132` to pass `None` (Task 4 wires real values).
+  - [x] Updated 1 call site in `src/bridge.rs:233` to pass `None`.
+  - [x] Private helper `shell_spec_to_wire` normalizes `None` and empty `ShellSpec` to `(None, vec![])`.
+  - [x] Tests: 3 unit (`shell_spec_to_wire_*`) + 1 integration (`spawn_in_with_shell_spec_routes_program_to_daemon`).
+  - [x] `cargo test --bin terminal-manager pty::` green (19/19); full suite 823 pass.
 
 ### Checkpoint
-- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
+- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
 - [ ] `cargo run` opens default shell exactly as before (no UI for shell selection yet).
 
 ## Phase 3: App wide default

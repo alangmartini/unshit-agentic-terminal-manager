@@ -461,6 +461,7 @@ fn main() {
             init_cols,
             init_rows,
             cwd.as_deref(),
+            None,
         ) {
             Ok((Some(snapshot), reader)) => {
                 let rows = snapshot.grid.rows();

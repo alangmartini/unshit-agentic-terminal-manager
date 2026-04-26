@@ -865,7 +865,7 @@ pub fn mutate_add_tab(state: &mut AppState) {
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
     match state
         .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
+        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref(), None)
     {
         Ok(reader) => {
             state
@@ -1070,7 +1070,7 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
     let mut terminal = Terminal::new(rows as usize, cols as usize);
     match state
         .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
+        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref(), None)
     {
         Ok(reader) => {
             state
@@ -1129,7 +1129,7 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
     let mut terminal = Terminal::new(rows as usize, cols as usize);
     match state
         .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
+        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref(), None)
     {
         Ok(reader) => {
             state
