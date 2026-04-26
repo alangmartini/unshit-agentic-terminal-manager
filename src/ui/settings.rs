@@ -1231,12 +1231,13 @@ mod tests {
     // -- build_keybinds_section -------------------------------------------------
 
     #[test]
-    fn keybinds_section_has_banner_thirteen_rows_and_footer() {
+    fn keybinds_section_has_banner_one_row_per_action_and_footer() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_keybinds_section(&snap, &shared);
-        // title + restart banner + error banner + 13 rows + footer
-        assert_eq!(el.children.len(), 17);
+        // title + restart banner + error banner + one row per action + footer
+        let expected = 4 + KeybindAction::ALL.len();
+        assert_eq!(el.children.len(), expected);
     }
 
     #[test]
