@@ -71,15 +71,17 @@ pub struct WriteError {
     pub error: io::Error,
 }
 
-/// Opaque holder for the parked `cmd_rx` returned by the test-only
+/// Opaque holder for the parked `cmd_rx` returned by
 /// `DaemonPty::test_install_slow_daemon_inner`. Dropping the guard
 /// closes the channel and turns subsequent `cmd_tx.send` calls into
-/// errors, so tests must keep it alive for the duration of the
-/// slow-daemon scenario. Hidden behind `#[cfg(test)]` so the type
-/// does not leak into release builds.
-#[cfg(test)]
-struct SlowDaemonGuard {
-    _cmd_rx: tokio_mpsc::UnboundedReceiver<Command>,
+/// errors, so callers must keep it alive for the duration of the
+/// slow-daemon scenario. Exposed (hidden in docs) so the criterion
+/// bench in `benches/` can drive the same scenario the unit test
+/// uses without spinning up a real daemon. Callers outside this
+/// crate should not depend on it.
+#[doc(hidden)]
+pub struct SlowDaemonGuard {
+    _keep_alive: Box<dyn Send>,
 }
 
 enum Command {
@@ -548,16 +550,21 @@ impl DaemonPty {
         });
     }
 
-    /// Test-only: install an `Inner` whose `cmd_tx` channel is alive
-    /// but whose receiver is parked (held but never drained). Models
-    /// a worst-case "infinitely slow daemon" so a fire-and-forget
-    /// `write` test can prove the call returns immediately even when
-    /// the round trip never completes. Returns an opaque guard that
-    /// owns the parked receiver (dropping it would close the channel
-    /// and turn `cmd_tx.send` into a `SendError`) and the worker-side
-    /// error sender so the test can simulate failures.
-    #[cfg(test)]
-    fn test_install_slow_daemon_inner(
+    /// Install an `Inner` whose `cmd_tx` channel is alive but whose
+    /// receiver is parked (held but never drained). Models a
+    /// worst-case "infinitely slow daemon" so unit tests and the
+    /// criterion bench in `benches/` can prove that fire-and-forget
+    /// `write` returns immediately even when the round trip never
+    /// completes. Returns an opaque guard that owns the parked
+    /// receiver (dropping it would close the channel and turn
+    /// `cmd_tx.send` into a `SendError`) and the worker-side error
+    /// sender so the caller can simulate failures.
+    ///
+    /// Marked `#[doc(hidden)]` because it is only intended for the
+    /// in-tree test and bench harnesses; outside callers should not
+    /// depend on it.
+    #[doc(hidden)]
+    pub fn test_install_slow_daemon_inner(
         &mut self,
         pane_id: u32,
         session_id: u64,
@@ -573,7 +580,12 @@ impl DaemonPty {
             worker: None,
             write_error_rx,
         });
-        (SlowDaemonGuard { _cmd_rx: cmd_rx }, write_error_tx)
+        (
+            SlowDaemonGuard {
+                _keep_alive: Box::new(cmd_rx),
+            },
+            write_error_tx,
+        )
     }
 
     #[cfg(test)]
