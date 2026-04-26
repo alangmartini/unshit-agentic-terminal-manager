@@ -16,11 +16,10 @@ use crate::ui::icons::*;
 pub fn build_settings_modal(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal")
-        .with_style(StyleDeclaration::Display(Display::Flex))
-        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-        .with_style(StyleDeclaration::Width(Dimension::Px(680.0)))
-        .with_style(StyleDeclaration::Height(Dimension::Percent(80.0)))
-        .with_style(StyleDeclaration::MaxHeight(Dimension::Percent(80.0)))
+        .with_style(StyleDeclaration::Display(Display::Grid))
+        .with_style(StyleDeclaration::Width(Dimension::Px(860.0)))
+        .with_style(StyleDeclaration::Height(Dimension::Percent(76.0)))
+        .with_style(StyleDeclaration::MaxHeight(Dimension::Px(760.0)))
         .with_child(build_modal_header(shared))
         .with_child(build_modal_nav(state.settings_section, shared))
         .with_child(build_modal_body(state, shared))
@@ -43,7 +42,7 @@ fn build_modal_header(shared: &SharedState) -> ElementDef {
                     ElementDef::new(Tag::Div)
                         .with_class("modal-title")
                         .with_id("settings-title")
-                        .with_text("settings"),
+                        .with_text("Settings"),
                 ),
         )
         .with_child(
