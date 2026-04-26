@@ -2858,8 +2858,7 @@ fn emit_grid_cells(
     // [`unshit_core::cell_grid::CURSOR_BLINK_HALF_CYCLE_MS`]). When the
     // OS window is not focused we draw the cursor steady on so the
     // unfocused state mirrors the legacy behaviour.
-    let cursor_phase_on =
-        !CellGrid::is_window_focused() || CellGrid::cursor_blink_phase_now();
+    let cursor_phase_on = !CellGrid::is_window_focused() || CellGrid::cursor_blink_phase_now();
     if grid.cursor_visible() && cursor_phase_on {
         let crow = grid.cursor_row();
         let ccol = grid.cursor_col();
