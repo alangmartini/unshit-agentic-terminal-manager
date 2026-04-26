@@ -1208,6 +1208,58 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
     sync_live_tab_from_panes(state);
 }
 
+/// Move focus to the pane immediately left of the active pane in the
+/// same row. No-op when the active pane is at column 0 or cannot be
+/// located. When rows have differing column counts the up/down variants
+/// clamp to the target row's last column.
+pub fn mutate_focus_left(state: &mut AppState) {
+    let Some((row, col)) = find_pane_coord(state, state.active_pane) else {
+        return;
+    };
+    if col == 0 {
+        return;
+    }
+    state.active_pane = state.panes[row][col - 1].id;
+    sync_live_tab_from_panes(state);
+}
+
+pub fn mutate_focus_right(state: &mut AppState) {
+    let Some((row, col)) = find_pane_coord(state, state.active_pane) else {
+        return;
+    };
+    if col + 1 >= state.panes[row].len() {
+        return;
+    }
+    state.active_pane = state.panes[row][col + 1].id;
+    sync_live_tab_from_panes(state);
+}
+
+pub fn mutate_focus_up(state: &mut AppState) {
+    let Some((row, col)) = find_pane_coord(state, state.active_pane) else {
+        return;
+    };
+    if row == 0 {
+        return;
+    }
+    let target_row = row - 1;
+    let target_col = col.min(state.panes[target_row].len().saturating_sub(1));
+    state.active_pane = state.panes[target_row][target_col].id;
+    sync_live_tab_from_panes(state);
+}
+
+pub fn mutate_focus_down(state: &mut AppState) {
+    let Some((row, col)) = find_pane_coord(state, state.active_pane) else {
+        return;
+    };
+    if row + 1 >= state.panes.len() {
+        return;
+    }
+    let target_row = row + 1;
+    let target_col = col.min(state.panes[target_row].len().saturating_sub(1));
+    state.active_pane = state.panes[target_row][target_col].id;
+    sync_live_tab_from_panes(state);
+}
+
 /// Move `target` out of the active tab into a new tab inserted at
 /// `new_tab_index`. The PTY handle and terminal emulator state are
 /// kept untouched so the running process, scrollback and cwd survive
@@ -2092,6 +2144,22 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "pane.close" => {
             mutate_close_pane(state, state.active_pane);
+            true
+        }
+        "pane.focus_left" => {
+            mutate_focus_left(state);
+            true
+        }
+        "pane.focus_right" => {
+            mutate_focus_right(state);
+            true
+        }
+        "pane.focus_up" => {
+            mutate_focus_up(state);
+            true
+        }
+        "pane.focus_down" => {
+            mutate_focus_down(state);
             true
         }
         other if other.starts_with("pane.extract_to_tab:") => {
@@ -4329,6 +4397,179 @@ mod tests {
         assert_eq!(state.panes.len(), 1);
     }
 
+    // -- mutate_focus_* -------------------------------------------------------
+
+    /// Replace the active tab's pane grid with a synthetic layout. Each
+    /// inner Vec is a row; values are pane ids. Sets active_pane to the
+    /// pane with id `active`. Avoids spawning PTYs.
+    fn install_pane_grid(state: &mut AppState, grid: Vec<Vec<u32>>, active: u32) {
+        let panes: Vec<Vec<Pane>> = grid
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|id| Pane {
+                        id: PaneId(*id),
+                        title: "shell".to_string(),
+                        subtitle: "bash".to_string(),
+                        pid: 0,
+                        cpu: 0.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        state.row_ratios = vec![1.0; panes.len()];
+        state.col_ratios = panes.iter().map(|r| vec![1.0; r.len()]).collect();
+        state.panes = panes;
+        state.active_pane = PaneId(active);
+        state.next_id = grid.iter().flatten().max().copied().unwrap_or(0) + 1;
+        sync_live_tab_from_panes(state);
+    }
+
+    #[test]
+    fn focus_left_moves_to_previous_column_in_same_row() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2, 3]], 3);
+
+        mutate_focus_left(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_left_at_leftmost_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2]], 1);
+
+        mutate_focus_left(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn focus_right_moves_to_next_column_in_same_row() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2, 3]], 1);
+
+        mutate_focus_right(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_right_at_rightmost_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2]], 2);
+
+        mutate_focus_right(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_down_moves_to_next_row_same_column() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2], vec![3, 4]], 2);
+
+        mutate_focus_down(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(4));
+    }
+
+    #[test]
+    fn focus_down_clamps_column_when_target_row_is_shorter() {
+        let mut state = seed_state();
+        // Row 0 has three panes; row 1 has two. Focusing down from the
+        // rightmost pane in row 0 must clamp to the last pane of row 1
+        // rather than panicking.
+        install_pane_grid(&mut state, vec![vec![1, 2, 3], vec![4, 5]], 3);
+
+        mutate_focus_down(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(5));
+    }
+
+    #[test]
+    fn focus_down_at_bottom_row_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1], vec![2]], 2);
+
+        mutate_focus_down(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_up_moves_to_previous_row_same_column() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2], vec![3, 4]], 4);
+
+        mutate_focus_up(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_up_clamps_column_when_target_row_is_shorter() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1], vec![2, 3, 4]], 4);
+
+        mutate_focus_up(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn focus_up_at_top_row_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1], vec![2]], 1);
+
+        mutate_focus_up(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn focus_in_single_pane_layout_is_noop_in_every_direction() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1]], 1);
+
+        mutate_focus_left(&mut state);
+        assert_eq!(state.active_pane, PaneId(1));
+        mutate_focus_right(&mut state);
+        assert_eq!(state.active_pane, PaneId(1));
+        mutate_focus_up(&mut state);
+        assert_eq!(state.active_pane, PaneId(1));
+        mutate_focus_down(&mut state);
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn focus_with_invalid_active_pane_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2]], 1);
+        // Corrupt the active pane to an id not present in the grid.
+        state.active_pane = PaneId(9999);
+
+        mutate_focus_left(&mut state);
+        mutate_focus_right(&mut state);
+        mutate_focus_up(&mut state);
+        mutate_focus_down(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(9999));
+    }
+
+    #[test]
+    fn focus_syncs_active_pane_into_live_tab() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2]], 1);
+        assert_eq!(state.tabs[state.active_tab].active_pane, PaneId(1));
+
+        mutate_focus_right(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+        assert_eq!(state.tabs[state.active_tab].active_pane, PaneId(2));
+    }
+
     // -- dispatch pane commands -----------------------------------------------
 
     #[test]
@@ -4358,6 +4599,25 @@ mod tests {
 
         assert!(dispatch(&mut state, "pane.close"));
         assert_eq!(state.panes[0].len(), pane_count - 1);
+    }
+
+    #[test]
+    fn dispatch_pane_focus_directions_route_to_focus_mutators() {
+        // Build a 2x2 grid: panes 1,2 in row 0 and 3,4 in row 1; start at 1.
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2], vec![3, 4]], 1);
+
+        assert!(dispatch(&mut state, "pane.focus_right"));
+        assert_eq!(state.active_pane, PaneId(2));
+
+        assert!(dispatch(&mut state, "pane.focus_down"));
+        assert_eq!(state.active_pane, PaneId(4));
+
+        assert!(dispatch(&mut state, "pane.focus_left"));
+        assert_eq!(state.active_pane, PaneId(3));
+
+        assert!(dispatch(&mut state, "pane.focus_up"));
+        assert_eq!(state.active_pane, PaneId(1));
     }
 
     #[test]
