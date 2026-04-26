@@ -285,7 +285,12 @@ impl DaemonPty {
         Ok((None, reader))
     }
 
-    pub fn write(&mut self, pane_id: u32, data: &[u8]) -> io::Result<()> {
+    /// Synchronous write that round-trips through the daemon and waits
+    /// for the reply. Suitable for tests, benchmarks, and any caller
+    /// that needs to know the daemon accepted the bytes before
+    /// returning. Render-thread callers MUST NOT use this; see
+    /// [`write`](Self::write) for the fire-and-forget variant.
+    pub fn write_blocking(&mut self, pane_id: u32, data: &[u8]) -> io::Result<()> {
         let inner = self.inner.as_mut().ok_or_else(not_connected)?;
         let session_id = *inner.sessions.get(&pane_id).ok_or_else(|| {
             io::Error::new(
@@ -830,7 +835,7 @@ mod tests {
             Ok(_) => panic!("spawn_in on unconnected shim must fail"),
         };
         assert_eq!(spawn_in_err.kind(), io::ErrorKind::NotConnected);
-        let write_err = shim.write(1, b"hi").unwrap_err();
+        let write_err = shim.write_blocking(1, b"hi").unwrap_err();
         assert_eq!(write_err.kind(), io::ErrorKind::NotConnected);
         let list_err = shim.list_sessions().unwrap_err();
         assert_eq!(list_err.kind(), io::ErrorKind::NotConnected);
@@ -885,7 +890,7 @@ mod tests {
             let mut reader = shim.spawn_in(pane_id, 1, 80, 24, None).expect("spawn_in");
             assert!(shim.has(pane_id));
 
-            shim.write(pane_id, ECHO_CMD).expect("write");
+            shim.write_blocking(pane_id, ECHO_CMD).expect("write");
 
             let deadline = std::time::Instant::now() + Duration::from_millis(1500);
             let mut collected: Vec<u8> = Vec::new();
@@ -1021,7 +1026,8 @@ mod tests {
 
             // Writing through the attached pane must reach the same
             // session and the live reader must see SOMETHING back.
-            shim.write(200, ECHO_CMD).expect("write via attached pane");
+            shim.write_blocking(200, ECHO_CMD)
+                .expect("write via attached pane");
             let deadline = std::time::Instant::now() + Duration::from_millis(1500);
             let mut collected: Vec<u8> = Vec::new();
             let mut buf = [0u8; 4096];
@@ -1071,7 +1077,8 @@ mod tests {
             assert!(shim.has(300));
 
             // write + resize on the attached pane must not error.
-            shim.write(300, ECHO_CMD).expect("write via attached pane");
+            shim.write_blocking(300, ECHO_CMD)
+                .expect("write via attached pane");
             shim.resize(300, 120, 40);
 
             // And the route is live: drain briefly, assert bytes flow.
