@@ -46,7 +46,7 @@ async fn shell_exit_in_one_session_does_not_kill_the_other() {
     let Response::SessionSpawned {
         session_id: victim, ..
     } = client
-        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 0, None)
+        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), vec![], 0, 0, None)
         .await
         .unwrap()
     else {
@@ -56,7 +56,7 @@ async fn shell_exit_in_one_session_does_not_kill_the_other() {
         session_id: survivor,
         ..
     } = client
-        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 1, None)
+        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), vec![], 0, 1, None)
         .await
         .unwrap()
     else {

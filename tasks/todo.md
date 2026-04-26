@@ -15,16 +15,17 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase 2: Daemon honors `shell_args`
 
-- [ ] **Task 2: Additive `shell_args` field on `SpawnSession`**
-  - [ ] Add `shell_args: Vec<String>` (with `#[serde(default)]`) to `Request::SpawnSession`.
-  - [ ] Update `Client::spawn_session` signature.
-  - [ ] Update `Session::spawn` to forward each arg via `CommandBuilder::arg`.
-  - [ ] Test: old wire payload (no `shell_args` key) deserializes with empty vector.
-  - [ ] Test: round trip with `shell_args = ["--login"]`.
-  - [ ] Test: IPC integration test (Windows + Unix branches) spawns with a recognizable arg, asserts token in output stream.
-  - [ ] Test: PowerShell user args + cwd still results in `-NoExit -Command "Set-Location ..."` being appended after them.
-  - [ ] Update every existing `client.spawn_session` and `Session::spawn` call site.
-  - [ ] `cargo test -p unshit-ptyd` green.
+- [x] **Task 2: Additive `shell_args` field on `SpawnSession`** [DONE]
+  - [x] Add `shell_args: Vec<String>` (with `#[serde(default, skip_serializing_if = "Vec::is_empty")]`) to `Request::SpawnSession`.
+  - [x] Update `Client::spawn_session` signature.
+  - [x] Update `Session::spawn` to forward args via new `pty::build_spawn_args` helper.
+  - [x] Test: old wire payload (no `shell_args` key) deserializes with empty vector.
+  - [x] Test: round trip with `shell_args = ["--login", "-i"]`.
+  - [x] Test: empty `shell_args` is omitted from the wire (old daemon compat).
+  - [x] Test: IPC integration test spawns `cmd.exe /C echo MARKER` (Windows) / `/bin/sh -c echo MARKER` (Unix), asserts MARKER in output stream.
+  - [x] Test: `build_spawn_args` appends PowerShell `-NoExit -Command "Set-Location ..."` AFTER user args.
+  - [x] Updated 12 test call sites + handler + registry + UI shim (`src/pty.rs`).
+  - [x] `cargo test -p unshit-ptyd` green (141 unit + all integration tests).
 
 - [ ] **Task 3: `DaemonPty` shim carries `ShellSpec`**
   - [ ] `DaemonPty::spawn_in` and `attach_or_spawn` accept `Option<&ShellSpec>`.

@@ -611,7 +611,16 @@ fn worker_main(
                 } => {
                     let cwd_string = cwd.map(|p| p.display().to_string());
                     let result = match client
-                        .spawn_session(cols, rows, cwd_string, None, workspace_id, pane_id, name)
+                        .spawn_session(
+                            cols,
+                            rows,
+                            cwd_string,
+                            None,
+                            vec![],
+                            workspace_id,
+                            pane_id,
+                            name,
+                        )
                         .await
                     {
                         Ok(Response::SessionSpawned { session_id, .. }) => {

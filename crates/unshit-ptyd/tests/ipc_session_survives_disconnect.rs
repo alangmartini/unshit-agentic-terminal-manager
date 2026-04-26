@@ -31,7 +31,7 @@ async fn session_from_disconnected_client_stays_alive() {
     {
         let (mut client, _events) = common::connect_with_events_retry(&path).await;
         let Response::SessionSpawned { session_id, .. } = client
-            .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 0, None)
+            .spawn_session(80, 24, None, Some(TEST_SHELL.into()), vec![], 0, 0, None)
             .await
             .unwrap()
         else {
