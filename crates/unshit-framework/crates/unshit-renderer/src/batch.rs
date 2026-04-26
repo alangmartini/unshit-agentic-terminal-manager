@@ -2848,7 +2848,19 @@ fn emit_grid_cells(
     // typical interactive case; we do not cache it, because the pertinent
     // row's content hash may still be stable while the cursor shifts inside
     // that row.
-    if grid.cursor_visible() {
+    //
+    // Renderer side blink (#135 Phase 1): `cursor_visible` is a one-shot
+    // flag that means "this pane owns the focused cursor". The actual
+    // blink animation is computed here from a global phase clock, so
+    // toggling the cursor on a 500 ms timer no longer requires a tree
+    // rebuild. The phase is "on" for half a cycle, "off" for the next,
+    // matching the legacy 530 ms cadence (see
+    // [`unshit_core::cell_grid::CURSOR_BLINK_HALF_CYCLE_MS`]). When the
+    // OS window is not focused we draw the cursor steady on so the
+    // unfocused state mirrors the legacy behaviour.
+    let cursor_phase_on =
+        !CellGrid::is_window_focused() || CellGrid::cursor_blink_phase_now();
+    if grid.cursor_visible() && cursor_phase_on {
         let crow = grid.cursor_row();
         let ccol = grid.cursor_col();
         if crow < rows && ccol < cols {
