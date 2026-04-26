@@ -56,16 +56,18 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
   - [x] Test: inference with `[pwsh, powershell]` picks `pwsh` (`infer_default_shell_prefers_pwsh_over_powershell`).
   - [x] `cargo test --bin terminal-manager`: 830 passed (up from 823, +7 new). clippy + fmt clean.
 
-- [ ] **Task 5: All other spawn sites resolve and pass spec**
-  - [ ] Update three sites in `src/state.rs:868`, `:1073`, `:1132`.
-  - [ ] Update `src/bridge.rs:233`.
-  - [ ] Grep audit: no `pty_manager.spawn_in(.*None)` or `attach_or_spawn(.*None)` literals outside test code.
-  - [ ] Test: dispatching the new pane command with `default_shell` set spawns the configured shell.
-  - [ ] Test: with `default_shell` cleared, daemon falls back to today's behavior.
-  - [ ] `cargo test` green; `cargo clippy` clean.
+- [x] **Task 5: All other spawn sites resolve and pass spec** [DONE]
+  - [x] Updated three sites in `src/state.rs` (`mutate_add_tab`, `mutate_split_right`, `mutate_split_down`) to use new `pane_spawn_shell(state)` helper.
+  - [x] Updated `src/bridge.rs:233` resize-loop attach_or_spawn to use the same helper.
+  - [x] Grep audit: only the `DaemonPty::spawn` shorthand still passes `None` literally and no production code calls it.
+  - [x] Test: `add_tab_records_resolved_default_shell_on_pty_shim` (dispatch with `default_shell` set spawns the configured shell).
+  - [x] Test: `add_tab_with_empty_default_shell_does_not_record_a_shell` (daemon falls back when default cleared).
+  - [x] Test: `split_right_records_*` and `split_down_records_*` cover the split sites.
+  - [x] Added `DaemonPty::spawn_shell` accessor (mirrors `spawn_cwd`) so unit tests can assert what was forwarded without standing up a daemon.
+  - [x] `cargo test --bin terminal-manager`: 836 passed (up from 830, +6 new). clippy + fmt clean.
 
 ### Checkpoint
-- [ ] `cargo test` green.
+- [x] `cargo test` green.
 - [ ] Manual: edit `workspaces.json` to set `"default_shell": { "program": "/bin/bash", "args": [] }`, restart, open a new pane, confirm `bash` runs (`echo $0`).
 
 ## Phase 4: Per workspace override

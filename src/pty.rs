@@ -46,6 +46,12 @@ pub struct DaemonPty {
     /// tests that never connect) and across a disconnect. Populated by
     /// `spawn_in` and read by `spawn_cwd`.
     spawn_cwds: HashMap<u32, PathBuf>,
+    /// Local record of the resolved shell each pane was asked to spawn
+    /// with. Mirrors `spawn_cwds` so unit tests can assert which spawn
+    /// sites forward `state.default_shell`. Only populated when the
+    /// caller passes `Some(spec)`; missing key = "no shell requested",
+    /// equivalent to letting the daemon's own `default_shell()` decide.
+    spawn_shells: HashMap<u32, ShellSpec>,
 }
 
 struct Inner {
@@ -115,6 +121,7 @@ impl DaemonPty {
         Self {
             inner: None,
             spawn_cwds: HashMap::new(),
+            spawn_shells: HashMap::new(),
         }
     }
 
@@ -204,6 +211,9 @@ impl DaemonPty {
         if let Some(path) = cwd_owned.as_ref() {
             self.spawn_cwds.insert(pane_id, path.clone());
         }
+        if let Some(spec) = shell.filter(|s| !s.is_empty()) {
+            self.spawn_shells.insert(pane_id, spec.clone());
+        }
         let (shell_program, shell_args) = shell_spec_to_wire(shell);
         let inner = self.inner.as_mut().ok_or_else(not_connected)?;
         let (byte_tx, byte_rx) = std_mpsc::channel::<Vec<u8>>();
@@ -232,6 +242,14 @@ impl DaemonPty {
     /// (cross-run restart) will return `None`.
     pub fn spawn_cwd(&self, pane_id: u32) -> Option<&Path> {
         self.spawn_cwds.get(&pane_id).map(PathBuf::as_path)
+    }
+
+    /// Return the resolved shell this pane's session was asked to
+    /// spawn with, if any. Mirrors `spawn_cwd`: missing key means the
+    /// caller passed `None` (or an empty spec) and the daemon's own
+    /// `default_shell()` decided.
+    pub fn spawn_shell(&self, pane_id: u32) -> Option<&ShellSpec> {
+        self.spawn_shells.get(&pane_id)
     }
 
     pub fn attach_to(
@@ -328,6 +346,7 @@ impl DaemonPty {
 
     pub fn destroy(&mut self, pane_id: u32) {
         self.spawn_cwds.remove(&pane_id);
+        self.spawn_shells.remove(&pane_id);
         let Some(inner) = self.inner.as_mut() else {
             log::warn!("DaemonPty::destroy called before connect");
             return;
@@ -386,6 +405,7 @@ impl DaemonPty {
 
     pub fn destroy_all(&mut self) {
         self.spawn_cwds.clear();
+        self.spawn_shells.clear();
         let Some(inner) = self.inner.as_mut() else {
             return;
         };

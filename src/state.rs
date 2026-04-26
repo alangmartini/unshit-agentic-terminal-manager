@@ -851,6 +851,13 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
     load_workspace_state(state);
 }
 
+/// Resolve which shell a new pane should spawn with for the given
+/// state. Today this only inspects the app wide default; Task 6
+/// extends it to consult the active workspace's override too.
+pub fn pane_spawn_shell(state: &AppState) -> Option<crate::shell::ShellSpec> {
+    crate::shell::resolve(None, Some(&state.default_shell))
+}
+
 pub fn mutate_add_tab(state: &mut AppState) {
     save_tab_state(state);
 
@@ -871,11 +878,16 @@ pub fn mutate_add_tab(state: &mut AppState) {
     // Spawn PTY eagerly so the terminal is live immediately.
     let cwd = active_workspace_cwd(state);
     let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref(), None)
-    {
+    match state.pty_manager.spawn_in(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        cwd.as_deref(),
+        shell.as_ref(),
+    ) {
         Ok(reader) => {
             state
                 .terminals
@@ -1076,11 +1088,16 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
 
     let cwd = active_workspace_cwd(state);
     let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref(), None)
-    {
+    match state.pty_manager.spawn_in(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        cwd.as_deref(),
+        shell.as_ref(),
+    ) {
         Ok(reader) => {
             state
                 .terminals
@@ -1135,11 +1152,16 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
 
     let cwd = active_workspace_cwd(state);
     let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref(), None)
-    {
+    match state.pty_manager.spawn_in(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        cwd.as_deref(),
+        shell.as_ref(),
+    ) {
         Ok(reader) => {
             state
                 .terminals
@@ -3010,6 +3032,90 @@ mod tests {
         assert_eq!(state.tabs[1].id, "t2");
         assert_eq!(state.active_tab, 1);
         assert_eq!(state.next_id, 3);
+    }
+
+    #[test]
+    fn pane_spawn_shell_returns_resolved_default_when_set() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec!["--login".into()],
+        };
+        let resolved = pane_spawn_shell(&state).expect("non empty default must resolve");
+        assert_eq!(resolved.program, "/bin/bash");
+        assert_eq!(resolved.args, vec!["--login".to_string()]);
+    }
+
+    #[test]
+    fn pane_spawn_shell_returns_none_when_default_is_empty() {
+        let state = test_state();
+        assert!(state.default_shell.is_empty());
+        assert!(
+            pane_spawn_shell(&state).is_none(),
+            "empty default must yield None so the daemon's own default_shell() takes over"
+        );
+    }
+
+    #[test]
+    fn add_tab_records_resolved_default_shell_on_pty_shim() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/usr/local/bin/fish".into(),
+            args: vec![],
+        };
+        let new_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        let shell = state
+            .pty_manager
+            .spawn_shell(new_pane_id)
+            .expect("add_tab must forward the resolved default shell to the shim");
+        assert_eq!(shell.program, "/usr/local/bin/fish");
+    }
+
+    #[test]
+    fn split_right_records_resolved_default_shell_on_pty_shim() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/zsh".into(),
+            args: vec![],
+        };
+        let target = state.active_pane;
+        let new_pane_id = state.next_id;
+        mutate_split_right(&mut state, target);
+        let shell = state
+            .pty_manager
+            .spawn_shell(new_pane_id)
+            .expect("split_right must forward the resolved default shell to the shim");
+        assert_eq!(shell.program, "/bin/zsh");
+    }
+
+    #[test]
+    fn split_down_records_resolved_default_shell_on_pty_shim() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/dash".into(),
+            args: vec![],
+        };
+        let target = state.active_pane;
+        let new_pane_id = state.next_id;
+        mutate_split_down(&mut state, target);
+        let shell = state
+            .pty_manager
+            .spawn_shell(new_pane_id)
+            .expect("split_down must forward the resolved default shell to the shim");
+        assert_eq!(shell.program, "/bin/dash");
+    }
+
+    #[test]
+    fn add_tab_with_empty_default_shell_does_not_record_a_shell() {
+        let mut state = test_state();
+        assert!(state.default_shell.is_empty());
+        let new_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        assert!(
+            state.pty_manager.spawn_shell(new_pane_id).is_none(),
+            "empty default must surface as None so the daemon falls back"
+        );
     }
 
     #[test]
