@@ -377,6 +377,15 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
 /// Subscription that periodically checks for renderer-computed pending
 /// resizes and applies them to all terminals. Runs every 100ms for quick
 /// response to window resize events.
+///
+/// PTY dimension sync is not user perceptible at the millisecond level
+/// (the cell grid count flipping from 80 to 81 cols is invisible until
+/// the next character lands), so this subscription yields
+/// `RequestRedraw` rather than `RequestRebuild` (#135 Phase 1, item 3).
+/// The next paint reads the new grid dimensions directly from the
+/// `CellGrid` and reflows without a tree reconciliation. A real PTY
+/// chunk landing in the new dimensions will request a rebuild via
+/// `pty_subscription` on its own.
 fn resize_poll_subscription(shared: SharedState) -> Subscription {
     Subscription::new(
         "resize-poll",
@@ -398,7 +407,7 @@ fn resize_poll_subscription(shared: SharedState) -> Subscription {
                                 }
                             }
                         } // guard drops before yield
-                        yield ExternalEvent::RequestRebuild;
+                        yield ExternalEvent::RequestRedraw;
                     }
                 }
             })
