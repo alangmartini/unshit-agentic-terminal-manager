@@ -57,8 +57,17 @@ pub fn build_terminal_grid(
                 .and_then(|r| r.get(col_idx))
                 .copied()
                 .unwrap_or(1.0);
-            let pane_el = build_pane(pane, is_active, single_pane, state, shared, grids)
-                .with_style(StyleDeclaration::FlexGrow(col_ratio));
+            let capture_keyboard = is_active && !state.settings_open;
+            let pane_el = build_pane(
+                pane,
+                is_active,
+                capture_keyboard,
+                single_pane,
+                state,
+                shared,
+                grids,
+            )
+            .with_style(StyleDeclaration::FlexGrow(col_ratio));
             row_el = row_el.with_child(pane_el);
         }
         if row_idx > 0 {
@@ -186,6 +195,7 @@ fn build_row_resizer(row_idx: usize, shared: &SharedState) -> ElementDef {
 fn build_pane(
     pane: &Pane,
     is_active: bool,
+    capture_keyboard: bool,
     single_pane: bool,
     state: &UiSnapshot,
     shared: &SharedState,
@@ -218,7 +228,7 @@ fn build_pane(
         let header = build_pane_header(pane, shared).with_key("pane-header");
         container = container.with_child(header);
     }
-    let body = build_pane_body(pane.id, is_active, shared, grids).with_key("pane-body");
+    let body = build_pane_body(pane.id, capture_keyboard, shared, grids).with_key("pane-body");
     container = container.with_child(body);
     // During a tab drag, layer the 4-edge drop overlay inside the pane
     // so it tracks the pane's real layout rather than a recomputed
@@ -334,7 +344,7 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
 
 fn build_pane_body(
     pane_id: PaneId,
-    is_active: bool,
+    capture_keyboard: bool,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
@@ -351,7 +361,7 @@ fn build_pane_body(
         // framework ignores click-to-focus and keyboard events never arrive.
         grid_el = grid_el.with_tab_index(0);
 
-        if is_active {
+        if capture_keyboard {
             grid_el = grid_el.captures_keyboard(true);
 
             // Register keyboard capture handler to send input to PTY.
@@ -683,7 +693,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &make_snapshot(), &shared, &grids);
+        let el = build_pane(&pane, true, true, false, &make_snapshot(), &shared, &grids);
         assert!(el.classes.contains(&"pane".to_string()));
         assert!(el.classes.contains(&"active".to_string()));
     }
@@ -693,7 +703,15 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &make_snapshot(), &shared, &grids);
+        let el = build_pane(
+            &pane,
+            false,
+            false,
+            false,
+            &make_snapshot(),
+            &shared,
+            &grids,
+        );
         assert!(el.classes.contains(&"pane".to_string()));
         assert!(!el.classes.contains(&"active".to_string()));
     }
@@ -703,7 +721,7 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &make_snapshot(), &shared, &grids);
+        let el = build_pane(&pane, true, true, false, &make_snapshot(), &shared, &grids);
         assert_eq!(el.children.len(), 2);
         assert!(el.children[0].classes.contains(&"pane-header".to_string()));
         assert!(el.children[1].classes.contains(&"pane-body".to_string()));
@@ -714,7 +732,15 @@ mod tests {
         let pane = make_pane_titled(1, "shell");
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &make_snapshot(), &shared, &grids);
+        let el = build_pane(
+            &pane,
+            false,
+            false,
+            false,
+            &make_snapshot(),
+            &shared,
+            &grids,
+        );
         assert!(el.on_click.is_some());
     }
 
@@ -848,7 +874,15 @@ mod tests {
             guard.col_ratios[0].push(1.0);
         }
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, false, false, &make_snapshot(), &shared, &grids);
+        let el = build_pane(
+            &pane,
+            false,
+            false,
+            false,
+            &make_snapshot(),
+            &shared,
+            &grids,
+        );
         (el.on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().active_pane, PaneId(42));
     }
@@ -1037,6 +1071,29 @@ mod tests {
         );
     }
 
+    /// When the settings modal is open, the active pane must NOT capture
+    /// the keyboard so that Escape and other modal shortcuts reach the
+    /// dialog instead of being forwarded to the PTY.
+    #[test]
+    fn active_pane_does_not_capture_keyboard_when_settings_open() {
+        let mut state = seed_state();
+        state.settings_open = true;
+        let pane = state.panes[0][0].clone();
+        state.active_pane = pane.id;
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane.id.0, CellGrid::new(24, 80));
+
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        let content = find_terminal_content(&el)
+            .expect("terminal-content element should exist when grid is present");
+        assert!(
+            !content.captures_keyboard,
+            "active pane must not capture keyboard while settings modal is open"
+        );
+    }
+
     /// Active pane must register an on_resize handler so the PTY dimensions
     /// stay in sync with the visible grid area.
     #[test]
@@ -1091,7 +1148,7 @@ mod tests {
         let shared = test_shared();
         let pane = make_pane(1);
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, true, &make_snapshot(), &shared, &grids);
+        let el = build_pane(&pane, true, true, true, &make_snapshot(), &shared, &grids);
 
         assert!(
             !tree_has_class(&el, "pane-header"),
@@ -1107,7 +1164,7 @@ mod tests {
         let shared = test_shared();
         let pane = make_pane(1);
         let grids = std::collections::HashMap::new();
-        let el = build_pane(&pane, true, false, &make_snapshot(), &shared, &grids);
+        let el = build_pane(&pane, true, true, false, &make_snapshot(), &shared, &grids);
 
         assert!(
             tree_has_class(&el, "pane-header"),
