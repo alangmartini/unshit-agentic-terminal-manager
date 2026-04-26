@@ -87,9 +87,14 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                 });
 
                 // Drain channel and feed bytes to the terminal emulator.
-                // Batch all buffered chunks into a single rebuild to avoid
-                // triggering one full tree-rebuild per PTY read (the framework
-                // does not coalesce RequestRebuild events).
+                // Batch all buffered chunks into a single rebuild so we
+                // pay one VTE parse pass per drain rather than one per
+                // PTY read. The framework also collapses any number of
+                // RequestRebuild events that arrive in the same drain
+                // window into a single rebuild
+                // (see `RebuildCoalescer` in `unshit-app/src/app.rs`),
+                // but draining here keeps the per pane terminal mutex
+                // hold time bounded.
                 //
                 // Acquire the state mutex only to look up the per-pane
                 // Terminal handle, then release it before running the VTE
