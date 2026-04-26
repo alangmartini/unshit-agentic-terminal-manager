@@ -603,6 +603,7 @@ mod tests {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         }
     }
 

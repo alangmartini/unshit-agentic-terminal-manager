@@ -271,6 +271,10 @@ pub struct Workspace {
     /// inactive, this is the source of truth.
     pub tabs: Vec<TerminalTab>,
     pub active_tab: usize,
+    /// Per workspace shell override. When non empty, beats
+    /// `AppState.default_shell` in `pane_spawn_shell`. Empty means
+    /// "inherit the app default", matching today's behavior.
+    pub shell: crate::shell::ShellSpec,
 }
 
 #[derive(Clone, Debug)]
@@ -627,6 +631,7 @@ pub fn seed_state() -> AppState {
             git_branch: ws1_branch,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
         Workspace {
             num: 2,
@@ -647,6 +652,7 @@ pub fn seed_state() -> AppState {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
         Workspace {
             num: 3,
@@ -667,6 +673,7 @@ pub fn seed_state() -> AppState {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
         Workspace {
             num: 4,
@@ -687,6 +694,7 @@ pub fn seed_state() -> AppState {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
     ];
 
@@ -852,10 +860,15 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
 }
 
 /// Resolve which shell a new pane should spawn with for the given
-/// state. Today this only inspects the app wide default; Task 6
-/// extends it to consult the active workspace's override too.
+/// state. The active workspace's `shell` beats `state.default_shell`;
+/// both empty yields `None` so the daemon's `default_shell()` keeps
+/// its floor.
 pub fn pane_spawn_shell(state: &AppState) -> Option<crate::shell::ShellSpec> {
-    crate::shell::resolve(None, Some(&state.default_shell))
+    let workspace = state
+        .workspaces
+        .get(state.active_workspace)
+        .map(|w| &w.shell);
+    crate::shell::resolve(workspace, Some(&state.default_shell))
 }
 
 pub fn mutate_add_tab(state: &mut AppState) {
@@ -1000,6 +1013,7 @@ pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace
         git_branch,
         tabs: vec![],
         active_tab: 0,
+        shell: crate::shell::ShellSpec::default(),
     }
 }
 
@@ -3104,6 +3118,84 @@ mod tests {
             .spawn_shell(new_pane_id)
             .expect("split_down must forward the resolved default shell to the shim");
         assert_eq!(shell.program, "/bin/dash");
+    }
+
+    #[test]
+    fn pane_spawn_shell_prefers_active_workspace_shell_over_app_default() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.active_workspace = 0;
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec![],
+        };
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/usr/local/bin/fish".into(),
+            args: vec!["-l".into()],
+        };
+
+        let resolved = pane_spawn_shell(&state).expect("workspace override must resolve");
+        assert_eq!(resolved.program, "/usr/local/bin/fish");
+        assert_eq!(resolved.args, vec!["-l".to_string()]);
+    }
+
+    #[test]
+    fn pane_spawn_shell_falls_back_to_app_default_when_workspace_shell_is_empty() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.active_workspace = 0;
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/zsh".into(),
+            args: vec![],
+        };
+        assert!(state.workspaces[0].shell.is_empty());
+
+        let resolved = pane_spawn_shell(&state).expect("app default must take over");
+        assert_eq!(resolved.program, "/bin/zsh");
+    }
+
+    #[test]
+    fn pane_spawn_shell_uses_correct_workspace_after_switch() {
+        // Two workspaces: ws0 has an override, ws1 does not.
+        // Adding a tab in each must record the right shell on the
+        // shim. This catches a regression where pane_spawn_shell
+        // forgets to consult the active workspace.
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.workspaces.push(new_workspace(2, "beta".into(), None));
+        state.active_workspace = 0;
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/dash".into(),
+            args: vec![],
+        };
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/usr/local/bin/fish".into(),
+            args: vec![],
+        };
+        // workspaces[1].shell stays empty so it falls back to the app default.
+
+        let ws0_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        let ws0_shell = state
+            .pty_manager
+            .spawn_shell(ws0_pane_id)
+            .expect("ws0 add_tab must record the override");
+        assert_eq!(ws0_shell.program, "/usr/local/bin/fish");
+
+        mutate_switch_workspace(&mut state, 1);
+        let ws1_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        let ws1_shell = state
+            .pty_manager
+            .spawn_shell(ws1_pane_id)
+            .expect("ws1 add_tab must fall back to the app default");
+        assert_eq!(ws1_shell.program, "/bin/dash");
     }
 
     #[test]
@@ -6526,6 +6618,7 @@ mod tests {
             git_branch: None,
             tabs: vec![tab],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         }
     }
 

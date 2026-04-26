@@ -14,6 +14,11 @@ pub struct PersistedWorkspace {
     pub path: Option<PathBuf>,
     #[serde(default)]
     pub collapsed: bool,
+    /// Per workspace shell override. Empty for upgraders predating
+    /// the feature so they fall back to `default_shell` and then to
+    /// the daemon's own `default_shell()` fallback.
+    #[serde(default)]
+    pub shell: ShellSpec,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -46,6 +51,7 @@ impl PersistedState {
                     name: w.name.clone(),
                     path: w.path.clone(),
                     collapsed: w.collapsed,
+                    shell: w.shell.clone(),
                 })
                 .collect(),
             active_workspace: state.active_workspace,
@@ -160,6 +166,7 @@ mod tests {
                 name: "alpha".into(),
                 path: Some(PathBuf::from("/tmp/alpha")),
                 collapsed: true,
+                shell: ShellSpec::default(),
             }],
             active_workspace: 0,
             remember_close_choice: false,
@@ -194,6 +201,40 @@ mod tests {
         assert_eq!(loaded.default_shell.program, "/bin/bash");
         assert_eq!(loaded.default_shell.args, vec!["--login".to_string()]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn round_trip_preserves_per_workspace_shell() {
+        let mut state = seed_state();
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/bin/fish".into(),
+            args: vec!["-i".into()],
+        };
+        let persisted = PersistedState::from_state(&state);
+        let path = unique_temp_path("ws-shell-round-trip");
+        persisted.write_to(&path).unwrap();
+        let loaded = PersistedState::read_from(&path).unwrap();
+        assert_eq!(loaded.workspaces[0].shell.program, "/bin/fish");
+        assert_eq!(loaded.workspaces[0].shell.args, vec!["-i".to_string()]);
+        assert!(
+            loaded.workspaces[1].shell.is_empty(),
+            "workspaces without an override must round trip as empty"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persisted_workspace_deserializes_with_empty_shell_when_field_is_missing() {
+        // A workspaces.json from before the per-workspace shell feature
+        // omits the field. Serde must hydrate it as the empty spec so
+        // upgraders keep falling back to the app default.
+        let json = r#"{"name":"alpha","path":null,"collapsed":false}"#;
+        let loaded: PersistedWorkspace = serde_json::from_str(json).unwrap();
+        assert!(
+            loaded.shell.is_empty(),
+            "missing shell field must deserialize to an empty ShellSpec, got {:?}",
+            loaded.shell
+        );
     }
 
     #[test]

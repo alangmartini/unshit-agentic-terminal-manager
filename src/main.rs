@@ -374,6 +374,7 @@ fn main() {
                 .map(|(i, entry)| {
                     let mut ws = new_workspace((i + 1) as u32, entry.name, entry.path);
                     ws.collapsed = entry.collapsed;
+                    ws.shell = entry.shell;
                     ws
                 })
                 .collect();

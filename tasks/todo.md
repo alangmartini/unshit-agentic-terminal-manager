@@ -72,18 +72,19 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase 4: Per workspace override
 
-- [ ] **Task 6: Per workspace `shell` field**
-  - [ ] Add `shell: ShellSpec` to `state::Workspace` (initialized in `new_workspace`).
-  - [ ] Add `shell: ShellSpec` to `persist::PersistedWorkspace` with `#[serde(default)]`.
-  - [ ] Update `from_state` and the workspace restoration loop in `main.rs`.
-  - [ ] Spawn sites resolve via `shell::resolve(Some(&active_ws.shell), Some(&state.default_shell))`.
-  - [ ] Test: workspace override beats app default in `shell::resolve`.
-  - [ ] Test: state level dispatch with workspace 0 override + workspace 1 no override hits the right shell on each.
-  - [ ] Persist round trip test covers both fields.
-  - [ ] `cargo test` green.
+- [x] **Task 6: Per workspace `shell` field** [DONE]
+  - [x] Added `shell: ShellSpec` to `state::Workspace` (initialized in `new_workspace`, `seed_state`, all test helpers).
+  - [x] Added `shell: ShellSpec` to `persist::PersistedWorkspace` with `#[serde(default)]`.
+  - [x] Updated `from_state` to copy `w.shell` and `main.rs` restoration loop to thread `entry.shell` back.
+  - [x] `pane_spawn_shell` now consults the active workspace via `shell::resolve(Some(&active_ws.shell), Some(&state.default_shell))`.
+  - [x] Test: `pane_spawn_shell_prefers_active_workspace_shell_over_app_default`.
+  - [x] Test: `pane_spawn_shell_uses_correct_workspace_after_switch` (state-level dispatch with two workspaces).
+  - [x] Test: `pane_spawn_shell_falls_back_to_app_default_when_workspace_shell_is_empty`.
+  - [x] Persist round trip + missing-field tests cover `PersistedWorkspace.shell`.
+  - [x] `cargo test --bin terminal-manager`: 841 passed (up from 836, +5 new). clippy + fmt clean.
 
 ### Checkpoint
-- [ ] `cargo test` green.
+- [x] `cargo test` green.
 - [ ] Manual: give two workspaces different `shell.program` values via `workspaces.json`, restart, open a tab in each, confirm each opens the right shell.
 
 ## Phase 5: Discovery and dispatch
