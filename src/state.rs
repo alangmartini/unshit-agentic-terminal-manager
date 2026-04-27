@@ -111,6 +111,7 @@ pub enum CloseAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSection {
     Appearance,
+    Shell,
     Keybinds,
     Sessions,
     DangerZone,
@@ -120,15 +121,17 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Appearance => "appearance",
+            SettingsSection::Shell => "shell",
             SettingsSection::Keybinds => "keybinds",
             SettingsSection::Sessions => "sessions",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 4] {
+    pub fn all() -> [SettingsSection; 5] {
         [
             SettingsSection::Appearance,
+            SettingsSection::Shell,
             SettingsSection::Keybinds,
             SettingsSection::Sessions,
             SettingsSection::DangerZone,
@@ -207,6 +210,10 @@ pub struct Workspace {
     /// inactive, this is the source of truth.
     pub tabs: Vec<TerminalTab>,
     pub active_tab: usize,
+    /// Per workspace shell override. When non empty, beats
+    /// `AppState.default_shell` in `pane_spawn_shell`. Empty means
+    /// "inherit the app default", matching today's behavior.
+    pub shell: crate::shell::ShellSpec,
 }
 
 #[derive(Clone, Debug)]
@@ -353,6 +360,10 @@ pub struct AppState {
     /// [`push_error_toast`]; ticked down by the cursor-blink
     /// subscription so dismissal stays deterministic in tests.
     pub toasts: unshit::core::toast::ToastStore,
+    /// App wide default shell. Empty means "let the daemon's own
+    /// `default_shell()` decide". Per workspace overrides land in
+    /// Task 6 and take precedence via `shell::resolve`.
+    pub default_shell: crate::shell::ShellSpec,
 }
 
 impl AppState {
@@ -451,6 +462,7 @@ impl AppState {
                     message: t.message.clone(),
                 })
                 .collect(),
+            default_shell: self.default_shell.clone(),
         }
     }
 
@@ -517,6 +529,9 @@ pub struct UiSnapshot {
     pub sessions_stale: bool,
     /// Flat projection of the live `ToastStore`. Push order preserved.
     pub toasts: Vec<ToastView>,
+    /// Mirror of `AppState::default_shell` so settings UI can render
+    /// the current value without reaching into the live state.
+    pub default_shell: crate::shell::ShellSpec,
 }
 
 fn current_folder_name() -> String {
@@ -549,6 +564,7 @@ pub fn seed_state() -> AppState {
             git_branch: ws1_branch,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
         Workspace {
             num: 2,
@@ -569,6 +585,7 @@ pub fn seed_state() -> AppState {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
         Workspace {
             num: 3,
@@ -589,6 +606,7 @@ pub fn seed_state() -> AppState {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
         Workspace {
             num: 4,
@@ -609,6 +627,7 @@ pub fn seed_state() -> AppState {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
     ];
 
@@ -676,6 +695,7 @@ pub fn seed_state() -> AppState {
         sessions: Vec::new(),
         sessions_stale: false,
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
+        default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
     }
 }
 
@@ -758,6 +778,18 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
     load_workspace_state(state);
 }
 
+/// Resolve which shell a new pane should spawn with for the given
+/// state. The active workspace's `shell` beats `state.default_shell`;
+/// both empty yields `None` so the daemon's `default_shell()` keeps
+/// its floor.
+pub fn pane_spawn_shell(state: &AppState) -> Option<crate::shell::ShellSpec> {
+    let workspace = state
+        .workspaces
+        .get(state.active_workspace)
+        .map(|w| &w.shell);
+    crate::shell::resolve(workspace, Some(&state.default_shell))
+}
+
 pub fn mutate_add_tab(state: &mut AppState) {
     save_tab_state(state);
 
@@ -778,11 +810,16 @@ pub fn mutate_add_tab(state: &mut AppState) {
     // Spawn PTY eagerly so the terminal is live immediately.
     let cwd = active_workspace_cwd(state);
     let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
-    {
+    match state.pty_manager.spawn_in(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        cwd.as_deref(),
+        shell.as_ref(),
+    ) {
         Ok(reader) => {
             state
                 .terminals
@@ -895,6 +932,7 @@ pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace
         git_branch,
         tabs: vec![],
         active_tab: 0,
+        shell: crate::shell::ShellSpec::default(),
     }
 }
 
@@ -983,11 +1021,16 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
 
     let cwd = active_workspace_cwd(state);
     let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
-    {
+    match state.pty_manager.spawn_in(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        cwd.as_deref(),
+        shell.as_ref(),
+    ) {
         Ok(reader) => {
             state
                 .terminals
@@ -1042,11 +1085,16 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
 
     let cwd = active_workspace_cwd(state);
     let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
-    {
+    match state.pty_manager.spawn_in(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        cwd.as_deref(),
+        shell.as_ref(),
+    ) {
         Ok(reader) => {
             state
                 .terminals
@@ -2287,6 +2335,16 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             true
         }
+        other if other.starts_with("shell.set_default:") => {
+            dispatch_shell_set_default(state, other)
+        }
+        "shell.clear_default" => dispatch_shell_clear_default(state),
+        other if other.starts_with("shell.set_workspace:") => {
+            dispatch_shell_set_workspace(state, other)
+        }
+        other if other.starts_with("shell.clear_workspace:") => {
+            dispatch_shell_clear_workspace(state, other)
+        }
         other if other.starts_with("keybind.set:") => dispatch_keybind_set(state, other),
         other if other.starts_with("keybind.reset:") => dispatch_keybind_reset(state, other),
         "keybind.reset_all" => {
@@ -2310,6 +2368,65 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Parse `shell.set_default:<json>` and apply. The json must
+/// deserialize to a `ShellSpec`; malformed input returns `false` with
+/// no state change.
+fn dispatch_shell_set_default(state: &mut AppState, cmd: &str) -> bool {
+    let json = &cmd["shell.set_default:".len()..];
+    let Ok(spec) = serde_json::from_str::<crate::shell::ShellSpec>(json) else {
+        return false;
+    };
+    state.default_shell = spec;
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Clear the app wide default shell. Idempotent: succeeds even when
+/// already empty so the UI can wire a single button without checking
+/// state first.
+fn dispatch_shell_clear_default(state: &mut AppState) -> bool {
+    state.default_shell = crate::shell::ShellSpec::default();
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Parse `shell.set_workspace:<idx>:<json>` and apply. Both an
+/// out-of-range index and malformed json return `false` with no
+/// state change.
+fn dispatch_shell_set_workspace(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["shell.set_workspace:".len()..];
+    let Some((idx_str, json)) = rest.split_once(':') else {
+        return false;
+    };
+    let Ok(idx) = idx_str.parse::<usize>() else {
+        return false;
+    };
+    if idx >= state.workspaces.len() {
+        return false;
+    }
+    let Ok(spec) = serde_json::from_str::<crate::shell::ShellSpec>(json) else {
+        return false;
+    };
+    state.workspaces[idx].shell = spec;
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Parse `shell.clear_workspace:<idx>` and clear that workspace's
+/// override. Out-of-range index returns `false`.
+fn dispatch_shell_clear_workspace(state: &mut AppState, cmd: &str) -> bool {
+    let idx_str = &cmd["shell.clear_workspace:".len()..];
+    let Ok(idx) = idx_str.parse::<usize>() else {
+        return false;
+    };
+    if idx >= state.workspaces.len() {
+        return false;
+    }
+    state.workspaces[idx].shell = crate::shell::ShellSpec::default();
+    crate::persist::save_workspaces(state);
+    true
 }
 
 /// Parse `keybind.set:<action_id>:<combo>` and apply. The combo can
@@ -2836,6 +2953,7 @@ mod tests {
             sessions: Vec::new(),
             sessions_stale: false,
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
+            default_shell: crate::shell::ShellSpec::default(),
         }
     }
 
@@ -2844,19 +2962,21 @@ mod tests {
     #[test]
     fn settings_section_labels() {
         assert_eq!(SettingsSection::Appearance.label(), "appearance");
+        assert_eq!(SettingsSection::Shell.label(), "shell");
         assert_eq!(SettingsSection::Keybinds.label(), "keybinds");
         assert_eq!(SettingsSection::Sessions.label(), "sessions");
         assert_eq!(SettingsSection::DangerZone.label(), "danger zone");
     }
 
     #[test]
-    fn settings_section_all_returns_four() {
+    fn settings_section_all_returns_five() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
         assert_eq!(all[0], SettingsSection::Appearance);
-        assert_eq!(all[1], SettingsSection::Keybinds);
-        assert_eq!(all[2], SettingsSection::Sessions);
-        assert_eq!(all[3], SettingsSection::DangerZone);
+        assert_eq!(all[1], SettingsSection::Shell);
+        assert_eq!(all[2], SettingsSection::Keybinds);
+        assert_eq!(all[3], SettingsSection::Sessions);
+        assert_eq!(all[4], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -2873,6 +2993,168 @@ mod tests {
         assert_eq!(state.tabs[1].id, "t2");
         assert_eq!(state.active_tab, 1);
         assert_eq!(state.next_id, 3);
+    }
+
+    #[test]
+    fn pane_spawn_shell_returns_resolved_default_when_set() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec!["--login".into()],
+        };
+        let resolved = pane_spawn_shell(&state).expect("non empty default must resolve");
+        assert_eq!(resolved.program, "/bin/bash");
+        assert_eq!(resolved.args, vec!["--login".to_string()]);
+    }
+
+    #[test]
+    fn pane_spawn_shell_returns_none_when_default_is_empty() {
+        let state = test_state();
+        assert!(state.default_shell.is_empty());
+        assert!(
+            pane_spawn_shell(&state).is_none(),
+            "empty default must yield None so the daemon's own default_shell() takes over"
+        );
+    }
+
+    #[test]
+    fn add_tab_records_resolved_default_shell_on_pty_shim() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/usr/local/bin/fish".into(),
+            args: vec![],
+        };
+        let new_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        let shell = state
+            .pty_manager
+            .spawn_shell(new_pane_id)
+            .expect("add_tab must forward the resolved default shell to the shim");
+        assert_eq!(shell.program, "/usr/local/bin/fish");
+    }
+
+    #[test]
+    fn split_right_records_resolved_default_shell_on_pty_shim() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/zsh".into(),
+            args: vec![],
+        };
+        let target = state.active_pane;
+        let new_pane_id = state.next_id;
+        mutate_split_right(&mut state, target);
+        let shell = state
+            .pty_manager
+            .spawn_shell(new_pane_id)
+            .expect("split_right must forward the resolved default shell to the shim");
+        assert_eq!(shell.program, "/bin/zsh");
+    }
+
+    #[test]
+    fn split_down_records_resolved_default_shell_on_pty_shim() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/dash".into(),
+            args: vec![],
+        };
+        let target = state.active_pane;
+        let new_pane_id = state.next_id;
+        mutate_split_down(&mut state, target);
+        let shell = state
+            .pty_manager
+            .spawn_shell(new_pane_id)
+            .expect("split_down must forward the resolved default shell to the shim");
+        assert_eq!(shell.program, "/bin/dash");
+    }
+
+    #[test]
+    fn pane_spawn_shell_prefers_active_workspace_shell_over_app_default() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.active_workspace = 0;
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec![],
+        };
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/usr/local/bin/fish".into(),
+            args: vec!["-l".into()],
+        };
+
+        let resolved = pane_spawn_shell(&state).expect("workspace override must resolve");
+        assert_eq!(resolved.program, "/usr/local/bin/fish");
+        assert_eq!(resolved.args, vec!["-l".to_string()]);
+    }
+
+    #[test]
+    fn pane_spawn_shell_falls_back_to_app_default_when_workspace_shell_is_empty() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.active_workspace = 0;
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/zsh".into(),
+            args: vec![],
+        };
+        assert!(state.workspaces[0].shell.is_empty());
+
+        let resolved = pane_spawn_shell(&state).expect("app default must take over");
+        assert_eq!(resolved.program, "/bin/zsh");
+    }
+
+    #[test]
+    fn pane_spawn_shell_uses_correct_workspace_after_switch() {
+        // Two workspaces: ws0 has an override, ws1 does not.
+        // Adding a tab in each must record the right shell on the
+        // shim. This catches a regression where pane_spawn_shell
+        // forgets to consult the active workspace.
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.workspaces.push(new_workspace(2, "beta".into(), None));
+        state.active_workspace = 0;
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/dash".into(),
+            args: vec![],
+        };
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/usr/local/bin/fish".into(),
+            args: vec![],
+        };
+        // workspaces[1].shell stays empty so it falls back to the app default.
+
+        let ws0_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        let ws0_shell = state
+            .pty_manager
+            .spawn_shell(ws0_pane_id)
+            .expect("ws0 add_tab must record the override");
+        assert_eq!(ws0_shell.program, "/usr/local/bin/fish");
+
+        mutate_switch_workspace(&mut state, 1);
+        let ws1_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        let ws1_shell = state
+            .pty_manager
+            .spawn_shell(ws1_pane_id)
+            .expect("ws1 add_tab must fall back to the app default");
+        assert_eq!(ws1_shell.program, "/bin/dash");
+    }
+
+    #[test]
+    fn add_tab_with_empty_default_shell_does_not_record_a_shell() {
+        let mut state = test_state();
+        assert!(state.default_shell.is_empty());
+        let new_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        assert!(
+            state.pty_manager.spawn_shell(new_pane_id).is_none(),
+            "empty default must surface as None so the daemon falls back"
+        );
     }
 
     #[test]
@@ -3019,6 +3301,140 @@ mod tests {
     }
 
     // -- dispatch -------------------------------------------------------------
+
+    #[test]
+    fn dispatch_shell_set_default_updates_state() {
+        let mut state = test_state();
+        assert!(state.default_shell.is_empty());
+        let json = r#"{"program":"/bin/zsh","args":["-l"]}"#;
+        let cmd = format!("shell.set_default:{json}");
+        assert!(dispatch(&mut state, &cmd));
+        assert_eq!(state.default_shell.program, "/bin/zsh");
+        assert_eq!(state.default_shell.args, vec!["-l".to_string()]);
+    }
+
+    #[test]
+    fn dispatch_shell_set_default_with_malformed_json_returns_false() {
+        let mut state = test_state();
+        let original = state.default_shell.clone();
+        assert!(!dispatch(&mut state, "shell.set_default:not-json"));
+        assert_eq!(
+            state.default_shell, original,
+            "malformed json must not mutate state"
+        );
+    }
+
+    #[test]
+    fn dispatch_shell_set_default_with_empty_json_payload_returns_false() {
+        let mut state = test_state();
+        // Missing colon means no payload — also malformed.
+        assert!(!dispatch(&mut state, "shell.set_default"));
+    }
+
+    #[test]
+    fn dispatch_shell_clear_default_clears_state() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/dash".into(),
+            args: vec![],
+        };
+        assert!(dispatch(&mut state, "shell.clear_default"));
+        assert!(state.default_shell.is_empty());
+    }
+
+    #[test]
+    fn dispatch_shell_clear_default_when_already_empty_still_returns_true() {
+        // The handler is idempotent: clearing an already empty default
+        // is a successful no-op, not an error. Persisting it is cheap.
+        let mut state = test_state();
+        assert!(state.default_shell.is_empty());
+        assert!(dispatch(&mut state, "shell.clear_default"));
+        assert!(state.default_shell.is_empty());
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_updates_correct_workspace() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.workspaces.push(new_workspace(2, "beta".into(), None));
+        let json = r#"{"program":"/usr/local/bin/fish","args":[]}"#;
+        let cmd = format!("shell.set_workspace:1:{json}");
+        assert!(dispatch(&mut state, &cmd));
+        assert!(
+            state.workspaces[0].shell.is_empty(),
+            "workspace 0 must be untouched"
+        );
+        assert_eq!(state.workspaces[1].shell.program, "/usr/local/bin/fish");
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_with_out_of_range_index_returns_false() {
+        let mut state = test_state();
+        let count = state.workspaces.len();
+        let cmd = format!(
+            "shell.set_workspace:{count}:{}",
+            r#"{"program":"/bin/zsh","args":[]}"#
+        );
+        assert!(!dispatch(&mut state, &cmd));
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_with_malformed_index_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(
+            &mut state,
+            r#"shell.set_workspace:abc:{"program":"/bin/zsh","args":[]}"#
+        ));
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_with_malformed_json_returns_false() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        assert!(!dispatch(&mut state, "shell.set_workspace:0:not-json"));
+        assert!(state.workspaces[0].shell.is_empty());
+    }
+
+    #[test]
+    fn dispatch_shell_clear_workspace_clears_the_right_workspace() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.workspaces.push(new_workspace(2, "beta".into(), None));
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/bin/zsh".into(),
+            args: vec![],
+        };
+        state.workspaces[1].shell = crate::shell::ShellSpec {
+            program: "/bin/fish".into(),
+            args: vec![],
+        };
+        assert!(dispatch(&mut state, "shell.clear_workspace:0"));
+        assert!(state.workspaces[0].shell.is_empty());
+        assert_eq!(
+            state.workspaces[1].shell.program, "/bin/fish",
+            "clearing workspace 0 must not touch workspace 1"
+        );
+    }
+
+    #[test]
+    fn dispatch_shell_clear_workspace_with_out_of_range_index_returns_false() {
+        let mut state = test_state();
+        let count = state.workspaces.len();
+        let cmd = format!("shell.clear_workspace:{count}");
+        assert!(!dispatch(&mut state, &cmd));
+    }
+
+    #[test]
+    fn dispatch_shell_clear_workspace_with_malformed_index_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "shell.clear_workspace:abc"));
+    }
 
     #[test]
     fn dispatch_modal_open_close() {
@@ -6220,6 +6636,7 @@ mod tests {
             git_branch: None,
             tabs: vec![tab],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         }
     }
 

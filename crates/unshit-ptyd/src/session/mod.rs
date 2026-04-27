@@ -79,13 +79,16 @@ impl Session {
     /// `Receiver` it can poll for outbound bytes.
     ///
     /// `shell` overrides the platform default when `Some`; falling back
-    /// to `SHELL` + platform default when `None`.
+    /// to `SHELL` + platform default when `None`. `shell_args` are
+    /// forwarded to the program before any daemon side cwd args (the
+    /// PowerShell `-NoExit -Command "Set-Location ..."` workaround).
     pub fn spawn(
         id: u64,
         cols: u16,
         rows: u16,
         cwd: Option<&Path>,
         shell: Option<&str>,
+        shell_args: &[String],
         workspace_id: u32,
         pane_id: u32,
         name: Option<String>,
@@ -104,13 +107,11 @@ impl Session {
             .unwrap_or_else(crate::pty::default_shell);
 
         let mut cmd = CommandBuilder::new(&shell);
+        for arg in crate::pty::build_spawn_args(&shell, shell_args, cwd) {
+            cmd.arg(arg);
+        }
         if let Some(dir) = cwd {
             cmd.cwd(dir);
-            if crate::pty::is_powershell_shell(&shell) {
-                for arg in crate::pty::build_powershell_cwd_args(dir) {
-                    cmd.arg(arg);
-                }
-            }
         } else if let Some(home) = dirs::home_dir() {
             cmd.cwd(home);
         }
@@ -387,7 +388,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_emits_output_from_echo() {
         let (mut session, mut rx) =
-            Session::spawn(1, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn session");
+            Session::spawn(1, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
 
         #[cfg(windows)]
         let payload = b"echo session-hi\r\n";
@@ -408,7 +410,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resize_updates_recorded_dimensions() {
         let (mut session, _rx) =
-            Session::spawn(2, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn session");
+            Session::spawn(2, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
         assert_eq!(session.cols(), 80);
         assert_eq!(session.rows(), 24);
 
@@ -422,7 +425,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn set_name_stores_and_clears_display_name() {
         let (mut session, _rx) =
-            Session::spawn(10, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn");
+            Session::spawn(10, 80, 24, None, Some(test_shell()), &[], 0, 0, None).expect("spawn");
         assert_eq!(session.name(), None);
 
         session.set_name(Some("build".to_string()));
@@ -443,7 +446,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kill_is_idempotent_and_marks_session_dead() {
         let (mut session, _rx) =
-            Session::spawn(3, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn session");
+            Session::spawn(3, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
         assert!(
             session.alive(),
             "session must be alive immediately after spawn"
@@ -457,7 +461,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drop_kills_child_and_closes_receiver() {
         let (session, mut rx) =
-            Session::spawn(4, 80, 24, None, Some(test_shell()), 0, 0, None).expect("spawn session");
+            Session::spawn(4, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
         drop(session);
 
         // With the session gone the reader task should stop and the
@@ -486,7 +491,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_reflects_bytes_written_to_pty() {
         let (mut session, mut rx) =
-            Session::spawn(10, 80, 24, None, Some(test_shell()), 0, 0, None)
+            Session::spawn(10, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
 
         #[cfg(windows)]
@@ -508,8 +513,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_is_empty_for_fresh_session() {
-        let (mut session, _rx) = Session::spawn(11, 80, 24, None, Some(test_shell()), 0, 0, None)
-            .expect("spawn session");
+        let (mut session, _rx) =
+            Session::spawn(11, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
         let snap = session.snapshot(0);
         assert_eq!(snap.grid.rows(), 24);
         assert_eq!(snap.grid.cols(), 80);
@@ -519,8 +525,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resize_propagates_to_terminal() {
-        let (mut session, _rx) = Session::spawn(12, 80, 24, None, Some(test_shell()), 0, 0, None)
-            .expect("spawn session");
+        let (mut session, _rx) =
+            Session::spawn(12, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
         let snap = session.snapshot(0);
         assert_eq!(snap.grid.rows(), 24);
         assert_eq!(snap.grid.cols(), 80);
@@ -534,8 +541,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_on_dead_session_returns_empty_grid() {
-        let (mut session, _rx) = Session::spawn(13, 80, 24, None, Some(test_shell()), 0, 0, None)
-            .expect("spawn session");
+        let (mut session, _rx) =
+            Session::spawn(13, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
         session.kill();
         let snap = session.snapshot(0);
         assert_eq!(snap.grid.rows(), 24);
@@ -553,6 +561,7 @@ mod tests {
             24,
             None,
             Some(test_shell()),
+            &[],
             7,
             3,
             Some("scratch".into()),
@@ -566,7 +575,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attach_replaces_prior_receiver_and_drops_it() {
         let (mut session, original_rx) =
-            Session::spawn(21, 80, 24, None, Some(test_shell()), 0, 0, None)
+            Session::spawn(21, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
 
         let mut new_rx = session.attach();
@@ -593,8 +602,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detach_clears_tx_but_keeps_terminal_parsing() {
-        let (mut session, rx) = Session::spawn(22, 80, 24, None, Some(test_shell()), 0, 0, None)
-            .expect("spawn session");
+        let (mut session, rx) =
+            Session::spawn(22, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
         drop(rx);
         session.detach();
 
@@ -617,8 +627,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reader_does_not_exit_when_output_receiver_dropped() {
-        let (mut session, rx) = Session::spawn(23, 80, 24, None, Some(test_shell()), 0, 0, None)
-            .expect("spawn session");
+        let (mut session, rx) =
+            Session::spawn(23, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
         drop(rx);
 
         #[cfg(windows)]

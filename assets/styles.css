@@ -1554,6 +1554,98 @@ body.dragging-pane {
   /* inherits font size and color from parent */
 }
 
+.ctx-menu-section-header {
+  padding: 6px 12px 2px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-tertiary);
+}
+
+.ctx-menu-item.active {
+  color: var(--amber-200);
+}
+
+/* ---- Shell tab ---- */
+
+.shell-scope-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4) 0;
+  border-bottom: 1px solid rgba(74, 62, 42, 0.3);
+}
+
+.shell-scope-block:last-child {
+  border-bottom: none;
+}
+
+.shell-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+.shell-chip {
+  padding: 4px 10px;
+  font-size: var(--t-sm);
+  color: var(--fg-secondary);
+  background: rgba(20, 17, 12, 0.78);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast);
+}
+
+.shell-chip:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+  border-color: var(--border-default);
+}
+
+.shell-chip.active {
+  color: var(--amber-200);
+  border-color: var(--amber-200);
+  box-shadow: 0 0 0 1px rgba(212, 163, 72, 0.18);
+}
+
+.shell-chip.clear {
+  font-style: italic;
+}
+
+.shell-custom-input,
+.shell-args-input {
+  width: 100%;
+  padding: 6px 10px;
+  font-size: var(--t-sm);
+  font-family: var(--font-mono, monospace);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-sm);
+  color: var(--fg-primary);
+}
+
+.shell-custom-input:focus,
+.shell-args-input:focus {
+  border-color: var(--amber-400);
+  outline: none;
+}
+
+.workspace-overrides {
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--sp-5);
+  padding-top: var(--sp-4);
+  border-top: 1px solid rgba(74, 62, 42, 0.45);
+}
+
+.workspace-overrides .modal-section-title {
+  font-size: var(--t-md);
+  margin-bottom: var(--sp-2);
+  border-bottom: none;
+}
+
 /* ---- Confirm Dialog ---- */
 
 .confirm-dialog-hidden {

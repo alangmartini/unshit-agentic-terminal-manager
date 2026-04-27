@@ -1,349 +1,324 @@
-# Plan: Split Panel Functionality
+# Plan: Configurable default shell
 
-Derived from `SPEC.md`. Order: F2 -> F3 -> F5 -> F4 -> F1. Each task is a vertical slice: data + dispatch + UI + tests, landed as one PR.
+Derived from `SPEC.md`. Each task is a vertical slice: type changes + tests + the smallest end to end behavior change that proves the slice. Tasks are sequential per the project's "merge agents one at a time" guidance.
 
-## Ground truth from code exploration
+## Architecture decisions
 
-* Dispatch lives in `src/state.rs` `dispatch()` at ~line 1042 with no `keybind.*`, `pane.drop_split`, `pane.extract_to_tab`, or `tab.reorder` arms yet.
-* `ShortcutRegistry` (`crates/unshit-framework/crates/unshit-app/src/shortcut.rs` lines 157 onward) already supports runtime `register` and `unregister` with `BindingPriority`. No framework change needed for F5's hot-reload.
-* `DragEvent` carries absolute viewport `x`, `y` plus deltas. F1's open question (cross-pane hit-testing) is resolved; no framework addition required.
-* `build_pane_header()` already exists at `src/ui/terminal_grid.rs` ~line 201 as display-only. F4 adds drag to it; also hides it when `panes.len() == 1`.
-* Today's read-only keybinds in `src/ui/settings.rs` lines 230 to 246: `New terminal`, `Close tab`, `Split right`, `Split down`, `Next tab`, `Previous tab`, `Command palette`, `Toggle sidebar`, `Settings`, `Zoom in`, `Zoom out`, `Fullscreen`.
-* No `changelog/` directory exists in this repo. Skip changelog fragments (user's rule is "if it exists").
+* **`ShellSpec { program: String, args: Vec<String> }`** is the single representation everywhere (state, persist, IPC). Empty `program` means "fall back to the next level"; both empty means "let the daemon's `default_shell()` decide" (today's behavior).
+* **Resolution function** `shell::resolve(workspace, app) -> Option<ShellSpec>` is called at every spawn site. The resolved spec (if `Some`) is forwarded to the daemon as `(shell, shell_args)`.
+* **Wire change is additive**: `Request::SpawnSession` gains `shell_args: Vec<String>` defaulted via `#[serde(default)]`. No protocol version bump (per the contract in `protocol/message.rs`).
+* **Daemon owns PowerShell quirk**: the existing `is_powershell_shell` + `build_powershell_cwd_args` runs after the user's args, unchanged.
+* **Persistence reuses `workspaces.json`**: app default at the top, per workspace overrides inside each `PersistedWorkspace`. New fields default to `ShellSpec::default()` so old configs upgrade silently.
+* **Two UI surfaces**: Settings → Shell tab (full editor with dropdown + custom path + args) and the workspace context menu in the sidebar (quick switcher: pick a discovered shell, no args editor).
+* **Picker shape**: dropdown of `discover_installed()` results plus a "Custom path..." entry that reveals a text input. Args field is always visible and editable. (Confirmed during planning.)
+* **First time inference**: pre populate `default_shell.program` on fresh install with `pwsh.exe` > `powershell.exe` > today's `default_shell()` value. Resolution still treats an empty program as "fall back."
+* **MCP wiring is out of scope** (see SPEC.md "Decisions resolved during planning"). The MCP tool names exist in the registered tool list but are not implemented today; not part of this work.
 
 ## Dependency graph
 
 ```
-F2 (split hotkeys)  ----\
-                         +--- F5 (editable keybinds)
-F3 (unsplit hotkey) ----/           |
-                                    v
-                         F4 (pane extract to tab)
-                                    |
-                                    v
-                         F1 (tab drag + 5-zone drop)
+Task 1: ShellSpec type + resolve()
+   |
+   +-> Task 2: Daemon protocol additive change (shell_args)
+   |       |
+   |       +-> Task 3: UI shim DaemonPty carries ShellSpec
+   |               |
+   |               +-> Task 4: AppState.default_shell + persist + first time inference
+   |                       |
+   |                       +-> Task 5: All other spawn sites use resolve()
+   |                               |
+   |                               +-> Task 6: Per workspace override
+   |                                       |
+   |                                       +-> Task 7: discover_installed
+   |                                       |       |
+   |                                       |       +-> Task 9: Settings tab picker
+   |                                       |       +-> Task 10: Workspace context menu
+   |                                       |
+   |                                       +-> Task 8: Dispatch handlers
+   |                                               |
+   |                                               +-> Task 9: Settings tab picker
+   |                                               +-> Task 10: Workspace context menu
+   |
+   +-> Task 11: Remove bench SHELL override
 ```
 
-F2 and F3 are independent and can land in either order. F5 consumes the wired-up keybind registry from F2/F3. F4 introduces the pane-header drag-source and `pane.extract_to_tab` dispatch that F1 reuses. F1 is last because it stacks on everything.
+Tasks 7 and 8 are independent (could parallelize). Tasks 9 and 10 both depend on Tasks 7 and 8 but are independent of each other (different files; could parallelize). Task 11 has no dependencies and can land any time.
 
-## Phases and checkpoints
+## Task list
 
-### Phase A: Hotkey plumbing (F2 + F3)
+### Phase 1: Foundation
 
-**Goal:** every split/unsplit action is a named action in a registry, not a hard-coded match arm. Unblocks F5.
+- [ ] **Task 1: `ShellSpec` type and `resolve()`**
 
----
+  **Description:** Add `src/shell.rs` containing the `ShellSpec` struct, a `resolve(workspace, app) -> Option<ShellSpec>` function, and unit tests for both. No call sites yet. Declare `pub mod shell;` in `src/main.rs`.
 
-#### Task A1: Introduce `KeybindAction` enum and action -> default-combo map
+  **Acceptance criteria:**
+  * `ShellSpec` derives `Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize`.
+  * `is_empty()` returns true when `program` is empty (regardless of args).
+  * `resolve` returns workspace override when both are non empty, app default when workspace is empty, `None` when both are empty.
+  * Round trips through `serde_json` with empty args defaulted in.
 
-**Files**: `src/keybinds/mod.rs` (new), `src/keybinds/defaults.rs` (new), `src/state.rs` (import).
+  **Verification:**
+  * `cargo test --lib shell::` passes.
+  * `cargo clippy --all-targets --all-features` passes with no warnings.
 
-**Acceptance:**
-* `KeybindAction` enum has one variant per dispatched action currently shown in Settings: `NewTerminal`, `CloseTab`, `SplitRight`, `SplitDown`, `Unsplit`, `NextTab`, `PrevTab`, `CommandPalette`, `ToggleSidebar`, `OpenSettings`, `ZoomIn`, `ZoomOut`, `Fullscreen`.
-* `KeybindAction::dispatch_command(self) -> &'static str` returns the dispatch string (e.g. `SplitRight -> "pane.split_right"`).
-* `KeybindAction::default_combo(self) -> KeyCombo` returns the default combo parsed via `KeyCombo::parse`.
-* `KeybindAction::label(self) -> &'static str` returns the human label.
-* `KeybindAction::id(self) -> &'static str` returns a stable snake_case id (used for JSON serialization).
+  **Files likely touched:** `src/shell.rs` (new), `src/main.rs` (module declaration).
 
-**Verification:**
-* Unit tests in `src/keybinds/mod.rs` cover `id()` round-trips, `default_combo()` parses successfully for every variant, `dispatch_command()` matches the strings in `src/state.rs dispatch()`.
-* `cargo test keybinds::` passes.
-* `cargo clippy` clean.
+  **Estimated scope:** S (1 new file, 1 line in main.rs).
 
-**Red -> Green -> Refactor:** Write the parse/round-trip tests first. Add enum + functions until they pass.
+### Checkpoint after Task 1
+* `cargo test` green; foundation compiles; no behavior change.
 
----
+### Phase 2: Daemon honors shell_args
 
-#### Task A2: Register default bindings and dispatch through `ShortcutRegistry`
+- [ ] **Task 2: Additive `shell_args` field on `SpawnSession`**
 
-**Files**: `src/main.rs` or `src/bridge.rs` (wherever `ShortcutResolver` is constructed), `src/keybinds/registry.rs` (new helper).
+  **Description:** Add `shell_args: Vec<String>` (with `#[serde(default)]`) to `Request::SpawnSession`. Thread it through `Client::spawn_session` and `Session::spawn` so it lands at `CommandBuilder::arg`. Existing PowerShell cwd args are appended after the user's args.
 
-**Acceptance:**
-* On app start, every `KeybindAction` default is registered in `ShortcutResolver` with its dispatch command and `BindingPriority::Default`.
-* Key events resolved through `resolver.process_key(...)` produce the dispatch string, which is routed to `state::dispatch()`.
-* Existing hard-coded keybind handling that bypasses the registry (if any) is removed in favor of the registry path.
-* `Ctrl+Shift+V` and `Ctrl+Shift+H` are registered as aliases for `SplitRight` and `SplitDown` per spec F2.
-* `Ctrl+Shift+W` is registered for the new `Unsplit` action per spec F3.
+  **Acceptance criteria:**
+  * Old wire payload (no `shell_args` key) deserializes with an empty vector.
+  * New `spawn_session_round_trips_with_shell_args` test asserts JSON contains `"shell_args":["--login"]` when set; absent or empty is acceptable when unset.
+  * `Session::spawn` forwards each arg to `CommandBuilder::arg` in order.
+  * IPC integration test spawns with `shell = "/bin/sh"` (Unix) or `cmd.exe` (Windows) plus a single arg that prints a recognizable token, asserts the token appears in the output stream.
+  * PowerShell with user args + cwd still appends `-NoExit -Command "Set-Location ..."` after the user's args (regression test).
+  * Existing tests still pass: every `client.spawn_session(...)` and `Session::spawn(...)` call site updated to the new signature.
 
-**Verification:**
-* Integration test simulating key events (via the existing shortcut test infrastructure) confirms each combo fires the correct dispatch string.
-* `cargo test` passes.
-* `cargo run` and visually verify: `Ctrl+Shift+V` splits right; `Ctrl+Shift+H` splits down; `Ctrl+Shift+W` closes the focused pane. User does visual verification per memory.
+  **Verification:**
+  * `cargo test -p unshit-ptyd` passes.
+  * `cargo clippy -p unshit-ptyd` passes.
 
----
+  **Files likely touched:**
+  * `crates/unshit-ptyd/src/protocol/message.rs`
+  * `crates/unshit-ptyd/src/client/mod.rs`
+  * `crates/unshit-ptyd/src/session/mod.rs`
+  * `crates/unshit-ptyd/tests/ipc_session_spawn.rs`
 
-#### Task A3: Implement `Unsplit` dispatch with last-pane-closes-tab semantics
+  **Estimated scope:** M (4 files).
 
-**Files**: `src/state.rs`.
+- [ ] **Task 3: `DaemonPty` shim carries `ShellSpec`**
 
-**Acceptance:**
-* New dispatch arm `pane.close` (already exists) is updated so that when the closed pane is the tab's only pane, the tab is also closed.
-* If this behavior already exists in `pane.close`, add a unit test asserting it and move on.
-* The associated PTY is killed and removed from `AppState`.
+  **Description:** `DaemonPty::spawn_in` and `DaemonPty::attach_or_spawn` accept `Option<&ShellSpec>`. The shim's internal `Command::Spawn` enum variant stores `(shell, shell_args)` so the worker forwards them to `client.spawn_session`. Test helpers updated to pass `None`.
 
-**Verification:**
-* Unit test in `src/state.rs`: build a tab with one pane, dispatch `pane.close`, assert the tab is gone and the PTY is cleaned.
-* Unit test: build a tab with two panes, dispatch `pane.close`, assert one pane remains and ratios are normalized.
-* `cargo test state::` passes.
+  **Acceptance criteria:**
+  * `spawn_in` and `attach_or_spawn` signatures take `shell: Option<&ShellSpec>` (borrowed; the worker clones into the IPC payload).
+  * The 4 call sites in `src/main.rs:457` and `src/state.rs:868`, `:1073`, `:1132` updated to pass `None` (Task 4 wires the real value).
+  * The 1 call site in `src/bridge.rs:233` updated to pass `None`.
+  * `pty.rs` unit and integration tests still pass.
+  * New `pty.rs` unit test: `spawn_in` with a `ShellSpec` whose program is empty is treated as `None` at the wire (i.e. `client.spawn_session` is called with `shell: None, shell_args: vec![]`).
 
----
+  **Verification:**
+  * `cargo test --lib pty::` passes.
+  * `cargo build` succeeds.
 
-### Checkpoint 1 (after Phase A)
+  **Files likely touched:** `src/pty.rs`, `src/main.rs`, `src/state.rs`, `src/bridge.rs` (mechanical updates).
 
-Before starting F5, confirm:
+  **Estimated scope:** M (4 files; mostly call site mechanics).
 
-* [ ] All 13 actions registered and firing through the registry.
-* [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green.
-* [ ] User has manually verified `Ctrl+Shift+V`, `Ctrl+Shift+H`, `Ctrl+Shift+W` all work and that the existing `Ctrl+D`, `Ctrl+Shift+D`, `Ctrl+W` still work.
-* [ ] Commit per feature (A1+A2 = "feat: keybind registry for split actions"; A3 = "feat: unsplit closes last-pane tab"). Two PRs.
+### Checkpoint after Phase 2
+* `cargo test` green; daemon honors shell_args programmatically; UI still passes `None` so behavior is unchanged from today.
+* Manual: `cargo run` opens a default shell exactly as before. (No shell selection yet.)
 
----
+### Phase 3: App wide default
 
-### Phase B: Editable keybinds (F5)
+- [ ] **Task 4: `AppState.default_shell` + persistence + first time inference + initial spawn**
 
-**Goal:** user can remap every action from Settings > Keybinds, with conflict detection, reset, and JSON persistence. Unblocks further iteration without code rebuilds.
+  **Description:** Add `default_shell: ShellSpec` to `AppState` and `UiSnapshot`. Add `default_shell: ShellSpec` to `PersistedState` (with `#[serde(default)]`). Wire load/save. On fresh install (no `workspaces.json`), `seed_state()` infers the program: prefer `pwsh.exe` if `discover_installed` finds it, else `powershell.exe`, else today's `default_shell()` value. The initial pane spawn in `main.rs:457` resolves via `shell::resolve(None, Some(&state.default_shell))` and passes the result.
 
----
+  **Acceptance criteria:**
+  * Loading an old `workspaces.json` (no `default_shell` key) yields `ShellSpec::default()`; the inferred default is only applied when no config file exists.
+  * `PersistedState` round trips with a non default `default_shell`.
+  * `seed_state()` initializes `default_shell` via the inference rule.
+  * Inference rule unit test: with a stubbed `discover_installed` returning `[pwsh.exe, powershell.exe]`, the inferred program is `pwsh.exe`.
+  * Integration test: programmatically setting `state.default_shell = ShellSpec { program: "/bin/sh", args: vec![] }` and routing through the initial spawn flow results in the daemon receiving `shell: Some("/bin/sh")`.
+  * `UiSnapshot` exposes `default_shell` so the future settings UI can read it.
 
-#### Task B1: JSON persistence layer
+  **Verification:**
+  * `cargo test --lib state::` and `cargo test --lib persist::` pass.
+  * `cargo test` green overall.
 
-**Files**: `src/keybinds/loader.rs` (new).
+  **Files likely touched:** `src/state.rs`, `src/persist.rs`, `src/main.rs`, `src/shell.rs` (test helper).
 
-**Acceptance:**
-* `load_user_keybinds(path: &Path) -> Result<HashMap<KeybindAction, KeyCombo>, Error>`: reads JSON; missing file returns empty map (not error); malformed file logs warning and returns empty.
-* `save_user_keybinds(path: &Path, map: &HashMap<KeybindAction, KeyCombo>) -> Result<()>`: writes JSON atomically (write to `.tmp`, rename).
-* Path resolver: `keybinds_config_path() -> PathBuf` returns `<config_dir>/godly-terminal/keybindings.json`. Use `dirs::config_dir()` or whatever the app already uses for config (verify during implementation).
+  **Estimated scope:** M (4 files).
 
-**Verification:**
-* Unit tests cover: load-missing-returns-empty, load-malformed-returns-empty-with-log, round-trip write-then-read equals original, atomic write leaves no `.tmp` file on success.
-* `cargo test keybinds::loader` passes.
+- [ ] **Task 5: All other spawn sites resolve and pass spec**
 
-**Open question to resolve during implementation:** confirm where the app currently resolves its config dir and reuse that; don't add a second config path.
+  **Description:** Update the three remaining spawn sites in `src/state.rs:868`, `:1073`, `:1132` and the reattach site in `src/bridge.rs:233` to call `shell::resolve(...)` with the active workspace's eventual override (still `None` until Task 6) and the app default.
 
----
+  **Acceptance criteria:**
+  * Every `pty_manager.spawn_in` and `pty_manager.attach_or_spawn` call resolves the spec from state and passes it through.
+  * Grep audit: no remaining `pty_manager.spawn_in(.*, None)` or `attach_or_spawn(.*, None)` literals (should only appear in tests).
+  * State level test: dispatching the new pane command (`tab.new` or equivalent) with `state.default_shell.program = "X"` results in the shim's recorded `last_spawn_shell` matching `Some("X")`. (Use a test seam on `DaemonPty` or assert via the IPC integration test below.)
+  * Integration test: with `default_shell` set, opening a new tab spawns the configured shell. With it cleared, the daemon falls back to today's behavior.
 
-#### Task B2: Keybind state in `AppState` and dispatch arms
+  **Verification:**
+  * `cargo test` green.
+  * `cargo clippy` clean.
 
-**Files**: `src/state.rs`, `src/keybinds/recorder.rs` (new).
+  **Files likely touched:** `src/state.rs`, `src/bridge.rs`, possibly a small test seam in `src/pty.rs`.
 
-**Acceptance:**
-* `AppState` gains `keybinds: HashMap<KeybindAction, KeyCombo>` populated on startup from `load_user_keybinds` + defaults for missing entries.
-* New dispatch arms:
-  * `keybind.set:<action_id>:<combo>` -> validates combo, checks conflicts; if conflict, sets `AppState.keybind_error` and does nothing; else updates map, calls `save_user_keybinds`, and rebinds the registry (`unregister` old + `register` new).
-  * `keybind.reset:<action_id>` -> replaces with default; persists.
-  * `keybind.reset_all` -> replaces all with defaults; persists.
-* `RecordingState` struct in `recorder.rs` captures "which action is being recorded" + "pending combo"; lives in `AppState.keybind_recording: Option<RecordingState>`.
+  **Estimated scope:** M (3 files).
 
-**Verification:**
-* Unit tests:
-  * `keybind.set` with non-conflicting combo updates state and persists.
-  * `keybind.set` with conflicting combo leaves state unchanged and sets `keybind_error`.
-  * `keybind.reset` restores default.
-  * `keybind.reset_all` restores all 13 actions to defaults.
-* Integration test: call `keybind.set`, restart `AppState` by reloading from the on-disk JSON, assert the new combo persists.
+### Checkpoint after Phase 3
+* `cargo test` green.
+* Manual: edit `workspaces.json` by hand to set `"default_shell": { "program": "/bin/bash", "args": [] }`, restart, open a new pane, confirm `bash` is running (`echo $0`).
 
----
+### Phase 4: Per workspace override
 
-#### Task B3: Editable UI in Settings > Keybinds
+- [ ] **Task 6: Per workspace `shell` field + resolve takes both levels**
 
-**Files**: `src/ui/settings.rs`.
+  **Description:** Add `shell: ShellSpec` to `state::Workspace` and `persist::PersistedWorkspace` (both with `#[serde(default)]`). `new_workspace` initializes to `ShellSpec::default()`. Spawn sites pass `Some(&active_workspace.shell)` plus `Some(&state.default_shell)` to `shell::resolve`.
 
-**Acceptance:**
-* Replace the static `keybind_row()` list with a dynamic builder iterating `AppState.keybinds`.
-* Each row: `Label | Combo button | Reset button | Conflict indicator`.
-* Clicking the combo button sets `keybind_recording = Some(action)` and the cell shows "Press keys...".
-* While recording, the app intercepts the next key combo (not through normal dispatch); captures it, calls `keybind.set`. `Escape` cancels.
-* Conflict indicator: when `AppState.keybind_error` targets this row, show red border + tooltip with the conflicting action name.
-* `Reset all` button in the section header fires `keybind.reset_all`.
+  **Acceptance criteria:**
+  * Workspace serde round trips include the new field; old configs load with the default.
+  * `shell::resolve` continues to satisfy its existing tests; new test asserts a non empty workspace override beats the app default.
+  * State level test: setting `workspaces[0].shell.program = "X"` and `state.default_shell.program = "Y"`, then dispatching the new pane command on workspace 0, results in the shim seeing `X`. Same flow on workspace 1 sees `Y`.
 
-**Verification:**
-* Unit test: `build_keybinds_section()` renders 13 rows.
-* Integration test via framework test harness: click a combo, send a key event, verify the new combo is persisted and visible in the row.
-* `cargo run` and visually verify: change `Ctrl+T` to `Ctrl+Shift+T`, confirm new terminal hotkey works, close and reopen app, confirm persistence. User does visual verification per memory.
+  **Verification:**
+  * `cargo test` green.
+  * Persist round trip test in `src/persist.rs` covers both fields.
 
----
+  **Files likely touched:** `src/state.rs`, `src/persist.rs`, `src/shell.rs` (test only), `src/bridge.rs` (resolve call), `src/main.rs` (initial spawn resolve call).
 
-### Checkpoint 2 (after Phase B)
+  **Estimated scope:** M (5 files; mostly small).
 
-* [ ] Settings > Keybinds shows editable rows for all 13 actions.
-* [ ] Conflict detection blocks invalid sets and surfaces which action conflicts.
-* [ ] JSON persists across restart.
-* [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green.
-* [ ] User has verified remap + restart + conflict flow manually.
-* [ ] PR landed ("feat: editable keybinds with conflict detection and persistence").
+### Checkpoint after Phase 4
+* `cargo test` green.
+* Manual: edit `workspaces.json` to give two workspaces different `shell.program` values, restart, open a tab in each, confirm each opens the right shell.
 
----
+### Phase 5: Discovery and dispatch (parallel safe)
 
-### Phase C: Pane extract to tab (F4)
+- [ ] **Task 7: `discover_installed` shell scan**
 
-**Goal:** pane header is a drag handle; dragging to tab bar creates a new tab.
+  **Description:** Implement `shell::discover_installed() -> Vec<PathBuf>`. Walk `PATH` for known stems (`pwsh`, `powershell`, `cmd`, `bash`, `zsh`, `fish`, `nu`, `wsl`). On Windows also probe `C:\Program Files\Git\bin\bash.exe` and `C:\Windows\System32\wsl.exe`. Deduplicate by canonical path; preserve a stable, deterministic order.
 
----
+  **Acceptance criteria:**
+  * Returns at least one entry on the test host (sanity assertion).
+  * Order is stable across calls with the same PATH.
+  * Does not panic when PATH is unset or empty.
+  * Skips entries that are not regular files / not executable.
+  * Cap on number of returned entries (e.g. 16) so a pathological PATH cannot blow up the picker.
 
-#### Task C1: Pane header visibility + drag grip
+  **Verification:**
+  * `cargo test --lib shell::discover_installed_` passes on Windows and Unix.
 
-**Files**: `src/ui/terminal_grid.rs`, `assets/styles.css`.
+  **Files likely touched:** `src/shell.rs`.
 
-**Acceptance:**
-* `build_pane_header()` is rendered only when the current tab has more than one pane. When `panes.len() == 1`, the header is omitted (not just hidden via CSS) so the terminal gets the full pane area.
-* Header shows a grip icon (6 dots or equivalent) on the left, the terminal title in the center, and existing metadata on the right.
-* Header has `cursor: grab` and `cursor: grabbing` while dragging.
-* Clicking (not dragging) the header focuses the pane.
+  **Estimated scope:** S (1 file).
 
-**Verification:**
-* Unit test on the builder: single-pane tab has no header; multi-pane tab has header.
-* Visual verification: split a tab, see headers appear on both panes; close one, remaining header disappears.
+- [ ] **Task 8: Dispatch handlers and persist trigger**
 
----
+  **Description:** Add `dispatch` handlers for `shell.set_default:<json>`, `shell.set_workspace:<idx>:<json>`, `shell.clear_default`, `shell.clear_workspace:<idx>`. Each parses (using `serde_json` on the trailing `<json>` payload), mutates state, and triggers `persist::save_workspaces`.
 
-#### Task C2: Drag state machine and dispatch
+  **Acceptance criteria:**
+  * Each command updates the corresponding state field.
+  * Each command triggers a persist save (verified with the existing `install` test seam).
+  * Malformed JSON returns false (no panic, no state change).
+  * Out of range workspace index returns false.
+  * Unit tests cover all four commands plus the malformed and out of range cases.
 
-**Files**: `src/drag/mod.rs` (new), `src/state.rs`.
+  **Verification:**
+  * `cargo test --lib state::dispatch_shell` passes.
 
-**Acceptance:**
-* `DragState` enum: `Idle`, `DraggingPane { source_pane: PaneId, cursor: (f32, f32) }`.
-* `AppState.drag: DragState` field.
-* New dispatch arms:
-  * `drag.start_pane:<pane_id>` -> set `DragState::DraggingPane`.
-  * `drag.update:<x>:<y>` -> update cursor; recompute hover target.
-  * `drag.end:<x>:<y>` -> resolve drop via hit-test; route to `pane.extract_to_tab` or cancel.
-  * `pane.extract_to_tab:<pane_id>:<index>` -> move the pane's terminal+PTY into a new `TerminalTab` inserted at `index`; remove it from the source tab; reflow ratios on the source tab; focus the new tab.
+  **Files likely touched:** `src/state.rs`.
 
-**Verification:**
-* Unit tests for `pane.extract_to_tab`:
-  * Extracting from a 2-pane tab leaves one pane in source (ratios normalized) and creates new tab at specified index.
-  * Extracting the only pane from its tab closes the source tab (matches F3 semantics).
-  * PTY and terminal state survive the move (no respawn).
-* Unit test for drag state transitions.
+  **Estimated scope:** S (1 file).
 
-**Open question to resolve:** confirm the PTY handoff works by moving the `Arc<Mutex<Terminal>>` rather than killing and respawning. If the PTY is keyed by tab id anywhere, that mapping must update. Check during implementation; if this requires nontrivial refactoring, surface before proceeding.
+### Checkpoint after Phase 5
+* `cargo test` green.
+* Programmatically dispatching the new commands now updates state and persists correctly. UI still doesn't expose them (Tasks 9 and 10).
 
----
+### Phase 6: UI surfaces (parallel safe)
 
-#### Task C3: Pane header drag handler and tab-bar drop target
+- [ ] **Task 9: Settings → Shell tab full editor; remove General placeholder**
 
-**Files**: `src/ui/terminal_grid.rs` (attach `on_drag` to header), `src/ui/tabbar.rs` (drop zones + insertion placeholder).
+  **Description:** In `build_shell_section` (`src/ui/settings.rs:199`), build the App default editor: a dropdown listing `discover_installed()` results plus a "Custom path..." entry that reveals an editable program text field; an always visible args text field bound to the same state. Below it, the "Per workspace overrides" subsection lists each workspace with the same dropdown + custom + args layout. Each interaction dispatches the matching `shell.*` command from Task 8. Remove the placeholder "Default shell" row from `build_general_section` (`src/ui/settings.rs:108`).
 
-**Acceptance:**
-* Dragging the pane header more than 4px dispatches `drag.start_pane:<id>`, then `drag.update:<x>:<y>` per frame.
-* When the cursor is within the tab bar's bounding rect, the tab bar shows a vertical placeholder between tabs at the computed insertion index.
-* `DragPhase::End` dispatches `drag.end:<x>:<y>`; if over the tab bar, dispatches `pane.extract_to_tab`. Otherwise cancels (for now; F1 extends this to drop-on-other-pane).
+  **Note:** The settings modal is now `Display::Grid` (168px nav | body) per cbca91b; the shell section content lives inside the body grid cell.
 
-**Verification:**
-* Integration test simulating a drag from a pane header into the tab bar; asserts a new tab exists at the expected index and the source tab is reflowed.
-* `cargo run` and visually verify: split a pane, drag its header up to the tab bar, see placeholder, drop, see a new tab. User does visual verification per memory.
+  **Acceptance criteria:**
+  * Selecting a discovered entry from the dropdown sets `state.default_shell.program` and persists.
+  * Selecting "Custom path..." reveals a text field; typing into it sets `state.default_shell.program` and persists on commit (Enter or blur).
+  * Editing the args text field sets `state.default_shell.args` and persists on commit.
+  * Per workspace rows reflect each workspace's `shell` and dispatch the per workspace variants.
+  * The "Default shell" row no longer appears in the General tab.
+  * Existing `build_settings_modal` snapshot tests still pass; new tests cover the section's structural classes.
 
----
+  **Verification:**
+  * `cargo test --lib ui::settings::` passes.
+  * **Manual smoke test (required per CLAUDE.md):**
+    1. `cargo run`.
+    2. Open Settings → Shell.
+    3. Pick a non default shell (e.g. `pwsh`) from the dropdown.
+    4. Open a new pane, run `$Host.Name` (PowerShell) / `echo $0` (bash) and confirm the right shell.
+    5. Pick "Custom path..." and enter a non discovered path; confirm a new pane uses it.
+    6. Set a workspace override different from the app default; open a tab in that workspace; confirm the override wins.
+    7. Restart the app; confirm the picks survived.
 
-### Checkpoint 3 (after Phase C)
+  **Files likely touched:** `src/ui/settings.rs`, `assets/styles.css` (if new CSS classes are needed).
 
-* [ ] Pane header is a working drag source.
-* [ ] Dropping on the tab bar creates a new tab with the pane's terminal intact.
-* [ ] PTY is not respawned (verified by shell state: history, cwd, running process survive).
-* [ ] Source tab closes if it had only one pane.
-* [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green.
-* [ ] User has verified the drag visually.
-* [ ] PR landed ("feat: drag pane header to tab bar to extract as tab").
+  **Estimated scope:** M (1 to 2 files; rendering only, all logic landed in Task 8).
 
----
+- [ ] **Task 10: Workspace context menu shell submenu**
 
-### Phase D: Tab drag with 5-zone drop (F1)
+  **Description:** The sidebar workspace context menu (`src/ui/sidebar.rs` and / or `src/ui/ctx_menu.rs`; locate during implementation) gains a "Shell" submenu listing `discover_installed()` results plus an "Use app default" entry. Picking a discovered shell dispatches `shell.set_workspace:<idx>:{ "program": "...", "args": [] }`; "Use app default" dispatches `shell.clear_workspace:<idx>`. No args editor in this menu (quick switcher only; the full editor is in Settings).
 
-**Goal:** drag any tab, get a 5-zone drop preview in every pane, drop to split or reorder.
+  **Acceptance criteria:**
+  * Right clicking a workspace in the sidebar shows the existing context menu items plus a "Shell" submenu.
+  * Submenu items are sourced from `discover_installed`.
+  * The currently selected entry is marked active.
+  * "Use app default" appears at the bottom of the submenu when an override is set; hidden otherwise.
+  * Picking an entry dispatches the right command and the menu closes.
+  * Unit test on the menu builder asserts the structural layout (label list + active marker).
 
----
+  **Verification:**
+  * `cargo test --lib ui::sidebar::` (or wherever the context menu builder lives) passes.
+  * Manual: right click workspaces in the sidebar, confirm the submenu works end to end.
 
-#### Task D1: Drop-zone hit-testing
+  **Files likely touched:** `src/ui/sidebar.rs` or `src/ui/ctx_menu.rs` (locate during implementation), possibly `assets/styles.css`.
 
-**Files**: `src/drag/drop_zones.rs` (new).
+  **Estimated scope:** M (1 to 2 files).
 
-**Acceptance:**
-* `pub enum DropZone { Top, Right, Bottom, Left, Center }`.
-* `pub fn hit_test(pane_rect: Rect, cursor: (f32, f32)) -> Option<DropZone>`: returns `None` if cursor is outside; otherwise returns the zone. Edge zones occupy the outer 25% of each side; center occupies the inner 50%.
-* Ambiguity on corners: edge zones take priority over center; when two edges overlap (corner), the closer edge wins.
+### Checkpoint after Phase 6
+* The feature is end to end usable from both UI surfaces. Pause for human review before continuing.
 
-**Verification:**
-* Unit tests covering: every zone hit, outside returns None, corner disambiguation, exact center, exact edge boundary.
-* Table-driven tests with at least 20 cases.
+### Phase 7: Cleanup
 
----
+- [ ] **Task 11: Remove `SHELL=cmd.exe` bench override**
 
-#### Task D2: Drop-zone overlay rendering
+  **Description:** Delete `std::env::set_var("SHELL", "cmd.exe")` at `src/main.rs:325`. Bench mode now honors the configured `default_shell` like every other spawn. (Removing the General placeholder is part of Task 9; this task only handles the bench override and adds the regression test.)
 
-**Files**: `src/drag/overlay.rs` (new), `src/ui/terminal_grid.rs` (conditional overlay when `DragState::DraggingTab`), `assets/styles.css`.
+  **Acceptance criteria:**
+  * The `set_var("SHELL", ...)` call is gone from `main.rs`.
+  * Regression test: a `#[test]` that grep / asserts the source string is absent (compile time match against `include_str!("main.rs")`).
+  * `cargo run --features ... --bench scroll` (or the equivalent invocation) still completes without crashing on Windows. (Manual; bench numbers are not part of the acceptance criteria here.)
 
-**Acceptance:**
-* When `DragState::DraggingTab`, render a translucent overlay over every pane showing 5 zones (edge trapezoids + center rectangle).
-* The zone currently under the cursor is filled with an accent color; others are subtly outlined.
-* Overlay uses `pointer-events: none` except for the hit-test logic (drag events continue to fire on the underlying pane).
+  **Verification:**
+  * `cargo test --lib bench_no_set_shell` passes.
+  * `cargo build --features bench` succeeds.
 
-**Verification:**
-* Visual verification after integration in D4. Unit tests cover the layout math if not trivial.
+  **Files likely touched:** `src/main.rs`, possibly `src/bench/mod.rs` if a bench time default needs to be configured through the new path instead.
 
----
+  **Estimated scope:** S (1 to 2 files).
 
-#### Task D3: Tab drag source and `tab.reorder` / `pane.drop_split` dispatch
+### Final checkpoint
+* All success criteria from `SPEC.md` verified.
+* `cargo test`, `cargo clippy --all-targets --all-features`, `cargo fmt --check` clean.
+* Manual smoke test of the full flow performed (both UI surfaces, both per workspace and app default).
+* PR ready for review.
 
-**Files**: `src/ui/tabbar.rs`, `src/state.rs`, `src/drag/mod.rs` extended.
+## Risks and mitigations
 
-**Acceptance:**
-* Each tab element has `on_drag`. Dragging more than 4px dispatches `drag.start_tab:<tab_id>`; extends `DragState` with `DraggingTab { source_tab: TabId, cursor: (f32, f32) }`.
-* `DragPhase::Update` dispatches `drag.update:<x>:<y>`.
-* `DragPhase::End` dispatches `drag.end:<x>:<y>`:
-  * If cursor is within another tab's bounds -> `tab.reorder:<source>:<index>` (moves tab adjacent).
-  * If cursor is within a pane and a zone is hit:
-    * Edge -> `pane.drop_split:<target_pane>:<edge>` (moves source tab's active terminal into the target tab at the given edge).
-    * Center -> for v1, reorder as an adjacent tab (true stacking deferred per spec).
-  * Otherwise cancel.
-* `pane.drop_split` dispatch: insert the source terminal as a new pane on the specified edge of the target pane, update `row_ratios` / `col_ratios`, remove from source tab (closing source tab if empty).
+| Risk | Impact | Mitigation |
+|---|---|---|
+| Old daemon clients see new wire field and break | High | Additive serde change with `#[serde(default)]` plus a "missing field deserializes to empty vec" test in Task 2. |
+| One of 4 spawn sites missed; some tabs ignore the preference | High | Grep audit at the end of Task 5 (no `spawn_in.*None` literals outside tests); code review. |
+| User args clash with daemon injected PowerShell `-NoExit -Command` | Medium | Regression test in Task 2 spawning PowerShell with both user args and a cwd; assert the cwd wins. |
+| `discover_installed` slow on Windows (PATH walk on every settings open) | Low | Cap at 16 entries; only call when Settings → Shell is opened or the workspace context menu opens (not on startup). Cache inside `UiSnapshot` if it shows up in profiling. |
+| Settings UI snapshot tests break on the new picker | Low | Update snapshots as the rendering lands; pure mechanical change. |
+| Bench numbers shift after removing `SHELL=cmd.exe` override | Low | Documented; bench mode now uses configured shell. The hack was a workaround for a missing feature, which now exists. |
+| Workspace context menu currently undiscovered location | Low | Task 10 begins with locating the existing right click menu builder via grep; small risk it lives in a less obvious file. |
 
-**Verification:**
-* Unit tests for `pane.drop_split` on each of the four edges.
-* Unit test for `tab.reorder`.
-* Integration test simulating a full tab drag into another pane's edge zone; assert layout.
+## Notes on recent upstream changes
 
----
-
-#### Task D4: Wire overlay to active drag and final visual QA
-
-**Files**: `src/ui/terminal_grid.rs` (mount overlay), `src/ui/tabbar.rs` (source-tab ghost placeholder during drag).
-
-**Acceptance:**
-* While `DragState::DraggingTab`, every pane shows the 5-zone overlay and highlights the hovered zone.
-* The source tab shows a faded "ghost" placeholder; the dragged tab label follows the cursor.
-* Drop resolves per Task D3 semantics.
-
-**Verification:**
-* `cargo run` and visually verify the full flow:
-  * Drag tab B onto tab A's right edge -> B's terminal becomes a right split of A, B tab is gone.
-  * Drag tab B onto tab A's center -> B moves adjacent to A (no stacking in v1).
-  * Drag tab B outside the window -> cancel.
-* User does visual verification per memory.
-
----
-
-### Checkpoint 4 (after Phase D)
-
-* [ ] Tab drag with 5-zone preview works across all edges and center.
-* [ ] All original keybinds still work.
-* [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green.
-* [ ] `cargo llvm-cov` shows no decrease vs. baseline.
-* [ ] User has verified the full drag-drop-split flow.
-* [ ] PR landed ("feat: tab drag with 5-zone drop into pane edges or center").
-
----
-
-## Risk register
-
-* **PTY handoff (F4/F1)**: if the PTY is stored keyed by tab id or pane id in a way that doesn't survive a move, we need to refactor the storage to key by a stable terminal id. Surface this in Task C2 if discovered; do not ship a workaround that respawns the shell.
-* **Drag event ordering**: the framework's `DragEvent` is per-element. A tab's drag may stop firing when the cursor leaves the tab bar. Verify early; if true, attach a window-level pointer-move subscription for the duration of the drag (existing pattern in `terminal_grid.rs` resizers).
-* **Overlay z-index**: the 5-zone overlay must render above the terminal canvas but not intercept clicks. Keep `pointer-events: none` and hit-test against `DragEvent.x/y` instead.
-* **Keybind live rebind**: `ShortcutRegistry` supports `unregister` + `register`, but any cached resolver outside the app must also be refreshed. Check `bridge.rs` for cached bindings during Task B2.
-
-## Out of scope (reaffirmed)
-
-* True tab stacking (multiple terminals in one tab slot).
-* Multi-window drag.
-* Keybind profiles / presets.
-* File-watcher hot-reload of `keybindings.json`.
-* Changelog fragments (no `changelog/` dir in repo).
+* `cbca91b` (style: settings restyle) switched the settings modal from `Display::Flex` to `Display::Grid` (168px nav | body) and widened it to 860px. Section builders are unchanged; Task 9 fits inside the body grid cell with no structural rewrites.
+* `cfbfe44` (Ctrl+Arrow pane navigation) added 260 lines to `src/state.rs` but did not move any spawn site referenced in this plan; line numbers cited above (868, 1073, 1132) are post merge values.
