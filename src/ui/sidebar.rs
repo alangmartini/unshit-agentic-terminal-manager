@@ -448,13 +448,9 @@ fn workspace_ctx_shell_items(
     let mut items: Vec<ElementDef> = Vec::new();
     items.push(ctx_menu_section_header("Shell"));
 
-    for path in installed {
+    let labels = crate::shell::label_installed_shells(installed);
+    for (path, label) in installed.iter().zip(labels.iter()) {
         let program = path.display().to_string();
-        let label = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| program.clone());
         let spec = crate::shell::ShellSpec {
             program: program.clone(),
             args: current.args.clone(),
@@ -463,9 +459,9 @@ fn workspace_ctx_shell_items(
         let command = format!("shell.set_workspace:{ws_idx}:{json}");
         let is_active = !current.program.is_empty() && current.program == program;
         let item = if is_active {
-            ctx_menu_item_active(&label, shared, command)
+            ctx_menu_item_active(label, shared, command)
         } else {
-            ctx_menu_item(&label, shared, command)
+            ctx_menu_item(label, shared, command)
         };
         items.push(item);
     }

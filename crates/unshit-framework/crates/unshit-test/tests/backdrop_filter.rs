@@ -209,3 +209,87 @@ fn blur_perturbs_pixels_inside_rect() {
     }
     assert!(diff_sum > 0, "blur should perturb pixels inside the element rect");
 }
+
+/// Regression test for issue #142: with `backdrop-filter` active, rendering
+/// the same tree across consecutive frames must produce pixel-identical
+/// output. The user reported subtle vibration in the area behind the
+/// settings modal (visible through `backdrop-filter: blur(6px)`) on every
+/// hover-driven rebuild, even when nothing in the underlying scene changed.
+///
+/// The render walk is a pure function of tree state. If this test fails,
+/// the backdrop pipeline produces frame-to-frame drift on identical input,
+/// which is the framework-level root cause for the reported vibration.
+///
+/// If this test passes, the vibration must come from genuine scene changes
+/// during hover (transition tick interpolation, cursor blink subscription
+/// firing concurrently, etc.), and the fix belongs either at the app level
+/// (pause underlying animations while a backdrop modal is open) or via
+/// blur-output caching in the renderer.
+#[test]
+fn backdrop_renders_stable_across_repeated_steps() {
+    let css = format!(
+        "{}\n.modal {{ position: absolute; top: 60px; left: 60px; \
+         width: 80px; height: 80px; background: rgba(255, 255, 255, 0.4); \
+         backdrop-filter: blur(8px); }}",
+        BASE_CSS
+    );
+    let h = TestHarness::new(&css, checkerboard_tree_with_modal, 200.0, 200.0);
+    let Some(mut h) = try_with_gpu(h) else {
+        eprintln!("Skipping: no GPU available");
+        return;
+    };
+    h.step();
+    let _warmup = h.render();
+
+    {
+        let gpu = h.gpu_ref();
+        assert!(
+            gpu.backdrop_blur_pipeline.is_some(),
+            "test must exercise backdrop path; blur pipeline was not allocated"
+        );
+    }
+
+    h.assert_render_stable(5);
+}
+
+/// Regression test for #142: the BatchCache replay path must restore
+/// backdrop-filter boundaries on every cache-hit rebuild. Without the
+/// boundary, the renderer skips the blur pass and the modal-overlay's
+/// own background quad is composited directly over the unblurred scene.
+/// In the real app this manifests as the area behind the modal flipping
+/// between blurred and unblurred on every hover-driven rebuild, which
+/// reads as visible vibration.
+#[test]
+fn backdrop_boundary_preserved_across_rebuilds() {
+    let css = format!(
+        "{}\n.modal {{ position: absolute; top: 60px; left: 60px; \
+         width: 80px; height: 80px; background: rgba(255, 255, 255, 0.4); \
+         backdrop-filter: blur(8px); }}",
+        BASE_CSS
+    );
+    let h = TestHarness::new(&css, checkerboard_tree_with_modal, 200.0, 200.0);
+    let Some(mut h) = try_with_gpu(h) else {
+        eprintln!("Skipping: no GPU available");
+        return;
+    };
+
+    for i in 0..4 {
+        h.rebuild(checkerboard_tree_with_modal);
+        h.step();
+        let _pixels = h.render();
+        let total_boundaries: usize = h
+            .gpu_ref()
+            .layered_batch
+            .layers
+            .iter()
+            .map(|l| l.backdrop_boundaries.len())
+            .sum();
+        assert_eq!(
+            total_boundaries, 1,
+            "iter {}: BackdropBoundary missing after rebuild. Cache replay \
+             must restore boundaries; otherwise the blur pass is silently \
+             skipped on every cache-hit frame.",
+            i
+        );
+    }
+}

@@ -110,11 +110,9 @@ pub enum CloseAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSection {
-    General,
     Appearance,
     Shell,
     Keybinds,
-    Agents,
     Sessions,
     DangerZone,
 }
@@ -122,23 +120,19 @@ pub enum SettingsSection {
 impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
-            SettingsSection::General => "general",
             SettingsSection::Appearance => "appearance",
             SettingsSection::Shell => "shell",
             SettingsSection::Keybinds => "keybinds",
-            SettingsSection::Agents => "agents",
             SettingsSection::Sessions => "sessions",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 7] {
+    pub fn all() -> [SettingsSection; 5] {
         [
-            SettingsSection::General,
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
-            SettingsSection::Agents,
             SettingsSection::Sessions,
             SettingsSection::DangerZone,
         ]
@@ -179,23 +173,8 @@ pub fn push_error_toast(state: &mut AppState, message: impl Into<String>) {
 /// Typed keys for the `AppState::toggles` map. Previously string literals
 /// like "confirm-close" were spread across the UI, with the type system
 /// no help against typos (e.g. "confirm-clsoe" silently read as `false`).
-///
-/// Agent enable/disable flags used to live here too (`AgentClaude`, etc.)
-/// but were moved to `AppState::agents` so general/appearance toggles and
-/// agent rows are not mixed in one map. See `AgentKey`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ToggleKey {
-    RestoreOnStartup,
-    ConfirmClose,
-    StartMinimized,
-    CheckUpdates,
-    GlowEffect,
-    BackgroundTexture,
-    FontLigatures,
-    ShellIntegration,
-    ScrollOnOutput,
-    BellNotification,
-    AutoDiscovery,
     /// When true, the close-app prompt is skipped and the action stored
     /// in `KillAllOnClose` runs silently. Toggled on by the "remember my
     /// choice" checkbox in the close-app confirm dialog and cleared by
@@ -210,50 +189,10 @@ pub enum ToggleKey {
 impl ToggleKey {
     pub fn as_str(self) -> &'static str {
         match self {
-            ToggleKey::RestoreOnStartup => "restore-on-startup",
-            ToggleKey::ConfirmClose => "confirm-close",
-            ToggleKey::StartMinimized => "start-minimized",
-            ToggleKey::CheckUpdates => "check-updates",
-            ToggleKey::GlowEffect => "glow-effect",
-            ToggleKey::BackgroundTexture => "background-texture",
-            ToggleKey::FontLigatures => "font-ligatures",
-            ToggleKey::ShellIntegration => "shell-integration",
-            ToggleKey::ScrollOnOutput => "scroll-on-output",
-            ToggleKey::BellNotification => "bell-notification",
-            ToggleKey::AutoDiscovery => "auto-discovery",
             ToggleKey::RememberCloseChoice => "remember-close-choice",
             ToggleKey::KillAllOnClose => "kill-all-on-close",
         }
     }
-}
-
-/// Identifies which configured agent an `Agent` entry represents. Kept
-/// separate from `ToggleKey` because agents are a list of records (icon,
-/// path, status, enabled) rather than booleans against a well-known name.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum AgentKey {
-    Claude,
-    Amp,
-    Codex,
-}
-
-impl AgentKey {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AgentKey::Claude => "agent-claude",
-            AgentKey::Amp => "agent-amp",
-            AgentKey::Codex => "agent-codex",
-        }
-    }
-}
-
-/// A single configured agent and whether it is enabled. The full set lives
-/// in `AppState::agents` as a `Vec<Agent>` so new agents can be added
-/// without touching the generic toggles map.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Agent {
-    pub key: AgentKey,
-    pub enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -368,10 +307,6 @@ pub struct AppState {
     pub theme: String,
     pub font_size_pt: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
-    /// Configured agents and their enabled state. Separate from `toggles`
-    /// because agents are records (icon, path, status, enabled) whereas
-    /// `toggles` holds boolean feature flags.
-    pub agents: Vec<Agent>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
@@ -498,7 +433,6 @@ impl AppState {
             theme: self.theme.clone(),
             font_size_pt: self.font_size_pt,
             toggles: self.toggles.clone(),
-            agents: self.agents.clone(),
             palette_open: self.palette_open,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
@@ -562,7 +496,6 @@ pub struct UiSnapshot {
     pub theme: String,
     pub font_size_pt: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
-    pub agents: Vec<Agent>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
@@ -719,21 +652,8 @@ pub fn seed_state() -> AppState {
     }];
 
     let mut toggles = BTreeMap::new();
-    toggles.insert(ToggleKey::RestoreOnStartup, true);
-    toggles.insert(ToggleKey::ConfirmClose, true);
-    toggles.insert(ToggleKey::StartMinimized, false);
-    toggles.insert(ToggleKey::CheckUpdates, true);
-    toggles.insert(ToggleKey::GlowEffect, true);
-    toggles.insert(ToggleKey::BackgroundTexture, true);
-    toggles.insert(ToggleKey::FontLigatures, true);
-    toggles.insert(ToggleKey::ShellIntegration, true);
-    toggles.insert(ToggleKey::ScrollOnOutput, true);
-    toggles.insert(ToggleKey::BellNotification, false);
-    toggles.insert(ToggleKey::AutoDiscovery, true);
     toggles.insert(ToggleKey::RememberCloseChoice, false);
     toggles.insert(ToggleKey::KillAllOnClose, false);
-
-    let agents = default_agents();
 
     AppState {
         workspaces,
@@ -743,11 +663,10 @@ pub fn seed_state() -> AppState {
         panes,
         active_pane: PaneId(1),
         settings_open: false,
-        settings_section: SettingsSection::General,
+        settings_section: SettingsSection::Appearance,
         theme: "amber".to_string(),
         font_size_pt: 13,
         toggles,
-        agents,
         palette_open: false,
         sidebar_collapsed: false,
         sidebar_width: 252.0,
@@ -2881,46 +2800,6 @@ pub fn is_on(state: &UiSnapshot, key: ToggleKey) -> bool {
     state.toggles.get(&key).copied().unwrap_or(false)
 }
 
-/// Default agent list used when seeding or resetting state. Kept in state.rs
-/// so `AppState`/`UiSnapshot` share one source of truth for which agents
-/// exist. The settings UI walks this list (plus static metadata) to render
-/// rows.
-pub fn default_agents() -> Vec<Agent> {
-    vec![
-        Agent {
-            key: AgentKey::Claude,
-            enabled: true,
-        },
-        Agent {
-            key: AgentKey::Amp,
-            enabled: true,
-        },
-        Agent {
-            key: AgentKey::Codex,
-            enabled: false,
-        },
-    ]
-}
-
-/// Whether the agent identified by `key` is enabled. Returns `false` if
-/// no entry is present (same semantics as `is_on` for unknown toggle keys).
-pub fn agent_enabled(state: &UiSnapshot, key: AgentKey) -> bool {
-    state
-        .agents
-        .iter()
-        .find(|a| a.key == key)
-        .map(|a| a.enabled)
-        .unwrap_or(false)
-}
-
-/// Flip the enabled flag for `key` in `state.agents`. Other agents are
-/// left untouched. No-op if the key is not present.
-pub fn mutate_toggle_agent(state: &mut AppState, key: AgentKey) {
-    if let Some(agent) = state.agents.iter_mut().find(|a| a.key == key) {
-        agent.enabled = !agent.enabled;
-    }
-}
-
 /// Resize all active terminals and their PTYs to the given column/row count.
 pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
     let ids: Vec<u32> = state.terminals.keys().copied().collect();
@@ -3044,11 +2923,10 @@ mod tests {
             panes,
             active_pane: PaneId(1),
             settings_open: false,
-            settings_section: SettingsSection::General,
+            settings_section: SettingsSection::Appearance,
             theme: "amber".to_string(),
             font_size_pt: 13,
             toggles: BTreeMap::new(),
-            agents: default_agents(),
             palette_open: false,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
@@ -3083,22 +2961,22 @@ mod tests {
 
     #[test]
     fn settings_section_labels() {
-        assert_eq!(SettingsSection::General.label(), "general");
         assert_eq!(SettingsSection::Appearance.label(), "appearance");
         assert_eq!(SettingsSection::Shell.label(), "shell");
         assert_eq!(SettingsSection::Keybinds.label(), "keybinds");
-        assert_eq!(SettingsSection::Agents.label(), "agents");
+        assert_eq!(SettingsSection::Sessions.label(), "sessions");
         assert_eq!(SettingsSection::DangerZone.label(), "danger zone");
     }
 
     #[test]
-    fn settings_section_all_returns_seven() {
+    fn settings_section_all_returns_five() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 7);
-        assert_eq!(all[0], SettingsSection::General);
-        assert_eq!(all[4], SettingsSection::Agents);
-        assert_eq!(all[5], SettingsSection::Sessions);
-        assert_eq!(all[6], SettingsSection::DangerZone);
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0], SettingsSection::Appearance);
+        assert_eq!(all[1], SettingsSection::Shell);
+        assert_eq!(all[2], SettingsSection::Keybinds);
+        assert_eq!(all[3], SettingsSection::Sessions);
+        assert_eq!(all[4], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -4479,82 +4357,19 @@ mod tests {
     #[test]
     fn is_on_returns_value_or_false() {
         let mut state = test_state();
-        state.toggles.insert(ToggleKey::GlowEffect, true);
-        state.toggles.insert(ToggleKey::BackgroundTexture, false);
+        state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+        state.toggles.insert(ToggleKey::KillAllOnClose, false);
         let snap = state.ui_snapshot();
 
-        assert!(is_on(&snap, ToggleKey::GlowEffect));
-        assert!(!is_on(&snap, ToggleKey::BackgroundTexture));
-        assert!(!is_on(&snap, ToggleKey::ConfirmClose));
-    }
+        assert!(is_on(&snap, ToggleKey::RememberCloseChoice));
+        assert!(!is_on(&snap, ToggleKey::KillAllOnClose));
 
-    // -- agents field (refs #107) --------------------------------------------
-
-    #[test]
-    fn default_agents_has_three_entries() {
-        let agents = default_agents();
-        assert_eq!(agents.len(), 3);
-        assert_eq!(agents[0].key, AgentKey::Claude);
-        assert_eq!(agents[1].key, AgentKey::Amp);
-        assert_eq!(agents[2].key, AgentKey::Codex);
-    }
-
-    #[test]
-    fn seed_state_has_expected_agent_entries() {
-        let state = seed_state();
-        assert_eq!(state.agents.len(), 3);
-        assert!(state.agents.iter().any(|a| a.key == AgentKey::Claude));
-        assert!(state.agents.iter().any(|a| a.key == AgentKey::Amp));
-        assert!(state.agents.iter().any(|a| a.key == AgentKey::Codex));
-    }
-
-    #[test]
-    fn seed_state_agent_defaults_match_legacy_toggles() {
-        // Prior to the split these lived in `toggles`: claude=on, amp=on, codex=off.
-        let state = seed_state();
-        assert!(agent_enabled(&state.ui_snapshot(), AgentKey::Claude));
-        assert!(agent_enabled(&state.ui_snapshot(), AgentKey::Amp));
-        assert!(!agent_enabled(&state.ui_snapshot(), AgentKey::Codex));
-    }
-
-    #[test]
-    fn agent_enabled_returns_false_when_missing() {
-        let mut state = test_state();
-        state.agents.clear();
+        // Unknown / missing keys default to false. Drop a key from the
+        // map and confirm `is_on` reports the absent value rather than
+        // panicking.
+        state.toggles.remove(&ToggleKey::KillAllOnClose);
         let snap = state.ui_snapshot();
-        assert!(!agent_enabled(&snap, AgentKey::Claude));
-    }
-
-    #[test]
-    fn mutate_toggle_agent_flips_only_target() {
-        // Regression: toggling one agent must not change sibling agents.
-        let mut state = test_state();
-        let before_amp = agent_enabled(&state.ui_snapshot(), AgentKey::Amp);
-        let before_codex = agent_enabled(&state.ui_snapshot(), AgentKey::Codex);
-
-        mutate_toggle_agent(&mut state, AgentKey::Claude);
-
-        let snap = state.ui_snapshot();
-        assert!(!agent_enabled(&snap, AgentKey::Claude));
-        assert_eq!(agent_enabled(&snap, AgentKey::Amp), before_amp);
-        assert_eq!(agent_enabled(&snap, AgentKey::Codex), before_codex);
-    }
-
-    #[test]
-    fn mutate_toggle_agent_round_trips() {
-        let mut state = test_state();
-        let before = agent_enabled(&state.ui_snapshot(), AgentKey::Codex);
-        mutate_toggle_agent(&mut state, AgentKey::Codex);
-        mutate_toggle_agent(&mut state, AgentKey::Codex);
-        let after = agent_enabled(&state.ui_snapshot(), AgentKey::Codex);
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn agent_key_as_str_is_stable() {
-        assert_eq!(AgentKey::Claude.as_str(), "agent-claude");
-        assert_eq!(AgentKey::Amp.as_str(), "agent-amp");
-        assert_eq!(AgentKey::Codex.as_str(), "agent-codex");
+        assert!(!is_on(&snap, ToggleKey::KillAllOnClose));
     }
 
     // -- ui_snapshot ----------------------------------------------------------

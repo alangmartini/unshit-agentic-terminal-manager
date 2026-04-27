@@ -406,7 +406,8 @@ impl GpuContext {
             1,
         ));
         self.backdrop_image_pipeline = Some(ImagePipeline::new(&self.device, format, 1));
-        self.backdrop_svg_pipeline = Some(SvgPipeline::new(&self.device, format, 1));
+        self.backdrop_svg_pipeline =
+            Some(self.svg_pipeline.create_backdrop_variant(&self.device, format));
     }
 
     /// Creates a headless GPU context for offscreen rendering (no window required).

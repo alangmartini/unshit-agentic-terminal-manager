@@ -151,6 +151,67 @@ fn try_push(path: PathBuf, out: &mut Vec<PathBuf>, seen: &mut std::collections::
     }
 }
 
+/// Build display labels for a discovered shell list. When a stem
+/// is unique the label is the bare stem (e.g. `pwsh`). When a stem
+/// repeats (multiple `bash.exe` installs are common on Windows: Git
+/// Bash, MSYS2, etc.), the label is suffixed with the parent dir to
+/// disambiguate; if every duplicate's parent dir is also identical
+/// (e.g. all in `bin/`), the grandparent dir is included. The result
+/// is positionally aligned with `installed`.
+pub fn label_installed_shells(installed: &[PathBuf]) -> Vec<String> {
+    use std::collections::HashMap;
+    let stems: Vec<String> = installed.iter().map(|p| display_stem(p)).collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for s in &stems {
+        *counts.entry(s.as_str()).or_insert(0) += 1;
+    }
+    installed
+        .iter()
+        .zip(stems.iter())
+        .map(|(path, stem)| {
+            if counts.get(stem.as_str()).copied().unwrap_or(0) <= 1 {
+                return stem.clone();
+            }
+            let suffix = disambiguating_suffix(path);
+            if suffix.is_empty() {
+                stem.clone()
+            } else {
+                format!("{stem} ({suffix})")
+            }
+        })
+        .collect()
+}
+
+fn display_stem(path: &std::path::Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// For a duplicate-stem path, pick a short ancestor segment that
+/// distinguishes installs. Falls back through parent and grandparent
+/// because the immediate parent for shells is often a generic `bin`.
+fn disambiguating_suffix(path: &std::path::Path) -> String {
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let grand = path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    match (parent, grand) {
+        ("", "") => String::new(),
+        (p, "") => p.to_string(),
+        (p, g) if matches!(p, "bin" | "usr") && !g.is_empty() => format!("{g}\\{p}"),
+        (p, _) => p.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +469,58 @@ mod tests {
         // Smoke test: the public API must not panic even if PATH is
         // weird. This exercises the production path that hits real env.
         let _ = discover_installed();
+    }
+
+    #[test]
+    fn label_installed_shells_returns_bare_stem_when_unique() {
+        let installed = vec![
+            PathBuf::from("/usr/bin/pwsh"),
+            PathBuf::from("/usr/bin/bash"),
+        ];
+        let labels = label_installed_shells(&installed);
+        assert_eq!(labels, vec!["pwsh".to_string(), "bash".to_string()]);
+    }
+
+    #[test]
+    fn label_installed_shells_disambiguates_duplicate_stems_with_parent() {
+        // Different parent dirs distinguish two bash.exe installs.
+        let installed = vec![
+            PathBuf::from(r"C:\Program Files\Git\cmd\bash.exe"),
+            PathBuf::from(r"C:\msys64\bash.exe"),
+        ];
+        let labels = label_installed_shells(&installed);
+        assert_eq!(
+            labels,
+            vec!["bash (cmd)".to_string(), "bash (msys64)".to_string()]
+        );
+    }
+
+    #[test]
+    fn label_installed_shells_uses_grandparent_when_parent_is_generic_bin() {
+        // Two bash installs, both with parent "bin": the grandparent
+        // segment carries the actual identity (Git vs msys64).
+        let installed = vec![
+            PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            PathBuf::from(r"C:\msys64\usr\bin\bash.exe"),
+        ];
+        let labels = label_installed_shells(&installed);
+        assert_eq!(
+            labels,
+            vec!["bash (Git\\bin)".to_string(), "bash (usr\\bin)".to_string()]
+        );
+    }
+
+    #[test]
+    fn label_installed_shells_does_not_disambiguate_unique_entries_in_a_mixed_list() {
+        let installed = vec![
+            PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            PathBuf::from(r"C:\msys64\usr\bin\bash.exe"),
+        ];
+        let labels = label_installed_shells(&installed);
+        assert_eq!(labels[0], "pwsh");
+        assert!(labels[1].starts_with("bash ("));
+        assert!(labels[2].starts_with("bash ("));
+        assert_ne!(labels[1], labels[2], "duplicate stems must be distinct");
     }
 }
