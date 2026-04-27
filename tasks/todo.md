@@ -114,18 +114,18 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase 6: UI surfaces
 
-- [ ] **Task 9: Settings → Shell tab full editor; remove General placeholder**
-  - [ ] App default editor: dropdown of `discover_installed` results + "Custom path..." entry that reveals an editable program field.
-  - [ ] Always visible args text field bound to `state.default_shell.args`.
-  - [ ] Per workspace overrides subsection: one row per workspace, same dropdown / custom / args layout.
-  - [ ] Each interaction dispatches the matching `shell.*` command.
-  - [ ] Remove the "Default shell" row from `build_general_section` (`src/ui/settings.rs:108`).
-  - [ ] Update or add UI snapshot tests for new structural classes.
-  - [ ] `cargo test --lib ui::settings::` green.
-  - [ ] **Manual smoke test (per CLAUDE.md):**
+- [x] **Task 9: Settings → Shell tab full editor; remove General placeholder** [DONE]
+  - [x] App default editor: chip group of `discover_installed` results + always visible custom path text input (Enter to apply, framework's `Tag::Input` doesn't seed initial value so placeholder shows current).
+  - [x] Always visible args text input under each scope; submit splits on whitespace and dispatches matching `shell.set_*`.
+  - [x] Per workspace overrides subsection: one `shell-scope-block` per workspace, with extra "Use default" chip that dispatches `shell.clear_workspace:<idx>`.
+  - [x] Each chip / submit dispatches via the new `ShellScope::{AppDefault, Workspace(idx)}` enum so no command strings are duplicated.
+  - [x] Removed the "Default shell" placeholder row from `build_general_section` and its now-orphan `select_display` helper + test.
+  - [x] Updated `general_section_has_title_and_five_rows` (was six) and added 7 new structural tests (`shell_section_starts_with_app_default_block`, `shell_section_includes_shell_picker_under_app_default_block`, `shell_picker_marks_active_chip_when_program_matches`, `shell_picker_for_workspace_includes_use_default_chip`, `shell_picker_for_app_default_omits_use_default_chip`, `shell_section_has_one_workspace_override_block_per_workspace`, `general_section_no_longer_has_default_shell_row`).
+  - [x] `cargo test --bin terminal-manager ui::settings`: 80 passed. clippy + fmt clean. Full suite 867.
+  - [ ] **Manual smoke test (per CLAUDE.md, deferred to user):**
     - [ ] `cargo run`, open Settings → Shell.
     - [ ] Pick a non default discovered shell, confirm new pane opens it.
-    - [ ] Pick "Custom path..." with a non discovered path, confirm a new pane uses it.
+    - [ ] Type a non discovered path into the custom input, confirm a new pane uses it.
     - [ ] Set a workspace override, confirm it wins inside that workspace.
     - [ ] Restart, confirm picks survived.
 

@@ -106,11 +106,6 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
 fn build_general_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     section_shell("general")
         .with_child(setting_row(
-            "Default shell",
-            "Command run when opening a new terminal",
-            select_display("bash"),
-        ))
-        .with_child(setting_row(
             "Working directory",
             "Starting directory for new terminals",
             text_input_display("~/projects/main"),
@@ -196,7 +191,38 @@ fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> Element
 }
 
 fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    section_shell("shell")
+    let installed = crate::shell::discover_installed();
+    let mut section = section_shell("shell").with_child(shell_scope_block(
+        ShellScope::AppDefault,
+        "App default",
+        "Shell launched for new panes when no workspace overrides it",
+        &state.default_shell,
+        &installed,
+        shared,
+    ));
+
+    if !state.workspaces.is_empty() {
+        let mut overrides = ElementDef::new(Tag::Div)
+            .with_class("workspace-overrides")
+            .with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("modal-section-title")
+                    .with_text("Workspace overrides"),
+            );
+        for (idx, ws) in state.workspaces.iter().enumerate() {
+            overrides = overrides.with_child(shell_scope_block(
+                ShellScope::Workspace(idx),
+                &ws.name,
+                "Override the app default for this workspace only",
+                &ws.shell,
+                &installed,
+                shared,
+            ));
+        }
+        section = section.with_child(overrides);
+    }
+
+    section
         .with_child(toggle_row(
             state,
             shared,
@@ -228,6 +254,184 @@ fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             "Characters that break word selection on double-click",
             compact_input_display(" /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}`~?"),
         ))
+}
+
+/// Which shell scope a picker mutates: the app wide default, or a
+/// specific workspace override (carries the workspace index used in
+/// the dispatch command).
+#[derive(Clone, Copy)]
+enum ShellScope {
+    AppDefault,
+    Workspace(usize),
+}
+
+impl ShellScope {
+    fn set_cmd_prefix(&self) -> String {
+        match self {
+            ShellScope::AppDefault => "shell.set_default:".to_string(),
+            ShellScope::Workspace(idx) => format!("shell.set_workspace:{idx}:"),
+        }
+    }
+
+    fn clear_cmd(&self) -> String {
+        match self {
+            ShellScope::AppDefault => "shell.clear_default".to_string(),
+            ShellScope::Workspace(idx) => format!("shell.clear_workspace:{idx}"),
+        }
+    }
+}
+
+/// One editable scope in the Shell tab. Bundles label + description,
+/// the chip picker (one chip per discovered shell, plus a "Use
+/// default" chip for workspace scopes), a custom path input for
+/// shells that aren't on PATH, and an args input.
+fn shell_scope_block(
+    scope: ShellScope,
+    label: &str,
+    desc: &str,
+    current: &crate::shell::ShellSpec,
+    installed: &[std::path::PathBuf],
+    shared: &SharedState,
+) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("shell-scope-block")
+        .with_child(setting_meta(label, Some(desc)))
+        .with_child(shell_picker(scope, current, installed, shared))
+        .with_child(shell_custom_program_input(scope, current, shared))
+        .with_child(shell_args_input(scope, current, shared))
+}
+
+/// Chip group of every discovered shell. The chip whose path matches
+/// `current.program` is marked active. Workspace pickers also get a
+/// "Use default" chip that dispatches the matching `shell.clear_*`.
+fn shell_picker(
+    scope: ShellScope,
+    current: &crate::shell::ShellSpec,
+    installed: &[std::path::PathBuf],
+    shared: &SharedState,
+) -> ElementDef {
+    let mut picker = ElementDef::new(Tag::Div).with_class("shell-picker");
+
+    if let ShellScope::Workspace(_) = scope {
+        let mut chip = ElementDef::new(Tag::Button)
+            .with_class("shell-chip")
+            .with_class("clear")
+            .with_text("Use default");
+        if current.is_empty() {
+            chip = chip.with_class("active");
+        }
+        let s = shared.clone();
+        let cmd = scope.clear_cmd();
+        chip = chip.on_click(move || {
+            mutate_with(&s, |st| dispatch(st, &cmd));
+        });
+        picker = picker.with_child(chip);
+    }
+
+    for path in installed {
+        let program = path.display().to_string();
+        let label = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| program.clone());
+        let active = !current.program.is_empty() && current.program == program;
+        let mut chip = ElementDef::new(Tag::Button)
+            .with_class("shell-chip")
+            .with_text(label.as_str());
+        if active {
+            chip = chip.with_class("active");
+        }
+        let s = shared.clone();
+        let prefix = scope.set_cmd_prefix();
+        let prog = program.clone();
+        let args = current.args.clone();
+        chip = chip.on_click(move || {
+            let spec = crate::shell::ShellSpec {
+                program: prog.clone(),
+                args: args.clone(),
+            };
+            let json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
+            mutate_with(&s, |st| {
+                dispatch(st, &format!("{prefix}{json}"));
+            });
+        });
+        picker = picker.with_child(chip);
+    }
+
+    picker
+}
+
+/// Text input that reads as the current `program` (via placeholder)
+/// and on submit dispatches a fresh `shell.set_*` with the typed path
+/// and the existing args. Lets users pick a shell that isn't on the
+/// PATH probe (e.g. portable installs, custom toolchains).
+fn shell_custom_program_input(
+    scope: ShellScope,
+    current: &crate::shell::ShellSpec,
+    shared: &SharedState,
+) -> ElementDef {
+    let placeholder = if current.program.is_empty() {
+        "Custom shell path (press Enter to apply)".to_string()
+    } else {
+        current.program.clone()
+    };
+    let s = shared.clone();
+    let prefix = scope.set_cmd_prefix();
+    let args = current.args.clone();
+    ElementDef::new(Tag::Input)
+        .with_class("input")
+        .with_class("shell-custom-input")
+        .with_placeholder(placeholder)
+        .on_submit(move |text| {
+            let typed = text.trim().to_string();
+            if typed.is_empty() {
+                return;
+            }
+            let spec = crate::shell::ShellSpec {
+                program: typed,
+                args: args.clone(),
+            };
+            let json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
+            mutate_with(&s, |st| {
+                dispatch(st, &format!("{prefix}{json}"));
+            });
+        })
+}
+
+/// Always visible args text input. Placeholder shows the current
+/// args (space joined) so the user can see what's set without
+/// pre-population (the framework's input doesn't seed initial value).
+/// On submit, splits on whitespace and dispatches a fresh
+/// `shell.set_*` with the existing program.
+fn shell_args_input(
+    scope: ShellScope,
+    current: &crate::shell::ShellSpec,
+    shared: &SharedState,
+) -> ElementDef {
+    let placeholder = if current.args.is_empty() {
+        "Optional args, space separated".to_string()
+    } else {
+        current.args.join(" ")
+    };
+    let s = shared.clone();
+    let prefix = scope.set_cmd_prefix();
+    let program = current.program.clone();
+    ElementDef::new(Tag::Input)
+        .with_class("input")
+        .with_class("shell-args-input")
+        .with_placeholder(placeholder)
+        .on_submit(move |text| {
+            let args: Vec<String> = text.split_whitespace().map(|s| s.to_string()).collect();
+            let spec = crate::shell::ShellSpec {
+                program: program.clone(),
+                args,
+            };
+            let json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
+            mutate_with(&s, |st| {
+                dispatch(st, &format!("{prefix}{json}"));
+            });
+        })
 }
 
 fn build_keybinds_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -660,13 +864,6 @@ fn toggle_button(on: bool, key: ToggleKey, shared: &SharedState) -> ElementDef {
             st.toggles.insert(key, next);
         });
     })
-}
-
-fn select_display(value: &str) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("input")
-        .with_class("select")
-        .with_text(value)
 }
 
 fn text_input_display(value: &str) -> ElementDef {
@@ -1102,13 +1299,13 @@ mod tests {
     // -- build_general_section --------------------------------------------------
 
     #[test]
-    fn general_section_has_title_and_six_rows() {
+    fn general_section_has_title_and_five_rows() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_general_section(&snap, &shared);
         assert!(el.classes.contains(&"modal-section".to_string()));
-        // title + 6 rows
-        assert_eq!(el.children.len(), 7);
+        // title + 5 rows (Default shell row moved to the Shell tab in Task 9)
+        assert_eq!(el.children.len(), 6);
         let title = &el.children[0];
         assert!(title.classes.contains(&"modal-section-title".to_string()));
     }
@@ -1218,13 +1415,133 @@ mod tests {
 
     // -- build_shell_section ----------------------------------------------------
 
+    fn find_first_with_class<'a>(root: &'a ElementDef, class: &str) -> Option<&'a ElementDef> {
+        if root.classes.iter().any(|c| c == class) {
+            return Some(root);
+        }
+        root.children
+            .iter()
+            .find_map(|c| find_first_with_class(c, class))
+    }
+
+    fn count_with_class(root: &ElementDef, class: &str) -> usize {
+        let here = if root.classes.iter().any(|c| c == class) {
+            1
+        } else {
+            0
+        };
+        here + root
+            .children
+            .iter()
+            .map(|c| count_with_class(c, class))
+            .sum::<usize>()
+    }
+
+    fn collect_text_recursive(root: &ElementDef) -> String {
+        let mut acc = String::new();
+        if let Some(t) = text_of(root) {
+            acc.push_str(t);
+            acc.push(' ');
+        }
+        for child in &root.children {
+            acc.push_str(&collect_text_recursive(child));
+        }
+        acc
+    }
+
     #[test]
-    fn shell_section_has_title_and_five_rows() {
+    fn shell_section_starts_with_app_default_block() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_shell_section(&snap, &shared);
-        // title + 5 rows
-        assert_eq!(el.children.len(), 6);
+        // first child after the title must be the app default scope block
+        let first = &el.children[1];
+        assert!(
+            first.classes.contains(&"shell-scope-block".to_string()),
+            "first body child must be a shell-scope-block, got classes: {:?}",
+            first.classes
+        );
+    }
+
+    #[test]
+    fn shell_section_includes_shell_picker_under_app_default_block() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_shell_section(&snap, &shared);
+        assert!(
+            find_first_with_class(&el, "shell-picker").is_some(),
+            "shell section must include a shell-picker"
+        );
+    }
+
+    #[test]
+    fn shell_picker_marks_active_chip_when_program_matches() {
+        // Build a snapshot whose default_shell.program matches a fake
+        // discovered shell, then assert at least one chip carries the
+        // "active" class. We feed the picker directly so the test does
+        // not depend on what's installed on the host.
+        let installed = vec![std::path::PathBuf::from("/bin/bash")];
+        let current = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec![],
+        };
+        let shared = make_shared();
+        let picker = shell_picker(ShellScope::AppDefault, &current, &installed, &shared);
+        assert!(
+            count_with_class(&picker, "active") >= 1,
+            "matching program must mark a chip active"
+        );
+    }
+
+    #[test]
+    fn shell_picker_for_workspace_includes_use_default_chip() {
+        let installed: Vec<std::path::PathBuf> = vec![];
+        let current = crate::shell::ShellSpec::default();
+        let shared = make_shared();
+        let picker = shell_picker(ShellScope::Workspace(0), &current, &installed, &shared);
+        assert!(
+            collect_text_recursive(&picker).contains("Use default"),
+            "workspace picker must include a Use default chip"
+        );
+    }
+
+    #[test]
+    fn shell_picker_for_app_default_omits_use_default_chip() {
+        let installed: Vec<std::path::PathBuf> = vec![];
+        let current = crate::shell::ShellSpec::default();
+        let shared = make_shared();
+        let picker = shell_picker(ShellScope::AppDefault, &current, &installed, &shared);
+        assert!(
+            !collect_text_recursive(&picker).contains("Use default"),
+            "app default picker must NOT have a Use default chip"
+        );
+    }
+
+    #[test]
+    fn shell_section_has_one_workspace_override_block_per_workspace() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_shell_section(&snap, &shared);
+        let overrides = find_first_with_class(&el, "workspace-overrides")
+            .expect("workspace-overrides subsection must be present");
+        let blocks = count_with_class(overrides, "shell-scope-block");
+        assert_eq!(
+            blocks,
+            snap.workspaces.len(),
+            "workspace overrides must have one block per workspace"
+        );
+    }
+
+    #[test]
+    fn general_section_no_longer_has_default_shell_row() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_general_section(&snap, &shared);
+        let text = collect_text_recursive(&el);
+        assert!(
+            !text.contains("Default shell"),
+            "general section must not contain the legacy 'Default shell' placeholder; got text: {text:?}"
+        );
     }
 
     // -- build_keybinds_section -------------------------------------------------
@@ -1652,14 +1969,6 @@ mod tests {
     }
 
     // -- helper widget tests ----------------------------------------------------
-
-    #[test]
-    fn select_display_has_input_and_select_classes() {
-        let el = select_display("bash");
-        assert!(el.classes.contains(&"input".to_string()));
-        assert!(el.classes.contains(&"select".to_string()));
-        assert_eq!(text_of(&el), Some("bash"));
-    }
 
     #[test]
     fn text_input_display_has_input_class() {
