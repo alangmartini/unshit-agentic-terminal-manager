@@ -260,6 +260,13 @@ struct AppState {
     needs_rebuild: bool,
     needs_restyle: bool,
     needs_relayout: bool,
+    /// When `Some`, the next `needs_restyle` pass cascades from this node
+    /// instead of the document root. Set by hover / focus / active state
+    /// changes to the lowest common ancestor of the leaving and entering
+    /// node, narrowing the cascade to the smallest subtree that could
+    /// contain a re-evaluating pseudo-class selector. Cleared by `take()`
+    /// when the restyle pass consumes it. A full rebuild ignores it.
+    restyle_root: Option<NodeId>,
     scale_factor: f32,
     zoom_factor: f32,
     ctrl_held: bool,
@@ -459,6 +466,23 @@ impl AppState {
     /// we would hit `current_monitor()` once per pixel of motion.
     fn should_reprobe_refresh(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.last_refresh_probe) >= ACTIVITY_WINDOW
+    }
+
+    /// Mark the app as needing a restyle and narrow the next cascade
+    /// to the lowest common ancestor of `old` and `new`.
+    ///
+    /// When called multiple times before the next paint (e.g. hover
+    /// changes from A to B to C in one input drain), the scope widens
+    /// to the LCA of every change so the eventual cascade is still
+    /// correct. The narrowed root is reset to `None` (full tree) by the
+    /// restyle pass via `take()`.
+    fn mark_restyle_pseudo_change(&mut self, old: NodeId, new: NodeId) {
+        self.needs_restyle = true;
+        let candidate = self.arena.lowest_common_ancestor(old, new, self.root);
+        self.restyle_root = Some(match self.restyle_root {
+            Some(prev) => self.arena.lowest_common_ancestor(prev, candidate, self.root),
+            None => candidate,
+        });
     }
 }
 
@@ -880,6 +904,7 @@ impl ApplicationHandler for AppHandler {
             needs_rebuild: false,
             needs_restyle: false,
             needs_relayout: false,
+            restyle_root: None,
             scale_factor,
             zoom_factor: 1.0,
             ctrl_held: false,
@@ -1324,9 +1349,13 @@ impl ApplicationHandler for AppHandler {
                                 state.interaction.last_click_node = hovered;
 
                                 if !hovered.is_dangling() {
+                                    let old_active = state
+                                        .interaction
+                                        .active
+                                        .unwrap_or(NodeId::DANGLING);
                                     state.interaction.active = Some(hovered);
                                     state.interaction.mousedown_target = Some(hovered);
-                                    state.needs_restyle = true;
+                                    state.mark_restyle_pseudo_change(old_active, hovered);
                                     state.window.request_redraw();
                                 }
 
@@ -1336,10 +1365,11 @@ impl ApplicationHandler for AppHandler {
                                 )
                                 .unwrap_or(NodeId::DANGLING);
                                 if new_focused != state.interaction.focused {
+                                    let old_focused = state.interaction.focused;
                                     state.interaction.focused = new_focused;
                                     state.interaction.focus_via_keyboard = false;
                                     update_focus_context(state);
-                                    state.needs_restyle = true;
+                                    state.mark_restyle_pseudo_change(old_focused, new_focused);
                                     state.window.request_redraw();
                                 }
 
@@ -1547,9 +1577,9 @@ impl ApplicationHandler for AppHandler {
 
                             state.interaction.selecting = false;
 
-                            if state.interaction.active.is_some() {
+                            if let Some(old_active) = state.interaction.active {
                                 state.interaction.active = None;
-                                state.needs_restyle = true;
+                                state.mark_restyle_pseudo_change(old_active, NodeId::DANGLING);
                                 state.window.request_redraw();
                             }
                         }
@@ -1627,13 +1657,17 @@ impl ApplicationHandler for AppHandler {
                             .map(|e| matches!(e.tag, Tag::Input | Tag::Select))
                             .unwrap_or(false);
                         if !focused_editable {
-                            if let Some((fallback_id, _)) =
-                                state.arena.iter().find(|(_, e)| e.captures_keyboard)
-                            {
+                            let fallback_id = state
+                                .arena
+                                .iter()
+                                .find(|(_, e)| e.captures_keyboard)
+                                .map(|(id, _)| id);
+                            if let Some(fallback_id) = fallback_id {
                                 if fallback_id != state.interaction.focused {
+                                    let old_focused = state.interaction.focused;
                                     state.interaction.focused = fallback_id;
                                     state.interaction.focus_via_keyboard = false;
-                                    state.needs_restyle = true;
+                                    state.mark_restyle_pseudo_change(old_focused, fallback_id);
                                 }
                                 focused_captures = true;
                             }
@@ -2068,6 +2102,11 @@ impl ApplicationHandler for AppHandler {
                     state.needs_rebuild = false;
                     state.needs_restyle = false;
                     state.needs_relayout = false;
+                    // Full rebuild walked from root, so any narrowed
+                    // `restyle_root` from a prior hover/focus/active
+                    // change is now irrelevant. Drop it so the next
+                    // restyle sees a clean slate.
+                    state.restyle_root = None;
 
                     // Reconcile subscriptions after each rebuild.
                     #[cfg(feature = "async")]
@@ -2079,11 +2118,21 @@ impl ApplicationHandler for AppHandler {
                         mgr.reconcile(self.app.runtime.handle(), &sink);
                     }
                 } else if state.needs_restyle {
+                    // Pseudo-class state changes (hover / focus / active)
+                    // narrow `restyle_root` to the LCA of the leaving and
+                    // entering nodes. Cascading from there instead of from
+                    // `state.root` is correct because every selector that
+                    // can re-evaluate (descendant or chain rooted at the
+                    // changed pseudo state) lives in that subtree. Sibling
+                    // combinators (`.x:hover ~ .y`) are not supported by
+                    // this scoping rule (see the doc on
+                    // [`NodeArena::lowest_common_ancestor`]).
+                    let cascade_root = state.restyle_root.take().unwrap_or(state.root);
                     let t1 = Instant::now();
                     resolve_all_styles_with_transitions(
                         &mut state.arena,
                         &state.stylesheet,
-                        state.root,
+                        cascade_root,
                         state.interaction.hovered,
                         state.interaction.active,
                         state.interaction.focused,
@@ -2095,7 +2144,7 @@ impl ApplicationHandler for AppHandler {
                         &mut state.arena,
                         &mut state.taffy,
                         &state.stylesheet,
-                        state.root,
+                        cascade_root,
                         state.interaction.hovered,
                         state.interaction.active,
                         state.interaction.focused,
@@ -2560,9 +2609,10 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32)) {
     let new_hover = hit_test(&state.arena, state.root, pos.0, pos.1).unwrap_or(NodeId::DANGLING);
 
     if new_hover != state.interaction.hovered {
+        let old_hover = state.interaction.hovered;
         state.interaction.hovered = new_hover;
         apply_cursor_icon(&*state.window, &state.arena, new_hover);
-        state.needs_restyle = true;
+        state.mark_restyle_pseudo_change(old_hover, new_hover);
         state.window.request_redraw();
     }
 
@@ -2994,10 +3044,11 @@ fn dispatch_command(
             let new_focused = next_focusable(&state.arena, state.root, state.interaction.focused);
             if let Some(id) = new_focused {
                 if id != state.interaction.focused {
+                    let old_focused = state.interaction.focused;
                     state.interaction.focused = id;
                     state.interaction.focus_via_keyboard = true;
                     update_focus_context(state);
-                    state.needs_restyle = true;
+                    state.mark_restyle_pseudo_change(old_focused, id);
                     state.window.request_redraw();
                 }
             }
@@ -3006,10 +3057,11 @@ fn dispatch_command(
             let new_focused = prev_focusable(&state.arena, state.root, state.interaction.focused);
             if let Some(id) = new_focused {
                 if id != state.interaction.focused {
+                    let old_focused = state.interaction.focused;
                     state.interaction.focused = id;
                     state.interaction.focus_via_keyboard = true;
                     update_focus_context(state);
-                    state.needs_restyle = true;
+                    state.mark_restyle_pseudo_change(old_focused, id);
                     state.window.request_redraw();
                 }
             }
