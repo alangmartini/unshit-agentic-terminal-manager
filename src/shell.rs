@@ -61,30 +61,94 @@ fn stem_matches(path: &std::path::Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Probe PATH for a small set of preferred shell names so first run
-/// inference has something to choose from. The full discovery surface
-/// (Git Bash, WSL, dedup by canonical path, etc.) lands in Task 7.
-pub fn discover_installed() -> Vec<PathBuf> {
-    let names: &[&str] = if cfg!(windows) {
-        &["pwsh.exe", "powershell.exe"]
-    } else {
-        &["pwsh", "powershell"]
-    };
+/// Stems we probe for on PATH and at well known install locations.
+/// Order matters for the Settings dropdown: discovered shells appear
+/// in stem order, then in PATH order within each stem.
+const STEMS: &[&str] = &[
+    "pwsh",
+    "powershell",
+    "cmd",
+    "bash",
+    "zsh",
+    "fish",
+    "nu",
+    "wsl",
+];
 
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
+/// Cap on the number of discovered binaries returned. Keeps the
+/// Settings dropdown manageable even on machines with PATHs full of
+/// shell shims.
+const MAX_DISCOVERED: usize = 16;
+
+/// Walk PATH for known shell stems plus a small set of well known
+/// fixed install paths. Deduplicates by canonical path so the same
+/// binary reachable via two PATH entries (or via PATH and a fixed
+/// probe) only shows up once. Capped at `MAX_DISCOVERED` so a
+/// pathological PATH can't blow up the UI.
+pub fn discover_installed() -> Vec<PathBuf> {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    discover_from(&dirs, &fixed_well_known_paths())
+}
+
+/// Per stem extension. On Windows we want `.exe`; everywhere else the
+/// bare stem is the executable name.
+fn executable_name(stem: &str) -> String {
+    if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem.to_string()
+    }
+}
+
+/// Locations we probe in addition to PATH. Today this covers the two
+/// common Windows installs that often live outside PATH: Git Bash and
+/// WSL. Other platforms get an empty list.
+fn fixed_well_known_paths() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        vec![
+            PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            PathBuf::from(r"C:\Windows\System32\wsl.exe"),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Pure variant of [`discover_installed`] that takes the inputs
+/// explicitly so unit tests can drive it without touching real env.
+fn discover_from(path_dirs: &[PathBuf], fixed: &[PathBuf]) -> Vec<PathBuf> {
+    use std::collections::HashSet;
 
     let mut out: Vec<PathBuf> = Vec::new();
-    for dir in std::env::split_paths(&path_var) {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() && !out.iter().any(|p| p == &candidate) {
-                out.push(candidate);
+    let mut canonical_seen: HashSet<PathBuf> = HashSet::new();
+
+    'walk: for dir in path_dirs {
+        for stem in STEMS {
+            if out.len() >= MAX_DISCOVERED {
+                break 'walk;
             }
+            let candidate = dir.join(executable_name(stem));
+            try_push(candidate, &mut out, &mut canonical_seen);
         }
     }
+    for path in fixed {
+        if out.len() >= MAX_DISCOVERED {
+            break;
+        }
+        try_push(path.clone(), &mut out, &mut canonical_seen);
+    }
     out
+}
+
+fn try_push(path: PathBuf, out: &mut Vec<PathBuf>, seen: &mut std::collections::HashSet<PathBuf>) {
+    if !path.is_file() {
+        return;
+    }
+    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    if seen.insert(canonical) {
+        out.push(path);
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +292,121 @@ mod tests {
         let installed = vec![PathBuf::from("/opt/Pwsh.EXE")];
         let got = infer_default_shell(&installed);
         assert_eq!(got.program, "/opt/Pwsh.EXE");
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("godly-discover-{tag}-{pid}-{n}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir for discover test");
+        dir
+    }
+
+    fn touch(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir for touch");
+        }
+        std::fs::write(path, b"").expect("touch test file");
+    }
+
+    fn fake_shell_in(dir: &std::path::Path, stem: &str) -> PathBuf {
+        let path = dir.join(executable_name(stem));
+        touch(&path);
+        path
+    }
+
+    #[test]
+    fn discover_from_returns_empty_when_no_dirs_and_no_fixed() {
+        let got = discover_from(&[], &[]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn discover_from_finds_known_shell_in_a_path_dir() {
+        let dir = unique_temp_dir("finds");
+        let bash = fake_shell_in(&dir, "bash");
+        let got = discover_from(std::slice::from_ref(&dir), &[]);
+        assert!(got.iter().any(|p| p == &bash), "expected bash in {got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_from_dedupes_when_same_dir_listed_twice() {
+        let dir = unique_temp_dir("dedup-dirs");
+        let _bash = fake_shell_in(&dir, "bash");
+        let got = discover_from(&[dir.clone(), dir.clone()], &[]);
+        let bash_hits = got
+            .iter()
+            .filter(|p| p.file_stem().and_then(|s| s.to_str()) == Some("bash"))
+            .count();
+        assert_eq!(bash_hits, 1, "duplicate dirs must collapse, got {got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_from_skips_missing_files() {
+        // dir exists but contains no shell binaries
+        let dir = unique_temp_dir("missing");
+        let got = discover_from(std::slice::from_ref(&dir), &[]);
+        assert!(got.is_empty(), "empty dir must yield no hits, got {got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_from_includes_fixed_paths_when_they_exist() {
+        let dir = unique_temp_dir("fixed");
+        let bash = fake_shell_in(&dir, "bash");
+        // Pretend bash also lives at a "well known" location by passing
+        // it as a fixed path. Dedup will collapse it but absent dedup
+        // it would still appear because the file exists.
+        let got = discover_from(&[], std::slice::from_ref(&bash));
+        assert_eq!(got, vec![bash.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_from_skips_missing_fixed_paths() {
+        let missing = unique_temp_dir("fixed-missing").join(executable_name("does-not-exist"));
+        assert!(!missing.exists());
+        let got = discover_from(&[], &[missing]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn discover_from_is_capped_at_max_discovered() {
+        // Pile MAX_DISCOVERED + 5 fake binaries into the fixed list and
+        // verify the cap holds.
+        let dir = unique_temp_dir("cap");
+        let mut fixed: Vec<PathBuf> = Vec::new();
+        for i in 0..(MAX_DISCOVERED + 5) {
+            let name = if cfg!(windows) {
+                format!("fake{i}.exe")
+            } else {
+                format!("fake{i}")
+            };
+            let path = dir.join(name);
+            touch(&path);
+            fixed.push(path);
+        }
+        let got = discover_from(&[], &fixed);
+        assert_eq!(got.len(), MAX_DISCOVERED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_installed_returns_stable_order_across_calls() {
+        let a = discover_installed();
+        let b = discover_installed();
+        assert_eq!(a, b, "discover_installed must be deterministic");
+    }
+
+    #[test]
+    fn discover_installed_does_not_panic() {
+        // Smoke test: the public API must not panic even if PATH is
+        // weird. This exercises the production path that hits real env.
+        let _ = discover_installed();
     }
 }

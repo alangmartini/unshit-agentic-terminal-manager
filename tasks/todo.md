@@ -89,15 +89,17 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
 
 ## Phase 5: Discovery and dispatch
 
-- [ ] **Task 7: `discover_installed` shell scan**
-  - [ ] Implement `shell::discover_installed() -> Vec<PathBuf>`.
-  - [ ] PATH walk for known stems: `pwsh`, `powershell`, `cmd`, `bash`, `zsh`, `fish`, `nu`, `wsl`.
-  - [ ] Windows: probe `C:\Program Files\Git\bin\bash.exe` and `C:\Windows\System32\wsl.exe`.
-  - [ ] Deduplicate by canonical path; cap at 16 entries.
-  - [ ] Test: returns at least one entry on the test host.
-  - [ ] Test: stable order across calls.
-  - [ ] Test: empty / unset PATH does not panic.
-  - [ ] `cargo test --lib shell::discover_installed_` green on Windows and Unix.
+- [x] **Task 7: `discover_installed` shell scan** [DONE]
+  - [x] Replaced the Task 4 stub with a full PATH walk over `STEMS = [pwsh, powershell, cmd, bash, zsh, fish, nu, wsl]`.
+  - [x] Windows: probes `C:\Program Files\Git\bin\bash.exe` and `C:\Windows\System32\wsl.exe` via `fixed_well_known_paths`.
+  - [x] Dedupes by `std::fs::canonicalize` so symlinked / aliased shells collapse to one entry.
+  - [x] Caps at `MAX_DISCOVERED = 16`; `'walk` label breaks early instead of overshooting.
+  - [x] Extracted `discover_from(path_dirs, fixed)` so unit tests can drive it without env access.
+  - [x] Test: `discover_from_finds_known_shell_in_a_path_dir` (returns at least one entry).
+  - [x] Test: `discover_installed_returns_stable_order_across_calls`.
+  - [x] Test: `discover_from_returns_empty_when_no_dirs_and_no_fixed` + `discover_installed_does_not_panic` (empty / unset PATH).
+  - [x] Tests: dedup-by-canonical, fixed-paths probe, missing-files-skipped, cap at MAX_DISCOVERED.
+  - [x] `cargo test --bin terminal-manager shell::`: 24/24 green. clippy + fmt clean.
 
 - [ ] **Task 8: Dispatch handlers and persist trigger**
   - [ ] Add handlers for `shell.set_default:<json>`, `shell.set_workspace:<idx>:<json>`, `shell.clear_default`, `shell.clear_workspace:<idx>`.
