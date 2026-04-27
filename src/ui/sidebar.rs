@@ -398,7 +398,8 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
 
     let menu = match &ctx.target {
         crate::state::CtxMenuTarget::Workspace { idx } => {
-            build_workspace_ctx_menu(snap, shared, ctx.x, ctx.y, *idx)
+            let installed = crate::shell::discover_installed();
+            build_workspace_ctx_menu(snap, shared, ctx.x, ctx.y, *idx, &installed)
         }
         crate::state::CtxMenuTarget::Tab { pane_id } => {
             build_tab_ctx_menu(snap, shared, ctx.x, ctx.y, *pane_id)
@@ -428,26 +429,73 @@ fn ctx_menu_separator() -> ElementDef {
     ElementDef::new(Tag::Div).with_class("ctx-menu-separator")
 }
 
+fn ctx_menu_section_header(label: &str) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-section-header")
+        .with_text(label.to_string())
+}
+
+fn ctx_menu_item_active(label: &str, shared: &SharedState, command: String) -> ElementDef {
+    ctx_menu_item(label, shared, command).with_class("active")
+}
+
+fn workspace_ctx_shell_items(
+    ws_idx: usize,
+    current: &crate::shell::ShellSpec,
+    installed: &[std::path::PathBuf],
+    shared: &SharedState,
+) -> Vec<ElementDef> {
+    let mut items: Vec<ElementDef> = Vec::new();
+    items.push(ctx_menu_section_header("Shell"));
+
+    for path in installed {
+        let program = path.display().to_string();
+        let label = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| program.clone());
+        let spec = crate::shell::ShellSpec {
+            program: program.clone(),
+            args: current.args.clone(),
+        };
+        let json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
+        let command = format!("shell.set_workspace:{ws_idx}:{json}");
+        let is_active = !current.program.is_empty() && current.program == program;
+        let item = if is_active {
+            ctx_menu_item_active(&label, shared, command)
+        } else {
+            ctx_menu_item(&label, shared, command)
+        };
+        items.push(item);
+    }
+
+    if !current.is_empty() {
+        items.push(ctx_menu_item(
+            "Use app default",
+            shared,
+            format!("shell.clear_workspace:{ws_idx}"),
+        ));
+    }
+
+    items
+}
+
 fn build_workspace_ctx_menu(
     snap: &UiSnapshot,
     shared: &SharedState,
     x: f32,
     y: f32,
     ws_idx: usize,
+    installed: &[std::path::PathBuf],
 ) -> ElementDef {
     use unshit::core::style::parse::StyleDeclaration;
     use unshit::core::style::types::Dimension;
 
-    let ws_name = snap
-        .workspaces
-        .get(ws_idx)
-        .map(|w| w.name.clone())
-        .unwrap_or_default();
-    let is_collapsed = snap
-        .workspaces
-        .get(ws_idx)
-        .map(|w| w.collapsed)
-        .unwrap_or(false);
+    let ws = snap.workspaces.get(ws_idx);
+    let ws_name = ws.map(|w| w.name.clone()).unwrap_or_default();
+    let is_collapsed = ws.map(|w| w.collapsed).unwrap_or(false);
+    let current_shell = ws.map(|w| w.shell.clone()).unwrap_or_default();
     let can_remove = snap.workspaces.len() > 1;
     let collapse_label = if is_collapsed { "Expand" } else { "Collapse" };
 
@@ -476,6 +524,11 @@ fn build_workspace_ctx_menu(
             shared,
             format!("workspace.collapse:{}", ws_idx),
         ));
+
+    menu = menu.with_child(ctx_menu_separator());
+    for item in workspace_ctx_shell_items(ws_idx, &current_shell, installed, shared) {
+        menu = menu.with_child(item);
+    }
 
     menu = menu.with_child(ctx_menu_separator()).with_child(
         ctx_menu_item(
@@ -1148,6 +1201,173 @@ mod tests {
         let hints = build_sidebar_hints();
         assert!(has_class(&hints, "sidebar-hints"));
         assert_eq!(hints.children.len(), 4);
+    }
+
+    // -- build_workspace_ctx_menu shell submenu (Task 10) --
+
+    fn fake_installed() -> Vec<std::path::PathBuf> {
+        vec![
+            std::path::PathBuf::from("/usr/bin/pwsh"),
+            std::path::PathBuf::from("/usr/bin/cmd"),
+        ]
+    }
+
+    fn collect_text_recursive(root: &ElementDef) -> String {
+        let mut acc = String::new();
+        if let Some(t) = text_of(root) {
+            acc.push_str(t);
+            acc.push(' ');
+        }
+        for child in &root.children {
+            acc.push_str(&collect_text_recursive(child));
+        }
+        acc
+    }
+
+    fn collect_with_class<'a>(root: &'a ElementDef, class: &str) -> Vec<&'a ElementDef> {
+        let mut out = Vec::new();
+        if has_class(root, class) {
+            out.push(root);
+        }
+        for child in &root.children {
+            out.extend(collect_with_class(child, class));
+        }
+        out
+    }
+
+    fn item_text_contains(el: &ElementDef, needle: &str) -> bool {
+        collect_text_recursive(el).contains(needle)
+    }
+
+    #[test]
+    fn workspace_ctx_menu_includes_shell_subsection_header() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed = fake_installed();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let text = collect_text_recursive(&menu);
+        assert!(
+            text.contains("Shell"),
+            "ctx menu must include a Shell subsection header, got text: {text:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_lists_each_installed_shell_by_stem() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed = fake_installed();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let items = collect_with_class(&menu, "ctx-menu-item");
+        assert!(
+            items.iter().any(|el| item_text_contains(el, "pwsh")),
+            "menu must list a pwsh item; items text: {:?}",
+            items
+                .iter()
+                .map(|e| collect_text_recursive(e))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            items.iter().any(|el| item_text_contains(el, "cmd")),
+            "menu must list a cmd item"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_marks_current_shell_as_active() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.workspaces[0].shell = crate::shell::ShellSpec {
+                program: "/usr/bin/pwsh".into(),
+                args: vec![],
+            };
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed = fake_installed();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let active_items: Vec<&ElementDef> = collect_with_class(&menu, "ctx-menu-item")
+            .into_iter()
+            .filter(|el| has_class(el, "active"))
+            .collect();
+        assert!(
+            active_items.iter().any(|el| item_text_contains(el, "pwsh")),
+            "active class must mark the chip whose program matches workspace shell"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_includes_use_app_default_when_override_set() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.workspaces[0].shell = crate::shell::ShellSpec {
+                program: "/usr/bin/pwsh".into(),
+                args: vec![],
+            };
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed = fake_installed();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let text = collect_text_recursive(&menu);
+        assert!(
+            text.contains("Use app default"),
+            "menu must include 'Use app default' when override is set, got text: {text:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_omits_use_app_default_when_no_override() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        assert!(snap.workspaces[0].shell.is_empty());
+        let installed = fake_installed();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let text = collect_text_recursive(&menu);
+        assert!(
+            !text.contains("Use app default"),
+            "menu must NOT include 'Use app default' when no override, got text: {text:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_clicking_shell_dispatches_set_workspace() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed = vec![std::path::PathBuf::from("/usr/bin/pwsh")];
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let pwsh_item = collect_with_class(&menu, "ctx-menu-item")
+            .into_iter()
+            .find(|el| item_text_contains(el, "pwsh"))
+            .expect("pwsh item must be present");
+        (pwsh_item.on_click.as_ref().expect("pwsh item on_click"))();
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.workspaces[0].shell.program, "/usr/bin/pwsh");
+    }
+
+    #[test]
+    fn workspace_ctx_menu_clicking_use_app_default_clears_override() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.workspaces[0].shell = crate::shell::ShellSpec {
+                program: "/usr/bin/pwsh".into(),
+                args: vec![],
+            };
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed = fake_installed();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let item = collect_with_class(&menu, "ctx-menu-item")
+            .into_iter()
+            .find(|el| item_text_contains(el, "Use app default"))
+            .expect("Use app default item must be present");
+        (item.on_click.as_ref().expect("use default on_click"))();
+        let guard = shared.lock().unwrap();
+        assert!(
+            guard.workspaces[0].shell.is_empty(),
+            "clicking Use app default must clear the workspace override"
+        );
     }
 
     // -- hint_item --
