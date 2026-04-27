@@ -2152,8 +2152,14 @@ impl ApplicationHandler for AppHandler {
                     );
                     metrics.style_resolve_us = t1.elapsed().as_micros() as u64;
 
+                    // Scale only the subtree we just re-resolved.
+                    // `scale_all_styles` mutates `computed_style` in place,
+                    // so calling it from the document root would compound
+                    // the scale onto already-scaled nodes outside the LCA
+                    // every restyle. Visible as runaway font / layout
+                    // sizes after a few hover changes on HiDPI displays.
                     let t2 = Instant::now();
-                    scale_all_styles(&mut state.arena, state.root, state.scale_factor);
+                    scale_all_styles(&mut state.arena, cascade_root, state.scale_factor);
                     metrics.scale_us = t2.elapsed().as_micros() as u64;
 
                     mark_layout_dirty(&mut state.arena, state.root);
