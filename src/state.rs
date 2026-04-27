@@ -2416,6 +2416,16 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             true
         }
+        other if other.starts_with("shell.set_default:") => {
+            dispatch_shell_set_default(state, other)
+        }
+        "shell.clear_default" => dispatch_shell_clear_default(state),
+        other if other.starts_with("shell.set_workspace:") => {
+            dispatch_shell_set_workspace(state, other)
+        }
+        other if other.starts_with("shell.clear_workspace:") => {
+            dispatch_shell_clear_workspace(state, other)
+        }
         other if other.starts_with("keybind.set:") => dispatch_keybind_set(state, other),
         other if other.starts_with("keybind.reset:") => dispatch_keybind_reset(state, other),
         "keybind.reset_all" => {
@@ -2439,6 +2449,65 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Parse `shell.set_default:<json>` and apply. The json must
+/// deserialize to a `ShellSpec`; malformed input returns `false` with
+/// no state change.
+fn dispatch_shell_set_default(state: &mut AppState, cmd: &str) -> bool {
+    let json = &cmd["shell.set_default:".len()..];
+    let Ok(spec) = serde_json::from_str::<crate::shell::ShellSpec>(json) else {
+        return false;
+    };
+    state.default_shell = spec;
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Clear the app wide default shell. Idempotent: succeeds even when
+/// already empty so the UI can wire a single button without checking
+/// state first.
+fn dispatch_shell_clear_default(state: &mut AppState) -> bool {
+    state.default_shell = crate::shell::ShellSpec::default();
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Parse `shell.set_workspace:<idx>:<json>` and apply. Both an
+/// out-of-range index and malformed json return `false` with no
+/// state change.
+fn dispatch_shell_set_workspace(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["shell.set_workspace:".len()..];
+    let Some((idx_str, json)) = rest.split_once(':') else {
+        return false;
+    };
+    let Ok(idx) = idx_str.parse::<usize>() else {
+        return false;
+    };
+    if idx >= state.workspaces.len() {
+        return false;
+    }
+    let Ok(spec) = serde_json::from_str::<crate::shell::ShellSpec>(json) else {
+        return false;
+    };
+    state.workspaces[idx].shell = spec;
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Parse `shell.clear_workspace:<idx>` and clear that workspace's
+/// override. Out-of-range index returns `false`.
+fn dispatch_shell_clear_workspace(state: &mut AppState, cmd: &str) -> bool {
+    let idx_str = &cmd["shell.clear_workspace:".len()..];
+    let Ok(idx) = idx_str.parse::<usize>() else {
+        return false;
+    };
+    if idx >= state.workspaces.len() {
+        return false;
+    }
+    state.workspaces[idx].shell = crate::shell::ShellSpec::default();
+    crate::persist::save_workspaces(state);
+    true
 }
 
 /// Parse `keybind.set:<action_id>:<combo>` and apply. The combo can
@@ -3354,6 +3423,140 @@ mod tests {
     }
 
     // -- dispatch -------------------------------------------------------------
+
+    #[test]
+    fn dispatch_shell_set_default_updates_state() {
+        let mut state = test_state();
+        assert!(state.default_shell.is_empty());
+        let json = r#"{"program":"/bin/zsh","args":["-l"]}"#;
+        let cmd = format!("shell.set_default:{json}");
+        assert!(dispatch(&mut state, &cmd));
+        assert_eq!(state.default_shell.program, "/bin/zsh");
+        assert_eq!(state.default_shell.args, vec!["-l".to_string()]);
+    }
+
+    #[test]
+    fn dispatch_shell_set_default_with_malformed_json_returns_false() {
+        let mut state = test_state();
+        let original = state.default_shell.clone();
+        assert!(!dispatch(&mut state, "shell.set_default:not-json"));
+        assert_eq!(
+            state.default_shell, original,
+            "malformed json must not mutate state"
+        );
+    }
+
+    #[test]
+    fn dispatch_shell_set_default_with_empty_json_payload_returns_false() {
+        let mut state = test_state();
+        // Missing colon means no payload — also malformed.
+        assert!(!dispatch(&mut state, "shell.set_default"));
+    }
+
+    #[test]
+    fn dispatch_shell_clear_default_clears_state() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/dash".into(),
+            args: vec![],
+        };
+        assert!(dispatch(&mut state, "shell.clear_default"));
+        assert!(state.default_shell.is_empty());
+    }
+
+    #[test]
+    fn dispatch_shell_clear_default_when_already_empty_still_returns_true() {
+        // The handler is idempotent: clearing an already empty default
+        // is a successful no-op, not an error. Persisting it is cheap.
+        let mut state = test_state();
+        assert!(state.default_shell.is_empty());
+        assert!(dispatch(&mut state, "shell.clear_default"));
+        assert!(state.default_shell.is_empty());
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_updates_correct_workspace() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.workspaces.push(new_workspace(2, "beta".into(), None));
+        let json = r#"{"program":"/usr/local/bin/fish","args":[]}"#;
+        let cmd = format!("shell.set_workspace:1:{json}");
+        assert!(dispatch(&mut state, &cmd));
+        assert!(
+            state.workspaces[0].shell.is_empty(),
+            "workspace 0 must be untouched"
+        );
+        assert_eq!(state.workspaces[1].shell.program, "/usr/local/bin/fish");
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_with_out_of_range_index_returns_false() {
+        let mut state = test_state();
+        let count = state.workspaces.len();
+        let cmd = format!(
+            "shell.set_workspace:{count}:{}",
+            r#"{"program":"/bin/zsh","args":[]}"#
+        );
+        assert!(!dispatch(&mut state, &cmd));
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_with_malformed_index_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(
+            &mut state,
+            r#"shell.set_workspace:abc:{"program":"/bin/zsh","args":[]}"#
+        ));
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_with_malformed_json_returns_false() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        assert!(!dispatch(&mut state, "shell.set_workspace:0:not-json"));
+        assert!(state.workspaces[0].shell.is_empty());
+    }
+
+    #[test]
+    fn dispatch_shell_clear_workspace_clears_the_right_workspace() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.workspaces.push(new_workspace(2, "beta".into(), None));
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/bin/zsh".into(),
+            args: vec![],
+        };
+        state.workspaces[1].shell = crate::shell::ShellSpec {
+            program: "/bin/fish".into(),
+            args: vec![],
+        };
+        assert!(dispatch(&mut state, "shell.clear_workspace:0"));
+        assert!(state.workspaces[0].shell.is_empty());
+        assert_eq!(
+            state.workspaces[1].shell.program, "/bin/fish",
+            "clearing workspace 0 must not touch workspace 1"
+        );
+    }
+
+    #[test]
+    fn dispatch_shell_clear_workspace_with_out_of_range_index_returns_false() {
+        let mut state = test_state();
+        let count = state.workspaces.len();
+        let cmd = format!("shell.clear_workspace:{count}");
+        assert!(!dispatch(&mut state, &cmd));
+    }
+
+    #[test]
+    fn dispatch_shell_clear_workspace_with_malformed_index_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "shell.clear_workspace:abc"));
+    }
 
     #[test]
     fn dispatch_modal_open_close() {

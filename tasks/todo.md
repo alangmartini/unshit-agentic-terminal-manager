@@ -101,16 +101,16 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
   - [x] Tests: dedup-by-canonical, fixed-paths probe, missing-files-skipped, cap at MAX_DISCOVERED.
   - [x] `cargo test --bin terminal-manager shell::`: 24/24 green. clippy + fmt clean.
 
-- [ ] **Task 8: Dispatch handlers and persist trigger**
-  - [ ] Add handlers for `shell.set_default:<json>`, `shell.set_workspace:<idx>:<json>`, `shell.clear_default`, `shell.clear_workspace:<idx>`.
-  - [ ] Each parses, mutates, and persists.
-  - [ ] Test: each command updates the right state field and triggers persist.
-  - [ ] Test: malformed JSON returns false, no state change, no panic.
-  - [ ] Test: out of range workspace index returns false.
-  - [ ] `cargo test --lib state::dispatch_shell` green.
+- [x] **Task 8: Dispatch handlers and persist trigger** [DONE]
+  - [x] Added arms for `shell.set_default:<json>`, `shell.set_workspace:<idx>:<json>`, `shell.clear_default`, `shell.clear_workspace:<idx>` in the main `dispatch` match.
+  - [x] Each helper parses, mutates, then calls `crate::persist::save_workspaces(state)`.
+  - [x] Test: `dispatch_shell_set_default_updates_state` and `dispatch_shell_set_workspace_updates_correct_workspace` cover the happy path.
+  - [x] Test: malformed JSON / missing payload / non-numeric index / out-of-range index all return false without panic (`with_malformed_*`, `with_out_of_range_index_*`).
+  - [x] Test: `dispatch_shell_clear_default_when_already_empty_still_returns_true` covers idempotent clear.
+  - [x] `cargo test --bin terminal-manager state::tests::dispatch_shell`: 12/12 green.
 
 ### Checkpoint
-- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
+- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
 
 ## Phase 6: UI surfaces
 
