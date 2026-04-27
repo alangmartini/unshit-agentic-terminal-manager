@@ -671,6 +671,18 @@ fn main() {
     // Set up PTY output subscriptions.
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
 
+    // Hand the framework's shared clipboard handle to AppState so
+    // `terminal.paste` and any future paste callers reuse the same
+    // underlying `arboard::Clipboard` instance. Concurrent arboard
+    // handles in the same process can heap-corrupt on Windows; the
+    // framework regression test `concurrent_clipboard_access_does_not_corrupt_heap`
+    // documents that failure mode.
+    {
+        let app_clipboard = app.clipboard();
+        let mut guard = shared.lock_recover();
+        guard.clipboard = app_clipboard;
+    }
+
     app.run();
 }
 
@@ -690,6 +702,32 @@ mod tests {
                 .iter()
                 .any(|(s, c)| s == "Ctrl+Shift+F" && c == "fps_overlay.toggle"),
             "Ctrl+Shift+F must dispatch fps_overlay.toggle"
+        );
+    }
+
+    /// Regression test for the clipboard paste keybind feature.
+    ///
+    /// Both Ctrl+V (Windows convention) and Ctrl+Shift+V (Linux
+    /// terminal convention, where Ctrl+V is reserved by the shell for
+    /// literal-input mode) MUST be registered against
+    /// `terminal.paste`. If a future agent removes one binding the
+    /// user loses paste from at least one platform's muscle memory;
+    /// this test catches that before it ships.
+    #[test]
+    fn user_shortcut_bindings_wires_terminal_paste_to_both_combos() {
+        let bindings = user_shortcut_bindings();
+        let pasters: Vec<&str> = bindings
+            .iter()
+            .filter(|(_, c)| c == "terminal.paste")
+            .map(|(s, _)| s.as_str())
+            .collect();
+        assert!(
+            pasters.contains(&"Ctrl+V"),
+            "Ctrl+V must dispatch terminal.paste; got {pasters:?}"
+        );
+        assert!(
+            pasters.contains(&"Ctrl+Shift+V"),
+            "Ctrl+Shift+V must dispatch terminal.paste; got {pasters:?}"
         );
     }
 
