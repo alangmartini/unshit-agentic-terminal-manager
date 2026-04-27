@@ -1037,7 +1037,12 @@ impl ApplicationHandler for AppHandler {
                 if !should_exit {
                     // Application vetoed the close (e.g. to show a confirm
                     // prompt). The app is expected to drive its own exit
-                    // via `process::exit` once the user decides.
+                    // via `process::exit` once the user decides. Schedule a
+                    // rebuild + redraw so any UI state the callback set
+                    // (like a confirm dialog) actually paints, otherwise
+                    // the window appears frozen until the next input event.
+                    state.needs_rebuild = true;
+                    state.window.request_redraw();
                     return;
                 }
                 if let Some(log) = state.event_log.take() {
