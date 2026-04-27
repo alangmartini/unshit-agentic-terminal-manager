@@ -83,6 +83,13 @@ pub struct SvgPipeline {
     global_bind_group: wgpu::BindGroup,
     global_uniform_buffer: wgpu::Buffer,
 
+    /// Layout for bind group 0 (global uniforms). Retained on the struct so a
+    /// backdrop-filter variant pipeline can be built that SHARES this layout
+    /// handle. Without sharing, a bind group built against this pipeline's
+    /// layout is rejected (or silently malfunctions) when bound on a render
+    /// pass that uses the variant pipeline, even if the layouts are
+    /// structurally identical.
+    global_bind_group_layout: wgpu::BindGroupLayout,
     instance_bind_group_layout: wgpu::BindGroupLayout,
     /// Pool of per submission instance uniform buffers. Each slot is
     /// padded to `INSTANCE_UNIFORM_STRIDE` (256 bytes) so the pool
@@ -112,18 +119,6 @@ pub struct SvgPipeline {
 
 impl SvgPipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("svg shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/svg.wgsl").into()),
-        });
-
-        let global_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("svg globals"),
-            size: std::mem::size_of::<GlobalUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let global_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("svg global bgl"),
@@ -138,16 +133,6 @@ impl SvgPipeline {
                     count: None,
                 }],
             });
-
-        let global_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("svg global bg"),
-            layout: &global_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: global_uniform_buffer.as_entire_binding(),
-            }],
-        });
-
         let instance_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("svg instance bgl"),
@@ -164,6 +149,66 @@ impl SvgPipeline {
                     count: None,
                 }],
             });
+        Self::new_with_shared_layouts(
+            device,
+            format,
+            sample_count,
+            global_bind_group_layout,
+            instance_bind_group_layout,
+        )
+    }
+
+    /// Build a sample-count-1 variant of this pipeline for the
+    /// backdrop-filter render path. The variant SHARES this pipeline's bind
+    /// group layouts, so bind groups created against either pipeline's
+    /// layouts can be bound on the other's render pass without wgpu
+    /// validation rejecting them.
+    ///
+    /// Without this sharing, the backdrop SVG path silently fails to draw
+    /// SVG geometry on real GPUs that strictly enforce bind group layout
+    /// identity (not structural equivalence), producing the
+    /// disappear-with-pulse symptom seen when settings opens.
+    pub fn create_backdrop_variant(
+        &self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        Self::new_with_shared_layouts(
+            device,
+            format,
+            1,
+            self.global_bind_group_layout.clone(),
+            self.instance_bind_group_layout.clone(),
+        )
+    }
+
+    fn new_with_shared_layouts(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        sample_count: u32,
+        global_bind_group_layout: wgpu::BindGroupLayout,
+        instance_bind_group_layout: wgpu::BindGroupLayout,
+    ) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("svg shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/svg.wgsl").into()),
+        });
+
+        let global_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("svg globals"),
+            size: std::mem::size_of::<GlobalUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let global_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("svg global bg"),
+            layout: &global_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: global_uniform_buffer.as_entire_binding(),
+            }],
+        });
 
         let initial_instance_capacity = 64usize;
         let instance_pool = InstanceBufferPool::<SvgInstanceSlot>::new(
@@ -225,6 +270,7 @@ impl SvgPipeline {
             pipeline,
             global_bind_group,
             global_uniform_buffer,
+            global_bind_group_layout,
             instance_bind_group_layout,
             instance_pool,
             current_instance_buffer: None,
