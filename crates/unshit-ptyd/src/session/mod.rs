@@ -115,6 +115,13 @@ impl Session {
         } else if let Some(home) = dirs::home_dir() {
             cmd.cwd(home);
         }
+        // Advertise xterm capabilities so TUI apps (Claude Code, vim,
+        // less, htop, etc) enable alt-screen, true color, and other
+        // modern features instead of falling back to a degraded inline
+        // rendering path. Without TERM set, ink-based apps treat us as
+        // a dumb terminal and skip DECSET 1049 / 256-color escapes.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
 
         let child = pty
             .slave
