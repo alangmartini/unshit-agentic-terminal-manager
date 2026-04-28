@@ -8,19 +8,17 @@ use unshit::core::shortcut::KeyCombo;
 
 use crate::keybinds::{KeybindAction, KeybindError, KeybindErrorKind};
 use crate::state::{
-    agent_enabled, dispatch, is_on, mutate_toggle_agent, mutate_with, AgentKey, SettingsSection,
-    SharedState, ToggleKey, UiSnapshot,
+    dispatch, is_on, mutate_with, SettingsSection, SharedState, ToggleKey, UiSnapshot,
 };
 use crate::ui::icons::*;
 
 pub fn build_settings_modal(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal")
-        .with_style(StyleDeclaration::Display(Display::Flex))
-        .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-        .with_style(StyleDeclaration::Width(Dimension::Px(680.0)))
-        .with_style(StyleDeclaration::Height(Dimension::Percent(80.0)))
-        .with_style(StyleDeclaration::MaxHeight(Dimension::Percent(80.0)))
+        .with_style(StyleDeclaration::Display(Display::Grid))
+        .with_style(StyleDeclaration::Width(Dimension::Px(860.0)))
+        .with_style(StyleDeclaration::Height(Dimension::Percent(76.0)))
+        .with_style(StyleDeclaration::MaxHeight(Dimension::Px(760.0)))
         .with_child(build_modal_header(shared))
         .with_child(build_modal_nav(state.settings_section, shared))
         .with_child(build_modal_body(state, shared))
@@ -43,7 +41,7 @@ fn build_modal_header(shared: &SharedState) -> ElementDef {
                     ElementDef::new(Tag::Div)
                         .with_class("modal-title")
                         .with_id("settings-title")
-                        .with_text("settings"),
+                        .with_text("Settings"),
                 ),
         )
         .with_child(
@@ -83,11 +81,9 @@ fn build_modal_nav(active: SettingsSection, shared: &SharedState) -> ElementDef 
 
 fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let section = match state.settings_section {
-        SettingsSection::General => build_general_section(state, shared),
         SettingsSection::Appearance => build_appearance_section(state, shared),
         SettingsSection::Shell => build_shell_section(state, shared),
         SettingsSection::Keybinds => build_keybinds_section(state, shared),
-        SettingsSection::Agents => build_agents_section(state, shared),
         SettingsSection::Sessions => build_sessions_section(state, shared),
         SettingsSection::DangerZone => build_danger_zone_section(state, shared),
     };
@@ -104,48 +100,6 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
 
 // -- section builders -------------------------------------------------------
 
-fn build_general_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    section_shell("general")
-        .with_child(setting_row(
-            "Default shell",
-            "Command run when opening a new terminal",
-            select_display("bash"),
-        ))
-        .with_child(setting_row(
-            "Working directory",
-            "Starting directory for new terminals",
-            text_input_display("~/projects/main"),
-        ))
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Restore on startup",
-            "Reopen last active session and panes",
-            ToggleKey::RestoreOnStartup,
-        ))
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Confirm before closing",
-            "Warn when closing a tab with a running process",
-            ToggleKey::ConfirmClose,
-        ))
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Start minimized",
-            "Launch to system tray on startup",
-            ToggleKey::StartMinimized,
-        ))
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Check for updates",
-            "Notify when a new version is available",
-            ToggleKey::CheckUpdates,
-        ))
-}
-
 fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     section_shell("appearance")
         .with_child(setting_row(
@@ -158,77 +112,215 @@ fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> Element
             "Terminal output size in points",
             font_stepper(state.font_size_pt, shared),
         ))
-        .with_child(setting_row(
-            "Cursor style",
-            "Terminal cursor appearance",
-            cursor_style_group(),
-        ))
-        .with_child(setting_row(
-            "Terminal opacity",
-            "Window transparency level",
-            slider_control("100%"),
-        ))
-        .with_child(setting_row(
-            "Line height",
-            "Spacing between terminal rows",
-            stepper("1.4", None),
-        ))
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Glow effect",
-            "Subtle CRT-style text shadow on output",
-            ToggleKey::GlowEffect,
-        ))
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Background texture",
-            "Warm ambient gradient behind content",
-            ToggleKey::BackgroundTexture,
-        ))
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Font ligatures",
-            "Combine character pairs like => and !=",
-            ToggleKey::FontLigatures,
-        ))
 }
 
 fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    section_shell("shell")
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Shell integration",
-            "Inject prompt markers for smart scrollback",
-            ToggleKey::ShellIntegration,
-        ))
-        .with_child(setting_row(
-            "History size",
-            "Lines retained per pane",
-            text_input_display("50000"),
-        ))
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Scroll on output",
-            "Auto-scroll terminal when new output arrives",
-            ToggleKey::ScrollOnOutput,
-        ))
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Bell notification",
-            "Flash tab badge when terminal rings the bell",
-            ToggleKey::BellNotification,
-        ))
-        .with_child(setting_row(
-            "Word separators",
-            "Characters that break word selection on double-click",
-            compact_input_display(" /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}`~?"),
-        ))
+    let installed = crate::shell::discover_installed();
+    let mut section = section_shell("shell").with_child(shell_scope_block(
+        ShellScope::AppDefault,
+        "App default",
+        "Shell launched for new panes when no workspace overrides it",
+        &state.default_shell,
+        &installed,
+        shared,
+    ));
+
+    if !state.workspaces.is_empty() {
+        let mut overrides = ElementDef::new(Tag::Div)
+            .with_class("workspace-overrides")
+            .with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("modal-section-title")
+                    .with_text("Workspace overrides"),
+            );
+        for (idx, ws) in state.workspaces.iter().enumerate() {
+            overrides = overrides.with_child(shell_scope_block(
+                ShellScope::Workspace(idx),
+                &ws.name,
+                "Override the app default for this workspace only",
+                &ws.shell,
+                &installed,
+                shared,
+            ));
+        }
+        section = section.with_child(overrides);
+    }
+
+    section
+}
+
+/// Which shell scope a picker mutates: the app wide default, or a
+/// specific workspace override (carries the workspace index used in
+/// the dispatch command).
+#[derive(Clone, Copy)]
+enum ShellScope {
+    AppDefault,
+    Workspace(usize),
+}
+
+impl ShellScope {
+    fn set_cmd_prefix(&self) -> String {
+        match self {
+            ShellScope::AppDefault => "shell.set_default:".to_string(),
+            ShellScope::Workspace(idx) => format!("shell.set_workspace:{idx}:"),
+        }
+    }
+
+    fn clear_cmd(&self) -> String {
+        match self {
+            ShellScope::AppDefault => "shell.clear_default".to_string(),
+            ShellScope::Workspace(idx) => format!("shell.clear_workspace:{idx}"),
+        }
+    }
+}
+
+/// One editable scope in the Shell tab. Bundles label + description,
+/// the chip picker (one chip per discovered shell, plus a "Use
+/// default" chip for workspace scopes), a custom path input for
+/// shells that aren't on PATH, and an args input.
+fn shell_scope_block(
+    scope: ShellScope,
+    label: &str,
+    desc: &str,
+    current: &crate::shell::ShellSpec,
+    installed: &[std::path::PathBuf],
+    shared: &SharedState,
+) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("shell-scope-block")
+        .with_child(setting_meta(label, Some(desc)))
+        .with_child(shell_picker(scope, current, installed, shared))
+        .with_child(shell_custom_program_input(scope, current, shared))
+        .with_child(shell_args_input(scope, current, shared))
+}
+
+/// Chip group of every discovered shell. The chip whose path matches
+/// `current.program` is marked active. Workspace pickers also get a
+/// "Use default" chip that dispatches the matching `shell.clear_*`.
+fn shell_picker(
+    scope: ShellScope,
+    current: &crate::shell::ShellSpec,
+    installed: &[std::path::PathBuf],
+    shared: &SharedState,
+) -> ElementDef {
+    let mut picker = ElementDef::new(Tag::Div).with_class("shell-picker");
+
+    if let ShellScope::Workspace(_) = scope {
+        let mut chip = ElementDef::new(Tag::Button)
+            .with_class("shell-chip")
+            .with_class("clear")
+            .with_text("Use default");
+        if current.is_empty() {
+            chip = chip.with_class("active");
+        }
+        let s = shared.clone();
+        let cmd = scope.clear_cmd();
+        chip = chip.on_click(move || {
+            mutate_with(&s, |st| dispatch(st, &cmd));
+        });
+        picker = picker.with_child(chip);
+    }
+
+    let labels = crate::shell::label_installed_shells(installed);
+    for (path, label) in installed.iter().zip(labels.iter()) {
+        let program = path.display().to_string();
+        let active = !current.program.is_empty() && current.program == program;
+        let mut chip = ElementDef::new(Tag::Button)
+            .with_class("shell-chip")
+            .with_text(label.as_str());
+        if active {
+            chip = chip.with_class("active");
+        }
+        let s = shared.clone();
+        let prefix = scope.set_cmd_prefix();
+        let prog = program.clone();
+        let args = current.args.clone();
+        chip = chip.on_click(move || {
+            let spec = crate::shell::ShellSpec {
+                program: prog.clone(),
+                args: args.clone(),
+            };
+            let json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
+            mutate_with(&s, |st| {
+                dispatch(st, &format!("{prefix}{json}"));
+            });
+        });
+        picker = picker.with_child(chip);
+    }
+
+    picker
+}
+
+/// Text input that reads as the current `program` (via placeholder)
+/// and on submit dispatches a fresh `shell.set_*` with the typed path
+/// and the existing args. Lets users pick a shell that isn't on the
+/// PATH probe (e.g. portable installs, custom toolchains).
+fn shell_custom_program_input(
+    scope: ShellScope,
+    current: &crate::shell::ShellSpec,
+    shared: &SharedState,
+) -> ElementDef {
+    let placeholder = if current.program.is_empty() {
+        "Custom shell path (press Enter to apply)".to_string()
+    } else {
+        current.program.clone()
+    };
+    let s = shared.clone();
+    let prefix = scope.set_cmd_prefix();
+    let args = current.args.clone();
+    ElementDef::new(Tag::Input)
+        .with_class("input")
+        .with_class("shell-custom-input")
+        .with_placeholder(placeholder)
+        .on_submit(move |text| {
+            let typed = text.trim().to_string();
+            if typed.is_empty() {
+                return;
+            }
+            let spec = crate::shell::ShellSpec {
+                program: typed,
+                args: args.clone(),
+            };
+            let json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
+            mutate_with(&s, |st| {
+                dispatch(st, &format!("{prefix}{json}"));
+            });
+        })
+}
+
+/// Always visible args text input. Placeholder shows the current
+/// args (space joined) so the user can see what's set without
+/// pre-population (the framework's input doesn't seed initial value).
+/// On submit, splits on whitespace and dispatches a fresh
+/// `shell.set_*` with the existing program.
+fn shell_args_input(
+    scope: ShellScope,
+    current: &crate::shell::ShellSpec,
+    shared: &SharedState,
+) -> ElementDef {
+    let placeholder = if current.args.is_empty() {
+        "Optional args, space separated".to_string()
+    } else {
+        current.args.join(" ")
+    };
+    let s = shared.clone();
+    let prefix = scope.set_cmd_prefix();
+    let program = current.program.clone();
+    ElementDef::new(Tag::Input)
+        .with_class("input")
+        .with_class("shell-args-input")
+        .with_placeholder(placeholder)
+        .on_submit(move |text| {
+            let args: Vec<String> = text.split_whitespace().map(|s| s.to_string()).collect();
+            let spec = crate::shell::ShellSpec {
+                program: program.clone(),
+                args,
+            };
+            let json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
+            mutate_with(&s, |st| {
+                dispatch(st, &format!("{prefix}{json}"));
+            });
+        })
 }
 
 fn build_keybinds_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -369,27 +461,6 @@ fn combo_parts(combo: KeyCombo) -> Vec<String> {
     }
     parts.push(combo.key.to_string());
     parts
-}
-
-fn build_agents_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    let mut section = section_shell("agents")
-        .with_child(toggle_row(
-            state,
-            shared,
-            "Auto-discovery",
-            "Detect installed AI agents on PATH",
-            ToggleKey::AutoDiscovery,
-        ))
-        .with_child(setting_row(
-            "Default timeout",
-            "Seconds before an agent task is canceled",
-            stepper("300", None),
-        ))
-        .with_child(agent_list_header(AGENT_SPECS.len()));
-    for spec in AGENT_SPECS {
-        section = section.with_child(agent_row(spec, agent_enabled(state, spec.key), shared));
-    }
-    section
 }
 
 fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -639,47 +710,6 @@ fn setting_row(label: &str, desc: &str, control: ElementDef) -> ElementDef {
         .with_child(control)
 }
 
-fn toggle_row(
-    state: &UiSnapshot,
-    shared: &SharedState,
-    label: &str,
-    desc: &str,
-    key: ToggleKey,
-) -> ElementDef {
-    setting_row(label, desc, toggle_button(is_on(state, key), key, shared))
-}
-
-fn toggle_button(on: bool, key: ToggleKey, shared: &SharedState) -> ElementDef {
-    let mut btn = ElementDef::new(Tag::Button).with_class("toggle");
-    if on {
-        btn = btn.with_class("on");
-    }
-    let s = shared.clone();
-    btn.on_click(move || {
-        mutate_with(&s, |st| {
-            let next = !st.toggles.get(&key).copied().unwrap_or(false);
-            st.toggles.insert(key, next);
-        });
-    })
-}
-
-fn select_display(value: &str) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("input")
-        .with_class("select")
-        .with_text(value)
-}
-
-fn text_input_display(value: &str) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("input")
-        .with_text(value)
-}
-
-fn compact_input_display(value: &str) -> ElementDef {
-    text_input_display(value).with_class("compact")
-}
-
 fn theme_chip_group(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let mut chips = ElementDef::new(Tag::Div).with_class("theme-chips");
     for theme in ["amber", "green", "cyan", "mono"] {
@@ -706,29 +736,15 @@ struct StepCallbacks {
     on_inc: StepCallback,
 }
 
-fn stepper(value: &str, callbacks: Option<StepCallbacks>) -> ElementDef {
-    let (dec, inc) = match callbacks {
-        Some(cb) => (
-            ElementDef::new(Tag::Button)
-                .with_class("stepper-btn")
-                .with_text("\u{2212}")
-                .on_click(cb.on_dec),
-            ElementDef::new(Tag::Button)
-                .with_class("stepper-btn")
-                .with_text("+")
-                .on_click(cb.on_inc),
-        ),
-        None => (
-            ElementDef::new(Tag::Button)
-                .with_class("stepper-btn")
-                .with_class("disabled")
-                .with_text("\u{2212}"),
-            ElementDef::new(Tag::Button)
-                .with_class("stepper-btn")
-                .with_class("disabled")
-                .with_text("+"),
-        ),
-    };
+fn stepper(value: &str, callbacks: StepCallbacks) -> ElementDef {
+    let dec = ElementDef::new(Tag::Button)
+        .with_class("stepper-btn")
+        .with_text("\u{2212}")
+        .on_click(callbacks.on_dec);
+    let inc = ElementDef::new(Tag::Button)
+        .with_class("stepper-btn")
+        .with_text("+")
+        .on_click(callbacks.on_inc);
     ElementDef::new(Tag::Div)
         .with_class("stepper")
         .with_child(dec)
@@ -752,43 +768,7 @@ fn font_stepper(value: u32, shared: &SharedState) -> ElementDef {
             mutate_with(&inc_shared, |st| dispatch(st, "font.inc"));
         }),
     };
-    stepper(&value.to_string(), Some(callbacks))
-}
-
-fn cursor_style_group() -> ElementDef {
-    let variants = [
-        ("block-cursor", "block", true),
-        ("underline-cursor", "line", false),
-        ("bar-cursor", "bar", false),
-    ];
-    let mut group = ElementDef::new(Tag::Div).with_class("cursor-group");
-    for (preview_class, label, active) in variants {
-        let mut option = ElementDef::new(Tag::Button).with_class("cursor-option");
-        if active {
-            option = option.with_class("active");
-        }
-        option = option
-            .with_child(
-                ElementDef::new(Tag::Span)
-                    .with_class("cursor-preview")
-                    .with_class(preview_class),
-            )
-            .with_child(ElementDef::new(Tag::Span).with_text(label));
-        group = group.with_child(option);
-    }
-    group
-}
-
-fn slider_control(value_label: &str) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("slider-control")
-        .with_child(ElementDef::new(Tag::Div).with_class("slider"))
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("slider-val")
-                .with_class("tnum")
-                .with_text(value_label),
-        )
+    stepper(&value.to_string(), callbacks)
 }
 
 fn pill(base: &str, modifier: Option<&str>, text: &str) -> ElementDef {
@@ -816,117 +796,6 @@ fn keybind_footer(shared: &SharedState) -> ElementDef {
                     mutate_with(&s, |st| dispatch(st, "keybind.reset_all"));
                 }),
         )
-}
-
-#[derive(Clone, Copy)]
-enum AgentStatus {
-    Running,
-    Idle,
-    Disabled,
-}
-
-impl AgentStatus {
-    fn kind(self) -> &'static str {
-        match self {
-            AgentStatus::Running => "running",
-            AgentStatus::Idle => "idle",
-            AgentStatus::Disabled => "disabled",
-        }
-    }
-}
-
-struct AgentSpec {
-    name: &'static str,
-    path: &'static str,
-    status: AgentStatus,
-    key: AgentKey,
-}
-
-const AGENT_SPECS: &[AgentSpec] = &[
-    AgentSpec {
-        name: "claude",
-        path: "~/.local/bin/claude",
-        status: AgentStatus::Running,
-        key: AgentKey::Claude,
-    },
-    AgentSpec {
-        name: "amp",
-        path: "~/.local/bin/amp",
-        status: AgentStatus::Idle,
-        key: AgentKey::Amp,
-    },
-    AgentSpec {
-        name: "codex",
-        path: "~/.local/bin/codex",
-        status: AgentStatus::Disabled,
-        key: AgentKey::Codex,
-    },
-];
-
-fn agent_list_header(count: usize) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("agent-list-header")
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("agent-list-title")
-                .with_text("configured agents"),
-        )
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("agent-list-count")
-                .with_text(count.to_string()),
-        )
-}
-
-fn agent_row(spec: &AgentSpec, enabled: bool, shared: &SharedState) -> ElementDef {
-    let label = spec.status.kind();
-    ElementDef::new(Tag::Div)
-        .with_class("agent-row")
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("agent-icon")
-                .with_child(svg_icon(icon_agent())),
-        )
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("agent-info")
-                .with_style(StyleDeclaration::Display(Display::Flex))
-                .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("agent-name")
-                        .with_text(spec.name),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("agent-path")
-                        .with_text(spec.path),
-                ),
-        )
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("agent-controls")
-                .with_child(agent_badge(spec.status.kind(), label))
-                .with_child(agent_toggle_button(enabled, spec.key, shared)),
-        )
-}
-
-/// Toggle button for an agent row. Mirrors `toggle_button` but writes to
-/// the typed `state.agents` vec via `mutate_toggle_agent` instead of the
-/// generic `state.toggles` map.
-fn agent_toggle_button(on: bool, key: AgentKey, shared: &SharedState) -> ElementDef {
-    let mut btn = ElementDef::new(Tag::Button).with_class("toggle");
-    if on {
-        btn = btn.with_class("on");
-    }
-    let s = shared.clone();
-    btn.on_click(move || {
-        mutate_with(&s, |st| mutate_toggle_agent(st, key));
-    })
-}
-
-fn agent_badge(kind: &str, label: &str) -> ElementDef {
-    pill("agent-badge", Some(kind), label)
 }
 
 #[cfg(test)]
@@ -1000,21 +869,21 @@ mod tests {
     #[test]
     fn modal_nav_has_nav_class() {
         let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::General, &shared);
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
         assert!(el.classes.contains(&"modal-nav".to_string()));
     }
 
     #[test]
-    fn modal_nav_has_seven_items() {
+    fn modal_nav_has_five_items() {
         let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::General, &shared);
-        assert_eq!(el.children.len(), 7);
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
+        assert_eq!(el.children.len(), 5);
     }
 
     #[test]
-    fn modal_nav_marks_general_active() {
+    fn modal_nav_marks_appearance_active() {
         let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::General, &shared);
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
         assert!(el.children[0].classes.contains(&"active".to_string()));
         for child in &el.children[1..] {
             assert!(!child.classes.contains(&"active".to_string()));
@@ -1022,38 +891,37 @@ mod tests {
     }
 
     #[test]
-    fn modal_nav_marks_appearance_active() {
-        let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::Appearance, &shared);
-        assert!(!el.children[0].classes.contains(&"active".to_string()));
-        assert!(el.children[1].classes.contains(&"active".to_string()));
-    }
-
-    #[test]
     fn modal_nav_marks_shell_active() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::Shell, &shared);
-        assert!(el.children[2].classes.contains(&"active".to_string()));
+        assert!(el.children[1].classes.contains(&"active".to_string()));
     }
 
     #[test]
     fn modal_nav_marks_keybinds_active() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::Keybinds, &shared);
+        assert!(el.children[2].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn modal_nav_marks_sessions_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Sessions, &shared);
         assert!(el.children[3].classes.contains(&"active".to_string()));
     }
 
     #[test]
-    fn modal_nav_marks_agents_active() {
+    fn modal_nav_marks_danger_zone_active() {
         let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::Agents, &shared);
+        let el = build_modal_nav(SettingsSection::DangerZone, &shared);
         assert!(el.children[4].classes.contains(&"active".to_string()));
     }
 
     #[test]
     fn modal_nav_items_have_click_handlers() {
         let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::General, &shared);
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
         for child in &el.children {
             assert!(child.on_click.is_some());
         }
@@ -1063,7 +931,7 @@ mod tests {
 
     #[test]
     fn modal_body_renders_only_active_section() {
-        let snap = make_snapshot_section(SettingsSection::General);
+        let snap = make_snapshot_section(SettingsSection::Appearance);
         let shared = make_shared();
         let el = build_modal_body(&snap, &shared);
         assert!(el.classes.contains(&"modal-body".to_string()));
@@ -1091,38 +959,24 @@ mod tests {
     }
 
     #[test]
-    fn modal_body_switches_to_agents() {
-        let snap = make_snapshot_section(SettingsSection::Agents);
+    fn modal_body_switches_to_shell() {
+        let snap = make_snapshot_section(SettingsSection::Shell);
         let shared = make_shared();
         let el = build_modal_body(&snap, &shared);
         let section = &el.children[0];
         let title = &section.children[0];
-        assert_eq!(text_of(title), Some("agents"));
-    }
-
-    // -- build_general_section --------------------------------------------------
-
-    #[test]
-    fn general_section_has_title_and_six_rows() {
-        let snap = make_snapshot();
-        let shared = make_shared();
-        let el = build_general_section(&snap, &shared);
-        assert!(el.classes.contains(&"modal-section".to_string()));
-        // title + 6 rows
-        assert_eq!(el.children.len(), 7);
-        let title = &el.children[0];
-        assert!(title.classes.contains(&"modal-section-title".to_string()));
+        assert_eq!(text_of(title), Some("shell"));
     }
 
     // -- build_appearance_section -----------------------------------------------
 
     #[test]
-    fn appearance_section_has_title_and_eight_rows() {
+    fn appearance_section_has_title_and_two_rows() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
-        // title + 8 rows (theme, font, cursor, opacity, line-height, glow, bg, ligatures)
-        assert_eq!(el.children.len(), 9);
+        // title + 2 rows (theme, font)
+        assert_eq!(el.children.len(), 3);
     }
 
     #[test]
@@ -1191,52 +1045,135 @@ mod tests {
         assert_eq!(stepper.children.len(), 3);
     }
 
-    #[test]
-    fn appearance_section_has_cursor_group() {
-        let snap = make_snapshot();
-        let shared = make_shared();
-        let el = build_appearance_section(&snap, &shared);
-        let cursor_row = &el.children[3];
-        let cursor_group = &cursor_row.children[1];
-        assert!(cursor_group.classes.contains(&"cursor-group".to_string()));
-        assert_eq!(cursor_group.children.len(), 3);
-        // First option active by default
-        assert!(cursor_group.children[0]
-            .classes
-            .contains(&"active".to_string()));
-    }
-
-    #[test]
-    fn appearance_section_has_slider_control() {
-        let snap = make_snapshot();
-        let shared = make_shared();
-        let el = build_appearance_section(&snap, &shared);
-        let opacity_row = &el.children[4];
-        let slider = &opacity_row.children[1];
-        assert!(slider.classes.contains(&"slider-control".to_string()));
-        assert_eq!(slider.children.len(), 2);
-    }
-
     // -- build_shell_section ----------------------------------------------------
 
+    fn find_first_with_class<'a>(root: &'a ElementDef, class: &str) -> Option<&'a ElementDef> {
+        if root.classes.iter().any(|c| c == class) {
+            return Some(root);
+        }
+        root.children
+            .iter()
+            .find_map(|c| find_first_with_class(c, class))
+    }
+
+    fn count_with_class(root: &ElementDef, class: &str) -> usize {
+        let here = if root.classes.iter().any(|c| c == class) {
+            1
+        } else {
+            0
+        };
+        here + root
+            .children
+            .iter()
+            .map(|c| count_with_class(c, class))
+            .sum::<usize>()
+    }
+
+    fn collect_text_recursive(root: &ElementDef) -> String {
+        let mut acc = String::new();
+        if let Some(t) = text_of(root) {
+            acc.push_str(t);
+            acc.push(' ');
+        }
+        for child in &root.children {
+            acc.push_str(&collect_text_recursive(child));
+        }
+        acc
+    }
+
     #[test]
-    fn shell_section_has_title_and_five_rows() {
+    fn shell_section_starts_with_app_default_block() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_shell_section(&snap, &shared);
-        // title + 5 rows
-        assert_eq!(el.children.len(), 6);
+        // first child after the title must be the app default scope block
+        let first = &el.children[1];
+        assert!(
+            first.classes.contains(&"shell-scope-block".to_string()),
+            "first body child must be a shell-scope-block, got classes: {:?}",
+            first.classes
+        );
+    }
+
+    #[test]
+    fn shell_section_includes_shell_picker_under_app_default_block() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_shell_section(&snap, &shared);
+        assert!(
+            find_first_with_class(&el, "shell-picker").is_some(),
+            "shell section must include a shell-picker"
+        );
+    }
+
+    #[test]
+    fn shell_picker_marks_active_chip_when_program_matches() {
+        // Build a snapshot whose default_shell.program matches a fake
+        // discovered shell, then assert at least one chip carries the
+        // "active" class. We feed the picker directly so the test does
+        // not depend on what's installed on the host.
+        let installed = vec![std::path::PathBuf::from("/bin/bash")];
+        let current = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec![],
+        };
+        let shared = make_shared();
+        let picker = shell_picker(ShellScope::AppDefault, &current, &installed, &shared);
+        assert!(
+            count_with_class(&picker, "active") >= 1,
+            "matching program must mark a chip active"
+        );
+    }
+
+    #[test]
+    fn shell_picker_for_workspace_includes_use_default_chip() {
+        let installed: Vec<std::path::PathBuf> = vec![];
+        let current = crate::shell::ShellSpec::default();
+        let shared = make_shared();
+        let picker = shell_picker(ShellScope::Workspace(0), &current, &installed, &shared);
+        assert!(
+            collect_text_recursive(&picker).contains("Use default"),
+            "workspace picker must include a Use default chip"
+        );
+    }
+
+    #[test]
+    fn shell_picker_for_app_default_omits_use_default_chip() {
+        let installed: Vec<std::path::PathBuf> = vec![];
+        let current = crate::shell::ShellSpec::default();
+        let shared = make_shared();
+        let picker = shell_picker(ShellScope::AppDefault, &current, &installed, &shared);
+        assert!(
+            !collect_text_recursive(&picker).contains("Use default"),
+            "app default picker must NOT have a Use default chip"
+        );
+    }
+
+    #[test]
+    fn shell_section_has_one_workspace_override_block_per_workspace() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_shell_section(&snap, &shared);
+        let overrides = find_first_with_class(&el, "workspace-overrides")
+            .expect("workspace-overrides subsection must be present");
+        let blocks = count_with_class(overrides, "shell-scope-block");
+        assert_eq!(
+            blocks,
+            snap.workspaces.len(),
+            "workspace overrides must have one block per workspace"
+        );
     }
 
     // -- build_keybinds_section -------------------------------------------------
 
     #[test]
-    fn keybinds_section_has_banner_thirteen_rows_and_footer() {
+    fn keybinds_section_has_banner_one_row_per_action_and_footer() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_keybinds_section(&snap, &shared);
-        // title + restart banner + error banner + 13 rows + footer
-        assert_eq!(el.children.len(), 17);
+        // title + restart banner + error banner + one row per action + footer
+        let expected = 4 + KeybindAction::ALL.len();
+        assert_eq!(el.children.len(), expected);
     }
 
     #[test]
@@ -1323,95 +1260,6 @@ mod tests {
         assert!(!error_banner.classes.contains(&"hidden".to_string()));
     }
 
-    // -- build_agents_section ---------------------------------------------------
-
-    #[test]
-    fn agents_section_has_expected_children() {
-        let snap = make_snapshot();
-        let shared = make_shared();
-        let el = build_agents_section(&snap, &shared);
-        // title + auto-discovery + timeout + header + 3 agent rows
-        assert_eq!(el.children.len(), 7);
-    }
-
-    #[test]
-    fn agents_section_claude_row_has_running_badge() {
-        let snap = make_snapshot();
-        let shared = make_shared();
-        let el = build_agents_section(&snap, &shared);
-        let claude_row = &el.children[4];
-        assert!(claude_row.classes.contains(&"agent-row".to_string()));
-        let controls = &claude_row.children[2];
-        let badge = &controls.children[0];
-        assert!(badge.classes.contains(&"agent-badge".to_string()));
-        assert!(badge.classes.contains(&"running".to_string()));
-    }
-
-    #[test]
-    fn agents_section_codex_toggle_is_off() {
-        let snap = make_snapshot();
-        let shared = make_shared();
-        let el = build_agents_section(&snap, &shared);
-        let codex_row = &el.children[6];
-        let controls = &codex_row.children[2];
-        let toggle = &controls.children[1];
-        assert!(toggle.classes.contains(&"toggle".to_string()));
-        assert!(!toggle.classes.contains(&"on".to_string()));
-    }
-
-    #[test]
-    fn agents_section_claude_toggle_is_on() {
-        let snap = make_snapshot();
-        let shared = make_shared();
-        let el = build_agents_section(&snap, &shared);
-        let claude_row = &el.children[4];
-        let controls = &claude_row.children[2];
-        let toggle = &controls.children[1];
-        assert!(toggle.classes.contains(&"on".to_string()));
-    }
-
-    #[test]
-    fn agents_list_header_has_count() {
-        let el = agent_list_header(3);
-        assert!(el.classes.contains(&"agent-list-header".to_string()));
-        assert_eq!(el.children.len(), 2);
-        let count = &el.children[1];
-        assert_eq!(text_of(count), Some("3"));
-    }
-
-    #[test]
-    fn agent_toggle_click_writes_to_agents_field() {
-        // refs #107 - agent enabled state lives in `state.agents`, not in
-        // the generic `state.toggles` map. Clicking an agent row's toggle
-        // must flip the corresponding `Agent::enabled` field.
-        let shared = make_shared();
-        let snap = make_snapshot();
-        let el = build_agents_section(&snap, &shared);
-        let claude_row = &el.children[4];
-        let toggle = &claude_row.children[2].children[1];
-
-        let was_on = agent_enabled(&shared.lock().unwrap().ui_snapshot(), AgentKey::Claude);
-        (toggle.on_click.as_ref().unwrap())();
-        let is_on_now = agent_enabled(&shared.lock().unwrap().ui_snapshot(), AgentKey::Claude);
-        assert_ne!(was_on, is_on_now);
-    }
-
-    #[test]
-    fn agent_toggle_click_does_not_touch_toggles_map() {
-        // refs #107 - before the split, agent toggles wrote to `state.toggles`.
-        // After the split they must only touch `state.agents`.
-        let shared = make_shared();
-        let snap = make_snapshot();
-        let el = build_agents_section(&snap, &shared);
-        let claude_row = &el.children[4];
-        let toggle = &claude_row.children[2].children[1];
-
-        let toggles_before = shared.lock().unwrap().toggles.clone();
-        (toggle.on_click.as_ref().unwrap())();
-        let toggles_after = shared.lock().unwrap().toggles.clone();
-        assert_eq!(toggles_before, toggles_after);
-    }
-
     // -- build_modal_footer -----------------------------------------------------
 
     #[test]
@@ -1467,26 +1315,6 @@ mod tests {
         assert_eq!(meta.children.len(), 2);
     }
 
-    // -- toggle_button ----------------------------------------------------------
-
-    #[test]
-    fn toggle_button_on_has_on_class() {
-        let shared = make_shared();
-        let el = toggle_button(true, ToggleKey::GlowEffect, &shared);
-        assert!(el.classes.contains(&"toggle".to_string()));
-        assert!(el.classes.contains(&"on".to_string()));
-        assert!(el.on_click.is_some());
-    }
-
-    #[test]
-    fn toggle_button_off_lacks_on_class() {
-        let shared = make_shared();
-        let el = toggle_button(false, ToggleKey::GlowEffect, &shared);
-        assert!(el.classes.contains(&"toggle".to_string()));
-        assert!(!el.classes.contains(&"on".to_string()));
-        assert!(el.on_click.is_some());
-    }
-
     // -- closure invocation tests ----------------------------------------------
 
     #[test]
@@ -1500,21 +1328,10 @@ mod tests {
     }
 
     #[test]
-    fn nav_item_click_changes_section() {
-        let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::General, &shared);
-        (el.children[1].on_click.as_ref().unwrap())();
-        assert_eq!(
-            shared.lock().unwrap().settings_section,
-            SettingsSection::Appearance
-        );
-    }
-
-    #[test]
     fn nav_item_click_changes_to_shell() {
         let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::General, &shared);
-        (el.children[2].on_click.as_ref().unwrap())();
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
+        (el.children[1].on_click.as_ref().unwrap())();
         assert_eq!(
             shared.lock().unwrap().settings_section,
             SettingsSection::Shell
@@ -1524,8 +1341,8 @@ mod tests {
     #[test]
     fn nav_item_click_changes_to_keybinds() {
         let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::General, &shared);
-        (el.children[3].on_click.as_ref().unwrap())();
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
+        (el.children[2].on_click.as_ref().unwrap())();
         assert_eq!(
             shared.lock().unwrap().settings_section,
             SettingsSection::Keybinds
@@ -1533,13 +1350,24 @@ mod tests {
     }
 
     #[test]
-    fn nav_item_click_changes_to_agents() {
+    fn nav_item_click_changes_to_sessions() {
         let shared = make_shared();
-        let el = build_modal_nav(SettingsSection::General, &shared);
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
+        (el.children[3].on_click.as_ref().unwrap())();
+        assert_eq!(
+            shared.lock().unwrap().settings_section,
+            SettingsSection::Sessions
+        );
+    }
+
+    #[test]
+    fn nav_item_click_changes_to_danger_zone() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
         (el.children[4].on_click.as_ref().unwrap())();
         assert_eq!(
             shared.lock().unwrap().settings_section,
-            SettingsSection::Agents
+            SettingsSection::DangerZone
         );
     }
 
@@ -1600,36 +1428,6 @@ mod tests {
     }
 
     #[test]
-    fn toggle_button_click_toggles_state() {
-        let shared = make_shared();
-        let key = ToggleKey::StartMinimized;
-        let el = toggle_button(false, key, &shared);
-        assert!(!shared
-            .lock()
-            .unwrap()
-            .toggles
-            .get(&key)
-            .copied()
-            .unwrap_or(false));
-        (el.on_click.as_ref().unwrap())();
-        assert!(shared
-            .lock()
-            .unwrap()
-            .toggles
-            .get(&key)
-            .copied()
-            .unwrap_or(false));
-        (el.on_click.as_ref().unwrap())();
-        assert!(!shared
-            .lock()
-            .unwrap()
-            .toggles
-            .get(&key)
-            .copied()
-            .unwrap_or(false));
-    }
-
-    #[test]
     fn cancel_button_click_closes_modal() {
         let shared = make_shared();
         shared.lock().unwrap().settings_open = true;
@@ -1654,99 +1452,19 @@ mod tests {
     // -- helper widget tests ----------------------------------------------------
 
     #[test]
-    fn select_display_has_input_and_select_classes() {
-        let el = select_display("bash");
-        assert!(el.classes.contains(&"input".to_string()));
-        assert!(el.classes.contains(&"select".to_string()));
-        assert_eq!(text_of(&el), Some("bash"));
-    }
-
-    #[test]
-    fn text_input_display_has_input_class() {
-        let el = text_input_display("~/path");
-        assert!(el.classes.contains(&"input".to_string()));
-        assert_eq!(text_of(&el), Some("~/path"));
-    }
-
-    #[test]
-    fn compact_input_display_has_compact_modifier() {
-        let el = compact_input_display("stuff");
-        assert!(el.classes.contains(&"input".to_string()));
-        assert!(el.classes.contains(&"compact".to_string()));
-    }
-
-    #[test]
-    fn stepper_without_callbacks_disables_buttons() {
-        let el = stepper("1.4", None);
-        assert!(el.classes.contains(&"stepper".to_string()));
-        assert_eq!(el.children.len(), 3);
-        let val = &el.children[1];
-        assert_eq!(text_of(val), Some("1.4"));
-        let dec = &el.children[0];
-        let inc = &el.children[2];
-        assert!(dec.classes.contains(&"disabled".to_string()));
-        assert!(inc.classes.contains(&"disabled".to_string()));
-        assert!(dec.on_click.is_none());
-        assert!(inc.on_click.is_none());
-    }
-
-    #[test]
-    fn stepper_with_callbacks_wires_handlers() {
+    fn stepper_wires_callbacks_to_buttons() {
         let callbacks = StepCallbacks {
             on_dec: Box::new(|| {}),
             on_inc: Box::new(|| {}),
         };
-        let el = stepper("7", Some(callbacks));
+        let el = stepper("7", callbacks);
+        assert!(el.classes.contains(&"stepper".to_string()));
+        assert_eq!(el.children.len(), 3);
         let dec = &el.children[0];
         let inc = &el.children[2];
-        assert!(!dec.classes.contains(&"disabled".to_string()));
+        assert_eq!(text_of(&el.children[1]), Some("7"));
         assert!(dec.on_click.is_some());
         assert!(inc.on_click.is_some());
-    }
-
-    #[test]
-    fn cursor_style_group_marks_block_active() {
-        let el = cursor_style_group();
-        assert!(el.classes.contains(&"cursor-group".to_string()));
-        assert!(el.children[0].classes.contains(&"active".to_string()));
-        assert!(!el.children[1].classes.contains(&"active".to_string()));
-        assert!(!el.children[2].classes.contains(&"active".to_string()));
-    }
-
-    #[test]
-    fn slider_control_has_slider_and_val() {
-        let el = slider_control("75%");
-        assert!(el.classes.contains(&"slider-control".to_string()));
-        assert_eq!(el.children.len(), 2);
-        assert!(el.children[0].classes.contains(&"slider".to_string()));
-        assert_eq!(text_of(&el.children[1]), Some("75%"));
-    }
-
-    #[test]
-    fn agent_badge_has_kind_class() {
-        let el = agent_badge("running", "running");
-        assert!(el.classes.contains(&"agent-badge".to_string()));
-        assert!(el.classes.contains(&"running".to_string()));
-        assert_eq!(text_of(&el), Some("running"));
-    }
-
-    #[test]
-    fn agent_row_has_icon_info_and_controls() {
-        let shared = make_shared();
-        let spec = AgentSpec {
-            name: "test",
-            path: "~/bin/test",
-            status: AgentStatus::Idle,
-            key: AgentKey::Amp,
-        };
-        let el = agent_row(&spec, true, &shared);
-        assert!(el.classes.contains(&"agent-row".to_string()));
-        assert_eq!(el.children.len(), 3);
-        assert!(el.children[0].classes.contains(&"agent-icon".to_string()));
-        assert!(el.children[1].classes.contains(&"agent-info".to_string()));
-        assert!(el.children[2]
-            .classes
-            .contains(&"agent-controls".to_string()));
     }
 
     // -- build_sessions_section -------------------------------------------------

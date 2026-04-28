@@ -24,6 +24,10 @@ pub enum KeybindAction {
     SplitRight,
     SplitDown,
     Unsplit,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
     NextTab,
     PrevTab,
     CommandPalette,
@@ -42,6 +46,10 @@ impl KeybindAction {
         Self::SplitRight,
         Self::SplitDown,
         Self::Unsplit,
+        Self::FocusLeft,
+        Self::FocusRight,
+        Self::FocusUp,
+        Self::FocusDown,
         Self::NextTab,
         Self::PrevTab,
         Self::CommandPalette,
@@ -60,6 +68,10 @@ impl KeybindAction {
             Self::SplitRight => "split_right",
             Self::SplitDown => "split_down",
             Self::Unsplit => "unsplit",
+            Self::FocusLeft => "focus_left",
+            Self::FocusRight => "focus_right",
+            Self::FocusUp => "focus_up",
+            Self::FocusDown => "focus_down",
             Self::NextTab => "next_tab",
             Self::PrevTab => "prev_tab",
             Self::CommandPalette => "command_palette",
@@ -84,6 +96,10 @@ impl KeybindAction {
             Self::SplitRight => "Split right",
             Self::SplitDown => "Split down",
             Self::Unsplit => "Unsplit",
+            Self::FocusLeft => "Focus pane left",
+            Self::FocusRight => "Focus pane right",
+            Self::FocusUp => "Focus pane up",
+            Self::FocusDown => "Focus pane down",
             Self::NextTab => "Next tab",
             Self::PrevTab => "Previous tab",
             Self::CommandPalette => "Command palette",
@@ -106,6 +122,10 @@ impl KeybindAction {
             Self::SplitRight => "pane.split_right",
             Self::SplitDown => "pane.split_down",
             Self::Unsplit => "pane.close",
+            Self::FocusLeft => "pane.focus_left",
+            Self::FocusRight => "pane.focus_right",
+            Self::FocusUp => "pane.focus_up",
+            Self::FocusDown => "pane.focus_down",
             Self::NextTab => "tab.next",
             Self::PrevTab => "tab.prev",
             Self::CommandPalette => "palette.toggle",
@@ -125,6 +145,10 @@ impl KeybindAction {
             Self::SplitRight => "Ctrl+D",
             Self::SplitDown => "Ctrl+Shift+D",
             Self::Unsplit => "Ctrl+W",
+            Self::FocusLeft => "Ctrl+Left",
+            Self::FocusRight => "Ctrl+Right",
+            Self::FocusUp => "Ctrl+Up",
+            Self::FocusDown => "Ctrl+Down",
             Self::NextTab => "Ctrl+Tab",
             Self::PrevTab => "Ctrl+Shift+Tab",
             Self::CommandPalette => "Ctrl+K",
@@ -148,8 +172,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_has_thirteen_variants() {
-        assert_eq!(KeybindAction::ALL.len(), 13);
+    fn all_has_seventeen_variants() {
+        assert_eq!(KeybindAction::ALL.len(), 17);
     }
 
     #[test]
@@ -249,6 +273,19 @@ mod tests {
             "pane.split_down"
         );
         assert_eq!(KeybindAction::Unsplit.dispatch_command(), "pane.close");
+        assert_eq!(
+            KeybindAction::FocusLeft.dispatch_command(),
+            "pane.focus_left"
+        );
+        assert_eq!(
+            KeybindAction::FocusRight.dispatch_command(),
+            "pane.focus_right"
+        );
+        assert_eq!(KeybindAction::FocusUp.dispatch_command(), "pane.focus_up");
+        assert_eq!(
+            KeybindAction::FocusDown.dispatch_command(),
+            "pane.focus_down"
+        );
         assert_eq!(KeybindAction::NextTab.dispatch_command(), "tab.next");
         assert_eq!(KeybindAction::PrevTab.dispatch_command(), "tab.prev");
         assert_eq!(

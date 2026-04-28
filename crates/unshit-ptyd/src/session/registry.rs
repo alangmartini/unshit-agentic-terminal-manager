@@ -62,13 +62,23 @@ impl SessionRegistry {
         rows: u16,
         cwd: Option<&Path>,
         shell: Option<&str>,
+        shell_args: &[String],
         workspace_id: u32,
         pane_id: u32,
         name: Option<String>,
     ) -> std::io::Result<(u64, mpsc::Receiver<Vec<u8>>)> {
         let id = self.next_id();
-        let (session, rx) =
-            Session::spawn(id, cols, rows, cwd, shell, workspace_id, pane_id, name)?;
+        let (session, rx) = Session::spawn(
+            id,
+            cols,
+            rows,
+            cwd,
+            shell,
+            shell_args,
+            workspace_id,
+            pane_id,
+            name,
+        )?;
         let mut guard = self.sessions.lock().await;
         guard.insert(id, session);
         Ok((id, rx))
@@ -269,7 +279,7 @@ mod tests {
     async fn snapshot_round_trips_through_registry() {
         let reg = SessionRegistry::new();
         let (id, mut rx) = reg
-            .spawn(100, 30, None, Some(test_shell()), 0, 0, None)
+            .spawn(100, 30, None, Some(test_shell()), &[], 0, 0, None)
             .await
             .expect("spawn");
 
@@ -293,7 +303,16 @@ mod tests {
     async fn spawn_stores_workspace_and_pane_metadata() {
         let reg = SessionRegistry::new();
         let (id, _rx) = reg
-            .spawn(80, 24, None, Some(test_shell()), 4, 2, Some("alpha".into()))
+            .spawn(
+                80,
+                24,
+                None,
+                Some(test_shell()),
+                &[],
+                4,
+                2,
+                Some("alpha".into()),
+            )
             .await
             .expect("spawn");
 
@@ -310,11 +329,20 @@ mod tests {
     async fn list_returns_full_metadata_for_every_session() {
         let reg = SessionRegistry::new();
         let (a, _rx_a) = reg
-            .spawn(80, 24, None, Some(test_shell()), 1, 0, Some("a".into()))
+            .spawn(
+                80,
+                24,
+                None,
+                Some(test_shell()),
+                &[],
+                1,
+                0,
+                Some("a".into()),
+            )
             .await
             .expect("spawn a");
         let (b, _rx_b) = reg
-            .spawn(90, 30, None, Some(test_shell()), 2, 1, None)
+            .spawn(90, 30, None, Some(test_shell()), &[], 2, 1, None)
             .await
             .expect("spawn b");
 
@@ -349,7 +377,7 @@ mod tests {
     async fn attach_returns_receiver_for_known_session() {
         let reg = SessionRegistry::new();
         let (id, _original_rx) = reg
-            .spawn(80, 24, None, Some(test_shell()), 0, 0, None)
+            .spawn(80, 24, None, Some(test_shell()), &[], 0, 0, None)
             .await
             .expect("spawn");
 
@@ -363,7 +391,7 @@ mod tests {
     async fn detach_returns_true_for_known_session() {
         let reg = SessionRegistry::new();
         let (id, _rx) = reg
-            .spawn(80, 24, None, Some(test_shell()), 0, 0, None)
+            .spawn(80, 24, None, Some(test_shell()), &[], 0, 0, None)
             .await
             .expect("spawn");
 

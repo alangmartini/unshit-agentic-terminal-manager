@@ -1,162 +1,156 @@
-# TODO: Split Panel Functionality
+# TODO: Configurable default shell
 
-Implementation checklist derived from `tasks/plan.md`. Check items off as they land.
+Implementation checklist derived from `tasks/plan.md`. Check items off as they land. Each task ends with `cargo test && cargo clippy --all-targets --all-features && cargo fmt --check` clean.
 
-## Phase A: Hotkey plumbing (F2 + F3)
+## Phase 1: Foundation
 
-### A1: `KeybindAction` enum and default-combo map [DONE]
-- [x] Create `src/keybinds/mod.rs` with `KeybindAction` enum (13 variants)
-- [x] Add `dispatch_command`, `default_combo`, `label`, `id` methods
-- [x] Unit tests: id round-trip, default_combo parses, dispatch_command matches state.rs
-- [x] `cargo test keybinds::` green (10/10)
+- [x] **Task 1: `ShellSpec` type + `resolve()`** [DONE]
+  - [x] Create `src/shell.rs` with `ShellSpec { program, args }`, `is_empty()`, and `resolve(workspace, app)`.
+  - [x] Add `pub mod shell;` to `src/main.rs`.
+  - [x] Unit tests: `is_empty`, `resolve` (workspace wins, fallback, both empty), serde round trip with empty args defaulted in.
+  - [x] `cargo test --bin terminal-manager shell::` green (10/10).
 
-### A2: Register defaults and route dispatch through registry [DONE]
-- [x] Locate `ShortcutResolver` construction; register all 13 defaults on startup
-- [x] Wire `Ctrl+Shift+V` (SplitRight alias), `Ctrl+Shift+H` (SplitDown alias), `Ctrl+Shift+W` (Unsplit)
-- [x] Refactor `user_shortcut_bindings` to derive from `KeybindAction::ALL`
-- [x] Unit tests: aliases, Ctrl+W = tab.close.active, Ctrl+Shift+W = pane.close, system shortcuts intact
-- [ ] Visual verify: all three new combos plus all existing combos still work (pending user)
+### Checkpoint
+- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean (terminal-manager package). No behavior change.
 
-### A3: Last-pane-closes-tab semantics in `pane.close` [DONE]
-- [x] Verified existing behavior (mutate_close_pane:984-991); no code change needed
-- [x] Added `dispatch_pane_close_on_last_pane_closes_tab` regression test (locks down Unsplit semantics via dispatch path)
-- [x] Added `close_pane_absorbs_ratio_into_neighbor` (pins ratio math)
-- [x] 559/559 tests green
+## Phase 2: Daemon honors `shell_args`
 
-### Checkpoint 1
-- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green
-- [ ] User visual verification sign-off
-- [ ] PR 1: "feat: keybind registry for split actions"
-- [ ] PR 2: "feat: unsplit closes last-pane tab"
+- [x] **Task 2: Additive `shell_args` field on `SpawnSession`** [DONE]
+  - [x] Add `shell_args: Vec<String>` (with `#[serde(default, skip_serializing_if = "Vec::is_empty")]`) to `Request::SpawnSession`.
+  - [x] Update `Client::spawn_session` signature.
+  - [x] Update `Session::spawn` to forward args via new `pty::build_spawn_args` helper.
+  - [x] Test: old wire payload (no `shell_args` key) deserializes with empty vector.
+  - [x] Test: round trip with `shell_args = ["--login", "-i"]`.
+  - [x] Test: empty `shell_args` is omitted from the wire (old daemon compat).
+  - [x] Test: IPC integration test spawns `cmd.exe /C echo MARKER` (Windows) / `/bin/sh -c echo MARKER` (Unix), asserts MARKER in output stream.
+  - [x] Test: `build_spawn_args` appends PowerShell `-NoExit -Command "Set-Location ..."` AFTER user args.
+  - [x] Updated 12 test call sites + handler + registry + UI shim (`src/pty.rs`).
+  - [x] `cargo test -p unshit-ptyd` green (141 unit + all integration tests).
 
----
+- [x] **Task 3: `DaemonPty` shim carries `ShellSpec`** [DONE]
+  - [x] `DaemonPty::spawn_in` and `attach_or_spawn` accept `Option<&ShellSpec>`.
+  - [x] `Command::Spawn` enum variant carries `(shell, shell_args)`.
+  - [x] Worker forwards them to `client.spawn_session`.
+  - [x] Updated 4 call sites in `src/main.rs:458` and `src/state.rs:868`, `:1073`, `:1132` to pass `None` (Task 4 wires real values).
+  - [x] Updated 1 call site in `src/bridge.rs:233` to pass `None`.
+  - [x] Private helper `shell_spec_to_wire` normalizes `None` and empty `ShellSpec` to `(None, vec![])`.
+  - [x] Tests: 3 unit (`shell_spec_to_wire_*`) + 1 integration (`spawn_in_with_shell_spec_routes_program_to_daemon`).
+  - [x] `cargo test --bin terminal-manager pty::` green (19/19); full suite 823 pass.
 
-## Phase B: Editable keybinds (F5)
+### Checkpoint
+- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
+- [ ] `cargo run` opens default shell exactly as before (no UI for shell selection yet).
 
-### B1: JSON persistence [DONE]
-- [x] Create `src/keybinds/loader.rs`
-- [x] `load_user_keybinds` with missing-file and malformed-file fallbacks + unknown-id/bad-combo skip
-- [x] `save_user_keybinds` with atomic write (`.tmp` + rename)
-- [x] Config dir matches existing app usage (`com.godly.terminal` namespace under `dirs::config_dir()`)
-- [x] 10/10 unit tests green (round-trip, missing, malformed, atomic, overwrite, parent-dir, empty, namespace)
+## Phase 3: App wide default
 
-### B2: `AppState.keybinds` + dispatch arms [DONE]
-- [x] Add `keybinds: KeybindsState` to `AppState` (sparse overrides, recording, error)
-- [x] Load overrides on startup via `load_if_installed` in `seed_state`
-- [x] Implement `keybind.set:<action>:<combo>` with conflict + invalid-combo errors
-- [x] Implement `keybind.reset:<action>` and `keybind.reset_all`
-- [x] Add `keybind.record:<action>` and `keybind.cancel_record` dispatch arms
-- [x] 12 KeybindsState unit tests + 8 dispatch tests green (all 589/589 suite)
-- [x] `user_shortcut_bindings()` now honors saved overrides on startup (restart-to-apply per user's option-1 choice)
-- [x] Persistence path installed in `main.rs` alongside `persist::install`
+- [x] **Task 4: `AppState.default_shell` + persistence + first time inference + initial spawn** [DONE]
+  - [x] Added `default_shell: ShellSpec` to `AppState` (initialized in `seed_state` via `infer_default_shell(&discover_installed())`).
+  - [x] Added `default_shell: ShellSpec` to `UiSnapshot`.
+  - [x] Added `default_shell: ShellSpec` to `PersistedState` with `#[serde(default)]`.
+  - [x] Wired load / save (`from_state`, restoration in `main.rs:391`).
+  - [x] First time inference in `seed_state`: prefers `pwsh`, then `powershell`, else empty (daemon falls back).
+  - [x] `discover_installed()` minimal PATH probe for `pwsh` / `powershell` (full impl in Task 7).
+  - [x] Updated `main.rs:458` initial spawn to call `shell::resolve(None, Some(&guard.default_shell))`.
+  - [x] Test: old `workspaces.json` without `default_shell` loads with `ShellSpec::default()` (`deserializes_with_default_shell_when_field_is_missing`).
+  - [x] Test: round trip preserves a non default `default_shell` (`round_trip_preserves_non_default_default_shell`).
+  - [x] Test: inference with `[pwsh, powershell]` picks `pwsh` (`infer_default_shell_prefers_pwsh_over_powershell`).
+  - [x] `cargo test --bin terminal-manager`: 830 passed (up from 823, +7 new). clippy + fmt clean.
 
-### B3: Editable Settings > Keybinds UI [DONE]
-- [x] Replace static `keybind_row` block with dynamic builder over `AppState.keybinds`
-- [x] Row layout: Label | Combo button | Reset button | Conflict indicator + restart/error banners
-- [x] Click combo -> enter recording mode; "Press keys... (Esc to cancel)"
-- [x] Framework `on_raw_key` hook added; `main.rs` consumes keys while recording
-- [x] Intercept next combo; Escape cancels; any other combo fires `keybind.set`
-- [x] Conflict indicator: red border on cell + error banner at top
-- [x] "Reset all" button dispatches `keybind.reset_all`; per-row reset when overridden
-- [x] 6 new unit tests green (section children count, row content, recording state, override reset button, error banner)
-- [x] CSS for banner, error banner, recording cell, conflict cell, per-row reset
-- [ ] Visual verify: remap, restart, confirm persistence (pending user)
+- [x] **Task 5: All other spawn sites resolve and pass spec** [DONE]
+  - [x] Updated three sites in `src/state.rs` (`mutate_add_tab`, `mutate_split_right`, `mutate_split_down`) to use new `pane_spawn_shell(state)` helper.
+  - [x] Updated `src/bridge.rs:233` resize-loop attach_or_spawn to use the same helper.
+  - [x] Grep audit: only the `DaemonPty::spawn` shorthand still passes `None` literally and no production code calls it.
+  - [x] Test: `add_tab_records_resolved_default_shell_on_pty_shim` (dispatch with `default_shell` set spawns the configured shell).
+  - [x] Test: `add_tab_with_empty_default_shell_does_not_record_a_shell` (daemon falls back when default cleared).
+  - [x] Test: `split_right_records_*` and `split_down_records_*` cover the split sites.
+  - [x] Added `DaemonPty::spawn_shell` accessor (mirrors `spawn_cwd`) so unit tests can assert what was forwarded without standing up a daemon.
+  - [x] `cargo test --bin terminal-manager`: 836 passed (up from 830, +6 new). clippy + fmt clean.
 
-### Checkpoint 2
-- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green
-- [ ] User visual sign-off on remap + restart + conflict flow
-- [ ] PR 3: "feat: editable keybinds with conflict detection and persistence"
+### Checkpoint
+- [x] `cargo test` green.
+- [ ] Manual: edit `workspaces.json` to set `"default_shell": { "program": "/bin/bash", "args": [] }`, restart, open a new pane, confirm `bash` runs (`echo $0`).
 
----
+## Phase 4: Per workspace override
 
-## Phase C: Pane extract to tab (F4)
+- [x] **Task 6: Per workspace `shell` field** [DONE]
+  - [x] Added `shell: ShellSpec` to `state::Workspace` (initialized in `new_workspace`, `seed_state`, all test helpers).
+  - [x] Added `shell: ShellSpec` to `persist::PersistedWorkspace` with `#[serde(default)]`.
+  - [x] Updated `from_state` to copy `w.shell` and `main.rs` restoration loop to thread `entry.shell` back.
+  - [x] `pane_spawn_shell` now consults the active workspace via `shell::resolve(Some(&active_ws.shell), Some(&state.default_shell))`.
+  - [x] Test: `pane_spawn_shell_prefers_active_workspace_shell_over_app_default`.
+  - [x] Test: `pane_spawn_shell_uses_correct_workspace_after_switch` (state-level dispatch with two workspaces).
+  - [x] Test: `pane_spawn_shell_falls_back_to_app_default_when_workspace_shell_is_empty`.
+  - [x] Persist round trip + missing-field tests cover `PersistedWorkspace.shell`.
+  - [x] `cargo test --bin terminal-manager`: 841 passed (up from 836, +5 new). clippy + fmt clean.
 
-### C1: Pane header visibility + grip [DONE]
-- [x] `build_pane` omits `build_pane_header` entirely when single_pane
-- [x] Added `icon_grip` (6-dot SVG) and wired into `pane-header-left`
-- [x] CSS: `.pane-grip` with `cursor: grab` / `grabbing`, opacity fades on hover/active
-- [x] Click-to-focus on the pane container still works (grip inherits)
-- [x] Updated existing test `pane_header_left_has_grip_dot_title_subtitle` for new 4-child order
-- [x] New tests `single_pane_tab_omits_pane_header` and `multi_pane_tab_renders_header_with_grip`
-- [x] 588/588 tests green, clippy clean
+### Checkpoint
+- [x] `cargo test` green.
+- [ ] Manual: give two workspaces different `shell.program` values via `workspaces.json`, restart, open a tab in each, confirm each opens the right shell.
 
-### C2: Drag state + `pane.extract_to_tab` dispatch [DONE]
-- [x] Create `src/drag/mod.rs` with `DragState` enum (`Idle`, `DraggingPane`)
-- [x] Add `AppState.drag` (+ `UiSnapshot.drag`, default Idle)
-- [x] Implement `drag.start_pane:<pane>:<x>:<y>`, `drag.update:<x>:<y>`, `drag.end` dispatch arms (7 new tests)
-- [x] Implement `pane.extract_to_tab:<pane>:<index>`: PTY handle preserved, ratios reflowed, new tab activated (9 new tests)
-- [x] PTY handoff verified via Arc::strong_count — no respawn
-- [x] 607/607 tests green, clippy/fmt clean
+## Phase 5: Discovery and dispatch
 
-### C3: Header `on_drag` + tab bar drop target [DONE]
-- [x] `on_drag` attached to `.pane-grip` in `build_pane_header`; framework handles 4px threshold
-- [x] `DragPhase::Start/Update/End` dispatch to `drag.start_pane` / `drag.update` / `drag.end`
-- [x] Tab bar `on_resize` records absolute `tabbar_rect` (x = sidebar + resizer, y = titlebar height)
-- [x] `pane_drag_insertion_index` renders vertical `.tab-drop-placeholder` at computed slot
-- [x] `drag.end` dispatch extracts pane into new tab when cursor lies in `tabbar_rect`
-- [x] Pure hit-test helpers (`Rect::contains`, `resolve_tabbar_drop`) with 8 table-driven tests
-- [x] Grip handler end-to-end test: simulate Start/Update/End -> new tab appears, drag state clears
-- [x] 627/627 tests green, clippy clean, fmt clean
-- [ ] Visual verify: drag pane grip onto tab bar, placeholder appears, drop creates new tab (pending user)
+- [x] **Task 7: `discover_installed` shell scan** [DONE]
+  - [x] Replaced the Task 4 stub with a full PATH walk over `STEMS = [pwsh, powershell, cmd, bash, zsh, fish, nu, wsl]`.
+  - [x] Windows: probes `C:\Program Files\Git\bin\bash.exe` and `C:\Windows\System32\wsl.exe` via `fixed_well_known_paths`.
+  - [x] Dedupes by `std::fs::canonicalize` so symlinked / aliased shells collapse to one entry.
+  - [x] Caps at `MAX_DISCOVERED = 16`; `'walk` label breaks early instead of overshooting.
+  - [x] Extracted `discover_from(path_dirs, fixed)` so unit tests can drive it without env access.
+  - [x] Test: `discover_from_finds_known_shell_in_a_path_dir` (returns at least one entry).
+  - [x] Test: `discover_installed_returns_stable_order_across_calls`.
+  - [x] Test: `discover_from_returns_empty_when_no_dirs_and_no_fixed` + `discover_installed_does_not_panic` (empty / unset PATH).
+  - [x] Tests: dedup-by-canonical, fixed-paths probe, missing-files-skipped, cap at MAX_DISCOVERED.
+  - [x] `cargo test --bin terminal-manager shell::`: 24/24 green. clippy + fmt clean.
 
-### Checkpoint 3
-- [ ] PTY state survives extraction (history, cwd, running process intact)
-- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green
-- [ ] User visual sign-off
-- [ ] PR 4: "feat: drag pane header to tab bar to extract as tab"
+- [x] **Task 8: Dispatch handlers and persist trigger** [DONE]
+  - [x] Added arms for `shell.set_default:<json>`, `shell.set_workspace:<idx>:<json>`, `shell.clear_default`, `shell.clear_workspace:<idx>` in the main `dispatch` match.
+  - [x] Each helper parses, mutates, then calls `crate::persist::save_workspaces(state)`.
+  - [x] Test: `dispatch_shell_set_default_updates_state` and `dispatch_shell_set_workspace_updates_correct_workspace` cover the happy path.
+  - [x] Test: malformed JSON / missing payload / non-numeric index / out-of-range index all return false without panic (`with_malformed_*`, `with_out_of_range_index_*`).
+  - [x] Test: `dispatch_shell_clear_default_when_already_empty_still_returns_true` covers idempotent clear.
+  - [x] `cargo test --bin terminal-manager state::tests::dispatch_shell`: 12/12 green.
 
----
+### Checkpoint
+- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
 
-## Phase D: Tab drag with 5-zone drop (F1)
+## Phase 6: UI surfaces
 
-### D1: Drop-zone hit-testing [DONE]
-- [x] Create `src/drag/drop_zones.rs`
-- [x] `DropZone` enum + `hit_test(rect, cursor) -> Option<DropZone>`
-- [x] Edge zones = outer 25%; center = inner 50%; corner disambiguation (closer edge wins, tie -> vertical)
-- [x] 21 table-driven unit tests green; 659/659 suite, clippy/fmt clean
+- [x] **Task 9: Settings → Shell tab full editor; remove General placeholder** [DONE]
+  - [x] App default editor: chip group of `discover_installed` results + always visible custom path text input (Enter to apply, framework's `Tag::Input` doesn't seed initial value so placeholder shows current).
+  - [x] Always visible args text input under each scope; submit splits on whitespace and dispatches matching `shell.set_*`.
+  - [x] Per workspace overrides subsection: one `shell-scope-block` per workspace, with extra "Use default" chip that dispatches `shell.clear_workspace:<idx>`.
+  - [x] Each chip / submit dispatches via the new `ShellScope::{AppDefault, Workspace(idx)}` enum so no command strings are duplicated.
+  - [x] Removed the "Default shell" placeholder row from `build_general_section` and its now-orphan `select_display` helper + test.
+  - [x] Updated `general_section_has_title_and_five_rows` (was six) and added 7 new structural tests (`shell_section_starts_with_app_default_block`, `shell_section_includes_shell_picker_under_app_default_block`, `shell_picker_marks_active_chip_when_program_matches`, `shell_picker_for_workspace_includes_use_default_chip`, `shell_picker_for_app_default_omits_use_default_chip`, `shell_section_has_one_workspace_override_block_per_workspace`, `general_section_no_longer_has_default_shell_row`).
+  - [x] `cargo test --bin terminal-manager ui::settings`: 80 passed. clippy + fmt clean. Full suite 867.
+  - [ ] **Manual smoke test (per CLAUDE.md, deferred to user):**
+    - [ ] `cargo run`, open Settings → Shell.
+    - [ ] Pick a non default discovered shell, confirm new pane opens it.
+    - [ ] Type a non discovered path into the custom input, confirm a new pane uses it.
+    - [ ] Set a workspace override, confirm it wins inside that workspace.
+    - [ ] Restart, confirm picks survived.
 
-### D2: Overlay rendering [DONE]
-- [x] Create `src/drag/overlay.rs`
-- [x] Render 5-zone overlay per pane when `DragState::DraggingTab`
-- [x] Highlight hovered zone; others outlined
-- [x] `pointer-events: none` on overlay; hit-test driven by `DragState` cursor + `pane_rects`
-- [x] CSS additions (`.drop-zone-overlay`, `.drop-zone`, `.drop-zone.hovered`)
-- [x] `DragState::DraggingTab { source_tab, cursor_x, cursor_y }` variant added; `drag.update` now refreshes cursor for both pane and tab drags
-- [x] `AppState.pane_rects` and `pane.rect:<pane>:<x>:<y>:<w>:<h>` dispatch arm (6 new tests); overlay module has 14 unit tests; 678/678 suite green, clippy/fmt clean
+- [ ] **Task 10: Workspace context menu shell submenu**
+  - [ ] Locate the existing workspace context menu builder (likely `src/ui/sidebar.rs` or `src/ui/ctx_menu.rs`).
+  - [ ] Add a "Shell" submenu listing `discover_installed` results plus "Use app default" when an override is set.
+  - [ ] Picking an entry dispatches `shell.set_workspace:<idx>:<json>`; "Use app default" dispatches `shell.clear_workspace:<idx>`.
+  - [ ] Mark the currently selected entry as active.
+  - [ ] Unit test: menu builder structural test (label list + active marker + "Use app default" visible only when override set).
+  - [ ] Manual: right click each workspace, confirm the submenu works end to end.
 
-### D3: Tab drag source + `pane.drop_split` + `tab.reorder` [DONE]
-- [x] `on_drag` on each tab button dispatches `drag.start_tab:<id>:<x>:<y>` / `drag.update` / `drag.end`
-- [x] `DragState::DraggingTab { source_tab, cursor }` (added in D2)
-- [x] `drag.start_tab` / `drag.update` / `drag.end` dispatch arms
-- [x] `drag.end` (tab variant): tab-bar -> `mutate_tab_reorder`; edge zone -> `mutate_pane_drop_split`; center zone -> reorder next to active tab
-- [x] `pane.drop_split:<target>:<edge>` dispatch arm (reads source from drag state; rejects center and no-drag states)
-- [x] `tab.reorder:<source>:<index>` dispatch arm (preserves active tab by id)
-- [x] Source tab removed after edge drop (single-pane-source restriction for safety)
-- [x] Replaced stored `pane_rects` with pure `compute_pane_rects` + `grid_rect_from_state` used by both overlay and drag-end hit-test
-- [x] 20 new tests (reorder, drop_split per edge, dispatch arms, drag.end variants); 697/697 suite green, clippy/fmt clean
+### Checkpoint
+- [ ] Pause for human review before continuing to Phase 7.
 
-### D4: Wire overlay + ghost placeholder [DONE]
-- [x] `build_drop_zone_overlay` mounted at root in `main.rs` (same layer as drag ghost, Position::Fixed)
-- [x] Source tab gets `.tab.dragging` class (CSS fades it to 0.4 opacity); ghost extended to show tab label + subtitle
-- [x] Drop outside window falls through `dispatch_drag_end` tab branch with no hit and clears drag state
-- [x] 4 new tests (dragging-class on source tab only, ghost renders for tab drag with correct label, ghost `None` when dragged tab id missing)
-- [x] 701/701 suite green, clippy clean, fmt clean
-- [ ] Visual verify (pending user):
-  - [ ] Drag B onto A's right edge -> B becomes right split of A
-  - [ ] Drag B onto A's center -> B moves adjacent to A
-  - [ ] Drag B outside window -> cancel
+## Phase 7: Cleanup
 
-### Checkpoint 4
-- [ ] All prior keybinds still work
-- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` green
-- [ ] `cargo llvm-cov` no regression
-- [ ] User visual sign-off on full flow
-- [ ] PR 5: "feat: tab drag with 5-zone drop into pane edges or center"
+- [ ] **Task 11: Remove bench `SHELL=cmd.exe` override**
+  - [ ] Delete `std::env::set_var("SHELL", "cmd.exe")` at `src/main.rs:325`.
+  - [ ] Add regression test asserting the string is absent from `main.rs` source.
+  - [ ] If bench mode needs a deterministic shell, route it through `default_shell` config instead of env var mutation.
+  - [ ] `cargo test --lib bench_no_set_shell` green.
+  - [ ] `cargo build --features bench` succeeds (manual sanity).
 
----
-
-## Release
-
-- [ ] All 5 PRs merged into `feat/rust-terminal-manager`
-- [ ] Final `cargo run` smoke test: every feature works end-to-end
-- [ ] SPEC.md marked as implemented; open questions in §10 resolved or closed
+### Final checkpoint
+- [ ] All success criteria from `SPEC.md` verified.
+- [ ] `cargo test`, `cargo clippy --all-targets --all-features`, `cargo fmt --check` clean.
+- [ ] Full manual smoke test of the user flow performed (both UI surfaces, per workspace and app default).
+- [ ] PR ready for review.

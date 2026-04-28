@@ -267,6 +267,20 @@ pub fn build_powershell_cwd_args(dir: &Path) -> Vec<String> {
     ]
 }
 
+/// Compose the full args list for a spawn. User supplied args come
+/// first; the PowerShell cwd workaround (if applicable) is appended
+/// after so it runs once the user's profile + args have settled. For
+/// non PowerShell shells, only the user args are returned.
+pub fn build_spawn_args(shell: &str, user_args: &[String], cwd: Option<&Path>) -> Vec<String> {
+    let mut args: Vec<String> = user_args.to_vec();
+    if let Some(dir) = cwd {
+        if is_powershell_shell(shell) {
+            args.extend(build_powershell_cwd_args(dir));
+        }
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +546,60 @@ mod tests {
         // and we either fail to cd or (worse) execute injected code.
         let args = build_powershell_cwd_args(Path::new(r"C:\Users\a'b\proj"));
         assert_eq!(args[2], r"Set-Location -LiteralPath 'C:\Users\a''b\proj'");
+    }
+
+    // refs #140: build_spawn_args is the central place that combines a
+    // user supplied args list with the daemon side PowerShell cwd
+    // workaround. Order matters: user args must come first, the cwd
+    // workaround must be appended after so it runs once the user's
+    // profile / args have settled.
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn build_spawn_args_passes_user_args_through_for_non_powershell() {
+        let args = build_spawn_args("bash", &s(&["--login", "-i"]), None);
+        assert_eq!(args, s(&["--login", "-i"]));
+    }
+
+    #[test]
+    fn build_spawn_args_omits_powershell_cwd_args_for_non_powershell_shell() {
+        let args = build_spawn_args("bash", &s(&[]), Some(Path::new("/tmp")));
+        assert!(
+            args.is_empty(),
+            "non PowerShell shells must not get cwd workaround args, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_spawn_args_skips_powershell_cwd_args_when_no_cwd_given() {
+        let args = build_spawn_args("pwsh.exe", &s(&["-NoLogo"]), None);
+        assert_eq!(
+            args,
+            s(&["-NoLogo"]),
+            "no cwd means no Set-Location workaround; user args pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn build_spawn_args_appends_powershell_cwd_args_after_user_args() {
+        let args = build_spawn_args(
+            "pwsh.exe",
+            &s(&["-NoLogo"]),
+            Some(Path::new(r"C:\Users\alanm\project")),
+        );
+        assert_eq!(
+            args,
+            s(&[
+                "-NoLogo",
+                "-NoExit",
+                "-Command",
+                r"Set-Location -LiteralPath 'C:\Users\alanm\project'",
+            ]),
+            "PowerShell cwd workaround must come AFTER user args so the user's \
+             profile + args run first and the workaround takes effect last"
+        );
     }
 }

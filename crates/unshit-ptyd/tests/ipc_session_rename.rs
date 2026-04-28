@@ -20,7 +20,7 @@ async fn rename_session_updates_list_output() {
 
     let (mut client, _events) = common::connect_with_events_retry(&path).await;
     let Response::SessionSpawned { session_id, .. } = client
-        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 0, None)
+        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), vec![], 0, 0, None)
         .await
         .unwrap()
     else {

@@ -635,6 +635,15 @@ pub struct BatchRange {
     pub glyph_keys: Vec<GlyphKey>,
     /// Glyph atlas generation this range was built against.
     pub atlas_generation: u64,
+    /// Backdrop boundaries emitted within this node's subtree. Prefix counts
+    /// are stored RELATIVE to the snapshot's quad_start / glyph_start /
+    /// svg_start / image_start / canvas_start. Replay restores absolute
+    /// prefixes against the current layer state. Without this, cache replay
+    /// silently drops the boundary, the blur pass never runs on subsequent
+    /// frames, and elements behind a `backdrop-filter` overlay alternate
+    /// between blurred and unblurred whenever the renderer takes the cache
+    /// path (issues #143, #142).
+    pub backdrop_boundaries: Vec<BackdropBoundary>,
 }
 
 /// Per-frame cache that stores the actual `QuadInstance` and `GlyphInstance`
@@ -685,8 +694,11 @@ impl BatchCache {
         self.pending.clear();
     }
 
-    /// Record the quads, glyphs, SVG draws, and draw spans emitted for
-    /// `node_id` on `layer_index` during the current frame into the staging map.
+    /// Record the primitives emitted for `node_id` on `layer_index` during
+    /// the current frame into the staging map. `backdrop_boundaries` carry
+    /// prefix counts relative to the snapshot's primitive start indices; the
+    /// replay path restores absolute prefixes.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         node_id: NodeId,
@@ -697,10 +709,19 @@ impl BatchCache {
         draw_spans: Vec<DrawSpan>,
         glyph_keys: Vec<GlyphKey>,
         atlas_generation: u64,
+        backdrop_boundaries: Vec<BackdropBoundary>,
     ) {
         self.pending.insert(
             (node_id, layer_index),
-            BatchRange { quads, glyphs, svgs, draw_spans, glyph_keys, atlas_generation },
+            BatchRange {
+                quads,
+                glyphs,
+                svgs,
+                draw_spans,
+                glyph_keys,
+                atlas_generation,
+                backdrop_boundaries,
+            },
         );
     }
 
@@ -1172,6 +1193,9 @@ fn walk_for_batch(
             let lb = batch.layer_mut(effective_layer);
             let quad_offset = lb.quad_instances.len() as u32;
             let glyph_offset = lb.glyph_instances.len() as u32;
+            let svg_offset = lb.svg_draws.len() as u32;
+            let image_offset = lb.image_batches.len() as u32;
+            let canvas_offset = lb.canvas_callbacks.len() as u32;
             lb.quad_instances.extend_from_slice(&cached.quads);
             lb.glyph_instances.extend_from_slice(&cached.glyphs);
             lb.svg_draws.extend_from_slice(&cached.svgs);
@@ -1184,6 +1208,24 @@ fn walk_for_batch(
                     kind: span.kind,
                     start: span.start + offset,
                     count: span.count,
+                });
+            }
+            // Restore backdrop boundaries with absolute prefixes adjusted to
+            // the current layer state. Without this, the blur pass never
+            // runs on cache-hit frames and elements behind a
+            // `backdrop-filter` overlay alternate between blurred and
+            // unblurred whenever the cache path is taken.
+            for b in &cached.backdrop_boundaries {
+                lb.backdrop_boundaries.push(BackdropBoundary {
+                    rect: b.rect,
+                    clip_rect: b.clip_rect,
+                    blur_radius: b.blur_radius,
+                    quad_prefix: b.quad_prefix + quad_offset,
+                    glyph_prefix: b.glyph_prefix + glyph_offset,
+                    svg_prefix: b.svg_prefix + svg_offset,
+                    image_batch_prefix: b.image_batch_prefix + image_offset,
+                    canvas_prefix: b.canvas_prefix + canvas_offset,
+                    dirty: b.dirty,
                 });
             }
             if let Some(parent_keys) = parent_glyph_keys {
@@ -1203,6 +1245,9 @@ fn walk_for_batch(
     let glyph_start = batch.layer_mut(effective_layer).glyph_instances.len();
     let svg_start = batch.layer_mut(effective_layer).svg_draws.len();
     let span_start = batch.layer_mut(effective_layer).draw_spans.len();
+    let image_start = batch.layer_mut(effective_layer).image_batches.len();
+    let canvas_start = batch.layer_mut(effective_layer).canvas_callbacks.len();
+    let boundary_start = batch.layer_mut(effective_layer).backdrop_boundaries.len();
     let mut node_glyph_keys: FxHashSet<GlyphKey> = FxHashSet::default();
 
     // Running cursors for draw span tracking. Updated after each flush.
@@ -2208,6 +2253,9 @@ fn walk_for_batch(
         let svgs = lb.svg_draws[svg_start..].to_vec();
         let quad_start_u32 = quad_start as u32;
         let glyph_start_u32 = glyph_start as u32;
+        let svg_start_u32 = svg_start as u32;
+        let image_start_u32 = image_start as u32;
+        let canvas_start_u32 = canvas_start as u32;
         let spans = lb.draw_spans[span_start..]
             .iter()
             .map(|span| DrawSpan {
@@ -2217,6 +2265,23 @@ fn walk_for_batch(
                     DrawKind::Glyph => span.start.saturating_sub(glyph_start_u32),
                 },
                 count: span.count,
+            })
+            .collect::<Vec<_>>();
+        // Capture backdrop boundaries with prefix counts converted to be
+        // relative to this node's primitive start indices. Replay restores
+        // absolute prefixes against the layer state at replay time.
+        let boundaries = lb.backdrop_boundaries[boundary_start..]
+            .iter()
+            .map(|b| BackdropBoundary {
+                rect: b.rect,
+                clip_rect: b.clip_rect,
+                blur_radius: b.blur_radius,
+                quad_prefix: b.quad_prefix.saturating_sub(quad_start_u32),
+                glyph_prefix: b.glyph_prefix.saturating_sub(glyph_start_u32),
+                svg_prefix: b.svg_prefix.saturating_sub(svg_start_u32),
+                image_batch_prefix: b.image_batch_prefix.saturating_sub(image_start_u32),
+                canvas_prefix: b.canvas_prefix.saturating_sub(canvas_start_u32),
+                dirty: b.dirty,
             })
             .collect::<Vec<_>>();
         let glyph_keys = node_glyph_keys.iter().copied().collect::<Vec<_>>();
@@ -2229,6 +2294,7 @@ fn walk_for_batch(
             spans,
             glyph_keys,
             atlas.generation,
+            boundaries,
         );
     }
     if let Some(parent_keys) = parent_glyph_keys {
@@ -3901,7 +3967,7 @@ mod tests {
         // Simulate "frame 1": record something for the root node.
         batch_cache.begin_frame();
         // Dirty node produces output; we fake it by recording an empty range.
-        batch_cache.record(root, 0, vec![], vec![], vec![], vec![], vec![], 0);
+        batch_cache.record(root, 0, vec![], vec![], vec![], vec![], vec![], 0, vec![]);
         batch_cache.commit_frame();
 
         batch
@@ -3941,7 +4007,7 @@ mod tests {
 
         // Populate staging with a fake record.
         cache.begin_frame();
-        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], vec![], vec![], 0);
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], vec![], vec![], 0, vec![]);
         // Before commit, `get` reads from the previous frame (empty).
         assert!(cache.get(NodeId::DANGLING, 0).is_none());
 
@@ -3973,7 +4039,7 @@ mod tests {
 
         // Frame 1: a dirty node produces primitives. record -> commit.
         cache.begin_frame();
-        cache.record(id, 0, vec![], vec![], vec![], vec![], vec![], 0);
+        cache.record(id, 0, vec![], vec![], vec![], vec![], vec![], 0, vec![]);
         cache.commit_frame();
         assert!(cache.get(id, 0).is_some(), "frame 1 recorded and committed");
 
@@ -4021,7 +4087,7 @@ mod tests {
         let mut cache = BatchCache::new();
         let id = NodeId::DANGLING;
         cache.begin_frame();
-        cache.record(id, 0, vec![], vec![], vec![], vec![], vec![], 7);
+        cache.record(id, 0, vec![], vec![], vec![], vec![], vec![], 7, vec![]);
         cache.commit_frame();
 
         cache.begin_frame();
@@ -4039,7 +4105,7 @@ mod tests {
 
         // Seed ranges with an empty entry (stale previous-frame state).
         cache.begin_frame();
-        cache.record(id, 0, vec![], vec![], vec![], vec![], vec![], 0);
+        cache.record(id, 0, vec![], vec![], vec![], vec![], vec![], 0, vec![]);
         cache.commit_frame();
 
         // New frame: caller records fresh data with one distinctive span.
@@ -4053,6 +4119,7 @@ mod tests {
             vec![DrawSpan { kind: DrawKind::Quad, start: 0, count: 7 }],
             vec![],
             0,
+            vec![],
         );
 
         // A subsequent replay call should return the just-recorded entry,
@@ -4076,7 +4143,7 @@ mod tests {
         ];
         let mut cache = BatchCache::new();
         cache.begin_frame();
-        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans.clone(), vec![], 0);
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans.clone(), vec![], 0, vec![]);
         cache.commit_frame();
 
         let cached = cache.get(NodeId::DANGLING, 0).expect("should have cached entry");
@@ -4148,7 +4215,7 @@ mod tests {
         ];
         let mut cache = BatchCache::new();
         cache.begin_frame();
-        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans, vec![], 0);
+        cache.record(NodeId::DANGLING, 0, vec![], vec![], vec![], spans, vec![], 0, vec![]);
         cache.commit_frame();
 
         // Replay into a batch that already has some data, simulating offset.

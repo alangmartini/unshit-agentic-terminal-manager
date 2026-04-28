@@ -110,11 +110,9 @@ pub enum CloseAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSection {
-    General,
     Appearance,
     Shell,
     Keybinds,
-    Agents,
     Sessions,
     DangerZone,
 }
@@ -122,23 +120,19 @@ pub enum SettingsSection {
 impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
-            SettingsSection::General => "general",
             SettingsSection::Appearance => "appearance",
             SettingsSection::Shell => "shell",
             SettingsSection::Keybinds => "keybinds",
-            SettingsSection::Agents => "agents",
             SettingsSection::Sessions => "sessions",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 7] {
+    pub fn all() -> [SettingsSection; 5] {
         [
-            SettingsSection::General,
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
-            SettingsSection::Agents,
             SettingsSection::Sessions,
             SettingsSection::DangerZone,
         ]
@@ -267,23 +261,8 @@ pub fn normalize_pasted_text(text: &str) -> String {
 /// Typed keys for the `AppState::toggles` map. Previously string literals
 /// like "confirm-close" were spread across the UI, with the type system
 /// no help against typos (e.g. "confirm-clsoe" silently read as `false`).
-///
-/// Agent enable/disable flags used to live here too (`AgentClaude`, etc.)
-/// but were moved to `AppState::agents` so general/appearance toggles and
-/// agent rows are not mixed in one map. See `AgentKey`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ToggleKey {
-    RestoreOnStartup,
-    ConfirmClose,
-    StartMinimized,
-    CheckUpdates,
-    GlowEffect,
-    BackgroundTexture,
-    FontLigatures,
-    ShellIntegration,
-    ScrollOnOutput,
-    BellNotification,
-    AutoDiscovery,
     /// When true, the close-app prompt is skipped and the action stored
     /// in `KillAllOnClose` runs silently. Toggled on by the "remember my
     /// choice" checkbox in the close-app confirm dialog and cleared by
@@ -298,50 +277,10 @@ pub enum ToggleKey {
 impl ToggleKey {
     pub fn as_str(self) -> &'static str {
         match self {
-            ToggleKey::RestoreOnStartup => "restore-on-startup",
-            ToggleKey::ConfirmClose => "confirm-close",
-            ToggleKey::StartMinimized => "start-minimized",
-            ToggleKey::CheckUpdates => "check-updates",
-            ToggleKey::GlowEffect => "glow-effect",
-            ToggleKey::BackgroundTexture => "background-texture",
-            ToggleKey::FontLigatures => "font-ligatures",
-            ToggleKey::ShellIntegration => "shell-integration",
-            ToggleKey::ScrollOnOutput => "scroll-on-output",
-            ToggleKey::BellNotification => "bell-notification",
-            ToggleKey::AutoDiscovery => "auto-discovery",
             ToggleKey::RememberCloseChoice => "remember-close-choice",
             ToggleKey::KillAllOnClose => "kill-all-on-close",
         }
     }
-}
-
-/// Identifies which configured agent an `Agent` entry represents. Kept
-/// separate from `ToggleKey` because agents are a list of records (icon,
-/// path, status, enabled) rather than booleans against a well-known name.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum AgentKey {
-    Claude,
-    Amp,
-    Codex,
-}
-
-impl AgentKey {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AgentKey::Claude => "agent-claude",
-            AgentKey::Amp => "agent-amp",
-            AgentKey::Codex => "agent-codex",
-        }
-    }
-}
-
-/// A single configured agent and whether it is enabled. The full set lives
-/// in `AppState::agents` as a `Vec<Agent>` so new agents can be added
-/// without touching the generic toggles map.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Agent {
-    pub key: AgentKey,
-    pub enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -359,6 +298,10 @@ pub struct Workspace {
     /// inactive, this is the source of truth.
     pub tabs: Vec<TerminalTab>,
     pub active_tab: usize,
+    /// Per workspace shell override. When non empty, beats
+    /// `AppState.default_shell` in `pane_spawn_shell`. Empty means
+    /// "inherit the app default", matching today's behavior.
+    pub shell: crate::shell::ShellSpec,
 }
 
 #[derive(Clone, Debug)]
@@ -452,10 +395,6 @@ pub struct AppState {
     pub theme: String,
     pub font_size_pt: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
-    /// Configured agents and their enabled state. Separate from `toggles`
-    /// because agents are records (icon, path, status, enabled) whereas
-    /// `toggles` holds boolean feature flags.
-    pub agents: Vec<Agent>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
@@ -517,6 +456,10 @@ pub struct AppState {
     /// arboard handles can corrupt the heap on Windows; see the
     /// regression in `unshit-app::clipboard`).
     pub clipboard: Arc<unshit::app::ClipboardContext>,
+    /// App wide default shell. Empty means "let the daemon's own
+    /// `default_shell()` decide". Per workspace overrides land in
+    /// Task 6 and take precedence via `shell::resolve`.
+    pub default_shell: crate::shell::ShellSpec,
 }
 
 impl AppState {
@@ -586,7 +529,6 @@ impl AppState {
             theme: self.theme.clone(),
             font_size_pt: self.font_size_pt,
             toggles: self.toggles.clone(),
-            agents: self.agents.clone(),
             palette_open: self.palette_open,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
@@ -616,6 +558,7 @@ impl AppState {
                     message: t.message.clone(),
                 })
                 .collect(),
+            default_shell: self.default_shell.clone(),
         }
     }
 
@@ -649,7 +592,6 @@ pub struct UiSnapshot {
     pub theme: String,
     pub font_size_pt: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
-    pub agents: Vec<Agent>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
@@ -683,6 +625,9 @@ pub struct UiSnapshot {
     pub sessions_stale: bool,
     /// Flat projection of the live `ToastStore`. Push order preserved.
     pub toasts: Vec<ToastView>,
+    /// Mirror of `AppState::default_shell` so settings UI can render
+    /// the current value without reaching into the live state.
+    pub default_shell: crate::shell::ShellSpec,
 }
 
 fn current_folder_name() -> String {
@@ -715,6 +660,7 @@ pub fn seed_state() -> AppState {
             git_branch: ws1_branch,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
         Workspace {
             num: 2,
@@ -735,6 +681,7 @@ pub fn seed_state() -> AppState {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
         Workspace {
             num: 3,
@@ -755,6 +702,7 @@ pub fn seed_state() -> AppState {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
         Workspace {
             num: 4,
@@ -775,6 +723,7 @@ pub fn seed_state() -> AppState {
             git_branch: None,
             tabs: vec![],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         },
     ];
 
@@ -799,21 +748,8 @@ pub fn seed_state() -> AppState {
     }];
 
     let mut toggles = BTreeMap::new();
-    toggles.insert(ToggleKey::RestoreOnStartup, true);
-    toggles.insert(ToggleKey::ConfirmClose, true);
-    toggles.insert(ToggleKey::StartMinimized, false);
-    toggles.insert(ToggleKey::CheckUpdates, true);
-    toggles.insert(ToggleKey::GlowEffect, true);
-    toggles.insert(ToggleKey::BackgroundTexture, true);
-    toggles.insert(ToggleKey::FontLigatures, true);
-    toggles.insert(ToggleKey::ShellIntegration, true);
-    toggles.insert(ToggleKey::ScrollOnOutput, true);
-    toggles.insert(ToggleKey::BellNotification, false);
-    toggles.insert(ToggleKey::AutoDiscovery, true);
     toggles.insert(ToggleKey::RememberCloseChoice, false);
     toggles.insert(ToggleKey::KillAllOnClose, false);
-
-    let agents = default_agents();
 
     AppState {
         workspaces,
@@ -823,11 +759,10 @@ pub fn seed_state() -> AppState {
         panes,
         active_pane: PaneId(1),
         settings_open: false,
-        settings_section: SettingsSection::General,
+        settings_section: SettingsSection::Appearance,
         theme: "amber".to_string(),
         font_size_pt: 13,
         toggles,
-        agents,
         palette_open: false,
         sidebar_collapsed: false,
         sidebar_width: 252.0,
@@ -857,6 +792,7 @@ pub fn seed_state() -> AppState {
         sessions_stale: false,
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
         clipboard: Arc::new(unshit::app::ClipboardContext::new()),
+        default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
     }
 }
 
@@ -939,6 +875,18 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
     load_workspace_state(state);
 }
 
+/// Resolve which shell a new pane should spawn with for the given
+/// state. The active workspace's `shell` beats `state.default_shell`;
+/// both empty yields `None` so the daemon's `default_shell()` keeps
+/// its floor.
+pub fn pane_spawn_shell(state: &AppState) -> Option<crate::shell::ShellSpec> {
+    let workspace = state
+        .workspaces
+        .get(state.active_workspace)
+        .map(|w| &w.shell);
+    crate::shell::resolve(workspace, Some(&state.default_shell))
+}
+
 pub fn mutate_add_tab(state: &mut AppState) {
     save_tab_state(state);
 
@@ -959,11 +907,16 @@ pub fn mutate_add_tab(state: &mut AppState) {
     // Spawn PTY eagerly so the terminal is live immediately.
     let cwd = active_workspace_cwd(state);
     let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
-    {
+    match state.pty_manager.spawn_in(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        cwd.as_deref(),
+        shell.as_ref(),
+    ) {
         Ok(reader) => {
             state
                 .terminals
@@ -1076,6 +1029,7 @@ pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace
         git_branch,
         tabs: vec![],
         active_tab: 0,
+        shell: crate::shell::ShellSpec::default(),
     }
 }
 
@@ -1164,11 +1118,16 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
 
     let cwd = active_workspace_cwd(state);
     let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
-    {
+    match state.pty_manager.spawn_in(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        cwd.as_deref(),
+        shell.as_ref(),
+    ) {
         Ok(reader) => {
             state
                 .terminals
@@ -1223,11 +1182,16 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
 
     let cwd = active_workspace_cwd(state);
     let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, cwd.as_deref())
-    {
+    match state.pty_manager.spawn_in(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        cwd.as_deref(),
+        shell.as_ref(),
+    ) {
         Ok(reader) => {
             state
                 .terminals
@@ -1302,6 +1266,58 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         let new_col = col_idx.min(state.panes[new_row].len() - 1);
         state.active_pane = state.panes[new_row][new_col].id;
     }
+    sync_live_tab_from_panes(state);
+}
+
+/// Move focus to the pane immediately left of the active pane in the
+/// same row. No-op when the active pane is at column 0 or cannot be
+/// located. When rows have differing column counts the up/down variants
+/// clamp to the target row's last column.
+pub fn mutate_focus_left(state: &mut AppState) {
+    let Some((row, col)) = find_pane_coord(state, state.active_pane) else {
+        return;
+    };
+    if col == 0 {
+        return;
+    }
+    state.active_pane = state.panes[row][col - 1].id;
+    sync_live_tab_from_panes(state);
+}
+
+pub fn mutate_focus_right(state: &mut AppState) {
+    let Some((row, col)) = find_pane_coord(state, state.active_pane) else {
+        return;
+    };
+    if col + 1 >= state.panes[row].len() {
+        return;
+    }
+    state.active_pane = state.panes[row][col + 1].id;
+    sync_live_tab_from_panes(state);
+}
+
+pub fn mutate_focus_up(state: &mut AppState) {
+    let Some((row, col)) = find_pane_coord(state, state.active_pane) else {
+        return;
+    };
+    if row == 0 {
+        return;
+    }
+    let target_row = row - 1;
+    let target_col = col.min(state.panes[target_row].len().saturating_sub(1));
+    state.active_pane = state.panes[target_row][target_col].id;
+    sync_live_tab_from_panes(state);
+}
+
+pub fn mutate_focus_down(state: &mut AppState) {
+    let Some((row, col)) = find_pane_coord(state, state.active_pane) else {
+        return;
+    };
+    if row + 1 >= state.panes.len() {
+        return;
+    }
+    let target_row = row + 1;
+    let target_col = col.min(state.panes[target_row].len().saturating_sub(1));
+    state.active_pane = state.panes[target_row][target_col].id;
     sync_live_tab_from_panes(state);
 }
 
@@ -2191,6 +2207,22 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             mutate_close_pane(state, state.active_pane);
             true
         }
+        "pane.focus_left" => {
+            mutate_focus_left(state);
+            true
+        }
+        "pane.focus_right" => {
+            mutate_focus_right(state);
+            true
+        }
+        "pane.focus_up" => {
+            mutate_focus_up(state);
+            true
+        }
+        "pane.focus_down" => {
+            mutate_focus_down(state);
+            true
+        }
         other if other.starts_with("pane.extract_to_tab:") => {
             dispatch_pane_extract_to_tab(state, other)
         }
@@ -2411,6 +2443,16 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             true
         }
+        other if other.starts_with("shell.set_default:") => {
+            dispatch_shell_set_default(state, other)
+        }
+        "shell.clear_default" => dispatch_shell_clear_default(state),
+        other if other.starts_with("shell.set_workspace:") => {
+            dispatch_shell_set_workspace(state, other)
+        }
+        other if other.starts_with("shell.clear_workspace:") => {
+            dispatch_shell_clear_workspace(state, other)
+        }
         other if other.starts_with("keybind.set:") => dispatch_keybind_set(state, other),
         other if other.starts_with("keybind.reset:") => dispatch_keybind_reset(state, other),
         "keybind.reset_all" => {
@@ -2491,6 +2533,65 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
         log::warn!("terminal.paste: queue write failed for pane {pane_id}: {e}");
         push_error_toast(state, format!("paste failed: {e}"));
     }
+    true
+}
+
+/// Parse `shell.set_default:<json>` and apply. The json must
+/// deserialize to a `ShellSpec`; malformed input returns `false` with
+/// no state change.
+fn dispatch_shell_set_default(state: &mut AppState, cmd: &str) -> bool {
+    let json = &cmd["shell.set_default:".len()..];
+    let Ok(spec) = serde_json::from_str::<crate::shell::ShellSpec>(json) else {
+        return false;
+    };
+    state.default_shell = spec;
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Clear the app wide default shell. Idempotent: succeeds even when
+/// already empty so the UI can wire a single button without checking
+/// state first.
+fn dispatch_shell_clear_default(state: &mut AppState) -> bool {
+    state.default_shell = crate::shell::ShellSpec::default();
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Parse `shell.set_workspace:<idx>:<json>` and apply. Both an
+/// out-of-range index and malformed json return `false` with no
+/// state change.
+fn dispatch_shell_set_workspace(state: &mut AppState, cmd: &str) -> bool {
+    let rest = &cmd["shell.set_workspace:".len()..];
+    let Some((idx_str, json)) = rest.split_once(':') else {
+        return false;
+    };
+    let Ok(idx) = idx_str.parse::<usize>() else {
+        return false;
+    };
+    if idx >= state.workspaces.len() {
+        return false;
+    }
+    let Ok(spec) = serde_json::from_str::<crate::shell::ShellSpec>(json) else {
+        return false;
+    };
+    state.workspaces[idx].shell = spec;
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Parse `shell.clear_workspace:<idx>` and clear that workspace's
+/// override. Out-of-range index returns `false`.
+fn dispatch_shell_clear_workspace(state: &mut AppState, cmd: &str) -> bool {
+    let idx_str = &cmd["shell.clear_workspace:".len()..];
+    let Ok(idx) = idx_str.parse::<usize>() else {
+        return false;
+    };
+    if idx >= state.workspaces.len() {
+        return false;
+    }
+    state.workspaces[idx].shell = crate::shell::ShellSpec::default();
+    crate::persist::save_workspaces(state);
     true
 }
 
@@ -2865,46 +2966,6 @@ pub fn is_on(state: &UiSnapshot, key: ToggleKey) -> bool {
     state.toggles.get(&key).copied().unwrap_or(false)
 }
 
-/// Default agent list used when seeding or resetting state. Kept in state.rs
-/// so `AppState`/`UiSnapshot` share one source of truth for which agents
-/// exist. The settings UI walks this list (plus static metadata) to render
-/// rows.
-pub fn default_agents() -> Vec<Agent> {
-    vec![
-        Agent {
-            key: AgentKey::Claude,
-            enabled: true,
-        },
-        Agent {
-            key: AgentKey::Amp,
-            enabled: true,
-        },
-        Agent {
-            key: AgentKey::Codex,
-            enabled: false,
-        },
-    ]
-}
-
-/// Whether the agent identified by `key` is enabled. Returns `false` if
-/// no entry is present (same semantics as `is_on` for unknown toggle keys).
-pub fn agent_enabled(state: &UiSnapshot, key: AgentKey) -> bool {
-    state
-        .agents
-        .iter()
-        .find(|a| a.key == key)
-        .map(|a| a.enabled)
-        .unwrap_or(false)
-}
-
-/// Flip the enabled flag for `key` in `state.agents`. Other agents are
-/// left untouched. No-op if the key is not present.
-pub fn mutate_toggle_agent(state: &mut AppState, key: AgentKey) {
-    if let Some(agent) = state.agents.iter_mut().find(|a| a.key == key) {
-        agent.enabled = !agent.enabled;
-    }
-}
-
 /// Resize all active terminals and their PTYs to the given column/row count.
 pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
     let ids: Vec<u32> = state.terminals.keys().copied().collect();
@@ -3047,11 +3108,10 @@ mod tests {
             panes,
             active_pane: PaneId(1),
             settings_open: false,
-            settings_section: SettingsSection::General,
+            settings_section: SettingsSection::Appearance,
             theme: "amber".to_string(),
             font_size_pt: 13,
             toggles: BTreeMap::new(),
-            agents: default_agents(),
             palette_open: false,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
@@ -3079,6 +3139,7 @@ mod tests {
             sessions_stale: false,
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
             clipboard: Arc::new(unshit::app::ClipboardContext::new()),
+            default_shell: crate::shell::ShellSpec::default(),
         }
     }
 
@@ -3086,22 +3147,22 @@ mod tests {
 
     #[test]
     fn settings_section_labels() {
-        assert_eq!(SettingsSection::General.label(), "general");
         assert_eq!(SettingsSection::Appearance.label(), "appearance");
         assert_eq!(SettingsSection::Shell.label(), "shell");
         assert_eq!(SettingsSection::Keybinds.label(), "keybinds");
-        assert_eq!(SettingsSection::Agents.label(), "agents");
+        assert_eq!(SettingsSection::Sessions.label(), "sessions");
         assert_eq!(SettingsSection::DangerZone.label(), "danger zone");
     }
 
     #[test]
-    fn settings_section_all_returns_seven() {
+    fn settings_section_all_returns_five() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 7);
-        assert_eq!(all[0], SettingsSection::General);
-        assert_eq!(all[4], SettingsSection::Agents);
-        assert_eq!(all[5], SettingsSection::Sessions);
-        assert_eq!(all[6], SettingsSection::DangerZone);
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0], SettingsSection::Appearance);
+        assert_eq!(all[1], SettingsSection::Shell);
+        assert_eq!(all[2], SettingsSection::Keybinds);
+        assert_eq!(all[3], SettingsSection::Sessions);
+        assert_eq!(all[4], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -3118,6 +3179,168 @@ mod tests {
         assert_eq!(state.tabs[1].id, "t2");
         assert_eq!(state.active_tab, 1);
         assert_eq!(state.next_id, 3);
+    }
+
+    #[test]
+    fn pane_spawn_shell_returns_resolved_default_when_set() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec!["--login".into()],
+        };
+        let resolved = pane_spawn_shell(&state).expect("non empty default must resolve");
+        assert_eq!(resolved.program, "/bin/bash");
+        assert_eq!(resolved.args, vec!["--login".to_string()]);
+    }
+
+    #[test]
+    fn pane_spawn_shell_returns_none_when_default_is_empty() {
+        let state = test_state();
+        assert!(state.default_shell.is_empty());
+        assert!(
+            pane_spawn_shell(&state).is_none(),
+            "empty default must yield None so the daemon's own default_shell() takes over"
+        );
+    }
+
+    #[test]
+    fn add_tab_records_resolved_default_shell_on_pty_shim() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/usr/local/bin/fish".into(),
+            args: vec![],
+        };
+        let new_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        let shell = state
+            .pty_manager
+            .spawn_shell(new_pane_id)
+            .expect("add_tab must forward the resolved default shell to the shim");
+        assert_eq!(shell.program, "/usr/local/bin/fish");
+    }
+
+    #[test]
+    fn split_right_records_resolved_default_shell_on_pty_shim() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/zsh".into(),
+            args: vec![],
+        };
+        let target = state.active_pane;
+        let new_pane_id = state.next_id;
+        mutate_split_right(&mut state, target);
+        let shell = state
+            .pty_manager
+            .spawn_shell(new_pane_id)
+            .expect("split_right must forward the resolved default shell to the shim");
+        assert_eq!(shell.program, "/bin/zsh");
+    }
+
+    #[test]
+    fn split_down_records_resolved_default_shell_on_pty_shim() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/dash".into(),
+            args: vec![],
+        };
+        let target = state.active_pane;
+        let new_pane_id = state.next_id;
+        mutate_split_down(&mut state, target);
+        let shell = state
+            .pty_manager
+            .spawn_shell(new_pane_id)
+            .expect("split_down must forward the resolved default shell to the shim");
+        assert_eq!(shell.program, "/bin/dash");
+    }
+
+    #[test]
+    fn pane_spawn_shell_prefers_active_workspace_shell_over_app_default() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.active_workspace = 0;
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/bash".into(),
+            args: vec![],
+        };
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/usr/local/bin/fish".into(),
+            args: vec!["-l".into()],
+        };
+
+        let resolved = pane_spawn_shell(&state).expect("workspace override must resolve");
+        assert_eq!(resolved.program, "/usr/local/bin/fish");
+        assert_eq!(resolved.args, vec!["-l".to_string()]);
+    }
+
+    #[test]
+    fn pane_spawn_shell_falls_back_to_app_default_when_workspace_shell_is_empty() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.active_workspace = 0;
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/zsh".into(),
+            args: vec![],
+        };
+        assert!(state.workspaces[0].shell.is_empty());
+
+        let resolved = pane_spawn_shell(&state).expect("app default must take over");
+        assert_eq!(resolved.program, "/bin/zsh");
+    }
+
+    #[test]
+    fn pane_spawn_shell_uses_correct_workspace_after_switch() {
+        // Two workspaces: ws0 has an override, ws1 does not.
+        // Adding a tab in each must record the right shell on the
+        // shim. This catches a regression where pane_spawn_shell
+        // forgets to consult the active workspace.
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.workspaces.push(new_workspace(2, "beta".into(), None));
+        state.active_workspace = 0;
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/dash".into(),
+            args: vec![],
+        };
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/usr/local/bin/fish".into(),
+            args: vec![],
+        };
+        // workspaces[1].shell stays empty so it falls back to the app default.
+
+        let ws0_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        let ws0_shell = state
+            .pty_manager
+            .spawn_shell(ws0_pane_id)
+            .expect("ws0 add_tab must record the override");
+        assert_eq!(ws0_shell.program, "/usr/local/bin/fish");
+
+        mutate_switch_workspace(&mut state, 1);
+        let ws1_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        let ws1_shell = state
+            .pty_manager
+            .spawn_shell(ws1_pane_id)
+            .expect("ws1 add_tab must fall back to the app default");
+        assert_eq!(ws1_shell.program, "/bin/dash");
+    }
+
+    #[test]
+    fn add_tab_with_empty_default_shell_does_not_record_a_shell() {
+        let mut state = test_state();
+        assert!(state.default_shell.is_empty());
+        let new_pane_id = state.next_id;
+        mutate_add_tab(&mut state);
+        assert!(
+            state.pty_manager.spawn_shell(new_pane_id).is_none(),
+            "empty default must surface as None so the daemon falls back"
+        );
     }
 
     #[test]
@@ -3264,6 +3487,140 @@ mod tests {
     }
 
     // -- dispatch -------------------------------------------------------------
+
+    #[test]
+    fn dispatch_shell_set_default_updates_state() {
+        let mut state = test_state();
+        assert!(state.default_shell.is_empty());
+        let json = r#"{"program":"/bin/zsh","args":["-l"]}"#;
+        let cmd = format!("shell.set_default:{json}");
+        assert!(dispatch(&mut state, &cmd));
+        assert_eq!(state.default_shell.program, "/bin/zsh");
+        assert_eq!(state.default_shell.args, vec!["-l".to_string()]);
+    }
+
+    #[test]
+    fn dispatch_shell_set_default_with_malformed_json_returns_false() {
+        let mut state = test_state();
+        let original = state.default_shell.clone();
+        assert!(!dispatch(&mut state, "shell.set_default:not-json"));
+        assert_eq!(
+            state.default_shell, original,
+            "malformed json must not mutate state"
+        );
+    }
+
+    #[test]
+    fn dispatch_shell_set_default_with_empty_json_payload_returns_false() {
+        let mut state = test_state();
+        // Missing colon means no payload — also malformed.
+        assert!(!dispatch(&mut state, "shell.set_default"));
+    }
+
+    #[test]
+    fn dispatch_shell_clear_default_clears_state() {
+        let mut state = test_state();
+        state.default_shell = crate::shell::ShellSpec {
+            program: "/bin/dash".into(),
+            args: vec![],
+        };
+        assert!(dispatch(&mut state, "shell.clear_default"));
+        assert!(state.default_shell.is_empty());
+    }
+
+    #[test]
+    fn dispatch_shell_clear_default_when_already_empty_still_returns_true() {
+        // The handler is idempotent: clearing an already empty default
+        // is a successful no-op, not an error. Persisting it is cheap.
+        let mut state = test_state();
+        assert!(state.default_shell.is_empty());
+        assert!(dispatch(&mut state, "shell.clear_default"));
+        assert!(state.default_shell.is_empty());
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_updates_correct_workspace() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.workspaces.push(new_workspace(2, "beta".into(), None));
+        let json = r#"{"program":"/usr/local/bin/fish","args":[]}"#;
+        let cmd = format!("shell.set_workspace:1:{json}");
+        assert!(dispatch(&mut state, &cmd));
+        assert!(
+            state.workspaces[0].shell.is_empty(),
+            "workspace 0 must be untouched"
+        );
+        assert_eq!(state.workspaces[1].shell.program, "/usr/local/bin/fish");
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_with_out_of_range_index_returns_false() {
+        let mut state = test_state();
+        let count = state.workspaces.len();
+        let cmd = format!(
+            "shell.set_workspace:{count}:{}",
+            r#"{"program":"/bin/zsh","args":[]}"#
+        );
+        assert!(!dispatch(&mut state, &cmd));
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_with_malformed_index_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(
+            &mut state,
+            r#"shell.set_workspace:abc:{"program":"/bin/zsh","args":[]}"#
+        ));
+    }
+
+    #[test]
+    fn dispatch_shell_set_workspace_with_malformed_json_returns_false() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        assert!(!dispatch(&mut state, "shell.set_workspace:0:not-json"));
+        assert!(state.workspaces[0].shell.is_empty());
+    }
+
+    #[test]
+    fn dispatch_shell_clear_workspace_clears_the_right_workspace() {
+        let mut state = test_state();
+        state
+            .workspaces
+            .push(new_workspace(1, "alpha".into(), None));
+        state.workspaces.push(new_workspace(2, "beta".into(), None));
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "/bin/zsh".into(),
+            args: vec![],
+        };
+        state.workspaces[1].shell = crate::shell::ShellSpec {
+            program: "/bin/fish".into(),
+            args: vec![],
+        };
+        assert!(dispatch(&mut state, "shell.clear_workspace:0"));
+        assert!(state.workspaces[0].shell.is_empty());
+        assert_eq!(
+            state.workspaces[1].shell.program, "/bin/fish",
+            "clearing workspace 0 must not touch workspace 1"
+        );
+    }
+
+    #[test]
+    fn dispatch_shell_clear_workspace_with_out_of_range_index_returns_false() {
+        let mut state = test_state();
+        let count = state.workspaces.len();
+        let cmd = format!("shell.clear_workspace:{count}");
+        assert!(!dispatch(&mut state, &cmd));
+    }
+
+    #[test]
+    fn dispatch_shell_clear_workspace_with_malformed_index_returns_false() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "shell.clear_workspace:abc"));
+    }
 
     #[test]
     fn dispatch_modal_open_close() {
@@ -4207,82 +4564,19 @@ mod tests {
     #[test]
     fn is_on_returns_value_or_false() {
         let mut state = test_state();
-        state.toggles.insert(ToggleKey::GlowEffect, true);
-        state.toggles.insert(ToggleKey::BackgroundTexture, false);
+        state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+        state.toggles.insert(ToggleKey::KillAllOnClose, false);
         let snap = state.ui_snapshot();
 
-        assert!(is_on(&snap, ToggleKey::GlowEffect));
-        assert!(!is_on(&snap, ToggleKey::BackgroundTexture));
-        assert!(!is_on(&snap, ToggleKey::ConfirmClose));
-    }
+        assert!(is_on(&snap, ToggleKey::RememberCloseChoice));
+        assert!(!is_on(&snap, ToggleKey::KillAllOnClose));
 
-    // -- agents field (refs #107) --------------------------------------------
-
-    #[test]
-    fn default_agents_has_three_entries() {
-        let agents = default_agents();
-        assert_eq!(agents.len(), 3);
-        assert_eq!(agents[0].key, AgentKey::Claude);
-        assert_eq!(agents[1].key, AgentKey::Amp);
-        assert_eq!(agents[2].key, AgentKey::Codex);
-    }
-
-    #[test]
-    fn seed_state_has_expected_agent_entries() {
-        let state = seed_state();
-        assert_eq!(state.agents.len(), 3);
-        assert!(state.agents.iter().any(|a| a.key == AgentKey::Claude));
-        assert!(state.agents.iter().any(|a| a.key == AgentKey::Amp));
-        assert!(state.agents.iter().any(|a| a.key == AgentKey::Codex));
-    }
-
-    #[test]
-    fn seed_state_agent_defaults_match_legacy_toggles() {
-        // Prior to the split these lived in `toggles`: claude=on, amp=on, codex=off.
-        let state = seed_state();
-        assert!(agent_enabled(&state.ui_snapshot(), AgentKey::Claude));
-        assert!(agent_enabled(&state.ui_snapshot(), AgentKey::Amp));
-        assert!(!agent_enabled(&state.ui_snapshot(), AgentKey::Codex));
-    }
-
-    #[test]
-    fn agent_enabled_returns_false_when_missing() {
-        let mut state = test_state();
-        state.agents.clear();
+        // Unknown / missing keys default to false. Drop a key from the
+        // map and confirm `is_on` reports the absent value rather than
+        // panicking.
+        state.toggles.remove(&ToggleKey::KillAllOnClose);
         let snap = state.ui_snapshot();
-        assert!(!agent_enabled(&snap, AgentKey::Claude));
-    }
-
-    #[test]
-    fn mutate_toggle_agent_flips_only_target() {
-        // Regression: toggling one agent must not change sibling agents.
-        let mut state = test_state();
-        let before_amp = agent_enabled(&state.ui_snapshot(), AgentKey::Amp);
-        let before_codex = agent_enabled(&state.ui_snapshot(), AgentKey::Codex);
-
-        mutate_toggle_agent(&mut state, AgentKey::Claude);
-
-        let snap = state.ui_snapshot();
-        assert!(!agent_enabled(&snap, AgentKey::Claude));
-        assert_eq!(agent_enabled(&snap, AgentKey::Amp), before_amp);
-        assert_eq!(agent_enabled(&snap, AgentKey::Codex), before_codex);
-    }
-
-    #[test]
-    fn mutate_toggle_agent_round_trips() {
-        let mut state = test_state();
-        let before = agent_enabled(&state.ui_snapshot(), AgentKey::Codex);
-        mutate_toggle_agent(&mut state, AgentKey::Codex);
-        mutate_toggle_agent(&mut state, AgentKey::Codex);
-        let after = agent_enabled(&state.ui_snapshot(), AgentKey::Codex);
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn agent_key_as_str_is_stable() {
-        assert_eq!(AgentKey::Claude.as_str(), "agent-claude");
-        assert_eq!(AgentKey::Amp.as_str(), "agent-amp");
-        assert_eq!(AgentKey::Codex.as_str(), "agent-codex");
+        assert!(!is_on(&snap, ToggleKey::KillAllOnClose));
     }
 
     // -- ui_snapshot ----------------------------------------------------------
@@ -4536,6 +4830,179 @@ mod tests {
         assert_eq!(state.panes.len(), 1);
     }
 
+    // -- mutate_focus_* -------------------------------------------------------
+
+    /// Replace the active tab's pane grid with a synthetic layout. Each
+    /// inner Vec is a row; values are pane ids. Sets active_pane to the
+    /// pane with id `active`. Avoids spawning PTYs.
+    fn install_pane_grid(state: &mut AppState, grid: Vec<Vec<u32>>, active: u32) {
+        let panes: Vec<Vec<Pane>> = grid
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|id| Pane {
+                        id: PaneId(*id),
+                        title: "shell".to_string(),
+                        subtitle: "bash".to_string(),
+                        pid: 0,
+                        cpu: 0.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        state.row_ratios = vec![1.0; panes.len()];
+        state.col_ratios = panes.iter().map(|r| vec![1.0; r.len()]).collect();
+        state.panes = panes;
+        state.active_pane = PaneId(active);
+        state.next_id = grid.iter().flatten().max().copied().unwrap_or(0) + 1;
+        sync_live_tab_from_panes(state);
+    }
+
+    #[test]
+    fn focus_left_moves_to_previous_column_in_same_row() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2, 3]], 3);
+
+        mutate_focus_left(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_left_at_leftmost_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2]], 1);
+
+        mutate_focus_left(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn focus_right_moves_to_next_column_in_same_row() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2, 3]], 1);
+
+        mutate_focus_right(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_right_at_rightmost_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2]], 2);
+
+        mutate_focus_right(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_down_moves_to_next_row_same_column() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2], vec![3, 4]], 2);
+
+        mutate_focus_down(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(4));
+    }
+
+    #[test]
+    fn focus_down_clamps_column_when_target_row_is_shorter() {
+        let mut state = seed_state();
+        // Row 0 has three panes; row 1 has two. Focusing down from the
+        // rightmost pane in row 0 must clamp to the last pane of row 1
+        // rather than panicking.
+        install_pane_grid(&mut state, vec![vec![1, 2, 3], vec![4, 5]], 3);
+
+        mutate_focus_down(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(5));
+    }
+
+    #[test]
+    fn focus_down_at_bottom_row_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1], vec![2]], 2);
+
+        mutate_focus_down(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_up_moves_to_previous_row_same_column() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2], vec![3, 4]], 4);
+
+        mutate_focus_up(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+    }
+
+    #[test]
+    fn focus_up_clamps_column_when_target_row_is_shorter() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1], vec![2, 3, 4]], 4);
+
+        mutate_focus_up(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn focus_up_at_top_row_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1], vec![2]], 1);
+
+        mutate_focus_up(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn focus_in_single_pane_layout_is_noop_in_every_direction() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1]], 1);
+
+        mutate_focus_left(&mut state);
+        assert_eq!(state.active_pane, PaneId(1));
+        mutate_focus_right(&mut state);
+        assert_eq!(state.active_pane, PaneId(1));
+        mutate_focus_up(&mut state);
+        assert_eq!(state.active_pane, PaneId(1));
+        mutate_focus_down(&mut state);
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn focus_with_invalid_active_pane_is_noop() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2]], 1);
+        // Corrupt the active pane to an id not present in the grid.
+        state.active_pane = PaneId(9999);
+
+        mutate_focus_left(&mut state);
+        mutate_focus_right(&mut state);
+        mutate_focus_up(&mut state);
+        mutate_focus_down(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(9999));
+    }
+
+    #[test]
+    fn focus_syncs_active_pane_into_live_tab() {
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2]], 1);
+        assert_eq!(state.tabs[state.active_tab].active_pane, PaneId(1));
+
+        mutate_focus_right(&mut state);
+
+        assert_eq!(state.active_pane, PaneId(2));
+        assert_eq!(state.tabs[state.active_tab].active_pane, PaneId(2));
+    }
+
     // -- dispatch pane commands -----------------------------------------------
 
     #[test]
@@ -4565,6 +5032,25 @@ mod tests {
 
         assert!(dispatch(&mut state, "pane.close"));
         assert_eq!(state.panes[0].len(), pane_count - 1);
+    }
+
+    #[test]
+    fn dispatch_pane_focus_directions_route_to_focus_mutators() {
+        // Build a 2x2 grid: panes 1,2 in row 0 and 3,4 in row 1; start at 1.
+        let mut state = seed_state();
+        install_pane_grid(&mut state, vec![vec![1, 2], vec![3, 4]], 1);
+
+        assert!(dispatch(&mut state, "pane.focus_right"));
+        assert_eq!(state.active_pane, PaneId(2));
+
+        assert!(dispatch(&mut state, "pane.focus_down"));
+        assert_eq!(state.active_pane, PaneId(4));
+
+        assert!(dispatch(&mut state, "pane.focus_left"));
+        assert_eq!(state.active_pane, PaneId(3));
+
+        assert!(dispatch(&mut state, "pane.focus_up"));
+        assert_eq!(state.active_pane, PaneId(1));
     }
 
     #[test]
@@ -6357,6 +6843,7 @@ mod tests {
             git_branch: None,
             tabs: vec![tab],
             active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
         }
     }
 

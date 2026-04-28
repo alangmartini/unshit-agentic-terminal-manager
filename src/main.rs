@@ -6,6 +6,7 @@ pub mod git;
 pub mod keybinds;
 pub mod persist;
 pub mod pty;
+pub mod shell;
 pub mod state;
 pub mod terminal;
 pub mod ui;
@@ -317,16 +318,6 @@ fn main() {
 
     let bench_config = parse_bench_args();
 
-    // When running in bench mode on Windows, force the PTY to spawn cmd.exe
-    // so `dir` produces real Windows output. Otherwise the user's SHELL env
-    // (often `/usr/bin/bash` from Git Bash) wins in `pty::default_shell`,
-    // and `dir` becomes a "command not found" two-liner. Bench numbers from
-    // bash would undermeasure the scroll-heavy workload the issue targets.
-    #[cfg(windows)]
-    if bench_config.is_some() {
-        std::env::set_var("SHELL", "cmd.exe");
-    }
-
     // Guard against ghost handles (#32): ensure the process exits
     // immediately on Ctrl+C or panic so spawn_blocking reader tasks
     // (bridge.rs) cannot keep the .exe locked on Windows (os error 32).
@@ -374,6 +365,7 @@ fn main() {
                 .map(|(i, entry)| {
                     let mut ws = new_workspace((i + 1) as u32, entry.name, entry.path);
                     ws.collapsed = entry.collapsed;
+                    ws.shell = entry.shell;
                     ws
                 })
                 .collect();
@@ -388,6 +380,24 @@ fn main() {
             crate::state::ToggleKey::KillAllOnClose,
             persisted.kill_all_on_close,
         );
+        // Override the seed_state inference with whatever the user
+        // last persisted. An upgrader without the field gets an
+        // empty spec here, which keeps the daemon's `default_shell()`
+        // floor exactly as before.
+        initial_state.default_shell = persisted.default_shell;
+    }
+    // Bench mode needs a deterministic shell so the scroll workload
+    // measures comparable output across runs. On Windows the bench
+    // exercises `dir`, which only behaves on cmd.exe; route it through
+    // the same `default_shell` channel the rest of the app uses instead
+    // of mutating the SHELL env var (which would leak into any spawned
+    // child).
+    #[cfg(windows)]
+    if bench_config.is_some() {
+        initial_state.default_shell = crate::shell::ShellSpec {
+            program: "cmd.exe".into(),
+            args: Vec::new(),
+        };
     }
     let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
 
@@ -455,12 +465,14 @@ fn main() {
         let pane_id = guard.active_pane.0;
         let workspace_id = crate::state::active_workspace_num(&guard);
         let cwd = crate::state::active_workspace_cwd(&guard);
+        let shell = crate::shell::resolve(None, Some(&guard.default_shell));
         match guard.pty_manager.attach_or_spawn(
             pane_id,
             workspace_id,
             init_cols,
             init_rows,
             cwd.as_deref(),
+            shell.as_ref(),
         ) {
             Ok((Some(snapshot), reader)) => {
                 let rows = snapshot.grid.rows();
@@ -816,6 +828,25 @@ mod tests {
     /// trip.
     fn post_snapshot_reset_like_production(_terminal: &mut Terminal) {
         // Intentionally empty. See issue #63.
+    }
+
+    // refs #140 / Task 11: the bench mode used to mutate the SHELL env
+    // var to force cmd.exe on Windows so `dir` produced real Windows
+    // output. The default-shell pipeline now owns shell selection;
+    // mutating SHELL would silently override the user's persisted
+    // `default_shell` and produce bench numbers that diverge from the
+    // configured shell. This regression scans the main.rs source so a
+    // future commit reintroducing the env hack fails loudly.
+    #[test]
+    fn bench_does_not_mutate_shell_env_var() {
+        let src = include_str!("main.rs");
+        // Constructed from parts so the test source itself does not
+        // match the needle and trip the assertion.
+        let needle = concat!("set_", "var(\"SHELL\"");
+        assert!(
+            !src.contains(needle),
+            "bench must not mutate the SHELL env var; route the bench shell through default_shell instead"
+        );
     }
 
     /// Auxiliary regression for #63: the live grid's damage must keep

@@ -275,6 +275,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                     .collect();
                                 let cwd = crate::state::active_workspace_cwd(&guard);
                                 let workspace_id = crate::state::active_workspace_num(&guard);
+                                let shell = crate::state::pane_spawn_shell(&guard);
                                 for id in &all_pane_ids {
                                     if !guard.terminals.contains_key(id) {
                                         match guard.pty_manager.attach_or_spawn(
@@ -283,6 +284,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                             cols,
                                             rows,
                                             cwd.as_deref(),
+                                            shell.as_ref(),
                                         ) {
                                             Ok((Some(snapshot), reader)) => {
                                                 let snap_rows = snapshot.grid.rows();

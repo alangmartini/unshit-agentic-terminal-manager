@@ -146,11 +146,10 @@ mod tests {
             }]],
             active_pane: PaneId(1),
             settings_open: false,
-            settings_section: SettingsSection::General,
+            settings_section: SettingsSection::Appearance,
             theme: "amber".into(),
             font_size_pt: 13,
             toggles: BTreeMap::new(),
-            agents: vec![],
             palette_open: false,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
@@ -172,6 +171,7 @@ mod tests {
             last_grid_width: 0.0,
             last_grid_height: 0.0,
             scale_factor: 1.0,
+            default_shell: crate::shell::ShellSpec::default(),
         }
     }
 

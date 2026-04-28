@@ -49,7 +49,7 @@ async fn attach_after_write_returns_snapshot_with_recent_output() {
 
     let (mut client, mut events) = common::connect_with_events_retry(&path).await;
     let Response::SessionSpawned { session_id, .. } = client
-        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 0, None)
+        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), vec![], 0, 0, None)
         .await
         .unwrap()
     else {
@@ -111,7 +111,7 @@ async fn detach_session_acks_on_live_session() {
 
     let (mut client, _events) = common::connect_with_events_retry(&path).await;
     let Response::SessionSpawned { session_id, .. } = client
-        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 0, None)
+        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), vec![], 0, 0, None)
         .await
         .unwrap()
     else {
@@ -146,7 +146,7 @@ async fn attach_clamps_scrollback_lines_at_cap() {
 
     let (mut client, mut events) = common::connect_with_events_retry(&path).await;
     let Response::SessionSpawned { session_id, .. } = client
-        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), 0, 0, None)
+        .spawn_session(80, 24, None, Some(TEST_SHELL.into()), vec![], 0, 0, None)
         .await
         .unwrap()
     else {

@@ -51,6 +51,13 @@ pub enum Request {
         cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shell: Option<String>,
+        /// Args forwarded to `shell` before any daemon side cwd args
+        /// (e.g. the PowerShell `-NoExit -Command "Set-Location ..."`
+        /// workaround). Additive in v1: defaults to empty for old
+        /// clients, omitted from the wire when empty so old daemons
+        /// see the same shape they always have.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shell_args: Vec<String>,
         workspace_id: u32,
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,6 +515,7 @@ mod tests {
             rows: 40,
             cwd: Some("/tmp".into()),
             shell: None,
+            shell_args: vec![],
             workspace_id: 2,
             pane_id: 5,
             name: Some("scratch".into()),
@@ -529,6 +537,7 @@ mod tests {
             rows: 24,
             cwd: None,
             shell: None,
+            shell_args: vec![],
             workspace_id: 0,
             pane_id: 0,
             name: None,
@@ -542,6 +551,72 @@ mod tests {
         assert!(s.contains("\"pane_id\":0"), "{s}");
         let back: Request = serde_json::from_str(&s).unwrap();
         assert_eq!(req, back);
+    }
+
+    // refs #140: shell_args is an additive field. When set it must
+    // round trip; when empty it must be omitted from the wire so old
+    // daemons reading new payloads see the same shape they always have.
+    #[test]
+    fn spawn_session_round_trips_with_shell_args() {
+        let req = Request::SpawnSession {
+            id: 13,
+            cols: 80,
+            rows: 24,
+            cwd: None,
+            shell: Some("bash".into()),
+            shell_args: vec!["--login".into(), "-i".into()],
+            workspace_id: 0,
+            pane_id: 0,
+            name: None,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(
+            s.contains(r#""shell_args":["--login","-i"]"#),
+            "shell_args must serialize when non empty: {s}"
+        );
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // refs #140: empty shell_args must not appear on the wire so the
+    // change is invisible to old daemons that ignore unknown fields.
+    #[test]
+    fn spawn_session_omits_shell_args_when_empty() {
+        let req = Request::SpawnSession {
+            id: 14,
+            cols: 80,
+            rows: 24,
+            cwd: None,
+            shell: None,
+            shell_args: vec![],
+            workspace_id: 0,
+            pane_id: 0,
+            name: None,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(
+            !s.contains("\"shell_args\""),
+            "empty shell_args must be omitted on the wire: {s}"
+        );
+    }
+
+    // refs #140: an old wire payload (no shell_args key) must
+    // deserialize with an empty vec so newer daemons keep accepting
+    // requests from clients that have not been rebuilt yet.
+    #[test]
+    fn spawn_session_deserializes_with_default_shell_args_when_field_is_missing() {
+        let json =
+            r#"{"kind":"spawn_session","id":15,"cols":80,"rows":24,"workspace_id":0,"pane_id":0}"#;
+        let back: Request = serde_json::from_str(json).unwrap();
+        match back {
+            Request::SpawnSession { shell_args, .. } => {
+                assert!(
+                    shell_args.is_empty(),
+                    "missing shell_args field must deserialize to an empty vector"
+                );
+            }
+            other => panic!("expected SpawnSession, got {other:?}"),
+        }
     }
 
     #[test]
@@ -726,6 +801,7 @@ mod tests {
                 rows: 24,
                 cwd: None,
                 shell: None,
+                shell_args: vec![],
                 workspace_id: 0,
                 pane_id: 0,
                 name: None,

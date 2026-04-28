@@ -3,19 +3,22 @@ name: PR Quality Gate
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  issue_comment:
-    types: [created]
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-quality-gate-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
   pull-requests: write
-  issues: write
 
 jobs:
-  # Standard Rust checks (fast, cheap, always run)
   rust-checks:
     name: Rust Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
@@ -43,10 +46,11 @@ jobs:
       - name: Run tests
         run: cargo test --all
 
-  # Code coverage with cargo-llvm-cov
   coverage:
     name: Code Coverage
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -64,55 +68,8 @@ jobs:
       - name: Generate coverage report
         run: cargo llvm-cov --all-features --lcov --output-path lcov.info
 
-      - name: Generate coverage summary
-        run: cargo llvm-cov --all-features --no-run
-
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: lcov.info
-
-  # Claude Code review + simplify (disabled: requires ANTHROPIC_API_KEY secret)
-  # claude-review:
-  #   name: Claude Code Review & Simplify
-  #   runs-on: ubuntu-latest
-  #   if: >
-  #     github.event_name == 'pull_request' ||
-  #     (github.event_name == 'issue_comment' &&
-  #      github.event.issue.pull_request &&
-  #      contains(github.event.comment.body, '@claude'))
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         fetch-depth: 0
-  #
-  #     - uses: anthropics/claude-code-action@v1
-  #       with:
-  #         anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-  #         model: claude-sonnet-4-6
-  #         prompt: |
-  #           You are reviewing a PR for the terminal-manager project (Rust + web frontend).
-  #
-  #           Do the following in order:
-  #
-  #           1. **Simplify**: Review all changed code for reuse opportunities, code quality,
-  #              and efficiency. Suggest concrete simplifications. Flag any unnecessary
-  #              complexity, dead code, or duplicated logic.
-  #
-  #           2. **Test coverage**: Check that every new feature has unit + integration tests,
-  #              and every bug fix has a regression test. If tests are missing, list exactly
-  #              what tests should be added.
-  #
-  #           3. **Code review**: Check for:
-  #              - Logic errors and broken edge cases
-  #              - Security issues (command injection, unsafe blocks without justification)
-  #              - Violations of the CLAUDE.md guidelines
-  #              - Rust idioms (proper error handling, no unwrap in non-test code)
-  #              - Performance concerns
-  #
-  #           4. **Summary**: Give a clear verdict: APPROVE, REQUEST_CHANGES, or COMMENT.
-  #              Be specific about what needs to change.
-  #
-  #           Post your findings as a structured PR review comment.
-  #         claude_args: "--max-turns 10"
