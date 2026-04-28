@@ -1146,7 +1146,24 @@ fn walk_for_batch(
     // Replay is additionally gated on glyph atlas generation. Cached ranges
     // built against an older atlas generation are discarded so stale UVs are
     // never replayed after atlas eviction/repack.
-    let node_dirty = element.dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT);
+    let mut node_dirty = element.dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT);
+
+    // Cell grids that own the focused cursor must re-emit on every paint
+    // so the global blink phase clock (`CellGrid::cursor_blink_phase_now`)
+    // can flip the cursor on and off. Without this bypass the batch cache
+    // serves up the previously-emitted cursor quad and the cursor appears
+    // to stop blinking. The line-quad cache inside `emit_grid_cells`
+    // still skips per-row work, so the cost of the bypass is tiny: we
+    // pay an arena-of-rows replay against the row cache plus the cursor
+    // emit, not full glyph shaping.
+    if !node_dirty {
+        if let ElementContent::Grid(ref grid) = element.content {
+            if grid.cursor_visible() {
+                node_dirty = true;
+            }
+        }
+    }
+
     if !node_dirty {
         if let Some(cached) = batch_cache.replay(node_id, layer_index, atlas.generation) {
             for key in &cached.glyph_keys {
