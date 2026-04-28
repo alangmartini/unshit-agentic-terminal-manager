@@ -78,6 +78,13 @@ pub struct Terminal {
     /// Default is `rows` (full screen). DECSTBM updates it; resize
     /// clamps it back when the previous region no longer fits.
     scroll_bot: usize,
+    /// Bytes the parser produced as a reply to a host query (DA1, DA2,
+    /// DSR, CPR, XTVERSION, ...). The bridge subscription drains this
+    /// after every `process_bytes` and writes it back to the PTY so
+    /// TUIs that probe terminal capabilities (Claude Code, vim, fzf)
+    /// see a real terminal and pick their full-feature rendering path
+    /// instead of falling back to a defensive minimal layout.
+    pending_response: Vec<u8>,
 }
 
 /// Default foreground: warm amber.
@@ -123,7 +130,15 @@ impl Terminal {
             alt_saved_attrs: CellAttrs::empty(),
             scroll_top: 0,
             scroll_bot: rows,
+            pending_response: Vec::new(),
         }
+    }
+
+    /// Drain bytes the parser queued as a host-query reply. The bridge
+    /// calls this after `process_bytes` to forward the reply over the
+    /// PTY back to the running TUI.
+    pub fn take_pending_response(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_response)
     }
 
     /// Feed raw bytes (from PTY output) through the VTE parser.
@@ -737,6 +752,7 @@ impl<'a> Perform for Performer<'a> {
         // values (no subparams).
         let pv: Vec<u16> = params.iter().map(|sub| sub[0]).collect();
 
+
         // Convenience: first param with a default value.
         let p = |idx: usize, default: u16| -> u16 {
             pv.get(idx).copied().unwrap_or(0).max(default) // treat 0 as default
@@ -1036,6 +1052,50 @@ impl<'a> Perform for Performer<'a> {
                         t.exit_alt_screen();
                     }
                 }
+            }
+
+            // -- Host queries --------------------------------------------------
+            //
+            // TUIs (Claude Code, fzf, etc) probe the terminal to decide
+            // which rendering path to use. With no reply they assume a
+            // primitive terminal and fall back to a minimal layout (e.g.
+            // Claude renders a 4-row bordered input box with the prompt
+            // glyph on a row of its own instead of a single `> ABC|`
+            // line). Replies are queued in `pending_response`; the
+            // bridge drains and writes them back to the PTY.
+            //
+            // DA1 - Primary Device Attributes: `CSI c` or `CSI 0 c`.
+            // Reply `CSI ? 1 ; 2 c` advertises VT100 with advanced video
+            // option, the same baseline xterm reports.
+            'c' if intermediates.is_empty() => {
+                t.pending_response.extend_from_slice(b"\x1b[?1;2c");
+            }
+            // DA2 - Secondary Device Attributes: `CSI > c` or `CSI > 0 c`.
+            // Reply `CSI > 0 ; 95 ; 0 c` mirrors xterm patch 95.
+            'c' if intermediates == [b'>'] => {
+                t.pending_response.extend_from_slice(b"\x1b[>0;95;0c");
+            }
+            // DSR - Device Status Report: `CSI 5 n` "are you ok?".
+            // Reply `CSI 0 n` = ok.
+            'n' if intermediates.is_empty() && pv.first() == Some(&5) => {
+                t.pending_response.extend_from_slice(b"\x1b[0n");
+            }
+            // CPR - Cursor Position Report: `CSI 6 n`. Reply with the
+            // current 1-indexed cursor position.
+            'n' if intermediates.is_empty() && pv.first() == Some(&6) => {
+                let row = t.cursor_row + 1;
+                let col = t.cursor_col + 1;
+                let reply = format!("\x1b[{};{}R", row, col);
+                t.pending_response.extend_from_slice(reply.as_bytes());
+            }
+            // XTVERSION - terminal name and version: `CSI > q` or
+            // `CSI > 0 q`. Claude Code sends this before deciding
+            // between compact and bordered layouts. Reply with a DCS
+            // string `DCS > | name version ST` so the probe succeeds
+            // and Claude picks the rich path.
+            'q' if intermediates == [b'>'] => {
+                t.pending_response
+                    .extend_from_slice(b"\x1bP>|godly-terminal 0.1\x1b\\");
             }
 
             _ => {

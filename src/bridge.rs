@@ -111,7 +111,7 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                     };
 
                     let mut batched = 1u32;
-                    {
+                    let pending_response = {
                         let mut terminal = terminal_handle.lock_recover();
                         terminal.process_bytes(&data);
                         while let Ok(more) = rx.try_recv() {
@@ -132,6 +132,22 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                                 rows.get(2).cloned().unwrap_or_default(),
                                 rows.get(3).cloned().unwrap_or_default(),
                             ));
+                        }
+                        terminal.take_pending_response()
+                    };
+                    if !pending_response.is_empty() {
+                        // Reply to host queries (DA1, DA2, DSR, CPR,
+                        // XTVERSION) the parser collected. Done outside
+                        // the per-terminal mutex; the write is fire and
+                        // forget through the daemon shim.
+                        let mut guard = shared.lock_recover();
+                        if let Err(e) = guard.pty_manager.write(pane_id, &pending_response) {
+                            log::warn!(
+                                "pty-{}: failed to write {} bytes of query reply: {}",
+                                pane_id,
+                                pending_response.len(),
+                                e
+                            );
                         }
                     }
                     if batched > 1 {
