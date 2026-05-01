@@ -37,7 +37,8 @@ fn parse_mask_image_linear_gradient_to_right() {
         100.0,
         100.0,
     );
-    let mask = h.query(".t").expect("element").computed_style.mask_image.expect("mask-image parsed");
+    let mask =
+        h.query(".t").expect("element").computed_style.mask_image.expect("mask-image parsed");
     assert!((mask.angle_deg - 90.0).abs() < 0.01, "expected 90deg, got {}", mask.angle_deg);
     assert_eq!(mask.stops.len(), 2);
     // The first stop is `transparent` (alpha 0), the last is `#000000`
@@ -67,12 +68,8 @@ fn parse_mask_image_with_explicit_percent_stops() {
         100.0,
         100.0,
     );
-    let mask = h
-        .query(".t")
-        .expect("element")
-        .computed_style
-        .mask_image
-        .expect("mask-image parsed");
+    let mask =
+        h.query(".t").expect("element").computed_style.mask_image.expect("mask-image parsed");
     assert_eq!(mask.stops.len(), 4);
     // Verify the middle two stops sit at 10% and 90%.
     match mask.stops[1].position {
@@ -98,12 +95,8 @@ fn parse_mask_image_with_angle_in_degrees() {
         100.0,
         100.0,
     );
-    let mask = h
-        .query(".t")
-        .expect("element")
-        .computed_style
-        .mask_image
-        .expect("mask-image parsed");
+    let mask =
+        h.query(".t").expect("element").computed_style.mask_image.expect("mask-image parsed");
     assert!((mask.angle_deg - 45.0).abs() < 0.01, "expected 45deg, got {}", mask.angle_deg);
 }
 

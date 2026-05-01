@@ -513,10 +513,7 @@ mod tests {
     fn lca_both_dangling_returns_root() {
         let mut arena = NodeArena::new();
         let root = alloc_div(&mut arena);
-        assert_eq!(
-            arena.lowest_common_ancestor(NodeId::DANGLING, NodeId::DANGLING, root),
-            root,
-        );
+        assert_eq!(arena.lowest_common_ancestor(NodeId::DANGLING, NodeId::DANGLING, root), root,);
     }
 
     #[test]

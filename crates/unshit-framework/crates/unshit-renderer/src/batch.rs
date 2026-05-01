@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-#[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 
 use crate::atlas::{GlyphAtlas, GlyphEntry, GlyphKey};
@@ -29,7 +28,7 @@ pub struct Rasterizer<'a> {
     pub dw: &'a DwRasterizer,
 }
 use rustc_hash::{FxHashMap, FxHashSet};
-use unshit_core::cell_grid::{CellAttrs, CellGrid};
+use unshit_core::cell_grid::{BgRun, CellAttrs, CellGrid};
 use unshit_core::cursor::CursorShape;
 use unshit_core::dirty::DirtyFlags;
 use unshit_core::element::{ElementContent, InputType, Tag};
@@ -70,6 +69,10 @@ pub(crate) const EMPTY_MASK_PARAMS: [f32; 4] = [0.0; 4];
 /// One shot flag so the stop truncation warning does not spam logs.
 static GRADIENT_TRUNCATE_WARNED: AtomicBool = AtomicBool::new(false);
 static LAST_TERMINAL_RENDER_TRACE_HASH: AtomicU64 = AtomicU64::new(0);
+const WINDOWS_TERMINAL_PARITY_CALIBRATED_FG: Color = Color { r: 196, g: 196, b: 196, a: 255 };
+const WINDOWS_TERMINAL_PARITY_LITERAL_FG: Color = Color { r: 204, g: 204, b: 204, a: 255 };
+const ENV_PARITY_CELL_WIDTH_SCALE: &str = "TM_PARITY_CELL_WIDTH_SCALE";
+const WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE: f32 = 0.996;
 
 fn terminal_grid_trace_hash(grid: &CellGrid) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -90,6 +93,37 @@ fn terminal_grid_trace_hash(grid: &CellGrid) -> u64 {
 fn use_directwrite_grid_rasterization() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_DIRECTWRITE_GRID").is_some())
+}
+
+fn parity_windows_terminal_colors_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("TM_PARITY_WINDOWS_TERMINAL_COLORS")
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                let normalized = v.to_string_lossy().trim().to_ascii_lowercase();
+                !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn parity_cell_width_scale_from_values(value: Option<std::ffi::OsString>, wt_profile: bool) -> f32 {
+    value
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| (0.95..=1.05).contains(v))
+        .unwrap_or(if wt_profile { WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE } else { 1.0 })
+}
+
+fn parity_terminal_cell_width_scale() -> f32 {
+    static SCALE: OnceLock<f32> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        parity_cell_width_scale_from_values(
+            std::env::var_os(ENV_PARITY_CELL_WIDTH_SCALE),
+            parity_windows_terminal_colors_enabled(),
+        )
+    })
 }
 
 #[inline]
@@ -266,9 +300,7 @@ fn pack_radial_gradient(
 /// `mask_params.w` is the stop count. The fragment shader selects the
 /// "no mask" fast path when this is zero, so the pre-normalization here is
 /// defensive: we emit `stop_count = 0` when the source list is empty.
-pub(crate) fn pack_mask_image(
-    mask: &LinearGradient,
-) -> ([f32; 4], [f32; 4], [f32; 4]) {
+pub(crate) fn pack_mask_image(mask: &LinearGradient) -> ([f32; 4], [f32; 4], [f32; 4]) {
     let mut stops_01 = [0.0_f32; 4];
     let mut stops_23 = [0.0_f32; 4];
     let axis_length = projected_axis_length(mask.angle_deg, 1.0, 1.0);
@@ -1264,10 +1296,7 @@ fn walk_for_batch(
     // and hit testing are unaffected; only the painted position shifts.
     // Transform offsets propagate down into child scroll offsets so the
     // whole subtree translates together.
-    let transform_dx = style
-        .transform_translate_x
-        .map(|t| t.resolve(rect.width))
-        .unwrap_or(0.0);
+    let transform_dx = style.transform_translate_x.map(|t| t.resolve(rect.width)).unwrap_or(0.0);
 
     let render_x = rect.x - scroll_offset_x + transform_dx;
     let render_y = rect.y - scroll_offset_y;
@@ -1973,7 +2002,12 @@ fn walk_for_batch(
                 let cell_w = if use_directwrite_grid_rasterization() {
                     rasterizer.dw.measure_advance_width('M', style.font_size)
                 } else {
-                    measure_monospace_cell_width(font_system, style.font_size, cell_h)
+                    measure_monospace_cell_width_for_family(
+                        font_system,
+                        &rasterizer.dw.font_family,
+                        style.font_size,
+                        cell_h,
+                    )
                 };
                 #[cfg(not(target_os = "windows"))]
                 let cell_w = measure_monospace_cell_width(font_system, style.font_size, cell_h);
@@ -1992,6 +2026,7 @@ fn walk_for_batch(
                 if cols as usize != grid.cols() || rows as usize != grid.rows() {
                     unshit_core::cell_grid::CellGrid::publish_pending_resize(cols, rows);
                 }
+                let render_cell_w = cell_w * parity_terminal_cell_width_scale();
 
                 #[cfg(feature = "grid-fragment-shader")]
                 let routed_to_fragment = try_record_grid_for_fragment_path(
@@ -2000,7 +2035,7 @@ fn walk_for_batch(
                     node_id,
                     render_x + style.padding.left,
                     render_y + style.padding.top,
-                    cell_w,
+                    render_cell_w,
                     cell_h,
                     cols as u32,
                     rows as u32,
@@ -2016,7 +2051,7 @@ fn walk_for_batch(
                         grid,
                         render_x + style.padding.left,
                         render_y + style.padding.top,
-                        cell_w,
+                        render_cell_w,
                         cell_h,
                         style.font_size,
                         opacity,
@@ -2532,6 +2567,468 @@ struct ResolvedGlyph {
     line_y: f32,
 }
 
+const TERMINAL_SHAPE_STYLE_REGULAR: u64 = 0;
+const TERMINAL_SHAPE_STYLE_ITALIC: u64 = 1 << 0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalCellRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+// Terminal drawing glyphs need exact cell geometry. Font rasterizers often
+// leave side bearings on box/block glyphs, which shows up as seams under
+// DirectWrite subpixel text.
+fn terminal_fg_color(cell: &unshit_core::cell_grid::Cell, opacity: f32) -> [f32; 4] {
+    let fg = if cell.attrs.contains(CellAttrs::INVERSE) {
+        if cell.bg.a == 0 {
+            Color::BLACK
+        } else {
+            cell.bg
+        }
+    } else {
+        cell.fg
+    };
+    let mut fg_linear = fg.to_linear_f32();
+    if cell.attrs.contains(CellAttrs::DIM) {
+        fg_linear[3] *= 0.5;
+    }
+    fg_linear[3] *= opacity;
+    fg_linear
+}
+
+fn terminal_effective_bg(grid: &CellGrid, row: usize, col: usize) -> Color {
+    let cell = &grid.cells()[row * grid.cols() + col];
+    terminal_effective_bg_for_cell(cell, parity_windows_terminal_colors_enabled())
+}
+
+fn terminal_effective_bg_for_cell(
+    cell: &unshit_core::cell_grid::Cell,
+    parity_colors: bool,
+) -> Color {
+    if cell.attrs.contains(CellAttrs::INVERSE) {
+        terminal_inverse_bg_color(cell.fg, parity_colors)
+    } else {
+        cell.bg
+    }
+}
+
+fn terminal_inverse_bg_color(fg: Color, parity_colors: bool) -> Color {
+    if parity_colors && fg == WINDOWS_TERMINAL_PARITY_CALIBRATED_FG {
+        WINDOWS_TERMINAL_PARITY_LITERAL_FG
+    } else {
+        fg
+    }
+}
+
+fn terminal_bg_runs_in_range(
+    grid: &CellGrid,
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+) -> Vec<BgRun> {
+    terminal_bg_runs_in_range_for_parity(
+        grid,
+        row,
+        start_col,
+        end_col,
+        parity_windows_terminal_colors_enabled(),
+    )
+}
+
+fn terminal_bg_runs_in_range_for_parity(
+    grid: &CellGrid,
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    parity_colors: bool,
+) -> Vec<BgRun> {
+    if row >= grid.rows() {
+        return Vec::new();
+    }
+    let end_col = end_col.min(grid.cols());
+    if start_col >= end_col {
+        return Vec::new();
+    }
+
+    let mut runs: Vec<BgRun> = Vec::new();
+    let row_base = row * grid.cols();
+    let mut cur: Option<BgRun> = None;
+    for col in start_col..end_col {
+        let cell = &grid.cells()[row_base + col];
+        let bg = terminal_effective_bg_for_cell(cell, parity_colors);
+        match cur.as_mut() {
+            Some(run) if run.bg == bg => run.end_col = col + 1,
+            _ => {
+                if let Some(finished) = cur.take() {
+                    runs.push(finished);
+                }
+                cur = Some(BgRun { start_col: col, end_col: col + 1, bg });
+            }
+        }
+    }
+    if let Some(finished) = cur.take() {
+        runs.push(finished);
+    }
+    runs
+}
+
+fn terminal_bg_overlap_enabled(origin_x: f32, cell_w: f32) -> bool {
+    origin_x.fract().abs() > 0.001 || cell_w.fract().abs() > 0.001
+}
+
+fn terminal_bg_boundary_x(origin_x: f32, cell_w: f32, col: usize) -> f32 {
+    origin_x + col as f32 * cell_w
+}
+
+fn terminal_bg_snapped_boundary_x(origin_x: f32, cell_w: f32, col: usize) -> f32 {
+    terminal_bg_boundary_x(origin_x, cell_w, col).round()
+}
+
+fn terminal_bg_run_edges(
+    grid: &CellGrid,
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    run_start_col: usize,
+    run_end_col: usize,
+    origin_x: f32,
+    cell_w: f32,
+) -> (f32, f32) {
+    let mut left = terminal_bg_boundary_x(origin_x, cell_w, run_start_col);
+    let mut right = terminal_bg_boundary_x(origin_x, cell_w, run_end_col);
+
+    if run_start_col > start_col && terminal_effective_bg(grid, row, run_start_col - 1).a != 0 {
+        left = terminal_bg_snapped_boundary_x(origin_x, cell_w, run_start_col);
+    }
+
+    if run_end_col < end_col && terminal_effective_bg(grid, row, run_end_col).a != 0 {
+        right = terminal_bg_snapped_boundary_x(origin_x, cell_w, run_end_col);
+    }
+
+    (left, right)
+}
+
+fn terminal_row_has_blink(cells: &[unshit_core::cell_grid::Cell], row: usize, cols: usize) -> bool {
+    let start = row * cols;
+    let end = start + cols;
+    cells[start..end].iter().any(|cell| cell.attrs.contains(CellAttrs::BLINK))
+}
+
+fn terminal_row_content_sig(
+    cells: &[unshit_core::cell_grid::Cell],
+    row: usize,
+    cols: usize,
+    blink_phase_on: bool,
+) -> u64 {
+    let sig = hash_row_cells(cells, row, cols);
+    if terminal_row_has_blink(cells, row, cols) && !blink_phase_on {
+        sig ^ 0x9e37_79b9_7f4a_7c15
+    } else {
+        sig
+    }
+}
+
+fn terminal_cell_foreground_visible(
+    cell: &unshit_core::cell_grid::Cell,
+    blink_phase_on: bool,
+) -> bool {
+    blink_phase_on || !cell.attrs.contains(CellAttrs::BLINK)
+}
+
+fn terminal_shape_style(attrs: CellAttrs) -> u64 {
+    let mut style = TERMINAL_SHAPE_STYLE_REGULAR;
+    if attrs.contains(CellAttrs::ITALIC) {
+        style |= TERMINAL_SHAPE_STYLE_ITALIC;
+    }
+    style
+}
+
+fn terminal_text_attrs<'a>(
+    family: cosmic_text::Family<'a>,
+    attrs: CellAttrs,
+) -> cosmic_text::Attrs<'a> {
+    let mut text_attrs = cosmic_text::Attrs::new().family(family);
+    if attrs.contains(CellAttrs::ITALIC) {
+        text_attrs = text_attrs.style(cosmic_text::Style::Oblique);
+    }
+    text_attrs
+}
+
+fn push_terminal_quad(
+    row_quads: &mut Vec<QuadInstance>,
+    pos: [f32; 2],
+    size: [f32; 2],
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+) {
+    if size[0] <= 0.0 || size[1] <= 0.0 || color[3] <= 0.0 {
+        return;
+    }
+
+    row_quads.push(QuadInstance {
+        pos,
+        size,
+        color,
+        border_color: [0.0; 4],
+        border_width: [0.0; 4],
+        border_radius: [0.0; 4],
+        clip_rect,
+        shadow_color: [0.0; 4],
+        shadow_offset: [0.0; 2],
+        shadow_params: [0.0; 2],
+        shadow_spread: [0.0; 2],
+        gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
+        gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
+        gradient_params: [0.0; 4],
+        gradient_extra: EMPTY_GRADIENT_EXTRA,
+        mask_stops_01: EMPTY_MASK_STOPS,
+        mask_stops_23: EMPTY_MASK_STOPS,
+        mask_params: EMPTY_MASK_PARAMS,
+    });
+}
+
+fn push_terminal_cell_rect(
+    row_quads: &mut Vec<QuadInstance>,
+    cell_x: f32,
+    cell_y: f32,
+    rect: TerminalCellRect,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+) {
+    push_terminal_quad(
+        row_quads,
+        [cell_x + rect.x, cell_y + rect.y],
+        [rect.width, rect.height],
+        color,
+        clip_rect,
+    );
+}
+
+fn emit_terminal_text_decorations(
+    cell: &unshit_core::cell_grid::Cell,
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) -> bool {
+    let mut emitted = false;
+    let thickness = (cell_h / 16.0).round().max(1.0);
+    let overlap = 0.25;
+
+    if cell.attrs.contains(CellAttrs::UNDERLINE) {
+        let y = (cell_h * 0.82).round().min(cell_h - thickness);
+        push_terminal_quad(
+            row_quads,
+            [cell_x - overlap, cell_y + y],
+            [cell_w + overlap * 2.0, thickness],
+            color,
+            clip_rect,
+        );
+        emitted = true;
+    }
+
+    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
+        let y = (cell_h * 0.50).round().min(cell_h - thickness);
+        push_terminal_quad(
+            row_quads,
+            [cell_x - overlap, cell_y + y],
+            [cell_w + overlap * 2.0, thickness],
+            color,
+            clip_rect,
+        );
+        emitted = true;
+    }
+
+    emitted
+}
+
+fn terminal_block_rect(ch: char, cell_w: f32, cell_h: f32) -> Option<TerminalCellRect> {
+    let overlap = 0.5;
+    match ch {
+        '\u{2588}' => Some(TerminalCellRect {
+            x: -overlap,
+            y: -overlap,
+            width: cell_w + overlap * 2.0,
+            height: cell_h + overlap * 2.0,
+        }),
+        '\u{2580}' => Some(TerminalCellRect {
+            x: -overlap,
+            y: -overlap,
+            width: cell_w + overlap * 2.0,
+            height: cell_h * 0.5 + overlap,
+        }),
+        '\u{2584}' => Some(TerminalCellRect {
+            x: -overlap,
+            y: cell_h * 0.5,
+            width: cell_w + overlap * 2.0,
+            height: cell_h * 0.5 + overlap,
+        }),
+        '\u{258c}' => Some(TerminalCellRect {
+            x: -overlap,
+            y: -overlap,
+            width: cell_w * 0.5 + overlap,
+            height: cell_h + overlap * 2.0,
+        }),
+        '\u{2590}' => Some(TerminalCellRect {
+            x: cell_w * 0.5,
+            y: -overlap,
+            width: cell_w * 0.5 + overlap,
+            height: cell_h + overlap * 2.0,
+        }),
+        '\u{2581}'..='\u{2587}' => {
+            let eighths = ch as u32 - 0x2580;
+            let height = cell_h * (eighths as f32 / 8.0) + overlap;
+            Some(TerminalCellRect {
+                x: -overlap,
+                y: cell_h - height,
+                width: cell_w + overlap * 2.0,
+                height,
+            })
+        }
+        '\u{2589}'..='\u{258f}' => {
+            let eighths = 8 - (ch as u32 - 0x2588);
+            Some(TerminalCellRect {
+                x: -overlap,
+                y: -overlap,
+                width: cell_w * (eighths as f32 / 8.0) + overlap,
+                height: cell_h + overlap * 2.0,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn box_stroke_width(cell_h: f32, heavy: bool) -> f32 {
+    let light = (cell_h / 16.0).round().max(1.0);
+    if heavy {
+        (light * 2.0).max(2.0)
+    } else {
+        light
+    }
+}
+
+fn box_connections(ch: char) -> Option<(bool, bool, bool, bool, bool)> {
+    let (left, right, up, down, heavy) = match ch {
+        '\u{2500}' => (true, true, false, false, false),
+        '\u{2502}' => (false, false, true, true, false),
+        '\u{250c}' => (false, true, false, true, false),
+        '\u{2510}' => (true, false, false, true, false),
+        '\u{2514}' => (false, true, true, false, false),
+        '\u{2518}' => (true, false, true, false, false),
+        '\u{251c}' => (false, true, true, true, false),
+        '\u{2524}' => (true, false, true, true, false),
+        '\u{252c}' => (true, true, false, true, false),
+        '\u{2534}' => (true, true, true, false, false),
+        '\u{253c}' => (true, true, true, true, false),
+        '\u{2501}' => (true, true, false, false, true),
+        '\u{2503}' => (false, false, true, true, true),
+        '\u{250f}' => (false, true, false, true, true),
+        '\u{2513}' => (true, false, false, true, true),
+        '\u{2517}' => (false, true, true, false, true),
+        '\u{251b}' => (true, false, true, false, true),
+        '\u{2523}' => (false, true, true, true, true),
+        '\u{252b}' => (true, false, true, true, true),
+        '\u{2533}' => (true, true, false, true, true),
+        '\u{253b}' => (true, true, true, false, true),
+        '\u{254b}' => (true, true, true, true, true),
+        _ => return None,
+    };
+    Some((left, right, up, down, heavy))
+}
+
+fn emit_box_drawing_primitive(
+    ch: char,
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) -> bool {
+    let Some((left, right, up, down, heavy)) = box_connections(ch) else {
+        return false;
+    };
+
+    let overlap = 0.5;
+    let stroke = box_stroke_width(cell_h, heavy);
+    let cx = cell_w * 0.5;
+    let cy = cell_h * 0.5;
+
+    if left || right {
+        let x0 = if left { -overlap } else { cx - stroke * 0.5 };
+        let x1 = if right { cell_w + overlap } else { cx + stroke * 0.5 };
+        push_terminal_cell_rect(
+            row_quads,
+            cell_x,
+            cell_y,
+            TerminalCellRect { x: x0, y: cy - stroke * 0.5, width: x1 - x0, height: stroke },
+            color,
+            clip_rect,
+        );
+    }
+
+    if up || down {
+        let y0 = if up { -overlap } else { cy - stroke * 0.5 };
+        let y1 = if down { cell_h + overlap } else { cy + stroke * 0.5 };
+        push_terminal_cell_rect(
+            row_quads,
+            cell_x,
+            cell_y,
+            TerminalCellRect { x: cx - stroke * 0.5, y: y0, width: stroke, height: y1 - y0 },
+            color,
+            clip_rect,
+        );
+    }
+
+    true
+}
+
+fn emit_terminal_cell_primitive(
+    cell: &unshit_core::cell_grid::Cell,
+    row: usize,
+    col: usize,
+    origin_x: f32,
+    origin_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    opacity: f32,
+    clip_rect: [f32; 4],
+    blink_phase_on: bool,
+    row_quads: &mut Vec<QuadInstance>,
+) -> bool {
+    if cell.ch == '\0' || cell.wide_continuation {
+        return false;
+    }
+    if !terminal_cell_foreground_visible(cell, blink_phase_on) {
+        return true;
+    }
+
+    let cell_x = origin_x + col as f32 * cell_w;
+    let cell_y = origin_y + row as f32 * cell_h;
+    let color = terminal_fg_color(cell, opacity);
+    let decorated = emit_terminal_text_decorations(
+        cell, cell_x, cell_y, cell_w, cell_h, color, clip_rect, row_quads,
+    );
+
+    if cell.ch == ' ' {
+        return decorated;
+    }
+
+    if let Some(rect) = terminal_block_rect(cell.ch, cell_w, cell_h) {
+        push_terminal_cell_rect(row_quads, cell_x, cell_y, rect, color, clip_rect);
+        return true;
+    }
+
+    emit_box_drawing_primitive(cell.ch, cell_x, cell_y, cell_w, cell_h, color, clip_rect, row_quads)
+}
+
 /// Emit a background `QuadInstance` for every bg run on `row` between
 /// `start_col` (inclusive) and `end_col` (exclusive). Adjacent cells with
 /// matching background color merge regardless of foreground color or
@@ -2568,23 +3065,41 @@ fn emit_grid_row_backgrounds(
     row_quads: &mut Vec<QuadInstance>,
 ) {
     let py = origin_y + row as f32 * cell_h;
+    let overlap_enabled = terminal_bg_overlap_enabled(origin_x, cell_w);
     // Issue #84: merge adjacent cells that share a bg regardless of fg
     // or attrs. A typical colorized row has uniform bg but varies fg per
     // token, so collapsing on bg alone cuts redundant bg quads. Mirrors
     // Zed's `BackgroundRegion` pass.
-    for run in grid.compute_bg_runs_in_range(row, start_col, end_col) {
+    for run in terminal_bg_runs_in_range(grid, row, start_col, end_col) {
         // Default background elision. The terminal cell `DEFAULT_BG` is
         // fully transparent (see `src/terminal/mod.rs`), and the frame
         // clear already paints the chrome color which shows through by
         // design. Emitting a zero alpha quad is a visual no op and a
         // waste of an instance, so skip it.
-        if run.bg.a == 0 {
+        let bg = run.bg;
+        if bg.a == 0 {
             continue;
         }
-        let mut bg_color = run.bg.to_linear_f32();
+        let mut bg_color = bg.to_linear_f32();
         bg_color[3] *= opacity;
-        let px = origin_x + run.start_col as f32 * cell_w;
-        let width = run.col_count() as f32 * cell_w;
+        let (px, width) = if overlap_enabled {
+            let (left, right) = terminal_bg_run_edges(
+                grid,
+                row,
+                start_col,
+                end_col,
+                run.start_col,
+                run.end_col,
+                origin_x,
+                cell_w,
+            );
+            (left, right - left)
+        } else {
+            (
+                terminal_bg_boundary_x(origin_x, cell_w, run.start_col),
+                run.col_count() as f32 * cell_w,
+            )
+        };
         if width <= 0.0 {
             continue;
         }
@@ -2647,6 +3162,7 @@ fn emit_grid_cells(
     let mut trace_glyphs: Vec<String> = Vec::new();
 
     let atlas_generation = atlas.generation;
+    let blink_phase_on = !CellGrid::is_window_focused() || CellGrid::cursor_blink_phase_now();
 
     // Shape each unique character once, then cache the fully resolved glyph
     // per actual atlas key. Fractional cell origins can change the subpixel
@@ -2655,16 +3171,13 @@ fn emit_grid_cells(
     // (cache miss path) in this pass.
     let mut glyph_cache: FxHashMap<GlyphKey, ResolvedGlyph> = FxHashMap::default();
 
-    // Precompute the (font_family, font_id, style) fields for the ShapeCache
-    // key. These are identical for every cell in this grid, so we lift them
-    // out of the inner loop.
+    // Precompute the font-family fields for the ShapeCache key. The style
+    // portion still comes from each cell's SGR attrs (bold/italic).
     #[cfg(target_os = "windows")]
     let family_name: &str = &rasterizer.dw.font_family;
     #[cfg(not(target_os = "windows"))]
     let family_name: &str = "";
     let shape_font_id = shape_cache_font_id(family_name);
-    // Style hash reserved for bold/italic/etc; currently single bucket.
-    const SHAPE_STYLE_REGULAR: u64 = 0;
     let shape_font_size_tenths = (font_size * 10.0).round() as u32;
 
     // Auto-invalidate the cache if font, DPI, or size has changed since the
@@ -2712,7 +3225,7 @@ fn emit_grid_cells(
         // freshness; the damage range decides emission extent on miss.
         // Mirrors Alacritty's `LineDamageBounds` and WezTerm's
         // `changed_since(seqno)` patterns (issue #52 Step 4).
-        let content_sig = hash_row_cells(cells, row, cols);
+        let content_sig = terminal_row_content_sig(cells, row, cols, blink_phase_on);
 
         // Cache probe: replay the cached instances for this line when its
         // content hash and geometry signature still match. This is the
@@ -2826,9 +3339,10 @@ fn emit_grid_cells(
                 opacity,
                 clip_rect,
                 shape_font_id,
-                SHAPE_STYLE_REGULAR,
+                TERMINAL_SHAPE_STYLE_REGULAR,
                 shape_font_size_tenths,
                 family_name,
+                blink_phase_on,
                 &mut row_quads,
                 &mut row_glyphs,
                 &mut row_keys,
@@ -2857,9 +3371,10 @@ fn emit_grid_cells(
                 opacity,
                 clip_rect,
                 shape_font_id,
-                SHAPE_STYLE_REGULAR,
+                TERMINAL_SHAPE_STYLE_REGULAR,
                 shape_font_size_tenths,
                 family_name,
+                blink_phase_on,
                 &mut row_quads,
                 &mut row_glyphs,
                 &mut row_keys,
@@ -2941,8 +3456,7 @@ fn emit_grid_cells(
     // [`unshit_core::cell_grid::CURSOR_BLINK_HALF_CYCLE_MS`]). When the
     // OS window is not focused we draw the cursor steady on so the
     // unfocused state mirrors the legacy behaviour.
-    let cursor_phase_on = !CellGrid::is_window_focused() || CellGrid::cursor_blink_phase_now();
-    if grid.cursor_visible() && cursor_phase_on {
+    if grid.cursor_visible() && blink_phase_on {
         let crow = grid.cursor_row();
         let ccol = grid.cursor_col();
         if crow < rows && ccol < cols {
@@ -3025,12 +3539,8 @@ fn emit_grid_cell_glyph(
     let py = origin_y + row as f32 * cell_h;
     // INVERSE swaps fg/bg; only fg is needed here since the bg quad
     // was already emitted via the run loop in the caller.
-    let fg = if cell.attrs.contains(CellAttrs::INVERSE) { cell.bg } else { cell.fg };
-    let mut fg_linear = fg.to_linear_f32();
-    if cell.attrs.contains(CellAttrs::DIM) {
-        fg_linear[3] *= 0.5;
-    }
-    fg_linear[3] *= opacity;
+    let fg_linear = terminal_fg_color(cell, opacity);
+    let shape_style = shape_style | terminal_shape_style(cell.attrs);
 
     let cache_key = ShapeCacheKey {
         ch: cell.ch,
@@ -3051,12 +3561,8 @@ fn emit_grid_cell_glyph(
         let family = cosmic_text::Family::Monospace;
         // Silence unused on non-windows.
         let _ = family_name;
-        buffer.set_text(
-            font_system,
-            ch_str,
-            cosmic_text::Attrs::new().family(family),
-            cosmic_text::Shaping::Advanced,
-        );
+        let attrs = terminal_text_attrs(family, cell.attrs);
+        buffer.set_text(font_system, ch_str, attrs, cosmic_text::Shaping::Advanced);
         buffer.shape_until_scroll(font_system, false);
 
         let shaped = buffer.layout_runs().find_map(|run| {
@@ -3175,6 +3681,7 @@ fn emit_grid_row_fresh(
     shape_style: u64,
     shape_font_size_tenths: u32,
     family_name: &str,
+    blink_phase_on: bool,
     row_quads: &mut Vec<QuadInstance>,
     row_glyphs: &mut Vec<GlyphInstance>,
     row_keys: &mut Vec<GlyphKey>,
@@ -3208,6 +3715,27 @@ fn emit_grid_row_fresh(
     // unchanged cells without reshaping.
     for col in 0..cols {
         let cell = &cells[row_base + col];
+        if emit_terminal_cell_primitive(
+            cell,
+            row,
+            col,
+            origin_x,
+            origin_y,
+            cell_w,
+            cell_h,
+            opacity,
+            clip_rect,
+            blink_phase_on,
+            row_quads,
+        ) {
+            row_glyph_col_index.push(None);
+            continue;
+        }
+        if !terminal_cell_foreground_visible(cell, blink_phase_on) {
+            row_glyph_col_index.push(None);
+            continue;
+        }
+
         let pre_len = row_glyphs.len() as u32;
         let emitted = emit_grid_cell_glyph(
             cell,
@@ -3278,6 +3806,7 @@ fn emit_grid_row_splice(
     shape_style: u64,
     shape_font_size_tenths: u32,
     family_name: &str,
+    blink_phase_on: bool,
     row_quads: &mut Vec<QuadInstance>,
     row_glyphs: &mut Vec<GlyphInstance>,
     row_keys: &mut Vec<GlyphKey>,
@@ -3305,9 +3834,30 @@ fn emit_grid_row_splice(
     row_glyph_col_index.reserve(cols);
 
     for col in 0..cols {
+        let cell = &cells[row_base + col];
+        if emit_terminal_cell_primitive(
+            cell,
+            row,
+            col,
+            origin_x,
+            origin_y,
+            cell_w,
+            cell_h,
+            opacity,
+            clip_rect,
+            blink_phase_on,
+            row_quads,
+        ) {
+            row_glyph_col_index.push(None);
+            continue;
+        }
+        if !terminal_cell_foreground_visible(cell, blink_phase_on) {
+            row_glyph_col_index.push(None);
+            continue;
+        }
+
         if col >= damage_start && col < damage_end {
             // Damaged column: emit fresh glyph.
-            let cell = &cells[row_base + col];
             let pre_len = row_glyphs.len() as u32;
             let emitted = emit_grid_cell_glyph(
                 cell,
@@ -3759,12 +4309,26 @@ fn measure_monospace_cell_width(
     font_size: f32,
     line_height: f32,
 ) -> f32 {
+    measure_monospace_cell_width_for_family(
+        font_system,
+        monospace_family_name(),
+        font_size,
+        line_height,
+    )
+}
+
+fn measure_monospace_cell_width_for_family(
+    font_system: &mut FontSystem,
+    font_family: &str,
+    font_size: f32,
+    line_height: f32,
+) -> f32 {
     use std::sync::Mutex;
     static CACHE: Mutex<Option<CellMetricsCache>> = Mutex::new(None);
 
     let mut guard = CACHE.lock().expect("cell metrics cache mutex poisoned");
     let cache = guard.get_or_insert_with(CellMetricsCache::new);
-    cache.get_or_measure(font_system, monospace_family_name(), font_size, line_height, 1.0).cell_w
+    cache.get_or_measure(font_system, font_family, font_size, line_height, 1.0).cell_w
 }
 
 /// Default family name used for the free-function measurement path. Tests and
@@ -3917,6 +4481,112 @@ mod tests {
         let elem = Element::new(Tag::Div);
         let root = arena.alloc(elem);
         (arena, root)
+    }
+
+    #[test]
+    fn terminal_inverse_transparent_bg_uses_opaque_glyph_color() {
+        let cell = unshit_core::cell_grid::Cell {
+            ch: 'z',
+            fg: Color { r: 204, g: 204, b: 204, a: 255 },
+            bg: Color::TRANSPARENT,
+            attrs: CellAttrs::INVERSE,
+            wide_continuation: false,
+        };
+
+        let fg = terminal_fg_color(&cell, 1.0);
+
+        assert_eq!(fg, Color::BLACK.to_linear_f32());
+    }
+
+    #[test]
+    fn terminal_inverse_bg_uses_literal_campbell_fg_under_parity_profile() {
+        assert_eq!(
+            terminal_inverse_bg_color(WINDOWS_TERMINAL_PARITY_CALIBRATED_FG, true),
+            WINDOWS_TERMINAL_PARITY_LITERAL_FG
+        );
+        assert_eq!(
+            terminal_inverse_bg_color(WINDOWS_TERMINAL_PARITY_CALIBRATED_FG, false),
+            WINDOWS_TERMINAL_PARITY_CALIBRATED_FG
+        );
+        assert_eq!(terminal_inverse_bg_color(Color::rgb(10, 20, 30), true), Color::rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn terminal_bg_runs_only_recalibrate_inverse_default_fg_under_parity_profile() {
+        let mut grid = CellGrid::new(1, 2);
+        grid.set_cell(
+            0,
+            0,
+            unshit_core::cell_grid::Cell {
+                ch: 'i',
+                fg: WINDOWS_TERMINAL_PARITY_CALIBRATED_FG,
+                bg: Color::TRANSPARENT,
+                attrs: CellAttrs::INVERSE,
+                wide_continuation: false,
+            },
+        );
+        grid.set_cell(
+            0,
+            1,
+            unshit_core::cell_grid::Cell {
+                ch: 'b',
+                fg: Color::WHITE,
+                bg: WINDOWS_TERMINAL_PARITY_CALIBRATED_FG,
+                attrs: CellAttrs::empty(),
+                wide_continuation: false,
+            },
+        );
+
+        let runs = terminal_bg_runs_in_range_for_parity(&grid, 0, 0, 2, true);
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].bg, WINDOWS_TERMINAL_PARITY_LITERAL_FG);
+        assert_eq!(runs[1].bg, WINDOWS_TERMINAL_PARITY_CALIBRATED_FG);
+    }
+
+    #[test]
+    fn parity_cell_width_scale_from_values_uses_windows_terminal_profile_default() {
+        assert_eq!(
+            parity_cell_width_scale_from_values(None, true),
+            WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE
+        );
+        assert_eq!(
+            parity_cell_width_scale_from_values(Some(std::ffi::OsString::from("")), true),
+            WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE
+        );
+    }
+
+    #[test]
+    fn parity_cell_width_scale_from_values_defaults_to_neutral_outside_parity_profile() {
+        assert_eq!(parity_cell_width_scale_from_values(None, false), 1.0);
+        assert_eq!(
+            parity_cell_width_scale_from_values(Some(std::ffi::OsString::from("invalid")), false),
+            1.0
+        );
+    }
+
+    #[test]
+    fn parity_cell_width_scale_from_values_accepts_small_calibration_range() {
+        assert_eq!(
+            parity_cell_width_scale_from_values(Some(std::ffi::OsString::from("0.985")), true),
+            0.985
+        );
+        assert_eq!(
+            parity_cell_width_scale_from_values(Some(std::ffi::OsString::from("1.015")), false),
+            1.015
+        );
+    }
+
+    #[test]
+    fn parity_cell_width_scale_from_values_rejects_large_distortion() {
+        assert_eq!(
+            parity_cell_width_scale_from_values(Some(std::ffi::OsString::from("0.5")), true),
+            WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE
+        );
+        assert_eq!(
+            parity_cell_width_scale_from_values(Some(std::ffi::OsString::from("1.5")), false),
+            1.0
+        );
     }
 
     /// Helper: run `build_render_batch` using only CPU-side structures (no GPU
@@ -4290,6 +4960,16 @@ mod tests {
         let line_height = font_size * 1.2;
         let w = measure_monospace_cell_width(&mut fs, font_size, line_height);
         assert!(w > 0.0, "cell width must be positive, got {}", w);
+    }
+
+    #[test]
+    fn measure_monospace_cell_width_for_family_returns_positive() {
+        let mut fs = FontSystem::new();
+        let font_size = 14.0_f32;
+        let line_height = font_size * 1.2;
+        let w =
+            measure_monospace_cell_width_for_family(&mut fs, "Consolas", font_size, line_height);
+        assert!(w > 0.0, "family-specific cell width must be positive, got {w}");
     }
 
     /// Different line_height values must not change the measured advance width,
@@ -4822,6 +5502,257 @@ mod tests {
         assert!(chars.contains(&'\u{2500}'));
         assert!(chars.contains(&'\u{257f}'));
         assert_eq!(chars.len(), 95 + 128);
+    }
+
+    fn terminal_cell(ch: char) -> unshit_core::cell_grid::Cell {
+        unshit_core::cell_grid::Cell {
+            ch,
+            fg: Color { r: 255, g: 128, b: 64, a: 255 },
+            bg: Color { r: 0, g: 0, b: 0, a: 0 },
+            attrs: CellAttrs::empty(),
+            wide_continuation: false,
+        }
+    }
+
+    #[test]
+    fn terminal_primitive_renders_full_block_as_cell_aligned_quad() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{2588}'),
+            0,
+            2,
+            10.0,
+            20.0,
+            8.0,
+            16.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            &mut quads,
+        );
+
+        assert!(emitted, "full block must be rendered by terminal primitive path");
+        assert_eq!(quads.len(), 1);
+        assert!(quads[0].pos[0] < 26.0, "block should overlap left cell edge");
+        assert!(quads[0].pos[1] < 20.0, "block should overlap top cell edge");
+        assert!(quads[0].size[0] > 8.0, "block width should cover the full cell plus seam guard");
+        assert!(quads[0].size[1] > 16.0, "block height should cover the full cell plus seam guard");
+    }
+
+    #[test]
+    fn terminal_primitive_renders_horizontal_rule_across_cell_edges() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{2500}'),
+            1,
+            3,
+            4.0,
+            6.0,
+            9.0,
+            18.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            &mut quads,
+        );
+
+        assert!(emitted, "box drawing horizontal must bypass glyph rasterization");
+        assert_eq!(quads.len(), 1);
+        let cell_x = 4.0 + 3.0 * 9.0;
+        assert!(quads[0].pos[0] < cell_x, "rule should overlap the left cell edge");
+        assert!(
+            quads[0].size[0] > 9.0,
+            "rule should span the full cell plus edge overlap to avoid seams"
+        );
+        assert!(quads[0].size[1] >= 1.0, "light rule must be at least one physical pixel");
+    }
+
+    #[test]
+    fn terminal_primitive_renders_box_corner_as_two_strokes() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{250c}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            &mut quads,
+        );
+
+        assert!(emitted);
+        assert_eq!(quads.len(), 2, "corner should render horizontal and vertical strokes");
+    }
+
+    #[test]
+    fn terminal_primitive_leaves_regular_text_on_glyph_path() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('A'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            &mut quads,
+        );
+
+        assert!(!emitted);
+        assert!(quads.is_empty());
+    }
+
+    #[test]
+    fn terminal_shape_style_distinguishes_bold_and_italic() {
+        assert_eq!(terminal_shape_style(CellAttrs::empty()), TERMINAL_SHAPE_STYLE_REGULAR);
+        assert_eq!(
+            terminal_shape_style(CellAttrs::BOLD),
+            TERMINAL_SHAPE_STYLE_REGULAR,
+            "Windows Terminal's default intense style does not select a bold face"
+        );
+        assert_eq!(terminal_shape_style(CellAttrs::ITALIC), TERMINAL_SHAPE_STYLE_ITALIC);
+        assert_eq!(
+            terminal_shape_style(CellAttrs::BOLD | CellAttrs::ITALIC),
+            TERMINAL_SHAPE_STYLE_ITALIC
+        );
+    }
+
+    #[test]
+    fn terminal_text_attrs_maps_sgr_italic_to_oblique_without_bold_face() {
+        let attrs = terminal_text_attrs(
+            cosmic_text::Family::Name("Consolas"),
+            CellAttrs::BOLD | CellAttrs::ITALIC,
+        );
+
+        assert_eq!(attrs.weight, cosmic_text::Weight::NORMAL);
+        assert_eq!(attrs.style, cosmic_text::Style::Oblique);
+    }
+
+    #[test]
+    fn terminal_primitive_draws_underline_without_bypassing_text_glyph() {
+        let mut cell = terminal_cell('A');
+        cell.attrs = CellAttrs::UNDERLINE;
+
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &cell,
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            &mut quads,
+        );
+
+        assert!(!emitted, "text glyph must still render through the glyph path");
+        assert_eq!(quads.len(), 1, "underline should add one decoration quad");
+        assert_eq!(quads[0].pos[1], 16.0, "underline should sit just above the cell baseline");
+    }
+
+    #[test]
+    fn terminal_primitive_draws_strikethrough_on_spaces() {
+        let mut cell = terminal_cell(' ');
+        cell.attrs = CellAttrs::STRIKETHROUGH;
+
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &cell,
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            &mut quads,
+        );
+
+        assert!(emitted, "decorated spaces have visible output without a glyph");
+        assert_eq!(quads.len(), 1);
+        assert!((8.0..=12.0).contains(&quads[0].pos[1]), "strike belongs around mid-cell");
+    }
+
+    #[test]
+    fn terminal_blink_off_suppresses_regular_text_before_glyph_path() {
+        let mut cell = terminal_cell('A');
+        cell.attrs = CellAttrs::BLINK;
+
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &cell,
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            &mut quads,
+        );
+
+        assert!(emitted, "blink-off text must not fall through to glyph emission");
+        assert!(quads.is_empty(), "blink-off text should leave only the background visible");
+    }
+
+    #[test]
+    fn terminal_blink_off_suppresses_cell_primitives() {
+        let mut cell = terminal_cell('\u{2588}');
+        cell.attrs = CellAttrs::BLINK;
+
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &cell,
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            &mut quads,
+        );
+
+        assert!(emitted, "blink-off primitives must consume the cell foreground path");
+        assert!(quads.is_empty(), "blink-off block drawing should not render foreground quads");
+    }
+
+    #[test]
+    fn terminal_row_content_sig_changes_with_blink_phase_only_for_blink_rows() {
+        let mut plain = terminal_cell('A');
+        plain.attrs = CellAttrs::empty();
+        let mut blinking = terminal_cell('B');
+        blinking.attrs = CellAttrs::BLINK;
+
+        let plain_cells = vec![plain, plain];
+        assert_eq!(
+            terminal_row_content_sig(&plain_cells, 0, 2, true),
+            terminal_row_content_sig(&plain_cells, 0, 2, false),
+            "plain rows should stay cacheable across blink phases"
+        );
+
+        let blink_cells = vec![plain, blinking];
+        assert_ne!(
+            terminal_row_content_sig(&blink_cells, 0, 2, true),
+            terminal_row_content_sig(&blink_cells, 0, 2, false),
+            "blink rows must invalidate cached foreground payloads across phases"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5797,6 +6728,101 @@ mod tests {
             (green_quad.color[1] - green_linear[1]).abs() < f32::EPSILON,
             "green quad color must match green bg",
         );
+    }
+
+    #[test]
+    fn emit_grid_row_backgrounds_snaps_fractional_adjacent_opaque_boundaries() {
+        use unshit_core::cell_grid::Cell;
+
+        let cols = 3;
+        let mut g = CellGrid::new(1, cols);
+        g.clear_dirty();
+        let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+        let colors = [
+            Color { r: 200, g: 20, b: 20, a: 255 },
+            Color { r: 20, g: 200, b: 20, a: 255 },
+            Color { r: 20, g: 30, b: 200, a: 255 },
+        ];
+        for (col, bg) in colors.into_iter().enumerate() {
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+
+        let mut row_quads: Vec<QuadInstance> = Vec::new();
+        let cell_w = 10.25;
+        emit_grid_row_backgrounds(
+            &g,
+            0,
+            0,
+            cols,
+            0.0,
+            0.0,
+            cell_w,
+            20.0,
+            1.0,
+            [0.0; 4],
+            &mut row_quads,
+        );
+
+        assert_eq!(row_quads.len(), cols);
+        assert!((row_quads[0].pos[0] - 0.0).abs() < f32::EPSILON);
+        assert!((row_quads[0].size[0] - 10.0).abs() < f32::EPSILON);
+        assert!((row_quads[1].pos[0] - 10.0).abs() < f32::EPSILON);
+        assert!((row_quads[1].size[0] - 11.0).abs() < f32::EPSILON);
+        assert!((row_quads[2].pos[0] - 21.0).abs() < f32::EPSILON);
+        assert!((row_quads[2].size[0] - 9.75).abs() < f32::EPSILON);
+        assert!(
+            ((row_quads[0].pos[0] + row_quads[0].size[0]) - row_quads[1].pos[0]).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            ((row_quads[1].pos[0] + row_quads[1].size[0]) - row_quads[2].pos[0]).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn emit_grid_row_backgrounds_does_not_overlap_transparent_gaps() {
+        use unshit_core::cell_grid::Cell;
+
+        let mut g = CellGrid::new(1, 3);
+        g.clear_dirty();
+        let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+        let red = Color { r: 200, g: 20, b: 20, a: 255 };
+        let transparent = Color { r: 0, g: 0, b: 0, a: 0 };
+        let blue = Color { r: 20, g: 30, b: 200, a: 255 };
+        for (col, bg) in [red, transparent, blue].into_iter().enumerate() {
+            g.set_cell(
+                0,
+                col,
+                Cell { ch: 'x', fg, bg, attrs: CellAttrs::empty(), wide_continuation: false },
+            );
+        }
+
+        let mut row_quads: Vec<QuadInstance> = Vec::new();
+        let cell_w = 10.25;
+        emit_grid_row_backgrounds(
+            &g,
+            0,
+            0,
+            3,
+            0.0,
+            0.0,
+            cell_w,
+            20.0,
+            1.0,
+            [0.0; 4],
+            &mut row_quads,
+        );
+
+        assert_eq!(row_quads.len(), 2);
+        assert!((row_quads[0].pos[0] - 0.0).abs() < f32::EPSILON);
+        assert!((row_quads[0].size[0] - cell_w).abs() < f32::EPSILON);
+        assert!((row_quads[1].pos[0] - (cell_w * 2.0)).abs() < f32::EPSILON);
+        assert!((row_quads[1].size[0] - cell_w).abs() < f32::EPSILON);
     }
 
     #[test]

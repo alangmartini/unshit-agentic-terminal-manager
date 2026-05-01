@@ -19,6 +19,10 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
+#[allow(dead_code)]
+#[path = "../src/shell.rs"]
+mod shell;
+
 // Bring the bin's pty module in via a path attribute so the bench can
 // reach the public `DaemonPty` API without making the whole package a
 // library. The included module's `#[cfg(test)]` block compiles but is

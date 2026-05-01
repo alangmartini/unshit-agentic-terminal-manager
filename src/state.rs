@@ -3021,14 +3021,15 @@ pub fn measure_cell_width_ratio_at(font_size: f32, line_height: f32) -> f32 {
     0.6
 }
 
-/// CSS base font-size in px. Must match `--t-md` in assets/styles.css.
-pub const CSS_BASE_FONT_SIZE: f32 = 12.0;
+/// Default terminal font-size in CSS px. Must match the `.terminal-content`
+/// fallback in assets/styles.css and the seeded `font_size_pt` value.
+pub const CSS_BASE_FONT_SIZE: f32 = 13.0;
 
 /// CSS line-height for `.terminal-content`. Must match
-/// `.terminal-content { line-height: 1.2; }` in assets/styles.css.
+/// `.terminal-content { line-height: 1.25; }` in assets/styles.css.
 /// If this value drifts from the CSS, the renderer cell_h and the
 /// pre-published cell_h will disagree, causing row-height mismatches.
-pub const CSS_LINE_HEIGHT: f32 = 1.2;
+pub const CSS_LINE_HEIGHT: f32 = 1.25;
 
 /// Pre-publish cell metrics to the global atomics so that `on_resize` handlers
 /// can compute correct PTY dimensions on the very first frame.
@@ -6589,6 +6590,15 @@ mod tests {
     }
 
     #[test]
+    fn default_terminal_font_size_matches_cell_metric_constant() {
+        let state = seed_state();
+        assert_eq!(
+            state.font_size_pt as f32, CSS_BASE_FONT_SIZE,
+            "default terminal font size and initial cell metric estimate must stay in sync"
+        );
+    }
+
+    #[test]
     fn measure_cell_width_ratio_reasonable_range() {
         for &size in &[10.0_f32, 12.0, 14.0, 16.0, 24.0] {
             let ratio = measure_cell_width_ratio_at(size, size * 1.2);
@@ -6606,7 +6616,8 @@ mod tests {
     // the PowerShell greeting to wrap before on_cell_metrics corrected it.
     #[test]
     fn initial_pty_estimate_not_hardcoded_80x24() {
-        let ratio = measure_cell_width_ratio_at(12.0, 12.0 * CSS_LINE_HEIGHT);
+        let ratio =
+            measure_cell_width_ratio_at(CSS_BASE_FONT_SIZE, CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT);
         let cell_w = CSS_BASE_FONT_SIZE * ratio;
         let cell_h = CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT;
         // Same formula as main.rs: window(1280x800) minus chrome(284x109)
@@ -6626,7 +6637,8 @@ mod tests {
 
     #[test]
     fn initial_pty_estimate_reasonable_range() {
-        let ratio = measure_cell_width_ratio_at(12.0, 12.0 * CSS_LINE_HEIGHT);
+        let ratio =
+            measure_cell_width_ratio_at(CSS_BASE_FONT_SIZE, CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT);
         let cell_w = CSS_BASE_FONT_SIZE * ratio;
         let cell_h = CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT;
         let cols = ((1280.0_f32 - 284.0) / cell_w).max(1.0) as u16;
@@ -7197,10 +7209,7 @@ mod tests {
     fn normalize_pasted_text_no_op_when_already_normalised() {
         // Plain text without newlines or markers should pass straight
         // through with no allocations bigger than the input.
-        assert_eq!(
-            super::normalize_pasted_text("ls -al"),
-            "ls -al"
-        );
+        assert_eq!(super::normalize_pasted_text("ls -al"), "ls -al");
     }
 
     #[test]
@@ -7208,14 +7217,8 @@ mod tests {
         // A standalone ESC or short prefix (`\x1b[20`) must not be
         // consumed; only the full 6-byte marker should drop. This
         // guards against eating real shell escape codes in a paste.
-        assert_eq!(
-            super::normalize_pasted_text("\x1b[20"),
-            "\x1b[20"
-        );
-        assert_eq!(
-            super::normalize_pasted_text("\x1b[200"),
-            "\x1b[200"
-        );
+        assert_eq!(super::normalize_pasted_text("\x1b[20"), "\x1b[20");
+        assert_eq!(super::normalize_pasted_text("\x1b[200"), "\x1b[200");
     }
 
     #[test]
@@ -7274,7 +7277,12 @@ mod tests {
         // ClipboardError::Unavailable on headless CI would also
         // trigger a toast and fail this test; that is intentional
         // because surfacing real failures is exactly what we want.
-        if state.clipboard.read_text().map(|s| s.is_empty()).unwrap_or(false) {
+        if state
+            .clipboard
+            .read_text()
+            .map(|s| s.is_empty())
+            .unwrap_or(false)
+        {
             assert_eq!(
                 state.toasts.len(),
                 toasts_before,

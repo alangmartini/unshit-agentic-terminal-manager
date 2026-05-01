@@ -273,6 +273,14 @@ pub struct BgRun {
     pub bg: Color,
 }
 
+fn inverse_fg_from_bg(bg: Color) -> Color {
+    if bg.a == 0 {
+        Color::BLACK
+    } else {
+        bg
+    }
+}
+
 impl BgRun {
     /// Number of columns covered by the run.
     pub fn col_count(&self) -> usize {
@@ -593,7 +601,7 @@ impl CellGrid {
         for col in start_col..end_col {
             let cell = &self.cells[row_base + col];
             let (fg, bg) = if cell.attrs.contains(CellAttrs::INVERSE) {
-                (cell.bg, cell.fg)
+                (inverse_fg_from_bg(cell.bg), cell.fg)
             } else {
                 (cell.fg, cell.bg)
             };
@@ -1441,6 +1449,29 @@ mod tests {
 
         assert_eq!(runs.len(), 1, "single cell must produce a single run");
         assert_eq!(runs[0].bg, yellow, "INVERSE must surface stored fg as the effective bg color",);
+    }
+
+    #[test]
+    fn compute_style_runs_inverse_transparent_bg_keeps_glyph_visible() {
+        let fg = Color { r: 204, g: 204, b: 204, a: 255 };
+        let mut g = CellGrid::new(1, 1);
+        g.set_cell(
+            0,
+            0,
+            Cell {
+                ch: 'z',
+                fg,
+                bg: Color::TRANSPARENT,
+                attrs: CellAttrs::INVERSE,
+                wide_continuation: false,
+            },
+        );
+
+        let runs = g.compute_style_runs_in_range(0, 0, 1);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].style.fg, Color::BLACK);
+        assert_eq!(runs[0].style.bg, fg);
     }
 
     #[test]

@@ -6,8 +6,109 @@ use crate::grid::Grid;
 use crate::scrollback::Scrollback;
 use crate::snapshot::Snapshot;
 
+const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
 const DEFAULT_FG: Color = Color::WHITE;
+// Windows Terminal's Campbell foreground setting is #cccccc, but this
+// renderer's atlas/blending path matches WT captures more closely with #c4c4c4.
+const WINDOWS_TERMINAL_PARITY_DEFAULT_FG: Color = Color::rgb(196, 196, 196);
+const WINDOWS_TERMINAL_ANSI_16: [Color; 16] = [
+    Color::rgb(12, 12, 12),
+    Color::rgb(197, 15, 31),
+    Color::rgb(19, 161, 14),
+    Color::rgb(193, 156, 0),
+    Color::rgb(0, 55, 218),
+    Color::rgb(136, 23, 152),
+    Color::rgb(58, 150, 221),
+    Color::rgb(204, 204, 204),
+    Color::rgb(118, 118, 118),
+    Color::rgb(231, 72, 86),
+    Color::rgb(22, 198, 12),
+    Color::rgb(249, 241, 165),
+    Color::rgb(59, 120, 255),
+    Color::rgb(180, 0, 158),
+    Color::rgb(97, 214, 214),
+    Color::rgb(242, 242, 242),
+];
 const DEFAULT_BG: Color = Color::TRANSPARENT;
+
+fn parity_windows_terminal_colors_enabled() -> bool {
+    std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            let normalized = v.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn default_fg_for_parity(enabled: bool) -> Color {
+    if enabled {
+        WINDOWS_TERMINAL_PARITY_DEFAULT_FG
+    } else {
+        DEFAULT_FG
+    }
+}
+
+fn default_fg() -> Color {
+    default_fg_for_parity(parity_windows_terminal_colors_enabled())
+}
+
+fn default_bg() -> Color {
+    DEFAULT_BG
+}
+
+fn ansi_16_color_for_parity(index: usize, enabled: bool) -> Color {
+    if enabled {
+        WINDOWS_TERMINAL_ANSI_16[index]
+    } else {
+        ANSI_16[index]
+    }
+}
+
+fn ansi_16_fg_color_for_parity(index: usize, enabled: bool) -> Color {
+    let color = ansi_16_color_for_parity(index, enabled);
+    if !enabled {
+        return color;
+    }
+
+    match index {
+        7 => WINDOWS_TERMINAL_PARITY_DEFAULT_FG,
+        8 => Color::rgb(114, 114, 114),
+        _ => color,
+    }
+}
+
+fn ansi_16_fg_color(index: usize) -> Color {
+    ansi_16_fg_color_for_parity(index, parity_windows_terminal_colors_enabled())
+}
+
+fn ansi_16_color(index: usize) -> Color {
+    ansi_16_color_for_parity(index, parity_windows_terminal_colors_enabled())
+}
+
+fn fg_color_256_for_parity_with_profile(index: u8, parity_enabled: bool) -> Color {
+    if index < 16 {
+        ansi_16_fg_color_for_parity(index as usize, parity_enabled)
+    } else {
+        color_256(index)
+    }
+}
+
+fn bg_color_256_for_parity_with_profile(index: u8, parity_enabled: bool) -> Color {
+    if index < 16 {
+        ansi_16_color_for_parity(index as usize, parity_enabled)
+    } else {
+        color_256(index)
+    }
+}
+
+fn fg_color_256_for_parity(index: u8) -> Color {
+    fg_color_256_for_parity_with_profile(index, parity_windows_terminal_colors_enabled())
+}
+
+fn bg_color_256_for_parity(index: u8) -> Color {
+    bg_color_256_for_parity_with_profile(index, parity_windows_terminal_colors_enabled())
+}
 
 pub struct Terminal {
     grid: Grid,
@@ -17,11 +118,20 @@ pub struct Terminal {
     cols: usize,
     cursor_row: usize,
     cursor_col: usize,
+    wrap_pending: bool,
     saved_cursor: (usize, usize),
     fg: Color,
     bg: Color,
     attrs: CellAttrs,
     title: String,
+    alt_grid: Option<Grid>,
+    alt_saved_cursor: (usize, usize),
+    alt_saved_fg: Color,
+    alt_saved_bg: Color,
+    alt_saved_attrs: CellAttrs,
+    scroll_top: usize,
+    scroll_bot: usize,
+    pending_response: Vec<u8>,
 }
 
 impl Terminal {
@@ -34,12 +144,25 @@ impl Terminal {
             cols,
             cursor_row: 0,
             cursor_col: 0,
+            wrap_pending: false,
             saved_cursor: (0, 0),
-            fg: DEFAULT_FG,
-            bg: DEFAULT_BG,
+            fg: default_fg(),
+            bg: default_bg(),
             attrs: CellAttrs::empty(),
             title: String::new(),
+            alt_grid: None,
+            alt_saved_cursor: (0, 0),
+            alt_saved_fg: default_fg(),
+            alt_saved_bg: default_bg(),
+            alt_saved_attrs: CellAttrs::empty(),
+            scroll_top: 0,
+            scroll_bot: rows,
+            pending_response: Vec::new(),
         }
+    }
+
+    pub fn take_pending_response(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_response)
     }
 
     pub fn process_bytes(&mut self, bytes: &[u8]) {
@@ -60,34 +183,73 @@ impl Terminal {
     /// do not touch scrollback.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let old_rows = self.rows;
+        let alt_active = self.alt_grid.is_some();
+
+        if alt_active {
+            if let Some(main) = self.alt_grid.take() {
+                let mut previous = main;
+                std::mem::swap(&mut self.grid, &mut previous);
+                self.alt_grid = Some(previous);
+            }
+        }
 
         if rows > old_rows {
             let k = rows - old_rows;
             let lifted = self.scrollback.pop_back_n(k);
             self.grid.grow_rows_at_top(k, lifted);
-            self.cursor_row += k;
+            if alt_active {
+                self.alt_saved_cursor.0 += k;
+            } else {
+                self.cursor_row += k;
+            }
         } else if rows < old_rows {
             let k = old_rows - rows;
             // Only evict rows that sit above the cursor, so the live
             // prompt row is never pushed into scrollback.
-            let evict_above = k.min(self.cursor_row);
+            let cursor_for_eviction = if alt_active {
+                self.alt_saved_cursor.0
+            } else {
+                self.cursor_row
+            };
+            let evict_above = k.min(cursor_for_eviction);
             if evict_above > 0 {
                 let evicted = self.grid.shrink_rows_from_top(evict_above);
                 for line in evicted {
                     self.scrollback.push(line);
                 }
-                self.cursor_row -= evict_above;
+                if alt_active {
+                    self.alt_saved_cursor.0 -= evict_above;
+                } else {
+                    self.cursor_row -= evict_above;
+                }
             }
             // Any remaining shrink (k > cursor_row) trims the blank tail
             // below the cursor; grid.resize handles it by clipping.
         }
 
         self.grid.resize(rows, cols);
+        if alt_active {
+            if let Some(mut main) = self.alt_grid.take() {
+                std::mem::swap(&mut self.grid, &mut main);
+                self.grid.resize(rows, cols);
+                self.alt_grid = Some(main);
+            }
+        }
         self.rows = rows;
         self.cols = cols;
 
+        if self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot {
+            self.scroll_top = 0;
+            self.scroll_bot = rows;
+        }
+
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        self.wrap_pending = false;
+        if alt_active {
+            self.alt_saved_cursor.0 = self.alt_saved_cursor.0.min(rows.saturating_sub(1));
+            self.alt_saved_cursor.1 = self.alt_saved_cursor.1.min(cols.saturating_sub(1));
+        }
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
@@ -121,6 +283,86 @@ impl Terminal {
         }
     }
 
+    fn clear_pending_wrap(&mut self) {
+        self.wrap_pending = false;
+    }
+
+    fn wrap_to_next_line(&mut self) {
+        self.cursor_col = 0;
+        if self.cursor_row + 1 == self.scroll_bot {
+            self.scroll_up();
+        } else if self.cursor_row + 1 < self.rows {
+            self.cursor_row += 1;
+        } else {
+            self.cursor_row = self.rows.saturating_sub(1);
+        }
+        self.wrap_pending = false;
+    }
+
+    fn prepare_for_printable(&mut self) {
+        if self.wrap_pending {
+            self.wrap_to_next_line();
+        }
+    }
+
+    fn region_is_full_screen(&self) -> bool {
+        self.scroll_top == 0 && self.scroll_bot == self.rows
+    }
+
+    fn copy_row(&mut self, dst: usize, src: usize) {
+        if dst >= self.rows || src >= self.rows {
+            return;
+        }
+        for col in 0..self.cols {
+            let cell = self.grid.get(src, col).copied().unwrap_or(Cell::BLANK);
+            self.grid.set(dst, col, cell);
+        }
+    }
+
+    fn clear_row(&mut self, row: usize) {
+        if row >= self.rows {
+            return;
+        }
+        let blank = Cell {
+            ch: ' ',
+            fg: self.fg,
+            bg: self.bg,
+            attrs: CellAttrs::empty(),
+        };
+        for col in 0..self.cols {
+            self.grid.set(row, col, blank);
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        if self.rows == 0 || self.scroll_bot <= self.scroll_top {
+            return;
+        }
+        if self.region_is_full_screen() {
+            self.scroll_up_and_capture();
+            return;
+        }
+
+        let top = self.scroll_top;
+        let bot = self.scroll_bot;
+        for row in top..bot.saturating_sub(1) {
+            self.copy_row(row, row + 1);
+        }
+        self.clear_row(bot - 1);
+    }
+
+    fn scroll_down(&mut self) {
+        if self.rows == 0 || self.scroll_bot <= self.scroll_top {
+            return;
+        }
+        let top = self.scroll_top;
+        let bot = self.scroll_bot;
+        for row in (top + 1..bot).rev() {
+            self.copy_row(row, row - 1);
+        }
+        self.clear_row(top);
+    }
+
     fn clear_region(&mut self, start_row: usize, start_col: usize, end_row: usize, end_col: usize) {
         let blank = Cell {
             ch: ' ',
@@ -141,6 +383,7 @@ impl Terminal {
         if self.rows == 0 || self.cols == 0 {
             return;
         }
+        self.prepare_for_printable();
         let cell = Cell {
             ch: c,
             fg: self.fg,
@@ -148,15 +391,46 @@ impl Terminal {
             attrs: self.attrs,
         };
         self.grid.set(self.cursor_row, self.cursor_col, cell);
-        self.cursor_col += 1;
-        if self.cursor_col >= self.cols {
-            self.cursor_col = 0;
-            self.cursor_row += 1;
-            if self.cursor_row >= self.rows {
-                self.cursor_row = self.rows - 1;
-                self.scroll_up_and_capture();
-            }
+        if self.cursor_col + 1 >= self.cols {
+            self.cursor_col = self.cols - 1;
+            self.wrap_pending = true;
+        } else {
+            self.cursor_col += 1;
+            self.wrap_pending = false;
         }
+    }
+
+    fn enter_alt_screen(&mut self) {
+        if self.alt_grid.is_some() {
+            return;
+        }
+        self.clear_pending_wrap();
+        self.alt_saved_cursor = (self.cursor_row, self.cursor_col);
+        self.alt_saved_fg = self.fg;
+        self.alt_saved_bg = self.bg;
+        self.alt_saved_attrs = self.attrs;
+
+        let mut fresh = Grid::new(self.rows, self.cols);
+        std::mem::swap(&mut self.grid, &mut fresh);
+        self.alt_grid = Some(fresh);
+
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.grid.set_cursor(0, 0);
+    }
+
+    fn exit_alt_screen(&mut self) {
+        let Some(mut main) = self.alt_grid.take() else {
+            return;
+        };
+        std::mem::swap(&mut self.grid, &mut main);
+        self.cursor_row = self.alt_saved_cursor.0.min(self.rows.saturating_sub(1));
+        self.cursor_col = self.alt_saved_cursor.1.min(self.cols.saturating_sub(1));
+        self.clear_pending_wrap();
+        self.fg = self.alt_saved_fg;
+        self.bg = self.alt_saved_bg;
+        self.attrs = self.alt_saved_attrs;
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 }
 
@@ -179,20 +453,26 @@ impl Perform for Performer<'_> {
         let t = &mut *self.terminal;
         match byte {
             0x0A => {
-                t.cursor_row += 1;
-                if t.cursor_row >= t.rows {
+                t.clear_pending_wrap();
+                if t.cursor_row + 1 == t.scroll_bot {
+                    t.scroll_up();
+                } else if t.cursor_row + 1 < t.rows {
+                    t.cursor_row += 1;
+                } else {
                     t.cursor_row = t.rows.saturating_sub(1);
-                    t.scroll_up_and_capture();
                 }
             }
             0x0D => {
+                t.clear_pending_wrap();
                 t.cursor_col = 0;
             }
             0x09 => {
+                t.clear_pending_wrap();
                 let next_tab = (t.cursor_col / 8 + 1) * 8;
                 t.cursor_col = next_tab.min(t.cols.saturating_sub(1));
             }
             0x08 => {
+                t.clear_pending_wrap();
                 t.cursor_col = t.cursor_col.saturating_sub(1);
             }
             0x07 => {}
@@ -220,8 +500,11 @@ impl Perform for Performer<'_> {
                 'h' | 'l' => {
                     let on = action == 'h';
                     for code in &pv {
-                        if *code == 25 {
-                            t.grid.set_cursor_visible(on);
+                        match *code {
+                            25 => t.grid.set_cursor_visible(on),
+                            47 | 1047 | 1049 if on => t.enter_alt_screen(),
+                            47 | 1047 | 1049 => t.exit_alt_screen(),
+                            _ => {}
                         }
                     }
                 }
@@ -233,6 +516,10 @@ impl Perform for Performer<'_> {
         // DECSCUSR: `\x1b[<n> q`. The intermediate is a space.
         if intermediates == b" " && action == 'q' {
             return;
+        }
+
+        if !matches!(action, 'm' | 'c' | 'n' | 'q') {
+            t.clear_pending_wrap();
         }
 
         match action {
@@ -306,6 +593,126 @@ impl Perform for Performer<'_> {
                 }
                 _ => {}
             },
+            'L' => {
+                let n = p0();
+                let cursor_row = t.cursor_row;
+                if cursor_row >= t.scroll_top && cursor_row < t.scroll_bot {
+                    let bot = t.scroll_bot;
+                    let n = n.min(bot.saturating_sub(cursor_row));
+                    if n > 0 {
+                        for row in (cursor_row + n..bot).rev() {
+                            t.copy_row(row, row - n);
+                        }
+                        for row in cursor_row..cursor_row + n {
+                            t.clear_row(row);
+                        }
+                    }
+                }
+            }
+            'M' if intermediates.is_empty() => {
+                let n = p0();
+                let cursor_row = t.cursor_row;
+                if cursor_row >= t.scroll_top && cursor_row < t.scroll_bot {
+                    let bot = t.scroll_bot;
+                    let n = n.min(bot.saturating_sub(cursor_row));
+                    if n > 0 {
+                        for row in cursor_row..bot.saturating_sub(n) {
+                            t.copy_row(row, row + n);
+                        }
+                        for row in bot.saturating_sub(n)..bot {
+                            t.clear_row(row);
+                        }
+                    }
+                }
+            }
+            'S' => {
+                for _ in 0..p0() {
+                    t.scroll_up();
+                }
+            }
+            'T' => {
+                for _ in 0..p0() {
+                    t.scroll_down();
+                }
+            }
+            '@' => {
+                let n = p0().min(t.cols.saturating_sub(t.cursor_col));
+                for col in (t.cursor_col + n..t.cols).rev() {
+                    if let Some(cell) = t.grid.get(t.cursor_row, col - n).copied() {
+                        t.grid.set(t.cursor_row, col, cell);
+                    }
+                }
+                let blank = Cell {
+                    ch: ' ',
+                    fg: t.fg,
+                    bg: t.bg,
+                    attrs: CellAttrs::empty(),
+                };
+                for col in t.cursor_col..t.cursor_col + n {
+                    t.grid.set(t.cursor_row, col, blank);
+                }
+            }
+            'P' => {
+                let n = p0().min(t.cols.saturating_sub(t.cursor_col));
+                for col in t.cursor_col..t.cols.saturating_sub(n) {
+                    if let Some(cell) = t.grid.get(t.cursor_row, col + n).copied() {
+                        t.grid.set(t.cursor_row, col, cell);
+                    }
+                }
+                let blank = Cell {
+                    ch: ' ',
+                    fg: t.fg,
+                    bg: t.bg,
+                    attrs: CellAttrs::empty(),
+                };
+                for col in t.cols.saturating_sub(n)..t.cols {
+                    t.grid.set(t.cursor_row, col, blank);
+                }
+            }
+            'X' => {
+                let n = p0().min(t.cols.saturating_sub(t.cursor_col));
+                let blank = Cell {
+                    ch: ' ',
+                    fg: t.fg,
+                    bg: t.bg,
+                    attrs: CellAttrs::empty(),
+                };
+                for col in t.cursor_col..t.cursor_col + n {
+                    t.grid.set(t.cursor_row, col, blank);
+                }
+            }
+            'r' if intermediates.is_empty() => {
+                let rows = t.rows;
+                let top_1 = pv.first().copied().unwrap_or(0);
+                let bot_1 = pv.get(1).copied().unwrap_or(0);
+                let top = if top_1 == 0 { 1 } else { top_1 as usize };
+                let bot = if bot_1 == 0 { rows } else { bot_1 as usize };
+                let new_top = top.saturating_sub(1);
+                let new_bot = bot.min(rows);
+                if new_top < new_bot && new_bot <= rows {
+                    t.scroll_top = new_top;
+                    t.scroll_bot = new_bot;
+                    t.cursor_row = 0;
+                    t.cursor_col = 0;
+                }
+            }
+            'c' if intermediates.is_empty() => {
+                t.pending_response.extend_from_slice(b"\x1b[?1;2c");
+            }
+            'c' if intermediates == [b'>'] => {
+                t.pending_response.extend_from_slice(b"\x1b[>0;95;0c");
+            }
+            'n' if intermediates.is_empty() && pv.first() == Some(&5) => {
+                t.pending_response.extend_from_slice(b"\x1b[0n");
+            }
+            'n' if intermediates.is_empty() && pv.first() == Some(&6) => {
+                let reply = format!("\x1b[{};{}R", t.cursor_row + 1, t.cursor_col + 1);
+                t.pending_response.extend_from_slice(reply.as_bytes());
+            }
+            'q' if intermediates == [b'>'] => {
+                t.pending_response
+                    .extend_from_slice(b"\x1bP>|godly-terminal 0.1\x1b\\");
+            }
             'm' => handle_sgr(t, &pv),
             _ => {}
         }
@@ -329,8 +736,17 @@ impl Perform for Performer<'_> {
                 t.saved_cursor = (t.cursor_row, t.cursor_col);
             }
             b'8' => {
+                t.clear_pending_wrap();
                 t.cursor_row = t.saved_cursor.0.min(t.rows.saturating_sub(1));
                 t.cursor_col = t.saved_cursor.1.min(t.cols.saturating_sub(1));
+            }
+            b'M' => {
+                t.clear_pending_wrap();
+                if t.cursor_row == 0 {
+                    t.scroll_down();
+                } else {
+                    t.cursor_row -= 1;
+                }
             }
             _ => {}
         }
@@ -364,7 +780,7 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
             25 => t.attrs &= !CellAttrs::BLINK,
             27 => t.attrs &= !CellAttrs::INVERSE,
             29 => t.attrs &= !CellAttrs::STRIKETHROUGH,
-            30..=37 => t.fg = ANSI_16[(code - 30) as usize],
+            30..=37 => t.fg = ansi_16_fg_color((code - 30) as usize),
             38 => {
                 i += 1;
                 if i < pv.len() {
@@ -372,7 +788,7 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
                         5 => {
                             i += 1;
                             if i < pv.len() {
-                                t.fg = color_256(pv[i] as u8);
+                                t.fg = fg_color_256_for_parity(pv[i] as u8);
                             }
                         }
                         2 => {
@@ -386,8 +802,8 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
                     }
                 }
             }
-            39 => t.fg = DEFAULT_FG,
-            40..=47 => t.bg = ANSI_16[(code - 40) as usize],
+            39 => t.fg = default_fg(),
+            40..=47 => t.bg = ansi_16_color((code - 40) as usize),
             48 => {
                 i += 1;
                 if i < pv.len() {
@@ -395,7 +811,7 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
                         5 => {
                             i += 1;
                             if i < pv.len() {
-                                t.bg = color_256(pv[i] as u8);
+                                t.bg = bg_color_256_for_parity(pv[i] as u8);
                             }
                         }
                         2 => {
@@ -409,9 +825,9 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
                     }
                 }
             }
-            49 => t.bg = DEFAULT_BG,
-            90..=97 => t.fg = ANSI_16[(code - 90 + 8) as usize],
-            100..=107 => t.bg = ANSI_16[(code - 100 + 8) as usize],
+            49 => t.bg = default_bg(),
+            90..=97 => t.fg = ansi_16_fg_color((code - 90 + 8) as usize),
+            100..=107 => t.bg = ansi_16_color((code - 100 + 8) as usize),
             _ => {}
         }
         i += 1;
@@ -419,8 +835,8 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
 }
 
 fn reset_attrs(t: &mut Terminal) {
-    t.fg = DEFAULT_FG;
-    t.bg = DEFAULT_BG;
+    t.fg = default_fg();
+    t.bg = default_bg();
     t.attrs = CellAttrs::empty();
 }
 
@@ -460,6 +876,65 @@ mod tests {
         t.process_bytes(b"ab\rc");
         assert_eq!(t.grid().get(0, 0).unwrap().ch, 'c');
         assert_eq!(t.grid().get(0, 1).unwrap().ch, 'b');
+    }
+
+    #[test]
+    fn full_width_line_delays_wrap_until_next_printable() {
+        let mut t = Terminal::new(2, 5, 100);
+        t.process_bytes(b"ABCDE");
+
+        assert_eq!(t.grid().cursor(), (0, 4));
+        assert_eq!(row_text(&t, 0), "ABCDE");
+        assert_eq!(row_text(&t, 1), "");
+
+        t.process_bytes(b"F");
+
+        assert_eq!(t.grid().cursor(), (1, 1));
+        assert_eq!(row_text(&t, 0), "ABCDE");
+        assert_eq!(row_text(&t, 1), "F");
+    }
+
+    #[test]
+    fn carriage_return_clears_pending_wrap_after_full_width_line() {
+        let mut t = Terminal::new(2, 5, 100);
+        t.process_bytes(b"ABCDE\rZ");
+
+        assert_eq!(t.grid().cursor(), (0, 1));
+        assert_eq!(row_text(&t, 0), "ZBCDE");
+        assert_eq!(row_text(&t, 1), "");
+    }
+
+    #[test]
+    fn terminal_query_preserves_pending_wrap() {
+        let mut t = Terminal::new(2, 5, 100);
+        t.process_bytes(b"ABCDE\x1b[6nF");
+
+        assert_eq!(t.grid().cursor(), (1, 1));
+        assert_eq!(row_text(&t, 0), "ABCDE");
+        assert_eq!(row_text(&t, 1), "F");
+    }
+
+    #[test]
+    fn host_queries_queue_capability_responses() {
+        let mut t = Terminal::new(3, 5, 100);
+
+        t.process_bytes(b"\x1b[c");
+        assert_eq!(t.take_pending_response(), b"\x1b[?1;2c");
+
+        t.process_bytes(b"\x1b[>c");
+        assert_eq!(t.take_pending_response(), b"\x1b[>0;95;0c");
+
+        t.process_bytes(b"\x1b[5n");
+        assert_eq!(t.take_pending_response(), b"\x1b[0n");
+
+        t.process_bytes(b"\x1b[2;3H\x1b[6n");
+        assert_eq!(t.take_pending_response(), b"\x1b[2;3R");
+
+        t.process_bytes(b"\x1b[>q");
+        assert_eq!(
+            t.take_pending_response(),
+            b"\x1bP>|godly-terminal 0.1\x1b\\"
+        );
     }
 
     #[test]
@@ -543,6 +1018,65 @@ mod tests {
         assert_eq!(t.grid().get(0, 0).unwrap().fg, ANSI_16[1]);
         assert_eq!(t.grid().get(0, 1).unwrap().attrs, CellAttrs::empty());
         assert_eq!(t.grid().get(0, 1).unwrap().fg, DEFAULT_FG);
+    }
+
+    #[test]
+    fn parity_default_fg_uses_capture_calibrated_windows_terminal_value() {
+        assert_eq!(default_fg_for_parity(true), Color::rgb(196, 196, 196));
+        assert_eq!(default_fg_for_parity(false), DEFAULT_FG);
+    }
+
+    #[test]
+    fn parity_ansi_palette_matches_windows_terminal_campbell() {
+        assert_eq!(ansi_16_color_for_parity(1, true), Color::rgb(197, 15, 31));
+        assert_eq!(ansi_16_color_for_parity(1, false), ANSI_16[1]);
+    }
+
+    #[test]
+    fn parity_neutral_foregrounds_are_capture_calibrated_separately_from_backgrounds() {
+        assert_eq!(
+            ansi_16_fg_color_for_parity(7, true),
+            Color::rgb(196, 196, 196)
+        );
+        assert_eq!(
+            ansi_16_fg_color_for_parity(8, true),
+            Color::rgb(114, 114, 114)
+        );
+        assert_eq!(
+            ansi_16_color_for_parity(7, true),
+            Color::rgb(204, 204, 204),
+            "background swatches should keep the literal Campbell palette"
+        );
+    }
+
+    #[test]
+    fn parity_256_color_low_indices_follow_ansi_profile_mapping() {
+        assert_eq!(
+            fg_color_256_for_parity_with_profile(7, true),
+            Color::rgb(196, 196, 196)
+        );
+        assert_eq!(
+            bg_color_256_for_parity_with_profile(7, true),
+            Color::rgb(204, 204, 204)
+        );
+        assert_eq!(
+            fg_color_256_for_parity_with_profile(8, true),
+            Color::rgb(114, 114, 114)
+        );
+        assert_eq!(fg_color_256_for_parity_with_profile(7, false), ANSI_16[7]);
+        assert_eq!(bg_color_256_for_parity_with_profile(7, false), ANSI_16[7]);
+    }
+
+    #[test]
+    fn parity_256_color_high_indices_stay_in_256_color_cube() {
+        assert_eq!(
+            fg_color_256_for_parity_with_profile(196, true),
+            color_256(196)
+        );
+        assert_eq!(
+            bg_color_256_for_parity_with_profile(82, true),
+            color_256(82)
+        );
     }
 
     #[test]
@@ -631,6 +1165,15 @@ mod tests {
     }
 
     #[test]
+    fn csi_ech_blanks_without_moving_cursor_or_shifting() {
+        let mut t = Terminal::new(1, 10, 10);
+        t.process_bytes(b"> abcdef\x1b[1;3H\x1b[4X");
+
+        assert_eq!(t.grid().cursor(), (0, 2));
+        assert_eq!(row_text(&t, 0), ">     ef");
+    }
+
+    #[test]
     fn decscusr_is_silently_accepted() {
         // We do not model cursor shape yet; `\x1b[2 q` must not break the parser.
         let mut t = Terminal::new(1, 2, 10);
@@ -650,6 +1193,87 @@ mod tests {
         let mut t = Terminal::new(1, 2, 10);
         t.process_bytes(b"\x1b[91ma");
         assert_eq!(t.grid().get(0, 0).unwrap().fg, ANSI_16[9]);
+    }
+
+    #[test]
+    fn alt_screen_exit_restores_main_screen_and_cursor() {
+        let mut t = Terminal::new(4, 6, 100);
+        t.process_bytes(b"hello\r\nworld");
+        let cursor_before = t.grid().cursor();
+
+        t.process_bytes(b"\x1b[?1049h");
+        t.process_bytes(b"ALT");
+        assert_eq!(row_text(&t, 0), "ALT");
+
+        t.process_bytes(b"\x1b[?1049l");
+
+        assert_eq!(row_text(&t, 0), "hello");
+        assert_eq!(row_text(&t, 1), "world");
+        assert_eq!(t.grid().cursor(), cursor_before);
+        assert!(t.alt_grid.is_none());
+    }
+
+    #[test]
+    fn alt_screen_resize_scales_both_buffers() {
+        let mut t = Terminal::new(4, 6, 100);
+        t.process_bytes(b"main");
+        t.process_bytes(b"\x1b[?1049h");
+        t.process_bytes(b"alt");
+
+        t.resize(6, 8);
+
+        assert_eq!(t.grid().rows(), 6);
+        assert_eq!(t.grid().cols(), 8);
+        let main = t.alt_grid.as_ref().expect("main grid should be parked");
+        assert_eq!(main.rows(), 6);
+        assert_eq!(main.cols(), 8);
+
+        t.process_bytes(b"\x1b[?1049l");
+        assert_eq!(t.grid().rows(), 6);
+        assert_eq!(t.grid().cols(), 8);
+        assert_eq!(row_text(&t, 2), "main");
+    }
+
+    #[test]
+    fn reverse_index_at_top_scrolls_down() {
+        let mut t = Terminal::new(3, 10, 100);
+        t.process_bytes(b"line1\r\nline2\r\nline3");
+        t.process_bytes(b"\x1b[1;1H");
+        t.process_bytes(b"\x1bM");
+
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "line1");
+    }
+
+    #[test]
+    fn decstbm_lf_at_region_bottom_scrolls_region_only() {
+        let mut t = Terminal::new(5, 4, 100);
+        t.process_bytes(b"AA\r\nBB\r\nCC\r\nDD\r\nEE");
+        t.process_bytes(b"\x1b[2;4r");
+        t.process_bytes(b"\x1b[4;1H");
+        t.process_bytes(b"\n");
+
+        assert_eq!(t.grid().cursor(), (3, 0));
+        assert_eq!(row_text(&t, 0), "AA");
+        assert_eq!(row_text(&t, 1), "CC");
+        assert_eq!(row_text(&t, 2), "DD");
+        assert_eq!(row_text(&t, 3), "");
+        assert_eq!(row_text(&t, 4), "EE");
+    }
+
+    #[test]
+    fn decstbm_il_inside_region_preserves_pinned_rows() {
+        let mut t = Terminal::new(5, 4, 100);
+        t.process_bytes(b"AA\r\nBB\r\nCC\r\nDD\r\nEE");
+        t.process_bytes(b"\x1b[2;4r");
+        t.process_bytes(b"\x1b[2;1H");
+        t.process_bytes(b"\x1b[1L");
+
+        assert_eq!(row_text(&t, 0), "AA");
+        assert_eq!(row_text(&t, 1), "");
+        assert_eq!(row_text(&t, 2), "BB");
+        assert_eq!(row_text(&t, 3), "CC");
+        assert_eq!(row_text(&t, 4), "EE");
     }
 
     // -- Resize reflow (issue #129) ----------------------------------------

@@ -12,7 +12,8 @@ use unshit_test::TestHarness;
 
 fn logo_mark_svg() -> SvgNode {
     let white = unshit_core::style::types::Color::WHITE;
-    let commands = parse_svg_path("M4 3 H18 V19 L15 17 L12 19 L9 17 L6 19 L4 17 Z").unwrap_or_default();
+    let commands =
+        parse_svg_path("M4 3 H18 V19 L15 17 L12 19 L9 17 L6 19 L4 17 Z").unwrap_or_default();
     let mut body = SvgNode {
         primitive: SvgPrimitive::Path {
             d: "M4 3 H18 V19 L15 17 L12 19 L9 17 L6 19 L4 17 Z".to_string(),
@@ -465,9 +466,7 @@ fn nav_receives_space_between_and_width_from_ancestors() {
                             .with_child(
                                 ElementDef::new(Tag::Button)
                                     .with_class("btn-pill")
-                                    .with_child(
-                                        ElementDef::new(Tag::Span).with_text("Começar"),
-                                    ),
+                                    .with_child(ElementDef::new(Tag::Span).with_text("Começar")),
                             ),
                     ),
             )
@@ -549,31 +548,29 @@ fn nav_receives_space_between_and_width_from_ancestors() {
                             ),
                     )
                     .with_child(
-                        ElementDef::new(Tag::Div)
-                            .with_class("stats")
-                            .with_child(
-                                ElementDef::new(Tag::Div)
-                                    .with_class("stat")
-                                    .with_child(
-                                        ElementDef::new(Tag::Div)
-                                            .with_class("stat-v")
-                                            .with_child(
-                                                ElementDef::new(Tag::Span)
-                                                    .with_class("stat-v-num")
-                                                    .with_text("26"),
-                                            )
-                                            .with_child(
-                                                ElementDef::new(Tag::Span)
-                                                    .with_class("stat-v-unit")
-                                                    .with_text("/26"),
-                                            ),
-                                    )
-                                    .with_child(
-                                        ElementDef::new(Tag::Span)
-                                            .with_class("stat-k")
-                                            .with_text("Estados"),
-                                    ),
-                            ),
+                        ElementDef::new(Tag::Div).with_class("stats").with_child(
+                            ElementDef::new(Tag::Div)
+                                .with_class("stat")
+                                .with_child(
+                                    ElementDef::new(Tag::Div)
+                                        .with_class("stat-v")
+                                        .with_child(
+                                            ElementDef::new(Tag::Span)
+                                                .with_class("stat-v-num")
+                                                .with_text("26"),
+                                        )
+                                        .with_child(
+                                            ElementDef::new(Tag::Span)
+                                                .with_class("stat-v-unit")
+                                                .with_text("/26"),
+                                        ),
+                                )
+                                .with_child(
+                                    ElementDef::new(Tag::Span)
+                                        .with_class("stat-k")
+                                        .with_text("Estados"),
+                                ),
+                        ),
                     ),
             )
             .with_child(
@@ -601,9 +598,7 @@ fn nav_receives_space_between_and_width_from_ancestors() {
         if e.classes.iter().any(|c| c == "nav") {
             eprintln!(
                 "nav element: jc={:?} width={:?} padding={:?}",
-                e.computed_style.justify_content,
-                e.computed_style.width,
-                e.computed_style.padding
+                e.computed_style.justify_content, e.computed_style.width, e.computed_style.padding
             );
             assert_eq!(
                 e.computed_style.justify_content,

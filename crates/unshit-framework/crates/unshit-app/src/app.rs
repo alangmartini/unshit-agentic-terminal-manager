@@ -1052,13 +1052,7 @@ impl ApplicationHandler for AppHandler {
 
         match event {
             WindowEvent::CloseRequested => {
-                let should_exit = self
-                    .app
-                    .config
-                    .on_close
-                    .as_ref()
-                    .map(|cb| cb())
-                    .unwrap_or(true);
+                let should_exit = self.app.config.on_close.as_ref().map(|cb| cb()).unwrap_or(true);
                 if !should_exit {
                     // Application vetoed the close (e.g. to show a confirm
                     // prompt). The app is expected to drive its own exit
@@ -1349,10 +1343,8 @@ impl ApplicationHandler for AppHandler {
                                 state.interaction.last_click_node = hovered;
 
                                 if !hovered.is_dangling() {
-                                    let old_active = state
-                                        .interaction
-                                        .active
-                                        .unwrap_or(NodeId::DANGLING);
+                                    let old_active =
+                                        state.interaction.active.unwrap_or(NodeId::DANGLING);
                                     state.interaction.active = Some(hovered);
                                     state.interaction.mousedown_target = Some(hovered);
                                     state.mark_restyle_pseudo_change(old_active, hovered);

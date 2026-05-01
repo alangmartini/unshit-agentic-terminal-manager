@@ -78,10 +78,7 @@ fn alias_bindings() -> Vec<(String, String)> {
 fn system_bindings() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![
         ("Escape".to_string(), "modal.close".to_string()),
-        (
-            "Ctrl+Shift+F".to_string(),
-            "fps_overlay.toggle".to_string(),
-        ),
+        ("Ctrl+Shift+F".to_string(), "fps_overlay.toggle".to_string()),
         ("Ctrl+V".to_string(), "terminal.paste".to_string()),
         ("Ctrl+Shift+V".to_string(), "terminal.paste".to_string()),
     ];

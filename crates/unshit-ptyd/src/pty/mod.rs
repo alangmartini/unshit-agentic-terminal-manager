@@ -438,7 +438,10 @@ mod tests {
             "powershell.exe"
         );
         // Case-insensitive match on the file stem.
-        assert_eq!(pick_default_shell(Some("PowerShell.EXE"), true), "PowerShell.EXE");
+        assert_eq!(
+            pick_default_shell(Some("PowerShell.EXE"), true),
+            "PowerShell.EXE"
+        );
     }
 
     #[test]

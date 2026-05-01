@@ -42,6 +42,11 @@ pub struct Terminal {
     grid: CellGrid,
     cursor_row: usize,
     cursor_col: usize,
+    /// Delayed autowrap state. When a printable lands in the last
+    /// column, real terminals leave the cursor on that cell and wrap
+    /// only before the next printable character. Full-width TUI rules
+    /// depend on this to avoid creating phantom rows.
+    wrap_pending: bool,
     saved_cursor: (usize, usize),
     fg: Color,
     bg: Color,
@@ -87,6 +92,8 @@ pub struct Terminal {
     pending_response: Vec<u8>,
 }
 
+const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
+
 /// Default foreground: warm amber.
 const DEFAULT_FG: Color = Color {
     r: 212,
@@ -95,6 +102,116 @@ const DEFAULT_FG: Color = Color {
     a: 255,
 };
 
+/// Calibrated foreground for Windows Terminal parity screenshots.
+///
+/// Windows Terminal's Campbell foreground setting is `#cccccc`, but this
+/// renderer's atlas/blending path lands closer to WT captures with `#c4c4c4`.
+const WINDOWS_TERMINAL_PARITY_DEFAULT_FG: Color = Color {
+    r: 196,
+    g: 196,
+    b: 196,
+    a: 255,
+};
+
+const WINDOWS_TERMINAL_ANSI_16: [Color; 16] = [
+    Color {
+        r: 12,
+        g: 12,
+        b: 12,
+        a: 255,
+    },
+    Color {
+        r: 197,
+        g: 15,
+        b: 31,
+        a: 255,
+    },
+    Color {
+        r: 19,
+        g: 161,
+        b: 14,
+        a: 255,
+    },
+    Color {
+        r: 193,
+        g: 156,
+        b: 0,
+        a: 255,
+    },
+    Color {
+        r: 0,
+        g: 55,
+        b: 218,
+        a: 255,
+    },
+    Color {
+        r: 136,
+        g: 23,
+        b: 152,
+        a: 255,
+    },
+    Color {
+        r: 58,
+        g: 150,
+        b: 221,
+        a: 255,
+    },
+    Color {
+        r: 204,
+        g: 204,
+        b: 204,
+        a: 255,
+    },
+    Color {
+        r: 118,
+        g: 118,
+        b: 118,
+        a: 255,
+    },
+    Color {
+        r: 231,
+        g: 72,
+        b: 86,
+        a: 255,
+    },
+    Color {
+        r: 22,
+        g: 198,
+        b: 12,
+        a: 255,
+    },
+    Color {
+        r: 249,
+        g: 241,
+        b: 165,
+        a: 255,
+    },
+    Color {
+        r: 59,
+        g: 120,
+        b: 255,
+        a: 255,
+    },
+    Color {
+        r: 180,
+        g: 0,
+        b: 158,
+        a: 255,
+    },
+    Color {
+        r: 97,
+        g: 214,
+        b: 214,
+        a: 255,
+    },
+    Color {
+        r: 242,
+        g: 242,
+        b: 242,
+        a: 255,
+    },
+];
+
 /// Default background: fully transparent black.
 const DEFAULT_BG: Color = Color {
     r: 0,
@@ -102,6 +219,92 @@ const DEFAULT_BG: Color = Color {
     b: 0,
     a: 0,
 };
+
+fn parity_windows_terminal_colors_enabled() -> bool {
+    std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            let normalized = v.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn default_fg_for_parity(enabled: bool) -> Color {
+    if enabled {
+        WINDOWS_TERMINAL_PARITY_DEFAULT_FG
+    } else {
+        DEFAULT_FG
+    }
+}
+
+fn default_fg() -> Color {
+    default_fg_for_parity(parity_windows_terminal_colors_enabled())
+}
+
+fn default_bg() -> Color {
+    DEFAULT_BG
+}
+
+fn ansi_16_color_for_parity(index: usize, enabled: bool) -> Color {
+    if enabled {
+        WINDOWS_TERMINAL_ANSI_16[index]
+    } else {
+        ANSI_16[index]
+    }
+}
+
+fn ansi_16_fg_color_for_parity(index: usize, enabled: bool) -> Color {
+    let color = ansi_16_color_for_parity(index, enabled);
+    if !enabled {
+        return color;
+    }
+
+    match index {
+        // Foreground text goes through glyph coverage/blending; keep neutral
+        // foregrounds calibrated separately from literal background swatches.
+        7 => WINDOWS_TERMINAL_PARITY_DEFAULT_FG,
+        8 => Color {
+            r: 114,
+            g: 114,
+            b: 114,
+            a: 255,
+        },
+        _ => color,
+    }
+}
+
+fn ansi_16_fg_color(index: usize) -> Color {
+    ansi_16_fg_color_for_parity(index, parity_windows_terminal_colors_enabled())
+}
+
+fn ansi_16_color(index: usize) -> Color {
+    ansi_16_color_for_parity(index, parity_windows_terminal_colors_enabled())
+}
+
+fn fg_color_256_for_parity_with_profile(index: u8, parity_enabled: bool) -> Color {
+    if index < 16 {
+        ansi_16_fg_color_for_parity(index as usize, parity_enabled)
+    } else {
+        color_256(index)
+    }
+}
+
+fn bg_color_256_for_parity_with_profile(index: u8, parity_enabled: bool) -> Color {
+    if index < 16 {
+        ansi_16_color_for_parity(index as usize, parity_enabled)
+    } else {
+        color_256(index)
+    }
+}
+
+fn fg_color_256_for_parity(index: u8) -> Color {
+    fg_color_256_for_parity_with_profile(index, parity_windows_terminal_colors_enabled())
+}
+
+fn bg_color_256_for_parity(index: u8) -> Color {
+    bg_color_256_for_parity_with_profile(index, parity_windows_terminal_colors_enabled())
+}
 
 impl Terminal {
     /// Create a new terminal emulator with the given dimensions.
@@ -113,9 +316,10 @@ impl Terminal {
             grid: CellGrid::new(rows, cols),
             cursor_row: 0,
             cursor_col: 0,
+            wrap_pending: false,
             saved_cursor: (0, 0),
-            fg: DEFAULT_FG,
-            bg: DEFAULT_BG,
+            fg: default_fg(),
+            bg: default_bg(),
             attrs: CellAttrs::empty(),
             parser: vte::Parser::new(),
             rows,
@@ -125,8 +329,8 @@ impl Terminal {
             scroll_offset: 0,
             alt_grid: None,
             alt_saved_cursor: (0, 0),
-            alt_saved_fg: DEFAULT_FG,
-            alt_saved_bg: DEFAULT_BG,
+            alt_saved_fg: default_fg(),
+            alt_saved_bg: default_bg(),
             alt_saved_attrs: CellAttrs::empty(),
             scroll_top: 0,
             scroll_bot: rows,
@@ -270,6 +474,7 @@ impl Terminal {
         // main-screen cursor otherwise) and the parked save slot.
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        self.wrap_pending = false;
         if alt_active {
             self.alt_saved_cursor.0 = self.alt_saved_cursor.0.min(rows.saturating_sub(1));
             self.alt_saved_cursor.1 = self.alt_saved_cursor.1.min(cols.saturating_sub(1));
@@ -358,6 +563,7 @@ impl Terminal {
         let (cur_row, cur_col) = snapshot.grid.cursor();
         self.cursor_row = cur_row.min(rows.saturating_sub(1));
         self.cursor_col = cur_col.min(cols.saturating_sub(1));
+        self.wrap_pending = false;
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
         self.grid.set_cursor_visible(snapshot.grid.cursor_visible());
 
@@ -483,6 +689,28 @@ impl Terminal {
 
     // -- helpers --------------------------------------------------------------
 
+    fn clear_pending_wrap(&mut self) {
+        self.wrap_pending = false;
+    }
+
+    fn wrap_to_next_line(&mut self) {
+        self.cursor_col = 0;
+        if self.cursor_row + 1 == self.scroll_bot {
+            self.scroll_up();
+        } else if self.cursor_row + 1 < self.rows {
+            self.cursor_row += 1;
+        } else {
+            self.cursor_row = self.rows.saturating_sub(1);
+        }
+        self.wrap_pending = false;
+    }
+
+    fn prepare_for_printable(&mut self) {
+        if self.wrap_pending {
+            self.wrap_to_next_line();
+        }
+    }
+
     /// `true` when the active scroll region covers the full screen.
     /// Used by `scroll_up` to decide whether the evicted top row should
     /// be pushed into scrollback. A DECSTBM-narrowed region is part of
@@ -599,6 +827,7 @@ impl Terminal {
         if self.alt_grid.is_some() {
             return;
         }
+        self.clear_pending_wrap();
         self.alt_saved_cursor = (self.cursor_row, self.cursor_col);
         self.alt_saved_fg = self.fg;
         self.alt_saved_bg = self.bg;
@@ -610,6 +839,7 @@ impl Terminal {
 
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.clear_pending_wrap();
         self.grid.set_cursor(0, 0);
     }
 
@@ -627,14 +857,9 @@ impl Terminal {
         // `main` now holds the discarded alt-buffer contents and is
         // dropped here.
 
-        self.cursor_row = self
-            .alt_saved_cursor
-            .0
-            .min(self.rows.saturating_sub(1));
-        self.cursor_col = self
-            .alt_saved_cursor
-            .1
-            .min(self.cols.saturating_sub(1));
+        self.cursor_row = self.alt_saved_cursor.0.min(self.rows.saturating_sub(1));
+        self.cursor_col = self.alt_saved_cursor.1.min(self.cols.saturating_sub(1));
+        self.clear_pending_wrap();
         self.fg = self.alt_saved_fg;
         self.bg = self.alt_saved_bg;
         self.attrs = self.alt_saved_attrs;
@@ -647,6 +872,7 @@ impl Terminal {
         if self.rows == 0 || self.cols == 0 {
             return;
         }
+        self.prepare_for_printable();
         let cell = Cell {
             ch: c,
             fg: self.fg,
@@ -655,20 +881,12 @@ impl Terminal {
             wide_continuation: false,
         };
         self.grid.set_cell(self.cursor_row, self.cursor_col, cell);
-        self.cursor_col += 1;
-        // Line wrap. If the cursor is on the bottom row of the active
-        // scroll region, wrap by scrolling the region; otherwise just
-        // step down (clamped to the screen so we don't escape the
-        // region's bottom).
-        if self.cursor_col >= self.cols {
-            self.cursor_col = 0;
-            if self.cursor_row + 1 == self.scroll_bot {
-                self.scroll_up();
-            } else if self.cursor_row + 1 < self.rows {
-                self.cursor_row += 1;
-            } else {
-                self.cursor_row = self.rows - 1;
-            }
+        if self.cursor_col + 1 >= self.cols {
+            self.cursor_col = self.cols - 1;
+            self.wrap_pending = true;
+        } else {
+            self.cursor_col += 1;
+            self.wrap_pending = false;
         }
     }
 }
@@ -709,6 +927,7 @@ impl<'a> Perform for Performer<'a> {
         match byte {
             // Line Feed
             0x0A => {
+                t.clear_pending_wrap();
                 // If the cursor is sitting on the last row of the active
                 // scroll region, LF scrolls the region instead of moving
                 // past it. Outside the region, LF just advances the cursor
@@ -726,15 +945,18 @@ impl<'a> Perform for Performer<'a> {
             }
             // Carriage Return
             0x0D => {
+                t.clear_pending_wrap();
                 t.cursor_col = 0;
             }
             // Horizontal Tab
             0x09 => {
+                t.clear_pending_wrap();
                 let next_tab = (t.cursor_col / 8 + 1) * 8;
                 t.cursor_col = next_tab.min(t.cols.saturating_sub(1));
             }
             // Backspace
             0x08 => {
+                t.clear_pending_wrap();
                 t.cursor_col = t.cursor_col.saturating_sub(1);
             }
             // Bell: ignored
@@ -752,7 +974,6 @@ impl<'a> Perform for Performer<'a> {
         // values (no subparams).
         let pv: Vec<u16> = params.iter().map(|sub| sub[0]).collect();
 
-
         // Convenience: first param with a default value.
         let p = |idx: usize, default: u16| -> u16 {
             pv.get(idx).copied().unwrap_or(0).max(default) // treat 0 as default
@@ -761,6 +982,12 @@ impl<'a> Perform for Performer<'a> {
 
         // Helper to extract a param or return 0 (not clamped to 1).
         let raw = |idx: usize| -> u16 { pv.get(idx).copied().unwrap_or(0) };
+
+        let preserves_pending_wrap = matches!(action, 'm' | 'c' | 'n' | 'q')
+            || (intermediates == [b'?'] && matches!(action, 'h' | 'l'));
+        if !preserves_pending_wrap {
+            t.clear_pending_wrap();
+        }
 
         match action {
             // -- Cursor movement -----------------------------------------------
@@ -993,6 +1220,20 @@ impl<'a> Perform for Performer<'a> {
                     t.grid.set_cell(t.cursor_row, col, blank);
                 }
             }
+            // ECH: Erase Characters (blank cells in place; cursor does not move)
+            'X' => {
+                let n = p0().min(t.cols.saturating_sub(t.cursor_col));
+                let blank = Cell {
+                    ch: ' ',
+                    fg: t.fg,
+                    bg: t.bg,
+                    attrs: CellAttrs::empty(),
+                    wide_continuation: false,
+                };
+                for col in t.cursor_col..t.cursor_col + n {
+                    t.grid.set_cell(t.cursor_row, col, blank);
+                }
+            }
 
             // -- SGR: Select Graphic Rendition ---------------------------------
             'm' => {
@@ -1127,11 +1368,13 @@ impl<'a> Perform for Performer<'a> {
             }
             // DECRC: Restore Cursor Position
             b'8' => {
+                t.clear_pending_wrap();
                 t.cursor_row = t.saved_cursor.0.min(t.rows.saturating_sub(1));
                 t.cursor_col = t.saved_cursor.1.min(t.cols.saturating_sub(1));
             }
             // RI: Reverse Index (move cursor up; scroll down if at top)
             b'M' => {
+                t.clear_pending_wrap();
                 if t.cursor_row == 0 {
                     t.scroll_down();
                 } else {
@@ -1173,6 +1416,7 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
             2 => t.attrs |= CellAttrs::DIM,
             3 => t.attrs |= CellAttrs::ITALIC,
             4 => t.attrs |= CellAttrs::UNDERLINE,
+            5 => t.attrs |= CellAttrs::BLINK,
             7 => t.attrs |= CellAttrs::INVERSE,
             9 => t.attrs |= CellAttrs::STRIKETHROUGH,
 
@@ -1180,12 +1424,13 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
             22 => t.attrs &= !(CellAttrs::BOLD | CellAttrs::DIM),
             23 => t.attrs &= !CellAttrs::ITALIC,
             24 => t.attrs &= !CellAttrs::UNDERLINE,
+            25 => t.attrs &= !CellAttrs::BLINK,
             27 => t.attrs &= !CellAttrs::INVERSE,
             29 => t.attrs &= !CellAttrs::STRIKETHROUGH,
 
             // Standard foreground colors (30..37).
             30..=37 => {
-                t.fg = ANSI_16[(code - 30) as usize];
+                t.fg = ansi_16_fg_color((code - 30) as usize);
             }
             // Extended foreground: 38;5;N (256-color) or 38;2;R;G;B (RGB).
             38 => {
@@ -1196,7 +1441,7 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
                             // 256-color
                             i += 1;
                             if i < pv.len() {
-                                t.fg = color_256(pv[i] as u8);
+                                t.fg = fg_color_256_for_parity(pv[i] as u8);
                             }
                         }
                         2 => {
@@ -1215,12 +1460,12 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
             }
             // Default foreground.
             39 => {
-                t.fg = DEFAULT_FG;
+                t.fg = default_fg();
             }
 
             // Standard background colors (40..47).
             40..=47 => {
-                t.bg = ANSI_16[(code - 40) as usize];
+                t.bg = ansi_16_color((code - 40) as usize);
             }
             // Extended background: 48;5;N (256-color) or 48;2;R;G;B (RGB).
             48 => {
@@ -1231,7 +1476,7 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
                             // 256-color
                             i += 1;
                             if i < pv.len() {
-                                t.bg = color_256(pv[i] as u8);
+                                t.bg = bg_color_256_for_parity(pv[i] as u8);
                             }
                         }
                         2 => {
@@ -1250,16 +1495,16 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
             }
             // Default background.
             49 => {
-                t.bg = DEFAULT_BG;
+                t.bg = default_bg();
             }
 
             // Bright foreground colors (90..97).
             90..=97 => {
-                t.fg = ANSI_16[(code - 90 + 8) as usize];
+                t.fg = ansi_16_fg_color((code - 90 + 8) as usize);
             }
             // Bright background colors (100..107).
             100..=107 => {
-                t.bg = ANSI_16[(code - 100 + 8) as usize];
+                t.bg = ansi_16_color((code - 100 + 8) as usize);
             }
 
             _ => {
@@ -1272,8 +1517,8 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
 
 /// Reset all text attributes and colors to their defaults.
 fn reset_attrs(t: &mut Terminal) {
-    t.fg = DEFAULT_FG;
-    t.bg = DEFAULT_BG;
+    t.fg = default_fg();
+    t.bg = default_bg();
     t.attrs = CellAttrs::empty();
 }
 
@@ -1511,6 +1756,17 @@ mod tests {
         t.process_bytes(b"\x1b[1;5H");
         t.process_bytes(b"\x1b[2K"); // erase entire line
         assert_eq!(row_text(&t, 0), "");
+    }
+
+    #[test]
+    fn erase_characters_blanks_without_moving_cursor_or_shifting() {
+        let mut t = Terminal::new(1, 10);
+        t.process_bytes(b"> abcdef");
+        t.process_bytes(b"\x1b[1;3H"); // editable input starts after "> "
+        t.process_bytes(b"\x1b[4X"); // ECH: blank four cells in place
+
+        assert_eq!(t.cursor_position(), (0, 2));
+        assert_eq!(row_text(&t, 0), ">     ef");
     }
 
     #[test]
@@ -1797,6 +2053,111 @@ mod tests {
     }
 
     #[test]
+    fn parity_default_fg_uses_capture_calibrated_windows_terminal_value() {
+        assert_eq!(
+            default_fg_for_parity(true),
+            Color {
+                r: 196,
+                g: 196,
+                b: 196,
+                a: 255,
+            }
+        );
+        assert_eq!(default_fg_for_parity(false), DEFAULT_FG);
+    }
+
+    #[test]
+    fn parity_ansi_palette_matches_windows_terminal_campbell() {
+        assert_eq!(
+            ansi_16_color_for_parity(1, true),
+            Color {
+                r: 197,
+                g: 15,
+                b: 31,
+                a: 255,
+            }
+        );
+        assert_eq!(ansi_16_color_for_parity(1, false), ANSI_16[1]);
+    }
+
+    #[test]
+    fn parity_neutral_foregrounds_are_capture_calibrated_separately_from_backgrounds() {
+        assert_eq!(
+            ansi_16_fg_color_for_parity(7, true),
+            Color {
+                r: 196,
+                g: 196,
+                b: 196,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            ansi_16_fg_color_for_parity(8, true),
+            Color {
+                r: 114,
+                g: 114,
+                b: 114,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            ansi_16_color_for_parity(7, true),
+            Color {
+                r: 204,
+                g: 204,
+                b: 204,
+                a: 255,
+            },
+            "background swatches should keep the literal Campbell palette"
+        );
+    }
+
+    #[test]
+    fn parity_256_color_low_indices_follow_ansi_profile_mapping() {
+        assert_eq!(
+            fg_color_256_for_parity_with_profile(7, true),
+            Color {
+                r: 196,
+                g: 196,
+                b: 196,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            bg_color_256_for_parity_with_profile(7, true),
+            Color {
+                r: 204,
+                g: 204,
+                b: 204,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            fg_color_256_for_parity_with_profile(8, true),
+            Color {
+                r: 114,
+                g: 114,
+                b: 114,
+                a: 255,
+            }
+        );
+        assert_eq!(fg_color_256_for_parity_with_profile(7, false), ANSI_16[7]);
+        assert_eq!(bg_color_256_for_parity_with_profile(7, false), ANSI_16[7]);
+    }
+
+    #[test]
+    fn parity_256_color_high_indices_stay_in_256_color_cube() {
+        assert_eq!(
+            fg_color_256_for_parity_with_profile(196, true),
+            color_256(196)
+        );
+        assert_eq!(
+            bg_color_256_for_parity_with_profile(82, true),
+            color_256(82)
+        );
+    }
+
+    #[test]
     fn sgr_bright_colors() {
         let mut t = Terminal::new(3, 20);
         t.process_bytes(b"\x1b[91mX"); // bright red fg
@@ -1960,6 +2321,18 @@ mod tests {
     }
 
     #[test]
+    fn sgr_blink_toggles_blink_attr() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[5mB");
+        let blinking = t.grid.get_cell(0, 0).unwrap();
+        assert!(blinking.attrs.contains(CellAttrs::BLINK));
+
+        t.process_bytes(b"\x1b[25mX");
+        let steady = t.grid.get_cell(0, 1).unwrap();
+        assert!(!steady.attrs.contains(CellAttrs::BLINK));
+    }
+
+    #[test]
     fn sgr_inverse() {
         let mut t = Terminal::new(3, 20);
         t.process_bytes(b"\x1b[7mI");
@@ -2117,11 +2490,43 @@ mod tests {
     }
 
     #[test]
-    fn cursor_wraps_at_end_of_line() {
+    fn full_width_line_delays_wrap_until_next_printable() {
         let mut term = Terminal::new(2, 5);
         term.process_bytes(b"ABCDE");
-        // After writing 5 chars in a 5-col terminal, cursor wraps to next row.
-        assert_eq!(term.cursor_position(), (1, 0));
+        // Real terminals use delayed autowrap: a character written into
+        // the last column leaves the cursor there until the next printable
+        // character arrives. Claude Code draws full-width rules/status
+        // rows; eager wrapping creates phantom rows that make input drift
+        // into previously-rendered output.
+        assert_eq!(term.cursor_position(), (0, 4));
+        assert_eq!(row_text(&term, 0), "ABCDE");
+        assert_eq!(row_text(&term, 1), "");
+
+        term.process_bytes(b"F");
+
+        assert_eq!(term.cursor_position(), (1, 1));
+        assert_eq!(row_text(&term, 0), "ABCDE");
+        assert_eq!(row_text(&term, 1), "F");
+    }
+
+    #[test]
+    fn carriage_return_clears_pending_wrap_after_full_width_line() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"ABCDE\rZ");
+
+        assert_eq!(term.cursor_position(), (0, 1));
+        assert_eq!(row_text(&term, 0), "ZBCDE");
+        assert_eq!(row_text(&term, 1), "");
+    }
+
+    #[test]
+    fn terminal_query_preserves_pending_wrap() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"ABCDE\x1b[6nF");
+
+        assert_eq!(term.cursor_position(), (1, 1));
+        assert_eq!(row_text(&term, 0), "ABCDE");
+        assert_eq!(row_text(&term, 1), "F");
     }
 
     #[test]
@@ -3276,13 +3681,15 @@ mod tests {
         let mut t = Terminal::new(5, 4);
         t.process_bytes(b"AA\r\nBB\r\nCC\r\nDD\r\nEE");
         t.process_bytes(b"\x1b[2;4r"); // region [1, 4)
+
         // Cursor inside the region.
         t.process_bytes(b"\x1b[2;1H"); // (1, 0)
+
         // Insert one line at row 1: rows in [1, 4) shift down by one,
         // row 1 becomes blank, row 4 (below region) is untouched.
         t.process_bytes(b"\x1b[1L");
         assert_eq!(row_text(&t, 0), "AA"); // pinned above
-        assert_eq!(row_text(&t, 1), "");   // inserted blank
+        assert_eq!(row_text(&t, 1), ""); // inserted blank
         assert_eq!(row_text(&t, 2), "BB"); // shifted down
         assert_eq!(row_text(&t, 3), "CC"); // shifted down
         assert_eq!(row_text(&t, 4), "EE"); // pinned below
@@ -3298,7 +3705,7 @@ mod tests {
         let scrollback_before = t.scrollback_len();
 
         t.process_bytes(b"\x1b[2;3r"); // region [1, 3)
-        t.process_bytes(b"\x1b[3S");   // scroll up 3 inside region
+        t.process_bytes(b"\x1b[3S"); // scroll up 3 inside region
 
         assert_eq!(
             t.scrollback_len(),
