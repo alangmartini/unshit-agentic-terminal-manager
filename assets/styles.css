@@ -2462,6 +2462,23 @@ body.dragging-pane {
   border-left: 3px solid var(--accent-danger, #d75f5f);
 }
 
+.toast-notification {
+  border-left: 3px solid var(--accent-primary, #d6a045);
+}
+
+.toast-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg-primary);
+  margin-bottom: 4px;
+}
+
+.toast-text {
+  font-size: 12px;
+  color: var(--fg-secondary, var(--fg-primary));
+  line-height: 1.35;
+}
+
 .toast:hover {
   background: var(--bg-elevated, var(--bg-subtle));
 }

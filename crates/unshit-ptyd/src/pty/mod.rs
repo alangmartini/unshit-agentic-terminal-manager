@@ -235,9 +235,7 @@ fn pick_default_shell(shell_env: Option<&str>, is_windows: bool) -> String {
 /// `pick_default_shell` to whitelist `SHELL` overrides; non-native
 /// values like `bash.exe` fall back to PowerShell.
 fn is_windows_native_shell(path: &str) -> bool {
-    Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
+    shell_file_stem(path)
         .map(|stem| {
             let lower = stem.to_ascii_lowercase();
             matches!(lower.as_str(), "powershell" | "pwsh" | "cmd")
@@ -248,11 +246,21 @@ fn is_windows_native_shell(path: &str) -> bool {
 /// Returns true when `shell` points at `powershell` or `pwsh` (with or
 /// without a `.exe` suffix, any path prefix, case-insensitive stem).
 pub fn is_powershell_shell(shell: &str) -> bool {
-    Path::new(shell)
-        .file_stem()
-        .and_then(|s| s.to_str())
+    shell_file_stem(shell)
         .map(|stem| stem.eq_ignore_ascii_case("powershell") || stem.eq_ignore_ascii_case("pwsh"))
         .unwrap_or(false)
+}
+
+fn shell_file_stem(shell: &str) -> Option<&str> {
+    let file_name = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())?;
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    (!stem.is_empty()).then_some(stem)
 }
 
 /// Build the `-NoExit -Command "Set-Location ..."` args that force PowerShell

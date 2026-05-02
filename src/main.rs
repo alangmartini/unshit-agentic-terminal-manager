@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod drag;
 pub mod git;
 pub mod keybinds;
+pub mod notifications;
 pub mod persist;
 pub mod pty;
 pub mod shell;
@@ -452,6 +453,10 @@ fn parse_bench_args() -> Option<crate::bench::BenchConfig> {
 }
 
 fn main() {
+    if let Some(code) = notifications::handle_cli_from_env(std::env::args_os().skip(1)) {
+        std::process::exit(code);
+    }
+
     #[cfg(feature = "profiling")]
     init_profiler();
 

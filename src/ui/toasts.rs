@@ -42,16 +42,36 @@ pub fn build_toast_overlay(snap: &UiSnapshot, shared: &SharedState) -> ElementDe
 fn build_toast_card(view: &crate::state::ToastView, shared: &SharedState) -> ElementDef {
     let dispatch_shared = shared.clone();
     let id = view.id;
-    ElementDef::new(Tag::Div)
+    let command = if view.target.is_some() {
+        format!("notification.activate:{id}")
+    } else {
+        format!("toast.dismiss:{id}")
+    };
+    let mut card = ElementDef::new(Tag::Div)
         .with_class("toast")
-        .with_class("toast-error")
+        .with_class(if view.target.is_some() {
+            "toast-notification"
+        } else {
+            "toast-error"
+        })
         .with_id(format!("toast-{id}"))
         .on_click(move || {
             mutate_with(&dispatch_shared, |st| {
-                dispatch(st, &format!("toast.dismiss:{id}"));
+                dispatch(st, &command);
             });
-        })
-        .with_child(ElementDef::new(Tag::Span).with_text(view.message.clone()))
+        });
+    if let Some(title) = &view.title {
+        card = card.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("toast-title")
+                .with_text(title.clone()),
+        );
+    }
+    card.with_child(
+        ElementDef::new(Tag::Div)
+            .with_class("toast-text")
+            .with_text(view.message.clone()),
+    )
 }
 
 #[cfg(test)]
@@ -88,8 +108,8 @@ mod tests {
         let messages: Vec<String> = el
             .children
             .iter()
-            .filter_map(|c| c.children.first())
-            .filter_map(|span| match &span.content {
+            .filter_map(|c| c.children.last())
+            .filter_map(|body| match &body.content {
                 ElementContent::Text(s) => Some(s.clone()),
                 _ => None,
             })
@@ -106,5 +126,21 @@ mod tests {
         handler();
         let after = shared.lock().expect("lock").toasts.len();
         assert_eq!(after, 0);
+    }
+
+    #[test]
+    fn notification_card_renders_title_and_body() {
+        let mut state = seed_state();
+        crate::state::push_notification_toast(&mut state, "Build done", "Tests passed", 1, 1);
+        let snap = state.ui_snapshot();
+        let shared = Arc::new(Mutex::new(state));
+
+        let el = build_toast_overlay(&snap, &shared);
+        let card = el.children.first().expect("one card");
+        assert!(card.classes.contains(&"toast-notification".to_string()));
+        let title = card.children.first().expect("title");
+        let body = card.children.last().expect("body");
+        assert!(matches!(&title.content, ElementContent::Text(s) if s == "Build done"));
+        assert!(matches!(&body.content, ElementContent::Text(s) if s == "Tests passed"));
     }
 }

@@ -676,6 +676,15 @@ impl ApplicationHandler for AppHandler {
                 ExternalEvent::RequestRedraw => {
                     coalescer.observe(false);
                 }
+                ExternalEvent::ActivateWindow => {
+                    state.window.set_visible(true);
+                    state.window.set_minimized(false);
+                    state.window.focus_window();
+                    state
+                        .window
+                        .request_user_attention(Some(AttentionUrgency::Informational.to_winit()));
+                    coalescer.observe(false);
+                }
                 ExternalEvent::Custom(payload) => {
                     if let Some(ref handler) = self.app.config.on_external_event {
                         handler(payload);

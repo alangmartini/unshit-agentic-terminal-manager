@@ -85,6 +85,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         SettingsSection::Shell => build_shell_section(state, shared),
         SettingsSection::Keybinds => build_keybinds_section(state, shared),
         SettingsSection::Sessions => build_sessions_section(state, shared),
+        SettingsSection::Notifications => build_notifications_section(shared),
         SettingsSection::DangerZone => build_danger_zone_section(state, shared),
     };
     ElementDef::new(Tag::Div)
@@ -333,6 +334,26 @@ fn build_keybinds_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
     }
 
     section.with_child(keybind_footer(shared))
+}
+
+fn build_notifications_section(shared: &SharedState) -> ElementDef {
+    let test_notification_shared = shared.clone();
+    let test_notification = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("ghost")
+        .with_id("settings-test-notification")
+        .with_text("send test")
+        .on_click(move || {
+            mutate_with(&test_notification_shared, |st| {
+                dispatch(st, "notifications.test");
+            });
+        });
+
+    section_shell("notifications").with_child(setting_row(
+        "Test notification",
+        "Sends a notification targeted at the active workspace and terminal.",
+        test_notification,
+    ))
 }
 
 fn keybind_restart_banner() -> ElementDef {
@@ -874,10 +895,10 @@ mod tests {
     }
 
     #[test]
-    fn modal_nav_has_five_items() {
+    fn modal_nav_has_six_items() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::Appearance, &shared);
-        assert_eq!(el.children.len(), 5);
+        assert_eq!(el.children.len(), 6);
     }
 
     #[test]
@@ -912,10 +933,17 @@ mod tests {
     }
 
     #[test]
+    fn modal_nav_marks_notifications_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Notifications, &shared);
+        assert!(el.children[4].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
     fn modal_nav_marks_danger_zone_active() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::DangerZone, &shared);
-        assert!(el.children[4].classes.contains(&"active".to_string()));
+        assert!(el.children[5].classes.contains(&"active".to_string()));
     }
 
     #[test]
@@ -966,6 +994,16 @@ mod tests {
         let section = &el.children[0];
         let title = &section.children[0];
         assert_eq!(text_of(title), Some("shell"));
+    }
+
+    #[test]
+    fn modal_body_switches_to_notifications() {
+        let snap = make_snapshot_section(SettingsSection::Notifications);
+        let shared = make_shared();
+        let el = build_modal_body(&snap, &shared);
+        let section = &el.children[0];
+        let title = &section.children[0];
+        assert_eq!(text_of(title), Some("notifications"));
     }
 
     // -- build_appearance_section -----------------------------------------------
@@ -1260,6 +1298,31 @@ mod tests {
         assert!(!error_banner.classes.contains(&"hidden".to_string()));
     }
 
+    // -- build_notifications_section ------------------------------------------
+
+    #[test]
+    fn notifications_section_test_button_pushes_notification() {
+        let shared = make_shared();
+        let el = build_notifications_section(&shared);
+        assert_eq!(text_of(&el.children[0]), Some("notifications"));
+        let test_btn =
+            find_by_id(&el, "settings-test-notification").expect("test notification button");
+
+        (test_btn.on_click.as_ref().unwrap())();
+
+        let state = shared.lock().unwrap();
+        let snap = state.ui_snapshot();
+        let toast = snap.toasts.first().expect("test notification toast");
+        assert_eq!(toast.title.as_deref(), Some("Test notification"));
+        assert_eq!(
+            toast.target,
+            Some(crate::state::ToastTarget {
+                workspace_id: crate::state::active_workspace_num(&state),
+                pane_id: state.active_pane.0,
+            })
+        );
+    }
+
     // -- build_modal_footer -----------------------------------------------------
 
     #[test]
@@ -1364,10 +1427,21 @@ mod tests {
     fn nav_item_click_changes_to_danger_zone() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::Appearance, &shared);
-        (el.children[4].on_click.as_ref().unwrap())();
+        (el.children[5].on_click.as_ref().unwrap())();
         assert_eq!(
             shared.lock().unwrap().settings_section,
             SettingsSection::DangerZone
+        );
+    }
+
+    #[test]
+    fn nav_item_click_changes_to_notifications() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Appearance, &shared);
+        (el.children[4].on_click.as_ref().unwrap())();
+        assert_eq!(
+            shared.lock().unwrap().settings_section,
+            SettingsSection::Notifications
         );
     }
 
@@ -1604,7 +1678,7 @@ mod tests {
             .iter()
             .filter(|c| c.classes.contains(&"setting-row".to_string()))
             .collect();
-        // rows[0] is header; rows[1] alive, rows[2] dead
+        // rows[0] is header; rows[1] alive, rows[2] dead.
         let alive_meta = &rows[1].children[0];
         let dead_meta = &rows[2].children[0];
         let has_status_class = |meta: &ElementDef, cls: &str| {

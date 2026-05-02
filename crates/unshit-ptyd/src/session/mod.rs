@@ -31,6 +31,10 @@ const DEFAULT_SCROLLBACK: usize = 10_000;
 /// slices.
 const READ_BUF_LEN: usize = 4096;
 
+pub const ENV_NOTIFY_SOCKET: &str = "TM_NOTIFY_SOCKET";
+pub const ENV_WORKSPACE_ID: &str = "TM_WORKSPACE_ID";
+pub const ENV_PANE_ID: &str = "TM_PANE_ID";
+
 /// Owns one PTY child and the reader task that fans its bytes into the
 /// outbound mpsc.
 pub struct Session {
@@ -122,6 +126,9 @@ impl Session {
         // a dumb terminal and skip DECSET 1049 / 256-color escapes.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        for (key, value) in terminal_manager_session_env(workspace_id, pane_id) {
+            cmd.env(key, value);
+        }
 
         let child = pty
             .slave
@@ -293,6 +300,50 @@ impl Session {
     pub fn set_name(&mut self, name: Option<String>) {
         self.name = name.filter(|s| !s.is_empty());
     }
+}
+
+pub fn terminal_manager_session_env(
+    workspace_id: u32,
+    pane_id: u32,
+) -> Vec<(&'static str, String)> {
+    vec![
+        (ENV_NOTIFY_SOCKET, notification_socket_path_from_env()),
+        (ENV_WORKSPACE_ID, workspace_id.to_string()),
+        (ENV_PANE_ID, pane_id.to_string()),
+    ]
+}
+
+fn notification_socket_path_from_env() -> String {
+    std::env::var_os(ENV_NOTIFY_SOCKET)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
+            default_notification_socket_path()
+                .to_string_lossy()
+                .to_string()
+        })
+}
+
+fn default_notification_socket_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::path::PathBuf::from(r"\\.\pipe\terminal-manager-notify")
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+            return std::path::PathBuf::from(dir).join("terminal-manager-notify.sock");
+        }
+        std::env::temp_dir().join(format!("terminal-manager-notify-{}.sock", current_euid()))
+    }
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() }
 }
 
 impl Drop for Session {
@@ -577,6 +628,21 @@ mod tests {
         assert_eq!(session.workspace_id(), 7);
         assert_eq!(session.pane_id(), 3);
         assert_eq!(session.name(), Some("scratch"));
+    }
+
+    #[test]
+    fn session_env_includes_notification_target_metadata() {
+        let env = terminal_manager_session_env(7, 3);
+        let find = |key: &str| {
+            env.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+        };
+
+        assert!(!find(ENV_NOTIFY_SOCKET).is_empty());
+        assert_eq!(find(ENV_WORKSPACE_ID), "7");
+        assert_eq!(find(ENV_PANE_ID), "3");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
