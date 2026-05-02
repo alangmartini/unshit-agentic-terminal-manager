@@ -3,6 +3,7 @@
 //! into a fresh worktree. Slice 1 lands the empty overlay shell;
 //! richer state and behavior land in later slices per `tasks/plan.md`.
 
+pub mod spawn;
 pub mod state;
 pub mod ui;
 

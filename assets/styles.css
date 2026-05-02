@@ -1764,6 +1764,14 @@ body.dragging-pane {
   outline-offset: -1px;
 }
 
+.quick-prompt-error {
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: var(--rust);
+  color: var(--bg-base);
+}
+
 .confirm-dialog-card {
   background: var(--bg-subtle);
   border: 1px solid var(--border-default);

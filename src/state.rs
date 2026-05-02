@@ -970,6 +970,96 @@ pub fn mutate_add_tab(state: &mut AppState) {
     state.col_ratios = vec![vec![1.0]];
 }
 
+/// Build the tab title for a Quick Prompt submission. Truncates on
+/// character boundaries (not bytes) so the buffer is safe for any
+/// prompt the user types.
+fn quick_prompt_tab_title(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    let truncated: String = trimmed.chars().take(30).collect();
+    if truncated.is_empty() {
+        "qp".to_string()
+    } else {
+        format!("qp: {}", truncated)
+    }
+}
+
+/// Spawn a new tab running an agent at `cwd` with `shell`. Mirrors
+/// `mutate_add_tab` but takes the cwd and shell explicitly so it does
+/// not consult the active workspace's settings.
+pub fn mutate_add_quick_prompt_tab(
+    state: &mut AppState,
+    prompt: &str,
+    cwd: &std::path::Path,
+    shell: &crate::shell::ShellSpec,
+) {
+    save_tab_state(state);
+
+    let id_num = state.next_id;
+    state.next_id += 1;
+    let pane_id = PaneId(id_num);
+
+    let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w();
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let (cols, rows) = compute_pty_dimensions(
+        state.last_grid_width,
+        state.last_grid_height,
+        cell_w,
+        cell_h,
+    );
+
+    let workspace_id = active_workspace_num(state);
+    let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+    match state
+        .pty_manager
+        .spawn_in(id_num, workspace_id, cols, rows, Some(cwd), Some(shell))
+    {
+        Ok(reader) => {
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
+            crate::bridge::register_reader(id_num, reader);
+        }
+        Err(e) => {
+            log::error!(
+                "failed to spawn PTY for quick prompt pane {}: {}",
+                id_num,
+                e
+            );
+            terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
+        }
+    }
+
+    let title = quick_prompt_tab_title(prompt);
+    let pane = Pane {
+        id: pane_id,
+        title: title.clone(),
+        subtitle: shell.program.clone(),
+        pid: 0,
+        cpu: 0.0,
+    };
+    let tab = TerminalTab {
+        id: format!("t{}", id_num),
+        name: title,
+        subtitle: shell.program.clone(),
+        status: TabStatus::Running,
+        panes: vec![vec![pane.clone()]],
+        active_pane: pane_id,
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+
+    state.tabs.push(tab);
+    state.active_tab = state.tabs.len() - 1;
+
+    state.panes = vec![vec![pane]];
+    state.active_pane = pane_id;
+    state.row_ratios = vec![1.0];
+    state.col_ratios = vec![vec![1.0]];
+}
+
 pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     if index >= state.tabs.len() {
         return;
@@ -2205,6 +2295,41 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             qp.error = None;
             crate::quick_prompt::state::QuickPromptStore::save(qp);
             true
+        }
+        "quick_prompt.submit" => {
+            let Some(qp) = state.quick_prompt.as_ref() else {
+                return false;
+            };
+            let prompt = qp.prompt.trim().to_string();
+            let agent = qp.agent;
+
+            if prompt.is_empty() {
+                let qp = state.quick_prompt.as_mut().unwrap();
+                qp.error = Some("Type a prompt to continue.".into());
+                return true;
+            }
+
+            if agent == crate::quick_prompt::Agent::Codex {
+                // Codex parity lands in Slice 6.
+                let qp = state.quick_prompt.as_mut().unwrap();
+                qp.error = Some("Codex coming soon".into());
+                return true;
+            }
+
+            let cwd = active_workspace_cwd(state);
+            match crate::quick_prompt::spawn::prepare_target(cwd.as_deref()) {
+                Ok(target) => {
+                    let shell_spec = crate::quick_prompt::spawn::claude_shell_spec(&prompt);
+                    mutate_add_quick_prompt_tab(state, &prompt, &target.path, &shell_spec);
+                    state.quick_prompt = None;
+                    true
+                }
+                Err(e) => {
+                    let qp = state.quick_prompt.as_mut().unwrap();
+                    qp.error = Some(format!("submit failed: {}", e));
+                    true
+                }
+            }
         }
         "tab.new" => {
             mutate_add_tab(state);
@@ -3755,6 +3880,84 @@ mod tests {
         let mut state = test_state();
         assert!(state.quick_prompt.is_none());
         assert!(!dispatch(&mut state, "quick_prompt.toggle_agent"));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_submit_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(state.quick_prompt.is_none());
+        assert!(!dispatch(&mut state, "quick_prompt.submit"));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_submit_empty_prompt_sets_error() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        assert!(dispatch(&mut state, "quick_prompt.submit"));
+        let qp = state.quick_prompt.as_ref().expect("overlay still open");
+        assert_eq!(qp.error.as_deref(), Some("Type a prompt to continue."));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_submit_whitespace_only_sets_error() {
+        let mut state = test_state();
+        let mut qp = crate::quick_prompt::QuickPromptState::open_default();
+        qp.prompt = "   \n\t  ".into();
+        state.quick_prompt = Some(qp);
+
+        assert!(dispatch(&mut state, "quick_prompt.submit"));
+        assert!(state
+            .quick_prompt
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .map(|e| e.contains("Type a prompt"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_submit_codex_shows_coming_soon() {
+        use crate::quick_prompt::Agent;
+        let mut state = test_state();
+        let mut qp = crate::quick_prompt::QuickPromptState::open_with_agent(Agent::Codex);
+        qp.prompt = "do the thing".into();
+        state.quick_prompt = Some(qp);
+
+        assert!(dispatch(&mut state, "quick_prompt.submit"));
+        // Overlay stays open; error chip is set.
+        let qp = state.quick_prompt.as_ref().expect("overlay still open");
+        assert_eq!(qp.agent, Agent::Codex);
+        assert_eq!(qp.error.as_deref(), Some("Codex coming soon"));
+    }
+
+    #[test]
+    fn quick_prompt_tab_title_truncates_to_thirty_chars() {
+        let title = super::quick_prompt_tab_title(&"a".repeat(50));
+        // "qp: " + 30 chars = 34 chars total.
+        assert_eq!(title.chars().count(), 34);
+        assert!(title.starts_with("qp: "));
+    }
+
+    #[test]
+    fn quick_prompt_tab_title_handles_empty_prompt() {
+        // Defensive: even though dispatch rejects empty prompts, the
+        // title helper should not panic on one.
+        assert_eq!(super::quick_prompt_tab_title(""), "qp");
+        assert_eq!(super::quick_prompt_tab_title("   "), "qp");
+    }
+
+    #[test]
+    fn quick_prompt_tab_title_truncates_on_char_boundary() {
+        // Multi-byte chars must not split. 30 emojis is well over 30
+        // bytes but exactly 30 chars; the truncation is on chars.
+        let prompt: String = "🎯".repeat(50);
+        let title = super::quick_prompt_tab_title(&prompt);
+        assert!(title.starts_with("qp: "));
+        // Body should be exactly 30 chars.
+        let body: String = title.chars().skip(4).collect();
+        assert_eq!(body.chars().count(), 30);
     }
 
     #[test]

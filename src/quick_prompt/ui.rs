@@ -44,7 +44,7 @@ fn build_quick_prompt_card(qp: &QuickPromptState, shared: &SharedState) -> Eleme
     let agent_row = build_agent_row(qp.agent, shared);
     let prompt_input = build_prompt_input(shared);
 
-    ElementDef::new(Tag::Div)
+    let mut card = ElementDef::new(Tag::Div)
         .with_class("quick-prompt-card")
         .on_click(|| {
             // Prevent backdrop click from also firing when the user
@@ -52,7 +52,17 @@ fn build_quick_prompt_card(qp: &QuickPromptState, shared: &SharedState) -> Eleme
             // input would also dispatch quick_prompt.close.
         })
         .with_child(agent_row)
-        .with_child(prompt_input)
+        .with_child(prompt_input);
+
+    if let Some(msg) = qp.error.as_ref() {
+        card = card.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("quick-prompt-error")
+                .with_text(msg.clone()),
+        );
+    }
+
+    card
 }
 
 fn build_agent_row(active: Agent, shared: &SharedState) -> ElementDef {
@@ -86,17 +96,29 @@ fn build_agent_chip(chip: Agent, active: Agent, shared: &SharedState) -> Element
 }
 
 fn build_prompt_input(shared: &SharedState) -> ElementDef {
-    let input_shared = shared.clone();
+    let change_shared = shared.clone();
+    let submit_shared = shared.clone();
     ElementDef::new(Tag::Input)
         .with_class("quick-prompt-input")
         .with_placeholder("What should the agent do?")
         .on_change(move |text| {
             let typed = text.to_string();
-            mutate_with(&input_shared, |st| {
+            mutate_with(&change_shared, |st| {
                 if let Some(qp) = st.quick_prompt.as_mut() {
                     qp.prompt = typed;
                     qp.error = None;
                 }
+            });
+        })
+        .on_submit(move |text| {
+            let typed = text.to_string();
+            mutate_with(&submit_shared, |st| {
+                // Sync the buffer in case on_change is debounced or
+                // missed an event before the user pressed Enter.
+                if let Some(qp) = st.quick_prompt.as_mut() {
+                    qp.prompt = typed;
+                }
+                dispatch(st, "quick_prompt.submit");
             });
         })
 }
@@ -255,6 +277,65 @@ mod tests {
             .prompt
             .clone();
         assert_eq!(prompt, "hello world");
+    }
+
+    #[test]
+    fn card_renders_error_chip_when_state_has_error() {
+        let mut state = seed_state();
+        let mut qp = QuickPromptState::open_with_agent(Agent::Claude);
+        qp.error = Some("Codex coming soon".into());
+        state.quick_prompt = Some(qp);
+        let shared = shared_with(state);
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let overlay = build_quick_prompt_overlay(&snap, &shared);
+        let card = &overlay.children[0];
+        assert!(
+            card.children
+                .iter()
+                .any(|c| c.classes.iter().any(|cl| cl == "quick-prompt-error")),
+            "expected error chip, got {:?}",
+            card.children
+                .iter()
+                .map(|c| c.classes.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn card_omits_error_chip_when_state_has_no_error() {
+        let mut state = seed_state();
+        state.quick_prompt = Some(QuickPromptState::open_with_agent(Agent::Claude));
+        let shared = shared_with(state);
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let overlay = build_quick_prompt_overlay(&snap, &shared);
+        let card = &overlay.children[0];
+        assert!(!card
+            .children
+            .iter()
+            .any(|c| c.classes.iter().any(|cl| cl == "quick-prompt-error")));
+    }
+
+    #[test]
+    fn input_on_submit_dispatches_quick_prompt_submit() {
+        // The on_submit handler dispatches quick_prompt.submit through
+        // the existing dispatcher; we verify the side effect (overlay
+        // gets the empty-prompt error chip when the buffer is empty).
+        let mut state = seed_state();
+        state.quick_prompt = Some(QuickPromptState::open_with_agent(Agent::Claude));
+        let shared = shared_with(state);
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let overlay = build_quick_prompt_overlay(&snap, &shared);
+        let card = &overlay.children[0];
+        let input = card
+            .children
+            .iter()
+            .find(|c| c.classes.iter().any(|cl| cl == "quick-prompt-input"))
+            .expect("prompt input");
+        // Submit with an empty buffer; the dispatch arm sets the error
+        // chip and keeps the overlay open.
+        (input.on_submit.as_ref().unwrap())("");
+        let qp = shared.lock().unwrap().quick_prompt.clone().unwrap();
+        assert_eq!(qp.error.as_deref(), Some("Type a prompt to continue."));
     }
 
     #[test]
