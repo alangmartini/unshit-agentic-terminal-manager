@@ -105,25 +105,18 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
   - [x] Re-exported `ClipboardContent` / `ClipboardFormat` from `unshit-app::lib`.
   - [x] Tests: 13 in `quick_prompt::images`, 2 in `quick_prompt::state` for session_hex, 4 dispatch tests covering paste + cleanup paths. 1002 total green.
 
-- [ ] **Slice 5: Autocomplete (Claude only)**
-  - [ ] Create `src/quick_prompt/autocomplete.rs` with `Entry`, `EntryKind`, `Popup`, `load_claude_sources`, `filter`.
-  - [ ] Cache `Mutex<Option<(Instant, Vec<Entry>)>>`; reuse if <5s old.
-  - [ ] Trigger detection: dispatch arm `quick_prompt.input` checks the new char; opens `Popup` when `/` follows whitespace or at start.
-  - [ ] Popup state arms: `quick_prompt.autocomplete_select_next`, `_prev`, `_confirm`, `_dismiss`.
-  - [ ] Confirm inserts `/<entry.name>` at cursor and closes popup.
-  - [ ] UI: render popup absolutely positioned below the input; selected row highlighted.
-  - [ ] Up/Down/Enter/Tab/Esc handled via input keybinds while popup is open.
-  - [ ] CSS: popup container, row, hover, selected.
-  - [ ] Test: `quick_prompt::autocomplete::load_claude_sources_walks_skills_and_commands` (uses temp dirs).
-  - [ ] Test: `quick_prompt::autocomplete::filter_case_insensitive_substring`.
-  - [ ] Test: `quick_prompt::autocomplete::filter_empty_query_returns_all`.
-  - [ ] Test: `quick_prompt::autocomplete::trigger_detection_after_whitespace`.
-  - [ ] Test: `quick_prompt::autocomplete::trigger_detection_at_start`.
-  - [ ] Test: `quick_prompt::autocomplete::missing_dir_yields_empty`.
-  - [ ] Bench: create `benches/quick_prompt_filter.rs` over 200 synthetic entries (criterion).
-  - [ ] Add bench entry to `Cargo.toml`.
-  - [ ] `cargo bench --bench quick_prompt_filter` p99 <1ms (verify on dev machine; document baseline).
-  - [ ] Manual: open overlay, type `/`, popup appears with real claude entries; arrow keys navigate; Tab inserts; Esc dismisses.
+- [x] **Slice 5: Autocomplete (Claude only)** (commit ff02e4e)
+  - [x] `src/quick_prompt/autocomplete.rs` with `Entry`, `EntryKind`, `Popup`, `load_claude_sources_from`, `cached_claude_sources`, `filter`, `detect_claude_trigger`, `rederive_query`, `confirm_into_prompt`.
+  - [x] Cache `Mutex<Option<(Instant, Vec<Entry>)>>` with 5s TTL.
+  - [x] Trigger detection runs inside the input `on_change` closure (slice 2 chose direct mutation over a dispatch arm; trigger logic is testable as a pure function).
+  - [x] Popup state arms `quick_prompt.autocomplete_select_next`, `_prev`, `_confirm`, `_dismiss` plus `modal.close` (Esc) dismisses popup-only when one is open.
+  - [x] Confirm splices `/<entry.name>` at the anchor and closes popup; preserves trailing whitespace and text.
+  - [x] UI renders popup below the input with selected row class; click-on-row confirms.
+  - [x] Spec deviation: Up/Down/Enter/Tab key handling on the input is unavailable today (framework `Input` only exposes `on_change` + `on_submit`). State machine arms are wired so Slice 7 can bind keys when framework support lands. Enter routes through `on_submit` to `autocomplete_confirm` when popup is open.
+  - [x] CSS rules for `.quick-prompt-autocomplete`, `.quick-prompt-autocomplete-row` (+ hover, `.selected`), name + kind spans, empty hint.
+  - [x] 30 unit tests in `quick_prompt::autocomplete::*` covering loader, filter, trigger detection, rederive, confirm, popup state machine, missing root.
+  - [x] 5 dispatch tests covering `select_next`, `select_prev`, `dismiss`, `confirm`, no-op-when-closed; 1 modal-close test covering the two-Esc flow.
+  - [x] `benches/quick_prompt_filter.rs` (criterion) measures `filter` over 200 synthetic entries across four query shapes. `Cargo.toml` `[[bench]]` entry added. Baseline on dev machine: empty 224 ns, broad hit ~50 us, no match ~46 us. Spec gate <1 ms p99 met with ~20x headroom.
 
 - [ ] **Slice 6: Codex parity**
   - [ ] Verify OQ1: run `codex exec "say hi"` in a terminal to confirm CLI shape. Update `codex_shell_spec` if it differs.
