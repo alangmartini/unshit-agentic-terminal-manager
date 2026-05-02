@@ -1696,6 +1696,39 @@ body.dragging-pane {
   z-index: 300;
 }
 
+.quick-prompt-hidden {
+  display: none;
+}
+
+.quick-prompt-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-overlay);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 320;
+}
+
+.quick-prompt-card {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  padding: 20px 24px;
+  min-width: 480px;
+  max-width: 720px;
+  box-shadow: var(--shadow-lg);
+  flex-direction: column;
+}
+
+.quick-prompt-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg-primary);
+  margin-bottom: 10px;
+}
+
 .confirm-dialog-card {
   background: var(--bg-subtle);
   border: 1px solid var(--border-default);

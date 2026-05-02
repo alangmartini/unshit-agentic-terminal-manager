@@ -460,6 +460,10 @@ pub struct AppState {
     /// `default_shell()` decide". Per workspace overrides land in
     /// Task 6 and take precedence via `shell::resolve`.
     pub default_shell: crate::shell::ShellSpec,
+    /// Quick Prompt overlay. `None` when closed. Slice 1 keeps the
+    /// inner state empty; later slices add prompt text, agent, images,
+    /// and autocomplete fields per `tasks/plan.md`.
+    pub quick_prompt: Option<crate::quick_prompt::QuickPromptState>,
 }
 
 impl AppState {
@@ -559,6 +563,7 @@ impl AppState {
                 })
                 .collect(),
             default_shell: self.default_shell.clone(),
+            quick_prompt: self.quick_prompt.clone(),
         }
     }
 
@@ -628,6 +633,9 @@ pub struct UiSnapshot {
     /// Mirror of `AppState::default_shell` so settings UI can render
     /// the current value without reaching into the live state.
     pub default_shell: crate::shell::ShellSpec,
+    /// Mirror of `AppState::quick_prompt`. `None` when the overlay is
+    /// closed.
+    pub quick_prompt: Option<crate::quick_prompt::QuickPromptState>,
 }
 
 fn current_folder_name() -> String {
@@ -793,6 +801,7 @@ pub fn seed_state() -> AppState {
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
         clipboard: Arc::new(unshit::app::ClipboardContext::new()),
         default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
+        quick_prompt: None,
     }
 }
 
@@ -2061,6 +2070,10 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.confirm_dialog = None;
                 changed = true;
             }
+            if state.quick_prompt.is_some() {
+                state.quick_prompt = None;
+                changed = true;
+            }
             changed
         }
         "dialog.confirm" => {
@@ -2161,6 +2174,24 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         "modal.open" => {
             if !state.settings_open {
                 state.settings_open = true;
+                true
+            } else {
+                false
+            }
+        }
+        "quick_prompt.open" => {
+            if state.quick_prompt.is_some() {
+                // Re-pressing the hotkey while open closes the overlay
+                // (toggle behavior per spec A1.2).
+                state.quick_prompt = None;
+            } else {
+                state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+            }
+            true
+        }
+        "quick_prompt.close" => {
+            if state.quick_prompt.is_some() {
+                state.quick_prompt = None;
                 true
             } else {
                 false
@@ -3141,6 +3172,7 @@ mod tests {
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
             clipboard: Arc::new(unshit::app::ClipboardContext::new()),
             default_shell: crate::shell::ShellSpec::default(),
+            quick_prompt: None,
         }
     }
 
@@ -3639,6 +3671,47 @@ mod tests {
 
         // Closing again returns false (already closed)
         assert!(!dispatch(&mut state, "modal.close"));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_open_sets_state() {
+        let mut state = test_state();
+        assert!(state.quick_prompt.is_none());
+
+        assert!(dispatch(&mut state, "quick_prompt.open"));
+        assert!(state.quick_prompt.is_some());
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_open_toggles_when_already_open() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "quick_prompt.open"));
+        assert!(state.quick_prompt.is_some());
+
+        // Re-pressing the hotkey closes the overlay (A1.2 toggle).
+        assert!(dispatch(&mut state, "quick_prompt.open"));
+        assert!(state.quick_prompt.is_none());
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_close_clears_state() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        assert!(dispatch(&mut state, "quick_prompt.close"));
+        assert!(state.quick_prompt.is_none());
+
+        // Closing again returns false (nothing to close).
+        assert!(!dispatch(&mut state, "quick_prompt.close"));
+    }
+
+    #[test]
+    fn dispatch_modal_close_clears_quick_prompt() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.quick_prompt.is_none());
     }
 
     #[test]

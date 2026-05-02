@@ -6,6 +6,7 @@ pub mod git;
 pub mod keybinds;
 pub mod persist;
 pub mod pty;
+pub mod quick_prompt;
 pub mod shell;
 pub mod state;
 pub mod terminal;
@@ -267,6 +268,9 @@ fn build_tree(
         root: root
             .with_child(build_ctx_menu_overlay(snap, shared))
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
+                snap, shared,
+            ))
+            .with_child(crate::quick_prompt::build_quick_prompt_overlay(
                 snap, shared,
             ))
             .with_child(build_toast_overlay(snap, shared))
