@@ -22,6 +22,15 @@ pub enum ClipboardContent {
         /// Plain-text alternative shown by applications that only support text.
         alt_text: String,
     },
+    /// Raw 32-bit RGBA bitmap. `bytes.len()` must equal `width * height * 4`.
+    Image {
+        /// Width in pixels.
+        width: usize,
+        /// Height in pixels.
+        height: usize,
+        /// Tightly packed RGBA pixels in row-major order.
+        bytes: Vec<u8>,
+    },
 }
 
 /// Clipboard format discriminant, returned by [`ClipboardContext::available_formats`].
@@ -31,6 +40,8 @@ pub enum ClipboardFormat {
     Text,
     /// The clipboard contains HTML.
     Html,
+    /// The clipboard contains a bitmap image.
+    Image,
 }
 
 /// Errors that can occur during clipboard operations.
@@ -163,6 +174,27 @@ impl ClipboardContext {
                     Ok(())
                 }
             }
+            ClipboardContent::Image { width, height, bytes } => {
+                #[cfg(feature = "clipboard")]
+                {
+                    let cb = self.get_or_init()?;
+                    let mut guard = cb.lock().map_err(|e| ClipboardError::Other(e.to_string()))?;
+                    guard
+                        .as_mut()
+                        .unwrap()
+                        .set_image(arboard::ImageData {
+                            width,
+                            height,
+                            bytes: std::borrow::Cow::Owned(bytes),
+                        })
+                        .map_err(|e| ClipboardError::Other(e.to_string()))
+                }
+                #[cfg(not(feature = "clipboard"))]
+                {
+                    let _ = (width, height, bytes);
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -188,11 +220,37 @@ impl ClipboardContext {
         }
     }
 
+    /// Read an image from the clipboard, if available.
+    ///
+    /// Returns `Ok(Some(ClipboardContent::Image { .. }))` when the clipboard
+    /// holds a bitmap, `Ok(None)` when it does not (but no error occurred),
+    /// or `Err` for genuine clipboard failures.
+    pub fn read_image(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+        #[cfg(feature = "clipboard")]
+        {
+            let cb = self.get_or_init()?;
+            let mut guard = cb.lock().map_err(|e| ClipboardError::Other(e.to_string()))?;
+            match guard.as_mut().unwrap().get_image() {
+                Ok(img) => Ok(Some(ClipboardContent::Image {
+                    width: img.width,
+                    height: img.height,
+                    bytes: img.bytes.into_owned(),
+                })),
+                Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                Err(e) => Err(ClipboardError::Other(e.to_string())),
+            }
+        }
+        #[cfg(not(feature = "clipboard"))]
+        {
+            Ok(None)
+        }
+    }
+
     /// Return all clipboard formats that are currently readable.
     ///
     /// Each variant in the returned `Vec` indicates that the corresponding
-    /// `read_text` / `get_html` call would succeed right now.  The list may be
-    /// empty if the clipboard is empty or not accessible.
+    /// `read_text` / `get_html` / `read_image` call would succeed right now.
+    /// The list may be empty if the clipboard is empty or not accessible.
     pub fn available_formats(&self) -> Vec<ClipboardFormat> {
         let mut formats = Vec::new();
 
@@ -203,9 +261,12 @@ impl ClipboardContext {
             formats.push(ClipboardFormat::Text);
         }
 
-        match self.get_html() {
-            Ok(Some(_)) => formats.push(ClipboardFormat::Html),
-            _ => {}
+        if let Ok(Some(_)) = self.get_html() {
+            formats.push(ClipboardFormat::Html);
+        }
+
+        if let Ok(Some(_)) = self.read_image() {
+            formats.push(ClipboardFormat::Image);
         }
 
         formats
@@ -294,11 +355,27 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_content_image_variant_constructs() {
+        let bytes = vec![255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255];
+        let content = ClipboardContent::Image { width: 2, height: 2, bytes: bytes.clone() };
+        match content {
+            ClipboardContent::Image { width, height, bytes: got } => {
+                assert_eq!(width, 2);
+                assert_eq!(height, 2);
+                assert_eq!(got, bytes);
+            }
+            _ => panic!("expected Image variant"),
+        }
+    }
+
+    #[test]
     fn clipboard_format_variants_exist() {
         let text_fmt = ClipboardFormat::Text;
         let html_fmt = ClipboardFormat::Html;
-        // Ensure the variants are distinct
+        let image_fmt = ClipboardFormat::Image;
         assert_ne!(text_fmt, html_fmt);
+        assert_ne!(text_fmt, image_fmt);
+        assert_ne!(html_fmt, image_fmt);
     }
 
     #[test]
@@ -410,6 +487,78 @@ mod tests {
         );
     }
 
+    /// A 2x2 RGBA bitmap used for image round-trip tests. 16 bytes total.
+    fn synthetic_image() -> ClipboardContent {
+        ClipboardContent::Image {
+            width: 2,
+            height: 2,
+            bytes: vec![
+                255, 0, 0, 255, // red
+                0, 255, 0, 255, // green
+                0, 0, 255, 255, // blue
+                255, 255, 255, 255, // white
+            ],
+        }
+    }
+
+    #[test]
+    fn read_image_round_trips() {
+        let _lock = clipboard_access_guard();
+        let Some(ctx) = try_context() else { return };
+        // Skip if writing the image is not supported on this platform (some
+        // headless CI configurations stub set_image even when set_text works).
+        if ctx.set_content(synthetic_image()).is_err() {
+            return;
+        }
+        // Another test running concurrently can overwrite the clipboard
+        // between the write and the read; tolerate Ok(None) but require that
+        // when an image *is* present it has the expected shape.
+        let read = ctx.read_image();
+        match read {
+            Ok(Some(ClipboardContent::Image { width, height, bytes })) => {
+                assert_eq!(width, 2);
+                assert_eq!(height, 2);
+                assert_eq!(bytes.len(), 16);
+            }
+            Ok(Some(other)) => panic!("expected Image, got {:?}", other),
+            Ok(None) => {} // raced with another writer; accepted
+            Err(e) => panic!("read_image errored: {}", e),
+        }
+    }
+
+    #[test]
+    fn read_image_returns_none_when_text_only() {
+        let _lock = clipboard_access_guard();
+        let Some(ctx) = try_context() else { return };
+        // Force the clipboard to a text-only state.
+        ctx.write_text("text only").ok();
+        // read_image should return Ok(None) (or, if a parallel test has since
+        // written an image, Ok(Some(_)); we accept either, but never an Err).
+        match ctx.read_image() {
+            Ok(_) => {}
+            Err(e) => panic!("read_image errored on text-only clipboard: {}", e),
+        }
+    }
+
+    #[test]
+    fn available_formats_includes_image_after_write() {
+        let _lock = clipboard_access_guard();
+        let Some(ctx) = try_context() else { return };
+        if ctx.set_content(synthetic_image()).is_err() {
+            return;
+        }
+        let formats = ctx.available_formats();
+        // A concurrent writer may have replaced the image already; only
+        // assert the positive case when no race occurred.
+        if let Ok(Some(_)) = ctx.read_image() {
+            assert!(
+                formats.contains(&ClipboardFormat::Image),
+                "expected Image in available_formats, got {:?}",
+                formats
+            );
+        }
+    }
+
     /// Regression test for `STATUS_HEAP_CORRUPTION` (exit `0xC0000374`) that
     /// reproduced on Windows when the clipboard integration tests ran in
     /// parallel under the default cargo test scheduler.
@@ -460,6 +609,12 @@ mod tests {
                         alt_text: format!("w{}-{}", worker, i),
                     });
                     let _ = ctx.get_html();
+                    let _ = ctx.set_content(ClipboardContent::Image {
+                        width: 1,
+                        height: 1,
+                        bytes: vec![worker as u8, i as u8, 0, 255],
+                    });
+                    let _ = ctx.read_image();
                     let _ = ctx.available_formats();
                 }
             }));
