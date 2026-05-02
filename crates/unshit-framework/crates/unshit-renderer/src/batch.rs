@@ -1039,6 +1039,37 @@ impl ShapeCache {
     }
 }
 
+/// Collect every ancestor (and self) of any `ElementContent::Grid` whose
+/// cursor is currently visible. The renderer's cursor blink phase clock
+/// changes every paint, so a cached batch entry on any ancestor of a
+/// cursor-bearing grid would freeze the cursor at the phase recorded at
+/// cache write time. Returning every ancestor here lets `walk_for_batch`
+/// force `node_dirty = true` along the path and re-emit the cursor on
+/// each redraw, even when no `DirtyFlags::PAINT` was set externally.
+fn cursor_blink_dirty_ancestors(arena: &NodeArena) -> FxHashSet<NodeId> {
+    let mut force_dirty: FxHashSet<NodeId> = FxHashSet::default();
+    for (id, elem) in arena.iter() {
+        if let ElementContent::Grid(ref grid) = elem.content {
+            if grid.cursor_visible() {
+                let mut cur = id;
+                if !force_dirty.insert(cur) {
+                    continue;
+                }
+                while let Some(e) = arena.get(cur) {
+                    if e.parent.is_dangling() {
+                        break;
+                    }
+                    cur = e.parent;
+                    if !force_dirty.insert(cur) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    force_dirty
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_render_batch(
     arena: &NodeArena,
@@ -1060,6 +1091,7 @@ pub fn build_render_batch(
 ) {
     let initial_clip = [0.0_f32, 0.0, 9999.0, 9999.0];
     let mut portals: Vec<(NodeId, Layer)> = Vec::new();
+    let cursor_blink_force_dirty = cursor_blink_dirty_ancestors(arena);
     walk_for_batch(
         arena,
         root,
@@ -1084,6 +1116,7 @@ pub fn build_render_batch(
         batch_cache,
         None,
         line_cache.as_deref_mut(),
+        &cursor_blink_force_dirty,
     );
 
     // Process deferred portal nodes with fresh viewport clip
@@ -1112,6 +1145,7 @@ pub fn build_render_batch(
             batch_cache,
             None,
             line_cache.as_deref_mut(),
+            &cursor_blink_force_dirty,
         );
     }
 }
@@ -1165,6 +1199,7 @@ fn walk_for_batch(
     batch_cache: &mut BatchCache,
     parent_glyph_keys: Option<&mut FxHashSet<GlyphKey>>,
     mut line_cache: Option<&mut LineQuadCache>,
+    cursor_blink_force_dirty: &FxHashSet<NodeId>,
 ) {
     let Some(element) = arena.get(node_id) else {
         return;
@@ -1203,18 +1238,15 @@ fn walk_for_batch(
 
     // Cell grids that own the focused cursor must re-emit on every paint
     // so the global blink phase clock (`CellGrid::cursor_blink_phase_now`)
-    // can flip the cursor on and off. Without this bypass the batch cache
-    // serves up the previously-emitted cursor quad and the cursor appears
-    // to stop blinking. The line-quad cache inside `emit_grid_cells`
-    // still skips per-row work, so the cost of the bypass is tiny: we
-    // pay an arena-of-rows replay against the row cache plus the cursor
-    // emit, not full glyph shaping.
-    if !node_dirty {
-        if let ElementContent::Grid(ref grid) = element.content {
-            if grid.cursor_visible() {
-                node_dirty = true;
-            }
-        }
+    // can flip the cursor on and off. The bypass also covers every
+    // ancestor of such a grid (precomputed by `cursor_blink_dirty_ancestors`):
+    // without it, a clean ancestor would replay its cached subtree and the
+    // walk would never reach the grid, freezing the cursor at whatever
+    // phase was recorded when the cache was written. The line-quad cache
+    // inside `emit_grid_cells` still skips per-row work, so the cost of
+    // the bypass is bounded by the focused pane's depth times row count.
+    if !node_dirty && cursor_blink_force_dirty.contains(&node_id) {
+        node_dirty = true;
     }
 
     if !node_dirty {
@@ -2160,6 +2192,7 @@ fn walk_for_batch(
             batch_cache,
             Some(&mut node_glyph_keys),
             line_cache.as_deref_mut(),
+            cursor_blink_force_dirty,
         );
     }
 
@@ -4822,6 +4855,53 @@ mod tests {
         let elem = Element::new(Tag::Div);
         let root = arena.alloc(elem);
         (arena, root)
+    }
+
+    /// Regression guard for issue #147: a clean idle frame must keep the
+    /// cursor's grid (and every ancestor on the path from the root) out of
+    /// the batch cache replay path so the renderer can re-emit the cursor
+    /// quad with the current blink phase. Without this, the cursor freezes
+    /// at whatever phase was recorded when the cache was last written.
+    fn build_grid_under_parent(cursor_visible: bool) -> (NodeArena, NodeId, NodeId) {
+        let mut arena = NodeArena::new();
+        let root = arena.alloc(Element::new(Tag::Div));
+        let pane = arena.alloc(Element::new(Tag::Div));
+        let mut grid = unshit_core::cell_grid::CellGrid::new(2, 2);
+        grid.set_cursor(0, 0);
+        grid.set_cursor_visible(cursor_visible);
+        let mut grid_elem = Element::new(Tag::Div);
+        grid_elem.content = ElementContent::Grid(grid);
+        let grid_id = arena.alloc(grid_elem);
+        arena.append_child(root, pane);
+        arena.append_child(pane, grid_id);
+        (arena, root, grid_id)
+    }
+
+    #[test]
+    fn cursor_blink_dirty_ancestors_includes_grid_and_path_to_root() {
+        let (arena, root, grid_id) = build_grid_under_parent(true);
+        let pane = arena.get(grid_id).unwrap().parent;
+        let force = cursor_blink_dirty_ancestors(&arena);
+        assert!(force.contains(&grid_id), "grid itself must be force-dirtied");
+        assert!(force.contains(&pane), "intermediate parent must be force-dirtied");
+        assert!(force.contains(&root), "root must be force-dirtied");
+    }
+
+    #[test]
+    fn cursor_blink_dirty_ancestors_empty_when_cursor_hidden() {
+        let (arena, _root, _grid_id) = build_grid_under_parent(false);
+        let force = cursor_blink_dirty_ancestors(&arena);
+        assert!(
+            force.is_empty(),
+            "no node should be force-dirtied when no grid has a visible cursor"
+        );
+    }
+
+    #[test]
+    fn cursor_blink_dirty_ancestors_handles_no_grids() {
+        let (arena, _root) = build_single_node();
+        let force = cursor_blink_dirty_ancestors(&arena);
+        assert!(force.is_empty(), "arenas without grids produce an empty set");
     }
 
     #[test]
