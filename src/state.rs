@@ -2197,6 +2197,15 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 false
             }
         }
+        "quick_prompt.toggle_agent" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            qp.agent = qp.agent.toggled();
+            qp.error = None;
+            crate::quick_prompt::state::QuickPromptStore::save(qp);
+            true
+        }
         "tab.new" => {
             mutate_add_tab(state);
             true
@@ -3712,6 +3721,40 @@ mod tests {
 
         assert!(dispatch(&mut state, "modal.close"));
         assert!(state.quick_prompt.is_none());
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_toggle_agent_flips_when_open() {
+        use crate::quick_prompt::state::Agent;
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+        let initial = state.quick_prompt.as_ref().unwrap().agent;
+
+        assert!(dispatch(&mut state, "quick_prompt.toggle_agent"));
+        let toggled = state.quick_prompt.as_ref().unwrap().agent;
+        assert_ne!(initial, toggled);
+        assert!(matches!(toggled, Agent::Claude | Agent::Codex));
+
+        assert!(dispatch(&mut state, "quick_prompt.toggle_agent"));
+        assert_eq!(state.quick_prompt.as_ref().unwrap().agent, initial);
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_toggle_agent_clears_error() {
+        let mut state = test_state();
+        let mut qp = crate::quick_prompt::QuickPromptState::open_default();
+        qp.error = Some("stale".into());
+        state.quick_prompt = Some(qp);
+
+        assert!(dispatch(&mut state, "quick_prompt.toggle_agent"));
+        assert!(state.quick_prompt.as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_toggle_agent_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(state.quick_prompt.is_none());
+        assert!(!dispatch(&mut state, "quick_prompt.toggle_agent"));
     }
 
     #[test]

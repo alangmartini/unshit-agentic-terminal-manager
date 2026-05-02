@@ -498,6 +498,10 @@ fn main() {
         crate::keybinds::loader::install(path);
     }
 
+    if let Some(path) = crate::quick_prompt::state::default_config_path() {
+        crate::quick_prompt::state::QuickPromptStore::install(path);
+    }
+
     let mut initial_state = seed_state();
     if let Some(persisted) = persist::load_workspaces() {
         if !persisted.workspaces.is_empty() {

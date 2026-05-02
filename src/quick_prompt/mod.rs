@@ -6,5 +6,5 @@
 pub mod state;
 pub mod ui;
 
-pub use state::QuickPromptState;
+pub use state::{Agent, QuickPromptState, QuickPromptStore};
 pub use ui::build_quick_prompt_overlay;
