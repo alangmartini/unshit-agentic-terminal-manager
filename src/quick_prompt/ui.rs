@@ -43,6 +43,7 @@ pub fn build_quick_prompt_overlay(snap: &UiSnapshot, shared: &SharedState) -> El
 fn build_quick_prompt_card(qp: &QuickPromptState, shared: &SharedState) -> ElementDef {
     let agent_row = build_agent_row(qp.agent, shared);
     let prompt_input = build_prompt_input(shared);
+    let toolbar = build_toolbar(shared);
 
     let mut card = ElementDef::new(Tag::Div)
         .with_class("quick-prompt-card")
@@ -52,7 +53,12 @@ fn build_quick_prompt_card(qp: &QuickPromptState, shared: &SharedState) -> Eleme
             // input would also dispatch quick_prompt.close.
         })
         .with_child(agent_row)
-        .with_child(prompt_input);
+        .with_child(prompt_input)
+        .with_child(toolbar);
+
+    if !qp.images.is_empty() {
+        card = card.with_child(build_image_strip(&qp.images, shared));
+    }
 
     if let Some(msg) = qp.error.as_ref() {
         card = card.with_child(
@@ -63,6 +69,67 @@ fn build_quick_prompt_card(qp: &QuickPromptState, shared: &SharedState) -> Eleme
     }
 
     card
+}
+
+fn build_toolbar(shared: &SharedState) -> ElementDef {
+    let paste_shared = shared.clone();
+    let paste_button = ElementDef::new(Tag::Div)
+        .with_class("quick-prompt-toolbar-button")
+        .on_click(move || {
+            mutate_with(&paste_shared, |st| {
+                dispatch(st, "quick_prompt.image_paste");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Attach image".to_string()));
+
+    ElementDef::new(Tag::Div)
+        .with_class("quick-prompt-toolbar")
+        .with_child(paste_button)
+}
+
+fn build_image_strip(
+    images: &[crate::quick_prompt::QuickPromptImage],
+    shared: &SharedState,
+) -> ElementDef {
+    let mut strip = ElementDef::new(Tag::Div).with_class("quick-prompt-image-strip");
+    for img in images {
+        strip = strip.with_child(build_image_chip(img, shared));
+    }
+    strip
+}
+
+fn build_image_chip(
+    image: &crate::quick_prompt::QuickPromptImage,
+    shared: &SharedState,
+) -> ElementDef {
+    let hash = image.hash.clone();
+    let remove_shared = shared.clone();
+    let thumb_path = image.thumb_path.to_string_lossy().to_string();
+
+    let thumb = ElementDef::new(Tag::Div)
+        .with_class("quick-prompt-image-thumb")
+        .with_image(thumb_path);
+
+    let remove = ElementDef::new(Tag::Div)
+        .with_class("quick-prompt-image-remove")
+        .on_click(move || {
+            let h = hash.clone();
+            mutate_with(&remove_shared, |st| {
+                if let Some(qp) = st.quick_prompt.as_mut() {
+                    if let Some(idx) = qp.images.iter().position(|i| i.hash == h) {
+                        let img = qp.images.remove(idx);
+                        let _ = std::fs::remove_file(&img.temp_path);
+                        let _ = std::fs::remove_file(&img.thumb_path);
+                    }
+                }
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("×".to_string()));
+
+    ElementDef::new(Tag::Div)
+        .with_class("quick-prompt-image-chip")
+        .with_child(thumb)
+        .with_child(remove)
 }
 
 fn build_agent_row(active: Agent, shared: &SharedState) -> ElementDef {

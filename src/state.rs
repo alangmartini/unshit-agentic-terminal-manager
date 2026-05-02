@@ -2160,8 +2160,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.confirm_dialog = None;
                 changed = true;
             }
-            if state.quick_prompt.is_some() {
-                state.quick_prompt = None;
+            if let Some(qp) = state.quick_prompt.take() {
+                crate::quick_prompt::images::cleanup_session(&qp.session_hex);
                 changed = true;
             }
             changed
@@ -2270,18 +2270,19 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
         }
         "quick_prompt.open" => {
-            if state.quick_prompt.is_some() {
+            if let Some(qp) = state.quick_prompt.take() {
                 // Re-pressing the hotkey while open closes the overlay
-                // (toggle behavior per spec A1.2).
-                state.quick_prompt = None;
+                // (toggle behavior per spec A1.2). Clean up any pasted
+                // images that have not been submitted.
+                crate::quick_prompt::images::cleanup_session(&qp.session_hex);
             } else {
                 state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
             }
             true
         }
         "quick_prompt.close" => {
-            if state.quick_prompt.is_some() {
-                state.quick_prompt = None;
+            if let Some(qp) = state.quick_prompt.take() {
+                crate::quick_prompt::images::cleanup_session(&qp.session_hex);
                 true
             } else {
                 false
@@ -2296,12 +2297,47 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             crate::quick_prompt::state::QuickPromptStore::save(qp);
             true
         }
+        "quick_prompt.image_paste" => {
+            let Some(qp) = state.quick_prompt.as_ref() else {
+                return false;
+            };
+            let session_hex = qp.session_hex.clone();
+            let captured = crate::quick_prompt::images::capture_clipboard_image(
+                &state.clipboard,
+                &session_hex,
+            );
+            let Some(qp_mut) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            match captured {
+                Ok(Some(img)) => {
+                    if !qp_mut.images.iter().any(|i| i.hash == img.hash) {
+                        qp_mut.images.push(img);
+                    }
+                    qp_mut.error = None;
+                    true
+                }
+                Ok(None) => {
+                    // Clipboard had no image; surface a friendly hint
+                    // so the user knows the paste did not silently
+                    // disappear.
+                    qp_mut.error = Some("No image on clipboard".into());
+                    true
+                }
+                Err(e) => {
+                    qp_mut.error = Some(format!("paste failed: {e}"));
+                    true
+                }
+            }
+        }
         "quick_prompt.submit" => {
             let Some(qp) = state.quick_prompt.as_ref() else {
                 return false;
             };
             let prompt = qp.prompt.trim().to_string();
             let agent = qp.agent;
+            let images = qp.images.clone();
+            let session_hex = qp.session_hex.clone();
 
             if prompt.is_empty() {
                 let qp = state.quick_prompt.as_mut().unwrap();
@@ -2317,19 +2353,29 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
 
             let cwd = active_workspace_cwd(state);
-            match crate::quick_prompt::spawn::prepare_target(cwd.as_deref()) {
-                Ok(target) => {
-                    let shell_spec = crate::quick_prompt::spawn::claude_shell_spec(&prompt);
-                    mutate_add_quick_prompt_tab(state, &prompt, &target.path, &shell_spec);
-                    state.quick_prompt = None;
-                    true
-                }
+            let target = match crate::quick_prompt::spawn::prepare_target(cwd.as_deref()) {
+                Ok(t) => t,
                 Err(e) => {
                     let qp = state.quick_prompt.as_mut().unwrap();
-                    qp.error = Some(format!("submit failed: {}", e));
-                    true
+                    qp.error = Some(format!("submit failed: {e}"));
+                    return true;
                 }
-            }
+            };
+            let refs = match crate::quick_prompt::images::move_into_target(&images, &target.path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let qp = state.quick_prompt.as_mut().unwrap();
+                    qp.error = Some(format!("submit failed (image move): {e}"));
+                    return true;
+                }
+            };
+            let augmented_prompt =
+                crate::quick_prompt::images::append_image_references(&prompt, &refs);
+            let shell_spec = crate::quick_prompt::spawn::claude_shell_spec(&augmented_prompt);
+            mutate_add_quick_prompt_tab(state, &prompt, &target.path, &shell_spec);
+            crate::quick_prompt::images::cleanup_session(&session_hex);
+            state.quick_prompt = None;
+            true
         }
         "tab.new" => {
             mutate_add_tab(state);
@@ -3958,6 +4004,72 @@ mod tests {
         // Body should be exactly 30 chars.
         let body: String = title.chars().skip(4).collect();
         assert_eq!(body.chars().count(), 30);
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_image_paste_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "quick_prompt.image_paste"));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_image_paste_sets_error_when_clipboard_empty() {
+        // The test clipboard is uninitialized so read_image returns
+        // Ok(None); the dispatch arm surfaces a friendly hint.
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        // We can't reliably write or clear an image on the OS clipboard
+        // from a test, but read_image on a freshly-created context with
+        // text or no content returns Ok(None) and we surface the
+        // "No image on clipboard" hint. This is the behavior we lock in.
+        let _ = dispatch(&mut state, "quick_prompt.image_paste");
+        let qp = state.quick_prompt.as_ref().unwrap();
+        // Either we got a "no image" hint or the clipboard genuinely
+        // had an image (unlikely in CI). Both are valid outcomes; the
+        // test only enforces that dispatch did not panic and the
+        // overlay is still open.
+        if let Some(err) = qp.error.as_deref() {
+            assert!(
+                err == "No image on clipboard" || err.starts_with("paste failed:"),
+                "unexpected error chip: {err}"
+            );
+        } else {
+            // An image was actually pasted: at least one entry should
+            // exist and have a non-empty hash.
+            assert!(qp.images.iter().all(|i| !i.hash.is_empty()));
+        }
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_close_cleans_session_dir() {
+        // Open with a fresh session_hex, drop a marker file in its
+        // session dir, and verify quick_prompt.close removes the dir.
+        let mut state = test_state();
+        let qp = crate::quick_prompt::QuickPromptState::open_default();
+        let session_hex = qp.session_hex.clone();
+        state.quick_prompt = Some(qp);
+        let dir = crate::quick_prompt::images::session_dir(&session_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), b"x").unwrap();
+        assert!(dir.exists());
+
+        assert!(dispatch(&mut state, "quick_prompt.close"));
+        assert!(!dir.exists(), "session dir should be cleaned up");
+    }
+
+    #[test]
+    fn dispatch_modal_close_cleans_quick_prompt_session_dir() {
+        let mut state = test_state();
+        let qp = crate::quick_prompt::QuickPromptState::open_default();
+        let session_hex = qp.session_hex.clone();
+        state.quick_prompt = Some(qp);
+        let dir = crate::quick_prompt::images::session_dir(&session_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(dir.exists());
+
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!dir.exists());
     }
 
     #[test]

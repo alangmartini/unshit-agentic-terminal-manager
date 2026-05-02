@@ -3,9 +3,11 @@
 //! into a fresh worktree. Slice 1 lands the empty overlay shell;
 //! richer state and behavior land in later slices per `tasks/plan.md`.
 
+pub mod images;
 pub mod spawn;
 pub mod state;
 pub mod ui;
 
+pub use images::QuickPromptImage;
 pub use state::{Agent, QuickPromptState, QuickPromptStore};
 pub use ui::build_quick_prompt_overlay;

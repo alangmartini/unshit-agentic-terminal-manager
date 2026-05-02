@@ -41,10 +41,18 @@ impl Agent {
 /// overlay is closed; `Some(QuickPromptState { .. })` means it is open.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QuickPromptState {
+    /// Per-overlay-session hex used as the temp dir name for pasted
+    /// images. Generated fresh on every open so two opens cannot
+    /// share image state.
+    pub session_hex: String,
     /// User typed prompt buffer.
     pub prompt: String,
     /// Agent that will run when the user submits.
     pub agent: Agent,
+    /// Pasted images, in paste order. Submit moves them into the
+    /// worktree and inlines `@.quick-prompt/<hash>.png` references.
+    /// Cancel removes the session dir wholesale.
+    pub images: Vec<crate::quick_prompt::QuickPromptImage>,
     /// Inline error chip; populated by `quick_prompt.submit` failures
     /// (Slice 3 onward). Cleared when the user starts typing again.
     pub error: Option<String>,
@@ -52,11 +60,14 @@ pub struct QuickPromptState {
 
 impl QuickPromptState {
     /// Construct the open state with the given agent. The prompt buffer
-    /// starts empty and the error chip starts cleared.
+    /// starts empty, the image list is empty, and a fresh session_hex
+    /// is generated for the temp dir.
     pub fn open_with_agent(agent: Agent) -> Self {
         Self {
+            session_hex: generate_session_hex(),
             prompt: String::new(),
             agent,
+            images: Vec::new(),
             error: None,
         }
     }
@@ -67,6 +78,26 @@ impl QuickPromptState {
     pub fn open_default() -> Self {
         Self::open_with_agent(QuickPromptStore::load().agent)
     }
+}
+
+/// 8-hex random suffix for the session temp dir. Mixes the system
+/// clock, process id, and a process-local counter so two opens in
+/// the same nanosecond still produce distinct dirs.
+fn generate_session_hex() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    let mixed = nanos
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(pid.wrapping_mul(0x100000001B3))
+        .wrapping_add(n as u128);
+    format!("{:08x}", mixed as u32)
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +229,25 @@ mod tests {
         let s = QuickPromptState::open_with_agent(Agent::Claude);
         assert!(s.prompt.is_empty());
         assert!(s.error.is_none());
+        assert!(s.images.is_empty());
+        assert!(!s.session_hex.is_empty(), "session_hex should be generated");
         assert_eq!(s.agent, Agent::Claude);
+    }
+
+    #[test]
+    fn open_with_agent_generates_unique_session_hex() {
+        let a = QuickPromptState::open_with_agent(Agent::Claude);
+        let b = QuickPromptState::open_with_agent(Agent::Claude);
+        assert_ne!(a.session_hex, b.session_hex);
+    }
+
+    #[test]
+    fn generate_session_hex_is_eight_hex_chars() {
+        let hex = generate_session_hex();
+        assert_eq!(hex.len(), 8);
+        assert!(hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]

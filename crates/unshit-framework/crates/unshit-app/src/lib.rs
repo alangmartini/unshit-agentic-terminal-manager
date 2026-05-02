@@ -15,7 +15,7 @@ pub mod subscription;
 pub mod window;
 
 pub use app::{App, AppConfig, FrameMetrics};
-pub use clipboard::{ClipboardContext, ClipboardError};
+pub use clipboard::{ClipboardContent, ClipboardContext, ClipboardError, ClipboardFormat};
 pub use event_sink::{EventSink, ExternalEvent, SendError};
 pub use font::{
     check_fallback_chain, load_custom_fonts, FallbackChain, FontLoadReport, FontSource,
