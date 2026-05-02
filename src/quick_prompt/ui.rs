@@ -56,6 +56,10 @@ fn build_quick_prompt_card(qp: &QuickPromptState, shared: &SharedState) -> Eleme
         .with_child(prompt_input)
         .with_child(toolbar);
 
+    if let Some(popup) = qp.popup.as_ref() {
+        card = card.with_child(build_autocomplete_popup(popup, shared));
+    }
+
     if !qp.images.is_empty() {
         card = card.with_child(build_image_strip(&qp.images, shared));
     }
@@ -69,6 +73,70 @@ fn build_quick_prompt_card(qp: &QuickPromptState, shared: &SharedState) -> Eleme
     }
 
     card
+}
+
+fn build_autocomplete_popup(
+    popup: &crate::quick_prompt::Popup,
+    shared: &SharedState,
+) -> ElementDef {
+    let mut container = ElementDef::new(Tag::Div).with_class("quick-prompt-autocomplete");
+    if popup.matches.is_empty() {
+        container = container.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("quick-prompt-autocomplete-empty")
+                .with_text("No matches".to_string()),
+        );
+        return container;
+    }
+    for (row_index, &entry_index) in popup.matches.iter().enumerate() {
+        let Some(entry) = popup.entries.get(entry_index) else {
+            continue;
+        };
+        container = container.with_child(build_autocomplete_row(
+            entry,
+            row_index,
+            row_index == popup.selected,
+            shared,
+        ));
+    }
+    container
+}
+
+fn build_autocomplete_row(
+    entry: &crate::quick_prompt::Entry,
+    row_index: usize,
+    is_selected: bool,
+    shared: &SharedState,
+) -> ElementDef {
+    let row_shared = shared.clone();
+    let mut row = ElementDef::new(Tag::Div)
+        .with_class("quick-prompt-autocomplete-row")
+        .on_click(move || {
+            mutate_with(&row_shared, |st| {
+                if let Some(qp) = st.quick_prompt.as_mut() {
+                    if let Some(popup) = qp.popup.as_mut() {
+                        if row_index < popup.matches.len() {
+                            popup.selected = row_index;
+                        }
+                    }
+                }
+                dispatch(st, "quick_prompt.autocomplete_confirm");
+            });
+        })
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("quick-prompt-autocomplete-name")
+                .with_text(format!("/{}", entry.name)),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("quick-prompt-autocomplete-kind")
+                .with_text(entry.kind.label().to_string()),
+        );
+    if is_selected {
+        row = row.with_class("selected");
+    }
+    row
 }
 
 fn build_toolbar(shared: &SharedState) -> ElementDef {
@@ -171,9 +239,41 @@ fn build_prompt_input(shared: &SharedState) -> ElementDef {
         .on_change(move |text| {
             let typed = text.to_string();
             mutate_with(&change_shared, |st| {
+                let agent = st.quick_prompt.as_ref().map(|qp| qp.agent);
+                let prev_prompt = st
+                    .quick_prompt
+                    .as_ref()
+                    .map(|qp| qp.prompt.clone())
+                    .unwrap_or_default();
+
                 if let Some(qp) = st.quick_prompt.as_mut() {
-                    qp.prompt = typed;
+                    qp.prompt = typed.clone();
                     qp.error = None;
+
+                    if let Some(popup) = qp.popup.as_mut() {
+                        // Recompute the live query against the new
+                        // buffer; if the user backspaced past the
+                        // anchor or typed whitespace inside the query
+                        // window, drop the popup.
+                        let keep =
+                            crate::quick_prompt::autocomplete::rederive_query(popup, &qp.prompt);
+                        if !keep {
+                            qp.popup = None;
+                        }
+                    } else if matches!(agent, Some(crate::quick_prompt::Agent::Claude)) {
+                        if let Some(anchor) =
+                            crate::quick_prompt::autocomplete::detect_claude_trigger(
+                                &prev_prompt,
+                                &qp.prompt,
+                            )
+                        {
+                            let entries =
+                                crate::quick_prompt::autocomplete::cached_claude_sources();
+                            if !entries.is_empty() {
+                                qp.popup = Some(crate::quick_prompt::Popup::open(entries, anchor));
+                            }
+                        }
+                    }
                 }
             });
         })
@@ -185,7 +285,18 @@ fn build_prompt_input(shared: &SharedState) -> ElementDef {
                 if let Some(qp) = st.quick_prompt.as_mut() {
                     qp.prompt = typed;
                 }
-                dispatch(st, "quick_prompt.submit");
+                let popup_open = st
+                    .quick_prompt
+                    .as_ref()
+                    .map(|qp| qp.popup.is_some())
+                    .unwrap_or(false);
+                if popup_open {
+                    // Enter confirms the selected popup row instead of
+                    // submitting the prompt.
+                    dispatch(st, "quick_prompt.autocomplete_confirm");
+                } else {
+                    dispatch(st, "quick_prompt.submit");
+                }
             });
         })
 }

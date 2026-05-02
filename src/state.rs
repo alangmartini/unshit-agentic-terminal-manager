@@ -2160,7 +2160,21 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.confirm_dialog = None;
                 changed = true;
             }
-            if let Some(qp) = state.quick_prompt.take() {
+            // Esc with the autocomplete popup open dismisses just the
+            // popup (per spec A8.3); the overlay stays. A second Esc
+            // closes the overlay through the normal cleanup path
+            // below.
+            let dismiss_popup_only = state
+                .quick_prompt
+                .as_ref()
+                .map(|qp| qp.popup.is_some())
+                .unwrap_or(false);
+            if dismiss_popup_only {
+                if let Some(qp) = state.quick_prompt.as_mut() {
+                    qp.popup = None;
+                    changed = true;
+                }
+            } else if let Some(qp) = state.quick_prompt.take() {
                 crate::quick_prompt::images::cleanup_session(&qp.session_hex);
                 changed = true;
             }
@@ -2329,6 +2343,52 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                     true
                 }
             }
+        }
+        "quick_prompt.autocomplete_select_next" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            let Some(popup) = qp.popup.as_mut() else {
+                return false;
+            };
+            popup.select_next();
+            true
+        }
+        "quick_prompt.autocomplete_select_prev" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            let Some(popup) = qp.popup.as_mut() else {
+                return false;
+            };
+            popup.select_prev();
+            true
+        }
+        "quick_prompt.autocomplete_dismiss" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            qp.popup.take().is_some()
+        }
+        "quick_prompt.autocomplete_confirm" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            let Some(popup) = qp.popup.as_ref() else {
+                return false;
+            };
+            let Some(entry) = popup.current() else {
+                return false;
+            };
+            let entry_name = entry.name.clone();
+            let anchor = popup.anchor_offset;
+            qp.prompt = crate::quick_prompt::autocomplete::confirm_into_prompt(
+                &qp.prompt,
+                anchor,
+                &entry_name,
+            );
+            qp.popup = None;
+            true
         }
         "quick_prompt.submit" => {
             let Some(qp) = state.quick_prompt.as_ref() else {
@@ -4070,6 +4130,110 @@ mod tests {
 
         assert!(dispatch(&mut state, "modal.close"));
         assert!(!dir.exists());
+    }
+
+    fn open_with_popup() -> AppState {
+        let mut state = test_state();
+        let mut qp = crate::quick_prompt::QuickPromptState::open_default();
+        qp.popup = Some(crate::quick_prompt::Popup::open(
+            vec![
+                crate::quick_prompt::Entry {
+                    name: "alpha".into(),
+                    kind: crate::quick_prompt::EntryKind::Skill,
+                },
+                crate::quick_prompt::Entry {
+                    name: "beta".into(),
+                    kind: crate::quick_prompt::EntryKind::Command,
+                },
+            ],
+            0,
+        ));
+        qp.prompt = "/".into();
+        state.quick_prompt = Some(qp);
+        state
+    }
+
+    #[test]
+    fn dispatch_autocomplete_select_next_advances_popup_selection() {
+        let mut state = open_with_popup();
+        assert!(dispatch(
+            &mut state,
+            "quick_prompt.autocomplete_select_next"
+        ));
+        let popup = state.quick_prompt.as_ref().unwrap().popup.as_ref().unwrap();
+        assert_eq!(popup.selected, 1);
+    }
+
+    #[test]
+    fn dispatch_autocomplete_select_prev_wraps_from_zero() {
+        let mut state = open_with_popup();
+        assert!(dispatch(
+            &mut state,
+            "quick_prompt.autocomplete_select_prev"
+        ));
+        let popup = state.quick_prompt.as_ref().unwrap().popup.as_ref().unwrap();
+        assert_eq!(popup.selected, 1);
+    }
+
+    #[test]
+    fn dispatch_autocomplete_dismiss_clears_popup_only() {
+        let mut state = open_with_popup();
+        assert!(dispatch(&mut state, "quick_prompt.autocomplete_dismiss"));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert!(qp.popup.is_none(), "popup should be cleared");
+        // Overlay itself is still open.
+        assert_eq!(qp.prompt, "/");
+    }
+
+    #[test]
+    fn dispatch_autocomplete_confirm_inserts_entry_and_closes_popup() {
+        let mut state = open_with_popup();
+        // Selected is 0, which is "alpha".
+        assert!(dispatch(&mut state, "quick_prompt.autocomplete_confirm"));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert_eq!(qp.prompt, "/alpha");
+        assert!(qp.popup.is_none());
+    }
+
+    #[test]
+    fn dispatch_modal_close_dismisses_popup_only_when_present() {
+        // Two Esc presses: first dismisses the popup, second closes
+        // the overlay. The session dir should only be removed on the
+        // overlay close (second press).
+        let mut state = open_with_popup();
+        let session_hex = state.quick_prompt.as_ref().unwrap().session_hex.clone();
+        let dir = crate::quick_prompt::images::session_dir(&session_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(dir.exists());
+
+        // First Esc: popup should be cleared, overlay still open, dir
+        // still on disk.
+        assert!(dispatch(&mut state, "modal.close"));
+        let qp = state.quick_prompt.as_ref().expect("overlay still open");
+        assert!(qp.popup.is_none(), "popup should be cleared");
+        assert!(dir.exists(), "session dir kept while overlay open");
+
+        // Second Esc: overlay closes and the session dir is cleaned
+        // up.
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.quick_prompt.is_none());
+        assert!(!dir.exists(), "session dir cleaned up on overlay close");
+    }
+
+    #[test]
+    fn dispatch_autocomplete_arms_no_op_when_popup_closed() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+        assert!(!dispatch(
+            &mut state,
+            "quick_prompt.autocomplete_select_next"
+        ));
+        assert!(!dispatch(
+            &mut state,
+            "quick_prompt.autocomplete_select_prev"
+        ));
+        assert!(!dispatch(&mut state, "quick_prompt.autocomplete_dismiss"));
+        assert!(!dispatch(&mut state, "quick_prompt.autocomplete_confirm"));
     }
 
     #[test]

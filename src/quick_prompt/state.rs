@@ -53,6 +53,11 @@ pub struct QuickPromptState {
     /// worktree and inlines `@.quick-prompt/<hash>.png` references.
     /// Cancel removes the session dir wholesale.
     pub images: Vec<crate::quick_prompt::QuickPromptImage>,
+    /// Active autocomplete popup. `Some` when the user typed `/` after
+    /// whitespace (or at the start of the buffer) and the source list
+    /// has at least one entry; otherwise `None`. Slice 5 only opens
+    /// this for Claude; Slice 6 wires up Codex.
+    pub popup: Option<crate::quick_prompt::Popup>,
     /// Inline error chip; populated by `quick_prompt.submit` failures
     /// (Slice 3 onward). Cleared when the user starts typing again.
     pub error: Option<String>,
@@ -68,6 +73,7 @@ impl QuickPromptState {
             prompt: String::new(),
             agent,
             images: Vec::new(),
+            popup: None,
             error: None,
         }
     }

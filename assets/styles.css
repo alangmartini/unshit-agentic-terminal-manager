@@ -1839,6 +1839,51 @@ body.dragging-pane {
   background: var(--rust);
 }
 
+.quick-prompt-autocomplete {
+  flex-direction: column;
+  margin-top: 8px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  max-height: 220px;
+  overflow: hidden;
+}
+
+.quick-prompt-autocomplete-empty {
+  padding: 8px 12px;
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+.quick-prompt-autocomplete-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.quick-prompt-autocomplete-row:hover {
+  background: var(--bg-hover);
+}
+
+.quick-prompt-autocomplete-row.selected {
+  background: var(--bg-selected);
+}
+
+.quick-prompt-autocomplete-name {
+  color: var(--fg-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.quick-prompt-autocomplete-kind {
+  color: var(--fg-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
 .confirm-dialog-card {
   background: var(--bg-subtle);
   border: 1px solid var(--border-default);

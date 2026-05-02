@@ -130,3 +130,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "pty_write"
 harness = false
+
+[[bench]]
+name = "quick_prompt_filter"
+harness = false
