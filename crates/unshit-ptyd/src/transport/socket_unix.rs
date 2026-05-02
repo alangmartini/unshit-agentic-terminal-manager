@@ -17,6 +17,7 @@ pub type Connection = UnixStream;
 /// Windows API shape.
 pub type ClientConnection = UnixStream;
 
+#[derive(Debug)]
 pub struct Server {
     listener: UnixListener,
     path: PathBuf,
