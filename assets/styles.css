@@ -566,7 +566,7 @@ body::before {
   align-items: center;
   gap: var(--sp-3);
   width: 100%;
-  padding: var(--sp-2) var(--sp-6) var(--sp-2) calc(var(--sp-6) + var(--sp-4));
+  padding: var(--sp-2) var(--sp-6) var(--sp-2) 32px;
   color: var(--fg-secondary);
   font-size: var(--t-sm);
   text-align: left;
@@ -689,7 +689,7 @@ body::before {
   display: flex;
   align-items: center;
   gap: var(--sp-3);
-  padding: var(--sp-1) var(--sp-6) var(--sp-1) calc(var(--sp-6) + 32px);
+  padding: var(--sp-1) var(--sp-6) var(--sp-1) 64px;
   color: var(--fg-secondary);
   font-size: var(--t-sm);
   transition: background var(--dur-fast), color var(--dur-fast);
