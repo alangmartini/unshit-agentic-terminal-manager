@@ -104,10 +104,7 @@ fn apply_declaration_sets_transform_translate_x() {
     // as `Some(Px(10))` after application.
     let mut style = ComputedStyle::default();
     assert!(style.transform_translate_x.is_none());
-    apply_declaration(
-        &mut style,
-        &StyleDeclaration::TransformTranslateX(TransformX::Px(10.0)),
-    );
+    apply_declaration(&mut style, &StyleDeclaration::TransformTranslateX(TransformX::Px(10.0)));
     assert_eq!(style.transform_translate_x, Some(TransformX::Px(10.0)));
 }
 

@@ -18,11 +18,7 @@ fn comment_before_rule_does_not_leak_into_selector() {
 "#;
     let ss = CompiledStylesheet::parse(css);
     for rule in &ss.rules {
-        eprintln!(
-            "rule selector={:?} decls={}",
-            rule.selector,
-            rule.declarations.len()
-        );
+        eprintln!("rule selector={:?} decls={}", rule.selector, rule.declarations.len());
     }
 
     let nav_rule = ss

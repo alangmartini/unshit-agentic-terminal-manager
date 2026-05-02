@@ -4,10 +4,12 @@
 //! Entries come from three sources:
 //! 1. `KeybindAction::ALL` defaults (the editable set surfaced in
 //!    Settings > Keybinds).
-//! 2. Aliases for a handful of actions (e.g. `Ctrl+Shift+V` as an alias
-//!    for split right) so muscle memory from other terminals works.
-//! 3. Non-editable system shortcuts: `Escape` to close modals and
-//!    `Ctrl+1` through `Ctrl+9` to jump to a tab.
+//! 2. Aliases for a handful of actions (e.g. `Ctrl+Shift+H` as an
+//!    alias for split right) so muscle memory from other terminals
+//!    works.
+//! 3. Non-editable system shortcuts: `Escape` to close modals,
+//!    `Ctrl+1` through `Ctrl+9` to jump to a tab, and the clipboard
+//!    paste keybind (`Ctrl+V` / `Ctrl+Shift+V` -> `terminal.paste`).
 
 use super::loader::UserKeybinds;
 use super::KeybindAction;
@@ -44,17 +46,10 @@ pub fn default_shortcut_bindings() -> Vec<(String, String)> {
 /// Convenience aliases that map a second combo to an existing action's
 /// dispatch command.
 ///
-/// `Ctrl+Shift+V` and `Ctrl+Shift+H` follow the tmux convention where V
-/// means "stack panes vertically" (so the new pane lands below) and H
-/// means "stack panes horizontally" (so the new pane lands beside the
-/// current one). This way V and H are complements, not duplicates of
-/// the primary Ctrl+D / Ctrl+Shift+D bindings.
+/// `Ctrl+Shift+H` follows the tmux convention where H means "stack
+/// panes horizontally" (so the new pane lands beside the current one).
 fn alias_bindings() -> Vec<(String, String)> {
     vec![
-        (
-            "Ctrl+Shift+V".to_string(),
-            KeybindAction::SplitDown.dispatch_command().to_string(),
-        ),
         (
             "Ctrl+Shift+H".to_string(),
             KeybindAction::SplitRight.dispatch_command().to_string(),
@@ -72,8 +67,21 @@ fn alias_bindings() -> Vec<(String, String)> {
 
 /// Non-editable system shortcuts. These don't appear in Settings >
 /// Keybinds; they're hard-wired.
+///
+/// `Ctrl+V` and `Ctrl+Shift+V` both dispatch `terminal.paste` so the
+/// user can paste clipboard text into the focused PTY using either
+/// the conventional Windows binding or the Linux-terminal convention
+/// where `Ctrl+Shift+V` sidesteps the shell's `Ctrl+V` literal-input
+/// handling. Paste is a system binding rather than an editable action
+/// because rebinding it would risk leaving the user with no way to
+/// paste at all.
 fn system_bindings() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = vec![("Escape".to_string(), "modal.close".to_string())];
+    let mut out: Vec<(String, String)> = vec![
+        ("Escape".to_string(), "modal.close".to_string()),
+        ("Ctrl+Shift+F".to_string(), "fps_overlay.toggle".to_string()),
+        ("Ctrl+V".to_string(), "terminal.paste".to_string()),
+        ("Ctrl+Shift+V".to_string(), "terminal.paste".to_string()),
+    ];
     for i in 0..TAB_SWITCH_COUNT {
         out.push((format!("Ctrl+{}", i + 1), format!("tab.switch:{}", i)));
     }
@@ -119,9 +127,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_v_aliases_split_down() {
-        // tmux convention: V stacks panes vertically -> new pane below.
-        assert_eq!(find("Ctrl+Shift+V").as_deref(), Some("pane.split_down"));
+    fn ctrl_v_dispatches_terminal_paste() {
+        // Conventional Windows paste binding routed through the
+        // app-level paste action so the focused PTY receives the text.
+        assert_eq!(find("Ctrl+V").as_deref(), Some("terminal.paste"));
+    }
+
+    #[test]
+    fn ctrl_shift_v_aliases_terminal_paste() {
+        // Linux-terminal convention: Ctrl+Shift+V pastes so the shell's
+        // Ctrl+V literal-input handler is not shadowed.
+        assert_eq!(find("Ctrl+Shift+V").as_deref(), Some("terminal.paste"));
     }
 
     #[test]

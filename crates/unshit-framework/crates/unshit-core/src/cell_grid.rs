@@ -6,6 +6,8 @@
 //! looking up monospace glyphs directly from the atlas.
 
 use std::sync::atomic::AtomicU32;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::style::types::Color;
 use bitflags::bitflags;
@@ -21,6 +23,15 @@ static GLOBAL_PENDING_COLS: AtomicU32 = AtomicU32::new(0);
 static GLOBAL_PENDING_ROWS: AtomicU32 = AtomicU32::new(0);
 /// Whether the application window currently has OS focus. 1 = focused, 0 = not.
 static GLOBAL_WINDOW_FOCUSED: AtomicU32 = AtomicU32::new(1);
+
+/// Anchor time used to derive the global cursor blink phase. Lazily set
+/// the first time any code reads the phase, so the first observed value
+/// is "on" rather than wherever the panel's wall clock happens to fall.
+static BLINK_PHASE_EPOCH: OnceLock<Instant> = OnceLock::new();
+/// Half cycle of the global cursor blink, in milliseconds. Matches
+/// `CursorState`'s `blink_rate_ms` default so the input cursor and the
+/// terminal cursor share a single visual cadence.
+pub const CURSOR_BLINK_HALF_CYCLE_MS: u64 = 530;
 
 // ---------------------------------------------------------------------------
 // Cell attributes
@@ -260,6 +271,14 @@ pub struct BgRun {
     pub start_col: usize,
     pub end_col: usize,
     pub bg: Color,
+}
+
+fn inverse_fg_from_bg(bg: Color) -> Color {
+    if bg.a == 0 {
+        Color::BLACK
+    } else {
+        bg
+    }
 }
 
 impl BgRun {
@@ -582,7 +601,7 @@ impl CellGrid {
         for col in start_col..end_col {
             let cell = &self.cells[row_base + col];
             let (fg, bg) = if cell.attrs.contains(CellAttrs::INVERSE) {
-                (cell.bg, cell.fg)
+                (inverse_fg_from_bg(cell.bg), cell.fg)
             } else {
                 (cell.fg, cell.bg)
             };
@@ -708,6 +727,41 @@ impl CellGrid {
     /// Read whether the window is focused.
     pub fn is_window_focused() -> bool {
         GLOBAL_WINDOW_FOCUSED.load(std::sync::atomic::Ordering::Relaxed) == 1
+    }
+
+    // -- Global cursor blink phase (renderer side blink, #135 Phase 1) -------
+
+    /// Compute the current cursor blink phase from a synthetic clock.
+    /// Returns `true` for the "on" half of the cycle and `false` for
+    /// the "off" half. Pure helper so the logic can be unit tested with
+    /// a deterministic [`Instant`] and so the renderer's blink phase
+    /// progression does not depend on real wall-clock readings inside
+    /// hot draw loops.
+    ///
+    /// `epoch` is the anchor instant (typically the first time the
+    /// process observed the phase). `now` is the current frame
+    /// timestamp. The phase flips every
+    /// [`CURSOR_BLINK_HALF_CYCLE_MS`] milliseconds starting at "on" at
+    /// the epoch.
+    pub fn cursor_blink_phase_at(epoch: Instant, now: Instant) -> bool {
+        let elapsed_ms = now.saturating_duration_since(epoch).as_millis() as u64;
+        let toggles = elapsed_ms / CURSOR_BLINK_HALF_CYCLE_MS;
+        toggles % 2 == 0
+    }
+
+    /// Read the current cursor blink phase off the global epoch.
+    /// `true` means the cursor should be drawn this frame; `false`
+    /// means it should be hidden. The first call after process start
+    /// pins the epoch so the phase begins at "on".
+    ///
+    /// Renderer side blink (#135 Phase 1): callers used to drive the
+    /// blink by toggling `set_cursor_visible` on a 500 ms timer and
+    /// emitting `RequestRebuild` events. The renderer now interpolates
+    /// this phase per draw, so the bridge no longer needs to rebuild
+    /// the UI tree just to flip a cursor pixel.
+    pub fn cursor_blink_phase_now() -> bool {
+        let epoch = *BLINK_PHASE_EPOCH.get_or_init(Instant::now);
+        Self::cursor_blink_phase_at(epoch, Instant::now())
     }
 
     // -- Pending resize (renderer -> app) ------------------------------------
@@ -1398,6 +1452,29 @@ mod tests {
     }
 
     #[test]
+    fn compute_style_runs_inverse_transparent_bg_keeps_glyph_visible() {
+        let fg = Color { r: 204, g: 204, b: 204, a: 255 };
+        let mut g = CellGrid::new(1, 1);
+        g.set_cell(
+            0,
+            0,
+            Cell {
+                ch: 'z',
+                fg,
+                bg: Color::TRANSPARENT,
+                attrs: CellAttrs::INVERSE,
+                wide_continuation: false,
+            },
+        );
+
+        let runs = g.compute_style_runs_in_range(0, 0, 1);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].style.fg, Color::BLACK);
+        assert_eq!(runs[0].style.bg, fg);
+    }
+
+    #[test]
     fn compute_bg_runs_range_respects_bounds() {
         // Populate the whole row with bg = red, then ask for cols 2..5.
         // Runs must be clipped to that window.
@@ -1439,5 +1516,71 @@ mod tests {
         let red = Color { r: 200, g: 0, b: 0, a: 255 };
         let run = BgRun { start_col: 3, end_col: 9, bg: red };
         assert_eq!(run.col_count(), 6);
+    }
+
+    // -- Cursor blink phase (#135 Phase 1, item 2) ---------------------------
+
+    #[test]
+    fn cursor_blink_phase_starts_on_at_epoch() {
+        // The first observed phase is "on" so the cursor is visible the
+        // moment the user can see it. A "first frame is dark" surprise
+        // is much worse than a half cycle of asymmetry.
+        let epoch = Instant::now();
+        assert!(CellGrid::cursor_blink_phase_at(epoch, epoch));
+    }
+
+    #[test]
+    fn cursor_blink_phase_flips_after_half_cycle() {
+        let epoch = Instant::now();
+        let half = std::time::Duration::from_millis(CURSOR_BLINK_HALF_CYCLE_MS);
+        // One half cycle later: "off". Two half cycles later: back to "on".
+        assert!(!CellGrid::cursor_blink_phase_at(epoch, epoch + half));
+        assert!(CellGrid::cursor_blink_phase_at(epoch, epoch + half * 2));
+        assert!(!CellGrid::cursor_blink_phase_at(epoch, epoch + half * 3));
+        assert!(CellGrid::cursor_blink_phase_at(epoch, epoch + half * 4));
+    }
+
+    #[test]
+    fn cursor_blink_phase_advances_without_request_rebuild() {
+        // The Phase 1 exit criterion: the renderer's blink phase must
+        // progress purely from elapsed time, never from a tree rebuild
+        // event. We assert the phase reflects the synthetic clock at
+        // every checkpoint without any state mutation in between, which
+        // is exactly the invariant the renderer side blink relies on.
+        let epoch = Instant::now();
+        let half = std::time::Duration::from_millis(CURSOR_BLINK_HALF_CYCLE_MS);
+        let mut prev = CellGrid::cursor_blink_phase_at(epoch, epoch);
+        let mut flips = 0usize;
+        for i in 1..=20 {
+            let cur = CellGrid::cursor_blink_phase_at(epoch, epoch + half * i);
+            if cur != prev {
+                flips += 1;
+            }
+            prev = cur;
+        }
+        assert_eq!(
+            flips, 20,
+            "20 elapsed half cycles must produce 20 phase flips, all driven by the clock alone"
+        );
+    }
+
+    #[test]
+    fn cursor_blink_phase_handles_clock_skew() {
+        // If `now` precedes `epoch` (should not happen, but defend
+        // against monotonic clock weirdness on suspended laptops),
+        // saturating_duration_since clamps elapsed to zero and we
+        // report the "on" phase rather than panicking.
+        let epoch = Instant::now() + std::time::Duration::from_millis(200);
+        let now = epoch - std::time::Duration::from_millis(50);
+        assert!(CellGrid::cursor_blink_phase_at(epoch, now));
+    }
+
+    #[test]
+    fn cursor_blink_half_cycle_matches_legacy_530ms_default() {
+        // Regression guard: any change to the half cycle ripples into
+        // the visible cursor cadence and must be a deliberate decision.
+        // 530 ms matches `unshit_core::cursor::CursorState::default()`
+        // so the input cursor and the terminal cursor stay in lockstep.
+        assert_eq!(CURSOR_BLINK_HALF_CYCLE_MS, 530);
     }
 }

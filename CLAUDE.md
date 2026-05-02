@@ -54,6 +54,18 @@ Issues in `crates/unshit-framework/` that currently require care in the app. Pre
 
 2. **PTY must be spawned eagerly (app-level concern, keep as is).** Do NOT defer PTY spawning until cell metrics are available. This creates a deadlock: no terminal, no CellGrid rendered, no metrics published, PTY never spawns. Always spawn at 80x24, then correct dimensions once metrics arrive.
 
+## Performance Invariants
+
+Established by the 120fps initiative (`specs/120fps.md`, issue #135). Future changes that violate these regress the perf gates.
+
+1. **No sync IPC on the render thread.** `DaemonPty::write()` is fire-and-forget; it queues `Command::WriteAsync` and returns in ~200 ns. Errors flow back via `take_write_errors()` drained by the cursor blink subscription and surfaced as toasts. The legacy sync API lives on as `DaemonPty::write_blocking()` and is only valid for tests and bench setup, never the render path. Adding a new sync IPC call on the render thread is a regression.
+
+2. **Cursor blink is renderer-side, not tree-side.** The cursor's on/off cycle is computed from a global epoch clock in `CellGrid::cursor_blink_phase_now()` and applied by the renderer per draw. The bridge's cursor blink subscription yields `RequestRedraw` (not `RequestRebuild`) on quiet ticks so the cursor visibly toggles without burning a tree rebuild. Only focus changes, toast events, and write errors promote the tick to `RequestRebuild`.
+
+3. **`RequestRebuild` events coalesce per drain window.** N rebuild events that arrive in the same `proxy_wake_up` produce exactly one tree rebuild, via `RebuildCoalescer` in `crates/unshit-framework/crates/unshit-app/src/app.rs`. Subscriptions can fire as often as they like; the framework deduplicates.
+
+4. **Dimension/span sync defers to redraw, not rebuild.** Resize-poll subscriptions yield `RequestRedraw`, not `RequestRebuild`. The renderer's persistent buffers handle the geometry update without a fresh tree pass.
+
 ## Agent/Worktree Guidelines
 
 The unshit framework lives inside this repo as a git subtree at `crates/unshit-framework/`. Agents in worktrees can freely modify both app code and framework code without path issues, and per the **Framework-First Development** policy above, they are **expected** to fix framework issues in `crates/unshit-framework/` rather than patch around them in app code.

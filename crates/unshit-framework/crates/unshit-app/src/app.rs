@@ -260,6 +260,13 @@ struct AppState {
     needs_rebuild: bool,
     needs_restyle: bool,
     needs_relayout: bool,
+    /// When `Some`, the next `needs_restyle` pass cascades from this node
+    /// instead of the document root. Set by hover / focus / active state
+    /// changes to the lowest common ancestor of the leaving and entering
+    /// node, narrowing the cascade to the smallest subtree that could
+    /// contain a re-evaluating pseudo-class selector. Cleared by `take()`
+    /// when the restyle pass consumes it. A full rebuild ignores it.
+    restyle_root: Option<NodeId>,
     scale_factor: f32,
     zoom_factor: f32,
     ctrl_held: bool,
@@ -306,10 +313,12 @@ struct AppState {
     /// on the very next frame. After [`ACTIVITY_WINDOW`] of silence the loop
     /// falls back to `ControlFlow::Wait` and idle CPU returns to ~zero.
     last_activity: Instant,
-    /// Rolling window of per-frame durations. Debug-only; emits p50/p95/
-    /// p99 quantiles once per second via `log::info!`. See
-    /// [`crate::frame_probe`].
-    #[cfg(debug_assertions)]
+    /// Rolling window of per-frame durations. Always present. Emits
+    /// p50/p95/p99 quantiles once per second via `log::info!` only while
+    /// the runtime enable flag is set; debug builds default to enabled
+    /// to preserve the previous behavior, release builds default to
+    /// disabled and rely on the in-app FPS overlay (or other callers)
+    /// flipping the flag on. See [`crate::frame_probe`].
     frame_probe: crate::frame_probe::FrameProbe,
     /// Nanosecond-grained input latency histograms. See
     /// [`crate::input_latency`]. Only present when the
@@ -346,6 +355,58 @@ pub(crate) fn is_within_activity_window(
     window: Duration,
 ) -> bool {
     now.saturating_duration_since(last_activity) < window
+}
+
+/// Coalesces external events that arrive between two paints into a
+/// single per-frame decision. The contract that callers depend on:
+/// any number of [`ExternalEvent::RequestRebuild`] events that land in
+/// one drain window collapse to exactly one tree rebuild on the next
+/// paint. The renderer reads `needs_rebuild` once per frame, runs the
+/// rebuild pipeline if set, then resets the flag, so additional events
+/// that arrive after the drain but before the redraw still piggyback on
+/// the same rebuild as long as they land in the same drain window.
+///
+/// Kept as a small explicit value type (rather than an inline boolean
+/// in `proxy_wake_up`) so the coalescing guarantee has a unit test that
+/// does not need a full winit [`AppState`]. See
+/// [`tests::request_rebuild_events_coalesce_to_single_rebuild`].
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct RebuildCoalescer {
+    /// Set to true the first time a rebuild-implying event lands. Stays
+    /// true regardless of how many further rebuild events arrive in the
+    /// same drain.
+    pub needs_rebuild: bool,
+    /// True if any event was observed during the current drain. Used
+    /// independently of `needs_rebuild` to mark UI activity for the
+    /// speculative-frame window.
+    pub saw_event: bool,
+    /// Telemetry: how many rebuild-implying events arrived during the
+    /// drain. Always >= 1 when `needs_rebuild` is set; saturates at
+    /// `u32::MAX` to avoid wrapping under pathological storms.
+    pub rebuild_request_count: u32,
+}
+
+impl RebuildCoalescer {
+    /// Reset to "no events yet for this drain". Called once per
+    /// `proxy_wake_up` entry so the same struct can be reused across
+    /// frames without per-frame allocation.
+    pub(crate) fn begin_drain(&mut self) {
+        self.needs_rebuild = false;
+        self.saw_event = false;
+        self.rebuild_request_count = 0;
+    }
+
+    /// Record one event. `request_rebuild` is true when the event
+    /// semantically implies a tree rebuild ([`ExternalEvent::RequestRebuild`],
+    /// [`ExternalEvent::Custom`], hot-reloaded stylesheet). All other
+    /// variants only mark activity.
+    pub(crate) fn observe(&mut self, request_rebuild: bool) {
+        self.saw_event = true;
+        if request_rebuild {
+            self.needs_rebuild = true;
+            self.rebuild_request_count = self.rebuild_request_count.saturating_add(1);
+        }
+    }
 }
 
 /// Adapter that exposes a winit [`Window`] as a
@@ -405,6 +466,23 @@ impl AppState {
     /// we would hit `current_monitor()` once per pixel of motion.
     fn should_reprobe_refresh(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.last_refresh_probe) >= ACTIVITY_WINDOW
+    }
+
+    /// Mark the app as needing a restyle and narrow the next cascade
+    /// to the lowest common ancestor of `old` and `new`.
+    ///
+    /// When called multiple times before the next paint (e.g. hover
+    /// changes from A to B to C in one input drain), the scope widens
+    /// to the LCA of every change so the eventual cascade is still
+    /// correct. The narrowed root is reset to `None` (full tree) by the
+    /// restyle pass via `take()`.
+    fn mark_restyle_pseudo_change(&mut self, old: NodeId, new: NodeId) {
+        self.needs_restyle = true;
+        let candidate = self.arena.lowest_common_ancestor(old, new, self.root);
+        self.restyle_root = Some(match self.restyle_root {
+            Some(prev) => self.arena.lowest_common_ancestor(prev, candidate, self.root),
+            None => candidate,
+        });
     }
 }
 
@@ -588,27 +666,28 @@ impl ApplicationHandler for AppHandler {
         let Some(state) = self.app.state.as_mut() else {
             return;
         };
-        let mut saw_event = false;
+        let mut coalescer = RebuildCoalescer::default();
+        coalescer.begin_drain();
         for event in self.event_rx.try_iter() {
-            saw_event = true;
             match event {
                 ExternalEvent::RequestRebuild => {
-                    state.needs_rebuild = true;
+                    coalescer.observe(true);
                 }
                 ExternalEvent::RequestRedraw => {
-                    // Redraw happens below via request_redraw.
+                    coalescer.observe(false);
                 }
                 ExternalEvent::Custom(payload) => {
                     if let Some(ref handler) = self.app.config.on_external_event {
                         handler(payload);
                     }
                     // Custom events typically change app state, so rebuild.
-                    state.needs_rebuild = true;
+                    coalescer.observe(true);
                 }
                 ExternalEvent::Bytes(data) => {
                     if let Some(ref handler) = self.app.config.on_bytes {
                         (handler)(data);
                     }
+                    coalescer.observe(false);
                 }
                 #[cfg(feature = "hot-reload")]
                 ExternalEvent::StylesheetReload(new_stylesheet) => {
@@ -625,11 +704,14 @@ impl ApplicationHandler for AppHandler {
                                 | unshit_core::dirty::DirtyFlags::SUBTREE_STYLE;
                         }
                     }
-                    state.needs_rebuild = true;
+                    coalescer.observe(true);
                 }
             }
         }
-        if saw_event {
+        if coalescer.needs_rebuild {
+            state.needs_rebuild = true;
+        }
+        if coalescer.saw_event {
             // An external source (PTY reader, subscription, bridge, hot
             // reload, etc.) produced work for the UI thread. Count this as
             // activity so `about_to_wait` schedules speculative frames
@@ -822,6 +904,7 @@ impl ApplicationHandler for AppHandler {
             needs_rebuild: false,
             needs_restyle: false,
             needs_relayout: false,
+            restyle_root: None,
             scale_factor,
             zoom_factor: 1.0,
             ctrl_held: false,
@@ -858,7 +941,6 @@ impl ApplicationHandler for AppHandler {
             // smooths over the initial PTY-spawn / cell-metrics dance on
             // the app side before any user input arrives.
             last_activity: Instant::now(),
-            #[cfg(debug_assertions)]
             frame_probe: crate::frame_probe::FrameProbe::new(),
             #[cfg(feature = "input-latency-histogram")]
             input_latency: crate::input_latency::InputLatencyTracker::new()
@@ -970,17 +1052,16 @@ impl ApplicationHandler for AppHandler {
 
         match event {
             WindowEvent::CloseRequested => {
-                let should_exit = self
-                    .app
-                    .config
-                    .on_close
-                    .as_ref()
-                    .map(|cb| cb())
-                    .unwrap_or(true);
+                let should_exit = self.app.config.on_close.as_ref().map(|cb| cb()).unwrap_or(true);
                 if !should_exit {
                     // Application vetoed the close (e.g. to show a confirm
                     // prompt). The app is expected to drive its own exit
-                    // via `process::exit` once the user decides.
+                    // via `process::exit` once the user decides. Schedule a
+                    // rebuild + redraw so any UI state the callback set
+                    // (like a confirm dialog) actually paints, otherwise
+                    // the window appears frozen until the next input event.
+                    state.needs_rebuild = true;
+                    state.window.request_redraw();
                     return;
                 }
                 if let Some(log) = state.event_log.take() {
@@ -1262,9 +1343,11 @@ impl ApplicationHandler for AppHandler {
                                 state.interaction.last_click_node = hovered;
 
                                 if !hovered.is_dangling() {
+                                    let old_active =
+                                        state.interaction.active.unwrap_or(NodeId::DANGLING);
                                     state.interaction.active = Some(hovered);
                                     state.interaction.mousedown_target = Some(hovered);
-                                    state.needs_restyle = true;
+                                    state.mark_restyle_pseudo_change(old_active, hovered);
                                     state.window.request_redraw();
                                 }
 
@@ -1274,10 +1357,11 @@ impl ApplicationHandler for AppHandler {
                                 )
                                 .unwrap_or(NodeId::DANGLING);
                                 if new_focused != state.interaction.focused {
+                                    let old_focused = state.interaction.focused;
                                     state.interaction.focused = new_focused;
                                     state.interaction.focus_via_keyboard = false;
                                     update_focus_context(state);
-                                    state.needs_restyle = true;
+                                    state.mark_restyle_pseudo_change(old_focused, new_focused);
                                     state.window.request_redraw();
                                 }
 
@@ -1485,9 +1569,9 @@ impl ApplicationHandler for AppHandler {
 
                             state.interaction.selecting = false;
 
-                            if state.interaction.active.is_some() {
+                            if let Some(old_active) = state.interaction.active {
                                 state.interaction.active = None;
-                                state.needs_restyle = true;
+                                state.mark_restyle_pseudo_change(old_active, NodeId::DANGLING);
                                 state.window.request_redraw();
                             }
                         }
@@ -1565,13 +1649,17 @@ impl ApplicationHandler for AppHandler {
                             .map(|e| matches!(e.tag, Tag::Input | Tag::Select))
                             .unwrap_or(false);
                         if !focused_editable {
-                            if let Some((fallback_id, _)) =
-                                state.arena.iter().find(|(_, e)| e.captures_keyboard)
-                            {
+                            let fallback_id = state
+                                .arena
+                                .iter()
+                                .find(|(_, e)| e.captures_keyboard)
+                                .map(|(id, _)| id);
+                            if let Some(fallback_id) = fallback_id {
                                 if fallback_id != state.interaction.focused {
+                                    let old_focused = state.interaction.focused;
                                     state.interaction.focused = fallback_id;
                                     state.interaction.focus_via_keyboard = false;
-                                    state.needs_restyle = true;
+                                    state.mark_restyle_pseudo_change(old_focused, fallback_id);
                                 }
                                 focused_captures = true;
                             }
@@ -2006,6 +2094,11 @@ impl ApplicationHandler for AppHandler {
                     state.needs_rebuild = false;
                     state.needs_restyle = false;
                     state.needs_relayout = false;
+                    // Full rebuild walked from root, so any narrowed
+                    // `restyle_root` from a prior hover/focus/active
+                    // change is now irrelevant. Drop it so the next
+                    // restyle sees a clean slate.
+                    state.restyle_root = None;
 
                     // Reconcile subscriptions after each rebuild.
                     #[cfg(feature = "async")]
@@ -2017,11 +2110,21 @@ impl ApplicationHandler for AppHandler {
                         mgr.reconcile(self.app.runtime.handle(), &sink);
                     }
                 } else if state.needs_restyle {
+                    // Pseudo-class state changes (hover / focus / active)
+                    // narrow `restyle_root` to the LCA of the leaving and
+                    // entering nodes. Cascading from there instead of from
+                    // `state.root` is correct because every selector that
+                    // can re-evaluate (descendant or chain rooted at the
+                    // changed pseudo state) lives in that subtree. Sibling
+                    // combinators (`.x:hover ~ .y`) are not supported by
+                    // this scoping rule (see the doc on
+                    // [`NodeArena::lowest_common_ancestor`]).
+                    let cascade_root = state.restyle_root.take().unwrap_or(state.root);
                     let t1 = Instant::now();
                     resolve_all_styles_with_transitions(
                         &mut state.arena,
                         &state.stylesheet,
-                        state.root,
+                        cascade_root,
                         state.interaction.hovered,
                         state.interaction.active,
                         state.interaction.focused,
@@ -2033,7 +2136,7 @@ impl ApplicationHandler for AppHandler {
                         &mut state.arena,
                         &mut state.taffy,
                         &state.stylesheet,
-                        state.root,
+                        cascade_root,
                         state.interaction.hovered,
                         state.interaction.active,
                         state.interaction.focused,
@@ -2041,8 +2144,14 @@ impl ApplicationHandler for AppHandler {
                     );
                     metrics.style_resolve_us = t1.elapsed().as_micros() as u64;
 
+                    // Scale only the subtree we just re-resolved.
+                    // `scale_all_styles` mutates `computed_style` in place,
+                    // so calling it from the document root would compound
+                    // the scale onto already-scaled nodes outside the LCA
+                    // every restyle. Visible as runaway font / layout
+                    // sizes after a few hover changes on HiDPI displays.
                     let t2 = Instant::now();
-                    scale_all_styles(&mut state.arena, state.root, state.scale_factor);
+                    scale_all_styles(&mut state.arena, cascade_root, state.scale_factor);
                     metrics.scale_us = t2.elapsed().as_micros() as u64;
 
                     mark_layout_dirty(&mut state.arena, state.root);
@@ -2322,18 +2431,15 @@ impl ApplicationHandler for AppHandler {
                 metrics.rss_bytes = get_rss_bytes();
                 metrics.pacer_min_interval_ns = state.frame_pacer.min_interval().as_nanos() as u64;
 
-                // Debug-only per-second frame-time probe. Feeds this frame's
-                // duration into a rolling window and emits p50/p95/p99
-                // quantiles once per second. Release builds skip the whole
-                // block via cfg(debug_assertions); see crate::frame_probe.
-                #[cfg(debug_assertions)]
-                {
-                    state
-                        .frame_probe
-                        .record_frame(std::time::Duration::from_micros(metrics.total_us));
-                    if let Some(snap) = state.frame_probe.maybe_emit(Instant::now()) {
-                        log::info!("[FRAME] {}", snap);
-                    }
+                // Per-second frame-time probe. Always records this
+                // frame's duration into a rolling window so the in-app
+                // FPS overlay can read live quantiles without rebuilding;
+                // [`FrameProbe::maybe_emit`] only returns a summary when
+                // the runtime enable flag is set (default on in debug,
+                // off in release). See crate::frame_probe.
+                state.frame_probe.record_frame(std::time::Duration::from_micros(metrics.total_us));
+                if let Some(snap) = state.frame_probe.maybe_emit(Instant::now()) {
+                    log::info!("[FRAME] {}", snap);
                 }
 
                 // Log slow frames
@@ -2501,9 +2607,10 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32)) {
     let new_hover = hit_test(&state.arena, state.root, pos.0, pos.1).unwrap_or(NodeId::DANGLING);
 
     if new_hover != state.interaction.hovered {
+        let old_hover = state.interaction.hovered;
         state.interaction.hovered = new_hover;
         apply_cursor_icon(&*state.window, &state.arena, new_hover);
-        state.needs_restyle = true;
+        state.mark_restyle_pseudo_change(old_hover, new_hover);
         state.window.request_redraw();
     }
 
@@ -2935,10 +3042,11 @@ fn dispatch_command(
             let new_focused = next_focusable(&state.arena, state.root, state.interaction.focused);
             if let Some(id) = new_focused {
                 if id != state.interaction.focused {
+                    let old_focused = state.interaction.focused;
                     state.interaction.focused = id;
                     state.interaction.focus_via_keyboard = true;
                     update_focus_context(state);
-                    state.needs_restyle = true;
+                    state.mark_restyle_pseudo_change(old_focused, id);
                     state.window.request_redraw();
                 }
             }
@@ -2947,10 +3055,11 @@ fn dispatch_command(
             let new_focused = prev_focusable(&state.arena, state.root, state.interaction.focused);
             if let Some(id) = new_focused {
                 if id != state.interaction.focused {
+                    let old_focused = state.interaction.focused;
                     state.interaction.focused = id;
                     state.interaction.focus_via_keyboard = true;
                     update_focus_context(state);
-                    state.needs_restyle = true;
+                    state.mark_restyle_pseudo_change(old_focused, id);
                     state.window.request_redraw();
                 }
             }
@@ -3576,5 +3685,109 @@ mod tests {
         let last = Instant::now() + Duration::from_millis(100);
         let now = last - Duration::from_millis(50);
         assert!(is_within_activity_window(last, now, ACTIVITY_WINDOW));
+    }
+
+    // === RebuildCoalescer (#135 Phase 1, item 1) ===
+
+    #[test]
+    fn rebuild_coalescer_default_is_idle() {
+        let c = RebuildCoalescer::default();
+        assert!(!c.needs_rebuild);
+        assert!(!c.saw_event);
+        assert_eq!(c.rebuild_request_count, 0);
+    }
+
+    #[test]
+    fn rebuild_coalescer_observe_redraw_only_marks_activity() {
+        let mut c = RebuildCoalescer::default();
+        c.observe(false);
+        assert!(c.saw_event, "redraw-only events still count as activity");
+        assert!(!c.needs_rebuild, "redraw-only events do not request a rebuild");
+        assert_eq!(c.rebuild_request_count, 0);
+    }
+
+    #[test]
+    fn rebuild_coalescer_observe_rebuild_sets_flag() {
+        let mut c = RebuildCoalescer::default();
+        c.observe(true);
+        assert!(c.saw_event);
+        assert!(c.needs_rebuild);
+        assert_eq!(c.rebuild_request_count, 1);
+    }
+
+    #[test]
+    fn one_hundred_rebuild_events_coalesce_to_single_rebuild_flag() {
+        // The Phase 1 cornerstone guarantee: any number of rebuild
+        // requests that arrive in one drain window collapse to exactly
+        // one tree rebuild on the next paint. The flag is idempotent;
+        // the counter records how many requests landed for telemetry,
+        // but `needs_rebuild` is unchanged after the first observation.
+        let mut c = RebuildCoalescer::default();
+        c.begin_drain();
+        for _ in 0..100 {
+            c.observe(true);
+        }
+        assert!(c.needs_rebuild, "100 rebuild events must set the flag exactly once");
+        assert!(c.saw_event);
+        assert_eq!(
+            c.rebuild_request_count, 100,
+            "telemetry counts every rebuild request even though they coalesce"
+        );
+    }
+
+    #[test]
+    fn begin_drain_resets_state_between_frames() {
+        let mut c = RebuildCoalescer::default();
+        for _ in 0..50 {
+            c.observe(true);
+        }
+        assert!(c.needs_rebuild);
+        assert_eq!(c.rebuild_request_count, 50);
+
+        c.begin_drain();
+        assert!(!c.needs_rebuild, "begin_drain clears the rebuild flag for the next frame");
+        assert!(!c.saw_event);
+        assert_eq!(c.rebuild_request_count, 0);
+
+        // The next drain stands on its own: a single redraw event does not
+        // resurrect a stale rebuild flag from the previous drain.
+        c.observe(false);
+        assert!(c.saw_event);
+        assert!(!c.needs_rebuild);
+        assert_eq!(c.rebuild_request_count, 0);
+    }
+
+    #[test]
+    fn rebuild_coalescer_mixed_events_collapse_to_single_rebuild() {
+        // A mix of redraw-only and rebuild-implying events lands in the
+        // same drain. We expect the flag set exactly once and the counter
+        // to track only the rebuild-implying events.
+        let mut c = RebuildCoalescer::default();
+        c.begin_drain();
+        c.observe(false); // RequestRedraw
+        c.observe(true); // RequestRebuild
+        c.observe(false); // Bytes
+        c.observe(true); // Custom (mutating)
+        c.observe(false); // RequestRedraw
+        c.observe(true); // RequestRebuild
+
+        assert!(c.needs_rebuild);
+        assert_eq!(c.rebuild_request_count, 3, "only rebuild-implying events count");
+    }
+
+    #[test]
+    fn rebuild_coalescer_counter_saturates_under_extreme_storm() {
+        // Pathological input must not wrap the telemetry counter. Pick
+        // a sentinel value just below u32::MAX and confirm `saturating_add`
+        // pins it at the ceiling rather than overflowing.
+        let mut c = RebuildCoalescer {
+            needs_rebuild: true,
+            saw_event: true,
+            rebuild_request_count: u32::MAX - 1,
+        };
+        c.observe(true);
+        c.observe(true);
+        c.observe(true);
+        assert_eq!(c.rebuild_request_count, u32::MAX);
     }
 }

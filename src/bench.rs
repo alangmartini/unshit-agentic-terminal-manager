@@ -287,7 +287,7 @@ fn first_pane_id(shared: &SharedState) -> Option<u32> {
 
 fn write_pty(shared: &SharedState, pane_id: u32, data: &[u8]) {
     if let Ok(mut guard) = shared.lock() {
-        let _ = guard.pty_manager.write(pane_id, data);
+        let _ = guard.pty_manager.write_blocking(pane_id, data);
     }
 }
 

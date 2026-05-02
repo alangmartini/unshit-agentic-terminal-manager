@@ -1,18 +1,71 @@
 use unshit::core::element::*;
 use unshit::core::event::{DragPhase, Event, EventType, Key, KeyEventKind, Modifiers};
 use unshit::core::style::parse::StyleDeclaration;
+use unshit::core::style::types::TransformX;
 
 use crate::state::{
     apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with,
-    MutexExt, Pane, PaneId, ResizeDragSnapshot, SharedState, UiSnapshot,
+    MutexExt, Pane, PaneId, ResizeDragSnapshot, SharedState, UiSnapshot, CSS_LINE_HEIGHT,
 };
 use crate::ui::icons::*;
+
+const ENV_PARITY_LINE_HEIGHT: &str = "TM_PARITY_LINE_HEIGHT";
+const ENV_PARITY_CONTENT_X_OFFSET: &str = "TM_PARITY_CONTENT_X_OFFSET";
+const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
+const WINDOWS_TERMINAL_PARITY_LINE_HEIGHT: f32 = 1.15;
+const WINDOWS_TERMINAL_PARITY_CONTENT_X_OFFSET: f32 = 3.0;
 
 /// Returns `true` when the pane grid contains exactly one pane (one row with
 /// one column). In that case the tab bar already displays the pane title and
 /// subtitle, so the pane header can omit them to avoid visual duplication.
 fn is_single_pane(panes: &[Vec<Pane>]) -> bool {
     panes.len() == 1 && panes[0].len() == 1
+}
+
+fn terminal_line_height_from_values(value: Option<std::ffi::OsString>, wt_profile: bool) -> f32 {
+    value
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| (0.5..=2.0).contains(v))
+        .unwrap_or(if wt_profile {
+            WINDOWS_TERMINAL_PARITY_LINE_HEIGHT
+        } else {
+            CSS_LINE_HEIGHT
+        })
+}
+
+fn terminal_line_height() -> f32 {
+    terminal_line_height_from_values(
+        std::env::var_os(ENV_PARITY_LINE_HEIGHT),
+        crate::truthy_env_value(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)),
+    )
+}
+
+fn terminal_content_x_offset_from_values(
+    value: Option<std::ffi::OsString>,
+    wt_profile: bool,
+) -> f32 {
+    value
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| (-32.0..=32.0).contains(v))
+        .unwrap_or(if wt_profile {
+            WINDOWS_TERMINAL_PARITY_CONTENT_X_OFFSET
+        } else {
+            0.0
+        })
+}
+
+fn terminal_content_x_offset() -> f32 {
+    terminal_content_x_offset_from_values(
+        std::env::var_os(ENV_PARITY_CONTENT_X_OFFSET),
+        crate::truthy_env_value(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)),
+    )
+}
+
+#[cfg(test)]
+fn parity_windows_terminal_profile_from_value(value: Option<std::ffi::OsString>) -> bool {
+    crate::truthy_env_value(value)
 }
 
 pub fn build_terminal_grid(
@@ -228,7 +281,8 @@ fn build_pane(
         let header = build_pane_header(pane, shared).with_key("pane-header");
         container = container.with_child(header);
     }
-    let body = build_pane_body(pane.id, capture_keyboard, shared, grids).with_key("pane-body");
+    let body = build_pane_body(pane.id, capture_keyboard, state.font_size_pt, shared, grids)
+        .with_key("pane-body");
     container = container.with_child(body);
     // During a tab drag, layer the 4-edge drop overlay inside the pane
     // so it tracks the pane's real layout rather than a recomputed
@@ -345,6 +399,7 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
 fn build_pane_body(
     pane_id: PaneId,
     capture_keyboard: bool,
+    font_size_pt: u32,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
@@ -354,8 +409,16 @@ fn build_pane_body(
         // Real terminal grid rendering.
         let mut grid_el = ElementDef::new(Tag::Div)
             .with_class("terminal-content")
+            .with_style(StyleDeclaration::FontSize(font_size_pt as f32))
+            .with_style(StyleDeclaration::LineHeight(terminal_line_height()))
             .with_grid(grid.clone())
             .with_persistent_buffer(true);
+        let content_x_offset = terminal_content_x_offset();
+        if content_x_offset.abs() > f32::EPSILON {
+            grid_el = grid_el.with_style(StyleDeclaration::TransformTranslateX(TransformX::Px(
+                content_x_offset,
+            )));
+        }
 
         // A tab_index is required so the element is focusable; without it the
         // framework ignores click-to-focus and keyboard events never arrive.
@@ -804,7 +867,7 @@ mod tests {
         let shared = make_shared();
         let mut grids = std::collections::HashMap::new();
         grids.insert(1, CellGrid::new(24, 80));
-        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
         assert!(el.classes.contains(&"pane-body".to_string()));
         assert_eq!(el.children.len(), 1);
         let grid_el = &el.children[0];
@@ -813,11 +876,119 @@ mod tests {
     }
 
     #[test]
+    fn pane_body_applies_configured_terminal_font_metrics() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+
+        let el = build_pane_body(PaneId(1), true, 18, &shared, &grids);
+        let grid_el = &el.children[0];
+
+        assert!(
+            grid_el.style_overrides.iter().any(|decl| {
+                matches!(
+                    decl,
+                    StyleDeclaration::FontSize(v) if (*v - 18.0).abs() < f32::EPSILON
+                )
+            }),
+            "terminal-content must use the configured terminal font size"
+        );
+        assert!(
+            grid_el.style_overrides.iter().any(|decl| {
+                matches!(
+                    decl,
+                    StyleDeclaration::LineHeight(v)
+                        if (*v - CSS_LINE_HEIGHT).abs() < f32::EPSILON
+                )
+            }),
+            "terminal-content line-height must stay in sync with cell metrics"
+        );
+    }
+
+    #[test]
+    fn terminal_line_height_from_values_uses_windows_terminal_profile_default() {
+        let got = terminal_line_height_from_values(None, true);
+        assert!((got - WINDOWS_TERMINAL_PARITY_LINE_HEIGHT).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn terminal_line_height_from_values_accepts_tuning_override() {
+        let got = terminal_line_height_from_values(Some(std::ffi::OsString::from("1.12")), true);
+        assert!((got - 1.12).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn terminal_line_height_from_values_rejects_invalid_tuning_override() {
+        for value in ["invalid", "0.25", "2.5"] {
+            let got = terminal_line_height_from_values(Some(std::ffi::OsString::from(value)), true);
+            assert!(
+                (got - WINDOWS_TERMINAL_PARITY_LINE_HEIGHT).abs() < f32::EPSILON,
+                "invalid override {value:?} should fall back to the parity default"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_content_x_offset_from_values_uses_windows_terminal_profile_default() {
+        let got = terminal_content_x_offset_from_values(None, true);
+        assert!((got - WINDOWS_TERMINAL_PARITY_CONTENT_X_OFFSET).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn terminal_content_x_offset_from_values_accepts_tuning_override() {
+        let got =
+            terminal_content_x_offset_from_values(Some(std::ffi::OsString::from("6.5")), true);
+        assert!((got - 6.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn terminal_content_x_offset_from_values_rejects_invalid_tuning_override() {
+        for value in ["invalid", "-33", "33"] {
+            let got =
+                terminal_content_x_offset_from_values(Some(std::ffi::OsString::from(value)), true);
+            assert!(
+                (got - WINDOWS_TERMINAL_PARITY_CONTENT_X_OFFSET).abs() < f32::EPSILON,
+                "invalid override {value:?} should fall back to the parity default"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_content_x_offset_from_values_stays_zero_outside_parity_profile() {
+        let got = terminal_content_x_offset_from_values(None, false);
+        assert!(got.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parity_windows_terminal_profile_from_value_rejects_disabled_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("no"),
+        ] {
+            let value = value.map(std::ffi::OsString::from);
+            assert!(!parity_windows_terminal_profile_from_value(value));
+        }
+    }
+
+    #[test]
+    fn parity_windows_terminal_profile_from_value_accepts_enabled_values() {
+        for value in ["1", "true", "yes", "on"] {
+            assert!(parity_windows_terminal_profile_from_value(Some(
+                std::ffi::OsString::from(value)
+            )));
+        }
+    }
+
+    #[test]
     fn pane_body_with_grid_active_captures_keyboard() {
         let shared = make_shared();
         let mut grids = std::collections::HashMap::new();
         grids.insert(1, CellGrid::new(24, 80));
-        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
         let grid_el = &el.children[0];
         assert!(grid_el.captures_keyboard);
     }
@@ -827,7 +998,7 @@ mod tests {
         let shared = make_shared();
         let mut grids = std::collections::HashMap::new();
         grids.insert(1, CellGrid::new(24, 80));
-        let el = build_pane_body(PaneId(1), false, &shared, &grids);
+        let el = build_pane_body(PaneId(1), false, 13, &shared, &grids);
         let grid_el = &el.children[0];
         assert!(!grid_el.captures_keyboard);
     }
@@ -838,7 +1009,7 @@ mod tests {
     fn pane_body_without_grid_shows_fallback() {
         let shared = make_shared();
         let grids = std::collections::HashMap::new(); // no grid for pane 1
-        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
         assert!(el.classes.contains(&"pane-body".to_string()));
         assert_eq!(el.children.len(), 1);
         let fallback = &el.children[0];
@@ -857,7 +1028,7 @@ mod tests {
     fn pane_body_without_grid_inactive_also_shows_fallback() {
         let shared = make_shared();
         let grids = std::collections::HashMap::new();
-        let el = build_pane_body(PaneId(99), false, &shared, &grids);
+        let el = build_pane_body(PaneId(99), false, 13, &shared, &grids);
         assert_eq!(el.children.len(), 1);
         assert!(el.children[0].classes.contains(&"term-line".to_string()));
     }
@@ -929,7 +1100,7 @@ mod tests {
         let shared = make_shared();
         let mut grids = std::collections::HashMap::new();
         grids.insert(1, CellGrid::new(24, 80));
-        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
         let grid_el = &el.children[0];
         // Should have event handlers registered (KeyboardCapture)
         assert!(!grid_el.handlers.is_empty());
@@ -940,7 +1111,7 @@ mod tests {
         let shared = make_shared();
         let mut grids = std::collections::HashMap::new();
         grids.insert(1, CellGrid::new(24, 80));
-        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
         let grid_el = &el.children[0];
         assert!(grid_el.on_resize.is_some());
     }
@@ -950,7 +1121,7 @@ mod tests {
         let shared = make_shared();
         let mut grids = std::collections::HashMap::new();
         grids.insert(1, CellGrid::new(24, 80));
-        let el = build_pane_body(PaneId(1), false, &shared, &grids);
+        let el = build_pane_body(PaneId(1), false, 13, &shared, &grids);
         let grid_el = &el.children[0];
         assert!(grid_el.handlers.is_empty());
         assert!(grid_el.on_resize.is_none());
@@ -961,7 +1132,7 @@ mod tests {
         let shared = make_shared();
         let mut grids = std::collections::HashMap::new();
         grids.insert(1, CellGrid::new(24, 80));
-        let el = build_pane_body(PaneId(1), true, &shared, &grids);
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
         let grid_el = &el.children[0];
         let resize_fn = grid_el.on_resize.as_ref().unwrap();
         // Invoke with a 640x384 area (should yield 80 cols, 24 rows)
@@ -1020,7 +1191,7 @@ mod tests {
         let mut grids = std::collections::HashMap::new();
         grids.insert(pane_id.0, grid);
 
-        let body = build_pane_body(pane_id, true, &shared, &grids);
+        let body = build_pane_body(pane_id, true, 13, &shared, &grids);
         let content = find_terminal_content(&body)
             .expect("terminal-content element should exist when grid is present");
         assert_eq!(
@@ -1040,7 +1211,7 @@ mod tests {
         let mut grids = std::collections::HashMap::new();
         grids.insert(pane_id.0, grid);
 
-        let body = build_pane_body(pane_id, true, &shared, &grids);
+        let body = build_pane_body(pane_id, true, 13, &shared, &grids);
         let content = find_terminal_content(&body).expect("terminal-content element should exist");
         assert!(
             content.captures_keyboard,
@@ -1058,7 +1229,7 @@ mod tests {
         let mut grids = std::collections::HashMap::new();
         grids.insert(pane_id.0, grid);
 
-        let body = build_pane_body(pane_id, false, &shared, &grids);
+        let body = build_pane_body(pane_id, false, 13, &shared, &grids);
         let content = find_terminal_content(&body).expect("terminal-content element should exist");
         assert_eq!(
             content.tab_index,
@@ -1104,7 +1275,7 @@ mod tests {
         let mut grids = std::collections::HashMap::new();
         grids.insert(pane_id.0, grid);
 
-        let body = build_pane_body(pane_id, true, &shared, &grids);
+        let body = build_pane_body(pane_id, true, 13, &shared, &grids);
         let content = find_terminal_content(&body).expect("terminal-content element should exist");
         assert!(
             content.on_resize.is_some(),

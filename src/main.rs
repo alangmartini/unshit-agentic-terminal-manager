@@ -11,7 +11,7 @@ pub mod state;
 pub mod terminal;
 pub mod ui;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use unshit::app::{App, AppConfig, FontSource};
 use unshit::core::element::*;
@@ -35,6 +35,13 @@ use crate::ui::titlebar::build_titlebar;
 use crate::ui::toasts::build_toast_overlay;
 
 const STYLES: &str = include_str!("../assets/styles.css");
+const ENV_PTYD_SOCKET: &str = "TM_PTYD_SOCKET";
+const ENV_PARITY_SHELL_PROGRAM: &str = "TM_PARITY_SHELL_PROGRAM";
+const ENV_PARITY_SHELL_ARGS_JSON: &str = "TM_PARITY_SHELL_ARGS_JSON";
+const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
+const ENV_PARITY_FONT_SIZE_PT: &str = "TM_PARITY_FONT_SIZE_PT";
+const ENV_PARITY_FONT_FAMILY: &str = "TM_PARITY_FONT_FAMILY";
+const WINDOWS_TERMINAL_PARITY_FONT_SIZE_PT: u32 = 16;
 
 // Heap profiling via dhat. Only compiled in when --features profiling is set.
 //
@@ -225,6 +232,9 @@ fn build_tree(
                         .with_child(build_statusbar(snap)),
                 ),
         );
+    if parity_windows_terminal_colors_enabled() {
+        root = root.with_class("parity-windows-terminal");
+    }
 
     if snap.settings_open {
         let s = shared.clone();
@@ -259,13 +269,143 @@ fn build_tree(
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
                 snap, shared,
             ))
-            .with_child(build_toast_overlay(snap, shared)),
+            .with_child(build_toast_overlay(snap, shared))
+            .with_child(crate::ui::fps_overlay::build_fps_overlay()),
     }
 }
 
 fn user_shortcut_bindings() -> Vec<(String, String)> {
     let overrides = crate::keybinds::loader::load_if_installed();
     crate::keybinds::registry::shortcut_bindings_with_overrides(&overrides)
+}
+
+fn terminal_font_sources_from_value(value: Option<std::ffi::OsString>) -> Vec<FontSource> {
+    let mut fonts = vec![
+        FontSource::System("Cascadia Mono".to_string()),
+        FontSource::System("Cascadia Code".to_string()),
+        FontSource::System("JetBrains Mono".to_string()),
+        FontSource::System("Berkeley Mono".to_string()),
+        FontSource::System("SF Mono".to_string()),
+        FontSource::System("Menlo".to_string()),
+        FontSource::System("Consolas".to_string()),
+    ];
+
+    if let Some(value) = value {
+        let raw = value.to_string_lossy();
+        let family = raw.trim();
+        if !family.is_empty() {
+            fonts.retain(|source| match source {
+                FontSource::System(name) => !name.eq_ignore_ascii_case(family),
+                _ => true,
+            });
+            fonts.insert(0, FontSource::System(family.to_string()));
+        }
+    }
+
+    fonts
+}
+
+fn terminal_font_sources() -> Vec<FontSource> {
+    terminal_font_sources_from_value(std::env::var_os(ENV_PARITY_FONT_FAMILY))
+}
+
+fn ptyd_socket_path_from_env(value: Option<std::ffi::OsString>) -> PathBuf {
+    value
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(unshit_ptyd::transport::default_socket_path)
+}
+
+fn ptyd_socket_path() -> PathBuf {
+    ptyd_socket_path_from_env(std::env::var_os(ENV_PTYD_SOCKET))
+}
+
+fn truthy_env_value(value: Option<std::ffi::OsString>) -> bool {
+    value
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            let normalized = v.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn parity_windows_terminal_colors_enabled() -> bool {
+    truthy_env_value(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS))
+}
+
+fn parity_shell_spec_from_values(
+    program: Option<std::ffi::OsString>,
+    args_json: Option<std::ffi::OsString>,
+) -> Result<Option<crate::shell::ShellSpec>, String> {
+    let Some(program) = program else {
+        return Ok(None);
+    };
+    if program.is_empty() {
+        return Ok(None);
+    }
+
+    let program = program.to_string_lossy().trim().to_string();
+    if program.is_empty() {
+        return Ok(None);
+    }
+
+    let args = match args_json {
+        Some(raw) if !raw.is_empty() => {
+            let text = raw.to_string_lossy();
+            serde_json::from_str::<Vec<String>>(&text)
+                .map_err(|e| format!("invalid {ENV_PARITY_SHELL_ARGS_JSON}: {e}"))?
+        }
+        _ => Vec::new(),
+    };
+
+    Ok(Some(crate::shell::ShellSpec { program, args }))
+}
+
+fn parity_shell_spec_from_env() -> Option<crate::shell::ShellSpec> {
+    parity_shell_spec_from_values(
+        std::env::var_os(ENV_PARITY_SHELL_PROGRAM),
+        std::env::var_os(ENV_PARITY_SHELL_ARGS_JSON),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    })
+}
+
+fn parity_font_size_pt_from_value(value: Option<std::ffi::OsString>) -> Result<u32, String> {
+    let Some(value) = value else {
+        return Ok(WINDOWS_TERMINAL_PARITY_FONT_SIZE_PT);
+    };
+    let raw = value
+        .into_string()
+        .map_err(|_| format!("{ENV_PARITY_FONT_SIZE_PT} must be valid UTF-8"))?;
+    let parsed: u32 = raw
+        .parse()
+        .map_err(|_| format!("{ENV_PARITY_FONT_SIZE_PT} must be an integer, got {raw:?}"))?;
+    if !(crate::state::MIN_FONT_SIZE..=crate::state::MAX_FONT_SIZE).contains(&parsed) {
+        return Err(format!(
+            "{ENV_PARITY_FONT_SIZE_PT} must be between {} and {}, got {parsed}",
+            crate::state::MIN_FONT_SIZE,
+            crate::state::MAX_FONT_SIZE
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parity_font_size_pt_from_env() -> u32 {
+    parity_font_size_pt_from_value(std::env::var_os(ENV_PARITY_FONT_SIZE_PT)).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    })
+}
+
+fn apply_parity_shell_override(state: &mut crate::state::AppState, spec: crate::shell::ShellSpec) {
+    *state = seed_state();
+    state.default_shell = spec;
+    state.font_size_pt = parity_font_size_pt_from_env();
+    state.sidebar_collapsed = true;
+    state.sidebar_width = 48.0;
 }
 
 fn parse_bench_args() -> Option<crate::bench::BenchConfig> {
@@ -398,6 +538,9 @@ fn main() {
             args: Vec::new(),
         };
     }
+    if let Some(spec) = parity_shell_spec_from_env() {
+        apply_parity_shell_override(&mut initial_state, spec);
+    }
     let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
 
     // Bring the unshit-ptyd daemon up and wire the UI's DaemonPty shim
@@ -405,7 +548,7 @@ fn main() {
     // is async; the shim's own worker thread drives every subsequent
     // IPC call, so this runtime dies once the probe completes.
     {
-        let socket_path = unshit_ptyd::transport::default_socket_path();
+        let socket_path = ptyd_socket_path();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for daemon probe");
         rt.block_on(daemon::connect_or_spawn(&socket_path))
             .expect("connect or spawn unshit-ptyd daemon");
@@ -530,13 +673,7 @@ fn main() {
             width: 1280,
             height: 800,
             css: STYLES.to_string(),
-            fonts: vec![
-                FontSource::System("JetBrains Mono".to_string()),
-                FontSource::System("Berkeley Mono".to_string()),
-                FontSource::System("SF Mono".to_string()),
-                FontSource::System("Menlo".to_string()),
-                FontSource::System("Consolas".to_string()),
-            ],
+            fonts: terminal_font_sources(),
             user_shortcuts: user_shortcut_bindings(),
             on_command: Some(Arc::new(move |command: &str| -> bool {
                 let mut guard = command_shared.lock_recover();
@@ -631,7 +768,10 @@ fn main() {
                 );
                 resize_all_terminals(&mut guard, cols, rows);
             })),
-            on_frame_metrics: Some(Box::new(|m| crate::bench::record_frame(m))),
+            on_frame_metrics: Some(Box::new(|m| {
+                crate::bench::record_frame(m);
+                crate::ui::fps_overlay::record_frame(m);
+            })),
             #[cfg(feature = "input-latency-histogram")]
             on_input_latency: Some(Box::new(|snap| crate::bench::record_input_latency(snap))),
             ..Default::default()
@@ -679,6 +819,18 @@ fn main() {
     // Set up PTY output subscriptions.
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
 
+    // Hand the framework's shared clipboard handle to AppState so
+    // `terminal.paste` and any future paste callers reuse the same
+    // underlying `arboard::Clipboard` instance. Concurrent arboard
+    // handles in the same process can heap-corrupt on Windows; the
+    // framework regression test `concurrent_clipboard_access_does_not_corrupt_heap`
+    // documents that failure mode.
+    {
+        let app_clipboard = app.clipboard();
+        let mut guard = shared.lock_recover();
+        guard.clipboard = app_clipboard;
+    }
+
     app.run();
 }
 
@@ -686,6 +838,261 @@ fn main() {
 mod tests {
     use super::*;
     use crate::terminal::Terminal;
+
+    #[test]
+    fn user_shortcut_bindings_includes_fps_overlay_toggle() {
+        // Phase 0 of the 120fps perf work (refs #135) ships an in-app
+        // FPS overlay toggled by Ctrl+Shift+F. Without this binding the
+        // overlay is unreachable from the keyboard.
+        let bindings = user_shortcut_bindings();
+        assert!(
+            bindings
+                .iter()
+                .any(|(s, c)| s == "Ctrl+Shift+F" && c == "fps_overlay.toggle"),
+            "Ctrl+Shift+F must dispatch fps_overlay.toggle"
+        );
+    }
+
+    #[test]
+    fn stylesheet_prefers_cascadia_for_terminal_text() {
+        let cascadia = STYLES
+            .find("'Cascadia Mono'")
+            .expect("terminal font stack should include Cascadia Mono");
+        let consolas = STYLES
+            .find("Consolas")
+            .expect("terminal font stack should keep Consolas as a fallback");
+        assert!(
+            cascadia < consolas,
+            "Cascadia Mono should be preferred over Consolas to match Windows Terminal"
+        );
+    }
+
+    #[test]
+    fn renderer_font_sources_prefer_cascadia() {
+        let fonts = terminal_font_sources_from_value(None);
+        let first = fonts.first().expect("font source list must not be empty");
+        match first {
+            FontSource::System(name) => assert_eq!(name, "Cascadia Mono"),
+            other => panic!("first terminal font source must be Cascadia Mono, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renderer_font_sources_accept_parity_override() {
+        let fonts =
+            terminal_font_sources_from_value(Some(std::ffi::OsString::from("Cascadia Code")));
+        let first = fonts.first().expect("font source list must not be empty");
+        match first {
+            FontSource::System(name) => assert_eq!(name, "Cascadia Code"),
+            other => panic!("first terminal font source must be override, got {other:?}"),
+        }
+
+        let count = fonts
+            .iter()
+            .filter(|font| matches!(font, FontSource::System(name) if name == "Cascadia Code"))
+            .count();
+        assert_eq!(
+            count, 1,
+            "override should not duplicate an existing fallback"
+        );
+    }
+
+    #[test]
+    fn ptyd_socket_path_from_env_uses_override() {
+        let path = ptyd_socket_path_from_env(Some(std::ffi::OsString::from(
+            r"\\.\pipe\unshit-ptyd-parity-test",
+        )));
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(r"\\.\pipe\unshit-ptyd-parity-test")
+        );
+    }
+
+    #[test]
+    fn ptyd_socket_path_from_env_uses_default_when_missing() {
+        assert_eq!(
+            ptyd_socket_path_from_env(None),
+            unshit_ptyd::transport::default_socket_path()
+        );
+    }
+
+    #[test]
+    fn truthy_env_value_accepts_common_enabled_values() {
+        assert!(truthy_env_value(Some(std::ffi::OsString::from("1"))));
+        assert!(truthy_env_value(Some(std::ffi::OsString::from("true"))));
+        assert!(truthy_env_value(Some(std::ffi::OsString::from(
+            "WindowsTerminal"
+        ))));
+    }
+
+    #[test]
+    fn truthy_env_value_rejects_common_disabled_values() {
+        assert!(!truthy_env_value(None));
+        assert!(!truthy_env_value(Some(std::ffi::OsString::from(""))));
+        assert!(!truthy_env_value(Some(std::ffi::OsString::from("0"))));
+        assert!(!truthy_env_value(Some(std::ffi::OsString::from("false"))));
+        assert!(!truthy_env_value(Some(std::ffi::OsString::from("off"))));
+        assert!(!truthy_env_value(Some(std::ffi::OsString::from("no"))));
+    }
+
+    #[test]
+    fn parity_shell_spec_from_values_returns_none_without_program() {
+        let got = parity_shell_spec_from_values(None, None).expect("parse");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn parity_shell_spec_from_values_parses_json_args() {
+        let got = parity_shell_spec_from_values(
+            Some(std::ffi::OsString::from("pwsh.exe")),
+            Some(std::ffi::OsString::from(
+                r#"["-NoLogo","-File","tools/parity/smoke-scene.ps1"]"#,
+            )),
+        )
+        .expect("parse")
+        .expect("spec");
+        assert_eq!(got.program, "pwsh.exe");
+        assert_eq!(
+            got.args,
+            vec![
+                "-NoLogo".to_string(),
+                "-File".to_string(),
+                "tools/parity/smoke-scene.ps1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parity_shell_spec_from_values_rejects_invalid_json_args() {
+        let err = parity_shell_spec_from_values(
+            Some(std::ffi::OsString::from("pwsh.exe")),
+            Some(std::ffi::OsString::from("{bad json")),
+        )
+        .expect_err("invalid JSON must be rejected");
+        assert!(
+            err.contains(ENV_PARITY_SHELL_ARGS_JSON),
+            "error should name the env var, got {err}"
+        );
+    }
+
+    #[test]
+    fn apply_parity_shell_override_resets_persisted_workspace_shells() {
+        let mut state = seed_state();
+        state.active_workspace = 1;
+        state.workspaces[0].shell = crate::shell::ShellSpec {
+            program: "bash.exe".into(),
+            args: vec!["--login".into()],
+        };
+        let parity_shell = crate::shell::ShellSpec {
+            program: "pwsh.exe".into(),
+            args: vec!["-File".into(), "tools/parity/smoke-scene.ps1".into()],
+        };
+
+        apply_parity_shell_override(&mut state, parity_shell.clone());
+
+        assert_eq!(state.active_workspace, 0);
+        assert_eq!(state.default_shell, parity_shell);
+        assert_eq!(
+            state.font_size_pt, WINDOWS_TERMINAL_PARITY_FONT_SIZE_PT,
+            "parity mode should match Windows Terminal's 12pt-equivalent terminal font size"
+        );
+        assert!(
+            state.sidebar_collapsed,
+            "parity mode should focus capture space on the terminal content"
+        );
+        assert_eq!(
+            state.sidebar_width, 48.0,
+            "parity mode should narrow the sidebar layout width for screenshots"
+        );
+        assert!(
+            state.workspaces.iter().all(|w| w.shell.is_empty()),
+            "parity mode must clear workspace-specific shell overrides so the smoke shell wins"
+        );
+    }
+
+    #[test]
+    fn parity_font_size_pt_from_value_defaults_to_windows_terminal_equivalent() {
+        let got = parity_font_size_pt_from_value(None).expect("default parity font size");
+        assert_eq!(got, WINDOWS_TERMINAL_PARITY_FONT_SIZE_PT);
+    }
+
+    #[test]
+    fn parity_font_size_pt_from_value_rejects_out_of_range_values() {
+        let err =
+            parity_font_size_pt_from_value(Some(std::ffi::OsString::from("99"))).expect_err("err");
+        assert!(
+            err.contains(ENV_PARITY_FONT_SIZE_PT),
+            "error should name the env var, got {err}"
+        );
+    }
+
+    #[test]
+    fn parity_font_size_pt_from_value_rejects_non_integer_values() {
+        let err = parity_font_size_pt_from_value(Some(std::ffi::OsString::from("16.5")))
+            .expect_err("err");
+        assert!(
+            err.contains("must be an integer"),
+            "error should describe the invalid integer parse, got {err}"
+        );
+    }
+
+    #[test]
+    fn stylesheet_does_not_apply_global_scanline_overlay() {
+        assert!(
+            !STYLES.contains("body::after"),
+            "global overlays darken terminal glyphs and make screenshots look lower quality"
+        );
+    }
+
+    #[test]
+    fn stylesheet_collapsed_sidebar_reclaims_terminal_capture_space() {
+        assert!(
+            STYLES.contains(".sidebar.collapsed"),
+            "parity mode depends on the collapsed sidebar class changing layout width"
+        );
+        assert!(
+            STYLES.contains("min-width: 48px"),
+            "collapsed sidebar should reclaim horizontal terminal capture space"
+        );
+    }
+
+    #[test]
+    fn stylesheet_has_windows_terminal_parity_theme() {
+        assert!(
+            STYLES.contains(".app.parity-windows-terminal"),
+            "parity harness needs a class-gated theme override for Windows Terminal screenshots"
+        );
+        assert!(
+            STYLES.contains("#0c0c0c") && STYLES.contains("#c4c4c4"),
+            "parity theme should pin Windows Terminal default background and foreground"
+        );
+    }
+
+    /// Regression test for the clipboard paste keybind feature.
+    ///
+    /// Both Ctrl+V (Windows convention) and Ctrl+Shift+V (Linux
+    /// terminal convention, where Ctrl+V is reserved by the shell for
+    /// literal-input mode) MUST be registered against
+    /// `terminal.paste`. If a future agent removes one binding the
+    /// user loses paste from at least one platform's muscle memory;
+    /// this test catches that before it ships.
+    #[test]
+    fn user_shortcut_bindings_wires_terminal_paste_to_both_combos() {
+        let bindings = user_shortcut_bindings();
+        let pasters: Vec<&str> = bindings
+            .iter()
+            .filter(|(_, c)| c == "terminal.paste")
+            .map(|(s, _)| s.as_str())
+            .collect();
+        assert!(
+            pasters.contains(&"Ctrl+V"),
+            "Ctrl+V must dispatch terminal.paste; got {pasters:?}"
+        );
+        assert!(
+            pasters.contains(&"Ctrl+Shift+V"),
+            "Ctrl+Shift+V must dispatch terminal.paste; got {pasters:?}"
+        );
+    }
 
     /// Regression test for issue #63.
     ///

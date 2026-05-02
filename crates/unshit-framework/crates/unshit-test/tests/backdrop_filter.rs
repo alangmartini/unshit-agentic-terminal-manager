@@ -277,13 +277,8 @@ fn backdrop_boundary_preserved_across_rebuilds() {
         h.rebuild(checkerboard_tree_with_modal);
         h.step();
         let _pixels = h.render();
-        let total_boundaries: usize = h
-            .gpu_ref()
-            .layered_batch
-            .layers
-            .iter()
-            .map(|l| l.backdrop_boundaries.len())
-            .sum();
+        let total_boundaries: usize =
+            h.gpu_ref().layered_batch.layers.iter().map(|l| l.backdrop_boundaries.len()).sum();
         assert_eq!(
             total_boundaries, 1,
             "iter {}: BackdropBoundary missing after rebuild. Cache replay \

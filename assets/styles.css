@@ -67,7 +67,7 @@
   --resizer:     4px;
 
   
-  --font-mono: 'JetBrains Mono', 'Berkeley Mono', 'SF Mono', Menlo, Consolas, monospace;
+  --font-mono: 'Cascadia Mono', 'Cascadia Code', 'JetBrains Mono', 'Berkeley Mono', 'SF Mono', Menlo, Consolas, monospace;
   --t-xs:  10px;
   --t-sm:  11px;
   --t-md:  12px;
@@ -92,6 +92,37 @@
   --dur-fast: 120ms;
   --dur-norm: 200ms;
   --dur-slow: 320ms;
+}
+
+.app.parity-windows-terminal {
+  --bg-void:       #0c0c0c;
+  --bg-base:       #0c0c0c;
+  --bg-subtle:     #0c0c0c;
+  --bg-elevated:   #0c0c0c;
+  --bg-hover:      #1e1e1e;
+  --bg-selected:   #2a2a2a;
+  --border-hair:    #0c0c0c;
+  --border-soft:    #1e1e1e;
+  --border-default: #333333;
+  --border-strong:  #555555;
+  --border-focus:   #cccccc;
+  --fg-primary:   #c4c4c4;
+  --fg-secondary: #c4c4c4;
+  --fg-tertiary:  #767676;
+  --fg-muted:     #767676;
+  --fg-ghost:     #303030;
+  --amber-100: #c4c4c4;
+  --amber-200: #c4c4c4;
+  --amber-300: #c4c4c4;
+  --amber-400: #767676;
+  --amber-500: #555555;
+}
+
+.app.parity-windows-terminal .pane-body,
+.app.parity-windows-terminal .terminal-content {
+  background: #0c0c0c;
+  color: #c4c4c4;
+  text-shadow: none;
 }
 
 
@@ -161,19 +192,6 @@ body::before {
     radial-gradient(ellipse 60% 40% at 85% 0%, rgba(212, 163, 72, 0.035), transparent 70%),
     radial-gradient(ellipse 80% 50% at 10% 100%, rgba(138, 96, 32, 0.025), transparent 70%);
 }
-
-body::after {
-  content: '';
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 0;
-  background-image:
-    repeating-linear-gradient(0deg, transparent 0, transparent 2px, rgba(0,0,0,0.12) 2px, rgba(0,0,0,0.12) 3px);
-  opacity: 0.22;
-  mix-blend-mode: multiply;
-}
-
 
 .app {
   position: relative;
@@ -340,6 +358,20 @@ body::after {
   flex-direction: column;
   overflow: hidden;
   position: relative;
+}
+
+.sidebar.collapsed {
+  width: 48px;
+  min-width: 48px;
+}
+
+.sidebar.collapsed .sidebar-title,
+.sidebar.collapsed .sidebar-head-actions,
+.sidebar.collapsed .workspace-name,
+.sidebar.collapsed .workspace-body,
+.sidebar.collapsed .sidebar-footer,
+.sidebar.collapsed .sidebar-hints {
+  display: none;
 }
 
 .sidebar::after {
@@ -1298,7 +1330,8 @@ body::after {
   min-width: 0;
   width: 100%;
   height: 100%;
-  line-height: 1.2;
+  font-size: 13px;
+  line-height: 1.25;
 }
 
 .term-line {
@@ -2450,4 +2483,65 @@ body.dragging-pane {
   margin-top: 6px;
   font-size: 12px;
   color: var(--accent-danger, #d75f5f);
+}
+
+/* ============================================================ */
+/* FPS OVERLAY (Phase 0 of 120fps perf work, toggle Ctrl+Shift+F)*/
+/* ============================================================ */
+
+.fps-overlay-hidden {
+  display: none;
+}
+
+.fps-overlay {
+  position: fixed;
+  bottom: 56px;
+  right: 12px;
+  z-index: 9000;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 200px;
+  padding: 10px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-md);
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--fg-primary);
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.fps-overlay-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  line-height: 1.35;
+}
+
+.fps-overlay-label {
+  color: var(--fg-tertiary);
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+}
+
+.fps-overlay-value {
+  color: var(--amber-100);
+  font-weight: 500;
+}
+
+.fps-overlay-sep {
+  height: 1px;
+  background: var(--border-soft);
+  margin: 4px 0;
+}
+
+.fps-overlay-hint {
+  color: var(--fg-muted);
+  font-size: 9px;
+  text-align: center;
+  margin-top: 2px;
+  letter-spacing: 0.06em;
 }

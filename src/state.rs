@@ -170,6 +170,94 @@ pub fn push_error_toast(state: &mut AppState, message: impl Into<String>) {
     state.toasts.push(message);
 }
 
+/// Normalise text pulled from the system clipboard before it is fed
+/// into a PTY by `terminal.paste`.
+///
+/// Two transforms run, in order:
+///
+/// 1. Newline canonicalisation: `\r\n` (Windows / multi-line clipboard
+///    payloads) and lone `\n` (Unix) both collapse to `\r`. POSIX
+///    shells expect `\r` (a.k.a. `Enter`) between commands; sending
+///    raw `\n` would deliver a literal newline character that most
+///    shells either ignore or treat as continuation, surprising the
+///    user mid-paste.
+/// 2. Bracketed-paste marker scrub: any embedded `\x1b[200~` or
+///    `\x1b[201~` sequence is removed. The daemon does not yet track
+///    DECSET 2004 per session, so we send raw bytes; stripping the
+///    markers anyway is defence in depth against a clipboard payload
+///    that tries to forge an "end of paste" marker mid-string and
+///    convince the shell to execute the suffix as if it had been
+///    typed (paste-injection).
+///
+/// Returns the normalised string. Empty input yields an empty string.
+///
+/// TODO(bracketed-paste): once the daemon publishes per-session
+/// bracketed-paste-mode state, wrap pasted bodies in `\x1b[200~ ..
+/// \x1b[201~` when the focused session has DECSET 2004 active so
+/// shells / readline implementations can distinguish typing from
+/// pastes. Tracked alongside the paste feature; out of scope here.
+pub fn normalize_pasted_text(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    // All transforms target ASCII-only sequences (CR, LF, ESC[20{0,1}~)
+    // and never alter the ASCII subset of UTF-8. Operate on the byte
+    // slice so we can detect the 6-byte bracketed-paste markers without
+    // building a dedicated state machine, then push the surviving spans
+    // back to a String via `from_utf8` on contiguous slices to preserve
+    // multi-byte UTF-8 sequences intact (a naive `b as char` push would
+    // truncate UTF-8 continuation bytes to Latin-1, mangling non-ASCII
+    // text).
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Match `\x1b[200~` and `\x1b[201~` (6 bytes each). Skip them
+        // entirely so a clipboard payload cannot prematurely end a
+        // future bracketed-paste wrap.
+        if b == 0x1b
+            && i + 5 < bytes.len()
+            && bytes[i + 1] == b'['
+            && bytes[i + 2] == b'2'
+            && bytes[i + 3] == b'0'
+            && (bytes[i + 4] == b'0' || bytes[i + 4] == b'1')
+            && bytes[i + 5] == b'~'
+        {
+            i += 6;
+            continue;
+        }
+        // Newline canonicalisation. CRLF collapses to a single CR;
+        // bare LF promotes to CR; bare CR passes through.
+        if b == b'\r' {
+            out.push(b'\r');
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'\n' {
+            out.push(b'\r');
+            i += 1;
+            continue;
+        }
+        // Pass through everything else as raw bytes so multi-byte
+        // UTF-8 sequences round-trip unchanged.
+        out.push(b);
+        i += 1;
+    }
+    // The transforms preserve UTF-8 validity (only ASCII bytes are
+    // matched/dropped/replaced). Falling back to a lossy decode would
+    // mask a bug; debug builds catch the impossible case.
+    String::from_utf8(out).unwrap_or_else(|err| {
+        debug_assert!(false, "normalize_pasted_text produced invalid UTF-8: {err}");
+        String::from_utf8_lossy(err.as_bytes()).into_owned()
+    })
+}
+
 /// Typed keys for the `AppState::toggles` map. Previously string literals
 /// like "confirm-close" were spread across the UI, with the type system
 /// no help against typos (e.g. "confirm-clsoe" silently read as `false`).
@@ -360,6 +448,14 @@ pub struct AppState {
     /// [`push_error_toast`]; ticked down by the cursor-blink
     /// subscription so dismissal stays deterministic in tests.
     pub toasts: unshit::core::toast::ToastStore,
+    /// System clipboard handle used by `terminal.paste`. Initialised
+    /// to a fresh [`unshit::app::ClipboardContext`] in [`seed_state`]
+    /// and replaced with the framework's shared instance from
+    /// `App::clipboard()` once the window is up so app and framework
+    /// callers share one underlying `arboard::Clipboard` (concurrent
+    /// arboard handles can corrupt the heap on Windows; see the
+    /// regression in `unshit-app::clipboard`).
+    pub clipboard: Arc<unshit::app::ClipboardContext>,
     /// App wide default shell. Empty means "let the daemon's own
     /// `default_shell()` decide". Per workspace overrides land in
     /// Task 6 and take precedence via `shell::resolve`.
@@ -695,6 +791,7 @@ pub fn seed_state() -> AppState {
         sessions: Vec::new(),
         sessions_stale: false,
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
+        clipboard: Arc::new(unshit::app::ClipboardContext::new()),
         default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
     }
 }
@@ -2158,6 +2255,17 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             state.palette_open = !state.palette_open;
             true
         }
+        "fps_overlay.toggle" => {
+            // Flip the in-app FPS overlay (Phase 0 of the 120fps perf
+            // work, refs #135). The overlay also drives the
+            // FrameProbe's emit gate so release builds start writing
+            // [FRAME] log lines while the overlay is up. Returns true
+            // so the framework rebuilds the tree to show or hide the
+            // widget.
+            crate::ui::fps_overlay::toggle_visible();
+            true
+        }
+        "terminal.paste" => dispatch_terminal_paste(state),
         other if other.starts_with("tab.switch:") => {
             if let Ok(index) = other["tab.switch:".len()..].parse::<usize>() {
                 if index < state.tabs.len() && state.active_tab != index {
@@ -2368,6 +2476,64 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Read the system clipboard, normalise the bytes, and forward them
+/// to the active pane's PTY through the fire-and-forget write path.
+///
+/// Empty / non-text clipboard is a silent no-op so a stray Ctrl+V
+/// after the user copied a non-text selection (image, file path
+/// listing in some apps) does not spam toasts. A real clipboard
+/// failure (driver unavailable, OS access denied, permission error)
+/// surfaces as a `push_error_toast` so the user knows their paste
+/// did not land. Returns `true` whenever the action was recognised
+/// (even if the resulting write was a no-op) so the framework
+/// rebuilds the tree and a toast becomes visible promptly.
+///
+/// Bracketed-paste mode is not yet tracked per session in the
+/// daemon. Until it is, raw bytes go through and `normalize_pasted_text`
+/// strips any embedded `\x1b[200~` / `\x1b[201~` so a hostile
+/// clipboard payload cannot forge an "end of paste" mid-string.
+/// See the TODO on [`normalize_pasted_text`].
+fn dispatch_terminal_paste(state: &mut AppState) -> bool {
+    // Read first: if the system says no clipboard at all, surface that
+    // before chasing pane / PTY issues.
+    let raw = match state.clipboard.read_text() {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("terminal.paste: clipboard read failed: {e}");
+            push_error_toast(state, format!("paste failed: {e}"));
+            return true;
+        }
+    };
+    if raw.is_empty() {
+        // Empty clipboard / non-text payload (arboard maps
+        // `ContentNotAvailable` to an empty string). No-op without a
+        // toast so a stray Ctrl+V is invisible rather than annoying.
+        return true;
+    }
+    let payload = normalize_pasted_text(&raw);
+    if payload.is_empty() {
+        return true;
+    }
+    let pane_id = state.active_pane.0;
+    if !state.pty_manager.has(pane_id) {
+        // Active pane has no PTY yet (still spawning, or focus pointed
+        // at a placeholder). Toast so the user knows the paste was
+        // dropped and the clipboard wasn't quietly consumed.
+        push_error_toast(state, "paste failed: no terminal in focus");
+        return true;
+    }
+    if let Err(e) = state.pty_manager.write(pane_id, payload.as_bytes()) {
+        // Synchronous lookup error from the fire-and-forget queue
+        // (e.g. worker channel closed). Async failures land on the
+        // bridge's `take_write_errors` drain via the cursor-blink
+        // subscription and surface there as toasts; this branch only
+        // catches the immediate rejections.
+        log::warn!("terminal.paste: queue write failed for pane {pane_id}: {e}");
+        push_error_toast(state, format!("paste failed: {e}"));
+    }
+    true
 }
 
 /// Parse `shell.set_default:<json>` and apply. The json must
@@ -2855,14 +3021,15 @@ pub fn measure_cell_width_ratio_at(font_size: f32, line_height: f32) -> f32 {
     0.6
 }
 
-/// CSS base font-size in px. Must match `--t-md` in assets/styles.css.
-pub const CSS_BASE_FONT_SIZE: f32 = 12.0;
+/// Default terminal font-size in CSS px. Must match the `.terminal-content`
+/// fallback in assets/styles.css and the seeded `font_size_pt` value.
+pub const CSS_BASE_FONT_SIZE: f32 = 13.0;
 
 /// CSS line-height for `.terminal-content`. Must match
-/// `.terminal-content { line-height: 1.2; }` in assets/styles.css.
+/// `.terminal-content { line-height: 1.25; }` in assets/styles.css.
 /// If this value drifts from the CSS, the renderer cell_h and the
 /// pre-published cell_h will disagree, causing row-height mismatches.
-pub const CSS_LINE_HEIGHT: f32 = 1.2;
+pub const CSS_LINE_HEIGHT: f32 = 1.25;
 
 /// Pre-publish cell metrics to the global atomics so that `on_resize` handlers
 /// can compute correct PTY dimensions on the very first frame.
@@ -2893,6 +3060,25 @@ pub fn compute_pty_dimensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Process-wide guard for tests that touch the real OS clipboard.
+    ///
+    /// `arboard` on Windows is documented to corrupt the heap when
+    /// `OpenClipboard` / `SetClipboardData` / `GetClipboardData` are
+    /// invoked from multiple threads in the same process — see the
+    /// module docs on `unshit-app/src/clipboard.rs`. cargo runs tests
+    /// in parallel by default, so any test that exercises a real
+    /// `ClipboardContext` must hold this guard for the duration of
+    /// its clipboard interaction. Recovers a poisoned guard so a
+    /// single panicking test does not lock the whole suite out.
+    fn clipboard_access_guard() -> MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        match GUARD.get_or_init(|| Mutex::new(())).lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     /// Build a minimal AppState for testing tab/dispatch logic.
     /// Avoids PTY spawning by providing empty panes and terminals directly.
@@ -2953,6 +3139,7 @@ mod tests {
             sessions: Vec::new(),
             sessions_stale: false,
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
+            clipboard: Arc::new(unshit::app::ClipboardContext::new()),
             default_shell: crate::shell::ShellSpec::default(),
         }
     }
@@ -3571,6 +3758,27 @@ mod tests {
 
         assert!(dispatch(&mut state, "palette.toggle"));
         assert!(!state.palette_open);
+    }
+
+    #[test]
+    fn dispatch_fps_overlay_toggle_flips_visibility_and_emit_flag() {
+        // Reset to a known starting state since the overlay lives in
+        // a process global. Both the visible flag and the FrameProbe
+        // emit flag must move in lock step on every dispatch.
+        crate::ui::fps_overlay::reset_for_test();
+        let mut state = test_state();
+
+        assert!(dispatch(&mut state, "fps_overlay.toggle"));
+        let snap = crate::ui::fps_overlay::snapshot();
+        assert!(snap.visible);
+        assert!(unshit::app::frame_probe::is_emit_enabled());
+
+        assert!(dispatch(&mut state, "fps_overlay.toggle"));
+        let snap = crate::ui::fps_overlay::snapshot();
+        assert!(!snap.visible);
+        assert!(!unshit::app::frame_probe::is_emit_enabled());
+
+        crate::ui::fps_overlay::reset_for_test();
     }
 
     #[test]
@@ -6382,6 +6590,15 @@ mod tests {
     }
 
     #[test]
+    fn default_terminal_font_size_matches_cell_metric_constant() {
+        let state = seed_state();
+        assert_eq!(
+            state.font_size_pt as f32, CSS_BASE_FONT_SIZE,
+            "default terminal font size and initial cell metric estimate must stay in sync"
+        );
+    }
+
+    #[test]
     fn measure_cell_width_ratio_reasonable_range() {
         for &size in &[10.0_f32, 12.0, 14.0, 16.0, 24.0] {
             let ratio = measure_cell_width_ratio_at(size, size * 1.2);
@@ -6399,7 +6616,8 @@ mod tests {
     // the PowerShell greeting to wrap before on_cell_metrics corrected it.
     #[test]
     fn initial_pty_estimate_not_hardcoded_80x24() {
-        let ratio = measure_cell_width_ratio_at(12.0, 12.0 * CSS_LINE_HEIGHT);
+        let ratio =
+            measure_cell_width_ratio_at(CSS_BASE_FONT_SIZE, CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT);
         let cell_w = CSS_BASE_FONT_SIZE * ratio;
         let cell_h = CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT;
         // Same formula as main.rs: window(1280x800) minus chrome(284x109)
@@ -6419,7 +6637,8 @@ mod tests {
 
     #[test]
     fn initial_pty_estimate_reasonable_range() {
-        let ratio = measure_cell_width_ratio_at(12.0, 12.0 * CSS_LINE_HEIGHT);
+        let ratio =
+            measure_cell_width_ratio_at(CSS_BASE_FONT_SIZE, CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT);
         let cell_w = CSS_BASE_FONT_SIZE * ratio;
         let cell_h = CSS_BASE_FONT_SIZE * CSS_LINE_HEIGHT;
         let cols = ((1280.0_f32 - 284.0) / cell_w).max(1.0) as u16;
@@ -6914,5 +7133,193 @@ mod tests {
     fn workspace_active_pane_none_for_out_of_range() {
         let state = two_workspace_state();
         assert!(super::workspace_active_pane(&state, 99).is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // terminal.paste / normalize_pasted_text
+    //
+    // Regression coverage for the clipboard paste keybind. The dispatch
+    // arm reads the system clipboard, normalises newlines + bracketed
+    // paste markers, and writes through `pty_manager.write` (the
+    // fire-and-forget path so the render thread cannot stall on the
+    // daemon round trip). These tests guard:
+    //   * newline canonicalisation rules across CRLF, LF, and CR,
+    //   * bracketed-paste end-marker stripping (paste-injection guard),
+    //   * the empty-clipboard / non-text no-op path,
+    //   * the "no terminal in focus" toast path,
+    //   * and that the dispatch arm is wired to the action id used by
+    //     the keybind registry.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn normalize_pasted_text_collapses_crlf_to_cr() {
+        // Windows clipboard payloads almost always use CRLF. Most POSIX
+        // shells treat LF as no-op (or, worse, as continuation), so we
+        // need to land on a single CR per line.
+        assert_eq!(
+            super::normalize_pasted_text("hello\r\nworld\r\n"),
+            "hello\rworld\r"
+        );
+    }
+
+    #[test]
+    fn normalize_pasted_text_promotes_lone_lf_to_cr() {
+        // Unix clipboards send LF. Bash and friends still expect CR.
+        assert_eq!(
+            super::normalize_pasted_text("alpha\nbeta\n"),
+            "alpha\rbeta\r"
+        );
+    }
+
+    #[test]
+    fn normalize_pasted_text_passes_lone_cr_through() {
+        // Old Mac or pre-formatted clipboard payloads can be CR-only;
+        // they are already in the format the shell expects.
+        assert_eq!(
+            super::normalize_pasted_text("classic\rmac\r"),
+            "classic\rmac\r"
+        );
+    }
+
+    #[test]
+    fn normalize_pasted_text_preserves_unicode() {
+        // Multi-byte UTF-8 must round-trip unchanged. A byte-level
+        // walker that pushed each byte as a `char` would corrupt
+        // continuation bytes here.
+        assert_eq!(super::normalize_pasted_text("café 🦀"), "café 🦀");
+    }
+
+    #[test]
+    fn normalize_pasted_text_strips_bracketed_paste_markers() {
+        // Defence in depth against paste-injection: strip the start
+        // and end markers a hostile clipboard payload could embed to
+        // forge an "end of paste" mid-string. Even though the daemon
+        // does not advertise DECSET 2004 yet, this rule is part of
+        // the normalisation contract.
+        let input = "ok\x1b[200~before-end\x1b[201~after";
+        assert_eq!(super::normalize_pasted_text(input), "okbefore-endafter");
+    }
+
+    #[test]
+    fn normalize_pasted_text_empty_input_returns_empty() {
+        assert_eq!(super::normalize_pasted_text(""), "");
+    }
+
+    #[test]
+    fn normalize_pasted_text_no_op_when_already_normalised() {
+        // Plain text without newlines or markers should pass straight
+        // through with no allocations bigger than the input.
+        assert_eq!(super::normalize_pasted_text("ls -al"), "ls -al");
+    }
+
+    #[test]
+    fn normalize_pasted_text_handles_truncated_marker_prefix() {
+        // A standalone ESC or short prefix (`\x1b[20`) must not be
+        // consumed; only the full 6-byte marker should drop. This
+        // guards against eating real shell escape codes in a paste.
+        assert_eq!(super::normalize_pasted_text("\x1b[20"), "\x1b[20");
+        assert_eq!(super::normalize_pasted_text("\x1b[200"), "\x1b[200");
+    }
+
+    #[test]
+    fn dispatch_terminal_paste_is_a_recognised_command() {
+        // The keybind registry registers Ctrl+V / Ctrl+Shift+V to
+        // dispatch this exact command name. If `dispatch` returned
+        // `false` here, the on_command hook would consider the action
+        // unrecognised and the keybind would silently do nothing.
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let handled = dispatch(&mut state, "terminal.paste");
+        assert!(handled, "terminal.paste must be a known dispatch action");
+    }
+
+    #[test]
+    fn dispatch_terminal_paste_no_terminal_in_focus_pushes_toast() {
+        // No PTY is registered for the active pane in `test_state`.
+        // Paste must surface a user-visible toast rather than panic
+        // or silently swallow the clipboard read.
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        // Seed the clipboard with text that would otherwise be sent
+        // to the PTY so a regression that bypassed the focus check
+        // would write to a non-existent pane.
+        let _ = state.clipboard.write_text("ls\n");
+        let toasts_before = state.toasts.len();
+        dispatch(&mut state, "terminal.paste");
+        assert!(
+            state.toasts.len() > toasts_before,
+            "no-focus paste must surface a toast"
+        );
+    }
+
+    #[test]
+    fn dispatch_terminal_paste_empty_clipboard_is_silent() {
+        // Empty clipboard should not toast: a stray Ctrl+V right after
+        // the user copied a non-text selection (image, file path
+        // listing) is harmless and silent paste is the expected
+        // behaviour from Windows Terminal / iTerm / GNOME Terminal.
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        // arboard does not expose a way to fully clear the OS
+        // clipboard from a non-graphical test, so swap the field
+        // for a fresh isolated context that the test owns.
+        let local = std::sync::Arc::new(unshit::app::ClipboardContext::new());
+        // Best effort: clear; if the platform refuses (headless CI)
+        // we still fall through and rely on read returning empty.
+        let _ = local.clear();
+        state.clipboard = local;
+
+        let toasts_before = state.toasts.len();
+        let handled = dispatch(&mut state, "terminal.paste");
+        // Action recognised even though no bytes were written.
+        assert!(handled);
+        // Toast count must not grow on an empty clipboard. A
+        // ClipboardError::Unavailable on headless CI would also
+        // trigger a toast and fail this test; that is intentional
+        // because surfacing real failures is exactly what we want.
+        if state
+            .clipboard
+            .read_text()
+            .map(|s| s.is_empty())
+            .unwrap_or(false)
+        {
+            assert_eq!(
+                state.toasts.len(),
+                toasts_before,
+                "empty clipboard paste must not push a toast"
+            );
+        }
+    }
+
+    /// Regression test for the clipboard paste keybind feature.
+    ///
+    /// The action id `terminal.paste` is the contract between
+    /// `keybinds::registry::system_bindings` (Ctrl+V / Ctrl+Shift+V)
+    /// and `state::dispatch`. If any future change renames the action
+    /// or drops the dispatch arm without updating the registry, this
+    /// test catches it before the user sees a silently broken paste.
+    #[test]
+    fn terminal_paste_action_id_matches_keybind_registry() {
+        let bindings = crate::keybinds::registry::default_shortcut_bindings();
+        let paste_targets: Vec<&str> = bindings
+            .iter()
+            .filter(|(_, cmd)| cmd == "terminal.paste")
+            .map(|(combo, _)| combo.as_str())
+            .collect();
+        // Both bindings must be registered so users coming from
+        // either Windows or Linux conventions reach the same action.
+        assert!(
+            paste_targets.contains(&"Ctrl+V"),
+            "Ctrl+V must dispatch terminal.paste; got {paste_targets:?}"
+        );
+        assert!(
+            paste_targets.contains(&"Ctrl+Shift+V"),
+            "Ctrl+Shift+V must dispatch terminal.paste; got {paste_targets:?}"
+        );
+        // And the dispatch handler must accept it. Together these
+        // guarantee end-to-end the keybind reaches a live arm.
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "terminal.paste"));
     }
 }

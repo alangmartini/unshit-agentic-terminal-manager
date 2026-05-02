@@ -63,6 +63,33 @@ struct Inner {
     /// `(workspace_id, pane_id)` tuple still gets a fresh spawn.
     reattach_cache: HashMap<(u32, u32), u64>,
     worker: Option<thread::JoinHandle<()>>,
+    /// Receive end of the worker's async-write error channel. Drained
+    /// by [`DaemonPty::take_write_errors`]; the bridge polls it and
+    /// surfaces failures as toasts. Phase 2 of #135.
+    write_error_rx: std_mpsc::Receiver<WriteError>,
+}
+
+/// Failure delivered from the worker for a fire-and-forget write that
+/// the daemon could not accept. The `pane_id` is the UI-side pane the
+/// write was issued for; the worker carries it through so the bridge
+/// can mention it in the user-visible toast.
+#[derive(Debug)]
+pub struct WriteError {
+    pub pane_id: u32,
+    pub error: io::Error,
+}
+
+/// Opaque holder for the parked `cmd_rx` returned by
+/// `DaemonPty::test_install_slow_daemon_inner`. Dropping the guard
+/// closes the channel and turns subsequent `cmd_tx.send` calls into
+/// errors, so callers must keep it alive for the duration of the
+/// slow-daemon scenario. Exposed (hidden in docs) so the criterion
+/// bench in `benches/` can drive the same scenario the unit test
+/// uses without spinning up a real daemon. Callers outside this
+/// crate should not depend on it.
+#[doc(hidden)]
+pub struct SlowDaemonGuard {
+    _keep_alive: Box<dyn Send>,
 }
 
 enum Command {
@@ -88,6 +115,14 @@ enum Command {
         session_id: u64,
         bytes: Vec<u8>,
         reply: std_mpsc::SyncSender<io::Result<()>>,
+    },
+    /// Fire-and-forget variant of [`Command::Write`]. The worker
+    /// pushes failures to the shared `write_error_tx` so the UI never
+    /// blocks waiting for the daemon. Phase 2 of #135.
+    WriteAsync {
+        session_id: u64,
+        pane_id: u32,
+        bytes: Vec<u8>,
     },
     Resize {
         session_id: u64,
@@ -135,12 +170,13 @@ impl DaemonPty {
 
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel::<io::Result<()>>(1);
+        let (write_error_tx, write_error_rx) = std_mpsc::channel::<WriteError>();
         let socket_path = socket_path.to_path_buf();
 
         let worker = thread::Builder::new()
             .name("daemon-pty-worker".into())
             .spawn(move || {
-                worker_main(socket_path, cmd_rx, ready_tx);
+                worker_main(socket_path, cmd_rx, ready_tx, write_error_tx);
             })
             .map_err(io::Error::other)?;
 
@@ -151,6 +187,7 @@ impl DaemonPty {
                     sessions: HashMap::new(),
                     reattach_cache: HashMap::new(),
                     worker: Some(worker),
+                    write_error_rx,
                 });
                 // Populate the reattach cache from the daemon. A failure
                 // here (fresh-daemon case, slow daemon, transient IO)
@@ -312,7 +349,12 @@ impl DaemonPty {
         Ok((None, reader))
     }
 
-    pub fn write(&mut self, pane_id: u32, data: &[u8]) -> io::Result<()> {
+    /// Synchronous write that round-trips through the daemon and waits
+    /// for the reply. Suitable for tests, benchmarks, and any caller
+    /// that needs to know the daemon accepted the bytes before
+    /// returning. Render-thread callers MUST NOT use this; see
+    /// [`write`](Self::write) for the fire-and-forget variant.
+    pub fn write_blocking(&mut self, pane_id: u32, data: &[u8]) -> io::Result<()> {
         let inner = self.inner.as_mut().ok_or_else(not_connected)?;
         let session_id = *inner.sessions.get(&pane_id).ok_or_else(|| {
             io::Error::new(
@@ -328,6 +370,47 @@ impl DaemonPty {
         };
         inner.cmd_tx.send(cmd).map_err(|_| worker_gone())?;
         reply_rx.recv().map_err(|_| worker_gone())?
+    }
+
+    /// Fire-and-forget write. Queues the bytes on the worker's
+    /// command channel and returns immediately, without waiting for
+    /// the daemon's reply. The render thread uses this so a slow
+    /// daemon round-trip cannot stall a frame.
+    ///
+    /// Returns `Ok(())` if the command was queued and `Err(_)` only
+    /// for synchronous lookup failures (no connection, unknown pane).
+    /// Daemon-side write failures are delivered asynchronously via
+    /// [`take_write_errors`](Self::take_write_errors); the bridge
+    /// drains that queue and surfaces failures as toasts. Phase 2
+    /// of #135.
+    pub fn write(&mut self, pane_id: u32, data: &[u8]) -> io::Result<()> {
+        let inner = self.inner.as_mut().ok_or_else(not_connected)?;
+        let session_id = *inner.sessions.get(&pane_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no PTY for pane {pane_id}"),
+            )
+        })?;
+        let cmd = Command::WriteAsync {
+            session_id,
+            pane_id,
+            bytes: data.to_vec(),
+        };
+        inner.cmd_tx.send(cmd).map_err(|_| worker_gone())
+    }
+
+    /// Drain any pending fire-and-forget write failures the worker
+    /// has reported since the last call. Returns an empty vector when
+    /// the shim is not connected. Phase 2 of #135.
+    pub fn take_write_errors(&mut self) -> Vec<WriteError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(err) = inner.write_error_rx.try_recv() {
+            out.push(err);
+        }
+        out
     }
 
     pub fn resize(&mut self, pane_id: u32, cols: u16, rows: u16) {
@@ -486,12 +569,52 @@ impl DaemonPty {
         drop(cmd_rx);
         let mut sessions = HashMap::new();
         sessions.insert(pane_id, session_id);
+        let (_write_error_tx, write_error_rx) = std_mpsc::channel::<WriteError>();
         self.inner = Some(Inner {
             cmd_tx,
             sessions,
             reattach_cache: HashMap::new(),
             worker: None,
+            write_error_rx,
         });
+    }
+
+    /// Install an `Inner` whose `cmd_tx` channel is alive but whose
+    /// receiver is parked (held but never drained). Models a
+    /// worst-case "infinitely slow daemon" so unit tests and the
+    /// criterion bench in `benches/` can prove that fire-and-forget
+    /// `write` returns immediately even when the round trip never
+    /// completes. Returns an opaque guard that owns the parked
+    /// receiver (dropping it would close the channel and turn
+    /// `cmd_tx.send` into a `SendError`) and the worker-side error
+    /// sender so the caller can simulate failures.
+    ///
+    /// Marked `#[doc(hidden)]` because it is only intended for the
+    /// in-tree test and bench harnesses; outside callers should not
+    /// depend on it.
+    #[doc(hidden)]
+    pub fn test_install_slow_daemon_inner(
+        &mut self,
+        pane_id: u32,
+        session_id: u64,
+    ) -> (SlowDaemonGuard, std_mpsc::Sender<WriteError>) {
+        let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
+        let mut sessions = HashMap::new();
+        sessions.insert(pane_id, session_id);
+        let (write_error_tx, write_error_rx) = std_mpsc::channel::<WriteError>();
+        self.inner = Some(Inner {
+            cmd_tx,
+            sessions,
+            reattach_cache: HashMap::new(),
+            worker: None,
+            write_error_rx,
+        });
+        (
+            SlowDaemonGuard {
+                _keep_alive: Box::new(cmd_rx),
+            },
+            write_error_tx,
+        )
     }
 
     #[cfg(test)]
@@ -606,6 +729,7 @@ fn worker_main(
     socket_path: PathBuf,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>,
     ready: std_mpsc::SyncSender<io::Result<()>>,
+    write_error_tx: std_mpsc::Sender<WriteError>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -652,6 +776,15 @@ fn worker_main(
                     reply,
                 } => {
                     let cwd_string = cwd.map(|p| p.display().to_string());
+                    // Resolve the shell on the UI side so the daemon does
+                    // not fall back to its own (potentially stale) default.
+                    // The UI binary is rebuilt on every `cargo run`; the
+                    // daemon survives across UI restarts. When the caller
+                    // supplied an explicit shell (per-app or per-workspace
+                    // setting from #144) we honour it; otherwise we resolve
+                    // a sane default here so PowerShell / bash selection
+                    // tracks the latest UI binary.
+                    let shell = shell.or_else(|| Some(unshit_ptyd::pty::default_shell()));
                     let result = match client
                         .spawn_session(
                             cols,
@@ -725,6 +858,29 @@ fn worker_main(
                         Err(other) => Err(io::Error::other(other.to_string())),
                     };
                     let _ = reply.send(result);
+                }
+                Command::WriteAsync {
+                    session_id,
+                    pane_id,
+                    bytes,
+                } => {
+                    let result: io::Result<()> = match client.write(session_id, bytes).await {
+                        Ok(Response::Ack { .. }) => Ok(()),
+                        Ok(Response::Error { code, message, .. }) => {
+                            Err(io::Error::other(format!("{code}: {message}")))
+                        }
+                        Ok(other) => Err(io::Error::other(format!("unexpected: {other:?}"))),
+                        Err(ProtocolError::Io(e)) => Err(e),
+                        Err(other) => Err(io::Error::other(other.to_string())),
+                    };
+                    if let Err(e) = result {
+                        log::warn!(
+                            "DaemonPty::write (async) failed for pane {}: {}",
+                            pane_id,
+                            e
+                        );
+                        let _ = write_error_tx.send(WriteError { pane_id, error: e });
+                    }
                 }
                 Command::Resize {
                     session_id,
@@ -881,8 +1037,12 @@ mod tests {
             Ok(_) => panic!("spawn_in on unconnected shim must fail"),
         };
         assert_eq!(spawn_in_err.kind(), io::ErrorKind::NotConnected);
-        let write_err = shim.write(1, b"hi").unwrap_err();
+        let write_err = shim.write_blocking(1, b"hi").unwrap_err();
         assert_eq!(write_err.kind(), io::ErrorKind::NotConnected);
+        // The fire-and-forget variant uses the same error contract for
+        // synchronous lookup failures.
+        let write_async_err = shim.write(1, b"hi").unwrap_err();
+        assert_eq!(write_async_err.kind(), io::ErrorKind::NotConnected);
         let list_err = shim.list_sessions().unwrap_err();
         assert_eq!(list_err.kind(), io::ErrorKind::NotConnected);
         let attach_or_spawn_err = match shim.attach_or_spawn(1, 1, 80, 24, None, None) {
@@ -938,7 +1098,7 @@ mod tests {
                 .expect("spawn_in");
             assert!(shim.has(pane_id));
 
-            shim.write(pane_id, ECHO_CMD).expect("write");
+            shim.write_blocking(pane_id, ECHO_CMD).expect("write");
 
             let deadline = std::time::Instant::now() + Duration::from_millis(1500);
             let mut collected: Vec<u8> = Vec::new();
@@ -1076,7 +1236,8 @@ mod tests {
 
             // Writing through the attached pane must reach the same
             // session and the live reader must see SOMETHING back.
-            shim.write(200, ECHO_CMD).expect("write via attached pane");
+            shim.write_blocking(200, ECHO_CMD)
+                .expect("write via attached pane");
             let deadline = std::time::Instant::now() + Duration::from_millis(1500);
             let mut collected: Vec<u8> = Vec::new();
             let mut buf = [0u8; 4096];
@@ -1126,7 +1287,8 @@ mod tests {
             assert!(shim.has(300));
 
             // write + resize on the attached pane must not error.
-            shim.write(300, ECHO_CMD).expect("write via attached pane");
+            shim.write_blocking(300, ECHO_CMD)
+                .expect("write via attached pane");
             shim.resize(300, 120, 40);
 
             // And the route is live: drain briefly, assert bytes flow.
@@ -1403,5 +1565,84 @@ mod tests {
 
         daemon.abort();
         let _ = daemon.await;
+    }
+
+    // refs #135 Phase 2: fire-and-forget write must return immediately
+    // regardless of how slow the daemon side is. The slow daemon is
+    // simulated by a parked `cmd_rx` that never consumes anything; the
+    // call should still return in well under 100us per write because
+    // `cmd_tx.send` on an unbounded tokio channel is non-blocking.
+    #[test]
+    fn write_returns_immediately_even_when_daemon_is_infinitely_slow() {
+        let mut shim = DaemonPty::new();
+        let (_guard, _parked_err_tx) = shim.test_install_slow_daemon_inner(7, 42);
+
+        // Sample a batch of writes and assert the per-call cost stays
+        // far below the 100us frame-budget guideline. We use 100 calls
+        // so a one-off OS scheduling hiccup does not flake the test;
+        // an average over 100 cleanly distinguishes microseconds (the
+        // queue-on-channel cost) from milliseconds (a sync IPC round
+        // trip on the render thread).
+        let n = 100u32;
+        let payload = b"x";
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            shim.write(7, payload).expect("write must queue");
+        }
+        let elapsed = start.elapsed();
+        let per_call = elapsed / n;
+        assert!(
+            per_call < Duration::from_micros(100),
+            "fire-and-forget write took {per_call:?} per call (over 100 calls); \
+             must be << 100us so it cannot block the render thread"
+        );
+    }
+
+    // refs #135 Phase 2: synchronous lookup failure (unknown pane)
+    // must still return an error from `write` so the caller does not
+    // silently no-op.
+    #[test]
+    fn write_returns_not_found_when_pane_unknown() {
+        let mut shim = DaemonPty::new();
+        let (_guard, _parked_err_tx) = shim.test_install_slow_daemon_inner(7, 42);
+        let err = shim.write(999, b"hi").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    // refs #135 Phase 2: when the worker reports an async-write
+    // failure, it lands on the shared error queue and surfaces via
+    // `take_write_errors`, NOT via `write`'s return value.
+    #[test]
+    fn write_failures_surface_via_take_write_errors_queue() {
+        let mut shim = DaemonPty::new();
+        let (_guard, parked_err_tx) = shim.test_install_slow_daemon_inner(7, 42);
+        // Simulate the worker noticing a failed write for pane 7. In
+        // production this happens inside the `Command::WriteAsync`
+        // branch of `worker_main`. Here we drive it directly so the
+        // test does not need a live daemon.
+        parked_err_tx
+            .send(WriteError {
+                pane_id: 7,
+                error: io::Error::new(io::ErrorKind::BrokenPipe, "daemon died"),
+            })
+            .expect("error channel must be alive");
+
+        // The `write` call itself succeeded (it queued the bytes) and
+        // does not surface async failures. Failures arrive only via
+        // the drain method.
+        shim.write(7, b"hi").expect("queue must succeed");
+        let errors = shim.take_write_errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].pane_id, 7);
+        assert_eq!(errors[0].error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    // refs #135 Phase 2: `take_write_errors` is safe to call before
+    // `connect_to` and returns an empty vec rather than panicking.
+    #[test]
+    fn take_write_errors_on_unconnected_shim_returns_empty() {
+        let mut shim = DaemonPty::new();
+        let errors = shim.take_write_errors();
+        assert!(errors.is_empty());
     }
 }

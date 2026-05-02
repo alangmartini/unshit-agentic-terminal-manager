@@ -1288,9 +1288,7 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         }
         "border-color" => StyleDeclaration::BorderColor(parse_color(parser)?),
         "border-width" => StyleDeclaration::BorderWidth(parse_edges(parser)?),
-        "border-top-width" => {
-            StyleDeclaration::BorderSideWidth(BorderSide::Top, parse_px(parser)?)
-        }
+        "border-top-width" => StyleDeclaration::BorderSideWidth(BorderSide::Top, parse_px(parser)?),
         "border-right-width" => {
             StyleDeclaration::BorderSideWidth(BorderSide::Right, parse_px(parser)?)
         }
@@ -2133,11 +2131,9 @@ fn parse_linear_gradient(parser: &mut Parser) -> Result<types::LinearGradient, (
                             // Consume one or two side keywords.
                             let a = p.expect_ident_cloned().map_err(|_| ())?;
                             let b = p.try_parse(|p| p.expect_ident_cloned()).ok();
-                            let degrees = sides_to_angle_deg(
-                                a.as_ref(),
-                                b.as_ref().map(|s| s.as_ref()),
-                            )
-                            .ok_or(())?;
+                            let degrees =
+                                sides_to_angle_deg(a.as_ref(), b.as_ref().map(|s| s.as_ref()))
+                                    .ok_or(())?;
                             p.expect_comma().map_err(|_| ())?;
                             Ok(degrees)
                         }
@@ -2184,39 +2180,19 @@ fn sides_to_angle_deg(a: &str, b: Option<&str>) -> Option<f32> {
         None => side_deg(a),
         Some(b_str) => {
             // Accept vertical + horizontal in either order.
-            let vertical = matches!(
-                a.to_ascii_lowercase().as_str(),
-                "top" | "bottom"
-            ) || matches!(
-                b_str.to_ascii_lowercase().as_str(),
-                "top" | "bottom"
-            );
-            let horizontal = matches!(
-                a.to_ascii_lowercase().as_str(),
-                "left" | "right"
-            ) || matches!(
-                b_str.to_ascii_lowercase().as_str(),
-                "left" | "right"
-            );
+            let vertical = matches!(a.to_ascii_lowercase().as_str(), "top" | "bottom")
+                || matches!(b_str.to_ascii_lowercase().as_str(), "top" | "bottom");
+            let horizontal = matches!(a.to_ascii_lowercase().as_str(), "left" | "right")
+                || matches!(b_str.to_ascii_lowercase().as_str(), "left" | "right");
             if !(vertical && horizontal) {
                 return None;
             }
             // Corner angles: top right=45, bottom right=135, bottom left=225,
             // top left=315.
-            let is_top = matches!(
-                a.to_ascii_lowercase().as_str(),
-                "top"
-            ) || matches!(
-                b_str.to_ascii_lowercase().as_str(),
-                "top"
-            );
-            let is_right = matches!(
-                a.to_ascii_lowercase().as_str(),
-                "right"
-            ) || matches!(
-                b_str.to_ascii_lowercase().as_str(),
-                "right"
-            );
+            let is_top = matches!(a.to_ascii_lowercase().as_str(), "top")
+                || matches!(b_str.to_ascii_lowercase().as_str(), "top");
+            let is_right = matches!(a.to_ascii_lowercase().as_str(), "right")
+                || matches!(b_str.to_ascii_lowercase().as_str(), "right");
             match (is_top, is_right) {
                 (true, true) => Some(45.0),
                 (false, true) => Some(135.0),
@@ -2282,9 +2258,7 @@ fn parse_transform_translate_x(parser: &mut Parser) -> Option<types::TransformX>
                 {
                     Ok(types::TransformX::Px(*value))
                 }
-                Ok(Token::Number { value, .. }) if *value == 0.0 => {
-                    Ok(types::TransformX::Px(0.0))
-                }
+                Ok(Token::Number { value, .. }) if *value == 0.0 => Ok(types::TransformX::Px(0.0)),
                 _ => Err(p.new_custom_error(())),
             }
         })
@@ -6233,11 +6207,7 @@ mod tests {
         // oklch(0.65 50% 145) must equal oklch(0.65 0.2 145).
         let pct = parse_single_color("oklch(0.65 50% 145)").expect("percent parse");
         let num = parse_single_color("oklch(0.65 0.2 145)").expect("number parse");
-        assert_eq!(
-            (pct.r, pct.g, pct.b),
-            (num.r, num.g, num.b),
-            "oklch chroma 50% must equal 0.2"
-        );
+        assert_eq!((pct.r, pct.g, pct.b), (num.r, num.g, num.b), "oklch chroma 50% must equal 0.2");
     }
 
     #[test]
@@ -6261,10 +6231,7 @@ mod tests {
     fn oklch_rejects_malformed_input() {
         assert!(parse_single_color("oklch()").is_none(), "oklch() is invalid");
         assert!(parse_single_color("oklch(0.5)").is_none(), "oklch missing C and H is invalid");
-        assert!(
-            parse_single_color("oklch(0.5 0.1)").is_none(),
-            "oklch missing H is invalid"
-        );
+        assert!(parse_single_color("oklch(0.5 0.1)").is_none(), "oklch missing H is invalid");
     }
 
     #[test]

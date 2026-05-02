@@ -48,7 +48,10 @@ fn red_circle_svg() -> SvgNode {
     };
     SvgNode {
         primitive: SvgPrimitive::Group,
-        attrs: SvgAttrs { view_box: Some(ViewBox::new(0.0, 0.0, 32.0, 32.0)), ..Default::default() },
+        attrs: SvgAttrs {
+            view_box: Some(ViewBox::new(0.0, 0.0, 32.0, 32.0)),
+            ..Default::default()
+        },
         children: vec![circle],
     }
 }

@@ -87,9 +87,14 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                 });
 
                 // Drain channel and feed bytes to the terminal emulator.
-                // Batch all buffered chunks into a single rebuild to avoid
-                // triggering one full tree-rebuild per PTY read (the framework
-                // does not coalesce RequestRebuild events).
+                // Batch all buffered chunks into a single rebuild so we
+                // pay one VTE parse pass per drain rather than one per
+                // PTY read. The framework also collapses any number of
+                // RequestRebuild events that arrive in the same drain
+                // window into a single rebuild
+                // (see `RebuildCoalescer` in `unshit-app/src/app.rs`),
+                // but draining here keeps the per pane terminal mutex
+                // hold time bounded.
                 //
                 // Acquire the state mutex only to look up the per-pane
                 // Terminal handle, then release it before running the VTE
@@ -106,7 +111,7 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                     };
 
                     let mut batched = 1u32;
-                    {
+                    let pending_response = {
                         let mut terminal = terminal_handle.lock_recover();
                         terminal.process_bytes(&data);
                         while let Ok(more) = rx.try_recv() {
@@ -128,6 +133,22 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                                 rows.get(3).cloned().unwrap_or_default(),
                             ));
                         }
+                        terminal.take_pending_response()
+                    };
+                    if !pending_response.is_empty() {
+                        // Reply to host queries (DA1, DA2, DSR, CPR,
+                        // XTVERSION) the parser collected. Done outside
+                        // the per-terminal mutex; the write is fire and
+                        // forget through the daemon shim.
+                        let mut guard = shared.lock_recover();
+                        if let Err(e) = guard.pty_manager.write(pane_id, &pending_response) {
+                            log::warn!(
+                                "pty-{}: failed to write {} bytes of query reply: {}",
+                                pane_id,
+                                pending_response.len(),
+                                e
+                            );
+                        }
                     }
                     if batched > 1 {
                         log::debug!("pty-{}: batched {} chunks into 1 rebuild", pane_id, batched);
@@ -139,51 +160,93 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
     ))
 }
 
-/// Cursor blink and deferred PTY spawn subscription.
+/// Cursor focus, toast bookkeeping, and deferred PTY spawn subscription.
 ///
-/// Every 500ms: toggles cursor visibility on the active pane. On the first
-/// tick where the renderer has published valid cell metrics, spawns PTYs
-/// for any panes that do not yet have a terminal (the initial pane) and
-/// resizes any that already exist.
+/// Runs every 500 ms. Each tick:
+///   * Sets `cursor_visible` to "this pane owns the focused cursor" for
+///     the active pane and clears it on the others. The actual blink
+///     animation is now driven by the renderer's global blink phase
+///     clock (#135 Phase 1, item 2), so this flag is one shot per focus
+///     change rather than a 2 Hz toggle.
+///   * Advances toast lifetimes and drains fire and forget PTY write
+///     errors into user visible toasts.
+///   * Spawns any deferred PTYs once the renderer publishes valid cell
+///     metrics.
+///
+/// Yields `RequestRedraw` (not `RequestRebuild`) on every tick so the
+/// renderer's blink phase animation always reaches the screen, then
+/// upgrades to `RequestRebuild` only when something actually changed
+/// the UI tree (new toast, focus state flip, deferred spawn). Cursor
+/// blink alone never triggers a tree rebuild after this change.
 fn cursor_blink_subscription(shared: SharedState) -> Subscription {
     Subscription::new(
         "cursor-blink".to_string(),
         move |_sink: EventSink| -> Pin<Box<dyn Stream<Item = ExternalEvent> + Send>> {
             let shared = shared.clone();
             Box::pin(async_stream::stream! {
-                let mut visible = true;
                 let mut synced = false;
+                let mut last_focus_signature: Option<(u32, bool)> = None;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    visible = !visible;
+                    let mut needs_rebuild = false;
                     {
                         let mut guard = shared.lock_recover();
 
-                        // Cursor blink: active pane blinks when focused,
-                        // shows steady cursor when window is unfocused.
-                        // Inactive panes never show a cursor.
+                        // Per pane cursor focus: the active pane shows the
+                        // cursor (the renderer animates the blink phase
+                        // from a global clock); inactive panes never do.
+                        // This loop only mutates state when focus actually
+                        // changes, so steady state is a no op.
                         let active_id = guard.active_pane.0;
                         let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
-                        for (&id, terminal_handle) in guard.terminals.iter() {
-                            let mut terminal = terminal_handle.lock_recover();
-                            if id == active_id {
-                                if win_focused {
-                                    terminal.grid_mut().set_cursor_visible(visible);
-                                } else {
-                                    terminal.grid_mut().set_cursor_visible(true);
+                        let signature = (active_id, win_focused);
+                        if last_focus_signature != Some(signature) {
+                            for (&id, terminal_handle) in guard.terminals.iter() {
+                                let mut terminal = terminal_handle.lock_recover();
+                                let should_show = id == active_id;
+                                if terminal.grid().cursor_visible() != should_show {
+                                    terminal.grid_mut().set_cursor_visible(should_show);
                                 }
-                            } else {
-                                terminal.grid_mut().set_cursor_visible(false);
                             }
+                            last_focus_signature = Some(signature);
+                            // A focus change is observable in the tree
+                            // (e.g. focused pane border styling), so
+                            // promote this tick to a full rebuild.
+                            needs_rebuild = true;
                         }
 
                         // Toast lifetimes are tick-driven from this same
                         // 500 ms cadence. ToastStore::with_capacity(_, 8)
-                        // gives ~4 s before auto-dismiss. The ids of any
-                        // dismissed toasts are intentionally ignored; the
-                        // snapshot path picks up the new state on the
-                        // next render.
-                        let _ = guard.toasts.advance_ticks(1);
+                        // gives ~4 s before auto-dismiss. We rebuild only
+                        // if a toast was actually dismissed so a quiet
+                        // toast queue does not keep waking the tree.
+                        let dismissed = guard.toasts.advance_ticks(1);
+                        if !dismissed.is_empty() {
+                            needs_rebuild = true;
+                        }
+
+                        // Drain any fire-and-forget PTY write failures
+                        // the worker has reported since the last tick
+                        // (Phase 2 of #135). The render thread never
+                        // waits for daemon acks anymore, so failures
+                        // surface here as user-visible toasts. 500 ms
+                        // latency is acceptable for an error message;
+                        // it matches the existing toast tick cadence.
+                        let write_errors = guard.pty_manager.take_write_errors();
+                        if !write_errors.is_empty() {
+                            needs_rebuild = true;
+                        }
+                        for err in write_errors {
+                            log::warn!(
+                                "pty write failed for pane {}: {}",
+                                err.pane_id,
+                                err.error
+                            );
+                            crate::state::push_error_toast(
+                                &mut guard,
+                                format!("write failed (pane {}): {}", err.pane_id, err.error),
+                            );
+                        }
 
                         // Deferred PTY spawn and dimension sync.
                         // Wait until the renderer has published real cell
@@ -311,10 +374,23 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                         t.lock_recover().resize(rows as usize, cols as usize);
                                     }
                                 }
+                                // Deferred spawn introduces new terminal
+                                // handles into the tree; the next frame
+                                // must rebuild to mount the matching grid.
+                                needs_rebuild = true;
                             }
                         }
                     }
-                    yield ExternalEvent::RequestRebuild;
+                    if needs_rebuild {
+                        yield ExternalEvent::RequestRebuild;
+                    } else {
+                        // Cursor blink alone never rebuilds the tree
+                        // (#135 Phase 1 exit criterion). The renderer
+                        // animates the global blink phase from elapsed
+                        // time, so a cheap repaint is all we need to
+                        // make the cursor visibly toggle on screen.
+                        yield ExternalEvent::RequestRedraw;
+                    }
                 }
             })
         },
@@ -324,6 +400,15 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
 /// Subscription that periodically checks for renderer-computed pending
 /// resizes and applies them to all terminals. Runs every 100ms for quick
 /// response to window resize events.
+///
+/// PTY dimension sync is not user perceptible at the millisecond level
+/// (the cell grid count flipping from 80 to 81 cols is invisible until
+/// the next character lands), so this subscription yields
+/// `RequestRedraw` rather than `RequestRebuild` (#135 Phase 1, item 3).
+/// The next paint reads the new grid dimensions directly from the
+/// `CellGrid` and reflows without a tree reconciliation. A real PTY
+/// chunk landing in the new dimensions will request a rebuild via
+/// `pty_subscription` on its own.
 fn resize_poll_subscription(shared: SharedState) -> Subscription {
     Subscription::new(
         "resize-poll",
@@ -345,7 +430,7 @@ fn resize_poll_subscription(shared: SharedState) -> Subscription {
                                 }
                             }
                         } // guard drops before yield
-                        yield ExternalEvent::RequestRebuild;
+                        yield ExternalEvent::RequestRedraw;
                     }
                 }
             })

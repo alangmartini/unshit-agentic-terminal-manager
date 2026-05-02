@@ -42,6 +42,11 @@ pub struct Terminal {
     grid: CellGrid,
     cursor_row: usize,
     cursor_col: usize,
+    /// Delayed autowrap state. When a printable lands in the last
+    /// column, real terminals leave the cursor on that cell and wrap
+    /// only before the next printable character. Full-width TUI rules
+    /// depend on this to avoid creating phantom rows.
+    wrap_pending: bool,
     saved_cursor: (usize, usize),
     fg: Color,
     bg: Color,
@@ -54,7 +59,40 @@ pub struct Terminal {
     scrollback: VecDeque<Vec<Cell>>,
     /// How many lines the user has scrolled back (0 = at bottom / live).
     scroll_offset: usize,
+    /// When the alternate screen buffer is active, this holds the
+    /// previously-active main screen so it can be swapped back on exit
+    /// (DEC private mode 1049 / 47 / 1047). `None` means the main
+    /// screen is currently in `grid`.
+    alt_grid: Option<CellGrid>,
+    /// Cursor position saved by the alt-screen entry sequence. Kept
+    /// separate from `saved_cursor` (DECSC) so a TUI nesting `ESC 7` /
+    /// `ESC 8` inside the alt screen cannot trample the slot used to
+    /// restore the cursor on `?1049l` exit.
+    alt_saved_cursor: (usize, usize),
+    /// SGR foreground saved on alt-screen entry; restored on exit.
+    alt_saved_fg: Color,
+    /// SGR background saved on alt-screen entry; restored on exit.
+    alt_saved_bg: Color,
+    /// SGR attribute flags saved on alt-screen entry; restored on exit.
+    alt_saved_attrs: CellAttrs,
+    /// Top of the active scroll region (inclusive), zero-indexed.
+    /// Half-open with `scroll_bot`: the region is `[scroll_top, scroll_bot)`.
+    /// Default is 0; DECSTBM (`CSI <top>;<bot> r`) overrides it.
+    scroll_top: usize,
+    /// Bottom of the active scroll region (exclusive), zero-indexed.
+    /// Default is `rows` (full screen). DECSTBM updates it; resize
+    /// clamps it back when the previous region no longer fits.
+    scroll_bot: usize,
+    /// Bytes the parser produced as a reply to a host query (DA1, DA2,
+    /// DSR, CPR, XTVERSION, ...). The bridge subscription drains this
+    /// after every `process_bytes` and writes it back to the PTY so
+    /// TUIs that probe terminal capabilities (Claude Code, vim, fzf)
+    /// see a real terminal and pick their full-feature rendering path
+    /// instead of falling back to a defensive minimal layout.
+    pending_response: Vec<u8>,
 }
+
+const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
 
 /// Default foreground: warm amber.
 const DEFAULT_FG: Color = Color {
@@ -64,6 +102,116 @@ const DEFAULT_FG: Color = Color {
     a: 255,
 };
 
+/// Calibrated foreground for Windows Terminal parity screenshots.
+///
+/// Windows Terminal's Campbell foreground setting is `#cccccc`, but this
+/// renderer's atlas/blending path lands closer to WT captures with `#c4c4c4`.
+const WINDOWS_TERMINAL_PARITY_DEFAULT_FG: Color = Color {
+    r: 196,
+    g: 196,
+    b: 196,
+    a: 255,
+};
+
+const WINDOWS_TERMINAL_ANSI_16: [Color; 16] = [
+    Color {
+        r: 12,
+        g: 12,
+        b: 12,
+        a: 255,
+    },
+    Color {
+        r: 197,
+        g: 15,
+        b: 31,
+        a: 255,
+    },
+    Color {
+        r: 19,
+        g: 161,
+        b: 14,
+        a: 255,
+    },
+    Color {
+        r: 193,
+        g: 156,
+        b: 0,
+        a: 255,
+    },
+    Color {
+        r: 0,
+        g: 55,
+        b: 218,
+        a: 255,
+    },
+    Color {
+        r: 136,
+        g: 23,
+        b: 152,
+        a: 255,
+    },
+    Color {
+        r: 58,
+        g: 150,
+        b: 221,
+        a: 255,
+    },
+    Color {
+        r: 204,
+        g: 204,
+        b: 204,
+        a: 255,
+    },
+    Color {
+        r: 118,
+        g: 118,
+        b: 118,
+        a: 255,
+    },
+    Color {
+        r: 231,
+        g: 72,
+        b: 86,
+        a: 255,
+    },
+    Color {
+        r: 22,
+        g: 198,
+        b: 12,
+        a: 255,
+    },
+    Color {
+        r: 249,
+        g: 241,
+        b: 165,
+        a: 255,
+    },
+    Color {
+        r: 59,
+        g: 120,
+        b: 255,
+        a: 255,
+    },
+    Color {
+        r: 180,
+        g: 0,
+        b: 158,
+        a: 255,
+    },
+    Color {
+        r: 97,
+        g: 214,
+        b: 214,
+        a: 255,
+    },
+    Color {
+        r: 242,
+        g: 242,
+        b: 242,
+        a: 255,
+    },
+];
+
 /// Default background: fully transparent black.
 const DEFAULT_BG: Color = Color {
     r: 0,
@@ -71,6 +219,92 @@ const DEFAULT_BG: Color = Color {
     b: 0,
     a: 0,
 };
+
+fn parity_windows_terminal_colors_enabled() -> bool {
+    std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            let normalized = v.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn default_fg_for_parity(enabled: bool) -> Color {
+    if enabled {
+        WINDOWS_TERMINAL_PARITY_DEFAULT_FG
+    } else {
+        DEFAULT_FG
+    }
+}
+
+fn default_fg() -> Color {
+    default_fg_for_parity(parity_windows_terminal_colors_enabled())
+}
+
+fn default_bg() -> Color {
+    DEFAULT_BG
+}
+
+fn ansi_16_color_for_parity(index: usize, enabled: bool) -> Color {
+    if enabled {
+        WINDOWS_TERMINAL_ANSI_16[index]
+    } else {
+        ANSI_16[index]
+    }
+}
+
+fn ansi_16_fg_color_for_parity(index: usize, enabled: bool) -> Color {
+    let color = ansi_16_color_for_parity(index, enabled);
+    if !enabled {
+        return color;
+    }
+
+    match index {
+        // Foreground text goes through glyph coverage/blending; keep neutral
+        // foregrounds calibrated separately from literal background swatches.
+        7 => WINDOWS_TERMINAL_PARITY_DEFAULT_FG,
+        8 => Color {
+            r: 114,
+            g: 114,
+            b: 114,
+            a: 255,
+        },
+        _ => color,
+    }
+}
+
+fn ansi_16_fg_color(index: usize) -> Color {
+    ansi_16_fg_color_for_parity(index, parity_windows_terminal_colors_enabled())
+}
+
+fn ansi_16_color(index: usize) -> Color {
+    ansi_16_color_for_parity(index, parity_windows_terminal_colors_enabled())
+}
+
+fn fg_color_256_for_parity_with_profile(index: u8, parity_enabled: bool) -> Color {
+    if index < 16 {
+        ansi_16_fg_color_for_parity(index as usize, parity_enabled)
+    } else {
+        color_256(index)
+    }
+}
+
+fn bg_color_256_for_parity_with_profile(index: u8, parity_enabled: bool) -> Color {
+    if index < 16 {
+        ansi_16_color_for_parity(index as usize, parity_enabled)
+    } else {
+        color_256(index)
+    }
+}
+
+fn fg_color_256_for_parity(index: u8) -> Color {
+    fg_color_256_for_parity_with_profile(index, parity_windows_terminal_colors_enabled())
+}
+
+fn bg_color_256_for_parity(index: u8) -> Color {
+    bg_color_256_for_parity_with_profile(index, parity_windows_terminal_colors_enabled())
+}
 
 impl Terminal {
     /// Create a new terminal emulator with the given dimensions.
@@ -82,9 +316,10 @@ impl Terminal {
             grid: CellGrid::new(rows, cols),
             cursor_row: 0,
             cursor_col: 0,
+            wrap_pending: false,
             saved_cursor: (0, 0),
-            fg: DEFAULT_FG,
-            bg: DEFAULT_BG,
+            fg: default_fg(),
+            bg: default_bg(),
             attrs: CellAttrs::empty(),
             parser: vte::Parser::new(),
             rows,
@@ -92,7 +327,22 @@ impl Terminal {
             title: String::new(),
             scrollback: VecDeque::new(),
             scroll_offset: 0,
+            alt_grid: None,
+            alt_saved_cursor: (0, 0),
+            alt_saved_fg: default_fg(),
+            alt_saved_bg: default_bg(),
+            alt_saved_attrs: CellAttrs::empty(),
+            scroll_top: 0,
+            scroll_bot: rows,
+            pending_response: Vec::new(),
         }
+    }
+
+    /// Drain bytes the parser queued as a host-query reply. The bridge
+    /// calls this after `process_bytes` to forward the reply over the
+    /// PTY back to the running TUI.
+    pub fn take_pending_response(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_response)
     }
 
     /// Feed raw bytes (from PTY output) through the VTE parser.
@@ -150,25 +400,85 @@ impl Terminal {
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let old_rows = self.rows;
 
+        // The bottom-anchored reflow (lift scrollback / evict to
+        // scrollback) only applies to the *main* grid: alt screens have
+        // no scrollback and no concept of reflow. While the alt screen
+        // is active, swap the parked main back in so the reflow runs on
+        // the right grid, then swap the alt back into place and resize
+        // it as a plain buffer.
+        let alt_active = self.alt_grid.is_some();
+        if alt_active {
+            if let Some(alt) = self.alt_grid.take() {
+                let mut prev = alt;
+                std::mem::swap(&mut self.grid, &mut prev);
+                // `prev` now holds the alt-screen contents.
+                self.alt_grid = Some(prev);
+            }
+        }
+
         if rows > old_rows {
             let k = rows - old_rows;
             self.grow_rows_lifting_scrollback(k);
-            self.cursor_row += k;
+            // The cursor on the parked main was saved into
+            // `alt_saved_cursor` on entry; bump it so it stays anchored
+            // to the same content row after the lift.
+            if alt_active {
+                self.alt_saved_cursor.0 += k;
+            } else {
+                self.cursor_row += k;
+            }
         } else if rows < old_rows {
             let k = old_rows - rows;
-            let evict_above = k.min(self.cursor_row);
+            let cursor_for_eviction = if alt_active {
+                self.alt_saved_cursor.0
+            } else {
+                self.cursor_row
+            };
+            let evict_above = k.min(cursor_for_eviction);
             if evict_above > 0 {
                 self.shrink_rows_evicting_to_scrollback(evict_above);
-                self.cursor_row -= evict_above;
+                if alt_active {
+                    self.alt_saved_cursor.0 -= evict_above;
+                } else {
+                    self.cursor_row -= evict_above;
+                }
             }
         }
 
         self.grid.resize(rows, cols);
+        // Swap the alt buffer back on top and resize it plainly.
+        if alt_active {
+            if let Some(mut main) = self.alt_grid.take() {
+                std::mem::swap(&mut self.grid, &mut main);
+                // `main` now holds the resized main; `self.grid` holds
+                // the alt buffer at its old size. Resize alt and stash
+                // the resized main.
+                self.grid.resize(rows, cols);
+                self.alt_grid = Some(main);
+            }
+        }
+
         self.rows = rows;
         self.cols = cols;
 
+        // Clamp the scroll region to the new row count. If the previous
+        // region no longer fits (top out of range, or top >= bot), reset
+        // to full-screen so subsequent scrolls behave as if no DECSTBM
+        // was set. Half-open: `[scroll_top, scroll_bot)`.
+        if self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot {
+            self.scroll_top = 0;
+            self.scroll_bot = rows;
+        }
+
+        // Clamp both the live cursor (alt-screen cursor when alt active,
+        // main-screen cursor otherwise) and the parked save slot.
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        self.wrap_pending = false;
+        if alt_active {
+            self.alt_saved_cursor.0 = self.alt_saved_cursor.0.min(rows.saturating_sub(1));
+            self.alt_saved_cursor.1 = self.alt_saved_cursor.1.min(cols.saturating_sub(1));
+        }
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
@@ -230,6 +540,18 @@ impl Terminal {
             self.rows = rows;
             self.cols = cols;
             self.grid.resize(rows, cols);
+            if let Some(alt) = self.alt_grid.as_mut() {
+                alt.resize(rows, cols);
+            }
+            // The previous scroll region may no longer fit; reset to full
+            // screen so the snapshot's view starts from a clean slate.
+            if self.scroll_top >= rows
+                || self.scroll_bot > rows
+                || self.scroll_top >= self.scroll_bot
+            {
+                self.scroll_top = 0;
+                self.scroll_bot = rows;
+            }
         }
         for r in 0..rows {
             for c in 0..cols {
@@ -241,6 +563,7 @@ impl Terminal {
         let (cur_row, cur_col) = snapshot.grid.cursor();
         self.cursor_row = cur_row.min(rows.saturating_sub(1));
         self.cursor_col = cur_col.min(cols.saturating_sub(1));
+        self.wrap_pending = false;
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
         self.grid.set_cursor_visible(snapshot.grid.cursor_visible());
 
@@ -366,25 +689,70 @@ impl Terminal {
 
     // -- helpers --------------------------------------------------------------
 
-    /// Scroll the grid up by one line. The top row is saved to the
-    /// scrollback buffer before it is lost.
-    fn scroll_up(&mut self) {
-        // Capture the top row before it scrolls off.
-        let mut row = Vec::with_capacity(self.cols);
-        for col in 0..self.cols {
-            row.push(self.grid.get_cell(0, col).copied().unwrap_or_default());
-        }
-        self.scrollback.push_back(row);
-        if self.scrollback.len() > MAX_SCROLLBACK {
-            self.scrollback.pop_front();
-        }
-
-        self.grid.scroll_up(1);
-        self.clear_row(self.rows.saturating_sub(1));
+    fn clear_pending_wrap(&mut self) {
+        self.wrap_pending = false;
     }
 
-    /// Scroll the grid down by one line. Moves all rows down and clears the
-    /// top row.
+    fn wrap_to_next_line(&mut self) {
+        self.cursor_col = 0;
+        if self.cursor_row + 1 == self.scroll_bot {
+            self.scroll_up();
+        } else if self.cursor_row + 1 < self.rows {
+            self.cursor_row += 1;
+        } else {
+            self.cursor_row = self.rows.saturating_sub(1);
+        }
+        self.wrap_pending = false;
+    }
+
+    fn prepare_for_printable(&mut self) {
+        if self.wrap_pending {
+            self.wrap_to_next_line();
+        }
+    }
+
+    /// `true` when the active scroll region covers the full screen.
+    /// Used by `scroll_up` to decide whether the evicted top row should
+    /// be pushed into scrollback. A DECSTBM-narrowed region is part of
+    /// a TUI's redraw machinery (vim's status line, htop's header), so
+    /// rows scrolled off it must NOT pollute scrollback.
+    fn region_is_full_screen(&self) -> bool {
+        self.scroll_top == 0 && self.scroll_bot == self.rows
+    }
+
+    /// Scroll the active region up by one line. When the region covers
+    /// the whole screen, the top row is also saved to scrollback before
+    /// it scrolls off; with a narrowed region scrollback is left alone.
+    fn scroll_up(&mut self) {
+        if self.rows == 0 || self.scroll_bot <= self.scroll_top {
+            return;
+        }
+        let top = self.scroll_top;
+        let bot = self.scroll_bot;
+
+        // Only the full-screen region feeds scrollback.
+        if self.region_is_full_screen() {
+            let mut row = Vec::with_capacity(self.cols);
+            for col in 0..self.cols {
+                row.push(self.grid.get_cell(top, col).copied().unwrap_or_default());
+            }
+            self.scrollback.push_back(row);
+            if self.scrollback.len() > MAX_SCROLLBACK {
+                self.scrollback.pop_front();
+            }
+        }
+
+        // Shift rows [top+1, bot) up into [top, bot-1) and blank row bot-1.
+        let move_count = bot - top - 1;
+        if move_count > 0 {
+            self.grid.shift_rows(top, top + 1, move_count);
+        }
+        self.clear_row(bot - 1);
+    }
+
+    /// Scroll the active region down by one line. The top row of the
+    /// region is blanked and the rest of the region shifts down by one;
+    /// content above and below the region is untouched.
     ///
     /// Uses `CellGrid::shift_rows` which rotates content, stable line_ids,
     /// and per-row damage together. The line quad cache is keyed on
@@ -394,12 +762,17 @@ impl Terminal {
     /// gone, so the cache misses against the blanked content on the next
     /// emit pass (preventing id reuse after the caller rotates content).
     fn scroll_down(&mut self) {
-        if self.rows == 0 {
+        if self.rows == 0 || self.scroll_bot <= self.scroll_top {
             return;
         }
-        // Shift rows 0..rows-1 down into rows 1..rows, then blank row 0.
-        self.grid.shift_rows(1, 0, self.rows - 1);
-        self.clear_row(0);
+        let top = self.scroll_top;
+        let bot = self.scroll_bot;
+        let move_count = bot - top - 1;
+        if move_count > 0 {
+            // Shift rows [top, bot-1) down into [top+1, bot), then blank top.
+            self.grid.shift_rows(top + 1, top, move_count);
+        }
+        self.clear_row(top);
     }
 
     /// Fill an entire row with blank cells using the current background
@@ -441,12 +814,65 @@ impl Terminal {
         }
     }
 
+    /// Enter the alternate screen buffer (DEC private mode 1049 / 47 /
+    /// 1047). The current main grid is swapped into `alt_grid` and a
+    /// fresh blank grid takes its place. The cursor and SGR state are
+    /// captured into dedicated alt-screen save slots so a `?1049l`
+    /// later can restore them, regardless of any DECSC/DECRC the TUI
+    /// performs while it owns the alt screen.
+    ///
+    /// Calling this while the alt screen is already active is a no-op:
+    /// the original main-screen save slot is preserved.
+    fn enter_alt_screen(&mut self) {
+        if self.alt_grid.is_some() {
+            return;
+        }
+        self.clear_pending_wrap();
+        self.alt_saved_cursor = (self.cursor_row, self.cursor_col);
+        self.alt_saved_fg = self.fg;
+        self.alt_saved_bg = self.bg;
+        self.alt_saved_attrs = self.attrs;
+
+        let mut fresh = CellGrid::new(self.rows, self.cols);
+        std::mem::swap(&mut self.grid, &mut fresh);
+        self.alt_grid = Some(fresh);
+
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.clear_pending_wrap();
+        self.grid.set_cursor(0, 0);
+    }
+
+    /// Exit the alternate screen buffer. Swaps the saved main grid back
+    /// into place, restores the cursor and SGR state captured on entry,
+    /// and discards everything drawn into the alt buffer (it's the
+    /// *alt* buffer; that's the whole point).
+    ///
+    /// No-op when the alt screen is not active.
+    fn exit_alt_screen(&mut self) {
+        let Some(mut main) = self.alt_grid.take() else {
+            return;
+        };
+        std::mem::swap(&mut self.grid, &mut main);
+        // `main` now holds the discarded alt-buffer contents and is
+        // dropped here.
+
+        self.cursor_row = self.alt_saved_cursor.0.min(self.rows.saturating_sub(1));
+        self.cursor_col = self.alt_saved_cursor.1.min(self.cols.saturating_sub(1));
+        self.clear_pending_wrap();
+        self.fg = self.alt_saved_fg;
+        self.bg = self.alt_saved_bg;
+        self.attrs = self.alt_saved_attrs;
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
+    }
+
     /// Write a character at the current cursor position with the current
     /// attributes, then advance the cursor.
     fn put_char(&mut self, c: char) {
         if self.rows == 0 || self.cols == 0 {
             return;
         }
+        self.prepare_for_printable();
         let cell = Cell {
             ch: c,
             fg: self.fg,
@@ -455,15 +881,12 @@ impl Terminal {
             wide_continuation: false,
         };
         self.grid.set_cell(self.cursor_row, self.cursor_col, cell);
-        self.cursor_col += 1;
-        // Line wrap.
-        if self.cursor_col >= self.cols {
-            self.cursor_col = 0;
-            self.cursor_row += 1;
-            if self.cursor_row >= self.rows {
-                self.cursor_row = self.rows - 1;
-                self.scroll_up();
-            }
+        if self.cursor_col + 1 >= self.cols {
+            self.cursor_col = self.cols - 1;
+            self.wrap_pending = true;
+        } else {
+            self.cursor_col += 1;
+            self.wrap_pending = false;
         }
     }
 }
@@ -504,23 +927,36 @@ impl<'a> Perform for Performer<'a> {
         match byte {
             // Line Feed
             0x0A => {
-                t.cursor_row += 1;
-                if t.cursor_row >= t.rows {
-                    t.cursor_row = t.rows.saturating_sub(1);
+                t.clear_pending_wrap();
+                // If the cursor is sitting on the last row of the active
+                // scroll region, LF scrolls the region instead of moving
+                // past it. Outside the region, LF just advances the cursor
+                // and clamps to the screen bottom (no scroll, since DECSTBM
+                // pins the rest of the screen).
+                if t.cursor_row + 1 == t.scroll_bot {
                     t.scroll_up();
+                } else if t.cursor_row + 1 < t.rows {
+                    t.cursor_row += 1;
+                } else {
+                    // Outside the region and at the absolute bottom: stay
+                    // put. The region pins everything below it.
+                    t.cursor_row = t.rows.saturating_sub(1);
                 }
             }
             // Carriage Return
             0x0D => {
+                t.clear_pending_wrap();
                 t.cursor_col = 0;
             }
             // Horizontal Tab
             0x09 => {
+                t.clear_pending_wrap();
                 let next_tab = (t.cursor_col / 8 + 1) * 8;
                 t.cursor_col = next_tab.min(t.cols.saturating_sub(1));
             }
             // Backspace
             0x08 => {
+                t.clear_pending_wrap();
                 t.cursor_col = t.cursor_col.saturating_sub(1);
             }
             // Bell: ignored
@@ -546,6 +982,12 @@ impl<'a> Perform for Performer<'a> {
 
         // Helper to extract a param or return 0 (not clamped to 1).
         let raw = |idx: usize| -> u16 { pv.get(idx).copied().unwrap_or(0) };
+
+        let preserves_pending_wrap = matches!(action, 'm' | 'c' | 'n' | 'q')
+            || (intermediates == [b'?'] && matches!(action, 'h' | 'l'));
+        if !preserves_pending_wrap {
+            t.clear_pending_wrap();
+        }
 
         match action {
             // -- Cursor movement -----------------------------------------------
@@ -666,15 +1108,22 @@ impl<'a> Perform for Performer<'a> {
             'L' => {
                 let n = p0();
                 let cursor_row = t.cursor_row;
-                let rows = t.rows;
-                let n = n.min(rows.saturating_sub(cursor_row));
-                if n > 0 {
-                    let move_count = rows.saturating_sub(cursor_row + n);
-                    if move_count > 0 {
-                        t.grid.shift_rows(cursor_row + n, cursor_row, move_count);
-                    }
-                    for row in cursor_row..cursor_row + n {
-                        t.clear_row(row);
+                // IL is a no-op when the cursor is outside the active
+                // scroll region. Inside the region, it scrolls the
+                // sub-range `[cursor_row, scroll_bot)` down by `n`.
+                if cursor_row < t.scroll_top || cursor_row >= t.scroll_bot {
+                    // ignored
+                } else {
+                    let bot = t.scroll_bot;
+                    let n = n.min(bot.saturating_sub(cursor_row));
+                    if n > 0 {
+                        let move_count = bot.saturating_sub(cursor_row + n);
+                        if move_count > 0 {
+                            t.grid.shift_rows(cursor_row + n, cursor_row, move_count);
+                        }
+                        for row in cursor_row..cursor_row + n {
+                            t.clear_row(row);
+                        }
                     }
                 }
             }
@@ -690,15 +1139,22 @@ impl<'a> Perform for Performer<'a> {
             'M' if intermediates.is_empty() => {
                 let n = p0();
                 let cursor_row = t.cursor_row;
-                let rows = t.rows;
-                let n = n.min(rows.saturating_sub(cursor_row));
-                if n > 0 {
-                    let move_count = rows.saturating_sub(cursor_row + n);
-                    if move_count > 0 {
-                        t.grid.shift_rows(cursor_row, cursor_row + n, move_count);
-                    }
-                    for row in rows.saturating_sub(n)..rows {
-                        t.clear_row(row);
+                // DL is a no-op when the cursor is outside the active
+                // scroll region. Inside the region, it scrolls the
+                // sub-range `[cursor_row, scroll_bot)` up by `n`.
+                if cursor_row < t.scroll_top || cursor_row >= t.scroll_bot {
+                    // ignored
+                } else {
+                    let bot = t.scroll_bot;
+                    let n = n.min(bot.saturating_sub(cursor_row));
+                    if n > 0 {
+                        let move_count = bot.saturating_sub(cursor_row + n);
+                        if move_count > 0 {
+                            t.grid.shift_rows(cursor_row, cursor_row + n, move_count);
+                        }
+                        for row in bot.saturating_sub(n)..bot {
+                            t.clear_row(row);
+                        }
                     }
                 }
             }
@@ -764,15 +1220,123 @@ impl<'a> Perform for Performer<'a> {
                     t.grid.set_cell(t.cursor_row, col, blank);
                 }
             }
+            // ECH: Erase Characters (blank cells in place; cursor does not move)
+            'X' => {
+                let n = p0().min(t.cols.saturating_sub(t.cursor_col));
+                let blank = Cell {
+                    ch: ' ',
+                    fg: t.fg,
+                    bg: t.bg,
+                    attrs: CellAttrs::empty(),
+                    wide_continuation: false,
+                };
+                for col in t.cursor_col..t.cursor_col + n {
+                    t.grid.set_cell(t.cursor_row, col, blank);
+                }
+            }
 
             // -- SGR: Select Graphic Rendition ---------------------------------
             'm' => {
                 handle_sgr(t, &pv);
             }
 
-            // -- DECSTBM: Set Scrolling Region (stored but not enforced) -------
+            // -- DECSTBM: Set Top/Bottom Scroll Margins ------------------------
+            //
+            // `CSI <top>;<bot> r`. Params are 1-based, half-open after
+            // conversion: the active region is rows `[top-1, bot)`. With
+            // no params (or zero), the region resets to the full screen.
+            // Origin mode (DECOM) is intentionally not implemented; the
+            // cursor is moved to absolute (0, 0) on success regardless,
+            // matching xterm's "non-origin" behaviour.
             'r' if intermediates.is_empty() => {
-                // Intentionally ignored for now.
+                let rows = t.rows;
+                let top_1 = pv.first().copied().unwrap_or(0);
+                let bot_1 = pv.get(1).copied().unwrap_or(0);
+                let top = if top_1 == 0 { 1 } else { top_1 as usize };
+                let bot = if bot_1 == 0 { rows } else { bot_1 as usize };
+                // Convert to half-open [scroll_top, scroll_bot).
+                let new_top = top.saturating_sub(1);
+                let new_bot = bot.min(rows);
+                // Spec: must satisfy `top < bot` and both within bounds.
+                // Invalid params leave the existing region intact.
+                if new_top < new_bot && new_bot <= rows {
+                    t.scroll_top = new_top;
+                    t.scroll_bot = new_bot;
+                    t.cursor_row = 0;
+                    t.cursor_col = 0;
+                }
+            }
+
+            // -- DEC private mode set/reset (CSI ? Pn h / l) -------------------
+            //
+            // We currently care about the alt-screen modes only:
+            //   1049: save cursor + switch to alt screen (combined op)
+            //   1047: switch to alt screen without explicit save (legacy)
+            //     47: ditto, the original DEC alt-screen mode
+            //
+            // `?1049h/l` is the canonical "this is a TUI app" sequence
+            // emitted by xterm-derived clients. We forward all three
+            // variants to the same handler since many TUIs still send
+            // the older aliases. Other private modes (mouse reporting,
+            // bracketed paste, application keypad, etc.) are ignored
+            // here; the daemon owns those semantics.
+            'h' if intermediates == [b'?'] => {
+                for &mode in &pv {
+                    if matches!(mode, 47 | 1047 | 1049) {
+                        t.enter_alt_screen();
+                    }
+                }
+            }
+            'l' if intermediates == [b'?'] => {
+                for &mode in &pv {
+                    if matches!(mode, 47 | 1047 | 1049) {
+                        t.exit_alt_screen();
+                    }
+                }
+            }
+
+            // -- Host queries --------------------------------------------------
+            //
+            // TUIs (Claude Code, fzf, etc) probe the terminal to decide
+            // which rendering path to use. With no reply they assume a
+            // primitive terminal and fall back to a minimal layout (e.g.
+            // Claude renders a 4-row bordered input box with the prompt
+            // glyph on a row of its own instead of a single `> ABC|`
+            // line). Replies are queued in `pending_response`; the
+            // bridge drains and writes them back to the PTY.
+            //
+            // DA1 - Primary Device Attributes: `CSI c` or `CSI 0 c`.
+            // Reply `CSI ? 1 ; 2 c` advertises VT100 with advanced video
+            // option, the same baseline xterm reports.
+            'c' if intermediates.is_empty() => {
+                t.pending_response.extend_from_slice(b"\x1b[?1;2c");
+            }
+            // DA2 - Secondary Device Attributes: `CSI > c` or `CSI > 0 c`.
+            // Reply `CSI > 0 ; 95 ; 0 c` mirrors xterm patch 95.
+            'c' if intermediates == [b'>'] => {
+                t.pending_response.extend_from_slice(b"\x1b[>0;95;0c");
+            }
+            // DSR - Device Status Report: `CSI 5 n` "are you ok?".
+            // Reply `CSI 0 n` = ok.
+            'n' if intermediates.is_empty() && pv.first() == Some(&5) => {
+                t.pending_response.extend_from_slice(b"\x1b[0n");
+            }
+            // CPR - Cursor Position Report: `CSI 6 n`. Reply with the
+            // current 1-indexed cursor position.
+            'n' if intermediates.is_empty() && pv.first() == Some(&6) => {
+                let row = t.cursor_row + 1;
+                let col = t.cursor_col + 1;
+                let reply = format!("\x1b[{};{}R", row, col);
+                t.pending_response.extend_from_slice(reply.as_bytes());
+            }
+            // XTVERSION - terminal name and version: `CSI > q` or
+            // `CSI > 0 q`. Claude Code sends this before deciding
+            // between compact and bordered layouts. Reply with a DCS
+            // string `DCS > | name version ST` so the probe succeeds
+            // and Claude picks the rich path.
+            'q' if intermediates == [b'>'] => {
+                t.pending_response
+                    .extend_from_slice(b"\x1bP>|godly-terminal 0.1\x1b\\");
             }
 
             _ => {
@@ -804,11 +1368,13 @@ impl<'a> Perform for Performer<'a> {
             }
             // DECRC: Restore Cursor Position
             b'8' => {
+                t.clear_pending_wrap();
                 t.cursor_row = t.saved_cursor.0.min(t.rows.saturating_sub(1));
                 t.cursor_col = t.saved_cursor.1.min(t.cols.saturating_sub(1));
             }
             // RI: Reverse Index (move cursor up; scroll down if at top)
             b'M' => {
+                t.clear_pending_wrap();
                 if t.cursor_row == 0 {
                     t.scroll_down();
                 } else {
@@ -850,6 +1416,7 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
             2 => t.attrs |= CellAttrs::DIM,
             3 => t.attrs |= CellAttrs::ITALIC,
             4 => t.attrs |= CellAttrs::UNDERLINE,
+            5 => t.attrs |= CellAttrs::BLINK,
             7 => t.attrs |= CellAttrs::INVERSE,
             9 => t.attrs |= CellAttrs::STRIKETHROUGH,
 
@@ -857,12 +1424,13 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
             22 => t.attrs &= !(CellAttrs::BOLD | CellAttrs::DIM),
             23 => t.attrs &= !CellAttrs::ITALIC,
             24 => t.attrs &= !CellAttrs::UNDERLINE,
+            25 => t.attrs &= !CellAttrs::BLINK,
             27 => t.attrs &= !CellAttrs::INVERSE,
             29 => t.attrs &= !CellAttrs::STRIKETHROUGH,
 
             // Standard foreground colors (30..37).
             30..=37 => {
-                t.fg = ANSI_16[(code - 30) as usize];
+                t.fg = ansi_16_fg_color((code - 30) as usize);
             }
             // Extended foreground: 38;5;N (256-color) or 38;2;R;G;B (RGB).
             38 => {
@@ -873,7 +1441,7 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
                             // 256-color
                             i += 1;
                             if i < pv.len() {
-                                t.fg = color_256(pv[i] as u8);
+                                t.fg = fg_color_256_for_parity(pv[i] as u8);
                             }
                         }
                         2 => {
@@ -892,12 +1460,12 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
             }
             // Default foreground.
             39 => {
-                t.fg = DEFAULT_FG;
+                t.fg = default_fg();
             }
 
             // Standard background colors (40..47).
             40..=47 => {
-                t.bg = ANSI_16[(code - 40) as usize];
+                t.bg = ansi_16_color((code - 40) as usize);
             }
             // Extended background: 48;5;N (256-color) or 48;2;R;G;B (RGB).
             48 => {
@@ -908,7 +1476,7 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
                             // 256-color
                             i += 1;
                             if i < pv.len() {
-                                t.bg = color_256(pv[i] as u8);
+                                t.bg = bg_color_256_for_parity(pv[i] as u8);
                             }
                         }
                         2 => {
@@ -927,16 +1495,16 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
             }
             // Default background.
             49 => {
-                t.bg = DEFAULT_BG;
+                t.bg = default_bg();
             }
 
             // Bright foreground colors (90..97).
             90..=97 => {
-                t.fg = ANSI_16[(code - 90 + 8) as usize];
+                t.fg = ansi_16_fg_color((code - 90 + 8) as usize);
             }
             // Bright background colors (100..107).
             100..=107 => {
-                t.bg = ANSI_16[(code - 100 + 8) as usize];
+                t.bg = ansi_16_color((code - 100 + 8) as usize);
             }
 
             _ => {
@@ -949,8 +1517,8 @@ fn handle_sgr(t: &mut Terminal, pv: &[u16]) {
 
 /// Reset all text attributes and colors to their defaults.
 fn reset_attrs(t: &mut Terminal) {
-    t.fg = DEFAULT_FG;
-    t.bg = DEFAULT_BG;
+    t.fg = default_fg();
+    t.bg = default_bg();
     t.attrs = CellAttrs::empty();
 }
 
@@ -1188,6 +1756,17 @@ mod tests {
         t.process_bytes(b"\x1b[1;5H");
         t.process_bytes(b"\x1b[2K"); // erase entire line
         assert_eq!(row_text(&t, 0), "");
+    }
+
+    #[test]
+    fn erase_characters_blanks_without_moving_cursor_or_shifting() {
+        let mut t = Terminal::new(1, 10);
+        t.process_bytes(b"> abcdef");
+        t.process_bytes(b"\x1b[1;3H"); // editable input starts after "> "
+        t.process_bytes(b"\x1b[4X"); // ECH: blank four cells in place
+
+        assert_eq!(t.cursor_position(), (0, 2));
+        assert_eq!(row_text(&t, 0), ">     ef");
     }
 
     #[test]
@@ -1474,6 +2053,111 @@ mod tests {
     }
 
     #[test]
+    fn parity_default_fg_uses_capture_calibrated_windows_terminal_value() {
+        assert_eq!(
+            default_fg_for_parity(true),
+            Color {
+                r: 196,
+                g: 196,
+                b: 196,
+                a: 255,
+            }
+        );
+        assert_eq!(default_fg_for_parity(false), DEFAULT_FG);
+    }
+
+    #[test]
+    fn parity_ansi_palette_matches_windows_terminal_campbell() {
+        assert_eq!(
+            ansi_16_color_for_parity(1, true),
+            Color {
+                r: 197,
+                g: 15,
+                b: 31,
+                a: 255,
+            }
+        );
+        assert_eq!(ansi_16_color_for_parity(1, false), ANSI_16[1]);
+    }
+
+    #[test]
+    fn parity_neutral_foregrounds_are_capture_calibrated_separately_from_backgrounds() {
+        assert_eq!(
+            ansi_16_fg_color_for_parity(7, true),
+            Color {
+                r: 196,
+                g: 196,
+                b: 196,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            ansi_16_fg_color_for_parity(8, true),
+            Color {
+                r: 114,
+                g: 114,
+                b: 114,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            ansi_16_color_for_parity(7, true),
+            Color {
+                r: 204,
+                g: 204,
+                b: 204,
+                a: 255,
+            },
+            "background swatches should keep the literal Campbell palette"
+        );
+    }
+
+    #[test]
+    fn parity_256_color_low_indices_follow_ansi_profile_mapping() {
+        assert_eq!(
+            fg_color_256_for_parity_with_profile(7, true),
+            Color {
+                r: 196,
+                g: 196,
+                b: 196,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            bg_color_256_for_parity_with_profile(7, true),
+            Color {
+                r: 204,
+                g: 204,
+                b: 204,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            fg_color_256_for_parity_with_profile(8, true),
+            Color {
+                r: 114,
+                g: 114,
+                b: 114,
+                a: 255,
+            }
+        );
+        assert_eq!(fg_color_256_for_parity_with_profile(7, false), ANSI_16[7]);
+        assert_eq!(bg_color_256_for_parity_with_profile(7, false), ANSI_16[7]);
+    }
+
+    #[test]
+    fn parity_256_color_high_indices_stay_in_256_color_cube() {
+        assert_eq!(
+            fg_color_256_for_parity_with_profile(196, true),
+            color_256(196)
+        );
+        assert_eq!(
+            bg_color_256_for_parity_with_profile(82, true),
+            color_256(82)
+        );
+    }
+
+    #[test]
     fn sgr_bright_colors() {
         let mut t = Terminal::new(3, 20);
         t.process_bytes(b"\x1b[91mX"); // bright red fg
@@ -1637,6 +2321,18 @@ mod tests {
     }
 
     #[test]
+    fn sgr_blink_toggles_blink_attr() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b[5mB");
+        let blinking = t.grid.get_cell(0, 0).unwrap();
+        assert!(blinking.attrs.contains(CellAttrs::BLINK));
+
+        t.process_bytes(b"\x1b[25mX");
+        let steady = t.grid.get_cell(0, 1).unwrap();
+        assert!(!steady.attrs.contains(CellAttrs::BLINK));
+    }
+
+    #[test]
     fn sgr_inverse() {
         let mut t = Terminal::new(3, 20);
         t.process_bytes(b"\x1b[7mI");
@@ -1794,11 +2490,43 @@ mod tests {
     }
 
     #[test]
-    fn cursor_wraps_at_end_of_line() {
+    fn full_width_line_delays_wrap_until_next_printable() {
         let mut term = Terminal::new(2, 5);
         term.process_bytes(b"ABCDE");
-        // After writing 5 chars in a 5-col terminal, cursor wraps to next row.
-        assert_eq!(term.cursor_position(), (1, 0));
+        // Real terminals use delayed autowrap: a character written into
+        // the last column leaves the cursor there until the next printable
+        // character arrives. Claude Code draws full-width rules/status
+        // rows; eager wrapping creates phantom rows that make input drift
+        // into previously-rendered output.
+        assert_eq!(term.cursor_position(), (0, 4));
+        assert_eq!(row_text(&term, 0), "ABCDE");
+        assert_eq!(row_text(&term, 1), "");
+
+        term.process_bytes(b"F");
+
+        assert_eq!(term.cursor_position(), (1, 1));
+        assert_eq!(row_text(&term, 0), "ABCDE");
+        assert_eq!(row_text(&term, 1), "F");
+    }
+
+    #[test]
+    fn carriage_return_clears_pending_wrap_after_full_width_line() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"ABCDE\rZ");
+
+        assert_eq!(term.cursor_position(), (0, 1));
+        assert_eq!(row_text(&term, 0), "ZBCDE");
+        assert_eq!(row_text(&term, 1), "");
+    }
+
+    #[test]
+    fn terminal_query_preserves_pending_wrap() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"ABCDE\x1b[6nF");
+
+        assert_eq!(term.cursor_position(), (1, 1));
+        assert_eq!(row_text(&term, 0), "ABCDE");
+        assert_eq!(row_text(&term, 1), "F");
     }
 
     #[test]
@@ -2664,5 +3392,325 @@ mod tests {
         assert_eq!(ui.cols, 5);
         assert_eq!(ui.grid().rows(), 3);
         assert_eq!(ui.grid().cols(), 5);
+    }
+
+    // -- Alt screen buffer (DEC private mode 1049 / 47 / 1047) ----------------
+    //
+    // These cover the entry/exit invariants documented in the issue:
+    //   - cursor resets to (0, 0) on entry, original screen preserved
+    //   - cursor restored, alt content discarded on exit
+    //   - SGR state survives the round trip
+    //   - resize while in alt screen sizes both buffers
+    //   - the older `?47` and `?1047` aliases route to the same handler
+
+    #[test]
+    fn alt_screen_enter_resets_cursor_and_preserves_main_content() {
+        let mut t = Terminal::new(4, 6);
+        t.process_bytes(b"hello\r\nworld");
+        let cursor_before = t.cursor_position();
+        assert_eq!(row_text(&t, 0), "hello");
+
+        t.process_bytes(b"\x1b[?1049h"); // enter alt screen
+
+        // Cursor reset to (0, 0).
+        assert_eq!(t.cursor_position(), (0, 0));
+        // Alt grid is now active and is blank.
+        for row in 0..t.rows {
+            assert_eq!(row_text(&t, row), "");
+        }
+        // The original main grid is parked in alt_grid with its content.
+        assert!(t.alt_grid.is_some());
+        let stashed = t.alt_grid.as_ref().unwrap();
+        assert_eq!(stashed.get_cell(0, 0).unwrap().ch, 'h');
+        // The pre-entry cursor lives in the dedicated save slot.
+        assert_eq!(t.alt_saved_cursor, cursor_before);
+    }
+
+    #[test]
+    fn alt_screen_exit_restores_main_screen_and_cursor() {
+        let mut t = Terminal::new(4, 6);
+        t.process_bytes(b"hello\r\nworld");
+        let cursor_before = t.cursor_position();
+
+        t.process_bytes(b"\x1b[?1049h");
+        // Draw something into the alt screen.
+        t.process_bytes(b"ALT");
+        assert_eq!(row_text(&t, 0), "ALT");
+
+        t.process_bytes(b"\x1b[?1049l"); // exit alt screen
+
+        // Main screen content is back.
+        assert_eq!(row_text(&t, 0), "hello");
+        assert_eq!(row_text(&t, 1), "world");
+        // Cursor restored to its pre-entry slot.
+        assert_eq!(t.cursor_position(), cursor_before);
+        // alt_grid slot is empty again.
+        assert!(t.alt_grid.is_none());
+    }
+
+    #[test]
+    fn alt_screen_discards_alt_buffer_drawing_on_exit() {
+        let mut t = Terminal::new(3, 5);
+        t.process_bytes(b"\x1b[?1049h");
+        t.process_bytes(b"XXXXX");
+        // A clean exit + re-entry should give a blank alt buffer.
+        t.process_bytes(b"\x1b[?1049l"); // exit, alt content tossed
+        t.process_bytes(b"\x1b[?1049h"); // re-enter
+
+        // CellGrid::new fills with Cell::default() whose char is the
+        // null byte (the framework's "uninitialized" marker), not space.
+        // What matters is that the previous 'X's are gone.
+        let blank_ch = Cell::default().ch;
+        for col in 0..t.cols {
+            let cell = t.grid.get_cell(0, col).unwrap();
+            assert_eq!(
+                cell.ch, blank_ch,
+                "alt buffer must be blank on re-entry, found {:?}",
+                cell.ch
+            );
+        }
+    }
+
+    #[test]
+    fn alt_screen_preserves_sgr_state_across_round_trip() {
+        let mut t = Terminal::new(3, 5);
+        // Bold + red foreground on the main screen.
+        t.process_bytes(b"\x1b[1;31m");
+        let main_fg = t.fg;
+        let main_attrs = t.attrs;
+        assert!(main_attrs.contains(CellAttrs::BOLD));
+
+        // Enter alt screen and clobber the SGR state in there.
+        t.process_bytes(b"\x1b[?1049h");
+        t.process_bytes(b"\x1b[0m\x1b[34m"); // reset + blue
+        assert!(!t.attrs.contains(CellAttrs::BOLD));
+
+        // Exit must restore the main-screen SGR slot byte-for-byte.
+        t.process_bytes(b"\x1b[?1049l");
+        assert_eq!(t.fg, main_fg);
+        assert_eq!(t.attrs, main_attrs);
+        assert!(t.attrs.contains(CellAttrs::BOLD));
+    }
+
+    #[test]
+    fn alt_screen_resize_scales_both_buffers() {
+        let mut t = Terminal::new(4, 6);
+        t.process_bytes(b"main"); // some content on main
+        t.process_bytes(b"\x1b[?1049h");
+        t.process_bytes(b"alt");
+
+        // Resize while inside the alt screen.
+        t.resize(6, 8);
+        assert_eq!(t.grid().rows(), 6);
+        assert_eq!(t.grid().cols(), 8);
+        let alt = t.alt_grid.as_ref().expect("alt_grid must still exist");
+        assert_eq!(alt.rows(), 6);
+        assert_eq!(alt.cols(), 8);
+
+        // Exiting should now restore at the new size, not the old one.
+        t.process_bytes(b"\x1b[?1049l");
+        assert!(t.alt_grid.is_none());
+        assert_eq!(t.grid().rows(), 6);
+        assert_eq!(t.grid().cols(), 8);
+        // The original "main" content (lifted into the new top via
+        // resize) should still be visible on row 2 (we grew by 2 rows
+        // from a 4-row main with no scrollback).
+        assert_eq!(read_row_str(&t, 2, 0, 4), "main");
+    }
+
+    #[test]
+    fn alt_screen_legacy_47_and_1047_aliases() {
+        // ?47 and ?1047 should both route to the same alt-screen path.
+        for seq in [&b"\x1b[?47h"[..], &b"\x1b[?1047h"[..]] {
+            let mut t = Terminal::new(3, 5);
+            t.process_bytes(b"main");
+            t.process_bytes(seq);
+            assert!(
+                t.alt_grid.is_some(),
+                "{} should switch to alt screen",
+                std::str::from_utf8(seq).unwrap(),
+            );
+        }
+        for seq in [&b"\x1b[?47l"[..], &b"\x1b[?1047l"[..]] {
+            let mut t = Terminal::new(3, 5);
+            t.process_bytes(b"\x1b[?1049h"); // enter via 1049
+            t.process_bytes(b"alt");
+            t.process_bytes(seq); // exit via legacy alias
+            assert!(
+                t.alt_grid.is_none(),
+                "{} should leave the alt screen",
+                std::str::from_utf8(seq).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn alt_screen_double_enter_is_idempotent() {
+        let mut t = Terminal::new(3, 5);
+        t.process_bytes(b"main");
+        let cursor_before = t.cursor_position();
+        t.process_bytes(b"\x1b[?1049h");
+        let saved_after_first = t.alt_saved_cursor;
+        // Move the cursor inside the alt screen.
+        t.process_bytes(b"\x1b[2;3H");
+        // Re-entering must NOT clobber the original cursor save slot.
+        t.process_bytes(b"\x1b[?1049h");
+        assert_eq!(t.alt_saved_cursor, saved_after_first);
+        assert_eq!(saved_after_first, cursor_before);
+    }
+
+    // -- DECSTBM (CSI <top>;<bot> r) ------------------------------------------
+
+    #[test]
+    fn decstbm_clamps_scroll_up_to_region() {
+        let mut t = Terminal::new(6, 4);
+        t.process_bytes(b"AA\r\nBB\r\nCC\r\nDD\r\nEE\r\nFF");
+        // Set region rows 3..=5 (1-based) -> half-open [2, 5).
+        t.process_bytes(b"\x1b[3;5r");
+        assert_eq!(t.scroll_top, 2);
+        assert_eq!(t.scroll_bot, 5);
+        // Cursor is parked at home after DECSTBM.
+        assert_eq!(t.cursor_position(), (0, 0));
+
+        // Move cursor inside the region and trigger a scroll by emitting
+        // CSI 1 S (scroll up). With my changes, this now operates only
+        // on rows [2, 5).
+        t.process_bytes(b"\x1b[1S");
+
+        // Rows 0 and 1 are pinned by the region.
+        assert_eq!(row_text(&t, 0), "AA");
+        assert_eq!(row_text(&t, 1), "BB");
+        // The region's top (row 2) was discarded; CC is gone, DD shifted up.
+        assert_eq!(row_text(&t, 2), "DD");
+        assert_eq!(row_text(&t, 3), "EE");
+        // Region's last row (row 4 = 5-1) is now blank.
+        assert_eq!(row_text(&t, 4), "");
+        // Row 5 sits below the region and is untouched.
+        assert_eq!(row_text(&t, 5), "FF");
+    }
+
+    #[test]
+    fn decstbm_reset_restores_full_screen_scrolling() {
+        let mut t = Terminal::new(4, 4);
+        t.process_bytes(b"\x1b[2;3r"); // narrow region
+        assert_eq!(t.scroll_top, 1);
+        assert_eq!(t.scroll_bot, 3);
+        // Reset to full screen with CSI r (no params).
+        t.process_bytes(b"\x1b[r");
+        assert_eq!(t.scroll_top, 0);
+        assert_eq!(t.scroll_bot, 4);
+        // Now a regular scroll affects the whole grid as before.
+        t.process_bytes(b"L1\r\nL2\r\nL3\r\nL4\r\nL5");
+        assert_eq!(row_text(&t, 0), "L2");
+        assert_eq!(row_text(&t, 1), "L3");
+        assert_eq!(row_text(&t, 2), "L4");
+        assert_eq!(row_text(&t, 3), "L5");
+    }
+
+    #[test]
+    fn decstbm_lf_at_region_bottom_scrolls_region_only() {
+        // Issue Claude Code symptom: input prompt pinned below the region.
+        let mut t = Terminal::new(5, 4);
+        // Pre-fill the screen so we can see what shifts.
+        t.process_bytes(b"AA\r\nBB\r\nCC\r\nDD\r\nEE");
+        // Region [1, 4) — rows 0 and 4 are pinned.
+        t.process_bytes(b"\x1b[2;4r");
+        // Move cursor to last row of region (row 3 zero-indexed), col 0.
+        t.process_bytes(b"\x1b[4;1H");
+        assert_eq!(t.cursor_position(), (3, 0));
+        // LF at the region's bottom must scroll the region up by one,
+        // not move the cursor below the region.
+        t.process_bytes(b"\n");
+        assert_eq!(t.cursor_position(), (3, 0));
+        // Pinned rows untouched.
+        assert_eq!(row_text(&t, 0), "AA");
+        assert_eq!(row_text(&t, 4), "EE");
+        // Region content shifted: CC lost, DD moved to row 1, BB stayed
+        // at row 1? Let's trace it carefully.
+        // Before: row1=BB row2=CC row3=DD. Scroll up region [1,4):
+        // row1=CC row2=DD row3=blank.
+        assert_eq!(row_text(&t, 1), "CC");
+        assert_eq!(row_text(&t, 2), "DD");
+        assert_eq!(row_text(&t, 3), "");
+    }
+
+    #[test]
+    fn decstbm_invalid_params_leave_region_unchanged() {
+        let mut t = Terminal::new(5, 4);
+        // Set a valid region first so we can verify it survives bad params.
+        t.process_bytes(b"\x1b[2;4r");
+        let (top_before, bot_before) = (t.scroll_top, t.scroll_bot);
+
+        // top > bot — must be ignored. (1-based 4;2 means top=3, bot=2;
+        // half-open: top=3, bot=2, fails the strict `top < bot` check.)
+        t.process_bytes(b"\x1b[4;2r");
+        assert_eq!((t.scroll_top, t.scroll_bot), (top_before, bot_before));
+
+        // top out of range and bot equally invalid (top_1 > rows).
+        // top_1 = 99 -> new_top = 98, new_bot clamped to 5: 98 >= 5,
+        // strict `top < bot` fails -> ignored.
+        t.process_bytes(b"\x1b[99;5r");
+        assert_eq!((t.scroll_top, t.scroll_bot), (top_before, bot_before));
+
+        // bot beyond rows clamps to rows. With rows = 5 the params
+        // (1, 99) become [0, 5) -- xterm accepts this and so do we.
+        t.process_bytes(b"\x1b[1;99r");
+        assert_eq!((t.scroll_top, t.scroll_bot), (0, 5));
+    }
+
+    #[test]
+    fn decstbm_resize_clamps_or_resets_region() {
+        let mut t = Terminal::new(6, 4);
+        t.process_bytes(b"\x1b[2;5r"); // region [1, 5) within 6 rows
+        assert_eq!((t.scroll_top, t.scroll_bot), (1, 5));
+
+        // Shrink so the previous region no longer fits.
+        t.resize(3, 4);
+        // Region must reset to full-screen [0, 3) since [1, 5) is now invalid.
+        assert_eq!((t.scroll_top, t.scroll_bot), (0, 3));
+
+        // Now set a region and resize within bounds: it should NOT reset.
+        t.process_bytes(b"\x1b[1;2r"); // [0, 2) on a 3-row screen
+        t.resize(4, 4);
+        // Still within bounds (bot = 2 <= rows = 4), region preserved.
+        assert_eq!((t.scroll_top, t.scroll_bot), (0, 2));
+    }
+
+    #[test]
+    fn decstbm_il_dl_inside_region_only() {
+        let mut t = Terminal::new(5, 4);
+        t.process_bytes(b"AA\r\nBB\r\nCC\r\nDD\r\nEE");
+        t.process_bytes(b"\x1b[2;4r"); // region [1, 4)
+
+        // Cursor inside the region.
+        t.process_bytes(b"\x1b[2;1H"); // (1, 0)
+
+        // Insert one line at row 1: rows in [1, 4) shift down by one,
+        // row 1 becomes blank, row 4 (below region) is untouched.
+        t.process_bytes(b"\x1b[1L");
+        assert_eq!(row_text(&t, 0), "AA"); // pinned above
+        assert_eq!(row_text(&t, 1), ""); // inserted blank
+        assert_eq!(row_text(&t, 2), "BB"); // shifted down
+        assert_eq!(row_text(&t, 3), "CC"); // shifted down
+        assert_eq!(row_text(&t, 4), "EE"); // pinned below
+    }
+
+    #[test]
+    fn decstbm_region_does_not_pollute_scrollback() {
+        // TUIs use scroll regions to redraw status lines; that scrolling
+        // must NOT leak into scrollback (which would let the user scroll
+        // up and see partial frames).
+        let mut t = Terminal::new(4, 4);
+        t.process_bytes(b"AA\r\nBB\r\nCC\r\nDD");
+        let scrollback_before = t.scrollback_len();
+
+        t.process_bytes(b"\x1b[2;3r"); // region [1, 3)
+        t.process_bytes(b"\x1b[3S"); // scroll up 3 inside region
+
+        assert_eq!(
+            t.scrollback_len(),
+            scrollback_before,
+            "narrowed-region scrolls must not push to scrollback",
+        );
     }
 }

@@ -99,6 +99,59 @@ impl NodeArena {
         })
     }
 
+    /// Lowest common ancestor of `a` and `b`, falling back to `root` when
+    /// either node is dangling, deallocated, or not in `root`'s subtree.
+    ///
+    /// Used to narrow restyle cascades after pseudo-class state changes
+    /// (`:hover`, `:focus`, `:active`): both the leaving and entering nodes
+    /// share an ancestor whose subtree contains every selector the change
+    /// could possibly re-evaluate, so the cascade can stop walking at the
+    /// LCA and skip every other branch of the tree.
+    ///
+    /// Sibling combinators (`.parent:hover ~ .other`) are NOT supported by
+    /// this scoping rule because the affected sibling subtree may live
+    /// outside the LCA. Callers that depend on sibling-combinator pseudo
+    /// rules must restyle from `root` instead.
+    pub fn lowest_common_ancestor(&self, a: NodeId, b: NodeId, root: NodeId) -> NodeId {
+        if a == b && self.get(a).is_some() {
+            return a;
+        }
+        let a_in = !a.is_dangling() && self.get(a).is_some();
+        let b_in = !b.is_dangling() && self.get(b).is_some();
+        if !a_in && !b_in {
+            return root;
+        }
+        if !a_in {
+            return b;
+        }
+        if !b_in {
+            return a;
+        }
+
+        let mut a_path: smallvec::SmallVec<[NodeId; 16]> = smallvec::SmallVec::new();
+        let mut cur = a;
+        while !cur.is_dangling() {
+            a_path.push(cur);
+            cur = match self.get(cur) {
+                Some(el) => el.parent,
+                None => NodeId::DANGLING,
+            };
+        }
+
+        let mut cur = b;
+        while !cur.is_dangling() {
+            if a_path.contains(&cur) {
+                return cur;
+            }
+            cur = match self.get(cur) {
+                Some(el) => el.parent,
+                None => NodeId::DANGLING,
+            };
+        }
+
+        root
+    }
+
     /// Recursively deallocate a node and all its descendants (depth-first).
     pub fn dealloc_subtree(&mut self, id: NodeId) {
         if id.is_dangling() || self.get(id).is_none() {
@@ -404,6 +457,108 @@ mod tests {
         assert_eq!(arena.get(inserted).unwrap().prev_sibling, c1);
         assert_eq!(arena.get(inserted).unwrap().next_sibling, c2);
         assert_eq!(arena.get(c2).unwrap().prev_sibling, inserted);
+    }
+
+    #[test]
+    fn lca_self_returns_self() {
+        let mut arena = NodeArena::new();
+        let root = alloc_div(&mut arena);
+        let a = alloc_div(&mut arena);
+        arena.append_child(root, a);
+        assert_eq!(arena.lowest_common_ancestor(a, a, root), a);
+    }
+
+    #[test]
+    fn lca_siblings_returns_parent() {
+        let mut arena = NodeArena::new();
+        let root = alloc_div(&mut arena);
+        let a = alloc_div(&mut arena);
+        let b = alloc_div(&mut arena);
+        arena.append_child(root, a);
+        arena.append_child(root, b);
+        assert_eq!(arena.lowest_common_ancestor(a, b, root), root);
+    }
+
+    #[test]
+    fn lca_ancestor_descendant_returns_ancestor() {
+        let mut arena = NodeArena::new();
+        let root = alloc_div(&mut arena);
+        let parent = alloc_div(&mut arena);
+        let child = alloc_div(&mut arena);
+        arena.append_child(root, parent);
+        arena.append_child(parent, child);
+        assert_eq!(arena.lowest_common_ancestor(parent, child, root), parent);
+        assert_eq!(arena.lowest_common_ancestor(child, parent, root), parent);
+    }
+
+    #[test]
+    fn lca_dangling_a_returns_b() {
+        let mut arena = NodeArena::new();
+        let root = alloc_div(&mut arena);
+        let b = alloc_div(&mut arena);
+        arena.append_child(root, b);
+        assert_eq!(arena.lowest_common_ancestor(NodeId::DANGLING, b, root), b);
+    }
+
+    #[test]
+    fn lca_dangling_b_returns_a() {
+        let mut arena = NodeArena::new();
+        let root = alloc_div(&mut arena);
+        let a = alloc_div(&mut arena);
+        arena.append_child(root, a);
+        assert_eq!(arena.lowest_common_ancestor(a, NodeId::DANGLING, root), a);
+    }
+
+    #[test]
+    fn lca_both_dangling_returns_root() {
+        let mut arena = NodeArena::new();
+        let root = alloc_div(&mut arena);
+        assert_eq!(arena.lowest_common_ancestor(NodeId::DANGLING, NodeId::DANGLING, root), root,);
+    }
+
+    #[test]
+    fn lca_deep_subtrees_finds_first_shared_ancestor() {
+        // Build:    root
+        //           /  \
+        //          x    y
+        //         / \   |
+        //        x1 x2  y1
+        //        /
+        //       x1a
+        let mut arena = NodeArena::new();
+        let root = alloc_div(&mut arena);
+        let x = alloc_div(&mut arena);
+        let x1 = alloc_div(&mut arena);
+        let x2 = alloc_div(&mut arena);
+        let x1a = alloc_div(&mut arena);
+        let y = alloc_div(&mut arena);
+        let y1 = alloc_div(&mut arena);
+        arena.append_child(root, x);
+        arena.append_child(root, y);
+        arena.append_child(x, x1);
+        arena.append_child(x, x2);
+        arena.append_child(x1, x1a);
+        arena.append_child(y, y1);
+
+        // Cousins under x.
+        assert_eq!(arena.lowest_common_ancestor(x1a, x2, root), x);
+        // Across subtrees.
+        assert_eq!(arena.lowest_common_ancestor(x1a, y1, root), root);
+    }
+
+    #[test]
+    fn lca_after_dealloc_falls_back_to_root() {
+        let mut arena = NodeArena::new();
+        let root = alloc_div(&mut arena);
+        let a = alloc_div(&mut arena);
+        let b = alloc_div(&mut arena);
+        arena.append_child(root, a);
+        arena.append_child(root, b);
+        let stale = a;
+        arena.remove_child(root, a);
+        arena.dealloc(a);
+        // `stale` no longer resolves; fall back to using `b` since b is still in tree.
+        assert_eq!(arena.lowest_common_ancestor(stale, b, root), b);
     }
 
     #[test]
