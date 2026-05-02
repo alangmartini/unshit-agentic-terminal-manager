@@ -44,6 +44,7 @@ namespace GodlyParity {
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
         [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int x, int y, int width, int height, bool repaint);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int width, int height, uint flags);
@@ -220,10 +221,25 @@ function Set-ParityWindowBounds {
         [int]$X,
         [int]$Y,
         [int]$Width,
-        [int]$Height
+        [int]$Height,
+        [switch]$NoActivate
     )
 
     $targetHwnd = $WindowProcess.MainWindowHandle
+    if ($NoActivate) {
+        [GodlyParity.Win32]::ShowWindowAsync($targetHwnd, 4) | Out-Null
+        [GodlyParity.Win32]::SetWindowPos(
+            $targetHwnd,
+            [IntPtr]::Zero,
+            $X,
+            $Y,
+            $Width,
+            $Height,
+            0x0054
+        ) | Out-Null
+        return
+    }
+
     $targetProcessId = [uint32]0
     $targetThread = [GodlyParity.Win32]::GetWindowThreadProcessId(
         $targetHwnd,
@@ -314,20 +330,72 @@ function Test-ParityBitmapLooksBlank {
     return $true
 }
 
+function Invoke-ParityPythonWindowCapture {
+    param(
+        [Parameter(Mandatory)]$WindowProcess,
+        [Parameter(Mandatory)]$Rect,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$PythonExe,
+        [Parameter(Mandatory)][string]$PythonCaptureScript
+    )
+
+    if ($PythonCaptureScript -eq '' -or -not (Test-Path -LiteralPath $PythonCaptureScript)) {
+        throw "Python capture script not found at '$PythonCaptureScript'."
+    }
+
+    $tempBmp = [System.IO.Path]::ChangeExtension($Path, '.python-capture.bmp')
+    Remove-Item -LiteralPath $tempBmp -Force -ErrorAction SilentlyContinue
+
+    $hwnd = $WindowProcess.MainWindowHandle.ToInt64()
+    $output = & $PythonExe $PythonCaptureScript `
+        --hwnd ([string]$hwnd) `
+        --width ([string]$Rect.Width) `
+        --height ([string]$Rect.Height) `
+        --out $tempBmp 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $message = ($output | Out-String).Trim()
+        if ($message -eq '') {
+            $message = "Python window capture failed with exit code $LASTEXITCODE."
+        }
+        throw $message
+    }
+
+    $captured = [System.Drawing.Bitmap]::FromFile($tempBmp)
+    try {
+        $captured.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally {
+        $captured.Dispose()
+        Remove-Item -LiteralPath $tempBmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Capture-ParityWindow {
     param(
         [Parameter(Mandatory)]$WindowProcess,
         [Parameter(Mandatory)][string]$Path,
-        [ValidateSet('Window', 'Screen')][string]$Mode = 'Window'
+        [ValidateSet('Window', 'WindowStrict', 'PythonWindow', 'Screen')][string]$Mode = 'Window',
+        [string]$PythonExe = 'python',
+        [string]$PythonCaptureScript = '',
+        [switch]$NoForeground
     )
 
     $rect = Get-ParityWindowRect -WindowProcess $WindowProcess
+    if ($Mode -eq 'PythonWindow') {
+        Invoke-ParityPythonWindowCapture `
+            -WindowProcess $WindowProcess `
+            -Rect $rect `
+            -Path $Path `
+            -PythonExe $PythonExe `
+            -PythonCaptureScript $PythonCaptureScript
+        return $rect
+    }
+
     $bitmap = New-Object System.Drawing.Bitmap $rect.Width, $rect.Height
     $graphics = $null
     try {
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
         $captured = $false
-        if ($Mode -eq 'Window') {
+        if ($Mode -eq 'Window' -or $Mode -eq 'WindowStrict') {
             $hdc = $graphics.GetHdc()
             try {
                 $captured = [GodlyParity.Win32]::PrintWindow(
@@ -341,9 +409,18 @@ function Capture-ParityWindow {
             if ($captured -and (Test-ParityBitmapLooksBlank -Bitmap $bitmap)) {
                 $captured = $false
             }
+            if (-not $captured -and $Mode -eq 'WindowStrict') {
+                if ([GodlyParity.Win32]::IsIconic($WindowProcess.MainWindowHandle)) {
+                    throw "WindowStrict capture failed because the window is minimized."
+                }
+                throw "WindowStrict capture failed: PrintWindow returned no usable pixels."
+            }
         }
 
         if (-not $captured) {
+            if ($NoForeground) {
+                throw "Capture mode '$Mode' requires foreground screen fallback; use WindowStrict or PythonWindow for background capture."
+            }
             [GodlyParity.Win32]::BringWindowToTop($WindowProcess.MainWindowHandle) | Out-Null
             [GodlyParity.Win32]::SetForegroundWindow($WindowProcess.MainWindowHandle) | Out-Null
             Start-Sleep -Milliseconds 150
@@ -379,14 +456,18 @@ function ConvertTo-ParityRect {
 function Get-DefaultTerminalManagerCropRect {
     param(
         [int]$Width,
-        [int]$Height
+        [int]$Height,
+        [string]$CaptureMode = 'Screen'
     )
 
+    $x = if ($CaptureMode -eq 'Screen') { 148 } else { 139 }
+    $y = if ($CaptureMode -eq 'Screen') { 236 } else { 212 }
+
     [pscustomobject]@{
-        X = [Math]::Min(241, [Math]::Max(0, $Width - 1))
-        Y = [Math]::Min(333, [Math]::Max(0, $Height - 1))
-        Width = [Math]::Min(832, [Math]::Max(1, $Width - [Math]::Min(241, [Math]::Max(0, $Width - 1))))
-        Height = [Math]::Min(216, [Math]::Max(1, $Height - [Math]::Min(333, [Math]::Max(0, $Height - 1))))
+        X = [Math]::Min($x, [Math]::Max(0, $Width - 1))
+        Y = [Math]::Min($y, [Math]::Max(0, $Height - 1))
+        Width = [Math]::Min(832, [Math]::Max(1, $Width - [Math]::Min($x, [Math]::Max(0, $Width - 1))))
+        Height = [Math]::Min(216, [Math]::Max(1, $Height - [Math]::Min($y, [Math]::Max(0, $Height - 1))))
     }
 }
 
@@ -398,8 +479,8 @@ function Get-DefaultWindowsTerminalCropRect {
         [int]$CropHeight
     )
 
-    $x = 36
-    $y = 131
+    $x = 47
+    $y = 120
     if (($x + $CropWidth) -gt $Width) {
         $x = [Math]::Max(0, $Width - $CropWidth)
     }
@@ -571,12 +652,16 @@ function Invoke-ParitySelfTest {
     }
 
     $tmCrop = Get-DefaultTerminalManagerCropRect -Width 1280 -Height 800
-    if ($tmCrop.X -ne 241 -or $tmCrop.Y -ne 333 -or $tmCrop.Width -ne 832 -or $tmCrop.Height -ne 216) {
+    if ($tmCrop.X -ne 148 -or $tmCrop.Y -ne 236 -or $tmCrop.Width -ne 832 -or $tmCrop.Height -ne 216) {
         throw "Terminal-manager default crop self-test failed: $($tmCrop | ConvertTo-Json -Compress)"
+    }
+    $tmPythonCrop = Get-DefaultTerminalManagerCropRect -Width 1280 -Height 800 -CaptureMode 'PythonWindow'
+    if ($tmPythonCrop.X -ne 139 -or $tmPythonCrop.Y -ne 212 -or $tmPythonCrop.Width -ne 832 -or $tmPythonCrop.Height -ne 216) {
+        throw "Terminal-manager PythonWindow default crop self-test failed: $($tmPythonCrop | ConvertTo-Json -Compress)"
     }
 
     $wtCrop = Get-DefaultWindowsTerminalCropRect -Width 1280 -Height 800 -CropWidth 832 -CropHeight 216
-    if ($wtCrop.X -ne 36 -or $wtCrop.Y -ne 131 -or $wtCrop.Width -ne 832 -or $wtCrop.Height -ne 216) {
+    if ($wtCrop.X -ne 47 -or $wtCrop.Y -ne 120 -or $wtCrop.Width -ne 832 -or $wtCrop.Height -ne 216) {
         throw "Windows Terminal default crop self-test failed: $($wtCrop | ConvertTo-Json -Compress)"
     }
 

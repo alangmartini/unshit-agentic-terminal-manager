@@ -33,8 +33,8 @@ Useful calibration knobs:
 pwsh tools/parity/run_parity.ps1 `
   -WtProfile "PowerShell" `
   -WtColorScheme "Campbell" `
-  -TerminalManagerCrop "241,333,832,216" `
-  -WindowsTerminalCrop "36,131,832,216" `
+  -TerminalManagerCrop "148,236,832,216" `
+  -WindowsTerminalCrop "47,120,832,216" `
   -SceneInitialDelayMs 5000 `
   -CaptureDelayMs 9000
 ```
@@ -47,6 +47,7 @@ pwsh tools/parity/run_parity.ps1 `
   -TerminalManagerWindowWidth 1625 `
   -TerminalManagerWindowHeight 896 `
   -WindowsTerminalWindowWidth 1576 `
+  -WindowsTerminalWindowHeight 816 `
   -SceneHoldSeconds 5
 ```
 
@@ -76,9 +77,41 @@ By default the harness uses screen capture for terminal-manager, because
 `PrintWindow` can return nonblank but stale or incorrectly scaled wgpu frames,
 and window capture for Windows Terminal. Override with
 `-TerminalManagerCaptureMode` or `-WindowsTerminalCaptureMode` if needed.
-For reliable GUI captures, keep the spawned Windows Terminal and
-terminal-manager windows visible, uncovered, unminimized, and unmoved until the
-script exits. If the desktop is in use, run only `-SelfTest` and Rust tests.
+Supported capture modes are `Screen`, `Window`, `WindowStrict`, and
+`PythonWindow`. `Window` keeps the historical behavior: it tries `PrintWindow`
+first, then falls back to foreground screen capture. `WindowStrict` and
+`PythonWindow` never use foreground screen fallback, so they can capture
+unfocused or covered windows when the app provides live pixels through
+`PrintWindow`.
+
+Use background capture when you want to keep using the desktop while the
+harness runs:
+
+```powershell
+pwsh tools/parity/run_parity.ps1 `
+  -SkipBuild `
+  -TerminalManagerExe target\parity-build\debug\terminal-manager.exe `
+  -TerminalManagerWindowWidth 1625 `
+  -TerminalManagerWindowHeight 896 `
+  -WindowsTerminalWindowWidth 1576 `
+  -BackgroundCapture `
+  -SceneHoldSeconds 5
+```
+
+Background capture uses the dependency-free `tools/parity/capture_window.py`
+helper and does not intentionally activate the spawned windows. Keep the
+windows unminimized; Windows often stops rendering fresh GPU content for
+minimized windows, so minimized capture can fail or return stale pixels. If a
+background run fails, rerun without `-BackgroundCapture` and keep the spawned
+Windows Terminal and terminal-manager windows visible, uncovered, unminimized,
+and unmoved until the script exits. If the desktop is in use and background
+capture is not viable, run only `-SelfTest` and Rust tests.
+
+The current calibrated default crops are `TerminalManagerCrop=148,236,832,216`
+and `WindowsTerminalCrop=47,120,832,216` for foreground screen captures.
+When terminal-manager uses `PythonWindow`/`WindowStrict`, its calibrated
+default crop is `139,212,832,216` because `PrintWindow` frames the app window
+differently than screen capture.
 
 Use the `*-full.png` captures to tune crop rectangles. Crop specs are
 `x,y,width,height`. The scene waits before writing so terminal-manager can

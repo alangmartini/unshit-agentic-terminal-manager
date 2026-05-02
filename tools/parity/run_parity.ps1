@@ -4,6 +4,7 @@ param(
     [string]$DaemonExe = '',
     [string]$WtExe = 'wt.exe',
     [string]$PowerShellExe = 'pwsh.exe',
+    [string]$PythonExe = 'python',
     [string]$WtProfile = '',
     [string]$WtColorScheme = '',
     [string]$TerminalManagerCrop = '',
@@ -25,9 +26,10 @@ param(
     [int]$SceneMaxSizeWaitMs = 3000,
     [int]$WindowTimeoutSeconds = 60,
     [int]$Tolerance = 8,
-    [ValidateSet('Window', 'Screen')][string]$CaptureMode = 'Window',
+    [ValidateSet('Window', 'WindowStrict', 'PythonWindow', 'Screen')][string]$CaptureMode = 'Window',
     [string]$TerminalManagerCaptureMode = '',
     [string]$WindowsTerminalCaptureMode = '',
+    [switch]$BackgroundCapture,
     [switch]$SkipBuild,
     [switch]$SelfTest
 )
@@ -66,6 +68,7 @@ $diffPath = Join-Path $absoluteArtifactDir 'diff.png'
 $reportPath = Join-Path $absoluteArtifactDir 'report.json'
 $terminalManagerSceneMetaPath = Join-Path $absoluteArtifactDir 'terminal-manager-scene.json'
 $windowsTerminalSceneMetaPath = Join-Path $absoluteArtifactDir 'windows-terminal-scene.json'
+$pythonCaptureScript = Join-Path $scriptDir 'capture_window.py'
 
 function Invoke-Checked {
     param(
@@ -133,8 +136,9 @@ function Resolve-CaptureModeOverride {
     if ($Value -eq '') {
         return $DefaultValue
     }
-    if ($Value -ne 'Window' -and $Value -ne 'Screen') {
-        throw "Capture mode '$Value' must be Window or Screen."
+    $allowedModes = @('Window', 'WindowStrict', 'PythonWindow', 'Screen')
+    if ($allowedModes -notcontains $Value) {
+        throw "Capture mode '$Value' must be one of: $($allowedModes -join ', ')."
     }
     $Value
 }
@@ -383,14 +387,34 @@ $windowsTerminalBounds = [pscustomobject]@{
     x = $WindowX
     y = $WindowY
     width = Resolve-PositiveIntOverride -Value $WindowsTerminalWindowWidth -DefaultValue $WindowWidth
-    height = Resolve-PositiveIntOverride -Value $WindowsTerminalWindowHeight -DefaultValue $WindowHeight
+    height = Resolve-PositiveIntOverride -Value $WindowsTerminalWindowHeight -DefaultValue 816
+}
+$terminalManagerDefaultCaptureMode = if ($BackgroundCapture) {
+    'PythonWindow'
+} elseif ($PSBoundParameters.ContainsKey('CaptureMode')) {
+    $CaptureMode
+} else {
+    'Screen'
+}
+$windowsTerminalDefaultCaptureMode = if ($BackgroundCapture) {
+    'PythonWindow'
+} elseif ($PSBoundParameters.ContainsKey('CaptureMode')) {
+    $CaptureMode
+} else {
+    'Window'
 }
 $terminalManagerResolvedCaptureMode = Resolve-CaptureModeOverride `
     -Value $TerminalManagerCaptureMode `
-    -DefaultValue $(if ($PSBoundParameters.ContainsKey('CaptureMode')) { $CaptureMode } else { 'Screen' })
+    -DefaultValue $terminalManagerDefaultCaptureMode
 $windowsTerminalResolvedCaptureMode = Resolve-CaptureModeOverride `
     -Value $WindowsTerminalCaptureMode `
-    -DefaultValue $(if ($PSBoundParameters.ContainsKey('CaptureMode')) { $CaptureMode } else { 'Window' })
+    -DefaultValue $windowsTerminalDefaultCaptureMode
+if ($BackgroundCapture -and (
+        $terminalManagerResolvedCaptureMode -eq 'Screen' -or
+        $windowsTerminalResolvedCaptureMode -eq 'Screen'
+    )) {
+    throw "BackgroundCapture cannot use Screen mode because screen capture depends on foreground visibility. Use WindowStrict or PythonWindow."
+}
 
 $terminalManagerProcess = $null
 $terminalManagerWindow = $null
@@ -412,19 +436,24 @@ try {
         -X $terminalManagerBounds.x `
         -Y $terminalManagerBounds.y `
         -Width $terminalManagerBounds.width `
-        -Height $terminalManagerBounds.height
+        -Height $terminalManagerBounds.height `
+        -NoActivate:$BackgroundCapture
     Start-Sleep -Milliseconds $CaptureDelayMs
     $terminalManagerRect = Capture-ParityWindow `
         -WindowProcess $terminalManagerWindow `
         -Path $terminalManagerFullPath `
-        -Mode $terminalManagerResolvedCaptureMode
+        -Mode $terminalManagerResolvedCaptureMode `
+        -PythonExe $PythonExe `
+        -PythonCaptureScript $pythonCaptureScript `
+        -NoForeground:$BackgroundCapture
 
     $terminalManagerCropRect = if ($TerminalManagerCrop -ne '') {
         ConvertTo-ParityRect -Spec $TerminalManagerCrop
     } else {
         Get-DefaultTerminalManagerCropRect `
             -Width $terminalManagerRect.Width `
-            -Height $terminalManagerRect.Height
+            -Height $terminalManagerRect.Height `
+            -CaptureMode $terminalManagerResolvedCaptureMode
     }
     Save-ParityImageCrop `
         -SourcePath $terminalManagerFullPath `
@@ -454,12 +483,16 @@ try {
         -X $windowsTerminalBounds.x `
         -Y $windowsTerminalBounds.y `
         -Width $windowsTerminalBounds.width `
-        -Height $windowsTerminalBounds.height
+        -Height $windowsTerminalBounds.height `
+        -NoActivate:$BackgroundCapture
     Start-Sleep -Milliseconds $CaptureDelayMs
     $windowsTerminalRect = Capture-ParityWindow `
         -WindowProcess $windowsTerminalWindow `
         -Path $windowsTerminalFullPath `
-        -Mode $windowsTerminalResolvedCaptureMode
+        -Mode $windowsTerminalResolvedCaptureMode `
+        -PythonExe $PythonExe `
+        -PythonCaptureScript $pythonCaptureScript `
+        -NoForeground:$BackgroundCapture
 
     $windowsTerminalCropRect = if ($WindowsTerminalCrop -ne '') {
         ConvertTo-ParityRect -Spec $WindowsTerminalCrop
@@ -523,6 +556,7 @@ $report = [pscustomobject]@{
         capture_mode = $CaptureMode
         terminal_manager_capture_mode = $terminalManagerResolvedCaptureMode
         windows_terminal_capture_mode = $windowsTerminalResolvedCaptureMode
+        background_capture = [bool]$BackgroundCapture
         terminal_manager_visual_profile = 'WindowsTerminal'
         scene_hold_seconds = $SceneHoldSeconds
         scene_initial_delay_ms = $SceneInitialDelayMs
@@ -535,6 +569,7 @@ $report = [pscustomobject]@{
         unshit_ptyd = $daemonExePath
         wt = $WtExe
         powershell = $PowerShellExe
+        python = $PythonExe
     }
     windows_terminal = [pscustomobject]@{
         full = $windowsTerminalFullPath

@@ -2604,6 +2604,14 @@ fn terminal_effective_bg(grid: &CellGrid, row: usize, col: usize) -> Color {
     terminal_effective_bg_for_cell(cell, parity_windows_terminal_colors_enabled())
 }
 
+fn terminal_glyph_position_for_parity(gx: f32, gy: f32, parity_colors: bool) -> [f32; 2] {
+    if parity_colors {
+        [gx, gy.round()]
+    } else {
+        [gx, gy]
+    }
+}
+
 fn terminal_effective_bg_for_cell(
     cell: &unshit_core::cell_grid::Cell,
     parity_colors: bool,
@@ -2807,6 +2815,27 @@ fn push_terminal_cell_rect(
     );
 }
 
+fn push_terminal_cell_rect_snapped(
+    row_quads: &mut Vec<QuadInstance>,
+    cell_x: f32,
+    cell_y: f32,
+    rect: TerminalCellRect,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+) {
+    let x0 = (cell_x + rect.x).round();
+    let y0 = (cell_y + rect.y).round();
+    let x1 = (cell_x + rect.x + rect.width).round();
+    let y1 = (cell_y + rect.y + rect.height).round();
+    push_terminal_quad(
+        row_quads,
+        [x0, y0],
+        [(x1 - x0).max(1.0), (y1 - y0).max(1.0)],
+        color,
+        clip_rect,
+    );
+}
+
 fn emit_terminal_text_decorations(
     cell: &unshit_core::cell_grid::Cell,
     cell_x: f32,
@@ -2848,13 +2877,18 @@ fn emit_terminal_text_decorations(
     emitted
 }
 
-fn terminal_block_rect(ch: char, cell_w: f32, cell_h: f32) -> Option<TerminalCellRect> {
+fn terminal_block_rect(
+    ch: char,
+    cell_w: f32,
+    cell_h: f32,
+    trailing_edge_clamp: f32,
+) -> Option<TerminalCellRect> {
     let overlap = 0.5;
     match ch {
         '\u{2588}' => Some(TerminalCellRect {
             x: -overlap,
             y: -overlap,
-            width: cell_w + overlap * 2.0,
+            width: cell_w + overlap * 2.0 - trailing_edge_clamp,
             height: cell_h + overlap * 2.0,
         }),
         '\u{2580}' => Some(TerminalCellRect {
@@ -2904,6 +2938,102 @@ fn terminal_block_rect(ch: char, cell_w: f32, cell_h: f32) -> Option<TerminalCel
     }
 }
 
+fn terminal_primitive_y_bias_for_parity(ch: char, parity_colors: bool) -> f32 {
+    if !parity_colors {
+        return 0.0;
+    }
+
+    match ch {
+        '\u{2580}'..='\u{259f}' => 1.0,
+        '\u{2500}' | '\u{250c}' | '\u{252c}' | '\u{2510}' | '\u{251c}' | '\u{253c}'
+        | '\u{2524}' | '\u{2514}' | '\u{2534}' | '\u{2518}' => 1.0,
+        '\u{2501}' => 1.0,
+        _ => 0.0,
+    }
+}
+
+fn terminal_block_or_shade_char(ch: char) -> bool {
+    matches!(ch, '\u{2580}'..='\u{259f}')
+}
+
+fn terminal_primitive_trailing_edge_clamp_for_parity(
+    ch: char,
+    next_ch: Option<char>,
+    parity_colors: bool,
+) -> f32 {
+    if !parity_colors {
+        return 0.0;
+    }
+
+    match ch {
+        '\u{2588}' if !next_ch.is_some_and(terminal_block_or_shade_char) => 1.0,
+        '\u{2501}' if next_ch != Some('\u{2501}') => 1.0,
+        _ => 0.0,
+    }
+}
+
+fn terminal_shade_threshold(ch: char) -> Option<u8> {
+    match ch {
+        '\u{2591}' => Some(4),
+        '\u{2592}' => Some(8),
+        '\u{2593}' => Some(12),
+        _ => None,
+    }
+}
+
+fn terminal_shade_pixel_filled(x: u32, y: u32, threshold: u8) -> bool {
+    let diagonal_phase = if y % 2 == 0 { 0 } else { 2 };
+    match threshold {
+        4 => (x + diagonal_phase) % 4 == 0,
+        8 => (x + (diagonal_phase / 2)) % 2 == 0,
+        12 => (x + diagonal_phase) % 4 != 0,
+        _ => false,
+    }
+}
+
+fn emit_shade_block_primitive(
+    ch: char,
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) -> bool {
+    let Some(threshold) = terminal_shade_threshold(ch) else {
+        return false;
+    };
+
+    let width = cell_w.round().max(1.0) as u32;
+    let height = cell_h.round().max(1.0) as u32;
+    let origin_x = cell_x.floor();
+    let origin_y = cell_y.floor();
+    for y in 0..height {
+        let mut span_start: Option<u32> = None;
+        for x in 0..=width {
+            let filled = x < width
+                && terminal_shade_pixel_filled(origin_x as u32 + x, origin_y as u32 + y, threshold);
+            match (span_start, filled) {
+                (None, true) => span_start = Some(x),
+                (Some(start), false) => {
+                    push_terminal_quad(
+                        row_quads,
+                        [origin_x + start as f32, origin_y + y as f32],
+                        [(x - start) as f32, 1.0],
+                        color,
+                        clip_rect,
+                    );
+                    span_start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    true
+}
+
 fn box_stroke_width(cell_h: f32, heavy: bool) -> f32 {
     let light = (cell_h / 16.0).round().max(1.0);
     if heavy {
@@ -2948,6 +3078,8 @@ fn emit_box_drawing_primitive(
     cell_y: f32,
     cell_w: f32,
     cell_h: f32,
+    trailing_edge_clamp: f32,
+    parity_colors: bool,
     color: [f32; 4],
     clip_rect: [f32; 4],
     row_quads: &mut Vec<QuadInstance>,
@@ -2960,31 +3092,174 @@ fn emit_box_drawing_primitive(
     let stroke = box_stroke_width(cell_h, heavy);
     let cx = cell_w * 0.5;
     let cy = cell_h * 0.5;
+    let snap_to_pixels = parity_colors;
 
     if left || right {
         let x0 = if left { -overlap } else { cx - stroke * 0.5 };
-        let x1 = if right { cell_w + overlap } else { cx + stroke * 0.5 };
-        push_terminal_cell_rect(
-            row_quads,
-            cell_x,
-            cell_y,
-            TerminalCellRect { x: x0, y: cy - stroke * 0.5, width: x1 - x0, height: stroke },
-            color,
-            clip_rect,
-        );
+        let x1 = if right { cell_w + overlap - trailing_edge_clamp } else { cx + stroke * 0.5 };
+        let rect = TerminalCellRect { x: x0, y: cy - stroke * 0.5, width: x1 - x0, height: stroke };
+        if snap_to_pixels {
+            push_terminal_cell_rect_snapped(row_quads, cell_x, cell_y, rect, color, clip_rect);
+        } else {
+            push_terminal_cell_rect(row_quads, cell_x, cell_y, rect, color, clip_rect);
+        }
     }
 
     if up || down {
         let y0 = if up { -overlap } else { cy - stroke * 0.5 };
         let y1 = if down { cell_h + overlap } else { cy + stroke * 0.5 };
-        push_terminal_cell_rect(
-            row_quads,
-            cell_x,
-            cell_y,
-            TerminalCellRect { x: cx - stroke * 0.5, y: y0, width: stroke, height: y1 - y0 },
-            color,
-            clip_rect,
-        );
+        let rect = TerminalCellRect { x: cx - stroke * 0.5, y: y0, width: stroke, height: y1 - y0 };
+        if snap_to_pixels {
+            push_terminal_cell_rect_snapped(row_quads, cell_x, cell_y, rect, color, clip_rect);
+        } else {
+            push_terminal_cell_rect(row_quads, cell_x, cell_y, rect, color, clip_rect);
+        }
+    }
+
+    true
+}
+
+fn emit_box_double_stroke(
+    horizontal: bool,
+    center: f32,
+    start: f32,
+    end: f32,
+    stroke: f32,
+    snap_to_pixels: bool,
+    cell_x: f32,
+    cell_y: f32,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) {
+    if horizontal {
+        let rect = TerminalCellRect {
+            x: start,
+            y: center - stroke * 0.5,
+            width: end - start,
+            height: stroke,
+        };
+        if snap_to_pixels {
+            push_terminal_cell_rect_snapped(row_quads, cell_x, cell_y, rect, color, clip_rect);
+        } else {
+            push_terminal_cell_rect(row_quads, cell_x, cell_y, rect, color, clip_rect);
+        }
+    } else {
+        let rect = TerminalCellRect {
+            x: center - stroke * 0.5,
+            y: start,
+            width: stroke,
+            height: end - start,
+        };
+        if snap_to_pixels {
+            push_terminal_cell_rect_snapped(row_quads, cell_x, cell_y, rect, color, clip_rect);
+        } else {
+            push_terminal_cell_rect(row_quads, cell_x, cell_y, rect, color, clip_rect);
+        }
+    }
+}
+
+fn emit_double_box_drawing_primitive(
+    ch: char,
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    parity_colors: bool,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) -> bool {
+    let (left, right, up, down, double_horizontal, double_vertical) = match ch {
+        '\u{2550}' => (true, true, false, false, true, false), // ═
+        '\u{2551}' => (false, false, true, true, false, true), // ║
+        '\u{2554}' => (false, true, false, true, true, true),  // ╔
+        '\u{2557}' => (true, false, false, true, true, true),  // ╗
+        '\u{255a}' => (false, true, true, false, true, true),  // ╚
+        '\u{255d}' => (true, false, true, false, true, true),  // ╝
+        '\u{255f}' => (false, true, true, true, false, true),  // ╟
+        '\u{2562}' => (true, false, true, true, false, true),  // ╢
+        _ => return false,
+    };
+
+    let overlap = 0.5;
+    let stroke = box_stroke_width(cell_h, false);
+    let cx = cell_w * 0.5;
+    let cy = cell_h * 0.5;
+    let x_offset = (cell_w * 0.15).round().max(stroke);
+    let y_offset = (cell_h * 0.09).round().max(stroke);
+    let snap_to_pixels = parity_colors;
+    let horizontal_centers =
+        if double_horizontal { [cy - y_offset, cy + y_offset] } else { [cy, cy] };
+    let vertical_centers = if double_vertical { [cx - x_offset, cx + x_offset] } else { [cx, cx] };
+    let horizontal_count = if double_horizontal { 2 } else { 1 };
+    let vertical_count = if double_vertical { 2 } else { 1 };
+    let corner_join = double_horizontal && double_vertical && (left ^ right) && (up ^ down);
+    let corner_reversed_pairs = corner_join && ((left && down) || (right && up));
+    let corner_pair = |index: usize| {
+        if corner_reversed_pairs {
+            1 - index
+        } else {
+            index
+        }
+    };
+
+    if left || right {
+        for (index, center) in horizontal_centers.iter().take(horizontal_count).enumerate() {
+            let mut x0 = if left { -overlap } else { cx - stroke * 0.5 };
+            let mut x1 = if right { cell_w + overlap } else { cx + stroke * 0.5 };
+            if corner_join {
+                let vertical_center = vertical_centers[corner_pair(index)];
+                if !left {
+                    x0 = vertical_center - stroke * 0.5;
+                }
+                if !right {
+                    x1 = vertical_center + stroke * 0.5;
+                }
+            }
+            emit_box_double_stroke(
+                true,
+                *center,
+                x0,
+                x1,
+                stroke,
+                snap_to_pixels,
+                cell_x,
+                cell_y,
+                color,
+                clip_rect,
+                row_quads,
+            );
+        }
+    }
+
+    if up || down {
+        for (index, center) in vertical_centers.iter().take(vertical_count).enumerate() {
+            let mut y0 = if up { -overlap } else { cy - stroke * 0.5 };
+            let mut y1 = if down { cell_h + overlap } else { cy + stroke * 0.5 };
+            if corner_join {
+                let horizontal_center = horizontal_centers[corner_pair(index)];
+                if !up {
+                    y0 = horizontal_center - stroke * 0.5;
+                }
+                if !down {
+                    y1 = horizontal_center + stroke * 0.5;
+                }
+            }
+            emit_box_double_stroke(
+                false,
+                *center,
+                y0,
+                y1,
+                stroke,
+                snap_to_pixels,
+                cell_x,
+                cell_y,
+                color,
+                clip_rect,
+                row_quads,
+            );
+        }
     }
 
     true
@@ -3000,7 +3275,9 @@ fn emit_terminal_cell_primitive(
     cell_h: f32,
     opacity: f32,
     clip_rect: [f32; 4],
+    parity_colors: bool,
     blink_phase_on: bool,
+    next_ch: Option<char>,
     row_quads: &mut Vec<QuadInstance>,
 ) -> bool {
     if cell.ch == '\0' || cell.wide_continuation {
@@ -3012,6 +3289,9 @@ fn emit_terminal_cell_primitive(
 
     let cell_x = origin_x + col as f32 * cell_w;
     let cell_y = origin_y + row as f32 * cell_h;
+    let primitive_y = cell_y + terminal_primitive_y_bias_for_parity(cell.ch, parity_colors);
+    let trailing_edge_clamp =
+        terminal_primitive_trailing_edge_clamp_for_parity(cell.ch, next_ch, parity_colors);
     let color = terminal_fg_color(cell, opacity);
     let decorated = emit_terminal_text_decorations(
         cell, cell_x, cell_y, cell_w, cell_h, color, clip_rect, row_quads,
@@ -3021,12 +3301,53 @@ fn emit_terminal_cell_primitive(
         return decorated;
     }
 
-    if let Some(rect) = terminal_block_rect(cell.ch, cell_w, cell_h) {
-        push_terminal_cell_rect(row_quads, cell_x, cell_y, rect, color, clip_rect);
+    if let Some(rect) = terminal_block_rect(cell.ch, cell_w, cell_h, trailing_edge_clamp) {
+        if parity_colors {
+            push_terminal_cell_rect_snapped(row_quads, cell_x, primitive_y, rect, color, clip_rect);
+        } else {
+            push_terminal_cell_rect(row_quads, cell_x, primitive_y, rect, color, clip_rect);
+        }
         return true;
     }
 
-    emit_box_drawing_primitive(cell.ch, cell_x, cell_y, cell_w, cell_h, color, clip_rect, row_quads)
+    if parity_colors
+        && emit_shade_block_primitive(
+            cell.ch,
+            cell_x,
+            primitive_y,
+            cell_w,
+            cell_h,
+            color,
+            clip_rect,
+            row_quads,
+        )
+    {
+        return true;
+    }
+
+    emit_box_drawing_primitive(
+        cell.ch,
+        cell_x,
+        primitive_y,
+        cell_w,
+        cell_h,
+        trailing_edge_clamp,
+        parity_colors,
+        color,
+        clip_rect,
+        row_quads,
+    ) || (parity_colors
+        && emit_double_box_drawing_primitive(
+            cell.ch,
+            cell_x,
+            primitive_y,
+            cell_w,
+            cell_h,
+            parity_colors,
+            color,
+            clip_rect,
+            row_quads,
+        ))
 }
 
 /// Emit a background `QuadInstance` for every bg run on `row` between
@@ -3515,6 +3836,7 @@ fn emit_grid_cell_glyph(
     font_size: f32,
     opacity: f32,
     clip_rect: [f32; 4],
+    parity_colors: bool,
     shape_font_id: u64,
     shape_style: u64,
     shape_font_size_tenths: u32,
@@ -3641,7 +3963,7 @@ fn emit_grid_cell_glyph(
     }
 
     row_glyphs.push(GlyphInstance {
-        pos: [gx, gy],
+        pos: terminal_glyph_position_for_parity(gx, gy, parity_colors),
         size: resolved.entry.size,
         uv_min: [resolved.entry.uv_rect[0], resolved.entry.uv_rect[1]],
         uv_max: [resolved.entry.uv_rect[2], resolved.entry.uv_rect[3]],
@@ -3650,6 +3972,15 @@ fn emit_grid_cell_glyph(
     });
 
     true
+}
+
+fn terminal_row_next_ch(
+    cells: &[unshit_core::cell_grid::Cell],
+    row_base: usize,
+    col: usize,
+    cols: usize,
+) -> Option<char> {
+    (col + 1 < cols).then(|| cells[row_base + col + 1].ch)
 }
 
 /// Emit one row of a cell grid into the row-local output buffers. Called
@@ -3697,6 +4028,7 @@ fn emit_grid_row_fresh(
     trace_glyphs: &mut Vec<String>,
 ) {
     let row_base = row * cols;
+    let parity_colors = parity_windows_terminal_colors_enabled();
 
     // Merge adjacent cells that share the same background color (ignoring
     // fg and attrs) into a single background QuadInstance across the
@@ -3715,6 +4047,7 @@ fn emit_grid_row_fresh(
     // unchanged cells without reshaping.
     for col in 0..cols {
         let cell = &cells[row_base + col];
+        let next_ch = terminal_row_next_ch(cells, row_base, col, cols);
         if emit_terminal_cell_primitive(
             cell,
             row,
@@ -3725,7 +4058,9 @@ fn emit_grid_row_fresh(
             cell_h,
             opacity,
             clip_rect,
+            parity_colors,
             blink_phase_on,
+            next_ch,
             row_quads,
         ) {
             row_glyph_col_index.push(None);
@@ -3748,6 +4083,7 @@ fn emit_grid_row_fresh(
             font_size,
             opacity,
             clip_rect,
+            parity_colors,
             shape_font_id,
             shape_style,
             shape_font_size_tenths,
@@ -3822,6 +4158,7 @@ fn emit_grid_row_splice(
     trace_glyphs: &mut Vec<String>,
 ) {
     let row_base = row * cols;
+    let parity_colors = parity_windows_terminal_colors_enabled();
 
     // Backgrounds: always re-emit for the full row. Bg runs are cheap
     // (O(cols)) and may shift boundaries as cell bg colors change, so
@@ -3835,6 +4172,7 @@ fn emit_grid_row_splice(
 
     for col in 0..cols {
         let cell = &cells[row_base + col];
+        let next_ch = terminal_row_next_ch(cells, row_base, col, cols);
         if emit_terminal_cell_primitive(
             cell,
             row,
@@ -3845,7 +4183,9 @@ fn emit_grid_row_splice(
             cell_h,
             opacity,
             clip_rect,
+            parity_colors,
             blink_phase_on,
+            next_ch,
             row_quads,
         ) {
             row_glyph_col_index.push(None);
@@ -3870,6 +4210,7 @@ fn emit_grid_row_splice(
                 font_size,
                 opacity,
                 clip_rect,
+                parity_colors,
                 shape_font_id,
                 shape_style,
                 shape_font_size_tenths,
@@ -4512,6 +4853,12 @@ mod tests {
     }
 
     #[test]
+    fn terminal_glyph_position_snap_is_parity_scoped() {
+        assert_eq!(terminal_glyph_position_for_parity(10.25, 20.75, false), [10.25, 20.75]);
+        assert_eq!(terminal_glyph_position_for_parity(10.25, 20.75, true), [10.25, 21.0]);
+    }
+
+    #[test]
     fn terminal_bg_runs_only_recalibrate_inverse_default_fg_under_parity_profile() {
         let mut grid = CellGrid::new(1, 2);
         grid.set_cell(
@@ -4542,6 +4889,126 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].bg, WINDOWS_TERMINAL_PARITY_LITERAL_FG);
         assert_eq!(runs[1].bg, WINDOWS_TERMINAL_PARITY_CALIBRATED_FG);
+    }
+
+    #[test]
+    fn terminal_primitive_y_bias_is_parity_scoped_and_targeted() {
+        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2588}', false), 0.0);
+        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2588}', true), 1.0);
+        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2592}', true), 1.0);
+        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2501}', true), 1.0);
+        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2554}', true), 0.0);
+        assert_eq!(
+            terminal_primitive_y_bias_for_parity('\u{2500}', true),
+            1.0,
+            "light horizontal table borders align one pixel lower in Windows Terminal"
+        );
+        assert_eq!(
+            terminal_primitive_y_bias_for_parity('\u{2502}', true),
+            0.0,
+            "vertical-only light borders keep their calibrated baseline"
+        );
+        assert_eq!(
+            terminal_primitive_y_bias_for_parity('\u{255f}', true),
+            0.0,
+            "mixed tee glyphs keep their calibrated double-stroke baseline"
+        );
+    }
+
+    #[test]
+    fn terminal_primitive_trailing_edge_clamp_targets_run_end_only() {
+        assert_eq!(
+            terminal_primitive_trailing_edge_clamp_for_parity('\u{2588}', Some('\u{2593}'), true),
+            0.0,
+            "full block followed by a shade glyph remains joined to the block run"
+        );
+        assert_eq!(
+            terminal_primitive_trailing_edge_clamp_for_parity('\u{2588}', Some(' '), true),
+            1.0,
+            "trailing full block edge is shortened in parity mode"
+        );
+        assert_eq!(
+            terminal_primitive_trailing_edge_clamp_for_parity('\u{2501}', Some('\u{2501}'), true),
+            0.0,
+            "interior heavy horizontal cells keep overlap"
+        );
+        assert_eq!(
+            terminal_primitive_trailing_edge_clamp_for_parity('\u{2501}', Some(' '), true),
+            1.0,
+            "last heavy horizontal cell loses the extra right-edge pixel"
+        );
+        assert_eq!(
+            terminal_primitive_trailing_edge_clamp_for_parity('\u{2588}', Some(' '), false),
+            0.0,
+            "clamp is parity-profile scoped"
+        );
+    }
+
+    #[test]
+    fn terminal_primitive_run_end_clamp_uses_row_next_ch() {
+        let cells = [terminal_cell('\u{2501}'), terminal_cell('\u{2501}'), terminal_cell(' ')];
+
+        assert_eq!(terminal_row_next_ch(&cells, 0, 0, 3), Some('\u{2501}'));
+        assert_eq!(terminal_row_next_ch(&cells, 0, 1, 3), Some(' '));
+        assert_eq!(terminal_row_next_ch(&cells, 0, 2, 3), None);
+
+        let mut interior = Vec::new();
+        assert!(emit_terminal_cell_primitive(
+            &cells[0],
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            terminal_row_next_ch(&cells, 0, 0, 3),
+            &mut interior,
+        ));
+
+        let mut run_end = Vec::new();
+        assert!(emit_terminal_cell_primitive(
+            &cells[1],
+            0,
+            1,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            terminal_row_next_ch(&cells, 0, 1, 3),
+            &mut run_end,
+        ));
+
+        assert_eq!(interior.len(), 1);
+        assert_eq!(run_end.len(), 1);
+        assert!(
+            interior[0].size[0] > run_end[0].size[0],
+            "interior heavy-rule cells keep overlap while the run end is clamped"
+        );
+    }
+
+    #[test]
+    fn terminal_primitive_cell_rect_snap_aligns_fractional_quads_to_pixels() {
+        let mut quads = Vec::new();
+        push_terminal_cell_rect_snapped(
+            &mut quads,
+            10.2,
+            20.2,
+            TerminalCellRect { x: 0.25, y: 0.25, width: 2.5, height: 0.8 },
+            [1.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 200.0, 200.0],
+        );
+
+        assert_eq!(quads.len(), 1);
+        assert_eq!(quads[0].pos, [10.0, 20.0]);
+        assert_eq!(quads[0].size, [3.0, 1.0]);
     }
 
     #[test]
@@ -5527,7 +5994,9 @@ mod tests {
             16.0,
             1.0,
             [0.0, 0.0, 200.0, 200.0],
+            false,
             true,
+            None,
             &mut quads,
         );
 
@@ -5537,6 +6006,31 @@ mod tests {
         assert!(quads[0].pos[1] < 20.0, "block should overlap top cell edge");
         assert!(quads[0].size[0] > 8.0, "block width should cover the full cell plus seam guard");
         assert!(quads[0].size[1] > 16.0, "block height should cover the full cell plus seam guard");
+    }
+
+    #[test]
+    fn terminal_primitive_snaps_full_block_rect_under_parity_profile() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{2588}'),
+            0,
+            2,
+            10.2,
+            20.2,
+            8.0,
+            16.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            Some(' '),
+            &mut quads,
+        );
+
+        assert!(emitted);
+        assert_eq!(quads.len(), 1);
+        assert_eq!(quads[0].pos, [26.0, 21.0]);
+        assert_eq!(quads[0].size, [8.0, 17.0]);
     }
 
     #[test]
@@ -5552,7 +6046,9 @@ mod tests {
             18.0,
             1.0,
             [0.0, 0.0, 200.0, 200.0],
+            false,
             true,
+            None,
             &mut quads,
         );
 
@@ -5580,12 +6076,211 @@ mod tests {
             20.0,
             1.0,
             [0.0, 0.0, 200.0, 200.0],
+            false,
             true,
+            None,
             &mut quads,
         );
 
         assert!(emitted);
         assert_eq!(quads.len(), 2, "corner should render horizontal and vertical strokes");
+    }
+
+    #[test]
+    fn terminal_primitive_renders_double_box_glyphs_without_font_path() {
+        let mut horizontal = Vec::new();
+        let emitted_horizontal = emit_terminal_cell_primitive(
+            &terminal_cell('\u{2550}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            None,
+            &mut horizontal,
+        );
+        assert!(emitted_horizontal, "double horizontal line should use primitive path");
+        assert_eq!(horizontal.len(), 2, "double horizontal line emits two strokes");
+        assert!(horizontal[0].pos[1] < horizontal[1].pos[1]);
+
+        let mut mixed = Vec::new();
+        let emitted_mixed = emit_terminal_cell_primitive(
+            &terminal_cell('\u{255f}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            None,
+            &mut mixed,
+        );
+        assert!(emitted_mixed, "mixed double/single box glyph should use primitive path");
+        assert_eq!(mixed.len(), 3, "mixed glyph emits one single stroke plus two double strokes");
+    }
+
+    #[test]
+    fn terminal_primitive_double_and_shade_bypass_is_parity_scoped() {
+        let mut double_quads = Vec::new();
+        assert!(!emit_terminal_cell_primitive(
+            &terminal_cell('\u{2550}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut double_quads,
+        ));
+        assert!(
+            double_quads.is_empty(),
+            "non-parity double box glyphs stay on the regular glyph path"
+        );
+
+        let mut shade_quads = Vec::new();
+        assert!(!emit_terminal_cell_primitive(
+            &terminal_cell('\u{2592}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            8.0,
+            16.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut shade_quads,
+        ));
+        assert!(shade_quads.is_empty(), "non-parity shaded blocks stay on the regular glyph path");
+    }
+
+    #[test]
+    fn terminal_primitive_double_corner_uses_tight_stroke_gap() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{2554}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            13.0,
+            25.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            None,
+            &mut quads,
+        );
+
+        assert!(emitted);
+        assert_eq!(
+            quads.len(),
+            4,
+            "double corner should emit paired horizontal and vertical strokes"
+        );
+        let horizontal_gap = quads[1].pos[1] - quads[0].pos[1];
+        let vertical_gap = quads[3].pos[0] - quads[2].pos[0];
+        assert_eq!(horizontal_gap, 4.0);
+        assert_eq!(vertical_gap, 4.0);
+    }
+
+    #[test]
+    fn terminal_primitive_renders_shaded_blocks_as_stippled_quads() {
+        let mut light_quads = Vec::new();
+        let mut medium_quads = Vec::new();
+        let mut dark_quads = Vec::new();
+
+        assert!(emit_terminal_cell_primitive(
+            &terminal_cell('\u{2591}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            8.0,
+            16.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            None,
+            &mut light_quads,
+        ));
+        assert!(emit_terminal_cell_primitive(
+            &terminal_cell('\u{2592}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            8.0,
+            16.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            None,
+            &mut medium_quads,
+        ));
+        assert!(emit_terminal_cell_primitive(
+            &terminal_cell('\u{2593}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            8.0,
+            16.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            None,
+            &mut dark_quads,
+        ));
+
+        let area = |quads: &[QuadInstance]| {
+            quads.iter().map(|quad| quad.size[0] * quad.size[1]).sum::<f32>()
+        };
+        let light_area = area(&light_quads);
+        let medium_area = area(&medium_quads);
+        let dark_area = area(&dark_quads);
+
+        assert!(light_area < medium_area);
+        assert!(medium_area < dark_area);
+        assert_eq!(light_area, 32.0, "light shade should cover 25% of an 8x16 cell");
+        assert_eq!(medium_area, 64.0, "medium shade should cover 50% of an 8x16 cell");
+        assert_eq!(dark_area, 96.0, "dark shade should cover 75% of an 8x16 cell");
+        assert!(
+            light_quads.iter().chain(&medium_quads).chain(&dark_quads).all(|quad| {
+                quad.size[1] == 1.0 && quad.pos[0].fract() == 0.0 && quad.pos[1].fract() == 0.0
+            }),
+            "shade primitives should snap to integer pixel rows"
+        );
+        assert!(
+            (1..=16).all(|row| light_quads.iter().any(|quad| quad.pos[1] == row as f32)),
+            "Windows Terminal shade lattice keeps light pixels on every row"
+        );
+        assert!(
+            (1..=16).all(|row| dark_quads
+                .iter()
+                .any(|quad| { quad.pos[1] == row as f32 && quad.size[0] < 8.0 })),
+            "dark shade keeps a gap on every row instead of alternating solid rows"
+        );
     }
 
     #[test]
@@ -5601,7 +6296,9 @@ mod tests {
             20.0,
             1.0,
             [0.0, 0.0, 200.0, 200.0],
+            false,
             true,
+            None,
             &mut quads,
         );
 
@@ -5651,7 +6348,9 @@ mod tests {
             20.0,
             1.0,
             [0.0, 0.0, 200.0, 200.0],
+            false,
             true,
+            None,
             &mut quads,
         );
 
@@ -5676,7 +6375,9 @@ mod tests {
             20.0,
             1.0,
             [0.0, 0.0, 200.0, 200.0],
+            false,
             true,
+            None,
             &mut quads,
         );
 
@@ -5702,6 +6403,8 @@ mod tests {
             1.0,
             [0.0, 0.0, 200.0, 200.0],
             false,
+            false,
+            None,
             &mut quads,
         );
 
@@ -5726,6 +6429,8 @@ mod tests {
             1.0,
             [0.0, 0.0, 200.0, 200.0],
             false,
+            false,
+            None,
             &mut quads,
         );
 
