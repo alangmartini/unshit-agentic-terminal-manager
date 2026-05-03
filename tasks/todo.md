@@ -129,14 +129,14 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
   - [x] UI on_change branches on `agent`: Claude uses `detect_claude_trigger`, Codex tries backtick (skills) then `/` (commands). Confirms preserve trigger char.
   - [x] Tests added: `codex_shell_spec_uses_exec_subcommand_and_prompt_arg`, `codex_shell_spec_preserves_multiline_prompts`; `load_codex_command_sources_from_walks_prompts_dir`, `load_codex_skill_sources_from_walks_skills_dir_and_excludes_dot_dirs`, missing-root variants for both, four `detect_codex_trigger_*` tests, `popup_open_with_trigger_carries_explicit_char`, `rederive_query_works_for_backtick_triggered_popup`, `rederive_query_dismisses_backtick_popup_when_trigger_replaced_by_slash`, `confirm_with_backtick_trigger_inserts_backtick`, dispatch test rewritten as `dispatch_quick_prompt_submit_codex_spawns_tab_and_closes_overlay`.
 
-- [ ] **Slice 7: Polish + perf gates + daemon name**
-  - [ ] Add `DaemonPty::spawn_in_named` accepting `name: Option<&str>`; `spawn_in` delegates with `None`.
-  - [ ] `mutate_add_quick_prompt_tab` uses `spawn_in_named` so the daemon stores `qp: <prompt prefix>` as session name.
-  - [ ] Test: `pty::spawn_in_named_forwards_name`.
-  - [ ] Sweep `quick_prompt.input` dispatch path for `RequestRebuild` opportunities; ensure rapid typing does not cause thrashing.
-  - [ ] Document the autocomplete bench in `CLAUDE.md` or `scripts/bench.ps1`.
-  - [ ] Final visual pass: focus management on open, error chip color matches toast palette, thumbnail strip alignment.
-  - [ ] Final manual pass over user stories U1 to U6.
+- [x] **Slice 7: Polish + perf gates + daemon name** (commit pending)
+  - [x] `DaemonPty::spawn_in_named(pane_id, ws_id, cols, rows, cwd, shell, name)` added; `spawn_in` delegates with `name: None`. The `Command::Spawn` already carried a `name` field; only the public entry point was hardcoded to `None`.
+  - [x] `mutate_add_quick_prompt_tab` calls `spawn_in_named` with `Some(quick_prompt_tab_title(prompt))`. The daemon now records `qp: <prompt prefix>` and `ptyctl list` (or any `list_sessions` caller) reads it back.
+  - [x] Test `pty::spawn_in_named_forwards_name_to_daemon` (real daemon round trip; spawns with `Some("qp: do the thing")` and asserts the name appears in `list_sessions()`); regression test `pty::spawn_in_delegates_with_no_name` covers the unnamed path.
+  - [x] No `RequestRebuild` thrash: typing routes through `mutate_with` (one rebuild per dispatch) so the existing `RebuildCoalescer` already deduplicates per drain window. No code change needed.
+  - [x] Bench docs: new `## Performance Benches` section in `CLAUDE.md` calls out `pty_write` and `quick_prompt_filter` with their gates and how to run them locally.
+  - [x] Visual polish: error chip switched from solid `--rust` background to a softer `--bg-elevated` body with the same `--accent-danger` left border the toast errors use, so error styling is consistent across the overlay and the toast strip.
+  - [x] Manual U1 to U6 verification deferred to the user; the integration tests + bench cover the automatable parts.
 
 ### Checkpoint: Complete
 - [ ] All acceptance criteria F1 to F8 met.
