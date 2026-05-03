@@ -1433,14 +1433,31 @@ mod tests {
             );
             assert!(shim.has(pane_id));
 
-            // And a read does not immediately error. The reader may
-            // not have any immediate bytes to deliver (no writes since
-            // the first shell prompt) but it must not crash.
+            // And the attached reader stays live: write a bounded marker
+            // through the reattached pane and wait for that output instead
+            // of blocking forever on an idle shell.
+            shim.write_blocking(pane_id, ECHO_CMD)
+                .expect("write through reattached pane");
+            let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+            let mut collected: Vec<u8> = Vec::new();
             let mut buf = [0u8; 64];
-            match reader.read(&mut buf) {
-                Ok(_) => {}
-                Err(e) => panic!("reader erroring on attach survivor: {e}"),
+            while std::time::Instant::now() < deadline {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        if String::from_utf8_lossy(&collected).contains("shim-hi") {
+                            break;
+                        }
+                    }
+                    Err(e) => panic!("reader erroring on attach survivor: {e}"),
+                }
             }
+            let text = String::from_utf8_lossy(&collected).to_string();
+            assert!(
+                text.contains("shim-hi"),
+                "reattached reader should receive marker output, got: {text:?}"
+            );
             shim.destroy(pane_id);
         })
         .await

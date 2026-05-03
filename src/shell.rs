@@ -223,6 +223,13 @@ mod tests {
         }
     }
 
+    fn test_path(parts: &[&str]) -> PathBuf {
+        parts.iter().fold(PathBuf::new(), |mut path, part| {
+            path.push(part);
+            path
+        })
+    }
+
     #[test]
     fn is_empty_returns_true_for_default() {
         assert!(ShellSpec::default().is_empty());
@@ -485,8 +492,8 @@ mod tests {
     fn label_installed_shells_disambiguates_duplicate_stems_with_parent() {
         // Different parent dirs distinguish two bash.exe installs.
         let installed = vec![
-            PathBuf::from(r"C:\Program Files\Git\cmd\bash.exe"),
-            PathBuf::from(r"C:\msys64\bash.exe"),
+            test_path(&["Program Files", "Git", "cmd", &executable_name("bash")]),
+            test_path(&["msys64", &executable_name("bash")]),
         ];
         let labels = label_installed_shells(&installed);
         assert_eq!(
@@ -500,8 +507,8 @@ mod tests {
         // Two bash installs, both with parent "bin": the grandparent
         // segment carries the actual identity (Git vs msys64).
         let installed = vec![
-            PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
-            PathBuf::from(r"C:\msys64\usr\bin\bash.exe"),
+            test_path(&["Program Files", "Git", "bin", &executable_name("bash")]),
+            test_path(&["msys64", "usr", "bin", &executable_name("bash")]),
         ];
         let labels = label_installed_shells(&installed);
         assert_eq!(
@@ -513,9 +520,9 @@ mod tests {
     #[test]
     fn label_installed_shells_does_not_disambiguate_unique_entries_in_a_mixed_list() {
         let installed = vec![
-            PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
-            PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
-            PathBuf::from(r"C:\msys64\usr\bin\bash.exe"),
+            test_path(&["Program Files", "PowerShell", "7", &executable_name("pwsh")]),
+            test_path(&["Program Files", "Git", "bin", &executable_name("bash")]),
+            test_path(&["msys64", "usr", "bin", &executable_name("bash")]),
         ];
         let labels = label_installed_shells(&installed);
         assert_eq!(labels[0], "pwsh");

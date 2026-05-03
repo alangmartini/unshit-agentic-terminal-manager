@@ -222,6 +222,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                         // toast queue does not keep waking the tree.
                         let dismissed = guard.toasts.advance_ticks(1);
                         if !dismissed.is_empty() {
+                            crate::state::prune_toast_metadata(&mut guard);
                             needs_rebuild = true;
                         }
 
@@ -448,6 +449,12 @@ pub fn build_subscriptions(shared: &SharedState) -> Vec<Subscription> {
 
     // Resize poll: checks for renderer-published pending resizes.
     subs.push(resize_poll_subscription(shared.clone()));
+
+    // Local notification IPC: accepts `terminal-manager notify` calls
+    // from child processes running inside managed terminals.
+    subs.push(crate::notifications::notification_subscription(
+        shared.clone(),
+    ));
 
     // Pick up any newly registered readers and create subscriptions for them.
     let pending = take_all_readers();

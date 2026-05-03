@@ -7,6 +7,9 @@ pub enum ExternalEvent {
     RequestRebuild,
     /// Request re-render without rebuilding the tree (repaint only).
     RequestRedraw,
+    /// Ask the application window to become visible, unminimized, focused,
+    /// and attention-requesting where the platform allows it.
+    ActivateWindow,
     /// User-defined payload (type-erased).
     Custom(Box<dyn std::any::Any + Send>),
     /// Zero-copy byte payload. Only the Arc refcount is bumped on send.

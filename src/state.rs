@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -114,6 +114,7 @@ pub enum SettingsSection {
     Shell,
     Keybinds,
     Sessions,
+    Notifications,
     DangerZone,
 }
 
@@ -124,16 +125,18 @@ impl SettingsSection {
             SettingsSection::Shell => "shell",
             SettingsSection::Keybinds => "keybinds",
             SettingsSection::Sessions => "sessions",
+            SettingsSection::Notifications => "notifications",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 5] {
+    pub fn all() -> [SettingsSection; 6] {
         [
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
             SettingsSection::Sessions,
+            SettingsSection::Notifications,
             SettingsSection::DangerZone,
         ]
     }
@@ -161,13 +164,65 @@ pub struct SessionSnapshot {
 pub struct ToastView {
     pub id: unshit::core::toast::ToastId,
     pub kind: unshit::core::toast::ToastKind,
+    pub title: Option<String>,
     pub message: String,
+    pub target: Option<ToastTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToastTarget {
+    pub workspace_id: u32,
+    pub pane_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NotificationToastMeta {
+    title: String,
+    target: ToastTarget,
 }
 
 /// Push an error-level toast onto `state.toasts`. Single entry point
 /// so dispatch handlers do not format user-facing strings inline.
 pub fn push_error_toast(state: &mut AppState, message: impl Into<String>) {
     state.toasts.push(message);
+    retain_live_toast_meta(state);
+}
+
+/// Push a user-triggered notification card with a focus target. The same
+/// `ToastStore` drives lifetime/dismissal; metadata lives in `AppState`
+/// because the framework toast primitive intentionally stays generic.
+pub fn push_notification_toast(
+    state: &mut AppState,
+    title: impl Into<String>,
+    message: impl Into<String>,
+    workspace_id: u32,
+    pane_id: u32,
+) -> unshit::core::toast::ToastId {
+    let id = state.toasts.push(message);
+    state.toast_meta.insert(
+        id,
+        NotificationToastMeta {
+            title: title.into(),
+            target: ToastTarget {
+                workspace_id,
+                pane_id,
+            },
+        },
+    );
+    retain_live_toast_meta(state);
+    id
+}
+
+fn retain_live_toast_meta(state: &mut AppState) {
+    if state.toast_meta.is_empty() {
+        return;
+    }
+    let live: BTreeSet<unshit::core::toast::ToastId> = state.toasts.iter().map(|t| t.id).collect();
+    state.toast_meta.retain(|id, _| live.contains(id));
+}
+
+pub fn prune_toast_metadata(state: &mut AppState) {
+    retain_live_toast_meta(state);
 }
 
 /// Normalise text pulled from the system clipboard before it is fed
@@ -448,6 +503,7 @@ pub struct AppState {
     /// [`push_error_toast`]; ticked down by the cursor-blink
     /// subscription so dismissal stays deterministic in tests.
     pub toasts: unshit::core::toast::ToastStore,
+    toast_meta: BTreeMap<unshit::core::toast::ToastId, NotificationToastMeta>,
     /// System clipboard handle used by `terminal.paste`. Initialised
     /// to a fresh [`unshit::app::ClipboardContext`] in [`seed_state`]
     /// and replaced with the framework's shared instance from
@@ -555,7 +611,9 @@ impl AppState {
                 .map(|t| ToastView {
                     id: t.id,
                     kind: t.kind,
+                    title: self.toast_meta.get(&t.id).map(|m| m.title.clone()),
                     message: t.message.clone(),
+                    target: self.toast_meta.get(&t.id).map(|m| m.target.clone()),
                 })
                 .collect(),
             default_shell: self.default_shell.clone(),
@@ -791,6 +849,7 @@ pub fn seed_state() -> AppState {
         sessions: Vec::new(),
         sessions_stale: false,
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
+        toast_meta: BTreeMap::new(),
         clipboard: Arc::new(unshit::app::ClipboardContext::new()),
         default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
     }
@@ -873,6 +932,70 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
     save_workspace_state(state);
     state.active_workspace = new_index;
     load_workspace_state(state);
+}
+
+pub fn focus_workspace_pane_by_num(state: &mut AppState, workspace_id: u32, pane_id: u32) -> bool {
+    let Some(workspace_idx) = state
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.num == workspace_id)
+    else {
+        return false;
+    };
+    focus_workspace_pane_by_index(state, workspace_idx, pane_id)
+}
+
+fn focus_workspace_pane_by_index(state: &mut AppState, workspace_idx: usize, pane_id: u32) -> bool {
+    if workspace_idx >= state.workspaces.len() {
+        return false;
+    }
+
+    let target = PaneId(pane_id);
+    let Some(tab_idx) = pane_tab_index_for_workspace(state, workspace_idx, target) else {
+        return false;
+    };
+
+    state.ctx_menu = None;
+    if workspace_idx != state.active_workspace {
+        mutate_switch_workspace(state, workspace_idx);
+    }
+    if tab_idx < state.tabs.len() && tab_idx != state.active_tab {
+        mutate_switch_tab(state, tab_idx);
+    }
+    state.active_pane = target;
+    if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+        tab.active_pane = target;
+    }
+    true
+}
+
+fn pane_tab_index_for_workspace(
+    state: &AppState,
+    workspace_idx: usize,
+    target: PaneId,
+) -> Option<usize> {
+    if workspace_idx == state.active_workspace {
+        if find_pane_coord(state, target).is_some() {
+            return Some(state.active_tab);
+        }
+        return state
+            .tabs
+            .iter()
+            .enumerate()
+            .find(|(idx, tab)| {
+                *idx != state.active_tab && tab.panes.iter().flatten().any(|pane| pane.id == target)
+            })
+            .map(|(idx, _)| idx);
+    }
+
+    state
+        .workspaces
+        .get(workspace_idx)?
+        .tabs
+        .iter()
+        .enumerate()
+        .find(|(_, tab)| tab.panes.iter().flatten().any(|pane| pane.id == target))
+        .map(|(idx, _)| idx)
 }
 
 /// Resolve which shell a new pane should spawn with for the given
@@ -2338,6 +2461,26 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             refresh_sessions(state);
             true
         }
+        "notifications.test" => {
+            let workspace_id = active_workspace_num(state);
+            let pane_id = state.active_pane.0;
+            let title = "Test notification";
+            let message =
+                format!("Notification test from workspace {workspace_id}, pane {pane_id}.");
+            push_notification_toast(state, title, message.clone(), workspace_id, pane_id);
+            #[cfg(not(test))]
+            {
+                if let Err(e) = crate::notifications::spawn_desktop_notification_for_target(
+                    title,
+                    message,
+                    workspace_id,
+                    pane_id,
+                ) {
+                    log::warn!("desktop test notification failed: {e}");
+                }
+            }
+            true
+        }
         other if other.starts_with("session.kill:") => {
             if let Ok(sid) = other["session.kill:".len()..].parse::<u64>() {
                 mutate_kill_session_id(state, sid);
@@ -2347,7 +2490,27 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         other if other.starts_with("toast.dismiss:") => {
             if let Ok(id) = other["toast.dismiss:".len()..].parse::<u64>() {
-                return state.toasts.dismiss(id);
+                let dismissed = state.toasts.dismiss(id);
+                if dismissed {
+                    state.toast_meta.remove(&id);
+                }
+                return dismissed;
+            }
+            false
+        }
+        other if other.starts_with("notification.activate:") => {
+            if let Ok(id) = other["notification.activate:".len()..].parse::<u64>() {
+                let meta = state.toast_meta.get(&id).cloned();
+                let dismissed = state.toasts.dismiss(id);
+                state.toast_meta.remove(&id);
+                if let Some(meta) = meta {
+                    return focus_workspace_pane_by_num(
+                        state,
+                        meta.target.workspace_id,
+                        meta.target.pane_id,
+                    ) || dismissed;
+                }
+                return dismissed;
             }
             false
         }
@@ -2413,35 +2576,15 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             let Ok(pane_num) = pane_str.parse::<u32>() else {
                 return false;
             };
-            if ws_idx >= state.workspaces.len() {
-                log::warn!("terminal.focus: workspace index {} out of range", ws_idx);
-                return false;
-            }
-            let target = PaneId(pane_num);
-            let pane_exists = if ws_idx == state.active_workspace {
-                find_pane_coord(state, target).is_some()
-            } else {
-                let ws = &state.workspaces[ws_idx];
-                ws.tabs
-                    .get(ws.active_tab)
-                    .map(|tab| tab.panes.iter().flatten().any(|p| p.id == target))
-                    .unwrap_or(false)
-            };
-            if !pane_exists {
+            let handled = focus_workspace_pane_by_index(state, ws_idx, pane_num);
+            if !handled {
                 log::warn!(
                     "terminal.focus: pane {} not found in workspace {}",
                     pane_num,
                     ws_idx
                 );
-                return false;
             }
-            state.ctx_menu = None;
-            mutate_switch_workspace(state, ws_idx);
-            state.active_pane = target;
-            if let Some(tab) = state.tabs.get_mut(state.active_tab) {
-                tab.active_pane = target;
-            }
-            true
+            handled
         }
         other if other.starts_with("shell.set_default:") => {
             dispatch_shell_set_default(state, other)
@@ -3139,6 +3282,7 @@ mod tests {
             sessions: Vec::new(),
             sessions_stale: false,
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
+            toast_meta: BTreeMap::new(),
             clipboard: Arc::new(unshit::app::ClipboardContext::new()),
             default_shell: crate::shell::ShellSpec::default(),
         }
@@ -3152,18 +3296,20 @@ mod tests {
         assert_eq!(SettingsSection::Shell.label(), "shell");
         assert_eq!(SettingsSection::Keybinds.label(), "keybinds");
         assert_eq!(SettingsSection::Sessions.label(), "sessions");
+        assert_eq!(SettingsSection::Notifications.label(), "notifications");
         assert_eq!(SettingsSection::DangerZone.label(), "danger zone");
     }
 
     #[test]
-    fn settings_section_all_returns_five() {
+    fn settings_section_all_returns_six() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         assert_eq!(all[0], SettingsSection::Appearance);
         assert_eq!(all[1], SettingsSection::Shell);
         assert_eq!(all[2], SettingsSection::Keybinds);
         assert_eq!(all[3], SettingsSection::Sessions);
-        assert_eq!(all[4], SettingsSection::DangerZone);
+        assert_eq!(all[4], SettingsSection::Notifications);
+        assert_eq!(all[5], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -4415,6 +4561,60 @@ mod tests {
         let messages: Vec<&str> = snap.toasts.iter().map(|t| t.message.as_str()).collect();
         assert_eq!(messages, vec!["first", "second"]);
         assert!(!snap.sessions_stale);
+    }
+
+    #[test]
+    fn push_notification_toast_adds_title_and_target_to_snapshot() {
+        let mut state = seed_state();
+        push_notification_toast(&mut state, "Build done", "Tests passed", 1, 1);
+
+        let snap = state.ui_snapshot();
+        let toast = snap.toasts.first().expect("notification toast");
+        assert_eq!(toast.title.as_deref(), Some("Build done"));
+        assert_eq!(toast.message, "Tests passed");
+        assert_eq!(
+            toast.target,
+            Some(ToastTarget {
+                workspace_id: 1,
+                pane_id: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn dispatch_notifications_test_pushes_targeted_toast() {
+        let mut state = seed_state();
+        let workspace_id = active_workspace_num(&state);
+        let pane_id = state.active_pane.0;
+
+        assert!(dispatch(&mut state, "notifications.test"));
+
+        let snap = state.ui_snapshot();
+        let toast = snap.toasts.first().expect("test notification toast");
+        assert_eq!(toast.title.as_deref(), Some("Test notification"));
+        assert_eq!(
+            toast.message,
+            format!("Notification test from workspace {workspace_id}, pane {pane_id}.")
+        );
+        assert_eq!(
+            toast.target,
+            Some(ToastTarget {
+                workspace_id,
+                pane_id
+            })
+        );
+    }
+
+    #[test]
+    fn notification_activate_focuses_workspace_pane_and_dismisses_toast() {
+        let mut state = two_workspace_state();
+        let id = push_notification_toast(&mut state, "Done", "Pane 8 finished", 2, 8);
+
+        assert!(dispatch(&mut state, &format!("notification.activate:{id}")));
+
+        assert!(state.toasts.is_empty());
+        assert_eq!(state.active_workspace, 1);
+        assert_eq!(state.active_pane, PaneId(8));
     }
 
     // refs #130: with the orphan-branch kill now blocking on a daemon
