@@ -7,6 +7,7 @@ pub mod keybinds;
 pub mod notifications;
 pub mod persist;
 pub mod pty;
+pub mod quick_prompt;
 pub mod shell;
 pub mod state;
 pub mod terminal;
@@ -270,6 +271,9 @@ fn build_tree(
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
                 snap, shared,
             ))
+            .with_child(crate::quick_prompt::build_quick_prompt_overlay(
+                snap, shared,
+            ))
             .with_child(build_toast_overlay(snap, shared))
             .with_child(crate::ui::fps_overlay::build_fps_overlay()),
     }
@@ -497,6 +501,10 @@ fn main() {
 
     if let Some(path) = crate::keybinds::loader::keybinds_config_path() {
         crate::keybinds::loader::install(path);
+    }
+
+    if let Some(path) = crate::quick_prompt::state::default_config_path() {
+        crate::quick_prompt::state::QuickPromptStore::install(path);
     }
 
     let mut initial_state = seed_state();

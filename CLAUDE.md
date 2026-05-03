@@ -128,6 +128,19 @@ For bug fixes, follow Red-Green-Refactor:
 2. **Green** - Fix with the simplest change possible
 3. **Refactor** - Clean up. Run `/simplify`.
 
+## Performance Benches
+
+The repo carries two criterion benches that gate hot paths. Run them via `cargo bench --bench <name>` from the repo root.
+
+### `pty_write`
+Guards against the regression that would put a sync `reply_rx.recv()` back on the render thread's `DaemonPty::write` path (#135). A regression shows up as a jump from sub-microsecond channel-send cost to the daemon round-trip cost.
+
+### `quick_prompt_filter`
+Guards the Quick Prompt autocomplete `filter` function. Spec gate (`specs/quick-prompt.md` A8.6): `<1 ms p99` over 200 entries. Baseline on a developer Windows 11 box: empty query ~224 ns, broad/narrow/no-match all under 50 µs. If a change pushes any function over a few hundred microseconds, that's a real regression worth investigating before merge. Run with a short window during local iteration:
+```bash
+cargo bench --bench quick_prompt_filter -- --warm-up-time 1 --measurement-time 3
+```
+
 ## Code Quality Gates
 
 ### Before Every Commit

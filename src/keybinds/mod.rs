@@ -31,6 +31,7 @@ pub enum KeybindAction {
     NextTab,
     PrevTab,
     CommandPalette,
+    QuickPromptOpen,
     ToggleSidebar,
     OpenSettings,
     ZoomIn,
@@ -53,6 +54,7 @@ impl KeybindAction {
         Self::NextTab,
         Self::PrevTab,
         Self::CommandPalette,
+        Self::QuickPromptOpen,
         Self::ToggleSidebar,
         Self::OpenSettings,
         Self::ZoomIn,
@@ -75,6 +77,7 @@ impl KeybindAction {
             Self::NextTab => "next_tab",
             Self::PrevTab => "prev_tab",
             Self::CommandPalette => "command_palette",
+            Self::QuickPromptOpen => "quick_prompt_open",
             Self::ToggleSidebar => "toggle_sidebar",
             Self::OpenSettings => "open_settings",
             Self::ZoomIn => "zoom_in",
@@ -103,6 +106,7 @@ impl KeybindAction {
             Self::NextTab => "Next tab",
             Self::PrevTab => "Previous tab",
             Self::CommandPalette => "Command palette",
+            Self::QuickPromptOpen => "Quick prompt",
             Self::ToggleSidebar => "Toggle sidebar",
             Self::OpenSettings => "Settings",
             Self::ZoomIn => "Zoom in",
@@ -129,6 +133,7 @@ impl KeybindAction {
             Self::NextTab => "tab.next",
             Self::PrevTab => "tab.prev",
             Self::CommandPalette => "palette.toggle",
+            Self::QuickPromptOpen => "quick_prompt.open",
             Self::ToggleSidebar => "sidebar.toggle",
             Self::OpenSettings => "modal.open",
             Self::ZoomIn => "font.inc",
@@ -152,6 +157,7 @@ impl KeybindAction {
             Self::NextTab => "Ctrl+Tab",
             Self::PrevTab => "Ctrl+Shift+Tab",
             Self::CommandPalette => "Ctrl+K",
+            Self::QuickPromptOpen => "Ctrl+Shift+Q",
             Self::ToggleSidebar => "Ctrl+B",
             Self::OpenSettings => "Ctrl+,",
             Self::ZoomIn => "Ctrl+=",
@@ -172,8 +178,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_has_seventeen_variants() {
-        assert_eq!(KeybindAction::ALL.len(), 17);
+    fn all_has_eighteen_variants() {
+        assert_eq!(KeybindAction::ALL.len(), 18);
     }
 
     #[test]
@@ -291,6 +297,10 @@ mod tests {
         assert_eq!(
             KeybindAction::CommandPalette.dispatch_command(),
             "palette.toggle"
+        );
+        assert_eq!(
+            KeybindAction::QuickPromptOpen.dispatch_command(),
+            "quick_prompt.open"
         );
         assert_eq!(
             KeybindAction::ToggleSidebar.dispatch_command(),

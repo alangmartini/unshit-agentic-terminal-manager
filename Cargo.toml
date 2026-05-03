@@ -121,6 +121,7 @@ rfd = "0.15"
 ctrlc = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+image = { workspace = true }
 dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
@@ -128,4 +129,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "pty_write"
+harness = false
+
+[[bench]]
+name = "quick_prompt_filter"
 harness = false

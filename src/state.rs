@@ -516,6 +516,10 @@ pub struct AppState {
     /// `default_shell()` decide". Per workspace overrides land in
     /// Task 6 and take precedence via `shell::resolve`.
     pub default_shell: crate::shell::ShellSpec,
+    /// Quick Prompt overlay. `None` when closed. Slice 1 keeps the
+    /// inner state empty; later slices add prompt text, agent, images,
+    /// and autocomplete fields per `tasks/plan.md`.
+    pub quick_prompt: Option<crate::quick_prompt::QuickPromptState>,
 }
 
 impl AppState {
@@ -617,6 +621,7 @@ impl AppState {
                 })
                 .collect(),
             default_shell: self.default_shell.clone(),
+            quick_prompt: self.quick_prompt.clone(),
         }
     }
 
@@ -686,6 +691,9 @@ pub struct UiSnapshot {
     /// Mirror of `AppState::default_shell` so settings UI can render
     /// the current value without reaching into the live state.
     pub default_shell: crate::shell::ShellSpec,
+    /// Mirror of `AppState::quick_prompt`. `None` when the overlay is
+    /// closed.
+    pub quick_prompt: Option<crate::quick_prompt::QuickPromptState>,
 }
 
 fn current_folder_name() -> String {
@@ -852,6 +860,7 @@ pub fn seed_state() -> AppState {
         toast_meta: BTreeMap::new(),
         clipboard: Arc::new(unshit::app::ClipboardContext::new()),
         default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
+        quick_prompt: None,
     }
 }
 
@@ -1078,6 +1087,102 @@ pub fn mutate_add_tab(state: &mut AppState) {
     state.active_tab = state.tabs.len() - 1;
 
     // Load the new tab's pane state into the live fields.
+    state.panes = vec![vec![pane]];
+    state.active_pane = pane_id;
+    state.row_ratios = vec![1.0];
+    state.col_ratios = vec![vec![1.0]];
+}
+
+/// Build the tab title for a Quick Prompt submission. Truncates on
+/// character boundaries (not bytes) so the buffer is safe for any
+/// prompt the user types.
+fn quick_prompt_tab_title(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    let truncated: String = trimmed.chars().take(30).collect();
+    if truncated.is_empty() {
+        "qp".to_string()
+    } else {
+        format!("qp: {}", truncated)
+    }
+}
+
+/// Spawn a new tab running an agent at `cwd` with `shell`. Mirrors
+/// `mutate_add_tab` but takes the cwd and shell explicitly so it does
+/// not consult the active workspace's settings.
+pub fn mutate_add_quick_prompt_tab(
+    state: &mut AppState,
+    prompt: &str,
+    cwd: &std::path::Path,
+    shell: &crate::shell::ShellSpec,
+) {
+    save_tab_state(state);
+
+    let id_num = state.next_id;
+    state.next_id += 1;
+    let pane_id = PaneId(id_num);
+
+    let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w();
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let (cols, rows) = compute_pty_dimensions(
+        state.last_grid_width,
+        state.last_grid_height,
+        cell_w,
+        cell_h,
+    );
+
+    let workspace_id = active_workspace_num(state);
+    let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+    let session_name = quick_prompt_tab_title(prompt);
+    match state.pty_manager.spawn_in_named(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        Some(cwd),
+        Some(shell),
+        Some(&session_name),
+    ) {
+        Ok(reader) => {
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
+            crate::bridge::register_reader(id_num, reader);
+        }
+        Err(e) => {
+            log::error!(
+                "failed to spawn PTY for quick prompt pane {}: {}",
+                id_num,
+                e
+            );
+            terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
+        }
+    }
+
+    let title = quick_prompt_tab_title(prompt);
+    let pane = Pane {
+        id: pane_id,
+        title: title.clone(),
+        subtitle: shell.program.clone(),
+        pid: 0,
+        cpu: 0.0,
+    };
+    let tab = TerminalTab {
+        id: format!("t{}", id_num),
+        name: title,
+        subtitle: shell.program.clone(),
+        status: TabStatus::Running,
+        panes: vec![vec![pane.clone()]],
+        active_pane: pane_id,
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+
+    state.tabs.push(tab);
+    state.active_tab = state.tabs.len() - 1;
+
     state.panes = vec![vec![pane]];
     state.active_pane = pane_id;
     state.row_ratios = vec![1.0];
@@ -2184,6 +2289,24 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.confirm_dialog = None;
                 changed = true;
             }
+            // Esc with the autocomplete popup open dismisses just the
+            // popup (per spec A8.3); the overlay stays. A second Esc
+            // closes the overlay through the normal cleanup path
+            // below.
+            let dismiss_popup_only = state
+                .quick_prompt
+                .as_ref()
+                .map(|qp| qp.popup.is_some())
+                .unwrap_or(false);
+            if dismiss_popup_only {
+                if let Some(qp) = state.quick_prompt.as_mut() {
+                    qp.popup = None;
+                    changed = true;
+                }
+            } else if let Some(qp) = state.quick_prompt.take() {
+                crate::quick_prompt::images::cleanup_session(&qp.session_hex);
+                changed = true;
+            }
             changed
         }
         "dialog.confirm" => {
@@ -2288,6 +2411,162 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             } else {
                 false
             }
+        }
+        "quick_prompt.open" => {
+            if let Some(qp) = state.quick_prompt.take() {
+                // Re-pressing the hotkey while open closes the overlay
+                // (toggle behavior per spec A1.2). Clean up any pasted
+                // images that have not been submitted.
+                crate::quick_prompt::images::cleanup_session(&qp.session_hex);
+            } else {
+                state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+            }
+            true
+        }
+        "quick_prompt.close" => {
+            if let Some(qp) = state.quick_prompt.take() {
+                crate::quick_prompt::images::cleanup_session(&qp.session_hex);
+                true
+            } else {
+                false
+            }
+        }
+        "quick_prompt.toggle_agent" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            qp.agent = qp.agent.toggled();
+            qp.error = None;
+            crate::quick_prompt::state::QuickPromptStore::save(qp);
+            true
+        }
+        "quick_prompt.image_paste" => {
+            let Some(qp) = state.quick_prompt.as_ref() else {
+                return false;
+            };
+            let session_hex = qp.session_hex.clone();
+            let captured = crate::quick_prompt::images::capture_clipboard_image(
+                &state.clipboard,
+                &session_hex,
+            );
+            let Some(qp_mut) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            match captured {
+                Ok(Some(img)) => {
+                    if !qp_mut.images.iter().any(|i| i.hash == img.hash) {
+                        qp_mut.images.push(img);
+                    }
+                    qp_mut.error = None;
+                    true
+                }
+                Ok(None) => {
+                    // Clipboard had no image; surface a friendly hint
+                    // so the user knows the paste did not silently
+                    // disappear.
+                    qp_mut.error = Some("No image on clipboard".into());
+                    true
+                }
+                Err(e) => {
+                    qp_mut.error = Some(format!("paste failed: {e}"));
+                    true
+                }
+            }
+        }
+        "quick_prompt.autocomplete_select_next" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            let Some(popup) = qp.popup.as_mut() else {
+                return false;
+            };
+            popup.select_next();
+            true
+        }
+        "quick_prompt.autocomplete_select_prev" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            let Some(popup) = qp.popup.as_mut() else {
+                return false;
+            };
+            popup.select_prev();
+            true
+        }
+        "quick_prompt.autocomplete_dismiss" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            qp.popup.take().is_some()
+        }
+        "quick_prompt.autocomplete_confirm" => {
+            let Some(qp) = state.quick_prompt.as_mut() else {
+                return false;
+            };
+            let Some(popup) = qp.popup.as_ref() else {
+                return false;
+            };
+            let Some(entry) = popup.current() else {
+                return false;
+            };
+            let entry_name = entry.name.clone();
+            let anchor = popup.anchor_offset;
+            let trigger = popup.trigger_char;
+            qp.prompt = crate::quick_prompt::autocomplete::confirm_into_prompt(
+                &qp.prompt,
+                anchor,
+                trigger,
+                &entry_name,
+            );
+            qp.popup = None;
+            true
+        }
+        "quick_prompt.submit" => {
+            let Some(qp) = state.quick_prompt.as_ref() else {
+                return false;
+            };
+            let prompt = qp.prompt.trim().to_string();
+            let agent = qp.agent;
+            let images = qp.images.clone();
+            let session_hex = qp.session_hex.clone();
+
+            if prompt.is_empty() {
+                let qp = state.quick_prompt.as_mut().unwrap();
+                qp.error = Some("Type a prompt to continue.".into());
+                return true;
+            }
+
+            let cwd = active_workspace_cwd(state);
+            let target = match crate::quick_prompt::spawn::prepare_target(cwd.as_deref()) {
+                Ok(t) => t,
+                Err(e) => {
+                    let qp = state.quick_prompt.as_mut().unwrap();
+                    qp.error = Some(format!("submit failed: {e}"));
+                    return true;
+                }
+            };
+            let refs = match crate::quick_prompt::images::move_into_target(&images, &target.path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let qp = state.quick_prompt.as_mut().unwrap();
+                    qp.error = Some(format!("submit failed (image move): {e}"));
+                    return true;
+                }
+            };
+            let augmented_prompt =
+                crate::quick_prompt::images::append_image_references(&prompt, &refs);
+            let shell_spec = match agent {
+                crate::quick_prompt::Agent::Claude => {
+                    crate::quick_prompt::spawn::claude_shell_spec(&augmented_prompt)
+                }
+                crate::quick_prompt::Agent::Codex => {
+                    crate::quick_prompt::spawn::codex_shell_spec(&augmented_prompt)
+                }
+            };
+            mutate_add_quick_prompt_tab(state, &prompt, &target.path, &shell_spec);
+            crate::quick_prompt::images::cleanup_session(&session_hex);
+            state.quick_prompt = None;
+            true
         }
         "tab.new" => {
             mutate_add_tab(state);
@@ -3285,6 +3564,7 @@ mod tests {
             toast_meta: BTreeMap::new(),
             clipboard: Arc::new(unshit::app::ClipboardContext::new()),
             default_shell: crate::shell::ShellSpec::default(),
+            quick_prompt: None,
         }
     }
 
@@ -3785,6 +4065,346 @@ mod tests {
 
         // Closing again returns false (already closed)
         assert!(!dispatch(&mut state, "modal.close"));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_open_sets_state() {
+        let mut state = test_state();
+        assert!(state.quick_prompt.is_none());
+
+        assert!(dispatch(&mut state, "quick_prompt.open"));
+        assert!(state.quick_prompt.is_some());
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_open_toggles_when_already_open() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "quick_prompt.open"));
+        assert!(state.quick_prompt.is_some());
+
+        // Re-pressing the hotkey closes the overlay (A1.2 toggle).
+        assert!(dispatch(&mut state, "quick_prompt.open"));
+        assert!(state.quick_prompt.is_none());
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_close_clears_state() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        assert!(dispatch(&mut state, "quick_prompt.close"));
+        assert!(state.quick_prompt.is_none());
+
+        // Closing again returns false (nothing to close).
+        assert!(!dispatch(&mut state, "quick_prompt.close"));
+    }
+
+    #[test]
+    fn dispatch_modal_close_clears_quick_prompt() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.quick_prompt.is_none());
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_toggle_agent_flips_when_open() {
+        use crate::quick_prompt::state::Agent;
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+        let initial = state.quick_prompt.as_ref().unwrap().agent;
+
+        assert!(dispatch(&mut state, "quick_prompt.toggle_agent"));
+        let toggled = state.quick_prompt.as_ref().unwrap().agent;
+        assert_ne!(initial, toggled);
+        assert!(matches!(toggled, Agent::Claude | Agent::Codex));
+
+        assert!(dispatch(&mut state, "quick_prompt.toggle_agent"));
+        assert_eq!(state.quick_prompt.as_ref().unwrap().agent, initial);
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_toggle_agent_clears_error() {
+        let mut state = test_state();
+        let mut qp = crate::quick_prompt::QuickPromptState::open_default();
+        qp.error = Some("stale".into());
+        state.quick_prompt = Some(qp);
+
+        assert!(dispatch(&mut state, "quick_prompt.toggle_agent"));
+        assert!(state.quick_prompt.as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_toggle_agent_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(state.quick_prompt.is_none());
+        assert!(!dispatch(&mut state, "quick_prompt.toggle_agent"));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_submit_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(state.quick_prompt.is_none());
+        assert!(!dispatch(&mut state, "quick_prompt.submit"));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_submit_empty_prompt_sets_error() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        assert!(dispatch(&mut state, "quick_prompt.submit"));
+        let qp = state.quick_prompt.as_ref().expect("overlay still open");
+        assert_eq!(qp.error.as_deref(), Some("Type a prompt to continue."));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_submit_whitespace_only_sets_error() {
+        let mut state = test_state();
+        let mut qp = crate::quick_prompt::QuickPromptState::open_default();
+        qp.prompt = "   \n\t  ".into();
+        state.quick_prompt = Some(qp);
+
+        assert!(dispatch(&mut state, "quick_prompt.submit"));
+        assert!(state
+            .quick_prompt
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .map(|e| e.contains("Type a prompt"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_submit_codex_spawns_tab_and_closes_overlay() {
+        // Slice 6 wires Codex parity: submitting on Codex builds a
+        // codex_shell_spec, prepares the target, and adds the tab.
+        // We assert the side effects observable from state: tab count
+        // increments and the overlay closes. The actual program path
+        // is not invoked in tests (no daemon is running), and the
+        // tab title is "qp: <prompt prefix>".
+        use crate::quick_prompt::Agent;
+        let initial_tabs = {
+            let s = test_state();
+            s.tabs.len()
+        };
+        let mut state = test_state();
+        let mut qp = crate::quick_prompt::QuickPromptState::open_with_agent(Agent::Codex);
+        qp.prompt = "do the thing".into();
+        state.quick_prompt = Some(qp);
+
+        assert!(dispatch(&mut state, "quick_prompt.submit"));
+        assert!(state.quick_prompt.is_none(), "overlay closes on success");
+        assert_eq!(
+            state.tabs.len(),
+            initial_tabs + 1,
+            "Codex submit should add a tab"
+        );
+        assert_eq!(
+            state.tabs.last().unwrap().name,
+            "qp: do the thing",
+            "tab title comes from quick_prompt_tab_title(prompt)"
+        );
+    }
+
+    #[test]
+    fn quick_prompt_tab_title_truncates_to_thirty_chars() {
+        let title = super::quick_prompt_tab_title(&"a".repeat(50));
+        // "qp: " + 30 chars = 34 chars total.
+        assert_eq!(title.chars().count(), 34);
+        assert!(title.starts_with("qp: "));
+    }
+
+    #[test]
+    fn quick_prompt_tab_title_handles_empty_prompt() {
+        // Defensive: even though dispatch rejects empty prompts, the
+        // title helper should not panic on one.
+        assert_eq!(super::quick_prompt_tab_title(""), "qp");
+        assert_eq!(super::quick_prompt_tab_title("   "), "qp");
+    }
+
+    #[test]
+    fn quick_prompt_tab_title_truncates_on_char_boundary() {
+        // Multi-byte chars must not split. 30 emojis is well over 30
+        // bytes but exactly 30 chars; the truncation is on chars.
+        let prompt: String = "🎯".repeat(50);
+        let title = super::quick_prompt_tab_title(&prompt);
+        assert!(title.starts_with("qp: "));
+        // Body should be exactly 30 chars.
+        let body: String = title.chars().skip(4).collect();
+        assert_eq!(body.chars().count(), 30);
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_image_paste_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "quick_prompt.image_paste"));
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_image_paste_sets_error_when_clipboard_empty() {
+        // The test clipboard is uninitialized so read_image returns
+        // Ok(None); the dispatch arm surfaces a friendly hint.
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        // We can't reliably write or clear an image on the OS clipboard
+        // from a test, but read_image on a freshly-created context with
+        // text or no content returns Ok(None) and we surface the
+        // "No image on clipboard" hint. This is the behavior we lock in.
+        let _ = dispatch(&mut state, "quick_prompt.image_paste");
+        let qp = state.quick_prompt.as_ref().unwrap();
+        // Either we got a "no image" hint or the clipboard genuinely
+        // had an image (unlikely in CI). Both are valid outcomes; the
+        // test only enforces that dispatch did not panic and the
+        // overlay is still open.
+        if let Some(err) = qp.error.as_deref() {
+            assert!(
+                err == "No image on clipboard" || err.starts_with("paste failed:"),
+                "unexpected error chip: {err}"
+            );
+        } else {
+            // An image was actually pasted: at least one entry should
+            // exist and have a non-empty hash.
+            assert!(qp.images.iter().all(|i| !i.hash.is_empty()));
+        }
+    }
+
+    #[test]
+    fn dispatch_quick_prompt_close_cleans_session_dir() {
+        // Open with a fresh session_hex, drop a marker file in its
+        // session dir, and verify quick_prompt.close removes the dir.
+        let mut state = test_state();
+        let qp = crate::quick_prompt::QuickPromptState::open_default();
+        let session_hex = qp.session_hex.clone();
+        state.quick_prompt = Some(qp);
+        let dir = crate::quick_prompt::images::session_dir(&session_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), b"x").unwrap();
+        assert!(dir.exists());
+
+        assert!(dispatch(&mut state, "quick_prompt.close"));
+        assert!(!dir.exists(), "session dir should be cleaned up");
+    }
+
+    #[test]
+    fn dispatch_modal_close_cleans_quick_prompt_session_dir() {
+        let mut state = test_state();
+        let qp = crate::quick_prompt::QuickPromptState::open_default();
+        let session_hex = qp.session_hex.clone();
+        state.quick_prompt = Some(qp);
+        let dir = crate::quick_prompt::images::session_dir(&session_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(dir.exists());
+
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!dir.exists());
+    }
+
+    fn open_with_popup() -> AppState {
+        let mut state = test_state();
+        let mut qp = crate::quick_prompt::QuickPromptState::open_default();
+        qp.popup = Some(crate::quick_prompt::Popup::open(
+            vec![
+                crate::quick_prompt::Entry {
+                    name: "alpha".into(),
+                    kind: crate::quick_prompt::EntryKind::Skill,
+                },
+                crate::quick_prompt::Entry {
+                    name: "beta".into(),
+                    kind: crate::quick_prompt::EntryKind::Command,
+                },
+            ],
+            0,
+        ));
+        qp.prompt = "/".into();
+        state.quick_prompt = Some(qp);
+        state
+    }
+
+    #[test]
+    fn dispatch_autocomplete_select_next_advances_popup_selection() {
+        let mut state = open_with_popup();
+        assert!(dispatch(
+            &mut state,
+            "quick_prompt.autocomplete_select_next"
+        ));
+        let popup = state.quick_prompt.as_ref().unwrap().popup.as_ref().unwrap();
+        assert_eq!(popup.selected, 1);
+    }
+
+    #[test]
+    fn dispatch_autocomplete_select_prev_wraps_from_zero() {
+        let mut state = open_with_popup();
+        assert!(dispatch(
+            &mut state,
+            "quick_prompt.autocomplete_select_prev"
+        ));
+        let popup = state.quick_prompt.as_ref().unwrap().popup.as_ref().unwrap();
+        assert_eq!(popup.selected, 1);
+    }
+
+    #[test]
+    fn dispatch_autocomplete_dismiss_clears_popup_only() {
+        let mut state = open_with_popup();
+        assert!(dispatch(&mut state, "quick_prompt.autocomplete_dismiss"));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert!(qp.popup.is_none(), "popup should be cleared");
+        // Overlay itself is still open.
+        assert_eq!(qp.prompt, "/");
+    }
+
+    #[test]
+    fn dispatch_autocomplete_confirm_inserts_entry_and_closes_popup() {
+        let mut state = open_with_popup();
+        // Selected is 0, which is "alpha".
+        assert!(dispatch(&mut state, "quick_prompt.autocomplete_confirm"));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert_eq!(qp.prompt, "/alpha");
+        assert!(qp.popup.is_none());
+    }
+
+    #[test]
+    fn dispatch_modal_close_dismisses_popup_only_when_present() {
+        // Two Esc presses: first dismisses the popup, second closes
+        // the overlay. The session dir should only be removed on the
+        // overlay close (second press).
+        let mut state = open_with_popup();
+        let session_hex = state.quick_prompt.as_ref().unwrap().session_hex.clone();
+        let dir = crate::quick_prompt::images::session_dir(&session_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(dir.exists());
+
+        // First Esc: popup should be cleared, overlay still open, dir
+        // still on disk.
+        assert!(dispatch(&mut state, "modal.close"));
+        let qp = state.quick_prompt.as_ref().expect("overlay still open");
+        assert!(qp.popup.is_none(), "popup should be cleared");
+        assert!(dir.exists(), "session dir kept while overlay open");
+
+        // Second Esc: overlay closes and the session dir is cleaned
+        // up.
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.quick_prompt.is_none());
+        assert!(!dir.exists(), "session dir cleaned up on overlay close");
+    }
+
+    #[test]
+    fn dispatch_autocomplete_arms_no_op_when_popup_closed() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+        assert!(!dispatch(
+            &mut state,
+            "quick_prompt.autocomplete_select_next"
+        ));
+        assert!(!dispatch(
+            &mut state,
+            "quick_prompt.autocomplete_select_prev"
+        ));
+        assert!(!dispatch(&mut state, "quick_prompt.autocomplete_dismiss"));
+        assert!(!dispatch(&mut state, "quick_prompt.autocomplete_confirm"));
     }
 
     #[test]

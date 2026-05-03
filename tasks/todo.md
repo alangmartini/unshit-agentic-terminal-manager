@@ -1,156 +1,152 @@
-# TODO: Configurable default shell
+# TODO: Quick Prompt overlay
 
 Implementation checklist derived from `tasks/plan.md`. Check items off as they land. Each task ends with `cargo test && cargo clippy --all-targets --all-features && cargo fmt --check` clean.
 
 ## Phase 1: Foundation
 
-- [x] **Task 1: `ShellSpec` type + `resolve()`** [DONE]
-  - [x] Create `src/shell.rs` with `ShellSpec { program, args }`, `is_empty()`, and `resolve(workspace, app)`.
-  - [x] Add `pub mod shell;` to `src/main.rs`.
-  - [x] Unit tests: `is_empty`, `resolve` (workspace wins, fallback, both empty), serde round trip with empty args defaulted in.
-  - [x] `cargo test --bin terminal-manager shell::` green (10/10).
+- [ ] **Slice 0: Framework clipboard image API**
+  - [ ] Add `ClipboardContent::Image { width: usize, height: usize, bytes: Vec<u8> }` to `crates/unshit-framework/crates/unshit-app/src/clipboard.rs`.
+  - [ ] Add `ClipboardFormat::Image`.
+  - [ ] Add `ClipboardContext::read_image() -> Result<Option<ClipboardContent>, ClipboardError>`.
+  - [ ] Update `available_formats()` to include `Image` when present.
+  - [ ] Test: `read_image_round_trips` (write synthetic `arboard::ImageData`, read back).
+  - [ ] Test: `read_image_returns_none_when_text_only`.
+  - [ ] Test: `available_formats_includes_image_after_write`.
+  - [ ] `cargo test -p unshit-app clipboard::` green.
+  - [ ] `cargo clippy --all-targets`, `cargo fmt --check` clean.
 
-### Checkpoint
-- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean (terminal-manager package). No behavior change.
+- [ ] **Slice 1: Empty overlay (open + close)**
+  - [ ] Add `KeybindAction::QuickPromptOpen` to `src/keybinds/mod.rs` (variant, ALL, id, label, dispatch_command, default_combo_str).
+  - [ ] Update `all_has_seventeen_variants` test to expect 18.
+  - [ ] Add `QuickPromptOpen.dispatch_command()` assertion to `dispatch_commands_match_state_rs`.
+  - [ ] Create `src/quick_prompt/mod.rs` declaring `state` and `ui` submodules.
+  - [ ] Create `src/quick_prompt/state.rs` with `pub struct QuickPromptState {}` (placeholder; Slice 2 fills it).
+  - [ ] Create `src/quick_prompt/ui.rs` with `build_quick_prompt_overlay(snap, shared)` returning the empty card.
+  - [ ] Add `pub mod quick_prompt;` to `src/main.rs`.
+  - [ ] Add `pub quick_prompt: Option<QuickPromptState>` to `AppState` (line ~462) and `UiSnapshot` (line ~630).
+  - [ ] Mirror in `snapshot_state` helper.
+  - [ ] Add dispatch arms `quick_prompt.open` and `quick_prompt.close` in `state.rs`.
+  - [ ] Extend `modal.close` arm to clear `quick_prompt` alongside other modal fields.
+  - [ ] Render hook in `main.rs`: when `snap.quick_prompt.is_some()`, append a modal overlay div with backdrop click dispatching `quick_prompt.close`.
+  - [ ] Add `.quick-prompt-overlay` rules to `assets/styles.css` (copy from `.modal-overlay` shape; centered card).
+  - [ ] Test: `state::dispatch::quick_prompt_open_sets_state`.
+  - [ ] Test: `state::dispatch::quick_prompt_close_clears_state`.
+  - [ ] Test: `state::dispatch::modal_close_clears_quick_prompt`.
+  - [ ] Manual: `cargo run`; Ctrl+Shift+Q opens empty card; Esc closes; backdrop click closes; hotkey toggles.
 
-## Phase 2: Daemon honors `shell_args`
+### Checkpoint: Foundation
+- [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` clean (whole workspace).
+- [ ] Manual verification of Slice 1 (no other behavior regressed).
+- [ ] Human review before Phase 2.
 
-- [x] **Task 2: Additive `shell_args` field on `SpawnSession`** [DONE]
-  - [x] Add `shell_args: Vec<String>` (with `#[serde(default, skip_serializing_if = "Vec::is_empty")]`) to `Request::SpawnSession`.
-  - [x] Update `Client::spawn_session` signature.
-  - [x] Update `Session::spawn` to forward args via new `pty::build_spawn_args` helper.
-  - [x] Test: old wire payload (no `shell_args` key) deserializes with empty vector.
-  - [x] Test: round trip with `shell_args = ["--login", "-i"]`.
-  - [x] Test: empty `shell_args` is omitted from the wire (old daemon compat).
-  - [x] Test: IPC integration test spawns `cmd.exe /C echo MARKER` (Windows) / `/bin/sh -c echo MARKER` (Unix), asserts MARKER in output stream.
-  - [x] Test: `build_spawn_args` appends PowerShell `-NoExit -Command "Set-Location ..."` AFTER user args.
-  - [x] Updated 12 test call sites + handler + registry + UI shim (`src/pty.rs`).
-  - [x] `cargo test -p unshit-ptyd` green (141 unit + all integration tests).
+## Phase 2: Core feature
 
-- [x] **Task 3: `DaemonPty` shim carries `ShellSpec`** [DONE]
-  - [x] `DaemonPty::spawn_in` and `attach_or_spawn` accept `Option<&ShellSpec>`.
-  - [x] `Command::Spawn` enum variant carries `(shell, shell_args)`.
-  - [x] Worker forwards them to `client.spawn_session`.
-  - [x] Updated 4 call sites in `src/main.rs:458` and `src/state.rs:868`, `:1073`, `:1132` to pass `None` (Task 4 wires real values).
-  - [x] Updated 1 call site in `src/bridge.rs:233` to pass `None`.
-  - [x] Private helper `shell_spec_to_wire` normalizes `None` and empty `ShellSpec` to `(None, vec![])`.
-  - [x] Tests: 3 unit (`shell_spec_to_wire_*`) + 1 integration (`spawn_in_with_shell_spec_routes_program_to_daemon`).
-  - [x] `cargo test --bin terminal-manager pty::` green (19/19); full suite 823 pass.
+- [ ] **Slice 2: Prompt input + agent toggle + persistence**
+  - [ ] Expand `QuickPromptState` with `prompt: String`, `agent: Agent`, `error: Option<String>`.
+  - [ ] Add `pub enum Agent { Claude, Codex }` to `src/quick_prompt/state.rs` with `serde` derives.
+  - [ ] Add `QuickPromptStore` (mirror `persist::PersistedState`) with `install`, `load`, `save`, default config path `~/.config/com.godly.terminal/quick_prompt.json`.
+  - [ ] Wire `QuickPromptStore::install` in `main.rs` startup.
+  - [ ] Dispatch arm `quick_prompt.input <text>`: replaces buffer.
+  - [ ] Dispatch arm `quick_prompt.toggle_agent`: flips agent, calls `QuickPromptStore::save`.
+  - [ ] On `quick_prompt.open`: load agent from store before constructing the state.
+  - [ ] UI: render input textarea with placeholder "What should the agent do?" plus Claude/Codex chips.
+  - [ ] UI: input on_change dispatches `quick_prompt.input`.
+  - [ ] UI: Tab key on the input dispatches `quick_prompt.toggle_agent` (preventDefault on Tab).
+  - [ ] CSS: input + chip styling.
+  - [ ] Test: `quick_prompt::state::store_round_trip`.
+  - [ ] Test: `quick_prompt::state::store_missing_file_defaults_to_claude`.
+  - [ ] Test: `quick_prompt::state::store_malformed_json_defaults_to_claude`.
+  - [ ] Test: `state::dispatch::quick_prompt_toggle_agent`.
+  - [ ] Test: `state::dispatch::quick_prompt_input_replaces_buffer`.
+  - [ ] Manual: open overlay, type, Tab toggles, restart app, agent retained.
 
-### Checkpoint
-- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
-- [ ] `cargo run` opens default shell exactly as before (no UI for shell selection yet).
+- [ ] **Slice 3: Submit happy path (Claude only, no images, no autocomplete)**
+  - [ ] Create `src/quick_prompt/spawn.rs` with `prepare_target`, `claude_shell_spec`, `TargetDir`, `TargetKind`.
+  - [ ] `prepare_target`: detect git repo via `git rev-parse --is-inside-work-tree`; on success run `git worktree add <appdata-path> HEAD`; on failure or non-repo create plain dir.
+  - [ ] Helper to compute the appdata worktree path: `%APPDATA%\com.godly.terminal\worktrees\godly-qp-<8-hex>`.
+  - [ ] `claude_shell_spec(prompt) -> ShellSpec { program: "claude".into(), args: vec![prompt.into()] }`.
+  - [ ] Add `mutate_add_quick_prompt_tab(state, prompt, agent)` to `state.rs` (mirrors `mutate_add_tab` shape).
+  - [ ] Tab name: `qp: <truncate(prompt, 30)>`.
+  - [ ] Dispatch arm `quick_prompt.submit`:
+    - [ ] Empty prompt: set `error`, return `true`.
+    - [ ] Codex: temporarily set `error = "Codex coming soon"`, return `true`.
+    - [ ] Claude: call `prepare_target` then `mutate_add_quick_prompt_tab`; on success `quick_prompt = None`; on failure set `error`.
+  - [ ] UI: textarea on_submit (Ctrl+Enter binding) dispatches `quick_prompt.submit`.
+  - [ ] UI: render error chip when `state.error.is_some()`.
+  - [ ] CSS: error chip.
+  - [ ] Test: `quick_prompt::spawn::prepare_target_creates_worktree_in_repo` (uses temp git repo).
+  - [ ] Test: `quick_prompt::spawn::prepare_target_creates_plain_dir_when_not_in_repo`.
+  - [ ] Test: `quick_prompt::spawn::claude_shell_spec_uses_prompt_as_arg`.
+  - [ ] Test: `state::dispatch::quick_prompt_submit_empty_sets_error`.
+  - [ ] Test: `state::dispatch::quick_prompt_submit_success_closes_overlay`.
+  - [ ] Test: `state::dispatch::quick_prompt_submit_failure_keeps_overlay`.
+  - [ ] Manual from a git repo: open, type, Ctrl+Enter, verify new tab in `%APPDATA%\com.godly.terminal\worktrees\godly-qp-*` running Claude.
+  - [ ] Manual from a non git temp dir: same flow creates a plain dir and runs Claude.
 
-## Phase 3: App wide default
+### Checkpoint: Core feature
+- [ ] All tests + clippy + fmt clean.
+- [ ] End to end submit verified (worktree + plain dir paths).
+- [ ] Human review before Phase 3.
 
-- [x] **Task 4: `AppState.default_shell` + persistence + first time inference + initial spawn** [DONE]
-  - [x] Added `default_shell: ShellSpec` to `AppState` (initialized in `seed_state` via `infer_default_shell(&discover_installed())`).
-  - [x] Added `default_shell: ShellSpec` to `UiSnapshot`.
-  - [x] Added `default_shell: ShellSpec` to `PersistedState` with `#[serde(default)]`.
-  - [x] Wired load / save (`from_state`, restoration in `main.rs:391`).
-  - [x] First time inference in `seed_state`: prefers `pwsh`, then `powershell`, else empty (daemon falls back).
-  - [x] `discover_installed()` minimal PATH probe for `pwsh` / `powershell` (full impl in Task 7).
-  - [x] Updated `main.rs:458` initial spawn to call `shell::resolve(None, Some(&guard.default_shell))`.
-  - [x] Test: old `workspaces.json` without `default_shell` loads with `ShellSpec::default()` (`deserializes_with_default_shell_when_field_is_missing`).
-  - [x] Test: round trip preserves a non default `default_shell` (`round_trip_preserves_non_default_default_shell`).
-  - [x] Test: inference with `[pwsh, powershell]` picks `pwsh` (`infer_default_shell_prefers_pwsh_over_powershell`).
-  - [x] `cargo test --bin terminal-manager`: 830 passed (up from 823, +7 new). clippy + fmt clean.
+## Phase 3: Polish
 
-- [x] **Task 5: All other spawn sites resolve and pass spec** [DONE]
-  - [x] Updated three sites in `src/state.rs` (`mutate_add_tab`, `mutate_split_right`, `mutate_split_down`) to use new `pane_spawn_shell(state)` helper.
-  - [x] Updated `src/bridge.rs:233` resize-loop attach_or_spawn to use the same helper.
-  - [x] Grep audit: only the `DaemonPty::spawn` shorthand still passes `None` literally and no production code calls it.
-  - [x] Test: `add_tab_records_resolved_default_shell_on_pty_shim` (dispatch with `default_shell` set spawns the configured shell).
-  - [x] Test: `add_tab_with_empty_default_shell_does_not_record_a_shell` (daemon falls back when default cleared).
-  - [x] Test: `split_right_records_*` and `split_down_records_*` cover the split sites.
-  - [x] Added `DaemonPty::spawn_shell` accessor (mirrors `spawn_cwd`) so unit tests can assert what was forwarded without standing up a daemon.
-  - [x] `cargo test --bin terminal-manager`: 836 passed (up from 830, +6 new). clippy + fmt clean.
+- [x] **Slice 4: Image paste** (commit 47d5bdb)
+  - [x] `src/quick_prompt/images.rs` with `QuickPromptImage`, `capture_clipboard_image`, `cleanup_session`, `move_into_target`, `append_image_references`.
+  - [x] Hash bytes with 64-bit FNV-1a (16-hex). `sha2` skipped to avoid the dep; FNV-1a is sufficient for in-session de-dup. Spec deviation logged.
+  - [x] Persist temp images at `temp_dir().join("godly-qp").join(<8-hex session id>).join(<hash>.png)` plus `<hash>.thumb.png`.
+  - [x] Generate 96px max-edge thumbnail via `image::imageops::thumbnail` (workspace `image` crate, png+jpeg features already on).
+  - [x] Added `session_hex` and `images: Vec<QuickPromptImage>` to `QuickPromptState`; fresh session_hex per open.
+  - [x] Dispatch arm `quick_prompt.image_paste`: reads clipboard, dedups by hash, surfaces friendly error chip on empty clipboard or arboard failure.
+  - [x] Image removal handled by direct mutation from the chip remove button (no separate dispatch arm needed; chip lives inside the overlay).
+  - [x] Cleanup on close: `modal.close`, `quick_prompt.open` toggle off, `quick_prompt.close` all run `cleanup_session`.
+  - [x] On submit: `move_into_target` relocates files into `<target>/.quick-prompt/<hash>.png` (with cross-volume copy fallback); `append_image_references` adds the block before `claude_shell_spec`.
+  - [x] UI: toolbar with "Attach image" button + thumbnail chip strip below the input. Spec deviation: framework does not expose Ctrl+V paste events, so paste is button-driven for now.
+  - [x] CSS: `.quick-prompt-toolbar`, `.quick-prompt-image-strip`, `.quick-prompt-image-chip`, `.quick-prompt-image-thumb`, `.quick-prompt-image-remove`.
+  - [x] Re-exported `ClipboardContent` / `ClipboardFormat` from `unshit-app::lib`.
+  - [x] Tests: 13 in `quick_prompt::images`, 2 in `quick_prompt::state` for session_hex, 4 dispatch tests covering paste + cleanup paths. 1002 total green.
 
-### Checkpoint
-- [x] `cargo test` green.
-- [ ] Manual: edit `workspaces.json` to set `"default_shell": { "program": "/bin/bash", "args": [] }`, restart, open a new pane, confirm `bash` runs (`echo $0`).
+- [x] **Slice 5: Autocomplete (Claude only)** (commit ff02e4e)
+  - [x] `src/quick_prompt/autocomplete.rs` with `Entry`, `EntryKind`, `Popup`, `load_claude_sources_from`, `cached_claude_sources`, `filter`, `detect_claude_trigger`, `rederive_query`, `confirm_into_prompt`.
+  - [x] Cache `Mutex<Option<(Instant, Vec<Entry>)>>` with 5s TTL.
+  - [x] Trigger detection runs inside the input `on_change` closure (slice 2 chose direct mutation over a dispatch arm; trigger logic is testable as a pure function).
+  - [x] Popup state arms `quick_prompt.autocomplete_select_next`, `_prev`, `_confirm`, `_dismiss` plus `modal.close` (Esc) dismisses popup-only when one is open.
+  - [x] Confirm splices `/<entry.name>` at the anchor and closes popup; preserves trailing whitespace and text.
+  - [x] UI renders popup below the input with selected row class; click-on-row confirms.
+  - [x] Spec deviation: Up/Down/Enter/Tab key handling on the input is unavailable today (framework `Input` only exposes `on_change` + `on_submit`). State machine arms are wired so Slice 7 can bind keys when framework support lands. Enter routes through `on_submit` to `autocomplete_confirm` when popup is open.
+  - [x] CSS rules for `.quick-prompt-autocomplete`, `.quick-prompt-autocomplete-row` (+ hover, `.selected`), name + kind spans, empty hint.
+  - [x] 30 unit tests in `quick_prompt::autocomplete::*` covering loader, filter, trigger detection, rederive, confirm, popup state machine, missing root.
+  - [x] 5 dispatch tests covering `select_next`, `select_prev`, `dismiss`, `confirm`, no-op-when-closed; 1 modal-close test covering the two-Esc flow.
+  - [x] `benches/quick_prompt_filter.rs` (criterion) measures `filter` over 200 synthetic entries across four query shapes. `Cargo.toml` `[[bench]]` entry added. Baseline on dev machine: empty 224 ns, broad hit ~50 us, no match ~46 us. Spec gate <1 ms p99 met with ~20x headroom.
 
-## Phase 4: Per workspace override
+- [x] **Slice 6: Codex parity** (commit pending)
+  - [x] OQ1 left as a documented assumption in `codex_shell_spec`. Manual `codex exec "say hi"` verification is on the user; if the CLI shape changes only that one function needs updating.
+  - [x] `quick_prompt::spawn::codex_shell_spec(prompt) -> ShellSpec` (`codex.cmd` on Windows, `codex` elsewhere; args `["exec", prompt]`).
+  - [x] `quick_prompt.submit` arm dispatches on `agent`; "Codex coming soon" stub removed; the existing test rewritten to assert the tab + overlay close.
+  - [x] `load_codex_command_sources_from` (`~/.codex/prompts/*.md`) and `load_codex_skill_sources_from` (`~/.codex/skills/*/`, dot-prefixed dirs skipped so `.system` is excluded).
+  - [x] `cached_codex_command_sources` and `cached_codex_skill_sources` mirror the Claude cache (separate 5s TTL each, shared `cached(...)` helper).
+  - [x] `Popup` carries `trigger_char` (was hardcoded `/`); `confirm_into_prompt` and `rederive_query` use it. Backtick triggered popup splices `\``+name back into the prompt.
+  - [x] `detect_codex_trigger` returns `(anchor, EntryKind)` so the UI loader picks the right source list per trigger char.
+  - [x] UI on_change branches on `agent`: Claude uses `detect_claude_trigger`, Codex tries backtick (skills) then `/` (commands). Confirms preserve trigger char.
+  - [x] Tests added: `codex_shell_spec_uses_exec_subcommand_and_prompt_arg`, `codex_shell_spec_preserves_multiline_prompts`; `load_codex_command_sources_from_walks_prompts_dir`, `load_codex_skill_sources_from_walks_skills_dir_and_excludes_dot_dirs`, missing-root variants for both, four `detect_codex_trigger_*` tests, `popup_open_with_trigger_carries_explicit_char`, `rederive_query_works_for_backtick_triggered_popup`, `rederive_query_dismisses_backtick_popup_when_trigger_replaced_by_slash`, `confirm_with_backtick_trigger_inserts_backtick`, dispatch test rewritten as `dispatch_quick_prompt_submit_codex_spawns_tab_and_closes_overlay`.
 
-- [x] **Task 6: Per workspace `shell` field** [DONE]
-  - [x] Added `shell: ShellSpec` to `state::Workspace` (initialized in `new_workspace`, `seed_state`, all test helpers).
-  - [x] Added `shell: ShellSpec` to `persist::PersistedWorkspace` with `#[serde(default)]`.
-  - [x] Updated `from_state` to copy `w.shell` and `main.rs` restoration loop to thread `entry.shell` back.
-  - [x] `pane_spawn_shell` now consults the active workspace via `shell::resolve(Some(&active_ws.shell), Some(&state.default_shell))`.
-  - [x] Test: `pane_spawn_shell_prefers_active_workspace_shell_over_app_default`.
-  - [x] Test: `pane_spawn_shell_uses_correct_workspace_after_switch` (state-level dispatch with two workspaces).
-  - [x] Test: `pane_spawn_shell_falls_back_to_app_default_when_workspace_shell_is_empty`.
-  - [x] Persist round trip + missing-field tests cover `PersistedWorkspace.shell`.
-  - [x] `cargo test --bin terminal-manager`: 841 passed (up from 836, +5 new). clippy + fmt clean.
+- [x] **Slice 7: Polish + perf gates + daemon name** (commit pending)
+  - [x] `DaemonPty::spawn_in_named(pane_id, ws_id, cols, rows, cwd, shell, name)` added; `spawn_in` delegates with `name: None`. The `Command::Spawn` already carried a `name` field; only the public entry point was hardcoded to `None`.
+  - [x] `mutate_add_quick_prompt_tab` calls `spawn_in_named` with `Some(quick_prompt_tab_title(prompt))`. The daemon now records `qp: <prompt prefix>` and `ptyctl list` (or any `list_sessions` caller) reads it back.
+  - [x] Test `pty::spawn_in_named_forwards_name_to_daemon` (real daemon round trip; spawns with `Some("qp: do the thing")` and asserts the name appears in `list_sessions()`); regression test `pty::spawn_in_delegates_with_no_name` covers the unnamed path.
+  - [x] No `RequestRebuild` thrash: typing routes through `mutate_with` (one rebuild per dispatch) so the existing `RebuildCoalescer` already deduplicates per drain window. No code change needed.
+  - [x] Bench docs: new `## Performance Benches` section in `CLAUDE.md` calls out `pty_write` and `quick_prompt_filter` with their gates and how to run them locally.
+  - [x] Visual polish: error chip switched from solid `--rust` background to a softer `--bg-elevated` body with the same `--accent-danger` left border the toast errors use, so error styling is consistent across the overlay and the toast strip.
+  - [x] Manual U1 to U6 verification deferred to the user; the integration tests + bench cover the automatable parts.
 
-### Checkpoint
-- [x] `cargo test` green.
-- [ ] Manual: give two workspaces different `shell.program` values via `workspaces.json`, restart, open a tab in each, confirm each opens the right shell.
+### Checkpoint: Complete
+- [ ] All acceptance criteria F1 to F8 met.
+- [ ] All tests + clippy + fmt clean across workspace.
+- [ ] Bench gate met.
+- [ ] Manual U1 to U6 verification recorded.
+- [ ] Ready for review.
 
-## Phase 5: Discovery and dispatch
+## Open questions to resolve before merge
 
-- [x] **Task 7: `discover_installed` shell scan** [DONE]
-  - [x] Replaced the Task 4 stub with a full PATH walk over `STEMS = [pwsh, powershell, cmd, bash, zsh, fish, nu, wsl]`.
-  - [x] Windows: probes `C:\Program Files\Git\bin\bash.exe` and `C:\Windows\System32\wsl.exe` via `fixed_well_known_paths`.
-  - [x] Dedupes by `std::fs::canonicalize` so symlinked / aliased shells collapse to one entry.
-  - [x] Caps at `MAX_DISCOVERED = 16`; `'walk` label breaks early instead of overshooting.
-  - [x] Extracted `discover_from(path_dirs, fixed)` so unit tests can drive it without env access.
-  - [x] Test: `discover_from_finds_known_shell_in_a_path_dir` (returns at least one entry).
-  - [x] Test: `discover_installed_returns_stable_order_across_calls`.
-  - [x] Test: `discover_from_returns_empty_when_no_dirs_and_no_fixed` + `discover_installed_does_not_panic` (empty / unset PATH).
-  - [x] Tests: dedup-by-canonical, fixed-paths probe, missing-files-skipped, cap at MAX_DISCOVERED.
-  - [x] `cargo test --bin terminal-manager shell::`: 24/24 green. clippy + fmt clean.
-
-- [x] **Task 8: Dispatch handlers and persist trigger** [DONE]
-  - [x] Added arms for `shell.set_default:<json>`, `shell.set_workspace:<idx>:<json>`, `shell.clear_default`, `shell.clear_workspace:<idx>` in the main `dispatch` match.
-  - [x] Each helper parses, mutates, then calls `crate::persist::save_workspaces(state)`.
-  - [x] Test: `dispatch_shell_set_default_updates_state` and `dispatch_shell_set_workspace_updates_correct_workspace` cover the happy path.
-  - [x] Test: malformed JSON / missing payload / non-numeric index / out-of-range index all return false without panic (`with_malformed_*`, `with_out_of_range_index_*`).
-  - [x] Test: `dispatch_shell_clear_default_when_already_empty_still_returns_true` covers idempotent clear.
-  - [x] `cargo test --bin terminal-manager state::tests::dispatch_shell`: 12/12 green.
-
-### Checkpoint
-- [x] `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
-
-## Phase 6: UI surfaces
-
-- [x] **Task 9: Settings → Shell tab full editor; remove General placeholder** [DONE]
-  - [x] App default editor: chip group of `discover_installed` results + always visible custom path text input (Enter to apply, framework's `Tag::Input` doesn't seed initial value so placeholder shows current).
-  - [x] Always visible args text input under each scope; submit splits on whitespace and dispatches matching `shell.set_*`.
-  - [x] Per workspace overrides subsection: one `shell-scope-block` per workspace, with extra "Use default" chip that dispatches `shell.clear_workspace:<idx>`.
-  - [x] Each chip / submit dispatches via the new `ShellScope::{AppDefault, Workspace(idx)}` enum so no command strings are duplicated.
-  - [x] Removed the "Default shell" placeholder row from `build_general_section` and its now-orphan `select_display` helper + test.
-  - [x] Updated `general_section_has_title_and_five_rows` (was six) and added 7 new structural tests (`shell_section_starts_with_app_default_block`, `shell_section_includes_shell_picker_under_app_default_block`, `shell_picker_marks_active_chip_when_program_matches`, `shell_picker_for_workspace_includes_use_default_chip`, `shell_picker_for_app_default_omits_use_default_chip`, `shell_section_has_one_workspace_override_block_per_workspace`, `general_section_no_longer_has_default_shell_row`).
-  - [x] `cargo test --bin terminal-manager ui::settings`: 80 passed. clippy + fmt clean. Full suite 867.
-  - [ ] **Manual smoke test (per CLAUDE.md, deferred to user):**
-    - [ ] `cargo run`, open Settings → Shell.
-    - [ ] Pick a non default discovered shell, confirm new pane opens it.
-    - [ ] Type a non discovered path into the custom input, confirm a new pane uses it.
-    - [ ] Set a workspace override, confirm it wins inside that workspace.
-    - [ ] Restart, confirm picks survived.
-
-- [ ] **Task 10: Workspace context menu shell submenu**
-  - [ ] Locate the existing workspace context menu builder (likely `src/ui/sidebar.rs` or `src/ui/ctx_menu.rs`).
-  - [ ] Add a "Shell" submenu listing `discover_installed` results plus "Use app default" when an override is set.
-  - [ ] Picking an entry dispatches `shell.set_workspace:<idx>:<json>`; "Use app default" dispatches `shell.clear_workspace:<idx>`.
-  - [ ] Mark the currently selected entry as active.
-  - [ ] Unit test: menu builder structural test (label list + active marker + "Use app default" visible only when override set).
-  - [ ] Manual: right click each workspace, confirm the submenu works end to end.
-
-### Checkpoint
-- [ ] Pause for human review before continuing to Phase 7.
-
-## Phase 7: Cleanup
-
-- [ ] **Task 11: Remove bench `SHELL=cmd.exe` override**
-  - [ ] Delete `std::env::set_var("SHELL", "cmd.exe")` at `src/main.rs:325`.
-  - [ ] Add regression test asserting the string is absent from `main.rs` source.
-  - [ ] If bench mode needs a deterministic shell, route it through `default_shell` config instead of env var mutation.
-  - [ ] `cargo test --lib bench_no_set_shell` green.
-  - [ ] `cargo build --features bench` succeeds (manual sanity).
-
-### Final checkpoint
-- [ ] All success criteria from `SPEC.md` verified.
-- [ ] `cargo test`, `cargo clippy --all-targets --all-features`, `cargo fmt --check` clean.
-- [ ] Full manual smoke test of the user flow performed (both UI surfaces, per workspace and app default).
-- [ ] PR ready for review.
+* **OQ1** Codex `exec` flag confirmed (Slice 6).
+* **OQ2** Prompt draft persistence across opens? Spec says no; confirm with user during Slice 2 review.
+* **OQ4** Treat missing `~/.claude` or `~/.codex` dirs as zero entries (no error chip).

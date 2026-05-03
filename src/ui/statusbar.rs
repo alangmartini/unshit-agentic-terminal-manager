@@ -172,6 +172,7 @@ mod tests {
             last_grid_height: 0.0,
             scale_factor: 1.0,
             default_shell: crate::shell::ShellSpec::default(),
+            quick_prompt: None,
         }
     }
 

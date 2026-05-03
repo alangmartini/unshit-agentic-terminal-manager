@@ -241,6 +241,23 @@ impl DaemonPty {
         cwd: Option<&Path>,
         shell: Option<&ShellSpec>,
     ) -> io::Result<Box<dyn io::Read + Send>> {
+        self.spawn_in_named(pane_id, workspace_id, cols, rows, cwd, shell, None)
+    }
+
+    /// Like `spawn_in` but also forwards a human readable session
+    /// `name` to the daemon. Used by the Quick Prompt tab so daemon
+    /// inspection (e.g. `ptyctl list`) shows `qp: <prompt prefix>`
+    /// instead of an opaque session id.
+    pub fn spawn_in_named(
+        &mut self,
+        pane_id: u32,
+        workspace_id: u32,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
+        shell: Option<&ShellSpec>,
+        name: Option<&str>,
+    ) -> io::Result<Box<dyn io::Read + Send>> {
         let cwd_owned = cwd.map(Path::to_path_buf);
         // Record the cwd before the IPC attempt so tests that never
         // connect, and production failures mid-handshake, still leave
@@ -263,7 +280,7 @@ impl DaemonPty {
             shell_args,
             workspace_id,
             pane_id,
-            name: None,
+            name: name.map(|s| s.to_string()),
             byte_tx,
             reply: reply_tx,
         };
@@ -1539,6 +1556,71 @@ mod tests {
                 "expected {MARKER} in output, got: {text:?}"
             );
             shim.destroy(11);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_in_named_forwards_name_to_daemon() {
+        // Quick Prompt registers a friendly session name on the daemon
+        // so `ptyctl list` shows `qp: <prompt prefix>` instead of an
+        // opaque session id. We spawn with name=Some(...) and assert
+        // list_sessions returns it.
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let pane_id = 313u32;
+            let _reader = shim
+                .spawn_in_named(pane_id, 1, 80, 24, None, None, Some("qp: do the thing"))
+                .expect("spawn_in_named");
+
+            let list = shim.list_sessions().expect("list_sessions");
+            let names: Vec<_> = list.iter().filter_map(|s| s.name.as_deref()).collect();
+            assert!(
+                names.contains(&"qp: do the thing"),
+                "expected name on daemon, got {list:?}"
+            );
+            shim.destroy(pane_id);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_in_delegates_with_no_name() {
+        // The unnamed entry point preserves the prior behavior: no
+        // name reaches the daemon, list_sessions returns the session
+        // with name=None.
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let pane_id = 314u32;
+            let _reader = shim
+                .spawn_in(pane_id, 1, 80, 24, None, None)
+                .expect("spawn_in");
+            let list = shim.list_sessions().expect("list_sessions");
+            assert!(
+                list.iter().any(|s| s.name.is_none()),
+                "expected at least one session with no name, got {list:?}"
+            );
+            shim.destroy(pane_id);
         })
         .await
         .unwrap();
