@@ -1700,114 +1700,203 @@ body.dragging-pane {
   display: none;
 }
 
+/* Backdrop. Heavier blur and darker scrim than the previous 4px so the
+ * overlay reads as the only thing on screen, matching the focus-mode
+ * power user expectation for a Cmd-K style command launcher. */
 .quick-prompt-overlay {
   position: fixed;
   inset: 0;
-  background: var(--bg-overlay);
-  backdrop-filter: blur(4px);
+  background: rgba(8, 6, 3, 0.72);
+  backdrop-filter: blur(10px);
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
+  padding-top: 14vh;
   z-index: 320;
 }
 
+/* Card. Slightly cooler than before (--bg-base instead of --bg-subtle),
+ * tighter radius for the modern launcher look, deeper shadow, fixed
+ * 600px width so the autocomplete + image strip do not feel cramped on
+ * tiny screens or sprawled on large ones. */
 .quick-prompt-card {
-  background: var(--bg-subtle);
+  background: var(--bg-base);
   border: 1px solid var(--border-default);
-  border-radius: 8px;
-  padding: 16px 20px;
-  min-width: 520px;
-  max-width: 720px;
+  border-radius: 10px;
+  padding: var(--sp-5) var(--sp-6) var(--sp-4) var(--sp-6);
+  width: 600px;
+  max-width: 90vw;
   box-shadow: var(--shadow-lg);
   flex-direction: column;
-  gap: 12px;
+  gap: var(--sp-4);
 }
 
+/* Identity caption row above the agent toggle. The hotkey echo on the
+ * right reinforces the Ctrl+Shift+Q affordance without taking real
+ * estate from the input. */
+.quick-prompt-header {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--sp-1);
+}
+
+.quick-prompt-label {
+  color: var(--amber-300);
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  font-weight: 600;
+}
+
+.quick-prompt-label-hint {
+  color: var(--fg-tertiary);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.4px;
+}
+
+/* Segmented agent toggle. Two chips packed into a single rounded
+ * surface so the active state reads as a real selector, not a pair of
+ * disconnected buttons. */
 .quick-prompt-agent-row {
   flex-direction: row;
-  gap: 6px;
+  gap: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  padding: 2px;
+  align-self: flex-start;
 }
 
 .quick-prompt-chip {
-  padding: 4px 12px;
+  padding: 4px var(--sp-5);
   font-size: 12px;
   border-radius: 4px;
   cursor: pointer;
-  border: 1px solid var(--border-default);
-  background: var(--bg-elevated);
+  border: 1px solid transparent;
+  background: transparent;
   color: var(--fg-secondary);
   align-items: center;
+  font-weight: 500;
+  transition: color var(--dur-fast) var(--ease-std), background var(--dur-fast) var(--ease-std);
 }
 
 .quick-prompt-chip:hover {
-  background: var(--bg-hover);
+  color: var(--fg-primary);
 }
 
+/* Active chip uses the brand amber, not the generic rust danger color
+ * the original shipped with. The amber matches the focus ring + label
+ * caption so the whole card reads as one design. */
 .quick-prompt-chip.active {
-  background: var(--rust);
-  color: var(--bg-base);
-  border-color: var(--rust);
+  background: var(--amber-300);
+  color: var(--bg-void);
+  border-color: var(--amber-300);
+  box-shadow: var(--glow-amber-s);
 }
 
+/* Input. Larger type and padding than the previous 13/10px because
+ * this IS the primary action on the card. Mono font matches the
+ * developer tool / terminal aesthetic the spec calls for. Focus ring
+ * uses the brand amber via --border-focus. */
 .quick-prompt-input {
-  font-size: 13px;
-  padding: 10px 12px;
-  border-radius: 4px;
+  font-size: 15px;
+  font-family: var(--font-mono);
+  padding: 12px 14px;
+  border-radius: 6px;
   border: 1px solid var(--border-default);
   background: var(--bg-elevated);
   color: var(--fg-primary);
   width: 100%;
+  transition: border-color var(--dur-fast) var(--ease-std), box-shadow var(--dur-fast) var(--ease-std);
 }
 
 .quick-prompt-input:focus {
-  outline: 1px solid var(--rust);
-  outline-offset: -1px;
+  border-color: var(--border-focus);
+  box-shadow: var(--glow-amber-s);
+  outline: none;
 }
 
+/* Error chip. Two-span layout (icon + text) so the framework can size
+ * the leading "!" independently. Matches the toast danger pattern with
+ * the same accent color but with the icon ahead instead of a left
+ * border, which reads better at small sizes. */
 .quick-prompt-error {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--sp-3);
   font-size: 12px;
-  padding: 6px 10px;
-  border-radius: 4px;
+  padding: var(--sp-3) var(--sp-5);
+  border-radius: 6px;
   background: var(--bg-elevated);
-  border-left: 3px solid var(--accent-danger, #d75f5f);
+  border: 1px solid var(--accent-danger, #d75f5f);
+}
+
+.quick-prompt-error-icon {
+  width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  background: var(--accent-danger, #d75f5f);
+  color: var(--bg-void);
+  font-size: 12px;
+  font-weight: 700;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.quick-prompt-error-text {
   color: var(--fg-primary);
 }
 
+/* Toolbar. Demoted to a thin secondary row; the attach button is a
+ * ghost icon-button rather than a primary call to action. */
 .quick-prompt-toolbar {
   flex-direction: row;
-  gap: 6px;
+  gap: var(--sp-3);
+  margin-top: -2px;
 }
 
 .quick-prompt-toolbar-button {
-  padding: 4px 10px;
-  font-size: 12px;
+  padding: 3px var(--sp-4);
+  font-size: 11px;
   border-radius: 4px;
   cursor: pointer;
-  border: 1px solid var(--border-default);
-  background: var(--bg-elevated);
-  color: var(--fg-secondary);
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--fg-tertiary);
   align-items: center;
+  letter-spacing: 0.3px;
+  transition: color var(--dur-fast) var(--ease-std), border-color var(--dur-fast) var(--ease-std);
 }
 
 .quick-prompt-toolbar-button:hover {
-  background: var(--bg-hover);
   color: var(--fg-primary);
+  border-color: var(--border-default);
 }
 
+/* Image strip. Smaller chips (52px not 64px) so the strip reads as a
+ * compact preview row rather than competing with the input for
+ * attention. Each chip carries a subtle hover lift. */
 .quick-prompt-image-strip {
   flex-direction: row;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--sp-3);
 }
 
 .quick-prompt-image-chip {
   position: relative;
-  width: 64px;
-  height: 64px;
-  border-radius: 4px;
+  width: 52px;
+  height: 52px;
+  border-radius: 6px;
   border: 1px solid var(--border-default);
   overflow: hidden;
   cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-std);
+}
+
+.quick-prompt-image-chip:hover {
+  border-color: var(--border-strong);
 }
 
 .quick-prompt-image-thumb {
@@ -1818,18 +1907,19 @@ body.dragging-pane {
 
 .quick-prompt-image-remove {
   position: absolute;
-  top: 2px;
-  right: 2px;
+  top: 3px;
+  right: 3px;
   width: 16px;
   height: 16px;
   border-radius: 8px;
-  background: rgba(0, 0, 0, 0.7);
+  background: rgba(0, 0, 0, 0.78);
   color: white;
   font-size: 11px;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-std), background var(--dur-fast) var(--ease-std);
 }
 
 .quick-prompt-image-chip:hover .quick-prompt-image-remove {
@@ -1840,28 +1930,33 @@ body.dragging-pane {
   background: var(--rust);
 }
 
+/* Autocomplete. Tighter rows for power user density. Selected row
+ * gets an amber left bar plus the bg-selected fill so the active
+ * suggestion is unmistakable. */
 .quick-prompt-autocomplete {
   flex-direction: column;
-  margin-top: 8px;
-  background: var(--bg-base);
+  background: var(--bg-elevated);
   border: 1px solid var(--border-default);
   border-radius: 6px;
-  max-height: 220px;
+  max-height: 240px;
   overflow: hidden;
 }
 
 .quick-prompt-autocomplete-empty {
-  padding: 8px 12px;
+  padding: var(--sp-4) var(--sp-5);
   color: var(--fg-muted);
-  font-size: 13px;
+  font-size: 12px;
+  font-family: var(--font-mono);
 }
 
 .quick-prompt-autocomplete-row {
   flex-direction: row;
   align-items: center;
-  justify-content: space-between;
-  padding: 6px 12px;
+  gap: var(--sp-4);
+  padding: 5px var(--sp-5);
   cursor: pointer;
+  border-left: 2px solid transparent;
+  transition: background var(--dur-fast) var(--ease-std), border-color var(--dur-fast) var(--ease-std);
 }
 
 .quick-prompt-autocomplete-row:hover {
@@ -1870,19 +1965,80 @@ body.dragging-pane {
 
 .quick-prompt-autocomplete-row.selected {
   background: var(--bg-selected);
+  border-left-color: var(--amber-300);
+}
+
+/* Leading kind badge: single-letter pill (S = skill, C = command).
+ * Mirrors the kind label on the right per the WCAG color-not-only
+ * rule (color + text + position all redundantly encode the kind). */
+.quick-prompt-autocomplete-badge {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.quick-prompt-autocomplete-badge.skill {
+  background: var(--azure);
+  color: var(--bg-void);
+}
+
+.quick-prompt-autocomplete-badge.command {
+  background: var(--sage);
+  color: var(--bg-void);
 }
 
 .quick-prompt-autocomplete-name {
   color: var(--fg-primary);
   font-family: var(--font-mono);
   font-size: 13px;
+  flex-grow: 1;
 }
 
 .quick-prompt-autocomplete-kind {
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.6px;
+}
+
+/* Keyboard hint footer. Muted by design; a power user reference, not
+ * primary content. Each pair is `<key> <label>` with a thin border on
+ * the key glyph so it reads as a keyboard cap. */
+.quick-prompt-footer {
+  flex-direction: row;
+  gap: var(--sp-5);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border-hair);
+  margin-top: var(--sp-1);
+}
+
+.quick-prompt-hint {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.quick-prompt-hint-key {
+  padding: 1px var(--sp-2);
+  border-radius: 3px;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-subtle);
+  color: var(--fg-secondary);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-weight: 500;
+}
+
+.quick-prompt-hint-label {
+  color: var(--fg-tertiary);
+  font-size: 10px;
+  letter-spacing: 0.3px;
 }
 
 .confirm-dialog-card {
