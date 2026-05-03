@@ -39,6 +39,11 @@ const CLAUDE_PROGRAM: &str = "claude.cmd";
 #[cfg(not(windows))]
 const CLAUDE_PROGRAM: &str = "claude";
 
+#[cfg(windows)]
+const CODEX_PROGRAM: &str = "codex.cmd";
+#[cfg(not(windows))]
+const CODEX_PROGRAM: &str = "codex";
+
 /// Production base for Quick Prompt worktrees:
 /// `%APPDATA%\com.godly.terminal\worktrees` on Windows; matching
 /// platform-specific data dir elsewhere.
@@ -143,6 +148,20 @@ pub fn claude_shell_spec(prompt: &str) -> ShellSpec {
     }
 }
 
+/// Build the `ShellSpec` for `codex exec <prompt>`. On Windows the
+/// program is `codex.cmd` for the same PathExt reason as Claude.
+///
+/// Note (per spec OQ1): we pass the prompt as the trailing positional
+/// argument to `codex exec`. This matches the documented Codex CLI
+/// surface; if a future Codex release changes the flag, only this
+/// function needs to update.
+pub fn codex_shell_spec(prompt: &str) -> ShellSpec {
+    ShellSpec {
+        program: CODEX_PROGRAM.to_string(),
+        args: vec!["exec".to_string(), prompt.to_string()],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +227,22 @@ mod tests {
     fn claude_shell_spec_preserves_multiline_prompts() {
         let spec = claude_shell_spec("line one\nline two");
         assert_eq!(spec.args, vec!["line one\nline two".to_string()]);
+    }
+
+    #[test]
+    fn codex_shell_spec_uses_exec_subcommand_and_prompt_arg() {
+        let spec = codex_shell_spec("say hi");
+        assert_eq!(spec.program, CODEX_PROGRAM);
+        assert_eq!(spec.args, vec!["exec".to_string(), "say hi".to_string()]);
+    }
+
+    #[test]
+    fn codex_shell_spec_preserves_multiline_prompts() {
+        let spec = codex_shell_spec("line one\nline two");
+        assert_eq!(
+            spec.args,
+            vec!["exec".to_string(), "line one\nline two".to_string()]
+        );
     }
 
     // --- prepare_target_in ----------------------------------------------

@@ -260,18 +260,51 @@ fn build_prompt_input(shared: &SharedState) -> ElementDef {
                         if !keep {
                             qp.popup = None;
                         }
-                    } else if matches!(agent, Some(crate::quick_prompt::Agent::Claude)) {
-                        if let Some(anchor) =
-                            crate::quick_prompt::autocomplete::detect_claude_trigger(
-                                &prev_prompt,
-                                &qp.prompt,
-                            )
-                        {
-                            let entries =
-                                crate::quick_prompt::autocomplete::cached_claude_sources();
-                            if !entries.is_empty() {
-                                qp.popup = Some(crate::quick_prompt::Popup::open(entries, anchor));
+                    } else {
+                        match agent {
+                            Some(crate::quick_prompt::Agent::Claude) => {
+                                if let Some(anchor) =
+                                    crate::quick_prompt::autocomplete::detect_claude_trigger(
+                                        &prev_prompt,
+                                        &qp.prompt,
+                                    )
+                                {
+                                    let entries =
+                                        crate::quick_prompt::autocomplete::cached_claude_sources();
+                                    if !entries.is_empty() {
+                                        qp.popup = Some(crate::quick_prompt::Popup::open(
+                                            entries, anchor,
+                                        ));
+                                    }
+                                }
                             }
+                            Some(crate::quick_prompt::Agent::Codex) => {
+                                if let Some((anchor, kind)) =
+                                    crate::quick_prompt::autocomplete::detect_codex_trigger(
+                                        &prev_prompt,
+                                        &qp.prompt,
+                                    )
+                                {
+                                    let (entries, trigger) = match kind {
+                                        crate::quick_prompt::EntryKind::Skill => (
+                                            crate::quick_prompt::autocomplete::cached_codex_skill_sources(),
+                                            '`',
+                                        ),
+                                        crate::quick_prompt::EntryKind::Command => (
+                                            crate::quick_prompt::autocomplete::cached_codex_command_sources(),
+                                            '/',
+                                        ),
+                                    };
+                                    if !entries.is_empty() {
+                                        qp.popup = Some(
+                                            crate::quick_prompt::Popup::open_with_trigger(
+                                                entries, anchor, trigger,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                            None => {}
                         }
                     }
                 }

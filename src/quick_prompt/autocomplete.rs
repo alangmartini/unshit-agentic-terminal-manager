@@ -1,20 +1,23 @@
 //! Autocomplete for the Quick Prompt overlay.
 //!
-//! Slice 5 wires up the Claude flavored sources only. The popup opens
-//! when the user types `/` after whitespace (or at the start of the
-//! buffer) and offers skills from `~/.claude/skills/` (one entry per
-//! directory) and slash commands from `~/.claude/commands/` (one entry
-//! per `*.md` file). Codex parity lands in Slice 6.
+//! Two agents are supported:
+//!
+//! * Claude: `/` after whitespace opens a popup with skills from
+//!   `~/.claude/skills/` (one entry per directory) and slash commands
+//!   from `~/.claude/commands/` (one entry per `*.md` file).
+//! * Codex: `/` opens commands from `~/.codex/prompts/*.md`; backtick
+//!   opens skills from `~/.codex/skills/` (excluding `.system/`).
 //!
 //! The design keeps three things separable:
 //!
 //! * Pure data (`Entry`, `EntryKind`, `Popup`) so the dispatch arms
 //!   and UI render path can match on shapes without owning IO logic.
-//! * IO loaders (`load_claude_sources`, `load_claude_sources_from`)
-//!   that walk the filesystem. Only the `_from(home)` variant is used
-//!   in tests so we never reach into the real `$HOME`.
-//! * A process global cache with a 5 second TTL so repeated opens of
-//!   the overlay do not re-walk the filesystem.
+//! * IO loaders (`load_claude_sources_from`, `load_codex_command_sources_from`,
+//!   `load_codex_skill_sources_from`) that walk the filesystem. Only
+//!   the `_from(home)` variants are used in tests so we never reach
+//!   into the real `$HOME`.
+//! * Process global caches per source list with a 5 second TTL so
+//!   repeated opens of the overlay do not re-walk the filesystem.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -67,14 +70,31 @@ pub struct Popup {
     /// Selected position inside `matches`. Always `< matches.len()`
     /// when `matches` is non-empty; clamped to 0 when empty.
     pub selected: usize,
-    /// Byte offset of the trigger character (`/`) in the prompt
-    /// buffer. The query is the slice immediately after it.
+    /// Byte offset of the trigger character in the prompt buffer.
+    /// The query is the slice immediately after it.
     pub anchor_offset: usize,
+    /// The literal trigger character that opened the popup. `/` for
+    /// Claude entries and Codex commands, backtick for Codex skills.
+    /// Confirm splices `<trigger_char><name>` back into the prompt.
+    pub trigger_char: char,
 }
 
 impl Popup {
-    /// Open a fresh popup at the given anchor with all entries visible.
+    /// Open a fresh `/` triggered popup at the given anchor with all
+    /// entries visible. Backtick triggered popups should use
+    /// [`Popup::open_with_trigger`].
     pub fn open(entries: Vec<Entry>, anchor_offset: usize) -> Self {
+        Self::open_with_trigger(entries, anchor_offset, '/')
+    }
+
+    /// Open a fresh popup with an explicit trigger char. Used by Codex
+    /// skill autocomplete (backtick) and any other trigger char a
+    /// future agent introduces.
+    pub fn open_with_trigger(
+        entries: Vec<Entry>,
+        anchor_offset: usize,
+        trigger_char: char,
+    ) -> Self {
         let matches = (0..entries.len()).collect();
         Self {
             entries,
@@ -82,6 +102,7 @@ impl Popup {
             matches,
             selected: 0,
             anchor_offset,
+            trigger_char,
         }
     }
 
@@ -142,30 +163,39 @@ pub fn filter(entries: &[Entry], query: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Trigger detection. Returns `Some(anchor_offset)` (byte index of the
-/// `/`) when the user just typed a `/` in a position that should open
-/// the popup: at the very start of the buffer, or right after an ASCII
-/// whitespace char.
+/// Trigger detection for a single ASCII trigger char (Claude `/`,
+/// Codex `/` for commands, Codex backtick for skills). Returns
+/// `Some(anchor_offset)` (byte index of the trigger) when the user
+/// just typed it in a position that should open the popup: at the very
+/// start of the buffer, or right after a whitespace char.
 ///
 /// `prev_prompt` is the previous buffer state and `next_prompt` is the
 /// new buffer state. We only fire on additions of a single trigger char
 /// at the end of the buffer; mid buffer insertions and replacements do
-/// not open the popup. The simple "ends with /" heuristic handles the
-/// common typing flow without needing real cursor tracking from the
-/// framework input.
-pub fn detect_claude_trigger(prev_prompt: &str, next_prompt: &str) -> Option<usize> {
+/// not open the popup. The simple "ends with <trigger>" heuristic
+/// handles the common typing flow without needing real cursor tracking
+/// from the framework input.
+///
+/// Constraint: `trigger` must be a single ASCII char (one byte in
+/// UTF-8). We use it that way today so `next_prompt.len() - 1` is the
+/// correct byte offset of the trailing trigger.
+pub fn detect_trigger_char(prev_prompt: &str, next_prompt: &str, trigger: char) -> Option<usize> {
+    debug_assert!(
+        trigger.is_ascii(),
+        "detect_trigger_char only handles single byte trigger chars"
+    );
     if next_prompt.len() <= prev_prompt.len() {
         return None;
     }
-    if !next_prompt.ends_with('/') {
+    if !next_prompt.ends_with(trigger) {
         return None;
     }
-    if prev_prompt.ends_with('/') {
+    if prev_prompt.ends_with(trigger) {
         // The user did not just type the trigger; they were already
         // sitting on one (e.g. backspaced something else).
         return None;
     }
-    // The byte just before the trailing '/' must be whitespace or
+    // The byte just before the trailing trigger must be whitespace or
     // missing (start of buffer).
     let trigger_pos = next_prompt.len() - 1;
     if trigger_pos == 0 {
@@ -178,6 +208,25 @@ pub fn detect_claude_trigger(prev_prompt: &str, next_prompt: &str) -> Option<usi
     }
 }
 
+/// Convenience: Claude only listens for `/`.
+pub fn detect_claude_trigger(prev_prompt: &str, next_prompt: &str) -> Option<usize> {
+    detect_trigger_char(prev_prompt, next_prompt, '/')
+}
+
+/// Result of a Codex trigger probe: the byte offset of the trigger and
+/// which kind of source list to populate. `Some((offset, EntryKind::Skill))`
+/// for backtick (skills) and `Some((offset, EntryKind::Command))` for
+/// `/` (prompts). None when neither trigger fired.
+pub fn detect_codex_trigger(prev_prompt: &str, next_prompt: &str) -> Option<(usize, EntryKind)> {
+    if let Some(off) = detect_trigger_char(prev_prompt, next_prompt, '`') {
+        return Some((off, EntryKind::Skill));
+    }
+    if let Some(off) = detect_trigger_char(prev_prompt, next_prompt, '/') {
+        return Some((off, EntryKind::Command));
+    }
+    None
+}
+
 /// Recompute `query` (and matches) from the current prompt buffer for
 /// an open popup. Returns `false` when the popup should be dismissed
 /// because the trigger char was deleted, the cursor moved before it,
@@ -187,7 +236,8 @@ pub fn rederive_query(popup: &mut Popup, prompt: &str) -> bool {
         return false;
     }
     let bytes = prompt.as_bytes();
-    if bytes[popup.anchor_offset] != b'/' {
+    let expected = popup.trigger_char as u8;
+    if bytes[popup.anchor_offset] != expected {
         return false;
     }
     let after = &prompt[popup.anchor_offset + 1..];
@@ -199,24 +249,33 @@ pub fn rederive_query(popup: &mut Popup, prompt: &str) -> bool {
     true
 }
 
-/// Insert `/<entry_name>` at `anchor_offset` (replacing whatever the
-/// user had typed as the query so far). Returns the new prompt buffer.
-pub fn confirm_into_prompt(prompt: &str, anchor_offset: usize, entry_name: &str) -> String {
+/// Insert `<trigger_char><entry_name>` at `anchor_offset` (replacing
+/// whatever the user had typed as the query so far). Returns the new
+/// prompt buffer. The trigger char is parameterized so backtick
+/// triggered Codex skill confirmations splice the backtick instead of
+/// `/`.
+pub fn confirm_into_prompt(
+    prompt: &str,
+    anchor_offset: usize,
+    trigger_char: char,
+    entry_name: &str,
+) -> String {
     if anchor_offset > prompt.len() {
         return prompt.to_string();
     }
     let head = &prompt[..anchor_offset];
-    // Drop everything from `/` to the next whitespace (or end). That is
-    // the literal the user was building when the popup was open.
-    let after_slash = &prompt[anchor_offset..];
-    let tail_start_in_after = after_slash
+    // Drop everything from the trigger char to the next whitespace (or
+    // end). That is the literal the user was building when the popup
+    // was open.
+    let after_trigger = &prompt[anchor_offset..];
+    let tail_start_in_after = after_trigger
         .char_indices()
         .skip(1)
         .find(|(_, c)| c.is_whitespace())
         .map(|(i, _)| i)
-        .unwrap_or(after_slash.len());
-    let tail = &after_slash[tail_start_in_after..];
-    format!("{head}/{entry_name}{tail}")
+        .unwrap_or(after_trigger.len());
+    let tail = &after_trigger[tail_start_in_after..];
+    format!("{head}{trigger_char}{entry_name}{tail}")
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +299,39 @@ pub fn load_claude_sources_from(home: &Path) -> Vec<Entry> {
     let mut out = Vec::new();
     out.extend(load_skill_dirs(&home.join(".claude").join("skills")));
     out.extend(load_command_files(&home.join(".claude").join("commands")));
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Codex slash command source: `~/.codex/prompts/*.md`. Display name
+/// is the filename without `.md`. Missing root yields zero entries.
+pub fn load_codex_command_sources() -> Vec<Entry> {
+    match dirs::home_dir() {
+        Some(home) => load_codex_command_sources_from(&home),
+        None => Vec::new(),
+    }
+}
+
+/// Testable variant of [`load_codex_command_sources`].
+pub fn load_codex_command_sources_from(home: &Path) -> Vec<Entry> {
+    let mut out = load_command_files(&home.join(".codex").join("prompts"));
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Codex backtick skill source: every directory under
+/// `~/.codex/skills/` excluding `.system/`. Missing root yields zero
+/// entries.
+pub fn load_codex_skill_sources() -> Vec<Entry> {
+    match dirs::home_dir() {
+        Some(home) => load_codex_skill_sources_from(&home),
+        None => Vec::new(),
+    }
+}
+
+/// Testable variant of [`load_codex_skill_sources`].
+pub fn load_codex_skill_sources_from(home: &Path) -> Vec<Entry> {
+    let mut out = load_skill_dirs(&home.join(".codex").join("skills"));
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
@@ -303,29 +395,47 @@ fn load_command_files(dir: &Path) -> Vec<Entry> {
 const CACHE_TTL: Duration = Duration::from_secs(5);
 
 static CLAUDE_CACHE: Mutex<Option<(Instant, Vec<Entry>)>> = Mutex::new(None);
+static CODEX_COMMAND_CACHE: Mutex<Option<(Instant, Vec<Entry>)>> = Mutex::new(None);
+static CODEX_SKILL_CACHE: Mutex<Option<(Instant, Vec<Entry>)>> = Mutex::new(None);
 
-/// Return the cached Claude source list when the most recent load is
-/// fresh; otherwise reload from disk and update the cache. The 5s TTL
-/// is the same window the spec calls out (A8.2).
-pub fn cached_claude_sources() -> Vec<Entry> {
-    let mut guard = CLAUDE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+fn cached(cache: &Mutex<Option<(Instant, Vec<Entry>)>>, load: fn() -> Vec<Entry>) -> Vec<Entry> {
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, entries)) = guard.as_ref() {
         if at.elapsed() < CACHE_TTL {
             return entries.clone();
         }
     }
-    let fresh = load_claude_sources();
+    let fresh = load();
     *guard = Some((Instant::now(), fresh.clone()));
     fresh
 }
 
-/// Test only: clear the cache so a follow up call re-walks the
+/// Return the cached Claude source list when the most recent load is
+/// fresh; otherwise reload from disk and update the cache. The 5s TTL
+/// is the same window the spec calls out (A8.2).
+pub fn cached_claude_sources() -> Vec<Entry> {
+    cached(&CLAUDE_CACHE, load_claude_sources)
+}
+
+/// Cache backed wrapper for Codex command sources (`~/.codex/prompts`).
+pub fn cached_codex_command_sources() -> Vec<Entry> {
+    cached(&CODEX_COMMAND_CACHE, load_codex_command_sources)
+}
+
+/// Cache backed wrapper for Codex skill sources (`~/.codex/skills`).
+pub fn cached_codex_skill_sources() -> Vec<Entry> {
+    cached(&CODEX_SKILL_CACHE, load_codex_skill_sources)
+}
+
+/// Test only: clear all source caches so a follow up call re-walks the
 /// filesystem. Production code never needs this; the TTL handles
 /// invalidation.
 #[cfg(test)]
 pub fn reset_cache_for_tests() {
-    if let Ok(mut guard) = CLAUDE_CACHE.lock() {
-        *guard = None;
+    for cache in [&CLAUDE_CACHE, &CODEX_COMMAND_CACHE, &CODEX_SKILL_CACHE] {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
     }
 }
 
@@ -453,6 +563,15 @@ mod tests {
         assert_eq!(p.selected, 0);
         assert!(p.query.is_empty());
         assert_eq!(p.anchor_offset, 0);
+        assert_eq!(p.trigger_char, '/');
+    }
+
+    #[test]
+    fn popup_open_with_trigger_carries_explicit_char() {
+        let entries = vec![entry("a", EntryKind::Skill)];
+        let p = Popup::open_with_trigger(entries, 3, '`');
+        assert_eq!(p.trigger_char, '`');
+        assert_eq!(p.anchor_offset, 3);
     }
 
     #[test]
@@ -566,7 +685,7 @@ mod tests {
 
     #[test]
     fn confirm_replaces_query_with_full_token() {
-        let out = confirm_into_prompt("hello /pl", 6, "plan");
+        let out = confirm_into_prompt("hello /pl", 6, '/', "plan");
         assert_eq!(out, "hello /plan");
     }
 
@@ -574,20 +693,29 @@ mod tests {
     fn confirm_preserves_trailing_text_after_first_whitespace() {
         // Anchor at byte 0; the first whitespace ends the token. The
         // trailing portion (including the leading space) is preserved.
-        let out = confirm_into_prompt("/pl rest", 0, "plan");
+        let out = confirm_into_prompt("/pl rest", 0, '/', "plan");
         assert_eq!(out, "/plan rest");
     }
 
     #[test]
     fn confirm_at_start_of_buffer() {
-        let out = confirm_into_prompt("/p", 0, "plan");
+        let out = confirm_into_prompt("/p", 0, '/', "plan");
         assert_eq!(out, "/plan");
     }
 
     #[test]
     fn confirm_returns_input_unchanged_when_anchor_out_of_bounds() {
-        let out = confirm_into_prompt("/p", 99, "plan");
+        let out = confirm_into_prompt("/p", 99, '/', "plan");
         assert_eq!(out, "/p");
+    }
+
+    #[test]
+    fn confirm_with_backtick_trigger_inserts_backtick() {
+        // Codex skill flow: user typed "talk to `re" then confirmed
+        // "review". The output should keep the backtick and replace
+        // the partial query.
+        let out = confirm_into_prompt("talk to `re", 8, '`', "review");
+        assert_eq!(out, "talk to `review");
     }
 
     // --- source loaders -------------------------------------------------
@@ -668,5 +796,114 @@ mod tests {
     fn entry_kind_label_is_human_readable() {
         assert_eq!(EntryKind::Skill.label(), "skill");
         assert_eq!(EntryKind::Command.label(), "command");
+    }
+
+    // --- Codex sources --------------------------------------------------
+
+    #[test]
+    fn load_codex_command_sources_from_walks_prompts_dir() {
+        let home = unique_temp_home("codex-cmd");
+        write_at(
+            &home.join(".codex").join("prompts").join("plan.md"),
+            "# plan",
+        );
+        write_at(
+            &home.join(".codex").join("prompts").join("ship.md"),
+            "# ship",
+        );
+        write_at(
+            &home.join(".codex").join("prompts").join("notes.txt"),
+            "ignored",
+        );
+
+        let entries = load_codex_command_sources_from(&home);
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["plan", "ship"]);
+        assert!(entries.iter().all(|e| e.kind == EntryKind::Command));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn load_codex_skill_sources_from_walks_skills_dir_and_excludes_dot_dirs() {
+        let home = unique_temp_home("codex-skill");
+        // `.system` should be skipped; real skill dirs become entries.
+        make_dir(&home.join(".codex").join("skills").join(".system"));
+        make_dir(&home.join(".codex").join("skills").join("review"));
+        make_dir(&home.join(".codex").join("skills").join("ship-it"));
+
+        let entries = load_codex_skill_sources_from(&home);
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["review", "ship-it"]);
+        assert!(entries.iter().all(|e| e.kind == EntryKind::Skill));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn load_codex_command_sources_from_missing_root_yields_empty() {
+        let home = unique_temp_home("codex-cmd-missing");
+        assert!(load_codex_command_sources_from(&home).is_empty());
+    }
+
+    #[test]
+    fn load_codex_skill_sources_from_missing_root_yields_empty() {
+        let home = unique_temp_home("codex-skill-missing");
+        assert!(load_codex_skill_sources_from(&home).is_empty());
+    }
+
+    // --- detect_codex_trigger ------------------------------------------
+
+    #[test]
+    fn detect_codex_trigger_backtick_signals_skills() {
+        assert_eq!(
+            detect_codex_trigger("hello ", "hello `"),
+            Some((6, EntryKind::Skill))
+        );
+    }
+
+    #[test]
+    fn detect_codex_trigger_slash_signals_commands() {
+        assert_eq!(
+            detect_codex_trigger("hello ", "hello /"),
+            Some((6, EntryKind::Command))
+        );
+    }
+
+    #[test]
+    fn detect_codex_trigger_at_start_of_buffer() {
+        assert_eq!(detect_codex_trigger("", "`"), Some((0, EntryKind::Skill)));
+        assert_eq!(detect_codex_trigger("", "/"), Some((0, EntryKind::Command)));
+    }
+
+    #[test]
+    fn detect_codex_trigger_no_fire_inside_word() {
+        assert_eq!(detect_codex_trigger("foo", "foo`"), None);
+        assert_eq!(detect_codex_trigger("foo", "foo/"), None);
+    }
+
+    #[test]
+    fn detect_codex_trigger_no_fire_when_buffer_did_not_grow() {
+        assert_eq!(detect_codex_trigger("abc`", "xyz`"), None);
+        assert_eq!(detect_codex_trigger("abc/", "xyz/"), None);
+    }
+
+    // --- rederive_query with backtick trigger --------------------------
+
+    #[test]
+    fn rederive_query_works_for_backtick_triggered_popup() {
+        let entries = vec![entry("review", EntryKind::Skill)];
+        let mut p = Popup::open_with_trigger(entries, 0, '`');
+        let prompt = "`rev";
+        assert!(rederive_query(&mut p, prompt));
+        assert_eq!(p.query, "rev");
+        assert_eq!(p.matches, vec![0]);
+    }
+
+    #[test]
+    fn rederive_query_dismisses_backtick_popup_when_trigger_replaced_by_slash() {
+        let entries = vec![entry("review", EntryKind::Skill)];
+        let mut p = Popup::open_with_trigger(entries, 0, '`');
+        // Anchor offset 0 is now `/`, not the original backtick.
+        let prompt = "/rev";
+        assert!(!rederive_query(&mut p, prompt));
     }
 }

@@ -2382,9 +2382,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             let entry_name = entry.name.clone();
             let anchor = popup.anchor_offset;
+            let trigger = popup.trigger_char;
             qp.prompt = crate::quick_prompt::autocomplete::confirm_into_prompt(
                 &qp.prompt,
                 anchor,
+                trigger,
                 &entry_name,
             );
             qp.popup = None;
@@ -2402,13 +2404,6 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if prompt.is_empty() {
                 let qp = state.quick_prompt.as_mut().unwrap();
                 qp.error = Some("Type a prompt to continue.".into());
-                return true;
-            }
-
-            if agent == crate::quick_prompt::Agent::Codex {
-                // Codex parity lands in Slice 6.
-                let qp = state.quick_prompt.as_mut().unwrap();
-                qp.error = Some("Codex coming soon".into());
                 return true;
             }
 
@@ -2431,7 +2426,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             let augmented_prompt =
                 crate::quick_prompt::images::append_image_references(&prompt, &refs);
-            let shell_spec = crate::quick_prompt::spawn::claude_shell_spec(&augmented_prompt);
+            let shell_spec = match agent {
+                crate::quick_prompt::Agent::Claude => {
+                    crate::quick_prompt::spawn::claude_shell_spec(&augmented_prompt)
+                }
+                crate::quick_prompt::Agent::Codex => {
+                    crate::quick_prompt::spawn::codex_shell_spec(&augmented_prompt)
+                }
+            };
             mutate_add_quick_prompt_tab(state, &prompt, &target.path, &shell_spec);
             crate::quick_prompt::images::cleanup_session(&session_hex);
             state.quick_prompt = None;
@@ -4024,18 +4026,35 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_quick_prompt_submit_codex_shows_coming_soon() {
+    fn dispatch_quick_prompt_submit_codex_spawns_tab_and_closes_overlay() {
+        // Slice 6 wires Codex parity: submitting on Codex builds a
+        // codex_shell_spec, prepares the target, and adds the tab.
+        // We assert the side effects observable from state: tab count
+        // increments and the overlay closes. The actual program path
+        // is not invoked in tests (no daemon is running), and the
+        // tab title is "qp: <prompt prefix>".
         use crate::quick_prompt::Agent;
+        let initial_tabs = {
+            let s = test_state();
+            s.tabs.len()
+        };
         let mut state = test_state();
         let mut qp = crate::quick_prompt::QuickPromptState::open_with_agent(Agent::Codex);
         qp.prompt = "do the thing".into();
         state.quick_prompt = Some(qp);
 
         assert!(dispatch(&mut state, "quick_prompt.submit"));
-        // Overlay stays open; error chip is set.
-        let qp = state.quick_prompt.as_ref().expect("overlay still open");
-        assert_eq!(qp.agent, Agent::Codex);
-        assert_eq!(qp.error.as_deref(), Some("Codex coming soon"));
+        assert!(state.quick_prompt.is_none(), "overlay closes on success");
+        assert_eq!(
+            state.tabs.len(),
+            initial_tabs + 1,
+            "Codex submit should add a tab"
+        );
+        assert_eq!(
+            state.tabs.last().unwrap().name,
+            "qp: do the thing",
+            "tab title comes from quick_prompt_tab_title(prompt)"
+        );
     }
 
     #[test]
