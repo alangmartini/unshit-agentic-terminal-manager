@@ -1009,10 +1009,16 @@ pub fn mutate_add_quick_prompt_tab(
 
     let workspace_id = active_workspace_num(state);
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
-    match state
-        .pty_manager
-        .spawn_in(id_num, workspace_id, cols, rows, Some(cwd), Some(shell))
-    {
+    let session_name = quick_prompt_tab_title(prompt);
+    match state.pty_manager.spawn_in_named(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        Some(cwd),
+        Some(shell),
+        Some(&session_name),
+    ) {
         Ok(reader) => {
             state
                 .terminals

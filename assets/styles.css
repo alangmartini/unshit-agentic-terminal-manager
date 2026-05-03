@@ -1768,8 +1768,9 @@ body.dragging-pane {
   font-size: 12px;
   padding: 6px 10px;
   border-radius: 4px;
-  background: var(--rust);
-  color: var(--bg-base);
+  background: var(--bg-elevated);
+  border-left: 3px solid var(--accent-danger, #d75f5f);
+  color: var(--fg-primary);
 }
 
 .quick-prompt-toolbar {
