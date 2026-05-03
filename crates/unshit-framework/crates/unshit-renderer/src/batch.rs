@@ -2602,6 +2602,7 @@ struct ResolvedGlyph {
 
 const TERMINAL_SHAPE_STYLE_REGULAR: u64 = 0;
 const TERMINAL_SHAPE_STYLE_ITALIC: u64 = 1 << 0;
+const TERMINAL_DIM_INTENSITY: f32 = 0.5;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalCellRect {
@@ -2626,7 +2627,9 @@ fn terminal_fg_color(cell: &unshit_core::cell_grid::Cell, opacity: f32) -> [f32;
     };
     let mut fg_linear = fg.to_linear_f32();
     if cell.attrs.contains(CellAttrs::DIM) {
-        fg_linear[3] *= 0.5;
+        fg_linear[0] *= TERMINAL_DIM_INTENSITY;
+        fg_linear[1] *= TERMINAL_DIM_INTENSITY;
+        fg_linear[2] *= TERMINAL_DIM_INTENSITY;
     }
     fg_linear[3] *= opacity;
     fg_linear
@@ -4917,6 +4920,28 @@ mod tests {
         let fg = terminal_fg_color(&cell, 1.0);
 
         assert_eq!(fg, Color::BLACK.to_linear_f32());
+    }
+
+    #[test]
+    fn terminal_dim_reduces_intensity_without_making_glyph_translucent() {
+        let cell = unshit_core::cell_grid::Cell {
+            ch: 'z',
+            fg: Color { r: 200, g: 120, b: 40, a: 255 },
+            bg: Color::TRANSPARENT,
+            attrs: CellAttrs::DIM,
+            wide_continuation: false,
+        };
+
+        let normal = cell.fg.to_linear_f32();
+        let dim = terminal_fg_color(&cell, 1.0);
+
+        assert_eq!(dim[0], normal[0] * TERMINAL_DIM_INTENSITY);
+        assert_eq!(dim[1], normal[1] * TERMINAL_DIM_INTENSITY);
+        assert_eq!(dim[2], normal[2] * TERMINAL_DIM_INTENSITY);
+        assert_eq!(
+            dim[3], normal[3],
+            "SGR faint should keep glyph coverage crisp; element opacity is applied separately"
+        );
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! Tree reconciliation engine - diffs ElementDef against live Element tree.
 
 use crate::dirty::DirtyFlags;
-use crate::element::{Element, ElementDef, ElementDefBump, SelectOption, SelectState, Tag};
+use crate::element::{
+    Element, ElementContent, ElementDef, ElementDefBump, SelectOption, SelectState, Tag,
+};
 use crate::id::NodeId;
 use crate::layout::TextMeasureCtx;
 use crate::tree::NodeArena;
@@ -203,6 +205,11 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     let id_changed = element.id != def.id;
     let classes_changed = element.classes.as_slice() != def.classes.as_slice();
     let content_changed = element.content != def.content;
+    let grid_content_paint_only = matches!(
+        (&element.content, &def.content),
+        (ElementContent::Grid(old), ElementContent::Grid(new))
+            if old.rows() == new.rows() && old.cols() == new.cols() && old != new
+    );
     let tab_index_changed = element.tab_index != def.tab_index;
     let captures_keyboard_changed = element.captures_keyboard != def.captures_keyboard;
 
@@ -249,8 +256,10 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     }
 
     let style_dirty = id_changed || classes_changed;
-    let layout_dirty =
-        content_changed || tab_index_changed || captures_keyboard_changed || overrides_changed;
+    let layout_dirty = (content_changed && !grid_content_paint_only)
+        || tab_index_changed
+        || captures_keyboard_changed
+        || overrides_changed;
 
     if style_dirty {
         // Class/id changes re-run the cascade, which can swap in entirely
@@ -260,6 +269,9 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     }
     if layout_dirty || input_type_changed {
         element.dirty |= DirtyFlags::LAYOUT | DirtyFlags::PAINT;
+    }
+    if grid_content_paint_only {
+        element.dirty |= DirtyFlags::PAINT;
     }
 
     // Propagate SUBTREE_STYLE to ancestors so the cascade can skip clean
@@ -857,5 +869,59 @@ mod tests {
             "parent should carry SUBTREE_PAINT after new child insertion; got {:?}",
             parent_dirty
         );
+    }
+
+    #[test]
+    fn same_size_grid_content_change_is_paint_only() {
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let mut pending = Vec::new();
+
+        let grid = crate::cell_grid::CellGrid::new(2, 2);
+        let def = ElementDef::new(Tag::Div).with_grid(grid);
+        let root_id = build_subtree(&def, &mut arena, &mut taffy, NodeId::DANGLING, &mut pending);
+        arena.get_mut(root_id).unwrap().dirty = DirtyFlags::empty();
+
+        let mut changed = crate::cell_grid::CellGrid::new(2, 2);
+        changed.set_cell(0, 0, crate::cell_grid::Cell::with_char('x'));
+        let changed_def = ElementDef::new(Tag::Div).with_grid(changed);
+
+        reconcile(&mut arena, &mut taffy, root_id, &changed_def);
+
+        let dirty = arena.get(root_id).unwrap().dirty;
+        assert!(dirty.contains(DirtyFlags::PAINT), "grid content must repaint");
+        assert!(
+            !dirty.intersects(
+                DirtyFlags::STYLE
+                    | DirtyFlags::SUBTREE_STYLE
+                    | DirtyFlags::LAYOUT
+                    | DirtyFlags::SUBTREE_LAYOUT
+            ),
+            "same-size grid content must not force style/layout work, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn resized_grid_content_still_marks_layout_dirty() {
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let mut pending = Vec::new();
+
+        let grid = crate::cell_grid::CellGrid::new(2, 2);
+        let def = ElementDef::new(Tag::Div).with_grid(grid);
+        let root_id = build_subtree(&def, &mut arena, &mut taffy, NodeId::DANGLING, &mut pending);
+        arena.get_mut(root_id).unwrap().dirty = DirtyFlags::empty();
+
+        let changed_def =
+            ElementDef::new(Tag::Div).with_grid(crate::cell_grid::CellGrid::new(3, 2));
+
+        reconcile(&mut arena, &mut taffy, root_id, &changed_def);
+
+        let dirty = arena.get(root_id).unwrap().dirty;
+        assert!(
+            dirty.contains(DirtyFlags::LAYOUT),
+            "grid dimension changes should keep the conservative layout invalidation"
+        );
+        assert!(dirty.contains(DirtyFlags::PAINT));
     }
 }

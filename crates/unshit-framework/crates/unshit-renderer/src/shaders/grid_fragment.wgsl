@@ -54,7 +54,9 @@ struct GpuGlyphMeta {
 
 const EMPTY_GLYPH_ID: u32 = 0xFFFFFFFFu;
 const FLAG_INVERSE: u32 = 16u; // bit 4
+const FLAG_DIM: u32 = 32u; // bit 5
 const FLAG_CURSOR: u32 = 256u; // bit 8
+const DIM_INTENSITY: f32 = 0.5;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -117,6 +119,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let tmp = fg;
         fg = bg;
         bg = tmp;
+    }
+    if (cell.flags & FLAG_DIM) != 0u {
+        fg = vec4<f32>(fg.rgb * DIM_INTENSITY, fg.a);
     }
 
     let cursor_here = is_cursor_cell(col, row);

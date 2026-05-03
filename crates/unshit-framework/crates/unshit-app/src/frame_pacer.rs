@@ -51,6 +51,7 @@ impl FramePacer {
     /// 8 milliseconds. See module documentation for the rationale. Used as
     /// the fallback when the active monitor does not report a refresh rate.
     pub const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(8);
+    pub const TIMER_COMPENSATED_120HZ_INTERVAL: Duration = Duration::from_millis(8);
 
     /// Floor on the interval derived from a refresh rate. Sub-millisecond
     /// periods (e.g. a hypothetical 1000Hz panel) would cause the event
@@ -95,6 +96,9 @@ impl FramePacer {
         // Use u64 for the division: 1e12 does not fit in u32 for low rates.
         let interval_ns = 1_000_000_000_000u64 / (mhz as u64);
         let interval = Duration::from_nanos(interval_ns);
+        if mhz == 120_000 && interval > Self::TIMER_COMPENSATED_120HZ_INTERVAL {
+            return Self::TIMER_COMPENSATED_120HZ_INTERVAL;
+        }
         if interval < Self::MIN_DERIVED_INTERVAL {
             Self::MIN_DERIVED_INTERVAL
         } else {
@@ -334,10 +338,12 @@ mod tests {
     // === Refresh-rate derived interval (capillary #82) ===
 
     #[test]
-    fn with_refresh_rate_mhz_120000_gives_8333us() {
-        // 120000 mHz == 120 Hz. Expected interval: 1e12 / 120000 = 8_333_333 ns.
+    fn with_refresh_rate_mhz_120000_uses_timer_compensated_8ms() {
+        // 120000 mHz == 120 Hz. The raw period is 8_333_333ns, but Windows
+        // WaitUntil wakeups arrive late enough that the legacy 8ms interval
+        // sustains the intended 120fps cadence more reliably.
         let pacer = FramePacer::with_refresh_rate_mhz(120_000);
-        assert_eq!(pacer.min_interval(), Duration::from_nanos(8_333_333));
+        assert_eq!(pacer.min_interval(), Duration::from_millis(8));
     }
 
     #[test]
@@ -383,7 +389,7 @@ mod tests {
     #[test]
     fn set_refresh_rate_mhz_updates_existing_pacer() {
         let mut pacer = FramePacer::with_refresh_rate_mhz(120_000);
-        assert_eq!(pacer.min_interval(), Duration::from_nanos(8_333_333));
+        assert_eq!(pacer.min_interval(), Duration::from_millis(8));
         pacer.set_refresh_rate_mhz(144_000);
         assert_eq!(pacer.min_interval(), Duration::from_nanos(6_944_444));
     }
@@ -427,8 +433,9 @@ mod tests {
         let t0 = Instant::now();
         pacer.record_paint(t0);
 
-        // Before the rate change: speculative deadline is t0 + ~8.333ms.
-        let expected_120 = t0 + Duration::from_nanos(8_333_333);
+        // Before the rate change: speculative deadline is t0 + the
+        // timer-compensated 120Hz interval.
+        let expected_120 = t0 + Duration::from_millis(8);
         assert_eq!(pacer.speculative_deadline(t0), expected_120);
 
         // Simulate moving to a 240Hz panel.

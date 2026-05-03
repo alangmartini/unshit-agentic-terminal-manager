@@ -6,6 +6,10 @@
 //!
 //! Modes:
 //! - `dir-loop`: writes `dir\r\n` every 80ms. Stresses scroll-heavy output.
+//! - `stress-cat`: starts the PowerShell `stress-cat` profile function when
+//!   available, falling back to the equivalent recursive System32 walk.
+//! - `stress-cat-2pane` / `stress-cat-4pane`: creates live split panes and
+//!   runs the same stress stream in every pane.
 //! - `type-burst`: writes one ASCII char every 50ms. Stresses the
 //!   single-cell keystroke path.
 //!
@@ -32,6 +36,9 @@ use crate::state::SharedState;
 #[derive(Clone, Copy, Debug)]
 pub enum BenchMode {
     DirLoop,
+    StressCat,
+    StressCat2Pane,
+    StressCat4Pane,
     TypeBurst,
     /// Stress mode for issue #86 (epic #81 item 2): run the dir-loop
     /// workload at the hardware's sustained rate while reporting per
@@ -44,6 +51,9 @@ impl BenchMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "dir-loop" => Some(Self::DirLoop),
+            "stress-cat" => Some(Self::StressCat),
+            "stress-cat-2pane" => Some(Self::StressCat2Pane),
+            "stress-cat-4pane" => Some(Self::StressCat4Pane),
             "type-burst" => Some(Self::TypeBurst),
             "instance-pool-stress" => Some(Self::InstancePoolStress),
             _ => None,
@@ -53,8 +63,20 @@ impl BenchMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::DirLoop => "dir-loop",
+            Self::StressCat => "stress-cat",
+            Self::StressCat2Pane => "stress-cat-2pane",
+            Self::StressCat4Pane => "stress-cat-4pane",
             Self::TypeBurst => "type-burst",
             Self::InstancePoolStress => "instance-pool-stress",
+        }
+    }
+
+    fn stress_cat_pane_count(self) -> Option<usize> {
+        match self {
+            Self::StressCat => Some(1),
+            Self::StressCat2Pane => Some(2),
+            Self::StressCat4Pane => Some(4),
+            _ => None,
         }
     }
 }
@@ -285,10 +307,51 @@ fn first_pane_id(shared: &SharedState) -> Option<u32> {
     guard.terminals.keys().copied().next()
 }
 
+fn live_pane_ids(shared: &SharedState) -> Vec<u32> {
+    let Ok(guard) = shared.lock() else {
+        return Vec::new();
+    };
+    guard.panes.iter().flatten().map(|pane| pane.id.0).collect()
+}
+
 fn write_pty(shared: &SharedState, pane_id: u32, data: &[u8]) {
     if let Ok(mut guard) = shared.lock() {
         let _ = guard.pty_manager.write_blocking(pane_id, data);
     }
+}
+
+fn start_stress_cat(shared: &SharedState, pane_id: u32) {
+    write_pty(shared, pane_id, STRESS_CAT_COMMAND.as_bytes());
+}
+
+fn create_split_stress_panes(shared: &SharedState, target_count: usize) -> Vec<u32> {
+    let first = {
+        let Ok(mut guard) = shared.lock() else {
+            return Vec::new();
+        };
+        let first = guard.active_pane;
+        match target_count {
+            1 => {}
+            2 => {
+                crate::state::mutate_split_right(&mut guard, first);
+            }
+            4 => {
+                crate::state::mutate_split_right(&mut guard, first);
+                crate::state::mutate_split_down(&mut guard, first);
+                let bottom_left = guard.active_pane;
+                crate::state::mutate_split_right(&mut guard, bottom_left);
+            }
+            _ => {}
+        }
+        first.0
+    };
+
+    if target_count > 1 {
+        write_pty(shared, first, b"echo split bench ready\r\n");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    live_pane_ids(shared)
 }
 
 /// Spawn the bench runner thread. Returns immediately; the thread
@@ -313,17 +376,32 @@ pub fn start(config: BenchConfig, shared: SharedState) {
             }
         };
 
+        let stress_cat_panes = if let Some(target_count) = config.mode.stress_cat_pane_count() {
+            let panes = create_split_stress_panes(&shared, target_count);
+            log::info!("[bench] prewarming stress-cat on panes {:?}", panes);
+            for pane_id in &panes {
+                start_stress_cat(&shared, *pane_id);
+            }
+            std::thread::sleep(Duration::from_secs(2));
+            panes
+        } else {
+            Vec::new()
+        };
         log::info!("[bench] activated; driving pane {}", pane_id);
         activate();
         let t_start = Instant::now();
 
         match config.mode {
             BenchMode::DirLoop => run_dir_loop(&shared, pane_id, config.duration),
+            BenchMode::StressCat | BenchMode::StressCat2Pane | BenchMode::StressCat4Pane => {
+                run_stress_cat(config.duration)
+            }
             BenchMode::TypeBurst => run_type_burst(&shared, pane_id, config.duration),
             BenchMode::InstancePoolStress => {
                 run_instance_pool_stress(&shared, pane_id, config.duration)
             }
         }
+        drop(stress_cat_panes);
 
         let elapsed = t_start.elapsed();
         deactivate();
@@ -379,6 +457,20 @@ fn run_dir_loop(shared: &SharedState, pane_id: u32, duration: Duration) {
     }
 }
 
+#[cfg(windows)]
+const STRESS_CAT_COMMAND: &str = concat!(
+    r#"powershell.exe -NoLogo -ExecutionPolicy Bypass -Command "if (Get-Command stress-cat -CommandType Function -ErrorAction SilentlyContinue) { stress-cat } else { while ($true) { Get-ChildItem -Recurse C:\Windows\System32 -ErrorAction SilentlyContinue } }""#,
+    "\r\n"
+);
+
+#[cfg(not(windows))]
+const STRESS_CAT_COMMAND: &str =
+    "while true; do find /usr/bin /bin /usr/local/bin 2>/dev/null; done\n";
+
+fn run_stress_cat(duration: Duration) {
+    std::thread::sleep(duration);
+}
+
 fn run_type_burst(shared: &SharedState, pane_id: u32, duration: Duration) {
     let interval = Duration::from_millis(50);
     let words = b"the quick brown fox jumps over the lazy dog ";
@@ -429,6 +521,18 @@ mod tests {
         assert!(matches!(
             BenchMode::parse("dir-loop"),
             Some(BenchMode::DirLoop)
+        ));
+        assert!(matches!(
+            BenchMode::parse("stress-cat"),
+            Some(BenchMode::StressCat)
+        ));
+        assert!(matches!(
+            BenchMode::parse("stress-cat-2pane"),
+            Some(BenchMode::StressCat2Pane)
+        ));
+        assert!(matches!(
+            BenchMode::parse("stress-cat-4pane"),
+            Some(BenchMode::StressCat4Pane)
         ));
         assert!(matches!(
             BenchMode::parse("type-burst"),
