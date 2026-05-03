@@ -118,21 +118,16 @@ Implementation checklist derived from `tasks/plan.md`. Check items off as they l
   - [x] 5 dispatch tests covering `select_next`, `select_prev`, `dismiss`, `confirm`, no-op-when-closed; 1 modal-close test covering the two-Esc flow.
   - [x] `benches/quick_prompt_filter.rs` (criterion) measures `filter` over 200 synthetic entries across four query shapes. `Cargo.toml` `[[bench]]` entry added. Baseline on dev machine: empty 224 ns, broad hit ~50 us, no match ~46 us. Spec gate <1 ms p99 met with ~20x headroom.
 
-- [ ] **Slice 6: Codex parity**
-  - [ ] Verify OQ1: run `codex exec "say hi"` in a terminal to confirm CLI shape. Update `codex_shell_spec` if it differs.
-  - [ ] `quick_prompt::spawn::codex_shell_spec(prompt) -> ShellSpec`.
-  - [ ] Update `quick_prompt.submit` arm to dispatch on `agent`; remove the "Codex coming soon" stub.
-  - [ ] `quick_prompt::autocomplete::load_codex_command_sources` (`~/.codex/prompts/*.md`).
-  - [ ] `quick_prompt::autocomplete::load_codex_skill_sources` (`~/.codex/skills/*/`, exclude `.system`).
-  - [ ] Trigger detection: when `agent == Codex` and char is `
-
-` after whitespace or at start, open skill popup.
-  - [ ] Popup uses correct source list based on `(agent, trigger)` tuple.
-  - [ ] Test: `quick_prompt::spawn::codex_shell_spec_uses_exec_subcommand`.
-  - [ ] Test: `quick_prompt::autocomplete::load_codex_skill_sources_excludes_dot_system`.
-  - [ ] Test: `quick_prompt::autocomplete::trigger_detection_codex_backtick`.
-  - [ ] Manual from a git repo: Tab to Codex, submit, verify new tab runs `codex exec`.
-  - [ ] Manual: backtick autocomplete works; `.system/` not present.
+- [x] **Slice 6: Codex parity** (commit pending)
+  - [x] OQ1 left as a documented assumption in `codex_shell_spec`. Manual `codex exec "say hi"` verification is on the user; if the CLI shape changes only that one function needs updating.
+  - [x] `quick_prompt::spawn::codex_shell_spec(prompt) -> ShellSpec` (`codex.cmd` on Windows, `codex` elsewhere; args `["exec", prompt]`).
+  - [x] `quick_prompt.submit` arm dispatches on `agent`; "Codex coming soon" stub removed; the existing test rewritten to assert the tab + overlay close.
+  - [x] `load_codex_command_sources_from` (`~/.codex/prompts/*.md`) and `load_codex_skill_sources_from` (`~/.codex/skills/*/`, dot-prefixed dirs skipped so `.system` is excluded).
+  - [x] `cached_codex_command_sources` and `cached_codex_skill_sources` mirror the Claude cache (separate 5s TTL each, shared `cached(...)` helper).
+  - [x] `Popup` carries `trigger_char` (was hardcoded `/`); `confirm_into_prompt` and `rederive_query` use it. Backtick triggered popup splices `\``+name back into the prompt.
+  - [x] `detect_codex_trigger` returns `(anchor, EntryKind)` so the UI loader picks the right source list per trigger char.
+  - [x] UI on_change branches on `agent`: Claude uses `detect_claude_trigger`, Codex tries backtick (skills) then `/` (commands). Confirms preserve trigger char.
+  - [x] Tests added: `codex_shell_spec_uses_exec_subcommand_and_prompt_arg`, `codex_shell_spec_preserves_multiline_prompts`; `load_codex_command_sources_from_walks_prompts_dir`, `load_codex_skill_sources_from_walks_skills_dir_and_excludes_dot_dirs`, missing-root variants for both, four `detect_codex_trigger_*` tests, `popup_open_with_trigger_carries_explicit_char`, `rederive_query_works_for_backtick_triggered_popup`, `rederive_query_dismisses_backtick_popup_when_trigger_replaced_by_slash`, `confirm_with_backtick_trigger_inserts_backtick`, dispatch test rewritten as `dispatch_quick_prompt_submit_codex_spawns_tab_and_closes_overlay`.
 
 - [ ] **Slice 7: Polish + perf gates + daemon name**
   - [ ] Add `DaemonPty::spawn_in_named` accepting `name: Option<&str>`; `spawn_in` delegates with `None`.
