@@ -846,7 +846,7 @@ mod tests {
 
         // Sync the animation definition onto the node.
         let base = ComputedStyle::default();
-        driver.sync_node(node_id, &[def.clone()], &base, start);
+        driver.sync_node(node_id, std::slice::from_ref(&def), &base, start);
 
         // Tick past the end of the animation so it completes.
         let after_end = start + Duration::from_millis(200);

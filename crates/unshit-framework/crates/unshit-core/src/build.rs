@@ -697,24 +697,6 @@ mod tests {
         (arena, root, stylesheet)
     }
 
-    fn setup_parent_child(
-        css: &str,
-    ) -> (NodeArena, NodeId, NodeId, CompiledStylesheet, taffy::TaffyTree<TextMeasureCtx>) {
-        let stylesheet = CompiledStylesheet::parse(css);
-        let mut arena = NodeArena::new();
-        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
-
-        let def = ElementDef::new(Tag::Div)
-            .with_class("root")
-            .with_child(ElementDef::new(Tag::Div).with_class("leaf"));
-        let root = build_tree_from_def(&def, &mut arena, &mut taffy, NodeId::DANGLING);
-        let leaf = arena.get(root).unwrap().first_child;
-
-        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
-
-        (arena, root, leaf, stylesheet, taffy)
-    }
-
     #[test]
     fn test_transition_starts_on_hover() {
         let css = r#"

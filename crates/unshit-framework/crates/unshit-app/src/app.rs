@@ -11,6 +11,7 @@ use unshit_core::build::{
     resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
     sync_all_animations, tick_all_animations, tick_all_transitions,
 };
+use unshit_core::dirty::DirtyFlags;
 use unshit_core::element::*;
 use unshit_core::event::*;
 use unshit_core::frame_arena::FrameArena;
@@ -355,6 +356,29 @@ pub(crate) fn is_within_activity_window(
     window: Duration,
 ) -> bool {
     now.saturating_duration_since(last_activity) < window
+}
+
+fn subtree_has_dirty_flags(arena: &NodeArena, node_id: NodeId, flags: DirtyFlags) -> bool {
+    let Some(element) = arena.get(node_id) else {
+        return false;
+    };
+    if element.dirty.intersects(flags) {
+        return true;
+    }
+    let mut child = element.first_child;
+    while !child.is_dangling() {
+        if subtree_has_dirty_flags(arena, child, flags) {
+            return true;
+        }
+        child = arena.get(child).map(|e| e.next_sibling).unwrap_or(NodeId::DANGLING);
+    }
+    false
+}
+
+fn mark_full_restyle_required(arena: &mut NodeArena, root: NodeId) {
+    if let Some(element) = arena.get_mut(root) {
+        element.dirty.insert(DirtyFlags::STYLE | DirtyFlags::LAYOUT | DirtyFlags::PAINT);
+    }
 }
 
 /// Coalesces external events that arrive between two paints into a
@@ -1099,6 +1123,7 @@ impl ApplicationHandler for AppHandler {
                     // monitor crossing, so re-probe the refresh rate now
                     // rather than waiting for the next `Moved` event.
                     refresh_pacer_from_window(state);
+                    mark_full_restyle_required(&mut state.arena, state.root);
                     state.needs_rebuild = true;
                 } else {
                     // Just a resize, only re-layout needed
@@ -2056,48 +2081,62 @@ impl ApplicationHandler for AppHandler {
                         state.interaction.focused = NodeId::DANGLING;
                     }
 
-                    let t1 = Instant::now();
-                    resolve_all_styles_with_transitions(
-                        &mut state.arena,
-                        &state.stylesheet,
+                    let style_work = subtree_has_dirty_flags(
+                        &state.arena,
                         state.root,
-                        state.interaction.hovered,
-                        state.interaction.active,
-                        state.interaction.focused,
-                        state.interaction.focus_via_keyboard,
-                        Some(frame_start),
-                        Some(&mut state.active_transitions),
+                        DirtyFlags::STYLE | DirtyFlags::SUBTREE_STYLE,
                     );
-                    unshit_core::build::resolve_pseudo_elements(
-                        &mut state.arena,
-                        &mut state.taffy,
-                        &state.stylesheet,
+                    if style_work {
+                        let t1 = Instant::now();
+                        resolve_all_styles_with_transitions(
+                            &mut state.arena,
+                            &state.stylesheet,
+                            state.root,
+                            state.interaction.hovered,
+                            state.interaction.active,
+                            state.interaction.focused,
+                            state.interaction.focus_via_keyboard,
+                            Some(frame_start),
+                            Some(&mut state.active_transitions),
+                        );
+                        unshit_core::build::resolve_pseudo_elements(
+                            &mut state.arena,
+                            &mut state.taffy,
+                            &state.stylesheet,
+                            state.root,
+                            state.interaction.hovered,
+                            state.interaction.active,
+                            state.interaction.focused,
+                            &mut state.pseudo_table,
+                        );
+                        metrics.style_resolve_us = t1.elapsed().as_micros() as u64;
+
+                        let t2 = Instant::now();
+                        scale_all_styles(&mut state.arena, state.root, state.scale_factor);
+                        metrics.scale_us = t2.elapsed().as_micros() as u64;
+
+                        mark_layout_dirty(&mut state.arena, state.root);
+                    }
+
+                    let layout_work = subtree_has_dirty_flags(
+                        &state.arena,
                         state.root,
-                        state.interaction.hovered,
-                        state.interaction.active,
-                        state.interaction.focused,
-                        &mut state.pseudo_table,
+                        DirtyFlags::LAYOUT | DirtyFlags::SUBTREE_LAYOUT | DirtyFlags::CHILDREN,
                     );
-                    metrics.style_resolve_us = t1.elapsed().as_micros() as u64;
-
-                    let t2 = Instant::now();
-                    scale_all_styles(&mut state.arena, state.root, state.scale_factor);
-                    metrics.scale_us = t2.elapsed().as_micros() as u64;
-
-                    mark_layout_dirty(&mut state.arena, state.root);
-
-                    let t3 = Instant::now();
-                    let (w, h) = state.gpu.window_size();
-                    run_layout_pipeline(
-                        &mut state.arena,
-                        &mut state.taffy,
-                        state.root,
-                        &mut state.font_system,
-                        w,
-                        h,
-                        &mut state.measure_cache,
-                    );
-                    metrics.layout_us = t3.elapsed().as_micros() as u64;
+                    if layout_work {
+                        let t3 = Instant::now();
+                        let (w, h) = state.gpu.window_size();
+                        run_layout_pipeline(
+                            &mut state.arena,
+                            &mut state.taffy,
+                            state.root,
+                            &mut state.font_system,
+                            w,
+                            h,
+                            &mut state.measure_cache,
+                        );
+                        metrics.layout_us = t3.elapsed().as_micros() as u64;
+                    }
 
                     metrics.node_count = state.arena.len();
                     state.needs_rebuild = false;
@@ -3694,6 +3733,40 @@ mod tests {
         let last = Instant::now() + Duration::from_millis(100);
         let now = last - Duration::from_millis(50);
         assert!(is_within_activity_window(last, now, ACTIVITY_WINDOW));
+    }
+
+    #[test]
+    fn subtree_has_dirty_flags_detects_descendant_work() {
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root_def =
+            ElementDef::new(Tag::Div).with_child(ElementDef::new(Tag::Div).with_class("child"));
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let ids: Vec<NodeId> = arena.iter().map(|(id, _)| id).collect();
+        for id in ids {
+            arena.get_mut(id).unwrap().dirty = DirtyFlags::empty();
+        }
+        let child = arena.children(root)[0];
+        arena.get_mut(child).unwrap().dirty = DirtyFlags::LAYOUT;
+
+        assert!(subtree_has_dirty_flags(&arena, root, DirtyFlags::LAYOUT));
+        assert!(!subtree_has_dirty_flags(&arena, root, DirtyFlags::STYLE));
+    }
+
+    #[test]
+    fn mark_full_restyle_required_sets_rebuild_work_flags() {
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root_def = ElementDef::new(Tag::Div);
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        arena.get_mut(root).unwrap().dirty = DirtyFlags::empty();
+
+        mark_full_restyle_required(&mut arena, root);
+
+        let dirty = arena.get(root).unwrap().dirty;
+        assert!(dirty.contains(DirtyFlags::STYLE));
+        assert!(dirty.contains(DirtyFlags::LAYOUT));
+        assert!(dirty.contains(DirtyFlags::PAINT));
     }
 
     // === RebuildCoalescer (#135 Phase 1, item 1) ===

@@ -48,7 +48,7 @@ fn refresh_pacer_from_source_falls_back_to_default_when_no_monitor() {
 #[test]
 fn refresh_pacer_from_source_updates_pacer_when_rate_changes() {
     let mut pacer = FramePacer::with_refresh_rate_mhz(120_000);
-    assert_eq!(pacer.min_interval(), Duration::from_nanos(8_333_333));
+    assert_eq!(pacer.min_interval(), Duration::from_millis(8));
 
     // Simulate dragging the window onto a 240Hz display.
     let faster = FakeSource(Some(240_000));
