@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:18px;background:var(--bg-void);overflow:hidden;font:var(--type-body)}
+  .pane{background:var(--bg-base);border:1px solid var(--border-default);border-radius:var(--r-md);overflow:hidden;box-shadow:var(--shadow-md)}
+  .pane.active{border-color:var(--amber-400);box-shadow:0 0 0 1px var(--amber-500),var(--shadow-md)}
+  .titlebar{display:flex;align-items:center;background:var(--bg-subtle);border-bottom:1px solid var(--border-hair);padding:0 4px;height:26px}
+  .tab{padding:4px 10px;font:var(--type-label);color:var(--fg-tertiary);border-right:1px solid var(--border-hair);display:flex;align-items:center;gap:6px;cursor:pointer}
+  .tab.active{background:var(--bg-base);color:var(--amber-200);box-shadow:inset 0 -1px 0 var(--amber-300)}
+  .tab .dot{width:6px;height:6px;border-radius:50%;background:var(--sage)}
+  .tab .x{color:var(--fg-tertiary);font-size:10px;margin-left:4px}
+  .body{padding:10px 12px;color:var(--fg-secondary);font:var(--type-body);min-height:60px}
+  .actions{margin-left:auto;display:flex;gap:6px;padding-right:6px}
+  .icon-btn{width:18px;height:18px;display:flex;align-items:center;justify-content:center;color:var(--fg-tertiary);font-size:11px;border-radius:2px;cursor:pointer}
+  .icon-btn:hover{background:var(--bg-hover);color:var(--fg-primary)}
+  .prompt{color:var(--amber-300)}
+  .branch{color:var(--sage)}
+  .cursor{display:inline-block;width:6px;height:1em;background:var(--amber-200);vertical-align:text-bottom;animation:bl 1.1s steps(2) infinite}
+  @keyframes bl{50%{opacity:0}}
+</style></head>
+<body>
+  <div class="pane active">
+    <div class="titlebar">
+      <div class="tab active"><span class="dot"></span>dashboard-dev<span class="x">×</span></div>
+      <div class="tab"><span class="dot" style="background:var(--violet)"></span>claude · refactor<span class="x">×</span></div>
+      <div class="tab"><span class="dot" style="background:var(--rust)"></span>tests<span class="x">×</span></div>
+      <div class="tab" style="color:var(--fg-tertiary)">+</div>
+      <div class="actions">
+        <div class="icon-btn">⊟</div>
+        <div class="icon-btn">⊞</div>
+        <div class="icon-btn">⤢</div>
+      </div>
+    </div>
+    <div class="body">
+      <div><span class="prompt">❯</span> ~/code/main/dashboard <span class="branch">(main)</span></div>
+      <div><span class="prompt">❯</span> npm run dev<span class="cursor"></span></div>
+    </div>
+  </div>
+</body></html>

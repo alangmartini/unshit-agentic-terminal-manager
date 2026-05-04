@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:20px;background:var(--bg-base);overflow:hidden;display:flex;flex-direction:column;gap:12px;font:var(--type-body)}
+  label{font:var(--type-meta);color:var(--fg-tertiary);text-transform:lowercase;letter-spacing:.1em;display:block;margin-bottom:4px}
+  .field{display:flex;align-items:center;gap:6px;padding:6px 10px;background:var(--bg-subtle);border:1px solid var(--border-soft);border-radius:var(--r-md);color:var(--fg-primary)}
+  .field.focus{border-color:var(--amber-300);box-shadow:0 0 0 2px rgba(212,163,72,.2)}
+  .field input{background:transparent;border:none;outline:none;color:inherit;font:inherit;flex:1}
+  .field .prefix{color:var(--amber-300);font-weight:600}
+  .field .suffix{color:var(--fg-tertiary);font:var(--type-meta)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .toggle{width:28px;height:16px;background:var(--bg-elevated);border-radius:8px;position:relative;border:1px solid var(--border-soft)}
+  .toggle::after{content:"";position:absolute;width:10px;height:10px;background:var(--fg-tertiary);border-radius:50%;top:2px;left:2px;transition:.2s}
+  .toggle.on{background:var(--amber-500);border-color:var(--amber-300)}
+  .toggle.on::after{left:14px;background:var(--amber-100);box-shadow:0 0 6px rgba(246,217,136,.6)}
+  .toggle-row{display:flex;align-items:center;gap:8px;font:var(--type-label);color:var(--fg-secondary)}
+</style></head>
+<body>
+  <div class="row">
+    <div>
+      <label>session name</label>
+      <div class="field"><span class="prefix">❯</span><input value="dashboard-dev"><span class="suffix">⏎</span></div>
+    </div>
+    <div>
+      <label>working directory</label>
+      <div class="field focus"><input value="~/code/main/dashboard"></div>
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <label>shell</label>
+      <div class="field"><input value="/bin/zsh"><span class="suffix">▾</span></div>
+    </div>
+    <div>
+      <label>port</label>
+      <div class="field" style="font-variant-numeric:tabular-nums"><input value="4040" style="font-variant-numeric:tabular-nums"></div>
+    </div>
+  </div>
+  <div style="display:flex;gap:18px;margin-top:4px">
+    <div class="toggle-row"><div class="toggle on"></div>Auto-restart</div>
+    <div class="toggle-row"><div class="toggle"></div>Capture stdout</div>
+    <div class="toggle-row"><div class="toggle on"></div>Persist scrollback</div>
+  </div>
+</body></html>

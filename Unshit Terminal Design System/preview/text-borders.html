@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:18px;background:var(--bg-base);overflow:hidden;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .col{display:flex;flex-direction:column;gap:6px}
+  .row{display:flex;align-items:center;gap:10px;padding:6px 10px;background:var(--bg-subtle);border-radius:var(--r-sm)}
+  .swatch{width:18px;height:18px;border-radius:3px}
+  .label{font-size:11px}
+  .hex{font-size:9px;color:var(--fg-tertiary);margin-left:auto}
+  .border-row{height:24px;display:flex;align-items:center;padding:0 10px;background:var(--bg-base);border-radius:var(--r-sm)}
+</style></head>
+<body>
+  <div class="col">
+    <div class="row"><div class="swatch" style="background:#ebdcb6"></div><span class="label" style="color:#ebdcb6">fg-primary</span><span class="hex">cream</span></div>
+    <div class="row"><div class="swatch" style="background:#b8a275"></div><span class="label" style="color:#b8a275">fg-secondary</span><span class="hex">tan</span></div>
+    <div class="row"><div class="swatch" style="background:#857149"></div><span class="label" style="color:#857149">fg-tertiary</span><span class="hex">brass</span></div>
+    <div class="row"><div class="swatch" style="background:#4e422b"></div><span class="label" style="color:#4e422b">fg-muted</span><span class="hex">disabled</span></div>
+    <div class="row"><div class="swatch" style="background:#2f2819"></div><span class="label" style="color:#857149">fg-ghost</span><span class="hex">placeholder</span></div>
+  </div>
+  <div class="col">
+    <div class="border-row" style="border:1px solid #241e15"><span class="label">border-hair</span><span class="hex">chrome</span></div>
+    <div class="border-row" style="border:1px solid #342b1e"><span class="label">border-soft</span><span class="hex">controls</span></div>
+    <div class="border-row" style="border:1px solid #4a3e2a"><span class="label">border-default</span><span class="hex">active pane</span></div>
+    <div class="border-row" style="border:1px solid #6a5939"><span class="label">border-strong</span><span class="hex">hover</span></div>
+    <div class="border-row" style="border:1px solid #d4a348"><span class="label" style="color:#d4a348">border-focus</span><span class="hex">amber-300</span></div>
+  </div>
+</body></html>

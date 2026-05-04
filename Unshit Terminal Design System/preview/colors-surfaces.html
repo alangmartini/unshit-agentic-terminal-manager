@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:18px;background:var(--bg-base);overflow:hidden}
+  .grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+  .swatch{aspect-ratio:1.2;border:1px solid var(--border-hair);border-radius:var(--r-md);padding:8px;display:flex;flex-direction:column;justify-content:space-between}
+  .swatch .name{font-size:10px;color:var(--fg-secondary)}
+  .swatch .hex{font-size:9px;color:var(--fg-tertiary)}
+</style></head>
+<body>
+  <div class="grid">
+    <div class="swatch" style="background:#14110c"><span class="name">bg-void</span><span class="hex">#14110c</span></div>
+    <div class="swatch" style="background:#1c1812"><span class="name">bg-base</span><span class="hex">#1c1812</span></div>
+    <div class="swatch" style="background:#221d16"><span class="name">bg-subtle</span><span class="hex">#221d16</span></div>
+    <div class="swatch" style="background:#29231a"><span class="name">bg-elevated</span><span class="hex">#29231a</span></div>
+    <div class="swatch" style="background:#342c20"><span class="name">bg-hover</span><span class="hex">#342c20</span></div>
+    <div class="swatch" style="background:#3e3425"><span class="name">bg-selected</span><span class="hex">#3e3425</span></div>
+    <div class="swatch" style="background:rgba(12,10,7,0.72);backdrop-filter:blur(4px)"><span class="name">bg-overlay</span><span class="hex">+blur</span></div>
+  </div>
+</body></html>

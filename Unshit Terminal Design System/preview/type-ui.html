@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:20px;background:var(--bg-base);overflow:hidden}
+  .row{display:flex;align-items:baseline;gap:14px;padding:6px 0;border-bottom:1px solid var(--border-hair)}
+  .row:last-child{border:none}
+  .meta{color:var(--fg-tertiary);font-size:10px;width:120px;flex-shrink:0}
+  .label{font:var(--type-label);color:var(--fg-secondary)}
+  .small{font:var(--type-meta);color:var(--fg-tertiary)}
+  .kbd{font:var(--type-kbd);color:var(--amber-200);border:1px solid var(--border-soft);padding:0 6px;border-radius:2px}
+  .num{font:var(--type-body);font-variant-numeric:tabular-nums;color:var(--amber-200)}
+</style></head>
+<body>
+  <div class="row"><span class="meta">label 11/500</span><span class="label">workspaces · agents · sessions</span></div>
+  <div class="row"><span class="meta">meta 10/400</span><span class="small">[14:32:07] GET /api/sessions 200 12ms</span></div>
+  <div class="row"><span class="meta">kbd 10/500</span><span class="kbd">⌘K</span><span class="kbd">⏎</span><span class="kbd">esc</span></div>
+  <div class="row"><span class="meta">tabular nums</span><span class="num">cpu 12.4% · mem 1.42G · 80×24</span></div>
+</body></html>

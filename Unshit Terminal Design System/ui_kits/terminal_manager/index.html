@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>terminal.mgr — UI kit</title>
+  <link rel="stylesheet" href="../../colors_and_type.css">
+  <link rel="stylesheet" href="kit.css">
+  <style>
+    body { margin: 0; height: 100vh; overflow: hidden; }
+    #icons { display: none; }
+  </style>
+</head>
+<body>
+  <div id="icons"></div>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script>
+    // Inline-load the icons sprite so <use href="#id"/> works.
+    fetch("../../assets/icons/icons.svg").then(r => r.text()).then(t => {
+      document.getElementById("icons").innerHTML = t;
+    });
+  </script>
+
+  <script type="text/babel" src="titlebar.jsx"></script>
+  <script type="text/babel" src="sidebar.jsx"></script>
+  <script type="text/babel" src="panes.jsx"></script>
+  <script type="text/babel" src="statusbar.jsx"></script>
+  <script type="text/babel" src="settings.jsx"></script>
+  <script type="text/babel" src="palette.jsx"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    function App() {
+      const [showSettings, setShowSettings] = useState(false);
+      const [showPalette, setShowPalette] = useState(false);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === "k" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); setShowPalette(p => !p); }
+          if (e.key === "," && (e.metaKey || e.ctrlKey)) { e.preventDefault(); setShowSettings(s => !s); }
+          if (e.key === "Escape") { setShowSettings(false); setShowPalette(false); }
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, []);
+
+      return (
+        <div className="tm-app" data-screen-label="Terminal Manager">
+          <Titlebar />
+          <Sidebar />
+          <TabStrip />
+          <div className="tm-content"><PaneGrid /></div>
+          <Statusbar />
+
+          {showPalette && <Palette onClose={() => setShowPalette(false)} />}
+          {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
