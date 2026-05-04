@@ -585,6 +585,7 @@ pub enum AlignSelf {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum JustifyContent {
     #[default]
+    Normal,
     Start,
     End,
     Center,
@@ -1126,7 +1127,7 @@ impl Default for ComputedStyle {
             flex_basis: Dimension::Auto,
             align_items: AlignItems::Stretch,
             align_self: AlignSelf::Auto,
-            justify_content: JustifyContent::Start,
+            justify_content: JustifyContent::Normal,
             flex_wrap: FlexWrap::NoWrap,
             align_content: AlignContent::Stretch,
             width: Dimension::Auto,
@@ -1237,21 +1238,14 @@ impl ComputedStyle {
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
             flex_basis: dim_to_taffy(self.flex_basis, viewport_w, viewport_h),
-            align_items: Some(match self.align_items {
-                AlignItems::Start => taffy::AlignItems::FlexStart,
-                AlignItems::End => taffy::AlignItems::FlexEnd,
-                AlignItems::Center => taffy::AlignItems::Center,
-                AlignItems::Stretch => taffy::AlignItems::Stretch,
-                AlignItems::Baseline => taffy::AlignItems::Baseline,
-            }),
-            justify_content: Some(match self.justify_content {
-                JustifyContent::Start => taffy::JustifyContent::FlexStart,
-                JustifyContent::End => taffy::JustifyContent::FlexEnd,
-                JustifyContent::Center => taffy::JustifyContent::Center,
-                JustifyContent::SpaceBetween => taffy::JustifyContent::SpaceBetween,
-                JustifyContent::SpaceAround => taffy::JustifyContent::SpaceAround,
-                JustifyContent::SpaceEvenly => taffy::JustifyContent::SpaceEvenly,
-            }),
+            align_items: Some(align_items_to_taffy(self.align_items)),
+            align_self: align_self_to_taffy(self.align_self),
+            // CSS Grid's initial `justify-items: normal` behaves as stretch
+            // for ordinary grid items. Taffy's implicit fallback may shrink
+            // items with intrinsic width, which leaves unpainted strips in a
+            // single-column grid container.
+            justify_items: Some(taffy::AlignItems::Stretch),
+            justify_content: Some(justify_content_to_taffy(self.justify_content, self.display)),
             flex_wrap: match self.flex_wrap {
                 FlexWrap::NoWrap => taffy::FlexWrap::NoWrap,
                 FlexWrap::Wrap => taffy::FlexWrap::Wrap,
@@ -1333,6 +1327,45 @@ impl ComputedStyle {
             },
             ..Default::default()
         }
+    }
+}
+
+fn align_items_to_taffy(value: AlignItems) -> taffy::AlignItems {
+    match value {
+        AlignItems::Start => taffy::AlignItems::FlexStart,
+        AlignItems::End => taffy::AlignItems::FlexEnd,
+        AlignItems::Center => taffy::AlignItems::Center,
+        AlignItems::Stretch => taffy::AlignItems::Stretch,
+        AlignItems::Baseline => taffy::AlignItems::Baseline,
+    }
+}
+
+fn align_self_to_taffy(value: AlignSelf) -> Option<taffy::AlignSelf> {
+    Some(match value {
+        AlignSelf::Auto => return None,
+        AlignSelf::Start => taffy::AlignSelf::FlexStart,
+        AlignSelf::End => taffy::AlignSelf::FlexEnd,
+        AlignSelf::Center => taffy::AlignSelf::Center,
+        AlignSelf::Stretch => taffy::AlignSelf::Stretch,
+        AlignSelf::Baseline => taffy::AlignSelf::Baseline,
+    })
+}
+
+fn justify_content_to_taffy(value: JustifyContent, display: Display) -> taffy::JustifyContent {
+    match value {
+        JustifyContent::Normal => {
+            if display == Display::Grid {
+                taffy::JustifyContent::Stretch
+            } else {
+                taffy::JustifyContent::FlexStart
+            }
+        }
+        JustifyContent::Start => taffy::JustifyContent::FlexStart,
+        JustifyContent::End => taffy::JustifyContent::FlexEnd,
+        JustifyContent::Center => taffy::JustifyContent::Center,
+        JustifyContent::SpaceBetween => taffy::JustifyContent::SpaceBetween,
+        JustifyContent::SpaceAround => taffy::JustifyContent::SpaceAround,
+        JustifyContent::SpaceEvenly => taffy::JustifyContent::SpaceEvenly,
     }
 }
 
@@ -1624,5 +1657,27 @@ mod tests {
         let taffy_style = style.to_taffy_style(1000.0, 500.0);
         // 80vh of a 500px-tall viewport = 400px.
         assert_eq!(taffy_style.max_size.height, taffy::Dimension::Length(400.0));
+    }
+
+    #[test]
+    fn to_taffy_style_defaults_grid_justify_items_to_stretch() {
+        let style = ComputedStyle { display: Display::Grid, ..Default::default() };
+        let taffy_style = style.to_taffy_style(800.0, 600.0);
+        assert_eq!(taffy_style.justify_items, Some(taffy::AlignItems::Stretch));
+        assert_eq!(taffy_style.justify_content, Some(taffy::JustifyContent::Stretch));
+    }
+
+    #[test]
+    fn to_taffy_style_defaults_flex_justify_content_to_start() {
+        let style = ComputedStyle { display: Display::Flex, ..Default::default() };
+        let taffy_style = style.to_taffy_style(800.0, 600.0);
+        assert_eq!(taffy_style.justify_content, Some(taffy::JustifyContent::FlexStart));
+    }
+
+    #[test]
+    fn to_taffy_style_maps_align_self() {
+        let style = ComputedStyle { align_self: AlignSelf::Center, ..Default::default() };
+        let taffy_style = style.to_taffy_style(800.0, 600.0);
+        assert_eq!(taffy_style.align_self, Some(taffy::AlignSelf::Center));
     }
 }

@@ -2743,7 +2743,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         "notifications.test" => {
             let workspace_id = active_workspace_num(state);
             let pane_id = state.active_pane.0;
-            let title = "Test notification";
+            let title = "test notification";
             let message =
                 format!("Notification test from workspace {workspace_id}, pane {pane_id}.");
             push_notification_toast(state, title, message.clone(), workspace_id, pane_id);
@@ -5211,7 +5211,7 @@ mod tests {
 
         let snap = state.ui_snapshot();
         let toast = snap.toasts.first().expect("test notification toast");
-        assert_eq!(toast.title.as_deref(), Some("Test notification"));
+        assert_eq!(toast.title.as_deref(), Some("test notification"));
         assert_eq!(
             toast.message,
             format!("Notification test from workspace {workspace_id}, pane {pane_id}.")
