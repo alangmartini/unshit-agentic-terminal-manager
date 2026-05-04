@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:20px;background:var(--bg-base);overflow:hidden;display:flex;flex-direction:column;gap:14px}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  button{
+    font:var(--type-label);
+    padding:6px 12px;
+    border-radius:var(--r-md);
+    border:1px solid var(--border-soft);
+    background:transparent;
+    color:var(--fg-primary);
+    cursor:pointer;
+    display:inline-flex;align-items:center;gap:6px;
+  }
+  /* Primary — minimal: amber outline + amber text, no fill, no glow */
+  button.primary{
+    background:transparent;
+    color:var(--amber-200);
+    border-color:var(--amber-400);
+  }
+  button.primary:hover{
+    background:rgba(212,163,72,.08);
+    border-color:var(--amber-300);
+    color:var(--amber-100);
+  }
+  /* Secondary stays as a hairline outline */
+  button.secondary{ color:var(--fg-secondary); }
+  button.secondary:hover{ background:var(--bg-hover); border-color:var(--border-strong); color:var(--fg-primary); }
+  /* Ghost — chromeless */
+  button.ghost{background:transparent;border-color:transparent;color:var(--fg-secondary)}
+  button.ghost:hover{background:var(--bg-hover);color:var(--fg-primary)}
+  /* Danger — rust outline only */
+  button.danger{background:transparent;border-color:rgba(201,85,58,.45);color:var(--rust)}
+  button.danger:hover{background:rgba(201,85,58,.08);border-color:var(--rust)}
+
+  .kbd{font:var(--type-kbd);color:var(--fg-tertiary);border:1px solid var(--border-hair);padding:0 4px;border-radius:2px;margin-left:4px}
+  .icon{width:10px;height:10px;border:1px solid currentColor;border-radius:1px;display:inline-block}
+  h5{margin:0;font:var(--type-meta);color:var(--fg-tertiary);text-transform:lowercase;letter-spacing:.1em}
+</style></head>
+<body>
+  <h5>primary / secondary / ghost / danger</h5>
+  <div class="row">
+    <button class="primary"><span class="icon"></span>New session</button>
+    <button class="secondary">Attach</button>
+    <button class="ghost">Cancel</button>
+    <button class="danger">Kill <span class="kbd">⌃C</span></button>
+  </div>
+  <h5>sizes</h5>
+  <div class="row">
+    <button class="primary" style="padding:3px 8px;font-size:10px">xs</button>
+    <button class="primary" style="padding:5px 10px;font-size:11px">sm</button>
+    <button class="primary">md</button>
+    <button class="primary" style="padding:9px 16px;font-size:13px">lg</button>
+  </div>
+  <h5>states</h5>
+  <div class="row">
+    <button class="primary">default</button>
+    <button class="primary" style="background:rgba(212,163,72,.08);border-color:var(--amber-300);color:var(--amber-100)">hover</button>
+    <button class="primary" style="outline:1px solid var(--amber-300);outline-offset:1px">focus</button>
+    <button class="primary" style="opacity:.4;cursor:not-allowed">disabled</button>
+  </div>
+</body></html>

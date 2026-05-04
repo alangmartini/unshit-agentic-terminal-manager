@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:24px;background:rgba(12,10,7,0.8);overflow:hidden;font:var(--type-body)}
+  .palette{max-width:420px;margin:0 auto;background:var(--bg-elevated);border:1px solid var(--border-default);border-radius:var(--r-lg);box-shadow:var(--shadow-lg);overflow:hidden}
+  .input{padding:10px 14px;border-bottom:1px solid var(--border-hair);display:flex;gap:8px;align-items:center}
+  .input::before{content:"❯";color:var(--amber-300);font-weight:600}
+  .input input{background:transparent;border:none;outline:none;color:var(--fg-primary);font:inherit;flex:1}
+  .group{padding:6px 0}
+  .group-title{font:var(--type-meta);color:var(--fg-tertiary);text-transform:uppercase;letter-spacing:.1em;padding:4px 14px}
+  .item{display:grid;grid-template-columns:14px 1fr auto;gap:10px;padding:6px 14px;align-items:center;cursor:pointer}
+  .item.active{background:rgba(212,163,72,.12);box-shadow:inset 2px 0 0 var(--amber-300)}
+  .icon{font-size:11px;color:var(--amber-300)}
+  .label{color:var(--fg-primary)}
+  .hint{font:var(--type-meta);color:var(--fg-tertiary)}
+  .kbd{font:var(--type-kbd);color:var(--fg-secondary);border:1px solid var(--border-hair);padding:0 5px;border-radius:2px;margin-left:3px}
+</style></head>
+<body>
+  <div class="palette">
+    <div class="input"><input value="kill" autofocus></div>
+    <div class="group">
+      <div class="group-title">actions</div>
+      <div class="item active"><span class="icon">⏻</span><span class="label">Kill session</span><span><span class="kbd">⌃C</span></span></div>
+      <div class="item"><span class="icon">⏻</span><span class="label">Kill all in workspace</span><span><span class="kbd">⇧⌘K</span></span></div>
+    </div>
+    <div class="group">
+      <div class="group-title">recent sessions</div>
+      <div class="item"><span class="icon" style="color:var(--rust)">●</span><span class="label">test-watcher <span class="hint">· exit 1</span></span><span class="hint">3s ago</span></div>
+      <div class="item"><span class="icon" style="color:var(--violet)">●</span><span class="label">claude · refactor-userlist</span><span class="hint">running</span></div>
+    </div>
+  </div>
+</body></html>

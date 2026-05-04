@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:18px;background:var(--bg-base);overflow:hidden;font:var(--type-body)}
+  .list{display:flex;flex-direction:column;border:1px solid var(--border-hair);border-radius:var(--r-md);overflow:hidden}
+  .row{display:grid;grid-template-columns:14px 1fr auto auto;gap:10px;padding:8px 12px;align-items:center;border-bottom:1px solid var(--border-hair);cursor:pointer}
+  .row:last-child{border:none}
+  .row:hover{background:var(--bg-hover)}
+  .row.selected{background:rgba(212,163,72,.1);box-shadow:inset 2px 0 0 var(--amber-300)}
+  .dot{width:7px;height:7px;border-radius:50%}
+  .name{color:var(--fg-primary);font-weight:500}
+  .meta{font:var(--type-meta);color:var(--fg-tertiary)}
+  .branch{color:var(--sage)}
+  .num{font-variant-numeric:tabular-nums;color:var(--fg-tertiary);font:var(--type-meta)}
+  .agent{color:var(--violet);font:var(--type-meta);text-transform:uppercase;letter-spacing:.08em}
+</style></head>
+<body>
+  <div class="list">
+    <div class="row selected">
+      <span class="dot" style="background:var(--sage);box-shadow:0 0 6px var(--sage)"></span>
+      <div><span class="name">dashboard-dev</span> <span class="meta">· ~/code/main/dashboard</span> <span class="branch">(main)</span></div>
+      <span class="num">2h 14m</span>
+      <span class="meta">⌘1</span>
+    </div>
+    <div class="row">
+      <span class="dot" style="background:var(--sage);box-shadow:0 0 6px var(--sage)"></span>
+      <div><span class="name">api-server</span> <span class="meta">· ~/code/main/api</span> <span class="branch">(feat/auth)</span></div>
+      <span class="num">42m</span>
+      <span class="meta">⌘2</span>
+    </div>
+    <div class="row">
+      <span class="dot" style="background:var(--violet);box-shadow:0 0 6px var(--violet)"></span>
+      <div><span class="agent">claude</span> <span class="name">refactor-userlist</span> <span class="meta">· 18 turns</span></div>
+      <span class="num">running</span>
+      <span class="meta">⌘3</span>
+    </div>
+    <div class="row">
+      <span class="dot" style="background:var(--azure)"></span>
+      <div><span class="name">postgres-tunnel</span> <span class="meta">· :5432 → staging</span></div>
+      <span class="num">12m idle</span>
+      <span class="meta">⌘4</span>
+    </div>
+    <div class="row">
+      <span class="dot" style="background:var(--rust)"></span>
+      <div><span class="name">test-watcher</span> <span class="meta">· vitest --watch · exit 1</span></div>
+      <span class="num">3s ago</span>
+      <span class="meta">⌘5</span>
+    </div>
+  </div>
+</body></html>

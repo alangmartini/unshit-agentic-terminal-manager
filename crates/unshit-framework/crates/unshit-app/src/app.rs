@@ -42,6 +42,7 @@ pub struct AppConfig {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    pub decorations: bool,
     pub css: String,
     pub keybindings_path: Option<String>,
     /// Callback invoked for [`ExternalEvent::Custom`] payloads.
@@ -161,6 +162,7 @@ impl Default for AppConfig {
             title: "unshit".to_string(),
             width: 800,
             height: 600,
+            decorations: true,
             css: String::new(),
             keybindings_path: None,
             on_external_event: None,
@@ -381,6 +383,20 @@ fn mark_full_restyle_required(arena: &mut NodeArena, root: NodeId) {
     }
 }
 
+fn pseudo_restyle_root_for_change(
+    arena: &NodeArena,
+    old: NodeId,
+    new: NodeId,
+    root: NodeId,
+) -> NodeId {
+    let old_in = !old.is_dangling() && arena.get(old).is_some();
+    let new_in = !new.is_dangling() && arena.get(new).is_some();
+    if !old_in || !new_in {
+        return root;
+    }
+    arena.lowest_common_ancestor(old, new, root)
+}
+
 /// Coalesces external events that arrive between two paints into a
 /// single per-frame decision. The contract that callers depend on:
 /// any number of [`ExternalEvent::RequestRebuild`] events that land in
@@ -502,7 +518,7 @@ impl AppState {
     /// restyle pass via `take()`.
     fn mark_restyle_pseudo_change(&mut self, old: NodeId, new: NodeId) {
         self.needs_restyle = true;
-        let candidate = self.arena.lowest_common_ancestor(old, new, self.root);
+        let candidate = pseudo_restyle_root_for_change(&self.arena, old, new, self.root);
         self.restyle_root = Some(match self.restyle_root {
             Some(prev) => self.arena.lowest_common_ancestor(prev, candidate, self.root),
             None => candidate,
@@ -764,6 +780,7 @@ impl ApplicationHandler for AppHandler {
             &self.app.config.title,
             self.app.config.width,
             self.app.config.height,
+            self.app.config.decorations,
         ));
 
         let scale_factor = window.scale_factor() as f32;
@@ -3767,6 +3784,40 @@ mod tests {
         assert!(dirty.contains(DirtyFlags::STYLE));
         assert!(dirty.contains(DirtyFlags::LAYOUT));
         assert!(dirty.contains(DirtyFlags::PAINT));
+    }
+
+    #[test]
+    fn pseudo_restyle_entering_from_no_hover_uses_root() {
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root_def = ElementDef::new(Tag::Div).with_child(
+            ElementDef::new(Tag::Button).with_child(ElementDef::new(Tag::Span).with_text("go")),
+        );
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let button = arena.children(root)[0];
+        let span = arena.children(button)[0];
+
+        assert_eq!(
+            pseudo_restyle_root_for_change(&arena, NodeId::DANGLING, span, root),
+            root,
+            "entering a child must restyle ancestors that may match :hover"
+        );
+    }
+
+    #[test]
+    fn pseudo_restyle_between_valid_nodes_uses_lca() {
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root_def = ElementDef::new(Tag::Div).with_child(
+            ElementDef::new(Tag::Button)
+                .with_child(ElementDef::new(Tag::Span).with_class("a"))
+                .with_child(ElementDef::new(Tag::Span).with_class("b")),
+        );
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let button = arena.children(root)[0];
+        let children = arena.children(button);
+
+        assert_eq!(pseudo_restyle_root_for_change(&arena, children[0], children[1], root), button);
     }
 
     // === RebuildCoalescer (#135 Phase 1, item 1) ===

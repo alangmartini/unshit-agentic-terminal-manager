@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:18px;background:var(--bg-base);overflow:hidden}
+  .grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+  .swatch{aspect-ratio:1.2;border:1px solid var(--border-hair);border-radius:var(--r-md);padding:8px;display:flex;flex-direction:column;justify-content:space-between;color:#1c1812}
+  .swatch .name{font-size:10px;font-weight:600}
+  .swatch .hex{font-size:9px;opacity:.7}
+  .swatch.dark{color:var(--amber-50)}
+</style></head>
+<body>
+  <div class="grid">
+    <div class="swatch" style="background:#fdf1cf"><span class="name">amber-50</span><span class="hex">#fdf1cf</span></div>
+    <div class="swatch" style="background:#f6d988"><span class="name">amber-100</span><span class="hex">#f6d988</span></div>
+    <div class="swatch" style="background:#e8b955"><span class="name">amber-200</span><span class="hex">#e8b955</span></div>
+    <div class="swatch" style="background:#d4a348;box-shadow:0 0 14px rgba(212,163,72,.4)"><span class="name">amber-300</span><span class="hex">brand</span></div>
+    <div class="swatch dark" style="background:#b8852c"><span class="name">amber-400</span><span class="hex">#b8852c</span></div>
+    <div class="swatch dark" style="background:#8a6020"><span class="name">amber-500</span><span class="hex">#8a6020</span></div>
+    <div class="swatch dark" style="background:#5c3f12"><span class="name">amber-600</span><span class="hex">#5c3f12</span></div>
+  </div>
+</body></html>

@@ -19,7 +19,7 @@ use unshit::app::{App, AppConfig, FontSource};
 use unshit::core::element::*;
 use unshit::core::event::DragPhase;
 use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::{AlignItems, CssPosition, Dimension, JustifyContent};
+use unshit::core::style::types::Dimension;
 use unshit::core::trace::{
     append_terminal_trace_line, terminal_trace_enabled, terminal_trace_file_path,
 };
@@ -28,7 +28,7 @@ use crate::state::{
     dispatch, mutate_with, new_workspace, resize_all_terminals, seed_state, MutexExt, SharedState,
     UiSnapshot, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
 };
-use crate::ui::settings::build_settings_modal;
+use crate::ui::settings::build_settings_page;
 use crate::ui::sidebar::{build_ctx_menu_overlay, build_sidebar};
 use crate::ui::statusbar::build_statusbar;
 use crate::ui::tabbar::build_tabbar;
@@ -43,6 +43,10 @@ const ENV_PARITY_SHELL_ARGS_JSON: &str = "TM_PARITY_SHELL_ARGS_JSON";
 const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
 const ENV_PARITY_FONT_SIZE_PT: &str = "TM_PARITY_FONT_SIZE_PT";
 const ENV_PARITY_FONT_FAMILY: &str = "TM_PARITY_FONT_FAMILY";
+const ENV_OPEN_SETTINGS: &str = "TM_OPEN_SETTINGS";
+const ENV_OPEN_QUICK_PROMPT: &str = "TM_OPEN_QUICK_PROMPT";
+const ENV_OPEN_CONFIRM_DIALOG: &str = "TM_OPEN_CONFIRM_DIALOG";
+const ENV_SHOW_TEST_TOAST: &str = "TM_SHOW_TEST_TOAST";
 const WINDOWS_TERMINAL_PARITY_FONT_SIZE_PT: u32 = 16;
 
 // Heap profiling via dhat. Only compiled in when --features profiling is set.
@@ -219,8 +223,20 @@ fn build_tree(
 
     let mut root = ElementDef::new(Tag::Div)
         .with_class("app")
-        .with_child(build_titlebar(shared))
         .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("ambient-layer")
+                .with_class("rust-glow"),
+        )
+        .with_child(build_titlebar(shared));
+
+    if snap.settings_open {
+        root = root
+            .with_class("settings")
+            .with_child(build_settings_page(snap, shared))
+            .with_child(build_statusbar(snap));
+    } else {
+        root = root.with_child(
             ElementDef::new(Tag::Div)
                 .with_class("layout")
                 .with_child(sidebar)
@@ -234,29 +250,9 @@ fn build_tree(
                         .with_child(build_statusbar(snap)),
                 ),
         );
+    }
     if parity_windows_terminal_colors_enabled() {
         root = root.with_class("parity-windows-terminal");
-    }
-
-    if snap.settings_open {
-        let s = shared.clone();
-        root = root.with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("modal-overlay")
-                .with_class("open")
-                .with_id("settings-modal")
-                .with_style(StyleDeclaration::Position(CssPosition::Fixed))
-                .with_style(StyleDeclaration::Top(Dimension::Px(0.0)))
-                .with_style(StyleDeclaration::Right(Dimension::Px(0.0)))
-                .with_style(StyleDeclaration::Bottom(Dimension::Px(0.0)))
-                .with_style(StyleDeclaration::Left(Dimension::Px(0.0)))
-                .with_style(StyleDeclaration::AlignItems(AlignItems::Center))
-                .with_style(StyleDeclaration::JustifyContent(JustifyContent::Center))
-                .on_click(move || {
-                    mutate_with(&s, |st| dispatch(st, "modal.close"));
-                })
-                .with_child(build_settings_modal(snap, shared)),
-        );
     }
 
     // The drop-zone overlay is rendered as a child inside each pane
@@ -286,8 +282,6 @@ fn user_shortcut_bindings() -> Vec<(String, String)> {
 
 fn terminal_font_sources_from_value(value: Option<std::ffi::OsString>) -> Vec<FontSource> {
     let mut fonts = vec![
-        FontSource::System("Cascadia Mono".to_string()),
-        FontSource::System("Cascadia Code".to_string()),
         FontSource::System("JetBrains Mono".to_string()),
         FontSource::System("Berkeley Mono".to_string()),
         FontSource::System("SF Mono".to_string()),
@@ -403,6 +397,47 @@ fn parity_font_size_pt_from_env() -> u32 {
         eprintln!("{e}");
         std::process::exit(2);
     })
+}
+
+fn open_settings_on_startup_from_value(value: Option<std::ffi::OsString>) -> bool {
+    value
+        .as_deref()
+        .and_then(|raw| raw.to_str())
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn open_settings_on_startup_from_env() -> bool {
+    open_settings_on_startup_from_value(std::env::var_os(ENV_OPEN_SETTINGS))
+}
+
+fn open_quick_prompt_on_startup_from_value(value: Option<std::ffi::OsString>) -> bool {
+    truthy_env_value(value)
+}
+
+fn open_quick_prompt_on_startup_from_env() -> bool {
+    open_quick_prompt_on_startup_from_value(std::env::var_os(ENV_OPEN_QUICK_PROMPT))
+}
+
+fn open_confirm_dialog_on_startup_from_value(value: Option<std::ffi::OsString>) -> bool {
+    truthy_env_value(value)
+}
+
+fn open_confirm_dialog_on_startup_from_env() -> bool {
+    open_confirm_dialog_on_startup_from_value(std::env::var_os(ENV_OPEN_CONFIRM_DIALOG))
+}
+
+fn show_test_toast_on_startup_from_value(value: Option<std::ffi::OsString>) -> bool {
+    truthy_env_value(value)
+}
+
+fn show_test_toast_on_startup_from_env() -> bool {
+    show_test_toast_on_startup_from_value(std::env::var_os(ENV_SHOW_TEST_TOAST))
 }
 
 fn apply_parity_shell_override(state: &mut crate::state::AppState, spec: crate::shell::ShellSpec) {
@@ -554,6 +589,29 @@ fn main() {
     if let Some(spec) = parity_shell_spec_from_env() {
         apply_parity_shell_override(&mut initial_state, spec);
     }
+    if open_settings_on_startup_from_env() {
+        initial_state.settings_open = true;
+    }
+    if open_quick_prompt_on_startup_from_env() {
+        initial_state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+    }
+    if open_confirm_dialog_on_startup_from_env() {
+        initial_state.confirm_dialog = Some(crate::state::ConfirmDialog::KillAll {
+            count: initial_state.terminals.len().max(1),
+        });
+    }
+    if show_test_toast_on_startup_from_env() {
+        let workspace_id = crate::state::active_workspace_num(&initial_state);
+        let pane_id = initial_state.active_pane.0;
+        initial_state.toasts = unshit::core::toast::ToastStore::with_capacity(3, 60);
+        crate::state::push_notification_toast(
+            &mut initial_state,
+            "test notification",
+            "design-system toast smoke",
+            workspace_id,
+            pane_id,
+        );
+    }
     let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
 
     // Bring the unshit-ptyd daemon up and wire the UI's DaemonPty shim
@@ -685,6 +743,7 @@ fn main() {
             title: "terminal manager".to_string(),
             width: 1280,
             height: 800,
+            decorations: false,
             css: STYLES.to_string(),
             fonts: terminal_font_sources(),
             user_shortcuts: user_shortcut_bindings(),
@@ -850,7 +909,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{seed_state, SettingsSection};
     use crate::terminal::Terminal;
+    use std::sync::{Arc, Mutex};
+    use unshit_test::TestHarness;
 
     #[test]
     fn user_shortcut_bindings_includes_fps_overlay_toggle() {
@@ -867,26 +929,63 @@ mod tests {
     }
 
     #[test]
-    fn stylesheet_prefers_cascadia_for_terminal_text() {
-        let cascadia = STYLES
-            .find("'Cascadia Mono'")
-            .expect("terminal font stack should include Cascadia Mono");
+    fn stylesheet_prefers_design_system_font_stack_for_terminal_text() {
+        let jetbrains = STYLES
+            .find("'JetBrains Mono'")
+            .expect("terminal font stack should include JetBrains Mono");
+        let berkeley = STYLES
+            .find("'Berkeley Mono'")
+            .expect("terminal font stack should include Berkeley Mono");
         let consolas = STYLES
             .find("Consolas")
             .expect("terminal font stack should keep Consolas as a fallback");
         assert!(
-            cascadia < consolas,
-            "Cascadia Mono should be preferred over Consolas to match Windows Terminal"
+            jetbrains < berkeley && berkeley < consolas,
+            "font stack should follow the design-system order: JetBrains Mono, Berkeley Mono, then platform fallbacks"
         );
     }
 
     #[test]
-    fn renderer_font_sources_prefer_cascadia() {
+    fn settings_route_controls_have_visible_scaled_layout() {
+        let mut state = seed_state();
+        state.settings_open = true;
+        state.settings_section = SettingsSection::Appearance;
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let grids = std::collections::HashMap::new();
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&tree_snap, &tree_shared, &grids),
+            1280.0,
+            800.0,
+        );
+        harness.set_scale_factor(1.5);
+        harness.step();
+
+        for selector in [".input-segmented", ".color-swatches", ".sw", ".toggle"] {
+            let snap = harness.query(selector).expect(selector);
+            assert!(
+                snap.layout_rect.width > 0.0 && snap.layout_rect.height > 0.0,
+                "{selector} should have non-zero layout, got {:?}",
+                snap.layout_rect
+            );
+            assert!(
+                snap.layout_rect.x >= 0.0 && snap.layout_rect.x + snap.layout_rect.width <= 1280.0,
+                "{selector} should be horizontally visible, got {:?}",
+                snap.layout_rect
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_font_sources_prefer_jetbrains() {
         let fonts = terminal_font_sources_from_value(None);
         let first = fonts.first().expect("font source list must not be empty");
         match first {
-            FontSource::System(name) => assert_eq!(name, "Cascadia Mono"),
-            other => panic!("first terminal font source must be Cascadia Mono, got {other:?}"),
+            FontSource::System(name) => assert_eq!(name, "JetBrains Mono"),
+            other => panic!("first terminal font source must be JetBrains Mono, got {other:?}"),
         }
     }
 
@@ -946,6 +1045,93 @@ mod tests {
         assert!(!truthy_env_value(Some(std::ffi::OsString::from("false"))));
         assert!(!truthy_env_value(Some(std::ffi::OsString::from("off"))));
         assert!(!truthy_env_value(Some(std::ffi::OsString::from("no"))));
+    }
+
+    #[test]
+    fn open_settings_on_startup_accepts_enabled_values() {
+        assert!(open_settings_on_startup_from_value(Some(
+            std::ffi::OsString::from("1")
+        )));
+        assert!(open_settings_on_startup_from_value(Some(
+            std::ffi::OsString::from("true")
+        )));
+        assert!(open_settings_on_startup_from_value(Some(
+            std::ffi::OsString::from("on")
+        )));
+    }
+
+    #[test]
+    fn open_settings_on_startup_rejects_missing_or_disabled_values() {
+        assert!(!open_settings_on_startup_from_value(None));
+        assert!(!open_settings_on_startup_from_value(Some(
+            std::ffi::OsString::from("0")
+        )));
+        assert!(!open_settings_on_startup_from_value(Some(
+            std::ffi::OsString::from("false")
+        )));
+    }
+
+    #[test]
+    fn open_quick_prompt_on_startup_accepts_enabled_values() {
+        assert!(open_quick_prompt_on_startup_from_value(Some(
+            std::ffi::OsString::from("1")
+        )));
+        assert!(open_quick_prompt_on_startup_from_value(Some(
+            std::ffi::OsString::from("true")
+        )));
+    }
+
+    #[test]
+    fn open_quick_prompt_on_startup_rejects_missing_or_disabled_values() {
+        assert!(!open_quick_prompt_on_startup_from_value(None));
+        assert!(!open_quick_prompt_on_startup_from_value(Some(
+            std::ffi::OsString::from("0")
+        )));
+        assert!(!open_quick_prompt_on_startup_from_value(Some(
+            std::ffi::OsString::from("false")
+        )));
+    }
+
+    #[test]
+    fn open_confirm_dialog_on_startup_accepts_enabled_values() {
+        assert!(open_confirm_dialog_on_startup_from_value(Some(
+            std::ffi::OsString::from("1")
+        )));
+        assert!(open_confirm_dialog_on_startup_from_value(Some(
+            std::ffi::OsString::from("true")
+        )));
+    }
+
+    #[test]
+    fn open_confirm_dialog_on_startup_rejects_missing_or_disabled_values() {
+        assert!(!open_confirm_dialog_on_startup_from_value(None));
+        assert!(!open_confirm_dialog_on_startup_from_value(Some(
+            std::ffi::OsString::from("0")
+        )));
+        assert!(!open_confirm_dialog_on_startup_from_value(Some(
+            std::ffi::OsString::from("false")
+        )));
+    }
+
+    #[test]
+    fn show_test_toast_on_startup_accepts_enabled_values() {
+        assert!(show_test_toast_on_startup_from_value(Some(
+            std::ffi::OsString::from("1")
+        )));
+        assert!(show_test_toast_on_startup_from_value(Some(
+            std::ffi::OsString::from("true")
+        )));
+    }
+
+    #[test]
+    fn show_test_toast_on_startup_rejects_missing_or_disabled_values() {
+        assert!(!show_test_toast_on_startup_from_value(None));
+        assert!(!show_test_toast_on_startup_from_value(Some(
+            std::ffi::OsString::from("0")
+        )));
+        assert!(!show_test_toast_on_startup_from_value(Some(
+            std::ffi::OsString::from("false")
+        )));
     }
 
     #[test]
@@ -1050,10 +1236,26 @@ mod tests {
     }
 
     #[test]
-    fn stylesheet_does_not_apply_global_scanline_overlay() {
+    fn stylesheet_applies_design_system_ambient_layers_to_app_root() {
         assert!(
-            !STYLES.contains("body::after"),
-            "global overlays darken terminal glyphs and make screenshots look lower quality"
+            STYLES.contains(".app::before") && STYLES.contains("radial-gradient"),
+            "design-system ambient amber radial glow should be applied to the app root"
+        );
+        assert!(
+            STYLES.contains(".ambient-layer.rust-glow") && STYLES.contains("10% 100%"),
+            "design-system lower-left rust glow should be represented as an app-level compatibility layer"
+        );
+        assert!(
+            STYLES.contains(".app::after") && STYLES.contains("repeating-linear-gradient"),
+            "design-system CRT scanline overlay should be applied to the app root"
+        );
+        assert!(
+            STYLES.contains(".app.parity-windows-terminal::after"),
+            "Windows Terminal parity mode should be able to disable the design-system scanline overlay"
+        );
+        assert!(
+            STYLES.contains(".app.parity-windows-terminal > .ambient-layer"),
+            "Windows Terminal parity mode should disable app-level ambient compatibility layers"
         );
     }
 

@@ -7,10 +7,12 @@ pub fn create_window(
     title: &str,
     width: u32,
     height: u32,
+    decorations: bool,
 ) -> Box<dyn Window> {
     let attrs = WindowAttributes::default()
         .with_title(title)
-        .with_surface_size(LogicalSize::new(width, height));
+        .with_surface_size(LogicalSize::new(width, height))
+        .with_decorations(decorations);
 
     event_loop.create_window(attrs).unwrap()
 }

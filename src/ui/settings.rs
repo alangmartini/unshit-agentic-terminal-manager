@@ -1,6 +1,8 @@
 use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::{Dimension, Display, FlexDirection, Overflow};
+use unshit::core::style::types::{
+    AlignItems, Dimension, Display, FlexDirection, JustifyContent, Overflow,
+};
 use unshit::prelude::SvgNode;
 
 use unshit::core::event::Modifiers;
@@ -15,33 +17,428 @@ use crate::ui::icons::*;
 pub fn build_settings_modal(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal")
+        .with_class("set-modal")
         .with_style(StyleDeclaration::Display(Display::Grid))
         .with_style(StyleDeclaration::Width(Dimension::Px(860.0)))
         .with_style(StyleDeclaration::Height(Dimension::Percent(76.0)))
         .with_style(StyleDeclaration::MaxHeight(Dimension::Px(760.0)))
         .with_child(build_modal_header(shared))
-        .with_child(build_modal_nav(state.settings_section, shared))
-        .with_child(build_modal_body(state, shared))
+        .with_child(build_modal_content(state, shared))
         .with_child(build_modal_footer(shared))
+}
+
+pub fn build_settings_page(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("settings-page")
+        .with_id("settings-page")
+        .with_child(build_settings_page_rail(state.settings_section, shared))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("set-page-content")
+                .with_child(build_settings_page_header(state.settings_section))
+                .with_child(build_settings_page_body(state, shared)),
+        )
+}
+
+fn build_settings_page_rail(active: SettingsSection, shared: &SharedState) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("set-page-rail")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("set-page-rail-head")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("title")
+                        .with_text("settings"),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("sub")
+                        .with_text("v0.4.2"),
+                ),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("set-page-search")
+                .with_child(svg_icon(icon_search()))
+                .with_child(
+                    ElementDef::new(Tag::Input)
+                        .with_class("set-page-search-input")
+                        .with_placeholder("find a setting..."),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("kbd")
+                        .with_text("\u{2318}F"),
+                ),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("set-page-nav")
+                .with_child(settings_nav_group("workspace"))
+                .with_child(settings_nav_item(
+                    SettingsSection::Appearance,
+                    active,
+                    shared,
+                ))
+                .with_child(settings_nav_item(SettingsSection::Shell, active, shared))
+                .with_child(settings_nav_item(SettingsSection::Sessions, active, shared))
+                .with_child(settings_nav_group("automation"))
+                .with_child(settings_nav_item(SettingsSection::Keybinds, active, shared))
+                .with_child(settings_nav_item(
+                    SettingsSection::Notifications,
+                    active,
+                    shared,
+                ))
+                .with_child(settings_nav_item(
+                    SettingsSection::DangerZone,
+                    active,
+                    shared,
+                )),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("set-page-foot")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("dot")
+                        .with_class("status-running"),
+                )
+                .with_child(ElementDef::new(Tag::Span).with_text("ptyd up"))
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("build")
+                        .with_text("build 4a2f1c"),
+                ),
+        )
+}
+
+fn settings_nav_group(label: &str) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("group")
+        .with_text(label.to_string())
+}
+
+fn settings_nav_item(
+    section: SettingsSection,
+    active: SettingsSection,
+    shared: &SharedState,
+) -> ElementDef {
+    let s = shared.clone();
+    let mut item = ElementDef::new(Tag::Button)
+        .with_class("set-page-nav-item")
+        .with_child(svg_icon(settings_nav_icon(section)))
+        .with_child(ElementDef::new(Tag::Span).with_text(section.label()));
+    if section == active {
+        item = item.with_class("active");
+    }
+    item.on_click(move || {
+        mutate_with(&s, |st| {
+            st.settings_section = section;
+            if section == SettingsSection::Sessions {
+                crate::state::refresh_sessions(st);
+            }
+        });
+    })
+}
+
+fn settings_nav_icon(section: SettingsSection) -> SvgNode {
+    match section {
+        SettingsSection::Appearance => icon_grid(),
+        SettingsSection::Shell => icon_terminal(),
+        SettingsSection::Keybinds => icon_chevrons(),
+        SettingsSection::Sessions => icon_folder(),
+        SettingsSection::Notifications => icon_agent(),
+        SettingsSection::DangerZone => icon_close(),
+    }
+}
+
+fn build_settings_page_header(active: SettingsSection) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("set-page-header")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("crumb")
+                .with_text(format!("settings · {}", active.label())),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("page-title")
+                .with_text(active.label()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("blurb")
+                .with_text(settings_section_desc(active)),
+        )
+}
+
+fn settings_section_desc(active: SettingsSection) -> &'static str {
+    match active {
+        SettingsSection::Appearance => "Theme, accent, density, preview.",
+        SettingsSection::Shell => "Default shell, font, scrollback.",
+        SettingsSection::Keybinds => "Every binding, grouped.",
+        SettingsSection::Sessions => "Daemon sessions and workspace attachment.",
+        SettingsSection::Notifications => "Desktop notifications and focused panes.",
+        SettingsSection::DangerZone => "Destructive session and close behavior.",
+    }
+}
+
+fn build_settings_page_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let mut body = ElementDef::new(Tag::Div)
+        .with_class("set-page-body")
+        .with_style(StyleDeclaration::Width(Dimension::Percent(100.0)))
+        .with_style(StyleDeclaration::MaxWidth(Dimension::Px(560.0)));
+    body = match state.settings_section {
+        SettingsSection::Appearance => {
+            body.with_child(build_appearance_page_section(state, shared))
+        }
+        SettingsSection::Shell => body.with_child(build_shell_section(state, shared)),
+        SettingsSection::Keybinds => body.with_child(build_keybinds_section(state, shared)),
+        SettingsSection::Sessions => body.with_child(build_sessions_section(state, shared)),
+        SettingsSection::Notifications => body.with_child(build_notifications_section(shared)),
+        SettingsSection::DangerZone => body.with_child(build_danger_zone_section(state, shared)),
+    };
+    body.with_child(build_settings_page_savebar(shared))
+}
+
+fn build_appearance_page_section(state: &UiSnapshot, _shared: &SharedState) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("set-page-section")
+        .with_child(
+            set_card("theme", None)
+                .with_child(settings_page_field(
+                    "Theme",
+                    Some(
+                        "Walnut amber is the only ship-able theme today. Light theme is roadmapped.",
+                    ),
+                    segmented_control(&["walnut", "ember", "void"], "walnut"),
+                ))
+                .with_child(settings_page_field(
+                    "Accent",
+                    Some("Drives prompt arrows, focus rings, primary buttons, brand mark."),
+                    accent_swatches("amber"),
+                ))
+                .with_child(settings_page_field(
+                    "Scanline overlay",
+                    Some("The CRT signature. Disable for accessibility or static screenshots."),
+                    segmented_control(&["off", "subtle", "default"], "subtle"),
+                ))
+                .with_child(settings_page_field(
+                    "Background grain",
+                    None,
+                    toggle_control(true),
+                )),
+        )
+        .with_child(
+            set_card("density", None)
+                .with_child(settings_page_field(
+                    "Tab bar density",
+                    None,
+                    segmented_control(&["compact", "default", "comfy"], "default"),
+                ))
+                .with_child(settings_page_field(
+                    "Sidebar width",
+                    None,
+                    readout_with_unit(&format!("{:.0}", state.sidebar_width), "px"),
+                )),
+        )
+        .with_child(set_card("preview", None).with_child(build_appearance_preview()))
+}
+
+fn set_card(name: &str, meta: Option<&str>) -> ElementDef {
+    let mut head = ElementDef::new(Tag::Div)
+        .with_class("set-card-head")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("name")
+                .with_text(name),
+        );
+    if let Some(meta) = meta {
+        head = head.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("name-meta")
+                .with_text(format!("/ {meta}")),
+        );
+    }
+    ElementDef::new(Tag::Div)
+        .with_class("set-card")
+        .with_style(StyleDeclaration::Width(Dimension::Percent(100.0)))
+        .with_child(head)
+}
+
+fn settings_page_field(label: &str, desc: Option<&str>, control: ElementDef) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("setting-row")
+        .with_class("set-field")
+        .with_style(StyleDeclaration::Display(Display::Flex))
+        .with_style(StyleDeclaration::AlignItems(AlignItems::Center))
+        .with_style(StyleDeclaration::JustifyContent(
+            JustifyContent::SpaceBetween,
+        ))
+        .with_child(setting_meta(label, desc))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("set-control")
+                .with_child(control),
+        )
+}
+
+fn segmented_control(options: &[&str], active: &str) -> ElementDef {
+    let mut root = ElementDef::new(Tag::Div).with_class("input-segmented");
+    for option in options {
+        let mut button = ElementDef::new(Tag::Span)
+            .with_class("seg-btn")
+            .with_text(*option);
+        if *option == active {
+            button = button.with_class("active");
+        }
+        root = root.with_child(button);
+    }
+    root
+}
+
+fn accent_swatches(active: &str) -> ElementDef {
+    let mut root = ElementDef::new(Tag::Div).with_class("color-swatches");
+    for accent in ["amber", "ember", "sage", "azure", "violet"] {
+        let mut swatch = ElementDef::new(Tag::Div)
+            .with_class("sw")
+            .with_class(accent);
+        if accent == active {
+            swatch = swatch.with_class("active");
+        }
+        root = root.with_child(swatch);
+    }
+    root
+}
+
+fn toggle_control(on: bool) -> ElementDef {
+    let mut toggle = ElementDef::new(Tag::Div).with_class("toggle");
+    if on {
+        toggle = toggle.with_class("on");
+    }
+    toggle
+}
+
+fn readout_with_unit(value: &str, unit: &str) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("set-inline-control")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("input-text")
+                .with_class("input-num")
+                .with_text(value),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("set-unit")
+                .with_text(unit),
+        )
+}
+
+fn build_appearance_preview() -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("preview-tile")
+        .with_child(preview_line(vec![
+            preview_span("prompt", "\u{276F} "),
+            preview_span("path", "~/code/main/dashboard "),
+            preview_span("branch", "(main)"),
+        ]))
+        .with_child(preview_line(vec![
+            preview_span("prompt", "\u{276F} "),
+            preview_span("cmd", "npm run dev"),
+        ]))
+        .with_child(preview_line(vec![preview_span(
+            "azure",
+            "\u{2192} vite v5.4.0 ready in 312 ms",
+        )]))
+        .with_child(preview_line(vec![preview_span(
+            "sage",
+            "\u{2713} recompiled in 84ms",
+        )]))
+        .with_child(preview_line(vec![preview_span(
+            "rust",
+            "\u{2717} src/lib/format.test.ts (2)",
+        )]))
+        .with_child(preview_line(vec![preview_span(
+            "muted",
+            "  expected 42 to be 41",
+        )]))
+        .with_child(preview_line(vec![
+            preview_span("prompt", "\u{276F} "),
+            ElementDef::new(Tag::Span).with_class("cur"),
+        ]))
+}
+
+fn preview_line(parts: Vec<ElementDef>) -> ElementDef {
+    let mut line = ElementDef::new(Tag::Div).with_class("preview-line");
+    for part in parts {
+        line = line.with_child(part);
+    }
+    line
+}
+
+fn preview_span(class: &str, text: &str) -> ElementDef {
+    ElementDef::new(Tag::Span).with_class(class).with_text(text)
+}
+
+fn build_settings_page_savebar(shared: &SharedState) -> ElementDef {
+    let discard_state = shared.clone();
+    let save_state = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("set-page-savebar")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("dirty")
+                .with_text("\u{2022} 2 unsaved changes"),
+        )
+        .with_child(ElementDef::new(Tag::Span).with_class("spacer"))
+        .with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("btn")
+                .with_class("ghost")
+                .with_text("discard")
+                .on_click(move || {
+                    mutate_with(&discard_state, |st| dispatch(st, "modal.close"));
+                }),
+        )
+        .with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("btn")
+                .with_class("ghost")
+                .with_text("reset to defaults"),
+        )
+        .with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("btn")
+                .with_class("primary")
+                .with_text("save changes")
+                .on_click(move || {
+                    mutate_with(&save_state, |st| dispatch(st, "modal.close"));
+                }),
+        )
 }
 
 fn build_modal_header(shared: &SharedState) -> ElementDef {
     let close_state = shared.clone();
     ElementDef::new(Tag::Div)
         .with_class("modal-header")
+        .with_class("set-head")
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("modal-title-row")
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("modal-mark")
+                        .with_class("set-mark")
                         .with_text("\u{25C6}"),
                 )
                 .with_child(
                     ElementDef::new(Tag::Div)
                         .with_class("modal-title")
+                        .with_class("set-title")
                         .with_id("settings-title")
-                        .with_text("Settings"),
+                        .with_text("settings"),
                 ),
         )
         .with_child(
@@ -56,10 +453,13 @@ fn build_modal_header(shared: &SharedState) -> ElementDef {
 }
 
 fn build_modal_nav(active: SettingsSection, shared: &SharedState) -> ElementDef {
-    let mut nav = ElementDef::new(Tag::Div).with_class("modal-nav");
+    let mut nav = ElementDef::new(Tag::Div)
+        .with_class("modal-nav")
+        .with_class("set-nav-rail");
     for section in SettingsSection::all() {
         let mut item = ElementDef::new(Tag::Button)
             .with_class("modal-nav-item")
+            .with_class("set-nav")
             .with_text(section.label());
         if section == active {
             item = item.with_class("active");
@@ -90,6 +490,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     };
     ElementDef::new(Tag::Div)
         .with_class("modal-body")
+        .with_class("set-content")
         .with_style(StyleDeclaration::Display(Display::Flex))
         .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_style(StyleDeclaration::FlexGrow(1.0))
@@ -97,6 +498,13 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_style(StyleDeclaration::Overflow(Overflow::Scroll))
         .with_style(StyleDeclaration::MinHeight(Dimension::Px(0.0)))
         .with_child(section)
+}
+
+fn build_modal_content(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("set-body")
+        .with_child(build_modal_nav(state.settings_section, shared))
+        .with_child(build_modal_body(state, shared))
 }
 
 // -- section builders -------------------------------------------------------
@@ -132,7 +540,7 @@ fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             .with_child(
                 ElementDef::new(Tag::Div)
                     .with_class("modal-section-title")
-                    .with_text("Workspace overrides"),
+                    .with_text("workspace overrides"),
             );
         for (idx, ws) in state.workspaces.iter().enumerate() {
             overrides = overrides.with_child(shell_scope_block(
@@ -210,7 +618,7 @@ fn shell_picker(
         let mut chip = ElementDef::new(Tag::Button)
             .with_class("shell-chip")
             .with_class("clear")
-            .with_text("Use default");
+            .with_text("use default");
         if current.is_empty() {
             chip = chip.with_class("active");
         }
@@ -262,7 +670,7 @@ fn shell_custom_program_input(
     shared: &SharedState,
 ) -> ElementDef {
     let placeholder = if current.program.is_empty() {
-        "Custom shell path (press Enter to apply)".to_string()
+        "custom shell path (press enter to apply)".to_string()
     } else {
         current.program.clone()
     };
@@ -300,7 +708,7 @@ fn shell_args_input(
     shared: &SharedState,
 ) -> ElementDef {
     let placeholder = if current.args.is_empty() {
-        "Optional args, space separated".to_string()
+        "optional args, space separated".to_string()
     } else {
         current.args.join(" ")
     };
@@ -350,8 +758,8 @@ fn build_notifications_section(shared: &SharedState) -> ElementDef {
         });
 
     section_shell("notifications").with_child(setting_row(
-        "Test notification",
-        "Sends a notification targeted at the active workspace and terminal.",
+        "test notification",
+        "sends a notification targeted at the active workspace and terminal",
         test_notification,
     ))
 }
@@ -359,7 +767,7 @@ fn build_notifications_section(shared: &SharedState) -> ElementDef {
 fn keybind_restart_banner() -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("keybind-banner")
-        .with_text("Keybind changes take effect after restarting the app.")
+        .with_text("keybind changes take effect after restarting the app")
 }
 
 fn keybind_error_banner(err: Option<&KeybindError>) -> ElementDef {
@@ -431,7 +839,7 @@ fn combo_cell(
         btn = btn.with_child(
             ElementDef::new(Tag::Span)
                 .with_class("keybind-recording-label")
-                .with_text("Press keys... (Esc to cancel)"),
+                .with_text("press keys... (esc to cancel)"),
         );
     } else {
         for part in combo_parts(combo) {
@@ -509,8 +917,8 @@ fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
     }
 
     let mut section = section_shell("sessions").with_child(setting_row(
-        "Daemon sessions",
-        "Sessions currently tracked by the session daemon. Refresh to re-poll.",
+        "daemon sessions",
+        "sessions currently tracked by the session daemon; refresh to re-poll",
         control,
     ));
 
@@ -518,7 +926,7 @@ fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
         section = section.with_child(
             ElementDef::new(Tag::Div)
                 .with_class("sessions-empty")
-                .with_text("No sessions. Press refresh to poll the daemon."),
+                .with_text("no sessions; press refresh to poll the daemon"),
         );
         return section;
     }
@@ -617,7 +1025,7 @@ fn build_danger_zone_section(state: &UiSnapshot, shared: &SharedState) -> Elemen
         });
 
     let mut section = section_shell("danger zone").with_child(setting_row(
-        "Kill all terminals",
+        "kill all terminals",
         "Destroys every running shell across every workspace. Workspaces are kept but emptied.",
         kill_all,
     ));
@@ -651,6 +1059,7 @@ fn build_modal_footer(shared: &SharedState) -> ElementDef {
     let save_state = shared.clone();
     ElementDef::new(Tag::Div)
         .with_class("modal-footer")
+        .with_class("set-foot")
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("modal-hint")
@@ -695,11 +1104,14 @@ fn build_modal_footer(shared: &SharedState) -> ElementDef {
 fn section_shell(title: &str) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("modal-section")
+        .with_class("set-card")
         .with_style(StyleDeclaration::Display(Display::Flex))
         .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("modal-section-title")
+                .with_class("set-card-head")
+                .with_class("name")
                 .with_text(title),
         )
 }
@@ -712,12 +1124,14 @@ fn setting_meta(label: &str, desc: Option<&str>) -> ElementDef {
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("setting-label")
+                .with_class("set-label")
                 .with_text(label),
         );
     if let Some(desc) = desc {
         meta = meta.with_child(
             ElementDef::new(Tag::Span)
                 .with_class("setting-desc")
+                .with_class("set-desc")
                 .with_text(desc),
         );
     }
@@ -727,15 +1141,19 @@ fn setting_meta(label: &str, desc: Option<&str>) -> ElementDef {
 fn setting_row(label: &str, desc: &str, control: ElementDef) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("setting-row")
+        .with_class("set-field")
         .with_child(setting_meta(label, Some(desc)))
         .with_child(control)
 }
 
 fn theme_chip_group(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    let mut chips = ElementDef::new(Tag::Div).with_class("theme-chips");
+    let mut chips = ElementDef::new(Tag::Div)
+        .with_class("theme-chips")
+        .with_class("color-swatches");
     for theme in ["amber", "green", "cyan", "mono"] {
         let mut chip = ElementDef::new(Tag::Button)
             .with_class("theme-chip")
+            .with_class("sw")
             .with_class(theme);
         if state.theme == theme {
             chip = chip.with_class("active");
@@ -824,7 +1242,8 @@ mod tests {
     use super::*;
     use crate::state::{seed_state, SettingsSection};
     use std::sync::{Arc, Mutex};
-    use unshit::core::element::ElementContent;
+    use unshit::core::element::{ElementContent, ElementTree};
+    use unshit_test::TestHarness;
 
     fn make_shared() -> SharedState {
         Arc::new(Mutex::new(seed_state()))
@@ -858,12 +1277,109 @@ mod tests {
     }
 
     #[test]
-    fn settings_modal_has_four_children() {
+    fn settings_modal_matches_design_system_shell_structure() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_settings_modal(&snap, &shared);
-        // header, nav, body, footer
-        assert_eq!(el.children.len(), 4);
+        // header, set-body(nav + content), footer
+        assert_eq!(el.children.len(), 3);
+        assert!(el.children[1].classes.contains(&"set-body".to_string()));
+        assert!(el.children[1].children[0]
+            .classes
+            .contains(&"set-nav-rail".to_string()));
+        assert!(el.children[1].children[1]
+            .classes
+            .contains(&"set-content".to_string()));
+    }
+
+    #[test]
+    fn settings_page_matches_design_system_page_structure() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let el = build_settings_page(&snap, &shared);
+
+        assert!(el.classes.contains(&"settings-page".to_string()));
+        assert_eq!(el.children.len(), 2);
+        assert!(el.children[0]
+            .classes
+            .contains(&"set-page-rail".to_string()));
+        assert!(el.children[1]
+            .classes
+            .contains(&"set-page-content".to_string()));
+        assert!(has_class_anywhere(&el, "set-page-search"));
+        assert!(has_class_anywhere(&el, "set-page-header"));
+        assert!(has_class_anywhere(&el, "set-page-savebar"));
+    }
+
+    #[test]
+    fn settings_page_appearance_renders_theme_density_and_preview() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let el = build_settings_page(&snap, &shared);
+
+        assert_eq!(count_with_class(&el, "set-card"), 3);
+        assert!(has_class_anywhere(&el, "input-segmented"));
+        assert!(has_class_anywhere(&el, "color-swatches"));
+        assert!(has_class_anywhere(&el, "toggle"));
+        assert!(has_class_anywhere(&el, "preview-tile"));
+        assert!(collect_text_recursive(&el).contains("Walnut amber"));
+    }
+
+    #[test]
+    fn settings_page_controls_have_visible_layout_with_stylesheet() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            1280.0,
+            800.0,
+        );
+        harness.set_scale_factor(1.5);
+        harness.step();
+
+        for selector in [
+            ".input-segmented",
+            ".seg-btn",
+            ".color-swatches",
+            ".sw",
+            ".toggle",
+            ".preview-tile",
+        ] {
+            let snap = harness.query(selector).expect(selector);
+            assert!(
+                snap.layout_rect.width > 0.0 && snap.layout_rect.height > 0.0,
+                "{selector} should have non-zero layout, got {:?}",
+                snap.layout_rect
+            );
+            assert!(
+                snap.layout_rect.x >= 0.0 && snap.layout_rect.x + snap.layout_rect.width <= 1280.0,
+                "{selector} should be horizontally visible, got {:?}",
+                snap.layout_rect
+            );
+        }
+    }
+
+    #[test]
+    fn settings_page_nav_item_click_changes_section() {
+        let shared = make_shared();
+        let rail = build_settings_page_rail(SettingsSection::Appearance, &shared);
+        let nav = &rail.children[2];
+        let shell = &nav.children[2];
+
+        (shell.on_click.as_ref().unwrap())();
+
+        assert_eq!(
+            shared.lock().unwrap().settings_section,
+            SettingsSection::Shell
+        );
     }
 
     // -- build_modal_header -----------------------------------------------------
@@ -1170,8 +1686,8 @@ mod tests {
         let shared = make_shared();
         let picker = shell_picker(ShellScope::Workspace(0), &current, &installed, &shared);
         assert!(
-            collect_text_recursive(&picker).contains("Use default"),
-            "workspace picker must include a Use default chip"
+            collect_text_recursive(&picker).contains("use default"),
+            "workspace picker must include a use default chip"
         );
     }
 
@@ -1182,8 +1698,8 @@ mod tests {
         let shared = make_shared();
         let picker = shell_picker(ShellScope::AppDefault, &current, &installed, &shared);
         assert!(
-            !collect_text_recursive(&picker).contains("Use default"),
-            "app default picker must NOT have a Use default chip"
+            !collect_text_recursive(&picker).contains("use default"),
+            "app default picker must NOT have a use default chip"
         );
     }
 
@@ -1276,7 +1792,7 @@ mod tests {
         assert_eq!(combo_cell.children.len(), 1);
         assert_eq!(
             text_of(&combo_cell.children[0]),
-            Some("Press keys... (Esc to cancel)")
+            Some("press keys... (esc to cancel)")
         );
     }
 
@@ -1313,7 +1829,7 @@ mod tests {
         let state = shared.lock().unwrap();
         let snap = state.ui_snapshot();
         let toast = snap.toasts.first().expect("test notification toast");
-        assert_eq!(toast.title.as_deref(), Some("Test notification"));
+        assert_eq!(toast.title.as_deref(), Some("test notification"));
         assert_eq!(
             toast.target,
             Some(crate::state::ToastTarget {
@@ -1584,7 +2100,7 @@ mod tests {
             .iter()
             .filter(|c| c.classes.contains(&"setting-row".to_string()))
             .collect();
-        // First row is the "Daemon sessions / Refresh" header row, then
+        // First row is the "daemon sessions / refresh" header row, then
         // one row per session.
         assert_eq!(rows.len(), 3);
     }

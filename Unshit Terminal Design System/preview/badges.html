@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:20px;background:var(--bg-base);overflow:hidden;display:flex;flex-direction:column;gap:14px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .badge{font:var(--type-meta);padding:2px 8px;border-radius:2px;display:inline-flex;align-items:center;gap:5px;letter-spacing:.05em;text-transform:uppercase}
+  .dot{width:6px;height:6px;border-radius:50%;display:inline-block}
+  h5{margin:0;font:var(--type-meta);color:var(--fg-tertiary);text-transform:lowercase;letter-spacing:.1em}
+  .chip{font:var(--type-meta);padding:3px 8px;border-radius:10px;background:var(--bg-elevated);border:1px solid var(--border-soft);color:var(--fg-secondary);display:inline-flex;align-items:center;gap:5px}
+  .chip.active{background:rgba(212,163,72,.15);border-color:var(--amber-400);color:var(--amber-200)}
+</style></head>
+<body>
+  <h5>status badges</h5>
+  <div class="row">
+    <span class="badge" style="background:rgba(139,168,92,.15);color:var(--sage)"><span class="dot" style="background:var(--sage);box-shadow:0 0 6px var(--sage);animation:p 1.4s infinite"></span>running</span>
+    <span class="badge" style="background:rgba(106,162,173,.15);color:var(--azure)"><span class="dot" style="background:var(--azure)"></span>idle 12m</span>
+    <span class="badge" style="background:rgba(232,185,85,.15);color:var(--amber-200)"><span class="dot" style="background:var(--amber-200)"></span>attached</span>
+    <span class="badge" style="background:rgba(201,85,58,.15);color:var(--rust)"><span class="dot" style="background:var(--rust)"></span>exit 1</span>
+    <span class="badge" style="background:var(--bg-elevated);color:var(--fg-tertiary)"><span class="dot" style="background:var(--fg-tertiary)"></span>stopped</span>
+  </div>
+  <h5>filter chips</h5>
+  <div class="row">
+    <span class="chip active">all · 12</span>
+    <span class="chip">running · 4</span>
+    <span class="chip">agents · 3</span>
+    <span class="chip">claude</span>
+    <span class="chip">aider</span>
+    <span class="chip">+ branch:main</span>
+  </div>
+  <h5>tags</h5>
+  <div class="row">
+    <span class="chip" style="border-color:var(--azure);color:var(--azure)">▎ dashboard</span>
+    <span class="chip" style="border-color:var(--sage);color:var(--sage)">▎ api</span>
+    <span class="chip" style="border-color:var(--violet);color:var(--violet)">▎ infra</span>
+  </div>
+  <style>@keyframes p{50%{opacity:.4}}</style>
+</body></html>

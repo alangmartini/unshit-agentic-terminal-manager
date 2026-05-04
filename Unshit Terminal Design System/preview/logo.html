@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:30px;background:var(--bg-base);overflow:hidden;display:flex;flex-direction:column;gap:24px;align-items:flex-start}
+  .lockup{display:flex;align-items:center;gap:10px}
+  .mark{width:28px;height:28px;border:1.5px solid var(--amber-300);border-radius:4px;display:flex;align-items:center;justify-content:center;color:var(--amber-200);font:var(--type-display);font-size:14px;box-shadow:var(--glow-amber-s);position:relative}
+  .mark::after{content:"";position:absolute;right:-2px;bottom:-2px;width:5px;height:5px;background:var(--amber-300);box-shadow:var(--glow-amber-s)}
+  .word{font:var(--type-display);font-size:18px;color:var(--amber-50);letter-spacing:-.01em}
+  .word .accent{color:var(--amber-300)}
+  .word .dim{color:var(--fg-tertiary);font-weight:400}
+  .small{font:var(--type-meta);color:var(--fg-tertiary);text-transform:uppercase;letter-spacing:.15em;margin-top:2px}
+</style></head>
+<body>
+  <div class="lockup">
+    <div class="mark">❯</div>
+    <div>
+      <div class="word">terminal<span class="accent">.</span>mgr</div>
+      <div class="small">agentic terminal manager</div>
+    </div>
+  </div>
+  <div class="lockup">
+    <div class="mark" style="width:18px;height:18px;font-size:10px">❯</div>
+    <div class="word" style="font-size:13px">terminal<span class="accent">.</span>mgr</div>
+  </div>
+  <div class="lockup">
+    <div class="word" style="font-size:14px"><span class="accent">❯</span> term<span class="dim">.mgr</span></div>
+  </div>
+</body></html>

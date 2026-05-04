@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body{margin:0;padding:18px;background:var(--bg-base);overflow:hidden}
+  .grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+  .swatch{aspect-ratio:1.3;border-radius:var(--r-md);padding:10px;display:flex;flex-direction:column;justify-content:space-between;color:#14110c;font-weight:600}
+  .swatch .name{font-size:11px}
+  .swatch .role{font-size:9px;opacity:.7;font-weight:400}
+  .swatch.dark{color:var(--amber-50)}
+</style></head>
+<body>
+  <div class="grid">
+    <div class="swatch dark" style="background:#8ba85c;box-shadow:0 0 8px rgba(139,168,92,.5)"><span class="name">sage</span><span class="role">success / running</span></div>
+    <div class="swatch dark" style="background:#c9553a;box-shadow:0 0 8px rgba(201,85,58,.5)"><span class="name">rust</span><span class="role">error / killed</span></div>
+    <div class="swatch dark" style="background:#d06e2c"><span class="name">ember</span><span class="role">warm warn</span></div>
+    <div class="swatch dark" style="background:#6aa2ad"><span class="name">azure</span><span class="role">info / paths</span></div>
+    <div class="swatch dark" style="background:#a88bb8"><span class="name">violet</span><span class="role">rare accent</span></div>
+  </div>
+</body></html>

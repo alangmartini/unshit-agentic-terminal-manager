@@ -12,7 +12,7 @@ use crate::pipeline::quad::{QuadInstance, MAX_GRADIENT_STOPS};
 use crate::pipeline::text::GlyphInstance;
 use crate::svg_cache::SvgTessCache;
 use crate::svg_tess::SvgGeometry;
-use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Buffer, FontSystem, Metrics, Shaping, SwashCache};
 
 /// Glyph rasterization backends.
 ///
@@ -34,12 +34,14 @@ use unshit_core::dirty::DirtyFlags;
 use unshit_core::element::{ElementContent, InputType, Tag};
 use unshit_core::event::TextSelection;
 use unshit_core::id::NodeId;
-use unshit_core::layout::TextMeasureCache;
+use unshit_core::layout::{
+    font_weight_number, measure_text_with_style_cached, text_attrs, TextMeasureCache,
+};
 use unshit_core::scroll::{self, ScrollbarVisualState};
 use unshit_core::style::types::{
-    Background, Color, CssPosition, CssResize, Display, FilterFunction, GradientStopPosition,
-    Layer, LinearGradient, Overflow, RadialGradient, RadialShape, RenderTarget, TextDecoration,
-    Visibility, WhiteSpace,
+    Background, Color, CssPosition, CssResize, Display, FilterFunction, FontWeight,
+    GradientStopPosition, Layer, LinearGradient, Overflow, RadialGradient, RadialShape,
+    RenderTarget, TextDecoration, Visibility, WhiteSpace,
 };
 use unshit_core::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, SvgTransform, ViewBox};
 use unshit_core::trace::{append_terminal_trace_line, terminal_trace_enabled};
@@ -604,6 +606,8 @@ pub struct ShapedTextCache {
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct ShapedCacheKey {
     text_hash: u64,
+    font_family_hash: u64,
+    font_weight: u16,
     font_size_tenths: i32,
     line_height_tenths: i32,
     letter_spacing_tenths: i32,
@@ -804,6 +808,8 @@ impl BatchCache {
 impl ShapedTextCache {
     fn make_key(
         text: &str,
+        font_family: &str,
+        font_weight: FontWeight,
         font_size: f32,
         line_height: f32,
         letter_spacing: f32,
@@ -814,6 +820,8 @@ impl ShapedTextCache {
         text.hash(&mut hasher);
         ShapedCacheKey {
             text_hash: hasher.finish(),
+            font_family_hash: shape_cache_font_id(font_family),
+            font_weight: font_weight_number(font_weight),
             font_size_tenths: (font_size * 10.0) as i32,
             line_height_tenths: (line_height * 10.0) as i32,
             letter_spacing_tenths: (letter_spacing * 10.0) as i32,
@@ -1587,8 +1595,10 @@ fn walk_for_batch(
                     };
                     let mut fg = style.color;
                     fg.a = (fg.a as f32 * opacity) as u8;
-                    let (gw, gh) = unshit_core::layout::measure_text_cached(
+                    let (gw, gh) = measure_text_with_style_cached(
                         glyph,
+                        &style.font_family,
+                        style.font_weight,
                         style.font_size,
                         style.line_height,
                         style.letter_spacing,
@@ -1606,6 +1616,8 @@ fn walk_for_batch(
                         style.font_size,
                         style.line_height,
                         style.letter_spacing,
+                        &style.font_family,
+                        style.font_weight,
                         &fg,
                         clip_rect,
                         batch.layer_mut(effective_layer),
@@ -1702,8 +1714,10 @@ fn walk_for_batch(
                         if is_placeholder { style.placeholder_color } else { style.color };
                     text_color.a = (text_color.a as f32 * opacity) as u8;
 
-                    let (_, text_h) = unshit_core::layout::measure_text_cached(
+                    let (_, text_h) = measure_text_with_style_cached(
                         display_text,
+                        &style.font_family,
+                        style.font_weight,
                         style.font_size,
                         style.line_height,
                         style.letter_spacing,
@@ -1722,6 +1736,8 @@ fn walk_for_batch(
                         style.font_size,
                         style.line_height,
                         style.letter_spacing,
+                        &style.font_family,
+                        style.font_weight,
                         &text_color,
                         clip_rect,
                         batch.layer_mut(effective_layer),
@@ -1746,8 +1762,10 @@ fn walk_for_batch(
                         } else {
                             input.value[..input.cursor_pos].to_string()
                         };
-                        let (w, _) = unshit_core::layout::measure_text_cached(
+                        let (w, _) = measure_text_with_style_cached(
                             &prefix,
+                            &style.font_family,
+                            style.font_weight,
                             style.font_size,
                             style.line_height,
                             style.letter_spacing,
@@ -1759,8 +1777,10 @@ fn walk_for_batch(
                     };
 
                     let caret_text = if input.value.is_empty() { " " } else { &input.value };
-                    let (_, caret_text_h) = unshit_core::layout::measure_text_cached(
+                    let (_, caret_text_h) = measure_text_with_style_cached(
                         caret_text,
+                        &style.font_family,
+                        style.font_weight,
                         style.font_size,
                         style.line_height,
                         style.letter_spacing,
@@ -1833,8 +1853,10 @@ fn walk_for_batch(
                         Some(content_w)
                     };
 
-                let (text_w, text_h) = unshit_core::layout::measure_text_cached(
+                let (text_w, text_h) = measure_text_with_style_cached(
                     text,
+                    &style.font_family,
+                    style.font_weight,
                     style.font_size,
                     style.line_height,
                     style.letter_spacing,
@@ -1928,6 +1950,8 @@ fn walk_for_batch(
                     style.font_size,
                     style.line_height,
                     style.letter_spacing,
+                    &style.font_family,
+                    style.font_weight,
                     &text_color,
                     clip_rect,
                     batch.layer_mut(effective_layer),
@@ -2476,6 +2500,8 @@ fn emit_text_glyphs_cached(
     font_size: f32,
     line_height: f32,
     letter_spacing: f32,
+    font_family: &str,
+    font_weight: FontWeight,
     color: &Color,
     clip_rect: [f32; 4],
     batch: &mut FrameBatch,
@@ -2485,8 +2511,15 @@ fn emit_text_glyphs_cached(
     shaped_cache: &mut ShapedTextCache,
     mut glyph_keys_out: Option<&mut FxHashSet<GlyphKey>>,
 ) {
-    let cache_key =
-        ShapedTextCache::make_key(text, font_size, line_height, letter_spacing, max_width);
+    let cache_key = ShapedTextCache::make_key(
+        text,
+        font_family,
+        font_weight,
+        font_size,
+        line_height,
+        letter_spacing,
+        max_width,
+    );
     let color_linear = color.to_linear_f32();
 
     // Check if we have a cached shaped result. If any atlas key is missing,
@@ -2524,7 +2557,7 @@ fn emit_text_glyphs_cached(
     let metrics = Metrics::new(font_size, font_size * line_height);
     let mut buffer = Buffer::new(font_system, metrics);
     buffer.set_size(font_system, max_width.map(|w| w.max(1.0)), None);
-    buffer.set_text(font_system, text, Attrs::new(), Shaping::Advanced);
+    buffer.set_text(font_system, text, text_attrs(font_family, font_weight), Shaping::Advanced);
     buffer.shape_until_scroll(font_system, false);
 
     let mut cached_glyphs = Vec::new();
@@ -4416,6 +4449,8 @@ fn emit_select_node(
             font_size,
             line_height,
             letter_spacing,
+            &style.font_family,
+            style.font_weight,
             &fg_color,
             clip,
             content_layer,
@@ -4441,6 +4476,8 @@ fn emit_select_node(
             font_size,
             line_height,
             letter_spacing,
+            &style.font_family,
+            style.font_weight,
             &fg_color,
             clip,
             content_layer,
@@ -4538,6 +4575,8 @@ fn emit_select_node(
                 font_size.min(14.0),
                 line_height,
                 letter_spacing,
+                &style.font_family,
+                style.font_weight,
                 &check_color,
                 item_clip,
                 overlay_layer,
@@ -4558,6 +4597,8 @@ fn emit_select_node(
             font_size,
             line_height,
             letter_spacing,
+            &style.font_family,
+            style.font_weight,
             &text_color,
             item_clip,
             overlay_layer,
@@ -6717,7 +6758,27 @@ mod tests {
     }
 
     fn shaped_key_for(text: &str) -> ShapedCacheKey {
-        ShapedTextCache::make_key(text, 14.0, 1.2, 0.0, None)
+        ShapedTextCache::make_key(text, "", FontWeight::Normal, 14.0, 1.2, 0.0, None)
+    }
+
+    #[test]
+    fn shaped_text_cache_key_includes_font_family_and_weight() {
+        let regular =
+            ShapedTextCache::make_key("keep", "Consolas", FontWeight::Normal, 11.0, 1.4, 0.0, None);
+        let semibold =
+            ShapedTextCache::make_key("keep", "Consolas", FontWeight::W(600), 11.0, 1.4, 0.0, None);
+        let other_family = ShapedTextCache::make_key(
+            "keep",
+            "JetBrains Mono",
+            FontWeight::Normal,
+            11.0,
+            1.4,
+            0.0,
+            None,
+        );
+
+        assert!(regular != semibold);
+        assert!(regular != other_family);
     }
 
     #[test]
