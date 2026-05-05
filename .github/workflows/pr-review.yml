@@ -41,7 +41,7 @@ jobs:
 
   coverage:
     name: Code Coverage
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/rust-terminal-manager')
     runs-on: [self-hosted, Windows, X64, local-windows]
     timeout-minutes: 25
     steps:
