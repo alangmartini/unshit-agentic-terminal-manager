@@ -1,4 +1,4 @@
-use crate::element::Element;
+use crate::element::{Element, Tag};
 use crate::event::is_or_ancestor_of;
 use crate::id::NodeId;
 use crate::style::parse::*;
@@ -65,6 +65,8 @@ pub fn resolve_style_with_pseudo(
         }
     }
 
+    apply_user_agent_defaults(&mut style, element.tag);
+
     for rule in &stylesheet.rules {
         let rule_pseudo = rule.selector.pseudo_element();
         if rule_pseudo != pseudo_target {
@@ -87,6 +89,12 @@ pub fn resolve_style_with_pseudo(
     }
 
     style
+}
+
+fn apply_user_agent_defaults(style: &mut ComputedStyle, tag: Tag) {
+    if tag == Tag::Button {
+        style.text_align = TextAlign::Center;
+    }
 }
 
 pub fn resolve_selection_style(

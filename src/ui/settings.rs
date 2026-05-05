@@ -1,8 +1,6 @@
 use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::{
-    AlignItems, Dimension, Display, FlexDirection, JustifyContent, Overflow,
-};
+use unshit::core::style::types::{Dimension, Display, FlexDirection, Overflow};
 use unshit::prelude::SvgNode;
 
 use unshit::core::event::Modifiers;
@@ -69,7 +67,7 @@ fn build_settings_page_rail(active: SettingsSection, shared: &SharedState) -> El
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("kbd")
-                        .with_text("\u{2318}F"),
+                        .with_text("Ctrl F"),
                 ),
         )
         .with_child(
@@ -175,7 +173,7 @@ fn build_settings_page_header(active: SettingsSection) -> ElementDef {
 
 fn settings_section_desc(active: SettingsSection) -> &'static str {
     match active {
-        SettingsSection::Appearance => "Theme, accent, density, preview.",
+        SettingsSection::Appearance => "Font size, sidebar width, preview.",
         SettingsSection::Shell => "Default shell, font, scrollback.",
         SettingsSection::Keybinds => "Every binding, grouped.",
         SettingsSection::Sessions => "Daemon sessions and workspace attachment.",
@@ -188,7 +186,7 @@ fn build_settings_page_body(state: &UiSnapshot, shared: &SharedState) -> Element
     let mut body = ElementDef::new(Tag::Div)
         .with_class("set-page-body")
         .with_style(StyleDeclaration::Width(Dimension::Percent(100.0)))
-        .with_style(StyleDeclaration::MaxWidth(Dimension::Px(560.0)));
+        .with_style(StyleDeclaration::MaxWidth(Dimension::Px(820.0)));
     body = match state.settings_section {
         SettingsSection::Appearance => {
             body.with_child(build_appearance_page_section(state, shared))
@@ -202,47 +200,19 @@ fn build_settings_page_body(state: &UiSnapshot, shared: &SharedState) -> Element
     body.with_child(build_settings_page_savebar(shared))
 }
 
-fn build_appearance_page_section(state: &UiSnapshot, _shared: &SharedState) -> ElementDef {
+fn build_appearance_page_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("set-page-section")
-        .with_child(
-            set_card("theme", None)
-                .with_child(settings_page_field(
-                    "Theme",
-                    Some(
-                        "Walnut amber is the only ship-able theme today. Light theme is roadmapped.",
-                    ),
-                    segmented_control(&["walnut", "ember", "void"], "walnut"),
-                ))
-                .with_child(settings_page_field(
-                    "Accent",
-                    Some("Drives prompt arrows, focus rings, primary buttons, brand mark."),
-                    accent_swatches("amber"),
-                ))
-                .with_child(settings_page_field(
-                    "Scanline overlay",
-                    Some("The CRT signature. Disable for accessibility or static screenshots."),
-                    segmented_control(&["off", "subtle", "default"], "subtle"),
-                ))
-                .with_child(settings_page_field(
-                    "Background grain",
-                    None,
-                    toggle_control(true),
-                )),
-        )
-        .with_child(
-            set_card("density", None)
-                .with_child(settings_page_field(
-                    "Tab bar density",
-                    None,
-                    segmented_control(&["compact", "default", "comfy"], "default"),
-                ))
-                .with_child(settings_page_field(
-                    "Sidebar width",
-                    None,
-                    readout_with_unit(&format!("{:.0}", state.sidebar_width), "px"),
-                )),
-        )
+        .with_child(set_card("terminal", None).with_child(settings_page_field(
+            "Font size",
+            Some("Terminal output size in points."),
+            font_stepper(state.font_size_pt, shared),
+        )))
+        .with_child(set_card("layout", None).with_child(settings_page_field(
+            "Sidebar width",
+            Some("Width of the workspace sidebar."),
+            readout_with_unit(&format!("{:.0}", state.sidebar_width), "px"),
+        )))
         .with_child(set_card("preview", None).with_child(build_appearance_preview()))
 }
 
@@ -258,7 +228,7 @@ fn set_card(name: &str, meta: Option<&str>) -> ElementDef {
         head = head.with_child(
             ElementDef::new(Tag::Span)
                 .with_class("name-meta")
-                .with_text(format!("/ {meta}")),
+                .with_text(format!("\u{00b7} {meta}")),
         );
     }
     ElementDef::new(Tag::Div)
@@ -271,53 +241,12 @@ fn settings_page_field(label: &str, desc: Option<&str>, control: ElementDef) -> 
     ElementDef::new(Tag::Div)
         .with_class("setting-row")
         .with_class("set-field")
-        .with_style(StyleDeclaration::Display(Display::Flex))
-        .with_style(StyleDeclaration::AlignItems(AlignItems::Center))
-        .with_style(StyleDeclaration::JustifyContent(
-            JustifyContent::SpaceBetween,
-        ))
         .with_child(setting_meta(label, desc))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("set-control")
                 .with_child(control),
         )
-}
-
-fn segmented_control(options: &[&str], active: &str) -> ElementDef {
-    let mut root = ElementDef::new(Tag::Div).with_class("input-segmented");
-    for option in options {
-        let mut button = ElementDef::new(Tag::Span)
-            .with_class("seg-btn")
-            .with_text(*option);
-        if *option == active {
-            button = button.with_class("active");
-        }
-        root = root.with_child(button);
-    }
-    root
-}
-
-fn accent_swatches(active: &str) -> ElementDef {
-    let mut root = ElementDef::new(Tag::Div).with_class("color-swatches");
-    for accent in ["amber", "ember", "sage", "azure", "violet"] {
-        let mut swatch = ElementDef::new(Tag::Div)
-            .with_class("sw")
-            .with_class(accent);
-        if accent == active {
-            swatch = swatch.with_class("active");
-        }
-        root = root.with_child(swatch);
-    }
-    root
-}
-
-fn toggle_control(on: bool) -> ElementDef {
-    let mut toggle = ElementDef::new(Tag::Div).with_class("toggle");
-    if on {
-        toggle = toggle.with_class("on");
-    }
-    toggle
 }
 
 fn readout_with_unit(value: &str, unit: &str) -> ElementDef {
@@ -1243,6 +1172,7 @@ mod tests {
     use crate::state::{seed_state, SettingsSection};
     use std::sync::{Arc, Mutex};
     use unshit::core::element::{ElementContent, ElementTree};
+    use unshit::core::style::types::TextAlign;
     use unshit_test::TestHarness;
 
     fn make_shared() -> SharedState {
@@ -1312,17 +1242,30 @@ mod tests {
     }
 
     #[test]
-    fn settings_page_appearance_renders_theme_density_and_preview() {
+    fn settings_page_appearance_renders_applied_controls_and_preview() {
         let snap = make_snapshot_section(SettingsSection::Appearance);
         let shared = make_shared();
         let el = build_settings_page(&snap, &shared);
 
         assert_eq!(count_with_class(&el, "set-card"), 3);
-        assert!(has_class_anywhere(&el, "input-segmented"));
-        assert!(has_class_anywhere(&el, "color-swatches"));
-        assert!(has_class_anywhere(&el, "toggle"));
+        assert!(has_class_anywhere(&el, "stepper"));
+        assert!(has_class_anywhere(&el, "set-inline-control"));
         assert!(has_class_anywhere(&el, "preview-tile"));
-        assert!(collect_text_recursive(&el).contains("Walnut amber"));
+        let text = collect_text_recursive(&el);
+        assert!(text.contains("Terminal output size"));
+        assert!(text.contains("Width of the workspace sidebar"));
+        for stripped in [
+            "Theme",
+            "Accent",
+            "Scanline overlay",
+            "Background grain",
+            "Tab bar density",
+        ] {
+            assert!(
+                !text.contains(stripped),
+                "settings page should not render unapplied/fake setting {stripped:?}"
+            );
+        }
     }
 
     #[test]
@@ -1346,11 +1289,10 @@ mod tests {
         harness.step();
 
         for selector in [
-            ".input-segmented",
-            ".seg-btn",
-            ".color-swatches",
-            ".sw",
-            ".toggle",
+            ".stepper",
+            ".stepper-btn",
+            ".set-inline-control",
+            ".input-text",
             ".preview-tile",
         ] {
             let snap = harness.query(selector).expect(selector);
@@ -1365,6 +1307,32 @@ mod tests {
                 snap.layout_rect
             );
         }
+
+        let stepper_btn = harness.query(".stepper-btn").expect(".stepper-btn");
+        assert_eq!(
+            stepper_btn.computed_style.text_align,
+            TextAlign::Center,
+            "button UA defaults should center stepper glyphs unless CSS overrides them"
+        );
+        let number = harness.query(".input-num").expect(".input-num");
+        assert_eq!(
+            number.computed_style.text_align,
+            TextAlign::Right,
+            "settings number readouts rely on source CSS text-align"
+        );
+    }
+
+    #[test]
+    fn settings_page_styles_match_design_system_geometry_and_effects() {
+        let css = include_str!("../../assets/styles.css");
+        assert!(css.contains("grid-template-columns: 240px minmax(0, 1fr);"));
+        assert!(css.contains("max-width: 820px;"));
+        assert!(css.contains("backdrop-filter: blur(6px);"));
+        assert!(css.contains(".kbd-table"));
+        assert!(css.contains(".kbd-binding"));
+        assert!(
+            css.contains(".preview-tile") && css.contains("border: 1px solid var(--border-hair);")
+        );
     }
 
     #[test]
@@ -1380,6 +1348,19 @@ mod tests {
             shared.lock().unwrap().settings_section,
             SettingsSection::Shell
         );
+    }
+
+    #[test]
+    fn settings_page_savebar_matches_design_system_actions() {
+        let shared = make_shared();
+        let el = build_settings_page_savebar(&shared);
+        let text = collect_text_recursive(&el);
+
+        assert!(el.classes.contains(&"set-page-savebar".to_string()));
+        assert!(text.contains("2 unsaved changes"));
+        assert!(text.contains("discard"));
+        assert!(text.contains("reset to defaults"));
+        assert!(text.contains("save changes"));
     }
 
     // -- build_modal_header -----------------------------------------------------
@@ -1829,7 +1810,7 @@ mod tests {
         let state = shared.lock().unwrap();
         let snap = state.ui_snapshot();
         let toast = snap.toasts.first().expect("test notification toast");
-        assert_eq!(toast.title.as_deref(), Some("test notification"));
+        assert_eq!(toast.title.as_deref(), Some("Test notification"));
         assert_eq!(
             toast.target,
             Some(crate::state::ToastTarget {

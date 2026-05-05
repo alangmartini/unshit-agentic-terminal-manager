@@ -358,6 +358,18 @@ pub(crate) fn is_within_activity_window(
     now.saturating_duration_since(last_activity) < window
 }
 
+fn cascade_root_for_restyle(
+    restyle_root: Option<NodeId>,
+    document_root: NodeId,
+    scale_factor: f32,
+) -> NodeId {
+    if (scale_factor - 1.0).abs() >= 0.001 {
+        document_root
+    } else {
+        restyle_root.unwrap_or(document_root)
+    }
+}
+
 fn subtree_has_dirty_flags(arena: &NodeArena, node_id: NodeId, flags: DirtyFlags) -> bool {
     let Some(element) = arena.get(node_id) else {
         return false;
@@ -2160,14 +2172,16 @@ impl ApplicationHandler for AppHandler {
                 } else if state.needs_restyle {
                     // Pseudo-class state changes (hover / focus / active)
                     // narrow `restyle_root` to the LCA of the leaving and
-                    // entering nodes. Cascading from there instead of from
-                    // `state.root` is correct because every selector that
-                    // can re-evaluate (descendant or chain rooted at the
-                    // changed pseudo state) lives in that subtree. Sibling
-                    // combinators (`.x:hover ~ .y`) are not supported by
-                    // this scoping rule (see the doc on
-                    // [`NodeArena::lowest_common_ancestor`]).
-                    let cascade_root = state.restyle_root.take().unwrap_or(state.root);
+                    // entering nodes. At non-1.0 scale factors, however,
+                    // inherited values outside that subtree have already
+                    // been scaled in-place, so a narrow cascade can inherit
+                    // scaled font metrics and then scale them again. Use a
+                    // full cascade when scaling is active.
+                    let cascade_root = cascade_root_for_restyle(
+                        state.restyle_root.take(),
+                        state.root,
+                        state.scale_factor,
+                    );
                     let t1 = Instant::now();
                     resolve_all_styles_with_transitions(
                         &mut state.arena,
@@ -3733,6 +3747,32 @@ mod tests {
         let last = Instant::now() + Duration::from_millis(100);
         let now = last - Duration::from_millis(50);
         assert!(is_within_activity_window(last, now, ACTIVITY_WINDOW));
+    }
+
+    #[test]
+    fn cascade_root_for_restyle_keeps_narrow_scope_at_normal_scale() {
+        let document_root = NodeId { index: 1, generation: 0 };
+        let restyle_root = NodeId { index: 8, generation: 0 };
+
+        assert_eq!(cascade_root_for_restyle(Some(restyle_root), document_root, 1.0), restyle_root);
+    }
+
+    #[test]
+    fn cascade_root_for_restyle_uses_document_root_when_scaled() {
+        let document_root = NodeId { index: 1, generation: 0 };
+        let restyle_root = NodeId { index: 8, generation: 0 };
+
+        assert_eq!(
+            cascade_root_for_restyle(Some(restyle_root), document_root, 1.25),
+            document_root
+        );
+    }
+
+    #[test]
+    fn cascade_root_for_restyle_defaults_to_document_root() {
+        let document_root = NodeId { index: 1, generation: 0 };
+
+        assert_eq!(cascade_root_for_restyle(None, document_root, 1.0), document_root);
     }
 
     #[test]

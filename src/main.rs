@@ -743,7 +743,6 @@ fn main() {
             title: "terminal manager".to_string(),
             width: 1280,
             height: 800,
-            decorations: false,
             css: STYLES.to_string(),
             fonts: terminal_font_sources(),
             user_shortcuts: user_shortcut_bindings(),
@@ -964,7 +963,13 @@ mod tests {
         harness.set_scale_factor(1.5);
         harness.step();
 
-        for selector in [".input-segmented", ".color-swatches", ".sw", ".toggle"] {
+        for selector in [
+            ".stepper",
+            ".stepper-btn",
+            ".set-inline-control",
+            ".input-text",
+            ".preview-tile",
+        ] {
             let snap = harness.query(selector).expect(selector);
             assert!(
                 snap.layout_rect.width > 0.0 && snap.layout_rect.height > 0.0,

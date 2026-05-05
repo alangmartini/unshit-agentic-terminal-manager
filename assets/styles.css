@@ -2812,7 +2812,7 @@ body.dragging-pane {
 
 .settings-page {
   display: grid;
-  grid-template-columns: 180px minmax(0, 1fr);
+  grid-template-columns: 240px minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
   background: var(--bg-base);
@@ -2934,6 +2934,12 @@ body.dragging-pane {
   box-shadow: inset 2px 0 0 var(--amber-300);
 }
 
+.set-page-nav-item .item-meta {
+  margin-left: auto;
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+}
+
 .set-page-foot {
   display: flex;
   align-items: center;
@@ -3001,7 +3007,7 @@ body.dragging-pane {
   flex-direction: column;
   gap: 22px;
   width: 100%;
-  max-width: 560px;
+  max-width: 820px;
   min-height: 0;
   padding: 18px 32px 40px;
 }
@@ -3097,6 +3103,17 @@ body.dragging-pane {
   color: var(--fg-primary);
   font: var(--type-body);
   outline: none;
+}
+
+.input-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 24px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--fg-tertiary) 50%),
+                    linear-gradient(135deg, var(--fg-tertiary) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 50%, calc(100% - 10px) 50%;
+  background-size: 4px 4px;
+  background-repeat: no-repeat;
 }
 
 .input-text:focus,
@@ -3232,6 +3249,66 @@ body.dragging-pane {
 .sw.azure { background: #6aa2ad; }
 .sw.violet { background: #a88bb8; }
 
+.kbd-binding {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px 4px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+.kbd-binding:hover {
+  background: var(--bg-hover);
+}
+
+.kbd-binding .edit-hint {
+  margin-left: 8px;
+  color: var(--fg-muted);
+  font: var(--type-meta);
+}
+
+.kbd-table {
+  width: 100%;
+  border-collapse: collapse;
+  font: var(--type-body);
+}
+
+.kbd-table th {
+  padding: 6px 14px;
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--border-hair);
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+  letter-spacing: 0.14em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.kbd-table td {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-hair);
+  color: var(--fg-secondary);
+}
+
+.kbd-table tr:hover td {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+
+.kbd-table tr:last-child td {
+  border-bottom: none;
+}
+
+.kbd-table .cmd-name {
+  color: var(--fg-primary);
+}
+
+.kbd-table .cmd-desc {
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+}
+
 .toggle {
   width: 28px;
   height: 16px;
@@ -3268,6 +3345,7 @@ body.dragging-pane {
 .preview-tile {
   padding: 14px 16px;
   background: var(--bg-base);
+  border: 1px solid var(--border-hair);
   border-radius: var(--r-md);
   color: var(--fg-secondary);
   font: var(--type-body);
