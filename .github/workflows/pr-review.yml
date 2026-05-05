@@ -27,8 +27,14 @@ jobs:
       - name: Install Rust toolchain
         shell: powershell
         run: |
-          "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & "$env:USERPROFILE\.cargo\bin\rustup.exe" toolchain install stable --component clippy,rustfmt
+          $toolchainBin = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin"
+          if (-not (Test-Path "$toolchainBin\cargo.exe")) {
+            throw "Stable Rust toolchain is missing at $toolchainBin"
+          }
+          $toolchainBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$toolchainBin\cargo.exe" --version
+          & "$toolchainBin\cargo-clippy.exe" --version
+          & "$toolchainBin\cargo-fmt.exe" --version
 
       - uses: Swatinem/rust-cache@v2
 
@@ -52,20 +58,26 @@ jobs:
       - name: Install Rust toolchain
         shell: powershell
         run: |
-          "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & "$env:USERPROFILE\.cargo\bin\rustup.exe" toolchain install stable --component llvm-tools-preview
+          $toolchainBin = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin"
+          if (-not (Test-Path "$toolchainBin\cargo.exe")) {
+            throw "Stable Rust toolchain is missing at $toolchainBin"
+          }
+          $toolchainBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$toolchainBin\cargo.exe" --version
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-llvm-cov
         shell: powershell
         run: |
-          if (-not (Get-Command cargo-llvm-cov -ErrorAction SilentlyContinue)) {
+          $cargoLlvmCov = "$env:USERPROFILE\.cargo\bin\cargo-llvm-cov.exe"
+          if (-not (Test-Path $cargoLlvmCov)) {
             cargo install cargo-llvm-cov --locked
           }
 
       - name: Generate coverage report
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+        shell: powershell
+        run: '& "$env:USERPROFILE\.cargo\bin\cargo-llvm-cov.exe" --all-features --lcov --output-path lcov.info'
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
