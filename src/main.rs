@@ -743,6 +743,7 @@ fn main() {
             title: "terminal manager".to_string(),
             width: 1280,
             height: 800,
+            decorations: false,
             css: STYLES.to_string(),
             fonts: terminal_font_sources(),
             user_shortcuts: user_shortcut_bindings(),

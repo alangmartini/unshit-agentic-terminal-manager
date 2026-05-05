@@ -1336,8 +1336,8 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             StyleDeclaration::FontWeight(w)
         }
         "font-family" => {
-            let val = parser.expect_ident_or_string().map_err(|_| ())?;
-            StyleDeclaration::FontFamily(val.as_ref().to_string())
+            let family = parse_font_family_list(parser)?;
+            StyleDeclaration::FontFamily(family)
         }
         "content" => StyleDeclaration::Content(parse_content_value(parser)?),
         "line-height" => StyleDeclaration::LineHeight(parse_number(parser)?),
@@ -1842,7 +1842,7 @@ fn parse_font_shorthand(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaratio
         }
 
         if font_family.is_none() {
-            font_family = Some(parse_font_family_first(parser)?);
+            font_family = Some(parse_font_family_list(parser)?);
             break;
         }
 
@@ -1861,10 +1861,6 @@ fn parse_font_shorthand(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaratio
     }
     decls.push(StyleDeclaration::FontFamily(family));
 
-    // The framework currently stores one font family string. Keep the first
-    // usable family and drain the rest of any comma-separated fallback list so
-    // leftover tokens do not poison the next declaration.
-    skip_to_semicolon(parser);
     Ok(decls)
 }
 
@@ -1928,11 +1924,46 @@ fn parse_font_line_height(parser: &mut Parser, font_size: f32) -> Result<f32, ()
     }
 }
 
-fn parse_font_family_first(parser: &mut Parser) -> Result<String, ()> {
-    match parser.next().map_err(|_| ())? {
-        Token::QuotedString(s) => Ok(s.as_ref().to_string()),
-        Token::Ident(s) => Ok(s.as_ref().to_string()),
-        _ => Err(()),
+fn parse_font_family_list(parser: &mut Parser) -> Result<String, ()> {
+    let mut families = Vec::new();
+    let mut current = String::new();
+    let mut consumed = false;
+
+    while !parser.is_exhausted() {
+        let state = parser.state();
+        if parser.try_parse(cssparser::Parser::expect_semicolon).is_ok() {
+            break;
+        }
+        parser.reset(&state);
+
+        match parser.next().map_err(|_| ())? {
+            Token::QuotedString(s) | Token::Ident(s) => {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(s.as_ref());
+                consumed = true;
+            }
+            Token::Comma => {
+                let family = current.trim();
+                if !family.is_empty() {
+                    families.push(family.to_string());
+                    current.clear();
+                }
+            }
+            _ => return Err(()),
+        }
+    }
+
+    let family = current.trim();
+    if !family.is_empty() {
+        families.push(family.to_string());
+    }
+
+    if consumed && !families.is_empty() {
+        Ok(families.join(", "))
+    } else {
+        Err(())
     }
 }
 
@@ -4147,7 +4178,23 @@ mod tests {
         assert_eq!(style.font_weight, FontWeight::W(600));
         assert!((style.font_size - 13.0).abs() < 0.01);
         assert!((style.line_height - 1.4).abs() < 0.01);
-        assert_eq!(style.font_family, "JetBrains Mono");
+        assert_eq!(style.font_family, "JetBrains Mono, monospace");
+    }
+
+    #[test]
+    fn test_font_family_preserves_fallback_list() {
+        let decls = parse_decls(
+            r#".x { font-family: "JetBrains Mono", "Berkeley Mono", "SF Mono", Menlo, Consolas, monospace; }"#,
+        );
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(
+            style.font_family,
+            "JetBrains Mono, Berkeley Mono, SF Mono, Menlo, Consolas, monospace"
+        );
     }
 
     #[test]
@@ -4177,7 +4224,7 @@ mod tests {
         assert_eq!(style.font_weight, FontWeight::W(400));
         assert!((style.font_size - 12.0).abs() < 0.01);
         assert!((style.line_height - 1.55).abs() < 0.01);
-        assert_eq!(style.font_family, "JetBrains Mono");
+        assert_eq!(style.font_family, "JetBrains Mono, Consolas, monospace");
     }
 
     #[test]
@@ -4213,7 +4260,7 @@ mod tests {
         assert_eq!(style.font_weight, FontWeight::W(500));
         assert!((style.font_size - 11.0).abs() < 0.01);
         assert!((style.line_height - 1.4).abs() < 0.01);
-        assert_eq!(style.font_family, "JetBrains Mono");
+        assert_eq!(style.font_family, "JetBrains Mono, Berkeley Mono, monospace");
     }
 
     #[test]

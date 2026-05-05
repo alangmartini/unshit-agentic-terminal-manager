@@ -153,6 +153,22 @@ fn atlas_font_namespace(cache_key: &cosmic_text::CacheKey) -> u64 {
     hasher.finish()
 }
 
+#[inline]
+fn atlas_text_font_namespace(
+    cache_key: &cosmic_text::CacheKey,
+    font_family: &str,
+    font_weight: FontWeight,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cache_key.font_id.hash(&mut hasher);
+    cache_key.flags.hash(&mut hasher);
+    font_family.hash(&mut hasher);
+    font_weight_number(font_weight).hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Compute the projected axis length of a gradient inside a box of size
 /// `(w, h)` for the given angle in degrees.
 ///
@@ -2625,7 +2641,7 @@ fn emit_text_glyphs_cached(
             let physical = glyph.physical((ls_offset, 0.0), 1.0);
 
             let key = GlyphKey {
-                font_id: atlas_font_namespace(&physical.cache_key),
+                font_id: atlas_text_font_namespace(&physical.cache_key, font_family, font_weight),
                 glyph_id: physical.cache_key.glyph_id,
                 font_size_tenths: (font_size * 10.0) as u16,
                 subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)

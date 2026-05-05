@@ -1,4 +1,4 @@
-use winit::dpi::LogicalSize;
+use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
 
@@ -11,7 +11,8 @@ pub fn create_window(
 ) -> Box<dyn Window> {
     let attrs = WindowAttributes::default()
         .with_title(title)
-        .with_surface_size(LogicalSize::new(width, height))
+        .with_surface_size(PhysicalSize::new(width, height))
+        .with_transparent(false)
         .with_decorations(decorations);
 
     event_loop.create_window(attrs).unwrap()

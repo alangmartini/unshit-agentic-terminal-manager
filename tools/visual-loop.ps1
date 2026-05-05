@@ -27,10 +27,17 @@ namespace VisualLoop {
         public int Right;
         public int Bottom;
     }
+    public struct POINT {
+        public int X;
+        public int Y;
+    }
     public static class Win32 {
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT point);
+        [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
     }
 }
 "@
@@ -45,6 +52,14 @@ function Wait-ForWindow {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
+        $window = Get-Process -Name 'terminal-manager' -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowHandle -ne 0 } |
+            Sort-Object StartTime -Descending |
+            Select-Object -First 1
+        if ($null -ne $window) {
+            return $window
+        }
+
         $window = Get-Process |
             Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like $TitleLike } |
             Sort-Object StartTime -Descending |
@@ -65,14 +80,33 @@ function Capture-Window {
     )
 
     $rect = New-Object VisualLoop.RECT
-    [VisualLoop.Win32]::GetWindowRect($WindowProcess.MainWindowHandle, [ref]$rect) | Out-Null
-    $width = [Math]::Max(1, $rect.Right - $rect.Left)
-    $height = [Math]::Max(1, $rect.Bottom - $rect.Top)
+    $dwmOk = [VisualLoop.Win32]::DwmGetWindowAttribute(
+        $WindowProcess.MainWindowHandle,
+        9,
+        [ref]$rect,
+        [System.Runtime.InteropServices.Marshal]::SizeOf([type][VisualLoop.RECT])
+    ) -eq 0
+    if ($dwmOk) {
+        $left = $rect.Left
+        $top = $rect.Top
+        $width = [Math]::Max(1, $rect.Right - $rect.Left)
+        $height = [Math]::Max(1, $rect.Bottom - $rect.Top)
+    } else {
+        [VisualLoop.Win32]::GetClientRect($WindowProcess.MainWindowHandle, [ref]$rect) | Out-Null
+        $origin = New-Object VisualLoop.POINT
+        $origin.X = 0
+        $origin.Y = 0
+        [VisualLoop.Win32]::ClientToScreen($WindowProcess.MainWindowHandle, [ref]$origin) | Out-Null
+        $left = $origin.X
+        $top = $origin.Y
+        $width = [Math]::Max(1, $rect.Right - $rect.Left)
+        $height = [Math]::Max(1, $rect.Bottom - $rect.Top)
+    }
 
     $bitmap = New-Object System.Drawing.Bitmap $width, $height
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     try {
-        $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
+        $graphics.CopyFromScreen($left, $top, 0, 0, $bitmap.Size)
         $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
     } finally {
         $graphics.Dispose()
@@ -80,8 +114,8 @@ function Capture-Window {
     }
 
     return @{
-        Left = $rect.Left
-        Top = $rect.Top
+        Left = $left
+        Top = $top
         Width = $width
         Height = $height
     }
