@@ -24,9 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install stable --component clippy,rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -47,9 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install stable --component llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
 
