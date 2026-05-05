@@ -77,7 +77,10 @@ jobs:
 
       - name: Generate coverage report
         shell: powershell
-        run: '& "$env:USERPROFILE\.cargo\bin\cargo-llvm-cov.exe" --all-features --lcov --output-path lcov.info'
+        run: |
+          $toolchainBin = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin"
+          $env:PATH = "$toolchainBin;$env:USERPROFILE\.cargo\bin;$env:PATH"
+          cargo llvm-cov --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
