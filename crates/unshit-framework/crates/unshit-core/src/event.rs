@@ -1,5 +1,5 @@
 use crate::id::NodeId;
-use crate::style::types::{CssResize, Layer, Overflow, PointerEvents};
+use crate::style::types::{AppRegion, CssResize, Layer, Overflow, PointerEvents};
 use crate::tree::NodeArena;
 use bitflags::bitflags;
 use std::fmt;
@@ -496,6 +496,26 @@ pub fn find_click_handler(arena: &NodeArena, start: NodeId) -> Option<NodeId> {
     None
 }
 
+/// Resolve browser/Electron-style app-region behavior from the hit node.
+///
+/// Descendants with `auto` stay part of the nearest explicit ancestor region,
+/// while `no-drag` carves out interactive islands inside a draggable titlebar.
+pub fn effective_app_region(arena: &NodeArena, start: NodeId) -> AppRegion {
+    let mut current = start;
+    while !current.is_dangling() {
+        let Some(element) = arena.get(current) else { break };
+        match element.computed_style.app_region {
+            AppRegion::Auto => current = element.parent,
+            explicit => return explicit,
+        }
+    }
+    AppRegion::Auto
+}
+
+pub fn is_window_drag_region(arena: &NodeArena, start: NodeId) -> bool {
+    effective_app_region(arena, start) == AppRegion::Drag
+}
+
 const GRIP_ZONE: f32 = 16.0;
 
 /// Walk the element tree looking for a resizable element whose bottom-right
@@ -848,7 +868,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::element::{Element, LayoutRect, Tag};
-    use crate::style::types::{CssResize as Resize, Overflow};
+    use crate::style::types::{AppRegion, CssResize as Resize, Overflow};
     use crate::tree::NodeArena;
 
     /// Build a single resizable element at a known position.
@@ -866,6 +886,36 @@ mod tests {
         elem.computed_style.resize = resize;
         elem.computed_style.overflow = overflow;
         arena.alloc(elem)
+    }
+
+    #[test]
+    fn app_region_inherits_nearest_explicit_ancestor() {
+        let mut arena = NodeArena::new();
+        let mut parent_el = Element::new(Tag::Div);
+        parent_el.computed_style.app_region = AppRegion::Drag;
+        let parent = arena.alloc(parent_el);
+        let child = arena.alloc(Element::new(Tag::Div));
+        arena.append_child(parent, child);
+
+        assert_eq!(effective_app_region(&arena, child), AppRegion::Drag);
+        assert!(is_window_drag_region(&arena, child));
+    }
+
+    #[test]
+    fn app_region_no_drag_overrides_drag_parent() {
+        let mut arena = NodeArena::new();
+        let mut parent_el = Element::new(Tag::Div);
+        parent_el.computed_style.app_region = AppRegion::Drag;
+        let parent = arena.alloc(parent_el);
+        let mut child_el = Element::new(Tag::Div);
+        child_el.computed_style.app_region = AppRegion::NoDrag;
+        let child = arena.alloc(child_el);
+        let grandchild = arena.alloc(Element::new(Tag::Div));
+        arena.append_child(parent, child);
+        arena.append_child(child, grandchild);
+
+        assert_eq!(effective_app_region(&arena, grandchild), AppRegion::NoDrag);
+        assert!(!is_window_drag_region(&arena, grandchild));
     }
 
     #[test]

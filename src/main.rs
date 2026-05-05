@@ -228,7 +228,7 @@ fn build_tree(
                 .with_class("ambient-layer")
                 .with_class("rust-glow"),
         )
-        .with_child(build_titlebar(shared));
+        .with_child(build_titlebar(snap, shared));
 
     if snap.settings_open {
         root = root
@@ -968,7 +968,10 @@ mod tests {
             ".stepper-btn",
             ".set-inline-control",
             ".input-text",
+            ".input-num",
+            ".set-unit",
             ".preview-tile",
+            ".set-page-savebar",
         ] {
             let snap = harness.query(selector).expect(selector);
             assert!(

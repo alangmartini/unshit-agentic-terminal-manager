@@ -64,6 +64,29 @@ impl Default for Edges {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EdgeAutoFlags {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl EdgeAutoFlags {
+    pub const NONE: EdgeAutoFlags =
+        EdgeAutoFlags { top: false, right: false, bottom: false, left: false };
+
+    pub fn any(self) -> bool {
+        self.top || self.right || self.bottom || self.left
+    }
+}
+
+impl Default for EdgeAutoFlags {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Corners {
     pub top_left: f32,
@@ -764,6 +787,14 @@ pub enum UserSelect {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AppRegion {
+    #[default]
+    Auto,
+    Drag,
+    NoDrag,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TextDecoration {
     #[default]
     None,
@@ -1014,6 +1045,7 @@ pub struct ComputedStyle {
     pub max_height: Dimension,
     pub padding: Edges,
     pub margin: Edges,
+    pub margin_auto: EdgeAutoFlags,
     pub row_gap: f32,
     pub column_gap: f32,
     pub overflow: Overflow,
@@ -1082,6 +1114,7 @@ pub struct ComputedStyle {
     pub visibility: Visibility,
     pub pointer_events: PointerEvents,
     pub user_select: UserSelect,
+    pub app_region: AppRegion,
 
     // Keyboard capture
     pub keyboard_capture: bool,
@@ -1138,6 +1171,7 @@ impl Default for ComputedStyle {
             max_height: Dimension::Auto,
             padding: Edges::ZERO,
             margin: Edges::ZERO,
+            margin_auto: EdgeAutoFlags::NONE,
             row_gap: 0.0,
             column_gap: 0.0,
             overflow: Overflow::Visible,
@@ -1188,6 +1222,7 @@ impl Default for ComputedStyle {
             visibility: Visibility::Visible,
             pointer_events: PointerEvents::Auto,
             user_select: UserSelect::Auto,
+            app_region: AppRegion::Auto,
             keyboard_capture: false,
             layer: Layer::Content,
             render_target: RenderTarget::Inline,
@@ -1273,7 +1308,7 @@ impl ComputedStyle {
                 height: dim_to_taffy(self.max_height, viewport_w, viewport_h),
             },
             padding: edges_to_taffy_rect(self.padding),
-            margin: edges_to_taffy_rect_auto(self.margin),
+            margin: edges_to_taffy_rect_auto(self.margin, self.margin_auto),
             gap: taffy::Size {
                 width: taffy::LengthPercentage::Length(self.column_gap),
                 height: taffy::LengthPercentage::Length(self.row_gap),
@@ -1413,12 +1448,22 @@ fn opt_dim_to_taffy_auto(
     }
 }
 
-fn edges_to_taffy_rect_auto(e: Edges) -> taffy::Rect<taffy::LengthPercentageAuto> {
+fn edges_to_taffy_rect_auto(
+    e: Edges,
+    auto: EdgeAutoFlags,
+) -> taffy::Rect<taffy::LengthPercentageAuto> {
+    let value = |v, is_auto| {
+        if is_auto {
+            taffy::LengthPercentageAuto::Auto
+        } else {
+            taffy::LengthPercentageAuto::Length(v)
+        }
+    };
     taffy::Rect {
-        left: taffy::LengthPercentageAuto::Length(e.left),
-        right: taffy::LengthPercentageAuto::Length(e.right),
-        top: taffy::LengthPercentageAuto::Length(e.top),
-        bottom: taffy::LengthPercentageAuto::Length(e.bottom),
+        left: value(e.left, auto.left),
+        right: value(e.right, auto.right),
+        top: value(e.top, auto.top),
+        bottom: value(e.bottom, auto.bottom),
     }
 }
 

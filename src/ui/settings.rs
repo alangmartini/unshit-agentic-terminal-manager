@@ -52,7 +52,7 @@ fn build_settings_page_rail(active: SettingsSection, shared: &SharedState) -> El
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("sub")
-                        .with_text("v0.4.2"),
+                        .with_text(format!("v{}", env!("CARGO_PKG_VERSION"))),
                 ),
         )
         .with_child(
@@ -102,12 +102,7 @@ fn build_settings_page_rail(active: SettingsSection, shared: &SharedState) -> El
                         .with_class("dot")
                         .with_class("status-running"),
                 )
-                .with_child(ElementDef::new(Tag::Span).with_text("ptyd up"))
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("build")
-                        .with_text("build 4a2f1c"),
-                ),
+                .with_child(ElementDef::new(Tag::Span).with_text("ptyd up")),
         )
 }
 
@@ -312,38 +307,22 @@ fn preview_span(class: &str, text: &str) -> ElementDef {
 }
 
 fn build_settings_page_savebar(shared: &SharedState) -> ElementDef {
-    let discard_state = shared.clone();
-    let save_state = shared.clone();
+    let close_state = shared.clone();
     ElementDef::new(Tag::Div)
         .with_class("set-page-savebar")
         .with_child(
             ElementDef::new(Tag::Span)
-                .with_class("dirty")
-                .with_text("\u{2022} 2 unsaved changes"),
+                .with_class("saved")
+                .with_text("changes apply immediately"),
         )
         .with_child(ElementDef::new(Tag::Span).with_class("spacer"))
         .with_child(
             ElementDef::new(Tag::Button)
                 .with_class("btn")
                 .with_class("ghost")
-                .with_text("discard")
+                .with_text("close")
                 .on_click(move || {
-                    mutate_with(&discard_state, |st| dispatch(st, "modal.close"));
-                }),
-        )
-        .with_child(
-            ElementDef::new(Tag::Button)
-                .with_class("btn")
-                .with_class("ghost")
-                .with_text("reset to defaults"),
-        )
-        .with_child(
-            ElementDef::new(Tag::Button)
-                .with_class("btn")
-                .with_class("primary")
-                .with_text("save changes")
-                .on_click(move || {
-                    mutate_with(&save_state, |st| dispatch(st, "modal.close"));
+                    mutate_with(&close_state, |st| dispatch(st, "modal.close"));
                 }),
         )
 }
@@ -439,17 +418,11 @@ fn build_modal_content(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
 // -- section builders -------------------------------------------------------
 
 fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    section_shell("appearance")
-        .with_child(setting_row(
-            "Theme",
-            "Visual palette for the entire application",
-            theme_chip_group(state, shared),
-        ))
-        .with_child(setting_row(
-            "Font size",
-            "Terminal output size in points",
-            font_stepper(state.font_size_pt, shared),
-        ))
+    section_shell("appearance").with_child(setting_row(
+        "Font size",
+        "Terminal output size in points",
+        font_stepper(state.font_size_pt, shared),
+    ))
 }
 
 fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -1075,28 +1048,6 @@ fn setting_row(label: &str, desc: &str, control: ElementDef) -> ElementDef {
         .with_child(control)
 }
 
-fn theme_chip_group(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    let mut chips = ElementDef::new(Tag::Div)
-        .with_class("theme-chips")
-        .with_class("color-swatches");
-    for theme in ["amber", "green", "cyan", "mono"] {
-        let mut chip = ElementDef::new(Tag::Button)
-            .with_class("theme-chip")
-            .with_class("sw")
-            .with_class(theme);
-        if state.theme == theme {
-            chip = chip.with_class("active");
-        }
-        let s = shared.clone();
-        let theme_name = theme.to_string();
-        chip = chip.on_click(move || {
-            mutate_with(&s, |st| st.theme = theme_name.clone());
-        });
-        chips = chips.with_child(chip);
-    }
-    chips
-}
-
 type StepCallback = Box<dyn Fn() + Send + Sync + 'static>;
 
 struct StepCallbacks {
@@ -1250,10 +1201,17 @@ mod tests {
         assert_eq!(count_with_class(&el, "set-card"), 3);
         assert!(has_class_anywhere(&el, "stepper"));
         assert!(has_class_anywhere(&el, "set-inline-control"));
+        assert!(has_class_anywhere(&el, "input-num"));
         assert!(has_class_anywhere(&el, "preview-tile"));
+        assert!(!has_class_anywhere(&el, "input-segmented"));
+        assert!(!has_class_anywhere(&el, "color-swatches"));
+        assert!(!has_class_anywhere(&el, "toggle"));
         let text = collect_text_recursive(&el);
+        assert!(text.contains("Font size"));
         assert!(text.contains("Terminal output size"));
+        assert!(text.contains("Sidebar width"));
         assert!(text.contains("Width of the workspace sidebar"));
+        assert!(text.contains("changes apply immediately"));
         for stripped in [
             "Theme",
             "Accent",
@@ -1293,7 +1251,10 @@ mod tests {
             ".stepper-btn",
             ".set-inline-control",
             ".input-text",
+            ".input-num",
+            ".set-unit",
             ".preview-tile",
+            ".set-page-savebar",
         ] {
             let snap = harness.query(selector).expect(selector);
             assert!(
@@ -1351,16 +1312,18 @@ mod tests {
     }
 
     #[test]
-    fn settings_page_savebar_matches_design_system_actions() {
+    fn settings_page_savebar_matches_immediate_apply_actions() {
         let shared = make_shared();
         let el = build_settings_page_savebar(&shared);
         let text = collect_text_recursive(&el);
 
         assert!(el.classes.contains(&"set-page-savebar".to_string()));
-        assert!(text.contains("2 unsaved changes"));
-        assert!(text.contains("discard"));
-        assert!(text.contains("reset to defaults"));
-        assert!(text.contains("save changes"));
+        assert!(text.contains("changes apply immediately"));
+        assert!(text.contains("close"));
+        assert!(!text.contains("2 unsaved changes"));
+        assert!(!text.contains("discard"));
+        assert!(!text.contains("reset to defaults"));
+        assert!(!text.contains("save changes"));
     }
 
     // -- build_modal_header -----------------------------------------------------
@@ -1506,67 +1469,16 @@ mod tests {
     // -- build_appearance_section -----------------------------------------------
 
     #[test]
-    fn appearance_section_has_title_and_two_rows() {
+    fn appearance_section_has_title_and_applied_font_row() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
-        // title + 2 rows (theme, font)
-        assert_eq!(el.children.len(), 3);
-    }
-
-    #[test]
-    fn appearance_section_theme_chips_mark_amber_active() {
-        let snap = make_snapshot(); // theme defaults to "amber"
-        let shared = make_shared();
-        let el = build_appearance_section(&snap, &shared);
-        let theme_row = &el.children[1];
-        let theme_chips = &theme_row.children[1];
-        assert!(theme_chips.classes.contains(&"theme-chips".to_string()));
-        assert!(theme_chips.children[0]
-            .classes
-            .contains(&"active".to_string()));
-        for chip in &theme_chips.children[1..] {
-            assert!(!chip.classes.contains(&"active".to_string()));
-        }
-    }
-
-    #[test]
-    fn appearance_section_theme_chips_mark_cyan_active() {
-        let mut state = seed_state();
-        state.theme = "cyan".to_string();
-        let snap = state.ui_snapshot();
-        let shared = make_shared();
-        let el = build_appearance_section(&snap, &shared);
-        let theme_chips = &el.children[1].children[1];
-        assert!(theme_chips.children[2]
-            .classes
-            .contains(&"active".to_string()));
-    }
-
-    #[test]
-    fn appearance_section_theme_chips_mark_green_active() {
-        let mut state = seed_state();
-        state.theme = "green".to_string();
-        let snap = state.ui_snapshot();
-        let shared = make_shared();
-        let el = build_appearance_section(&snap, &shared);
-        let theme_chips = &el.children[1].children[1];
-        assert!(theme_chips.children[1]
-            .classes
-            .contains(&"active".to_string()));
-    }
-
-    #[test]
-    fn appearance_section_theme_chips_mark_mono_active() {
-        let mut state = seed_state();
-        state.theme = "mono".to_string();
-        let snap = state.ui_snapshot();
-        let shared = make_shared();
-        let el = build_appearance_section(&snap, &shared);
-        let theme_chips = &el.children[1].children[1];
-        assert!(theme_chips.children[3]
-            .classes
-            .contains(&"active".to_string()));
+        // title + font row; fake theme/config rows are intentionally absent.
+        assert_eq!(el.children.len(), 2);
+        assert_eq!(
+            text_of(&el.children[1].children[0].children[0]),
+            Some("Font size")
+        );
     }
 
     #[test]
@@ -1574,7 +1486,7 @@ mod tests {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
-        let font_row = &el.children[2];
+        let font_row = &el.children[1];
         let stepper = &font_row.children[1];
         assert!(stepper.classes.contains(&"stepper".to_string()));
         assert_eq!(stepper.children.len(), 3);
@@ -1810,7 +1722,7 @@ mod tests {
         let state = shared.lock().unwrap();
         let snap = state.ui_snapshot();
         let toast = snap.toasts.first().expect("test notification toast");
-        assert_eq!(toast.title.as_deref(), Some("Test notification"));
+        assert_eq!(toast.title.as_deref(), Some("test notification"));
         assert_eq!(
             toast.target,
             Some(crate::state::ToastTarget {
@@ -1943,42 +1855,12 @@ mod tests {
     }
 
     #[test]
-    fn theme_chip_click_changes_theme() {
-        let shared = make_shared();
-        let snap = make_snapshot();
-        let el = build_appearance_section(&snap, &shared);
-        let theme_chips = &el.children[1].children[1];
-        (theme_chips.children[1].on_click.as_ref().unwrap())();
-        assert_eq!(shared.lock().unwrap().theme, "green");
-    }
-
-    #[test]
-    fn theme_chip_click_changes_to_cyan() {
-        let shared = make_shared();
-        let snap = make_snapshot();
-        let el = build_appearance_section(&snap, &shared);
-        let theme_chips = &el.children[1].children[1];
-        (theme_chips.children[2].on_click.as_ref().unwrap())();
-        assert_eq!(shared.lock().unwrap().theme, "cyan");
-    }
-
-    #[test]
-    fn theme_chip_click_changes_to_mono() {
-        let shared = make_shared();
-        let snap = make_snapshot();
-        let el = build_appearance_section(&snap, &shared);
-        let theme_chips = &el.children[1].children[1];
-        (theme_chips.children[3].on_click.as_ref().unwrap())();
-        assert_eq!(shared.lock().unwrap().theme, "mono");
-    }
-
-    #[test]
     fn font_dec_button_decreases_font_size() {
         let shared = make_shared();
         let initial = shared.lock().unwrap().font_size_pt;
         let snap = make_snapshot();
         let el = build_appearance_section(&snap, &shared);
-        let stepper = &el.children[2].children[1];
+        let stepper = &el.children[1].children[1];
         let dec_btn = &stepper.children[0];
         (dec_btn.on_click.as_ref().unwrap())();
         let after = shared.lock().unwrap().font_size_pt;
@@ -1991,7 +1873,7 @@ mod tests {
         let initial = shared.lock().unwrap().font_size_pt;
         let snap = make_snapshot();
         let el = build_appearance_section(&snap, &shared);
-        let stepper = &el.children[2].children[1];
+        let stepper = &el.children[1].children[1];
         let inc_btn = &stepper.children[2];
         (inc_btn.on_click.as_ref().unwrap())();
         let after = shared.lock().unwrap().font_size_pt;

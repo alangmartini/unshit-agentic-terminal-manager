@@ -527,7 +527,10 @@ pub fn apply_value(style: &mut ComputedStyle, prop: TransitionProperty, value: &
             style.border_radius = *v;
         }
         (TransitionProperty::Padding, AnimatableValue::Edges(v)) => style.padding = *v,
-        (TransitionProperty::Margin, AnimatableValue::Edges(v)) => style.margin = *v,
+        (TransitionProperty::Margin, AnimatableValue::Edges(v)) => {
+            style.margin = *v;
+            style.margin_auto = EdgeAutoFlags::NONE;
+        }
         (TransitionProperty::Width, AnimatableValue::Dimension(v)) => style.width = *v,
         (TransitionProperty::Height, AnimatableValue::Dimension(v)) => style.height = *v,
         (TransitionProperty::Gap, AnimatableValue::Float(v)) => {
