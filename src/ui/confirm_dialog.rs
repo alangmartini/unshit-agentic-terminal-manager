@@ -766,7 +766,10 @@ mod tests {
         assert!((title.computed_style.font_size - 13.0).abs() < 0.01);
         assert!((title.computed_style.line_height - 1.4).abs() < 0.01);
         assert_eq!(title.computed_style.font_weight, FontWeight::W(600));
-        assert_eq!(title.computed_style.font_family, "JetBrains Mono");
+        assert_eq!(
+            title.computed_style.font_family,
+            "JetBrains Mono, Berkeley Mono, SF Mono, Menlo, Consolas, monospace"
+        );
 
         let blurb = harness.query(".cd-blurb").expect(".cd-blurb");
         assert!((blurb.computed_style.font_size - 12.0).abs() < 0.01);
