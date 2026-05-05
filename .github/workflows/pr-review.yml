@@ -58,7 +58,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        shell: powershell
+        run: |
+          if (-not (Get-Command cargo-llvm-cov -ErrorAction SilentlyContinue)) {
+            cargo install cargo-llvm-cov --locked
+          }
 
       - name: Generate coverage report
         run: cargo llvm-cov --all-features --lcov --output-path lcov.info
