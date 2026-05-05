@@ -1307,6 +1307,7 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "border-radius" => StyleDeclaration::BorderRadius(parse_corners(parser)?),
         "opacity" => StyleDeclaration::Opacity(parse_number(parser)?),
         "color" => StyleDeclaration::Color(parse_color(parser)?),
+        "font" => return parse_font_shorthand(parser),
         "font-size" => StyleDeclaration::FontSize(parse_px(parser)?),
         "font-weight" => {
             let tok = parser.next().map_err(|_| ())?;
@@ -1325,7 +1326,6 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             let val = parser.expect_ident_or_string().map_err(|_| ())?;
             StyleDeclaration::FontFamily(val.as_ref().to_string())
         }
-        "font" => return parse_font_shorthand(parser),
         "content" => StyleDeclaration::Content(parse_content_value(parser)?),
         "line-height" => StyleDeclaration::LineHeight(parse_number(parser)?),
         "text-align" => {
@@ -4061,6 +4061,42 @@ mod tests {
         assert_eq!(style.font_weight, FontWeight::W(400));
         assert!((style.font_size - 12.0).abs() < 0.01);
         assert!((style.line_height - 1.55).abs() < 0.01);
+        assert_eq!(style.font_family, "JetBrains Mono");
+    }
+
+    #[test]
+    fn test_font_shorthand_resolves_settings_page_type_variable() {
+        let sheet = CompiledStylesheet::parse(
+            r#"
+            :root {
+                --font-mono: "JetBrains Mono", "Berkeley Mono", monospace;
+                --t-sm: 11px;
+                --type-label: 500 var(--t-sm)/1.4 var(--font-mono);
+            }
+            .set-page-nav-item { font: var(--type-label); }
+            "#,
+        );
+        let decls = sheet
+            .rules
+            .iter()
+            .find(|rule| {
+                rule.selector.parts.iter().any(|(parts, _)| {
+                    parts.iter().any(
+                        |part| matches!(part, SelectorPart::Class(class) if class == "set-page-nav-item"),
+                    )
+                })
+            })
+            .expect("expected .set-page-nav-item rule")
+            .declarations
+            .clone();
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.font_weight, FontWeight::W(500));
+        assert!((style.font_size - 11.0).abs() < 0.01);
+        assert!((style.line_height - 1.4).abs() < 0.01);
         assert_eq!(style.font_family, "JetBrains Mono");
     }
 

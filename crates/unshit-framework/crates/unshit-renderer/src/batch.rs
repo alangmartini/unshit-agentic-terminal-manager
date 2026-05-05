@@ -41,7 +41,7 @@ use unshit_core::scroll::{self, ScrollbarVisualState};
 use unshit_core::style::types::{
     Background, Color, CssPosition, CssResize, Display, FilterFunction, FontWeight,
     GradientStopPosition, Layer, LinearGradient, Overflow, RadialGradient, RadialShape,
-    RenderTarget, TextDecoration, Visibility, WhiteSpace,
+    RenderTarget, TextAlign, TextDecoration, Visibility, WhiteSpace,
 };
 use unshit_core::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, SvgTransform, ViewBox};
 use unshit_core::trace::{append_terminal_trace_line, terminal_trace_enabled};
@@ -75,6 +75,21 @@ const WINDOWS_TERMINAL_PARITY_CALIBRATED_FG: Color = Color { r: 196, g: 196, b: 
 const WINDOWS_TERMINAL_PARITY_LITERAL_FG: Color = Color { r: 204, g: 204, b: 204, a: 255 };
 const ENV_PARITY_CELL_WIDTH_SCALE: &str = "TM_PARITY_CELL_WIDTH_SCALE";
 const WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE: f32 = 0.996;
+
+fn aligned_text_x(
+    render_x: f32,
+    padding_left: f32,
+    content_w: f32,
+    text_w: f32,
+    align: TextAlign,
+) -> f32 {
+    let line_start = render_x + padding_left;
+    match align {
+        TextAlign::Left => line_start,
+        TextAlign::Center => line_start + (content_w - text_w) * 0.5,
+        TextAlign::Right => line_start + content_w - text_w,
+    }
+}
 
 fn terminal_grid_trace_hash(grid: &CellGrid) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1575,7 +1590,6 @@ fn walk_for_batch(
         let style = &element.computed_style;
         let content_w = rect.width - style.padding.left - style.padding.right;
         let content_h = rect.height - style.padding.top - style.padding.bottom;
-        let text_x = render_x + style.padding.left;
 
         let input = &element.input_state;
 
@@ -1714,7 +1728,7 @@ fn walk_for_batch(
                         if is_placeholder { style.placeholder_color } else { style.color };
                     text_color.a = (text_color.a as f32 * opacity) as u8;
 
-                    let (_, text_h) = measure_text_with_style_cached(
+                    let (text_w, text_h) = measure_text_with_style_cached(
                         display_text,
                         &style.font_family,
                         style.font_weight,
@@ -1726,6 +1740,13 @@ fn walk_for_batch(
                         Some(measure_cache),
                     );
                     let y_offset = ((content_h - text_h) * 0.5).max(0.0);
+                    let text_x = aligned_text_x(
+                        render_x,
+                        style.padding.left,
+                        content_w,
+                        text_w,
+                        style.text_align,
+                    );
                     let text_y = render_y + style.padding.top + y_offset;
 
                     emit_text_glyphs_cached(
@@ -1751,6 +1772,35 @@ fn walk_for_batch(
 
                 // Render cursor (caret) when focused and cursor is visible
                 if node_id == focused && element.cursor_state.visible {
+                    let value_text: std::borrow::Cow<'_, str> =
+                        if input.input_type == InputType::Password {
+                            std::borrow::Cow::Owned("\u{2022}".repeat(input.value.chars().count()))
+                        } else {
+                            std::borrow::Cow::Borrowed(input.value.as_str())
+                        };
+                    let value_w = if value_text.is_empty() {
+                        0.0
+                    } else {
+                        measure_text_with_style_cached(
+                            value_text.as_ref(),
+                            &style.font_family,
+                            style.font_weight,
+                            style.font_size,
+                            style.line_height,
+                            style.letter_spacing,
+                            Some(content_w),
+                            font_system,
+                            Some(measure_cache),
+                        )
+                        .0
+                    };
+                    let text_x = aligned_text_x(
+                        render_x,
+                        style.padding.left,
+                        content_w,
+                        value_w,
+                        style.text_align,
+                    );
                     // For password, measure prefix of masked text.
                     let cursor_x = if input.cursor_pos == 0 || input.value.is_empty() {
                         0.0
@@ -1866,7 +1916,13 @@ fn walk_for_batch(
                 );
                 let y_offset = ((content_h - text_h) * 0.5).max(0.0);
 
-                let text_x = render_x + style.padding.left;
+                let text_x = aligned_text_x(
+                    render_x,
+                    style.padding.left,
+                    content_w,
+                    text_w,
+                    style.text_align,
+                );
                 let text_y = render_y + style.padding.top + y_offset;
 
                 // Selection highlight rendering (emitted before text so it renders behind glyphs)
@@ -4899,6 +4955,17 @@ mod tests {
         let elem = Element::new(Tag::Div);
         let root = arena.alloc(elem);
         (arena, root)
+    }
+
+    #[test]
+    fn aligned_text_x_honors_text_align() {
+        let left = aligned_text_x(10.0, 4.0, 100.0, 20.0, TextAlign::Left);
+        let center = aligned_text_x(10.0, 4.0, 100.0, 20.0, TextAlign::Center);
+        let right = aligned_text_x(10.0, 4.0, 100.0, 20.0, TextAlign::Right);
+
+        assert_eq!(left, 14.0);
+        assert_eq!(center, 54.0);
+        assert_eq!(right, 94.0);
     }
 
     /// Regression guard for issue #147: a clean idle frame must keep the
