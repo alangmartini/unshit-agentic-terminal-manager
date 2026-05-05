@@ -57,6 +57,33 @@ fn row_layout_stacks_horizontally() {
 }
 
 #[test]
+fn flex_row_honors_margin_left_auto() {
+    let css = r#"
+        .root { display: flex; flex-direction: row; width: 500px; height: 50px; }
+        .left { width: 100px; height: 50px; }
+        .right { width: 50px; height: 50px; margin-left: auto; }
+    "#;
+    let h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_child(ElementDef::new(Tag::Div).with_class("left").with_id("left"))
+                .with_child(ElementDef::new(Tag::Div).with_class("right").with_id("right")),
+        },
+        500.0,
+        50.0,
+    );
+
+    let right = h.query("#right").unwrap();
+    assert!(
+        (right.layout_rect.x - 450.0).abs() < 1.0,
+        "margin-left:auto should push the right item to x=450, got {}",
+        right.layout_rect.x
+    );
+}
+
+#[test]
 fn padding_offsets_children() {
     let css = r#"
         .root { display: flex; flex-direction: column; width: 100%; height: 100%; padding: 20px; }

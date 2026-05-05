@@ -12,6 +12,7 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         scroll = scroll.with_child(build_workspace(
             w_idx,
             w_idx == state.active_workspace,
+            state.active_pane,
             workspace,
             shared,
         ));
@@ -27,8 +28,7 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     sidebar
         .with_child(build_sidebar_head(shared))
         .with_child(scroll)
-        .with_child(build_sidebar_footer())
-        .with_child(build_sidebar_hints())
+        .with_child(build_sidebar_footer(state))
 }
 
 fn build_sidebar_head(shared: &SharedState) -> ElementDef {
@@ -72,6 +72,7 @@ fn build_sidebar_head(shared: &SharedState) -> ElementDef {
 fn build_workspace(
     workspace_index: usize,
     is_active: bool,
+    active_pane: crate::state::PaneId,
     workspace: &Workspace,
     shared: &SharedState,
 ) -> ElementDef {
@@ -81,6 +82,7 @@ fn build_workspace(
     let idx = workspace_index;
     let head = ElementDef::new(Tag::Div)
         .with_class("workspace-head")
+        .with_class("sb-ws")
         .with_tab_index(0)
         .on_click(move || {
             mutate_with(&head_state, |st| {
@@ -136,7 +138,14 @@ fn build_workspace(
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("workspace-name")
+                .with_class("sb-label")
                 .with_text(workspace.name.clone()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("workspace-meta")
+                .with_class("ws-meta")
+                .with_text(workspace.terminal_entries.len().to_string()),
         );
 
     let mut body = ElementDef::new(Tag::Div).with_class("workspace-body");
@@ -159,6 +168,7 @@ fn build_workspace(
                     workspace_index,
                     entry,
                     t_idx == count - 1,
+                    entry.pane_id == active_pane,
                     shared,
                 ));
             }
@@ -266,6 +276,7 @@ fn build_terminal_entry(
     workspace_index: usize,
     entry: &TerminalEntry,
     is_last: bool,
+    is_active: bool,
     shared: &SharedState,
 ) -> ElementDef {
     let glyph = if is_last { "\u{2514}" } else { "\u{251C}" };
@@ -275,6 +286,7 @@ fn build_terminal_entry(
     let pane_id = entry.pane_id;
     let mut row = ElementDef::new(Tag::Div)
         .with_class("terminal-entry")
+        .with_class("sb-row")
         .with_tab_index(0)
         .on_click(move || {
             mutate_with(&click_shared, |st| {
@@ -289,11 +301,16 @@ fn build_terminal_entry(
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("terminal-entry-name")
+                .with_class("sb-label")
                 .with_text(entry.name.clone()),
         );
+    if is_active {
+        row = row.with_class("active");
+    }
 
     let mut tag = ElementDef::new(Tag::Span)
         .with_class("branch-tag")
+        .with_class("sb-branch")
         .with_text(entry.branch.clone());
     if entry.branch_muted {
         tag = tag.with_class("muted");
@@ -306,72 +323,31 @@ fn build_terminal_entry(
     row
 }
 
-fn build_sidebar_footer() -> ElementDef {
+fn build_sidebar_footer(state: &UiSnapshot) -> ElementDef {
+    let sessions = if state.terminal_count == 1 {
+        "1 sess".to_string()
+    } else {
+        format!("{} sess", state.terminal_count)
+    };
+    let panes: usize = state
+        .tabs
+        .iter()
+        .map(|tab| tab.panes.iter().map(|row| row.len()).sum::<usize>())
+        .sum();
     ElementDef::new(Tag::Div)
         .with_class("sidebar-footer")
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("footer-title")
-                .with_text("activity"),
-        )
-        .with_child(activity_item(
-            "running",
-            "claude",
-            "running",
-            "refactor split pane logic",
-        ))
-        .with_child(activity_item(
-            "stopped",
-            "amp",
-            "stopped",
-            "verify readme docs",
-        ))
-        .with_child(activity_item("waiting", "codex", "waiting", "needs review"))
-}
-
-fn activity_item(state_class: &str, name: &str, state: &str, desc: &str) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("activity-item")
-        .with_class(state_class.to_string())
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("activity-row")
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("activity-name")
-                        .with_text(name.to_string()),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("activity-state")
-                        .with_text(state.to_string()),
-                ),
-        )
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("activity-desc")
-                .with_text(desc.to_string()),
-        )
-}
-
-fn build_sidebar_hints() -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("sidebar-hints")
-        .with_child(hint_item("\u{2191}\u{2193}", "cycle"))
-        .with_child(hint_item("\u{23CE}", "open"))
-        .with_child(hint_item("x", "kill"))
-        .with_child(hint_item("t", "theme"))
-}
-
-fn hint_item(key: &str, label: &str) -> ElementDef {
-    ElementDef::new(Tag::Span)
-        .with_class("hint")
+        .with_class("sb-foot")
         .with_child(
             ElementDef::new(Tag::Span)
-                .with_class("kbd")
-                .with_text(key.to_string()),
+                .with_class("dot")
+                .with_class("status-running"),
         )
-        .with_child(ElementDef::new(Tag::Span).with_text(label.to_string()))
+        .with_child(ElementDef::new(Tag::Span).with_text("ptyd"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("dim")
+                .with_text(format!("\u{00B7} {sessions} \u{00B7} {panes} panes")),
+        )
 }
 
 pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -593,6 +569,7 @@ mod tests {
     use super::*;
     use crate::state::{seed_state, SharedState, Subtab, SubtabIcon, TerminalEntry, Workspace};
     use std::sync::{Arc, Mutex};
+    use unshit_test::TestHarness;
 
     fn has_class(el: &ElementDef, class: &str) -> bool {
         el.classes.iter().any(|c| c == class)
@@ -668,8 +645,8 @@ mod tests {
         assert!(has_class(&el, "sidebar"));
         assert!(!has_class(&el, "collapsed"));
         assert_eq!(el.id.as_deref(), Some("sidebar"));
-        // Should have 4 children: head, scroll, footer, hints
-        assert_eq!(el.children.len(), 4);
+        // head, scroll, real ptyd footer
+        assert_eq!(el.children.len(), 3);
     }
 
     #[test]
@@ -724,7 +701,7 @@ mod tests {
     fn workspace_not_collapsed_has_no_collapsed_class() {
         let shared = make_shared();
         let ws = make_workspace(2, false);
-        let el = build_workspace(0, false, &ws, &shared);
+        let el = build_workspace(0, false, crate::state::PaneId(1), &ws, &shared);
         assert!(has_class(&el, "workspace"));
         assert!(!has_class(&el, "collapsed"));
     }
@@ -733,7 +710,7 @@ mod tests {
     fn workspace_collapsed_has_collapsed_class() {
         let shared = make_shared();
         let ws = make_workspace(2, true);
-        let el = build_workspace(0, false, &ws, &shared);
+        let el = build_workspace(0, false, crate::state::PaneId(1), &ws, &shared);
         assert!(has_class(&el, "workspace"));
         assert!(has_class(&el, "collapsed"));
     }
@@ -742,7 +719,7 @@ mod tests {
     fn workspace_gets_active_class_when_is_active() {
         let shared = make_shared();
         let ws = make_workspace(1, false);
-        let el = build_workspace(0, true, &ws, &shared);
+        let el = build_workspace(0, true, crate::state::PaneId(1), &ws, &shared);
         assert!(has_class(&el, "active"));
     }
 
@@ -750,7 +727,7 @@ mod tests {
     fn workspace_gets_no_active_class_when_not_is_active() {
         let shared = make_shared();
         let ws = make_workspace(2, false);
-        let el = build_workspace(0, false, &ws, &shared);
+        let el = build_workspace(0, false, crate::state::PaneId(1), &ws, &shared);
         assert!(!has_class(&el, "active"));
     }
 
@@ -761,8 +738,8 @@ mod tests {
         let ws_num_5 = make_workspace(5, false);
         let ws_num_1 = make_workspace(1, false);
 
-        let el_active = build_workspace(2, true, &ws_num_5, &shared);
-        let el_other = build_workspace(0, false, &ws_num_1, &shared);
+        let el_active = build_workspace(2, true, crate::state::PaneId(1), &ws_num_5, &shared);
+        let el_other = build_workspace(0, false, crate::state::PaneId(1), &ws_num_1, &shared);
 
         assert!(has_class(&el_active, "active"));
         assert!(!has_class(&el_other, "active"));
@@ -782,6 +759,7 @@ mod tests {
         let el = build_workspace(
             2,
             2 == snapshot.active_workspace,
+            snapshot.active_pane,
             &snapshot.workspaces[2],
             &shared,
         );
@@ -805,6 +783,7 @@ mod tests {
         let el = build_workspace(
             2,
             2 == snapshot.active_workspace,
+            snapshot.active_pane,
             &snapshot.workspaces[2],
             &shared,
         );
@@ -828,6 +807,7 @@ mod tests {
         let el = build_workspace(
             1,
             1 == snapshot.active_workspace,
+            snapshot.active_pane,
             &snapshot.workspaces[1],
             &shared,
         );
@@ -857,6 +837,7 @@ mod tests {
         let el = build_workspace(
             1,
             1 == snapshot.active_workspace,
+            snapshot.active_pane,
             &snapshot.workspaces[1],
             &shared,
         );
@@ -877,7 +858,7 @@ mod tests {
             branch_error: false,
             pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(0, &entry, false, &make_shared());
+        let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(has_class(branch_tag, "muted"));
     }
@@ -891,7 +872,7 @@ mod tests {
             branch_error: false,
             pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(0, &entry, false, &make_shared());
+        let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(!has_class(branch_tag, "muted"));
     }
@@ -905,7 +886,7 @@ mod tests {
             branch_error: true,
             pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(0, &entry, false, &make_shared());
+        let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(has_class(branch_tag, "error"));
     }
@@ -919,7 +900,7 @@ mod tests {
             branch_error: false,
             pane_id: crate::state::PaneId(0),
         };
-        let el = build_terminal_entry(0, &entry, false, &make_shared());
+        let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(!has_class(branch_tag, "error"));
     }
@@ -928,7 +909,7 @@ mod tests {
     fn workspace_head_shows_name_and_num() {
         let shared = make_shared();
         let ws = make_workspace(3, false);
-        let el = build_workspace(0, false, &ws, &shared);
+        let el = build_workspace(0, false, crate::state::PaneId(1), &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         let num_el = find_by_class(head, "workspace-num").unwrap();
         assert_eq!(text_of(num_el), Some("3"));
@@ -941,7 +922,7 @@ mod tests {
         let shared = make_shared();
         assert_eq!(shared.lock().unwrap().active_workspace, 0);
         let ws = shared.lock().unwrap().ui_snapshot().workspaces[2].clone();
-        let el = build_workspace(2, false, &ws, &shared);
+        let el = build_workspace(2, false, crate::state::PaneId(1), &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         (head.on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().active_workspace, 2);
@@ -955,7 +936,7 @@ mod tests {
             guard.workspaces[1].collapsed = true;
         }
         let ws = shared.lock().unwrap().ui_snapshot().workspaces[1].clone();
-        let el = build_workspace(1, false, &ws, &shared);
+        let el = build_workspace(1, false, crate::state::PaneId(1), &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         (head.on_click.as_ref().unwrap())();
         assert!(!shared.lock().unwrap().workspaces[1].collapsed);
@@ -982,7 +963,7 @@ mod tests {
         // Clicking ws1's head must switch workspace and set active_pane to
         // ws1's saved pane, matching a terminal-entry click on that pane.
         let ws = shared.lock().unwrap().ui_snapshot().workspaces[1].clone();
-        let el = build_workspace(1, false, &ws, &shared);
+        let el = build_workspace(1, false, crate::state::PaneId(1), &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         (head.on_click.as_ref().unwrap())();
         let st = shared.lock().unwrap();
@@ -999,7 +980,7 @@ mod tests {
         assert_eq!(shared.lock().unwrap().active_workspace, 0);
         assert!(shared.lock().unwrap().workspaces[2].tabs.is_empty());
         let ws = shared.lock().unwrap().ui_snapshot().workspaces[2].clone();
-        let el = build_workspace(2, false, &ws, &shared);
+        let el = build_workspace(2, false, crate::state::PaneId(1), &ws, &shared);
         let head = find_by_class(&el, "workspace-head").unwrap();
         (head.on_click.as_ref().unwrap())();
         assert_eq!(shared.lock().unwrap().active_workspace, 2);
@@ -1009,7 +990,7 @@ mod tests {
     fn workspace_body_has_subtabs() {
         let shared = make_shared();
         let ws = make_workspace(2, false);
-        let el = build_workspace(0, false, &ws, &shared);
+        let el = build_workspace(0, false, crate::state::PaneId(1), &ws, &shared);
         let body = find_by_class(&el, "workspace-body").unwrap();
         assert_eq!(body.children.len(), 2);
     }
@@ -1164,39 +1145,42 @@ mod tests {
     // -- build_sidebar_footer --
 
     #[test]
-    fn sidebar_footer_has_activity_items() {
-        let footer = build_sidebar_footer();
+    fn sidebar_footer_has_ptyd_status() {
+        let shared = make_shared();
+        let state = shared.lock().unwrap().ui_snapshot();
+        let footer = build_sidebar_footer(&state);
         assert!(has_class(&footer, "sidebar-footer"));
-        // 1 title + 3 activity items
-        assert_eq!(footer.children.len(), 4);
-        let title = &footer.children[0];
-        assert!(has_class(title, "footer-title"));
-        assert_eq!(text_of(title), Some("activity"));
+        assert!(has_class(&footer, "sb-foot"));
+        assert_eq!(footer.children.len(), 3);
+        assert_eq!(text_of(&footer.children[1]), Some("ptyd"));
     }
 
-    // -- activity_item --
-
     #[test]
-    fn activity_item_structure() {
-        let item = activity_item("running", "claude", "running", "refactor logic");
-        assert!(has_class(&item, "activity-item"));
-        assert!(has_class(&item, "running"));
-        let row = find_by_class(&item, "activity-row").unwrap();
-        let name_el = find_by_class(row, "activity-name").unwrap();
-        assert_eq!(text_of(name_el), Some("claude"));
-        let state_el = find_by_class(row, "activity-state").unwrap();
-        assert_eq!(text_of(state_el), Some("running"));
-        let desc_el = find_by_class(&item, "activity-desc").unwrap();
-        assert_eq!(text_of(desc_el), Some("refactor logic"));
-    }
+    fn sidebar_footer_stays_statusbar_height_with_stylesheet() {
+        let shared = make_shared();
+        let state = shared.lock().unwrap().ui_snapshot();
+        let tree_shared = shared.clone();
+        let tree_state = state.clone();
+        let css = format!(
+            "{}\n.sidebar-test-root {{ display: flex; width: 252px; height: 720px; }}",
+            include_str!("../../assets/styles.css")
+        );
+        let mut harness = TestHarness::new(
+            &css,
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("sidebar-test-root")
+                    .with_child(build_sidebar(&tree_state, &tree_shared)),
+            },
+            1280.0,
+            720.0,
+        );
+        harness.step();
 
-    // -- build_sidebar_hints --
-
-    #[test]
-    fn sidebar_hints_has_four_hints() {
-        let hints = build_sidebar_hints();
-        assert!(has_class(&hints, "sidebar-hints"));
-        assert_eq!(hints.children.len(), 4);
+        let footer = harness
+            .query(".sb-foot")
+            .expect("sidebar footer should render");
+        assert_eq!(footer.layout_rect.height, 24.0);
     }
 
     // -- build_workspace_ctx_menu shell submenu (Task 10) --
@@ -1364,19 +1348,5 @@ mod tests {
             guard.workspaces[0].shell.is_empty(),
             "clicking Use app default must clear the workspace override"
         );
-    }
-
-    // -- hint_item --
-
-    #[test]
-    fn hint_item_structure() {
-        let item = hint_item("x", "kill");
-        assert!(has_class(&item, "hint"));
-        assert_eq!(item.children.len(), 2);
-        let kbd = &item.children[0];
-        assert!(has_class(kbd, "kbd"));
-        assert_eq!(text_of(kbd), Some("x"));
-        let label = &item.children[1];
-        assert_eq!(text_of(label), Some("kill"));
     }
 }

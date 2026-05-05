@@ -2745,7 +2745,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             let pane_id = state.active_pane.0;
             let title = "test notification";
             let message =
-                format!("Notification test from workspace {workspace_id}, pane {pane_id}.");
+                format!("notification test from workspace {workspace_id}, pane {pane_id}");
             push_notification_toast(state, title, message.clone(), workspace_id, pane_id);
             #[cfg(not(test))]
             {
@@ -5214,7 +5214,7 @@ mod tests {
         assert_eq!(toast.title.as_deref(), Some("test notification"));
         assert_eq!(
             toast.message,
-            format!("Notification test from workspace {workspace_id}, pane {pane_id}.")
+            format!("notification test from workspace {workspace_id}, pane {pane_id}")
         );
         assert_eq!(
             toast.target,

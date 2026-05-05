@@ -159,10 +159,15 @@ pub enum StyleDeclaration {
     PaddingBottom(f32),
     PaddingLeft(f32),
     Margin(Edges),
+    MarginWithAuto(Edges, EdgeAutoFlags),
     MarginTop(f32),
     MarginRight(f32),
     MarginBottom(f32),
     MarginLeft(f32),
+    MarginTopAuto,
+    MarginRightAuto,
+    MarginBottomAuto,
+    MarginLeftAuto,
     Gap(f32),
     RowGap(f32),
     ColumnGap(f32),
@@ -192,6 +197,7 @@ pub enum StyleDeclaration {
     Cursor(CursorStyle),
     Visibility(Visibility),
     PointerEvents(PointerEvents),
+    AppRegion(AppRegion),
     Position(CssPosition),
     Top(Dimension),
     Right(Dimension),
@@ -1170,11 +1176,18 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "padding-right" => StyleDeclaration::PaddingRight(parse_px(parser)?),
         "padding-bottom" => StyleDeclaration::PaddingBottom(parse_px(parser)?),
         "padding-left" => StyleDeclaration::PaddingLeft(parse_px(parser)?),
-        "margin" => StyleDeclaration::Margin(parse_edges(parser)?),
-        "margin-top" => StyleDeclaration::MarginTop(parse_px(parser)?),
-        "margin-right" => StyleDeclaration::MarginRight(parse_px(parser)?),
-        "margin-bottom" => StyleDeclaration::MarginBottom(parse_px(parser)?),
-        "margin-left" => StyleDeclaration::MarginLeft(parse_px(parser)?),
+        "margin" => {
+            let (edges, auto) = parse_margin_edges(parser)?;
+            if auto.any() {
+                StyleDeclaration::MarginWithAuto(edges, auto)
+            } else {
+                StyleDeclaration::Margin(edges)
+            }
+        }
+        "margin-top" => parse_margin_longhand(parser, MarginSide::Top)?,
+        "margin-right" => parse_margin_longhand(parser, MarginSide::Right)?,
+        "margin-bottom" => parse_margin_longhand(parser, MarginSide::Bottom)?,
+        "margin-left" => parse_margin_longhand(parser, MarginSide::Left)?,
         "gap" => {
             let first = parse_px(parser)?;
             let second = parser.try_parse(|p| parse_px(p)).unwrap_or(first);
@@ -1416,6 +1429,15 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 "none" => UserSelect::None,
                 "text" => UserSelect::Text,
                 "all" => UserSelect::All,
+                _ => return Err(()),
+            })
+        }
+        "-webkit-app-region" | "app-region" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            StyleDeclaration::AppRegion(match val.as_ref() {
+                "auto" => AppRegion::Auto,
+                "drag" => AppRegion::Drag,
+                "no-drag" => AppRegion::NoDrag,
                 _ => return Err(()),
             })
         }
@@ -2150,6 +2172,64 @@ fn parse_edges(parser: &mut Parser) -> Result<Edges, ()> {
         4 => Ok(Edges { top: values[0], right: values[1], bottom: values[2], left: values[3] }),
         _ => Err(()),
     }
+}
+
+#[derive(Clone, Copy)]
+enum MarginSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+fn parse_margin_longhand(parser: &mut Parser, side: MarginSide) -> Result<StyleDeclaration, ()> {
+    let (value, is_auto) = parse_margin_value(parser)?;
+    Ok(match (side, is_auto) {
+        (MarginSide::Top, false) => StyleDeclaration::MarginTop(value),
+        (MarginSide::Right, false) => StyleDeclaration::MarginRight(value),
+        (MarginSide::Bottom, false) => StyleDeclaration::MarginBottom(value),
+        (MarginSide::Left, false) => StyleDeclaration::MarginLeft(value),
+        (MarginSide::Top, true) => StyleDeclaration::MarginTopAuto,
+        (MarginSide::Right, true) => StyleDeclaration::MarginRightAuto,
+        (MarginSide::Bottom, true) => StyleDeclaration::MarginBottomAuto,
+        (MarginSide::Left, true) => StyleDeclaration::MarginLeftAuto,
+    })
+}
+
+fn parse_margin_edges(parser: &mut Parser) -> Result<(Edges, EdgeAutoFlags), ()> {
+    let mut values = Vec::with_capacity(4);
+    while values.len() < 4 {
+        match parser.try_parse(|p| parse_margin_value(p)) {
+            Ok(v) => values.push(v),
+            Err(_) => break,
+        }
+    }
+
+    let (top, right, bottom, left) = match values.as_slice() {
+        [a] => (*a, *a, *a, *a),
+        [a, b] => (*a, *b, *a, *b),
+        [a, b, c] => (*a, *b, *c, *b),
+        [a, b, c, d] => (*a, *b, *c, *d),
+        _ => return Err(()),
+    };
+
+    Ok((
+        Edges { top: top.0, right: right.0, bottom: bottom.0, left: left.0 },
+        EdgeAutoFlags { top: top.1, right: right.1, bottom: bottom.1, left: left.1 },
+    ))
+}
+
+fn parse_margin_value(parser: &mut Parser) -> Result<(f32, bool), ()> {
+    if parser
+        .try_parse(|p| match p.next().map_err(|_| ())? {
+            Token::Ident(ref s) if s.as_ref().eq_ignore_ascii_case("auto") => Ok(()),
+            _ => Err(()),
+        })
+        .is_ok()
+    {
+        return Ok((0.0, true));
+    }
+    parse_px(parser).map(|v| (v, false))
 }
 
 fn parse_corners(parser: &mut Parser) -> Result<Corners, ()> {
@@ -3866,11 +3946,46 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::PaddingRight(v) => style.padding.right = *v,
         StyleDeclaration::PaddingBottom(v) => style.padding.bottom = *v,
         StyleDeclaration::PaddingLeft(v) => style.padding.left = *v,
-        StyleDeclaration::Margin(v) => style.margin = *v,
-        StyleDeclaration::MarginTop(v) => style.margin.top = *v,
-        StyleDeclaration::MarginRight(v) => style.margin.right = *v,
-        StyleDeclaration::MarginBottom(v) => style.margin.bottom = *v,
-        StyleDeclaration::MarginLeft(v) => style.margin.left = *v,
+        StyleDeclaration::Margin(v) => {
+            style.margin = *v;
+            style.margin_auto = EdgeAutoFlags::NONE;
+        }
+        StyleDeclaration::MarginWithAuto(v, auto) => {
+            style.margin = *v;
+            style.margin_auto = *auto;
+        }
+        StyleDeclaration::MarginTop(v) => {
+            style.margin.top = *v;
+            style.margin_auto.top = false;
+        }
+        StyleDeclaration::MarginRight(v) => {
+            style.margin.right = *v;
+            style.margin_auto.right = false;
+        }
+        StyleDeclaration::MarginBottom(v) => {
+            style.margin.bottom = *v;
+            style.margin_auto.bottom = false;
+        }
+        StyleDeclaration::MarginLeft(v) => {
+            style.margin.left = *v;
+            style.margin_auto.left = false;
+        }
+        StyleDeclaration::MarginTopAuto => {
+            style.margin.top = 0.0;
+            style.margin_auto.top = true;
+        }
+        StyleDeclaration::MarginRightAuto => {
+            style.margin.right = 0.0;
+            style.margin_auto.right = true;
+        }
+        StyleDeclaration::MarginBottomAuto => {
+            style.margin.bottom = 0.0;
+            style.margin_auto.bottom = true;
+        }
+        StyleDeclaration::MarginLeftAuto => {
+            style.margin.left = 0.0;
+            style.margin_auto.left = true;
+        }
         StyleDeclaration::Gap(v) => {
             style.row_gap = *v;
             style.column_gap = *v;
@@ -3927,6 +4042,7 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::Visibility(v) => style.visibility = *v,
         StyleDeclaration::PointerEvents(v) => style.pointer_events = *v,
         StyleDeclaration::UserSelect(v) => style.user_select = *v,
+        StyleDeclaration::AppRegion(v) => style.app_region = *v,
         StyleDeclaration::Position(v) => style.position = *v,
         StyleDeclaration::Top(v) => style.top = Some(*v),
         StyleDeclaration::Right(v) => style.right = Some(*v),
@@ -5919,6 +6035,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_margin_left_auto_applies_auto_flag() {
+        use crate::style::types::ComputedStyle;
+
+        let decls = parse_decls(".x { margin-left: auto; }");
+        assert!(decls.iter().any(|d| matches!(d, StyleDeclaration::MarginLeftAuto)));
+
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert!(style.margin_auto.left);
+        assert_eq!(style.margin.left, 0.0);
+    }
+
+    #[test]
+    fn test_margin_shorthand_keeps_mixed_auto_and_lengths() {
+        use crate::style::types::ComputedStyle;
+
+        let decls = parse_decls(".x { margin: 4px auto 8px 12px; }");
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.margin.top, 4.0);
+        assert_eq!(style.margin.bottom, 8.0);
+        assert_eq!(style.margin.left, 12.0);
+        assert!(style.margin_auto.right);
+        assert!(!style.margin_auto.top);
+        assert!(!style.margin_auto.bottom);
+        assert!(!style.margin_auto.left);
+    }
+
     /// Extract flex-grow, flex-shrink, flex-basis from a declaration list.
     fn extract_flex(decls: &[StyleDeclaration]) -> (Option<f32>, Option<f32>, Option<Dimension>) {
         let grow = decls.iter().find_map(|d| match d {
@@ -6365,6 +6516,32 @@ mod tests {
             });
             assert_eq!(us, Some(expected), "user-select: {css_val} should parse to {expected:?}");
         }
+    }
+
+    #[test]
+    fn test_app_region_values() {
+        let values =
+            [("auto", AppRegion::Auto), ("drag", AppRegion::Drag), ("no-drag", AppRegion::NoDrag)];
+        for (css_val, expected) in values {
+            let css = format!(".x {{ -webkit-app-region: {}; }}", css_val);
+            let decls = parse_decls(&css);
+            let region = decls.iter().find_map(|d| match d {
+                StyleDeclaration::AppRegion(v) => Some(*v),
+                _ => None,
+            });
+            assert_eq!(region, Some(expected), "-webkit-app-region: {css_val}");
+        }
+    }
+
+    #[test]
+    fn test_app_region_applies_to_computed_style() {
+        let decls = parse_decls(".x { -webkit-app-region: no-drag; }");
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.app_region, AppRegion::NoDrag);
     }
 
     // -----------------------------------------------------------------

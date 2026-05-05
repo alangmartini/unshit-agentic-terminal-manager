@@ -1324,8 +1324,25 @@ impl ApplicationHandler for AppHandler {
                 if mouse_button == Some(winit::event::MouseButton::Left) {
                     match button_state {
                         ElementState::Pressed => {
-                            // Check for scrollbar interaction first
                             let sb_pos = state.interaction.last_cursor_pos;
+                            let region_target = if state.interaction.hovered.is_dangling() {
+                                hit_test(&state.arena, state.root, sb_pos.0, sb_pos.1)
+                                    .unwrap_or(NodeId::DANGLING)
+                            } else {
+                                state.interaction.hovered
+                            };
+                            if is_window_drag_region(&state.arena, region_target) {
+                                state.interaction.drag_origin = None;
+                                state.interaction.dragging = false;
+                                state.interaction.drag_target = None;
+                                state.interaction.mousedown_target = None;
+                                if let Err(err) = state.window.drag_window() {
+                                    log::warn!("native window drag failed: {err}");
+                                }
+                                return;
+                            }
+
+                            // Check for scrollbar interaction first
                             if let Some(hit) = scroll::find_scrollbar_at(
                                 &state.arena,
                                 state.root,
@@ -3629,6 +3646,12 @@ mod tests {
     fn app_config_css_path_defaults_to_none() {
         let config = AppConfig::default();
         assert!(config.css_path.is_none());
+    }
+
+    #[test]
+    fn app_config_decorations_defaults_to_native_chrome() {
+        let config = AppConfig::default();
+        assert!(config.decorations);
     }
 
     #[test]
