@@ -1127,6 +1127,7 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "justify-content" => {
             let val = parser.expect_ident().map_err(|_| ())?;
             StyleDeclaration::JustifyContent(match val.as_ref() {
+                "normal" => JustifyContent::Normal,
                 "flex-start" | "start" => JustifyContent::Start,
                 "flex-end" | "end" => JustifyContent::End,
                 "center" => JustifyContent::Center,
@@ -1286,6 +1287,11 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "background-color" => {
             StyleDeclaration::Background(types::Background::Color(parse_color(parser)?))
         }
+        "border" => return parse_border_shorthand(parser, None),
+        "border-top" => return parse_border_shorthand(parser, Some(BorderSide::Top)),
+        "border-right" => return parse_border_shorthand(parser, Some(BorderSide::Right)),
+        "border-bottom" => return parse_border_shorthand(parser, Some(BorderSide::Bottom)),
+        "border-left" => return parse_border_shorthand(parser, Some(BorderSide::Left)),
         "border-color" => StyleDeclaration::BorderColor(parse_color(parser)?),
         "border-width" => StyleDeclaration::BorderWidth(parse_edges(parser)?),
         "border-top-width" => StyleDeclaration::BorderSideWidth(BorderSide::Top, parse_px(parser)?),
@@ -1783,58 +1789,198 @@ fn parse_number(parser: &mut Parser) -> Result<f32, ()> {
 }
 
 fn parse_font_shorthand(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 2]>, ()> {
-    let mut declarations: SmallVec<[StyleDeclaration; 2]> = SmallVec::new();
-    let mut weight: Option<FontWeight> = None;
-    let size = loop {
-        let tok = parser.next().map_err(|_| ())?.clone();
-        match tok {
-            Token::Number { int_value: Some(n), .. } if weight.is_none() => {
-                weight = Some(FontWeight::W(n as u16));
-            }
-            Token::Ident(ref ident) if weight.is_none() => match ident.as_ref() {
-                "normal" => weight = Some(FontWeight::Normal),
-                "bold" => weight = Some(FontWeight::Bold),
-                // Ignore style/variant keywords that the style model does
-                // not represent yet; continue scanning for the required size.
-                "italic" | "oblique" | "small-caps" => {}
-                _ => return Err(()),
-            },
-            Token::Dimension { value, unit, .. } if unit.as_ref().eq_ignore_ascii_case("px") => {
-                break value;
-            }
-            Token::Number { value, .. } => break value,
-            _ => return Err(()),
-        }
-    };
+    let mut font_weight = None;
+    let mut font_size = None;
+    let mut line_height = None;
+    let mut font_family = None;
 
+    while !parser.is_exhausted() {
+        let state = parser.state();
+        if parser.try_parse(cssparser::Parser::expect_semicolon).is_ok() {
+            parser.reset(&state);
+            break;
+        }
+
+        if font_size.is_none() {
+            if let Ok((size, lh)) = parser.try_parse(|p| parse_font_size_and_line_height(p)) {
+                font_size = Some(size);
+                line_height = lh;
+                continue;
+            }
+            if font_weight.is_none() {
+                if let Ok(weight) = parser.try_parse(|p| parse_font_weight_value(p)) {
+                    font_weight = Some(weight);
+                    continue;
+                }
+            }
+            if parser.try_parse(|p| parse_ignored_font_keyword(p)).is_ok() {
+                continue;
+            }
+            return Err(());
+        }
+
+        if font_family.is_none() {
+            font_family = Some(parse_font_family_first(parser)?);
+            break;
+        }
+
+        break;
+    }
+
+    let size = font_size.ok_or(())?;
+    let family = font_family.ok_or(())?;
+    let mut decls = SmallVec::<[StyleDeclaration; 2]>::new();
+    if let Some(weight) = font_weight {
+        decls.push(StyleDeclaration::FontWeight(weight));
+    }
+    decls.push(StyleDeclaration::FontSize(size));
+    if let Some(lh) = line_height {
+        decls.push(StyleDeclaration::LineHeight(lh));
+    }
+    decls.push(StyleDeclaration::FontFamily(family));
+
+    // The framework currently stores one font family string. Keep the first
+    // usable family and drain the rest of any comma-separated fallback list so
+    // leftover tokens do not poison the next declaration.
+    skip_to_semicolon(parser);
+    Ok(decls)
+}
+
+fn parse_font_weight_value(parser: &mut Parser) -> Result<FontWeight, ()> {
+    let tok = parser.next().map_err(|_| ())?.clone();
+    match tok {
+        Token::Ident(ref s) => match s.as_ref() {
+            "normal" => Ok(FontWeight::Normal),
+            "bold" => Ok(FontWeight::Bold),
+            _ => Err(()),
+        },
+        Token::Number { int_value: Some(n), .. } => Ok(FontWeight::W(n as u16)),
+        Token::Number { value, .. } if value.fract() == 0.0 => Ok(FontWeight::W(value as u16)),
+        _ => Err(()),
+    }
+}
+
+fn parse_ignored_font_keyword(parser: &mut Parser) -> Result<(), ()> {
+    let ident = parser.expect_ident().map_err(|_| ())?;
+    match ident.as_ref() {
+        "normal" | "italic" | "oblique" | "small-caps" => Ok(()),
+        _ => Err(()),
+    }
+}
+
+fn parse_font_size_and_line_height(parser: &mut Parser) -> Result<(f32, Option<f32>), ()> {
+    let size = parse_font_size_px(parser)?;
     let line_height = if parser.try_parse(|p| p.expect_delim('/')).is_ok() {
-        Some(parse_number(parser)?)
+        Some(parse_font_line_height(parser, size)?)
     } else {
         None
     };
+    Ok((size, line_height))
+}
 
-    let family = match parser.next().map_err(|_| ())?.clone() {
-        Token::QuotedString(s) | Token::Ident(s) => Some(s.as_ref().to_string()),
-        _ => return Err(()),
-    };
+fn parse_font_size_px(parser: &mut Parser) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        Token::Dimension { value, unit, .. } => {
+            if unit.as_ref() == "vh" || unit.as_ref() == "vw" {
+                return Err(());
+            }
+            Ok(*value)
+        }
+        Token::Number { value, .. } if *value == 0.0 => Ok(*value),
+        _ => Err(()),
+    }
+}
 
-    while let Ok(tok) = parser.next() {
-        if matches!(tok, Token::Semicolon) {
+fn parse_font_line_height(parser: &mut Parser, font_size: f32) -> Result<f32, ()> {
+    match parser.next().map_err(|_| ())? {
+        Token::Number { value, .. } => Ok(*value),
+        Token::Percentage { unit_value, .. } => Ok(*unit_value),
+        Token::Dimension { value, unit, .. } => {
+            if unit.as_ref() == "vh" || unit.as_ref() == "vw" || font_size <= 0.0 {
+                return Err(());
+            }
+            Ok(*value / font_size)
+        }
+        Token::Ident(ref s) if s.as_ref() == "normal" => Ok(1.2),
+        _ => Err(()),
+    }
+}
+
+fn parse_font_family_first(parser: &mut Parser) -> Result<String, ()> {
+    match parser.next().map_err(|_| ())? {
+        Token::QuotedString(s) => Ok(s.as_ref().to_string()),
+        Token::Ident(s) => Ok(s.as_ref().to_string()),
+        _ => Err(()),
+    }
+}
+
+fn parse_border_shorthand(
+    parser: &mut Parser,
+    side: Option<BorderSide>,
+) -> Result<SmallVec<[StyleDeclaration; 2]>, ()> {
+    let mut width = None;
+    let mut color = None;
+    let mut style_none = false;
+    let mut consumed = false;
+
+    while !parser.is_exhausted() {
+        let state = parser.state();
+        if parser.try_parse(cssparser::Parser::expect_semicolon).is_ok() {
+            parser.reset(&state);
             break;
         }
+
+        if width.is_none() {
+            if let Ok(w) = parser.try_parse(|p| parse_px(p)) {
+                width = Some(w);
+                consumed = true;
+                continue;
+            }
+        }
+
+        if color.is_none() {
+            if let Ok(c) = parser.try_parse(|p| parse_color(p)) {
+                color = Some(c);
+                consumed = true;
+                continue;
+            }
+        }
+
+        if let Ok(ident) = parser.try_parse(|p| p.expect_ident().map(|s| s.to_string())) {
+            match ident.as_str() {
+                "none" | "hidden" => {
+                    style_none = true;
+                    consumed = true;
+                }
+                "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset"
+                | "outset" => {
+                    consumed = true;
+                }
+                _ => return Err(()),
+            }
+            continue;
+        }
+
+        return Err(());
     }
 
-    if let Some(weight) = weight {
-        declarations.push(StyleDeclaration::FontWeight(weight));
+    if !consumed {
+        return Err(());
     }
-    declarations.push(StyleDeclaration::FontSize(size));
-    if let Some(line_height) = line_height {
-        declarations.push(StyleDeclaration::LineHeight(line_height));
+
+    let resolved_width = if style_none { 0.0 } else { width.ok_or(())? };
+    let mut decls = SmallVec::<[StyleDeclaration; 2]>::new();
+    if let Some(side) = side {
+        decls.push(StyleDeclaration::BorderSideWidth(side, resolved_width));
+    } else {
+        decls.push(StyleDeclaration::BorderWidth(Edges::all(resolved_width)));
     }
-    if let Some(family) = family {
-        declarations.push(StyleDeclaration::FontFamily(family));
+    if let Some(color) = color {
+        decls.push(StyleDeclaration::BorderColor(color));
     }
-    Ok(declarations)
+
+    let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
+    Ok(decls)
 }
 
 /// Parse a value for the CSS `content` property.
@@ -3876,38 +4022,61 @@ mod tests {
 
     #[test]
     fn test_font_shorthand_expands_to_supported_longhands() {
-        let decls = parse_decls(
-            ".x { font: 600 16px/1.3 \"JetBrains Mono\", \"Berkeley Mono\", monospace; color: red; }",
-        );
+        let decls = parse_decls(r#".x { font: 600 13px/1.4 "JetBrains Mono", monospace; }"#);
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
 
-        assert!(decls
-            .iter()
-            .any(|d| matches!(d, StyleDeclaration::FontWeight(FontWeight::W(600)))));
-        assert!(decls.iter().any(
-            |d| matches!(d, StyleDeclaration::FontSize(v) if (*v - 16.0).abs() < f32::EPSILON)
-        ));
-        assert!(decls.iter().any(
-            |d| matches!(d, StyleDeclaration::LineHeight(v) if (*v - 1.3).abs() < f32::EPSILON)
-        ));
-        assert!(decls.iter().any(
-            |d| matches!(d, StyleDeclaration::FontFamily(family) if family == "JetBrains Mono")
-        ));
-        assert!(decls.iter().any(|d| matches!(d, StyleDeclaration::Color(_))));
+        assert_eq!(style.font_weight, FontWeight::W(600));
+        assert!((style.font_size - 13.0).abs() < 0.01);
+        assert!((style.line_height - 1.4).abs() < 0.01);
+        assert_eq!(style.font_family, "JetBrains Mono");
     }
 
     #[test]
-    fn test_font_shorthand_resolves_design_system_type_variable() {
+    fn test_font_shorthand_var_reference_resolves_design_token() {
+        let sheet = CompiledStylesheet::parse(
+            r#"
+            .x { font: var(--type-body); }
+            :root {
+                --t-md: 12px;
+                --font-mono: "JetBrains Mono", Consolas, monospace;
+                --type-body: 400 var(--t-md)/1.55 var(--font-mono);
+            }
+            "#,
+        );
+        let decls = sheet
+            .rules
+            .iter()
+            .find(|rule| !rule.declarations.is_empty())
+            .expect("font rule")
+            .declarations
+            .clone();
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.font_weight, FontWeight::W(400));
+        assert!((style.font_size - 12.0).abs() < 0.01);
+        assert!((style.line_height - 1.55).abs() < 0.01);
+        assert_eq!(style.font_family, "JetBrains Mono");
+    }
+
+    #[test]
+    fn test_font_shorthand_resolves_settings_page_type_variable() {
         let sheet = CompiledStylesheet::parse(
             r#"
             :root {
-              --font-mono: "JetBrains Mono", "Berkeley Mono", monospace;
-              --t-sm: 11px;
-              --type-label: 500 var(--t-sm)/1.4 var(--font-mono);
+                --font-mono: "JetBrains Mono", "Berkeley Mono", monospace;
+                --t-sm: 11px;
+                --type-label: 500 var(--t-sm)/1.4 var(--font-mono);
             }
             .set-page-nav-item { font: var(--type-label); }
             "#,
         );
-        let rule = sheet
+        let decls = sheet
             .rules
             .iter()
             .find(|rule| {
@@ -3917,21 +4086,66 @@ mod tests {
                     )
                 })
             })
-            .expect("expected .set-page-nav-item rule");
-        let decls = &rule.declarations;
+            .expect("expected .set-page-nav-item rule")
+            .declarations
+            .clone();
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
 
+        assert_eq!(style.font_weight, FontWeight::W(500));
+        assert!((style.font_size - 11.0).abs() < 0.01);
+        assert!((style.line_height - 1.4).abs() < 0.01);
+        assert_eq!(style.font_family, "JetBrains Mono");
+    }
+
+    #[test]
+    fn test_invalid_font_shorthand_does_not_swallow_next_declaration() {
+        let decls = parse_decls(".x { font: 12px; color: #ff0000; }");
+        assert!(!decls.iter().any(|d| matches!(d, StyleDeclaration::FontSize(_))));
         assert!(decls
             .iter()
-            .any(|d| matches!(d, StyleDeclaration::FontWeight(FontWeight::W(500)))));
-        assert!(decls.iter().any(
-            |d| matches!(d, StyleDeclaration::FontSize(v) if (*v - 11.0).abs() < f32::EPSILON)
-        ));
-        assert!(decls.iter().any(
-            |d| matches!(d, StyleDeclaration::LineHeight(v) if (*v - 1.4).abs() < f32::EPSILON)
-        ));
-        assert!(decls.iter().any(
-            |d| matches!(d, StyleDeclaration::FontFamily(family) if family == "JetBrains Mono")
-        ));
+            .any(|d| matches!(d, StyleDeclaration::Color(Color { r: 255, g: 0, b: 0, a: 255 }))));
+    }
+
+    #[test]
+    fn test_border_shorthand_sets_width_and_color() {
+        let decls = parse_decls(".x { border: 1px solid #112233; }");
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.border_width, Edges::all(1.0));
+        assert_eq!(style.border_color, Color::rgb(0x11, 0x22, 0x33));
+    }
+
+    #[test]
+    fn test_border_side_shorthand_sets_one_side_and_color() {
+        let decls = parse_decls(".x { border-bottom: 2px dashed #c9553a; }");
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.border_width.bottom, 2.0);
+        assert_eq!(style.border_width.top, 0.0);
+        assert_eq!(style.border_width.right, 0.0);
+        assert_eq!(style.border_width.left, 0.0);
+        assert_eq!(style.border_color, Color::rgb(0xc9, 0x55, 0x3a));
+    }
+
+    #[test]
+    fn test_border_none_clears_width_without_swallowing_next_declaration() {
+        let decls = parse_decls(".x { border: none; color: #ff0000; }");
+        let mut style = ComputedStyle { border_width: Edges::all(1.0), ..Default::default() };
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.border_width, Edges::ZERO);
+        assert_eq!(style.color, Color::rgb(255, 0, 0));
     }
 
     #[test]

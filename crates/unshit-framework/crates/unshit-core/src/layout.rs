@@ -1,9 +1,9 @@
 use crate::dirty::DirtyFlags;
 use crate::element::{ElementContent, InputType, Tag};
 use crate::id::NodeId;
-use crate::style::types::WhiteSpace;
+use crate::style::types::{FontWeight, WhiteSpace};
 use crate::tree::NodeArena;
-use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Weight};
 use rustc_hash::FxHashMap;
 use taffy::TaffyTree;
 
@@ -15,6 +15,8 @@ pub struct TextMeasureCtx {
     pub font_size: f32,
     pub line_height: f32,
     pub letter_spacing: f32,
+    pub font_family: String,
+    pub font_weight: FontWeight,
     pub white_space: WhiteSpace,
 }
 
@@ -27,10 +29,47 @@ pub struct TextMeasureCache {
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct MeasureCacheKey {
     text_hash: u64,
+    font_family_hash: u64,
+    font_weight: u16,
     font_size_tenths: i32,
     line_height_tenths: i32,
     letter_spacing_tenths: i32,
     max_width_tenths: i32, // -1 for None
+}
+
+pub fn font_weight_number(weight: FontWeight) -> u16 {
+    match weight {
+        FontWeight::Normal => 400,
+        FontWeight::Bold => 700,
+        FontWeight::W(weight) => weight,
+    }
+}
+
+pub fn cosmic_font_weight(weight: FontWeight) -> Weight {
+    Weight(font_weight_number(weight))
+}
+
+pub fn cosmic_font_family(font_family: &str) -> Family<'_> {
+    let family = font_family.trim();
+    if family.is_empty() {
+        Family::SansSerif
+    } else if family.eq_ignore_ascii_case("serif") {
+        Family::Serif
+    } else if family.eq_ignore_ascii_case("sans-serif") {
+        Family::SansSerif
+    } else if family.eq_ignore_ascii_case("cursive") {
+        Family::Cursive
+    } else if family.eq_ignore_ascii_case("fantasy") {
+        Family::Fantasy
+    } else if family.eq_ignore_ascii_case("monospace") {
+        Family::Monospace
+    } else {
+        Family::Name(family)
+    }
+}
+
+pub fn text_attrs(font_family: &str, font_weight: FontWeight) -> Attrs<'_> {
+    Attrs::new().family(cosmic_font_family(font_family)).weight(cosmic_font_weight(font_weight))
 }
 
 impl Default for TextMeasureCache {
@@ -58,16 +97,22 @@ impl TextMeasureCache {
 
     fn key(
         text: &str,
+        font_family: &str,
+        font_weight: FontWeight,
         font_size: f32,
         line_height: f32,
         letter_spacing: f32,
         max_width: Option<f32>,
     ) -> MeasureCacheKey {
         use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut hasher);
+        let mut text_hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut text_hasher);
+        let mut font_hasher = std::collections::hash_map::DefaultHasher::new();
+        font_family.hash(&mut font_hasher);
         MeasureCacheKey {
-            text_hash: hasher.finish(),
+            text_hash: text_hasher.finish(),
+            font_family_hash: font_hasher.finish(),
+            font_weight: font_weight_number(font_weight),
             font_size_tenths: (font_size * 10.0) as i32,
             line_height_tenths: (line_height * 10.0) as i32,
             letter_spacing_tenths: (letter_spacing * 10.0) as i32,
@@ -78,25 +123,45 @@ impl TextMeasureCache {
     fn get(
         &self,
         text: &str,
+        font_family: &str,
+        font_weight: FontWeight,
         font_size: f32,
         line_height: f32,
         letter_spacing: f32,
         max_width: Option<f32>,
     ) -> Option<(f32, f32)> {
-        let key = Self::key(text, font_size, line_height, letter_spacing, max_width);
+        let key = Self::key(
+            text,
+            font_family,
+            font_weight,
+            font_size,
+            line_height,
+            letter_spacing,
+            max_width,
+        );
         self.map.get(&key).copied()
     }
 
     fn insert(
         &mut self,
         text: &str,
+        font_family: &str,
+        font_weight: FontWeight,
         font_size: f32,
         line_height: f32,
         letter_spacing: f32,
         max_width: Option<f32>,
         result: (f32, f32),
     ) {
-        let key = Self::key(text, font_size, line_height, letter_spacing, max_width);
+        let key = Self::key(
+            text,
+            font_family,
+            font_weight,
+            font_size,
+            line_height,
+            letter_spacing,
+            max_width,
+        );
         self.map.insert(key, result);
     }
 }
@@ -167,6 +232,8 @@ pub fn sync_element_to_taffy(
                     font_size: element.computed_style.font_size,
                     line_height: element.computed_style.line_height,
                     letter_spacing: element.computed_style.letter_spacing,
+                    font_family: element.computed_style.font_family.clone(),
+                    font_weight: element.computed_style.font_weight,
                     white_space: element.computed_style.white_space,
                 };
                 taffy.new_leaf_with_context(style, ctx).unwrap()
@@ -184,6 +251,8 @@ pub fn sync_element_to_taffy(
                     font_size: element.computed_style.font_size,
                     line_height: element.computed_style.line_height,
                     letter_spacing: element.computed_style.letter_spacing,
+                    font_family: element.computed_style.font_family.clone(),
+                    font_weight: element.computed_style.font_weight,
                     white_space: element.computed_style.white_space,
                 };
                 taffy.set_node_context(taffy_node, Some(ctx)).unwrap();
@@ -209,6 +278,8 @@ pub fn sync_element_to_taffy(
 /// Create a cosmic-text Buffer with text shaped and ready for layout iteration.
 fn shaped_buffer(
     text: &str,
+    font_family: &str,
+    font_weight: FontWeight,
     font_size: f32,
     line_height: f32,
     max_width: Option<f32>,
@@ -217,7 +288,7 @@ fn shaped_buffer(
     let metrics = Metrics::new(font_size, font_size * line_height);
     let mut buffer = Buffer::new(font_system, metrics);
     buffer.set_size(font_system, max_width, None);
-    buffer.set_text(font_system, text, Attrs::new(), Shaping::Advanced);
+    buffer.set_text(font_system, text, text_attrs(font_family, font_weight), Shaping::Advanced);
     buffer.shape_until_scroll(font_system, false);
     buffer
 }
@@ -242,13 +313,54 @@ pub fn measure_text_cached(
     font_system: &mut FontSystem,
     cache: Option<&mut TextMeasureCache>,
 ) -> (f32, f32) {
+    measure_text_with_style_cached(
+        text,
+        "",
+        FontWeight::Normal,
+        font_size,
+        line_height,
+        letter_spacing,
+        max_width,
+        font_system,
+        cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn measure_text_with_style_cached(
+    text: &str,
+    font_family: &str,
+    font_weight: FontWeight,
+    font_size: f32,
+    line_height: f32,
+    letter_spacing: f32,
+    max_width: Option<f32>,
+    font_system: &mut FontSystem,
+    cache: Option<&mut TextMeasureCache>,
+) -> (f32, f32) {
     if let Some(ref cache) = cache {
-        if let Some(cached) = cache.get(text, font_size, line_height, letter_spacing, max_width) {
+        if let Some(cached) = cache.get(
+            text,
+            font_family,
+            font_weight,
+            font_size,
+            line_height,
+            letter_spacing,
+            max_width,
+        ) {
             return cached;
         }
     }
 
-    let buffer = shaped_buffer(text, font_size, line_height, max_width, font_system);
+    let buffer = shaped_buffer(
+        text,
+        font_family,
+        font_weight,
+        font_size,
+        line_height,
+        max_width,
+        font_system,
+    );
 
     let mut width = buffer.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max);
 
@@ -265,7 +377,16 @@ pub fn measure_text_cached(
     let result = (width.ceil(), height.ceil());
 
     if let Some(cache) = cache {
-        cache.insert(text, font_size, line_height, letter_spacing, max_width, result);
+        cache.insert(
+            text,
+            font_family,
+            font_weight,
+            font_size,
+            line_height,
+            letter_spacing,
+            max_width,
+            result,
+        );
     }
 
     result
@@ -303,7 +424,8 @@ pub fn hit_test_text_position(
         return None;
     }
 
-    let buffer = shaped_buffer(text, font_size, line_height, max_width, font_system);
+    let buffer =
+        shaped_buffer(text, "", FontWeight::Normal, font_size, line_height, max_width, font_system);
     let line_h = font_size * line_height;
 
     let mut best_offset: Option<usize> = None;
@@ -361,7 +483,8 @@ pub fn text_glyph_ranges(
         return ranges;
     }
 
-    let buffer = shaped_buffer(text, font_size, line_height, max_width, font_system);
+    let buffer =
+        shaped_buffer(text, "", FontWeight::Normal, font_size, line_height, max_width, font_system);
     let line_h = font_size * line_height;
 
     for run in buffer.layout_runs() {
@@ -411,7 +534,8 @@ pub fn text_line_ranges(
         return result;
     }
 
-    let buffer = shaped_buffer(text, font_size, line_height, max_width, font_system);
+    let buffer =
+        shaped_buffer(text, "", FontWeight::Normal, font_size, line_height, max_width, font_system);
     let line_h = font_size * line_height;
 
     for run in buffer.layout_runs() {
@@ -469,8 +593,10 @@ pub fn compute_layout(
                                 _ => None,
                             })
                         };
-                    let (tw, th) = measure_text_cached(
+                    let (tw, th) = measure_text_with_style_cached(
                         &ctx.text,
+                        &ctx.font_family,
+                        ctx.font_weight,
                         ctx.font_size,
                         ctx.line_height,
                         ctx.letter_spacing,
@@ -731,6 +857,62 @@ mod tests {
         let svg_rect = arena.get(svg_id).unwrap().layout_rect;
         assert_eq!(svg_rect.width, 16.0, "SVG should be 16px wide from CSS");
         assert_eq!(svg_rect.height, 16.0, "SVG should be 16px tall from CSS");
+    }
+
+    #[test]
+    fn text_measure_cache_key_includes_font_family_and_weight() {
+        let mut font_system = FontSystem::new();
+        let mut cache = TextMeasureCache::new();
+
+        let _ = measure_text_with_style_cached(
+            "keep",
+            "Consolas",
+            FontWeight::Normal,
+            11.0,
+            1.4,
+            0.0,
+            None,
+            &mut font_system,
+            Some(&mut cache),
+        );
+        let _ = measure_text_with_style_cached(
+            "keep",
+            "Consolas",
+            FontWeight::W(600),
+            11.0,
+            1.4,
+            0.0,
+            None,
+            &mut font_system,
+            Some(&mut cache),
+        );
+        let _ = measure_text_with_style_cached(
+            "keep",
+            "JetBrains Mono",
+            FontWeight::Normal,
+            11.0,
+            1.4,
+            0.0,
+            None,
+            &mut font_system,
+            Some(&mut cache),
+        );
+
+        assert_eq!(cache.len(), 3);
+
+        let _ = measure_text_with_style_cached(
+            "keep",
+            "Consolas",
+            FontWeight::Normal,
+            11.0,
+            1.4,
+            0.0,
+            None,
+            &mut font_system,
+            Some(&mut cache),
+        );
+
+        assert_eq!(cache.len(), 3);
     }
 
     /// Regression: clear_dirty_flags must only clear layout-phase flags
