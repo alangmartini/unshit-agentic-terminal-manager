@@ -101,14 +101,10 @@ pub struct SvgPipeline {
     /// the whole render pass. Must be taken and released by
     /// `GpuContext::render` after `queue.submit`.
     current_instance_buffer: Option<PooledBuffer<SvgInstanceSlot>>,
-    /// Bind group keyed on the address of the currently held pooled
-    /// buffer. Rebuilt whenever the acquired buffer differs from the
-    /// one that backed the previous bind group (e.g. after pool grow,
-    /// or simply when the pool handed out a different recycled buffer).
+    /// Bind group for the currently held pooled buffer. Rebuilt on every
+    /// upload because `PooledBuffer` is a movable wrapper around a GPU
+    /// buffer; wrapper addresses are not stable GPU resource identities.
     current_instance_bind_group: Option<wgpu::BindGroup>,
-    /// Cache key for `current_instance_bind_group` so we can detect
-    /// when the buffer behind the bind group changed identity.
-    current_instance_buffer_id: u64,
 
     // Lookup from an `Arc<SvgGeometry>` identity (pointer value) to the
     // uploaded GPU buffers. Keeping this map on the pipeline means the
@@ -275,7 +271,6 @@ impl SvgPipeline {
             instance_pool,
             current_instance_buffer: None,
             current_instance_bind_group: None,
-            current_instance_buffer_id: 0,
             geometry_gpu: HashMap::new(),
         }
     }
@@ -324,20 +319,11 @@ impl SvgPipeline {
         }
         pooled.write(queue, &slots);
 
-        // Use the buffer's heap pointer as a stable identity for bind
-        // group caching. The pointer stays valid as long as the pooled
-        // buffer is held.
-        let buffer_id = pooled.as_buffer() as *const wgpu::Buffer as u64;
-        if self.current_instance_buffer_id != buffer_id
-            || self.current_instance_bind_group.is_none()
-        {
-            self.current_instance_bind_group = Some(make_instance_bind_group(
-                device,
-                &self.instance_bind_group_layout,
-                pooled.as_buffer(),
-            ));
-            self.current_instance_buffer_id = buffer_id;
-        }
+        self.current_instance_bind_group = Some(make_instance_bind_group(
+            device,
+            &self.instance_bind_group_layout,
+            pooled.as_buffer(),
+        ));
         self.current_instance_buffer = Some(pooled);
     }
 

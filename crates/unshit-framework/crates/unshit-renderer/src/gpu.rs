@@ -68,14 +68,51 @@ fn trace_text_draw_ranges() -> bool {
 /// MSAA sample count for the main content pipelines. Set to 1 to disable.
 const MSAA_SAMPLE_COUNT: u32 = 4;
 
-/// Compute the usage flags for the window `SurfaceConfiguration`. When the
-/// surface allows `COPY_DST` the backdrop-filter path needs that flag so it
-/// can `copy_texture_to_texture` the blurred offscreen result onto the
-/// presented frame (see the copy around `backdrop_source.as_image_copy()`
-/// in `render`). If the surface does not expose `COPY_DST` we fall back to
-/// the base usages and `probe_backdrop_filter_support` disables the effect.
+fn parse_backend_env_value(value: &str) -> Option<wgpu::Backends> {
+    match value.to_ascii_lowercase().as_str() {
+        "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
+        "dx12" | "d3d12" | "directx12" => Some(wgpu::Backends::DX12),
+        "metal" => Some(wgpu::Backends::METAL),
+        "gl" | "opengl" => Some(wgpu::Backends::GL),
+        _ => None,
+    }
+}
+
+fn renderer_backends() -> wgpu::Backends {
+    for key in ["UNSHIT_RENDER_BACKEND", "WGPU_BACKEND"] {
+        if let Ok(value) = std::env::var(key) {
+            if let Some(backends) = parse_backend_env_value(&value) {
+                log::info!("renderer backend forced by {key}={value}");
+                return backends;
+            }
+            log::warn!("ignoring unsupported {key}={value}; expected vulkan, dx12, metal, or gl");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Prefer Vulkan on Windows because some D3D12 adapters expose the
+        // WebGPU minimum inter-stage component limit, which is too low for
+        // the current quad shader's gradient payload. `UNSHIT_RENDER_BACKEND`
+        // can still force D3D12 when a system needs it.
+        wgpu::Backends::VULKAN
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        wgpu::Backends::all()
+    }
+}
+
+/// Compute the usage flags for the window `SurfaceConfiguration`. Request
+/// only usages the surface advertises, plus the required render target usage.
+/// Some backends exposed through RDP/RemoteApp only support rendering to the
+/// swapchain texture, so optional copy usages must be negotiated.
 fn surface_config_usages(surface_usages: wgpu::TextureUsages) -> wgpu::TextureUsages {
-    let mut usages = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+    let mut usages = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    if surface_usages.contains(wgpu::TextureUsages::COPY_SRC) {
+        usages |= wgpu::TextureUsages::COPY_SRC;
+    }
     if surface_usages.contains(wgpu::TextureUsages::COPY_DST) {
         usages |= wgpu::TextureUsages::COPY_DST;
     }
@@ -209,11 +246,10 @@ pub struct GpuContext {
 impl GpuContext {
     pub async fn new(window: Arc<dyn winit::window::Window>) -> Self {
         let size = window.surface_size();
+        let backends = renderer_backends();
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        let instance =
+            wgpu::Instance::new(&wgpu::InstanceDescriptor { backends, ..Default::default() });
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
@@ -225,6 +261,7 @@ impl GpuContext {
             })
             .await
             .unwrap();
+        log::info!("renderer adapter selected: {:?}", adapter.get_info());
 
         // Request the adapter's actual hardware limits so pipelines with many
         // vertex attributes (gradient quad pipeline: 23 attrs, 84 inter-stage
@@ -275,13 +312,20 @@ impl GpuContext {
             wgpu::PresentMode::Fifo
         };
 
+        let alpha_mode = surface_caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|mode| *mode == wgpu::CompositeAlphaMode::Opaque)
+            .unwrap_or(surface_caps.alpha_modes[0]);
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: surface_config_usages(surface_caps.usages),
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode,
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -1989,13 +2033,19 @@ mod tests {
     fn surface_config_usages_always_includes_base_usages() {
         let usages = surface_config_usages(wgpu::TextureUsages::empty());
         assert!(usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
-        assert!(usages.contains(wgpu::TextureUsages::COPY_SRC));
+    }
+
+    #[test]
+    fn surface_config_usages_omits_copy_src_when_unsupported() {
+        let caps = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let usages = surface_config_usages(caps);
+        assert_eq!(usages, wgpu::TextureUsages::RENDER_ATTACHMENT);
     }
 
     /// Pins the additive-only contract: even when the input caps include
     /// usages outside the swapchain's needs (e.g. `STORAGE_BINDING`,
-    /// `TEXTURE_BINDING`), the helper must only enable `COPY_DST` from the
-    /// extra-flag set.
+    /// `TEXTURE_BINDING`), the helper must only enable supported copy flags
+    /// from the extra-flag set.
     #[test]
     fn surface_config_usages_does_not_pass_through_unrelated_flags() {
         let usages = surface_config_usages(wgpu::TextureUsages::all());
@@ -2004,7 +2054,7 @@ mod tests {
             | wgpu::TextureUsages::COPY_DST;
         assert_eq!(
             usages, allowed,
-            "surface_config_usages must be additive on COPY_DST only; \
+            "surface_config_usages must be additive on supported copy flags only; \
              unrelated flags from caps must not leak into the swapchain config"
         );
     }

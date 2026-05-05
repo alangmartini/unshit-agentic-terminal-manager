@@ -46,25 +46,63 @@ pub fn font_weight_number(weight: FontWeight) -> u16 {
 }
 
 pub fn cosmic_font_weight(weight: FontWeight) -> Weight {
-    Weight(font_weight_number(weight))
+    let numeric = font_weight_number(weight);
+    #[cfg(target_os = "windows")]
+    let numeric = if numeric == 500 { 400 } else { numeric };
+    Weight(numeric)
 }
 
 pub fn cosmic_font_family(font_family: &str) -> Family<'_> {
-    let family = font_family.trim();
+    let family = normalize_font_family_token(font_family.trim());
+    if font_family.contains(',') {
+        for token in font_family.split(',').map(|part| normalize_font_family_token(part.trim())) {
+            if let Some(generic) = generic_font_family(token) {
+                return generic;
+            }
+        }
+    }
     if family.is_empty() {
         Family::SansSerif
-    } else if family.eq_ignore_ascii_case("serif") {
-        Family::Serif
-    } else if family.eq_ignore_ascii_case("sans-serif") {
-        Family::SansSerif
-    } else if family.eq_ignore_ascii_case("cursive") {
-        Family::Cursive
-    } else if family.eq_ignore_ascii_case("fantasy") {
-        Family::Fantasy
-    } else if family.eq_ignore_ascii_case("monospace") {
-        Family::Monospace
+    } else if let Some(generic) = generic_font_family(family) {
+        generic
     } else {
         Family::Name(family)
+    }
+}
+
+fn normalize_font_family_token(token: &str) -> &str {
+    let trimmed = token.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
+}
+
+fn generic_font_family(family: &str) -> Option<Family<'static>> {
+    if family.eq_ignore_ascii_case("serif") {
+        Some(Family::Serif)
+    } else if family.eq_ignore_ascii_case("sans-serif") {
+        Some(Family::SansSerif)
+    } else if family.eq_ignore_ascii_case("cursive") {
+        Some(Family::Cursive)
+    } else if family.eq_ignore_ascii_case("fantasy") {
+        Some(Family::Fantasy)
+    } else if family.eq_ignore_ascii_case("monospace") {
+        #[cfg(target_os = "windows")]
+        {
+            Some(Family::Name("Consolas"))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Some(Family::Monospace)
+        }
+    } else {
+        None
     }
 }
 
@@ -810,6 +848,26 @@ mod tests {
     use super::*;
     use crate::element::{Element, ElementDef};
     use crate::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, ViewBox};
+
+    #[test]
+    fn cosmic_font_family_strips_css_quotes() {
+        assert!(matches!(cosmic_font_family("'Consolas'"), Family::Name("Consolas")));
+    }
+
+    #[test]
+    fn cosmic_font_family_prefers_generic_fallback_in_css_list() {
+        let family = "'JetBrains Mono', 'Berkeley Mono', 'SF Mono', Menlo, Consolas, monospace";
+        #[cfg(target_os = "windows")]
+        assert!(matches!(cosmic_font_family(family), Family::Name("Consolas")));
+        #[cfg(not(target_os = "windows"))]
+        assert!(matches!(cosmic_font_family(family), Family::Monospace));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cosmic_font_weight_maps_medium_to_regular_for_windows_fallback() {
+        assert_eq!(cosmic_font_weight(FontWeight::W(500)), Weight(400));
+    }
 
     /// SVG elements with CSS-assigned pixel dimensions (from a `svg`
     /// tag rule) must receive non-zero layout size. Without the CSS

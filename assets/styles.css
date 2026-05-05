@@ -196,12 +196,13 @@ input, select {
   inset: 0;
   pointer-events: none;
   z-index: 0;
-  background: radial-gradient(ellipse 60% 40% at 85% 0%, rgba(212, 163, 72, 0.035), transparent 70%);
+  background:
+    radial-gradient(ellipse 60% 40% at 85% 0%, rgba(212, 163, 72, 0.035), transparent 70%),
+    radial-gradient(ellipse 80% 50% at 10% 100%, rgba(138, 96, 32, 0.025), transparent 70%);
 }
 
 .app::after {
-  content: none;
-  display: none;
+  content: '';
   position: fixed;
   inset: 0;
   pointer-events: none;
