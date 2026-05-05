@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main]
+    branches: [main, feat/rust-terminal-manager]
 
 concurrency:
   group: pr-quality-gate-${{ github.head_ref || github.ref }}
