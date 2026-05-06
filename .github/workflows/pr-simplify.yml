@@ -23,29 +23,45 @@ jobs:
     runs-on: [self-hosted, Windows, X64, local-windows]
     timeout-minutes: 30
     env:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
     steps:
-      - name: Check agent configuration
+      - name: Add Codex CLI to PATH
+        shell: powershell
+        run: |
+          $npmBin = Join-Path $env:APPDATA 'npm'
+          if (Test-Path $npmBin) {
+            $npmBin >> $env:GITHUB_PATH
+            $env:PATH = "$npmBin;$env:PATH"
+          }
+
+      - name: Check Codex configuration
         id: config
         shell: powershell
         run: |
-          $hasAnthropic = -not [string]::IsNullOrWhiteSpace($env:ANTHROPIC_API_KEY)
+          $hasCodex = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
+          $hasOpenAIKey = -not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)
+          $hasCodexLogin = $false
+          if ($hasCodex -and -not $hasOpenAIKey) {
+            codex login status *> $null
+            $hasCodexLogin = $LASTEXITCODE -eq 0
+          }
           $hasApp = (-not [string]::IsNullOrWhiteSpace($env:APP_ID)) -and (-not [string]::IsNullOrWhiteSpace($env:APP_PRIVATE_KEY))
-          $ready = $hasAnthropic -and $hasApp
+          $ready = $hasCodex -and ($hasOpenAIKey -or $hasCodexLogin)
           "ready=$($ready.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "has_app=$($hasApp.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
           if (-not $ready) {
             "Agentic simplify skipped." >> $env:GITHUB_STEP_SUMMARY
             "" >> $env:GITHUB_STEP_SUMMARY
-            "Required repository secrets: ANTHROPIC_API_KEY, APP_ID, APP_PRIVATE_KEY." >> $env:GITHUB_STEP_SUMMARY
+            "Required: Codex CLI plus either OPENAI_API_KEY or an existing Codex login on the runner." >> $env:GITHUB_STEP_SUMMARY
           }
 
       - name: Generate GitHub App token
         id: app-token
-        if: steps.config.outputs.ready == 'true'
+        if: steps.config.outputs.ready == 'true' && steps.config.outputs.has_app == 'true'
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.APP_ID }}
@@ -57,13 +73,29 @@ jobs:
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.ref }}
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
           fetch-depth: 0
 
       - name: Fetch PR base
         if: steps.config.outputs.ready == 'true'
         shell: powershell
         run: git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1
+
+      - name: Configure git identity
+        if: steps.config.outputs.ready == 'true'
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Configure Codex auth
+        if: steps.config.outputs.ready == 'true'
+        shell: powershell
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) {
+            $env:OPENAI_API_KEY | codex login --with-api-key
+          }
+          codex login status
 
       - name: Skip agent-generated simplify commits
         id: guard
@@ -79,11 +111,12 @@ jobs:
 
       - name: Run /simplify
         if: steps.config.outputs.ready == 'true' && steps.guard.outputs.skip != 'true'
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ steps.app-token.outputs.token }}
-          prompt: |
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: |
+          $prompt = @'
             Run `/simplify` for PR #${{ github.event.pull_request.number }}.
 
             Scope:
@@ -105,6 +138,12 @@ jobs:
             If verification fails:
             - Do not push.
             - Comment on the PR with the failing command and the root cause.
-          claude_args: |
-            --model claude-sonnet-4-6
-            --max-turns 10
+          '@
+
+          $prompt | codex exec `
+            --model gpt-5.3-codex-spark `
+            --sandbox danger-full-access `
+            --ask-for-approval never `
+            --ephemeral `
+            --cd "$PWD" `
+            -
