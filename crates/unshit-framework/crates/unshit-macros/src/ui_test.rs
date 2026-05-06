@@ -61,10 +61,23 @@ pub fn ui_test_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let env_cleanup: Vec<TokenStream2> =
         env_vars.iter().map(|(name, _)| quote! { std::env::remove_var(#name); }).collect();
 
+    let env_guard = if env_vars.is_empty() {
+        quote! {}
+    } else {
+        quote! { let __ui_test_env_guard = ::unshit_test::__private::env_lock(); }
+    };
+
+    let env_guard_drop = if env_vars.is_empty() {
+        quote! {}
+    } else {
+        quote! { drop(__ui_test_env_guard); }
+    };
+
     let expanded = quote! {
         #(#fn_attrs)*
         #[test]
         #fn_vis fn #fn_name() {
+            #env_guard
             #(#env_setup)*
 
             let __ui_test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -72,6 +85,7 @@ pub fn ui_test_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             }));
 
             #(#env_cleanup)*
+            #env_guard_drop
 
             if let Err(err) = __ui_test_result {
                 std::panic::resume_unwind(err);

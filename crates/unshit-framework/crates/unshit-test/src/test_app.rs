@@ -444,6 +444,10 @@ mod tests {
     use std::time::Instant;
     use unshit_core::element::{ElementDef, ElementTree, Tag};
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::__private::env_lock()
+    }
+
     fn simple_tree() -> ElementTree {
         ElementTree {
             root: ElementDef::new(Tag::Div)
@@ -455,6 +459,8 @@ mod tests {
 
     #[test]
     fn test_app_defaults_to_headless() {
+        let _env = env_guard();
+
         // Ensure env vars are not set for this test
         std::env::remove_var("UNSHIT_TEST_HEADED");
         std::env::remove_var("UNSHIT_TEST_SLOW_MO");
@@ -466,6 +472,8 @@ mod tests {
 
     #[test]
     fn test_app_query_works_headless() {
+        let _env = env_guard();
+
         std::env::remove_var("UNSHIT_TEST_HEADED");
 
         let app = TestApp::new(".container { width: 100%; }", simple_tree, 800.0, 600.0);
@@ -482,6 +490,8 @@ mod tests {
 
     #[test]
     fn test_app_query_all_works_headless() {
+        let _env = env_guard();
+
         std::env::remove_var("UNSHIT_TEST_HEADED");
 
         let app = TestApp::new("", simple_tree, 800.0, 600.0);
@@ -492,6 +502,8 @@ mod tests {
 
     #[test]
     fn test_app_step_works_headless() {
+        let _env = env_guard();
+
         std::env::remove_var("UNSHIT_TEST_HEADED");
 
         let mut app = TestApp::new("", simple_tree, 800.0, 600.0);
@@ -503,6 +515,8 @@ mod tests {
 
     #[test]
     fn test_app_click_works_headless() {
+        let _env = env_guard();
+
         std::env::remove_var("UNSHIT_TEST_HEADED");
 
         let mut app =
@@ -514,6 +528,8 @@ mod tests {
 
     #[test]
     fn test_slow_mo_env_parsing() {
+        let _env = env_guard();
+
         std::env::set_var("UNSHIT_TEST_HEADED", "0");
         std::env::set_var("UNSHIT_TEST_SLOW_MO", "200");
 
@@ -527,6 +543,8 @@ mod tests {
 
     #[test]
     fn test_slow_mo_adds_delay() {
+        let _env = env_guard();
+
         std::env::set_var("UNSHIT_TEST_HEADED", "0");
         std::env::set_var("UNSHIT_TEST_SLOW_MO", "100");
 
@@ -551,6 +569,8 @@ mod tests {
 
     #[test]
     fn test_pause_is_noop_in_headless() {
+        let _env = env_guard();
+
         std::env::remove_var("UNSHIT_TEST_HEADED");
 
         let mut app = TestApp::new("", simple_tree, 800.0, 600.0);
@@ -564,6 +584,8 @@ mod tests {
 
     #[test]
     fn test_backend_access() {
+        let _env = env_guard();
+
         std::env::remove_var("UNSHIT_TEST_HEADED");
 
         let app = TestApp::new("", simple_tree, 800.0, 600.0);
@@ -576,6 +598,8 @@ mod tests {
 
     #[unshit_macros::ui_test]
     fn ui_test_macro_basic() {
+        let _env = env_guard();
+
         std::env::remove_var("UNSHIT_TEST_HEADED");
         let app = TestApp::new("", simple_tree, 800.0, 600.0);
         assert!(!app.is_headed());
