@@ -1,0 +1,182 @@
+name: Agentic Simplify
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: agentic-simplify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  simplify:
+    name: Run /simplify
+    if: >
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Windows, X64, local-windows]
+    timeout-minutes: 30
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+
+    steps:
+      - name: Add Codex CLI to PATH
+        shell: powershell
+        run: |
+          $npmBin = Join-Path $env:APPDATA 'npm'
+          if (Test-Path $npmBin) {
+            $npmBin >> $env:GITHUB_PATH
+            $env:PATH = "$npmBin;$env:PATH"
+          }
+
+      - name: Check Codex configuration
+        id: config
+        shell: powershell
+        run: |
+          $hasCodex = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
+          $hasOpenAIKey = -not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)
+          $hasCodexLogin = $false
+          if ($hasCodex -and -not $hasOpenAIKey) {
+            $previousErrorActionPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+              & codex login status 2>&1 | Out-Null
+              $hasCodexLogin = $LASTEXITCODE -eq 0
+            } finally {
+              $ErrorActionPreference = $previousErrorActionPreference
+            }
+          }
+          $hasApp = (-not [string]::IsNullOrWhiteSpace($env:APP_ID)) -and (-not [string]::IsNullOrWhiteSpace($env:APP_PRIVATE_KEY))
+          $ready = $hasCodex -and ($hasOpenAIKey -or $hasCodexLogin)
+          "ready=$($ready.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "has_app=$($hasApp.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+          if (-not $ready) {
+            "Agentic simplify skipped." >> $env:GITHUB_STEP_SUMMARY
+            "" >> $env:GITHUB_STEP_SUMMARY
+            "Required: Codex CLI plus either OPENAI_API_KEY or an existing Codex login on the runner." >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Generate GitHub App token
+        id: app-token
+        if: steps.config.outputs.ready == 'true' && steps.config.outputs.has_app == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout PR branch
+        if: steps.config.outputs.ready == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          fetch-depth: 0
+
+      - name: Fetch PR base
+        if: steps.config.outputs.ready == 'true'
+        shell: powershell
+        run: git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1
+
+      - name: Configure git identity
+        if: steps.config.outputs.ready == 'true'
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Configure Codex auth
+        if: steps.config.outputs.ready == 'true'
+        shell: powershell
+        run: |
+          $previousErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            if (-not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) {
+              $loginOutput = $env:OPENAI_API_KEY | codex login --with-api-key 2>&1
+              $loginExitCode = $LASTEXITCODE
+              $loginOutput | ForEach-Object { Write-Host $_ }
+              if ($loginExitCode -ne 0) {
+                exit $loginExitCode
+              }
+            }
+
+            $statusOutput = & codex login status 2>&1
+            $statusExitCode = $LASTEXITCODE
+            $statusOutput | ForEach-Object { Write-Host $_ }
+            if ($statusExitCode -ne 0) {
+              exit $statusExitCode
+            }
+          } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+          }
+
+      - name: Skip agent-generated simplify commits
+        id: guard
+        if: steps.config.outputs.ready == 'true'
+        shell: powershell
+        run: |
+          $message = git log -1 --pretty=%B
+          $skip = $message -match '\[agent-simplify\]'
+          "skip=$($skip.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($skip) {
+            "Skipping because the head commit already came from agentic simplify." >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Run /simplify
+        if: steps.config.outputs.ready == 'true' && steps.guard.outputs.skip != 'true'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: |
+          $prompt = @'
+            Run `/simplify` for PR #${{ github.event.pull_request.number }}.
+
+            Scope:
+            - Compare this PR branch against `${{ github.event.pull_request.base.ref }}`.
+            - Simplify only code touched by this PR, plus directly adjacent helper code when needed.
+            - Preserve behavior exactly. Do not add features.
+            - Do not touch generated artifacts, target directories, or unrelated files.
+
+            If useful simplifications exist:
+            - Apply the smallest behavior-preserving edits.
+            - Run the smallest relevant verification. For Rust code, include `cargo fmt --check` and `cargo clippy -- -D warnings`; run focused tests or `cargo test --all` when the change is broad.
+            - Commit with message `refactor: simplify PR changes [agent-simplify]`.
+            - Push to this PR branch.
+
+            If no useful simplification exists:
+            - Leave the tree unchanged.
+            - Comment on the PR that no simplification changes were needed.
+
+            If verification fails:
+            - Do not push.
+            - Comment on the PR with the failing command and the root cause.
+          '@
+
+          $previousErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $prompt | codex --ask-for-approval never exec `
+              --model gpt-5.3-codex-spark `
+              --sandbox danger-full-access `
+              --ephemeral `
+              --cd "$PWD" `
+              -
+            $codexExitCode = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+          }
+
+          if ($codexExitCode -ne 0) {
+            exit $codexExitCode
+          }
