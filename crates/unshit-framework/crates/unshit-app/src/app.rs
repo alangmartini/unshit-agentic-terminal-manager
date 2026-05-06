@@ -509,14 +509,15 @@ fn classify_surface_metrics_change(
     new_size: winit::dpi::PhysicalSize<u32>,
     new_scale: f32,
 ) -> SurfaceMetricsChange {
-    let size_changed = new_size.width > 0
-        && new_size.height > 0
-        && ((current_size.0 as u32) != new_size.width
-            || (current_size.1 as u32) != new_size.height);
+    let size_changed =
+        (current_size.0 as u32, current_size.1 as u32) != (new_size.width, new_size.height);
+    let has_size = new_size.width > 0 && new_size.height > 0;
     let scale_changed = (new_scale - current_scale).abs() > 0.01;
 
     if scale_changed {
         SurfaceMetricsChange::Rebuild
+    } else if !has_size {
+        SurfaceMetricsChange::None
     } else if size_changed {
         SurfaceMetricsChange::Relayout
     } else {
@@ -530,16 +531,12 @@ fn reconcile_surface_metrics(
     new_scale: f32,
     on_scale_factor: Option<&Arc<dyn Fn(f32) + Send + Sync>>,
 ) -> SurfaceMetricsChange {
-    let change = classify_surface_metrics_change(
-        state.gpu.window_size(),
-        state.scale_factor,
-        new_size,
-        new_scale,
-    );
+    let current_size = state.gpu.window_size();
+    let change =
+        classify_surface_metrics_change(current_size, state.scale_factor, new_size, new_scale);
 
     if new_size.width > 0 && new_size.height > 0 {
-        let current = state.gpu.window_size();
-        if (current.0 as u32) != new_size.width || (current.1 as u32) != new_size.height {
+        if (current_size.0 as u32) != new_size.width || (current_size.1 as u32) != new_size.height {
             state.gpu.resize(new_size);
         }
     }
@@ -1239,11 +1236,13 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::Moved(_position) => {
-                if reconcile_surface_metrics_from_window(
-                    state,
-                    self.app.config.on_scale_factor.as_ref(),
-                ) != SurfaceMetricsChange::None
-                {
+                if !matches!(
+                    reconcile_surface_metrics_from_window(
+                        state,
+                        self.app.config.on_scale_factor.as_ref(),
+                    ),
+                    SurfaceMetricsChange::None
+                ) {
                     state.window.request_redraw();
                 }
 
@@ -1759,11 +1758,13 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::Focused(focused) => {
-                if reconcile_surface_metrics_from_window(
-                    state,
-                    self.app.config.on_scale_factor.as_ref(),
-                ) != SurfaceMetricsChange::None
-                {
+                if !matches!(
+                    reconcile_surface_metrics_from_window(
+                        state,
+                        self.app.config.on_scale_factor.as_ref(),
+                    ),
+                    SurfaceMetricsChange::None
+                ) {
                     state.window.request_redraw();
                 }
 
