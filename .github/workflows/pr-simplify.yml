@@ -45,8 +45,14 @@ jobs:
           $hasOpenAIKey = -not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)
           $hasCodexLogin = $false
           if ($hasCodex -and -not $hasOpenAIKey) {
-            codex login status *> $null
-            $hasCodexLogin = $LASTEXITCODE -eq 0
+            $previousErrorActionPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+              & codex login status 2>&1 | Out-Null
+              $hasCodexLogin = $LASTEXITCODE -eq 0
+            } finally {
+              $ErrorActionPreference = $previousErrorActionPreference
+            }
           }
           $hasApp = (-not [string]::IsNullOrWhiteSpace($env:APP_ID)) -and (-not [string]::IsNullOrWhiteSpace($env:APP_PRIVATE_KEY))
           $ready = $hasCodex -and ($hasOpenAIKey -or $hasCodexLogin)
@@ -92,10 +98,27 @@ jobs:
         if: steps.config.outputs.ready == 'true'
         shell: powershell
         run: |
-          if (-not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) {
-            $env:OPENAI_API_KEY | codex login --with-api-key
+          $previousErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            if (-not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) {
+              $loginOutput = $env:OPENAI_API_KEY | codex login --with-api-key 2>&1
+              $loginExitCode = $LASTEXITCODE
+              $loginOutput | ForEach-Object { Write-Host $_ }
+              if ($loginExitCode -ne 0) {
+                exit $loginExitCode
+              }
+            }
+
+            $statusOutput = & codex login status 2>&1
+            $statusExitCode = $LASTEXITCODE
+            $statusOutput | ForEach-Object { Write-Host $_ }
+            if ($statusExitCode -ne 0) {
+              exit $statusExitCode
+            }
+          } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
           }
-          codex login status
 
       - name: Skip agent-generated simplify commits
         id: guard
@@ -140,10 +163,20 @@ jobs:
             - Comment on the PR with the failing command and the root cause.
           '@
 
-          $prompt | codex exec `
-            --model gpt-5.3-codex-spark `
-            --sandbox danger-full-access `
-            --ask-for-approval never `
-            --ephemeral `
-            --cd "$PWD" `
-            -
+          $previousErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $prompt | codex --ask-for-approval never exec `
+              --model gpt-5.3-codex-spark `
+              --sandbox danger-full-access `
+              --ephemeral `
+              --cd "$PWD" `
+              -
+            $codexExitCode = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+          }
+
+          if ($codexExitCode -ne 0) {
+            exit $codexExitCode
+          }
