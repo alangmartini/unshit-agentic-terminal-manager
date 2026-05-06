@@ -1,11 +1,11 @@
-name: Agentic Simplify
+name: Agentic Review and Simplify
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
-  group: agentic-simplify-${{ github.event.pull_request.number }}
+  group: agentic-review-simplify-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   simplify:
-    name: Run /simplify
+    name: Run review and simplification skills
     if: >
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
@@ -60,7 +60,7 @@ jobs:
           "has_app=$($hasApp.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
           if (-not $ready) {
-            "Agentic simplify skipped." >> $env:GITHUB_STEP_SUMMARY
+            "Agentic review and simplification skipped." >> $env:GITHUB_STEP_SUMMARY
             "" >> $env:GITHUB_STEP_SUMMARY
             "Required: Codex CLI plus either OPENAI_API_KEY or an existing Codex login on the runner." >> $env:GITHUB_STEP_SUMMARY
           }
@@ -120,19 +120,19 @@ jobs:
             $ErrorActionPreference = $previousErrorActionPreference
           }
 
-      - name: Skip agent-generated simplify commits
+      - name: Skip agent-generated review and simplification commits
         id: guard
         if: steps.config.outputs.ready == 'true'
         shell: powershell
         run: |
           $message = git log -1 --pretty=%B
-          $skip = $message -match '\[agent-simplify\]'
+          $skip = $message -match '\[(?:agent-simplify|agent-review-simplify)\]'
           "skip=$($skip.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           if ($skip) {
-            "Skipping because the head commit already came from agentic simplify." >> $env:GITHUB_STEP_SUMMARY
+            "Skipping because the head commit already came from agentic review and simplification." >> $env:GITHUB_STEP_SUMMARY
           }
 
-      - name: Run /simplify
+      - name: Run review and simplification skills
         if: steps.config.outputs.ready == 'true' && steps.guard.outputs.skip != 'true'
         shell: powershell
         env:
@@ -140,27 +140,40 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
         run: |
           $prompt = @'
-            Run `/simplify` for PR #${{ github.event.pull_request.number }}.
+            For PR #${{ github.event.pull_request.number }}, run these Codex skills in order:
+            1. code-review-and-quality
+            2. code-simplification
+
+            Do not run the `/simplify` slash command. Use the named skills above.
+            These skills are required; if either skill is unavailable, do not fall back to another workflow.
+            Comment on the PR with the missing skill and exit with failure.
 
             Scope:
             - Compare this PR branch against `${{ github.event.pull_request.base.ref }}`.
-            - Simplify only code touched by this PR, plus directly adjacent helper code when needed.
+            - First review the PR across correctness, readability, architecture, security, and performance.
+            - Then simplify only code touched by this PR, plus directly adjacent helper code when needed.
             - Preserve behavior exactly. Do not add features.
             - Do not touch generated artifacts, target directories, or unrelated files.
 
-            If useful simplifications exist:
-            - Apply the smallest behavior-preserving edits.
+            If review findings can be addressed with behavior-preserving edits or useful simplifications exist:
+            - Apply the smallest safe behavior-preserving edits that stay within the PR's scope.
             - Run the smallest relevant verification. For Rust code, include `cargo fmt --check` and `cargo clippy -- -D warnings`; run focused tests or `cargo test --all` when the change is broad.
-            - Commit with message `refactor: simplify PR changes [agent-simplify]`.
+            - Commit with message `refactor: apply review simplifications [agent-review-simplify]`.
             - Push to this PR branch.
 
-            If no useful simplification exists:
+            If review finds required changes that are unsafe to make automatically:
+            - Do not push.
+            - Comment on the PR with the findings, severity, file/line references, and recommended fix.
+            - Exit with failure.
+
+            If no review changes or useful simplifications are needed:
             - Leave the tree unchanged.
-            - Comment on the PR that no simplification changes were needed.
+            - Comment on the PR that the review and simplification passes found no needed changes.
 
             If verification fails:
             - Do not push.
             - Comment on the PR with the failing command and the root cause.
+            - Exit with failure.
           '@
 
           $previousErrorActionPreference = $ErrorActionPreference
