@@ -65,6 +65,7 @@ pub fn ui_test_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#fn_attrs)*
         #[test]
         #fn_vis fn #fn_name() {
+            let __ui_test_env_guard = ::unshit_test::__ui_test_env_lock();
             #(#env_setup)*
 
             let __ui_test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -72,6 +73,7 @@ pub fn ui_test_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             }));
 
             #(#env_cleanup)*
+            drop(__ui_test_env_guard);
 
             if let Err(err) = __ui_test_result {
                 std::panic::resume_unwind(err);

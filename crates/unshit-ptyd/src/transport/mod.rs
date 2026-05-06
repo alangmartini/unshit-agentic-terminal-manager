@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use crate::protocol::PROTOCOL_VERSION;
+
 #[cfg(windows)]
 pub mod pipe_windows;
 #[cfg(windows)]
@@ -29,9 +31,12 @@ pub fn default_socket_path() -> PathBuf {
     #[cfg(unix)]
     {
         if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(dir).join("unshit-ptyd.sock");
+            return PathBuf::from(dir).join(format!("unshit-ptyd-v{PROTOCOL_VERSION}.sock"));
         }
-        std::env::temp_dir().join(format!("unshit-ptyd-{}.sock", current_euid()))
+        std::env::temp_dir().join(format!(
+            "unshit-ptyd-v{PROTOCOL_VERSION}-{}.sock",
+            current_euid()
+        ))
     }
 }
 
@@ -41,7 +46,7 @@ fn default_named_pipe_path() -> PathBuf {
         std::env::var_os("USERDOMAIN").as_deref(),
         std::env::var_os("USERNAME").as_deref(),
     );
-    PathBuf::from(format!(r"\\.\pipe\unshit-ptyd-{user}"))
+    PathBuf::from(format!(r"\\.\pipe\unshit-ptyd-v{PROTOCOL_VERSION}-{user}"))
 }
 
 #[cfg(windows)]

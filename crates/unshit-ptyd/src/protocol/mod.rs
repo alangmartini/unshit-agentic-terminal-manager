@@ -22,4 +22,4 @@ pub use message::{
 
 /// Wire protocol version advertised in `HelloAck`. Bump on any
 /// non-additive change (see SPEC.md section 10).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;

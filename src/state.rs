@@ -520,6 +520,9 @@ pub struct AppState {
     /// inner state empty; later slices add prompt text, agent, images,
     /// and autocomplete fields per `tasks/plan.md`.
     pub quick_prompt: Option<crate::quick_prompt::QuickPromptState>,
+    /// Framework event sink used by custom titlebar controls to reach
+    /// native window operations owned by the event loop.
+    pub window_event_sink: Option<unshit::app::EventSink>,
 }
 
 impl AppState {
@@ -861,6 +864,7 @@ pub fn seed_state() -> AppState {
         clipboard: Arc::new(unshit::app::ClipboardContext::new()),
         default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
         quick_prompt: None,
+        window_event_sink: None,
     }
 }
 
@@ -3565,6 +3569,7 @@ mod tests {
             clipboard: Arc::new(unshit::app::ClipboardContext::new()),
             default_shell: crate::shell::ShellSpec::default(),
             quick_prompt: None,
+            window_event_sink: None,
         }
     }
 

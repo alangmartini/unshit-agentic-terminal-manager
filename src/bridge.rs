@@ -120,17 +120,31 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                         }
                         if terminal_trace_enabled() {
                             let rows = terminal.grid().debug_rows(4, 96);
+                            let near_start = terminal.grid().cursor_row().saturating_sub(2);
+                            let near = terminal.grid().debug_rows_from(near_start, 6, 96);
+                            let tail = terminal.grid().debug_tail_rows(4, 96);
                             append_terminal_trace_line(&format!(
-                                "terminal-trace stage=bridge_after_process pane={} batched={} bytes={} cursor=({}, {}) row0={:?} row1={:?} row2={:?} row3={:?}",
+                                "terminal-trace stage=bridge_after_process pane={} batched={} bytes={} cursor=({}, {}) near_start={} row0={:?} row1={:?} row2={:?} row3={:?} near0={:?} near1={:?} near2={:?} near3={:?} near4={:?} near5={:?} tail0={:?} tail1={:?} tail2={:?} tail3={:?}",
                                 pane_id,
                                 batched,
                                 preview_bytes(&data, 120),
                                 terminal.grid().cursor_row(),
                                 terminal.grid().cursor_col(),
+                                near_start,
                                 rows.first().cloned().unwrap_or_default(),
                                 rows.get(1).cloned().unwrap_or_default(),
                                 rows.get(2).cloned().unwrap_or_default(),
                                 rows.get(3).cloned().unwrap_or_default(),
+                                near.first().cloned().unwrap_or_default(),
+                                near.get(1).cloned().unwrap_or_default(),
+                                near.get(2).cloned().unwrap_or_default(),
+                                near.get(3).cloned().unwrap_or_default(),
+                                near.get(4).cloned().unwrap_or_default(),
+                                near.get(5).cloned().unwrap_or_default(),
+                                tail.first().cloned().unwrap_or_default(),
+                                tail.get(1).cloned().unwrap_or_default(),
+                                tail.get(2).cloned().unwrap_or_default(),
+                                tail.get(3).cloned().unwrap_or_default(),
                             ));
                         }
                         terminal.take_pending_response()
@@ -402,14 +416,10 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
 /// resizes and applies them to all terminals. Runs every 100ms for quick
 /// response to window resize events.
 ///
-/// PTY dimension sync is not user perceptible at the millisecond level
-/// (the cell grid count flipping from 80 to 81 cols is invisible until
-/// the next character lands), so this subscription yields
-/// `RequestRedraw` rather than `RequestRebuild` (#135 Phase 1, item 3).
-/// The next paint reads the new grid dimensions directly from the
-/// `CellGrid` and reflows without a tree reconciliation. A real PTY
-/// chunk landing in the new dimensions will request a rebuild via
-/// `pty_subscription` on its own.
+/// Resizing mutates the live terminal grids behind the UI snapshot, so
+/// the next frame must rebuild the tree. A redraw alone would reuse the
+/// old grid clone and can leave the terminal visibly stale or blank until
+/// fresh PTY output happens to arrive.
 fn resize_poll_subscription(shared: SharedState) -> Subscription {
     Subscription::new(
         "resize-poll",
@@ -431,7 +441,7 @@ fn resize_poll_subscription(shared: SharedState) -> Subscription {
                                 }
                             }
                         } // guard drops before yield
-                        yield ExternalEvent::RequestRedraw;
+                        yield ExternalEvent::RequestRebuild;
                     }
                 }
             })

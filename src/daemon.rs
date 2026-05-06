@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use unshit_ptyd::protocol::{Response, PROTOCOL_VERSION};
+
 const DAEMON_BIN_NAME: &str = "unshit-ptyd";
 const ENV_OVERRIDE: &str = "UNSHIT_PTYD_BINARY";
 const CONNECT_TOTAL_DEADLINE: Duration = Duration::from_secs(3);
@@ -149,7 +151,31 @@ pub async fn connect_or_spawn(socket_path: &Path) -> io::Result<()> {
 }
 
 async fn try_connect(socket_path: &Path) -> io::Result<()> {
-    let client = unshit_ptyd::client::Client::connect(socket_path).await?;
+    let mut client = unshit_ptyd::client::Client::connect(socket_path).await?;
+    match client.hello(env!("CARGO_PKG_VERSION")).await {
+        Ok(Response::HelloAck {
+            protocol_version, ..
+        }) if protocol_version == PROTOCOL_VERSION => {}
+        Ok(Response::HelloAck {
+            protocol_version, ..
+        }) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "daemon protocol mismatch: server={protocol_version}, client={PROTOCOL_VERSION}"
+                ),
+            ));
+        }
+        Ok(other) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected daemon hello response: {other:?}"),
+            ));
+        }
+        Err(e) => {
+            return Err(io::Error::other(format!("daemon hello failed: {e}")));
+        }
+    }
     drop(client);
     Ok(())
 }

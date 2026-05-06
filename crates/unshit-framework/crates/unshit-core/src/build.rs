@@ -633,11 +633,12 @@ const RESIZE_EPSILON: f32 = 0.5;
 /// Walk the element tree after layout, detect dimension changes, and fire
 /// `on_resize` callbacks in batch. Updates `prev_width`/`prev_height` after
 /// dispatching so that the next frame can detect further changes.
-pub fn dispatch_resize_callbacks(arena: &mut NodeArena, root: NodeId) {
+pub fn dispatch_resize_callbacks(arena: &mut NodeArena, root: NodeId) -> bool {
     // Phase 1: collect (NodeId, callback, new_width, new_height) for elements that resized
     let mut pending: Vec<(NodeId, std::sync::Arc<dyn Fn(f32, f32) + Send + Sync>, f32, f32)> =
         Vec::new();
     collect_resized_elements(arena, root, &mut pending);
+    let fired = !pending.is_empty();
 
     // Phase 2: dispatch all callbacks
     for (node_id, callback, width, height) in &pending {
@@ -648,6 +649,8 @@ pub fn dispatch_resize_callbacks(arena: &mut NodeArena, root: NodeId) {
             element.prev_height = *height;
         }
     }
+
+    fired
 }
 
 fn collect_resized_elements(

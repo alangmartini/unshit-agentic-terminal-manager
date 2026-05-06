@@ -121,7 +121,7 @@ fn parity_windows_terminal_colors_enabled() -> bool {
                 let normalized = v.to_string_lossy().trim().to_ascii_lowercase();
                 !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -3620,7 +3620,11 @@ fn emit_grid_cells(
     let trace_hash = terminal_grid_trace_hash(grid);
     let trace_this_grid = terminal_trace_enabled()
         && LAST_TERMINAL_RENDER_TRACE_HASH.swap(trace_hash, Ordering::Relaxed) != trace_hash;
-    let trace_rows = if trace_this_grid { Some(grid.debug_rows(4, 96)) } else { None };
+    let trace_rows = if trace_this_grid { Some(grid.debug_rows(8, 120)) } else { None };
+    let trace_tail_rows = if trace_this_grid { Some(grid.debug_tail_rows(8, 120)) } else { None };
+    let trace_near_start = grid.cursor_row().saturating_sub(2);
+    let trace_near_rows =
+        if trace_this_grid { Some(grid.debug_rows_from(trace_near_start, 10, 120)) } else { None };
     let mut trace_glyphs: Vec<String> = Vec::new();
 
     let atlas_generation = atlas.generation;
@@ -3885,8 +3889,10 @@ fn emit_grid_cells(
 
     if trace_this_grid {
         let rows_dump = trace_rows.unwrap_or_default();
+        let tail_dump = trace_tail_rows.unwrap_or_default();
+        let near_dump = trace_near_rows.unwrap_or_default();
         append_terminal_trace_line(&format!(
-            "terminal-trace stage=emit_grid_cells rows={} cols={} origin=({:.1}, {:.1}) cell=({:.2}, {:.2}) cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?} glyphs={}",
+            "terminal-trace stage=emit_grid_cells rows={} cols={} origin=({:.1}, {:.1}) cell=({:.2}, {:.2}) cursor=({}, {}) visible={} near_start={} row0={:?} row1={:?} row2={:?} row3={:?} row4={:?} row5={:?} row6={:?} row7={:?} near0={:?} near1={:?} near2={:?} near3={:?} near4={:?} near5={:?} near6={:?} near7={:?} near8={:?} near9={:?} tail0={:?} tail1={:?} tail2={:?} tail3={:?} tail4={:?} tail5={:?} tail6={:?} tail7={:?} glyphs={}",
             rows,
             cols,
             origin_x,
@@ -3896,10 +3902,33 @@ fn emit_grid_cells(
             grid.cursor_row(),
             grid.cursor_col(),
             grid.cursor_visible(),
+            trace_near_start,
             rows_dump.first().cloned().unwrap_or_default(),
             rows_dump.get(1).cloned().unwrap_or_default(),
             rows_dump.get(2).cloned().unwrap_or_default(),
             rows_dump.get(3).cloned().unwrap_or_default(),
+            rows_dump.get(4).cloned().unwrap_or_default(),
+            rows_dump.get(5).cloned().unwrap_or_default(),
+            rows_dump.get(6).cloned().unwrap_or_default(),
+            rows_dump.get(7).cloned().unwrap_or_default(),
+            near_dump.first().cloned().unwrap_or_default(),
+            near_dump.get(1).cloned().unwrap_or_default(),
+            near_dump.get(2).cloned().unwrap_or_default(),
+            near_dump.get(3).cloned().unwrap_or_default(),
+            near_dump.get(4).cloned().unwrap_or_default(),
+            near_dump.get(5).cloned().unwrap_or_default(),
+            near_dump.get(6).cloned().unwrap_or_default(),
+            near_dump.get(7).cloned().unwrap_or_default(),
+            near_dump.get(8).cloned().unwrap_or_default(),
+            near_dump.get(9).cloned().unwrap_or_default(),
+            tail_dump.first().cloned().unwrap_or_default(),
+            tail_dump.get(1).cloned().unwrap_or_default(),
+            tail_dump.get(2).cloned().unwrap_or_default(),
+            tail_dump.get(3).cloned().unwrap_or_default(),
+            tail_dump.get(4).cloned().unwrap_or_default(),
+            tail_dump.get(5).cloned().unwrap_or_default(),
+            tail_dump.get(6).cloned().unwrap_or_default(),
+            tail_dump.get(7).cloned().unwrap_or_default(),
             trace_glyphs.join(" | "),
         ));
     }

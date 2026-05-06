@@ -5,7 +5,6 @@ use unshit_core::event::*;
 use unshit_core::id::NodeId;
 use unshit_core::layout::{self, TextMeasureCache, TextMeasureCtx};
 use unshit_core::scroll::ScrollbarVisualState;
-use unshit_core::style::cascade;
 use unshit_core::style::parse::CompiledStylesheet;
 use unshit_core::style::pseudo::PseudoSideTable;
 use unshit_core::tree::NodeArena;
@@ -562,7 +561,7 @@ pub(crate) fn resolve_all_styles(
     focused: NodeId,
     focus_via_keyboard: bool,
 ) {
-    let new_style = cascade::resolve_style_fv(
+    unshit_core::build::resolve_all_styles_with_transitions(
         arena,
         stylesheet,
         node_id,
@@ -570,24 +569,9 @@ pub(crate) fn resolve_all_styles(
         active,
         focused,
         focus_via_keyboard,
+        None,
+        None,
     );
-    let children = arena.children(node_id);
-
-    if let Some(element) = arena.get_mut(node_id) {
-        element.computed_style = new_style;
-    }
-
-    for child_id in children {
-        resolve_all_styles(
-            arena,
-            stylesheet,
-            child_id,
-            hovered,
-            active,
-            focused,
-            focus_via_keyboard,
-        );
-    }
 }
 
 pub(crate) fn scale_all_styles(arena: &mut NodeArena, node_id: NodeId, scale: f32) {

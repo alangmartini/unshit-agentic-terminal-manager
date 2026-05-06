@@ -86,6 +86,7 @@ pub struct QuadPipeline {
     pub instance_pool: InstanceBufferPool<QuadInstance>,
     pub bind_group: wgpu::BindGroup,
     pub bind_group_layout: wgpu::BindGroupLayout,
+    pub instance_bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
 }
 
@@ -126,40 +127,26 @@ impl QuadPipeline {
             }],
         });
 
+        let instance_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("quad instance storage layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("quad pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &instance_bind_group_layout],
             push_constant_ranges: &[],
         });
-
-        let instance_attrs = wgpu::vertex_attr_array![
-            0 => Float32x2,  // pos
-            1 => Float32x2,  // size
-            2 => Float32x4,  // color
-            3 => Float32x4,  // border_color
-            4 => Float32x4,  // border_width
-            5 => Float32x4,  // border_radius
-            6 => Float32x4,  // clip_rect
-            7 => Float32x4,  // shadow_color
-            8 => Float32x2,  // shadow_offset
-            9 => Float32x2,  // shadow_params
-            10 => Float32x2, // shadow_spread
-            11 => Float32x4, // gradient_stop_colors[0]
-            12 => Float32x4, // gradient_stop_colors[1]
-            13 => Float32x4, // gradient_stop_colors[2]
-            14 => Float32x4, // gradient_stop_colors[3]
-            15 => Float32x4, // gradient_stop_colors[4]
-            16 => Float32x4, // gradient_stop_colors[5]
-            17 => Float32x4, // gradient_stop_colors[6]
-            18 => Float32x4, // gradient_stop_colors[7]
-            19 => Float32x4, // gradient_stop_positions[0..4]
-            20 => Float32x4, // gradient_stop_positions[4..8]
-            21 => Float32x4, // gradient_params
-            22 => Float32x4, // gradient_extra (radial center and radii)
-            23 => Float32x4, // mask_stops_01 (alpha0, pos0, alpha1, pos1)
-            24 => Float32x4, // mask_stops_23 (alpha2, pos2, alpha3, pos3)
-            25 => Float32x4, // mask_params (angle_rad, 0, 0, stop_count)
-        ];
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("quad pipeline"),
@@ -167,11 +154,7 @@ impl QuadPipeline {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<QuadInstance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &instance_attrs,
-                }],
+                buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -202,14 +185,33 @@ impl QuadPipeline {
         let instance_pool = InstanceBufferPool::<QuadInstance>::new(
             "quad instances",
             initial_capacity,
-            wgpu::BufferUsages::VERTEX,
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
         );
 
-        Self { pipeline, instance_pool, bind_group, bind_group_layout, uniform_buffer }
+        Self {
+            pipeline,
+            instance_pool,
+            bind_group,
+            bind_group_layout,
+            instance_bind_group_layout,
+            uniform_buffer,
+        }
     }
 
     pub fn update_uniforms(&self, queue: &wgpu::Queue, width: f32, height: f32) {
         let uniforms = Uniforms { viewport: [width, height], _pad: [0.0; 2] };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+    }
+
+    pub fn create_instance_bind_group(
+        &self,
+        device: &wgpu::Device,
+        buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("quad instance storage bind group"),
+            layout: &self.instance_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+        })
     }
 }

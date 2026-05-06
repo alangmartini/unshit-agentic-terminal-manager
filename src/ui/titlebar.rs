@@ -10,6 +10,8 @@ pub fn build_titlebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let search_state = shared.clone();
     let sidebar_state = shared.clone();
     let settings_state = shared.clone();
+    let minimize_state = shared.clone();
+    let maximize_state = shared.clone();
     let close_state = shared.clone();
     let workspace = state
         .workspaces
@@ -125,11 +127,31 @@ pub fn build_titlebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                         .with_child(
                             ElementDef::new(Tag::Button)
                                 .with_class("win-btn")
+                                .on_click(move || {
+                                    let sink =
+                                        minimize_state.lock_recover().window_event_sink.clone();
+                                    if let Some(sink) = sink {
+                                        let _ =
+                                            sink.send(unshit::app::ExternalEvent::WindowControl(
+                                                unshit::app::WindowControl::Minimize,
+                                            ));
+                                    }
+                                })
                                 .with_child(svg_icon(icon_window_minimize())),
                         )
                         .with_child(
                             ElementDef::new(Tag::Button)
                                 .with_class("win-btn")
+                                .on_click(move || {
+                                    let sink =
+                                        maximize_state.lock_recover().window_event_sink.clone();
+                                    if let Some(sink) = sink {
+                                        let _ =
+                                            sink.send(unshit::app::ExternalEvent::WindowControl(
+                                                unshit::app::WindowControl::ToggleMaximize,
+                                            ));
+                                    }
+                                })
                                 .with_child(svg_icon(icon_window_maximize())),
                         )
                         .with_child(
@@ -318,6 +340,8 @@ mod tests {
         let controls = &el.children[1].children[2];
         assert!(controls.classes.contains(&"tm-win-controls".to_string()));
         assert_eq!(controls.children.len(), 3);
+        assert!(controls.children[0].on_click.is_some());
+        assert!(controls.children[1].on_click.is_some());
         assert!(controls.children[2]
             .classes
             .contains(&"win-close".to_string()));

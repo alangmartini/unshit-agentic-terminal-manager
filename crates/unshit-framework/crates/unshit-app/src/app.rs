@@ -1,5 +1,5 @@
 use crate::clipboard::ClipboardContext;
-use crate::event_sink::{EventSink, ExternalEvent};
+use crate::event_sink::{EventSink, ExternalEvent, WindowControl};
 use crate::notification::{AttentionUrgency, BellConfig, BellState};
 use crate::shortcut::{key_combo_from_winit, ShortcutResolver};
 use crate::window;
@@ -7,7 +7,7 @@ use cosmic_text::{FontSystem, SwashCache};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use unshit_core::build::{
-    build_tree_from_def, mark_layout_dirty, resolve_all_styles,
+    build_tree_from_def, dispatch_resize_callbacks, mark_layout_dirty, resolve_all_styles,
     resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
     sync_all_animations, tick_all_animations, tick_all_transitions,
 };
@@ -36,7 +36,7 @@ use winit::cursor::CursorIcon;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::{ResizeDirection, Window, WindowId};
 
 pub struct AppConfig {
     pub title: String,
@@ -737,6 +737,15 @@ impl ApplicationHandler for AppHandler {
                         .request_user_attention(Some(AttentionUrgency::Informational.to_winit()));
                     coalescer.observe(false);
                 }
+                ExternalEvent::WindowControl(control) => {
+                    match control {
+                        WindowControl::Minimize => state.window.set_minimized(true),
+                        WindowControl::ToggleMaximize => {
+                            state.window.set_maximized(!state.window.is_maximized());
+                        }
+                    }
+                    coalescer.observe(false);
+                }
                 ExternalEvent::Custom(payload) => {
                     if let Some(ref handler) = self.app.config.on_external_event {
                         handler(payload);
@@ -1325,6 +1334,17 @@ impl ApplicationHandler for AppHandler {
                     match button_state {
                         ElementState::Pressed => {
                             let sb_pos = state.interaction.last_cursor_pos;
+                            if let Some(direction) = native_resize_direction_at(state, sb_pos) {
+                                state.interaction.drag_origin = None;
+                                state.interaction.dragging = false;
+                                state.interaction.drag_target = None;
+                                state.interaction.mousedown_target = None;
+                                if let Err(err) = state.window.drag_resize_window(direction) {
+                                    log::warn!("native window resize failed: {err}");
+                                }
+                                return;
+                            }
+
                             let region_target = if state.interaction.hovered.is_dangling() {
                                 hit_test(&state.arena, state.root, sb_pos.0, sb_pos.1)
                                     .unwrap_or(NodeId::DANGLING)
@@ -2271,7 +2291,7 @@ impl ApplicationHandler for AppHandler {
                 } else if state.needs_relayout {
                     let t3 = Instant::now();
                     let (w, h) = state.gpu.window_size();
-                    relayout_pipeline(
+                    let resize_callbacks_fired = relayout_pipeline(
                         &mut state.arena,
                         &mut state.taffy,
                         state.root,
@@ -2284,6 +2304,10 @@ impl ApplicationHandler for AppHandler {
 
                     metrics.node_count = state.arena.len();
                     state.needs_relayout = false;
+                    if resize_callbacks_fired {
+                        state.needs_rebuild = true;
+                        state.window.request_redraw();
+                    }
                 } else {
                     metrics.node_count = state.arena.len();
                 }
@@ -2377,6 +2401,8 @@ impl ApplicationHandler for AppHandler {
                         state.cell_metrics_fired = true;
                         if let Some(ref cb) = self.app.config.on_cell_metrics {
                             cb(cw, ch);
+                            state.needs_rebuild = true;
+                            state.window.request_redraw();
                         }
                     }
                 }
@@ -2713,6 +2739,12 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32)) {
     // Update select dropdown item highlighting on hover
     update_select_hover(state, pos.0, pos.1);
 
+    if let Some(direction) = native_resize_direction_at(state, pos) {
+        state.window.set_cursor(CursorIcon::from(direction).into());
+    } else {
+        apply_cursor_icon(&*state.window, &state.arena, state.interaction.hovered);
+    }
+
     // Extend text selection while dragging
     if state.interaction.selecting {
         if let Some((text_node, byte_offset)) = layout::nearest_text_hit_at(
@@ -2730,6 +2762,43 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32)) {
                 }
             }
         }
+    }
+}
+
+fn native_resize_direction_at(state: &AppState, pos: (f32, f32)) -> Option<ResizeDirection> {
+    if !state.window.is_resizable() || state.window.is_maximized() {
+        return None;
+    }
+    let (w, h) = state.gpu.window_size();
+    native_resize_direction_for_point(pos, w, h)
+}
+
+fn native_resize_direction_for_point(
+    pos: (f32, f32),
+    width: f32,
+    height: f32,
+) -> Option<ResizeDirection> {
+    const EDGE: f32 = 8.0;
+    if width <= EDGE * 2.0 || height <= EDGE * 2.0 {
+        return None;
+    }
+
+    let (x, y) = pos;
+    let left = (0.0..=EDGE).contains(&x);
+    let right = (width - EDGE..=width).contains(&x);
+    let top = (0.0..=EDGE).contains(&y);
+    let bottom = (height - EDGE..=height).contains(&y);
+
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(ResizeDirection::NorthWest),
+        (_, true, true, _) => Some(ResizeDirection::NorthEast),
+        (true, _, _, true) => Some(ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(ResizeDirection::West),
+        (_, true, _, _) => Some(ResizeDirection::East),
+        (_, _, true, _) => Some(ResizeDirection::North),
+        (_, _, _, true) => Some(ResizeDirection::South),
+        _ => None,
     }
 }
 
@@ -3248,11 +3317,12 @@ fn relayout_pipeline(
     width: f32,
     height: f32,
     cache: &mut TextMeasureCache,
-) {
+) -> bool {
     if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
         layout::compute_layout(taffy, tn, width, height, font_system, cache);
         layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
     }
+    dispatch_resize_callbacks(arena, root)
 }
 
 /// Get current process RSS (resident set size) in bytes.
@@ -3655,6 +3725,43 @@ mod tests {
     }
 
     #[test]
+    fn native_resize_direction_hits_all_window_edges() {
+        assert_eq!(
+            native_resize_direction_for_point((2.0, 2.0), 1280.0, 800.0),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            native_resize_direction_for_point((1278.0, 2.0), 1280.0, 800.0),
+            Some(ResizeDirection::NorthEast)
+        );
+        assert_eq!(
+            native_resize_direction_for_point((2.0, 798.0), 1280.0, 800.0),
+            Some(ResizeDirection::SouthWest)
+        );
+        assert_eq!(
+            native_resize_direction_for_point((1278.0, 798.0), 1280.0, 800.0),
+            Some(ResizeDirection::SouthEast)
+        );
+        assert_eq!(
+            native_resize_direction_for_point((640.0, 2.0), 1280.0, 800.0),
+            Some(ResizeDirection::North)
+        );
+        assert_eq!(
+            native_resize_direction_for_point((640.0, 798.0), 1280.0, 800.0),
+            Some(ResizeDirection::South)
+        );
+        assert_eq!(
+            native_resize_direction_for_point((2.0, 400.0), 1280.0, 800.0),
+            Some(ResizeDirection::West)
+        );
+        assert_eq!(
+            native_resize_direction_for_point((1278.0, 400.0), 1280.0, 800.0),
+            Some(ResizeDirection::East)
+        );
+        assert_eq!(native_resize_direction_for_point((640.0, 400.0), 1280.0, 800.0), None);
+    }
+
+    #[test]
     fn compiled_stylesheet_parse_roundtrip() {
         let stylesheet = CompiledStylesheet::parse(".hot { color: green; }");
         assert!(!stylesheet.rules.is_empty(), "should parse at least one rule");
@@ -3847,6 +3954,53 @@ mod tests {
         assert!(dirty.contains(DirtyFlags::STYLE));
         assert!(dirty.contains(DirtyFlags::LAYOUT));
         assert!(dirty.contains(DirtyFlags::PAINT));
+    }
+
+    #[test]
+    fn relayout_pipeline_dispatches_resize_callbacks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_cb = calls.clone();
+        let root_def = ElementDef::new(Tag::Div).on_resize(move |_, _| {
+            calls_for_cb.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let mut font_system = FontSystem::new();
+        let mut cache = TextMeasureCache::default();
+
+        run_layout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            100.0,
+            100.0,
+            &mut cache,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let callbacks_fired = relayout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            200.0,
+            100.0,
+            &mut cache,
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "pure relayout must fire on_resize when dimensions change"
+        );
+        assert!(
+            callbacks_fired,
+            "pure relayout must report resize callbacks so the app can rebuild mutated state"
+        );
     }
 
     #[test]
