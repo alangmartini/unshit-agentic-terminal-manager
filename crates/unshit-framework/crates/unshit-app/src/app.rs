@@ -7,7 +7,7 @@ use cosmic_text::{FontSystem, SwashCache};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use unshit_core::build::{
-    build_tree_from_def, mark_layout_dirty, resolve_all_styles,
+    build_tree_from_def, dispatch_resize_callbacks, mark_layout_dirty, resolve_all_styles,
     resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
     sync_all_animations, tick_all_animations, tick_all_transitions,
 };
@@ -480,7 +480,7 @@ impl<'a> crate::frame_pacer::MonitorRefreshSource for WindowRefreshSource<'a> {
 
 /// Update the pacer's coalescing interval from the window's current
 /// monitor, if it can be determined. Called on window creation, after
-/// scale-factor changes inside [`WindowEvent::SurfaceResized`], and from
+/// scale-factor changes inside surface metric reconciliation, and from
 /// [`WindowEvent::Moved`]. Silently falls back to
 /// [`crate::frame_pacer::FramePacer::DEFAULT_MIN_INTERVAL`] when the
 /// platform cannot enumerate the monitor's refresh rate (headless / some
@@ -494,6 +494,86 @@ fn refresh_pacer_from_window(state: &mut AppState) {
     if after != before {
         log::info!("pacer coalescing interval: {:.3}ms", after.as_secs_f64() * 1000.0);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfaceMetricsChange {
+    None,
+    Relayout,
+    Rebuild,
+}
+
+fn classify_surface_metrics_change(
+    current_size: (f32, f32),
+    current_scale: f32,
+    new_size: winit::dpi::PhysicalSize<u32>,
+    new_scale: f32,
+) -> SurfaceMetricsChange {
+    let size_changed = new_size.width > 0
+        && new_size.height > 0
+        && ((current_size.0 as u32) != new_size.width
+            || (current_size.1 as u32) != new_size.height);
+    let scale_changed = (new_scale - current_scale).abs() > 0.01;
+
+    if scale_changed {
+        SurfaceMetricsChange::Rebuild
+    } else if size_changed {
+        SurfaceMetricsChange::Relayout
+    } else {
+        SurfaceMetricsChange::None
+    }
+}
+
+fn reconcile_surface_metrics(
+    state: &mut AppState,
+    new_size: winit::dpi::PhysicalSize<u32>,
+    new_scale: f32,
+    on_scale_factor: Option<&Arc<dyn Fn(f32) + Send + Sync>>,
+) -> SurfaceMetricsChange {
+    let change = classify_surface_metrics_change(
+        state.gpu.window_size(),
+        state.scale_factor,
+        new_size,
+        new_scale,
+    );
+
+    if new_size.width > 0 && new_size.height > 0 {
+        let current = state.gpu.window_size();
+        if (current.0 as u32) != new_size.width || (current.1 as u32) != new_size.height {
+            state.gpu.resize(new_size);
+        }
+    }
+
+    match change {
+        SurfaceMetricsChange::Rebuild => {
+            log::info!("Scale factor changed: {:.2}x -> {:.2}x", state.scale_factor, new_scale);
+            state.scale_factor = new_scale;
+            if let Some(cb) = on_scale_factor {
+                cb(new_scale);
+            }
+            refresh_pacer_from_window(state);
+            mark_full_restyle_required(&mut state.arena, state.root);
+            state.needs_rebuild = true;
+        }
+        SurfaceMetricsChange::Relayout => {
+            state.needs_relayout = true;
+        }
+        SurfaceMetricsChange::None => {}
+    }
+
+    change
+}
+
+fn reconcile_surface_metrics_from_window(
+    state: &mut AppState,
+    on_scale_factor: Option<&Arc<dyn Fn(f32) + Send + Sync>>,
+) -> SurfaceMetricsChange {
+    reconcile_surface_metrics(
+        state,
+        state.window.surface_size(),
+        state.window.scale_factor() as f32,
+        on_scale_factor,
+    )
 }
 
 impl AppState {
@@ -1086,6 +1166,7 @@ impl ApplicationHandler for AppHandler {
                 | WindowEvent::PointerMoved { .. }
                 | WindowEvent::MouseWheel { .. }
                 | WindowEvent::SurfaceResized(_)
+                | WindowEvent::Moved(_)
                 | WindowEvent::Focused(_)
                 | WindowEvent::ModifiersChanged(_)
                 | WindowEvent::Ime(_)
@@ -1135,33 +1216,37 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::SurfaceResized(new_size) => {
-                state.gpu.resize(new_size);
-                let new_scale = state.window.scale_factor() as f32;
-                if (new_scale - state.scale_factor).abs() > 0.01 {
-                    // Scale factor changed (e.g. moved to different monitor)
-                    log::info!(
-                        "Scale factor changed: {:.2}x -> {:.2}x",
-                        state.scale_factor,
-                        new_scale
-                    );
-                    state.scale_factor = new_scale;
-                    if let Some(ref cb) = self.app.config.on_scale_factor {
-                        cb(new_scale);
-                    }
-                    // Scale factor changes almost always correlate with a
-                    // monitor crossing, so re-probe the refresh rate now
-                    // rather than waiting for the next `Moved` event.
-                    refresh_pacer_from_window(state);
-                    mark_full_restyle_required(&mut state.arena, state.root);
-                    state.needs_rebuild = true;
-                } else {
-                    // Just a resize, only re-layout needed
-                    state.needs_relayout = true;
-                }
+                reconcile_surface_metrics(
+                    state,
+                    new_size,
+                    state.window.scale_factor() as f32,
+                    self.app.config.on_scale_factor.as_ref(),
+                );
+                state.window.request_redraw();
+            }
+
+            WindowEvent::ScaleFactorChanged { scale_factor, surface_size_writer } => {
+                let new_size = surface_size_writer
+                    .surface_size()
+                    .unwrap_or_else(|_| state.window.surface_size());
+                reconcile_surface_metrics(
+                    state,
+                    new_size,
+                    scale_factor as f32,
+                    self.app.config.on_scale_factor.as_ref(),
+                );
                 state.window.request_redraw();
             }
 
             WindowEvent::Moved(_position) => {
+                if reconcile_surface_metrics_from_window(
+                    state,
+                    self.app.config.on_scale_factor.as_ref(),
+                ) != SurfaceMetricsChange::None
+                {
+                    state.window.request_redraw();
+                }
+
                 // A drag delta fires one event per mouse move; debounce so
                 // we only re-read the compositor every ACTIVITY_WINDOW.
                 // Monitors with different refresh rates (e.g. 144 + 60)
@@ -1674,6 +1759,14 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::Focused(focused) => {
+                if reconcile_surface_metrics_from_window(
+                    state,
+                    self.app.config.on_scale_factor.as_ref(),
+                ) != SurfaceMetricsChange::None
+                {
+                    state.window.request_redraw();
+                }
+
                 // Losing focus mid-drag (e.g. Alt-Tab) means the mouse-up
                 // will never be delivered to our window. Synthesize a
                 // DragPhase::End so the app's on_drag handler can clean up
@@ -3253,6 +3346,7 @@ fn relayout_pipeline(
         layout::compute_layout(taffy, tn, width, height, font_system, cache);
         layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
     }
+    dispatch_resize_callbacks(arena, root);
 }
 
 /// Get current process RSS (resident set size) in bytes.
@@ -3711,6 +3805,149 @@ mod tests {
             cb(8.0, 16.0);
         }
         assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lightweight_relayout_dispatches_resize_callbacks() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let fired = Arc::new(AtomicU32::new(0));
+        let fired_clone = fired.clone();
+        let stylesheet = CompiledStylesheet::parse(
+            ".root { width: 100%; height: 100%; } .pane { width: 100%; height: 100%; }",
+        );
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root_def = ElementDef::new(Tag::Div).with_class("root").with_child(
+            ElementDef::new(Tag::Div).with_class("pane").on_resize(move |_w, _h| {
+                fired_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let mut font_system = FontSystem::new();
+        let mut measure_cache = TextMeasureCache::new();
+
+        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+        run_layout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            800.0,
+            600.0,
+            &mut measure_cache,
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+        relayout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            400.0,
+            600.0,
+            &mut measure_cache,
+        );
+
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            2,
+            "window-size relayout must fire on_resize when element dimensions change"
+        );
+    }
+
+    #[test]
+    fn lightweight_relayout_resizes_full_height_flex_shell() {
+        let stylesheet = CompiledStylesheet::parse(
+            "
+            .app { width: 100%; height: 100%; display: flex; flex-direction: column; }
+            .titlebar { height: 34px; flex-shrink: 0; }
+            .content { flex: 1; min-height: 0; }
+            .statusbar { height: 24px; flex-shrink: 0; }
+            ",
+        );
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root_def = ElementDef::new(Tag::Div)
+            .with_class("app")
+            .with_child(ElementDef::new(Tag::Div).with_class("titlebar"))
+            .with_child(ElementDef::new(Tag::Div).with_class("content"))
+            .with_child(ElementDef::new(Tag::Div).with_class("statusbar"));
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let mut font_system = FontSystem::new();
+        let mut measure_cache = TextMeasureCache::new();
+
+        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+        run_layout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            1280.0,
+            800.0,
+            &mut measure_cache,
+        );
+
+        relayout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            1280.0,
+            1368.0,
+            &mut measure_cache,
+        );
+
+        let children = arena.children(root);
+        let content = arena.get(children[1]).unwrap().layout_rect;
+        let statusbar = arena.get(children[2]).unwrap().layout_rect;
+
+        assert!(
+            (content.height - 1310.0).abs() < 1.0,
+            "content must grow to fill snapped window height, got {}",
+            content.height
+        );
+        assert!(
+            (statusbar.y - 1344.0).abs() < 1.0,
+            "statusbar must stay at bottom after snapped resize, got y={}",
+            statusbar.y
+        );
+    }
+
+    #[test]
+    fn surface_metric_change_detects_snap_resize_without_scale_change() {
+        let change = classify_surface_metrics_change(
+            (1280.0, 800.0),
+            1.0,
+            winit::dpi::PhysicalSize::new(1280, 1368),
+            1.0,
+        );
+
+        assert_eq!(change, SurfaceMetricsChange::Relayout);
+    }
+
+    #[test]
+    fn surface_metric_change_ignores_zero_size() {
+        let change = classify_surface_metrics_change(
+            (1280.0, 800.0),
+            1.0,
+            winit::dpi::PhysicalSize::new(0, 1368),
+            1.0,
+        );
+
+        assert_eq!(change, SurfaceMetricsChange::None);
+    }
+
+    #[test]
+    fn surface_metric_change_promotes_scale_change_to_rebuild() {
+        let change = classify_surface_metrics_change(
+            (1280.0, 800.0),
+            1.0,
+            winit::dpi::PhysicalSize::new(640, 400),
+            1.25,
+        );
+
+        assert_eq!(change, SurfaceMetricsChange::Rebuild);
     }
 
     #[test]
