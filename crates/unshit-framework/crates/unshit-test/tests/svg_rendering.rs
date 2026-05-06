@@ -126,7 +126,7 @@ fn cache_hit_reuses_geometry_across_draws() {
         children: Vec::new(),
     };
     let another = SvgNode {
-        primitive: SvgPrimitive::Circle { cx: 24.0, cy: 8.0, r: 4.0 },
+        primitive: SvgPrimitive::Circle { cx: 8.0, cy: 8.0, r: 4.0 },
         attrs: attrs_fill(Color::rgb(0, 200, 0)),
         children: Vec::new(),
     };
