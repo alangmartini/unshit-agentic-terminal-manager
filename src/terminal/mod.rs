@@ -90,6 +90,7 @@ pub struct Terminal {
     /// see a real terminal and pick their full-feature rendering path
     /// instead of falling back to a defensive minimal layout.
     pending_response: Vec<u8>,
+    suppress_next_lf_scroll: bool,
 }
 
 const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
@@ -227,7 +228,7 @@ fn parity_windows_terminal_colors_enabled() -> bool {
             let normalized = v.to_string_lossy().trim().to_ascii_lowercase();
             !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn default_fg_for_parity(enabled: bool) -> Color {
@@ -335,6 +336,7 @@ impl Terminal {
             scroll_top: 0,
             scroll_bot: rows,
             pending_response: Vec::new(),
+            suppress_next_lf_scroll: false,
         }
     }
 
@@ -364,18 +366,44 @@ impl Terminal {
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
 
         if terminal_trace_enabled() && !bytes.is_empty() {
-            let rows = self.grid.debug_rows(4, 96);
+            let rows = self.grid.debug_rows(8, 120);
+            let tail = self.grid.debug_tail_rows(8, 120);
+            let near_start = self.cursor_row.saturating_sub(2);
+            let near = self.grid.debug_rows_from(near_start, 10, 120);
             append_terminal_trace_line(&format!(
-                "terminal-trace stage=process_bytes bytes={} cursor=({}, {}) rows={} cols={} row0={:?} row1={:?} row2={:?} row3={:?}",
-                preview_bytes(bytes, 120),
+                "terminal-trace stage=process_bytes bytes={} cursor=({}, {}) rows={} cols={} near_start={} row0={:?} row1={:?} row2={:?} row3={:?} row4={:?} row5={:?} row6={:?} row7={:?} near0={:?} near1={:?} near2={:?} near3={:?} near4={:?} near5={:?} near6={:?} near7={:?} near8={:?} near9={:?} tail0={:?} tail1={:?} tail2={:?} tail3={:?} tail4={:?} tail5={:?} tail6={:?} tail7={:?}",
+                preview_bytes(bytes, 1000),
                 self.cursor_row,
                 self.cursor_col,
                 self.rows,
                 self.cols,
+                near_start,
                 rows.first().cloned().unwrap_or_default(),
                 rows.get(1).cloned().unwrap_or_default(),
                 rows.get(2).cloned().unwrap_or_default(),
                 rows.get(3).cloned().unwrap_or_default(),
+                rows.get(4).cloned().unwrap_or_default(),
+                rows.get(5).cloned().unwrap_or_default(),
+                rows.get(6).cloned().unwrap_or_default(),
+                rows.get(7).cloned().unwrap_or_default(),
+                near.first().cloned().unwrap_or_default(),
+                near.get(1).cloned().unwrap_or_default(),
+                near.get(2).cloned().unwrap_or_default(),
+                near.get(3).cloned().unwrap_or_default(),
+                near.get(4).cloned().unwrap_or_default(),
+                near.get(5).cloned().unwrap_or_default(),
+                near.get(6).cloned().unwrap_or_default(),
+                near.get(7).cloned().unwrap_or_default(),
+                near.get(8).cloned().unwrap_or_default(),
+                near.get(9).cloned().unwrap_or_default(),
+                tail.first().cloned().unwrap_or_default(),
+                tail.get(1).cloned().unwrap_or_default(),
+                tail.get(2).cloned().unwrap_or_default(),
+                tail.get(3).cloned().unwrap_or_default(),
+                tail.get(4).cloned().unwrap_or_default(),
+                tail.get(5).cloned().unwrap_or_default(),
+                tail.get(6).cloned().unwrap_or_default(),
+                tail.get(7).cloned().unwrap_or_default(),
             ));
         }
     }
@@ -390,19 +418,20 @@ impl Terminal {
         &mut self.grid
     }
 
-    /// Bottom-anchored reflow on row resize (issue #129). Growing rows
-    /// lifts scrollback lines into the new top rows so the live prompt
-    /// stays anchored at the bottom; shrinking rows evicts the rows
+    /// History-aware reflow on row resize (issue #129). Growing rows lifts
+    /// available scrollback into the new top rows and leaves any extra new
+    /// rows blank below the existing screen. Shrinking rows evicts the rows
     /// above the cursor into scrollback so they survive the resize.
     /// Mirrors `unshit_terminal_core::Terminal::resize` so the UI's local
     /// emulator stays consistent with the daemon during a resize
     /// round-trip. Column-only resizes do not touch scrollback.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let old_rows = self.rows;
+        let had_full_screen_scroll_region = self.scroll_top == 0 && self.scroll_bot == old_rows;
 
-        // The bottom-anchored reflow (lift scrollback / evict to
-        // scrollback) only applies to the *main* grid: alt screens have
-        // no scrollback and no concept of reflow. While the alt screen
+        // History-aware reflow (lift scrollback / evict to scrollback)
+        // only applies to the *main* grid: alt screens have no scrollback
+        // and no concept of reflow. While the alt screen
         // is active, swap the parked main back in so the reflow runs on
         // the right grid, then swap the alt back into place and resize
         // it as a plain buffer.
@@ -418,14 +447,14 @@ impl Terminal {
 
         if rows > old_rows {
             let k = rows - old_rows;
-            self.grow_rows_lifting_scrollback(k);
+            let shifted = self.grow_rows_lifting_scrollback(k);
             // The cursor on the parked main was saved into
             // `alt_saved_cursor` on entry; bump it so it stays anchored
             // to the same content row after the lift.
             if alt_active {
-                self.alt_saved_cursor.0 += k;
+                self.alt_saved_cursor.0 += shifted;
             } else {
-                self.cursor_row += k;
+                self.cursor_row += shifted;
             }
         } else if rows < old_rows {
             let k = old_rows - rows;
@@ -461,11 +490,13 @@ impl Terminal {
         self.rows = rows;
         self.cols = cols;
 
-        // Clamp the scroll region to the new row count. If the previous
-        // region no longer fits (top out of range, or top >= bot), reset
-        // to full-screen so subsequent scrolls behave as if no DECSTBM
-        // was set. Half-open: `[scroll_top, scroll_bot)`.
-        if self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot {
+        // Clamp the scroll region to the new row count. A default full-screen
+        // region tracks the terminal height, while an explicit DECSTBM region
+        // stays fixed as long as it still fits. Half-open: `[scroll_top,
+        // scroll_bot)`.
+        let scroll_region_no_longer_fits =
+            self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot;
+        if had_full_screen_scroll_region || scroll_region_no_longer_fits {
             self.scroll_top = 0;
             self.scroll_bot = rows;
         }
@@ -482,29 +513,31 @@ impl Terminal {
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
-    /// Lift up to `k` newest scrollback rows into the top of the grid
-    /// after extending the row count by `k`. Existing rows shift down
-    /// so the bottom of the grid stays anchored to its previous content.
-    fn grow_rows_lifting_scrollback(&mut self, k: usize) {
+    /// Lift up to `k` newest scrollback rows above the current grid after
+    /// extending the row count by `k`. Existing rows shift only by the number
+    /// of lifted history rows; the rest of the new space stays blank at the
+    /// bottom so resize repaints cannot leave stale prompts there.
+    fn grow_rows_lifting_scrollback(&mut self, k: usize) -> usize {
         let cols = self.cols;
         let old_rows = self.rows;
         let split_at = self.scrollback.len().saturating_sub(k);
         let lifted: Vec<Vec<Cell>> = self.scrollback.split_off(split_at).into();
+        let shift = lifted.len();
 
         self.grid.resize(old_rows + k, cols);
-        self.grid.shift_rows(k, 0, old_rows);
-        for r in 0..k {
+        self.grid.shift_rows(shift, 0, old_rows);
+        for r in 0..shift {
             for c in 0..cols {
                 self.grid.set_cell(r, c, Cell::default());
             }
         }
-        let blank_top = k - lifted.len();
         for (i, row) in lifted.iter().enumerate() {
             let copy = row.len().min(cols);
             for (c, cell) in row.iter().take(copy).enumerate() {
-                self.grid.set_cell(blank_top + i, c, *cell);
+                self.grid.set_cell(i, c, *cell);
             }
         }
+        shift
     }
 
     /// Push the top `n` grid rows into scrollback (oldest first) and
@@ -623,16 +656,42 @@ impl Terminal {
         if self.scroll_offset == 0 {
             let view = self.grid.clone();
             if terminal_trace_enabled() {
-                let rows = view.debug_rows(4, 96);
+                let rows = view.debug_rows(8, 120);
+                let tail = view.debug_tail_rows(8, 120);
+                let near_start = self.cursor_row.saturating_sub(2);
+                let near = view.debug_rows_from(near_start, 10, 120);
                 append_terminal_trace_line(&format!(
-                    "terminal-trace stage=display_grid_live scroll_offset=0 cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?}",
+                    "terminal-trace stage=display_grid_live scroll_offset=0 cursor=({}, {}) visible={} near_start={} row0={:?} row1={:?} row2={:?} row3={:?} row4={:?} row5={:?} row6={:?} row7={:?} near0={:?} near1={:?} near2={:?} near3={:?} near4={:?} near5={:?} near6={:?} near7={:?} near8={:?} near9={:?} tail0={:?} tail1={:?} tail2={:?} tail3={:?} tail4={:?} tail5={:?} tail6={:?} tail7={:?}",
                     self.cursor_row,
                     self.cursor_col,
                     self.grid.cursor_visible(),
+                    near_start,
                     rows.first().cloned().unwrap_or_default(),
                     rows.get(1).cloned().unwrap_or_default(),
                     rows.get(2).cloned().unwrap_or_default(),
                     rows.get(3).cloned().unwrap_or_default(),
+                    rows.get(4).cloned().unwrap_or_default(),
+                    rows.get(5).cloned().unwrap_or_default(),
+                    rows.get(6).cloned().unwrap_or_default(),
+                    rows.get(7).cloned().unwrap_or_default(),
+                    near.first().cloned().unwrap_or_default(),
+                    near.get(1).cloned().unwrap_or_default(),
+                    near.get(2).cloned().unwrap_or_default(),
+                    near.get(3).cloned().unwrap_or_default(),
+                    near.get(4).cloned().unwrap_or_default(),
+                    near.get(5).cloned().unwrap_or_default(),
+                    near.get(6).cloned().unwrap_or_default(),
+                    near.get(7).cloned().unwrap_or_default(),
+                    near.get(8).cloned().unwrap_or_default(),
+                    near.get(9).cloned().unwrap_or_default(),
+                    tail.first().cloned().unwrap_or_default(),
+                    tail.get(1).cloned().unwrap_or_default(),
+                    tail.get(2).cloned().unwrap_or_default(),
+                    tail.get(3).cloned().unwrap_or_default(),
+                    tail.get(4).cloned().unwrap_or_default(),
+                    tail.get(5).cloned().unwrap_or_default(),
+                    tail.get(6).cloned().unwrap_or_default(),
+                    tail.get(7).cloned().unwrap_or_default(),
                 ));
             }
             return view;
@@ -796,6 +855,18 @@ impl Terminal {
         self.grid.reset_line_identity(row);
     }
 
+    fn row_is_blank(&self, row: usize) -> bool {
+        if row >= self.rows {
+            return true;
+        }
+        (0..self.cols).all(|col| {
+            self.grid
+                .get_cell(row, col)
+                .map(Cell::is_empty)
+                .unwrap_or(true)
+        })
+    }
+
     /// Clear a rectangular region (inclusive on all sides).
     fn clear_region(&mut self, start_row: usize, start_col: usize, end_row: usize, end_col: usize) {
         let blank = Cell {
@@ -873,6 +944,7 @@ impl Terminal {
             return;
         }
         self.prepare_for_printable();
+        self.suppress_next_lf_scroll = false;
         let cell = Cell {
             ch: c,
             fg: self.fg,
@@ -934,7 +1006,9 @@ impl<'a> Perform for Performer<'a> {
                 // and clamps to the screen bottom (no scroll, since DECSTBM
                 // pins the rest of the screen).
                 if t.cursor_row + 1 == t.scroll_bot {
-                    t.scroll_up();
+                    if !(t.suppress_next_lf_scroll && t.row_is_blank(t.cursor_row)) {
+                        t.scroll_up();
+                    }
                 } else if t.cursor_row + 1 < t.rows {
                     t.cursor_row += 1;
                 } else {
@@ -942,6 +1016,7 @@ impl<'a> Perform for Performer<'a> {
                     // put. The region pins everything below it.
                     t.cursor_row = t.rows.saturating_sub(1);
                 }
+                t.suppress_next_lf_scroll = false;
             }
             // Carriage Return
             0x0D => {
@@ -951,12 +1026,14 @@ impl<'a> Perform for Performer<'a> {
             // Horizontal Tab
             0x09 => {
                 t.clear_pending_wrap();
+                t.suppress_next_lf_scroll = false;
                 let next_tab = (t.cursor_col / 8 + 1) * 8;
                 t.cursor_col = next_tab.min(t.cols.saturating_sub(1));
             }
             // Backspace
             0x08 => {
                 t.clear_pending_wrap();
+                t.suppress_next_lf_scroll = false;
                 t.cursor_col = t.cursor_col.saturating_sub(1);
             }
             // Bell: ignored
@@ -987,6 +1064,9 @@ impl<'a> Perform for Performer<'a> {
             || (intermediates == [b'?'] && matches!(action, 'h' | 'l'));
         if !preserves_pending_wrap {
             t.clear_pending_wrap();
+        }
+        if action != 'K' {
+            t.suppress_next_lf_scroll = false;
         }
 
         match action {
@@ -1081,14 +1161,17 @@ impl<'a> Perform for Performer<'a> {
                             t.cursor_row,
                             t.cols.saturating_sub(1),
                         );
+                        t.suppress_next_lf_scroll = t.row_is_blank(t.cursor_row);
                     }
                     // 1: erase from start of line to cursor
                     1 => {
                         t.clear_region(t.cursor_row, 0, t.cursor_row, t.cursor_col);
+                        t.suppress_next_lf_scroll = t.row_is_blank(t.cursor_row);
                     }
                     // 2: erase entire line
                     2 => {
                         t.clear_region(t.cursor_row, 0, t.cursor_row, t.cols.saturating_sub(1));
+                        t.suppress_next_lf_scroll = t.row_is_blank(t.cursor_row);
                     }
                     _ => {}
                 }
@@ -1842,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_grow_with_empty_scrollback_blanks_top_and_advances_cursor_ui() {
+    fn resize_grow_with_empty_scrollback_keeps_content_at_top_ui() {
         let mut t = Terminal::new(2, 3);
         t.process_bytes(b"aa\r\nbb");
         assert_eq!(t.cursor_position().0, 1);
@@ -1850,11 +1933,76 @@ mod tests {
 
         t.resize(4, 3);
 
+        assert_eq!(row_text(&t, 0), "aa");
+        assert_eq!(row_text(&t, 1), "bb");
+        assert_eq!(row_text(&t, 2), "");
+        assert_eq!(row_text(&t, 3), "");
+        assert_eq!(t.cursor_position().0, 1);
+    }
+
+    #[test]
+    fn conpty_repaint_blank_el_lines_do_not_scroll_content_ui() {
+        let mut t = Terminal::new(5, 16);
+
+        t.process_bytes(
+            b"\x1b[Hone\x1b[K\r\ntwo\x1b[K\r\nprompt\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[3;7H",
+        );
+
+        assert_eq!(row_text(&t, 0), "one");
+        assert_eq!(row_text(&t, 1), "two");
+        assert_eq!(row_text(&t, 2), "prompt");
+        assert_eq!(row_text(&t, 3), "");
+        assert_eq!(row_text(&t, 4), "");
+        assert_eq!(t.cursor_position(), (2, 6));
+    }
+
+    #[test]
+    fn resize_grow_then_old_height_repaint_does_not_leave_stale_prompt_ui() {
+        let mut t = Terminal::new(4, 16);
+        t.process_bytes(b"file\r\nPS> ");
+
+        t.resize(8, 16);
+        t.process_bytes(b"\x1b[Hfile\x1b[K\r\nPS> \x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[2;5H");
+
+        let prompt_rows = (0..t.grid().rows())
+            .filter(|&row| row_text(&t, row).contains("PS>"))
+            .count();
+        assert_eq!(prompt_rows, 1);
+        assert_eq!(row_text(&t, 0), "file");
+        assert_eq!(row_text(&t, 1), "PS>");
+        for row in 2..t.grid().rows() {
+            assert_eq!(row_text(&t, row), "", "row {row} has stale content");
+        }
+    }
+
+    #[test]
+    fn resize_grow_extends_full_screen_scroll_region_ui() {
+        let mut t = Terminal::new(4, 8);
+        assert_eq!((t.scroll_top, t.scroll_bot), (0, 4));
+
+        t.resize(8, 8);
+
+        assert_eq!((t.scroll_top, t.scroll_bot), (0, 8));
+    }
+
+    #[test]
+    fn resize_grow_then_conpty_repaint_clears_rows_below_old_bottom_ui() {
+        let mut t = Terminal::new(4, 16);
+        t.process_bytes(b"aa\r\nbb\r\ncc\r\ndd\r\nstale\r\nPS> ");
+        assert!(t.scrollback_len() > 0);
+
+        t.resize(8, 16);
+        t.process_bytes(
+            b"\x1b[H\x1b[K\r\naa\x1b[K\r\nbb\x1b[K\r\nPS> \x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[4;5H",
+        );
+
         assert_eq!(row_text(&t, 0), "");
-        assert_eq!(row_text(&t, 1), "");
-        assert_eq!(row_text(&t, 2), "aa");
-        assert_eq!(row_text(&t, 3), "bb");
-        assert_eq!(t.cursor_position().0, 3);
+        assert_eq!(row_text(&t, 1), "aa");
+        assert_eq!(row_text(&t, 2), "bb");
+        assert_eq!(row_text(&t, 3), "PS>");
+        for row in 4..t.grid().rows() {
+            assert_eq!(row_text(&t, row), "", "row {row} has stale content");
+        }
     }
 
     #[test]
@@ -2014,7 +2162,7 @@ mod tests {
         let mut t = Terminal::new(3, 20);
         t.process_bytes(b"\x1b[31mR"); // red foreground
         let cell = t.grid.get_cell(0, 0).unwrap();
-        assert_eq!(cell.fg, ANSI_16[1]); // index 1 = red
+        assert_eq!(cell.fg, ansi_16_fg_color(1)); // index 1 = red
     }
 
     #[test]
@@ -2022,7 +2170,7 @@ mod tests {
         let mut t = Terminal::new(3, 20);
         t.process_bytes(b"\x1b[42mG"); // green background
         let cell = t.grid.get_cell(0, 0).unwrap();
-        assert_eq!(cell.bg, ANSI_16[2]); // index 2 = green
+        assert_eq!(cell.bg, ansi_16_color(2)); // index 2 = green
     }
 
     #[test]
@@ -2048,7 +2196,7 @@ mod tests {
         t.process_bytes(b"\x1b[39;49m"); // reset to default
         t.process_bytes(b"X");
         let cell = t.grid.get_cell(0, 0).unwrap();
-        assert_eq!(cell.fg, DEFAULT_FG);
+        assert_eq!(cell.fg, default_fg());
         assert_eq!(cell.bg, DEFAULT_BG);
     }
 
@@ -2162,11 +2310,11 @@ mod tests {
         let mut t = Terminal::new(3, 20);
         t.process_bytes(b"\x1b[91mX"); // bright red fg
         let cell = t.grid.get_cell(0, 0).unwrap();
-        assert_eq!(cell.fg, ANSI_16[9]); // bright red = 8+1
+        assert_eq!(cell.fg, ansi_16_fg_color(9)); // bright red = 8+1
 
         t.process_bytes(b"\x1b[102mY"); // bright green bg
         let cell = t.grid.get_cell(0, 1).unwrap();
-        assert_eq!(cell.bg, ANSI_16[10]); // bright green = 8+2
+        assert_eq!(cell.bg, ansi_16_color(10)); // bright green = 8+2
     }
 
     // -- ESC sequences --------------------------------------------------------
@@ -2426,7 +2574,7 @@ mod tests {
         let mut t = Terminal::new(3, 20);
         t.process_bytes(b"\x1b[103mX"); // bright yellow bg (100 + 3)
         let cell = t.grid.get_cell(0, 0).unwrap();
-        assert_eq!(cell.bg, ANSI_16[11]); // bright yellow = 8 + 3
+        assert_eq!(cell.bg, ansi_16_color(11)); // bright yellow = 8 + 3
     }
 
     // -- CSI 'f' (HVP) works like 'H' ----------------------------------------
@@ -3369,10 +3517,7 @@ mod tests {
             "bold attribute must survive translation, got {:?}",
             cell.attrs
         );
-        assert_eq!(
-            cell.fg, ANSI_16[1],
-            "red (SGR 31) foreground must map to UI ANSI_16[1]"
-        );
+        assert_eq!(cell.fg, ansi_16_fg_color(1));
     }
 
     #[test]
@@ -3512,10 +3657,9 @@ mod tests {
         assert!(t.alt_grid.is_none());
         assert_eq!(t.grid().rows(), 6);
         assert_eq!(t.grid().cols(), 8);
-        // The original "main" content (lifted into the new top via
-        // resize) should still be visible on row 2 (we grew by 2 rows
-        // from a 4-row main with no scrollback).
-        assert_eq!(read_row_str(&t, 2, 0, 4), "main");
+        // With no scrollback to lift, growth keeps the main-screen
+        // content at the top and leaves the extra new rows blank below.
+        assert_eq!(read_row_str(&t, 0, 0, 4), "main");
     }
 
     #[test]

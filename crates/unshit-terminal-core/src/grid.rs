@@ -139,35 +139,37 @@ impl Grid {
         evicted
     }
 
-    /// Grow the grid by `n` rows added at the top, filling them with the
-    /// rows from `lifted` (one per row, in iteration order). Existing rows
-    /// shift down. Lifted rows shorter than `cols` are padded with blanks;
-    /// longer rows are clipped. If `lifted` yields fewer than `n` rows,
-    /// the lifted rows occupy the bottom of the new top section so they
-    /// sit adjacent to the existing content; any missing rows above stay
-    /// blank. Cursor row is *not* adjusted; callers (`Terminal::resize`)
-    /// own the cursor policy.
-    pub fn grow_rows_at_top(&mut self, n: usize, lifted: impl IntoIterator<Item = Vec<Cell>>) {
+    /// Grow the grid by `n` rows. Scrollback rows are inserted above existing
+    /// content, but current rows shift only by the number of lifted history
+    /// rows. Any remaining new rows stay blank at the bottom, so a resize
+    /// repaint that only covers the old PTY height cannot leave stale prompts
+    /// in newly exposed rows. Cursor row is *not* adjusted; callers
+    /// (`Terminal::resize`) own that policy.
+    pub fn grow_rows_at_top(
+        &mut self,
+        n: usize,
+        lifted: impl IntoIterator<Item = Vec<Cell>>,
+    ) -> usize {
         if n == 0 {
-            return;
+            return 0;
         }
         let new_rows = self.rows + n;
         let mut next = vec![Cell::BLANK; new_rows * self.cols];
-        // Buffer the lifted rows so we know how many actually came in.
         let lifted_rows: Vec<Vec<Cell>> = lifted.into_iter().take(n).collect();
-        let blank_top = n - lifted_rows.len();
+        let shift = lifted_rows.len();
         for (i, row) in lifted_rows.into_iter().enumerate() {
             let copy = row.len().min(self.cols);
-            let dst = (blank_top + i) * self.cols;
+            let dst = i * self.cols;
             next[dst..dst + copy].copy_from_slice(&row[..copy]);
         }
         for r in 0..self.rows {
             let src = r * self.cols;
-            let dst = (r + n) * self.cols;
+            let dst = (r + shift) * self.cols;
             next[dst..dst + self.cols].copy_from_slice(&self.cells[src..src + self.cols]);
         }
         self.cells = next;
         self.rows = new_rows;
+        shift
     }
 
     pub fn scroll_up(&mut self) -> Vec<Cell> {
@@ -391,15 +393,15 @@ mod tests {
     }
 
     #[test]
-    fn grow_rows_at_top_pads_missing_rows_with_blank() {
+    fn grow_rows_at_top_leaves_extra_new_rows_at_bottom() {
         let mut g = Grid::new(1, 2);
         fill_row(&mut g, 0, 'z');
-        // Iterator yields 1 row, but we asked for 2 new rows at the top.
+        // Iterator yields 1 row, but we asked for 2 new rows.
         g.grow_rows_at_top(2, vec![vec![cell('x'), cell('x')]]);
         assert_eq!(g.rows(), 3);
-        assert_eq!(g.row(0).unwrap(), &[Cell::BLANK, Cell::BLANK]);
-        assert_eq!(g.row(1).unwrap(), &[cell('x'), cell('x')]);
-        assert_eq!(g.row(2).unwrap(), &[cell('z'), cell('z')]);
+        assert_eq!(g.row(0).unwrap(), &[cell('x'), cell('x')]);
+        assert_eq!(g.row(1).unwrap(), &[cell('z'), cell('z')]);
+        assert_eq!(g.row(2).unwrap(), &[Cell::BLANK, Cell::BLANK]);
     }
 
     #[test]

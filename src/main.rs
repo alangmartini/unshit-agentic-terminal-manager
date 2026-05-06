@@ -168,17 +168,43 @@ fn snapshot_terminal_for_render(
         grid.set_cursor_visible(false);
     }
     if terminal_trace_enabled() && is_active {
-        let rows = grid.debug_rows(4, 96);
+        let rows = grid.debug_rows(8, 120);
+        let tail = grid.debug_tail_rows(8, 120);
+        let near_start = grid.cursor_row().saturating_sub(2);
+        let near = grid.debug_rows_from(near_start, 10, 120);
         append_terminal_trace_line(&format!(
-            "terminal-trace stage=main_snapshot pane={} active=true cursor=({}, {}) visible={} row0={:?} row1={:?} row2={:?} row3={:?}",
+            "terminal-trace stage=main_snapshot pane={} active=true cursor=({}, {}) visible={} near_start={} row0={:?} row1={:?} row2={:?} row3={:?} row4={:?} row5={:?} row6={:?} row7={:?} near0={:?} near1={:?} near2={:?} near3={:?} near4={:?} near5={:?} near6={:?} near7={:?} near8={:?} near9={:?} tail0={:?} tail1={:?} tail2={:?} tail3={:?} tail4={:?} tail5={:?} tail6={:?} tail7={:?}",
             pane_id,
             grid.cursor_row(),
             grid.cursor_col(),
             grid.cursor_visible(),
+            near_start,
             rows.first().cloned().unwrap_or_default(),
             rows.get(1).cloned().unwrap_or_default(),
             rows.get(2).cloned().unwrap_or_default(),
             rows.get(3).cloned().unwrap_or_default(),
+            rows.get(4).cloned().unwrap_or_default(),
+            rows.get(5).cloned().unwrap_or_default(),
+            rows.get(6).cloned().unwrap_or_default(),
+            rows.get(7).cloned().unwrap_or_default(),
+            near.first().cloned().unwrap_or_default(),
+            near.get(1).cloned().unwrap_or_default(),
+            near.get(2).cloned().unwrap_or_default(),
+            near.get(3).cloned().unwrap_or_default(),
+            near.get(4).cloned().unwrap_or_default(),
+            near.get(5).cloned().unwrap_or_default(),
+            near.get(6).cloned().unwrap_or_default(),
+            near.get(7).cloned().unwrap_or_default(),
+            near.get(8).cloned().unwrap_or_default(),
+            near.get(9).cloned().unwrap_or_default(),
+            tail.first().cloned().unwrap_or_default(),
+            tail.get(1).cloned().unwrap_or_default(),
+            tail.get(2).cloned().unwrap_or_default(),
+            tail.get(3).cloned().unwrap_or_default(),
+            tail.get(4).cloned().unwrap_or_default(),
+            tail.get(5).cloned().unwrap_or_default(),
+            tail.get(6).cloned().unwrap_or_default(),
+            tail.get(7).cloned().unwrap_or_default(),
         ));
     }
     grid
@@ -319,18 +345,22 @@ fn ptyd_socket_path() -> PathBuf {
     ptyd_socket_path_from_env(std::env::var_os(ENV_PTYD_SOCKET))
 }
 
-fn truthy_env_value(value: Option<std::ffi::OsString>) -> bool {
+fn env_flag_enabled(value: Option<std::ffi::OsString>, default: bool) -> bool {
     value
         .filter(|v| !v.is_empty())
         .map(|v| {
             let normalized = v.to_string_lossy().trim().to_ascii_lowercase();
             !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
         })
-        .unwrap_or(false)
+        .unwrap_or(default)
+}
+
+fn truthy_env_value(value: Option<std::ffi::OsString>) -> bool {
+    env_flag_enabled(value, false)
 }
 
 fn parity_windows_terminal_colors_enabled() -> bool {
-    truthy_env_value(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS))
+    env_flag_enabled(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS), true)
 }
 
 fn parity_shell_spec_from_values(
@@ -899,8 +929,10 @@ fn main() {
     // documents that failure mode.
     {
         let app_clipboard = app.clipboard();
+        let window_event_sink = app.event_sink();
         let mut guard = shared.lock_recover();
         guard.clipboard = app_clipboard;
+        guard.window_event_sink = Some(window_event_sink);
     }
 
     app.run();

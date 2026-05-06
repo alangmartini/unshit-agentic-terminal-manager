@@ -232,6 +232,7 @@ pub struct GpuContext {
     /// batch writes happen mid render pass and cannot safely share one
     /// buffer.
     current_quad_instance_buffer: Option<PooledBuffer<QuadInstance>>,
+    current_quad_instance_bind_group: Option<wgpu::BindGroup>,
     current_glyph_instance_buffer: Option<PooledBuffer<GlyphInstance>>,
     current_image_instance_buffers: Vec<PooledBuffer<ImageInstance>>,
 
@@ -397,6 +398,7 @@ impl GpuContext {
             backdrop_image_pipeline: None,
             backdrop_svg_pipeline: None,
             current_quad_instance_buffer: None,
+            current_quad_instance_bind_group: None,
             current_glyph_instance_buffer: None,
             current_image_instance_buffers: Vec::new(),
             #[cfg(feature = "grid-fragment-shader")]
@@ -672,6 +674,7 @@ impl GpuContext {
             backdrop_image_pipeline: None,
             backdrop_svg_pipeline: None,
             current_quad_instance_buffer: None,
+            current_quad_instance_bind_group: None,
             current_glyph_instance_buffer: None,
             current_image_instance_buffers: Vec::new(),
             #[cfg(feature = "grid-fragment-shader")]
@@ -822,8 +825,12 @@ impl GpuContext {
         if !all_quads.is_empty() {
             let pooled = self.quad_pipeline.instance_pool.acquire(&self.device, all_quads.len());
             pooled.write(&self.queue, &all_quads);
+            self.current_quad_instance_bind_group = Some(
+                self.quad_pipeline.create_instance_bind_group(&self.device, pooled.as_buffer()),
+            );
             self.current_quad_instance_buffer = Some(pooled);
         } else {
+            self.current_quad_instance_bind_group = None;
             self.current_quad_instance_buffer = None;
         }
         if !all_glyphs.is_empty() {
@@ -837,20 +844,14 @@ impl GpuContext {
         (quad_bases, glyph_bases)
     }
 
-    /// Fetch the currently acquired quad buffer for draw recording.
-    /// Call sites guard with `quad_count > 0`, which implies the pool
-    /// produced a buffer in `upload_content_instance_buffers`; the
-    /// `expect` traps renderer bugs (e.g. counts and uploads drifting
-    /// out of sync) instead of silently skipping draws.
-    fn current_quad_buffer(&self) -> &wgpu::Buffer {
-        self.current_quad_instance_buffer
+    fn current_quad_bind_group(&self) -> &wgpu::BindGroup {
+        self.current_quad_instance_bind_group
             .as_ref()
-            .map(|p| p.as_buffer())
-            .expect("quad pool buffer must be acquired before draw")
+            .expect("quad instance bind group must be created before draw")
     }
 
     /// Fetch the currently acquired glyph buffer for draw recording.
-    /// See [`Self::current_quad_buffer`] for the invariant.
+    /// See [`Self::current_quad_bind_group`] for the invariant.
     fn current_glyph_buffer(&self) -> &wgpu::Buffer {
         self.current_glyph_instance_buffer
             .as_ref()
@@ -1131,7 +1132,7 @@ impl GpuContext {
                     if quad_count > 0 {
                         pass.set_pipeline(&self.quad_pipeline.pipeline);
                         pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                        pass.set_vertex_buffer(0, self.current_quad_buffer().slice(..));
+                        pass.set_bind_group(1, self.current_quad_bind_group(), &[]);
                         pass.draw(0..6, quad_base..quad_base + quad_count);
                     }
 
@@ -1222,7 +1223,7 @@ impl GpuContext {
                                 if current_kind != Some(DrawKind::Quad) {
                                     pass.set_pipeline(&self.quad_pipeline.pipeline);
                                     pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                                    pass.set_vertex_buffer(0, self.current_quad_buffer().slice(..));
+                                    pass.set_bind_group(1, self.current_quad_bind_group(), &[]);
                                     current_kind = Some(DrawKind::Quad);
                                 }
                                 let start = quad_base + span.start;
@@ -1575,9 +1576,10 @@ impl GpuContext {
                                                 &self.quad_pipeline.bind_group,
                                                 &[],
                                             );
-                                            pass.set_vertex_buffer(
-                                                0,
-                                                self.current_quad_buffer().slice(..),
+                                            pass.set_bind_group(
+                                                1,
+                                                self.current_quad_bind_group(),
+                                                &[],
                                             );
                                             current_kind = Some(DrawKind::Quad);
                                         }
@@ -1616,7 +1618,7 @@ impl GpuContext {
                         if quad_cur < quad_end {
                             pass.set_pipeline(quad_rp);
                             pass.set_bind_group(0, &self.quad_pipeline.bind_group, &[]);
-                            pass.set_vertex_buffer(0, self.current_quad_buffer().slice(..));
+                            pass.set_bind_group(1, self.current_quad_bind_group(), &[]);
                             pass.draw(0..6, quad_base + quad_cur..quad_base + quad_end);
                         }
                         if glyph_cur < glyph_end {

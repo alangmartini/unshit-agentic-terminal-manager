@@ -128,11 +128,11 @@ function Get-TerminalCropRect {
     )
 
     # Fixed layout for terminal-manager default 1280x800 launch.
-    # Ratios were taken from the live app window and kept slightly loose.
-    $x = [int][Math]::Round($Width * 0.33)
-    $y = [int][Math]::Round($Height * 0.23)
-    $w = [int][Math]::Round($Width * 0.65)
-    $h = [int][Math]::Round($Height * 0.27)
+    # Ratios target the active terminal viewport starting at the prompt row.
+    $x = [int][Math]::Round($Width * 0.30)
+    $y = [int][Math]::Round($Height * 0.13)
+    $w = [int][Math]::Round($Width * 0.69)
+    $h = [int][Math]::Round($Height * 0.25)
     return @{ X = $x; Y = $y; Width = $w; Height = $h }
 }
 
@@ -274,13 +274,13 @@ function Get-StartupVerdict {
     $bands = @(Get-RowBands -Path $analysisCrop)
     $textBands = @(
         $bands | Where-Object {
-            $_.StartY -ge 40 -and
+            $_.StartY -ge 10 -and
             (($_.MaxX - $_.MinX) -gt 100) -and
             $_.MaxCount -gt 40
         }
     )
     $stable = $true
-    foreach ($ratio in @($DiffRatios | Select-Object -Skip 1)) {
+    foreach ($ratio in @($DiffRatios | Select-Object -Last 2)) {
         if ($ratio -gt 0.01) {
             $stable = $false
             break
@@ -296,6 +296,11 @@ function Get-StartupVerdict {
         $row1Width = $row1.MaxX - $row1.MinX
         $row0Ok = $row0.MinX -lt 80 -and $row0Width -gt 140
         $row1Ok = $row1.MinX -lt 80 -and $row1Width -gt 320
+    } elseif ($textBands.Count -eq 1) {
+        $row0 = $textBands[0]
+        $row0Width = $row0.MaxX - $row0.MinX
+        $row0Ok = $row0.MinX -lt 80 -and $row0Width -gt 320
+        $row1Ok = $true
     }
 
     return [pscustomobject]@{

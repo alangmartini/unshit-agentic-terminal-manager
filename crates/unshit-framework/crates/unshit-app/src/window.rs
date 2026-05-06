@@ -12,7 +12,9 @@ pub fn create_window(
     let attrs = WindowAttributes::default()
         .with_title(title)
         .with_surface_size(PhysicalSize::new(width, height))
+        .with_min_surface_size(PhysicalSize::new(640, 400))
         .with_transparent(false)
+        .with_resizable(true)
         .with_decorations(decorations);
 
     event_loop.create_window(attrs).unwrap()

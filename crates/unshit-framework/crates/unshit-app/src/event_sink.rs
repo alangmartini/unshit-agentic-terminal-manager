@@ -10,6 +10,8 @@ pub enum ExternalEvent {
     /// Ask the application window to become visible, unminimized, focused,
     /// and attention-requesting where the platform allows it.
     ActivateWindow,
+    /// Apply a native window operation from app UI chrome.
+    WindowControl(WindowControl),
     /// User-defined payload (type-erased).
     Custom(Box<dyn std::any::Any + Send>),
     /// Zero-copy byte payload. Only the Arc refcount is bumped on send.
@@ -17,6 +19,12 @@ pub enum ExternalEvent {
     /// Hot-reload: a new stylesheet was parsed from a watched CSS file.
     #[cfg(feature = "hot-reload")]
     StylesheetReload(Box<unshit_core::style::parse::CompiledStylesheet>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowControl {
+    Minimize,
+    ToggleMaximize,
 }
 
 /// Error returned when the receiver has been dropped (event loop shut down).

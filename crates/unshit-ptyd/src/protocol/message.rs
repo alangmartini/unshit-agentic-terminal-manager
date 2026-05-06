@@ -14,6 +14,8 @@ use unshit_terminal_core::Snapshot;
 use super::error::ProtocolError;
 use super::frame::{KIND_CONTROL, KIND_EVENT, KIND_OUTPUT};
 use super::{read_frame, write_frame};
+#[cfg(test)]
+use crate::protocol::PROTOCOL_VERSION;
 
 /// Size of the session id prefix on `KIND_OUTPUT` frames.
 pub const OUTPUT_SESSION_ID_SIZE: usize = 8;
@@ -366,7 +368,7 @@ mod tests {
         let resp = Response::HelloAck {
             id: 1,
             server_version: "0.2.0".into(),
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let back: Response = serde_json::from_slice(&bytes).unwrap();
@@ -449,7 +451,7 @@ mod tests {
             Response::HelloAck {
                 id: 21,
                 server_version: "v".into(),
-                protocol_version: 1,
+                protocol_version: PROTOCOL_VERSION,
             }
             .id(),
             21
@@ -496,7 +498,7 @@ mod tests {
         let resp = Response::HelloAck {
             id: 1,
             server_version: "0.1.0".into(),
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
         };
         let sent = resp.clone();
         let writer = tokio::spawn(async move {

@@ -33,7 +33,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use unshit_ptyd::client::Client;
 use unshit_ptyd::protocol::message::{SessionInfo, SNAPSHOT_MAX_SCROLLBACK_LINES};
-use unshit_ptyd::protocol::{ProtocolError, Response, ServerEvent};
+use unshit_ptyd::protocol::{ProtocolError, Response, ServerEvent, PROTOCOL_VERSION};
 use unshit_terminal_core::Snapshot;
 
 use crate::shell::ShellSpec;
@@ -760,13 +760,42 @@ fn worker_main(
     };
 
     runtime.block_on(async move {
-        let (client, events) = match Client::connect_with_events(&socket_path).await {
+        let (mut client, events) = match Client::connect_with_events(&socket_path).await {
             Ok(pair) => pair,
             Err(e) => {
                 let _ = ready.send(Err(e));
                 return;
             }
         };
+        match client.hello(env!("CARGO_PKG_VERSION")).await {
+            Ok(Response::HelloAck {
+                protocol_version, ..
+            }) if protocol_version == PROTOCOL_VERSION => {}
+            Ok(Response::HelloAck {
+                protocol_version, ..
+            }) => {
+                let _ = ready.send(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "daemon protocol mismatch: server={protocol_version}, client={PROTOCOL_VERSION}"
+                    ),
+                )));
+                return;
+            }
+            Ok(other) => {
+                let _ = ready.send(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected daemon hello response: {other:?}"),
+                )));
+                return;
+            }
+            Err(e) => {
+                let _ = ready.send(Err(io::Error::other(format!(
+                    "daemon hello failed: {e}"
+                ))));
+                return;
+            }
+        }
         if ready.send(Ok(())).is_err() {
             return;
         }
@@ -777,7 +806,6 @@ fn worker_main(
             event_loop(events, sinks_for_events).await;
         });
 
-        let mut client = client;
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 Command::Spawn {

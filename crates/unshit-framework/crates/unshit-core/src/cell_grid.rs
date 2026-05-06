@@ -656,6 +656,20 @@ impl CellGrid {
         (0..rows.min(self.rows)).map(|row| self.debug_row_string(row, 0, cols)).collect()
     }
 
+    /// Debug helper: dump the last `rows` rows up to `cols` columns.
+    pub fn debug_tail_rows(&self, rows: usize, cols: usize) -> Vec<String> {
+        let count = rows.min(self.rows);
+        let start = self.rows.saturating_sub(count);
+        (start..self.rows).map(|row| self.debug_row_string(row, 0, cols)).collect()
+    }
+
+    /// Debug helper: dump a row range up to `cols` columns.
+    pub fn debug_rows_from(&self, start_row: usize, rows: usize, cols: usize) -> Vec<String> {
+        let start = start_row.min(self.rows);
+        let end = start.saturating_add(rows).min(self.rows);
+        (start..end).map(|row| self.debug_row_string(row, 0, cols)).collect()
+    }
+
     /// Returns `true` if any cell is marked dirty.
     pub fn has_dirty_cells(&self) -> bool {
         self.dirty.iter().any(|&d| d)

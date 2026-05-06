@@ -38,7 +38,7 @@ fn parity_windows_terminal_colors_enabled() -> bool {
             let normalized = v.to_string_lossy().trim().to_ascii_lowercase();
             !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn default_fg_for_parity(enabled: bool) -> Color {
@@ -132,6 +132,7 @@ pub struct Terminal {
     scroll_top: usize,
     scroll_bot: usize,
     pending_response: Vec<u8>,
+    suppress_next_lf_scroll: bool,
 }
 
 impl Terminal {
@@ -158,6 +159,7 @@ impl Terminal {
             scroll_top: 0,
             scroll_bot: rows,
             pending_response: Vec::new(),
+            suppress_next_lf_scroll: false,
         }
     }
 
@@ -175,14 +177,14 @@ impl Terminal {
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
-    /// Bottom-anchored reflow on row resize (issue #129). Growing rows
-    /// lifts scrollback into the new top so the cursor stays anchored to
-    /// its distance-from-bottom, rather than leaving a blank gap below
-    /// the live prompt. Shrinking rows pushes the rows above the cursor
-    /// into scrollback so they survive the resize. Column-only resizes
-    /// do not touch scrollback.
+    /// History-aware reflow on row resize (issue #129). Growing rows lifts
+    /// available scrollback into the new top rows and leaves any extra new
+    /// rows blank below the existing screen. Shrinking rows pushes the rows
+    /// above the cursor into scrollback so they survive the resize.
+    /// Column-only resizes do not touch scrollback.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let old_rows = self.rows;
+        let had_full_screen_scroll_region = self.scroll_top == 0 && self.scroll_bot == old_rows;
         let alt_active = self.alt_grid.is_some();
 
         if alt_active {
@@ -196,11 +198,11 @@ impl Terminal {
         if rows > old_rows {
             let k = rows - old_rows;
             let lifted = self.scrollback.pop_back_n(k);
-            self.grid.grow_rows_at_top(k, lifted);
+            let shifted = self.grid.grow_rows_at_top(k, lifted);
             if alt_active {
-                self.alt_saved_cursor.0 += k;
+                self.alt_saved_cursor.0 += shifted;
             } else {
-                self.cursor_row += k;
+                self.cursor_row += shifted;
             }
         } else if rows < old_rows {
             let k = old_rows - rows;
@@ -238,7 +240,9 @@ impl Terminal {
         self.rows = rows;
         self.cols = cols;
 
-        if self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot {
+        let scroll_region_no_longer_fits =
+            self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot;
+        if had_full_screen_scroll_region || scroll_region_no_longer_fits {
             self.scroll_top = 0;
             self.scroll_bot = rows;
         }
@@ -334,6 +338,13 @@ impl Terminal {
         }
     }
 
+    fn row_is_blank(&self, row: usize) -> bool {
+        self.grid
+            .row(row)
+            .map(|cells| cells.iter().all(|cell| cell.ch == ' '))
+            .unwrap_or(true)
+    }
+
     fn scroll_up(&mut self) {
         if self.rows == 0 || self.scroll_bot <= self.scroll_top {
             return;
@@ -384,6 +395,7 @@ impl Terminal {
             return;
         }
         self.prepare_for_printable();
+        self.suppress_next_lf_scroll = false;
         let cell = Cell {
             ch: c,
             fg: self.fg,
@@ -455,12 +467,15 @@ impl Perform for Performer<'_> {
             0x0A => {
                 t.clear_pending_wrap();
                 if t.cursor_row + 1 == t.scroll_bot {
-                    t.scroll_up();
+                    if !(t.suppress_next_lf_scroll && t.row_is_blank(t.cursor_row)) {
+                        t.scroll_up();
+                    }
                 } else if t.cursor_row + 1 < t.rows {
                     t.cursor_row += 1;
                 } else {
                     t.cursor_row = t.rows.saturating_sub(1);
                 }
+                t.suppress_next_lf_scroll = false;
             }
             0x0D => {
                 t.clear_pending_wrap();
@@ -468,11 +483,13 @@ impl Perform for Performer<'_> {
             }
             0x09 => {
                 t.clear_pending_wrap();
+                t.suppress_next_lf_scroll = false;
                 let next_tab = (t.cursor_col / 8 + 1) * 8;
                 t.cursor_col = next_tab.min(t.cols.saturating_sub(1));
             }
             0x08 => {
                 t.clear_pending_wrap();
+                t.suppress_next_lf_scroll = false;
                 t.cursor_col = t.cursor_col.saturating_sub(1);
             }
             0x07 => {}
@@ -520,6 +537,9 @@ impl Perform for Performer<'_> {
 
         if !matches!(action, 'm' | 'c' | 'n' | 'q') {
             t.clear_pending_wrap();
+        }
+        if action != 'K' {
+            t.suppress_next_lf_scroll = false;
         }
 
         match action {
@@ -584,12 +604,15 @@ impl Perform for Performer<'_> {
                         t.cursor_row,
                         t.cols.saturating_sub(1),
                     );
+                    t.suppress_next_lf_scroll = t.row_is_blank(t.cursor_row);
                 }
                 1 => {
                     t.clear_region(t.cursor_row, 0, t.cursor_row, t.cursor_col);
+                    t.suppress_next_lf_scroll = t.row_is_blank(t.cursor_row);
                 }
                 2 => {
                     t.clear_region(t.cursor_row, 0, t.cursor_row, t.cols.saturating_sub(1));
+                    t.suppress_next_lf_scroll = t.row_is_blank(t.cursor_row);
                 }
                 _ => {}
             },
@@ -993,7 +1016,7 @@ mod tests {
     fn sgr_31_sets_red_foreground() {
         let mut t = Terminal::new(1, 2, 10);
         t.process_bytes(b"\x1b[31ma");
-        assert_eq!(t.grid().get(0, 0).unwrap().fg, ANSI_16[1]);
+        assert_eq!(t.grid().get(0, 0).unwrap().fg, ansi_16_fg_color(1));
     }
 
     #[test]
@@ -1015,9 +1038,9 @@ mod tests {
         let mut t = Terminal::new(1, 3, 10);
         t.process_bytes(b"\x1b[1;31ma\x1b[0mb");
         assert_eq!(t.grid().get(0, 0).unwrap().attrs, CellAttrs::BOLD);
-        assert_eq!(t.grid().get(0, 0).unwrap().fg, ANSI_16[1]);
+        assert_eq!(t.grid().get(0, 0).unwrap().fg, ansi_16_fg_color(1));
         assert_eq!(t.grid().get(0, 1).unwrap().attrs, CellAttrs::empty());
-        assert_eq!(t.grid().get(0, 1).unwrap().fg, DEFAULT_FG);
+        assert_eq!(t.grid().get(0, 1).unwrap().fg, default_fg());
     }
 
     #[test]
@@ -1185,14 +1208,14 @@ mod tests {
     fn background_sgr_applies_to_cell() {
         let mut t = Terminal::new(1, 2, 10);
         t.process_bytes(b"\x1b[41ma");
-        assert_eq!(t.grid().get(0, 0).unwrap().bg, ANSI_16[1]);
+        assert_eq!(t.grid().get(0, 0).unwrap().bg, ansi_16_color(1));
     }
 
     #[test]
     fn bright_fg_maps_to_upper_ansi_half() {
         let mut t = Terminal::new(1, 2, 10);
         t.process_bytes(b"\x1b[91ma");
-        assert_eq!(t.grid().get(0, 0).unwrap().fg, ANSI_16[9]);
+        assert_eq!(t.grid().get(0, 0).unwrap().fg, ansi_16_fg_color(9));
     }
 
     #[test]
@@ -1231,7 +1254,7 @@ mod tests {
         t.process_bytes(b"\x1b[?1049l");
         assert_eq!(t.grid().rows(), 6);
         assert_eq!(t.grid().cols(), 8);
-        assert_eq!(row_text(&t, 2), "main");
+        assert_eq!(row_text(&t, 0), "main");
     }
 
     #[test]
@@ -1342,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_grow_with_empty_scrollback_blanks_top_and_advances_cursor() {
+    fn resize_grow_with_empty_scrollback_keeps_content_at_top() {
         let mut t = Terminal::new(2, 3, 100);
         t.process_bytes(b"aa\r\nbb");
         assert_eq!(t.grid().cursor().0, 1);
@@ -1350,13 +1373,11 @@ mod tests {
 
         t.resize(4, 3);
 
-        // No scrollback, so the new top rows are blank; existing content
-        // shifted down by 2.
-        assert_eq!(row_text(&t, 0), "");
-        assert_eq!(row_text(&t, 1), "");
-        assert_eq!(row_text(&t, 2), "aa");
-        assert_eq!(row_text(&t, 3), "bb");
-        assert_eq!(t.grid().cursor().0, 3);
+        assert_eq!(row_text(&t, 0), "aa");
+        assert_eq!(row_text(&t, 1), "bb");
+        assert_eq!(row_text(&t, 2), "");
+        assert_eq!(row_text(&t, 3), "");
+        assert_eq!(t.grid().cursor().0, 1);
     }
 
     #[test]
@@ -1367,16 +1388,81 @@ mod tests {
 
         t.resize(5, 3);
 
-        // Only 1 line in scrollback to lift, but we grew by 3. The lifted
-        // row sits adjacent to the original top so the bottom stays
-        // anchored: top 2 rows blank, then "aa", then "bb", "cc".
-        assert_eq!(row_text(&t, 0), "");
-        assert_eq!(row_text(&t, 1), "");
-        assert_eq!(row_text(&t, 2), "aa");
-        assert_eq!(row_text(&t, 3), "bb");
-        assert_eq!(row_text(&t, 4), "cc");
+        // Only 1 line in scrollback to lift, but we grew by 3. Lift the
+        // available row, shift existing content by one, and leave the
+        // extra new rows blank at the bottom.
+        assert_eq!(row_text(&t, 0), "aa");
+        assert_eq!(row_text(&t, 1), "bb");
+        assert_eq!(row_text(&t, 2), "cc");
+        assert_eq!(row_text(&t, 3), "");
+        assert_eq!(row_text(&t, 4), "");
         assert!(t.scrollback().is_empty());
-        assert_eq!(t.grid().cursor().0, 4);
+        assert_eq!(t.grid().cursor().0, 2);
+    }
+
+    #[test]
+    fn resize_grow_extends_full_screen_scroll_region() {
+        let mut t = Terminal::new(4, 8, 100);
+        assert_eq!((t.scroll_top, t.scroll_bot), (0, 4));
+
+        t.resize(8, 8);
+
+        assert_eq!((t.scroll_top, t.scroll_bot), (0, 8));
+    }
+
+    #[test]
+    fn resize_grow_then_conpty_repaint_clears_rows_below_old_bottom() {
+        let mut t = Terminal::new(4, 16, 100);
+        t.process_bytes(b"aa\r\nbb\r\ncc\r\ndd\r\nstale\r\nPS> ");
+        assert!(t.scrollback().len() > 0);
+
+        t.resize(8, 16);
+        t.process_bytes(
+            b"\x1b[H\x1b[K\r\naa\x1b[K\r\nbb\x1b[K\r\nPS> \x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[4;5H",
+        );
+
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "aa");
+        assert_eq!(row_text(&t, 2), "bb");
+        assert_eq!(row_text(&t, 3), "PS>");
+        for row in 4..t.grid().rows() {
+            assert_eq!(row_text(&t, row), "", "row {row} has stale content");
+        }
+    }
+
+    #[test]
+    fn conpty_repaint_blank_el_lines_do_not_scroll_content() {
+        let mut t = Terminal::new(5, 16, 100);
+
+        t.process_bytes(
+            b"\x1b[Hone\x1b[K\r\ntwo\x1b[K\r\nprompt\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[3;7H",
+        );
+
+        assert_eq!(row_text(&t, 0), "one");
+        assert_eq!(row_text(&t, 1), "two");
+        assert_eq!(row_text(&t, 2), "prompt");
+        assert_eq!(row_text(&t, 3), "");
+        assert_eq!(row_text(&t, 4), "");
+        assert_eq!(t.grid().cursor(), (2, 6));
+    }
+
+    #[test]
+    fn resize_grow_then_old_height_repaint_does_not_leave_stale_prompt() {
+        let mut t = Terminal::new(4, 16, 100);
+        t.process_bytes(b"file\r\nPS> ");
+
+        t.resize(8, 16);
+        t.process_bytes(b"\x1b[Hfile\x1b[K\r\nPS> \x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[2;5H");
+
+        let prompt_rows = (0..t.grid().rows())
+            .filter(|&row| row_text(&t, row).contains("PS>"))
+            .count();
+        assert_eq!(prompt_rows, 1);
+        assert_eq!(row_text(&t, 0), "file");
+        assert_eq!(row_text(&t, 1), "PS>");
+        for row in 2..t.grid().rows() {
+            assert_eq!(row_text(&t, row), "", "row {row} has stale content");
+        }
     }
 
     #[test]
