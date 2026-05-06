@@ -236,6 +236,14 @@ pub(crate) fn reset_for_test() {
 mod tests {
     use super::*;
 
+    static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     fn metrics_with(total_us: u64) -> FrameMetrics {
         FrameMetrics {
             total_us,
@@ -314,6 +322,7 @@ mod tests {
 
     #[test]
     fn build_returns_hidden_div_when_off() {
+        let _guard = global_state_test_lock();
         reset_for_test();
         let el = build_fps_overlay();
         assert!(el.classes.iter().any(|c| c == "fps-overlay-hidden"));
@@ -322,6 +331,7 @@ mod tests {
 
     #[test]
     fn toggle_visible_round_trip_flips_and_returns_new_value() {
+        let _guard = global_state_test_lock();
         reset_for_test();
         assert!(toggle_visible());
         assert!(snapshot().visible);
@@ -333,6 +343,7 @@ mod tests {
 
     #[test]
     fn build_visible_overlay_includes_metric_rows_and_hint() {
+        let _guard = global_state_test_lock();
         reset_for_test();
         toggle_visible();
         record_frame(&FrameMetrics {
@@ -368,6 +379,7 @@ mod tests {
 
     #[test]
     fn record_frame_module_function_updates_global_state() {
+        let _guard = global_state_test_lock();
         reset_for_test();
         record_frame(&metrics_with(4_000));
         let snap = snapshot();
