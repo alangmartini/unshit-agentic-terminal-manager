@@ -11,7 +11,9 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  actions: read
+  contents: write
+  issues: write
   pull-requests: write
 
 jobs:
@@ -46,6 +48,193 @@ jobs:
 
       - name: Run tests
         run: cargo test --all
+
+  repair-failing-checks:
+    name: Repair Failing Checks
+    needs: rust-checks
+    if: >
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      needs.rust-checks.result == 'failure'
+    runs-on: [self-hosted, Windows, X64, local-windows]
+    timeout-minutes: 45
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+
+    steps:
+      - name: Add Codex CLI to PATH
+        shell: powershell
+        run: |
+          $npmBin = Join-Path $env:APPDATA 'npm'
+          if (Test-Path $npmBin) {
+            $npmBin >> $env:GITHUB_PATH
+            $env:PATH = "$npmBin;$env:PATH"
+          }
+
+      - name: Check Codex configuration
+        id: config
+        shell: powershell
+        run: |
+          $hasCodex = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
+          $hasOpenAIKey = -not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)
+          $hasCodexLogin = $false
+          if ($hasCodex -and -not $hasOpenAIKey) {
+            $previousErrorActionPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+              & codex login status 2>&1 | Out-Null
+              $hasCodexLogin = $LASTEXITCODE -eq 0
+            } finally {
+              $ErrorActionPreference = $previousErrorActionPreference
+            }
+          }
+          $hasApp = (-not [string]::IsNullOrWhiteSpace($env:APP_ID)) -and (-not [string]::IsNullOrWhiteSpace($env:APP_PRIVATE_KEY))
+          $ready = $hasCodex -and ($hasOpenAIKey -or $hasCodexLogin)
+          "ready=$($ready.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "has_app=$($hasApp.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+          if (-not $ready) {
+            "Automated repair cannot run." >> $env:GITHUB_STEP_SUMMARY
+            "" >> $env:GITHUB_STEP_SUMMARY
+            "Required: Codex CLI plus either OPENAI_API_KEY or an existing Codex login on the runner." >> $env:GITHUB_STEP_SUMMARY
+            exit 1
+          }
+
+      - name: Generate GitHub App token
+        id: app-token
+        if: steps.config.outputs.ready == 'true' && steps.config.outputs.has_app == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout PR branch
+        if: steps.config.outputs.ready == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          fetch-depth: 0
+
+      - name: Skip stale repair runs
+        id: stale
+        if: steps.config.outputs.ready == 'true'
+        shell: powershell
+        run: |
+          $current = git rev-parse HEAD
+          $expected = "${{ github.event.pull_request.head.sha }}"
+          $stale = $current -ne $expected
+          "stale=$($stale.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($stale) {
+            "Skipping automated repair because the PR branch moved from $expected to $current." >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Fetch PR base
+        if: steps.config.outputs.ready == 'true' && steps.stale.outputs.stale != 'true'
+        shell: powershell
+        run: git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1
+
+      - name: Configure git identity
+        if: steps.config.outputs.ready == 'true' && steps.stale.outputs.stale != 'true'
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Configure Codex auth
+        if: steps.config.outputs.ready == 'true' && steps.stale.outputs.stale != 'true'
+        shell: powershell
+        run: |
+          $previousErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            if (-not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) {
+              $loginOutput = $env:OPENAI_API_KEY | codex login --with-api-key 2>&1
+              $loginExitCode = $LASTEXITCODE
+              $loginOutput | ForEach-Object { Write-Host $_ }
+              if ($loginExitCode -ne 0) {
+                exit $loginExitCode
+              }
+            }
+
+            $statusOutput = & codex login status 2>&1
+            $statusExitCode = $LASTEXITCODE
+            $statusOutput | ForEach-Object { Write-Host $_ }
+            if ($statusExitCode -ne 0) {
+              exit $statusExitCode
+            }
+          } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+          }
+
+      - name: Skip repeated repair commits
+        id: guard
+        if: steps.config.outputs.ready == 'true' && steps.stale.outputs.stale != 'true'
+        shell: powershell
+        run: |
+          $message = git log -1 --pretty=%B
+          $message = $message -join "`n"
+          $skip = [bool]($message -match '\[agent-fix\]')
+          "skip=$($skip.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($skip) {
+            "Skipping automated repair because the failing head commit is already an agent repair commit." >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Run GPT-5.5 xhigh repair
+        if: steps.config.outputs.ready == 'true' && steps.stale.outputs.stale != 'true' && steps.guard.outputs.skip != 'true'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: |
+          $prompt = @'
+            The PR quality gate failed for PR #${{ github.event.pull_request.number }}.
+
+            Diagnose why the Rust checks are not passing:
+            - `cargo fmt --check`
+            - `cargo clippy -- -D warnings`
+            - `cargo test --all`
+
+            Fix the smallest root cause inside this PR branch. Preserve project invariants from AGENTS.md:
+            - Do not add synchronous IPC to the render path.
+            - Do not remove eager PTY spawning in `main.rs`.
+            - Keep framework-level behavior in `crates/unshit-framework/`.
+            - Do not touch generated artifacts, target directories, or unrelated files.
+
+            If you can fix the failure:
+            - Run the relevant verification, including the command that failed.
+            - Commit with message `fix: repair failing PR checks [agent-fix]`.
+            - Push to this PR branch.
+
+            If you cannot fix the failure safely:
+            - Leave the tree unchanged.
+            - Comment on the PR with the failing command, the root cause, and the blocker.
+            - Exit non-zero.
+          '@
+
+          $previousErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $prompt | codex --ask-for-approval never exec `
+              --model gpt-5.5 `
+              -c 'model_reasoning_effort="xhigh"' `
+              --sandbox danger-full-access `
+              --ephemeral `
+              --cd "$PWD" `
+              -
+            $codexExitCode = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+          }
+
+          if ($codexExitCode -ne 0) {
+            exit $codexExitCode
+          }
 
   coverage:
     name: Code Coverage
