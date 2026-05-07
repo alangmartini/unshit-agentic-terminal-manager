@@ -1,11 +1,11 @@
-name: Agentic Simplify
+name: Agentic PR Review
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
-  group: agentic-simplify-${{ github.event.pull_request.number }}
+  group: agentic-pr-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   simplify:
-    name: Run /simplify
+    name: Run simplify and review
     if: >
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
@@ -60,9 +60,10 @@ jobs:
           "has_app=$($hasApp.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
           if (-not $ready) {
-            "Agentic simplify skipped." >> $env:GITHUB_STEP_SUMMARY
+            "Agentic PR review cannot run." >> $env:GITHUB_STEP_SUMMARY
             "" >> $env:GITHUB_STEP_SUMMARY
             "Required: Codex CLI plus either OPENAI_API_KEY or an existing Codex login on the runner." >> $env:GITHUB_STEP_SUMMARY
+            exit 1
           }
 
       - name: Generate GitHub App token
@@ -120,33 +121,38 @@ jobs:
             $ErrorActionPreference = $previousErrorActionPreference
           }
 
-      - name: Skip agent-generated simplify commits
+      - name: Skip agent-generated commits
         id: guard
         if: steps.config.outputs.ready == 'true'
         shell: powershell
         run: |
           $message = git log -1 --pretty=%B
-          $skip = $message -match '\[agent-simplify\]'
+          $message = $message -join "`n"
+          $skip = [bool]($message -match '\[(agent-simplify|agent-fix)\]')
           "skip=$($skip.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           if ($skip) {
-            "Skipping because the head commit already came from agentic simplify." >> $env:GITHUB_STEP_SUMMARY
+            "Skipping because the head commit already came from an agentic workflow." >> $env:GITHUB_STEP_SUMMARY
           }
 
-      - name: Run /simplify
+      - name: Run simplify and review
+        id: agent
         if: steps.config.outputs.ready == 'true' && steps.guard.outputs.skip != 'true'
         shell: powershell
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
         run: |
+          $before = git rev-parse HEAD
           $prompt = @'
-            Run `/simplify` for PR #${{ github.event.pull_request.number }}.
+            Run the code-simplification and code-review-and-quality passes for PR #${{ github.event.pull_request.number }}.
 
             Scope:
             - Compare this PR branch against `${{ github.event.pull_request.base.ref }}`.
-            - Simplify only code touched by this PR, plus directly adjacent helper code when needed.
+            - Simplify and review only code touched by this PR, plus directly adjacent helper code when needed.
             - Preserve behavior exactly. Do not add features.
             - Do not touch generated artifacts, target directories, or unrelated files.
+            - Review for correctness, simplicity/readability, architecture, security, performance, and missing tests.
+            - Do not repair pre-existing CI-only formatting, clippy, or test failures. The PR Quality Gate repair job owns failing checks.
 
             If useful simplifications exist:
             - Apply the smallest behavior-preserving edits.
@@ -154,13 +160,19 @@ jobs:
             - Commit with message `refactor: simplify PR changes [agent-simplify]`.
             - Push to this PR branch.
 
-            If no useful simplification exists:
+            If required review findings exist:
+            - If you can safely fix them within this PR scope, make the smallest fix, run relevant verification, commit with message `fix: address agentic review findings [agent-simplify]`, and push.
+            - If you cannot safely fix them, leave the tree unchanged, comment on the PR with the required findings and verification status, and exit non-zero so this workflow does not approve the PR.
+
+            If no useful simplification and no required review findings exist:
             - Leave the tree unchanged.
-            - Comment on the PR that no simplification changes were needed.
+            - Comment on the PR that no simplification or review changes were needed.
+            - Exit zero.
 
             If verification fails:
             - Do not push.
             - Comment on the PR with the failing command and the root cause.
+            - Exit non-zero.
           '@
 
           $previousErrorActionPreference = $ErrorActionPreference
@@ -177,6 +189,38 @@ jobs:
             $ErrorActionPreference = $previousErrorActionPreference
           }
 
+          $after = git rev-parse HEAD
+          $status = git status --porcelain
+          $changed = $before -ne $after
+          $dirty = -not [string]::IsNullOrWhiteSpace($status)
+          "changed=$($changed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "dirty=$($dirty.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
           if ($codexExitCode -ne 0) {
             exit $codexExitCode
           }
+
+          if ($dirty) {
+            Write-Host "Codex left uncommitted changes; refusing to approve or continue."
+            git status --short
+            exit 1
+          }
+
+      - name: Approve unchanged clean PR
+        if: steps.config.outputs.ready == 'true' && steps.guard.outputs.skip != 'true' && steps.agent.outputs.changed == 'false' && steps.agent.outputs.dirty == 'false'
+        shell: powershell
+        env:
+          REVIEW_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:REVIEW_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $body = @{
+            event = "APPROVE"
+            body = "Agentic simplify and review found no required changes."
+          } | ConvertTo-Json
+          $uri = "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews"
+          Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body -ContentType "application/json"
+          "Approved PR because simplify/review completed cleanly without changing the branch." >> $env:GITHUB_STEP_SUMMARY
