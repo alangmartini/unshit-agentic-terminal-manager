@@ -11,10 +11,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const DAEMON_BIN_NAME: &str = "unshit-ptyd";
+const DAEMON_PACKAGE_NAME: &str = "unshit-ptyd";
 const ENV_OVERRIDE: &str = "UNSHIT_PTYD_BINARY";
 const CONNECT_TOTAL_DEADLINE: Duration = Duration::from_secs(3);
 const CONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
 const CONNECT_MAX_BACKOFF: Duration = Duration::from_millis(200);
+const CARGO_BUILD_OUTPUT_LIMIT: usize = 4096;
 
 /// Resolves the daemon binary path.
 ///
@@ -32,6 +34,29 @@ pub fn locate_daemon_binary() -> io::Result<PathBuf> {
         }
     }
     sibling_of_current_exe()
+}
+
+fn ensure_daemon_binary() -> io::Result<PathBuf> {
+    if let Some(path) = env_override() {
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{ENV_OVERRIDE} points to a missing daemon binary at {}",
+                path.display()
+            ),
+        ));
+    }
+
+    let binary = sibling_of_current_exe()?;
+    if binary.exists() {
+        return Ok(binary);
+    }
+
+    maybe_build_daemon_from_workspace(&binary)?;
+    Ok(binary)
 }
 
 fn env_override() -> Option<PathBuf> {
@@ -52,6 +77,102 @@ fn sibling_of_current_exe() -> io::Result<PathBuf> {
         candidate.set_extension(suffix.trim_start_matches('.'));
     }
     Ok(candidate)
+}
+
+fn maybe_build_daemon_from_workspace(expected_binary: &Path) -> io::Result<()> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if !manifest_dir.join("Cargo.toml").is_file()
+        || !manifest_dir
+            .join("crates")
+            .join(DAEMON_PACKAGE_NAME)
+            .join("Cargo.toml")
+            .is_file()
+    {
+        return Ok(());
+    }
+
+    let Some(exe_dir) = expected_binary.parent() else {
+        return Ok(());
+    };
+
+    let profile = exe_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("debug");
+    let target_dir = exe_dir.parent();
+
+    log::info!(
+        "daemon binary missing at {}; building {DAEMON_PACKAGE_NAME}",
+        expected_binary.display()
+    );
+
+    let mut cmd = Command::new(cargo_command());
+    cmd.current_dir(&manifest_dir)
+        .arg("build")
+        .arg("-p")
+        .arg(DAEMON_PACKAGE_NAME)
+        .arg("--bin")
+        .arg(DAEMON_BIN_NAME);
+
+    if profile == "release" {
+        cmd.arg("--release");
+    } else if profile != "debug" {
+        cmd.arg("--profile").arg(profile);
+    }
+
+    if let Some(target_dir) = target_dir {
+        cmd.arg("--target-dir").arg(target_dir);
+    }
+
+    let output = cmd.output().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("failed to run cargo build for {DAEMON_PACKAGE_NAME}: {e}"),
+        )
+    })?;
+
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "failed to build {DAEMON_PACKAGE_NAME} with cargo (status {}):{}{}",
+            output.status,
+            format_command_output("stdout", &output.stdout),
+            format_command_output("stderr", &output.stderr),
+        )));
+    }
+
+    if !expected_binary.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "cargo build completed but daemon binary is still missing at {}",
+                expected_binary.display()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn cargo_command() -> PathBuf {
+    std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cargo"))
+}
+
+fn format_command_output(label: &str, bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut truncated = text
+        .chars()
+        .take(CARGO_BUILD_OUTPUT_LIMIT)
+        .collect::<String>();
+    if text.chars().count() > CARGO_BUILD_OUTPUT_LIMIT {
+        truncated.push_str("\n...");
+    }
+    format!("\n{label}:\n{truncated}")
 }
 
 /// Launches the daemon as a detached child with null stdio.
@@ -119,7 +240,7 @@ pub async fn connect_or_spawn(socket_path: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let binary = locate_daemon_binary()?;
+    let binary = ensure_daemon_binary()?;
     let _child = spawn_daemon_detached(&binary, socket_path)?;
 
     let deadline = Instant::now() + CONNECT_TOTAL_DEADLINE;

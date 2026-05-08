@@ -621,8 +621,10 @@ fn main() {
     {
         let socket_path = ptyd_socket_path();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for daemon probe");
-        rt.block_on(daemon::connect_or_spawn(&socket_path))
-            .expect("connect or spawn unshit-ptyd daemon");
+        if let Err(err) = rt.block_on(daemon::connect_or_spawn(&socket_path)) {
+            eprintln!("failed to connect or spawn unshit-ptyd daemon: {err}");
+            std::process::exit(1);
+        }
         drop(rt);
         let mut guard = shared.lock().unwrap();
         guard
