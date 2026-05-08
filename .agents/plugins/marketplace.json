@@ -1,0 +1,20 @@
+{
+  "name": "unshit2-plugins",
+  "interface": {
+    "displayName": "Unshit2 Plugins"
+  },
+  "plugins": [
+    {
+      "name": "agent-skills-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agent-skills-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "name": "agent-skills-codex",
+  "version": "1.0.0",
+  "description": "Production-grade software engineering skills packaged for OpenAI Codex.",
+  "author": {
+    "name": "Addy Osmani; Codex fork maintained by Alan Martini",
+    "url": "https://github.com/alangmartini"
+  },
+  "homepage": "https://github.com/alangmartini/agent-skills",
+  "repository": "https://github.com/alangmartini/agent-skills",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "skills",
+    "software-engineering",
+    "workflow",
+    "quality"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Agent Skills",
+    "shortDescription": "Engineering workflows for Codex, from spec to ship.",
+    "longDescription": "A Codex-only bundle of software engineering skills covering specification, planning, implementation, testing, review, security, performance, documentation, and launch readiness.",
+    "developerName": "Alan Martini",
+    "category": "Productivity",
+    "capabilities": [
+      "Write",
+      "Review",
+      "Automation"
+    ],
+    "websiteURL": "https://github.com/alangmartini/agent-skills",
+    "defaultPrompt": [
+      "Pick the right skill for this task.",
+      "Use TDD to implement this change.",
+      "Review this diff before merge."
+    ],
+    "brandColor": "#111827"
+  }
+}
