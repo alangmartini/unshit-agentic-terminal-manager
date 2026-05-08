@@ -482,6 +482,44 @@ impl Terminal {
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
 
+    /// Resize for viewport-driven growth without lifting existing screen
+    /// rows downward. During window snap the compositor can deliver several
+    /// intermediate sizes and the shell may redraw between them; using the
+    /// bottom-anchored scrollback reflow for the final grow leaves that
+    /// intermediate redraw floating in the middle of the new viewport.
+    ///
+    /// This keeps the existing top rows at the top on growth and falls back
+    /// to the normal scrollback-preserving resize for shrink/column changes.
+    pub fn resize_viewport_growth(&mut self, rows: usize, cols: usize) {
+        if rows <= self.rows {
+            self.resize(rows, cols);
+            return;
+        }
+
+        let alt_active = self.alt_grid.is_some();
+        self.grid.resize(rows, cols);
+        if let Some(alt) = self.alt_grid.as_mut() {
+            alt.resize(rows, cols);
+        }
+
+        self.rows = rows;
+        self.cols = cols;
+
+        if self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot {
+            self.scroll_top = 0;
+            self.scroll_bot = rows;
+        }
+
+        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        self.wrap_pending = false;
+        if alt_active {
+            self.alt_saved_cursor.0 = self.alt_saved_cursor.0.min(rows.saturating_sub(1));
+            self.alt_saved_cursor.1 = self.alt_saved_cursor.1.min(cols.saturating_sub(1));
+        }
+        self.grid.set_cursor(self.cursor_row, self.cursor_col);
+    }
+
     /// Lift up to `k` newest scrollback rows into the top of the grid
     /// after extending the row count by `k`. Existing rows shift down
     /// so the bottom of the grid stays anchored to its previous content.
@@ -1855,6 +1893,22 @@ mod tests {
         assert_eq!(row_text(&t, 2), "aa");
         assert_eq!(row_text(&t, 3), "bb");
         assert_eq!(t.cursor_position().0, 3);
+    }
+
+    #[test]
+    fn resize_viewport_growth_keeps_existing_rows_at_top_ui() {
+        let mut t = Terminal::new(2, 3);
+        t.process_bytes(b"aa\r\nbb");
+        let cursor_before = t.cursor_position();
+
+        t.resize_viewport_growth(4, 3);
+
+        assert_eq!(t.rows, 4);
+        assert_eq!(row_text(&t, 0), "aa");
+        assert_eq!(row_text(&t, 1), "bb");
+        assert_eq!(row_text(&t, 2), "");
+        assert_eq!(row_text(&t, 3), "");
+        assert_eq!(t.cursor_position(), cursor_before);
     }
 
     #[test]

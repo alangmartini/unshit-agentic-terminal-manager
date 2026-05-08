@@ -370,10 +370,11 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                 let existing_ids: Vec<u32> =
                                     guard.terminals.keys().copied().collect();
                                 for id in existing_ids {
-                                    guard.pty_manager.resize(id, cols, rows);
                                     if let Some(t) = guard.terminals.get(&id) {
-                                        t.lock_recover().resize(rows as usize, cols as usize);
+                                        t.lock_recover()
+                                            .resize_viewport_growth(rows as usize, cols as usize);
                                     }
+                                    guard.pty_manager.resize(id, cols, rows);
                                 }
                                 // Deferred spawn introduces new terminal
                                 // handles into the tree; the next frame
@@ -425,10 +426,11 @@ fn resize_poll_subscription(shared: SharedState) -> Subscription {
                             let mut guard = shared.lock_recover();
                             let ids: Vec<u32> = guard.terminals.keys().copied().collect();
                             for id in ids {
-                                guard.pty_manager.resize(id, cols, rows);
                                 if let Some(t) = guard.terminals.get(&id) {
-                                    t.lock_recover().resize(rows as usize, cols as usize);
+                                    t.lock_recover()
+                                        .resize_viewport_growth(rows as usize, cols as usize);
                                 }
+                                guard.pty_manager.resize(id, cols, rows);
                             }
                         } // guard drops before yield
                         yield ExternalEvent::RequestRedraw;

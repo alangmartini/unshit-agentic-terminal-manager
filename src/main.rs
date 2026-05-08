@@ -989,6 +989,49 @@ mod tests {
     }
 
     #[test]
+    fn snapped_main_route_statusbar_stays_below_terminal_grid_with_actual_styles() {
+        let state = seed_state();
+        let active_pane = state.active_pane.0;
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(active_pane, unshit::core::cell_grid::CellGrid::new(49, 79));
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&tree_snap, &tree_shared, &grids),
+            1280.0,
+            1368.0,
+        );
+        harness.set_scale_factor(1.5);
+        harness.step();
+
+        let content = harness.query(".content").expect("content exists");
+        let terminal_grid = harness
+            .query(".terminal-grid")
+            .expect("terminal grid exists");
+        let statusbar = harness.query(".statusbar").expect("statusbar exists");
+
+        assert!(
+            (statusbar.layout_rect.y + statusbar.layout_rect.height
+                - (content.layout_rect.y + content.layout_rect.height))
+                .abs()
+                < 1.0,
+            "statusbar should end at content bottom; content={:?} statusbar={:?}",
+            content.layout_rect,
+            statusbar.layout_rect
+        );
+        assert!(
+            terminal_grid.layout_rect.y + terminal_grid.layout_rect.height
+                <= statusbar.layout_rect.y + 1.0,
+            "terminal grid should not cover statusbar; grid={:?} statusbar={:?}",
+            terminal_grid.layout_rect,
+            statusbar.layout_rect
+        );
+    }
+
+    #[test]
     fn renderer_font_sources_prefer_jetbrains() {
         let fonts = terminal_font_sources_from_value(None);
         let first = fonts.first().expect("font source list must not be empty");

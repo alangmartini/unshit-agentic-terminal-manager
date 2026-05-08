@@ -577,6 +577,15 @@ impl AppState {
             }
             ws.terminal_entries = entries;
         }
+        let (active_terminal_cols, active_terminal_rows) = self
+            .terminals
+            .get(&self.active_pane.0)
+            .map(|terminal| {
+                let terminal = terminal.lock_recover();
+                (terminal.grid().cols() as u16, terminal.grid().rows() as u16)
+            })
+            .unwrap_or((80, 24));
+
         UiSnapshot {
             workspaces,
             active_workspace: self.active_workspace,
@@ -607,6 +616,8 @@ impl AppState {
             scale_factor: self.scale_factor,
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
+            active_terminal_cols,
+            active_terminal_rows,
             sessions: self.sessions.clone(),
             sessions_stale: self.sessions_stale,
             toasts: self
@@ -682,6 +693,9 @@ pub struct UiSnapshot {
     /// `state.terminals.len()` so the danger-zone button can show an
     /// accurate count without the UI having to reach into the map.
     pub terminal_count: usize,
+    /// Current dimensions of the active terminal grid.
+    pub active_terminal_cols: u16,
+    pub active_terminal_rows: u16,
     pub sessions: Vec<SessionSnapshot>,
     /// Mirrors `AppState::sessions_stale`. `true` when the most recent
     /// `list_sessions` RPC failed and the cached rows may be stale.
@@ -3392,13 +3406,13 @@ pub fn is_on(state: &UiSnapshot, key: ToggleKey) -> bool {
 pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
     let ids: Vec<u32> = state.terminals.keys().copied().collect();
     for id in ids {
-        state.pty_manager.resize(id, cols, rows);
         if let Some(terminal) = state.terminals.get(&id) {
             terminal
                 .lock()
                 .expect("terminal mutex poisoned")
-                .resize(rows as usize, cols as usize);
+                .resize_viewport_growth(rows as usize, cols as usize);
         }
+        state.pty_manager.resize(id, cols, rows);
     }
 }
 

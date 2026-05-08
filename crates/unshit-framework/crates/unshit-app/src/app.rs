@@ -33,10 +33,11 @@ use unshit_renderer::gpu::GpuContext;
 use unshit_renderer::pipeline::quad::QuadInstance;
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
+use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::{ResizeDirection, Window, WindowId};
 
 pub struct AppConfig {
     pub title: String,
@@ -341,6 +342,40 @@ struct AppState {
     /// zero. Only used when [`AppConfig::tree_fn_bump`] is set; left
     /// unused otherwise.
     frame_arena: FrameArena,
+}
+
+const WINDOW_RESIZE_GRIP_SIZE: f32 = 14.0;
+
+fn window_resize_direction(
+    surface_size: PhysicalSize<u32>,
+    cursor: (f32, f32),
+    scale_factor: f32,
+) -> Option<ResizeDirection> {
+    if surface_size.width == 0 || surface_size.height == 0 {
+        return None;
+    }
+
+    let (x, y) = cursor;
+    let width = surface_size.width as f32;
+    let height = surface_size.height as f32;
+    let grip = WINDOW_RESIZE_GRIP_SIZE * scale_factor.max(1.0);
+
+    let near_left = x <= grip && x <= width * 0.5;
+    let near_right = x >= width - grip && x > width * 0.5;
+    let near_top = y <= grip && y <= height * 0.5;
+    let near_bottom = y >= height - grip && y > height * 0.5;
+
+    match (near_left, near_right, near_top, near_bottom) {
+        (true, false, true, false) => Some(ResizeDirection::NorthWest),
+        (false, true, true, false) => Some(ResizeDirection::NorthEast),
+        (true, false, false, true) => Some(ResizeDirection::SouthWest),
+        (false, true, false, true) => Some(ResizeDirection::SouthEast),
+        (true, false, false, false) => Some(ResizeDirection::West),
+        (false, true, false, false) => Some(ResizeDirection::East),
+        (false, false, true, false) => Some(ResizeDirection::North),
+        (false, false, false, true) => Some(ResizeDirection::South),
+        _ => None,
+    }
 }
 
 /// How long after the last external event the loop keeps scheduling
@@ -1415,11 +1450,33 @@ impl ApplicationHandler for AppHandler {
                             } else {
                                 state.interaction.hovered
                             };
+                            if !self.app.config.decorations {
+                                if let Some(direction) = window_resize_direction(
+                                    state.window.surface_size(),
+                                    sb_pos,
+                                    state.window.scale_factor() as f32,
+                                ) {
+                                    state.interaction.drag_origin = None;
+                                    state.interaction.dragging = false;
+                                    state.interaction.drag_target = None;
+                                    state.interaction.mousedown_target = None;
+                                    state.interaction.resize_drag = None;
+                                    state.interaction.scrollbar_drag = None;
+                                    if let Err(err) = state.window.drag_resize_window(direction) {
+                                        log::warn!("native window resize drag failed: {err}");
+                                    }
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                            }
+
                             if is_window_drag_region(&state.arena, region_target) {
                                 state.interaction.drag_origin = None;
                                 state.interaction.dragging = false;
                                 state.interaction.drag_target = None;
                                 state.interaction.mousedown_target = None;
+                                state.interaction.resize_drag = None;
+                                state.interaction.scrollbar_drag = None;
                                 if let Err(err) = state.window.drag_window() {
                                     log::warn!("native window drag failed: {err}");
                                 }
@@ -2365,7 +2422,7 @@ impl ApplicationHandler for AppHandler {
                 } else if state.needs_relayout {
                     let t3 = Instant::now();
                     let (w, h) = state.gpu.window_size();
-                    relayout_pipeline(
+                    let resize_callbacks_fired = relayout_pipeline(
                         &mut state.arena,
                         &mut state.taffy,
                         state.root,
@@ -2378,6 +2435,10 @@ impl ApplicationHandler for AppHandler {
 
                     metrics.node_count = state.arena.len();
                     state.needs_relayout = false;
+                    if resize_callbacks_fired {
+                        state.needs_rebuild = true;
+                        state.window.request_redraw();
+                    }
                 } else {
                     metrics.node_count = state.arena.len();
                 }
@@ -3342,12 +3403,12 @@ fn relayout_pipeline(
     width: f32,
     height: f32,
     cache: &mut TextMeasureCache,
-) {
+) -> bool {
     if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
         layout::compute_layout(taffy, tn, width, height, font_system, cache);
         layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
     }
-    dispatch_resize_callbacks(arena, root);
+    dispatch_resize_callbacks(arena, root)
 }
 
 /// Get current process RSS (resident set size) in bytes.
@@ -3750,6 +3811,27 @@ mod tests {
     }
 
     #[test]
+    fn window_resize_direction_maps_edges_and_corners() {
+        let size = PhysicalSize::new(800, 600);
+
+        assert_eq!(window_resize_direction(size, (4.0, 300.0), 1.0), Some(ResizeDirection::West));
+        assert_eq!(window_resize_direction(size, (796.0, 300.0), 1.0), Some(ResizeDirection::East));
+        assert_eq!(
+            window_resize_direction(size, (4.0, 4.0), 1.0),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(window_resize_direction(size, (400.0, 300.0), 1.0), None);
+    }
+
+    #[test]
+    fn window_resize_direction_scales_grip_for_hidpi() {
+        let size = PhysicalSize::new(800, 600);
+
+        assert_eq!(window_resize_direction(size, (20.0, 300.0), 1.0), None);
+        assert_eq!(window_resize_direction(size, (20.0, 300.0), 2.0), Some(ResizeDirection::West));
+    }
+
+    #[test]
     fn compiled_stylesheet_parse_roundtrip() {
         let stylesheet = CompiledStylesheet::parse(".hot { color: green; }");
         assert!(!stylesheet.rules.is_empty(), "should parse at least one rule");
@@ -3840,7 +3922,7 @@ mod tests {
         );
         assert_eq!(fired.load(Ordering::SeqCst), 1);
 
-        relayout_pipeline(
+        let callbacks_fired = relayout_pipeline(
             &mut arena,
             &mut taffy,
             root,
@@ -3850,6 +3932,10 @@ mod tests {
             &mut measure_cache,
         );
 
+        assert!(
+            callbacks_fired,
+            "lightweight relayout must report fired resize callbacks so the app can rebuild snapshots"
+        );
         assert_eq!(
             fired.load(Ordering::SeqCst),
             2,
