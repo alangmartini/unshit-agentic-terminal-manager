@@ -1,6 +1,6 @@
 {
   "name": "agent-skills-codex",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Production-grade software engineering skills packaged for OpenAI Codex.",
   "author": {
     "name": "Addy Osmani; Codex fork maintained by Alan Martini",
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Codex Agent Skills",
     "shortDescription": "Engineering workflows for Codex, from spec to ship.",
-    "longDescription": "A Codex-only bundle of software engineering skills covering specification, planning, implementation, testing, review, security, performance, documentation, and launch readiness.",
+    "longDescription": "A Codex-only bundle of software engineering skills covering specification, planning, implementation, testing, review, security, performance, documentation, session handoffs, changelog and version release preparation, and launch readiness.",
     "developerName": "Alan Martini",
     "category": "Productivity",
     "capabilities": [
@@ -32,7 +32,9 @@
     "defaultPrompt": [
       "Pick the right skill for this task.",
       "Use TDD to implement this change.",
-      "Review this diff before merge."
+      "Review this diff before merge.",
+      "Create a handoff for the next Codex session.",
+      "Create a changelog fragment for this change."
     ],
     "brandColor": "#111827"
   }

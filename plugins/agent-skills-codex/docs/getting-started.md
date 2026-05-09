@@ -47,6 +47,18 @@ Use test-driven-development to reproduce and fix this bug.
 Use code-review-and-quality to review the current diff.
 ```
 
+```text
+Use handoff to prepare the next Codex session.
+```
+
+```text
+Use create-changelog-fragment for the completed change.
+```
+
+```text
+Use create-version-release to prepare a patch release.
+```
+
 ## Recommended Baseline
 
 For day-to-day coding, install these first:

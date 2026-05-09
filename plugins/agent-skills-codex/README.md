@@ -59,6 +59,7 @@ Codex reads each skill's `name` and `description` metadata to decide when to loa
 | Work type | Start with |
 |---|---|
 | Unsure which workflow applies | `using-agent-skills` |
+| Handing work to a fresh session | `handoff` |
 | Vague idea or product concept | `idea-refine` |
 | New project, feature, or significant change | `spec-driven-development` |
 | Turning a spec into tasks | `planning-and-task-breakdown` |
@@ -69,6 +70,8 @@ Codex reads each skill's `name` and `description` metadata to decide when to loa
 | Reviewing before merge | `code-review-and-quality` |
 | Security-sensitive work | `security-and-hardening` |
 | Performance-sensitive work | `performance-optimization` |
+| Capturing release notes | `create-changelog-fragment` |
+| Preparing a version release | `create-version-release` |
 | Preparing a release | `shipping-and-launch` |
 
 ## Skills
@@ -128,6 +131,8 @@ Codex reads each skill's `name` and `description` metadata to decide when to loa
 | [ci-cd-and-automation](skills/ci-cd-and-automation/SKILL.md) | Build quality gates and release automation |
 | [deprecation-and-migration](skills/deprecation-and-migration/SKILL.md) | Remove or migrate systems deliberately |
 | [documentation-and-adrs](skills/documentation-and-adrs/SKILL.md) | Document decisions, APIs, and operating context |
+| [create-changelog-fragment](skills/create-changelog-fragment/SKILL.md) | Write release-ready changelog fragments from completed work |
+| [create-version-release](skills/create-version-release/SKILL.md) | Prepare version bumps and release notes from repo history |
 | [shipping-and-launch](skills/shipping-and-launch/SKILL.md) | Launch with monitoring, rollout gates, and rollback plans |
 
 ## References

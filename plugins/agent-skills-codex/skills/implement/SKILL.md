@@ -1,9 +1,9 @@
 ---
 name: implement
-description: Trigger a complete flow of implementation using subagents in an autonomous way
+description: Trigger a complete flow of implementation using subagents in an autonomous way, from specification through planning, TDD, review, simplification, ship readiness, and changelog fragment creation.
 ---
 
-User will invoke with "$implement feature to be implemented/fixed"
+User will invoke with "$agent-skills-codex:implement feature to be implemented/fixed"
 
 You will then follow this steps, IN THE EXACT ORDER:
 
@@ -14,7 +14,7 @@ You will then follow this steps, IN THE EXACT ORDER:
   - Tech stack preferences and constraints
   - Known boundaries (what to always do, ask first about, and never do)
 
-Then, Spawn an subagent to invoke the $spec-driven-development skill with these answers./
+Then, Spawn an subagent to invoke the $agent-skills-codex:spec-driven-development skill with these answers./
 
 The subagent should:
 """
@@ -23,7 +23,7 @@ Generate a structured spec covering all six core areas: objective, commands, pro
 Save the spec as SPEC.md in the project root and proceed.
 """
 
-2.  Spawn an subagent to invoke the $planning-and-task-breakdown
+2.  Spawn an subagent to invoke the $agent-skills-codex:planning-and-task-breakdown
 The subagent should:
 
 """
@@ -39,7 +39,7 @@ Save the plan to tasks/plan.md and task list to tasks/todo.md.
 """
 3. Here, you will start an loop for each task in the plan, while you (main agent) act as an orchestrator:
 
-Spawn an subagent to invoke the $incremental-implementation skill alongside $test-driven-development skill.
+Spawn an subagent to invoke the $agent-skills-codex:incremental-implementation skill alongside $agent-skills-codex:test-driven-development skill.
 
 The subagent should:
 """
@@ -58,7 +58,7 @@ If any step fails, follow the debugging-and-error-recovery skill.
 """
 4. Loop in 3 until ALL tasks in the plan are marked as done.
 
-5. Spawn an subagent to invoke the $code-review-and-quality skill.
+5. Spawn an subagent to invoke the $agent-skills-codex:code-review-and-quality skill.
 
 The subagent should:
 """
@@ -72,7 +72,7 @@ The subagent should:
   Categorize findings as Critical, Important, or Suggestion. Output a structured review with specific file:line references and fix recommendations.
 """
 
-6. Spawn an subagent to invoke the $agent-skills:$code-simplification skill.
+6. Spawn an subagent to invoke the $agent-skills-codex:code-simplification skill.
 
 The subagent should:
 """
@@ -93,7 +93,7 @@ Verify all tests pass, the build succeeds, and the diff is clean
 If tests fail after a simplification, revert that change and reconsider. Use code-review-and-quality to review the result.
 """
 
-7. Now, we will ship. Invoke the $shipping-and-launch skill.
+7. Now, we will ship. Invoke the $agent-skills-codex:shipping-and-launch skill.
 
 This is a Codex fan-out orchestrator. Run three specialist subagents in parallel against the current change, then merge their reports into a single go/no-go decision with a rollback plan. The specialists operate independently with no shared state and no ordering dependency, which is what makes parallel execution safe and useful here.
 
@@ -153,7 +153,7 @@ Evaluate:
 - Performance: Pull from the code reviewer's performance axis and cross-check Core Web Vitals or service-level latency/resource constraints when applicable.
 - Accessibility: Verify keyboard navigation, screen reader support, focus management, labels, and contrast directly in the main session, or apply the accessibility checklist if the change has a UI surface.
 - Infrastructure: Verify environment variables, migrations, monitoring, alerts, feature flags, deploy order, and operational dependencies directly.
-- Documentation: Verify README updates, ADRs, changelog entries, runbooks, and user-facing docs directly.
+- Documentation: Verify README updates, ADRs, changelog inputs, runbooks, and user-facing docs directly. Changelog artifact creation happens in stage 8.
 
 ## Phase C: Decision and Rollback
 
@@ -202,3 +202,27 @@ Produce a single output:
 - While specialists run, the main session may independently verify build, tests, lint, docs, accessibility, infrastructure, and rollback details if those checks do not duplicate delegated work.
 - Use `wait_agent` only when the main session needs the reports to complete the decision.
 - After reports return, review them for duplicates, false positives, and missing file/line grounding before issuing the final go/no-go.
+
+8. Create a between-version changelog fragment. Invoke the $agent-skills-codex:create-changelog-fragment skill after the ship decision so the completed work has a release-note-ready artifact for the next version.
+
+Spawn a Codex subagent with `agent_type: "worker"` unless the repository's changelog convention is clearly read-only or the ship decision is `NO-GO`.
+
+The subagent should:
+"""
+Read the spec, task plan, todo list, ship decision, specialist reports, rollback plan, current branch diff, and recent commits. Then:
+
+- Discover the repository's changelog convention before writing.
+- Prefer an existing fragment system, Unreleased section, or release-notes draft area.
+- Create or update only the pending between-version changelog artifact.
+- Summarize user-visible changes, fixes, migration notes, config changes, feature flags, rollout implications, security notes, and compatibility impact when supported by evidence.
+- Do not edit historical released changelog sections.
+- Do not claim production deployment happened unless the ship evidence says it did.
+- If the ship decision is `NO-GO`, do not update a public release changelog; create or update a pending internal note that records blockers and the intended changelog once fixed.
+- Run the repository's changelog formatter or validator if one exists.
+- Run the general validation command if the changelog is part of docs or release validation.
+- Commit the changelog artifact separately when the project expects atomic commits.
+
+Return the changelog artifact path, convention detected, entries added, assumptions, and verification results.
+"""
+
+The main Codex session must review the fragment before final handoff. Confirm that the changelog reflects actual behavior and launch status, not implementation details or speculative product claims.
