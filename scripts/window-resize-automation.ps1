@@ -1,9 +1,9 @@
 #Requires -Version 5.1
 <#
-  Compatibility wrapper for the Desktop Interaction Regression harness.
+  Compatibility wrapper for the Desktop Interaction Regression framework.
 
   Prefer:
-    powershell.exe -ExecutionPolicy Bypass -File scripts\desktop-regression\run.ps1
+    powershell.exe -ExecutionPolicy Bypass -File tests\windows\desktop-regression\run.ps1
 
   The historical command still works:
     powershell.exe -ExecutionPolicy Bypass -File scripts\window-resize-automation.ps1 -OnlySnapTest
@@ -30,7 +30,7 @@ $ErrorActionPreference = "Stop"
 
 [void]$ScreenshotScale
 
-$runner = Join-Path $PSScriptRoot "desktop-regression\run.ps1"
+$runner = Join-Path $PSScriptRoot "..\tests\windows\desktop-regression\run.ps1"
 $suite = if ($OnlySnapTest) {
     @("post-resize-glitches")
 } elseif ($SkipSnapTest) {

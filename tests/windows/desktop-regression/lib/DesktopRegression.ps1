@@ -123,7 +123,7 @@ function New-DesktopRegressionContext {
     )
 
     $runId = Get-Date -Format "yyyyMMdd-HHmmss"
-    $runArtifactsDir = Join-Path $ArtifactsRoot "desktop-regression\$runId"
+    $runArtifactsDir = Join-Path $ArtifactsRoot "windows\desktop-regression\$runId"
     if (-not (Test-Path $runArtifactsDir)) {
         New-Item -ItemType Directory -Path $runArtifactsDir | Out-Null
     }

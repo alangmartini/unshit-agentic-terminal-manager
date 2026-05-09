@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 
-# Copy this file into ../suites/<suite-name>.ps1 and update the metadata.
+# Copy this file into tests/windows/desktop-regression/suites/<suite-name>.ps1 and update the metadata.
 # The runner dot-sources every suite file and executes the registered
 # scriptblock when the suite is selected.
 

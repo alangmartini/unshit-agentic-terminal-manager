@@ -78,6 +78,7 @@ Codex reads each skill's `name` and `description` metadata to decide when to loa
 | Skill | Purpose |
 |---|---|
 | [using-agent-skills](skills/using-agent-skills/SKILL.md) | Discover which skill applies to a task |
+| [handoff](skills/handoff/SKILL.md) | Compact current context for a fresh agent session |
 
 ### Define
 
