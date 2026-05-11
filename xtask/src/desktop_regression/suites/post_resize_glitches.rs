@@ -26,6 +26,10 @@ use terminal_manager_diagnostics::{
 const SUITE_ID: &str = "post-resize-glitches";
 const SNAP_LIT_RATIO_THRESHOLD: f64 = 0.01;
 const SNAP_MID_LIT_RATIO_THRESHOLD: f64 = 0.005;
+// Conservative lower bound for "some terminal content is present" after clear.
+// Keep this below the stale-row threshold and re-baseline when the terminal
+// theme, foreground palette, antialiasing, or sample geometry changes.
+const SNAP_MID_LIT_PRESENCE_THRESHOLD: f64 = 0.0005;
 const SNAP_TABBAR_PX: i32 = 88;
 const SNAP_STATUSBAR_PX: i32 = 32;
 const SNAP_SIDEBAR_PX: i32 = 252;
@@ -368,8 +372,9 @@ fn run_snap_scenario(
         samples.bottom.height
     );
     println!(
-        "snap_mid_max_lit_ratio={:.4} threshold={:.4} sample=({},{} {}x{})",
+        "snap_mid_max_lit_ratio={:.4} presence_threshold={:.4} stale_threshold={:.4} sample=({},{} {}x{})",
         ratios.mid_max_lit_ratio,
+        SNAP_MID_LIT_PRESENCE_THRESHOLD,
         SNAP_MID_LIT_RATIO_THRESHOLD,
         samples.mid.x,
         samples.mid.y,
@@ -443,6 +448,22 @@ fn assert_visual_ratios(grew: bool, ratios: PixelSampleRatios) -> SuiteResult<()
             ratios.bottom_lit_ratio, SNAP_LIT_RATIO_THRESHOLD
         ),
         &bottom_signal,
+    )?;
+
+    let mid_present = ratios.mid_max_lit_ratio >= SNAP_MID_LIT_PRESENCE_THRESHOLD;
+    let mid_present_signal = classify_snap_failure(
+        grew,
+        ratios.bottom_lit_ratio,
+        ratios.mid_max_lit_ratio,
+        None,
+    );
+    assert_true(
+        mid_present,
+        &format!(
+            "snap-resize regression: mid-pane lit ratio {:.4} < {:.4}; terminal pane appears blank after snap",
+            ratios.mid_max_lit_ratio, SNAP_MID_LIT_PRESENCE_THRESHOLD
+        ),
+        &mid_present_signal,
     )?;
 
     let mid_ok = ratios.mid_max_lit_ratio <= SNAP_MID_LIT_RATIO_THRESHOLD;
@@ -556,6 +577,9 @@ fn classify_snap_failure(
     if bottom_lit_ratio < SNAP_LIT_RATIO_THRESHOLD {
         return "snap-bottom-stripe-missing".to_owned();
     }
+    if mid_max_lit_ratio < SNAP_MID_LIT_PRESENCE_THRESHOLD {
+        return "snap-mid-pane-blank".to_owned();
+    }
     if mid_max_lit_ratio > SNAP_MID_LIT_RATIO_THRESHOLD {
         return "snap-mid-pane-stale-rows".to_owned();
     }
@@ -590,6 +614,81 @@ mod tests {
         let classification = classify_snap_failure(true, 0.0, 0.0, None);
 
         assert_eq!(classification, "snap-bottom-stripe-missing");
+    }
+
+    #[test]
+    fn classify_snap_failure_reports_blank_mid_pane_when_bottom_is_present() {
+        let classification = classify_snap_failure(true, 0.02, 0.0, None);
+
+        assert_eq!(classification, "snap-mid-pane-blank");
+    }
+
+    #[test]
+    fn classify_snap_failure_reports_stale_mid_pane_rows() {
+        let classification =
+            classify_snap_failure(true, 0.02, SNAP_MID_LIT_RATIO_THRESHOLD + 0.001, None);
+
+        assert_eq!(classification, "snap-mid-pane-stale-rows");
+    }
+
+    #[test]
+    fn assert_visual_ratios_rejects_blank_mid_pane() {
+        let err = assert_visual_ratios(
+            true,
+            PixelSampleRatios {
+                bottom_lit_ratio: 0.02,
+                mid_max_lit_ratio: 0.0,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.first_bad_signal.as_deref(), Some("snap-mid-pane-blank"));
+    }
+
+    #[test]
+    fn assert_visual_ratios_rejects_stale_mid_pane_rows() {
+        let err = assert_visual_ratios(
+            true,
+            PixelSampleRatios {
+                bottom_lit_ratio: 0.02,
+                mid_max_lit_ratio: SNAP_MID_LIT_RATIO_THRESHOLD + 0.001,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.first_bad_signal.as_deref(),
+            Some("snap-mid-pane-stale-rows")
+        );
+    }
+
+    #[test]
+    fn assert_visual_ratios_keeps_bottom_stripe_precedence() {
+        let err = assert_visual_ratios(
+            true,
+            PixelSampleRatios {
+                bottom_lit_ratio: 0.0,
+                mid_max_lit_ratio: 0.0,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.first_bad_signal.as_deref(),
+            Some("snap-bottom-stripe-missing")
+        );
+    }
+
+    #[test]
+    fn assert_visual_ratios_accepts_mid_pane_between_presence_and_stale_bounds() {
+        assert!(assert_visual_ratios(
+            true,
+            PixelSampleRatios {
+                bottom_lit_ratio: 0.02,
+                mid_max_lit_ratio: 0.001,
+            },
+        )
+        .is_ok());
     }
 
     #[test]
