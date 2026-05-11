@@ -117,6 +117,7 @@ impl SuiteExecutionRecord {
     }
 }
 
+#[cfg(test)]
 pub fn completed_result(
     run_id: String,
     observe: ObserveMode,
@@ -124,7 +125,21 @@ pub fn completed_result(
     app: Option<ResultAppInfo>,
     outcomes: Vec<SuiteExecutionRecord>,
 ) -> TestRunResult {
-    let timestamp = format_utc_timestamp(SystemTime::now());
+    let now = SystemTime::now();
+    completed_result_at(run_id, observe, selected, app, outcomes, now, now)
+}
+
+pub fn completed_result_at(
+    run_id: String,
+    observe: ObserveMode,
+    selected: &[&SuiteMetadata],
+    app: Option<ResultAppInfo>,
+    outcomes: Vec<SuiteExecutionRecord>,
+    started_at: SystemTime,
+    finished_at: SystemTime,
+) -> TestRunResult {
+    let started_at_utc = format_utc_timestamp(started_at);
+    let finished_at_utc = format_utc_timestamp(finished_at);
     let selected_suites = selected.iter().map(|suite| suite.id.to_owned()).collect();
     let suites = outcomes
         .into_iter()
@@ -162,8 +177,8 @@ pub fn completed_result(
             id: run_id,
             status,
             observe,
-            started_at_utc: timestamp.clone(),
-            finished_at_utc: Some(timestamp),
+            started_at_utc,
+            finished_at_utc: Some(finished_at_utc),
             selected_suites,
         },
         app,
@@ -289,6 +304,35 @@ mod tests {
         assert_eq!(
             result.suites[1].failure.as_ref().unwrap().kind,
             FailureClassification::Setup
+        );
+    }
+
+    #[test]
+    fn completed_result_at_keeps_distinct_run_timestamps() {
+        let suites = crate::desktop_regression::registry::resolve_suites(&[
+            "edge-resize-stability".to_owned(),
+        ])
+        .unwrap();
+        let started = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_778_434_212);
+        let finished = started + std::time::Duration::from_secs(5);
+
+        let result = completed_result_at(
+            "run-1".to_owned(),
+            ObserveMode::Off,
+            &suites,
+            None,
+            vec![SuiteExecutionRecord::passed(
+                "edge-resize-stability",
+                Vec::new(),
+            )],
+            started,
+            finished,
+        );
+
+        assert_eq!(result.run.started_at_utc, "2026-05-10T17:30:12Z");
+        assert_eq!(
+            result.run.finished_at_utc.as_deref(),
+            Some("2026-05-10T17:30:17Z")
         );
     }
 }

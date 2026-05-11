@@ -44,6 +44,21 @@ impl ValidatedTrace {
     pub fn action_count(&self) -> u32 {
         self.entries.len() as u32
     }
+
+    pub fn actions_for_suite(&self, suite_id: &str) -> Vec<RunnerAction> {
+        let trace_has_suite_ids = !self.suite_ids.is_empty();
+        self.entries
+            .iter()
+            .filter(|entry| {
+                if trace_has_suite_ids {
+                    entry.suite_id.as_deref() == Some(suite_id)
+                } else {
+                    entry.suite_id.is_none()
+                }
+            })
+            .map(|entry| entry.action.clone())
+            .collect()
+    }
 }
 
 struct ActionRecorderState {
@@ -227,7 +242,7 @@ fn validate_safe_relative_path(raw: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terminal_manager_diagnostics::Rect;
+    use terminal_manager_diagnostics::{Rect, RunnerAction};
 
     #[test]
     fn action_trace_jsonl_round_trip_preserves_version_and_action_fields() {
@@ -344,5 +359,61 @@ mod tests {
 
         assert!(err.contains("unknown variant"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn actions_for_suite_filters_tagged_trace_entries() {
+        let trace = ValidatedTrace {
+            suite_ids: vec!["edge-resize-stability".to_owned()],
+            entries: vec![
+                ActionTraceEntry::new(
+                    Some("edge-resize-stability"),
+                    RunnerAction {
+                        seq: 1,
+                        kind: RunnerActionKind::Note {
+                            message: "edge".to_owned(),
+                        },
+                        ..Default::default()
+                    },
+                ),
+                ActionTraceEntry::new(
+                    Some("post-resize-glitches"),
+                    RunnerAction {
+                        seq: 2,
+                        kind: RunnerActionKind::Note {
+                            message: "post".to_owned(),
+                        },
+                        ..Default::default()
+                    },
+                ),
+            ],
+        };
+
+        let actions = trace.actions_for_suite("edge-resize-stability");
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].seq, 1);
+    }
+
+    #[test]
+    fn actions_for_suite_allows_untagged_single_suite_traces() {
+        let trace = ValidatedTrace {
+            suite_ids: Vec::new(),
+            entries: vec![ActionTraceEntry::new(
+                None,
+                RunnerAction {
+                    seq: 1,
+                    kind: RunnerActionKind::Note {
+                        message: "legacy".to_owned(),
+                    },
+                    ..Default::default()
+                },
+            )],
+        };
+
+        let actions = trace.actions_for_suite("edge-resize-stability");
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].seq, 1);
     }
 }

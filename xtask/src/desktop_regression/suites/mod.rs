@@ -5,7 +5,7 @@ use terminal_manager_diagnostics::{FailureClassification, RunnerActionKind, Runn
 
 use crate::desktop_regression::artifacts::ArtifactLayout;
 use crate::desktop_regression::assertions::SuiteError;
-use crate::desktop_regression::replay::ActionRecorder;
+use crate::desktop_regression::replay::{ActionRecorder, ValidatedTrace};
 use crate::desktop_regression::results::SuiteExecutionRecord;
 
 pub const ENV_FORCE_FAILURE: &str = "TM_DESKTOP_REGRESSION_FORCE_FAILURE";
@@ -53,6 +53,23 @@ pub fn execute_suite(suite_id: &str, context: &SuiteContext<'_>) -> SuiteExecuti
             FailureClassification::Setup,
             format!("desktop-regression suite '{other}' is not implemented in Rust yet"),
             Some("suite-implementation-missing".to_owned()),
+            Vec::new(),
+        ),
+    }
+}
+
+pub fn execute_suite_replay(
+    suite_id: &str,
+    context: &SuiteContext<'_>,
+    trace: &ValidatedTrace,
+) -> SuiteExecutionRecord {
+    match suite_id {
+        "edge-resize-stability" => edge_resize_stability::run_replay(context, trace),
+        other => SuiteExecutionRecord::failed(
+            other,
+            FailureClassification::Setup,
+            format!("desktop-regression replay for suite '{other}' is not implemented"),
+            Some("suite-replay-implementation-missing".to_owned()),
             Vec::new(),
         ),
     }

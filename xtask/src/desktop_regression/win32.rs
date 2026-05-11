@@ -135,6 +135,32 @@ mod imp {
         let rect = get_window_rect(handle)?;
         let click_x = (rect.left + rect.right) / 2;
         let click_y = rect.top + 8;
+        show_and_click(handle, click_x, click_y)
+    }
+
+    pub fn mouse_click(x: i32, y: i32, button: Option<&str>) -> Result<(), String> {
+        if !button
+            .map(|value| value.eq_ignore_ascii_case("left"))
+            .unwrap_or(true)
+        {
+            return Err(format!(
+                "unsupported mouse button '{}'",
+                button.unwrap_or_default()
+            ));
+        }
+        unsafe {
+            SetCursorPos(x, y);
+            thread::sleep(Duration::from_millis(50));
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            thread::sleep(Duration::from_millis(30));
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        }
+        thread::sleep(Duration::from_millis(250));
+
+        Ok(())
+    }
+
+    fn show_and_click(handle: WindowHandle, click_x: i32, click_y: i32) -> Result<(), String> {
         unsafe {
             ShowWindow(hwnd(handle), SW_RESTORE);
             SetCursorPos(click_x, click_y);
@@ -352,6 +378,10 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn mouse_click(_x: i32, _y: i32, _button: Option<&str>) -> Result<(), String> {
+        Err(unsupported())
+    }
+
     pub fn left_edge_drag(
         _handle: WindowHandle,
         _from_x: i32,
@@ -407,6 +437,10 @@ pub fn get_window_rect(handle: WindowHandle) -> Result<DesktopRect, String> {
 
 pub fn focus_window(handle: WindowHandle) -> Result<(), String> {
     imp::focus_window(handle)
+}
+
+pub fn mouse_click(x: i32, y: i32, button: Option<&str>) -> Result<(), String> {
+    imp::mouse_click(x, y, button)
 }
 
 pub fn left_edge_drag(

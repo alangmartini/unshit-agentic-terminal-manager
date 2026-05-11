@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,7 @@ use crate::desktop_regression::artifacts::suite_artifact_name;
 pub const ENV_DIAGNOSTICS_ENABLE: &str = "TM_DIAGNOSTICS_ENABLE";
 pub const ENV_DIAGNOSTICS_PIPE_NAME: &str = "TM_DIAGNOSTICS_PIPE_NAME";
 pub const ENV_DIAGNOSTICS_TOKEN: &str = "TM_DIAGNOSTICS_TOKEN";
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticLaunchConfig {
@@ -118,6 +120,7 @@ pub struct DiagnosticClient {
     pipe_path: PathBuf,
     token: String,
     connect_timeout: Duration,
+    request_timeout: Duration,
 }
 
 impl DiagnosticClient {
@@ -126,6 +129,21 @@ impl DiagnosticClient {
             pipe_path: launch.pipe_path(),
             token: launch.token.clone(),
             connect_timeout: Duration::from_secs(5),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeouts(
+        launch: &DiagnosticLaunchConfig,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Self {
+        Self {
+            pipe_path: launch.pipe_path(),
+            token: launch.token.clone(),
+            connect_timeout,
+            request_timeout,
         }
     }
 
@@ -226,11 +244,46 @@ impl DiagnosticClient {
             command,
             ..Default::default()
         };
-        send_request(&self.pipe_path, &request)
+        send_request(&self.pipe_path, &request, self.request_timeout)
     }
 }
 
-fn send_request(path: &Path, request: &DiagnosticRequest) -> Result<DiagnosticResponse, String> {
+fn send_request(
+    path: &Path,
+    request: &DiagnosticRequest,
+    timeout: Duration,
+) -> Result<DiagnosticResponse, String> {
+    let path = path.to_path_buf();
+    let request = request.clone();
+    run_with_timeout(timeout, move || send_request_blocking(&path, &request))
+}
+
+fn run_with_timeout<T, F>(timeout: Duration, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(f());
+    });
+
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "diagnostic request timed out after {} ms",
+            timeout.as_millis()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("diagnostic request worker exited without a response".to_owned())
+        }
+    }
+}
+
+fn send_request_blocking(
+    path: &Path,
+    request: &DiagnosticRequest,
+) -> Result<DiagnosticResponse, String> {
     let mut pipe = OpenOptions::new()
         .read(true)
         .write(true)
@@ -535,5 +588,36 @@ mod tests {
         let err = response_into_hello(response).unwrap_err();
 
         assert!(err.contains(DIAGNOSTIC_PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn request_timeout_returns_without_waiting_for_blocked_worker() {
+        let start = Instant::now();
+
+        let err = run_with_timeout(Duration::from_millis(20), || {
+            thread::sleep(Duration::from_millis(250));
+            Ok::<_, String>(DiagnosticResponse::Ack { message: None })
+        })
+        .unwrap_err();
+
+        assert!(err.contains("timed out"));
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn diagnostic_client_test_constructor_sets_custom_timeouts() {
+        let launch = DiagnosticLaunchConfig {
+            pipe_name: "tm-test".to_owned(),
+            token: "secret".to_owned(),
+        };
+
+        let client = DiagnosticClient::with_timeouts(
+            &launch,
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        );
+
+        assert_eq!(client.connect_timeout, Duration::from_millis(10));
+        assert_eq!(client.request_timeout, Duration::from_millis(20));
     }
 }

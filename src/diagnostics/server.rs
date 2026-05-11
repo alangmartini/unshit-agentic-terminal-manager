@@ -3,7 +3,7 @@ use std::io;
 use terminal_manager_diagnostics::{
     is_supported_protocol_version, AppIdentity, DiagnosticCapabilities, DiagnosticCommand,
     DiagnosticEventFamily, DiagnosticProtocolError, DiagnosticRequest, DiagnosticResponse,
-    SnapshotOptions, DIAGNOSTIC_PROTOCOL_VERSION,
+    InvariantOutcome, SnapshotOptions, DIAGNOSTIC_PROTOCOL_VERSION,
 };
 
 use super::config::DiagnosticConfig;
@@ -67,9 +67,26 @@ where
             handle_snapshot(app_context, reason, options)
         }
         DiagnosticCommand::EvaluateInvariants { scope } => {
+            let requested_scope = scope.clone();
             let context = app_context();
             match snapshot::evaluate_invariants(&context.shared, scope) {
-                Ok(results) => DiagnosticResponse::InvariantResults { results },
+                Ok(results) => {
+                    let failed = results
+                        .iter()
+                        .filter(|result| result.outcome == InvariantOutcome::Failed)
+                        .count();
+                    events.record_event(
+                        DiagnosticEventFamily::Invariant,
+                        "diagnostics.invariants",
+                        "evaluated",
+                        serde_json::json!({
+                            "scope": requested_scope,
+                            "total": results.len(),
+                            "failed": failed,
+                        }),
+                    );
+                    DiagnosticResponse::InvariantResults { results }
+                }
                 Err(message) => protocol_error("invariant_evaluation_failed", &message, false),
             }
         }
@@ -180,7 +197,11 @@ fn handshake_capabilities() -> DiagnosticCapabilities {
             "drain_events".to_owned(),
             "prepare_deterministic_mode".to_owned(),
         ],
-        event_families: DiagnosticEventFamily::all().to_vec(),
+        event_families: vec![
+            DiagnosticEventFamily::TestStep,
+            DiagnosticEventFamily::Invariant,
+            DiagnosticEventFamily::Log,
+        ],
         snapshots: true,
         invariants: true,
         step_markers: true,
@@ -245,6 +266,12 @@ mod tests {
             .event_families
             .contains(&DiagnosticEventFamily::TestStep));
         assert!(capabilities
+            .event_families
+            .contains(&DiagnosticEventFamily::Invariant));
+        assert!(capabilities
+            .event_families
+            .contains(&DiagnosticEventFamily::Log));
+        assert!(!capabilities
             .event_families
             .contains(&DiagnosticEventFamily::Render));
         assert!(capabilities.snapshots);
@@ -351,6 +378,14 @@ mod tests {
         assert!(results
             .iter()
             .any(|result| result.id == "app.active_pane.exists"));
+
+        let drained = events.drain(None);
+        assert_eq!(drained.events.len(), 1);
+        assert_eq!(
+            drained.events[0].payload.family,
+            DiagnosticEventFamily::Invariant
+        );
+        assert_eq!(drained.events[0].payload.kind, "evaluated");
     }
 
     #[test]

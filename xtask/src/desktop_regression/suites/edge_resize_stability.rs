@@ -7,6 +7,7 @@ use crate::desktop_regression::diagnostics::diagnostic_launch_for_mode;
 use crate::desktop_regression::failure::collect_basic_failure_bundle;
 use crate::desktop_regression::interactive::InteractiveDecision;
 use crate::desktop_regression::launcher::{AppLogFiles, AppSession};
+use crate::desktop_regression::replay::ValidatedTrace;
 use crate::desktop_regression::results::SuiteExecutionRecord;
 use crate::desktop_regression::screenshots::capture_screen;
 use crate::desktop_regression::suites::observability::{
@@ -17,7 +18,7 @@ use crate::desktop_regression::suites::observability::{
 };
 use crate::desktop_regression::suites::{forced_failure_for_suite, SuiteContext};
 use crate::desktop_regression::win32::{self, DesktopRect};
-use terminal_manager_diagnostics::{Rect, RunnerActionKind, RunnerActionTarget};
+use terminal_manager_diagnostics::{Rect, RunnerAction, RunnerActionKind, RunnerActionTarget};
 
 const SUITE_ID: &str = "edge-resize-stability";
 const DRAG_DELTA: i32 = 220;
@@ -49,6 +50,42 @@ pub fn run(context: &SuiteContext<'_>) -> SuiteExecutionRecord {
             record
         }
     }
+}
+
+pub fn run_replay(context: &SuiteContext<'_>, trace: &ValidatedTrace) -> SuiteExecutionRecord {
+    let replay_actions = trace.actions_for_suite(SUITE_ID);
+    let mut artifacts = Vec::new();
+    let mut interactive_decision = None;
+    let mut record = match run_replay_inner(
+        context,
+        &replay_actions,
+        &mut artifacts,
+        &mut interactive_decision,
+    ) {
+        Ok(()) => SuiteExecutionRecord::passed(SUITE_ID, artifacts),
+        Err(err) => {
+            let failure = err.to_suite_failure();
+            let added = collect_basic_failure_bundle(
+                &context.artifact_layout.run_dir,
+                &context.artifact_layout.run_id,
+                SUITE_ID,
+                &failure,
+                &artifacts_with_common(context.common_artifacts, &artifacts),
+            );
+            artifacts.extend(added);
+            let mut record = SuiteExecutionRecord::failed(
+                SUITE_ID,
+                failure.kind,
+                failure.message,
+                failure.first_bad_signal,
+                artifacts,
+            );
+            record.set_interactive_decision(interactive_decision);
+            record
+        }
+    };
+    record.actions = replay_actions;
+    record
 }
 
 fn run_inner(
@@ -85,6 +122,88 @@ fn run_inner(
         Err(forced)
     } else {
         run_resize_scenario(context, artifacts, &session, diagnostics.as_ref())
+    };
+    let diagnostics_result = finalize_diagnostics(
+        context,
+        artifacts,
+        SUITE_ID,
+        diagnostics.as_ref(),
+        scenario_result.is_err(),
+    );
+
+    let result = match (scenario_result, diagnostics_result) {
+        (Err(primary), Err(diagnostic_error)) => {
+            record_diagnostic_error(context, artifacts, SUITE_ID, &diagnostic_error.message);
+            Err(primary)
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(diagnostic_error)) => {
+            record_diagnostic_error(context, artifacts, SUITE_ID, &diagnostic_error.message);
+            Err(diagnostic_error)
+        }
+        (Ok(()), Ok(())) => Ok(()),
+    };
+
+    if result.is_err() {
+        *interactive_decision = maybe_prompt_on_failure(
+            context,
+            artifacts,
+            SUITE_ID,
+            &mut session,
+            diagnostics.as_ref(),
+        );
+    }
+
+    result
+}
+
+fn run_replay_inner(
+    context: &SuiteContext<'_>,
+    replay_actions: &[RunnerAction],
+    artifacts: &mut Vec<String>,
+    interactive_decision: &mut Option<InteractiveDecision>,
+) -> SuiteResult<()> {
+    if replay_actions.is_empty() {
+        return Err(SuiteError::setup(format!(
+            "replay trace contains no actions for {SUITE_ID}"
+        )));
+    }
+
+    let app_logs = AppLogFiles::create(&context.artifact_layout.run_dir, SUITE_ID)
+        .map_err(|e| SuiteError::setup(format!("failed to create app log files: {e}")))?;
+    artifacts.extend(app_logs.artifact_names());
+
+    let diagnostic_launch =
+        diagnostic_launch_for_mode(context.observe, &context.artifact_layout.run_id, SUITE_ID);
+    let mut session = AppSession::launch_with_logs(
+        context.exe_path,
+        context.workspace_root,
+        Some(&app_logs),
+        diagnostic_launch.as_ref(),
+    )
+    .map_err(|e| SuiteError::setup(format!("failed to start app for replay: {e}")))?;
+    context
+        .record_action(
+            SUITE_ID,
+            None,
+            window_target(&session),
+            RunnerActionKind::Note {
+                message: "app.launch.replay".to_owned(),
+            },
+        )
+        .map_err(SuiteError::setup)?;
+    let diagnostics = start_diagnostics(context, artifacts, SUITE_ID, diagnostic_launch.as_ref())?;
+
+    let scenario_result = if let Some(forced) = forced_failure_for_suite(SUITE_ID) {
+        Err(forced)
+    } else {
+        run_replay_actions(
+            context,
+            artifacts,
+            &session,
+            diagnostics.as_ref(),
+            replay_actions,
+        )
     };
     let diagnostics_result = finalize_diagnostics(
         context,
@@ -368,6 +487,128 @@ fn run_resize_scenario(
     Ok(())
 }
 
+fn run_replay_actions(
+    context: &SuiteContext<'_>,
+    artifacts: &mut Vec<String>,
+    session: &AppSession,
+    diagnostics: Option<&ObservedDiagnostics>,
+    replay_actions: &[RunnerAction],
+) -> SuiteResult<()> {
+    let hwnd = session.window();
+    let mut resize_checks = 0;
+
+    for action in replay_actions {
+        match &action.kind {
+            RunnerActionKind::Note { .. } => {}
+            RunnerActionKind::MarkStep { id } => {
+                mark_full_step(context, diagnostics, id, &format!("Replay {id}"))?;
+            }
+            RunnerActionKind::MoveWindow { bounds } => {
+                win32::set_window_rect(
+                    hwnd,
+                    bounds.x,
+                    bounds.y,
+                    bounds.width as i32,
+                    bounds.height as i32,
+                )
+                .map_err(SuiteError::setup)?;
+                thread::sleep(Duration::from_millis(250));
+            }
+            RunnerActionKind::Mouse { x, y, button } => {
+                win32::mouse_click(*x, *y, button.as_deref()).map_err(SuiteError::setup)?;
+            }
+            RunnerActionKind::Wait { timeout_ms, .. } => {
+                thread::sleep(Duration::from_millis((*timeout_ms).min(5_000)));
+            }
+            RunnerActionKind::MouseDrag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button,
+            } => {
+                validate_left_button(button.as_deref())?;
+                if from_y != to_y {
+                    return Err(SuiteError::setup(format!(
+                        "logical replay only supports horizontal edge drags, got y {from_y}->{to_y}"
+                    )));
+                }
+                if from_x != to_x {
+                    win32::left_edge_drag(hwnd, *from_x, *from_y, *to_x)
+                        .map_err(SuiteError::setup)?;
+                }
+            }
+            RunnerActionKind::ResizeWindow { bounds } => {
+                let actual = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
+                assert_rect_matches_action(actual, *bounds, action.step_id.as_deref())?;
+                resize_checks += 1;
+            }
+            RunnerActionKind::Screenshot { path } => {
+                capture_screen(&context.artifact_layout.run_dir.join(path))
+                    .map_err(SuiteError::setup)?;
+                if !artifacts.contains(path) {
+                    artifacts.push(path.clone());
+                }
+            }
+            RunnerActionKind::SendKeys { keys } => {
+                replay_send_keys(keys)?;
+            }
+        }
+    }
+
+    assert_true(
+        resize_checks > 0,
+        "replay trace did not contain any resize assertions",
+        "replay-no-resize-checks",
+    )
+}
+
+fn validate_left_button(button: Option<&str>) -> SuiteResult<()> {
+    if button
+        .map(|value| value.eq_ignore_ascii_case("left"))
+        .unwrap_or(true)
+    {
+        Ok(())
+    } else {
+        Err(SuiteError::setup(format!(
+            "logical replay only supports left-button drags, got '{}'",
+            button.unwrap_or_default()
+        )))
+    }
+}
+
+fn replay_send_keys(keys: &[String]) -> SuiteResult<()> {
+    match keys {
+        [] => Ok(()),
+        [text] => win32::send_text_enter(text).map_err(SuiteError::setup),
+        _ => Err(SuiteError::setup(
+            "logical replay only supports single text-entry send_keys actions",
+        )),
+    }
+}
+
+fn assert_rect_matches_action(
+    actual: DesktopRect,
+    expected: Rect,
+    step_id: Option<&str>,
+) -> SuiteResult<()> {
+    let label = step_id.unwrap_or("replay-resize-window");
+    assert_close(actual.left, expected.x, TOLERANCE, &format!("{label}-left"))?;
+    assert_close(actual.top, expected.y, TOLERANCE, &format!("{label}-top"))?;
+    assert_close(
+        actual.width(),
+        expected.width as i32,
+        TOLERANCE,
+        &format!("{label}-width"),
+    )?;
+    assert_close(
+        actual.height(),
+        expected.height as i32,
+        TOLERANCE,
+        &format!("{label}-height"),
+    )
+}
+
 fn screenshot_path(context: &SuiteContext<'_>, name: &str) -> std::path::PathBuf {
     let file_name = suite_artifact_name(SUITE_ID, name, "png");
     context.artifact_layout.run_dir.join(file_name)
@@ -416,5 +657,54 @@ mod tests {
     #[test]
     fn restore_drag_points_allow_noop_when_inward_resize_did_not_move() {
         assert_eq!(restore_drag_points(rect(0, 500), rect(0, 500)), (4, 4));
+    }
+
+    #[test]
+    fn replay_rect_assertion_accepts_expected_bounds() {
+        assert!(assert_rect_matches_action(
+            DesktopRect {
+                left: 2,
+                top: 0,
+                right: 102,
+                bottom: 80,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            },
+            Some("resize")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn replay_rect_assertion_rejects_unexpected_bounds() {
+        let err = assert_rect_matches_action(
+            DesktopRect {
+                left: 10,
+                top: 0,
+                right: 110,
+                bottom: 80,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            },
+            Some("resize"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.first_bad_signal.as_deref(), Some("resize-left"));
+    }
+
+    #[test]
+    fn replay_rejects_non_left_button_drags() {
+        let err = validate_left_button(Some("right")).unwrap_err();
+
+        assert!(err.message.contains("left-button"));
     }
 }

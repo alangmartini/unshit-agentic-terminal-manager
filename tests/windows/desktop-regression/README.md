@@ -47,9 +47,24 @@ cargo xtask desktop-regression --suite post-resize-glitches --observe full
 evidence. `--observe full` also records step snapshots, invariants, and
 cross-layer assertions where the suite supports them.
 
+The current app diagnostic stream advertises the event families it actually
+emits: `test_step`, `invariant`, and `log`. Window, layout, render, terminal,
+PTY, and input events should be wired before those families are advertised.
+
 Artifacts are written under `artifacts/windows/desktop-regression/<run_id>/`
 by default. Use `--artifact-root <dir>` or `--artifacts-root <dir>` to choose a
 different Rust artifact root.
+
+Record and replay an edge-resize interaction trace:
+
+```powershell
+cargo xtask desktop-regression --suite edge-resize-stability --record
+cargo xtask desktop-regression --suite edge-resize-stability --replay artifacts\windows\desktop-regression\<run_id>\runner.actions.jsonl
+```
+
+Replay is currently logical replay for `edge-resize-stability`: runner input
+actions are re-applied to a fresh app process, and recorded `resize_window`
+actions are checked as assertions.
 
 ## PowerShell Compatibility
 

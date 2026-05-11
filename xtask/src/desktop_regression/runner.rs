@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::desktop_regression::artifacts::create_run_layout;
 use crate::desktop_regression::environment::{
@@ -12,8 +13,10 @@ use crate::desktop_regression::registry::{all_suites, resolve_suites, SuiteMetad
 use crate::desktop_regression::replay::{
     validate_replay_selection, validate_trace_file, ActionRecorder, ACTION_TRACE_FILE,
 };
-use crate::desktop_regression::results::{completed_result, write_results, SuiteExecutionRecord};
-use crate::desktop_regression::suites::{execute_suite, SuiteContext};
+use crate::desktop_regression::results::{
+    completed_result_at, write_results, SuiteExecutionRecord,
+};
+use crate::desktop_regression::suites::{execute_suite, execute_suite_replay, SuiteContext};
 use serde_json::json;
 use terminal_manager_diagnostics::{
     FailureClassification, ObserveMode, ReplayMode, ResultAppInfo, ResultDiagnosticInfo,
@@ -35,6 +38,7 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
         return Ok(RunOutcome::Success);
     }
 
+    let run_started_at = SystemTime::now();
     let workspace_root = workspace_root()?;
     let replay_trace = match opts.replay.as_deref() {
         Some(path) => Some(validate_trace_file(path)?),
@@ -124,12 +128,14 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
                         )
                     })
                     .collect::<Vec<_>>();
-                let result = completed_result(
+                let result = completed_result_at(
                     layout.run_id.clone(),
                     opts.observe,
                     &selected,
                     None,
                     outcomes,
+                    run_started_at,
+                    SystemTime::now(),
                 );
                 logger.log("run.end", None, json!({ "status": "failed" }))?;
                 let mut result = result;
@@ -204,7 +210,11 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
                 },
             )?;
         }
-        let mut outcome = execute_suite(suite.id, &context);
+        let mut outcome = if let Some(trace) = replay_trace.as_ref() {
+            execute_suite_replay(suite.id, &context, trace)
+        } else {
+            execute_suite(suite.id, &context)
+        };
         if let Some(recorder) = action_recorder.as_ref() {
             outcome.actions = recorder.actions_for_suite(suite.id);
         }
@@ -263,7 +273,7 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
         ResultStatus::Passed
     };
     logger.log("run.end", None, json!({ "status": run_status }))?;
-    let mut result = completed_result(
+    let mut result = completed_result_at(
         layout.run_id.clone(),
         opts.observe,
         &selected,
@@ -274,6 +284,8 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
             ..ResultAppInfo::default()
         }),
         outcomes,
+        run_started_at,
+        SystemTime::now(),
     );
     attach_replay_info(&mut result, opts, replay_trace.as_ref());
     let outcome = if result.run.status == ResultStatus::Failed {
