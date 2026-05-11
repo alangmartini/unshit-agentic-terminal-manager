@@ -8,6 +8,9 @@ input, screenshots, DPI, and pixel-level visual checks. They spawn
 These are manual desktop tests. They are not unit tests, browser e2e tests, or
 CI jobs.
 
+For a detailed execution and debugging runbook, see
+`docs/desktop-regression-debugging.md`.
+
 ## Commands
 
 The canonical runner is the Rust `xtask` command. List suites and coverage:
