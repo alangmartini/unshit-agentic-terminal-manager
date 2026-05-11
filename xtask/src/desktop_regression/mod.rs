@@ -1,5 +1,6 @@
 pub mod artifacts;
 pub mod assertions;
+pub mod diagnostics;
 pub mod environment;
 pub mod failure;
 pub mod launcher;

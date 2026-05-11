@@ -87,15 +87,15 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
   - [x] Verify: failure classification and manifest unit tests.
   - [x] Verify: intentional failure writes expected bundle.
 
-- [ ] **Task 8: Connect runner diagnostics for one observed suite**
-  - [ ] Add Rust diagnostic client.
-  - [ ] Wire observe modes into app launch environment.
-  - [ ] Keep `--observe off` diagnostic-free.
-  - [ ] Capture events/logs/failure snapshots in `--observe basic`.
-  - [ ] Capture step snapshots, invariants, and cross-layer assertions in `--observe full`.
-  - [ ] Add required/optional diagnostic capability checks.
-  - [ ] Verify: diagnostic client and observe-mode unit tests.
-  - [ ] Verify manually: `cargo xtask desktop-regression --suite edge-resize-stability --observe full`.
+- [x] **Task 8: Connect runner diagnostics for one observed suite**
+  - [x] Add Rust diagnostic client.
+  - [x] Wire observe modes into app launch environment.
+  - [x] Keep `--observe off` diagnostic-free.
+  - [x] Capture events/logs/failure snapshots in `--observe basic`.
+  - [x] Capture step snapshots, invariants, and cross-layer assertions in `--observe full`.
+  - [x] Add required/optional diagnostic capability checks.
+  - [x] Verify: diagnostic client and observe-mode unit tests.
+  - [x] Verify manually: `cargo xtask desktop-regression --suite edge-resize-stability --observe full`.
 
 - [ ] **Task 9: Port `post-resize-glitches` with cross-layer evidence**
   - [ ] Port Win+Left snap and pixel-ratio assertions to Rust.

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use terminal_manager_diagnostics::FailureClassification;
+use terminal_manager_diagnostics::ObserveMode;
 
 use crate::desktop_regression::artifacts::ArtifactLayout;
 use crate::desktop_regression::results::SuiteExecutionRecord;
@@ -12,6 +13,7 @@ pub struct SuiteContext<'a> {
     pub artifact_layout: &'a ArtifactLayout,
     pub exe_path: &'a Path,
     pub common_artifacts: &'a [String],
+    pub observe: ObserveMode,
 }
 
 pub fn execute_suite(suite_id: &str, context: &SuiteContext<'_>) -> SuiteExecutionRecord {

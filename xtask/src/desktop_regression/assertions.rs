@@ -25,6 +25,22 @@ impl SuiteError {
         }
     }
 
+    pub fn protocol(message: impl Into<String>, first_bad_signal: impl Into<String>) -> Self {
+        Self {
+            kind: FailureClassification::Protocol,
+            message: message.into(),
+            first_bad_signal: Some(first_bad_signal.into()),
+        }
+    }
+
+    pub fn cross_layer(message: impl Into<String>, first_bad_signal: impl Into<String>) -> Self {
+        Self {
+            kind: FailureClassification::CrossLayerInvariant,
+            message: message.into(),
+            first_bad_signal: Some(first_bad_signal.into()),
+        }
+    }
+
     pub fn to_suite_failure(&self) -> SuiteFailure {
         SuiteFailure {
             kind: self.kind,

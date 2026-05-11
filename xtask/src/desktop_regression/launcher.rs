@@ -4,6 +4,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::desktop_regression::diagnostics::DiagnosticLaunchConfig;
 use crate::desktop_regression::win32::{self, WindowHandle};
 
 pub struct AppLogFiles {
@@ -64,6 +65,7 @@ impl AppSession {
         exe_path: &Path,
         workspace_root: &Path,
         logs: Option<&AppLogFiles>,
+        diagnostics: Option<&DiagnosticLaunchConfig>,
     ) -> Result<Self, String> {
         if !exe_path.is_file() {
             return Err(format!("missing built binary: {}", exe_path.display()));
@@ -72,6 +74,7 @@ impl AppSession {
         let support_processes_before = process_ids_by_image("unshit-ptyd.exe");
         let mut command = Command::new(exe_path);
         command.current_dir(workspace_root);
+        apply_diagnostics_env(&mut command, diagnostics);
         if let Some(logs) = logs {
             let stdout = File::create(&logs.stdout_path).map_err(|e| {
                 format!(
@@ -118,6 +121,18 @@ impl AppSession {
 
     pub fn window(&self) -> WindowHandle {
         self.window
+    }
+
+    pub fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+pub fn apply_diagnostics_env(command: &mut Command, diagnostics: Option<&DiagnosticLaunchConfig>) {
+    if let Some(diagnostics) = diagnostics {
+        for (key, value) in diagnostics.env_vars() {
+            command.env(key, value);
+        }
     }
 }
 
@@ -290,6 +305,11 @@ fn parse_tasklist_csv(output: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desktop_regression::diagnostics::{
+        diagnostic_launch_for_mode, ENV_DIAGNOSTICS_ENABLE, ENV_DIAGNOSTICS_PIPE_NAME,
+        ENV_DIAGNOSTICS_TOKEN,
+    };
+    use terminal_manager_diagnostics::ObserveMode;
 
     #[test]
     fn prepare_app_binary_uses_explicit_path_when_skip_building() {
@@ -331,5 +351,52 @@ mod tests {
         assert!(dir.join(&logs.stdout_name).is_file());
         assert!(dir.join(&logs.stderr_name).is_file());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn diagnostic_env_is_absent_for_off_launches() {
+        let mut command = Command::new("terminal-manager.exe");
+
+        apply_diagnostics_env(&mut command, None);
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|raw| raw.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!envs
+            .iter()
+            .any(|(key, _)| key.starts_with("TM_DIAGNOSTICS_")));
+    }
+
+    #[test]
+    fn diagnostic_env_is_set_for_observed_launches() {
+        let launch = diagnostic_launch_for_mode(ObserveMode::Basic, "run-1", "edge").unwrap();
+        let mut command = Command::new("terminal-manager.exe");
+
+        apply_diagnostics_env(&mut command, Some(&launch));
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|raw| raw.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            envs.get(ENV_DIAGNOSTICS_ENABLE),
+            Some(&Some("1".to_owned()))
+        );
+        assert_eq!(
+            envs.get(ENV_DIAGNOSTICS_PIPE_NAME),
+            Some(&Some(launch.pipe_name))
+        );
+        assert_eq!(envs.get(ENV_DIAGNOSTICS_TOKEN), Some(&Some(launch.token)));
     }
 }

@@ -13,7 +13,8 @@ use crate::desktop_regression::results::{completed_result, write_results, SuiteE
 use crate::desktop_regression::suites::{execute_suite, SuiteContext};
 use serde_json::json;
 use terminal_manager_diagnostics::{
-    FailureClassification, ResultAppInfo, ResultStatus, SuiteFailure,
+    FailureClassification, ObserveMode, ResultAppInfo, ResultDiagnosticInfo, ResultStatus,
+    SuiteFailure, DIAGNOSTIC_PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +131,7 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
         artifact_layout: &layout,
         exe_path: &exe_path,
         common_artifacts: &common_artifacts,
+        observe: opts.observe,
     };
     let mut outcomes = Vec::new();
     for suite in &selected {
@@ -182,7 +184,7 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
         Some(ResultAppInfo {
             binary: exe_path.display().to_string(),
             sha256: app_sha256,
-            diagnostics: None,
+            diagnostics: result_diagnostics(opts.observe),
             ..ResultAppInfo::default()
         }),
         outcomes,
@@ -207,6 +209,18 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
     );
 
     Ok(outcome)
+}
+
+fn result_diagnostics(observe: ObserveMode) -> Option<ResultDiagnosticInfo> {
+    if observe == ObserveMode::Off {
+        None
+    } else {
+        Some(ResultDiagnosticInfo {
+            enabled: true,
+            protocol_version: Some(DIAGNOSTIC_PROTOCOL_VERSION.to_owned()),
+            transport: Some("named_pipe".to_owned()),
+        })
+    }
 }
 
 fn append_common_artifacts(outcome: &mut SuiteExecutionRecord, common_artifacts: &[String]) {
