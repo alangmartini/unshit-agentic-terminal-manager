@@ -1,17 +1,12 @@
 #[cfg(windows)]
 mod imp {
-    use std::{
-        io,
-        path::Path,
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::{io, path::Path, path::PathBuf};
 
     use terminal_manager_diagnostics::{DiagnosticRequest, DiagnosticResponse};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::windows::named_pipe::{
-        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
-    };
+    #[cfg(test)]
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
     use crate::diagnostics::config::DiagnosticConfig;
     use crate::diagnostics::events::DiagnosticEventStore;
@@ -119,6 +114,7 @@ mod imp {
         writer.flush().await
     }
 
+    #[cfg(test)]
     async fn connect(path: impl AsRef<Path>) -> io::Result<NamedPipeClient> {
         ClientOptions::new().open(path.as_ref())
     }
@@ -157,6 +153,8 @@ mod imp {
 
     #[cfg(test)]
     fn unique_pipe_name() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         format!("tm-diagnostics-test-{}-{n}", std::process::id())

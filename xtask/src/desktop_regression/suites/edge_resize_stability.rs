@@ -293,23 +293,25 @@ fn run_resize_scenario(
         "resize-restore-before-snapshot",
         "before resize restore",
     )?;
-    let restore_x = 0.max(r0.left + 4);
-    let restore_from_x = r1.left + 4;
-    win32::left_edge_drag(hwnd, restore_from_x, center_y, restore_x).map_err(SuiteError::setup)?;
-    context
-        .record_action(
-            SUITE_ID,
-            Some("resize-restore"),
-            window_target(session),
-            RunnerActionKind::MouseDrag {
-                from_x: restore_from_x,
-                from_y: center_y,
-                to_x: restore_x,
-                to_y: center_y,
-                button: Some("left".to_owned()),
-            },
-        )
-        .map_err(SuiteError::setup)?;
+    let (restore_from_x, restore_x) = restore_drag_points(r0, r1);
+    if restore_from_x != restore_x {
+        win32::left_edge_drag(hwnd, restore_from_x, center_y, restore_x)
+            .map_err(SuiteError::setup)?;
+        context
+            .record_action(
+                SUITE_ID,
+                Some("resize-restore"),
+                window_target(session),
+                RunnerActionKind::MouseDrag {
+                    from_x: restore_from_x,
+                    from_y: center_y,
+                    to_x: restore_x,
+                    to_y: center_y,
+                    button: Some("left".to_owned()),
+                },
+            )
+            .map_err(SuiteError::setup)?;
+    }
     let r2 = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
     context
         .record_action(
@@ -384,5 +386,35 @@ fn schema_rect(rect: DesktopRect) -> Rect {
         y: rect.top,
         width: rect.width().max(0) as u32,
         height: rect.height().max(0) as u32,
+    }
+}
+
+fn restore_drag_points(original: DesktopRect, after_inward: DesktopRect) -> (i32, i32) {
+    let restore_x = 0.max(original.left + 4);
+    let restore_from_x = after_inward.left + 4;
+    (restore_from_x, restore_x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(left: i32, right: i32) -> DesktopRect {
+        DesktopRect {
+            left,
+            top: 0,
+            right,
+            bottom: 100,
+        }
+    }
+
+    #[test]
+    fn restore_drag_points_return_distinct_values_after_inward_resize() {
+        assert_eq!(restore_drag_points(rect(0, 500), rect(220, 500)), (224, 4));
+    }
+
+    #[test]
+    fn restore_drag_points_allow_noop_when_inward_resize_did_not_move() {
+        assert_eq!(restore_drag_points(rect(0, 500), rect(0, 500)), (4, 4));
     }
 }
