@@ -100,6 +100,30 @@ pub struct DiagnosticEnvelope<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticRequest {
+    #[serde(default = "default_command_schema_version")]
+    pub schema_version: String,
+    pub token: String,
+    pub command: DiagnosticCommand,
+}
+
+impl Default for DiagnosticRequest {
+    fn default() -> Self {
+        Self {
+            schema_version: COMMAND_SCHEMA_VERSION.to_owned(),
+            token: String::new(),
+            command: DiagnosticCommand::Hello {
+                required_protocol_version: None,
+            },
+        }
+    }
+}
+
+fn default_command_schema_version() -> String {
+    COMMAND_SCHEMA_VERSION.to_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DiagnosticCommand {
     Hello {
@@ -149,6 +173,8 @@ pub struct DeterministicModeOptions {
 pub enum DiagnosticResponse {
     Hello {
         protocol_version: String,
+        #[serde(default)]
+        enabled_features: Vec<String>,
         #[serde(default)]
         app: AppIdentity,
         #[serde(default)]

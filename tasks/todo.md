@@ -12,13 +12,13 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
   - [x] Verify: `cargo test -p terminal-manager-diagnostics`.
   - [x] Verify: `cargo fmt --check`.
 
-- [ ] **Task 2: Add gated app diagnostic handshake**
-  - [ ] Add `src/diagnostics/` config and server modules.
-  - [ ] Require explicit enablement, pipe name, and token before listening.
-  - [ ] Implement `hello` handshake with protocol version, pid, build identity, features, and capabilities.
-  - [ ] Reject missing or invalid tokens.
-  - [ ] Prove default app launch exposes no diagnostic endpoint.
-  - [ ] Verify: app diagnostic handshake tests.
+- [x] **Task 2: Add gated app diagnostic handshake**
+  - [x] Add `src/diagnostics/` config and server modules.
+  - [x] Require explicit enablement, pipe name, and token before listening.
+  - [x] Implement `hello` handshake with protocol version, pid, build identity, features, and capabilities.
+  - [x] Reject missing or invalid tokens.
+  - [x] Prove default app launch exposes no diagnostic endpoint.
+  - [x] Verify: app diagnostic handshake tests.
   - [ ] Verify: manual launch with and without diagnostics env vars.
 
 - [ ] **Task 3: Expose app snapshots and invariants**

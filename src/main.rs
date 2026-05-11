@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod bridge;
 pub mod daemon;
+pub mod diagnostics;
 pub mod drag;
 pub mod git;
 pub mod keybinds;
@@ -523,6 +524,11 @@ fn main() {
     )
     .init();
 
+    let diagnostics_config = crate::diagnostics::DiagnosticConfig::from_env().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+
     if terminal_trace_enabled() {
         append_terminal_trace_line(&format!(
             "terminal-trace stage=startup trace_file={}",
@@ -892,6 +898,14 @@ fn main() {
 
     // Set up PTY output subscriptions.
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
+
+    if let Some(config) = diagnostics_config {
+        app.spawn(async move {
+            if let Err(err) = crate::diagnostics::server::run(config).await {
+                log::error!("diagnostic server stopped: {err}");
+            }
+        });
+    }
 
     // Hand the framework's shared clipboard handle to AppState so
     // `terminal.paste` and any future paste callers reuse the same

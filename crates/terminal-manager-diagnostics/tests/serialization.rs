@@ -1,11 +1,11 @@
 use terminal_manager_diagnostics::{
     is_supported_protocol_version, DiagnosticCapabilities, DiagnosticCommand, DiagnosticEnvelope,
-    DiagnosticEvent, DiagnosticEventFamily, DiagnosticResponse, FailureBundleArtifact,
-    FailureClassification, FailureManifest, InvariantEvaluation, InvariantOutcome, ObserveMode,
-    ProtocolCompatibilityError, Rect, ResultStatus, RunInfo, RunnerAction, RunnerActionKind,
-    RunnerActionTarget, SuiteFailure, SuiteResult, TerminalGridSnapshot, TerminalManagerSnapshot,
-    TestRunResult, DIAGNOSTIC_PROTOCOL_VERSION, FAILURE_MANIFEST_SCHEMA_VERSION,
-    RESULTS_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION,
+    DiagnosticEvent, DiagnosticEventFamily, DiagnosticRequest, DiagnosticResponse,
+    FailureBundleArtifact, FailureClassification, FailureManifest, InvariantEvaluation,
+    InvariantOutcome, ObserveMode, ProtocolCompatibilityError, Rect, ResultStatus, RunInfo,
+    RunnerAction, RunnerActionKind, RunnerActionTarget, SuiteFailure, SuiteResult,
+    TerminalGridSnapshot, TerminalManagerSnapshot, TestRunResult, DIAGNOSTIC_PROTOCOL_VERSION,
+    FAILURE_MANIFEST_SCHEMA_VERSION, RESULTS_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION,
 };
 
 #[test]
@@ -29,6 +29,29 @@ fn command_round_trip_uses_snake_case_tags() {
 
     let decoded: DiagnosticEnvelope<DiagnosticCommand> = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, envelope);
+}
+
+#[test]
+fn authenticated_request_wraps_command_without_leaking_token_into_command_shape() {
+    let request = DiagnosticRequest {
+        schema_version: terminal_manager_diagnostics::COMMAND_SCHEMA_VERSION.to_owned(),
+        token: "per-run-secret".to_owned(),
+        command: DiagnosticCommand::Hello {
+            required_protocol_version: Some(DIAGNOSTIC_PROTOCOL_VERSION.to_owned()),
+        },
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        json["schema_version"],
+        "terminal-manager.diagnostics.command/v1"
+    );
+    assert_eq!(json["token"], "per-run-secret");
+    assert_eq!(json["command"]["type"], "hello");
+    assert!(json["command"].get("token").is_none());
+
+    let decoded: DiagnosticRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded, request);
 }
 
 #[test]
@@ -185,9 +208,11 @@ fn compatibility_helpers_accept_known_versions_and_reject_unknown_required_versi
 
     let hello = DiagnosticResponse::Hello {
         protocol_version: DIAGNOSTIC_PROTOCOL_VERSION.to_owned(),
+        enabled_features: vec!["diagnostics".to_owned()],
         app: Default::default(),
         capabilities: DiagnosticCapabilities::default(),
     };
     let json = serde_json::to_value(hello).unwrap();
     assert_eq!(json["type"], "hello");
+    assert_eq!(json["enabled_features"][0], "diagnostics");
 }
