@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/terminal-manager-diagnostics",
     "crates/unshit-framework/crates/*",
     "crates/unshit-ptyd",
     "crates/unshit-terminal-core",
