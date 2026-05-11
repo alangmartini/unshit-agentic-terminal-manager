@@ -17,7 +17,9 @@ use crate::desktop_regression::suites::observability::{
 };
 use crate::desktop_regression::suites::SuiteContext;
 use crate::desktop_regression::win32::{self, DesktopRect};
-use terminal_manager_diagnostics::{Rect, TerminalManagerSnapshot};
+use terminal_manager_diagnostics::{
+    Rect, RunnerActionKind, RunnerActionTarget, TerminalManagerSnapshot,
+};
 
 const SUITE_ID: &str = "post-resize-glitches";
 const SNAP_LIT_RATIO_THRESHOLD: f64 = 0.01;
@@ -66,6 +68,16 @@ fn run_inner(context: &SuiteContext<'_>, artifacts: &mut Vec<String>) -> SuiteRe
         diagnostic_launch.as_ref(),
     )
     .map_err(|e| SuiteError::setup(format!("failed to start app: {e}")))?;
+    context
+        .record_action(
+            SUITE_ID,
+            None,
+            window_target(&session),
+            RunnerActionKind::Note {
+                message: "app.launch".to_owned(),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     let diagnostics = start_diagnostics(context, artifacts, SUITE_ID, diagnostic_launch.as_ref())?;
 
     let scenario_result = run_snap_scenario(context, artifacts, &session, diagnostics.as_ref());
@@ -103,8 +115,47 @@ fn run_snap_scenario(
     let pre_height = (screen.height as f64 / 2.0).round() as i32;
 
     win32::set_window_rect(hwnd, 200, 200, pre_width, pre_height).map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            None,
+            window_target(session),
+            RunnerActionKind::MoveWindow {
+                bounds: Rect {
+                    x: 200,
+                    y: 200,
+                    width: pre_width as u32,
+                    height: pre_height as u32,
+                },
+            },
+        )
+        .map_err(SuiteError::setup)?;
     thread::sleep(Duration::from_millis(800));
+    context
+        .record_action(
+            SUITE_ID,
+            None,
+            RunnerActionTarget::None,
+            RunnerActionKind::Wait {
+                mode: "fixed_sleep".to_owned(),
+                reason: "after initial window placement".to_owned(),
+                timeout_ms: 800,
+            },
+        )
+        .map_err(SuiteError::setup)?;
     win32::focus_window(hwnd).map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            None,
+            window_target(session),
+            RunnerActionKind::Mouse {
+                x: 200 + pre_width / 2,
+                y: 208,
+                button: Some("left".to_owned()),
+            },
+        )
+        .map_err(SuiteError::setup)?;
 
     mark_full_step(
         context,
@@ -112,6 +163,16 @@ fn run_snap_scenario(
         "pre-clear",
         "Clear terminal before snap",
     )?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-clear"),
+            RunnerActionTarget::None,
+            RunnerActionKind::MarkStep {
+                id: "pre-clear".to_owned(),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     capture_step_snapshot(
         context,
         artifacts,
@@ -121,7 +182,36 @@ fn run_snap_scenario(
         "before clear",
     )?;
     win32::send_text_enter("clear").map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-clear"),
+            window_target(session),
+            RunnerActionKind::SendKeys {
+                keys: vec![
+                    "c".to_owned(),
+                    "l".to_owned(),
+                    "e".to_owned(),
+                    "a".to_owned(),
+                    "r".to_owned(),
+                    "enter".to_owned(),
+                ],
+            },
+        )
+        .map_err(SuiteError::setup)?;
     thread::sleep(Duration::from_millis(500));
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-clear"),
+            RunnerActionTarget::None,
+            RunnerActionKind::Wait {
+                mode: "fixed_sleep".to_owned(),
+                reason: "after clear command".to_owned(),
+                timeout_ms: 500,
+            },
+        )
+        .map_err(SuiteError::setup)?;
     win32::focus_window(hwnd).map_err(SuiteError::setup)?;
 
     let pre_rect = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
@@ -129,6 +219,16 @@ fn run_snap_scenario(
     let post_path = screenshot_path(context, "post");
 
     mark_full_step(context, diagnostics, "pre-snap", "Before Win+Left snap")?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-snap"),
+            RunnerActionTarget::None,
+            RunnerActionKind::MarkStep {
+                id: "pre-snap".to_owned(),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     let pre_snapshot = capture_step_snapshot(
         context,
         artifacts,
@@ -139,10 +239,42 @@ fn run_snap_scenario(
     )?;
     capture_screen(&pre_path).map_err(SuiteError::setup)?;
     artifacts.push(suite_artifact_name(SUITE_ID, "pre", "png"));
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-snap"),
+            RunnerActionTarget::Desktop,
+            RunnerActionKind::Screenshot {
+                path: suite_artifact_name(SUITE_ID, "pre", "png"),
+            },
+        )
+        .map_err(SuiteError::setup)?;
 
     win32::focus_window(hwnd).map_err(SuiteError::setup)?;
     win32::send_win_left().map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-snap"),
+            window_target(session),
+            RunnerActionKind::SendKeys {
+                keys: vec!["win".to_owned(), "left".to_owned()],
+            },
+        )
+        .map_err(SuiteError::setup)?;
     thread::sleep(Duration::from_millis(1500));
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-snap"),
+            RunnerActionTarget::None,
+            RunnerActionKind::Wait {
+                mode: "fixed_sleep".to_owned(),
+                reason: "after Win+Left snap".to_owned(),
+                timeout_ms: 1500,
+            },
+        )
+        .map_err(SuiteError::setup)?;
 
     let post_rect = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
     let grew = post_rect.height() > pre_rect.height();
@@ -158,6 +290,16 @@ fn run_snap_scenario(
     )?;
 
     mark_full_step(context, diagnostics, "post-snap", "After Win+Left snap")?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("post-snap"),
+            RunnerActionTarget::None,
+            RunnerActionKind::MarkStep {
+                id: "post-snap".to_owned(),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     let post_snapshot = capture_step_snapshot(
         context,
         artifacts,
@@ -168,6 +310,16 @@ fn run_snap_scenario(
     )?;
     capture_screen(&post_path).map_err(SuiteError::setup)?;
     artifacts.push(suite_artifact_name(SUITE_ID, "post", "png"));
+    context
+        .record_action(
+            SUITE_ID,
+            Some("post-snap"),
+            RunnerActionTarget::Desktop,
+            RunnerActionKind::Screenshot {
+                path: suite_artifact_name(SUITE_ID, "post", "png"),
+            },
+        )
+        .map_err(SuiteError::setup)?;
 
     println!("snap_pre_rect={}", format_rect(pre_rect));
     println!("snap_post_rect={}", format_rect(post_rect));
@@ -388,6 +540,13 @@ fn classify_snap_failure(
 fn screenshot_path(context: &SuiteContext<'_>, name: &str) -> std::path::PathBuf {
     let file_name = suite_artifact_name(SUITE_ID, name, "png");
     context.artifact_layout.run_dir.join(file_name)
+}
+
+fn window_target(session: &AppSession) -> RunnerActionTarget {
+    RunnerActionTarget::Window {
+        title: Some("Terminal Manager".to_owned()),
+        process_id: Some(session.process_id()),
+    }
 }
 
 #[cfg(test)]

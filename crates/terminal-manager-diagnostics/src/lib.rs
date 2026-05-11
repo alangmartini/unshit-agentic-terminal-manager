@@ -17,6 +17,7 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[DIAGNOSTIC_PROTOCOL_VERSION];
 pub const SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS: &[&str] = &[SNAPSHOT_SCHEMA_VERSION];
 pub const SUPPORTED_RESULTS_SCHEMA_VERSIONS: &[&str] = &[RESULTS_SCHEMA_VERSION];
 pub const SUPPORTED_FAILURE_MANIFEST_SCHEMA_VERSIONS: &[&str] = &[FAILURE_MANIFEST_SCHEMA_VERSION];
+pub const SUPPORTED_RUNNER_ACTION_SCHEMA_VERSIONS: &[&str] = &[RUNNER_ACTION_SCHEMA_VERSION];
 
 pub type JsonObject = Map<String, Value>;
 
@@ -67,6 +68,12 @@ pub fn is_supported_failure_manifest_schema_version(
     version: &str,
 ) -> Result<(), ProtocolCompatibilityError> {
     require_supported_version(version, SUPPORTED_FAILURE_MANIFEST_SCHEMA_VERSIONS)
+}
+
+pub fn is_supported_runner_action_schema_version(
+    version: &str,
+) -> Result<(), ProtocolCompatibilityError> {
+    require_supported_version(version, SUPPORTED_RUNNER_ACTION_SCHEMA_VERSIONS)
 }
 
 fn require_supported_version(
@@ -657,8 +664,16 @@ pub enum RunnerActionKind {
         button: Option<String>,
     },
     Wait {
+        mode: String,
         reason: String,
         timeout_ms: u64,
+    },
+    MouseDrag {
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+        button: Option<String>,
     },
     Screenshot {
         path: String,
@@ -682,6 +697,7 @@ pub struct TestRunResult {
     pub schema_version: String,
     pub run: RunInfo,
     pub app: Option<ResultAppInfo>,
+    pub replay: Option<ResultReplayInfo>,
     pub summary: ResultSummary,
     pub suites: Vec<SuiteResult>,
 }
@@ -692,6 +708,7 @@ impl Default for TestRunResult {
             schema_version: RESULTS_SCHEMA_VERSION.to_owned(),
             run: RunInfo::default(),
             app: None,
+            replay: None,
             summary: ResultSummary::default(),
             suites: Vec::new(),
         }
@@ -757,6 +774,37 @@ impl Default for ResultDiagnosticInfo {
             protocol_version: None,
             transport: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResultReplayInfo {
+    pub mode: ReplayMode,
+    pub trace: String,
+    pub validated_actions: u32,
+}
+
+impl Default for ResultReplayInfo {
+    fn default() -> Self {
+        Self {
+            mode: ReplayMode::Logical,
+            trace: String::new(),
+            validated_actions: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayMode {
+    Logical,
+    ExactTimed,
+}
+
+impl Default for ReplayMode {
+    fn default() -> Self {
+        Self::Logical
     }
 }
 

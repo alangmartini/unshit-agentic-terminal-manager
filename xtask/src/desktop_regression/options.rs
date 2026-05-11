@@ -12,6 +12,7 @@ pub struct DesktopRegressionOpts {
     pub interactive: bool,
     pub keep_open_on_failure: bool,
     pub record: bool,
+    pub replay: Option<PathBuf>,
     pub artifact_root: PathBuf,
 }
 
@@ -26,6 +27,7 @@ impl Default for DesktopRegressionOpts {
             interactive: false,
             keep_open_on_failure: false,
             record: false,
+            replay: None,
             artifact_root: PathBuf::from("artifacts/windows/desktop-regression"),
         }
     }
@@ -63,6 +65,12 @@ where
             "--interactive" => opts.interactive = true,
             "--keep-open-on-failure" => opts.keep_open_on_failure = true,
             "--record" => opts.record = true,
+            "--replay" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--replay requires a value".to_owned())?;
+                opts.replay = Some(PathBuf::from(value));
+            }
             "--artifact-root" | "--artifacts-root" => {
                 let value = iter
                     .next()
@@ -80,6 +88,9 @@ where
             }
             other if other.starts_with("--observe=") => {
                 opts.observe = parse_observe_mode(&other["--observe=".len()..])?;
+            }
+            other if other.starts_with("--replay=") => {
+                opts.replay = Some(PathBuf::from(&other["--replay=".len()..]));
             }
             other if other.starts_with("--artifact-root=") => {
                 opts.artifact_root = PathBuf::from(&other["--artifact-root=".len()..]);
@@ -103,6 +114,7 @@ pub fn validate_options(opts: &DesktopRegressionOpts) -> Result<(), String> {
             || opts.interactive
             || opts.keep_open_on_failure
             || opts.record
+            || opts.replay.is_some()
             || opts.artifact_root != DesktopRegressionOpts::default().artifact_root)
     {
         return Err("--list cannot be combined with run options".to_owned());
@@ -118,6 +130,10 @@ pub fn validate_options(opts: &DesktopRegressionOpts) -> Result<(), String> {
 
     if opts.exe_path.is_some() && !opts.skip_build {
         return Err("--exe-path requires --skip-build".to_owned());
+    }
+
+    if opts.record && opts.replay.is_some() {
+        return Err("--record cannot be combined with --replay".to_owned());
     }
 
     Ok(())
@@ -165,6 +181,8 @@ mod tests {
             "--interactive",
             "--keep-open-on-failure",
             "--record",
+            "--replay",
+            "trace.jsonl",
             "--artifact-root",
             "target/dr",
         ])
@@ -180,6 +198,7 @@ mod tests {
         assert!(opts.interactive);
         assert!(opts.keep_open_on_failure);
         assert!(opts.record);
+        assert_eq!(opts.replay, Some(PathBuf::from("trace.jsonl")));
         assert_eq!(opts.artifact_root, PathBuf::from("target/dr"));
     }
 
@@ -211,16 +230,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_record_combined_with_replay() {
+        let opts = parse(&["--record", "--replay", "trace.jsonl"]).unwrap();
+        let err = validate_options(&opts).unwrap_err();
+        assert!(err.contains("--record"));
+    }
+
+    #[test]
     fn parses_equals_forms_and_alias_artifact_root() {
         let opts = parse(&[
             "--suite=post-resize-glitches",
             "--observe=off",
+            "--replay=trace.jsonl",
             "--artifacts-root=custom/artifacts",
         ])
         .unwrap();
 
         assert_eq!(opts.suite_ids, vec!["post-resize-glitches"]);
         assert_eq!(opts.observe, ObserveMode::Off);
+        assert_eq!(opts.replay, Some(PathBuf::from("trace.jsonl")));
         assert_eq!(opts.artifact_root, PathBuf::from("custom/artifacts"));
     }
 }

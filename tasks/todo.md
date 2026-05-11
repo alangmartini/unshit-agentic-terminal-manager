@@ -125,14 +125,14 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
   - [x] Verify: PowerShell one-suite skip-build path.
   - [x] Verify: `cargo xtask desktop-regression --list`.
 
-- [ ] **Task 11: Add record and replay for runner actions**
-  - [ ] Write versioned action trace JSONL for `--record`.
-  - [ ] Include action kind, timestamps, target metadata, coordinates, keys, step id, and wait mode.
-  - [ ] Add replay command/path that validates trace schema before app launch.
-  - [ ] Distinguish exact timed replay from logical replay in results.
-  - [ ] Reject unsafe or unknown trace actions.
-  - [ ] Verify: trace serialization/validation tests.
-  - [ ] Verify manually: record and replay `edge-resize-stability`.
+- [x] **Task 11: Add record and replay for runner actions**
+  - [x] Write versioned action trace JSONL for `--record`.
+  - [x] Include action kind, timestamps, target metadata, coordinates, keys, step id, and wait mode.
+  - [x] Add replay command/path that validates trace schema before app launch.
+  - [x] Distinguish exact timed replay from logical replay in results.
+  - [x] Reject unsafe or unknown trace actions.
+  - [x] Verify: trace serialization/validation tests.
+  - [x] Verify manually: record and replay `edge-resize-stability`.
 
 - [ ] **Task 12: Add interactive keep-open-on-failure workflow**
   - [ ] Implement `--interactive --keep-open-on-failure` pause after failure.

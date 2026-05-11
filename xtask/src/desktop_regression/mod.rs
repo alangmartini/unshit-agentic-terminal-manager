@@ -7,6 +7,7 @@ pub mod launcher;
 pub mod logging;
 pub mod options;
 pub mod registry;
+pub mod replay;
 pub mod results;
 pub mod runner;
 pub mod screenshots;

@@ -39,6 +39,7 @@ pub fn skipped_skeleton(
             selected_suites,
         },
         app: None,
+        replay: None,
         summary: ResultSummary {
             total: suites.len() as u32,
             passed: 0,
@@ -55,6 +56,7 @@ pub struct SuiteExecutionRecord {
     pub status: ResultStatus,
     pub failure: Option<SuiteFailure>,
     pub artifacts: Vec<String>,
+    pub actions: Vec<terminal_manager_diagnostics::RunnerAction>,
 }
 
 impl SuiteExecutionRecord {
@@ -64,6 +66,7 @@ impl SuiteExecutionRecord {
             status: ResultStatus::Passed,
             failure: None,
             artifacts,
+            actions: Vec::new(),
         }
     }
 
@@ -83,6 +86,7 @@ impl SuiteExecutionRecord {
                 first_bad_signal,
             }),
             artifacts,
+            actions: Vec::new(),
         }
     }
 }
@@ -103,7 +107,7 @@ pub fn completed_result(
             status: outcome.status,
             failure: outcome.failure,
             artifacts: outcome.artifacts,
-            actions: Vec::new(),
+            actions: outcome.actions,
         })
         .collect::<Vec<_>>();
     let passed = suites
@@ -137,6 +141,7 @@ pub fn completed_result(
             selected_suites,
         },
         app,
+        replay: None,
         summary: ResultSummary {
             total: suites.len() as u32,
             passed,

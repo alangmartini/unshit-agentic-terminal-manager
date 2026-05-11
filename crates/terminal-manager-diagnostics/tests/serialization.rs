@@ -181,6 +181,11 @@ fn result_round_trip_captures_runner_actions_and_suite_status() {
             selected_suites: vec!["post-resize-glitches".to_owned()],
         },
         app: None,
+        replay: Some(terminal_manager_diagnostics::ResultReplayInfo {
+            mode: terminal_manager_diagnostics::ReplayMode::Logical,
+            trace: "runner.actions.jsonl".to_owned(),
+            validated_actions: 3,
+        }),
         summary: Default::default(),
         suites: vec![SuiteResult {
             id: "post-resize-glitches".to_owned(),

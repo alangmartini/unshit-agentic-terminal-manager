@@ -14,7 +14,8 @@ use crate::desktop_regression::suites::observability::{
     mark_full_step, record_diagnostic_error, start_diagnostics, ObservedDiagnostics,
 };
 use crate::desktop_regression::suites::SuiteContext;
-use crate::desktop_regression::win32;
+use crate::desktop_regression::win32::{self, DesktopRect};
+use terminal_manager_diagnostics::{Rect, RunnerActionKind, RunnerActionTarget};
 
 const SUITE_ID: &str = "edge-resize-stability";
 const DRAG_DELTA: i32 = 220;
@@ -59,6 +60,16 @@ fn run_inner(context: &SuiteContext<'_>, artifacts: &mut Vec<String>) -> SuiteRe
         diagnostic_launch.as_ref(),
     )
     .map_err(|e| SuiteError::setup(format!("failed to start app: {e}")))?;
+    context
+        .record_action(
+            SUITE_ID,
+            None,
+            window_target(&session),
+            RunnerActionKind::Note {
+                message: "app.launch".to_owned(),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     let diagnostics = start_diagnostics(context, artifacts, SUITE_ID, diagnostic_launch.as_ref())?;
 
     let scenario_result = run_resize_scenario(context, artifacts, &session, diagnostics.as_ref());
@@ -96,9 +107,48 @@ fn run_resize_scenario(
     let target_width = (screen.width as f64 / 2.0).round() as i32;
     let target_height = 500.max((screen.height as f64 * 0.88).round() as i32);
     win32::set_window_rect(hwnd, 0, 0, target_width, target_height).map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            None,
+            window_target(session),
+            RunnerActionKind::MoveWindow {
+                bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    width: target_width as u32,
+                    height: target_height as u32,
+                },
+            },
+        )
+        .map_err(SuiteError::setup)?;
     thread::sleep(Duration::from_millis(700));
+    context
+        .record_action(
+            SUITE_ID,
+            None,
+            RunnerActionTarget::None,
+            RunnerActionKind::Wait {
+                mode: "fixed_sleep".to_owned(),
+                reason: "after initial window placement".to_owned(),
+                timeout_ms: 700,
+            },
+        )
+        .map_err(SuiteError::setup)?;
 
     win32::focus_window(hwnd).map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            None,
+            window_target(session),
+            RunnerActionKind::Mouse {
+                x: target_width / 2,
+                y: 8,
+                button: Some("left".to_owned()),
+            },
+        )
+        .map_err(SuiteError::setup)?;
 
     let start = screenshot_path(context, "start");
     let after = screenshot_path(context, "after");
@@ -110,6 +160,16 @@ fn run_resize_scenario(
         "resize-inward",
         "Drag left edge inward",
     )?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-inward"),
+            RunnerActionTarget::None,
+            RunnerActionKind::MarkStep {
+                id: "resize-inward".to_owned(),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     let r0 = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
     capture_step_snapshot(
         context,
@@ -121,6 +181,16 @@ fn run_resize_scenario(
     )?;
     capture_screen(&start).map_err(SuiteError::setup)?;
     artifacts.push(suite_artifact_name(SUITE_ID, "start", "png"));
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-inward"),
+            RunnerActionTarget::Desktop,
+            RunnerActionKind::Screenshot {
+                path: suite_artifact_name(SUITE_ID, "start", "png"),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     println!("initial_rect={}", format_rect(r0));
 
     let center_y = ((r0.top + r0.bottom) as f64 / 2.0).round() as i32;
@@ -128,7 +198,31 @@ fn run_resize_scenario(
     let drag_to_x = (r0.right - 20).min(left_x + DRAG_DELTA);
 
     win32::left_edge_drag(hwnd, left_x, center_y, drag_to_x).map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-inward"),
+            window_target(session),
+            RunnerActionKind::MouseDrag {
+                from_x: left_x,
+                from_y: center_y,
+                to_x: drag_to_x,
+                to_y: center_y,
+                button: Some("left".to_owned()),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     let r1 = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-inward"),
+            window_target(session),
+            RunnerActionKind::ResizeWindow {
+                bounds: schema_rect(r1),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     capture_step_snapshot(
         context,
         artifacts,
@@ -139,6 +233,16 @@ fn run_resize_scenario(
     )?;
     capture_screen(&after).map_err(SuiteError::setup)?;
     artifacts.push(suite_artifact_name(SUITE_ID, "after", "png"));
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-inward"),
+            RunnerActionTarget::Desktop,
+            RunnerActionKind::Screenshot {
+                path: suite_artifact_name(SUITE_ID, "after", "png"),
+            },
+        )
+        .map_err(SuiteError::setup)?;
 
     mark_full_step(
         context,
@@ -146,6 +250,16 @@ fn run_resize_scenario(
         "resize-restore",
         "Drag left edge back to origin",
     )?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-restore"),
+            RunnerActionTarget::None,
+            RunnerActionKind::MarkStep {
+                id: "resize-restore".to_owned(),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     capture_step_snapshot(
         context,
         artifacts,
@@ -157,7 +271,31 @@ fn run_resize_scenario(
     let restore_x = 0.max(r0.left + 4);
     let restore_from_x = r1.left + 4;
     win32::left_edge_drag(hwnd, restore_from_x, center_y, restore_x).map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-restore"),
+            window_target(session),
+            RunnerActionKind::MouseDrag {
+                from_x: restore_from_x,
+                from_y: center_y,
+                to_x: restore_x,
+                to_y: center_y,
+                button: Some("left".to_owned()),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     let r2 = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-restore"),
+            window_target(session),
+            RunnerActionKind::ResizeWindow {
+                bounds: schema_rect(r2),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     let restore_snapshot = capture_step_snapshot(
         context,
         artifacts,
@@ -168,6 +306,16 @@ fn run_resize_scenario(
     )?;
     capture_screen(&restore).map_err(SuiteError::setup)?;
     artifacts.push(suite_artifact_name(SUITE_ID, "restore", "png"));
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-restore"),
+            RunnerActionTarget::Desktop,
+            RunnerActionKind::Screenshot {
+                path: suite_artifact_name(SUITE_ID, "restore", "png"),
+            },
+        )
+        .map_err(SuiteError::setup)?;
 
     println!("after_rect={}", format_rect(r1));
     println!("restore_rect={}", format_rect(r2));
@@ -196,4 +344,20 @@ fn run_resize_scenario(
 fn screenshot_path(context: &SuiteContext<'_>, name: &str) -> std::path::PathBuf {
     let file_name = suite_artifact_name(SUITE_ID, name, "png");
     context.artifact_layout.run_dir.join(file_name)
+}
+
+fn window_target(session: &AppSession) -> RunnerActionTarget {
+    RunnerActionTarget::Window {
+        title: Some("Terminal Manager".to_owned()),
+        process_id: Some(session.process_id()),
+    }
+}
+
+fn schema_rect(rect: DesktopRect) -> Rect {
+    Rect {
+        x: rect.left,
+        y: rect.top,
+        width: rect.width().max(0) as u32,
+        height: rect.height().max(0) as u32,
+    }
 }

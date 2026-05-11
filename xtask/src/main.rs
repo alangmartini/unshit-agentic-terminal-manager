@@ -56,7 +56,7 @@ fn print_usage() {
     println!("cargo xtask <subcommand>");
     println!();
     println!("Subcommands:");
-    println!("  desktop-regression [--list] [--suite ID] [--observe off|basic|full]");
+    println!("  desktop-regression [--list] [--suite ID] [--observe off|basic|full] [--record] [--replay TRACE]");
     println!("  profile cpu    [--out-dir DIR] [--rate HZ]  Record CPU profile via samply");
     println!("  profile memory [--out-dir DIR]              Record heap profile via dhat");
     println!("  profile all    [--out-dir DIR] [--rate HZ]  Record both, then open dashboard");
