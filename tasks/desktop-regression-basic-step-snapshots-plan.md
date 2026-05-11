@@ -75,8 +75,8 @@ full-only diagnostic workflow.
 
 ### Checkpoint: Complete
 - [x] All acceptance criteria met.
-- [ ] Ship review complete.
-- [ ] Changelog artifact created if the repository convention supports it.
+- [x] Ship review complete.
+- [x] Changelog artifact created if the repository convention supports it.
 
 ## Risks and Mitigations
 | Risk | Impact | Mitigation |
