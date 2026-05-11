@@ -126,6 +126,42 @@ impl AppSession {
     pub fn process_id(&self) -> u32 {
         self.child.id()
     }
+
+    pub fn close_now(&mut self) -> Result<(), String> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|e| format!("failed to query app process {}: {e}", self.child.id()))?
+            .is_some()
+        {
+            kill_new_processes_by_image("unshit-ptyd.exe", &self.support_processes_before);
+            return Ok(());
+        }
+
+        let _ = win32::close_window(self.window);
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            if self
+                .child
+                .try_wait()
+                .map_err(|e| format!("failed to query app process {}: {e}", self.child.id()))?
+                .is_some()
+            {
+                kill_new_processes_by_image("unshit-ptyd.exe", &self.support_processes_before);
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        self.child
+            .kill()
+            .map_err(|e| format!("failed to kill app process {}: {e}", self.child.id()))?;
+        self.child
+            .wait()
+            .map_err(|e| format!("failed to wait for app process {}: {e}", self.child.id()))?;
+        kill_new_processes_by_image("unshit-ptyd.exe", &self.support_processes_before);
+        Ok(())
+    }
 }
 
 pub fn apply_diagnostics_env(command: &mut Command, diagnostics: Option<&DiagnosticLaunchConfig>) {
@@ -143,19 +179,7 @@ impl Drop for AppSession {
             return;
         }
 
-        let _ = win32::close_window(self.window);
-        let deadline = Instant::now() + Duration::from_millis(1500);
-        while Instant::now() < deadline {
-            if self.child.try_wait().ok().flatten().is_some() {
-                kill_new_processes_by_image("unshit-ptyd.exe", &self.support_processes_before);
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        kill_new_processes_by_image("unshit-ptyd.exe", &self.support_processes_before);
+        let _ = self.close_now();
     }
 }
 

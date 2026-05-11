@@ -134,14 +134,14 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
   - [x] Verify: trace serialization/validation tests.
   - [x] Verify manually: record and replay `edge-resize-stability`.
 
-- [ ] **Task 12: Add interactive keep-open-on-failure workflow**
-  - [ ] Implement `--interactive --keep-open-on-failure` pause after failure.
-  - [ ] Add prompt commands for snapshot, event tail, screenshot, rerun last assertion, note, continue, abort, and close.
-  - [ ] Store notes in the failure bundle.
-  - [ ] Ensure non-interactive failures never wait for input.
-  - [ ] Make cleanup behavior explicit for continue/abort/close.
-  - [ ] Verify: interactive command parser and note artifact tests.
-  - [ ] Verify manually: forced failure interactive workflow.
+- [x] **Task 12: Add interactive keep-open-on-failure workflow**
+  - [x] Implement `--interactive --keep-open-on-failure` pause after failure.
+  - [x] Add prompt commands for snapshot, event tail, screenshot, rerun last assertion, note, continue, abort, and close.
+  - [x] Store notes in the failure bundle.
+  - [x] Ensure non-interactive failures never wait for input.
+  - [x] Make cleanup behavior explicit for continue/abort/close.
+  - [x] Verify: interactive command parser and note artifact tests.
+  - [x] Verify manually: forced failure interactive workflow.
 
 ### Checkpoint: Migration Complete Enough For Review
 

@@ -3,6 +3,7 @@ pub mod assertions;
 pub mod diagnostics;
 pub mod environment;
 pub mod failure;
+pub mod interactive;
 pub mod launcher;
 pub mod logging;
 pub mod options;

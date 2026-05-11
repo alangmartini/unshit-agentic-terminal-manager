@@ -187,10 +187,12 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
         exe_path: &exe_path,
         common_artifacts: &common_artifacts,
         observe: opts.observe,
+        interactive: opts.interactive,
+        keep_open_on_failure: opts.keep_open_on_failure,
         action_recorder: action_recorder.as_ref(),
     };
     let mut outcomes = Vec::new();
-    for suite in &selected {
+    for (index, suite) in selected.iter().enumerate() {
         logger.log("suite.start", Some(suite.id), json!({}))?;
         if let Some(recorder) = action_recorder.as_ref() {
             recorder.record(
@@ -235,7 +237,22 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
             Some(suite.id),
             json!({ "scope": "suite" }),
         )?;
+        let should_abort = outcome.should_abort_run_after_interactive_failure();
         outcomes.push(outcome);
+        if should_abort {
+            for skipped in selected.iter().skip(index + 1) {
+                logger.log(
+                    "suite.skipped",
+                    Some(skipped.id),
+                    json!({ "reason": "interactive failure workflow aborted the run" }),
+                )?;
+                outcomes.push(SuiteExecutionRecord::skipped(
+                    skipped.id,
+                    common_artifacts.clone(),
+                ));
+            }
+            break;
+        }
     }
     let run_status = if outcomes
         .iter()

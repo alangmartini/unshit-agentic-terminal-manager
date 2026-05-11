@@ -7,6 +7,7 @@ use terminal_manager_diagnostics::{
 };
 
 use crate::desktop_regression::artifacts::format_utc_timestamp;
+use crate::desktop_regression::interactive::InteractiveDecision;
 use crate::desktop_regression::registry::SuiteMetadata;
 
 #[cfg(test)]
@@ -57,6 +58,7 @@ pub struct SuiteExecutionRecord {
     pub failure: Option<SuiteFailure>,
     pub artifacts: Vec<String>,
     pub actions: Vec<terminal_manager_diagnostics::RunnerAction>,
+    pub interactive_decision: Option<InteractiveDecision>,
 }
 
 impl SuiteExecutionRecord {
@@ -67,6 +69,18 @@ impl SuiteExecutionRecord {
             failure: None,
             artifacts,
             actions: Vec::new(),
+            interactive_decision: None,
+        }
+    }
+
+    pub fn skipped(id: impl Into<String>, artifacts: Vec<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: ResultStatus::Skipped,
+            failure: None,
+            artifacts,
+            actions: Vec::new(),
+            interactive_decision: None,
         }
     }
 
@@ -87,7 +101,19 @@ impl SuiteExecutionRecord {
             }),
             artifacts,
             actions: Vec::new(),
+            interactive_decision: None,
         }
+    }
+
+    pub fn set_interactive_decision(&mut self, decision: Option<InteractiveDecision>) {
+        self.interactive_decision = decision;
+    }
+
+    pub fn should_abort_run_after_interactive_failure(&self) -> bool {
+        matches!(
+            self.interactive_decision,
+            Some(InteractiveDecision::Abort | InteractiveDecision::Close)
+        )
     }
 }
 

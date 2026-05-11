@@ -4,6 +4,10 @@ use crate::desktop_regression::diagnostics::{
     write_diagnostic_events, write_json_artifact, DiagnosticClient, DiagnosticHello,
     DiagnosticLaunchConfig,
 };
+use crate::desktop_regression::interactive::{
+    prompt_interactive_failure, InteractiveDecision, SuiteInteractiveRuntime,
+};
+use crate::desktop_regression::launcher::AppSession;
 use crate::desktop_regression::suites::SuiteContext;
 use crate::desktop_regression::win32::DesktopRect;
 use terminal_manager_diagnostics::{
@@ -296,6 +300,40 @@ pub(crate) fn record_diagnostic_error(
     let path = context.artifact_layout.run_dir.join(&artifact);
     if std::fs::write(&path, message).is_ok() && !artifacts.contains(&artifact) {
         artifacts.push(artifact);
+    }
+}
+
+pub(crate) fn maybe_prompt_on_failure(
+    context: &SuiteContext<'_>,
+    artifacts: &mut Vec<String>,
+    suite_id: &str,
+    session: &mut AppSession,
+    diagnostics: Option<&ObservedDiagnostics>,
+) -> Option<InteractiveDecision> {
+    if !context.should_pause_on_failure() {
+        return None;
+    }
+
+    let mut runtime = SuiteInteractiveRuntime::new(
+        &context.artifact_layout.run_dir,
+        suite_id,
+        diagnostics.map(|diagnostics| &diagnostics.client),
+        session,
+    );
+    match prompt_interactive_failure(&context.artifact_layout.run_dir, suite_id, &mut runtime) {
+        Ok(result) => {
+            artifacts.extend(result.artifacts);
+            Some(result.decision)
+        }
+        Err(err) => {
+            record_diagnostic_error(
+                context,
+                artifacts,
+                suite_id,
+                &format!("interactive failure workflow failed: {err}"),
+            );
+            None
+        }
     }
 }
 

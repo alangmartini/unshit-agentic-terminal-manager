@@ -5,15 +5,17 @@ use crate::desktop_regression::artifacts::suite_artifact_name;
 use crate::desktop_regression::assertions::{assert_close, assert_true, SuiteError, SuiteResult};
 use crate::desktop_regression::diagnostics::diagnostic_launch_for_mode;
 use crate::desktop_regression::failure::collect_basic_failure_bundle;
+use crate::desktop_regression::interactive::InteractiveDecision;
 use crate::desktop_regression::launcher::{AppLogFiles, AppSession};
 use crate::desktop_regression::results::SuiteExecutionRecord;
 use crate::desktop_regression::screenshots::capture_screen;
 use crate::desktop_regression::suites::observability::{
     artifacts_with_common, assert_launched_process_snapshot, assert_renderer_surface_sane,
     assert_terminal_snapshot_sane, capture_step_snapshot, finalize_diagnostics, format_rect,
-    mark_full_step, record_diagnostic_error, start_diagnostics, ObservedDiagnostics,
+    mark_full_step, maybe_prompt_on_failure, record_diagnostic_error, start_diagnostics,
+    ObservedDiagnostics,
 };
-use crate::desktop_regression::suites::SuiteContext;
+use crate::desktop_regression::suites::{forced_failure_for_suite, SuiteContext};
 use crate::desktop_regression::win32::{self, DesktopRect};
 use terminal_manager_diagnostics::{Rect, RunnerActionKind, RunnerActionTarget};
 
@@ -23,7 +25,8 @@ const TOLERANCE: i32 = 2;
 
 pub fn run(context: &SuiteContext<'_>) -> SuiteExecutionRecord {
     let mut artifacts = Vec::new();
-    match run_inner(context, &mut artifacts) {
+    let mut interactive_decision = None;
+    match run_inner(context, &mut artifacts, &mut interactive_decision) {
         Ok(()) => SuiteExecutionRecord::passed(SUITE_ID, artifacts),
         Err(err) => {
             let failure = err.to_suite_failure();
@@ -35,25 +38,31 @@ pub fn run(context: &SuiteContext<'_>) -> SuiteExecutionRecord {
                 &artifacts_with_common(context.common_artifacts, &artifacts),
             );
             artifacts.extend(added);
-            SuiteExecutionRecord::failed(
+            let mut record = SuiteExecutionRecord::failed(
                 SUITE_ID,
                 failure.kind,
                 failure.message,
                 failure.first_bad_signal,
                 artifacts,
-            )
+            );
+            record.set_interactive_decision(interactive_decision);
+            record
         }
     }
 }
 
-fn run_inner(context: &SuiteContext<'_>, artifacts: &mut Vec<String>) -> SuiteResult<()> {
+fn run_inner(
+    context: &SuiteContext<'_>,
+    artifacts: &mut Vec<String>,
+    interactive_decision: &mut Option<InteractiveDecision>,
+) -> SuiteResult<()> {
     let app_logs = AppLogFiles::create(&context.artifact_layout.run_dir, SUITE_ID)
         .map_err(|e| SuiteError::setup(format!("failed to create app log files: {e}")))?;
     artifacts.extend(app_logs.artifact_names());
 
     let diagnostic_launch =
         diagnostic_launch_for_mode(context.observe, &context.artifact_layout.run_id, SUITE_ID);
-    let session = AppSession::launch_with_logs(
+    let mut session = AppSession::launch_with_logs(
         context.exe_path,
         context.workspace_root,
         Some(&app_logs),
@@ -72,7 +81,11 @@ fn run_inner(context: &SuiteContext<'_>, artifacts: &mut Vec<String>) -> SuiteRe
         .map_err(SuiteError::setup)?;
     let diagnostics = start_diagnostics(context, artifacts, SUITE_ID, diagnostic_launch.as_ref())?;
 
-    let scenario_result = run_resize_scenario(context, artifacts, &session, diagnostics.as_ref());
+    let scenario_result = if let Some(forced) = forced_failure_for_suite(SUITE_ID) {
+        Err(forced)
+    } else {
+        run_resize_scenario(context, artifacts, &session, diagnostics.as_ref())
+    };
     let diagnostics_result = finalize_diagnostics(
         context,
         artifacts,
@@ -81,7 +94,7 @@ fn run_inner(context: &SuiteContext<'_>, artifacts: &mut Vec<String>) -> SuiteRe
         scenario_result.is_err(),
     );
 
-    match (scenario_result, diagnostics_result) {
+    let result = match (scenario_result, diagnostics_result) {
         (Err(primary), Err(diagnostic_error)) => {
             record_diagnostic_error(context, artifacts, SUITE_ID, &diagnostic_error.message);
             Err(primary)
@@ -92,7 +105,19 @@ fn run_inner(context: &SuiteContext<'_>, artifacts: &mut Vec<String>) -> SuiteRe
             Err(diagnostic_error)
         }
         (Ok(()), Ok(())) => Ok(()),
+    };
+
+    if result.is_err() {
+        *interactive_decision = maybe_prompt_on_failure(
+            context,
+            artifacts,
+            SUITE_ID,
+            &mut session,
+            diagnostics.as_ref(),
+        );
     }
+
+    result
 }
 
 fn run_resize_scenario(
