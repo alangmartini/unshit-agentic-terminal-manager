@@ -83,7 +83,7 @@ pub(crate) fn capture_step_snapshot(
     artifact_stem: &str,
     reason: &str,
 ) -> SuiteResult<Option<TerminalManagerSnapshot>> {
-    if context.observe != ObserveMode::Full {
+    if !captures_step_snapshots(context.observe) {
         return Ok(None);
     }
     let Some(diagnostics) = diagnostics else {
@@ -105,6 +105,10 @@ pub(crate) fn capture_step_snapshot(
     .map_err(|e| SuiteError::protocol(e, "diagnostic-step-snapshot-artifact"))?;
     artifacts.push(artifact);
     Ok(Some(snapshot))
+}
+
+fn captures_step_snapshots(observe: ObserveMode) -> bool {
+    matches!(observe, ObserveMode::Basic | ObserveMode::Full)
 }
 
 pub(crate) fn finalize_diagnostics(
@@ -361,6 +365,55 @@ pub(crate) fn format_rect(rect: DesktopRect) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_snapshots_are_captured_for_observed_modes() {
+        assert!(!captures_step_snapshots(ObserveMode::Off));
+        assert!(captures_step_snapshots(ObserveMode::Basic));
+        assert!(captures_step_snapshots(ObserveMode::Full));
+    }
+
+    #[test]
+    fn basic_step_snapshot_returns_none_without_diagnostics() {
+        let workspace_root = std::env::temp_dir();
+        let run_dir = workspace_root.join(format!(
+            "xtask-observability-no-diagnostics-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let artifact_layout = crate::desktop_regression::artifacts::ArtifactLayout {
+            run_id: "run-test".to_owned(),
+            results_path: run_dir.join("results.json"),
+            run_dir,
+        };
+        let exe_path = workspace_root.join("terminal-manager.exe");
+        let common_artifacts = Vec::new();
+        let context = SuiteContext {
+            workspace_root: &workspace_root,
+            artifact_layout: &artifact_layout,
+            exe_path: &exe_path,
+            common_artifacts: &common_artifacts,
+            observe: ObserveMode::Basic,
+            interactive: false,
+            keep_open_on_failure: false,
+            action_recorder: None,
+        };
+        let mut artifacts = Vec::new();
+
+        let snapshot = capture_step_snapshot(
+            &context,
+            &mut artifacts,
+            "suite",
+            None,
+            "pre-snap-snapshot",
+            "pre-snap",
+        )
+        .unwrap();
+
+        assert!(snapshot.is_none());
+        assert!(artifacts.is_empty());
+        let _ = std::fs::remove_dir_all(&artifact_layout.run_dir);
+    }
 
     #[test]
     fn formats_rect_like_legacy_runner() {

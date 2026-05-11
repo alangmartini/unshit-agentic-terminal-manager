@@ -47,8 +47,10 @@ cargo xtask desktop-regression --suite post-resize-glitches --observe full
 
 `--observe off` keeps the run black-box and does not enable app diagnostics.
 `--observe basic` enables diagnostics for handshake, logs, events, and failure
-evidence. `--observe full` also records step snapshots, invariants, and
-cross-layer assertions where the suite supports them.
+evidence, and suite step snapshots such as `pre-snap` / `post-snap` so
+cross-layer assertions can run where the suite supports them. `--observe full`
+adds deterministic-mode preparation, step markers, invariant evaluation, and
+any extra full-only checks.
 
 The current app diagnostic stream advertises the event families it actually
 emits: `test_step`, `invariant`, and `log`. Window, layout, render, terminal,

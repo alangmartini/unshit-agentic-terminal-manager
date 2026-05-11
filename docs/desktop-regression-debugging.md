@@ -87,10 +87,10 @@ is already built and you want faster iteration.
 
 - `--observe off`: black-box desktop run. No app diagnostic endpoint.
 - `--observe basic`: diagnostic handshake, final snapshot, event/log drain, and
-  failure evidence.
+  failure evidence, plus suite step snapshots such as `pre-snap` / `post-snap`
+  so cross-layer assertions can run where suites use them.
 - `--observe full`: basic mode plus deterministic-mode preparation, step
-  markers, step snapshots, invariant evaluation, and cross-layer assertions
-  where suites use them.
+  markers, invariant evaluation, and any extra full-only checks.
 
 The app diagnostic endpoint is gated by environment variables set by the
 runner:
@@ -187,8 +187,8 @@ Recorded or replayed actions:
 
 ## Inspect App Inner State
 
-Use `--observe full` when you need app inner state. The important snapshot file
-is usually:
+Use `--observe basic` or `--observe full` when you need app inner state. The
+important snapshot file is usually:
 
 ```text
 <suite>-diagnostics-final-snapshot.json
