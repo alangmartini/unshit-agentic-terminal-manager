@@ -136,6 +136,8 @@ pub enum DiagnosticCommand {
     },
     Snapshot {
         reason: String,
+        #[serde(default)]
+        options: SnapshotOptions,
     },
     EvaluateInvariants {
         scope: InvariantScope,
@@ -166,6 +168,12 @@ pub struct DeterministicModeOptions {
     pub disable_animations: bool,
     pub disable_background_timers: bool,
     pub fixed_clock_utc: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SnapshotOptions {
+    pub include_terminal_buffer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

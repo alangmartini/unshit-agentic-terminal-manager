@@ -900,8 +900,9 @@ fn main() {
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
 
     if let Some(config) = diagnostics_config {
+        let diagnostics_shared = shared.clone();
         app.spawn(async move {
-            if let Err(err) = crate::diagnostics::server::run(config).await {
+            if let Err(err) = crate::diagnostics::server::run(config, diagnostics_shared).await {
                 log::error!("diagnostic server stopped: {err}");
             }
         });

@@ -3,7 +3,7 @@ use terminal_manager_diagnostics::{
     DiagnosticEvent, DiagnosticEventFamily, DiagnosticRequest, DiagnosticResponse,
     FailureBundleArtifact, FailureClassification, FailureManifest, InvariantEvaluation,
     InvariantOutcome, ObserveMode, ProtocolCompatibilityError, Rect, ResultStatus, RunInfo,
-    RunnerAction, RunnerActionKind, RunnerActionTarget, SuiteFailure, SuiteResult,
+    RunnerAction, RunnerActionKind, RunnerActionTarget, SnapshotOptions, SuiteFailure, SuiteResult,
     TerminalGridSnapshot, TerminalManagerSnapshot, TestRunResult, DIAGNOSTIC_PROTOCOL_VERSION,
     FAILURE_MANIFEST_SCHEMA_VERSION, RESULTS_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION,
 };
@@ -29,6 +29,35 @@ fn command_round_trip_uses_snake_case_tags() {
 
     let decoded: DiagnosticEnvelope<DiagnosticCommand> = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, envelope);
+}
+
+#[test]
+fn snapshot_command_defaults_to_excluding_terminal_buffer_contents() {
+    let request = serde_json::json!({
+        "schema_version": terminal_manager_diagnostics::COMMAND_SCHEMA_VERSION,
+        "token": "secret",
+        "command": {
+            "type": "snapshot",
+            "reason": "pre-assertion"
+        }
+    });
+
+    let decoded: DiagnosticRequest = serde_json::from_value(request).unwrap();
+    let DiagnosticCommand::Snapshot { reason, options } = decoded.command else {
+        panic!("expected snapshot command");
+    };
+    assert_eq!(reason, "pre-assertion");
+    assert_eq!(options, SnapshotOptions::default());
+    assert!(!options.include_terminal_buffer);
+
+    let encoded = serde_json::to_value(DiagnosticCommand::Snapshot {
+        reason: "debug".to_owned(),
+        options: SnapshotOptions {
+            include_terminal_buffer: true,
+        },
+    })
+    .unwrap();
+    assert_eq!(encoded["options"]["include_terminal_buffer"], true);
 }
 
 #[test]

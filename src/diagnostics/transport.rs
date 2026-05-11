@@ -14,13 +14,19 @@ mod imp {
     };
 
     use crate::diagnostics::config::DiagnosticConfig;
-    use crate::diagnostics::server::{handle_request, invalid_request_response};
+    use crate::diagnostics::server::{
+        handle_request, invalid_request_response, DiagnosticAppContext,
+    };
+    use crate::state::SharedState;
 
-    pub async fn run(config: DiagnosticConfig) -> io::Result<()> {
+    pub async fn run(config: DiagnosticConfig, shared: SharedState) -> io::Result<()> {
+        let endpoint = config.pipe_path().display().to_string();
         let mut server = Server::bind(config.pipe_path())?;
         loop {
             let connection = server.accept().await?;
-            if let Err(err) = serve_connection(connection, &config.token).await {
+            if let Err(err) =
+                serve_connection(connection, &config.token, shared.clone(), endpoint.clone()).await
+            {
                 log::warn!("diagnostic connection failed: {err}");
             }
         }
@@ -67,7 +73,12 @@ mod imp {
         })
     }
 
-    async fn serve_connection(connection: NamedPipeServer, expected_token: &str) -> io::Result<()> {
+    async fn serve_connection(
+        connection: NamedPipeServer,
+        expected_token: &str,
+        shared: SharedState,
+        endpoint: String,
+    ) -> io::Result<()> {
         let mut reader = BufReader::new(connection);
         let mut line = String::new();
         let bytes = reader.read_line(&mut line).await?;
@@ -75,7 +86,10 @@ mod imp {
             invalid_request_response("empty diagnostic request")
         } else {
             match serde_json::from_str::<DiagnosticRequest>(&line) {
-                Ok(request) => handle_request(request, expected_token),
+                Ok(request) => handle_request(request, expected_token, || DiagnosticAppContext {
+                    shared,
+                    diagnostic_endpoint: Some(endpoint),
+                }),
                 Err(err) => invalid_request_response(&format!("invalid diagnostic request: {err}")),
             }
         };
@@ -151,8 +165,9 @@ mod imp {
                 token: "secret-token".to_owned(),
             };
             let path = config.pipe_path();
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(crate::state::seed_state()));
             let server_task = tokio::spawn(async move {
-                let _ = run(config).await;
+                let _ = run(config, shared).await;
             });
 
             let hello = DiagnosticRequest {
@@ -177,7 +192,42 @@ mod imp {
             };
             assert_eq!(protocol_version, DIAGNOSTIC_PROTOCOL_VERSION);
             assert_eq!(app.process_id, Some(std::process::id()));
-            assert_eq!(capabilities.commands, vec!["hello".to_owned()]);
+            assert!(capabilities.commands.contains(&"hello".to_owned()));
+            assert!(capabilities.commands.contains(&"snapshot".to_owned()));
+
+            let snapshot = DiagnosticRequest {
+                token: "secret-token".to_owned(),
+                command: DiagnosticCommand::Snapshot {
+                    reason: "pipe-test".to_owned(),
+                    options: Default::default(),
+                },
+                ..Default::default()
+            };
+            let response = send_request(&path, serde_json::to_value(snapshot).unwrap())
+                .await
+                .expect("snapshot response");
+            let DiagnosticResponse::Snapshot { snapshot } = response else {
+                panic!("expected snapshot response");
+            };
+            assert_eq!(snapshot.reason, "pipe-test");
+            assert_eq!(snapshot.app.pid, Some(std::process::id()));
+
+            let invariants = DiagnosticRequest {
+                token: "secret-token".to_owned(),
+                command: DiagnosticCommand::EvaluateInvariants {
+                    scope: terminal_manager_diagnostics::InvariantScope::All,
+                },
+                ..Default::default()
+            };
+            let response = send_request(&path, serde_json::to_value(invariants).unwrap())
+                .await
+                .expect("invariant response");
+            let DiagnosticResponse::InvariantResults { results } = response else {
+                panic!("expected invariant response");
+            };
+            assert!(results
+                .iter()
+                .any(|result| result.id == "app.active_pane.exists"));
 
             let unauthorized = DiagnosticRequest {
                 token: "wrong".to_owned(),
@@ -205,8 +255,9 @@ mod imp {
                 token: "secret-token".to_owned(),
             };
             let path = config.pipe_path();
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(crate::state::seed_state()));
             let server_task = tokio::spawn(async move {
-                let _ = run(config).await;
+                let _ = run(config, shared).await;
             });
 
             let response = send_request(
@@ -237,7 +288,10 @@ mod imp {
 
     use crate::diagnostics::config::DiagnosticConfig;
 
-    pub async fn run(_config: DiagnosticConfig) -> io::Result<()> {
+    pub async fn run(
+        _config: DiagnosticConfig,
+        _shared: crate::state::SharedState,
+    ) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "diagnostic named-pipe transport is only supported on Windows",

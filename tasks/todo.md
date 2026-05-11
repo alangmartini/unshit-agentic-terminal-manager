@@ -21,14 +21,14 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
   - [x] Verify: app diagnostic handshake tests.
   - [ ] Verify: manual launch with and without diagnostics env vars.
 
-- [ ] **Task 3: Expose app snapshots and invariants**
-  - [ ] Add snapshot collectors for initial window/layout/terminal/renderer/PTY/input/config/log metadata.
-  - [ ] Exclude terminal buffer contents by default.
-  - [ ] Add invariant ids and pass/fail/skipped results.
-  - [ ] Add `snapshot`, `evaluate_invariants`, and `prepare_deterministic_mode` command handling.
-  - [ ] Return structured protocol errors for collector failures.
-  - [ ] Verify: snapshot/invariant serde and collector tests.
-  - [ ] Verify: handshake + snapshot + invariant protocol test.
+- [x] **Task 3: Expose app snapshots and invariants**
+  - [x] Add snapshot collectors for initial window/layout/terminal/renderer/PTY/input/config/log metadata.
+  - [x] Exclude terminal buffer contents by default.
+  - [x] Add invariant ids and pass/fail/skipped results.
+  - [x] Add `snapshot`, `evaluate_invariants`, and `prepare_deterministic_mode` command handling.
+  - [x] Return structured protocol errors for collector failures.
+  - [x] Verify: snapshot/invariant serde and collector tests.
+  - [x] Verify: handshake + snapshot + invariant protocol test.
 
 ### Checkpoint: Protocol Foundation
 
