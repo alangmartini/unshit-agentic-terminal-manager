@@ -48,15 +48,15 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
   - [x] Verify: event sequencing and JSONL tests.
   - [x] Verify: protocol test for mark step, event emission, and flush.
 
-- [ ] **Task 5: Add `xtask desktop-regression` list and result skeleton**
-  - [ ] Add CLI parsing for `desktop-regression`.
-  - [ ] Support `--list`, `--suite`, `--skip-build`, `--exe-path`, `--observe`, `--interactive`, `--keep-open-on-failure`, `--record`, and artifact root.
-  - [ ] Add Rust suite registry with metadata.
-  - [ ] Add run id and artifact directory creation only for real runs.
-  - [ ] Write v2 `results.json` with shared schema.
-  - [ ] Verify: `cargo test -p xtask desktop_regression`.
-  - [ ] Verify: `cargo run -p xtask -- desktop-regression --list`.
-  - [ ] Verify: missing suite fails before artifacts/app launch.
+- [x] **Task 5: Add `xtask desktop-regression` list and result skeleton**
+  - [x] Add CLI parsing for `desktop-regression`.
+  - [x] Support `--list`, `--suite`, `--skip-build`, `--exe-path`, `--observe`, `--interactive`, `--keep-open-on-failure`, `--record`, and artifact root.
+  - [x] Add Rust suite registry with metadata.
+  - [x] Add run id and artifact directory creation only for real runs.
+  - [x] Write v2 `results.json` with shared schema.
+  - [x] Verify: `cargo test -p xtask desktop_regression`.
+  - [x] Verify: `cargo run -p xtask -- desktop-regression --list`.
+  - [x] Verify: missing suite fails before artifacts/app launch.
 
 - [ ] **Task 6: Run first Rust black-box desktop suite**
   - [ ] Add Rust app build/launch path with `--skip-build` and `--exe-path`.

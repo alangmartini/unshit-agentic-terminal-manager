@@ -12,3 +12,5 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = { workspace = true }
+terminal-manager-diagnostics = { path = "../crates/terminal-manager-diagnostics" }

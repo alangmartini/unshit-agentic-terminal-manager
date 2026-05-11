@@ -18,11 +18,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod args;
+mod desktop_regression;
 mod profile;
 
 fn main() -> ExitCode {
     let raw: Vec<OsString> = env::args_os().skip(1).collect();
     match args::Cli::parse(&raw) {
+        Ok(args::Cli::DesktopRegression(opts)) => match desktop_regression::run(&opts) {
+            Ok(desktop_regression::RunOutcome::Success) => ExitCode::SUCCESS,
+            Ok(desktop_regression::RunOutcome::Failed) => ExitCode::from(1),
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                ExitCode::from(1)
+            }
+        },
         Ok(args::Cli::Profile(opts)) => match profile::run(&opts) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -47,6 +56,7 @@ fn print_usage() {
     println!("cargo xtask <subcommand>");
     println!();
     println!("Subcommands:");
+    println!("  desktop-regression [--list] [--suite ID] [--observe off|basic|full]");
     println!("  profile cpu    [--out-dir DIR] [--rate HZ]  Record CPU profile via samply");
     println!("  profile memory [--out-dir DIR]              Record heap profile via dhat");
     println!("  profile all    [--out-dir DIR] [--rate HZ]  Record both, then open dashboard");
