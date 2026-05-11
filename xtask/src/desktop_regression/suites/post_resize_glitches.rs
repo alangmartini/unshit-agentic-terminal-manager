@@ -318,6 +318,8 @@ fn run_snap_scenario(
         &resize_signal,
     )?;
 
+    assert_snap_capture_ready(hwnd, post_rect)?;
+
     mark_full_step(context, diagnostics, "post-snap", "After Win+Left snap")?;
     context
         .record_action(
@@ -480,6 +482,18 @@ fn assert_visual_ratios(grew: bool, ratios: PixelSampleRatios) -> SuiteResult<()
             ratios.mid_max_lit_ratio, SNAP_MID_LIT_RATIO_THRESHOLD
         ),
         &mid_signal,
+    )
+}
+
+fn assert_snap_capture_ready(hwnd: win32::WindowHandle, post_rect: DesktopRect) -> SuiteResult<()> {
+    win32::verify_snap_capture_ready(hwnd, post_rect)
+        .map_err(suite_error_for_snap_capture_readiness)
+}
+
+fn suite_error_for_snap_capture_readiness(err: win32::SnapCaptureReadinessError) -> SuiteError {
+    SuiteError::assertion(
+        format!("post-snap capture readiness failed: {}", err.message()),
+        err.first_bad_signal(),
     )
 }
 
@@ -713,5 +727,45 @@ mod tests {
         );
         assert_eq!(samples.mid.x, 492);
         assert_eq!(samples.mid.width, 408);
+    }
+
+    #[test]
+    fn snap_capture_readiness_errors_map_to_first_bad_signals() {
+        let foreground = suite_error_for_snap_capture_readiness(
+            win32::SnapCaptureReadinessError::ForegroundStolen {
+                foreground: Some(win32::WindowHandle(11)),
+            },
+        );
+        let modifier = suite_error_for_snap_capture_readiness(
+            win32::SnapCaptureReadinessError::StuckModifier { modifier: "win" },
+        );
+        let occlusion = suite_error_for_snap_capture_readiness(
+            win32::SnapCaptureReadinessError::WindowOccluded {
+                occluder: win32::WindowOcclusionCandidate {
+                    handle: win32::WindowHandle(12),
+                    rect: DesktopRect {
+                        left: 0,
+                        top: 0,
+                        right: 10,
+                        bottom: 10,
+                    },
+                    visible: true,
+                    owned: false,
+                },
+            },
+        );
+
+        assert_eq!(
+            foreground.first_bad_signal.as_deref(),
+            Some("snap-foreground-stolen")
+        );
+        assert_eq!(
+            modifier.first_bad_signal.as_deref(),
+            Some("snap-stuck-modifier")
+        );
+        assert_eq!(
+            occlusion.first_bad_signal.as_deref(),
+            Some("snap-window-occluded")
+        );
     }
 }

@@ -27,6 +27,85 @@ pub struct DesktopSize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowHandle(pub isize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowOcclusionCandidate {
+    pub handle: WindowHandle,
+    pub rect: DesktopRect,
+    pub visible: bool,
+    pub owned: bool,
+}
+
+impl WindowOcclusionCandidate {
+    fn occludes(self, target_rect: DesktopRect) -> bool {
+        self.visible && !self.owned && rects_overlap(target_rect, self.rect)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapCaptureReadinessError {
+    ForegroundStolen {
+        foreground: Option<WindowHandle>,
+    },
+    StuckModifier {
+        modifier: &'static str,
+    },
+    WindowOccluded {
+        occluder: WindowOcclusionCandidate,
+    },
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    Unsupported,
+}
+
+impl SnapCaptureReadinessError {
+    pub fn first_bad_signal(self) -> &'static str {
+        match self {
+            Self::ForegroundStolen { .. } => "snap-foreground-stolen",
+            Self::StuckModifier { .. } => "snap-stuck-modifier",
+            Self::WindowOccluded { .. } => "snap-window-occluded",
+            Self::Unsupported => "snap-composition-unsupported",
+        }
+    }
+
+    pub fn message(self) -> String {
+        match self {
+            Self::ForegroundStolen { foreground } => {
+                format!("foreground window changed before post-snap capture: {foreground:?}")
+            }
+            Self::StuckModifier { modifier } => {
+                format!("modifier key remained pressed after Win+Left: {modifier}")
+            }
+            Self::WindowOccluded { occluder } => {
+                format!("post-snap window is obscured by {occluder:?}")
+            }
+            Self::Unsupported => "snap composition checks are only supported on Windows".to_owned(),
+        }
+    }
+}
+
+pub fn rects_overlap(a: DesktopRect, b: DesktopRect) -> bool {
+    a.width() > 0
+        && a.height() > 0
+        && b.width() > 0
+        && b.height() > 0
+        && a.left < b.right
+        && a.right > b.left
+        && a.top < b.bottom
+        && a.bottom > b.top
+}
+
+#[cfg(test)]
+fn first_occluding_window_before_target(
+    target: WindowHandle,
+    target_rect: DesktopRect,
+    z_order_top_to_bottom: &[WindowOcclusionCandidate],
+) -> Option<WindowOcclusionCandidate> {
+    z_order_top_to_bottom
+        .iter()
+        .copied()
+        .take_while(|candidate| candidate.handle != target)
+        .find(|candidate| candidate.occludes(target_rect))
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use std::ffi::OsString;
@@ -37,17 +116,20 @@ mod imp {
     use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, TRUE};
     use winapi::shared::windef::{HWND, RECT};
     use winapi::um::winuser::{
-        keybd_event, mouse_event, CloseWindow, EnumWindows, GetClassNameW, GetSystemMetrics,
-        GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendInput,
-        SetCursorPos, SetForegroundWindow, SetProcessDPIAware, SetProcessDpiAwarenessContext,
-        SetWindowPos, ShowWindow, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        keybd_event, mouse_event, CloseWindow, EnumWindows, GetClassNameW, GetForegroundWindow,
+        GetKeyState, GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindowVisible, SendInput, SetCursorPos, SetForegroundWindow,
+        SetProcessDPIAware, SetProcessDpiAwarenessContext, SetWindowPos, ShowWindow, GW_HWNDFIRST,
+        GW_HWNDNEXT, GW_OWNER, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
         KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, SM_CXSCREEN, SM_CYSCREEN,
-        SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, VK_LEFT, VK_LWIN, VK_RETURN,
-        WM_CLOSE,
+        SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, VK_CONTROL, VK_LEFT, VK_LWIN,
+        VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE,
     };
     use winapi::um::winuser::{PostMessageW, HWND_TOP};
 
-    use super::{DesktopRect, DesktopSize, WindowHandle};
+    use super::{
+        DesktopRect, DesktopSize, SnapCaptureReadinessError, WindowHandle, WindowOcclusionCandidate,
+    };
 
     pub fn find_window_for_process(
         process_id: u32,
@@ -227,6 +309,28 @@ mod imp {
         Ok(())
     }
 
+    pub fn verify_snap_capture_ready(
+        handle: WindowHandle,
+        post_rect: DesktopRect,
+    ) -> Result<(), SnapCaptureReadinessError> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground != hwnd(handle) {
+            return Err(SnapCaptureReadinessError::ForegroundStolen {
+                foreground: non_null_window_handle(foreground),
+            });
+        }
+
+        if let Some(modifier) = stuck_modifier() {
+            return Err(SnapCaptureReadinessError::StuckModifier { modifier });
+        }
+
+        if let Some(occluder) = first_occluding_window(handle, post_rect) {
+            return Err(SnapCaptureReadinessError::WindowOccluded { occluder });
+        }
+
+        Ok(())
+    }
+
     pub fn send_text_enter(text: &str) -> Result<(), String> {
         for unit in text.encode_utf16() {
             send_keyboard_input(0, unit, KEYEVENTF_UNICODE)?;
@@ -291,6 +395,74 @@ mod imp {
         state.windows
     }
 
+    fn first_occluding_window(
+        target: WindowHandle,
+        target_rect: DesktopRect,
+    ) -> Option<WindowOcclusionCandidate> {
+        let mut current = unsafe { GetWindow(hwnd(target), GW_HWNDFIRST) };
+        for _ in 0..1024 {
+            if current.is_null() || current == hwnd(target) {
+                return None;
+            }
+            if let Some(candidate) = window_occlusion_candidate(current) {
+                if candidate.occludes(target_rect) {
+                    return Some(candidate);
+                }
+            }
+            current = unsafe { GetWindow(current, GW_HWNDNEXT) };
+        }
+
+        None
+    }
+
+    fn window_occlusion_candidate(window: HWND) -> Option<WindowOcclusionCandidate> {
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let ok = unsafe { GetWindowRect(window, &mut rect) };
+        if ok == 0 {
+            return None;
+        }
+
+        Some(WindowOcclusionCandidate {
+            handle: WindowHandle(window as isize),
+            rect: DesktopRect {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            visible: unsafe { IsWindowVisible(window) != 0 },
+            owned: unsafe { !GetWindow(window, GW_OWNER).is_null() },
+        })
+    }
+
+    fn stuck_modifier() -> Option<&'static str> {
+        const MODIFIERS: &[(i32, &str)] = &[
+            (VK_LWIN, "win"),
+            (VK_RWIN, "win"),
+            (VK_CONTROL, "ctrl"),
+            (VK_SHIFT, "shift"),
+            (VK_MENU, "alt"),
+        ];
+
+        MODIFIERS
+            .iter()
+            .copied()
+            .find_map(|(vk, name)| modifier_is_down(vk).then_some(name))
+    }
+
+    fn modifier_is_down(vk: i32) -> bool {
+        unsafe { (GetKeyState(vk) as u16 & 0x8000) != 0 }
+    }
+
+    fn non_null_window_handle(window: HWND) -> Option<WindowHandle> {
+        (!window.is_null()).then_some(WindowHandle(window as isize))
+    }
+
     fn matches_expected(
         window: HWND,
         title_substrings: &[&str],
@@ -345,7 +517,7 @@ mod imp {
 mod imp {
     use std::time::Duration;
 
-    use super::{DesktopRect, DesktopSize, WindowHandle};
+    use super::{DesktopRect, DesktopSize, SnapCaptureReadinessError, WindowHandle};
 
     pub fn find_window_for_process(
         _process_id: u32,
@@ -393,6 +565,13 @@ mod imp {
 
     pub fn send_win_left() -> Result<(), String> {
         Err(unsupported())
+    }
+
+    pub fn verify_snap_capture_ready(
+        _handle: WindowHandle,
+        _post_rect: DesktopRect,
+    ) -> Result<(), SnapCaptureReadinessError> {
+        Err(SnapCaptureReadinessError::Unsupported)
     }
 
     pub fn send_text_enter(_text: &str) -> Result<(), String> {
@@ -456,6 +635,13 @@ pub fn send_win_left() -> Result<(), String> {
     imp::send_win_left()
 }
 
+pub fn verify_snap_capture_ready(
+    handle: WindowHandle,
+    post_rect: DesktopRect,
+) -> Result<(), SnapCaptureReadinessError> {
+    imp::verify_snap_capture_ready(handle, post_rect)
+}
+
 pub fn send_text_enter(text: &str) -> Result<(), String> {
     imp::send_text_enter(text)
 }
@@ -479,5 +665,112 @@ mod tests {
 
         assert_eq!(rect.width(), 100);
         assert_eq!(rect.height(), 50);
+    }
+
+    #[test]
+    fn desktop_rect_overlap_requires_positive_area() {
+        let target = DesktopRect {
+            left: 10,
+            top: 10,
+            right: 50,
+            bottom: 50,
+        };
+
+        assert!(rects_overlap(
+            target,
+            DesktopRect {
+                left: 49,
+                top: 49,
+                right: 80,
+                bottom: 80,
+            }
+        ));
+        assert!(!rects_overlap(
+            target,
+            DesktopRect {
+                left: 50,
+                top: 10,
+                right: 80,
+                bottom: 50,
+            }
+        ));
+    }
+
+    #[test]
+    fn occlusion_decision_uses_first_visible_non_owned_overlap_above_target() {
+        let target = WindowHandle(7);
+        let target_rect = DesktopRect {
+            left: 100,
+            top: 100,
+            right: 300,
+            bottom: 300,
+        };
+        let hidden_overlap = WindowOcclusionCandidate {
+            handle: WindowHandle(1),
+            rect: target_rect,
+            visible: false,
+            owned: false,
+        };
+        let owned_overlap = WindowOcclusionCandidate {
+            handle: WindowHandle(2),
+            rect: target_rect,
+            visible: true,
+            owned: true,
+        };
+        let visible_overlap = WindowOcclusionCandidate {
+            handle: WindowHandle(3),
+            rect: DesktopRect {
+                left: 120,
+                top: 120,
+                right: 180,
+                bottom: 180,
+            },
+            visible: true,
+            owned: false,
+        };
+
+        let occluder = first_occluding_window_before_target(
+            target,
+            target_rect,
+            &[hidden_overlap, owned_overlap, visible_overlap],
+        );
+
+        assert_eq!(occluder, Some(visible_overlap));
+    }
+
+    #[test]
+    fn occlusion_decision_ignores_windows_below_target() {
+        let target = WindowHandle(7);
+        let target_rect = DesktopRect {
+            left: 100,
+            top: 100,
+            right: 300,
+            bottom: 300,
+        };
+        let below_target_overlap = WindowOcclusionCandidate {
+            handle: WindowHandle(9),
+            rect: target_rect,
+            visible: true,
+            owned: false,
+        };
+
+        let occluder =
+            first_occluding_window_before_target(target, target_rect, &[below_target_overlap]);
+        assert_eq!(occluder, Some(below_target_overlap));
+
+        let occluder = first_occluding_window_before_target(
+            target,
+            target_rect,
+            &[
+                WindowOcclusionCandidate {
+                    handle: target,
+                    rect: target_rect,
+                    visible: true,
+                    owned: false,
+                },
+                below_target_overlap,
+            ],
+        );
+        assert_eq!(occluder, None);
     }
 }
