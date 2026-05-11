@@ -37,11 +37,13 @@ mod imp {
     use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, TRUE};
     use winapi::shared::windef::{HWND, RECT};
     use winapi::um::winuser::{
-        mouse_event, CloseWindow, EnumWindows, GetClassNameW, GetSystemMetrics, GetWindowRect,
-        GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SetCursorPos,
-        SetForegroundWindow, SetProcessDPIAware, SetProcessDpiAwarenessContext, SetWindowPos,
-        ShowWindow, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, SM_CXSCREEN, SM_CYSCREEN,
-        SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, WM_CLOSE,
+        keybd_event, mouse_event, CloseWindow, EnumWindows, GetClassNameW, GetSystemMetrics,
+        GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendInput,
+        SetCursorPos, SetForegroundWindow, SetProcessDPIAware, SetProcessDpiAwarenessContext,
+        SetWindowPos, ShowWindow, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, SM_CXSCREEN, SM_CYSCREEN,
+        SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, VK_LEFT, VK_LWIN, VK_RETURN,
+        WM_CLOSE,
     };
     use winapi::um::winuser::{PostMessageW, HWND_TOP};
 
@@ -186,6 +188,49 @@ mod imp {
         Ok(())
     }
 
+    pub fn send_win_left() -> Result<(), String> {
+        unsafe {
+            keybd_event(VK_LWIN as u8, 0, 0, 0);
+            thread::sleep(Duration::from_millis(30));
+            keybd_event(VK_LEFT as u8, 0, 0, 0);
+            thread::sleep(Duration::from_millis(30));
+            keybd_event(VK_LEFT as u8, 0, KEYEVENTF_KEYUP, 0);
+            thread::sleep(Duration::from_millis(30));
+            keybd_event(VK_LWIN as u8, 0, KEYEVENTF_KEYUP, 0);
+        }
+        Ok(())
+    }
+
+    pub fn send_text_enter(text: &str) -> Result<(), String> {
+        for unit in text.encode_utf16() {
+            send_keyboard_input(0, unit, KEYEVENTF_UNICODE)?;
+            send_keyboard_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)?;
+            thread::sleep(Duration::from_millis(2));
+        }
+        send_keyboard_input(VK_RETURN as u16, 0, 0)?;
+        send_keyboard_input(VK_RETURN as u16, 0, KEYEVENTF_KEYUP)?;
+        Ok(())
+    }
+
+    fn send_keyboard_input(vk: u16, scan: u16, flags: u32) -> Result<(), String> {
+        let mut input = unsafe { std::mem::zeroed::<INPUT>() };
+        input.type_ = INPUT_KEYBOARD;
+        unsafe {
+            *input.u.ki_mut() = KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            };
+            let sent = SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
+            if sent != 1 {
+                return Err("SendInput failed".to_owned());
+            }
+        }
+        Ok(())
+    }
+
     pub fn close_window(handle: WindowHandle) -> Result<(), String> {
         unsafe {
             PostMessageW(hwnd(handle), WM_CLOSE, 0, 0);
@@ -316,6 +361,14 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn send_win_left() -> Result<(), String> {
+        Err(unsupported())
+    }
+
+    pub fn send_text_enter(_text: &str) -> Result<(), String> {
+        Err(unsupported())
+    }
+
     pub fn close_window(_handle: WindowHandle) -> Result<(), String> {
         Err(unsupported())
     }
@@ -363,6 +416,14 @@ pub fn left_edge_drag(
     to_x: i32,
 ) -> Result<(), String> {
     imp::left_edge_drag(handle, from_x, from_y, to_x)
+}
+
+pub fn send_win_left() -> Result<(), String> {
+    imp::send_win_left()
+}
+
+pub fn send_text_enter(text: &str) -> Result<(), String> {
+    imp::send_text_enter(text)
 }
 
 pub fn close_window(handle: WindowHandle) -> Result<(), String> {

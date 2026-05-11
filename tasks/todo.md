@@ -97,14 +97,14 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
   - [x] Verify: diagnostic client and observe-mode unit tests.
   - [x] Verify manually: `cargo xtask desktop-regression --suite edge-resize-stability --observe full`.
 
-- [ ] **Task 9: Port `post-resize-glitches` with cross-layer evidence**
-  - [ ] Port Win+Left snap and pixel-ratio assertions to Rust.
-  - [ ] Preserve black-box `--observe off` behavior.
-  - [ ] Add full-observe before/after snapshots and event correlation.
-  - [ ] Add cross-layer checks for window bounds, app surface/layout, and terminal dimensions.
-  - [ ] Add first-bad classification for resize/render/pixel failures.
-  - [ ] Verify manually: `cargo xtask desktop-regression --suite post-resize-glitches --observe off`.
-  - [ ] Verify manually: `cargo xtask desktop-regression --suite post-resize-glitches --observe full`.
+- [x] **Task 9: Port `post-resize-glitches` with cross-layer evidence**
+  - [x] Port Win+Left snap and pixel-ratio assertions to Rust.
+  - [x] Preserve black-box `--observe off` behavior.
+  - [x] Add full-observe before/after snapshots and event correlation.
+  - [x] Add cross-layer checks for window bounds, app surface/layout, and terminal dimensions.
+  - [x] Add first-bad classification for resize/render/pixel failures.
+  - [x] Verify manually: `cargo xtask desktop-regression --suite post-resize-glitches --observe off`.
+  - [x] Verify manually: `cargo xtask desktop-regression --suite post-resize-glitches --observe full`.
 
 ### Checkpoint: Observability Harness
 

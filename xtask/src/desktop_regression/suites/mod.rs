@@ -7,6 +7,8 @@ use crate::desktop_regression::artifacts::ArtifactLayout;
 use crate::desktop_regression::results::SuiteExecutionRecord;
 
 pub mod edge_resize_stability;
+pub(crate) mod observability;
+pub mod post_resize_glitches;
 
 pub struct SuiteContext<'a> {
     pub workspace_root: &'a Path,
@@ -19,6 +21,7 @@ pub struct SuiteContext<'a> {
 pub fn execute_suite(suite_id: &str, context: &SuiteContext<'_>) -> SuiteExecutionRecord {
     match suite_id {
         "edge-resize-stability" => edge_resize_stability::run(context),
+        "post-resize-glitches" => post_resize_glitches::run(context),
         other => SuiteExecutionRecord::failed(
             other,
             FailureClassification::Setup,
