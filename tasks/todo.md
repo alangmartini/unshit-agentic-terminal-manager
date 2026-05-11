@@ -115,15 +115,15 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
 
 ## Phase 4: Migration Compatibility And Advanced Debugging
 
-- [ ] **Task 10: Preserve PowerShell compatibility wrappers and docs**
-  - [ ] Keep `tests/windows/desktop-regression/run.ps1 -List` non-invasive.
-  - [ ] Map PowerShell `-Suite`, `-SkipBuild`, and `-ExePath` to Rust where coverage exists.
-  - [ ] Clearly report legacy-only suites if any remain.
-  - [ ] Update README and framework spec with Rust commands, observe modes, artifacts, and compatibility behavior.
-  - [ ] Validate historical wrapper paths if present.
-  - [ ] Verify: PowerShell `-List`.
-  - [ ] Verify: PowerShell one-suite skip-build path.
-  - [ ] Verify: `cargo xtask desktop-regression --list`.
+- [x] **Task 10: Preserve PowerShell compatibility wrappers and docs**
+  - [x] Keep `tests/windows/desktop-regression/run.ps1 -List` non-invasive.
+  - [x] Map PowerShell `-Suite`, `-SkipBuild`, and `-ExePath` to Rust where coverage exists.
+  - [x] Clearly report legacy-only suites if any remain.
+  - [x] Update README and framework spec with Rust commands, observe modes, artifacts, and compatibility behavior.
+  - [x] Validate historical wrapper paths if present.
+  - [x] Verify: PowerShell `-List`.
+  - [x] Verify: PowerShell one-suite skip-build path.
+  - [x] Verify: `cargo xtask desktop-regression --list`.
 
 - [ ] **Task 11: Add record and replay for runner actions**
   - [ ] Write versioned action trace JSONL for `--record`.

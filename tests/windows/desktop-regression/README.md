@@ -10,6 +10,52 @@ CI jobs.
 
 ## Commands
 
+The canonical runner is the Rust `xtask` command. List suites and coverage:
+
+```powershell
+cargo xtask desktop-regression --list
+```
+
+Run every suite sequentially:
+
+```powershell
+cargo xtask desktop-regression
+```
+
+Run one suite:
+
+```powershell
+cargo xtask desktop-regression --suite post-resize-glitches
+```
+
+Run one suite against an already-built binary:
+
+```powershell
+cargo xtask desktop-regression --suite edge-resize-stability --skip-build --exe-path target\debug\terminal-manager.exe
+```
+
+Choose observability level:
+
+```powershell
+cargo xtask desktop-regression --suite post-resize-glitches --observe off
+cargo xtask desktop-regression --suite post-resize-glitches --observe basic
+cargo xtask desktop-regression --suite post-resize-glitches --observe full
+```
+
+`--observe off` keeps the run black-box and does not enable app diagnostics.
+`--observe basic` enables diagnostics for handshake, logs, events, and failure
+evidence. `--observe full` also records step snapshots, invariants, and
+cross-layer assertions where the suite supports them.
+
+Artifacts are written under `artifacts/windows/desktop-regression/<run_id>/`
+by default. Use `--artifact-root <dir>` or `--artifacts-root <dir>` to choose a
+different Rust artifact root.
+
+## PowerShell Compatibility
+
+The historical PowerShell runner is now a compatibility wrapper around
+`cargo xtask desktop-regression`. It remains useful for old commands:
+
 List suites and coverage:
 
 ```powershell
@@ -34,6 +80,16 @@ Run one suite:
 powershell.exe -ExecutionPolicy Bypass -File tests\windows\desktop-regression\run.ps1 -Suite post-resize-glitches
 ```
 
+The wrapper maps repeated `-Suite`, `-SkipBuild`, `-ExePath`, `-Observe`,
+`-Interactive`, `-KeepOpenOnFailure`, `-Record`, and explicit `-ArtifactsDir`
+to Rust arguments. Legacy `-ArtifactsDir <dir>` keeps its old meaning and maps
+to Rust artifact root `<dir>\windows\desktop-regression`.
+
+PowerShell-only tuning flags such as `-Tolerance`, `-DragDelta`, and `-Snap*`
+are accepted for script compatibility but ignored with a warning because the
+migrated Rust suites own their thresholds and fixtures. No legacy-only
+PowerShell suites remain; both current suite ids run through Rust.
+
 Historical script paths still work as compatibility wrappers:
 
 ```powershell
@@ -43,11 +99,14 @@ powershell.exe -ExecutionPolicy Bypass -File scripts\window-resize-automation.ps
 
 ## Framework Layout
 
-- `run.ps1`: suite discovery, build orchestration, execution, and result
-  collection.
+- `run.ps1`: PowerShell compatibility wrapper that forwards to the Rust runner.
+- `xtask/src/desktop_regression/`: canonical suite registry, CLI parsing,
+  build/launch orchestration, observability, artifacts, and result collection.
 - `lib/DesktopRegression.ps1`: Win32 driver, process/window lifecycle,
-  screenshot capture, pixel sampling, and assertion helpers.
-- `suites/*.ps1`: registered desktop scenarios.
+  screenshot capture, pixel sampling, and assertion helpers kept for historical
+  reference and compatibility.
+- `suites/*.ps1`: legacy registered desktop scenarios retained while old notes
+  still point at this directory.
 - `templates/suite.ps1`: starting point for a new suite.
 - `SPEC.md`: framework contract and boundaries.
 
@@ -60,15 +119,16 @@ powershell.exe -ExecutionPolicy Bypass -File scripts\window-resize-automation.ps
 
 ## Adding A Suite
 
-1. Copy `templates/suite.ps1` to `suites/<suite-name>.ps1`.
-2. Set `-Name`, `-Title`, `-Covers`, and `-Tags`.
-3. Put the scenario in the registered `-ScriptBlock`.
-4. Use helpers from `lib/DesktopRegression.ps1` for app launch, window focus,
-   resize/snap input, screenshots, pixel sampling, and assertions.
+1. Add a Rust suite module under `xtask/src/desktop_regression/suites/`.
+2. Register its metadata in `xtask/src/desktop_regression/registry.rs`.
+3. Use the Rust desktop-regression helpers for app launch, window focus,
+   resize/snap input, screenshots, diagnostics, pixel sampling, and assertions.
+4. Add or update focused `xtask` tests for registry, options, result, or helper
+   behavior changed by the suite.
 5. Run it directly:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File tests\windows\desktop-regression\run.ps1 -Suite <suite-name>
+cargo xtask desktop-regression --suite <suite-name>
 ```
 
 Suites should be named after the behavior they protect, not after the bug

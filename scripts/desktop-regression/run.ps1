@@ -15,6 +15,11 @@ param(
     [switch]$SkipBuild,
     [string]$ExePath,
     [string]$ArtifactsDir = "artifacts",
+    [ValidateSet("off", "basic", "full")]
+    [string]$Observe,
+    [switch]$Interactive,
+    [switch]$KeepOpenOnFailure,
+    [switch]$Record,
     [double]$Tolerance = 2.0,
     [int]$DragDelta = 220,
     [double]$SnapLitRatioThreshold = 0.01,

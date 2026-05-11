@@ -39,18 +39,28 @@ $suite = if ($OnlySnapTest) {
     @("edge-resize-stability", "post-resize-glitches")
 }
 
-& $runner `
-    -Suite $suite `
-    -SkipBuild `
-    -DragDelta $DragDelta `
-    -Tolerance $Tolerance `
-    -SnapLitRatioThreshold $SnapLitRatioThreshold `
-    -SnapMidLitRatioThreshold $SnapMidLitRatioThreshold `
-    -SnapShell $SnapShell `
-    -SnapFillLines $SnapFillLines `
-    -SnapTabbarPx $SnapTabbarPx `
-    -SnapStatusbarPx $SnapStatusbarPx `
-    -SnapSidebarPx $SnapSidebarPx `
-    -SnapStripeHeightPx $SnapStripeHeightPx
+$forward = @{
+    Suite = $suite
+    SkipBuild = $true
+}
+
+foreach ($name in @(
+    "DragDelta",
+    "Tolerance",
+    "SnapLitRatioThreshold",
+    "SnapMidLitRatioThreshold",
+    "SnapShell",
+    "SnapFillLines",
+    "SnapTabbarPx",
+    "SnapStatusbarPx",
+    "SnapSidebarPx",
+    "SnapStripeHeightPx"
+)) {
+    if ($PSBoundParameters.ContainsKey($name)) {
+        $forward[$name] = $PSBoundParameters[$name]
+    }
+}
+
+& $runner @forward
 
 exit $LASTEXITCODE

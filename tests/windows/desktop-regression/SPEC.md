@@ -17,26 +17,45 @@ without adding them to CI/CD yet.
 ## Commands
 
 - List suites:
-  `powershell.exe -ExecutionPolicy Bypass -File tests\windows\desktop-regression\run.ps1 -List`
+  `cargo xtask desktop-regression --list`
 - Run all suites:
-  `powershell.exe -ExecutionPolicy Bypass -File tests\windows\desktop-regression\run.ps1`
+  `cargo xtask desktop-regression`
 - Run one suite:
-  `powershell.exe -ExecutionPolicy Bypass -File tests\windows\desktop-regression\run.ps1 -Suite <name>`
+  `cargo xtask desktop-regression --suite <name>`
 - Run against an existing binary:
-  `powershell.exe -ExecutionPolicy Bypass -File tests\windows\desktop-regression\run.ps1 -SkipBuild`
+  `cargo xtask desktop-regression --suite <name> --skip-build --exe-path target\debug\terminal-manager.exe`
+- Select observability:
+  `cargo xtask desktop-regression --suite <name> --observe off|basic|full`
+- Override artifact root:
+  `cargo xtask desktop-regression --artifact-root artifacts/windows/desktop-regression`
 
-Compatibility wrappers in `scripts/` may forward to the canonical runner, but
-new documentation should point to `tests/windows/desktop-regression`.
+`--observe off` is black-box and must not enable the app diagnostic endpoint.
+`--observe basic` enables runner/app diagnostic capture for handshake, logs,
+events, and failure evidence. `--observe full` records step snapshots,
+invariants, and cross-layer assertions where the suite supports them.
+
+`tests/windows/desktop-regression/run.ps1` and compatibility wrappers in
+`scripts/` forward to the Rust command. The PowerShell wrapper preserves
+`-List`, repeated `-Suite`, `-SkipBuild`, `-ExePath`, explicit `-ArtifactsDir`,
+and Rust-facing observe/interactive/record flags. Legacy PowerShell-only
+threshold and fixture flags are accepted but ignored with warnings because the
+migrated Rust suites own those defaults. No legacy-only PowerShell suites remain
+for the current suite set.
 
 ## Project Structure
 
-- `run.ps1`: command-line runner, suite discovery, build step, result writing.
-- `lib/DesktopRegression.ps1`: shared Win32, process, screenshot, input, and
-  assertion helpers.
-- `suites/*.ps1`: scenario files registered with `Register-DesktopRegressionSuite`.
-- `templates/suite.ps1`: starting template for new suites.
-- `artifacts/windows/desktop-regression/<run_id>/`: ignored output directory containing
-  screenshots and `results.json`.
+- `xtask/src/desktop_regression/`: canonical Rust runner, suite registry,
+  build/launch orchestration, Win32 driver, screenshots, diagnostics,
+  artifacts, failure bundles, and result writing.
+- `run.ps1`: PowerShell compatibility wrapper for old commands.
+- `lib/DesktopRegression.ps1`: historical shared Win32, process, screenshot,
+  input, and assertion helpers.
+- `suites/*.ps1`: historical scenario files retained for compatibility
+  reference.
+- `templates/suite.ps1`: historical PowerShell starting template.
+- `artifacts/windows/desktop-regression/<run_id>/`: ignored output directory
+  containing screenshots, logs, diagnostic evidence, failure manifests, and
+  `results.json`.
 
 The `tests/windows/` namespace is reserved for Windows-only desktop tests.
 Future macOS and Linux desktop frameworks should use sibling OS directories
@@ -54,8 +73,12 @@ instead of sharing this runner or helper library.
 
 ## Testing Strategy
 
-- Use `-List` as a non-invasive smoke check for suite discovery.
-- Use compatibility wrapper `-List` checks to protect old entry points.
+- Use `cargo xtask desktop-regression --list` as a non-invasive smoke check for
+  suite discovery.
+- Use PowerShell compatibility wrapper `-List` checks to protect old entry
+  points.
+- Use one-suite `--skip-build --exe-path <path>` checks when a built binary is
+  available and a full headed run is acceptable.
 - Full suite execution is manual because it takes over real desktop input,
   sends keys such as `Win+Left`, moves the mouse, and captures the screen.
 
