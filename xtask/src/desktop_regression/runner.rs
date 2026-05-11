@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 
 use crate::desktop_regression::artifacts::create_run_layout;
+use crate::desktop_regression::launcher::prepare_app_binary;
 use crate::desktop_regression::options::{validate_options, DesktopRegressionOpts};
 use crate::desktop_regression::registry::{all_suites, resolve_suites, SuiteMetadata};
-use crate::desktop_regression::results::{skipped_skeleton, write_results};
+use crate::desktop_regression::results::{completed_result, write_results, SuiteExecutionRecord};
+use crate::desktop_regression::suites::{execute_suite, SuiteContext};
+use terminal_manager_diagnostics::{FailureClassification, ResultAppInfo, ResultStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -22,19 +25,91 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
     let selected = resolve_suites(&opts.suite_ids)?;
     let workspace_root = workspace_root()?;
     let layout = create_run_layout(&workspace_root, &opts.artifact_root)?;
-    let result = skipped_skeleton(layout.run_id.clone(), opts.observe, &selected);
+
+    let exe_path =
+        match prepare_app_binary(&workspace_root, opts.skip_build, opts.exe_path.as_deref()) {
+            Ok(path) => path,
+            Err(err) => {
+                let outcomes = selected
+                    .iter()
+                    .map(|suite| {
+                        SuiteExecutionRecord::failed(
+                            suite.id,
+                            FailureClassification::Setup,
+                            format!("failed to prepare app binary: {err}"),
+                            Some("app-binary-setup".to_owned()),
+                            Vec::new(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let result = completed_result(
+                    layout.run_id.clone(),
+                    opts.observe,
+                    &selected,
+                    None,
+                    outcomes,
+                );
+                write_results(&layout.results_path, &result)?;
+                print_run_summary(
+                    &layout.run_id,
+                    &layout.run_dir,
+                    &layout.results_path,
+                    &result,
+                );
+                return Ok(RunOutcome::Failed);
+            }
+        };
+
+    let context = SuiteContext {
+        workspace_root: &workspace_root,
+        artifact_layout: &layout,
+        exe_path: &exe_path,
+    };
+    let outcomes = selected
+        .iter()
+        .map(|suite| execute_suite(suite.id, &context))
+        .collect::<Vec<_>>();
+    let result = completed_result(
+        layout.run_id.clone(),
+        opts.observe,
+        &selected,
+        Some(ResultAppInfo {
+            binary: exe_path.display().to_string(),
+            diagnostics: None,
+            ..ResultAppInfo::default()
+        }),
+        outcomes,
+    );
+    let outcome = if result.run.status == ResultStatus::Failed {
+        RunOutcome::Failed
+    } else {
+        RunOutcome::Success
+    };
     write_results(&layout.results_path, &result)?;
 
-    println!(
-        "desktop-regression: wrote skipped Task 5 result skeleton for {} suite(s)",
-        selected.len()
+    print_run_summary(
+        &layout.run_id,
+        &layout.run_dir,
+        &layout.results_path,
+        &result,
     );
-    println!("  run id: {}", layout.run_id);
-    println!("  artifacts: {}", layout.run_dir.display());
-    println!("  results: {}", layout.results_path.display());
-    println!("  suite execution is not implemented until Task 6");
 
-    Ok(RunOutcome::Failed)
+    Ok(outcome)
+}
+
+fn print_run_summary(
+    run_id: &str,
+    run_dir: &std::path::Path,
+    results_path: &std::path::Path,
+    result: &terminal_manager_diagnostics::TestRunResult,
+) {
+    println!(
+        "desktop-regression: {} passed, {} failed, {} skipped",
+        result.summary.passed, result.summary.failed, result.summary.skipped
+    );
+    println!("  run id: {}", run_id);
+    println!("  artifacts: {}", run_dir.display());
+    println!("  results: {}", results_path.display());
 }
 
 fn print_suite_list(suites: &[SuiteMetadata]) {

@@ -28,6 +28,20 @@ pub fn create_run_layout(
     })
 }
 
+pub fn suite_artifact_name(suite_id: &str, name: &str, extension: &str) -> String {
+    let safe_name = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("{suite_id}-{safe_name}.{extension}")
+}
+
 pub fn make_run_id(now: SystemTime) -> String {
     let (year, month, day, hour, minute, second) = utc_parts(now);
     format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
@@ -95,5 +109,13 @@ mod tests {
     fn formats_schema_timestamp_as_utc_iso_like_string() {
         let time = UNIX_EPOCH + Duration::from_secs(1_778_434_212);
         assert_eq!(format_utc_timestamp(time), "2026-05-10T17:30:12Z");
+    }
+
+    #[test]
+    fn suite_artifact_name_sanitizes_dynamic_parts() {
+        assert_eq!(
+            suite_artifact_name("edge-resize-stability", "after drag", "png"),
+            "edge-resize-stability-after-drag.png"
+        );
     }
 }

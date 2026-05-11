@@ -58,15 +58,15 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
   - [x] Verify: `cargo run -p xtask -- desktop-regression --list`.
   - [x] Verify: missing suite fails before artifacts/app launch.
 
-- [ ] **Task 6: Run first Rust black-box desktop suite**
-  - [ ] Add Rust app build/launch path with `--skip-build` and `--exe-path`.
-  - [ ] Add Win32 window lookup by process id and title/class fallback.
-  - [ ] Add window move/resize/focus/global input helpers.
-  - [ ] Add screenshot capture and rectangle assertion helpers.
-  - [ ] Port `edge-resize-stability` for `--observe off`.
-  - [ ] Write pass/fail results and screenshot artifacts.
-  - [ ] Verify: `cargo test -p xtask desktop_regression`.
-  - [ ] Verify manually on Windows: `cargo xtask desktop-regression --suite edge-resize-stability --skip-build --exe-path target\\debug\\terminal-manager.exe --observe off`.
+- [x] **Task 6: Run first Rust black-box desktop suite**
+  - [x] Add Rust app build/launch path with `--skip-build` and `--exe-path`.
+  - [x] Add Win32 window lookup by process id and title/class fallback.
+  - [x] Add window move/resize/focus/global input helpers.
+  - [x] Add screenshot capture and rectangle assertion helpers.
+  - [x] Port `edge-resize-stability` for `--observe off`.
+  - [x] Write pass/fail results and screenshot artifacts.
+  - [x] Verify: `cargo test -p xtask desktop_regression`.
+  - [x] Verify manually on Windows: `cargo xtask desktop-regression --suite edge-resize-stability --skip-build --exe-path target\\debug\\terminal-manager.exe --observe off`.
 
 ### Checkpoint: Runner Black-Box Path
 
