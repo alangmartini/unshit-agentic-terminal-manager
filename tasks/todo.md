@@ -39,14 +39,14 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
 
 ## Phase 2: Events, Logs, And Runner Skeleton
 
-- [ ] **Task 4: Add structured app events, step markers, and flush**
-  - [ ] Add ordered diagnostic event queue with sequence numbers and timestamps.
-  - [ ] Emit initial event families: `test.step`, `window`, `layout`, `render`, `terminal`, `pty`, `input`, `invariant`, `log`.
-  - [ ] Implement `mark_step` correlation.
-  - [ ] Implement `flush`.
-  - [ ] Add cap or dropped-event counter.
-  - [ ] Verify: event sequencing and JSONL tests.
-  - [ ] Verify: protocol test for mark step, event emission, and flush.
+- [x] **Task 4: Add structured app events, step markers, and flush**
+  - [x] Add ordered diagnostic event queue with sequence numbers and timestamps.
+  - [x] Emit initial event families: `test.step`, `window`, `layout`, `render`, `terminal`, `pty`, `input`, `invariant`, `log`.
+  - [x] Implement `mark_step` correlation.
+  - [x] Implement `flush`.
+  - [x] Add cap or dropped-event counter.
+  - [x] Verify: event sequencing and JSONL tests.
+  - [x] Verify: protocol test for mark step, event emission, and flush.
 
 - [ ] **Task 5: Add `xtask desktop-regression` list and result skeleton**
   - [ ] Add CLI parsing for `desktop-regression`.

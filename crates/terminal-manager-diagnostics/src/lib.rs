@@ -134,6 +134,10 @@ pub enum DiagnosticCommand {
         id: String,
         label: String,
     },
+    ClearStep {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     Snapshot {
         reason: String,
         #[serde(default)]
@@ -143,6 +147,10 @@ pub enum DiagnosticCommand {
         scope: InvariantScope,
     },
     Flush,
+    DrainEvents {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     PrepareDeterministicMode {
         #[serde(default)]
         options: DeterministicModeOptions,
@@ -200,6 +208,10 @@ pub enum DiagnosticResponse {
     },
     Flushed {
         events_flushed: u64,
+        dropped_events: u64,
+    },
+    Events {
+        events: Vec<DiagnosticEnvelope<DiagnosticEvent>>,
         dropped_events: u64,
     },
     Error {
@@ -274,9 +286,11 @@ impl Default for DiagnosticCapabilities {
             commands: vec![
                 "hello".to_owned(),
                 "mark_step".to_owned(),
+                "clear_step".to_owned(),
                 "snapshot".to_owned(),
                 "evaluate_invariants".to_owned(),
                 "flush".to_owned(),
+                "drain_events".to_owned(),
                 "prepare_deterministic_mode".to_owned(),
             ],
             event_families: DiagnosticEventFamily::all().to_vec(),

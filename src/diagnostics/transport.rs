@@ -14,6 +14,7 @@ mod imp {
     };
 
     use crate::diagnostics::config::DiagnosticConfig;
+    use crate::diagnostics::events::DiagnosticEventStore;
     use crate::diagnostics::server::{
         handle_request, invalid_request_response, DiagnosticAppContext,
     };
@@ -21,11 +22,18 @@ mod imp {
 
     pub async fn run(config: DiagnosticConfig, shared: SharedState) -> io::Result<()> {
         let endpoint = config.pipe_path().display().to_string();
+        let events = DiagnosticEventStore::default();
         let mut server = Server::bind(config.pipe_path())?;
         loop {
             let connection = server.accept().await?;
-            if let Err(err) =
-                serve_connection(connection, &config.token, shared.clone(), endpoint.clone()).await
+            if let Err(err) = serve_connection(
+                connection,
+                &config.token,
+                shared.clone(),
+                endpoint.clone(),
+                events.clone(),
+            )
+            .await
             {
                 log::warn!("diagnostic connection failed: {err}");
             }
@@ -78,6 +86,7 @@ mod imp {
         expected_token: &str,
         shared: SharedState,
         endpoint: String,
+        events: DiagnosticEventStore,
     ) -> io::Result<()> {
         let mut reader = BufReader::new(connection);
         let mut line = String::new();
@@ -86,10 +95,12 @@ mod imp {
             invalid_request_response("empty diagnostic request")
         } else {
             match serde_json::from_str::<DiagnosticRequest>(&line) {
-                Ok(request) => handle_request(request, expected_token, || DiagnosticAppContext {
-                    shared,
-                    diagnostic_endpoint: Some(endpoint),
-                }),
+                Ok(request) => {
+                    handle_request(request, expected_token, &events, || DiagnosticAppContext {
+                        shared,
+                        diagnostic_endpoint: Some(endpoint),
+                    })
+                }
                 Err(err) => invalid_request_response(&format!("invalid diagnostic request: {err}")),
             }
         };
@@ -155,7 +166,8 @@ mod imp {
     mod tests {
         use super::*;
         use terminal_manager_diagnostics::{
-            DiagnosticCommand, DiagnosticResponse, DIAGNOSTIC_PROTOCOL_VERSION,
+            DiagnosticCommand, DiagnosticEventFamily, DiagnosticResponse,
+            DIAGNOSTIC_PROTOCOL_VERSION,
         };
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -194,6 +206,7 @@ mod imp {
             assert_eq!(app.process_id, Some(std::process::id()));
             assert!(capabilities.commands.contains(&"hello".to_owned()));
             assert!(capabilities.commands.contains(&"snapshot".to_owned()));
+            assert!(capabilities.commands.contains(&"drain_events".to_owned()));
 
             let snapshot = DiagnosticRequest {
                 token: "secret-token".to_owned(),
@@ -244,6 +257,90 @@ mod imp {
             };
             assert_eq!(error.code, "unauthorized");
             assert!(error.details.as_object().unwrap().is_empty());
+
+            server_task.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn named_pipe_mark_step_flush_and_drain_events() {
+            let config = DiagnosticConfig {
+                pipe_name: unique_pipe_name(),
+                token: "secret-token".to_owned(),
+            };
+            let path = config.pipe_path();
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(crate::state::seed_state()));
+            let server_task = tokio::spawn(async move {
+                let _ = run(config, shared).await;
+            });
+
+            let mark_step = DiagnosticRequest {
+                token: "secret-token".to_owned(),
+                command: DiagnosticCommand::MarkStep {
+                    id: "resize-left".to_owned(),
+                    label: "Resize left edge".to_owned(),
+                },
+                ..Default::default()
+            };
+            assert!(matches!(
+                send_request(&path, serde_json::to_value(mark_step).unwrap())
+                    .await
+                    .expect("mark step response"),
+                DiagnosticResponse::Ack { .. }
+            ));
+
+            let deterministic = DiagnosticRequest {
+                token: "secret-token".to_owned(),
+                command: DiagnosticCommand::PrepareDeterministicMode {
+                    options: Default::default(),
+                },
+                ..Default::default()
+            };
+            assert!(matches!(
+                send_request(&path, serde_json::to_value(deterministic).unwrap())
+                    .await
+                    .expect("deterministic response"),
+                DiagnosticResponse::Ack { .. }
+            ));
+
+            let flush = DiagnosticRequest {
+                token: "secret-token".to_owned(),
+                command: DiagnosticCommand::Flush,
+                ..Default::default()
+            };
+            let response = send_request(&path, serde_json::to_value(flush).unwrap())
+                .await
+                .expect("flush response");
+            let DiagnosticResponse::Flushed {
+                events_flushed,
+                dropped_events,
+            } = response
+            else {
+                panic!("expected flush response");
+            };
+            assert_eq!(events_flushed, 2);
+            assert_eq!(dropped_events, 0);
+
+            let drain = DiagnosticRequest {
+                token: "secret-token".to_owned(),
+                command: DiagnosticCommand::DrainEvents { limit: None },
+                ..Default::default()
+            };
+            let response = send_request(&path, serde_json::to_value(drain).unwrap())
+                .await
+                .expect("events response");
+            let DiagnosticResponse::Events {
+                events,
+                dropped_events,
+            } = response
+            else {
+                panic!("expected events response");
+            };
+            assert_eq!(dropped_events, 0);
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].test_step_id.as_deref(), Some("resize-left"));
+            assert_eq!(events[0].payload.family, DiagnosticEventFamily::TestStep);
+            assert_eq!(events[1].payload.target, "diagnostics.deterministic_mode");
+            assert_eq!(events[1].test_step_id.as_deref(), Some("resize-left"));
 
             server_task.abort();
         }

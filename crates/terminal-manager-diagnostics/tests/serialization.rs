@@ -5,7 +5,8 @@ use terminal_manager_diagnostics::{
     InvariantOutcome, ObserveMode, ProtocolCompatibilityError, Rect, ResultStatus, RunInfo,
     RunnerAction, RunnerActionKind, RunnerActionTarget, SnapshotOptions, SuiteFailure, SuiteResult,
     TerminalGridSnapshot, TerminalManagerSnapshot, TestRunResult, DIAGNOSTIC_PROTOCOL_VERSION,
-    FAILURE_MANIFEST_SCHEMA_VERSION, RESULTS_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION,
+    EVENT_SCHEMA_VERSION, FAILURE_MANIFEST_SCHEMA_VERSION, RESULTS_SCHEMA_VERSION,
+    SNAPSHOT_SCHEMA_VERSION,
 };
 
 #[test]
@@ -29,6 +30,29 @@ fn command_round_trip_uses_snake_case_tags() {
 
     let decoded: DiagnosticEnvelope<DiagnosticCommand> = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, envelope);
+}
+
+#[test]
+fn event_collection_commands_are_versioned_and_additive() {
+    let drain = DiagnosticCommand::DrainEvents { limit: Some(25) };
+    let drain_json = serde_json::to_value(&drain).unwrap();
+    assert_eq!(drain_json["type"], "drain_events");
+    assert_eq!(drain_json["limit"], 25);
+
+    let clear = DiagnosticCommand::ClearStep {
+        reason: Some("between assertions".to_owned()),
+    };
+    let clear_json = serde_json::to_value(&clear).unwrap();
+    assert_eq!(clear_json["type"], "clear_step");
+    assert_eq!(clear_json["reason"], "between assertions");
+
+    let response = DiagnosticResponse::Events {
+        events: Vec::new(),
+        dropped_events: 3,
+    };
+    let response_json = serde_json::to_value(response).unwrap();
+    assert_eq!(response_json["type"], "events");
+    assert_eq!(response_json["dropped_events"], 3);
 }
 
 #[test]
@@ -86,7 +110,7 @@ fn authenticated_request_wraps_command_without_leaking_token_into_command_shape(
 #[test]
 fn event_jsonl_round_trip_preserves_extensible_fields() {
     let event = DiagnosticEnvelope {
-        schema_version: DIAGNOSTIC_PROTOCOL_VERSION.to_owned(),
+        schema_version: EVENT_SCHEMA_VERSION.to_owned(),
         seq: 42,
         timestamp_utc: "2026-05-10T17:30:13Z".to_owned(),
         monotonic_ms: 456,
