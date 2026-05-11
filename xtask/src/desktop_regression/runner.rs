@@ -1,12 +1,20 @@
 use std::path::PathBuf;
 
 use crate::desktop_regression::artifacts::create_run_layout;
+use crate::desktop_regression::environment::{
+    collect_environment_metadata, write_environment_metadata, ENVIRONMENT_METADATA_FILE,
+};
+use crate::desktop_regression::failure::collect_basic_failure_bundle;
 use crate::desktop_regression::launcher::prepare_app_binary;
+use crate::desktop_regression::logging::{RunnerEventLogger, RUNNER_EVENTS_FILE};
 use crate::desktop_regression::options::{validate_options, DesktopRegressionOpts};
 use crate::desktop_regression::registry::{all_suites, resolve_suites, SuiteMetadata};
 use crate::desktop_regression::results::{completed_result, write_results, SuiteExecutionRecord};
 use crate::desktop_regression::suites::{execute_suite, SuiteContext};
-use terminal_manager_diagnostics::{FailureClassification, ResultAppInfo, ResultStatus};
+use serde_json::json;
+use terminal_manager_diagnostics::{
+    FailureClassification, ResultAppInfo, ResultStatus, SuiteFailure,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -25,20 +33,58 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
     let selected = resolve_suites(&opts.suite_ids)?;
     let workspace_root = workspace_root()?;
     let layout = create_run_layout(&workspace_root, &opts.artifact_root)?;
+    let mut logger = RunnerEventLogger::create(&layout.run_dir.join(RUNNER_EVENTS_FILE))?;
+    let mut common_artifacts = vec![RUNNER_EVENTS_FILE.to_owned()];
+
+    logger.log(
+        "run.start",
+        None,
+        json!({
+            "run_id": layout.run_id,
+            "observe": opts.observe,
+            "selected_suites": selected.iter().map(|suite| suite.id).collect::<Vec<_>>(),
+        }),
+    )?;
+    logger.log(
+        "artifact.write",
+        None,
+        json!({ "kind": "runner_events", "path": RUNNER_EVENTS_FILE }),
+    )?;
 
     let exe_path =
         match prepare_app_binary(&workspace_root, opts.skip_build, opts.exe_path.as_deref()) {
             Ok(path) => path,
             Err(err) => {
+                logger.log(
+                    "run.failure",
+                    None,
+                    json!({
+                        "classification": "setup",
+                        "message": format!("failed to prepare app binary: {err}"),
+                    }),
+                )?;
                 let outcomes = selected
                     .iter()
                     .map(|suite| {
+                        let failure = SuiteFailure {
+                            kind: FailureClassification::Setup,
+                            message: format!("failed to prepare app binary: {err}"),
+                            first_bad_signal: Some("app-binary-setup".to_owned()),
+                        };
+                        let mut artifacts = common_artifacts.clone();
+                        artifacts.extend(collect_basic_failure_bundle(
+                            &layout.run_dir,
+                            &layout.run_id,
+                            suite.id,
+                            &failure,
+                            &artifacts,
+                        ));
                         SuiteExecutionRecord::failed(
                             suite.id,
-                            FailureClassification::Setup,
-                            format!("failed to prepare app binary: {err}"),
-                            Some("app-binary-setup".to_owned()),
-                            Vec::new(),
+                            failure.kind,
+                            failure.message,
+                            failure.first_bad_signal,
+                            artifacts,
                         )
                     })
                     .collect::<Vec<_>>();
@@ -49,7 +95,13 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
                     None,
                     outcomes,
                 );
+                logger.log("run.end", None, json!({ "status": "failed" }))?;
                 write_results(&layout.results_path, &result)?;
+                logger.log(
+                    "artifact.write",
+                    None,
+                    json!({ "kind": "results", "path": "results.json" }),
+                )?;
                 print_run_summary(
                     &layout.run_id,
                     &layout.run_dir,
@@ -60,21 +112,76 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
             }
         };
 
+    let environment = collect_environment_metadata(&workspace_root, &exe_path);
+    let app_sha256 = environment.binary.sha256.clone();
+    write_environment_metadata(
+        &layout.run_dir.join(ENVIRONMENT_METADATA_FILE),
+        &environment,
+    )?;
+    common_artifacts.push(ENVIRONMENT_METADATA_FILE.to_owned());
+    logger.log(
+        "artifact.write",
+        None,
+        json!({ "kind": "environment", "path": ENVIRONMENT_METADATA_FILE }),
+    )?;
+
     let context = SuiteContext {
         workspace_root: &workspace_root,
         artifact_layout: &layout,
         exe_path: &exe_path,
+        common_artifacts: &common_artifacts,
     };
-    let outcomes = selected
+    let mut outcomes = Vec::new();
+    for suite in &selected {
+        logger.log("suite.start", Some(suite.id), json!({}))?;
+        let mut outcome = execute_suite(suite.id, &context);
+        append_common_artifacts(&mut outcome, &common_artifacts);
+        for artifact in &outcome.artifacts {
+            logger.log(
+                "artifact.write",
+                Some(suite.id),
+                json!({ "path": artifact }),
+            )?;
+        }
+        if let Some(failure) = &outcome.failure {
+            logger.log(
+                "suite.failure",
+                Some(suite.id),
+                json!({
+                    "classification": failure.kind,
+                    "message": failure.message,
+                    "first_bad_signal": failure.first_bad_signal,
+                }),
+            )?;
+        }
+        logger.log(
+            "suite.end",
+            Some(suite.id),
+            json!({ "status": outcome.status }),
+        )?;
+        logger.log(
+            "cleanup.complete",
+            Some(suite.id),
+            json!({ "scope": "suite" }),
+        )?;
+        outcomes.push(outcome);
+    }
+    let run_status = if outcomes
         .iter()
-        .map(|suite| execute_suite(suite.id, &context))
-        .collect::<Vec<_>>();
+        .any(|outcome| outcome.status == ResultStatus::Failed)
+    {
+        ResultStatus::Failed
+    } else {
+        ResultStatus::Passed
+    };
+    logger.log("run.end", None, json!({ "status": run_status }))?;
     let result = completed_result(
         layout.run_id.clone(),
         opts.observe,
         &selected,
         Some(ResultAppInfo {
             binary: exe_path.display().to_string(),
+            sha256: app_sha256,
             diagnostics: None,
             ..ResultAppInfo::default()
         }),
@@ -86,6 +193,11 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
         RunOutcome::Success
     };
     write_results(&layout.results_path, &result)?;
+    logger.log(
+        "artifact.write",
+        None,
+        json!({ "kind": "results", "path": "results.json" }),
+    )?;
 
     print_run_summary(
         &layout.run_id,
@@ -95,6 +207,14 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
     );
 
     Ok(outcome)
+}
+
+fn append_common_artifacts(outcome: &mut SuiteExecutionRecord, common_artifacts: &[String]) {
+    for artifact in common_artifacts {
+        if !outcome.artifacts.contains(artifact) {
+            outcome.artifacts.push(artifact.clone());
+        }
+    }
 }
 
 fn print_run_summary(
@@ -166,5 +286,27 @@ mod tests {
 
         assert!(err.contains("missing"));
         assert!(!absolute_artifact_root.exists());
+    }
+
+    #[test]
+    fn common_artifacts_are_linked_without_duplicates() {
+        let mut outcome = SuiteExecutionRecord::passed(
+            "edge-resize-stability",
+            vec!["runner.events.jsonl".to_owned()],
+        );
+        let common = vec![
+            "runner.events.jsonl".to_owned(),
+            "environment.json".to_owned(),
+        ];
+
+        append_common_artifacts(&mut outcome, &common);
+
+        assert_eq!(
+            outcome.artifacts,
+            vec![
+                "runner.events.jsonl".to_owned(),
+                "environment.json".to_owned()
+            ]
+        );
     }
 }

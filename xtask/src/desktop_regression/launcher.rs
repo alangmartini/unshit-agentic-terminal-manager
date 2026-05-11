@@ -1,9 +1,57 @@
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::desktop_regression::win32::{self, WindowHandle};
+
+pub struct AppLogFiles {
+    pub stdout_name: String,
+    pub stderr_name: String,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+impl AppLogFiles {
+    pub fn create(run_dir: &Path, suite_id: &str) -> Result<Self, String> {
+        let stdout_name = crate::desktop_regression::artifacts::suite_artifact_name(
+            suite_id,
+            "app.stdout",
+            "log",
+        );
+        let stderr_name = crate::desktop_regression::artifacts::suite_artifact_name(
+            suite_id,
+            "app.stderr",
+            "log",
+        );
+        let stdout_path = run_dir.join(&stdout_name);
+        let stderr_path = run_dir.join(&stderr_name);
+        File::create(&stdout_path).map_err(|e| {
+            format!(
+                "failed to create app stdout log {}: {e}",
+                stdout_path.display()
+            )
+        })?;
+        File::create(&stderr_path).map_err(|e| {
+            format!(
+                "failed to create app stderr log {}: {e}",
+                stderr_path.display()
+            )
+        })?;
+
+        Ok(Self {
+            stdout_name,
+            stderr_name,
+            stdout_path,
+            stderr_path,
+        })
+    }
+
+    pub fn artifact_names(&self) -> [String; 2] {
+        [self.stdout_name.clone(), self.stderr_name.clone()]
+    }
+}
 
 pub struct AppSession {
     child: Child,
@@ -12,14 +60,36 @@ pub struct AppSession {
 }
 
 impl AppSession {
-    pub fn launch(exe_path: &Path, workspace_root: &Path) -> Result<Self, String> {
+    pub fn launch_with_logs(
+        exe_path: &Path,
+        workspace_root: &Path,
+        logs: Option<&AppLogFiles>,
+    ) -> Result<Self, String> {
         if !exe_path.is_file() {
             return Err(format!("missing built binary: {}", exe_path.display()));
         }
 
         let support_processes_before = process_ids_by_image("unshit-ptyd.exe");
-        let child = Command::new(exe_path)
-            .current_dir(workspace_root)
+        let mut command = Command::new(exe_path);
+        command.current_dir(workspace_root);
+        if let Some(logs) = logs {
+            let stdout = File::create(&logs.stdout_path).map_err(|e| {
+                format!(
+                    "failed to open app stdout log {}: {e}",
+                    logs.stdout_path.display()
+                )
+            })?;
+            let stderr = File::create(&logs.stderr_path).map_err(|e| {
+                format!(
+                    "failed to open app stderr log {}: {e}",
+                    logs.stderr_path.display()
+                )
+            })?;
+            command
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr));
+        }
+        let child = command
             .spawn()
             .map_err(|e| format!("failed to launch {}: {e}", exe_path.display()))?;
         let pid = child.id();
@@ -242,5 +312,24 @@ mod tests {
         let output = "\"unshit-ptyd.exe\",\"26372\",\"Console\",\"1\",\"12,340 K\"\r\n";
 
         assert_eq!(parse_tasklist_csv(output), vec![26372]);
+    }
+
+    #[test]
+    fn app_log_files_use_suite_artifact_names() {
+        let dir = std::env::temp_dir().join(format!("xtask-dr-app-logs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let logs = AppLogFiles::create(&dir, "edge-resize-stability").unwrap();
+
+        assert_eq!(
+            logs.artifact_names(),
+            [
+                "edge-resize-stability-app.stdout.log".to_owned(),
+                "edge-resize-stability-app.stderr.log".to_owned()
+            ]
+        );
+        assert!(dir.join(&logs.stdout_name).is_file());
+        assert!(dir.join(&logs.stderr_name).is_file());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

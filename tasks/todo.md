@@ -77,15 +77,15 @@ Implementation checklist derived from `tasks/plan.md` and `specs/desktop-regress
 
 ## Phase 3: Observed Suite And Failure Evidence
 
-- [ ] **Task 7: Add app launcher logs and basic failure bundles**
-  - [ ] Capture app stdout/stderr to artifact files.
-  - [ ] Write runner JSONL logs.
-  - [ ] Capture environment metadata, binary path/hash, source commit, and dirty-worktree metadata.
-  - [ ] Write final screenshot and failure manifest on suite failure.
-  - [ ] Preserve original error and record diagnostic capture errors separately.
-  - [ ] Link bundle artifacts from `results.json`.
-  - [ ] Verify: failure classification and manifest unit tests.
-  - [ ] Verify: intentional failure writes expected bundle.
+- [x] **Task 7: Add app launcher logs and basic failure bundles**
+  - [x] Capture app stdout/stderr to artifact files.
+  - [x] Write runner JSONL logs.
+  - [x] Capture environment metadata, binary path/hash, source commit, and dirty-worktree metadata.
+  - [x] Write final screenshot and failure manifest on suite failure.
+  - [x] Preserve original error and record diagnostic capture errors separately.
+  - [x] Link bundle artifacts from `results.json`.
+  - [x] Verify: failure classification and manifest unit tests.
+  - [x] Verify: intentional failure writes expected bundle.
 
 - [ ] **Task 8: Connect runner diagnostics for one observed suite**
   - [ ] Add Rust diagnostic client.

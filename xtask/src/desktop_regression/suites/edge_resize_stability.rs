@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use crate::desktop_regression::artifacts::suite_artifact_name;
 use crate::desktop_regression::assertions::{assert_close, assert_true, SuiteError, SuiteResult};
-use crate::desktop_regression::launcher::AppSession;
+use crate::desktop_regression::failure::collect_basic_failure_bundle;
+use crate::desktop_regression::launcher::{AppLogFiles, AppSession};
 use crate::desktop_regression::results::SuiteExecutionRecord;
 use crate::desktop_regression::screenshots::capture_screen;
 use crate::desktop_regression::suites::SuiteContext;
@@ -17,19 +18,35 @@ pub fn run(context: &SuiteContext<'_>) -> SuiteExecutionRecord {
     let mut artifacts = Vec::new();
     match run_inner(context, &mut artifacts) {
         Ok(()) => SuiteExecutionRecord::passed(SUITE_ID, artifacts),
-        Err(err) => SuiteExecutionRecord::failed(
-            SUITE_ID,
-            err.kind,
-            err.message,
-            err.first_bad_signal,
-            artifacts,
-        ),
+        Err(err) => {
+            let failure = err.to_suite_failure();
+            let added = collect_basic_failure_bundle(
+                &context.artifact_layout.run_dir,
+                &context.artifact_layout.run_id,
+                SUITE_ID,
+                &failure,
+                &artifacts_with_common(context.common_artifacts, &artifacts),
+            );
+            artifacts.extend(added);
+            SuiteExecutionRecord::failed(
+                SUITE_ID,
+                failure.kind,
+                failure.message,
+                failure.first_bad_signal,
+                artifacts,
+            )
+        }
     }
 }
 
 fn run_inner(context: &SuiteContext<'_>, artifacts: &mut Vec<String>) -> SuiteResult<()> {
-    let session = AppSession::launch(context.exe_path, context.workspace_root)
-        .map_err(|e| SuiteError::setup(format!("failed to start app: {e}")))?;
+    let app_logs = AppLogFiles::create(&context.artifact_layout.run_dir, SUITE_ID)
+        .map_err(|e| SuiteError::setup(format!("failed to create app log files: {e}")))?;
+    artifacts.extend(app_logs.artifact_names());
+
+    let session =
+        AppSession::launch_with_logs(context.exe_path, context.workspace_root, Some(&app_logs))
+            .map_err(|e| SuiteError::setup(format!("failed to start app: {e}")))?;
     let hwnd = session.window();
     let screen = win32::screen_size().map_err(SuiteError::setup)?;
 
@@ -82,6 +99,12 @@ fn run_inner(context: &SuiteContext<'_>, artifacts: &mut Vec<String>) -> SuiteRe
     )?;
 
     Ok(())
+}
+
+fn artifacts_with_common(common_artifacts: &[String], suite_artifacts: &[String]) -> Vec<String> {
+    let mut artifacts = common_artifacts.to_vec();
+    artifacts.extend(suite_artifacts.iter().cloned());
+    artifacts
 }
 
 fn screenshot_path(context: &SuiteContext<'_>, name: &str) -> std::path::PathBuf {

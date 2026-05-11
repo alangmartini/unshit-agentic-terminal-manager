@@ -11,6 +11,7 @@ pub struct SuiteContext<'a> {
     pub workspace_root: &'a Path,
     pub artifact_layout: &'a ArtifactLayout,
     pub exe_path: &'a Path,
+    pub common_artifacts: &'a [String],
 }
 
 pub fn execute_suite(suite_id: &str, context: &SuiteContext<'_>) -> SuiteExecutionRecord {

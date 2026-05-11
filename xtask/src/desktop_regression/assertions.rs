@@ -1,4 +1,5 @@
 use terminal_manager_diagnostics::FailureClassification;
+use terminal_manager_diagnostics::SuiteFailure;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuiteError {
@@ -21,6 +22,14 @@ impl SuiteError {
             kind: FailureClassification::Assertion,
             message: message.into(),
             first_bad_signal: Some(first_bad_signal.into()),
+        }
+    }
+
+    pub fn to_suite_failure(&self) -> SuiteFailure {
+        SuiteFailure {
+            kind: self.kind,
+            message: self.message.clone(),
+            first_bad_signal: self.first_bad_signal.clone(),
         }
     }
 }
