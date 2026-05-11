@@ -5,7 +5,8 @@ use unshit::core::style::types::TransformX;
 
 use crate::state::{
     apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with,
-    MutexExt, Pane, PaneId, ResizeDragSnapshot, SharedState, UiSnapshot, CSS_LINE_HEIGHT,
+    record_diagnostic_pty_event, MutexExt, Pane, PaneId, ResizeDragSnapshot, SharedState,
+    UiSnapshot, CSS_LINE_HEIGHT,
 };
 use crate::ui::icons::*;
 
@@ -479,8 +480,24 @@ fn build_pane_body(
                         });
 
                         if let Some(bytes) = crate::terminal::keys::encode_key(kb) {
+                            let byte_count = bytes.len();
                             mutate_with(&kbd_shared, |st| {
-                                let _ = st.pty_manager.write(kbd_pane_id.0, &bytes);
+                                match st.pty_manager.write(kbd_pane_id.0, &bytes) {
+                                    Ok(()) => record_diagnostic_pty_event(
+                                        st,
+                                        format!(
+                                            "write pane={} bytes={} source=keyboard",
+                                            kbd_pane_id.0, byte_count
+                                        ),
+                                    ),
+                                    Err(e) => record_diagnostic_pty_event(
+                                        st,
+                                        format!(
+                                            "write_failed pane={} source=keyboard error={}",
+                                            kbd_pane_id.0, e
+                                        ),
+                                    ),
+                                }
                             });
                         }
                     }

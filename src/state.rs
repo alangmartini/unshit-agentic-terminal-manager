@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +12,7 @@ pub const MAX_FONT_SIZE: u32 = 32;
 pub const MIN_PANE_RATIO: f32 = 0.1;
 pub const MIN_SIDEBAR_WIDTH: f32 = 150.0;
 pub const MAX_SIDEBAR_WIDTH: f32 = 500.0;
+const DIAGNOSTIC_PTY_EVENT_LIMIT: usize = 32;
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
@@ -499,6 +500,15 @@ pub struct AppState {
     /// the user sees that the cached rows may not match the daemon.
     /// Cleared on the next successful refresh.
     pub sessions_stale: bool,
+    /// Monotonic count of frames presented while app diagnostics are enabled.
+    pub diagnostic_frame_counter: u64,
+    /// Wall-clock time for the last presented frame, in Unix epoch
+    /// milliseconds. Kept as an integer so snapshot formatting owns the
+    /// string representation.
+    pub diagnostic_last_present_unix_ms: Option<u64>,
+    /// Recent PTY liveness observations. These are intentionally content-free:
+    /// only event kind, pane/session identifiers, and byte counts are stored.
+    pub diagnostic_pty_recent_events: VecDeque<String>,
     /// Ephemeral notification queue. Populated by
     /// [`push_error_toast`]; ticked down by the cursor-blink
     /// subscription so dismissal stays deterministic in tests.
@@ -870,6 +880,9 @@ pub fn seed_state() -> AppState {
         confirm_dialog: None,
         sessions: Vec::new(),
         sessions_stale: false,
+        diagnostic_frame_counter: 0,
+        diagnostic_last_present_unix_ms: None,
+        diagnostic_pty_recent_events: VecDeque::new(),
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
         toast_meta: BTreeMap::new(),
         clipboard: Arc::new(unshit::app::ClipboardContext::new()),
@@ -888,6 +901,18 @@ where
 {
     let mut guard = shared.lock_recover();
     f(&mut guard)
+}
+
+pub fn record_diagnostic_renderer_frame(state: &mut AppState, unix_epoch_ms: u64) {
+    state.diagnostic_frame_counter = state.diagnostic_frame_counter.saturating_add(1);
+    state.diagnostic_last_present_unix_ms = Some(unix_epoch_ms);
+}
+
+pub fn record_diagnostic_pty_event(state: &mut AppState, event: impl Into<String>) {
+    if state.diagnostic_pty_recent_events.len() == DIAGNOSTIC_PTY_EVENT_LIMIT {
+        state.diagnostic_pty_recent_events.pop_front();
+    }
+    state.diagnostic_pty_recent_events.push_back(event.into());
 }
 
 fn save_tab_state(state: &mut AppState) {
@@ -2960,6 +2985,7 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
         push_error_toast(state, "paste failed: no terminal in focus");
         return true;
     }
+    let byte_count = payload.len();
     if let Err(e) = state.pty_manager.write(pane_id, payload.as_bytes()) {
         // Synchronous lookup error from the fire-and-forget queue
         // (e.g. worker channel closed). Async failures land on the
@@ -2967,7 +2993,16 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
         // subscription and surface there as toasts; this branch only
         // catches the immediate rejections.
         log::warn!("terminal.paste: queue write failed for pane {pane_id}: {e}");
+        record_diagnostic_pty_event(
+            state,
+            format!("write_failed pane={pane_id} source=paste error={e}"),
+        );
         push_error_toast(state, format!("paste failed: {e}"));
+    } else {
+        record_diagnostic_pty_event(
+            state,
+            format!("write pane={pane_id} bytes={byte_count} source=paste"),
+        );
     }
     true
 }
@@ -3574,6 +3609,9 @@ mod tests {
             confirm_dialog: None,
             sessions: Vec::new(),
             sessions_stale: false,
+            diagnostic_frame_counter: 0,
+            diagnostic_last_present_unix_ms: None,
+            diagnostic_pty_recent_events: VecDeque::new(),
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
             toast_meta: BTreeMap::new(),
             clipboard: Arc::new(unshit::app::ClipboardContext::new()),

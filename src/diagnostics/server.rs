@@ -127,16 +127,13 @@ fn handle_snapshot(
     reason: String,
     options: SnapshotOptions,
 ) -> DiagnosticResponse {
-    if options.include_terminal_buffer {
-        return protocol_error(
-            "unsupported_snapshot_option",
-            "terminal buffer contents are excluded from diagnostic snapshots",
-            false,
-        );
-    }
-
     let context = app_context();
-    match snapshot::collect_snapshot(&context.shared, reason, context.diagnostic_endpoint) {
+    match snapshot::collect_snapshot(
+        &context.shared,
+        reason,
+        context.diagnostic_endpoint,
+        &options,
+    ) {
         Ok(snapshot) => DiagnosticResponse::Snapshot { snapshot },
         Err(message) => protocol_error("snapshot_collection_failed", &message, false),
     }
@@ -389,7 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_buffer_request_returns_protocol_error() {
+    fn snapshot_buffer_request_is_opt_in_and_authorized() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(crate::state::seed_state()));
         let response = handle_request(
             DiagnosticRequest {
                 token: "secret".to_owned(),
@@ -403,13 +401,16 @@ mod tests {
             },
             "secret",
             &event_store(),
-            || unreachable!("buffer rejection must not touch app state"),
+            || DiagnosticAppContext {
+                shared,
+                diagnostic_endpoint: None,
+            },
         );
 
-        let DiagnosticResponse::Error { error } = response else {
-            panic!("expected protocol error");
+        let DiagnosticResponse::Snapshot { snapshot } = response else {
+            panic!("expected snapshot response");
         };
-        assert_eq!(error.code, "unsupported_snapshot_option");
+        assert_eq!(snapshot.config["terminal_buffer_contents_included"], true);
     }
 
     #[test]

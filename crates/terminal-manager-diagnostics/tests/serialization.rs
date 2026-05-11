@@ -4,9 +4,9 @@ use terminal_manager_diagnostics::{
     FailureBundleArtifact, FailureClassification, FailureManifest, InvariantEvaluation,
     InvariantOutcome, ObserveMode, ProtocolCompatibilityError, Rect, ResultStatus, RunInfo,
     RunnerAction, RunnerActionKind, RunnerActionTarget, SnapshotOptions, SuiteFailure, SuiteResult,
-    TerminalGridSnapshot, TerminalManagerSnapshot, TestRunResult, DIAGNOSTIC_PROTOCOL_VERSION,
-    EVENT_SCHEMA_VERSION, FAILURE_MANIFEST_SCHEMA_VERSION, RESULTS_SCHEMA_VERSION,
-    SNAPSHOT_SCHEMA_VERSION,
+    TerminalBufferWindowSnapshot, TerminalGridSnapshot, TerminalManagerSnapshot, TerminalSnapshot,
+    TestRunResult, DIAGNOSTIC_PROTOCOL_VERSION, EVENT_SCHEMA_VERSION,
+    FAILURE_MANIFEST_SCHEMA_VERSION, RESULTS_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION,
 };
 
 #[test]
@@ -165,6 +165,33 @@ fn snapshot_round_trip_uses_defaults_for_additive_fields() {
 
     let encoded = serde_json::to_string(&snapshot).unwrap();
     let decoded: TerminalManagerSnapshot = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, snapshot);
+}
+
+#[test]
+fn snapshot_round_trip_preserves_opt_in_terminal_buffer_window() {
+    let snapshot = TerminalManagerSnapshot {
+        terminal: TerminalSnapshot {
+            buffer_window: Some(TerminalBufferWindowSnapshot {
+                start_row: 10,
+                start_col: 0,
+                row_count: 2,
+                col_count: 20,
+                rows: vec!["prompt> cargo test".to_owned(), "ok".to_owned()],
+                truncated: false,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(
+        json["terminal"]["buffer_window"]["rows"][0],
+        "prompt> cargo test"
+    );
+
+    let decoded: TerminalManagerSnapshot = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, snapshot);
 }
 

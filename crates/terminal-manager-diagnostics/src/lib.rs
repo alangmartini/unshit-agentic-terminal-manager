@@ -479,6 +479,8 @@ pub struct TerminalSnapshot {
     pub cursor: Option<TerminalCursorSnapshot>,
     pub selection_active: bool,
     pub active_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_window: Option<TerminalBufferWindowSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +495,17 @@ pub struct TerminalCursorSnapshot {
     pub col: u32,
     #[serde(default)]
     pub visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TerminalBufferWindowSnapshot {
+    pub start_row: u32,
+    pub start_col: u32,
+    pub row_count: u32,
+    pub col_count: u32,
+    pub rows: Vec<String>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

@@ -55,6 +55,11 @@ any extra full-only checks.
 The current app diagnostic stream advertises the event families it actually
 emits: `test_step`, `invariant`, and `log`. Window, layout, render, terminal,
 PTY, and input events should be wired before those families are advertised.
+Diagnostic snapshots do wire the active terminal cursor, scrollback length,
+active session id, PTY session mappings/recent liveness events, renderer frame
+counter, and renderer last-present time when diagnostics are enabled. Terminal
+buffer contents are excluded by default and are only present when a snapshot
+request explicitly sets `include_terminal_buffer`.
 
 Artifacts are written under `artifacts/windows/desktop-regression/<run_id>/`
 by default. Use `--artifact-root <dir>` or `--artifacts-root <dir>` to choose a

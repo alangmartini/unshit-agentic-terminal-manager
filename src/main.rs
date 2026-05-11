@@ -26,7 +26,8 @@ use unshit::core::trace::{
 };
 
 use crate::state::{
-    dispatch, mutate_with, new_workspace, resize_all_terminals, seed_state, MutexExt, SharedState,
+    dispatch, mutate_with, new_workspace, record_diagnostic_pty_event,
+    record_diagnostic_renderer_frame, resize_all_terminals, seed_state, MutexExt, SharedState,
     UiSnapshot, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
 };
 use crate::ui::settings::build_settings_page;
@@ -441,6 +442,14 @@ fn show_test_toast_on_startup_from_env() -> bool {
     show_test_toast_on_startup_from_value(std::env::var_os(ENV_SHOW_TEST_TOAST))
 }
 
+fn unix_epoch_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 fn apply_parity_shell_override(state: &mut crate::state::AppState, spec: crate::shell::ShellSpec) {
     *state = seed_state();
     state.default_shell = spec;
@@ -528,6 +537,7 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(2);
     });
+    let diagnostics_enabled = diagnostics_config.is_some();
 
     if terminal_trace_enabled() {
         append_terminal_trace_line(&format!(
@@ -705,6 +715,12 @@ fn main() {
                     std::sync::Arc::new(std::sync::Mutex::new(terminal)),
                 );
                 crate::bridge::register_reader(pane_id, reader);
+                if let Some(session_id) = guard.pty_manager.session_id(pane_id) {
+                    record_diagnostic_pty_event(
+                        &mut guard,
+                        format!("attach pane={pane_id} session={session_id} source=initial"),
+                    );
+                }
                 log::info!(
                     "reattached pane {} to surviving daemon session ({}x{})",
                     pane_id,
@@ -720,6 +736,12 @@ fn main() {
                     std::sync::Arc::new(std::sync::Mutex::new(terminal)),
                 );
                 crate::bridge::register_reader(pane_id, reader);
+                if let Some(session_id) = guard.pty_manager.session_id(pane_id) {
+                    record_diagnostic_pty_event(
+                        &mut guard,
+                        format!("spawn pane={pane_id} session={session_id} source=initial"),
+                    );
+                }
             }
             Err(e) => {
                 log::error!("failed to spawn initial PTY: {}", e);
@@ -745,6 +767,7 @@ fn main() {
     let close_shared = shared.clone();
     let sub_shared = shared.clone();
     let raw_key_shared = shared.clone();
+    let frame_metrics_shared = shared.clone();
 
     let mut app = App::new(
         AppConfig {
@@ -848,9 +871,13 @@ fn main() {
                 );
                 resize_all_terminals(&mut guard, cols, rows);
             })),
-            on_frame_metrics: Some(Box::new(|m| {
+            on_frame_metrics: Some(Box::new(move |m| {
                 crate::bench::record_frame(m);
                 crate::ui::fps_overlay::record_frame(m);
+                if diagnostics_enabled {
+                    let mut guard = frame_metrics_shared.lock_recover();
+                    record_diagnostic_renderer_frame(&mut guard, unix_epoch_millis_now());
+                }
             })),
             #[cfg(feature = "input-latency-histogram")]
             on_input_latency: Some(Box::new(|snap| crate::bench::record_input_latency(snap))),

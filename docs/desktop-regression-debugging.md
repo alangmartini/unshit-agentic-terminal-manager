@@ -212,10 +212,14 @@ Important snapshot areas:
 - `$snapshot.window`: reported window bounds, focus, scale factor, resize
   generation when available.
 - `$snapshot.layout`: layout nodes, bounds, visibility, z-order, dirty state.
-- `$snapshot.terminal`: grid rows/cols, visible rows, active session id.
-- `$snapshot.renderer`: surface size, dirty regions, cached layers, render
-  error fields.
-- `$snapshot.pty`: pty sessions, pending writes, recent pty events.
+- `$snapshot.terminal`: grid rows/cols, visible rows, cursor, scrollback
+  length, active session id, and the optional `buffer_window` only when a
+  snapshot request explicitly opts in to terminal contents.
+- `$snapshot.renderer`: surface size, frame counter, last-present time, dirty
+  cell regions, cached layers, and render error fields. Glyph atlas page counts
+  are not wired yet because the current app state does not expose them.
+- `$snapshot.pty`: pty sessions, pending writes, and content-free recent pty
+  liveness events.
 - `$snapshot.input`: focused element, pointer/drag state, modifiers.
 - `$snapshot.config`: config values that affect rendering and layout.
 - `$snapshot.recent_errors`: app-side errors captured in diagnostic state.
@@ -375,9 +379,10 @@ Compatibility entry points:
 ## Known Limits
 
 - The desktop suites are Windows-only and headed.
-- Full event instrumentation is not complete. Snapshot state exists for many
-  subsystems, but only `test_step`, `invariant`, and `log` diagnostic events are
-  currently emitted.
+- Full event instrumentation is not complete. Snapshot producer fields are wired
+  for active terminal cursor/scrollback/session, PTY mappings/recent liveness,
+  and renderer frame presence, but only `test_step`, `invariant`, and `log`
+  diagnostic events are currently emitted.
 - Replay is logical and currently implemented for `edge-resize-stability`.
 - Interactive `rerun` is a placeholder in v1.
 - The diagnostic endpoint is intentionally unavailable unless the runner sets

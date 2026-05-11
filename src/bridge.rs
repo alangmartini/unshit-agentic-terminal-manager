@@ -7,7 +7,7 @@ use futures_core::Stream;
 use unshit::app::{EventSink, ExternalEvent, Subscription};
 use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 
-use crate::state::{MutexExt, SharedState};
+use crate::state::{record_diagnostic_pty_event, MutexExt, SharedState};
 
 static PENDING_READERS: Mutex<Option<HashMap<u32, Box<dyn Read + Send>>>> = Mutex::new(None);
 
@@ -111,10 +111,12 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                     };
 
                     let mut batched = 1u32;
+                    let mut total_bytes = data.len();
                     let pending_response = {
                         let mut terminal = terminal_handle.lock_recover();
                         terminal.process_bytes(&data);
                         while let Ok(more) = rx.try_recv() {
+                            total_bytes += more.len();
                             terminal.process_bytes(&more);
                             batched += 1;
                         }
@@ -135,19 +137,37 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                         }
                         terminal.take_pending_response()
                     };
-                    if !pending_response.is_empty() {
-                        // Reply to host queries (DA1, DA2, DSR, CPR,
-                        // XTVERSION) the parser collected. Done outside
-                        // the per-terminal mutex; the write is fire and
-                        // forget through the daemon shim.
+                    {
                         let mut guard = shared.lock_recover();
-                        if let Err(e) = guard.pty_manager.write(pane_id, &pending_response) {
-                            log::warn!(
-                                "pty-{}: failed to write {} bytes of query reply: {}",
-                                pane_id,
-                                pending_response.len(),
-                                e
-                            );
+                        record_diagnostic_pty_event(
+                            &mut guard,
+                            format!(
+                                "read pane={} bytes={} batched={}",
+                                pane_id, total_bytes, batched
+                            ),
+                        );
+                        if !pending_response.is_empty() {
+                            // Reply to host queries (DA1, DA2, DSR, CPR,
+                            // XTVERSION) the parser collected. Done outside
+                            // the per-terminal mutex; the write is fire and
+                            // forget through the daemon shim.
+                            if let Err(e) = guard.pty_manager.write(pane_id, &pending_response) {
+                                log::warn!(
+                                    "pty-{}: failed to write {} bytes of query reply: {}",
+                                    pane_id,
+                                    pending_response.len(),
+                                    e
+                                );
+                            } else {
+                                record_diagnostic_pty_event(
+                                    &mut guard,
+                                    format!(
+                                        "write pane={} bytes={} source=query_reply",
+                                        pane_id,
+                                        pending_response.len()
+                                    ),
+                                );
+                            }
                         }
                     }
                     if batched > 1 {
@@ -243,6 +263,10 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                 err.pane_id,
                                 err.error
                             );
+                            record_diagnostic_pty_event(
+                                &mut guard,
+                                format!("write_failed pane={} error={}", err.pane_id, err.error),
+                            );
                             crate::state::push_error_toast(
                                 &mut guard,
                                 format!("write failed (pane {}): {}", err.pane_id, err.error),
@@ -317,6 +341,17 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                     )),
                                                 );
                                                 crate::bridge::register_reader(*id, reader);
+                                                if let Some(session_id) =
+                                                    guard.pty_manager.session_id(*id)
+                                                {
+                                                    record_diagnostic_pty_event(
+                                                        &mut guard,
+                                                        format!(
+                                                            "attach pane={} session={} source=deferred",
+                                                            id, session_id
+                                                        ),
+                                                    );
+                                                }
                                                 log::info!(
                                                     "deferred reattach for pane {}: {}x{}",
                                                     id, snap_cols, snap_rows
@@ -334,6 +369,17 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                     )),
                                                 );
                                                 crate::bridge::register_reader(*id, reader);
+                                                if let Some(session_id) =
+                                                    guard.pty_manager.session_id(*id)
+                                                {
+                                                    record_diagnostic_pty_event(
+                                                        &mut guard,
+                                                        format!(
+                                                            "spawn pane={} session={} source=deferred",
+                                                            id, session_id
+                                                        ),
+                                                    );
+                                                }
                                                 log::info!(
                                                     "deferred PTY spawn for pane {}: {}x{}",
                                                     id, cols, rows
