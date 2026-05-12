@@ -13,14 +13,15 @@ use crate::desktop_regression::screenshots::{
 };
 use crate::desktop_regression::suites::observability::{
     artifacts_with_common, assert_launched_process_snapshot, assert_renderer_surface_sane,
-    assert_terminal_snapshot_sane, capture_step_snapshot, finalize_diagnostics, format_rect,
-    mark_full_step, maybe_prompt_on_failure, record_diagnostic_error, start_diagnostics,
-    ObservedDiagnostics,
+    assert_terminal_snapshot_sane, capture_step_snapshot, capture_step_snapshot_with_options,
+    finalize_diagnostics, format_rect, mark_full_step, maybe_prompt_on_failure,
+    record_diagnostic_error, start_diagnostics, ObservedDiagnostics,
 };
 use crate::desktop_regression::suites::{forced_failure_for_suite, SuiteContext};
 use crate::desktop_regression::win32::{self, DesktopRect};
 use terminal_manager_diagnostics::{
-    Rect, RunnerActionKind, RunnerActionTarget, TerminalManagerSnapshot,
+    Rect, RunnerActionKind, RunnerActionTarget, SnapshotOptions, TerminalBufferWindowSnapshot,
+    TerminalManagerSnapshot,
 };
 
 const SUITE_ID: &str = "post-resize-glitches";
@@ -34,6 +35,10 @@ const SNAP_TABBAR_PX: i32 = 88;
 const SNAP_STATUSBAR_PX: i32 = 32;
 const SNAP_SIDEBAR_PX: i32 = 252;
 const SNAP_STRIPE_HEIGHT_PX: i32 = 12;
+const SNAP_REFOCUS_TITLEBAR_Y_OFFSET_PX: i32 = 8;
+const SNAP_REFOCUS_DELAY_MS: u64 = 250;
+const SNAP_SETTLE_MS: u64 = 1500;
+const SNAP_BUFFER_EXCERPT_CHARS: usize = 96;
 
 pub fn run(context: &SuiteContext<'_>) -> SuiteExecutionRecord {
     let mut artifacts = Vec::new();
@@ -258,13 +263,16 @@ fn run_snap_scenario(
             },
         )
         .map_err(SuiteError::setup)?;
-    let pre_snapshot = capture_step_snapshot(
+    let pre_snapshot = capture_step_snapshot_with_options(
         context,
         artifacts,
         SUITE_ID,
         diagnostics,
         "pre-snap-snapshot",
         "before snap",
+        SnapshotOptions {
+            include_terminal_buffer: true,
+        },
     )?;
     capture_screen(&pre_path).map_err(SuiteError::setup)?;
     artifacts.push(suite_artifact_name(SUITE_ID, "pre", "png"));
@@ -280,33 +288,20 @@ fn run_snap_scenario(
         .map_err(SuiteError::setup)?;
 
     win32::focus_window(hwnd).map_err(SuiteError::setup)?;
-    win32::send_win_left().map_err(SuiteError::setup)?;
-    context
-        .record_action(
-            SUITE_ID,
-            Some("pre-snap"),
-            window_target(session),
-            RunnerActionKind::SendKeys {
-                keys: vec!["win".to_owned(), "left".to_owned()],
-            },
-        )
-        .map_err(SuiteError::setup)?;
-    thread::sleep(Duration::from_millis(1500));
-    context
-        .record_action(
-            SUITE_ID,
-            Some("pre-snap"),
-            RunnerActionTarget::None,
-            RunnerActionKind::Wait {
-                mode: "fixed_sleep".to_owned(),
-                reason: "after Win+Left snap".to_owned(),
-                timeout_ms: 1500,
-            },
-        )
-        .map_err(SuiteError::setup)?;
+    let mut post_rect =
+        send_win_left_click_and_wait(context, session, hwnd, "after Win+Left snap", false)?;
+    if !snap_height_grew(pre_rect, post_rect) {
+        win32::focus_window(hwnd).map_err(SuiteError::setup)?;
+        post_rect = send_win_left_click_and_wait(
+            context,
+            session,
+            hwnd,
+            "after retry Win+Left snap",
+            true,
+        )?;
+    }
 
-    let post_rect = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
-    let grew = post_rect.height() > pre_rect.height();
+    let grew = snap_height_grew(pre_rect, post_rect);
     let resize_signal = classify_snap_failure(grew, 1.0, 0.0, None);
     assert_true(
         grew,
@@ -331,13 +326,16 @@ fn run_snap_scenario(
             },
         )
         .map_err(SuiteError::setup)?;
-    let post_snapshot = capture_step_snapshot(
+    let post_snapshot = capture_step_snapshot_with_options(
         context,
         artifacts,
         SUITE_ID,
         diagnostics,
         "post-snap-snapshot",
         "after snap",
+        SnapshotOptions {
+            include_terminal_buffer: true,
+        },
     )?;
     capture_screen(&post_path).map_err(SuiteError::setup)?;
     artifacts.push(suite_artifact_name(SUITE_ID, "post", "png"));
@@ -385,7 +383,9 @@ fn run_snap_scenario(
     );
     println!("screenshots:{};{}", pre_path.display(), post_path.display());
 
-    assert_visual_ratios(grew, ratios)?;
+    let blank_mid_pane_diagnosis =
+        diagnose_blank_mid_pane(pre_snapshot.as_ref(), post_snapshot.as_ref(), ratios);
+    assert_visual_ratios(grew, ratios, blank_mid_pane_diagnosis.as_ref())?;
     if let (Some(diagnostics), Some(pre_snapshot), Some(post_snapshot)) =
         (diagnostics, pre_snapshot.as_ref(), post_snapshot.as_ref())
     {
@@ -406,6 +406,20 @@ fn run_snap_scenario(
 struct SnapSamples {
     bottom: SampleRect,
     mid: SampleRect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlankMidPaneDiagnosis {
+    first_bad_signal: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalBufferEvidence {
+    visible_rows: usize,
+    visible_chars: usize,
+    first_visible_row: Option<u32>,
+    first_visible_excerpt: Option<String>,
 }
 
 fn snap_samples(post_rect: DesktopRect) -> SnapSamples {
@@ -435,7 +449,11 @@ fn snap_samples(post_rect: DesktopRect) -> SnapSamples {
     }
 }
 
-fn assert_visual_ratios(grew: bool, ratios: PixelSampleRatios) -> SuiteResult<()> {
+fn assert_visual_ratios(
+    grew: bool,
+    ratios: PixelSampleRatios,
+    blank_mid_pane_diagnosis: Option<&BlankMidPaneDiagnosis>,
+) -> SuiteResult<()> {
     let bottom_ok = ratios.bottom_lit_ratio >= SNAP_LIT_RATIO_THRESHOLD;
     let bottom_signal = classify_snap_failure(
         grew,
@@ -457,16 +475,20 @@ fn assert_visual_ratios(grew: bool, ratios: PixelSampleRatios) -> SuiteResult<()
         grew,
         ratios.bottom_lit_ratio,
         ratios.mid_max_lit_ratio,
-        None,
+        blank_mid_pane_diagnosis.map(|diagnosis| diagnosis.first_bad_signal.as_str()),
     );
-    assert_true(
-        mid_present,
-        &format!(
+    let mid_present_message = if let Some(diagnosis) = blank_mid_pane_diagnosis {
+        format!(
+            "snap-resize regression: mid-pane lit ratio {:.4} < {:.4}; terminal pane appears blank after snap; {}",
+            ratios.mid_max_lit_ratio, SNAP_MID_LIT_PRESENCE_THRESHOLD, diagnosis.message
+        )
+    } else {
+        format!(
             "snap-resize regression: mid-pane lit ratio {:.4} < {:.4}; terminal pane appears blank after snap",
             ratios.mid_max_lit_ratio, SNAP_MID_LIT_PRESENCE_THRESHOLD
-        ),
-        &mid_present_signal,
-    )?;
+        )
+    };
+    assert_true(mid_present, &mid_present_message, &mid_present_signal)?;
 
     let mid_ok = ratios.mid_max_lit_ratio <= SNAP_MID_LIT_RATIO_THRESHOLD;
     let mid_signal = classify_snap_failure(
@@ -485,9 +507,190 @@ fn assert_visual_ratios(grew: bool, ratios: PixelSampleRatios) -> SuiteResult<()
     )
 }
 
+fn diagnose_blank_mid_pane(
+    pre_snapshot: Option<&TerminalManagerSnapshot>,
+    post_snapshot: Option<&TerminalManagerSnapshot>,
+    ratios: PixelSampleRatios,
+) -> Option<BlankMidPaneDiagnosis> {
+    if ratios.mid_max_lit_ratio >= SNAP_MID_LIT_PRESENCE_THRESHOLD {
+        return None;
+    }
+
+    let pre_evidence = pre_snapshot.and_then(snapshot_buffer_evidence);
+    let post_evidence = post_snapshot.and_then(snapshot_buffer_evidence);
+    match (pre_evidence, post_evidence) {
+        (_, Some(post)) if post.visible_chars > 0 => Some(BlankMidPaneDiagnosis {
+            first_bad_signal: "snap-renderer-blank-with-buffer-content".to_owned(),
+            message: format!(
+                "terminal buffer still has visible content after snap ({}) so the buffer was not erased; renderer/layout did not paint it",
+                format_post_buffer_evidence(&post)
+            ),
+        }),
+        (Some(pre), Some(post)) if pre.visible_chars > 0 && post.visible_chars == 0 => {
+            Some(BlankMidPaneDiagnosis {
+                first_bad_signal: "snap-terminal-buffer-erased".to_owned(),
+                message: format!(
+                    "terminal buffer had visible content before snap ({}) but none after snap ({})",
+                    format_pre_buffer_evidence(&pre),
+                    format_post_buffer_evidence(&post)
+                ),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn snapshot_buffer_evidence(snapshot: &TerminalManagerSnapshot) -> Option<TerminalBufferEvidence> {
+    snapshot
+        .terminal
+        .buffer_window
+        .as_ref()
+        .map(terminal_buffer_evidence)
+}
+
+fn terminal_buffer_evidence(buffer: &TerminalBufferWindowSnapshot) -> TerminalBufferEvidence {
+    let mut visible_rows = 0;
+    let mut visible_chars = 0;
+    let mut first_visible_row = None;
+    let mut first_visible_excerpt = None;
+
+    for (row_offset, row) in buffer.rows.iter().enumerate() {
+        let trimmed = row.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        visible_rows += 1;
+        visible_chars += trimmed.chars().count();
+        if first_visible_row.is_none() {
+            first_visible_row = Some(buffer.start_row.saturating_add(row_offset as u32));
+            first_visible_excerpt = Some(truncated_excerpt(trimmed, SNAP_BUFFER_EXCERPT_CHARS));
+        }
+    }
+
+    TerminalBufferEvidence {
+        visible_rows,
+        visible_chars,
+        first_visible_row,
+        first_visible_excerpt,
+    }
+}
+
+fn format_pre_buffer_evidence(evidence: &TerminalBufferEvidence) -> String {
+    format_buffer_evidence("pre", evidence)
+}
+
+fn format_post_buffer_evidence(evidence: &TerminalBufferEvidence) -> String {
+    format_buffer_evidence("post", evidence)
+}
+
+fn format_buffer_evidence(label: &str, evidence: &TerminalBufferEvidence) -> String {
+    let mut parts = vec![
+        format!("{label}_buffer_visible_rows={}", evidence.visible_rows),
+        format!("{label}_buffer_visible_chars={}", evidence.visible_chars),
+    ];
+    if let Some(row) = evidence.first_visible_row {
+        parts.push(format!("{label}_first_visible_row={row}"));
+    }
+    if let Some(excerpt) = &evidence.first_visible_excerpt {
+        parts.push(format!("{label}_first_visible_excerpt={excerpt:?}"));
+    }
+    parts.join(" ")
+}
+
+fn truncated_excerpt(value: &str, max_chars: usize) -> String {
+    let mut excerpt = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        excerpt.push_str("...");
+    }
+    excerpt
+}
+
 fn assert_snap_capture_ready(hwnd: win32::WindowHandle, post_rect: DesktopRect) -> SuiteResult<()> {
     win32::verify_snap_capture_ready(hwnd, post_rect)
         .map_err(suite_error_for_snap_capture_readiness)
+}
+
+fn wait_after_snap(context: &SuiteContext<'_>, reason: &str) -> SuiteResult<()> {
+    thread::sleep(Duration::from_millis(SNAP_SETTLE_MS));
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-snap"),
+            RunnerActionTarget::None,
+            RunnerActionKind::Wait {
+                mode: "fixed_sleep".to_owned(),
+                reason: reason.to_owned(),
+                timeout_ms: SNAP_SETTLE_MS,
+            },
+        )
+        .map_err(SuiteError::setup)
+}
+
+fn send_win_left_click_and_wait(
+    context: &SuiteContext<'_>,
+    session: &AppSession,
+    hwnd: win32::WindowHandle,
+    settle_reason: &str,
+    retry: bool,
+) -> SuiteResult<DesktopRect> {
+    win32::send_win_left().map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-snap"),
+            window_target(session),
+            RunnerActionKind::SendKeys {
+                keys: snap_keys_for_action_trace(retry),
+            },
+        )
+        .map_err(SuiteError::setup)?;
+
+    thread::sleep(Duration::from_millis(SNAP_REFOCUS_DELAY_MS));
+    let refocus_rect = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
+    click_snapped_window_after_snap(context, session, refocus_rect)?;
+    wait_after_snap(context, settle_reason)?;
+    win32::get_window_rect(hwnd).map_err(SuiteError::setup)
+}
+
+fn snap_keys_for_action_trace(retry: bool) -> Vec<String> {
+    let mut keys = vec!["win".to_owned(), "left".to_owned()];
+    if retry {
+        keys.push("retry-after-refocus".to_owned());
+    }
+    keys
+}
+
+fn snap_height_grew(pre_rect: DesktopRect, post_rect: DesktopRect) -> bool {
+    post_rect.height() > pre_rect.height()
+}
+
+fn click_snapped_window_after_snap(
+    context: &SuiteContext<'_>,
+    session: &AppSession,
+    post_rect: DesktopRect,
+) -> SuiteResult<()> {
+    let (x, y) = post_snap_refocus_click_point(post_rect);
+    win32::mouse_click(x, y, Some("left")).map_err(SuiteError::setup)?;
+    context
+        .record_action(
+            SUITE_ID,
+            Some("pre-snap"),
+            window_target(session),
+            RunnerActionKind::Mouse {
+                x,
+                y,
+                button: Some("left".to_owned()),
+            },
+        )
+        .map_err(SuiteError::setup)
+}
+
+fn post_snap_refocus_click_point(post_rect: DesktopRect) -> (i32, i32) {
+    (
+        (post_rect.left + post_rect.right) / 2,
+        post_rect.top + SNAP_REFOCUS_TITLEBAR_Y_OFFSET_PX,
+    )
 }
 
 fn suite_error_for_snap_capture_readiness(err: win32::SnapCaptureReadinessError) -> SuiteError {
@@ -653,6 +856,7 @@ mod tests {
                 bottom_lit_ratio: 0.02,
                 mid_max_lit_ratio: 0.0,
             },
+            None,
         )
         .unwrap_err();
 
@@ -667,6 +871,7 @@ mod tests {
                 bottom_lit_ratio: 0.02,
                 mid_max_lit_ratio: SNAP_MID_LIT_RATIO_THRESHOLD + 0.001,
             },
+            None,
         )
         .unwrap_err();
 
@@ -684,6 +889,7 @@ mod tests {
                 bottom_lit_ratio: 0.0,
                 mid_max_lit_ratio: 0.0,
             },
+            None,
         )
         .unwrap_err();
 
@@ -701,8 +907,65 @@ mod tests {
                 bottom_lit_ratio: 0.02,
                 mid_max_lit_ratio: 0.001,
             },
+            None,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn blank_mid_pane_diagnosis_reports_renderer_blank_when_buffer_still_has_text() {
+        let pre = snapshot_with_buffer_rows(&["prompt> before"]);
+        let post = snapshot_with_buffer_rows(&["prompt> after"]);
+
+        let diagnosis = diagnose_blank_mid_pane(
+            Some(&pre),
+            Some(&post),
+            PixelSampleRatios {
+                bottom_lit_ratio: 0.02,
+                mid_max_lit_ratio: 0.0,
+            },
+        )
+        .expect("diagnosis");
+
+        assert_eq!(
+            diagnosis.first_bad_signal,
+            "snap-renderer-blank-with-buffer-content"
+        );
+        assert!(diagnosis.message.contains("post_buffer_visible_chars=13"));
+    }
+
+    #[test]
+    fn blank_mid_pane_diagnosis_reports_terminal_buffer_erased() {
+        let pre = snapshot_with_buffer_rows(&["prompt> before"]);
+        let post = snapshot_with_buffer_rows(&["   "]);
+
+        let diagnosis = diagnose_blank_mid_pane(
+            Some(&pre),
+            Some(&post),
+            PixelSampleRatios {
+                bottom_lit_ratio: 0.02,
+                mid_max_lit_ratio: 0.0,
+            },
+        )
+        .expect("diagnosis");
+
+        assert_eq!(diagnosis.first_bad_signal, "snap-terminal-buffer-erased");
+    }
+
+    #[test]
+    fn blank_mid_pane_diagnosis_skips_when_pixels_show_terminal_content() {
+        let pre = snapshot_with_buffer_rows(&["prompt> before"]);
+        let post = snapshot_with_buffer_rows(&["prompt> after"]);
+
+        assert!(diagnose_blank_mid_pane(
+            Some(&pre),
+            Some(&post),
+            PixelSampleRatios {
+                bottom_lit_ratio: 0.02,
+                mid_max_lit_ratio: SNAP_MID_LIT_PRESENCE_THRESHOLD,
+            },
+        )
+        .is_none());
     }
 
     #[test]
@@ -727,6 +990,59 @@ mod tests {
         );
         assert_eq!(samples.mid.x, 492);
         assert_eq!(samples.mid.width, 408);
+    }
+
+    #[test]
+    fn post_snap_refocus_click_targets_window_titlebar() {
+        let rect = DesktopRect {
+            left: 100,
+            top: 50,
+            right: 900,
+            bottom: 650,
+        };
+
+        assert_eq!(post_snap_refocus_click_point(rect), (500, 58));
+    }
+
+    #[test]
+    fn snap_height_grew_requires_post_snap_height_increase() {
+        let pre_rect = DesktopRect {
+            left: 200,
+            top: 200,
+            right: 1000,
+            bottom: 920,
+        };
+        let unchanged_rect = DesktopRect {
+            left: 0,
+            top: 0,
+            right: 1280,
+            bottom: 720,
+        };
+        let grown_rect = DesktopRect {
+            left: 0,
+            top: 0,
+            right: 1280,
+            bottom: 1040,
+        };
+
+        assert!(!snap_height_grew(pre_rect, unchanged_rect));
+        assert!(snap_height_grew(pre_rect, grown_rect));
+    }
+
+    #[test]
+    fn retry_snap_action_trace_marks_retry_after_refocus() {
+        assert_eq!(
+            snap_keys_for_action_trace(false),
+            vec!["win".to_owned(), "left".to_owned()]
+        );
+        assert_eq!(
+            snap_keys_for_action_trace(true),
+            vec![
+                "win".to_owned(),
+                "left".to_owned(),
+                "retry-after-refocus".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -767,5 +1083,22 @@ mod tests {
             occlusion.first_bad_signal.as_deref(),
             Some("snap-window-occluded")
         );
+    }
+
+    fn snapshot_with_buffer_rows(rows: &[&str]) -> TerminalManagerSnapshot {
+        TerminalManagerSnapshot {
+            terminal: terminal_manager_diagnostics::TerminalSnapshot {
+                buffer_window: Some(TerminalBufferWindowSnapshot {
+                    start_row: 0,
+                    start_col: 0,
+                    row_count: rows.len() as u32,
+                    col_count: 80,
+                    rows: rows.iter().map(|row| (*row).to_owned()).collect(),
+                    truncated: false,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 }

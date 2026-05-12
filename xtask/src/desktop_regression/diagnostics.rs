@@ -193,9 +193,17 @@ impl DiagnosticClient {
     }
 
     pub fn snapshot(&self, reason: &str) -> Result<TerminalManagerSnapshot, String> {
+        self.snapshot_with_options(reason, SnapshotOptions::default())
+    }
+
+    pub fn snapshot_with_options(
+        &self,
+        reason: &str,
+        options: SnapshotOptions,
+    ) -> Result<TerminalManagerSnapshot, String> {
         match self.request(DiagnosticCommand::Snapshot {
             reason: reason.to_owned(),
-            options: SnapshotOptions::default(),
+            options,
         })? {
             DiagnosticResponse::Snapshot { snapshot } => Ok(snapshot),
             response => Err(unexpected_response("snapshot", response)),

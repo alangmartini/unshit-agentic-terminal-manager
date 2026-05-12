@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+const MIN_OCCLUDER_WIDTH_PX: i32 = 2;
+const MIN_OCCLUDER_HEIGHT_PX: i32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopRect {
     pub left: i32,
@@ -37,7 +40,11 @@ pub struct WindowOcclusionCandidate {
 
 impl WindowOcclusionCandidate {
     fn occludes(self, target_rect: DesktopRect) -> bool {
-        self.visible && !self.owned && rects_overlap(target_rect, self.rect)
+        self.visible
+            && !self.owned
+            && self.rect.width() >= MIN_OCCLUDER_WIDTH_PX
+            && self.rect.height() >= MIN_OCCLUDER_HEIGHT_PX
+            && rects_overlap(target_rect, self.rect)
     }
 }
 
@@ -733,6 +740,47 @@ mod tests {
             target,
             target_rect,
             &[hidden_overlap, owned_overlap, visible_overlap],
+        );
+
+        assert_eq!(occluder, Some(visible_overlap));
+    }
+
+    #[test]
+    fn occlusion_decision_ignores_tiny_sentinel_windows() {
+        let target = WindowHandle(7);
+        let target_rect = DesktopRect {
+            left: 0,
+            top: 0,
+            right: 300,
+            bottom: 300,
+        };
+        let sentinel_overlap = WindowOcclusionCandidate {
+            handle: WindowHandle(1),
+            rect: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            },
+            visible: true,
+            owned: false,
+        };
+        let visible_overlap = WindowOcclusionCandidate {
+            handle: WindowHandle(2),
+            rect: DesktopRect {
+                left: 120,
+                top: 120,
+                right: 180,
+                bottom: 180,
+            },
+            visible: true,
+            owned: false,
+        };
+
+        let occluder = first_occluding_window_before_target(
+            target,
+            target_rect,
+            &[sentinel_overlap, visible_overlap],
         );
 
         assert_eq!(occluder, Some(visible_overlap));

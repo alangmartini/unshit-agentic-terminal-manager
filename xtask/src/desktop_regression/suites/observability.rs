@@ -11,7 +11,7 @@ use crate::desktop_regression::launcher::AppSession;
 use crate::desktop_regression::suites::SuiteContext;
 use crate::desktop_regression::win32::DesktopRect;
 use terminal_manager_diagnostics::{
-    DiagnosticEventFamily, InvariantEvaluation, InvariantOutcome, ObserveMode,
+    DiagnosticEventFamily, InvariantEvaluation, InvariantOutcome, ObserveMode, SnapshotOptions,
     TerminalManagerSnapshot,
 };
 
@@ -83,6 +83,26 @@ pub(crate) fn capture_step_snapshot(
     artifact_stem: &str,
     reason: &str,
 ) -> SuiteResult<Option<TerminalManagerSnapshot>> {
+    capture_step_snapshot_with_options(
+        context,
+        artifacts,
+        suite_id,
+        diagnostics,
+        artifact_stem,
+        reason,
+        SnapshotOptions::default(),
+    )
+}
+
+pub(crate) fn capture_step_snapshot_with_options(
+    context: &SuiteContext<'_>,
+    artifacts: &mut Vec<String>,
+    suite_id: &str,
+    diagnostics: Option<&ObservedDiagnostics>,
+    artifact_stem: &str,
+    reason: &str,
+    options: SnapshotOptions,
+) -> SuiteResult<Option<TerminalManagerSnapshot>> {
     if !captures_step_snapshots(context.observe) {
         return Ok(None);
     }
@@ -90,12 +110,15 @@ pub(crate) fn capture_step_snapshot(
         return Ok(None);
     };
 
-    let snapshot = diagnostics.client.snapshot(reason).map_err(|e| {
-        SuiteError::protocol(
-            format!("diagnostic snapshot failed for {reason}: {e}"),
-            "diagnostic-step-snapshot",
-        )
-    })?;
+    let snapshot = diagnostics
+        .client
+        .snapshot_with_options(reason, options)
+        .map_err(|e| {
+            SuiteError::protocol(
+                format!("diagnostic snapshot failed for {reason}: {e}"),
+                "diagnostic-step-snapshot",
+            )
+        })?;
     let artifact = write_json_artifact(
         &context.artifact_layout.run_dir,
         suite_id,
