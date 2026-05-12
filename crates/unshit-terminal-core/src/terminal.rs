@@ -184,6 +184,7 @@ impl Terminal {
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let old_rows = self.rows;
         let alt_active = self.alt_grid.is_some();
+        let scroll_region_was_full_screen = self.region_is_full_screen();
 
         if alt_active {
             if let Some(main) = self.alt_grid.take() {
@@ -238,10 +239,7 @@ impl Terminal {
         self.rows = rows;
         self.cols = cols;
 
-        if self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot {
-            self.scroll_top = 0;
-            self.scroll_bot = rows;
-        }
+        self.clamp_scroll_region_after_resize(rows, scroll_region_was_full_screen);
 
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
@@ -307,6 +305,17 @@ impl Terminal {
 
     fn region_is_full_screen(&self) -> bool {
         self.scroll_top == 0 && self.scroll_bot == self.rows
+    }
+
+    fn clamp_scroll_region_after_resize(&mut self, rows: usize, was_full_screen: bool) {
+        if was_full_screen
+            || self.scroll_top >= rows
+            || self.scroll_bot > rows
+            || self.scroll_top >= self.scroll_bot
+        {
+            self.scroll_top = 0;
+            self.scroll_bot = rows;
+        }
     }
 
     fn copy_row(&mut self, dst: usize, src: usize) {
@@ -1274,6 +1283,31 @@ mod tests {
         assert_eq!(row_text(&t, 2), "BB");
         assert_eq!(row_text(&t, 3), "CC");
         assert_eq!(row_text(&t, 4), "EE");
+    }
+
+    #[test]
+    fn resize_expands_full_screen_scroll_region_for_conpty_redraw() {
+        let mut t = Terminal::new(2, 10, 100);
+
+        t.resize(4, 10);
+
+        assert_eq!((t.scroll_top, t.scroll_bot), (0, 4));
+        t.process_bytes(b"\x1b[Hone\x1b[K\r\ntwo\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[2;4H");
+
+        assert_eq!(row_text(&t, 0), "one");
+        assert_eq!(row_text(&t, 1), "two");
+        assert_eq!(row_text(&t, 2), "");
+        assert_eq!(row_text(&t, 3), "");
+    }
+
+    #[test]
+    fn resize_preserves_valid_narrow_scroll_region() {
+        let mut t = Terminal::new(5, 4, 100);
+        t.process_bytes(b"\x1b[2;4r");
+
+        t.resize(6, 4);
+
+        assert_eq!((t.scroll_top, t.scroll_bot), (1, 4));
     }
 
     // -- Resize reflow (issue #129) ----------------------------------------

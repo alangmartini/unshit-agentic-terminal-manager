@@ -3,6 +3,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PixelSampleRatios {
     pub bottom_lit_ratio: f64,
+    pub content_lit_ratio: f64,
     pub mid_max_lit_ratio: f64,
 }
 
@@ -214,6 +215,7 @@ pub fn max_stripe_lit_ratio_rgba(
 pub fn sample_png_lit_ratios(
     path: &Path,
     bottom_sample: SampleRect,
+    content_sample: SampleRect,
     mid_sample: SampleRect,
     mid_stripe_height: i32,
     mid_step_px: i32,
@@ -236,6 +238,16 @@ pub fn sample_png_lit_ratios(
             bottom_sample.height,
             240,
         ),
+        content_lit_ratio: stripe_lit_ratio_rgba(
+            rgba,
+            bitmap_width,
+            bitmap_height,
+            content_sample.x,
+            content_sample.y,
+            content_sample.width,
+            content_sample.height,
+            240,
+        ),
         mid_max_lit_ratio: max_stripe_lit_ratio_rgba(
             rgba,
             bitmap_width,
@@ -255,6 +267,7 @@ pub fn sample_png_lit_ratios(
 pub fn sample_png_lit_ratios(
     _path: &Path,
     _bottom_sample: SampleRect,
+    _content_sample: SampleRect,
     _mid_sample: SampleRect,
     _mid_stripe_height: i32,
     _mid_step_px: i32,

@@ -35,6 +35,7 @@ const SNAP_TABBAR_PX: i32 = 88;
 const SNAP_STATUSBAR_PX: i32 = 32;
 const SNAP_SIDEBAR_PX: i32 = 252;
 const SNAP_STRIPE_HEIGHT_PX: i32 = 12;
+const SNAP_CONTENT_SAMPLE_Y_OFFSET_PX: i32 = 34;
 const SNAP_REFOCUS_TITLEBAR_Y_OFFSET_PX: i32 = 8;
 const SNAP_REFOCUS_DELAY_MS: u64 = 250;
 const SNAP_SETTLE_MS: u64 = 1500;
@@ -302,7 +303,7 @@ fn run_snap_scenario(
     }
 
     let grew = snap_height_grew(pre_rect, post_rect);
-    let resize_signal = classify_snap_failure(grew, 1.0, 0.0, None);
+    let resize_signal = classify_snap_failure(grew, 1.0, 1.0, 0.0, None);
     assert_true(
         grew,
         &format!(
@@ -357,6 +358,7 @@ fn run_snap_scenario(
     let ratios = sample_png_lit_ratios(
         &post_path,
         samples.bottom,
+        samples.content,
         samples.mid,
         SNAP_STRIPE_HEIGHT_PX,
         SNAP_STRIPE_HEIGHT_PX,
@@ -370,6 +372,15 @@ fn run_snap_scenario(
         samples.bottom.y,
         samples.bottom.width,
         samples.bottom.height
+    );
+    println!(
+        "snap_content_lit_ratio={:.4} presence_threshold={:.4} sample=({},{} {}x{})",
+        ratios.content_lit_ratio,
+        SNAP_MID_LIT_PRESENCE_THRESHOLD,
+        samples.content.x,
+        samples.content.y,
+        samples.content.width,
+        samples.content.height
     );
     println!(
         "snap_mid_max_lit_ratio={:.4} presence_threshold={:.4} stale_threshold={:.4} sample=({},{} {}x{})",
@@ -405,6 +416,7 @@ fn run_snap_scenario(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapSamples {
     bottom: SampleRect,
+    content: SampleRect,
     mid: SampleRect,
 }
 
@@ -440,6 +452,12 @@ fn snap_samples(post_rect: DesktopRect) -> SnapSamples {
             width: post_rect.width(),
             height: SNAP_STRIPE_HEIGHT_PX,
         },
+        content: SampleRect {
+            x: mid_x,
+            y: pane_top + SNAP_CONTENT_SAMPLE_Y_OFFSET_PX,
+            width: mid_width,
+            height: SNAP_STRIPE_HEIGHT_PX,
+        },
         mid: SampleRect {
             x: mid_x,
             y: mid_y,
@@ -458,6 +476,7 @@ fn assert_visual_ratios(
     let bottom_signal = classify_snap_failure(
         grew,
         ratios.bottom_lit_ratio,
+        ratios.content_lit_ratio,
         ratios.mid_max_lit_ratio,
         None,
     );
@@ -470,30 +489,37 @@ fn assert_visual_ratios(
         &bottom_signal,
     )?;
 
-    let mid_present = ratios.mid_max_lit_ratio >= SNAP_MID_LIT_PRESENCE_THRESHOLD;
+    let terminal_content_present = ratios.content_lit_ratio >= SNAP_MID_LIT_PRESENCE_THRESHOLD
+        || ratios.mid_max_lit_ratio >= SNAP_MID_LIT_PRESENCE_THRESHOLD;
     let mid_present_signal = classify_snap_failure(
         grew,
         ratios.bottom_lit_ratio,
+        ratios.content_lit_ratio,
         ratios.mid_max_lit_ratio,
         blank_mid_pane_diagnosis.map(|diagnosis| diagnosis.first_bad_signal.as_str()),
     );
     let mid_present_message = if let Some(diagnosis) = blank_mid_pane_diagnosis {
         format!(
-            "snap-resize regression: mid-pane lit ratio {:.4} < {:.4}; terminal pane appears blank after snap; {}",
-            ratios.mid_max_lit_ratio, SNAP_MID_LIT_PRESENCE_THRESHOLD, diagnosis.message
+            "snap-resize regression: content lit ratio {:.4} and mid-pane lit ratio {:.4} are below {:.4}; terminal pane appears blank after snap; {}",
+            ratios.content_lit_ratio, ratios.mid_max_lit_ratio, SNAP_MID_LIT_PRESENCE_THRESHOLD, diagnosis.message
         )
     } else {
         format!(
-            "snap-resize regression: mid-pane lit ratio {:.4} < {:.4}; terminal pane appears blank after snap",
-            ratios.mid_max_lit_ratio, SNAP_MID_LIT_PRESENCE_THRESHOLD
+            "snap-resize regression: content lit ratio {:.4} and mid-pane lit ratio {:.4} are below {:.4}; terminal pane appears blank after snap",
+            ratios.content_lit_ratio, ratios.mid_max_lit_ratio, SNAP_MID_LIT_PRESENCE_THRESHOLD
         )
     };
-    assert_true(mid_present, &mid_present_message, &mid_present_signal)?;
+    assert_true(
+        terminal_content_present,
+        &mid_present_message,
+        &mid_present_signal,
+    )?;
 
     let mid_ok = ratios.mid_max_lit_ratio <= SNAP_MID_LIT_RATIO_THRESHOLD;
     let mid_signal = classify_snap_failure(
         grew,
         ratios.bottom_lit_ratio,
+        ratios.content_lit_ratio,
         ratios.mid_max_lit_ratio,
         None,
     );
@@ -512,7 +538,9 @@ fn diagnose_blank_mid_pane(
     post_snapshot: Option<&TerminalManagerSnapshot>,
     ratios: PixelSampleRatios,
 ) -> Option<BlankMidPaneDiagnosis> {
-    if ratios.mid_max_lit_ratio >= SNAP_MID_LIT_PRESENCE_THRESHOLD {
+    if ratios.content_lit_ratio >= SNAP_MID_LIT_PRESENCE_THRESHOLD
+        || ratios.mid_max_lit_ratio >= SNAP_MID_LIT_PRESENCE_THRESHOLD
+    {
         return None;
     }
 
@@ -782,6 +810,7 @@ fn rect_close_to_window(rect: Rect, window: DesktopRect, tolerance: i32) -> bool
 fn classify_snap_failure(
     window_height_grew: bool,
     bottom_lit_ratio: f64,
+    content_lit_ratio: f64,
     mid_max_lit_ratio: f64,
     diagnostic_signal: Option<&str>,
 ) -> String {
@@ -794,7 +823,9 @@ fn classify_snap_failure(
     if bottom_lit_ratio < SNAP_LIT_RATIO_THRESHOLD {
         return "snap-bottom-stripe-missing".to_owned();
     }
-    if mid_max_lit_ratio < SNAP_MID_LIT_PRESENCE_THRESHOLD {
+    if content_lit_ratio < SNAP_MID_LIT_PRESENCE_THRESHOLD
+        && mid_max_lit_ratio < SNAP_MID_LIT_PRESENCE_THRESHOLD
+    {
         return "snap-mid-pane-blank".to_owned();
     }
     if mid_max_lit_ratio > SNAP_MID_LIT_RATIO_THRESHOLD {
@@ -821,21 +852,21 @@ mod tests {
 
     #[test]
     fn classify_snap_failure_prefers_resize_before_pixel_failures() {
-        let classification = classify_snap_failure(false, 0.0, 1.0, None);
+        let classification = classify_snap_failure(false, 0.0, 0.0, 1.0, None);
 
         assert_eq!(classification, "snap-window-height-not-grown");
     }
 
     #[test]
     fn classify_snap_failure_reports_pixel_only_visual_failures() {
-        let classification = classify_snap_failure(true, 0.0, 0.0, None);
+        let classification = classify_snap_failure(true, 0.0, 0.0, 0.0, None);
 
         assert_eq!(classification, "snap-bottom-stripe-missing");
     }
 
     #[test]
     fn classify_snap_failure_reports_blank_mid_pane_when_bottom_is_present() {
-        let classification = classify_snap_failure(true, 0.02, 0.0, None);
+        let classification = classify_snap_failure(true, 0.02, 0.0, 0.0, None);
 
         assert_eq!(classification, "snap-mid-pane-blank");
     }
@@ -843,7 +874,7 @@ mod tests {
     #[test]
     fn classify_snap_failure_reports_stale_mid_pane_rows() {
         let classification =
-            classify_snap_failure(true, 0.02, SNAP_MID_LIT_RATIO_THRESHOLD + 0.001, None);
+            classify_snap_failure(true, 0.02, 0.02, SNAP_MID_LIT_RATIO_THRESHOLD + 0.001, None);
 
         assert_eq!(classification, "snap-mid-pane-stale-rows");
     }
@@ -854,6 +885,7 @@ mod tests {
             true,
             PixelSampleRatios {
                 bottom_lit_ratio: 0.02,
+                content_lit_ratio: 0.0,
                 mid_max_lit_ratio: 0.0,
             },
             None,
@@ -869,6 +901,7 @@ mod tests {
             true,
             PixelSampleRatios {
                 bottom_lit_ratio: 0.02,
+                content_lit_ratio: 0.02,
                 mid_max_lit_ratio: SNAP_MID_LIT_RATIO_THRESHOLD + 0.001,
             },
             None,
@@ -887,6 +920,7 @@ mod tests {
             true,
             PixelSampleRatios {
                 bottom_lit_ratio: 0.0,
+                content_lit_ratio: 0.0,
                 mid_max_lit_ratio: 0.0,
             },
             None,
@@ -905,7 +939,22 @@ mod tests {
             true,
             PixelSampleRatios {
                 bottom_lit_ratio: 0.02,
+                content_lit_ratio: 0.0,
                 mid_max_lit_ratio: 0.001,
+            },
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn assert_visual_ratios_accepts_top_content_with_blank_mid_pane() {
+        assert!(assert_visual_ratios(
+            true,
+            PixelSampleRatios {
+                bottom_lit_ratio: 0.02,
+                content_lit_ratio: SNAP_MID_LIT_PRESENCE_THRESHOLD,
+                mid_max_lit_ratio: 0.0,
             },
             None,
         )
@@ -922,6 +971,7 @@ mod tests {
             Some(&post),
             PixelSampleRatios {
                 bottom_lit_ratio: 0.02,
+                content_lit_ratio: 0.0,
                 mid_max_lit_ratio: 0.0,
             },
         )
@@ -944,6 +994,7 @@ mod tests {
             Some(&post),
             PixelSampleRatios {
                 bottom_lit_ratio: 0.02,
+                content_lit_ratio: 0.0,
                 mid_max_lit_ratio: 0.0,
             },
         )
@@ -962,7 +1013,8 @@ mod tests {
             Some(&post),
             PixelSampleRatios {
                 bottom_lit_ratio: 0.02,
-                mid_max_lit_ratio: SNAP_MID_LIT_PRESENCE_THRESHOLD,
+                content_lit_ratio: SNAP_MID_LIT_PRESENCE_THRESHOLD,
+                mid_max_lit_ratio: 0.0,
             },
         )
         .is_none());
@@ -990,6 +1042,15 @@ mod tests {
         );
         assert_eq!(samples.mid.x, 492);
         assert_eq!(samples.mid.width, 408);
+        assert_eq!(
+            samples.content,
+            SampleRect {
+                x: 492,
+                y: 172,
+                width: 408,
+                height: 12,
+            }
+        );
     }
 
     #[test]

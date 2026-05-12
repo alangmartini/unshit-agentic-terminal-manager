@@ -399,6 +399,7 @@ impl Terminal {
     /// round-trip. Column-only resizes do not touch scrollback.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let old_rows = self.rows;
+        let scroll_region_was_full_screen = self.region_is_full_screen();
 
         // The bottom-anchored reflow (lift scrollback / evict to
         // scrollback) only applies to the *main* grid: alt screens have
@@ -461,14 +462,7 @@ impl Terminal {
         self.rows = rows;
         self.cols = cols;
 
-        // Clamp the scroll region to the new row count. If the previous
-        // region no longer fits (top out of range, or top >= bot), reset
-        // to full-screen so subsequent scrolls behave as if no DECSTBM
-        // was set. Half-open: `[scroll_top, scroll_bot)`.
-        if self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot {
-            self.scroll_top = 0;
-            self.scroll_bot = rows;
-        }
+        self.clamp_scroll_region_after_resize(rows, scroll_region_was_full_screen);
 
         // Clamp both the live cursor (alt-screen cursor when alt active,
         // main-screen cursor otherwise) and the parked save slot.
@@ -497,6 +491,7 @@ impl Terminal {
         }
 
         let alt_active = self.alt_grid.is_some();
+        let scroll_region_was_full_screen = self.region_is_full_screen();
         self.grid.resize(rows, cols);
         if let Some(alt) = self.alt_grid.as_mut() {
             alt.resize(rows, cols);
@@ -505,10 +500,7 @@ impl Terminal {
         self.rows = rows;
         self.cols = cols;
 
-        if self.scroll_top >= rows || self.scroll_bot > rows || self.scroll_top >= self.scroll_bot {
-            self.scroll_top = 0;
-            self.scroll_bot = rows;
-        }
+        self.clamp_scroll_region_after_resize(rows, scroll_region_was_full_screen);
 
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
@@ -564,6 +556,17 @@ impl Terminal {
         self.grid.shift_rows(0, n, self.rows.saturating_sub(n));
     }
 
+    fn clamp_scroll_region_after_resize(&mut self, rows: usize, was_full_screen: bool) {
+        if was_full_screen
+            || self.scroll_top >= rows
+            || self.scroll_bot > rows
+            || self.scroll_top >= self.scroll_bot
+        {
+            self.scroll_top = 0;
+            self.scroll_bot = rows;
+        }
+    }
+
     /// Overwrite this terminal's rendered state with `snapshot`.
     ///
     /// Used by the daemon attach path: after pulling a snapshot from the
@@ -575,21 +578,14 @@ impl Terminal {
         let rows = snapshot.grid.rows();
         let cols = snapshot.grid.cols();
         if rows != self.rows || cols != self.cols {
+            let scroll_region_was_full_screen = self.region_is_full_screen();
             self.rows = rows;
             self.cols = cols;
             self.grid.resize(rows, cols);
             if let Some(alt) = self.alt_grid.as_mut() {
                 alt.resize(rows, cols);
             }
-            // The previous scroll region may no longer fit; reset to full
-            // screen so the snapshot's view starts from a clean slate.
-            if self.scroll_top >= rows
-                || self.scroll_bot > rows
-                || self.scroll_top >= self.scroll_bot
-            {
-                self.scroll_top = 0;
-                self.scroll_bot = rows;
-            }
+            self.clamp_scroll_region_after_resize(rows, scroll_region_was_full_screen);
         }
         for r in 0..rows {
             for c in 0..cols {
@@ -1909,6 +1905,21 @@ mod tests {
         assert_eq!(row_text(&t, 2), "");
         assert_eq!(row_text(&t, 3), "");
         assert_eq!(t.cursor_position(), cursor_before);
+    }
+
+    #[test]
+    fn resize_viewport_growth_expands_full_screen_scroll_region_for_redraw_ui() {
+        let mut t = Terminal::new(2, 10);
+
+        t.resize_viewport_growth(4, 10);
+
+        assert_eq!((t.scroll_top, t.scroll_bot), (0, 4));
+        t.process_bytes(b"\x1b[Hone\x1b[K\r\ntwo\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[2;4H");
+
+        assert_eq!(row_text(&t, 0), "one");
+        assert_eq!(row_text(&t, 1), "two");
+        assert_eq!(row_text(&t, 2), "");
+        assert_eq!(row_text(&t, 3), "");
     }
 
     #[test]
