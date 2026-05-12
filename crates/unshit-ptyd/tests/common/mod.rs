@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use unshit_ptyd::client::Client;
-use unshit_ptyd::protocol::ServerEvent;
+use unshit_ptyd::protocol::{Response, ServerEvent};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -45,6 +45,31 @@ pub async fn connect_with_retry(path: &Path) -> Client {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             Err(e) => panic!("client failed to connect within deadline: {e}"),
+        }
+    }
+}
+
+/// Sends shutdown, retrying the complete connect/request roundtrip.
+///
+/// On Windows a named-pipe open can briefly succeed against an instance
+/// that is being closed during daemon restart. Retrying only `connect`
+/// is not enough for shutdown/rebind tests because the first write can
+/// still hit `BrokenPipe`.
+pub async fn shutdown_with_retry(path: &Path) -> Response {
+    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    loop {
+        match Client::connect(path).await {
+            Ok(mut client) => match client.shutdown().await {
+                Ok(resp) => return resp,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("client failed to shutdown within deadline: {e}"),
+            },
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => panic!("client failed to connect for shutdown within deadline: {e}"),
         }
     }
 }
