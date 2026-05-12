@@ -15,8 +15,15 @@
 use unshit_core::element::*;
 use unshit_test::TestHarness;
 
-fn try_with_gpu(h: TestHarness) -> Option<TestHarness> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.with_gpu())).ok()
+fn try_with_gpu(mut h: TestHarness) -> Option<TestHarness> {
+    // This test exercises the quad pipeline directly, so request the
+    // adapter's real limits instead of relying on panic-based GPU skipping.
+    std::env::set_var("TM_HEADLESS_ADAPTER_LIMITS", "1");
+    if h.try_with_gpu() {
+        Some(h)
+    } else {
+        None
+    }
 }
 
 fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
