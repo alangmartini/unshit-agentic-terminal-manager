@@ -208,7 +208,7 @@ pub enum DiagnosticResponse {
         message: Option<String>,
     },
     Snapshot {
-        snapshot: TerminalManagerSnapshot,
+        snapshot: Box<TerminalManagerSnapshot>,
     },
     InvariantResults {
         results: Vec<InvariantEvaluation>,

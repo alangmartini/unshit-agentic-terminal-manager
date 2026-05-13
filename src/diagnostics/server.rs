@@ -134,7 +134,9 @@ fn handle_snapshot(
         context.diagnostic_endpoint,
         &options,
     ) {
-        Ok(snapshot) => DiagnosticResponse::Snapshot { snapshot },
+        Ok(snapshot) => DiagnosticResponse::Snapshot {
+            snapshot: Box::new(snapshot),
+        },
         Err(message) => protocol_error("snapshot_collection_failed", &message, false),
     }
 }

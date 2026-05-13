@@ -205,7 +205,7 @@ impl DiagnosticClient {
             reason: reason.to_owned(),
             options,
         })? {
-            DiagnosticResponse::Snapshot { snapshot } => Ok(snapshot),
+            DiagnosticResponse::Snapshot { snapshot } => Ok(*snapshot),
             response => Err(unexpected_response("snapshot", response)),
         }
     }

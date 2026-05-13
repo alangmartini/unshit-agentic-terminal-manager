@@ -196,6 +196,26 @@ fn snapshot_round_trip_preserves_opt_in_terminal_buffer_window() {
 }
 
 #[test]
+fn snapshot_response_boxing_preserves_wire_shape() {
+    let response = DiagnosticResponse::Snapshot {
+        snapshot: Box::new(TerminalManagerSnapshot {
+            reason: "post-resize".to_owned(),
+            ..Default::default()
+        }),
+    };
+
+    let json = serde_json::to_value(response).unwrap();
+    assert_eq!(json["type"], "snapshot");
+    assert_eq!(json["snapshot"]["reason"], "post-resize");
+
+    let decoded: DiagnosticResponse = serde_json::from_value(json).unwrap();
+    let DiagnosticResponse::Snapshot { snapshot } = decoded else {
+        panic!("expected snapshot response");
+    };
+    assert_eq!(snapshot.reason, "post-resize");
+}
+
+#[test]
 fn result_round_trip_captures_runner_actions_and_suite_status() {
     let result = TestRunResult {
         schema_version: RESULTS_SCHEMA_VERSION.to_owned(),
