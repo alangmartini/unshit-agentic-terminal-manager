@@ -190,6 +190,7 @@ fn build_tree(
     snap: &UiSnapshot,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
+    window_events: Option<unshit::app::EventSink>,
 ) -> ElementTree {
     let sidebar = build_sidebar(snap, shared)
         .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
@@ -230,7 +231,7 @@ fn build_tree(
                 .with_class("ambient-layer")
                 .with_class("rust-glow"),
         )
-        .with_child(build_titlebar(snap, shared));
+        .with_child(build_titlebar(snap, shared, window_events));
 
     if snap.settings_open {
         root = root
@@ -768,6 +769,8 @@ fn main() {
     let sub_shared = shared.clone();
     let raw_key_shared = shared.clone();
     let frame_metrics_shared = shared.clone();
+    let window_event_sink = Arc::new(std::sync::OnceLock::new());
+    let tree_window_event_sink = window_event_sink.clone();
 
     let mut app = App::new(
         AppConfig {
@@ -919,9 +922,15 @@ fn main() {
                     (id, grid)
                 })
                 .collect();
-            build_tree(&snap, &tree_shared, &grids)
+            build_tree(
+                &snap,
+                &tree_shared,
+                &grids,
+                tree_window_event_sink.get().cloned(),
+            )
         },
     );
+    let _ = window_event_sink.set(app.event_sink());
 
     // Set up PTY output subscriptions.
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
@@ -1001,7 +1010,7 @@ mod tests {
         let grids = std::collections::HashMap::new();
         let mut harness = TestHarness::new(
             STYLES,
-            move || build_tree(&tree_snap, &tree_shared, &grids),
+            move || build_tree(&tree_snap, &tree_shared, &grids, None),
             1280.0,
             800.0,
         );
@@ -1044,7 +1053,7 @@ mod tests {
         grids.insert(active_pane, unshit::core::cell_grid::CellGrid::new(49, 79));
         let mut harness = TestHarness::new(
             STYLES,
-            move || build_tree(&tree_snap, &tree_shared, &grids),
+            move || build_tree(&tree_snap, &tree_shared, &grids, None),
             1280.0,
             1368.0,
         );

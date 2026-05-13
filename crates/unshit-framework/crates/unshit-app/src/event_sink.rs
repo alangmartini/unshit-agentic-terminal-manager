@@ -10,6 +10,10 @@ pub enum ExternalEvent {
     /// Ask the application window to become visible, unminimized, focused,
     /// and attention-requesting where the platform allows it.
     ActivateWindow,
+    /// Minimize the application window.
+    MinimizeWindow,
+    /// Toggle the application window between maximized and restored states.
+    ToggleMaximizeWindow,
     /// User-defined payload (type-erased).
     Custom(Box<dyn std::any::Any + Send>),
     /// Zero-copy byte payload. Only the Arc refcount is bumped on send.
@@ -81,6 +85,16 @@ impl EventSink {
         self.send(ExternalEvent::Bytes(data))
     }
 
+    /// Minimize the application window.
+    pub fn minimize_window(&self) -> Result<(), SendError> {
+        self.send(ExternalEvent::MinimizeWindow)
+    }
+
+    /// Toggle the application window between maximized and restored states.
+    pub fn toggle_maximize_window(&self) -> Result<(), SendError> {
+        self.send(ExternalEvent::ToggleMaximizeWindow)
+    }
+
     /// Async variant of send_bytes.
     pub async fn send_bytes_async(&self, data: Arc<[u8]>) -> Result<(), SendError> {
         self.send_async(ExternalEvent::Bytes(data)).await
@@ -101,6 +115,27 @@ mod tests {
     fn bytes_variant_constructs() {
         let data: Arc<[u8]> = Arc::from(b"hello".as_ref());
         let _event = ExternalEvent::Bytes(data);
+    }
+
+    #[test]
+    fn minimize_window_enqueues_window_control_event() {
+        let (sink, rx) = make_sink();
+
+        sink.minimize_window().unwrap();
+
+        assert!(matches!(rx.try_recv().unwrap(), ExternalEvent::MinimizeWindow));
+    }
+
+    #[test]
+    fn toggle_maximize_window_enqueues_window_control_event() {
+        let (sink, rx) = make_sink();
+
+        sink.toggle_maximize_window().unwrap();
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ExternalEvent::ToggleMaximizeWindow
+        ));
     }
 
     #[test]

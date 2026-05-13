@@ -1,3 +1,4 @@
+use unshit::app::EventSink;
 use unshit::core::element::*;
 
 use crate::state::{
@@ -6,11 +7,17 @@ use crate::state::{
 };
 use crate::ui::icons::*;
 
-pub fn build_titlebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+pub fn build_titlebar(
+    state: &UiSnapshot,
+    shared: &SharedState,
+    window_events: Option<EventSink>,
+) -> ElementDef {
     let search_state = shared.clone();
     let sidebar_state = shared.clone();
     let settings_state = shared.clone();
     let close_state = shared.clone();
+    let minimize_events = window_events.clone();
+    let maximize_events = window_events;
     let workspace = state
         .workspaces
         .get(state.active_workspace)
@@ -125,11 +132,21 @@ pub fn build_titlebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                         .with_child(
                             ElementDef::new(Tag::Button)
                                 .with_class("win-btn")
+                                .on_click(move || {
+                                    if let Some(sink) = &minimize_events {
+                                        let _ = sink.minimize_window();
+                                    }
+                                })
                                 .with_child(svg_icon(icon_window_minimize())),
                         )
                         .with_child(
                             ElementDef::new(Tag::Button)
                                 .with_class("win-btn")
+                                .on_click(move || {
+                                    if let Some(sink) = &maximize_events {
+                                        let _ = sink.toggle_maximize_window();
+                                    }
+                                })
                                 .with_child(svg_icon(icon_window_maximize())),
                         )
                         .with_child(
@@ -180,14 +197,14 @@ mod tests {
     fn build_titlebar_does_not_panic() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let _elem = build_titlebar(&snap, &shared);
+        let _elem = build_titlebar(&snap, &shared, None);
     }
 
     #[test]
     fn build_titlebar_returns_div() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let elem = build_titlebar(&snap, &shared);
+        let elem = build_titlebar(&snap, &shared, None);
         assert!(matches!(elem.tag, Tag::Div));
     }
 
@@ -195,7 +212,7 @@ mod tests {
     fn build_titlebar_has_children() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let elem = build_titlebar(&snap, &shared);
+        let elem = build_titlebar(&snap, &shared, None);
         assert_eq!(elem.children.len(), 2);
     }
 
@@ -203,7 +220,7 @@ mod tests {
     fn titlebar_has_correct_classes() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let el = build_titlebar(&snap, &shared);
+        let el = build_titlebar(&snap, &shared, None);
         assert!(el.classes.contains(&"titlebar".to_string()));
         assert!(el.classes.contains(&"role-header".to_string()));
     }
@@ -212,7 +229,7 @@ mod tests {
     fn titlebar_left_has_brand_and_breadcrumb() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let el = build_titlebar(&snap, &shared);
+        let el = build_titlebar(&snap, &shared, None);
         let left = &el.children[0];
         assert!(left.classes.contains(&"titlebar-left".to_string()));
         assert_eq!(left.children.len(), 2);
@@ -226,7 +243,7 @@ mod tests {
     fn titlebar_right_has_search_actions_and_window_controls() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let el = build_titlebar(&snap, &shared);
+        let el = build_titlebar(&snap, &shared, None);
         let right = &el.children[1];
         assert!(right.classes.contains(&"titlebar-right".to_string()));
         assert_eq!(right.children.len(), 3);
@@ -243,7 +260,7 @@ mod tests {
     fn search_button_click_toggles_palette() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let el = build_titlebar(&snap, &shared);
+        let el = build_titlebar(&snap, &shared, None);
         let right = &el.children[1];
         let search_btn = &right.children[0];
         assert!(search_btn.classes.contains(&"pill-btn".to_string()));
@@ -257,7 +274,7 @@ mod tests {
         let shared = test_shared();
         let initial = shared.lock().unwrap().sidebar_collapsed;
         let snap = test_snapshot();
-        let el = build_titlebar(&snap, &shared);
+        let el = build_titlebar(&snap, &shared, None);
         let actions = &el.children[1].children[1];
         let sidebar_btn = &actions.children[0];
         assert!(sidebar_btn.on_click.is_some());
@@ -270,7 +287,7 @@ mod tests {
     fn settings_button_opens_settings() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let el = build_titlebar(&snap, &shared);
+        let el = build_titlebar(&snap, &shared, None);
         let actions = &el.children[1].children[1];
         let settings_btn = &actions.children[1];
         assert!(settings_btn.on_click.is_some());
@@ -282,7 +299,7 @@ mod tests {
     fn brand_has_mark_and_name() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let el = build_titlebar(&snap, &shared);
+        let el = build_titlebar(&snap, &shared, None);
         let brand = &el.children[0].children[0];
         assert_eq!(brand.children.len(), 2);
         assert!(brand.children[0]
@@ -297,7 +314,7 @@ mod tests {
     fn breadcrumb_uses_design_system_segments() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let el = build_titlebar(&snap, &shared);
+        let el = build_titlebar(&snap, &shared, None);
         let breadcrumb = &el.children[0].children[1];
         assert_eq!(breadcrumb.children.len(), 5);
         assert!(breadcrumb.children[0]
@@ -314,10 +331,18 @@ mod tests {
     fn window_controls_are_present() {
         let shared = test_shared();
         let snap = test_snapshot();
-        let el = build_titlebar(&snap, &shared);
+        let el = build_titlebar(&snap, &shared, None);
         let controls = &el.children[1].children[2];
         assert!(controls.classes.contains(&"tm-win-controls".to_string()));
         assert_eq!(controls.children.len(), 3);
+        assert!(
+            controls.children[0].on_click.is_some(),
+            "minimize button should be wired"
+        );
+        assert!(
+            controls.children[1].on_click.is_some(),
+            "maximize button should be wired"
+        );
         assert!(controls.children[2]
             .classes
             .contains(&"win-close".to_string()));
@@ -334,7 +359,7 @@ mod tests {
             move || ElementTree {
                 root: ElementDef::new(Tag::Div)
                     .with_class("app")
-                    .with_child(build_titlebar(&tree_snap, &tree_shared)),
+                    .with_child(build_titlebar(&tree_snap, &tree_shared, None)),
             },
             1280.0,
             720.0,

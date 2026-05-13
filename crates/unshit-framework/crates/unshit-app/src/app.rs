@@ -849,6 +849,15 @@ impl ApplicationHandler for AppHandler {
                         .request_user_attention(Some(AttentionUrgency::Informational.to_winit()));
                     coalescer.observe(false);
                 }
+                ExternalEvent::MinimizeWindow => {
+                    state.window.set_minimized(true);
+                    coalescer.observe(false);
+                }
+                ExternalEvent::ToggleMaximizeWindow => {
+                    let maximized = state.window.is_maximized();
+                    state.window.set_maximized(!maximized);
+                    coalescer.observe(false);
+                }
                 ExternalEvent::Custom(payload) => {
                     if let Some(ref handler) = self.app.config.on_external_event {
                         handler(payload);
