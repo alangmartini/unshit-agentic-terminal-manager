@@ -18,6 +18,16 @@ pub fn build_titlebar(
     let close_state = shared.clone();
     let minimize_events = window_events.clone();
     let maximize_events = window_events;
+    let maximize_class = if state.window_maximized {
+        "win-restore"
+    } else {
+        "win-maximize"
+    };
+    let maximize_icon = if state.window_maximized {
+        icon_window_restore()
+    } else {
+        icon_window_maximize()
+    };
     let workspace = state
         .workspaces
         .get(state.active_workspace)
@@ -132,6 +142,7 @@ pub fn build_titlebar(
                         .with_child(
                             ElementDef::new(Tag::Button)
                                 .with_class("win-btn")
+                                .with_class("win-minimize")
                                 .on_click(move || {
                                     if let Some(sink) = &minimize_events {
                                         let _ = sink.minimize_window();
@@ -142,12 +153,13 @@ pub fn build_titlebar(
                         .with_child(
                             ElementDef::new(Tag::Button)
                                 .with_class("win-btn")
+                                .with_class(maximize_class)
                                 .on_click(move || {
                                     if let Some(sink) = &maximize_events {
                                         let _ = sink.toggle_maximize_window();
                                     }
                                 })
-                                .with_child(svg_icon(icon_window_maximize())),
+                                .with_child(svg_icon(maximize_icon)),
                         )
                         .with_child(
                             ElementDef::new(Tag::Button)
@@ -335,10 +347,16 @@ mod tests {
         let controls = &el.children[1].children[2];
         assert!(controls.classes.contains(&"tm-win-controls".to_string()));
         assert_eq!(controls.children.len(), 3);
+        assert!(controls.children[0]
+            .classes
+            .contains(&"win-minimize".to_string()));
         assert!(
             controls.children[0].on_click.is_some(),
             "minimize button should be wired"
         );
+        assert!(controls.children[1]
+            .classes
+            .contains(&"win-maximize".to_string()));
         assert!(
             controls.children[1].on_click.is_some(),
             "maximize button should be wired"
@@ -346,6 +364,25 @@ mod tests {
         assert!(controls.children[2]
             .classes
             .contains(&"win-close".to_string()));
+    }
+
+    #[test]
+    fn window_controls_show_restore_icon_when_window_is_maximized() {
+        let shared = test_shared();
+        let mut snap = test_snapshot();
+        snap.window_maximized = true;
+
+        let el = build_titlebar(&snap, &shared, None);
+        let maximize_button = &el.children[1].children[2].children[1];
+
+        assert!(maximize_button.classes.contains(&"win-restore".to_string()));
+        assert!(!maximize_button
+            .classes
+            .contains(&"win-maximize".to_string()));
+        match &maximize_button.children[0].content {
+            ElementContent::Svg(node) => assert_eq!(node.children.len(), 2),
+            other => panic!("expected restore svg icon, got {other:?}"),
+        }
     }
 
     #[test]

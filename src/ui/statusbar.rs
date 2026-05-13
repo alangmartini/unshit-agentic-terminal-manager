@@ -153,6 +153,7 @@ mod tests {
             palette_open: false,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
+            window_maximized: false,
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
             ctx_menu: None,

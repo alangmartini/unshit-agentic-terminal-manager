@@ -765,6 +765,7 @@ fn main() {
     let command_shared = shared.clone();
     let metrics_shared = shared.clone();
     let scale_shared = shared.clone();
+    let window_state_shared = shared.clone();
     let close_shared = shared.clone();
     let sub_shared = shared.clone();
     let raw_key_shared = shared.clone();
@@ -808,6 +809,10 @@ fn main() {
             on_scale_factor: Some(Arc::new(move |scale: f32| {
                 let mut guard = scale_shared.lock_recover();
                 guard.scale_factor = scale;
+            })),
+            on_window_maximized: Some(Arc::new(move |maximized: bool| {
+                let mut guard = window_state_shared.lock_recover();
+                guard.window_maximized = maximized;
             })),
             on_close: Some(Arc::new(move || -> bool {
                 // F7: when the user has not yet remembered a choice, veto

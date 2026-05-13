@@ -454,6 +454,8 @@ pub struct AppState {
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
+    /// Last window maximized state reported by the framework.
+    pub window_maximized: bool,
     /// Sidebar width at the start of a drag, `None` when not dragging.
     pub sidebar_drag_start: Option<f32>,
     pub cpu_pct: f32,
@@ -611,6 +613,7 @@ impl AppState {
             palette_open: self.palette_open,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
+            window_maximized: self.window_maximized,
             cpu_pct: self.cpu_pct,
             mem_gb: self.mem_gb,
             net_kbps: self.net_kbps,
@@ -679,6 +682,9 @@ pub struct UiSnapshot {
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
+    /// Mirrors `AppState::window_maximized` so titlebar controls can
+    /// render maximize or restore affordances from state.
+    pub window_maximized: bool,
     pub cpu_pct: f32,
     pub mem_gb: f32,
     pub net_kbps: f32,
@@ -856,6 +862,7 @@ pub fn seed_state() -> AppState {
         palette_open: false,
         sidebar_collapsed: false,
         sidebar_width: 252.0,
+        window_maximized: false,
         sidebar_drag_start: None,
         cpu_pct: 0.0,
         mem_gb: 0.0,
@@ -3587,6 +3594,7 @@ mod tests {
             palette_open: false,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
+            window_maximized: false,
             sidebar_drag_start: None,
             cpu_pct: 0.0,
             mem_gb: 0.0,
@@ -5233,6 +5241,16 @@ mod tests {
         let messages: Vec<&str> = snap.toasts.iter().map(|t| t.message.as_str()).collect();
         assert_eq!(messages, vec!["first", "second"]);
         assert!(!snap.sessions_stale);
+    }
+
+    #[test]
+    fn ui_snapshot_mirrors_window_maximized_state() {
+        let mut state = seed_state();
+        assert!(!state.ui_snapshot().window_maximized);
+
+        state.window_maximized = true;
+
+        assert!(state.ui_snapshot().window_maximized);
     }
 
     #[test]

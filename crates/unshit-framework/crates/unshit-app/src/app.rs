@@ -119,6 +119,10 @@ pub struct AppConfig {
     /// Fires once at startup and again whenever the window moves between
     /// monitors with different scale factors.
     pub on_scale_factor: Option<Arc<dyn Fn(f32) + Send + Sync>>,
+    /// Callback invoked when the window enters or leaves the maximized state.
+    /// Fires once at startup with the initial state, after framework-driven
+    /// maximize toggles, and when OS window events report a state change.
+    pub on_window_maximized: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     /// Callback invoked when the window's close button is clicked.
     /// Returning `true` lets the framework proceed with exit; returning
     /// `false` vetoes the close so the application can show a confirm
@@ -178,6 +182,7 @@ impl Default for AppConfig {
             css_path: None,
             on_frame_metrics: None,
             on_scale_factor: None,
+            on_window_maximized: None,
             on_close: None,
             on_cell_metrics: None,
             #[cfg(feature = "input-latency-histogram")]
@@ -272,6 +277,7 @@ struct AppState {
     /// when the restyle pass consumes it. A full rebuild ignores it.
     restyle_root: Option<NodeId>,
     scale_factor: f32,
+    window_maximized: bool,
     zoom_factor: f32,
     ctrl_held: bool,
     shift_held: bool,
@@ -630,6 +636,33 @@ fn reconcile_surface_metrics_from_window(
     )
 }
 
+fn publish_window_maximized_change(
+    last: &mut bool,
+    current: bool,
+    on_window_maximized: Option<&Arc<dyn Fn(bool) + Send + Sync>>,
+) -> bool {
+    if *last == current {
+        return false;
+    }
+
+    *last = current;
+    if let Some(cb) = on_window_maximized {
+        cb(current);
+    }
+    true
+}
+
+fn sync_window_maximized_from_window(
+    state: &mut AppState,
+    on_window_maximized: Option<&Arc<dyn Fn(bool) + Send + Sync>>,
+) -> bool {
+    publish_window_maximized_change(
+        &mut state.window_maximized,
+        state.window.is_maximized(),
+        on_window_maximized,
+    )
+}
+
 impl AppState {
     /// Record that external activity (user input, PTY output, resize, etc.)
     /// occurred at `now`. Opens the window during which `about_to_wait`
@@ -877,8 +910,14 @@ impl ApplicationHandler for AppHandler {
                 }
                 ExternalEvent::ToggleMaximizeWindow => {
                     let maximized = state.window.is_maximized();
-                    state.window.set_maximized(!maximized);
-                    coalescer.observe(false);
+                    let next_maximized = !maximized;
+                    state.window.set_maximized(next_maximized);
+                    publish_window_maximized_change(
+                        &mut state.window_maximized,
+                        next_maximized,
+                        self.app.config.on_window_maximized.as_ref(),
+                    );
+                    coalescer.observe(true);
                 }
                 ExternalEvent::Custom(payload) => {
                     if let Some(ref handler) = self.app.config.on_external_event {
@@ -943,6 +982,10 @@ impl ApplicationHandler for AppHandler {
 
         if let Some(ref cb) = self.app.config.on_scale_factor {
             cb(scale_factor);
+        }
+        let initial_window_maximized = window.is_maximized();
+        if let Some(ref cb) = self.app.config.on_window_maximized {
+            cb(initial_window_maximized);
         }
 
         // Read the active monitor's refresh rate so the frame pacer can
@@ -1111,6 +1154,7 @@ impl ApplicationHandler for AppHandler {
             needs_relayout: false,
             restyle_root: None,
             scale_factor,
+            window_maximized: initial_window_maximized,
             zoom_factor: 1.0,
             ctrl_held: false,
             shift_held: false,
@@ -1285,6 +1329,12 @@ impl ApplicationHandler for AppHandler {
                     state.window.scale_factor() as f32,
                     self.app.config.on_scale_factor.as_ref(),
                 );
+                if sync_window_maximized_from_window(
+                    state,
+                    self.app.config.on_window_maximized.as_ref(),
+                ) {
+                    state.needs_rebuild = true;
+                }
                 state.window.request_redraw();
             }
 
@@ -1298,17 +1348,31 @@ impl ApplicationHandler for AppHandler {
                     scale_factor as f32,
                     self.app.config.on_scale_factor.as_ref(),
                 );
+                if sync_window_maximized_from_window(
+                    state,
+                    self.app.config.on_window_maximized.as_ref(),
+                ) {
+                    state.needs_rebuild = true;
+                }
                 state.window.request_redraw();
             }
 
             WindowEvent::Moved(_position) => {
-                if !matches!(
+                let metrics_changed = !matches!(
                     reconcile_surface_metrics_from_window(
                         state,
-                        self.app.config.on_scale_factor.as_ref(),
+                        self.app.config.on_scale_factor.as_ref()
                     ),
                     SurfaceMetricsChange::None
-                ) {
+                );
+                let maximized_changed = sync_window_maximized_from_window(
+                    state,
+                    self.app.config.on_window_maximized.as_ref(),
+                );
+                if maximized_changed {
+                    state.needs_rebuild = true;
+                }
+                if metrics_changed || maximized_changed {
                     state.window.request_redraw();
                 }
 
@@ -3939,6 +4003,30 @@ mod tests {
     fn app_config_on_cell_metrics_defaults_to_none() {
         let config = AppConfig::default();
         assert!(config.on_cell_metrics.is_none());
+    }
+
+    #[test]
+    fn app_config_on_window_maximized_defaults_to_none() {
+        let config = AppConfig::default();
+        assert!(config.on_window_maximized.is_none());
+    }
+
+    #[test]
+    fn publish_window_maximized_change_only_notifies_on_change() {
+        use std::sync::Mutex;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let callback: Arc<dyn Fn(bool) + Send + Sync> =
+            Arc::new(move |maximized| calls_clone.lock().unwrap().push(maximized));
+        let mut last = false;
+
+        assert!(!publish_window_maximized_change(&mut last, false, Some(&callback)));
+        assert!(publish_window_maximized_change(&mut last, true, Some(&callback)));
+        assert!(!publish_window_maximized_change(&mut last, true, Some(&callback)));
+        assert!(publish_window_maximized_change(&mut last, false, Some(&callback)));
+
+        assert_eq!(*calls.lock().unwrap(), vec![true, false]);
     }
 
     #[test]
