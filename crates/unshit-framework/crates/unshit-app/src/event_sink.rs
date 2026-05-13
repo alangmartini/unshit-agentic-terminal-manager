@@ -132,10 +132,7 @@ mod tests {
 
         sink.toggle_maximize_window().unwrap();
 
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            ExternalEvent::ToggleMaximizeWindow
-        ));
+        assert!(matches!(rx.try_recv().unwrap(), ExternalEvent::ToggleMaximizeWindow));
     }
 
     #[test]

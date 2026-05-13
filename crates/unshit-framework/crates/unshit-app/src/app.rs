@@ -2883,9 +2883,7 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32), decorations: bool)
         pos,
         state.window.scale_factor() as f32,
     ) {
-        state
-            .window
-            .set_cursor(resize_direction_cursor_icon(direction).into());
+        state.window.set_cursor(resize_direction_cursor_icon(direction).into());
         if !state.interaction.hovered.is_dangling() {
             let old_hover = state.interaction.hovered;
             state.interaction.hovered = NodeId::DANGLING;
@@ -3883,10 +3881,7 @@ mod tests {
     fn custom_window_resize_direction_is_disabled_with_native_decorations() {
         let size = PhysicalSize::new(800, 600);
 
-        assert_eq!(
-            custom_window_resize_direction(true, size, (4.0, 4.0), 1.0),
-            None
-        );
+        assert_eq!(custom_window_resize_direction(true, size, (4.0, 4.0), 1.0), None);
         assert_eq!(
             custom_window_resize_direction(false, size, (4.0, 4.0), 1.0),
             Some(ResizeDirection::NorthWest)
@@ -3895,14 +3890,8 @@ mod tests {
 
     #[test]
     fn resize_direction_cursor_icon_uses_expected_edge_and_corner_cursors() {
-        assert_eq!(
-            resize_direction_cursor_icon(ResizeDirection::West),
-            CursorIcon::EwResize
-        );
-        assert_eq!(
-            resize_direction_cursor_icon(ResizeDirection::South),
-            CursorIcon::NsResize
-        );
+        assert_eq!(resize_direction_cursor_icon(ResizeDirection::West), CursorIcon::EwResize);
+        assert_eq!(resize_direction_cursor_icon(ResizeDirection::South), CursorIcon::NsResize);
         assert_eq!(
             resize_direction_cursor_icon(ResizeDirection::NorthWest),
             CursorIcon::NwseResize
