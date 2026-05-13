@@ -378,6 +378,28 @@ fn window_resize_direction(
     }
 }
 
+fn custom_window_resize_direction(
+    decorations: bool,
+    surface_size: PhysicalSize<u32>,
+    cursor: (f32, f32),
+    scale_factor: f32,
+) -> Option<ResizeDirection> {
+    if decorations {
+        None
+    } else {
+        window_resize_direction(surface_size, cursor, scale_factor)
+    }
+}
+
+fn resize_direction_cursor_icon(direction: ResizeDirection) -> CursorIcon {
+    match direction {
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::EwResize,
+        ResizeDirection::North | ResizeDirection::South => CursorIcon::NsResize,
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::NwseResize,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::NeswResize,
+    }
+}
+
 /// How long after the last external event the loop keeps scheduling
 /// speculative repaints. 250ms is long enough to coalesce bursts of
 /// keystrokes or PTY chunks without keeping the CPU warm after activity
@@ -1432,10 +1454,10 @@ impl ApplicationHandler for AppHandler {
                     }
                     // If threshold not met yet, fall through to normal hover
                     if !state.interaction.dragging {
-                        handle_normal_hover(state, pos);
+                        handle_normal_hover(state, pos, self.app.config.decorations);
                     }
                 } else {
-                    handle_normal_hover(state, pos);
+                    handle_normal_hover(state, pos, self.app.config.decorations);
                 }
             }
 
@@ -1459,24 +1481,23 @@ impl ApplicationHandler for AppHandler {
                             } else {
                                 state.interaction.hovered
                             };
-                            if !self.app.config.decorations {
-                                if let Some(direction) = window_resize_direction(
-                                    state.window.surface_size(),
-                                    sb_pos,
-                                    state.window.scale_factor() as f32,
-                                ) {
-                                    state.interaction.drag_origin = None;
-                                    state.interaction.dragging = false;
-                                    state.interaction.drag_target = None;
-                                    state.interaction.mousedown_target = None;
-                                    state.interaction.resize_drag = None;
-                                    state.interaction.scrollbar_drag = None;
-                                    if let Err(err) = state.window.drag_resize_window(direction) {
-                                        log::warn!("native window resize drag failed: {err}");
-                                    }
-                                    state.window.request_redraw();
-                                    return;
+                            if let Some(direction) = custom_window_resize_direction(
+                                self.app.config.decorations,
+                                state.window.surface_size(),
+                                sb_pos,
+                                state.window.scale_factor() as f32,
+                            ) {
+                                state.interaction.drag_origin = None;
+                                state.interaction.dragging = false;
+                                state.interaction.drag_target = None;
+                                state.interaction.mousedown_target = None;
+                                state.interaction.resize_drag = None;
+                                state.interaction.scrollbar_drag = None;
+                                if let Err(err) = state.window.drag_resize_window(direction) {
+                                    log::warn!("native window resize drag failed: {err}");
                                 }
+                                state.window.request_redraw();
+                                return;
                             }
 
                             if is_window_drag_region(&state.arena, region_target) {
@@ -2855,7 +2876,25 @@ fn update_select_hover(state: &mut AppState, px: f32, py: f32) {
 
 /// Normal hover/selection handling extracted from PointerMoved, so it can be
 /// called from both the "no drag" path and the "threshold not met yet" path.
-fn handle_normal_hover(state: &mut AppState, pos: (f32, f32)) {
+fn handle_normal_hover(state: &mut AppState, pos: (f32, f32), decorations: bool) {
+    if let Some(direction) = custom_window_resize_direction(
+        decorations,
+        state.window.surface_size(),
+        pos,
+        state.window.scale_factor() as f32,
+    ) {
+        state
+            .window
+            .set_cursor(resize_direction_cursor_icon(direction).into());
+        if !state.interaction.hovered.is_dangling() {
+            let old_hover = state.interaction.hovered;
+            state.interaction.hovered = NodeId::DANGLING;
+            state.mark_restyle_pseudo_change(old_hover, NodeId::DANGLING);
+            state.window.request_redraw();
+        }
+        return;
+    }
+
     // Check scrollbar hover
     let sb_hit = scroll::find_scrollbar_at(&state.arena, state.root, pos.0, pos.1);
     let old_visual = state.scrollbar_visual;
@@ -3838,6 +3877,40 @@ mod tests {
 
         assert_eq!(window_resize_direction(size, (20.0, 300.0), 1.0), None);
         assert_eq!(window_resize_direction(size, (20.0, 300.0), 2.0), Some(ResizeDirection::West));
+    }
+
+    #[test]
+    fn custom_window_resize_direction_is_disabled_with_native_decorations() {
+        let size = PhysicalSize::new(800, 600);
+
+        assert_eq!(
+            custom_window_resize_direction(true, size, (4.0, 4.0), 1.0),
+            None
+        );
+        assert_eq!(
+            custom_window_resize_direction(false, size, (4.0, 4.0), 1.0),
+            Some(ResizeDirection::NorthWest)
+        );
+    }
+
+    #[test]
+    fn resize_direction_cursor_icon_uses_expected_edge_and_corner_cursors() {
+        assert_eq!(
+            resize_direction_cursor_icon(ResizeDirection::West),
+            CursorIcon::EwResize
+        );
+        assert_eq!(
+            resize_direction_cursor_icon(ResizeDirection::South),
+            CursorIcon::NsResize
+        );
+        assert_eq!(
+            resize_direction_cursor_icon(ResizeDirection::NorthWest),
+            CursorIcon::NwseResize
+        );
+        assert_eq!(
+            resize_direction_cursor_icon(ResizeDirection::NorthEast),
+            CursorIcon::NeswResize
+        );
     }
 
     #[test]
