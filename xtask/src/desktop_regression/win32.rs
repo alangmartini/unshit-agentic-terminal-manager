@@ -121,18 +121,18 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, TRUE};
-    use winapi::shared::windef::{HWND, RECT};
+    use winapi::shared::windef::{HWND, POINT, RECT};
     use winapi::um::winuser::{
-        keybd_event, mouse_event, CloseWindow, EnumWindows, GetClassNameW, GetForegroundWindow,
-        GetKeyState, GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsWindowVisible, SendInput, SetCursorPos, SetForegroundWindow,
-        SetProcessDPIAware, SetProcessDpiAwarenessContext, SetWindowPos, ShowWindow, GW_HWNDFIRST,
-        GW_HWNDNEXT, GW_OWNER, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-        KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, SM_CXSCREEN, SM_CYSCREEN,
-        SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, VK_CONTROL, VK_LEFT, VK_LWIN,
-        VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE,
+        keybd_event, mouse_event, ClientToScreen, CloseWindow, EnumWindows, GetClassNameW,
+        GetDpiForWindow, GetForegroundWindow, GetKeyState, GetSystemMetrics, GetWindow,
+        GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendInput,
+        SetCursorPos, SetForegroundWindow, SetProcessDPIAware, SetProcessDpiAwarenessContext,
+        SetWindowPos, ShowWindow, GW_HWNDFIRST, GW_HWNDNEXT, GW_OWNER, INPUT, INPUT_KEYBOARD,
+        KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
+        VK_CONTROL, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE,
     };
-    use winapi::um::winuser::{PostMessageW, HWND_TOP};
+    use winapi::um::winuser::{GetClientRect, IsZoomed, PostMessageW, HWND_TOP};
 
     use super::{
         DesktopRect, DesktopSize, SnapCaptureReadinessError, WindowHandle, WindowOcclusionCandidate,
@@ -218,6 +218,53 @@ mod imp {
             right: rect.right,
             bottom: rect.bottom,
         })
+    }
+
+    pub fn get_client_rect(handle: WindowHandle) -> Result<DesktopRect, String> {
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let ok = unsafe { GetClientRect(hwnd(handle), &mut rect) };
+        if ok == 0 {
+            return Err("GetClientRect failed".to_owned());
+        }
+
+        let mut top_left = POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        let mut bottom_right = POINT {
+            x: rect.right,
+            y: rect.bottom,
+        };
+        let top_left_ok = unsafe { ClientToScreen(hwnd(handle), &mut top_left) };
+        let bottom_right_ok = unsafe { ClientToScreen(hwnd(handle), &mut bottom_right) };
+        if top_left_ok == 0 || bottom_right_ok == 0 {
+            return Err("ClientToScreen failed".to_owned());
+        }
+
+        Ok(DesktopRect {
+            left: top_left.x,
+            top: top_left.y,
+            right: bottom_right.x,
+            bottom: bottom_right.y,
+        })
+    }
+
+    pub fn window_scale_factor(handle: WindowHandle) -> Result<f64, String> {
+        let dpi = unsafe { GetDpiForWindow(hwnd(handle)) };
+        if dpi == 0 {
+            return Err("GetDpiForWindow returned 0".to_owned());
+        }
+
+        Ok(dpi as f64 / 96.0)
+    }
+
+    pub fn is_window_maximized(handle: WindowHandle) -> Result<bool, String> {
+        Ok(unsafe { IsZoomed(hwnd(handle)) != 0 })
     }
 
     pub fn focus_window(handle: WindowHandle) -> Result<(), String> {
@@ -553,6 +600,18 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn get_client_rect(_handle: WindowHandle) -> Result<DesktopRect, String> {
+        Err(unsupported())
+    }
+
+    pub fn window_scale_factor(_handle: WindowHandle) -> Result<f64, String> {
+        Err(unsupported())
+    }
+
+    pub fn is_window_maximized(_handle: WindowHandle) -> Result<bool, String> {
+        Err(unsupported())
+    }
+
     pub fn focus_window(_handle: WindowHandle) -> Result<(), String> {
         Err(unsupported())
     }
@@ -619,6 +678,18 @@ pub fn set_window_rect(
 
 pub fn get_window_rect(handle: WindowHandle) -> Result<DesktopRect, String> {
     imp::get_window_rect(handle)
+}
+
+pub fn get_client_rect(handle: WindowHandle) -> Result<DesktopRect, String> {
+    imp::get_client_rect(handle)
+}
+
+pub fn window_scale_factor(handle: WindowHandle) -> Result<f64, String> {
+    imp::window_scale_factor(handle)
+}
+
+pub fn is_window_maximized(handle: WindowHandle) -> Result<bool, String> {
+    imp::is_window_maximized(handle)
 }
 
 pub fn focus_window(handle: WindowHandle) -> Result<(), String> {

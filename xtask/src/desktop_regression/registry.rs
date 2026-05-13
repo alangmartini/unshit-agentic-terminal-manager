@@ -30,6 +30,14 @@ const SUITES: &[SuiteMetadata] = &[
         ],
         supported_platforms: &["windows"],
     },
+    SuiteMetadata {
+        id: "titlebar-window-controls",
+        title: "Titlebar window controls",
+        tags: &["windows", "titlebar", "maximize", "restore", "black-box"],
+        coverage: "Custom titlebar maximize/restore button behavior and restored window geometry.",
+        observability_needs: &["win32-window-bounds", "screenshots", "renderer-state"],
+        supported_platforms: &["windows"],
+    },
 ];
 
 pub fn all_suites() -> &'static [SuiteMetadata] {
@@ -64,14 +72,21 @@ mod tests {
     #[test]
     fn registry_contains_current_windows_suites() {
         let ids: Vec<_> = all_suites().iter().map(|suite| suite.id).collect();
-        assert_eq!(ids, vec!["edge-resize-stability", "post-resize-glitches"]);
+        assert_eq!(
+            ids,
+            vec![
+                "edge-resize-stability",
+                "post-resize-glitches",
+                "titlebar-window-controls"
+            ]
+        );
     }
 
     #[test]
     fn resolves_selected_suite() {
-        let selected = resolve_suites(&["post-resize-glitches".to_owned()]).unwrap();
+        let selected = resolve_suites(&["titlebar-window-controls".to_owned()]).unwrap();
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].title, "Post-resize visual glitch detection");
+        assert_eq!(selected[0].title, "Titlebar window controls");
         assert!(selected[0].supported_platforms.contains(&"windows"));
     }
 
