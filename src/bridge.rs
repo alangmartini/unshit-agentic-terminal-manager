@@ -468,18 +468,33 @@ fn resize_poll_subscription(shared: SharedState) -> Subscription {
                     if let Some((cols, rows)) =
                         unshit::core::cell_grid::CellGrid::take_pending_resize()
                     {
-                        {
+                        let should_redraw = {
                             let mut guard = shared.lock_recover();
-                            let ids: Vec<u32> = guard.terminals.keys().copied().collect();
-                            for id in ids {
-                                if let Some(t) = guard.terminals.get(&id) {
-                                    t.lock_recover()
-                                        .resize_viewport_growth(rows as usize, cols as usize);
+                            let pane_count: usize = guard.panes.iter().map(Vec::len).sum();
+
+                            // Renderer pending resize has no pane identity. In a split layout,
+                            // different panes can legitimately have different terminal sizes, so
+                            // applying one pane's pending size to every PTY creates a resize
+                            // feedback loop between adjacent panes. The per-pane on_resize handler
+                            // owns split-pane sizing; this global fallback is only safe for a
+                            // single visible pane.
+                            if pane_count == 1 {
+                                let ids: Vec<u32> = guard.terminals.keys().copied().collect();
+                                for id in ids {
+                                    if let Some(t) = guard.terminals.get(&id) {
+                                        t.lock_recover()
+                                            .resize_viewport_growth(rows as usize, cols as usize);
+                                    }
+                                    guard.pty_manager.resize(id, cols, rows);
                                 }
-                                guard.pty_manager.resize(id, cols, rows);
+                                true
+                            } else {
+                                false
                             }
-                        } // guard drops before yield
-                        yield ExternalEvent::RequestRedraw;
+                        }; // guard drops before yield
+                        if should_redraw {
+                            yield ExternalEvent::RequestRedraw;
+                        }
                     }
                 }
             })

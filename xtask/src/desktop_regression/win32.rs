@@ -129,14 +129,16 @@ mod imp {
         SetCursorPos, SetForegroundWindow, SetProcessDPIAware, SetProcessDpiAwarenessContext,
         SetWindowPos, ShowWindow, GW_HWNDFIRST, GW_HWNDNEXT, GW_OWNER, INPUT, INPUT_KEYBOARD,
         KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
-        VK_CONTROL, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE,
+        SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_RESTORE, VK_CONTROL, VK_LEFT,
+        VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE,
     };
-    use winapi::um::winuser::{GetClientRect, IsZoomed, PostMessageW, HWND_TOP};
+    use winapi::um::winuser::{GetClientRect, IsZoomed, PostMessageW, HWND_TOPMOST};
 
     use super::{
         DesktopRect, DesktopSize, SnapCaptureReadinessError, WindowHandle, WindowOcclusionCandidate,
     };
+
+    const VK_D: u16 = 0x44;
 
     pub fn find_window_for_process(
         process_id: u32,
@@ -182,20 +184,29 @@ mod imp {
         width: i32,
         height: i32,
     ) -> Result<(), String> {
+        unsafe {
+            ShowWindow(hwnd(handle), SW_RESTORE);
+        }
+        thread::sleep(Duration::from_millis(150));
+
         let ok = unsafe {
             SetWindowPos(
                 hwnd(handle),
-                HWND_TOP,
+                HWND_TOPMOST,
                 x,
                 y,
                 width,
                 height,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
             )
         };
         if ok == 0 {
             return Err("SetWindowPos failed".to_owned());
         }
+        unsafe {
+            SetForegroundWindow(hwnd(handle));
+        }
+        thread::sleep(Duration::from_millis(250));
 
         Ok(())
     }
@@ -324,9 +335,10 @@ mod imp {
 
         unsafe {
             SetCursorPos(from_x, from_y);
-            thread::sleep(Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(200));
             mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
         }
+        thread::sleep(Duration::from_millis(120));
 
         let direction = if to_x > from_x { 1 } else { -1 };
         let mut x = from_x;
@@ -393,6 +405,20 @@ mod imp {
         }
         send_keyboard_input(VK_RETURN as u16, 0, 0)?;
         send_keyboard_input(VK_RETURN as u16, 0, KEYEVENTF_KEYUP)?;
+        Ok(())
+    }
+
+    pub fn send_ctrl_d() -> Result<(), String> {
+        send_key_combo(VK_CONTROL as u16, VK_D as u16)
+    }
+
+    fn send_key_combo(modifier_vk: u16, vk: u16) -> Result<(), String> {
+        send_keyboard_input(modifier_vk, 0, 0)?;
+        send_keyboard_input(vk, 0, 0)?;
+        thread::sleep(Duration::from_millis(20));
+        send_keyboard_input(vk, 0, KEYEVENTF_KEYUP)?;
+        thread::sleep(Duration::from_millis(20));
+        send_keyboard_input(modifier_vk, 0, KEYEVENTF_KEYUP)?;
         Ok(())
     }
 
@@ -633,6 +659,10 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn send_ctrl_d() -> Result<(), String> {
+        Err(unsupported())
+    }
+
     pub fn verify_snap_capture_ready(
         _handle: WindowHandle,
         _post_rect: DesktopRect,
@@ -711,6 +741,10 @@ pub fn left_edge_drag(
 
 pub fn send_win_left() -> Result<(), String> {
     imp::send_win_left()
+}
+
+pub fn send_ctrl_d() -> Result<(), String> {
+    imp::send_ctrl_d()
 }
 
 pub fn verify_snap_capture_ready(

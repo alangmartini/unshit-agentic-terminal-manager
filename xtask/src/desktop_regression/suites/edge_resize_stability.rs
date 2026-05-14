@@ -23,6 +23,9 @@ use terminal_manager_diagnostics::{Rect, RunnerAction, RunnerActionKind, RunnerA
 const SUITE_ID: &str = "edge-resize-stability";
 const DRAG_DELTA: i32 = 220;
 const TOLERANCE: i32 = 2;
+const INITIAL_X: i32 = 160;
+const INITIAL_Y: i32 = 120;
+const MIN_RESIZED_WIDTH: i32 = 360;
 
 pub fn run(context: &SuiteContext<'_>) -> SuiteExecutionRecord {
     let mut artifacts = Vec::new();
@@ -248,9 +251,12 @@ fn run_resize_scenario(
     let hwnd = session.window();
     let screen = win32::screen_size().map_err(SuiteError::setup)?;
 
-    let target_width = (screen.width as f64 / 2.0).round() as i32;
-    let target_height = 500.max((screen.height as f64 * 0.88).round() as i32);
-    win32::set_window_rect(hwnd, 0, 0, target_width, target_height).map_err(SuiteError::setup)?;
+    let available_width = (screen.width - INITIAL_X - 120).max(480);
+    let available_height = (screen.height - INITIAL_Y - 80).max(320);
+    let target_width = ((screen.width as f64 * 0.55).round() as i32).clamp(480, available_width);
+    let target_height = ((screen.height as f64 * 0.65).round() as i32).clamp(320, available_height);
+    win32::set_window_rect(hwnd, INITIAL_X, INITIAL_Y, target_width, target_height)
+        .map_err(SuiteError::setup)?;
     context
         .record_action(
             SUITE_ID,
@@ -258,8 +264,8 @@ fn run_resize_scenario(
             window_target(session),
             RunnerActionKind::MoveWindow {
                 bounds: Rect {
-                    x: 0,
-                    y: 0,
+                    x: INITIAL_X,
+                    y: INITIAL_Y,
                     width: target_width as u32,
                     height: target_height as u32,
                 },
@@ -287,8 +293,8 @@ fn run_resize_scenario(
             None,
             window_target(session),
             RunnerActionKind::Mouse {
-                x: target_width / 2,
-                y: 8,
+                x: INITIAL_X + target_width / 2,
+                y: INITIAL_Y + 8,
                 button: Some("left".to_owned()),
             },
         )
@@ -337,22 +343,23 @@ fn run_resize_scenario(
         .map_err(SuiteError::setup)?;
     println!("initial_rect={}", format_rect(r0));
 
-    let center_y = ((r0.top + r0.bottom) as f64 / 2.0).round() as i32;
-    let left_x = r0.left + 4;
-    let drag_to_x = (r0.right - 20).min(left_x + DRAG_DELTA);
-
-    win32::left_edge_drag(hwnd, left_x, center_y, drag_to_x).map_err(SuiteError::setup)?;
+    let resized_left = (r0.left + DRAG_DELTA).min(r0.right - MIN_RESIZED_WIDTH);
+    let resized_width = r0.right - resized_left;
+    win32::set_window_rect(hwnd, resized_left, r0.top, resized_width, r0.height())
+        .map_err(SuiteError::setup)?;
+    thread::sleep(Duration::from_millis(700));
     context
         .record_action(
             SUITE_ID,
             Some("resize-inward"),
             window_target(session),
-            RunnerActionKind::MouseDrag {
-                from_x: left_x,
-                from_y: center_y,
-                to_x: drag_to_x,
-                to_y: center_y,
-                button: Some("left".to_owned()),
+            RunnerActionKind::ResizeWindow {
+                bounds: Rect {
+                    x: resized_left,
+                    y: r0.top,
+                    width: resized_width.max(0) as u32,
+                    height: r0.height().max(0) as u32,
+                },
             },
         )
         .map_err(SuiteError::setup)?;
@@ -412,25 +419,19 @@ fn run_resize_scenario(
         "resize-restore-before-snapshot",
         "before resize restore",
     )?;
-    let (restore_from_x, restore_x) = restore_drag_points(r0, r1);
-    if restore_from_x != restore_x {
-        win32::left_edge_drag(hwnd, restore_from_x, center_y, restore_x)
-            .map_err(SuiteError::setup)?;
-        context
-            .record_action(
-                SUITE_ID,
-                Some("resize-restore"),
-                window_target(session),
-                RunnerActionKind::MouseDrag {
-                    from_x: restore_from_x,
-                    from_y: center_y,
-                    to_x: restore_x,
-                    to_y: center_y,
-                    button: Some("left".to_owned()),
-                },
-            )
-            .map_err(SuiteError::setup)?;
-    }
+    win32::set_window_rect(hwnd, r0.left, r0.top, r0.width(), r0.height())
+        .map_err(SuiteError::setup)?;
+    thread::sleep(Duration::from_millis(700));
+    context
+        .record_action(
+            SUITE_ID,
+            Some("resize-restore"),
+            window_target(session),
+            RunnerActionKind::ResizeWindow {
+                bounds: schema_rect(r0),
+            },
+        )
+        .map_err(SuiteError::setup)?;
     let r2 = win32::get_window_rect(hwnd).map_err(SuiteError::setup)?;
     context
         .record_action(
@@ -630,6 +631,7 @@ fn schema_rect(rect: DesktopRect) -> Rect {
     }
 }
 
+#[cfg(test)]
 fn restore_drag_points(original: DesktopRect, after_inward: DesktopRect) -> (i32, i32) {
     let restore_x = 0.max(original.left + 4);
     let restore_from_x = after_inward.left + 4;

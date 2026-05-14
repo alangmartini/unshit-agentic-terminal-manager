@@ -16,3 +16,15 @@ powershell.exe -ExecutionPolicy Bypass -File tests\windows\desktop-regression\ru
 
 Existing commands that call `scripts\desktop-regression\run.ps1` still forward
 to the canonical runner.
+
+To run every migrated suite as separate sequential invocations:
+
+```powershell
+cargo xtask desktop-regression --sequential-isolated
+```
+
+or through the compatibility wrapper:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File scripts\desktop-regression\run-all-sequential.ps1
+```

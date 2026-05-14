@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -36,6 +37,10 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
     if opts.list {
         print_suite_list(all_suites());
         return Ok(RunOutcome::Success);
+    }
+
+    if opts.sequential_isolated {
+        return run_sequential_isolated(opts);
     }
 
     let run_started_at = SystemTime::now();
@@ -199,6 +204,7 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
     };
     let mut outcomes = Vec::new();
     for (index, suite) in selected.iter().enumerate() {
+        print_suite_start(index, selected.len(), suite);
         logger.log("suite.start", Some(suite.id), json!({}))?;
         if let Some(recorder) = action_recorder.as_ref() {
             recorder.record(
@@ -248,6 +254,7 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
             json!({ "scope": "suite" }),
         )?;
         let should_abort = outcome.should_abort_run_after_interactive_failure();
+        print_suite_end(index, selected.len(), suite, outcome.status);
         outcomes.push(outcome);
         if should_abort {
             for skipped in selected.iter().skip(index + 1) {
@@ -308,6 +315,70 @@ pub fn run(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
     );
 
     Ok(outcome)
+}
+
+fn run_sequential_isolated(opts: &DesktopRegressionOpts) -> Result<RunOutcome, String> {
+    let workspace_root = workspace_root()?;
+    let selected_suite_ids = if opts.suite_ids.is_empty() {
+        all_suites()
+            .iter()
+            .map(|suite| suite.id.to_owned())
+            .collect::<Vec<_>>()
+    } else {
+        opts.suite_ids.clone()
+    };
+    let selected = resolve_suites(&selected_suite_ids)?;
+    let exe_path = prepare_app_binary(&workspace_root, opts.skip_build, opts.exe_path.as_deref())?;
+    let total = selected.len();
+    let mut failed = Vec::new();
+
+    for (index, suite) in selected.iter().enumerate() {
+        print_isolated_suite_start(index, total, suite);
+        let child_opts = DesktopRegressionOpts {
+            list: false,
+            sequential_isolated: false,
+            suite_ids: vec![suite.id.to_owned()],
+            skip_build: true,
+            exe_path: Some(exe_path.clone()),
+            observe: opts.observe,
+            interactive: opts.interactive,
+            keep_open_on_failure: opts.keep_open_on_failure,
+            record: opts.record,
+            replay: None,
+            artifact_root: opts.artifact_root.clone(),
+        };
+
+        match run(&child_opts) {
+            Ok(RunOutcome::Success) => print_isolated_suite_end(index, total, suite, true),
+            Ok(RunOutcome::Failed) => {
+                print_isolated_suite_end(index, total, suite, false);
+                failed.push(suite.id.to_owned());
+            }
+            Err(err) => {
+                eprintln!(
+                    "desktop-regression: isolated suite {} failed before completion: {}",
+                    suite.id, err
+                );
+                print_isolated_suite_end(index, total, suite, false);
+                failed.push(suite.id.to_owned());
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "desktop-regression sequential isolated summary: {} passed, {} failed, {} total",
+        total - failed.len(),
+        failed.len(),
+        total
+    );
+    println!("  artifacts root: {}", opts.artifact_root.display());
+    if !failed.is_empty() {
+        println!("  failed suites: {}", failed.join(", "));
+        Ok(RunOutcome::Failed)
+    } else {
+        Ok(RunOutcome::Success)
+    }
 }
 
 fn selected_suite_ids(
@@ -373,6 +444,52 @@ fn print_run_summary(
     println!("  run id: {}", run_id);
     println!("  artifacts: {}", run_dir.display());
     println!("  results: {}", results_path.display());
+}
+
+fn print_suite_start(index: usize, total: usize, suite: &SuiteMetadata) {
+    println!();
+    println!(
+        ">>> desktop-regression suite {}/{} START: {} - {}",
+        index + 1,
+        total,
+        suite.id,
+        suite.title
+    );
+    let _ = io::stdout().flush();
+}
+
+fn print_suite_end(index: usize, total: usize, suite: &SuiteMetadata, status: ResultStatus) {
+    println!(
+        "<<< desktop-regression suite {}/{} END: {} - {:?}",
+        index + 1,
+        total,
+        suite.id,
+        status
+    );
+    let _ = io::stdout().flush();
+}
+
+fn print_isolated_suite_start(index: usize, total: usize, suite: &SuiteMetadata) {
+    println!();
+    println!(
+        "=== desktop-regression isolated suite {}/{} START: {} - {} ===",
+        index + 1,
+        total,
+        suite.id,
+        suite.title
+    );
+    let _ = io::stdout().flush();
+}
+
+fn print_isolated_suite_end(index: usize, total: usize, suite: &SuiteMetadata, passed: bool) {
+    println!(
+        "=== desktop-regression isolated suite {}/{} END: {} - {} ===",
+        index + 1,
+        total,
+        suite.id,
+        if passed { "passed" } else { "failed" }
+    );
+    let _ = io::stdout().flush();
 }
 
 fn print_suite_list(suites: &[SuiteMetadata]) {

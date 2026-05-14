@@ -203,6 +203,8 @@ pub fn prepare_app_binary(
 }
 
 fn build_app(workspace_root: &Path) -> Result<(), String> {
+    stop_processes_that_lock_debug_binaries()?;
+
     let cargo = cargo_program();
     run_cargo_build(
         &cargo,
@@ -223,6 +225,41 @@ fn build_app(workspace_root: &Path) -> Result<(), String> {
         "unshit-ptyd",
     )?;
     Ok(())
+}
+
+fn stop_processes_that_lock_debug_binaries() -> Result<(), String> {
+    let mut stopped = 0usize;
+    for image_name in build_locking_image_names() {
+        let pids = process_ids_by_image(image_name);
+        if pids.is_empty() {
+            continue;
+        }
+
+        println!(
+            "desktop-regression: stopping {} existing {} process(es) before build",
+            pids.len(),
+            image_name
+        );
+        for pid in pids {
+            if kill_process_by_id(pid, image_name)? {
+                stopped += 1;
+            }
+        }
+    }
+
+    if stopped > 0 {
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    Ok(())
+}
+
+fn build_locking_image_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["terminal-manager.exe", "unshit-ptyd.exe"]
+    } else {
+        &[]
+    }
 }
 
 fn run_cargo_build(
@@ -312,6 +349,51 @@ fn kill_new_processes_by_image(image_name: &str, existing: &[u32]) {
     }
 }
 
+fn kill_process_by_id(pid: u32, image_name: &str) -> Result<bool, String> {
+    let pid_string = pid.to_string();
+    let output = Command::new("taskkill")
+        .args(["/PID", &pid_string, "/F"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to start taskkill for {image_name} pid={pid}: {e}"))?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    if !process_ids_by_image(image_name).contains(&pid) {
+        return Ok(false);
+    }
+
+    Err(format!(
+        "failed to stop existing {image_name} pid={pid} before build ({}); close it and retry",
+        command_failure_details(&output.stdout, &output.stderr, output.status)
+    ))
+}
+
+fn command_failure_details(
+    stdout: &[u8],
+    stderr: &[u8],
+    status: std::process::ExitStatus,
+) -> String {
+    command_failure_details_text(stdout, stderr, &status.to_string())
+}
+
+fn command_failure_details_text(stdout: &[u8], stderr: &[u8], status: &str) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return format!("status {status}: {stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
+    if !stdout.is_empty() {
+        return format!("status {status}: {stdout}");
+    }
+
+    format!("status {status}")
+}
+
 fn parse_tasklist_csv(output: &str) -> Vec<u32> {
     output
         .lines()
@@ -356,6 +438,27 @@ mod tests {
         let output = "\"unshit-ptyd.exe\",\"26372\",\"Console\",\"1\",\"12,340 K\"\r\n";
 
         assert_eq!(parse_tasklist_csv(output), vec![26372]);
+    }
+
+    #[test]
+    fn build_cleanup_targets_windows_app_and_daemon_binaries() {
+        if cfg!(windows) {
+            assert_eq!(
+                build_locking_image_names(),
+                &["terminal-manager.exe", "unshit-ptyd.exe"]
+            );
+        } else {
+            assert!(build_locking_image_names().is_empty());
+        }
+    }
+
+    #[test]
+    fn command_failure_details_prefers_stderr() {
+        let details = command_failure_details_text(b"stdout text", b"stderr text", "exit 7");
+
+        assert!(details.contains("status"));
+        assert!(details.contains("stderr text"));
+        assert!(!details.contains("stdout text"));
     }
 
     #[test]

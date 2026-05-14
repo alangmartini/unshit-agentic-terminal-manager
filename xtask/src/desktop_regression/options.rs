@@ -5,6 +5,7 @@ use terminal_manager_diagnostics::ObserveMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopRegressionOpts {
     pub list: bool,
+    pub sequential_isolated: bool,
     pub suite_ids: Vec<String>,
     pub skip_build: bool,
     pub exe_path: Option<PathBuf>,
@@ -20,6 +21,7 @@ impl Default for DesktopRegressionOpts {
     fn default() -> Self {
         Self {
             list: false,
+            sequential_isolated: false,
             suite_ids: Vec::new(),
             skip_build: false,
             exe_path: None,
@@ -43,6 +45,7 @@ where
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--list" => opts.list = true,
+            "--sequential-isolated" => opts.sequential_isolated = true,
             "--suite" => {
                 let value = iter
                     .next()
@@ -109,6 +112,7 @@ pub fn validate_options(opts: &DesktopRegressionOpts) -> Result<(), String> {
     if opts.list
         && (!opts.suite_ids.is_empty()
             || opts.skip_build
+            || opts.sequential_isolated
             || opts.exe_path.is_some()
             || opts.observe != DesktopRegressionOpts::default().observe
             || opts.interactive
@@ -134,6 +138,10 @@ pub fn validate_options(opts: &DesktopRegressionOpts) -> Result<(), String> {
 
     if opts.record && opts.replay.is_some() {
         return Err("--record cannot be combined with --replay".to_owned());
+    }
+
+    if opts.sequential_isolated && opts.replay.is_some() {
+        return Err("--sequential-isolated cannot be combined with --replay".to_owned());
     }
 
     Ok(())
@@ -171,6 +179,7 @@ mod tests {
     #[test]
     fn parses_run_options() {
         let opts = parse(&[
+            "--sequential-isolated",
             "--suite",
             "edge-resize-stability",
             "--skip-build",
@@ -188,6 +197,7 @@ mod tests {
         ])
         .unwrap();
 
+        assert!(opts.sequential_isolated);
         assert_eq!(opts.suite_ids, vec!["edge-resize-stability"]);
         assert!(opts.skip_build);
         assert_eq!(
@@ -224,7 +234,7 @@ mod tests {
 
     #[test]
     fn rejects_list_combined_with_run_options() {
-        let opts = parse(&["--list", "--suite", "edge-resize-stability"]).unwrap();
+        let opts = parse(&["--list", "--sequential-isolated"]).unwrap();
         let err = validate_options(&opts).unwrap_err();
         assert!(err.contains("--list"));
     }
@@ -234,6 +244,13 @@ mod tests {
         let opts = parse(&["--record", "--replay", "trace.jsonl"]).unwrap();
         let err = validate_options(&opts).unwrap_err();
         assert!(err.contains("--record"));
+    }
+
+    #[test]
+    fn rejects_sequential_isolated_combined_with_replay() {
+        let opts = parse(&["--sequential-isolated", "--replay", "trace.jsonl"]).unwrap();
+        let err = validate_options(&opts).unwrap_err();
+        assert!(err.contains("--sequential-isolated"));
     }
 
     #[test]

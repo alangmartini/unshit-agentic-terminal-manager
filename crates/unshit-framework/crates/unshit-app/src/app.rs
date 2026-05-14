@@ -7,8 +7,8 @@ use cosmic_text::{FontSystem, SwashCache};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use unshit_core::build::{
-    build_tree_from_def, dispatch_resize_callbacks, mark_layout_dirty, resolve_all_styles,
-    resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
+    build_tree_from_def, dispatch_resize_callbacks, mark_layout_dirty, mark_paint_dirty,
+    resolve_all_styles, resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
     sync_all_animations, tick_all_animations, tick_all_transitions,
 };
 use unshit_core::dirty::DirtyFlags;
@@ -3517,6 +3517,7 @@ fn relayout_pipeline(
     if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
         layout::compute_layout(taffy, tn, width, height, font_system, cache);
         layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
+        mark_paint_dirty(arena, root);
     }
     dispatch_resize_callbacks(arena, root)
 }
@@ -4099,6 +4100,56 @@ mod tests {
             fired.load(Ordering::SeqCst),
             2,
             "window-size relayout must fire on_resize when element dimensions change"
+        );
+    }
+
+    #[test]
+    fn lightweight_relayout_marks_paint_dirty_after_window_resize() {
+        let stylesheet = CompiledStylesheet::parse(
+            ".root { width: 100%; height: 100%; } .pane { width: 100%; height: 100%; }",
+        );
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root_def = ElementDef::new(Tag::Div)
+            .with_class("root")
+            .with_child(ElementDef::new(Tag::Div).with_class("pane"));
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let pane = arena.children(root)[0];
+        let mut font_system = FontSystem::new();
+        let mut measure_cache = TextMeasureCache::new();
+
+        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+        run_layout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            800.0,
+            600.0,
+            &mut measure_cache,
+        );
+        let ids: Vec<NodeId> = arena.iter().map(|(id, _)| id).collect();
+        for id in ids {
+            arena.get_mut(id).unwrap().dirty = DirtyFlags::empty();
+        }
+
+        relayout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            400.0,
+            600.0,
+            &mut measure_cache,
+        );
+
+        assert!(
+            arena.get(root).unwrap().dirty.contains(DirtyFlags::PAINT),
+            "root must repaint after a window-size relayout"
+        );
+        assert!(
+            arena.get(pane).unwrap().dirty.contains(DirtyFlags::PAINT),
+            "resized child subtree must repaint after a window-size relayout"
         );
     }
 
