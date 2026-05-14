@@ -100,13 +100,13 @@ fn build_statusbar_right(state: &UiSnapshot) -> ElementDef {
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("tnum")
-                        .with_text("80"),
+                        .with_text(state.active_terminal_cols.to_string()),
                 )
                 .with_child(ElementDef::new(Tag::Span).with_text("\u{00D7}"))
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("tnum")
-                        .with_text("24"),
+                        .with_text(state.active_terminal_rows.to_string()),
                 ),
         )
         .with_child(
@@ -153,11 +153,14 @@ mod tests {
             palette_open: false,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
+            window_maximized: false,
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
             ctx_menu: None,
             confirm_dialog: None,
             terminal_count: 0,
+            active_terminal_cols: 80,
+            active_terminal_rows: 24,
             sessions: Vec::new(),
             sessions_stale: false,
             toasts: Vec::new(),

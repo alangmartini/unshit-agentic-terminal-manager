@@ -7,3 +7,5 @@
 - [ ] Event handler dispatch: wire up onclick, onkeydown, onmouseenter/leave through the handler system
 - [ ] Hot CSS reload: watch CSS files and re-parse on change without restarting
 - [ ] view! macro string interpolation: support `"{state.count}"` syntax expanding to format!()
+- [ ] Hover over divider should show expand-style cursor/pointer type for resize handles
+- [ ] Make pane divider drag feel smoother (e.g., smoother drag update cadence and easing)

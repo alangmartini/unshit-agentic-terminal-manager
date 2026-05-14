@@ -4,8 +4,11 @@
 
 use std::path::PathBuf;
 
+use crate::desktop_regression::options::{parse_desktop_regression, DesktopRegressionOpts};
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Cli {
+    DesktopRegression(DesktopRegressionOpts),
     Profile(ProfileOpts),
     Help,
 }
@@ -47,6 +50,7 @@ impl Cli {
 
         match first.as_str() {
             "-h" | "--help" | "help" => Ok(Cli::Help),
+            "desktop-regression" => parse_desktop_regression(iter).map(Cli::DesktopRegression),
             "profile" => parse_profile(iter),
             other => Err(format!(
                 "unknown subcommand '{other}'. Run `cargo xtask --help`."
@@ -242,5 +246,14 @@ mod tests {
     fn unknown_subcommand_errors() {
         let err = parse(&["frobnicate"]).unwrap_err();
         assert!(err.contains("frobnicate"));
+    }
+
+    #[test]
+    fn desktop_regression_subcommand_parses() {
+        let cli = parse(&["desktop-regression", "--list"]).unwrap();
+        let Cli::DesktopRegression(opts) = cli else {
+            panic!("expected DesktopRegression");
+        };
+        assert!(opts.list);
     }
 }

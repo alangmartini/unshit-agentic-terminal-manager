@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod bridge;
 pub mod daemon;
+pub mod diagnostics;
 pub mod drag;
 pub mod git;
 pub mod keybinds;
@@ -25,7 +26,8 @@ use unshit::core::trace::{
 };
 
 use crate::state::{
-    dispatch, mutate_with, new_workspace, resize_all_terminals, seed_state, MutexExt, SharedState,
+    dispatch, mutate_with, new_workspace, record_diagnostic_pty_event,
+    record_diagnostic_renderer_frame, resize_all_terminals, seed_state, MutexExt, SharedState,
     UiSnapshot, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
 };
 use crate::ui::settings::build_settings_page;
@@ -188,6 +190,7 @@ fn build_tree(
     snap: &UiSnapshot,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
+    window_events: Option<unshit::app::EventSink>,
 ) -> ElementTree {
     let sidebar = build_sidebar(snap, shared)
         .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
@@ -228,7 +231,7 @@ fn build_tree(
                 .with_class("ambient-layer")
                 .with_class("rust-glow"),
         )
-        .with_child(build_titlebar(snap, shared));
+        .with_child(build_titlebar(snap, shared, window_events));
 
     if snap.settings_open {
         root = root
@@ -440,6 +443,14 @@ fn show_test_toast_on_startup_from_env() -> bool {
     show_test_toast_on_startup_from_value(std::env::var_os(ENV_SHOW_TEST_TOAST))
 }
 
+fn unix_epoch_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 fn apply_parity_shell_override(state: &mut crate::state::AppState, spec: crate::shell::ShellSpec) {
     *state = seed_state();
     state.default_shell = spec;
@@ -522,6 +533,12 @@ fn main() {
         ),
     )
     .init();
+
+    let diagnostics_config = crate::diagnostics::DiagnosticConfig::from_env().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    let diagnostics_enabled = diagnostics_config.is_some();
 
     if terminal_trace_enabled() {
         append_terminal_trace_line(&format!(
@@ -621,8 +638,10 @@ fn main() {
     {
         let socket_path = ptyd_socket_path();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for daemon probe");
-        rt.block_on(daemon::connect_or_spawn(&socket_path))
-            .expect("connect or spawn unshit-ptyd daemon");
+        if let Err(err) = rt.block_on(daemon::connect_or_spawn(&socket_path)) {
+            eprintln!("failed to connect or spawn unshit-ptyd daemon: {err}");
+            std::process::exit(1);
+        }
         drop(rt);
         let mut guard = shared.lock().unwrap();
         guard
@@ -697,6 +716,12 @@ fn main() {
                     std::sync::Arc::new(std::sync::Mutex::new(terminal)),
                 );
                 crate::bridge::register_reader(pane_id, reader);
+                if let Some(session_id) = guard.pty_manager.session_id(pane_id) {
+                    record_diagnostic_pty_event(
+                        &mut guard,
+                        format!("attach pane={pane_id} session={session_id} source=initial"),
+                    );
+                }
                 log::info!(
                     "reattached pane {} to surviving daemon session ({}x{})",
                     pane_id,
@@ -712,6 +737,12 @@ fn main() {
                     std::sync::Arc::new(std::sync::Mutex::new(terminal)),
                 );
                 crate::bridge::register_reader(pane_id, reader);
+                if let Some(session_id) = guard.pty_manager.session_id(pane_id) {
+                    record_diagnostic_pty_event(
+                        &mut guard,
+                        format!("spawn pane={pane_id} session={session_id} source=initial"),
+                    );
+                }
             }
             Err(e) => {
                 log::error!("failed to spawn initial PTY: {}", e);
@@ -734,9 +765,13 @@ fn main() {
     let command_shared = shared.clone();
     let metrics_shared = shared.clone();
     let scale_shared = shared.clone();
+    let window_state_shared = shared.clone();
     let close_shared = shared.clone();
     let sub_shared = shared.clone();
     let raw_key_shared = shared.clone();
+    let frame_metrics_shared = shared.clone();
+    let window_event_sink = Arc::new(std::sync::OnceLock::new());
+    let tree_window_event_sink = window_event_sink.clone();
 
     let mut app = App::new(
         AppConfig {
@@ -774,6 +809,10 @@ fn main() {
             on_scale_factor: Some(Arc::new(move |scale: f32| {
                 let mut guard = scale_shared.lock_recover();
                 guard.scale_factor = scale;
+            })),
+            on_window_maximized: Some(Arc::new(move |maximized: bool| {
+                let mut guard = window_state_shared.lock_recover();
+                guard.window_maximized = maximized;
             })),
             on_close: Some(Arc::new(move || -> bool {
                 // F7: when the user has not yet remembered a choice, veto
@@ -840,9 +879,13 @@ fn main() {
                 );
                 resize_all_terminals(&mut guard, cols, rows);
             })),
-            on_frame_metrics: Some(Box::new(|m| {
+            on_frame_metrics: Some(Box::new(move |m| {
                 crate::bench::record_frame(m);
                 crate::ui::fps_overlay::record_frame(m);
+                if diagnostics_enabled {
+                    let mut guard = frame_metrics_shared.lock_recover();
+                    record_diagnostic_renderer_frame(&mut guard, unix_epoch_millis_now());
+                }
             })),
             #[cfg(feature = "input-latency-histogram")]
             on_input_latency: Some(Box::new(|snap| crate::bench::record_input_latency(snap))),
@@ -884,12 +927,27 @@ fn main() {
                     (id, grid)
                 })
                 .collect();
-            build_tree(&snap, &tree_shared, &grids)
+            build_tree(
+                &snap,
+                &tree_shared,
+                &grids,
+                tree_window_event_sink.get().cloned(),
+            )
         },
     );
+    let _ = window_event_sink.set(app.event_sink());
 
     // Set up PTY output subscriptions.
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
+
+    if let Some(config) = diagnostics_config {
+        let diagnostics_shared = shared.clone();
+        app.spawn(async move {
+            if let Err(err) = crate::diagnostics::server::run(config, diagnostics_shared).await {
+                log::error!("diagnostic server stopped: {err}");
+            }
+        });
+    }
 
     // Hand the framework's shared clipboard handle to AppState so
     // `terminal.paste` and any future paste callers reuse the same
@@ -957,7 +1015,7 @@ mod tests {
         let grids = std::collections::HashMap::new();
         let mut harness = TestHarness::new(
             STYLES,
-            move || build_tree(&tree_snap, &tree_shared, &grids),
+            move || build_tree(&tree_snap, &tree_shared, &grids, None),
             1280.0,
             800.0,
         );
@@ -986,6 +1044,49 @@ mod tests {
                 snap.layout_rect
             );
         }
+    }
+
+    #[test]
+    fn snapped_main_route_statusbar_stays_below_terminal_grid_with_actual_styles() {
+        let state = seed_state();
+        let active_pane = state.active_pane.0;
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(active_pane, unshit::core::cell_grid::CellGrid::new(49, 79));
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&tree_snap, &tree_shared, &grids, None),
+            1280.0,
+            1368.0,
+        );
+        harness.set_scale_factor(1.5);
+        harness.step();
+
+        let content = harness.query(".content").expect("content exists");
+        let terminal_grid = harness
+            .query(".terminal-grid")
+            .expect("terminal grid exists");
+        let statusbar = harness.query(".statusbar").expect("statusbar exists");
+
+        assert!(
+            (statusbar.layout_rect.y + statusbar.layout_rect.height
+                - (content.layout_rect.y + content.layout_rect.height))
+                .abs()
+                < 1.0,
+            "statusbar should end at content bottom; content={:?} statusbar={:?}",
+            content.layout_rect,
+            statusbar.layout_rect
+        );
+        assert!(
+            terminal_grid.layout_rect.y + terminal_grid.layout_rect.height
+                <= statusbar.layout_rect.y + 1.0,
+            "terminal grid should not cover statusbar; grid={:?} statusbar={:?}",
+            terminal_grid.layout_rect,
+            statusbar.layout_rect
+        );
     }
 
     #[test]

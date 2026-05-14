@@ -7,7 +7,7 @@ use futures_core::Stream;
 use unshit::app::{EventSink, ExternalEvent, Subscription};
 use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 
-use crate::state::{MutexExt, SharedState};
+use crate::state::{record_diagnostic_pty_event, MutexExt, SharedState};
 
 static PENDING_READERS: Mutex<Option<HashMap<u32, Box<dyn Read + Send>>>> = Mutex::new(None);
 
@@ -111,10 +111,12 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                     };
 
                     let mut batched = 1u32;
+                    let mut total_bytes = data.len();
                     let pending_response = {
                         let mut terminal = terminal_handle.lock_recover();
                         terminal.process_bytes(&data);
                         while let Ok(more) = rx.try_recv() {
+                            total_bytes += more.len();
                             terminal.process_bytes(&more);
                             batched += 1;
                         }
@@ -135,19 +137,37 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                         }
                         terminal.take_pending_response()
                     };
-                    if !pending_response.is_empty() {
-                        // Reply to host queries (DA1, DA2, DSR, CPR,
-                        // XTVERSION) the parser collected. Done outside
-                        // the per-terminal mutex; the write is fire and
-                        // forget through the daemon shim.
+                    {
                         let mut guard = shared.lock_recover();
-                        if let Err(e) = guard.pty_manager.write(pane_id, &pending_response) {
-                            log::warn!(
-                                "pty-{}: failed to write {} bytes of query reply: {}",
-                                pane_id,
-                                pending_response.len(),
-                                e
-                            );
+                        record_diagnostic_pty_event(
+                            &mut guard,
+                            format!(
+                                "read pane={} bytes={} batched={}",
+                                pane_id, total_bytes, batched
+                            ),
+                        );
+                        if !pending_response.is_empty() {
+                            // Reply to host queries (DA1, DA2, DSR, CPR,
+                            // XTVERSION) the parser collected. Done outside
+                            // the per-terminal mutex; the write is fire and
+                            // forget through the daemon shim.
+                            if let Err(e) = guard.pty_manager.write(pane_id, &pending_response) {
+                                log::warn!(
+                                    "pty-{}: failed to write {} bytes of query reply: {}",
+                                    pane_id,
+                                    pending_response.len(),
+                                    e
+                                );
+                            } else {
+                                record_diagnostic_pty_event(
+                                    &mut guard,
+                                    format!(
+                                        "write pane={} bytes={} source=query_reply",
+                                        pane_id,
+                                        pending_response.len()
+                                    ),
+                                );
+                            }
                         }
                     }
                     if batched > 1 {
@@ -243,6 +263,10 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                 err.pane_id,
                                 err.error
                             );
+                            record_diagnostic_pty_event(
+                                &mut guard,
+                                format!("write_failed pane={} error={}", err.pane_id, err.error),
+                            );
                             crate::state::push_error_toast(
                                 &mut guard,
                                 format!("write failed (pane {}): {}", err.pane_id, err.error),
@@ -317,6 +341,17 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                     )),
                                                 );
                                                 crate::bridge::register_reader(*id, reader);
+                                                if let Some(session_id) =
+                                                    guard.pty_manager.session_id(*id)
+                                                {
+                                                    record_diagnostic_pty_event(
+                                                        &mut guard,
+                                                        format!(
+                                                            "attach pane={} session={} source=deferred",
+                                                            id, session_id
+                                                        ),
+                                                    );
+                                                }
                                                 log::info!(
                                                     "deferred reattach for pane {}: {}x{}",
                                                     id, snap_cols, snap_rows
@@ -334,6 +369,17 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                     )),
                                                 );
                                                 crate::bridge::register_reader(*id, reader);
+                                                if let Some(session_id) =
+                                                    guard.pty_manager.session_id(*id)
+                                                {
+                                                    record_diagnostic_pty_event(
+                                                        &mut guard,
+                                                        format!(
+                                                            "spawn pane={} session={} source=deferred",
+                                                            id, session_id
+                                                        ),
+                                                    );
+                                                }
                                                 log::info!(
                                                     "deferred PTY spawn for pane {}: {}x{}",
                                                     id, cols, rows
@@ -370,10 +416,11 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                 let existing_ids: Vec<u32> =
                                     guard.terminals.keys().copied().collect();
                                 for id in existing_ids {
-                                    guard.pty_manager.resize(id, cols, rows);
                                     if let Some(t) = guard.terminals.get(&id) {
-                                        t.lock_recover().resize(rows as usize, cols as usize);
+                                        t.lock_recover()
+                                            .resize_viewport_growth(rows as usize, cols as usize);
                                     }
+                                    guard.pty_manager.resize(id, cols, rows);
                                 }
                                 // Deferred spawn introduces new terminal
                                 // handles into the tree; the next frame
@@ -421,17 +468,33 @@ fn resize_poll_subscription(shared: SharedState) -> Subscription {
                     if let Some((cols, rows)) =
                         unshit::core::cell_grid::CellGrid::take_pending_resize()
                     {
-                        {
+                        let should_redraw = {
                             let mut guard = shared.lock_recover();
-                            let ids: Vec<u32> = guard.terminals.keys().copied().collect();
-                            for id in ids {
-                                guard.pty_manager.resize(id, cols, rows);
-                                if let Some(t) = guard.terminals.get(&id) {
-                                    t.lock_recover().resize(rows as usize, cols as usize);
+                            let pane_count: usize = guard.panes.iter().map(Vec::len).sum();
+
+                            // Renderer pending resize has no pane identity. In a split layout,
+                            // different panes can legitimately have different terminal sizes, so
+                            // applying one pane's pending size to every PTY creates a resize
+                            // feedback loop between adjacent panes. The per-pane on_resize handler
+                            // owns split-pane sizing; this global fallback is only safe for a
+                            // single visible pane.
+                            if pane_count == 1 {
+                                let ids: Vec<u32> = guard.terminals.keys().copied().collect();
+                                for id in ids {
+                                    if let Some(t) = guard.terminals.get(&id) {
+                                        t.lock_recover()
+                                            .resize_viewport_growth(rows as usize, cols as usize);
+                                    }
+                                    guard.pty_manager.resize(id, cols, rows);
                                 }
+                                true
+                            } else {
+                                false
                             }
-                        } // guard drops before yield
-                        yield ExternalEvent::RequestRedraw;
+                        }; // guard drops before yield
+                        if should_redraw {
+                            yield ExternalEvent::RequestRedraw;
+                        }
                     }
                 }
             })

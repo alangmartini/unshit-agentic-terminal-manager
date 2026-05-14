@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +12,7 @@ pub const MAX_FONT_SIZE: u32 = 32;
 pub const MIN_PANE_RATIO: f32 = 0.1;
 pub const MIN_SIDEBAR_WIDTH: f32 = 150.0;
 pub const MAX_SIDEBAR_WIDTH: f32 = 500.0;
+const DIAGNOSTIC_PTY_EVENT_LIMIT: usize = 32;
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
@@ -453,6 +454,8 @@ pub struct AppState {
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
+    /// Last window maximized state reported by the framework.
+    pub window_maximized: bool,
     /// Sidebar width at the start of a drag, `None` when not dragging.
     pub sidebar_drag_start: Option<f32>,
     pub cpu_pct: f32,
@@ -499,6 +502,15 @@ pub struct AppState {
     /// the user sees that the cached rows may not match the daemon.
     /// Cleared on the next successful refresh.
     pub sessions_stale: bool,
+    /// Monotonic count of frames presented while app diagnostics are enabled.
+    pub diagnostic_frame_counter: u64,
+    /// Wall-clock time for the last presented frame, in Unix epoch
+    /// milliseconds. Kept as an integer so snapshot formatting owns the
+    /// string representation.
+    pub diagnostic_last_present_unix_ms: Option<u64>,
+    /// Recent PTY liveness observations. These are intentionally content-free:
+    /// only event kind, pane/session identifiers, and byte counts are stored.
+    pub diagnostic_pty_recent_events: VecDeque<String>,
     /// Ephemeral notification queue. Populated by
     /// [`push_error_toast`]; ticked down by the cursor-blink
     /// subscription so dismissal stays deterministic in tests.
@@ -577,6 +589,15 @@ impl AppState {
             }
             ws.terminal_entries = entries;
         }
+        let (active_terminal_cols, active_terminal_rows) = self
+            .terminals
+            .get(&self.active_pane.0)
+            .map(|terminal| {
+                let terminal = terminal.lock_recover();
+                (terminal.grid().cols() as u16, terminal.grid().rows() as u16)
+            })
+            .unwrap_or((80, 24));
+
         UiSnapshot {
             workspaces,
             active_workspace: self.active_workspace,
@@ -592,6 +613,7 @@ impl AppState {
             palette_open: self.palette_open,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
+            window_maximized: self.window_maximized,
             cpu_pct: self.cpu_pct,
             mem_gb: self.mem_gb,
             net_kbps: self.net_kbps,
@@ -607,6 +629,8 @@ impl AppState {
             scale_factor: self.scale_factor,
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
+            active_terminal_cols,
+            active_terminal_rows,
             sessions: self.sessions.clone(),
             sessions_stale: self.sessions_stale,
             toasts: self
@@ -658,6 +682,9 @@ pub struct UiSnapshot {
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
+    /// Mirrors `AppState::window_maximized` so titlebar controls can
+    /// render maximize or restore affordances from state.
+    pub window_maximized: bool,
     pub cpu_pct: f32,
     pub mem_gb: f32,
     pub net_kbps: f32,
@@ -682,6 +709,9 @@ pub struct UiSnapshot {
     /// `state.terminals.len()` so the danger-zone button can show an
     /// accurate count without the UI having to reach into the map.
     pub terminal_count: usize,
+    /// Current dimensions of the active terminal grid.
+    pub active_terminal_cols: u16,
+    pub active_terminal_rows: u16,
     pub sessions: Vec<SessionSnapshot>,
     /// Mirrors `AppState::sessions_stale`. `true` when the most recent
     /// `list_sessions` RPC failed and the cached rows may be stale.
@@ -832,6 +862,7 @@ pub fn seed_state() -> AppState {
         palette_open: false,
         sidebar_collapsed: false,
         sidebar_width: 252.0,
+        window_maximized: false,
         sidebar_drag_start: None,
         cpu_pct: 0.0,
         mem_gb: 0.0,
@@ -856,6 +887,9 @@ pub fn seed_state() -> AppState {
         confirm_dialog: None,
         sessions: Vec::new(),
         sessions_stale: false,
+        diagnostic_frame_counter: 0,
+        diagnostic_last_present_unix_ms: None,
+        diagnostic_pty_recent_events: VecDeque::new(),
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
         toast_meta: BTreeMap::new(),
         clipboard: Arc::new(unshit::app::ClipboardContext::new()),
@@ -874,6 +908,18 @@ where
 {
     let mut guard = shared.lock_recover();
     f(&mut guard)
+}
+
+pub fn record_diagnostic_renderer_frame(state: &mut AppState, unix_epoch_ms: u64) {
+    state.diagnostic_frame_counter = state.diagnostic_frame_counter.saturating_add(1);
+    state.diagnostic_last_present_unix_ms = Some(unix_epoch_ms);
+}
+
+pub fn record_diagnostic_pty_event(state: &mut AppState, event: impl Into<String>) {
+    if state.diagnostic_pty_recent_events.len() == DIAGNOSTIC_PTY_EVENT_LIMIT {
+        state.diagnostic_pty_recent_events.pop_front();
+    }
+    state.diagnostic_pty_recent_events.push_back(event.into());
 }
 
 fn save_tab_state(state: &mut AppState) {
@@ -2946,6 +2992,7 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
         push_error_toast(state, "paste failed: no terminal in focus");
         return true;
     }
+    let byte_count = payload.len();
     if let Err(e) = state.pty_manager.write(pane_id, payload.as_bytes()) {
         // Synchronous lookup error from the fire-and-forget queue
         // (e.g. worker channel closed). Async failures land on the
@@ -2953,7 +3000,16 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
         // subscription and surface there as toasts; this branch only
         // catches the immediate rejections.
         log::warn!("terminal.paste: queue write failed for pane {pane_id}: {e}");
+        record_diagnostic_pty_event(
+            state,
+            format!("write_failed pane={pane_id} source=paste error={e}"),
+        );
         push_error_toast(state, format!("paste failed: {e}"));
+    } else {
+        record_diagnostic_pty_event(
+            state,
+            format!("write pane={pane_id} bytes={byte_count} source=paste"),
+        );
     }
     true
 }
@@ -3392,13 +3448,13 @@ pub fn is_on(state: &UiSnapshot, key: ToggleKey) -> bool {
 pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
     let ids: Vec<u32> = state.terminals.keys().copied().collect();
     for id in ids {
-        state.pty_manager.resize(id, cols, rows);
         if let Some(terminal) = state.terminals.get(&id) {
             terminal
                 .lock()
                 .expect("terminal mutex poisoned")
-                .resize(rows as usize, cols as usize);
+                .resize_viewport_growth(rows as usize, cols as usize);
         }
+        state.pty_manager.resize(id, cols, rows);
     }
 }
 
@@ -3538,6 +3594,7 @@ mod tests {
             palette_open: false,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
+            window_maximized: false,
             sidebar_drag_start: None,
             cpu_pct: 0.0,
             mem_gb: 0.0,
@@ -3560,6 +3617,9 @@ mod tests {
             confirm_dialog: None,
             sessions: Vec::new(),
             sessions_stale: false,
+            diagnostic_frame_counter: 0,
+            diagnostic_last_present_unix_ms: None,
+            diagnostic_pty_recent_events: VecDeque::new(),
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
             toast_meta: BTreeMap::new(),
             clipboard: Arc::new(unshit::app::ClipboardContext::new()),
@@ -5181,6 +5241,16 @@ mod tests {
         let messages: Vec<&str> = snap.toasts.iter().map(|t| t.message.as_str()).collect();
         assert_eq!(messages, vec!["first", "second"]);
         assert!(!snap.sessions_stale);
+    }
+
+    #[test]
+    fn ui_snapshot_mirrors_window_maximized_state() {
+        let mut state = seed_state();
+        assert!(!state.ui_snapshot().window_maximized);
+
+        state.window_maximized = true;
+
+        assert!(state.ui_snapshot().window_maximized);
     }
 
     #[test]

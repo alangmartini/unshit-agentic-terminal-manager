@@ -7,8 +7,8 @@ use cosmic_text::{FontSystem, SwashCache};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use unshit_core::build::{
-    build_tree_from_def, dispatch_resize_callbacks, mark_layout_dirty, resolve_all_styles,
-    resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
+    build_tree_from_def, dispatch_resize_callbacks, mark_layout_dirty, mark_paint_dirty,
+    resolve_all_styles, resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
     sync_all_animations, tick_all_animations, tick_all_transitions,
 };
 use unshit_core::dirty::DirtyFlags;
@@ -33,10 +33,11 @@ use unshit_renderer::gpu::GpuContext;
 use unshit_renderer::pipeline::quad::QuadInstance;
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
+use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::{ResizeDirection, Window, WindowId};
 
 pub struct AppConfig {
     pub title: String,
@@ -118,6 +119,10 @@ pub struct AppConfig {
     /// Fires once at startup and again whenever the window moves between
     /// monitors with different scale factors.
     pub on_scale_factor: Option<Arc<dyn Fn(f32) + Send + Sync>>,
+    /// Callback invoked when the window enters or leaves the maximized state.
+    /// Fires once at startup with the initial state, after framework-driven
+    /// maximize toggles, and when OS window events report a state change.
+    pub on_window_maximized: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     /// Callback invoked when the window's close button is clicked.
     /// Returning `true` lets the framework proceed with exit; returning
     /// `false` vetoes the close so the application can show a confirm
@@ -177,6 +182,7 @@ impl Default for AppConfig {
             css_path: None,
             on_frame_metrics: None,
             on_scale_factor: None,
+            on_window_maximized: None,
             on_close: None,
             on_cell_metrics: None,
             #[cfg(feature = "input-latency-histogram")]
@@ -271,6 +277,7 @@ struct AppState {
     /// when the restyle pass consumes it. A full rebuild ignores it.
     restyle_root: Option<NodeId>,
     scale_factor: f32,
+    window_maximized: bool,
     zoom_factor: f32,
     ctrl_held: bool,
     shift_held: bool,
@@ -341,6 +348,62 @@ struct AppState {
     /// zero. Only used when [`AppConfig::tree_fn_bump`] is set; left
     /// unused otherwise.
     frame_arena: FrameArena,
+}
+
+const WINDOW_RESIZE_GRIP_SIZE: f32 = 14.0;
+
+fn window_resize_direction(
+    surface_size: PhysicalSize<u32>,
+    cursor: (f32, f32),
+    scale_factor: f32,
+) -> Option<ResizeDirection> {
+    if surface_size.width == 0 || surface_size.height == 0 {
+        return None;
+    }
+
+    let (x, y) = cursor;
+    let width = surface_size.width as f32;
+    let height = surface_size.height as f32;
+    let grip = WINDOW_RESIZE_GRIP_SIZE * scale_factor.max(1.0);
+
+    let near_left = x <= grip && x <= width * 0.5;
+    let near_right = x >= width - grip && x > width * 0.5;
+    let near_top = y <= grip && y <= height * 0.5;
+    let near_bottom = y >= height - grip && y > height * 0.5;
+
+    match (near_left, near_right, near_top, near_bottom) {
+        (true, false, true, false) => Some(ResizeDirection::NorthWest),
+        (false, true, true, false) => Some(ResizeDirection::NorthEast),
+        (true, false, false, true) => Some(ResizeDirection::SouthWest),
+        (false, true, false, true) => Some(ResizeDirection::SouthEast),
+        (true, false, false, false) => Some(ResizeDirection::West),
+        (false, true, false, false) => Some(ResizeDirection::East),
+        (false, false, true, false) => Some(ResizeDirection::North),
+        (false, false, false, true) => Some(ResizeDirection::South),
+        _ => None,
+    }
+}
+
+fn custom_window_resize_direction(
+    decorations: bool,
+    surface_size: PhysicalSize<u32>,
+    cursor: (f32, f32),
+    scale_factor: f32,
+) -> Option<ResizeDirection> {
+    if decorations {
+        None
+    } else {
+        window_resize_direction(surface_size, cursor, scale_factor)
+    }
+}
+
+fn resize_direction_cursor_icon(direction: ResizeDirection) -> CursorIcon {
+    match direction {
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::EwResize,
+        ResizeDirection::North | ResizeDirection::South => CursorIcon::NsResize,
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::NwseResize,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::NeswResize,
+    }
 }
 
 /// How long after the last external event the loop keeps scheduling
@@ -570,6 +633,33 @@ fn reconcile_surface_metrics_from_window(
         state.window.surface_size(),
         state.window.scale_factor() as f32,
         on_scale_factor,
+    )
+}
+
+fn publish_window_maximized_change(
+    last: &mut bool,
+    current: bool,
+    on_window_maximized: Option<&Arc<dyn Fn(bool) + Send + Sync>>,
+) -> bool {
+    if *last == current {
+        return false;
+    }
+
+    *last = current;
+    if let Some(cb) = on_window_maximized {
+        cb(current);
+    }
+    true
+}
+
+fn sync_window_maximized_from_window(
+    state: &mut AppState,
+    on_window_maximized: Option<&Arc<dyn Fn(bool) + Send + Sync>>,
+) -> bool {
+    publish_window_maximized_change(
+        &mut state.window_maximized,
+        state.window.is_maximized(),
+        on_window_maximized,
     )
 }
 
@@ -814,6 +904,21 @@ impl ApplicationHandler for AppHandler {
                         .request_user_attention(Some(AttentionUrgency::Informational.to_winit()));
                     coalescer.observe(false);
                 }
+                ExternalEvent::MinimizeWindow => {
+                    state.window.set_minimized(true);
+                    coalescer.observe(false);
+                }
+                ExternalEvent::ToggleMaximizeWindow => {
+                    let maximized = state.window.is_maximized();
+                    let next_maximized = !maximized;
+                    state.window.set_maximized(next_maximized);
+                    publish_window_maximized_change(
+                        &mut state.window_maximized,
+                        next_maximized,
+                        self.app.config.on_window_maximized.as_ref(),
+                    );
+                    coalescer.observe(true);
+                }
                 ExternalEvent::Custom(payload) => {
                     if let Some(ref handler) = self.app.config.on_external_event {
                         handler(payload);
@@ -877,6 +982,10 @@ impl ApplicationHandler for AppHandler {
 
         if let Some(ref cb) = self.app.config.on_scale_factor {
             cb(scale_factor);
+        }
+        let initial_window_maximized = window.is_maximized();
+        if let Some(ref cb) = self.app.config.on_window_maximized {
+            cb(initial_window_maximized);
         }
 
         // Read the active monitor's refresh rate so the frame pacer can
@@ -1045,6 +1154,7 @@ impl ApplicationHandler for AppHandler {
             needs_relayout: false,
             restyle_root: None,
             scale_factor,
+            window_maximized: initial_window_maximized,
             zoom_factor: 1.0,
             ctrl_held: false,
             shift_held: false,
@@ -1219,6 +1329,12 @@ impl ApplicationHandler for AppHandler {
                     state.window.scale_factor() as f32,
                     self.app.config.on_scale_factor.as_ref(),
                 );
+                if sync_window_maximized_from_window(
+                    state,
+                    self.app.config.on_window_maximized.as_ref(),
+                ) {
+                    state.needs_rebuild = true;
+                }
                 state.window.request_redraw();
             }
 
@@ -1232,17 +1348,31 @@ impl ApplicationHandler for AppHandler {
                     scale_factor as f32,
                     self.app.config.on_scale_factor.as_ref(),
                 );
+                if sync_window_maximized_from_window(
+                    state,
+                    self.app.config.on_window_maximized.as_ref(),
+                ) {
+                    state.needs_rebuild = true;
+                }
                 state.window.request_redraw();
             }
 
             WindowEvent::Moved(_position) => {
-                if !matches!(
+                let metrics_changed = !matches!(
                     reconcile_surface_metrics_from_window(
                         state,
-                        self.app.config.on_scale_factor.as_ref(),
+                        self.app.config.on_scale_factor.as_ref()
                     ),
                     SurfaceMetricsChange::None
-                ) {
+                );
+                let maximized_changed = sync_window_maximized_from_window(
+                    state,
+                    self.app.config.on_window_maximized.as_ref(),
+                );
+                if maximized_changed {
+                    state.needs_rebuild = true;
+                }
+                if metrics_changed || maximized_changed {
                     state.window.request_redraw();
                 }
 
@@ -1388,10 +1518,10 @@ impl ApplicationHandler for AppHandler {
                     }
                     // If threshold not met yet, fall through to normal hover
                     if !state.interaction.dragging {
-                        handle_normal_hover(state, pos);
+                        handle_normal_hover(state, pos, self.app.config.decorations);
                     }
                 } else {
-                    handle_normal_hover(state, pos);
+                    handle_normal_hover(state, pos, self.app.config.decorations);
                 }
             }
 
@@ -1415,11 +1545,32 @@ impl ApplicationHandler for AppHandler {
                             } else {
                                 state.interaction.hovered
                             };
+                            if let Some(direction) = custom_window_resize_direction(
+                                self.app.config.decorations,
+                                state.window.surface_size(),
+                                sb_pos,
+                                state.window.scale_factor() as f32,
+                            ) {
+                                state.interaction.drag_origin = None;
+                                state.interaction.dragging = false;
+                                state.interaction.drag_target = None;
+                                state.interaction.mousedown_target = None;
+                                state.interaction.resize_drag = None;
+                                state.interaction.scrollbar_drag = None;
+                                if let Err(err) = state.window.drag_resize_window(direction) {
+                                    log::warn!("native window resize drag failed: {err}");
+                                }
+                                state.window.request_redraw();
+                                return;
+                            }
+
                             if is_window_drag_region(&state.arena, region_target) {
                                 state.interaction.drag_origin = None;
                                 state.interaction.dragging = false;
                                 state.interaction.drag_target = None;
                                 state.interaction.mousedown_target = None;
+                                state.interaction.resize_drag = None;
+                                state.interaction.scrollbar_drag = None;
                                 if let Err(err) = state.window.drag_window() {
                                     log::warn!("native window drag failed: {err}");
                                 }
@@ -2365,7 +2516,7 @@ impl ApplicationHandler for AppHandler {
                 } else if state.needs_relayout {
                     let t3 = Instant::now();
                     let (w, h) = state.gpu.window_size();
-                    relayout_pipeline(
+                    let resize_callbacks_fired = relayout_pipeline(
                         &mut state.arena,
                         &mut state.taffy,
                         state.root,
@@ -2378,6 +2529,10 @@ impl ApplicationHandler for AppHandler {
 
                     metrics.node_count = state.arena.len();
                     state.needs_relayout = false;
+                    if resize_callbacks_fired {
+                        state.needs_rebuild = true;
+                        state.window.request_redraw();
+                    }
                 } else {
                     metrics.node_count = state.arena.len();
                 }
@@ -2785,7 +2940,23 @@ fn update_select_hover(state: &mut AppState, px: f32, py: f32) {
 
 /// Normal hover/selection handling extracted from PointerMoved, so it can be
 /// called from both the "no drag" path and the "threshold not met yet" path.
-fn handle_normal_hover(state: &mut AppState, pos: (f32, f32)) {
+fn handle_normal_hover(state: &mut AppState, pos: (f32, f32), decorations: bool) {
+    if let Some(direction) = custom_window_resize_direction(
+        decorations,
+        state.window.surface_size(),
+        pos,
+        state.window.scale_factor() as f32,
+    ) {
+        state.window.set_cursor(resize_direction_cursor_icon(direction).into());
+        if !state.interaction.hovered.is_dangling() {
+            let old_hover = state.interaction.hovered;
+            state.interaction.hovered = NodeId::DANGLING;
+            state.mark_restyle_pseudo_change(old_hover, NodeId::DANGLING);
+            state.window.request_redraw();
+        }
+        return;
+    }
+
     // Check scrollbar hover
     let sb_hit = scroll::find_scrollbar_at(&state.arena, state.root, pos.0, pos.1);
     let old_visual = state.scrollbar_visual;
@@ -3342,12 +3513,13 @@ fn relayout_pipeline(
     width: f32,
     height: f32,
     cache: &mut TextMeasureCache,
-) {
+) -> bool {
     if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
         layout::compute_layout(taffy, tn, width, height, font_system, cache);
         layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
+        mark_paint_dirty(arena, root);
     }
-    dispatch_resize_callbacks(arena, root);
+    dispatch_resize_callbacks(arena, root)
 }
 
 /// Get current process RSS (resident set size) in bytes.
@@ -3750,6 +3922,52 @@ mod tests {
     }
 
     #[test]
+    fn window_resize_direction_maps_edges_and_corners() {
+        let size = PhysicalSize::new(800, 600);
+
+        assert_eq!(window_resize_direction(size, (4.0, 300.0), 1.0), Some(ResizeDirection::West));
+        assert_eq!(window_resize_direction(size, (796.0, 300.0), 1.0), Some(ResizeDirection::East));
+        assert_eq!(
+            window_resize_direction(size, (4.0, 4.0), 1.0),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(window_resize_direction(size, (400.0, 300.0), 1.0), None);
+    }
+
+    #[test]
+    fn window_resize_direction_scales_grip_for_hidpi() {
+        let size = PhysicalSize::new(800, 600);
+
+        assert_eq!(window_resize_direction(size, (20.0, 300.0), 1.0), None);
+        assert_eq!(window_resize_direction(size, (20.0, 300.0), 2.0), Some(ResizeDirection::West));
+    }
+
+    #[test]
+    fn custom_window_resize_direction_is_disabled_with_native_decorations() {
+        let size = PhysicalSize::new(800, 600);
+
+        assert_eq!(custom_window_resize_direction(true, size, (4.0, 4.0), 1.0), None);
+        assert_eq!(
+            custom_window_resize_direction(false, size, (4.0, 4.0), 1.0),
+            Some(ResizeDirection::NorthWest)
+        );
+    }
+
+    #[test]
+    fn resize_direction_cursor_icon_uses_expected_edge_and_corner_cursors() {
+        assert_eq!(resize_direction_cursor_icon(ResizeDirection::West), CursorIcon::EwResize);
+        assert_eq!(resize_direction_cursor_icon(ResizeDirection::South), CursorIcon::NsResize);
+        assert_eq!(
+            resize_direction_cursor_icon(ResizeDirection::NorthWest),
+            CursorIcon::NwseResize
+        );
+        assert_eq!(
+            resize_direction_cursor_icon(ResizeDirection::NorthEast),
+            CursorIcon::NeswResize
+        );
+    }
+
+    #[test]
     fn compiled_stylesheet_parse_roundtrip() {
         let stylesheet = CompiledStylesheet::parse(".hot { color: green; }");
         assert!(!stylesheet.rules.is_empty(), "should parse at least one rule");
@@ -3786,6 +4004,30 @@ mod tests {
     fn app_config_on_cell_metrics_defaults_to_none() {
         let config = AppConfig::default();
         assert!(config.on_cell_metrics.is_none());
+    }
+
+    #[test]
+    fn app_config_on_window_maximized_defaults_to_none() {
+        let config = AppConfig::default();
+        assert!(config.on_window_maximized.is_none());
+    }
+
+    #[test]
+    fn publish_window_maximized_change_only_notifies_on_change() {
+        use std::sync::Mutex;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let callback: Arc<dyn Fn(bool) + Send + Sync> =
+            Arc::new(move |maximized| calls_clone.lock().unwrap().push(maximized));
+        let mut last = false;
+
+        assert!(!publish_window_maximized_change(&mut last, false, Some(&callback)));
+        assert!(publish_window_maximized_change(&mut last, true, Some(&callback)));
+        assert!(!publish_window_maximized_change(&mut last, true, Some(&callback)));
+        assert!(publish_window_maximized_change(&mut last, false, Some(&callback)));
+
+        assert_eq!(*calls.lock().unwrap(), vec![true, false]);
     }
 
     #[test]
@@ -3840,6 +4082,57 @@ mod tests {
         );
         assert_eq!(fired.load(Ordering::SeqCst), 1);
 
+        let callbacks_fired = relayout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            400.0,
+            600.0,
+            &mut measure_cache,
+        );
+
+        assert!(
+            callbacks_fired,
+            "lightweight relayout must report fired resize callbacks so the app can rebuild snapshots"
+        );
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            2,
+            "window-size relayout must fire on_resize when element dimensions change"
+        );
+    }
+
+    #[test]
+    fn lightweight_relayout_marks_paint_dirty_after_window_resize() {
+        let stylesheet = CompiledStylesheet::parse(
+            ".root { width: 100%; height: 100%; } .pane { width: 100%; height: 100%; }",
+        );
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root_def = ElementDef::new(Tag::Div)
+            .with_class("root")
+            .with_child(ElementDef::new(Tag::Div).with_class("pane"));
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let pane = arena.children(root)[0];
+        let mut font_system = FontSystem::new();
+        let mut measure_cache = TextMeasureCache::new();
+
+        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+        run_layout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            800.0,
+            600.0,
+            &mut measure_cache,
+        );
+        let ids: Vec<NodeId> = arena.iter().map(|(id, _)| id).collect();
+        for id in ids {
+            arena.get_mut(id).unwrap().dirty = DirtyFlags::empty();
+        }
+
         relayout_pipeline(
             &mut arena,
             &mut taffy,
@@ -3850,10 +4143,13 @@ mod tests {
             &mut measure_cache,
         );
 
-        assert_eq!(
-            fired.load(Ordering::SeqCst),
-            2,
-            "window-size relayout must fire on_resize when element dimensions change"
+        assert!(
+            arena.get(root).unwrap().dirty.contains(DirtyFlags::PAINT),
+            "root must repaint after a window-size relayout"
+        );
+        assert!(
+            arena.get(pane).unwrap().dirty.contains(DirtyFlags::PAINT),
+            "resized child subtree must repaint after a window-size relayout"
         );
     }
 

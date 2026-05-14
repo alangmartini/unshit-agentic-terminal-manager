@@ -241,6 +241,13 @@ pub fn icon_window_maximize() -> SvgNode {
     )
 }
 
+pub fn icon_window_restore() -> SvgNode {
+    group(
+        root_attrs(1.2, StrokeLineCap::Butt, StrokeLineJoin::Miter),
+        vec![rect(3.0, 5.0, 8.0, 8.0, 0.0), rect(5.0, 3.0, 8.0, 8.0, 0.0)],
+    )
+}
+
 pub fn icon_agent() -> SvgNode {
     // Same shell prompt glyph as `icon_search`, but without the surrounding
     // rect and with the chevron nudged 1px left / the tail extended 1px.
@@ -493,6 +500,13 @@ mod tests {
         let node = icon_window_maximize();
         assert!(matches!(node.primitive, SvgPrimitive::Group));
         assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn icon_window_restore_builds() {
+        let node = icon_window_restore();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2);
     }
 
     #[test]

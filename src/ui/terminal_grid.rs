@@ -5,7 +5,8 @@ use unshit::core::style::types::TransformX;
 
 use crate::state::{
     apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with,
-    MutexExt, Pane, PaneId, ResizeDragSnapshot, SharedState, UiSnapshot, CSS_LINE_HEIGHT,
+    record_diagnostic_pty_event, MutexExt, Pane, PaneId, ResizeDragSnapshot, SharedState,
+    UiSnapshot, CSS_LINE_HEIGHT,
 };
 use crate::ui::icons::*;
 
@@ -479,8 +480,24 @@ fn build_pane_body(
                         });
 
                         if let Some(bytes) = crate::terminal::keys::encode_key(kb) {
+                            let byte_count = bytes.len();
                             mutate_with(&kbd_shared, |st| {
-                                let _ = st.pty_manager.write(kbd_pane_id.0, &bytes);
+                                match st.pty_manager.write(kbd_pane_id.0, &bytes) {
+                                    Ok(()) => record_diagnostic_pty_event(
+                                        st,
+                                        format!(
+                                            "write pane={} bytes={} source=keyboard",
+                                            kbd_pane_id.0, byte_count
+                                        ),
+                                    ),
+                                    Err(e) => record_diagnostic_pty_event(
+                                        st,
+                                        format!(
+                                            "write_failed pane={} source=keyboard error={}",
+                                            kbd_pane_id.0, e
+                                        ),
+                                    ),
+                                }
                             });
                         }
                     }
@@ -548,13 +565,13 @@ fn build_pane_body(
                     if cell_w > 0.0 && cell_h > 0.0 {
                         let cols = (w / cell_w).max(1.0) as u16;
                         let rows = (h / cell_h).max(1.0) as u16;
-                        st.pty_manager.resize(resize_pane_id.0, cols, rows);
                         if let Some(handle) = st.terminals.get(&resize_pane_id.0) {
                             handle
                                 .lock()
                                 .expect("terminal mutex poisoned")
-                                .resize(rows as usize, cols as usize);
+                                .resize_viewport_growth(rows as usize, cols as usize);
                         }
+                        st.pty_manager.resize(resize_pane_id.0, cols, rows);
                     }
                 });
             });
@@ -1280,6 +1297,71 @@ mod tests {
         assert!(
             content.on_resize.is_some(),
             "active pane terminal-content must have a resize handler"
+        );
+    }
+
+    /// Regression for the Win+Left aero-snap bug: when the snap event
+    /// causes a relayout that grows the `terminal-content` height (e.g.
+    /// pane height jumps from 24 rows worth to 50), the `on_resize`
+    /// handler must reach the local Terminal and grow its grid. If the
+    /// closure short-circuits (zero cell metrics, missing handler on
+    /// active pane, etc.) the rendered cells stay capped at the old row
+    /// count and the lower portion of the pane renders as void — exactly
+    /// the symptom users hit when the powershell drag-only test misses
+    /// the snap path. The test exercises the active-pane code path with
+    /// real cell metrics so a regression that strips the handler or
+    /// gates it behind capture_keyboard alone fails here.
+    #[test]
+    fn terminal_content_on_resize_grows_local_terminal_after_snap() {
+        let pane_id: u32 = 1;
+        let shared = test_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(pane_id);
+            let term = crate::terminal::Terminal::new(24, 80);
+            guard
+                .terminals
+                .insert(pane_id, std::sync::Arc::new(std::sync::Mutex::new(term)));
+        }
+
+        // Renderer publishes cell metrics during the first paint; the
+        // on_resize handler reads them via globals. Without this the
+        // handler bails out (cell_w == 0) and the regression does not
+        // bite, so seed real values that match the running app.
+        CellGrid::publish_cell_metrics(10.0, 24.0);
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id, CellGrid::new(24, 80));
+        // capture_keyboard=true emulates the active pane, where the
+        // snap-resize handler must be registered.
+        let body = build_pane_body(PaneId(pane_id), true, 13, &shared, &grids);
+        let content =
+            find_terminal_content(&body).expect("terminal-content must exist when grid present");
+        let on_resize = content
+            .on_resize
+            .as_ref()
+            .cloned()
+            .expect("active pane terminal-content must register on_resize");
+
+        // Simulate a Win+Left snap: pane height grows from 576 px (24
+        // rows × 24 px) to 1200 px (50 rows × 24 px). Width unchanged.
+        on_resize(800.0, 1200.0);
+
+        let guard = shared.lock().unwrap();
+        let term = guard
+            .terminals
+            .get(&pane_id)
+            .expect("local terminal still present");
+        let term = term.lock().unwrap();
+        assert_eq!(
+            term.grid().rows(),
+            50,
+            "snap-resize must grow local Terminal grid rows from 24 to 50"
+        );
+        assert_eq!(
+            term.grid().cols(),
+            80,
+            "snap-resize without width change must keep cols at 80"
         );
     }
 

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/terminal-manager-diagnostics",
     "crates/unshit-framework/crates/*",
     "crates/unshit-ptyd",
     "crates/unshit-terminal-core",
@@ -106,10 +107,11 @@ workspace = true
 unshit = { path = "crates/unshit-framework/crates/unshit", features = ["async", "clipboard"] }
 unshit-ptyd = { path = "crates/unshit-ptyd" }
 unshit-terminal-core = { path = "crates/unshit-terminal-core" }
+terminal-manager-diagnostics = { path = "crates/terminal-manager-diagnostics" }
 cosmic-text = "0.12"
 portable-pty = "0.8"
 vte = "0.13"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "io-util", "net"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
 futures-core = "0.3"

@@ -694,6 +694,10 @@ impl ShapedTextCache {
 /// output for clean (non-dirty) nodes without rebuilding.
 #[derive(Clone, Default)]
 pub struct BatchRange {
+    /// Render-space geometry that produced this range. Cached primitives
+    /// contain absolute positions and clip rectangles, so a pure relayout
+    /// must not replay them when dirty flags were not raised.
+    pub signature: BatchCacheSignature,
     pub quads: Vec<QuadInstance>,
     pub glyphs: Vec<GlyphInstance>,
     pub svgs: Vec<SvgDrawCall>,
@@ -711,6 +715,26 @@ pub struct BatchRange {
     /// between blurred and unblurred whenever the renderer takes the cache
     /// path (issues #143, #142).
     pub backdrop_boundaries: Vec<BackdropBoundary>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BatchCacheSignature {
+    pub render_rect: [f32; 4],
+    pub clip_rect: [f32; 4],
+}
+
+impl BatchCacheSignature {
+    pub fn new(render_rect: [f32; 4], clip_rect: [f32; 4]) -> Self {
+        Self { render_rect, clip_rect }
+    }
+
+    fn matches(self, other: Self) -> bool {
+        self.render_rect
+            .iter()
+            .chain(self.clip_rect.iter())
+            .zip(other.render_rect.iter().chain(other.clip_rect.iter()))
+            .all(|(a, b)| (*a - *b).abs() <= 0.01)
+    }
 }
 
 /// Per-frame cache that stores the actual `QuadInstance` and `GlyphInstance`
@@ -778,9 +802,39 @@ impl BatchCache {
         atlas_generation: u64,
         backdrop_boundaries: Vec<BackdropBoundary>,
     ) {
+        self.record_with_signature(
+            node_id,
+            layer_index,
+            BatchCacheSignature::default(),
+            quads,
+            glyphs,
+            svgs,
+            draw_spans,
+            glyph_keys,
+            atlas_generation,
+            backdrop_boundaries,
+        );
+    }
+
+    /// Record a range with the render geometry that produced it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_signature(
+        &mut self,
+        node_id: NodeId,
+        layer_index: usize,
+        signature: BatchCacheSignature,
+        quads: Vec<QuadInstance>,
+        glyphs: Vec<GlyphInstance>,
+        svgs: Vec<SvgDrawCall>,
+        draw_spans: Vec<DrawSpan>,
+        glyph_keys: Vec<GlyphKey>,
+        atlas_generation: u64,
+        backdrop_boundaries: Vec<BackdropBoundary>,
+    ) {
         self.pending.insert(
             (node_id, layer_index),
             BatchRange {
+                signature,
                 quads,
                 glyphs,
                 svgs,
@@ -824,14 +878,36 @@ impl BatchCache {
         layer_index: usize,
         atlas_generation: u64,
     ) -> Option<&BatchRange> {
+        self.replay_with_signature(
+            node_id,
+            layer_index,
+            atlas_generation,
+            BatchCacheSignature::default(),
+        )
+    }
+
+    /// Replay only when both atlas generation and render geometry still
+    /// match. Layout can move elements without setting PAINT; without this
+    /// guard, stale absolute-position primitives replay after window resize.
+    pub fn replay_with_signature(
+        &mut self,
+        node_id: NodeId,
+        layer_index: usize,
+        atlas_generation: u64,
+        signature: BatchCacheSignature,
+    ) -> Option<&BatchRange> {
         let key = (node_id, layer_index);
-        if !self.pending.contains_key(&key) {
-            let range = self.ranges.get(&key)?.clone();
-            if range.atlas_generation != atlas_generation {
-                return None;
-            }
-            self.pending.insert(key, range);
+        if self.pending.contains_key(&key) {
+            let range = self.pending.get(&key).expect("contains_key checked pending entry");
+            return (range.atlas_generation == atlas_generation
+                && range.signature.matches(signature))
+            .then_some(range);
         }
+        let range = self.ranges.get(&key)?.clone();
+        if range.atlas_generation != atlas_generation || !range.signature.matches(signature) {
+            return None;
+        }
+        self.pending.insert(key, range);
         self.pending.get(&key)
     }
 }
@@ -1261,6 +1337,20 @@ fn walk_for_batch(
     let effective_layer = if style.layer != Layer::Content { style.layer } else { current_layer };
     let layer_index = effective_layer as usize;
 
+    let rect = element.layout_rect;
+
+    // CSS `transform: translateX(...)` is applied here as a pure render
+    // space offset. The layout rect keeps its in flow position so siblings
+    // and hit testing are unaffected; only the painted position shifts.
+    // Transform offsets propagate down into child scroll offsets so the
+    // whole subtree translates together.
+    let transform_dx = style.transform_translate_x.map(|t| t.resolve(rect.width)).unwrap_or(0.0);
+
+    let render_x = rect.x - scroll_offset_x + transform_dx;
+    let render_y = rect.y - scroll_offset_y;
+    let cache_signature =
+        BatchCacheSignature::new([render_x, render_y, rect.width, rect.height], clip_rect);
+
     // Damage-aware skip: if neither PAINT nor SUBTREE_PAINT is set, replay the
     // previously cached primitive instances and skip the entire subtree.
     //
@@ -1289,7 +1379,12 @@ fn walk_for_batch(
     }
 
     if !node_dirty {
-        if let Some(cached) = batch_cache.replay(node_id, layer_index, atlas.generation) {
+        if let Some(cached) = batch_cache.replay_with_signature(
+            node_id,
+            layer_index,
+            atlas.generation,
+            cache_signature,
+        ) {
             for key in &cached.glyph_keys {
                 atlas.touch(key);
             }
@@ -1358,19 +1453,7 @@ fn walk_for_batch(
     let glyph_cursor = glyph_start;
 
     let is_visible = style.visibility == Visibility::Visible;
-
-    let rect = element.layout_rect;
     let opacity = style.opacity;
-
-    // CSS `transform: translateX(...)` is applied here as a pure render
-    // space offset. The layout rect keeps its in flow position so siblings
-    // and hit testing are unaffected; only the painted position shifts.
-    // Transform offsets propagate down into child scroll offsets so the
-    // whole subtree translates together.
-    let transform_dx = style.transform_translate_x.map(|t| t.resolve(rect.width)).unwrap_or(0.0);
-
-    let render_x = rect.x - scroll_offset_x + transform_dx;
-    let render_y = rect.y - scroll_offset_y;
 
     let clips_children = style.overflow != Overflow::Visible;
     let child_clip = if clips_children {
@@ -2449,9 +2532,10 @@ fn walk_for_batch(
             })
             .collect::<Vec<_>>();
         let glyph_keys = node_glyph_keys.iter().copied().collect::<Vec<_>>();
-        batch_cache.record(
+        batch_cache.record_with_signature(
             node_id,
             layer_index,
+            cache_signature,
             quads,
             glyphs,
             svgs,
@@ -5458,6 +5542,39 @@ mod tests {
 
         cache.begin_frame();
         assert!(cache.replay(id, 0, 8).is_none(), "generation mismatch must force fresh render",);
+    }
+
+    #[test]
+    fn replay_returns_none_when_render_geometry_mismatches() {
+        // Cached ranges contain absolute primitive positions. A pure layout
+        // pass can move a node without setting PAINT, so replay must validate
+        // the geometry that produced the cached range before carrying it
+        // forward.
+        let mut cache = BatchCache::new();
+        let id = NodeId::DANGLING;
+        let old_sig = BatchCacheSignature::new([0.0, 680.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0]);
+        let new_sig = BatchCacheSignature::new([0.0, 888.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0]);
+
+        cache.begin_frame();
+        cache.record_with_signature(
+            id,
+            0,
+            old_sig,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            0,
+            vec![],
+        );
+        cache.commit_frame();
+
+        cache.begin_frame();
+        assert!(
+            cache.replay_with_signature(id, 0, 0, new_sig).is_none(),
+            "layout-only y changes must force fresh render instead of replaying stale primitives",
+        );
     }
 
     #[test]
