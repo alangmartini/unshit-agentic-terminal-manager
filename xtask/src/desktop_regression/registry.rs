@@ -21,7 +21,8 @@ const SUITES: &[SuiteMetadata] = &[
         id: "split-divider-stability",
         title: "Split divider stability",
         tags: &["windows", "split", "resize", "layout", "black-box"],
-        coverage: "Pane divider drag stability and terminal-grid size settling after split divider drag.",
+        coverage:
+            "Pane divider drag stability and terminal-grid size settling after split divider drag.",
         observability_needs: &[
             "win32-window-bounds",
             "screenshots",
@@ -87,7 +88,7 @@ mod tests {
         let ids: Vec<_> = all_suites().iter().map(|suite| suite.id).collect();
         assert_eq!(
             ids,
-        vec![
+            vec![
                 "edge-resize-stability",
                 "split-divider-stability",
                 "post-resize-glitches",
