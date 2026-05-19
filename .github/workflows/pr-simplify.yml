@@ -26,6 +26,9 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      # Codex sandbox may run cargo; keep its writes off the developer's
+      # ~/.cargo (see pr-review.yml for the multi-incident root-cause note).
+      CARGO_HOME: C:\Users\Alan Beelink\actions-runner\.cargo-runner
 
     steps:
       - name: Add Codex CLI to PATH

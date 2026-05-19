@@ -11,15 +11,17 @@ use crate::desktop_regression::launcher::{AppLogFiles, AppSession};
 use crate::desktop_regression::results::SuiteExecutionRecord;
 use crate::desktop_regression::screenshots::capture_screen;
 use crate::desktop_regression::suites::observability::{
-    assert_launched_process_snapshot, assert_renderer_surface_sane, assert_terminal_snapshot_sane,
-    artifacts_with_common, capture_step_snapshot, finalize_diagnostics, format_rect,
+    artifacts_with_common, assert_launched_process_snapshot, assert_renderer_surface_sane,
+    assert_terminal_snapshot_sane, capture_step_snapshot, finalize_diagnostics, format_rect,
     mark_full_step, maybe_prompt_on_failure, record_diagnostic_error, start_diagnostics,
     ObservedDiagnostics,
 };
 use crate::desktop_regression::suites::{forced_failure_for_suite, SuiteContext};
 use crate::desktop_regression::win32::{self, DesktopRect};
 use serde_json::json;
-use terminal_manager_diagnostics::{Rect, RunnerActionKind, RunnerActionTarget, TerminalManagerSnapshot};
+use terminal_manager_diagnostics::{
+    Rect, RunnerActionKind, RunnerActionTarget, TerminalManagerSnapshot,
+};
 
 const SUITE_ID: &str = "split-divider-stability";
 const INITIAL_X: i32 = 110;
@@ -223,7 +225,9 @@ fn run_divider_scenario(
             SUITE_ID,
             Some("split"),
             RunnerActionTarget::None,
-            RunnerActionKind::MarkStep { id: "split".to_owned() },
+            RunnerActionKind::MarkStep {
+                id: "split".to_owned(),
+            },
         )
         .map_err(SuiteError::setup)?;
     win32::send_ctrl_d().map_err(SuiteError::setup)?;
@@ -319,13 +323,7 @@ fn run_divider_scenario(
         "split-divider-stability did not collect enough post-drag samples",
         "divider-sample-count",
     )?;
-    write_geometry_summary(
-        context,
-        artifacts,
-        split_dims,
-        &drag_attempt_dims,
-        &samples,
-    )?;
+    write_geometry_summary(context, artifacts, split_dims, &drag_attempt_dims, &samples)?;
     let sample_dims = stability_sample_dims(&samples);
 
     let final_dims = sample_dims
@@ -534,8 +532,16 @@ fn divider_drag_point(
         + scaled_px(TITLEBAR_HEIGHT as f64, scale_factor)
         + scaled_px(TABBAR_HEIGHT as f64, scale_factor);
     let terminal_bottom = client.bottom - scaled_px(STATUSBAR_HEIGHT as f64, scale_factor);
-    let x = clamp_between(content_x + grid_width / 2, client.left + 8, client.right - 8);
-    let y = clamp_between(terminal_top + grid_height / 2, terminal_top + 8, terminal_bottom - 8);
+    let x = clamp_between(
+        content_x + grid_width / 2,
+        client.left + 8,
+        client.right - 8,
+    );
+    let y = clamp_between(
+        terminal_top + grid_height / 2,
+        terminal_top + 8,
+        terminal_bottom - 8,
+    );
 
     assert_true(
         x > client.left && x < client.right && y > client.top && y < client.bottom,
@@ -609,17 +615,18 @@ fn collect_stable_grid_samples(
 }
 
 fn snapshot_captured_at_utc(snapshot: &TerminalManagerSnapshot) -> Option<String> {
-    serde_json::to_value(snapshot)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("captured_at_utc")
-                .and_then(|captured_at_utc| captured_at_utc.as_str().map(str::to_owned))
-        })
+    serde_json::to_value(snapshot).ok().and_then(|value| {
+        value
+            .get("captured_at_utc")
+            .and_then(|captured_at_utc| captured_at_utc.as_str().map(str::to_owned))
+    })
 }
 
 fn assert_stable_after_drag(samples: &[(u32, u32)]) -> SuiteResult<()> {
-    let transitions = samples.windows(2).filter(|window| window[0] != window[1]).count();
+    let transitions = samples
+        .windows(2)
+        .filter(|window| window[0] != window[1])
+        .count();
     assert_true(
         transitions <= 2,
         &format!(
@@ -683,7 +690,10 @@ mod tests {
         ])
         .unwrap_err();
 
-        assert_eq!(err.first_bad_signal.as_deref(), Some("divider-flicker-transition"));
+        assert_eq!(
+            err.first_bad_signal.as_deref(),
+            Some("divider-flicker-transition")
+        );
     }
 
     #[test]

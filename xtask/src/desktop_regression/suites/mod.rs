@@ -12,8 +12,8 @@ pub const ENV_FORCE_FAILURE: &str = "TM_DESKTOP_REGRESSION_FORCE_FAILURE";
 
 pub mod edge_resize_stability;
 pub(crate) mod observability;
-pub mod split_divider_stability;
 pub mod post_resize_glitches;
+pub mod split_divider_stability;
 pub mod titlebar_window_controls;
 
 pub struct SuiteContext<'a> {
