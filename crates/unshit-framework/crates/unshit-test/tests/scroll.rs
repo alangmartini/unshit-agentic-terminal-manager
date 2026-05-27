@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use unshit_core::dirty::DirtyFlags;
 use unshit_core::element::{ElementDef, ElementTree, Tag};
 use unshit_test::TestHarness;
 
@@ -8,6 +11,27 @@ fn scroll_css() -> &'static str {
         display: flex;
         flex-direction: column;
         overflow: scroll;
+        height: 200px;
+        width: 100%;
+        gap: 10px;
+    }
+    .item {
+        display: flex;
+        flex-shrink: 0;
+        height: 50px;
+        width: 100%;
+        background: #333333;
+    }
+    "#
+}
+
+fn auto_scroll_css() -> &'static str {
+    r#"
+    .root { display: flex; flex-direction: column; width: 100%; height: 100%; }
+    .scroll-container {
+        display: flex;
+        flex-direction: column;
+        overflow: auto;
         height: 200px;
         width: 100%;
         gap: 10px;
@@ -43,6 +67,41 @@ fn hidden_css() -> &'static str {
     "#
 }
 
+fn absolute_footer_css() -> &'static str {
+    r#"
+    .root { width: 100%; height: 100%; }
+    .scroll-container {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        overflow: auto;
+        height: 200px;
+        width: 300px;
+        padding-bottom: 48px;
+    }
+    .item {
+        flex-shrink: 0;
+        height: 80px;
+        width: 100%;
+        background: #333333;
+    }
+    .savebar {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 44px;
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+    }
+    .done {
+        width: 72px;
+        height: 30px;
+    }
+    "#
+}
+
 /// Build a tree with a root containing a scroll container with `n` items.
 fn scroll_tree(n: usize) -> ElementTree {
     let mut container = ElementDef::new(Tag::Div).with_class("scroll-container");
@@ -55,6 +114,20 @@ fn scroll_tree(n: usize) -> ElementTree {
 /// Convenience: build a harness with 10 items (590px content in 200px container).
 fn make_harness(css: &str) -> TestHarness {
     TestHarness::new(css, || scroll_tree(10), 800.0, 600.0)
+}
+
+fn absolute_footer_tree(counter: Arc<AtomicU32>) -> ElementTree {
+    let mut container = ElementDef::new(Tag::Div).with_class("scroll-container");
+    for _ in 0..6 {
+        container = container.with_child(ElementDef::new(Tag::Div).with_class("item"));
+    }
+    container = container.with_child(ElementDef::new(Tag::Div).with_class("savebar").with_child(
+        ElementDef::new(Tag::Button).with_class("done").on_click(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }),
+    ));
+
+    ElementTree { root: ElementDef::new(Tag::Div).with_class("root").with_child(container) }
 }
 
 // -------------------------------------------------------------------------
@@ -78,6 +151,24 @@ fn scroll_wheel_updates_offset() {
     assert!(
         snap.scroll_y > 0.0,
         "scroll_y should increase after scrolling down, got {}",
+        snap.scroll_y
+    );
+}
+
+#[test]
+fn overflow_auto_scrolls_like_scroll() {
+    let mut h = make_harness(auto_scroll_css());
+    h.step();
+
+    let snap = h.query(".scroll-container").expect("scroll-container exists");
+    let cx = snap.layout_rect.x + snap.layout_rect.width / 2.0;
+    let cy = snap.layout_rect.y + snap.layout_rect.height / 2.0;
+    h.mouse_wheel(cx, cy, 0.0, -100.0);
+
+    let snap = h.query(".scroll-container").expect("scroll-container exists");
+    assert!(
+        snap.scroll_y > 0.0,
+        "overflow:auto should create a wheel-scrollable container, got scroll_y={}",
         snap.scroll_y
     );
 }
@@ -177,6 +268,35 @@ fn hit_test_accounts_for_scroll() {
 }
 
 #[test]
+fn absolute_child_in_scrolled_container_uses_visual_hitbox() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let tree_counter = counter.clone();
+    let mut h = TestHarness::new(
+        absolute_footer_css(),
+        move || absolute_footer_tree(tree_counter.clone()),
+        800.0,
+        600.0,
+    );
+    h.step();
+
+    let container = h.query(".scroll-container").expect("scroll-container exists");
+    let cx = container.layout_rect.x + container.layout_rect.width / 2.0;
+    let cy = container.layout_rect.y + container.layout_rect.height / 2.0;
+    h.mouse_wheel(cx, cy, 0.0, -160.0);
+
+    let done = h.query(".done").expect("done button exists");
+    let x = done.layout_rect.x + done.layout_rect.width / 2.0;
+    let y = done.layout_rect.y + done.layout_rect.height / 2.0;
+    h.click(x, y);
+
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "absolute footer button should remain clickable after parent scroll"
+    );
+}
+
+#[test]
 fn scrollbar_renders_when_content_overflows() {
     let mut h = make_harness(scroll_css());
     h.step();
@@ -216,6 +336,40 @@ fn scrollbar_thumb_position_changes_after_scroll() {
 
     let container_after = h.query(".scroll-container").expect("scroll-container exists");
     assert!(container_after.scroll_y > 0.0, "scroll_y should increase after scrolling");
+}
+
+#[test]
+fn scroll_wheel_marks_scrolled_subtree_and_ancestors_paint_dirty() {
+    let mut h = make_harness(scroll_css());
+    h.step();
+
+    let root_id = h.root();
+    unshit_renderer::batch::clear_paint_flags_subtree(h.arena_mut(), root_id);
+
+    let container = h.query(".scroll-container").expect("scroll-container exists");
+    let container_id = container.node_id;
+    let first_item_id = h.query_all(".item").first().expect("item exists").node_id;
+    let cx = container.layout_rect.x + container.layout_rect.width / 2.0;
+    let cy = container.layout_rect.y + container.layout_rect.height / 2.0;
+
+    h.mouse_wheel(cx, cy, 0.0, -100.0);
+
+    let root_dirty = h.arena().get(root_id).expect("root exists").dirty;
+    let container_dirty = h.arena().get(container_id).expect("container exists").dirty;
+    let first_item_dirty = h.arena().get(first_item_id).expect("item exists").dirty;
+
+    assert!(
+        root_dirty.contains(DirtyFlags::SUBTREE_PAINT),
+        "scrolling must dirty ancestors so cached parent batches do not replay stale content"
+    );
+    assert!(
+        container_dirty.contains(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT),
+        "scrolling must dirty the scroll container and its subtree"
+    );
+    assert!(
+        first_item_dirty.contains(DirtyFlags::PAINT),
+        "scrolling must dirty descendants because cached child quads use old absolute positions"
+    );
 }
 
 #[test]

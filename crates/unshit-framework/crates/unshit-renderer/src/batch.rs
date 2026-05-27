@@ -13,6 +13,8 @@ use crate::pipeline::text::GlyphInstance;
 use crate::svg_cache::SvgTessCache;
 use crate::svg_tess::SvgGeometry;
 use cosmic_text::{Buffer, FontSystem, Metrics, Shaping, SwashCache};
+use swash::scale::{Render, ScaleContext, Source, StrikeWith};
+use swash::zeno::{Angle, Format, Transform, Vector};
 
 /// Glyph rasterization backends.
 ///
@@ -24,8 +26,61 @@ use cosmic_text::{Buffer, FontSystem, Metrics, Shaping, SwashCache};
 /// On non-Windows, only SwashCache is available.
 pub struct Rasterizer<'a> {
     pub swash: &'a mut SwashCache,
+    pub subpixel_swash: &'a mut SubpixelSwashCache,
     #[cfg(target_os = "windows")]
     pub dw: &'a DwRasterizer,
+}
+
+/// Swash rasterizer variant that requests RGB subpixel masks. cosmic-text's
+/// public SwashCache currently hardcodes alpha masks, so the renderer owns the
+/// alternate scale context needed by the experimental subpixel text pipeline.
+pub struct SubpixelSwashCache {
+    context: ScaleContext,
+}
+
+impl SubpixelSwashCache {
+    pub fn new() -> Self {
+        Self { context: ScaleContext::new() }
+    }
+
+    fn get_image_uncached(
+        &mut self,
+        font_system: &mut FontSystem,
+        cache_key: cosmic_text::CacheKey,
+    ) -> Option<cosmic_text::SwashImage> {
+        let font = font_system.get_font(cache_key.font_id)?;
+        let mut scaler = self
+            .context
+            .builder(font.as_swash())
+            .size(f32::from_bits(cache_key.font_size_bits))
+            .hint(true)
+            .build();
+        let offset = Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
+
+        Render::new(&[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+            Source::Outline,
+        ])
+        .format(ui_subpixel_mask_format())
+        .offset(offset)
+        .transform(if cache_key.flags.contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC) {
+            Some(Transform::skew(Angle::from_degrees(14.0), Angle::from_degrees(0.0)))
+        } else {
+            None
+        })
+        .render(&mut scaler, cache_key.glyph_id)
+    }
+}
+
+fn ui_subpixel_mask_format() -> Format {
+    Format::subpixel_bgra()
+}
+
+impl Default for SubpixelSwashCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 use rustc_hash::{FxHashMap, FxHashSet};
 use unshit_core::cell_grid::{BgRun, CellAttrs, CellGrid};
@@ -39,8 +94,8 @@ use unshit_core::layout::{
 };
 use unshit_core::scroll::{self, ScrollbarVisualState};
 use unshit_core::style::types::{
-    Background, Color, CssPosition, CssResize, Display, FilterFunction, FontWeight,
-    GradientStopPosition, Layer, LinearGradient, Overflow, RadialGradient, RadialShape,
+    apply_text_transform, Background, Color, CssPosition, CssResize, Display, FilterFunction,
+    FontWeight, GradientStopPosition, Layer, LinearGradient, Overflow, RadialGradient, RadialShape,
     RenderTarget, TextAlign, TextDecoration, Visibility, WhiteSpace,
 };
 use unshit_core::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, SvgTransform, ViewBox};
@@ -141,6 +196,12 @@ fn parity_terminal_cell_width_scale() -> f32 {
             parity_windows_terminal_colors_enabled(),
         )
     })
+}
+
+#[cfg(target_os = "windows")]
+fn use_directwrite_ui_rasterization() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_DIRECTWRITE_UI").is_some())
 }
 
 #[inline]
@@ -1821,6 +1882,12 @@ fn walk_for_batch(
                 } else {
                     &input.value
                 };
+                let transformed_display_text = if input.input_type == InputType::Password {
+                    std::borrow::Cow::Borrowed(display_text)
+                } else {
+                    apply_text_transform(display_text, style.text_transform)
+                };
+                let display_text = transformed_display_text.as_ref();
 
                 if !display_text.is_empty() {
                     let mut text_color =
@@ -1875,7 +1942,7 @@ fn walk_for_batch(
                         if input.input_type == InputType::Password {
                             std::borrow::Cow::Owned("\u{2022}".repeat(input.value.chars().count()))
                         } else {
-                            std::borrow::Cow::Borrowed(input.value.as_str())
+                            apply_text_transform(input.value.as_str(), style.text_transform)
                         };
                     let value_w = if value_text.is_empty() {
                         0.0
@@ -1909,7 +1976,11 @@ fn walk_for_batch(
                             let char_count = input.value[..input.cursor_pos].chars().count();
                             "\u{2022}".repeat(char_count)
                         } else {
-                            input.value[..input.cursor_pos].to_string()
+                            apply_text_transform(
+                                &input.value[..input.cursor_pos],
+                                style.text_transform,
+                            )
+                            .into_owned()
                         };
                         let (w, _) = measure_text_with_style_cached(
                             &prefix,
@@ -1925,9 +1996,15 @@ fn walk_for_batch(
                         w
                     };
 
-                    let caret_text = if input.value.is_empty() { " " } else { &input.value };
+                    let caret_source = if input.value.is_empty() {
+                        std::borrow::Cow::Borrowed(" ")
+                    } else if input.input_type == InputType::Password {
+                        std::borrow::Cow::Borrowed(input.value.as_str())
+                    } else {
+                        apply_text_transform(input.value.as_str(), style.text_transform)
+                    };
                     let (_, caret_text_h) = measure_text_with_style_cached(
-                        caret_text,
+                        caret_source.as_ref(),
                         &style.font_family,
                         style.font_weight,
                         style.font_size,
@@ -1988,7 +2065,9 @@ fn walk_for_batch(
         }
     } else {
         match &element.content {
-            ElementContent::Text(ref text) if is_visible && !text.is_empty() => {
+            ElementContent::Text(ref raw_text) if is_visible && !raw_text.is_empty() => {
+                let transformed_text = apply_text_transform(raw_text, style.text_transform);
+                let text = transformed_text.as_ref();
                 let mut text_color = style.color;
                 text_color.a = (text_color.a as f32 * opacity) as u8;
 
@@ -2400,45 +2479,54 @@ fn walk_for_batch(
         let (v_geom, h_geom) =
             scroll::compute_scrollbar_geometry(arena, node_id, render_x, render_y);
 
-        const TRACK_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.05];
-        const CORNER_RADIUS: f32 = 3.0;
+        const TRACK_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.0];
+        const CORNER_RADIUS: f32 = 4.0;
+        const THUMB_INSET: f32 = 4.0;
 
-        let mut push_scrollbar_quad = |pos: [f32; 2], size: [f32; 2], color: [f32; 4]| {
-            batch.layer_mut(effective_layer).quad_instances.push(QuadInstance {
-                pos,
-                size,
-                color,
-                border_color: [0.0; 4],
-                border_width: [0.0; 4],
-                border_radius: [CORNER_RADIUS; 4],
-                clip_rect: child_clip,
-                shadow_color: [0.0; 4],
-                shadow_offset: [0.0; 2],
-                shadow_params: [0.0; 2],
-                shadow_spread: [0.0; 2],
-                gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
-                gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
-                gradient_params: [0.0; 4],
-                gradient_extra: EMPTY_GRADIENT_EXTRA,
-                mask_stops_01: EMPTY_MASK_STOPS,
-                mask_stops_23: EMPTY_MASK_STOPS,
-                mask_params: EMPTY_MASK_PARAMS,
-            });
-        };
+        let mut push_scrollbar_quad =
+            |pos: [f32; 2], size: [f32; 2], color: [f32; 4], radius: f32| {
+                batch.layer_mut(effective_layer).quad_instances.push(QuadInstance {
+                    pos,
+                    size,
+                    color,
+                    border_color: [0.0; 4],
+                    border_width: [0.0; 4],
+                    border_radius: [radius; 4],
+                    clip_rect: child_clip,
+                    shadow_color: [0.0; 4],
+                    shadow_offset: [0.0; 2],
+                    shadow_params: [0.0; 2],
+                    shadow_spread: [0.0; 2],
+                    gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
+                    gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
+                    gradient_params: [0.0; 4],
+                    gradient_extra: EMPTY_GRADIENT_EXTRA,
+                    mask_stops_01: EMPTY_MASK_STOPS,
+                    mask_stops_23: EMPTY_MASK_STOPS,
+                    mask_params: EMPTY_MASK_PARAMS,
+                });
+            };
 
         for geom in [v_geom.as_ref(), h_geom.as_ref()].into_iter().flatten() {
             let alpha = scrollbar_state.thumb_alpha(node_id, geom.axis);
             let thumb_color = [1.0, 1.0, 1.0, alpha];
+            let (thumb_pos, thumb_size) = match geom.axis {
+                scroll::ScrollbarAxis::Vertical => (
+                    [geom.thumb_x + THUMB_INSET, geom.thumb_y],
+                    [(geom.thumb_w - THUMB_INSET * 2.0).max(1.0), geom.thumb_h],
+                ),
+                scroll::ScrollbarAxis::Horizontal => (
+                    [geom.thumb_x, geom.thumb_y + THUMB_INSET],
+                    [geom.thumb_w, (geom.thumb_h - THUMB_INSET * 2.0).max(1.0)],
+                ),
+            };
             push_scrollbar_quad(
                 [geom.track_x, geom.track_y],
                 [geom.track_w, geom.track_h],
                 TRACK_COLOR,
+                CORNER_RADIUS,
             );
-            push_scrollbar_quad(
-                [geom.thumb_x, geom.thumb_y],
-                [geom.thumb_w, geom.thumb_h],
-                thumb_color,
-            );
+            push_scrollbar_quad(thumb_pos, thumb_size, thumb_color, CORNER_RADIUS);
         }
     }
 
@@ -2736,8 +2824,15 @@ fn emit_text_glyphs_cached(
                 atlas.touch(&key);
                 entry
             } else {
-                let raster_result =
-                    rasterize_swash_for_atlas(rasterizer.swash, font_system, &physical, atlas, key);
+                let raster_result = rasterize_swash_for_atlas(
+                    rasterizer,
+                    font_system,
+                    &physical,
+                    atlas,
+                    key,
+                    font_family,
+                    font_weight,
+                );
                 match raster_result {
                     Some(entry) => entry,
                     None => continue,
@@ -4956,13 +5051,44 @@ fn measure_monospace_advance(
 /// Rasterize a glyph via SwashCache and insert into the atlas.
 /// Used for CSS/UI text where cosmic-text metrics must match the rasterizer.
 fn rasterize_swash_for_atlas(
-    swash_cache: &mut SwashCache,
+    rasterizer: &mut Rasterizer<'_>,
     font_system: &mut FontSystem,
     physical: &cosmic_text::PhysicalGlyph,
     atlas: &mut GlyphAtlas,
     key: GlyphKey,
+    font_family: &str,
+    font_weight: FontWeight,
 ) -> Option<crate::atlas::GlyphEntry> {
-    let image = swash_cache.get_image_uncached(font_system, physical.cache_key)?;
+    #[cfg(target_os = "windows")]
+    if atlas.bytes_per_pixel == 4 && use_directwrite_ui_rasterization() {
+        let (dwrite_family, dwrite_weight) =
+            dwrite_ui_face_hint(font_system, physical.cache_key.font_id, font_family, font_weight);
+        if let Some(rg) = rasterizer.dw.rasterize_ui_glyph(
+            &dwrite_family,
+            dwrite_weight,
+            physical.cache_key.glyph_id,
+            f32::from_bits(physical.cache_key.font_size_bits),
+        ) {
+            if rg.width == 0 || rg.height == 0 {
+                return None;
+            }
+            let entry = atlas.get_or_insert(
+                key,
+                rg.width,
+                rg.height,
+                rgba_glyph_data_for_atlas(rg.data, atlas.bytes_per_pixel),
+                [rg.bearing_x, rg.bearing_y],
+            )?;
+            atlas.touch(&key);
+            return Some(entry);
+        }
+    }
+
+    let image = if atlas.bytes_per_pixel == 4 && crate::text_rendering::use_subpixel_text_shader() {
+        rasterizer.subpixel_swash.get_image_uncached(font_system, physical.cache_key)?
+    } else {
+        rasterizer.swash.get_image_uncached(font_system, physical.cache_key)?
+    };
     if image.placement.width == 0 || image.placement.height == 0 {
         return None;
     }
@@ -4972,29 +5098,77 @@ fn rasterize_swash_for_atlas(
     let bearing_x = image.placement.left as f32;
     let bearing_y = -(image.placement.top as f32);
 
-    let alpha_data = match image.content {
-        cosmic_text::SwashContent::Mask => image.data,
-        cosmic_text::SwashContent::Color => {
-            image.data.chunks(4).map(|c| c.get(3).copied().unwrap_or(255)).collect()
-        }
-        cosmic_text::SwashContent::SubpixelMask => image
-            .data
-            .chunks(3)
-            .map(|c| ((c[0] as u16 + c[1] as u16 + c[2] as u16) / 3) as u8)
-            .collect(),
-    };
-
-    // Match the upload shape to the current atlas format. The Windows path can
-    // now run either a monochrome R8 atlas or the old RGBA subpixel atlas.
-    let glyph_data = if atlas.bytes_per_pixel == 4 {
-        alpha_data.iter().flat_map(|&a| [a, a, a, a]).collect()
-    } else {
-        alpha_data
-    };
+    let glyph_data = glyph_image_data_for_atlas(image.content, image.data, atlas.bytes_per_pixel);
 
     let entry = atlas.get_or_insert(key, w, h, glyph_data, [bearing_x, bearing_y])?;
     atlas.touch(&key);
     Some(entry)
+}
+
+#[cfg(target_os = "windows")]
+fn dwrite_ui_face_hint(
+    font_system: &FontSystem,
+    font_id: cosmic_text::fontdb::ID,
+    css_font_family: &str,
+    css_font_weight: FontWeight,
+) -> (String, u16) {
+    if let Some(face) = font_system.db().face(font_id) {
+        if let Some((family, _)) = face.families.first() {
+            return (family.clone(), face.weight.0);
+        }
+    }
+
+    (css_font_family.to_string(), font_weight_number(css_font_weight))
+}
+
+fn glyph_image_data_for_atlas(
+    content: cosmic_text::SwashContent,
+    data: Vec<u8>,
+    bytes_per_pixel: u32,
+) -> Vec<u8> {
+    match (bytes_per_pixel, content) {
+        (4, cosmic_text::SwashContent::SubpixelMask) => data,
+        (4, cosmic_text::SwashContent::Mask) => {
+            data.into_iter().flat_map(|a| [a, a, a, a]).collect()
+        }
+        (4, cosmic_text::SwashContent::Color) => data
+            .chunks(4)
+            .flat_map(|c| {
+                let a = c.get(3).copied().unwrap_or(255);
+                [a, a, a, a]
+            })
+            .collect(),
+        (_, cosmic_text::SwashContent::Mask) => data,
+        (_, cosmic_text::SwashContent::Color) => {
+            data.chunks(4).map(|c| c.get(3).copied().unwrap_or(255)).collect()
+        }
+        (_, cosmic_text::SwashContent::SubpixelMask) => data
+            .chunks(4)
+            .map(|c| {
+                let r = c.first().copied().unwrap_or(0) as u16;
+                let g = c.get(1).copied().unwrap_or(r as u8) as u16;
+                let b = c.get(2).copied().unwrap_or(g as u8) as u16;
+                let a = c.get(3).copied().unwrap_or_else(|| r.max(g).max(b) as u8) as u16;
+                r.max(g).max(b).max(a) as u8
+            })
+            .collect(),
+    }
+}
+
+fn rgba_glyph_data_for_atlas(data: Vec<u8>, bytes_per_pixel: u32) -> Vec<u8> {
+    if bytes_per_pixel == 4 {
+        return data;
+    }
+
+    data.chunks(4)
+        .map(|c| {
+            let r = c.first().copied().unwrap_or(0);
+            let g = c.get(1).copied().unwrap_or(r);
+            let b = c.get(2).copied().unwrap_or(g);
+            let a = c.get(3).copied().unwrap_or_else(|| r.max(g).max(b));
+            a.max(r).max(g).max(b)
+        })
+        .collect()
 }
 
 /// Rasterize a terminal grid glyph and insert into the atlas.
@@ -5021,7 +5195,7 @@ fn rasterize_grid_glyph_for_atlas(
                 key,
                 rg.width,
                 rg.height,
-                rg.data,
+                rgba_glyph_data_for_atlas(rg.data, atlas.bytes_per_pixel),
                 [rg.bearing_x, rg.bearing_y],
             )?;
             atlas.touch(&key);
@@ -5031,13 +5205,29 @@ fn rasterize_grid_glyph_for_atlas(
             // so prefer the swash path until the Windows-specific raster data
             // corruption is understood. TM_FORCE_DIRECTWRITE_GRID=1 restores
             // the old path for A/B verification.
-            rasterize_swash_for_atlas(rasterizer.swash, font_system, physical, atlas, key)
+            rasterize_swash_for_atlas(
+                rasterizer,
+                font_system,
+                physical,
+                atlas,
+                key,
+                "",
+                FontWeight::Normal,
+            )
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (ch, font_size); // not needed on swash path
-        rasterize_swash_for_atlas(rasterizer.swash, font_system, physical, atlas, key)
+        rasterize_swash_for_atlas(
+            rasterizer,
+            font_system,
+            physical,
+            atlas,
+            key,
+            "",
+            FontWeight::Normal,
+        )
     }
 }
 
@@ -5048,6 +5238,40 @@ mod tests {
     use unshit_core::id::NodeId;
     use unshit_core::scroll::ScrollbarVisualState;
     use unshit_core::tree::NodeArena;
+
+    #[test]
+    fn ui_subpixel_mask_format_uses_bgr_order() {
+        assert_eq!(
+            ui_subpixel_mask_format(),
+            Format::CustomSubpixel([0.3, 0.0, -0.3]),
+            "settings/browser parity target uses BGR ClearType channel order"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dwrite_ui_face_hint_uses_actual_shaped_face() {
+        let font_system = FontSystem::new();
+        let face = font_system
+            .db()
+            .faces()
+            .find(|face| {
+                face.families.first().is_some_and(|(family, _)| family != "JetBrains Mono")
+            })
+            .expect("test requires at least one non-JetBrains system face");
+        let expected_family = face.families.first().unwrap().0.clone();
+        let expected_weight = face.weight.0;
+
+        let (family, weight) = dwrite_ui_face_hint(
+            &font_system,
+            face.id,
+            "\"JetBrains Mono\", monospace",
+            FontWeight::Bold,
+        );
+
+        assert_eq!(family, expected_family);
+        assert_eq!(weight, expected_weight);
+    }
 
     /// Helper: build a minimal arena with a single div node (no taffy needed).
     fn build_single_node() -> (NodeArena, NodeId) {
@@ -5387,10 +5611,12 @@ mod tests {
         // No glyphs are emitted for unstyled div nodes so this is safe.
         let mut font_system = FontSystem::new();
         let mut swash_cache = SwashCache::new();
+        let mut subpixel_swash_cache = SubpixelSwashCache::new();
         #[cfg(target_os = "windows")]
         let _dw = crate::dw_rasterizer::DwRasterizer::new("Consolas");
         let mut _rasterizer = Rasterizer {
             swash: &mut swash_cache,
+            subpixel_swash: &mut subpixel_swash_cache,
             #[cfg(target_os = "windows")]
             dw: &_dw,
         };
@@ -5913,6 +6139,43 @@ mod tests {
             atlas_font_namespace(&plain),
             atlas_font_namespace(&italic),
             "atlas font namespace must differ when glyph render flags differ",
+        );
+    }
+
+    #[test]
+    fn rgba_text_atlas_preserves_subpixel_mask_channels() {
+        let data = glyph_image_data_for_atlas(
+            cosmic_text::SwashContent::SubpixelMask,
+            vec![10, 30, 90, 90, 0, 20, 40, 40],
+            4,
+        );
+
+        assert_eq!(
+            data,
+            vec![10, 30, 90, 90, 0, 20, 40, 40],
+            "RGBA text atlas must keep per-channel coverage for ClearType-style smoothing"
+        );
+    }
+
+    #[test]
+    fn mono_text_atlas_collapses_subpixel_mask_to_alpha() {
+        let data = glyph_image_data_for_atlas(
+            cosmic_text::SwashContent::SubpixelMask,
+            vec![10, 30, 89, 89, 0, 20, 40, 40],
+            1,
+        );
+
+        assert_eq!(data, vec![89, 40], "R8 text atlas should keep the grayscale fallback path");
+    }
+
+    #[test]
+    fn directwrite_rgba_data_collapses_to_alpha_for_mono_atlas() {
+        let data = rgba_glyph_data_for_atlas(vec![10, 30, 90, 90, 0, 20, 40, 40], 1);
+
+        assert_eq!(
+            data,
+            vec![90, 40],
+            "R8 text atlas should receive one coverage byte per DirectWrite pixel"
         );
     }
 

@@ -287,6 +287,30 @@ fn parts_match(
                         return false;
                     }
                 }
+                PseudoClass::FirstOfType => {
+                    let mut current = element.prev_sibling;
+                    while !current.is_dangling() {
+                        let Some(sibling) = arena.get(current) else {
+                            return false;
+                        };
+                        if sibling.tag == element.tag {
+                            return false;
+                        }
+                        current = sibling.prev_sibling;
+                    }
+                }
+                PseudoClass::LastOfType => {
+                    let mut current = element.next_sibling;
+                    while !current.is_dangling() {
+                        let Some(sibling) = arena.get(current) else {
+                            return false;
+                        };
+                        if sibling.tag == element.tag {
+                            return false;
+                        }
+                        current = sibling.next_sibling;
+                    }
+                }
                 PseudoClass::NthChild(n) => {
                     let parent_id = element.parent;
                     if parent_id.is_dangling() {
@@ -330,4 +354,62 @@ fn parts_match(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::element::{Element, Tag};
+
+    fn element_with_class(tag: Tag, class: &str) -> Element {
+        let mut element = Element::new(tag);
+        element.classes.push(class.to_string());
+        element
+    }
+
+    #[test]
+    fn last_of_type_matches_only_last_sibling_with_same_tag() {
+        let sheet = CompiledStylesheet::parse(
+            ".cell { border-right: 1px solid #ffffff; } .cell:last-of-type { border-right: none; }",
+        );
+        let mut arena = NodeArena::new();
+        let root = arena.alloc(Element::new(Tag::Div));
+        let first = arena.alloc(element_with_class(Tag::Span, "cell"));
+        let marker = arena.alloc(Element::new(Tag::Div));
+        let last = arena.alloc(element_with_class(Tag::Span, "cell"));
+        arena.append_child(root, first);
+        arena.append_child(root, marker);
+        arena.append_child(root, last);
+
+        let first_style =
+            resolve_style(&arena, &sheet, first, NodeId::DANGLING, None, NodeId::DANGLING);
+        let last_style =
+            resolve_style(&arena, &sheet, last, NodeId::DANGLING, None, NodeId::DANGLING);
+
+        assert_eq!(first_style.border_width.right, 1.0);
+        assert_eq!(last_style.border_width.right, 0.0);
+    }
+
+    #[test]
+    fn first_of_type_matches_only_first_sibling_with_same_tag() {
+        let sheet = CompiledStylesheet::parse(
+            ".cell { border-left: 1px solid #ffffff; } .cell:first-of-type { border-left: none; }",
+        );
+        let mut arena = NodeArena::new();
+        let root = arena.alloc(Element::new(Tag::Div));
+        let first = arena.alloc(element_with_class(Tag::Span, "cell"));
+        let marker = arena.alloc(Element::new(Tag::Div));
+        let last = arena.alloc(element_with_class(Tag::Span, "cell"));
+        arena.append_child(root, first);
+        arena.append_child(root, marker);
+        arena.append_child(root, last);
+
+        let first_style =
+            resolve_style(&arena, &sheet, first, NodeId::DANGLING, None, NodeId::DANGLING);
+        let last_style =
+            resolve_style(&arena, &sheet, last, NodeId::DANGLING, None, NodeId::DANGLING);
+
+        assert_eq!(first_style.border_width.left, 0.0);
+        assert_eq!(last_style.border_width.left, 1.0);
+    }
 }

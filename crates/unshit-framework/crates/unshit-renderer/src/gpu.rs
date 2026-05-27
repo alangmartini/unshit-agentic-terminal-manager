@@ -13,6 +13,7 @@ use crate::pipeline::quad::{QuadInstance, QuadPipeline};
 use crate::pipeline::svg::{SvgInstanceUniforms, SvgPipeline};
 use crate::pipeline::text::{GlyphInstance, TextPipeline};
 use crate::svg_cache::SvgTessCache;
+use crate::text_rendering::use_subpixel_text_shader;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -51,12 +52,6 @@ fn log_backdrop_fallback_once(
 /// when the batch was skipped) and `count` is the instance count to
 /// draw.
 type ImageLayerPlan = Vec<Vec<(usize, u32)>>;
-
-#[cfg(target_os = "windows")]
-fn use_subpixel_text_shader() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_SUBPIXEL_TEXT").is_some())
-}
 
 fn trace_text_draw_ranges() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -264,9 +259,9 @@ impl GpuContext {
         log::info!("renderer adapter selected: {:?}", adapter.get_info());
 
         // Request the adapter's actual hardware limits so pipelines with many
-        // vertex attributes (gradient quad pipeline: 23 attrs, 84 inter-stage
-        // components) are accepted. Fall back to defaults if the adapter
-        // rejects its own reported limits (software renderers).
+        // vertex attributes (gradient quad pipeline: 26 attrs) are accepted.
+        // Fall back to defaults if the adapter rejects its own reported limits
+        // (software renderers).
         let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -527,22 +522,11 @@ impl GpuContext {
         };
 
         let info = adapter.get_info();
-        // The quad pipeline packs 23 vertex attributes (gradient stops
-        // take 8 slots plus the common geometry and color slots), which
-        // exceeds the wgpu default `max_vertex_attributes = 16`. Use
-        // the adapter's real limits so the pipeline passes validation.
-        // Fall back to defaults only if the adapter rejects its own
-        // reported limits (software renderers).
-        //
-        // Gated on `TM_HEADLESS_ADAPTER_LIMITS` so pre existing tests
-        // that rely on the quad pipeline panicking during construction
-        // (and being silently skipped by `try_with_gpu`) keep doing so
-        // until they are audited and fixed individually. The instance
-        // pool integration tests set the env var to opt into the real
-        // limits because they exercise the pool through a full render,
-        // which requires the pipeline to build.
-        let use_adapter_limits = std::env::var_os("TM_HEADLESS_ADAPTER_LIMITS").is_some();
-        let limits = if use_adapter_limits { adapter.limits() } else { wgpu::Limits::default() };
+        // The quad pipeline packs 26 vertex attributes, which exceeds the
+        // wgpu default `max_vertex_attributes = 16`. Headless tests need the
+        // same adapter limits as the windowed renderer so pixel assertions do
+        // not silently skip on GPUs that can render the real app.
+        let limits = adapter.limits();
         let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {

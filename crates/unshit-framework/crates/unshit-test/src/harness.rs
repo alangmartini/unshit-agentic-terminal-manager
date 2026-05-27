@@ -5,12 +5,11 @@ use unshit_core::event::*;
 use unshit_core::id::NodeId;
 use unshit_core::layout::{self, TextMeasureCache, TextMeasureCtx};
 use unshit_core::scroll::ScrollbarVisualState;
-use unshit_core::style::cascade;
-use unshit_core::style::parse::CompiledStylesheet;
+use unshit_core::style::parse::{CompiledStylesheet, FontFaceSrc};
 use unshit_core::style::pseudo::PseudoSideTable;
 use unshit_core::tree::NodeArena;
-use unshit_renderer::batch::Rasterizer;
 use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache};
+use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
 use unshit_renderer::gpu::GpuContext;
@@ -24,6 +23,7 @@ pub struct TestHarness {
     pub(crate) stylesheet: CompiledStylesheet,
     pub(crate) font_system: FontSystem,
     pub(crate) swash_cache: SwashCache,
+    pub(crate) subpixel_swash_cache: SubpixelSwashCache,
     #[cfg(target_os = "windows")]
     pub(crate) dw_rasterizer: DwRasterizer,
     pub(crate) shaped_cache: ShapedTextCache,
@@ -50,7 +50,9 @@ impl TestHarness {
     pub fn new(css: &str, tree_fn: impl Fn() -> ElementTree, width: f32, height: f32) -> Self {
         let stylesheet = CompiledStylesheet::parse(css);
         let mut font_system = FontSystem::new();
+        unshit_app::load_custom_fonts(&mut font_system, &[], &stylesheet);
         let swash_cache = SwashCache::new();
+        let subpixel_swash_cache = SubpixelSwashCache::new();
 
         let mut arena = NodeArena::new();
         let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
@@ -98,6 +100,8 @@ impl TestHarness {
         if crate::test_app::env_is_truthy("UNSHIT_TEST_TRACE") {
             trace.enable();
         }
+        #[cfg(target_os = "windows")]
+        let directwrite_paths = directwrite_font_paths(&stylesheet);
 
         Self {
             arena,
@@ -106,8 +110,9 @@ impl TestHarness {
             stylesheet,
             font_system,
             swash_cache,
+            subpixel_swash_cache,
             #[cfg(target_os = "windows")]
-            dw_rasterizer: DwRasterizer::new("Consolas"),
+            dw_rasterizer: DwRasterizer::new_with_custom_font_paths("Consolas", directwrite_paths),
             shaped_cache: ShapedTextCache::new(),
             batch_cache: BatchCache::new(),
             shape_cache: ShapeCache::new(),
@@ -388,6 +393,7 @@ impl TestHarness {
         self.batch_cache.begin_frame();
         let mut rasterizer = Rasterizer {
             swash: &mut self.swash_cache,
+            subpixel_swash: &mut self.subpixel_swash_cache,
             #[cfg(target_os = "windows")]
             dw: &self.dw_rasterizer,
         };
@@ -462,6 +468,20 @@ impl TestHarness {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn directwrite_font_paths(stylesheet: &CompiledStylesheet) -> Vec<std::path::PathBuf> {
+    stylesheet
+        .font_faces
+        .iter()
+        .filter_map(|rule| match &rule.src {
+            FontFaceSrc::Url(url) if !url.starts_with("data:") => {
+                Some(std::path::PathBuf::from(url))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions (replicate app.rs logic without GPU/window dependencies)
 // ---------------------------------------------------------------------------
@@ -492,6 +512,8 @@ pub(crate) fn build_tree_from_def(
     element.on_submit = def.on_submit.clone();
     element.memo_key = def.memo_key;
     element.name = def.name.clone();
+    element.persistent_buffer = def.persistent_buffer;
+    element.style_overrides = def.style_overrides.clone();
     element.input_state.input_type = def.input_type;
     if let Some(min) = def.min {
         element.input_state.min = min;
@@ -562,7 +584,7 @@ pub(crate) fn resolve_all_styles(
     focused: NodeId,
     focus_via_keyboard: bool,
 ) {
-    let new_style = cascade::resolve_style_fv(
+    unshit_core::build::resolve_all_styles_with_transitions(
         arena,
         stylesheet,
         node_id,
@@ -570,24 +592,9 @@ pub(crate) fn resolve_all_styles(
         active,
         focused,
         focus_via_keyboard,
+        None,
+        None,
     );
-    let children = arena.children(node_id);
-
-    if let Some(element) = arena.get_mut(node_id) {
-        element.computed_style = new_style;
-    }
-
-    for child_id in children {
-        resolve_all_styles(
-            arena,
-            stylesheet,
-            child_id,
-            hovered,
-            active,
-            focused,
-            focus_via_keyboard,
-        );
-    }
 }
 
 pub(crate) fn scale_all_styles(arena: &mut NodeArena, node_id: NodeId, scale: f32) {

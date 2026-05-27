@@ -784,7 +784,7 @@ mod tests {
             .expect(".cd-foot .confirm-dialog-button");
         assert!((button.computed_style.font_size - 11.0).abs() < 0.01);
         assert!((button.computed_style.line_height - 1.4).abs() < 0.01);
-        assert_eq!(button.computed_style.font_weight, FontWeight::W(500));
+        assert_eq!(button.computed_style.font_weight, FontWeight::W(600));
 
         let panel = harness.query(".cd-panel").expect(".cd-panel");
         assert_eq!(panel.computed_style.border_width, Edges::all(1.0));

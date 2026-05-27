@@ -459,12 +459,10 @@ impl Element {
         // Note: input_state.value, cursor_pos, checked, numeric_value are NOT
         // updated here (preserved like scroll state).
 
-        // Apply inline style overrides. Since StyleDeclaration does not derive
-        // PartialEq, mark LAYOUT dirty whenever either side is non-empty.
-        let overrides_changed = !self.style_overrides.is_empty() || !def.style_overrides.is_empty();
+        let overrides_changed = self.style_overrides.as_slice() != def.style_overrides.as_slice();
         self.style_overrides = def.style_overrides.clone();
         if overrides_changed {
-            flags |= DirtyFlags::LAYOUT;
+            flags |= DirtyFlags::STYLE | DirtyFlags::LAYOUT;
         }
 
         // For select elements: update options list but preserve open/highlighted state.

@@ -34,6 +34,33 @@ fn mark_ancestors_dirty(arena: &mut NodeArena, start: NodeId, flags: DirtyFlags)
     }
 }
 
+fn mark_subtree_dirty(arena: &mut NodeArena, node_id: NodeId, flags: DirtyFlags) {
+    let children = arena.children(node_id);
+    if let Some(elem) = arena.get_mut(node_id) {
+        elem.dirty |= flags;
+        if !children.is_empty() {
+            if flags.contains(DirtyFlags::STYLE) {
+                elem.dirty |= DirtyFlags::SUBTREE_STYLE;
+            }
+            if flags.contains(DirtyFlags::LAYOUT) {
+                elem.dirty |= DirtyFlags::SUBTREE_LAYOUT;
+            }
+            if flags.contains(DirtyFlags::PAINT) {
+                elem.dirty |= DirtyFlags::SUBTREE_PAINT;
+            }
+        }
+    }
+    for child in children {
+        mark_subtree_dirty(arena, child, flags);
+    }
+}
+
+fn mark_descendants_dirty(arena: &mut NodeArena, node_id: NodeId, flags: DirtyFlags) {
+    for child in arena.children(node_id) {
+        mark_subtree_dirty(arena, child, flags);
+    }
+}
+
 /// Reconcile a live element tree rooted at `node_id` against a new definition.
 ///
 /// This is the main entry point for the diffing engine. It updates the arena
@@ -232,9 +259,7 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     // Transfer lifecycle hooks. on_mount is NOT re-fired on update (only on initial build).
     // on_unmount is updated so the latest closure fires when the node is eventually removed.
     element.on_unmount = def.on_unmount.clone();
-    // Transfer inline style overrides. Since StyleDeclaration does not derive
-    // PartialEq, mark LAYOUT dirty whenever either side is non-empty.
-    let overrides_changed = !element.style_overrides.is_empty() || !def.style_overrides.is_empty();
+    let overrides_changed = element.style_overrides.as_slice() != def.style_overrides.as_slice();
     element.style_overrides = def.style_overrides.clone();
     // Transfer node_ref and refresh the stored NodeId in case the ref changed.
     if let Some(nr) = def.node_ref.clone() {
@@ -255,17 +280,21 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
         element.input_state.step = step;
     }
 
-    let style_dirty = id_changed || classes_changed;
+    let style_dirty = id_changed || classes_changed || overrides_changed;
     let layout_dirty = (content_changed && !grid_content_paint_only)
         || tab_index_changed
-        || captures_keyboard_changed
-        || overrides_changed;
+        || captures_keyboard_changed;
 
     if style_dirty {
         // Class/id changes re-run the cascade, which can swap in entirely
         // different layout properties (display, flex-direction, width, etc.).
         // Mark LAYOUT alongside STYLE so `sync_element_to_taffy` re-syncs.
-        element.dirty |= DirtyFlags::STYLE | DirtyFlags::LAYOUT | DirtyFlags::PAINT;
+        element.dirty |= DirtyFlags::STYLE
+            | DirtyFlags::LAYOUT
+            | DirtyFlags::PAINT
+            | DirtyFlags::SUBTREE_STYLE
+            | DirtyFlags::SUBTREE_LAYOUT
+            | DirtyFlags::SUBTREE_PAINT;
     }
     if layout_dirty || input_type_changed {
         element.dirty |= DirtyFlags::LAYOUT | DirtyFlags::PAINT;
@@ -278,8 +307,19 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     // branches. We do this after setting the node's own dirty flags so the
     // ancestor walk starts from the correct node.
     if style_dirty {
-        mark_ancestors_dirty(arena, node_id, DirtyFlags::SUBTREE_STYLE);
-        mark_ancestors_dirty(arena, node_id, DirtyFlags::SUBTREE_LAYOUT);
+        // Descendant selectors and inherited/custom-property-like values can
+        // depend on ancestor classes/ids. A dirty cascade must therefore visit
+        // the whole subtree, not only the element whose class changed.
+        mark_descendants_dirty(
+            arena,
+            node_id,
+            DirtyFlags::STYLE | DirtyFlags::LAYOUT | DirtyFlags::PAINT,
+        );
+        mark_ancestors_dirty(
+            arena,
+            node_id,
+            DirtyFlags::SUBTREE_STYLE | DirtyFlags::SUBTREE_LAYOUT,
+        );
     }
     if layout_dirty {
         mark_ancestors_dirty(arena, node_id, DirtyFlags::SUBTREE_LAYOUT);

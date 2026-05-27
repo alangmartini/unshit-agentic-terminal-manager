@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cosmic_text::{FontSystem, SwashCache};
-use unshit_renderer::batch::Rasterizer;
+use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
 use winit::application::ApplicationHandler;
@@ -22,7 +22,7 @@ use unshit_core::event::*;
 use unshit_core::id::NodeId;
 use unshit_core::layout::{TextMeasureCache, TextMeasureCtx};
 use unshit_core::scroll::ScrollbarVisualState;
-use unshit_core::style::parse::CompiledStylesheet;
+use unshit_core::style::parse::{CompiledStylesheet, FontFaceSrc};
 use unshit_core::tree::NodeArena;
 use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache};
 use unshit_renderer::gpu::GpuContext;
@@ -67,6 +67,7 @@ struct WindowedState {
     stylesheet: CompiledStylesheet,
     font_system: FontSystem,
     swash_cache: SwashCache,
+    subpixel_swash_cache: SubpixelSwashCache,
     #[cfg(target_os = "windows")]
     dw_rasterizer: DwRasterizer,
     shaped_cache: ShapedTextCache,
@@ -111,6 +112,7 @@ impl ApplicationHandler for InitHandler<'_> {
         let stylesheet = CompiledStylesheet::parse(&init.css);
         let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
+        let subpixel_swash_cache = SubpixelSwashCache::new();
 
         let mut arena = NodeArena::new();
         let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
@@ -133,6 +135,8 @@ impl ApplicationHandler for InitHandler<'_> {
             h,
             &mut measure_cache,
         );
+        #[cfg(target_os = "windows")]
+        let directwrite_paths = directwrite_font_paths(&stylesheet);
 
         *self.state = Some(WindowedState {
             window,
@@ -143,8 +147,9 @@ impl ApplicationHandler for InitHandler<'_> {
             stylesheet,
             font_system,
             swash_cache,
+            subpixel_swash_cache,
             #[cfg(target_os = "windows")]
-            dw_rasterizer: DwRasterizer::new("Consolas"),
+            dw_rasterizer: DwRasterizer::new_with_custom_font_paths("Consolas", directwrite_paths),
             shaped_cache: ShapedTextCache::new(),
             batch_cache: BatchCache::new(),
             shape_cache: ShapeCache::new(),
@@ -166,6 +171,20 @@ impl ApplicationHandler for InitHandler<'_> {
         _event: WindowEvent,
     ) {
     }
+}
+
+#[cfg(target_os = "windows")]
+fn directwrite_font_paths(stylesheet: &CompiledStylesheet) -> Vec<std::path::PathBuf> {
+    stylesheet
+        .font_faces
+        .iter()
+        .filter_map(|rule| match &rule.src {
+            FontFaceSrc::Url(url) if !url.starts_with("data:") => {
+                Some(std::path::PathBuf::from(url))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 struct PumpHandler<'a> {
@@ -370,6 +389,7 @@ impl WindowedTest {
         state.batch_cache.begin_frame();
         let mut rasterizer = Rasterizer {
             swash: &mut state.swash_cache,
+            subpixel_swash: &mut state.subpixel_swash_cache,
             #[cfg(target_os = "windows")]
             dw: &state.dw_rasterizer,
         };

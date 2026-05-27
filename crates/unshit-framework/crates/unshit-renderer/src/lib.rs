@@ -14,3 +14,4 @@ pub mod persistent_buffer;
 pub mod pipeline;
 pub mod svg_cache;
 pub mod svg_tess;
+mod text_rendering;

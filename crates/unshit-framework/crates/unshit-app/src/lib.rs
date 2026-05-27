@@ -14,7 +14,10 @@ pub mod shortcut;
 pub mod subscription;
 pub mod window;
 
-pub use app::{App, AppConfig, FrameMetrics};
+pub use app::{
+    App, AppConfig, FrameMetrics, ScrollTelemetry, ScrollTelemetryCallback, ScrollTelemetryPhase,
+    ScrollTuning, DEFAULT_SMOOTH_SCROLL_DURATION_MS, DEFAULT_WHEEL_LINE_SCROLL_PX,
+};
 pub use clipboard::{ClipboardContent, ClipboardContext, ClipboardError, ClipboardFormat};
 pub use event_sink::{EventSink, ExternalEvent, SendError};
 pub use font::{

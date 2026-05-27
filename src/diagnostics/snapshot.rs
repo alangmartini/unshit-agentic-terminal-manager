@@ -378,10 +378,37 @@ fn collect_config(ui: &UiSnapshot, terminal_buffer_contents_included: bool) -> V
         .iter()
         .map(|(key, value)| (key.as_str().to_owned(), Value::Bool(*value)))
         .collect();
+    let scroll_samples = ui
+        .diagnostic_scroll_samples
+        .iter()
+        .map(|sample| {
+            json!({
+                "phase": sample.phase,
+                "elapsed_ms": sample.elapsed_ms,
+                "duration_ms": sample.duration_ms,
+                "start_x": sample.start_x,
+                "start_y": sample.start_y,
+                "scroll_x": sample.scroll_x,
+                "scroll_y": sample.scroll_y,
+                "target_x": sample.target_x,
+                "target_y": sample.target_y,
+                "velocity_y": sample.velocity_y,
+                "progress_y": sample.progress_y,
+            })
+        })
+        .collect::<Vec<_>>();
 
     json!({
         "theme": ui.theme,
-        "font_size_pt": ui.font_size_pt,
+        "font_size_pt": ui.terminal_font_size_pt,
+        "terminal_font_size_pt": ui.terminal_font_size_pt,
+        "config_font_size_pt": ui.config_font_size_pt,
+        "scroll": {
+            "line_px": ui.scroll_line_px,
+            "smooth_duration_ms": ui.smooth_scroll_duration_ms,
+            "samples": scroll_samples,
+        },
+        "fps_overlay": crate::ui::fps_overlay::diagnostic_json(),
         "settings_open": ui.settings_open,
         "settings_section": ui.settings_section.label(),
         "palette_open": ui.palette_open,

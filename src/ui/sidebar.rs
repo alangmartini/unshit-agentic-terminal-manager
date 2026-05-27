@@ -497,11 +497,6 @@ fn build_workspace_ctx_menu(
             format!("workspace.collapse:{}", ws_idx),
         ));
 
-    menu = menu.with_child(ctx_menu_separator());
-    for item in workspace_ctx_shell_items(ws_idx, &current_shell, installed, shared) {
-        menu = menu.with_child(item);
-    }
-
     menu = menu.with_child(ctx_menu_separator()).with_child(
         ctx_menu_item(
             "Kill all terminals in workspace",
@@ -520,6 +515,11 @@ fn build_workspace_ctx_menu(
             )
             .with_class("danger"),
         );
+    }
+
+    menu = menu.with_child(ctx_menu_separator());
+    for item in workspace_ctx_shell_items(ws_idx, &current_shell, installed, shared) {
+        menu = menu.with_child(item);
     }
 
     menu
@@ -1192,6 +1192,58 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn ctx_menu_styles_keep_long_menus_scrollable() {
+        let css = include_str!("../../assets/styles.css").replace("\r\n", "\n");
+        let start = css
+            .find(".ctx-menu,\n.tm-menu {")
+            .expect("context menu rule must exist");
+        let end = start
+            + css[start..]
+                .find('}')
+                .expect("context menu rule must be closed");
+        let rule = &css[start..end];
+
+        assert!(
+            rule.contains("max-height: 92vh;"),
+            "context menu must be capped to viewport height, got rule: {rule}"
+        );
+        assert!(
+            rule.contains("overflow: auto;"),
+            "context menu must scroll when shell list is long, got rule: {rule}"
+        );
+    }
+
+    #[test]
+    fn workspace_names_avoid_broken_medium_font_path() {
+        let css = include_str!("../../assets/styles.css").replace("\r\n", "\n");
+        assert!(
+            !css.contains("JetBrainsMono-Medium.ttf"),
+            "bundled medium face currently corrupts UI name glyphs in the live renderer"
+        );
+        assert!(
+            !css.contains("font-weight: 500;"),
+            "UI text should avoid the broken medium font path"
+        );
+        assert!(
+            !css.contains("font: 500"),
+            "UI text should avoid the broken medium font shorthand path"
+        );
+        let start = css
+            .find(".workspace-name {")
+            .expect("workspace-name rule must exist");
+        let end = start
+            + css[start..]
+                .find('}')
+                .expect("workspace-name rule must be closed");
+        let rule = &css[start..end];
+
+        assert!(
+            rule.contains("font-weight: 600;"),
+            "workspace names should use the clean semibold text path, got rule: {rule}"
+        );
+    }
+
     fn collect_text_recursive(root: &ElementDef) -> String {
         let mut acc = String::new();
         if let Some(t) = text_of(root) {
@@ -1250,6 +1302,39 @@ mod tests {
         assert!(
             items.iter().any(|el| item_text_contains(el, "cmd")),
             "menu must list a cmd item"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_keeps_remove_workspace_above_long_shell_list() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed: Vec<std::path::PathBuf> = (0..16)
+            .map(|idx| std::path::PathBuf::from(format!("/opt/shells/shell{idx}")))
+            .collect();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let items = collect_with_class(&menu, "ctx-menu-item");
+
+        let kill_idx = items
+            .iter()
+            .position(|el| item_text_contains(el, "Kill all terminals in workspace"))
+            .expect("kill workspace terminals item must be present");
+        let remove_idx = items
+            .iter()
+            .position(|el| item_text_contains(el, "Remove workspace"))
+            .expect("remove workspace item must be present when multiple workspaces exist");
+        let first_shell_idx = items
+            .iter()
+            .position(|el| item_text_contains(el, "shell0"))
+            .expect("first installed shell item must be present");
+
+        assert!(
+            kill_idx < remove_idx,
+            "remove action should stay grouped after kill action"
+        );
+        assert!(
+            remove_idx < first_shell_idx,
+            "remove workspace must stay visible before long shell lists"
         );
     }
 

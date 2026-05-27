@@ -61,22 +61,14 @@ fn at_font_face_then_load_via_harness_font_system() {
          body {{ font-family: \"Fira Mono\"; }}",
         css_safe_path(&path),
     );
-    let mut h =
+    let h =
         TestHarness::new(&css, || ElementTree { root: ElementDef::new(Tag::Div) }, 800.0, 600.0);
 
     // Stylesheet should carry the @font-face rule straight through parsing.
     assert_eq!(h.stylesheet().font_faces.len(), 1);
 
-    // Simulate what App does at startup: load the faces into FontSystem.
-    let baseline = h.font_system().db().len();
-    // parse the CSS again to get an owned CompiledStylesheet, since the
-    // harness borrows itself during font loading.
-    let sheet = CompiledStylesheet::parse(&css);
-    let report = load_custom_fonts(h.font_system_mut(), &[], &sheet);
-
-    assert_eq!(report.css_errors, 0);
-    assert!(report.css_faces >= 1);
-    assert!(h.font_system().db().len() > baseline);
+    // TestHarness mirrors App startup by loading @font-face rules before the
+    // first layout and render pass.
     assert!(db_has_family(h.font_system(), "Fira Mono"));
 }
 

@@ -282,8 +282,14 @@ fn build_pane(
         let header = build_pane_header(pane, shared).with_key("pane-header");
         container = container.with_child(header);
     }
-    let body = build_pane_body(pane.id, capture_keyboard, state.font_size_pt, shared, grids)
-        .with_key("pane-body");
+    let body = build_pane_body(
+        pane.id,
+        capture_keyboard,
+        state.terminal_font_size_pt,
+        shared,
+        grids,
+    )
+    .with_key("pane-body");
     container = container.with_child(body);
     // During a tab drag, layer the 4-edge drop overlay inside the pane
     // so it tracks the pane's real layout rather than a recomputed
@@ -412,6 +418,7 @@ fn build_pane_body(
             .with_class("terminal-content")
             .with_style(StyleDeclaration::FontSize(font_size_pt as f32))
             .with_style(StyleDeclaration::LineHeight(terminal_line_height()))
+            .with_style(StyleDeclaration::FontScale(1.0))
             .with_grid(grid.clone())
             .with_persistent_buffer(true);
         let content_x_offset = terminal_content_x_offset();
@@ -583,6 +590,9 @@ fn build_pane_body(
         body = body.with_child(
             ElementDef::new(Tag::Div)
                 .with_class("term-line")
+                .with_style(StyleDeclaration::FontSize(font_size_pt as f32))
+                .with_style(StyleDeclaration::LineHeight(terminal_line_height()))
+                .with_style(StyleDeclaration::FontScale(1.0))
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("term-prompt")

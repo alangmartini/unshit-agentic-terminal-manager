@@ -23,12 +23,7 @@ impl TestHarness {
                 ScrollbarAxis::Horizontal => x,
             };
             let new_scroll = scroll::scroll_from_drag(&drag, cursor_pos);
-            if let Some(element) = self.arena.get_mut(drag.node_id) {
-                match drag.axis {
-                    ScrollbarAxis::Vertical => element.scroll_y = new_scroll,
-                    ScrollbarAxis::Horizontal => element.scroll_x = new_scroll,
-                }
-            }
+            scroll::set_axis_scroll_position(&mut self.arena, drag.node_id, drag.axis, new_scroll);
             self.interaction.last_cursor_pos = (x, y);
             return;
         }
@@ -141,12 +136,12 @@ impl TestHarness {
                         ScrollbarAxis::Horizontal => x,
                     };
                     let new_scroll = scroll::scroll_from_track_click(&hit.geometry, cursor_pos);
-                    if let Some(element) = self.arena.get_mut(hit.node_id) {
-                        match hit.axis {
-                            ScrollbarAxis::Vertical => element.scroll_y = new_scroll,
-                            ScrollbarAxis::Horizontal => element.scroll_x = new_scroll,
-                        }
-                    }
+                    scroll::set_axis_scroll_position(
+                        &mut self.arena,
+                        hit.node_id,
+                        hit.axis,
+                        new_scroll,
+                    );
                 }
             }
             return;
@@ -324,14 +319,7 @@ impl TestHarness {
         let scroll_target = scroll::find_scroll_container(&self.arena, self.interaction.hovered);
 
         if let Some(target_id) = scroll_target {
-            let max_scroll = compute_max_scroll(&self.arena, &self.taffy, target_id);
-
-            if let Some(element) = self.arena.get_mut(target_id) {
-                let old_x = element.scroll_x;
-                let old_y = element.scroll_y;
-                element.scroll_x = (old_x - delta_x).clamp(0.0, max_scroll.0);
-                element.scroll_y = (old_y - delta_y).clamp(0.0, max_scroll.1);
-            }
+            scroll::scroll_by(&mut self.arena, &self.taffy, target_id, delta_x, delta_y);
         }
     }
 
@@ -560,25 +548,4 @@ impl TestHarness {
         }
         Some(element.input_state.cursor_pos)
     }
-}
-
-fn compute_max_scroll(
-    arena: &unshit_core::tree::NodeArena,
-    taffy: &taffy::TaffyTree<unshit_core::layout::TextMeasureCtx>,
-    node_id: NodeId,
-) -> (f32, f32) {
-    let Some(element) = arena.get(node_id) else {
-        return (0.0, 0.0);
-    };
-
-    let container_w = element.layout_rect.width;
-    let container_h = element.layout_rect.height;
-
-    let content_size = element
-        .taffy_node
-        .and_then(|tn| taffy.layout(tn).ok())
-        .map(|layout| (layout.content_size.width, layout.content_size.height))
-        .unwrap_or((0.0, 0.0));
-
-    ((content_size.0 - container_w).max(0.0), (content_size.1 - container_h).max(0.0))
 }

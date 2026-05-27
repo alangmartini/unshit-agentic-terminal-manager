@@ -1,12 +1,16 @@
 use rustc_hash::FxHashMap;
-use std::sync::OnceLock;
 use wgpu;
 
 const ATLAS_SIZE: u32 = 2048;
 
-fn use_subpixel_text_shader() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("TM_FORCE_SUBPIXEL_TEXT").is_some())
+fn glyph_atlas_filter_mode(format: wgpu::TextureFormat) -> wgpu::FilterMode {
+    match format {
+        wgpu::TextureFormat::R8Unorm => wgpu::FilterMode::Nearest,
+        wgpu::TextureFormat::Rgba8Unorm if crate::text_rendering::use_subpixel_text_shader() => {
+            wgpu::FilterMode::Nearest
+        }
+        _ => wgpu::FilterMode::Linear,
+    }
 }
 
 /// Kind of atlas a glyph belongs to.
@@ -155,12 +159,7 @@ impl GlyphAtlas {
             _ => panic!("Unsupported atlas format: {format:?}"),
         };
 
-        let filter = match format {
-            wgpu::TextureFormat::Rgba8Unorm if use_subpixel_text_shader() => {
-                wgpu::FilterMode::Nearest
-            }
-            _ => wgpu::FilterMode::Linear,
-        };
+        let filter = glyph_atlas_filter_mode(format);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph atlas"),
@@ -521,6 +520,14 @@ mod tests {
 
     fn make_key(glyph_id: u16) -> GlyphKey {
         GlyphKey { font_id: 1, glyph_id, font_size_tenths: 120, subpixel_bin: 0 }
+    }
+
+    #[test]
+    fn glyph_atlas_uses_nearest_sampling_for_crisper_ui_text() {
+        assert_eq!(
+            glyph_atlas_filter_mode(wgpu::TextureFormat::R8Unorm),
+            wgpu::FilterMode::Nearest
+        );
     }
 
     #[test]

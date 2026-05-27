@@ -7,6 +7,9 @@ pub enum ExternalEvent {
     RequestRebuild,
     /// Request re-render without rebuilding the tree (repaint only).
     RequestRedraw,
+    /// Request an animation repaint. This bypasses redraw coalescing once so
+    /// short-lived motion does not stall behind unrelated frame pacing.
+    RequestAnimationFrame,
     /// Ask the application window to become visible, unminimized, focused,
     /// and attention-requesting where the platform allows it.
     ActivateWindow,

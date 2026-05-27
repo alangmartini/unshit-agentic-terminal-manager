@@ -1,4 +1,6 @@
+use unshit_core::dirty::DirtyFlags;
 use unshit_core::element::*;
+use unshit_core::style::types::{Background, Color};
 use unshit_test::TestHarness;
 
 fn try_with_gpu(h: TestHarness) -> Option<TestHarness> {
@@ -124,6 +126,17 @@ fn hover_pixel_color_matches_style() {
         b.layout_rect.y + b.layout_rect.height / 2.0,
     );
     h.step();
+    let after_hover = h.query(".box").unwrap();
+    assert_eq!(
+        after_hover.computed_style.background,
+        Background::Color(Color::rgb(0, 255, 0)),
+        "computed hover style should be green before pixel assertion"
+    );
+    let dirty = h.arena().get(after_hover.node_id).unwrap().dirty;
+    assert!(
+        dirty.contains(DirtyFlags::PAINT),
+        "hovered box should be paint dirty before render, got {dirty:?}"
+    );
     let pixels = h.render();
     assert!(pixels[idx] < 50, "expected red channel < 50 after hover, got {}", pixels[idx]);
     assert!(

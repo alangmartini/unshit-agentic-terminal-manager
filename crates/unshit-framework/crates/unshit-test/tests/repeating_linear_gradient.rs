@@ -187,3 +187,54 @@ fn non_repeating_linear_gradient_still_works() {
         bottom
     );
 }
+
+/// Regression: gradient backgrounds used to disappear when the same element
+/// had any border side, because the quad shader composited the border over
+/// the solid-color slot instead of the resolved gradient color.
+#[test]
+fn linear_gradient_with_border_keeps_gradient_fill() {
+    let css = r#"
+        .root {
+            display: flex;
+            width: 30px;
+            height: 20px;
+            padding: 0;
+            margin: 0;
+            background: #101820;
+        }
+        .chip {
+            width: 30px;
+            height: 20px;
+            background: linear-gradient(135deg, #7dd3fc 0%, #a5f3fc 100%);
+            border-bottom: 1px solid #101a25;
+        }
+    "#;
+
+    let tree_fn = || ElementTree {
+        root: ElementDef::new(Tag::Div)
+            .with_class("root")
+            .with_child(ElementDef::new(Tag::Div).with_class("chip")),
+    };
+
+    let h = TestHarness::new(css, tree_fn, 30.0, 20.0);
+    let Some(mut h) = try_with_gpu(h) else {
+        eprintln!("Skipping linear_gradient_with_border: no GPU available");
+        return;
+    };
+    h.step();
+    let pixels = h.render();
+
+    let middle = pixel_at(&pixels, 30, 15, 8);
+    assert!(
+        middle[1] > 150 && middle[2] > 180,
+        "expected cyan gradient fill above bordered edge, got {:?}",
+        middle
+    );
+
+    let bottom = pixel_at(&pixels, 30, 15, 19);
+    assert!(
+        bottom[0] < 60 && bottom[1] < 70 && bottom[2] < 80,
+        "expected dark bottom border, got {:?}",
+        bottom
+    );
+}

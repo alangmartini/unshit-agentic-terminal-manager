@@ -4,6 +4,8 @@ use crate::notification::{AttentionUrgency, BellConfig, BellState};
 use crate::shortcut::{key_combo_from_winit, ShortcutResolver};
 use crate::window;
 use cosmic_text::{FontSystem, SwashCache};
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use unshit_core::build::{
@@ -24,8 +26,8 @@ use unshit_core::style::theme::Theme;
 use unshit_core::style::transition::ActiveTransitions;
 use unshit_core::style::types::Layer;
 use unshit_core::tree::NodeArena;
-use unshit_renderer::batch::Rasterizer;
 use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache};
+use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
@@ -38,6 +40,65 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{ResizeDirection, Window, WindowId};
+
+pub const DEFAULT_WHEEL_LINE_SCROLL_PX: f32 = 100.0;
+pub const DEFAULT_SMOOTH_SCROLL_DURATION_MS: u64 = 180;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollTuning {
+    pub line_scroll_px: f32,
+    pub smooth_scroll_duration_ms: u64,
+}
+
+impl Default for ScrollTuning {
+    fn default() -> Self {
+        Self {
+            line_scroll_px: DEFAULT_WHEEL_LINE_SCROLL_PX,
+            smooth_scroll_duration_ms: DEFAULT_SMOOTH_SCROLL_DURATION_MS,
+        }
+    }
+}
+
+impl ScrollTuning {
+    pub fn sanitized(self) -> Self {
+        let line_scroll_px = if self.line_scroll_px.is_finite() {
+            self.line_scroll_px.clamp(8.0, 320.0)
+        } else {
+            DEFAULT_WHEEL_LINE_SCROLL_PX
+        };
+        Self {
+            line_scroll_px,
+            smooth_scroll_duration_ms: self.smooth_scroll_duration_ms.clamp(16, 500),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollTelemetryPhase {
+    Started,
+    Frame,
+    Completed,
+    Instant,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScrollTelemetry {
+    pub phase: ScrollTelemetryPhase,
+    pub node_id: NodeId,
+    pub elapsed_ms: f32,
+    pub duration_ms: f32,
+    pub start_x: f32,
+    pub start_y: f32,
+    pub scroll_x: f32,
+    pub scroll_y: f32,
+    pub target_x: f32,
+    pub target_y: f32,
+    pub velocity_x: f32,
+    pub velocity_y: f32,
+    pub progress_y: f32,
+}
+
+pub type ScrollTelemetryCallback = dyn Fn(&ScrollTelemetry) + Send;
 
 pub struct AppConfig {
     pub title: String,
@@ -115,6 +176,12 @@ pub struct AppConfig {
     /// Callback invoked after each rendered frame with the collected metrics.
     /// Called on the UI thread immediately after the frame is complete.
     pub on_frame_metrics: Option<Box<dyn Fn(&FrameMetrics) + Send>>,
+    /// Callback read on wheel input to tune line-wheel scroll distance and
+    /// animation duration without rebuilding the app.
+    pub scroll_tuning: Option<Arc<dyn Fn() -> ScrollTuning + Send + Sync>>,
+    /// Callback invoked when smooth scrolling starts and on each animation
+    /// sample. Intended for diagnostics and regression metrics.
+    pub on_scroll_telemetry: Option<Box<ScrollTelemetryCallback>>,
     /// Callback invoked when the OS reports the DPI scale factor.
     /// Fires once at startup and again whenever the window moves between
     /// monitors with different scale factors.
@@ -181,10 +248,12 @@ impl Default for AppConfig {
             max_atlas_bytes: None,
             css_path: None,
             on_frame_metrics: None,
+            scroll_tuning: None,
             on_scale_factor: None,
             on_window_maximized: None,
             on_close: None,
             on_cell_metrics: None,
+            on_scroll_telemetry: None,
             #[cfg(feature = "input-latency-histogram")]
             on_input_latency: None,
             tree_fn_bump: None,
@@ -263,6 +332,7 @@ struct AppState {
     stylesheet: CompiledStylesheet,
     font_system: FontSystem,
     swash_cache: SwashCache,
+    subpixel_swash_cache: SubpixelSwashCache,
     #[cfg(target_os = "windows")]
     dw_rasterizer: DwRasterizer,
     interaction: InteractionState,
@@ -300,6 +370,9 @@ struct AppState {
     event_log: Option<Vec<String>>,
     event_log_start: Instant,
     scrollbar_visual: ScrollbarVisualState,
+    smooth_scroll: Option<SmoothScroll>,
+    smooth_scroll_next_frame: Option<Instant>,
+    force_animation_paint: bool,
     active_transitions: ActiveTransitions,
     animation_driver: AnimationDriver,
     pseudo_table: unshit_core::style::pseudo::PseudoSideTable,
@@ -411,6 +484,423 @@ fn resize_direction_cursor_icon(direction: ResizeDirection) -> CursorIcon {
 /// keystrokes or PTY chunks without keeping the CPU warm after activity
 /// stops. Matches Ghostty's active-renderer-window concept.
 pub(crate) const ACTIVITY_WINDOW: Duration = Duration::from_millis(250);
+const SMOOTH_SCROLL_EPSILON: f32 = 0.5;
+const BROWSER_WHEEL_RAMP_START_PX: f32 = 100.0;
+const BROWSER_WHEEL_RAMP_END_PX: f32 = 400.0;
+const BROWSER_MIN_DURATION_RATIO: f32 = 0.52;
+const BROWSER_DURATION_RAMP_EXPONENT: f32 = 1.35;
+const BROWSER_INITIAL_SLOPE_MIN: f32 = 0.25;
+const BROWSER_INITIAL_SLOPE_MAX: f32 = 0.95;
+const SMOOTH_SCROLL_WAKE_INTERVAL: Duration = Duration::from_millis(8);
+const SMOOTH_SCROLL_WAKE_GRACE: Duration = Duration::from_millis(48);
+const WHEEL_LINE_DELTA_PER_NOTCH: f32 = 3.0;
+const EASE_IN_OUT_X1: f32 = 0.42;
+const EASE_IN_OUT_Y1: f32 = 0.0;
+const EASE_IN_OUT_X2: f32 = 0.58;
+const EASE_IN_OUT_Y2: f32 = 1.0;
+
+fn spawn_smooth_scroll_waker(
+    event_tx: flume::Sender<ExternalEvent>,
+    proxy_cell: Arc<OnceLock<EventLoopProxy>>,
+    duration: Duration,
+) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + duration + SMOOTH_SCROLL_WAKE_GRACE;
+        while Instant::now() <= deadline {
+            std::thread::sleep(SMOOTH_SCROLL_WAKE_INTERVAL);
+            if event_tx.send(ExternalEvent::RequestAnimationFrame).is_err() {
+                break;
+            }
+            if let Some(proxy) = proxy_cell.get() {
+                proxy.wake_up();
+            }
+        }
+    });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SmoothScroll {
+    node_id: NodeId,
+    start_x: f32,
+    start_y: f32,
+    target_x: f32,
+    target_y: f32,
+    started_at: Instant,
+    duration: Duration,
+    initial_slope: f32,
+}
+
+impl SmoothScroll {
+    fn position_at(self, now: Instant) -> ((f32, f32), bool) {
+        let (position, _, _, complete) = self.position_velocity_at(now);
+        (position, complete)
+    }
+
+    fn position_velocity_at(self, now: Instant) -> ((f32, f32), f32, f32, bool) {
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if self.duration.is_zero() {
+            return ((self.target_x, self.target_y), 0.0, 0.0, true);
+        }
+        let complete = elapsed >= self.duration;
+        let duration_secs = self.duration.as_secs_f32();
+        let (progress, progress_velocity) = if complete {
+            (1.0, 0.0)
+        } else {
+            browser_scroll_ease(elapsed.as_secs_f32() / duration_secs, self.initial_slope)
+        };
+        let x = self.start_x + (self.target_x - self.start_x) * progress;
+        let y = self.start_y + (self.target_y - self.start_y) * progress;
+        let vx = (self.target_x - self.start_x) * progress_velocity / duration_secs;
+        let vy = (self.target_y - self.start_y) * progress_velocity / duration_secs;
+        ((x, y), vx, vy, complete)
+    }
+}
+
+fn browser_scroll_ease(x: f32, initial_slope: f32) -> (f32, f32) {
+    let y1 = EASE_IN_OUT_Y1 + EASE_IN_OUT_X1 * initial_slope.clamp(-1000.0, 1000.0);
+    let x = x.clamp(0.0, 1.0);
+    cubic_bezier_y_and_velocity(x, EASE_IN_OUT_X1, y1, EASE_IN_OUT_X2, EASE_IN_OUT_Y2)
+}
+
+fn cubic_bezier_y_and_velocity(x: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> (f32, f32) {
+    let mut t = x;
+    for _ in 0..6 {
+        let current_x = cubic_bezier_axis(t, x1, x2);
+        let dx = cubic_bezier_axis_derivative(t, x1, x2);
+        if dx.abs() < 0.000_001 {
+            break;
+        }
+        let next = t - (current_x - x) / dx;
+        if !(0.0..=1.0).contains(&next) {
+            break;
+        }
+        t = next;
+    }
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    for _ in 0..8 {
+        let current_x = cubic_bezier_axis(t, x1, x2);
+        if (current_x - x).abs() <= 0.000_01 {
+            break;
+        }
+        if current_x < x {
+            lo = t;
+        } else {
+            hi = t;
+        }
+        t = (lo + hi) * 0.5;
+    }
+    let y = cubic_bezier_axis(t, y1, y2);
+    let dx = cubic_bezier_axis_derivative(t, x1, x2);
+    let dy = cubic_bezier_axis_derivative(t, y1, y2);
+    let velocity = if dx.abs() < 0.000_001 { 0.0 } else { dy / dx };
+    (y, velocity)
+}
+
+fn cubic_bezier_axis(t: f32, p1: f32, p2: f32) -> f32 {
+    let inv = 1.0 - t;
+    3.0 * inv * inv * t * p1 + 3.0 * inv * t * t * p2 + t * t * t
+}
+
+fn cubic_bezier_axis_derivative(t: f32, p1: f32, p2: f32) -> f32 {
+    let inv = 1.0 - t;
+    3.0 * inv * inv * p1 + 6.0 * inv * t * (p2 - p1) + 3.0 * t * t * (1.0 - p2)
+}
+
+fn wheel_scroll_delta_pixels(
+    delta: winit::event::MouseScrollDelta,
+    scale_factor: f32,
+    zoom_factor: f32,
+    tuning: ScrollTuning,
+) -> (f32, f32, bool) {
+    match delta {
+        winit::event::MouseScrollDelta::LineDelta(x, y) => {
+            let line_px = tuning.sanitized().line_scroll_px * scale_factor * zoom_factor;
+            (normalize_wheel_line_delta(x) * line_px, normalize_wheel_line_delta(y) * line_px, true)
+        }
+        winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32, false),
+    }
+}
+
+fn normalize_wheel_line_delta(value: f32) -> f32 {
+    if value.abs() >= WHEEL_LINE_DELTA_PER_NOTCH {
+        value / WHEEL_LINE_DELTA_PER_NOTCH
+    } else {
+        value
+    }
+}
+
+fn dominant_delta(delta: (f32, f32)) -> f32 {
+    if delta.0.abs() > delta.1.abs() {
+        delta.0
+    } else {
+        delta.1
+    }
+}
+
+fn unscaled_scroll_delta(delta: (f32, f32), scale_factor: f32, zoom_factor: f32) -> (f32, f32) {
+    let factor = (scale_factor * zoom_factor).max(0.01);
+    (delta.0 / factor, delta.1 / factor)
+}
+
+fn browser_like_wheel_duration(delta: (f32, f32), tuning: ScrollTuning) -> Duration {
+    let tuning = tuning.sanitized();
+    let max_ms = tuning.smooth_scroll_duration_ms as f32;
+    let min_ms = (max_ms * BROWSER_MIN_DURATION_RATIO).max(16.0);
+    let distance = dominant_delta(delta).abs();
+    let duration_ms = if distance <= BROWSER_WHEEL_RAMP_START_PX {
+        max_ms
+    } else if distance >= BROWSER_WHEEL_RAMP_END_PX {
+        min_ms
+    } else {
+        let t = (distance - BROWSER_WHEEL_RAMP_START_PX)
+            / (BROWSER_WHEEL_RAMP_END_PX - BROWSER_WHEEL_RAMP_START_PX);
+        min_ms + (max_ms - min_ms) * (1.0 - t).powf(BROWSER_DURATION_RAMP_EXPONENT)
+    };
+    Duration::from_millis(duration_ms.round() as u64)
+}
+
+fn browser_like_initial_slope(delta: (f32, f32)) -> f32 {
+    let distance = dominant_delta(delta).abs();
+    if distance <= BROWSER_WHEEL_RAMP_START_PX {
+        return BROWSER_INITIAL_SLOPE_MIN;
+    }
+    if distance >= BROWSER_WHEEL_RAMP_END_PX {
+        return BROWSER_INITIAL_SLOPE_MAX;
+    }
+    let t = (distance - BROWSER_WHEEL_RAMP_START_PX)
+        / (BROWSER_WHEEL_RAMP_END_PX - BROWSER_WHEEL_RAMP_START_PX);
+    BROWSER_INITIAL_SLOPE_MIN + (BROWSER_INITIAL_SLOPE_MAX - BROWSER_INITIAL_SLOPE_MIN) * t.sqrt()
+}
+
+fn next_smooth_scroll(
+    current: (f32, f32),
+    max_scroll: (f32, f32),
+    active: Option<SmoothScroll>,
+    node_id: NodeId,
+    delta: (f32, f32),
+    now: Instant,
+    duration: Duration,
+    initial_slope: f32,
+) -> Option<SmoothScroll> {
+    let base = active
+        .filter(|scroll| scroll.node_id == node_id)
+        .map(|scroll| (scroll.target_x, scroll.target_y))
+        .unwrap_or(current);
+    let target_x = (base.0 - delta.0).clamp(0.0, max_scroll.0);
+    let target_y = (base.1 - delta.1).clamp(0.0, max_scroll.1);
+
+    if (target_x - current.0).abs() < SMOOTH_SCROLL_EPSILON
+        && (target_y - current.1).abs() < SMOOTH_SCROLL_EPSILON
+    {
+        return None;
+    }
+
+    let continuity_slope = active.filter(|scroll| scroll.node_id == node_id).and_then(|scroll| {
+        let (_, vx, vy, complete) = scroll.position_velocity_at(now);
+        if complete || duration.is_zero() {
+            return None;
+        }
+        let velocity = dominant_delta((vx, vy));
+        let new_delta = dominant_delta((target_x - current.0, target_y - current.1));
+        if new_delta.abs() < SMOOTH_SCROLL_EPSILON {
+            None
+        } else {
+            Some(velocity * duration.as_secs_f32() / new_delta)
+        }
+    });
+    let initial_slope =
+        continuity_slope.map(|slope| slope.max(initial_slope)).unwrap_or(initial_slope);
+
+    Some(SmoothScroll {
+        node_id,
+        start_x: current.0,
+        start_y: current.1,
+        target_x,
+        target_y,
+        started_at: now,
+        duration,
+        initial_slope,
+    })
+}
+
+fn scroll_telemetry(
+    scroll: SmoothScroll,
+    phase: ScrollTelemetryPhase,
+    now: Instant,
+) -> ScrollTelemetry {
+    let ((scroll_x, scroll_y), velocity_x, velocity_y, _) = scroll.position_velocity_at(now);
+    let elapsed_ms = now.saturating_duration_since(scroll.started_at).as_secs_f32() * 1000.0;
+    let distance_y = scroll.target_y - scroll.start_y;
+    let progress_y = if distance_y.abs() < SMOOTH_SCROLL_EPSILON {
+        1.0
+    } else {
+        ((scroll_y - scroll.start_y) / distance_y).clamp(0.0, 1.0)
+    };
+
+    ScrollTelemetry {
+        phase,
+        node_id: scroll.node_id,
+        elapsed_ms,
+        duration_ms: scroll.duration.as_secs_f32() * 1000.0,
+        start_x: scroll.start_x,
+        start_y: scroll.start_y,
+        scroll_x,
+        scroll_y,
+        target_x: scroll.target_x,
+        target_y: scroll.target_y,
+        velocity_x,
+        velocity_y,
+        progress_y,
+    }
+}
+
+fn emit_scroll_telemetry(callback: Option<&ScrollTelemetryCallback>, telemetry: ScrollTelemetry) {
+    if let Some(callback) = callback {
+        callback(&telemetry);
+    }
+}
+
+fn tick_smooth_scroll(
+    state: &mut AppState,
+    now: Instant,
+    decorations: bool,
+    on_scroll_telemetry: Option<&ScrollTelemetryCallback>,
+) {
+    let Some(scroll_state) = state.smooth_scroll else {
+        return;
+    };
+
+    if state.arena.get(scroll_state.node_id).is_none() {
+        state.smooth_scroll = None;
+        return;
+    }
+
+    let ((next_x, next_y), complete) = scroll_state.position_at(now);
+    scroll::set_scroll_position(&mut state.arena, scroll_state.node_id, next_x, next_y);
+    emit_scroll_telemetry(
+        on_scroll_telemetry,
+        scroll_telemetry(
+            scroll_state,
+            if complete { ScrollTelemetryPhase::Completed } else { ScrollTelemetryPhase::Frame },
+            now,
+        ),
+    );
+
+    if complete {
+        let pos = state.interaction.last_cursor_pos;
+        handle_normal_hover(state, pos, decorations);
+        state.smooth_scroll = None;
+        state.smooth_scroll_next_frame = None;
+    }
+}
+
+fn can_fast_paint_smooth_scroll(state: &AppState) -> bool {
+    state.smooth_scroll.is_some()
+        && !state.needs_rebuild
+        && !state.needs_restyle
+        && !state.needs_relayout
+}
+
+fn fast_paint_smooth_scroll_frame(
+    state: &mut AppState,
+    frame_start: Instant,
+    decorations: bool,
+    on_scroll_telemetry: Option<&ScrollTelemetryCallback>,
+    on_frame_metrics: Option<&(dyn Fn(&FrameMetrics) + Send)>,
+) {
+    let mut metrics = FrameMetrics::default();
+
+    tick_smooth_scroll(state, frame_start, decorations, on_scroll_telemetry);
+
+    state.gpu.glyph_atlas.advance_frame();
+
+    let t4 = Instant::now();
+    state.gpu.layered_batch.clear();
+    state.batch_cache.begin_frame();
+    {
+        let mut rasterizer = Rasterizer {
+            swash: &mut state.swash_cache,
+            subpixel_swash: &mut state.subpixel_swash_cache,
+            #[cfg(target_os = "windows")]
+            dw: &state.dw_rasterizer,
+        };
+        batch::build_render_batch(
+            &state.arena,
+            state.root,
+            &mut state.gpu.layered_batch,
+            &mut state.gpu.glyph_atlas,
+            &mut state.font_system,
+            &mut rasterizer,
+            &mut state.measure_cache,
+            &mut state.shaped_cache,
+            &mut state.gpu.svg_cache,
+            &mut state.shape_cache,
+            state.interaction.text_selection.as_ref(),
+            Some(&state.canvas_registry),
+            &state.scrollbar_visual,
+            state.interaction.focused,
+            &mut state.batch_cache,
+            Some(&mut state.line_quad_cache),
+        );
+    }
+    state.batch_cache.commit_frame();
+    state.shaped_cache.finish_frame(state.gpu.glyph_atlas.generation);
+    state.shape_cache.finish_frame();
+    batch::clear_paint_flags_subtree(&mut state.arena, state.root);
+    metrics.batch_build_us = t4.elapsed().as_micros() as u64;
+    metrics.node_count = state.arena.len();
+
+    {
+        let mut total_quads: u32 = 0;
+        let mut total_glyphs: u32 = 0;
+        for layer in &state.gpu.layered_batch.layers {
+            total_quads = total_quads.saturating_add(layer.quad_instances.len() as u32);
+            total_glyphs = total_glyphs.saturating_add(layer.glyph_instances.len() as u32);
+        }
+        metrics.quad_count = total_quads;
+        metrics.glyph_count = total_glyphs;
+    }
+
+    metrics.atlas_fill_ratio = if state.gpu.glyph_atlas.size > 0 {
+        state.gpu.glyph_atlas.next_shelf_y as f32 / state.gpu.glyph_atlas.size as f32
+    } else {
+        0.0
+    };
+    metrics.gpu_upload_bytes =
+        state.gpu.glyph_atlas.pending_uploads.iter().map(|g| (g.width * g.height) as u64).sum();
+
+    let t5 = Instant::now();
+    state.window.pre_present_notify();
+    state.gpu.render();
+    metrics.gpu_render_us = t5.elapsed().as_micros() as u64;
+
+    if state.gpu.any_canvas_needs_repaint() {
+        state.window.request_redraw();
+    }
+
+    state.frame_pacer.record_paint(frame_start);
+    metrics.total_us = frame_start.elapsed().as_micros() as u64;
+    metrics.rss_bytes = get_rss_bytes();
+    metrics.pacer_min_interval_ns = state.frame_pacer.min_interval().as_nanos() as u64;
+
+    state.frame_probe.record_frame(std::time::Duration::from_micros(metrics.total_us));
+    if let Some(snap) = state.frame_probe.maybe_emit(Instant::now()) {
+        log::info!("[FRAME] {}", snap);
+    }
+    if metrics.total_us > 8333 {
+        log::warn!("[PERF] {}", metrics);
+    } else {
+        log::debug!("[PERF] {}", metrics);
+    }
+
+    if let Some(cb) = on_frame_metrics {
+        cb(&metrics);
+    }
+
+    state.last_metrics = metrics;
+    state.frame_count += 1;
+}
 
 /// Pure function: whether `now` is within [`ACTIVITY_WINDOW`] of the
 /// recorded `last_activity`. Extracted so it can be unit-tested with a
@@ -886,6 +1376,7 @@ impl ApplicationHandler for AppHandler {
             return;
         };
         let mut coalescer = RebuildCoalescer::default();
+        let mut saw_animation_frame = false;
         coalescer.begin_drain();
         for event in self.event_rx.try_iter() {
             match event {
@@ -894,6 +1385,10 @@ impl ApplicationHandler for AppHandler {
                 }
                 ExternalEvent::RequestRedraw => {
                     coalescer.observe(false);
+                }
+                ExternalEvent::RequestAnimationFrame => {
+                    saw_animation_frame = true;
+                    state.force_animation_paint = true;
                 }
                 ExternalEvent::ActivateWindow => {
                     state.window.set_visible(true);
@@ -961,7 +1456,39 @@ impl ApplicationHandler for AppHandler {
             // during the next [`ACTIVITY_WINDOW`].
             state.mark_activity(Instant::now());
         }
-        state.window.request_redraw();
+        if saw_animation_frame && can_fast_paint_smooth_scroll(state) {
+            let frame_start = Instant::now();
+            let due = state.smooth_scroll_next_frame.unwrap_or(frame_start);
+            if frame_start < due {
+                _event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                if coalescer.saw_event {
+                    state.window.request_redraw();
+                }
+                return;
+            }
+            state.force_animation_paint = false;
+            fast_paint_smooth_scroll_frame(
+                state,
+                frame_start,
+                self.app.config.decorations,
+                self.app.config.on_scroll_telemetry.as_deref(),
+                self.app.config.on_frame_metrics.as_deref(),
+            );
+            if state.smooth_scroll.is_some() {
+                state.smooth_scroll_next_frame = Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
+                _event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            } else {
+                _event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            }
+        } else if saw_animation_frame && state.smooth_scroll.is_none() && !coalescer.saw_event {
+            state.force_animation_paint = false;
+            _event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        } else if saw_animation_frame && state.smooth_scroll.is_some() {
+            state.window.request_redraw();
+            _event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        } else {
+            state.window.request_redraw();
+        }
     }
 
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
@@ -1036,6 +1563,7 @@ impl ApplicationHandler for AppHandler {
         }
         crate::font::check_fallback_chain(&font_system, &self.app.config.fallback_chain);
         let swash_cache = SwashCache::new();
+        let subpixel_swash_cache = SubpixelSwashCache::new();
         #[cfg(target_os = "windows")]
         let dw_rasterizer = {
             let font_name = self
@@ -1048,7 +1576,10 @@ impl ApplicationHandler for AppHandler {
                     _ => None,
                 })
                 .unwrap_or("Consolas");
-            DwRasterizer::new(font_name)
+            DwRasterizer::new_with_custom_font_paths(
+                font_name,
+                collect_directwrite_font_paths(&self.app.config.fonts, &stylesheet),
+            )
         };
 
         let mut arena = NodeArena::new();
@@ -1146,6 +1677,7 @@ impl ApplicationHandler for AppHandler {
             stylesheet,
             font_system,
             swash_cache,
+            subpixel_swash_cache,
             #[cfg(target_os = "windows")]
             dw_rasterizer,
             interaction: InteractionState::default(),
@@ -1174,6 +1706,9 @@ impl ApplicationHandler for AppHandler {
             event_log,
             event_log_start: Instant::now(),
             scrollbar_visual: ScrollbarVisualState::default(),
+            smooth_scroll: None,
+            smooth_scroll_next_frame: None,
+            force_animation_paint: false,
             active_transitions: ActiveTransitions::default(),
             animation_driver: AnimationDriver::new(),
             pseudo_table,
@@ -1450,13 +1985,14 @@ impl ApplicationHandler for AppHandler {
                         ScrollbarAxis::Horizontal => pos.0,
                     };
                     let new_scroll = scroll::scroll_from_drag(&drag, cursor_pos);
-                    if let Some(element) = state.arena.get_mut(drag.node_id) {
-                        match drag.axis {
-                            ScrollbarAxis::Vertical => element.scroll_y = new_scroll,
-                            ScrollbarAxis::Horizontal => element.scroll_x = new_scroll,
-                        }
+                    if scroll::set_axis_scroll_position(
+                        &mut state.arena,
+                        drag.node_id,
+                        drag.axis,
+                        new_scroll,
+                    ) {
+                        state.window.request_redraw();
                     }
-                    state.window.request_redraw();
                 } else if state.interaction.dragging {
                     // Active element drag: dispatch DragUpdate (pointer captured)
                     if let Some(handler_node) = state.interaction.drag_target {
@@ -1539,12 +2075,8 @@ impl ApplicationHandler for AppHandler {
                     match button_state {
                         ElementState::Pressed => {
                             let sb_pos = state.interaction.last_cursor_pos;
-                            let region_target = if state.interaction.hovered.is_dangling() {
-                                hit_test(&state.arena, state.root, sb_pos.0, sb_pos.1)
-                                    .unwrap_or(NodeId::DANGLING)
-                            } else {
-                                state.interaction.hovered
-                            };
+                            handle_normal_hover(state, sb_pos, self.app.config.decorations);
+                            let region_target = state.interaction.hovered;
                             if let Some(direction) = custom_window_resize_direction(
                                 self.app.config.decorations,
                                 state.window.surface_size(),
@@ -1584,6 +2116,7 @@ impl ApplicationHandler for AppHandler {
                                 sb_pos.0,
                                 sb_pos.1,
                             ) {
+                                state.smooth_scroll = None;
                                 match hit.part {
                                     ScrollbarPart::Thumb => {
                                         let grab_offset = match hit.axis {
@@ -1613,16 +2146,12 @@ impl ApplicationHandler for AppHandler {
                                             &hit.geometry,
                                             cursor_pos,
                                         );
-                                        if let Some(element) = state.arena.get_mut(hit.node_id) {
-                                            match hit.axis {
-                                                ScrollbarAxis::Vertical => {
-                                                    element.scroll_y = new_scroll
-                                                }
-                                                ScrollbarAxis::Horizontal => {
-                                                    element.scroll_x = new_scroll
-                                                }
-                                            }
-                                        }
+                                        scroll::set_axis_scroll_position(
+                                            &mut state.arena,
+                                            hit.node_id,
+                                            hit.axis,
+                                            new_scroll,
+                                        );
                                     }
                                 }
                                 state.window.request_redraw();
@@ -1865,9 +2394,10 @@ impl ApplicationHandler for AppHandler {
                             {
                                 // Normal click (no drag occurred)
                                 state.interaction.drag_origin = None;
+                                let pos = state.interaction.last_cursor_pos;
+                                handle_normal_hover(state, pos, self.app.config.decorations);
                                 // Handle checkbox/radio click before generic dispatch.
                                 let input_handled = handle_input_click(state, mousedown_target);
-                                let pos = state.interaction.last_cursor_pos;
                                 let consumed_by_select = handle_select_click(state, pos.0, pos.1);
                                 if input_handled
                                     || consumed_by_select
@@ -2173,29 +2703,106 @@ impl ApplicationHandler for AppHandler {
                         state.window.request_redraw();
                     }
                 } else {
-                    let (delta_x, delta_y) = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                            let line_height = 40.0 * state.scale_factor * state.zoom_factor;
-                            (x * line_height, y * line_height)
-                        }
-                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                            (pos.x as f32, pos.y as f32)
-                        }
-                    };
+                    let scroll_tuning = self
+                        .app
+                        .config
+                        .scroll_tuning
+                        .as_ref()
+                        .map(|read| read())
+                        .unwrap_or_default()
+                        .sanitized();
+                    let (delta_x, delta_y, smooth_scroll) = wheel_scroll_delta_pixels(
+                        delta,
+                        state.scale_factor,
+                        state.zoom_factor,
+                        scroll_tuning,
+                    );
+                    let duration_delta = unscaled_scroll_delta(
+                        (delta_x, delta_y),
+                        state.scale_factor,
+                        state.zoom_factor,
+                    );
+                    let pos = state.interaction.last_cursor_pos;
+                    handle_normal_hover(state, pos, self.app.config.decorations);
 
                     let scroll_target =
                         scroll::find_scroll_container(&state.arena, state.interaction.hovered);
 
                     if let Some(target_id) = scroll_target {
-                        let max_scroll = compute_max_scroll(&state.arena, &state.taffy, target_id);
-
-                        if let Some(element) = state.arena.get_mut(target_id) {
-                            let old_x = element.scroll_x;
-                            let old_y = element.scroll_y;
-                            // scroll wheel delta_y is negative when scrolling down
-                            element.scroll_x = (old_x - delta_x).clamp(0.0, max_scroll.0);
-                            element.scroll_y = (old_y - delta_y).clamp(0.0, max_scroll.1);
-                            if element.scroll_x != old_x || element.scroll_y != old_y {
+                        if smooth_scroll {
+                            let current =
+                                state.arena.get(target_id).map(|el| (el.scroll_x, el.scroll_y));
+                            if let Some(current) = current {
+                                let max_scroll = scroll::compute_max_scroll(
+                                    &state.arena,
+                                    &state.taffy,
+                                    target_id,
+                                );
+                                let duration =
+                                    browser_like_wheel_duration(duration_delta, scroll_tuning);
+                                let scroll_started_at = Instant::now();
+                                state.smooth_scroll = next_smooth_scroll(
+                                    current,
+                                    max_scroll,
+                                    state.smooth_scroll,
+                                    target_id,
+                                    (delta_x, delta_y),
+                                    scroll_started_at,
+                                    duration,
+                                    browser_like_initial_slope(duration_delta),
+                                );
+                                if state.smooth_scroll.is_some() {
+                                    state.smooth_scroll_next_frame = Some(scroll_started_at);
+                                    spawn_smooth_scroll_waker(
+                                        self.app.event_tx.clone(),
+                                        Arc::clone(&self.app.proxy_cell),
+                                        duration,
+                                    );
+                                    if let Some(scroll) = state.smooth_scroll {
+                                        emit_scroll_telemetry(
+                                            self.app.config.on_scroll_telemetry.as_deref(),
+                                            scroll_telemetry(
+                                                scroll,
+                                                ScrollTelemetryPhase::Started,
+                                                scroll.started_at,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            state.smooth_scroll = None;
+                            if scroll::scroll_by(
+                                &mut state.arena,
+                                &state.taffy,
+                                target_id,
+                                delta_x,
+                                delta_y,
+                            ) {
+                                let pos = state.interaction.last_cursor_pos;
+                                handle_normal_hover(state, pos, self.app.config.decorations);
+                                let scroll =
+                                    state.arena.get(target_id).map(|el| (el.scroll_x, el.scroll_y));
+                                if let Some((scroll_x, scroll_y)) = scroll {
+                                    emit_scroll_telemetry(
+                                        self.app.config.on_scroll_telemetry.as_deref(),
+                                        ScrollTelemetry {
+                                            phase: ScrollTelemetryPhase::Instant,
+                                            node_id: target_id,
+                                            elapsed_ms: 0.0,
+                                            duration_ms: 0.0,
+                                            start_x: scroll_x,
+                                            start_y: scroll_y,
+                                            scroll_x,
+                                            scroll_y,
+                                            target_x: scroll_x,
+                                            target_y: scroll_y,
+                                            velocity_x: 0.0,
+                                            velocity_y: 0.0,
+                                            progress_y: 1.0,
+                                        },
+                                    );
+                                }
                                 state.window.request_redraw();
                             }
                         }
@@ -2282,6 +2889,30 @@ impl ApplicationHandler for AppHandler {
 
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
+                let force_animation_paint = std::mem::take(&mut state.force_animation_paint);
+                let smooth_scroll_active = state.smooth_scroll.is_some();
+                if state.smooth_scroll.is_some() && can_fast_paint_smooth_scroll(state) {
+                    let due = state.smooth_scroll_next_frame.unwrap_or(frame_start);
+                    if frame_start < due && !force_animation_paint {
+                        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                        return;
+                    }
+                    fast_paint_smooth_scroll_frame(
+                        state,
+                        frame_start,
+                        self.app.config.decorations,
+                        self.app.config.on_scroll_telemetry.as_deref(),
+                        self.app.config.on_frame_metrics.as_deref(),
+                    );
+                    if state.smooth_scroll.is_some() {
+                        state.smooth_scroll_next_frame =
+                            Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
+                        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                    } else {
+                        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                    }
+                    return;
+                }
 
                 // Flip the input latency tracker BEFORE the pacer early
                 // return so events that arrive during a pacer sleep are
@@ -2294,17 +2925,27 @@ impl ApplicationHandler for AppHandler {
                 // most one paint per frame_pacer.min_interval. When the
                 // pacer says wait, schedule a WaitUntil and bail out so
                 // the event loop sleeps until the coalescing deadline.
-                match state.frame_pacer.on_redraw_requested(frame_start) {
-                    crate::frame_pacer::PaceDecision::PaintNow => {}
-                    crate::frame_pacer::PaceDecision::WaitUntil(deadline) => {
-                        event_loop
-                            .set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
-                        state.window.request_redraw();
-                        return;
+                if !(force_animation_paint || smooth_scroll_active) {
+                    match state.frame_pacer.on_redraw_requested(frame_start) {
+                        crate::frame_pacer::PaceDecision::PaintNow => {}
+                        crate::frame_pacer::PaceDecision::WaitUntil(deadline) => {
+                            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                                deadline,
+                            ));
+                            state.window.request_redraw();
+                            return;
+                        }
                     }
                 }
 
                 let mut metrics = FrameMetrics::default();
+
+                tick_smooth_scroll(
+                    state,
+                    frame_start,
+                    self.app.config.decorations,
+                    self.app.config.on_scroll_telemetry.as_deref(),
+                );
 
                 // Advance LRU frame counter at the start of each rendered frame.
                 state.gpu.glyph_atlas.advance_frame();
@@ -2586,6 +3227,7 @@ impl ApplicationHandler for AppHandler {
                 state.batch_cache.begin_frame();
                 let mut rasterizer = Rasterizer {
                     swash: &mut state.swash_cache,
+                    subpixel_swash: &mut state.subpixel_swash_cache,
                     #[cfg(target_os = "windows")]
                     dw: &state.dw_rasterizer,
                 };
@@ -2664,6 +3306,7 @@ impl ApplicationHandler for AppHandler {
                     let (vw, vh) = state.gpu.window_size();
                     let mut rasterizer2 = Rasterizer {
                         swash: &mut state.swash_cache,
+                        subpixel_swash: &mut state.subpixel_swash_cache,
                         #[cfg(target_os = "windows")]
                         dw: &state.dw_rasterizer,
                     };
@@ -2727,7 +3370,11 @@ impl ApplicationHandler for AppHandler {
                 // When any source is active we set WaitUntil to the minimum
                 // wake time across all sources, so the event loop sleeps
                 // between frames instead of busy-polling.
-                {
+                if state.smooth_scroll.is_some() {
+                    state.smooth_scroll_next_frame =
+                        Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                } else {
                     let mut next_wake: Option<Instant> = None;
 
                     // Cursor blink.
@@ -2764,7 +3411,9 @@ impl ApplicationHandler for AppHandler {
                     if let Some(wake) = next_wake {
                         event_loop
                             .set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wake));
-                        state.window.request_redraw();
+                        if wake <= Instant::now() {
+                            state.window.request_redraw();
+                        }
                     }
                 }
 
@@ -2860,6 +3509,37 @@ impl ApplicationHandler for AppHandler {
         };
 
         let now = Instant::now();
+        if state.smooth_scroll.is_some() {
+            if can_fast_paint_smooth_scroll(state) {
+                let due = state.smooth_scroll_next_frame.unwrap_or(now);
+                let wait = due.saturating_duration_since(now).min(SMOOTH_SCROLL_WAKE_INTERVAL);
+                if !wait.is_zero() {
+                    std::thread::sleep(wait);
+                }
+                let frame_start = Instant::now();
+                fast_paint_smooth_scroll_frame(
+                    state,
+                    frame_start,
+                    self.app.config.decorations,
+                    self.app.config.on_scroll_telemetry.as_deref(),
+                    self.app.config.on_frame_metrics.as_deref(),
+                );
+                if state.smooth_scroll.is_some() {
+                    state.smooth_scroll_next_frame =
+                        Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                } else {
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                }
+            } else {
+                state.window.request_redraw();
+                let next_frame = now + SMOOTH_SCROLL_WAKE_INTERVAL;
+                state.smooth_scroll_next_frame = Some(next_frame);
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            }
+            return;
+        }
+
         if state.is_recently_active(now) {
             // Pick the earlier of (speculative pacer deadline, any wake
             // the paint handler already set for animations). Taking the
@@ -2873,7 +3553,9 @@ impl ApplicationHandler for AppHandler {
                 _ => spec_deadline,
             };
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
-            state.window.request_redraw();
+            if deadline <= now {
+                state.window.request_redraw();
+            }
         } else {
             // Activity window has expired. If the current control flow is
             // a stale speculative `WaitUntil` (already in the past), winit
@@ -2884,6 +3566,7 @@ impl ApplicationHandler for AppHandler {
             match event_loop.control_flow() {
                 winit::event_loop::ControlFlow::WaitUntil(deadline) if deadline <= now => {
                     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                    state.window.request_redraw();
                 }
                 winit::event_loop::ControlFlow::Poll => {
                     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
@@ -3483,25 +4166,27 @@ fn apply_cursor_icon(window: &dyn Window, arena: &NodeArena, hovered: NodeId) {
     window.set_cursor(cursor.into());
 }
 
-fn compute_max_scroll(
-    arena: &NodeArena,
-    taffy: &taffy::TaffyTree<layout::TextMeasureCtx>,
-    node_id: NodeId,
-) -> (f32, f32) {
-    let Some(element) = arena.get(node_id) else {
-        return (0.0, 0.0);
-    };
+#[cfg(target_os = "windows")]
+fn collect_directwrite_font_paths(
+    config_fonts: &[crate::font::FontSource],
+    stylesheet: &CompiledStylesheet,
+) -> Vec<PathBuf> {
+    use unshit_core::style::parse::FontFaceSrc;
 
-    let container_w = element.layout_rect.width;
-    let container_h = element.layout_rect.height;
-
-    let content_size = element
-        .taffy_node
-        .and_then(|tn| taffy.layout(tn).ok())
-        .map(|layout| (layout.content_size.width, layout.content_size.height))
-        .unwrap_or((0.0, 0.0));
-
-    ((content_size.0 - container_w).max(0.0), (content_size.1 - container_h).max(0.0))
+    let mut paths = Vec::new();
+    for source in config_fonts {
+        if let crate::font::FontSource::Path(path) = source {
+            paths.push(path.clone());
+        }
+    }
+    for rule in &stylesheet.font_faces {
+        if let FontFaceSrc::Url(url) = &rule.src {
+            if !url.starts_with("data:") {
+                paths.push(PathBuf::from(url));
+            }
+        }
+    }
+    paths
 }
 
 /// Lightweight re-layout: recompute taffy layout and positions without rebuilding tree or styles.
@@ -4001,6 +4686,27 @@ mod tests {
     }
 
     #[test]
+    fn app_config_scroll_tuning_defaults_to_none() {
+        let config = AppConfig::default();
+        assert!(config.scroll_tuning.is_none());
+    }
+
+    #[test]
+    fn app_config_scroll_telemetry_defaults_to_none() {
+        let config = AppConfig::default();
+        assert!(config.on_scroll_telemetry.is_none());
+    }
+
+    #[test]
+    fn scroll_tuning_sanitizes_unusable_values() {
+        let tuning =
+            ScrollTuning { line_scroll_px: f32::NAN, smooth_scroll_duration_ms: 0 }.sanitized();
+
+        assert_eq!(tuning.line_scroll_px, DEFAULT_WHEEL_LINE_SCROLL_PX);
+        assert_eq!(tuning.smooth_scroll_duration_ms, 16);
+    }
+
+    #[test]
     fn app_config_on_cell_metrics_defaults_to_none() {
         let config = AppConfig::default();
         assert!(config.on_cell_metrics.is_none());
@@ -4321,6 +5027,182 @@ mod tests {
         let last = Instant::now() + Duration::from_millis(100);
         let now = last - Duration::from_millis(50);
         assert!(is_within_activity_window(last, now, ACTIVITY_WINDOW));
+    }
+
+    #[test]
+    fn line_wheel_delta_is_normalized_to_smooth_pixel_scroll() {
+        let (dx, dy, smooth) = wheel_scroll_delta_pixels(
+            winit::event::MouseScrollDelta::LineDelta(1.0, -2.0),
+            1.0,
+            1.0,
+            ScrollTuning::default(),
+        );
+
+        assert_eq!(dx, DEFAULT_WHEEL_LINE_SCROLL_PX);
+        assert_eq!(dy, -2.0 * DEFAULT_WHEEL_LINE_SCROLL_PX);
+        assert!(smooth);
+    }
+
+    #[test]
+    fn line_wheel_delta_uses_scroll_tuning() {
+        let (dx, dy, smooth) = wheel_scroll_delta_pixels(
+            winit::event::MouseScrollDelta::LineDelta(1.0, -1.0),
+            1.0,
+            1.0,
+            ScrollTuning { line_scroll_px: 72.0, smooth_scroll_duration_ms: 80 },
+        );
+
+        assert_eq!(dx, 72.0);
+        assert_eq!(dy, -72.0);
+        assert!(smooth);
+    }
+
+    #[test]
+    fn windows_wheel_notch_delta_is_normalized_to_one_browser_step() {
+        let (_, dy, smooth) = wheel_scroll_delta_pixels(
+            winit::event::MouseScrollDelta::LineDelta(0.0, -3.0),
+            1.5,
+            1.0,
+            ScrollTuning::default(),
+        );
+
+        assert_eq!(dy, -DEFAULT_WHEEL_LINE_SCROLL_PX * 1.5);
+        assert!(smooth);
+    }
+
+    #[test]
+    fn pixel_wheel_delta_stays_direct_for_precision_devices() {
+        let (dx, dy, smooth) = wheel_scroll_delta_pixels(
+            winit::event::MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(
+                3.0, -14.0,
+            )),
+            1.0,
+            1.0,
+            ScrollTuning::default(),
+        );
+
+        assert_eq!(dx, 3.0);
+        assert_eq!(dy, -14.0);
+        assert!(!smooth);
+    }
+
+    #[test]
+    fn browser_like_wheel_duration_matches_edge_wheel_metrics() {
+        let tuning = ScrollTuning::default();
+        assert_eq!(browser_like_wheel_duration((0.0, -100.0), tuning), Duration::from_millis(180));
+        assert_eq!(browser_like_wheel_duration((0.0, -200.0), tuning), Duration::from_millis(144));
+        assert_eq!(browser_like_wheel_duration((0.0, -400.0), tuning), Duration::from_millis(94));
+    }
+
+    #[test]
+    fn browser_like_notch_scroll_keeps_120hz_frame_steps_small() {
+        let now = Instant::now();
+        let slope = browser_like_initial_slope((0.0, -100.0));
+        let scroll = SmoothScroll {
+            node_id: NodeId { index: 1, generation: 0 },
+            start_x: 0.0,
+            start_y: 0.0,
+            target_x: 0.0,
+            target_y: DEFAULT_WHEEL_LINE_SCROLL_PX * 1.5,
+            started_at: now,
+            duration: Duration::from_millis(DEFAULT_SMOOTH_SCROLL_DURATION_MS),
+            initial_slope: slope,
+        };
+
+        let mut previous_y = 0.0;
+        let mut max_step = 0.0_f32;
+        let frame_interval = Duration::from_nanos(8_333_333);
+        for frame in 1..=22 {
+            let ((_, y), _) = scroll.position_at(now + frame_interval * frame);
+            max_step = max_step.max((y - previous_y).abs());
+            previous_y = y;
+        }
+
+        assert!(
+            max_step <= 12.0,
+            "120Hz wheel frames should move less than 12px at 150px total distance, got {max_step:.2}px"
+        );
+    }
+
+    #[test]
+    fn browser_scroll_ease_tracks_measured_edge_notch_curve() {
+        let slope = browser_like_initial_slope((0.0, -100.0));
+        let (quarter, _) = browser_scroll_ease(0.25, slope);
+        let (half, _) = browser_scroll_ease(0.5, slope);
+        let (three_quarter, _) = browser_scroll_ease(0.75, slope);
+
+        assert!((quarter - 0.17).abs() < 0.03);
+        assert!((half - 0.54).abs() < 0.03);
+        assert!((three_quarter - 0.88).abs() < 0.03);
+    }
+
+    #[test]
+    fn browser_scroll_ease_gets_more_front_loaded_for_large_wheel_deltas() {
+        let small = browser_like_initial_slope((0.0, -100.0));
+        let large = browser_like_initial_slope((0.0, -400.0));
+        let (small_half, _) = browser_scroll_ease(0.5, small);
+        let (large_half, _) = browser_scroll_ease(0.5, large);
+
+        assert!(large > small);
+        assert!(large_half > small_half);
+    }
+
+    #[test]
+    fn smooth_scroll_compounds_wheel_ticks_from_pending_target() {
+        let node_id = NodeId { index: 42, generation: 0 };
+        let now = Instant::now();
+        let first = next_smooth_scroll(
+            (0.0, 0.0),
+            (0.0, 500.0),
+            None,
+            node_id,
+            (0.0, -80.0),
+            now,
+            Duration::from_millis(80),
+            0.25,
+        )
+        .expect("first wheel tick should start scroll");
+
+        let second = next_smooth_scroll(
+            (0.0, 12.0),
+            (0.0, 500.0),
+            Some(first),
+            node_id,
+            (0.0, -80.0),
+            now + Duration::from_millis(20),
+            Duration::from_millis(80),
+            0.25,
+        )
+        .expect("second wheel tick should extend scroll target");
+
+        assert_eq!(first.target_y, 80.0);
+        assert_eq!(second.start_y, 12.0);
+        assert_eq!(second.target_y, 160.0);
+        assert!(second.initial_slope > 0.25, "retargeted wheel scroll should preserve velocity");
+    }
+
+    #[test]
+    fn smooth_scroll_eases_to_exact_target() {
+        let node_id = NodeId { index: 7, generation: 0 };
+        let now = Instant::now();
+        let scroll = SmoothScroll {
+            node_id,
+            start_x: 0.0,
+            start_y: 0.0,
+            target_x: 0.0,
+            target_y: 100.0,
+            started_at: now,
+            duration: Duration::from_millis(100),
+            initial_slope: 0.0,
+        };
+
+        let ((_, mid_y), done) = scroll.position_at(now + Duration::from_millis(50));
+        assert!((mid_y - 50.0).abs() < 0.1);
+        assert!(!done);
+
+        let ((_, end_y), done) = scroll.position_at(now + Duration::from_millis(100));
+        assert_eq!(end_y, 100.0);
+        assert!(done);
     }
 
     #[test]

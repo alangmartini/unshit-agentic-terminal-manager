@@ -83,6 +83,8 @@ pub enum PseudoClass {
     FocusWithin,
     FirstChild,
     LastChild,
+    FirstOfType,
+    LastOfType,
     NthChild(i32),
     Not(Box<SelectorPart>),
 }
@@ -134,7 +136,7 @@ pub enum BorderSide {
     Left,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StyleDeclaration {
     Content(ContentValue),
     Display(Display),
@@ -186,11 +188,18 @@ pub enum StyleDeclaration {
     BackdropFilter(types::BackdropFilter),
     Color(Color),
     FontSize(f32),
+    /// Runtime text scale applied after the CSS cascade.
+    ///
+    /// This is intentionally not parsed from CSS today; app builders use it as
+    /// an inline override when user settings need to scale a subtree while
+    /// preserving the stylesheet's relative text hierarchy.
+    FontScale(f32),
     FontWeight(FontWeight),
     FontFamily(String),
     LineHeight(f32),
     LetterSpacing(f32),
     TextAlign(TextAlign),
+    TextTransform(TextTransform),
     TextDecoration(TextDecoration),
     TextDecorationColor(Color),
     WhiteSpace(types::WhiteSpace),
@@ -964,12 +973,20 @@ fn parse_simple_selector(s: &str) -> Result<Vec<SelectorPart>, ()> {
                     }
                     "first-child" => parts.push(SelectorPart::PseudoClass(PseudoClass::FirstChild)),
                     "last-child" => parts.push(SelectorPart::PseudoClass(PseudoClass::LastChild)),
+                    "first-of-type" => {
+                        parts.push(SelectorPart::PseudoClass(PseudoClass::FirstOfType))
+                    }
+                    "last-of-type" => {
+                        parts.push(SelectorPart::PseudoClass(PseudoClass::LastOfType))
+                    }
                     // :root matches the root element; treat as universal for matching.
                     "root" => parts.push(SelectorPart::Universal),
                     "nth-child" if has_parens => {
                         let arg = consume_parenthesized(&mut chars);
                         if let Ok(n) = arg.trim().parse::<i32>() {
                             parts.push(SelectorPart::PseudoClass(PseudoClass::NthChild(n)));
+                        } else {
+                            return Err(());
                         }
                     }
                     "not" if has_parens => {
@@ -987,9 +1004,11 @@ fn parse_simple_selector(s: &str) -> Result<Vec<SelectorPart>, ()> {
                             parts.push(SelectorPart::PseudoClass(PseudoClass::Not(Box::new(
                                 SelectorPart::Tag(inner.to_string()),
                             ))));
+                        } else {
+                            return Err(());
                         }
                     }
-                    _ => {}
+                    _ => return Err(()),
                 }
                 buf.clear();
             }
@@ -1204,7 +1223,7 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             StyleDeclaration::Overflow(match val.as_ref() {
                 "visible" => Overflow::Visible,
                 "hidden" => Overflow::Hidden,
-                "scroll" => Overflow::Scroll,
+                "scroll" | "auto" => Overflow::Scroll,
                 _ => return Err(()),
             })
         }
@@ -1347,6 +1366,16 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 "left" => TextAlign::Left,
                 "center" => TextAlign::Center,
                 "right" => TextAlign::Right,
+                _ => return Err(()),
+            })
+        }
+        "text-transform" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            StyleDeclaration::TextTransform(match val.as_ref() {
+                "none" => TextTransform::None,
+                "uppercase" => TextTransform::Uppercase,
+                "lowercase" => TextTransform::Lowercase,
+                "capitalize" => TextTransform::Capitalize,
                 _ => return Err(()),
             })
         }
@@ -4060,12 +4089,17 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         }
         StyleDeclaration::BackdropFilter(v) => style.backdrop_filter = Some(v.clone()),
         StyleDeclaration::Color(v) => style.color = *v,
-        StyleDeclaration::FontSize(v) => style.font_size = *v,
+        StyleDeclaration::FontSize(v) => {
+            style.font_size = *v;
+            style.font_size_explicit = true;
+        }
+        StyleDeclaration::FontScale(v) => style.font_size_scale = v.clamp(0.25, 4.0),
         StyleDeclaration::FontWeight(v) => style.font_weight = *v,
         StyleDeclaration::FontFamily(v) => style.font_family = v.clone(),
         StyleDeclaration::LineHeight(v) => style.line_height = *v,
         StyleDeclaration::LetterSpacing(v) => style.letter_spacing = *v,
         StyleDeclaration::TextAlign(v) => style.text_align = *v,
+        StyleDeclaration::TextTransform(v) => style.text_transform = *v,
         StyleDeclaration::TextDecoration(v) => style.text_decoration = *v,
         StyleDeclaration::TextDecorationColor(v) => style.text_decoration_color = Some(*v),
         StyleDeclaration::WhiteSpace(v) => style.white_space = *v,
@@ -4195,6 +4229,17 @@ mod tests {
             style.font_family,
             "JetBrains Mono, Berkeley Mono, SF Mono, Menlo, Consolas, monospace"
         );
+    }
+
+    #[test]
+    fn test_text_transform_cascades() {
+        let decls = parse_decls(".x { text-transform: uppercase; }");
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.text_transform, TextTransform::Uppercase);
     }
 
     #[test]
@@ -6610,6 +6655,31 @@ mod tests {
         assert!(
             parts.iter().any(|p| matches!(p, SelectorPart::PseudoClass(PseudoClass::FocusWithin))),
             "should parse :focus-within pseudo-class"
+        );
+    }
+
+    #[test]
+    fn test_of_type_structural_selectors_parse() {
+        let first = last_parts_of(".cell:first-of-type { border-left: none; }");
+        assert!(
+            first.iter().any(|p| matches!(p, SelectorPart::PseudoClass(PseudoClass::FirstOfType))),
+            "should parse :first-of-type pseudo-class"
+        );
+
+        let last = last_parts_of(".cell:last-of-type { border-right: none; }");
+        assert!(
+            last.iter().any(|p| matches!(p, SelectorPart::PseudoClass(PseudoClass::LastOfType))),
+            "should parse :last-of-type pseudo-class"
+        );
+    }
+
+    #[test]
+    fn test_unknown_pseudo_class_rejects_selector() {
+        let sheet = CompiledStylesheet::parse(".cell:unsupported { color: #ff0000; }");
+        assert_eq!(
+            sheet.rules.len(),
+            0,
+            "unknown pseudo classes must not leak to the base selector"
         );
     }
 

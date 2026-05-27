@@ -1,5 +1,5 @@
 use crate::id::NodeId;
-use crate::style::types::{AppRegion, CssResize, Layer, Overflow, PointerEvents};
+use crate::style::types::{AppRegion, CssPosition, CssResize, Layer, Overflow, PointerEvents};
 use crate::tree::NodeArena;
 use bitflags::bitflags;
 use std::fmt;
@@ -421,7 +421,7 @@ pub fn hit_test(arena: &NodeArena, root: NodeId, x: f32, y: f32) -> Option<NodeI
         if layer == Layer::Tooltip {
             continue;
         }
-        if let Some(hit) = hit_test_in_layer(arena, root, x, y, layer, Layer::Content) {
+        if let Some(hit) = hit_test_in_layer(arena, root, x, y, layer, Layer::Content, 0.0, 0.0) {
             return Some(hit);
         }
     }
@@ -435,11 +435,15 @@ fn hit_test_in_layer(
     y: f32,
     target_layer: Layer,
     inherited_layer: Layer,
+    scroll_offset_x: f32,
+    scroll_offset_y: f32,
 ) -> Option<NodeId> {
     let element = arena.get(node_id)?;
     let rect = element.layout_rect;
+    let render_x = rect.x - scroll_offset_x;
+    let render_y = rect.y - scroll_offset_y;
 
-    if !rect.contains(x, y) {
+    if x < render_x || x > render_x + rect.width || y < render_y || y > render_y + rect.height {
         return None;
     }
 
@@ -450,17 +454,35 @@ fn hit_test_in_layer(
         inherited_layer
     };
 
-    // When this element scrolls, children are rendered shifted by -scroll.
-    // Reverse that shift for hit testing by adding the scroll offset.
-    let child_x = x + element.scroll_x;
-    let child_y = y + element.scroll_y;
+    let child_scroll_x = scroll_offset_x + element.scroll_x;
+    let child_scroll_y = scroll_offset_y + element.scroll_y;
 
     // Check children in reverse order (last child = frontmost)
     let mut child = element.last_child;
     while !child.is_dangling() {
-        if let Some(hit) =
-            hit_test_in_layer(arena, child, child_x, child_y, target_layer, effective_layer)
-        {
+        let (child_scroll_offset_x, child_scroll_offset_y) =
+            if let Some(child_element) = arena.get(child) {
+                if matches!(
+                    child_element.computed_style.position,
+                    CssPosition::Absolute | CssPosition::Fixed
+                ) {
+                    (scroll_offset_x, scroll_offset_y)
+                } else {
+                    (child_scroll_x, child_scroll_y)
+                }
+            } else {
+                (child_scroll_x, child_scroll_y)
+            };
+        if let Some(hit) = hit_test_in_layer(
+            arena,
+            child,
+            x,
+            y,
+            target_layer,
+            effective_layer,
+            child_scroll_offset_x,
+            child_scroll_offset_y,
+        ) {
             return Some(hit);
         }
         child = arena.get(child).map(|e| e.prev_sibling).unwrap_or(NodeId::DANGLING);
@@ -553,9 +575,27 @@ fn find_resize_grip_recursive(
     // Check children first (frontmost wins)
     let mut child = element.last_child;
     while !child.is_dangling() {
-        if let Some(info) =
-            find_resize_grip_recursive(arena, child, x, y, child_scroll_x, child_scroll_y)
-        {
+        let (child_scroll_offset_x, child_scroll_offset_y) =
+            if let Some(child_element) = arena.get(child) {
+                if matches!(
+                    child_element.computed_style.position,
+                    CssPosition::Absolute | CssPosition::Fixed
+                ) {
+                    (scroll_offset_x, scroll_offset_y)
+                } else {
+                    (child_scroll_x, child_scroll_y)
+                }
+            } else {
+                (child_scroll_x, child_scroll_y)
+            };
+        if let Some(info) = find_resize_grip_recursive(
+            arena,
+            child,
+            x,
+            y,
+            child_scroll_offset_x,
+            child_scroll_offset_y,
+        ) {
             return Some(info);
         }
         child = arena.get(child).map(|e| e.prev_sibling).unwrap_or(NodeId::DANGLING);

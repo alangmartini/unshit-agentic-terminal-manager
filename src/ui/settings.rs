@@ -1,6 +1,10 @@
+use smallvec::smallvec;
 use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::{Dimension, Display, FlexDirection, Overflow};
+use unshit::core::style::types::{
+    Background, Color, Dimension, Display, FlexDirection, GradientStop, GradientStopPosition,
+    LinearGradient, Overflow, TextAlign,
+};
 use unshit::prelude::SvgNode;
 
 use unshit::core::event::Modifiers;
@@ -8,8 +12,10 @@ use unshit::core::shortcut::KeyCombo;
 
 use crate::keybinds::{KeybindAction, KeybindError, KeybindErrorKind};
 use crate::state::{
-    dispatch, is_on, mutate_with, SettingsSection, SharedState, ToggleKey, UiSnapshot,
+    dispatch, is_on, mutate_with, SettingsSection, SharedState, ToggleKey, UiDensity, UiSnapshot,
+    DEFAULT_CONFIG_FONT_SIZE_PT,
 };
+use crate::theme;
 use crate::ui::icons::*;
 
 pub fn build_settings_modal(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -29,16 +35,19 @@ pub fn build_settings_page(state: &UiSnapshot, shared: &SharedState) -> ElementD
     ElementDef::new(Tag::Div)
         .with_class("settings-page")
         .with_id("settings-page")
-        .with_child(build_settings_page_rail(state.settings_section, shared))
+        .with_child(build_settings_page_rail(state, shared))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("set-page-content")
                 .with_child(build_settings_page_header(state.settings_section))
-                .with_child(build_settings_page_body(state, shared)),
+                .with_child(build_settings_page_body(state, shared))
+                .with_child(build_settings_page_savebar(shared)),
         )
 }
 
-fn build_settings_page_rail(active: SettingsSection, shared: &SharedState) -> ElementDef {
+fn build_settings_page_rail(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let active = state.settings_section;
+    let session_label = format!("ptyd up · session {:02}", state.active_tab + 1);
     ElementDef::new(Tag::Div)
         .with_class("set-page-rail")
         .with_child(
@@ -58,7 +67,7 @@ fn build_settings_page_rail(active: SettingsSection, shared: &SharedState) -> El
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("set-page-search")
-                .with_child(svg_icon(icon_search()))
+                .with_child(svg_icon(icon_magnifier()))
                 .with_child(
                     ElementDef::new(Tag::Input)
                         .with_class("set-page-search-input")
@@ -67,7 +76,16 @@ fn build_settings_page_rail(active: SettingsSection, shared: &SharedState) -> El
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("kbd")
-                        .with_text("Ctrl F"),
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("kbd-command")
+                                .with_text("\u{2318}"),
+                        )
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("kbd-key")
+                                .with_text("F"),
+                        ),
                 ),
         )
         .with_child(
@@ -102,7 +120,7 @@ fn build_settings_page_rail(active: SettingsSection, shared: &SharedState) -> El
                         .with_class("dot")
                         .with_class("status-running"),
                 )
-                .with_child(ElementDef::new(Tag::Span).with_text("ptyd up")),
+                .with_child(ElementDef::new(Tag::Span).with_text(session_label)),
         )
 }
 
@@ -110,6 +128,17 @@ fn settings_nav_group(label: &str) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("group")
         .with_text(label.to_string())
+}
+
+fn settings_section_title(section: SettingsSection) -> &'static str {
+    match section {
+        SettingsSection::Appearance => "Appearance",
+        SettingsSection::Shell => "Shell",
+        SettingsSection::Keybinds => "Keybinds",
+        SettingsSection::Sessions => "Sessions",
+        SettingsSection::Notifications => "Notifications",
+        SettingsSection::DangerZone => "Danger Zone",
+    }
 }
 
 fn settings_nav_item(
@@ -120,8 +149,9 @@ fn settings_nav_item(
     let s = shared.clone();
     let mut item = ElementDef::new(Tag::Button)
         .with_class("set-page-nav-item")
+        .with_class(settings_nav_class(section))
         .with_child(svg_icon(settings_nav_icon(section)))
-        .with_child(ElementDef::new(Tag::Span).with_text(section.label()));
+        .with_child(ElementDef::new(Tag::Span).with_text(settings_section_title(section)));
     if section == active {
         item = item.with_class("active");
     }
@@ -135,14 +165,25 @@ fn settings_nav_item(
     })
 }
 
+fn settings_nav_class(section: SettingsSection) -> &'static str {
+    match section {
+        SettingsSection::Appearance => "nav-appearance",
+        SettingsSection::Shell => "nav-shell",
+        SettingsSection::Sessions => "nav-sessions",
+        SettingsSection::Keybinds => "nav-keybinds",
+        SettingsSection::Notifications => "nav-notifications",
+        SettingsSection::DangerZone => "nav-danger-zone",
+    }
+}
+
 fn settings_nav_icon(section: SettingsSection) -> SvgNode {
     match section {
-        SettingsSection::Appearance => icon_grid(),
+        SettingsSection::Appearance => icon_settings_nav_grid(),
         SettingsSection::Shell => icon_terminal(),
         SettingsSection::Keybinds => icon_chevrons(),
         SettingsSection::Sessions => icon_folder(),
-        SettingsSection::Notifications => icon_agent(),
-        SettingsSection::DangerZone => icon_close(),
+        SettingsSection::Notifications => icon_bell(),
+        SettingsSection::DangerZone => icon_settings_nav_close(),
     }
 }
 
@@ -157,7 +198,7 @@ fn build_settings_page_header(active: SettingsSection) -> ElementDef {
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("page-title")
-                .with_text(active.label()),
+                .with_text(settings_section_title(active)),
         )
         .with_child(
             ElementDef::new(Tag::Div)
@@ -168,7 +209,9 @@ fn build_settings_page_header(active: SettingsSection) -> ElementDef {
 
 fn settings_section_desc(active: SettingsSection) -> &'static str {
     match active {
-        SettingsSection::Appearance => "Font size, sidebar width, preview.",
+        SettingsSection::Appearance => {
+            "Themes, density, and the visual feel of the terminal. Changes apply immediately."
+        }
         SettingsSection::Shell => "Default shell, font, scrollback.",
         SettingsSection::Keybinds => "Every binding, grouped.",
         SettingsSection::Sessions => "Daemon sessions and workspace attachment.",
@@ -178,10 +221,10 @@ fn settings_section_desc(active: SettingsSection) -> &'static str {
 }
 
 fn build_settings_page_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    let mut body = ElementDef::new(Tag::Div)
-        .with_class("set-page-body")
-        .with_style(StyleDeclaration::Width(Dimension::Percent(100.0)))
-        .with_style(StyleDeclaration::MaxWidth(Dimension::Px(820.0)));
+    let mut body = ElementDef::new(Tag::Div).with_class("set-page-body");
+    if let Some(font_size) = scaled_config_font_px(12.0, state.config_font_size_pt) {
+        body = body.with_style(StyleDeclaration::FontSize(font_size));
+    }
     body = match state.settings_section {
         SettingsSection::Appearance => {
             body.with_child(build_appearance_page_section(state, shared))
@@ -192,23 +235,443 @@ fn build_settings_page_body(state: &UiSnapshot, shared: &SharedState) -> Element
         SettingsSection::Notifications => body.with_child(build_notifications_section(shared)),
         SettingsSection::DangerZone => body.with_child(build_danger_zone_section(state, shared)),
     };
-    body.with_child(build_settings_page_savebar(shared))
+    body
 }
 
 fn build_appearance_page_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let active_theme = theme::resolve_theme_id(&state.theme);
+    let active_spec = theme::theme_spec(active_theme);
+    let theme_meta = if active_theme == theme::CUSTOM_THEME_ID {
+        "custom · your palette".to_string()
+    } else {
+        format!(
+            "{} · {}",
+            active_spec.label.to_lowercase(),
+            active_spec.meta
+        )
+    };
+    let mut theme_card = set_card("theme", Some(theme_meta.as_str())).with_child(
+        settings_page_field(
+            "Color theme",
+            Some("Sets surface, text, accent, and syntax tints across the whole app."),
+            build_theme_picker(state, shared),
+            state.config_font_size_pt,
+        )
+        .with_class("theme-field"),
+    );
+    if active_theme == theme::CUSTOM_THEME_ID {
+        theme_card = theme_card.with_child(build_custom_theme_editor(state, shared));
+    }
+
     ElementDef::new(Tag::Div)
         .with_class("set-page-section")
-        .with_child(set_card("terminal", None).with_child(settings_page_field(
-            "Font size",
-            Some("Terminal output size in points."),
-            font_stepper(state.font_size_pt, shared),
+        .with_child(theme_card)
+        .with_child(
+            set_card("interface", None)
+                .with_child(settings_page_field(
+                    "Config font size",
+                    Some("Settings and app chrome text size in points."),
+                    font_stepper(
+                        state.config_font_size_pt,
+                        "config_font.dec",
+                        "config_font.inc",
+                        shared,
+                    ),
+                    state.config_font_size_pt,
+                ))
+                .with_child(settings_page_field(
+                    "Density",
+                    Some("Vertical padding inside lists and panes."),
+                    density_segmented(state.ui_density, shared),
+                    state.config_font_size_pt,
+                ))
+                .with_child(settings_page_field(
+                    "Wheel scroll step",
+                    Some("Pixels moved per wheel notch."),
+                    command_stepper(
+                        state.scroll_line_px.to_string(),
+                        "scroll.line_px.dec",
+                        "scroll.line_px.inc",
+                        shared,
+                    ),
+                    state.config_font_size_pt,
+                ))
+                .with_child(settings_page_field(
+                    "Smooth scroll duration",
+                    Some("Animation time after wheel input."),
+                    command_stepper(
+                        format!("{} ms", state.smooth_scroll_duration_ms),
+                        "scroll.duration.dec",
+                        "scroll.duration.inc",
+                        shared,
+                    ),
+                    state.config_font_size_pt,
+                )),
+        )
+        .with_child(
+            set_card("terminal", None)
+                .with_child(settings_page_field(
+                    "Terminal font size",
+                    Some("Terminal output size in points."),
+                    font_stepper(
+                        state.terminal_font_size_pt,
+                        "terminal_font.dec",
+                        "terminal_font.inc",
+                        shared,
+                    ),
+                    state.config_font_size_pt,
+                ))
+                .with_child(settings_page_field(
+                    "Sidebar width",
+                    Some("Width of the workspace sidebar."),
+                    readout_with_unit(&format!("{:.0}", state.sidebar_width), "px"),
+                    state.config_font_size_pt,
+                )),
+        )
+        .with_child(set_card("preview", None).with_child(build_appearance_preview(state)))
+}
+
+fn build_theme_picker(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let active = theme::resolve_theme_id(&state.theme);
+    let mut picker = ElementDef::new(Tag::Div).with_class("theme-picker");
+    for spec in theme::themes() {
+        let swatches = spec.swatches.map(str::to_string);
+        let mut chip = build_theme_chip(
+            spec.id,
+            spec.label,
+            spec.meta,
+            &swatches,
+            spec.id == active,
+            &state.custom_theme,
+        );
+        let s = shared.clone();
+        let id = spec.id;
+        chip = chip.on_click(move || {
+            let id = id.to_string();
+            mutate_with(&s, move |st| {
+                crate::state::mutate_theme(st, &id);
+            });
+        });
+        picker = picker.with_child(chip);
+    }
+    let custom_swatches = custom_theme_swatches(&state.custom_theme);
+    let mut custom_chip = build_theme_chip(
+        theme::CUSTOM_THEME_ID,
+        "Custom",
+        "pick your own",
+        &custom_swatches,
+        active == theme::CUSTOM_THEME_ID,
+        &state.custom_theme,
+    );
+    let s = shared.clone();
+    custom_chip = custom_chip.on_click(move || {
+        mutate_with(&s, |st| {
+            crate::state::mutate_theme(st, theme::CUSTOM_THEME_ID);
+        });
+    });
+    picker = picker.with_child(custom_chip);
+    picker
+}
+
+fn build_theme_chip(
+    id: &str,
+    label: &str,
+    meta: &str,
+    swatches: &[String],
+    active: bool,
+    custom_theme: &theme::CustomTheme,
+) -> ElementDef {
+    let palette = theme_chip_palette(id, custom_theme);
+    let mut body = ElementDef::new(Tag::Div)
+        .with_class("theme-chip-main")
+        .with_class("theme-chip-screen")
+        .with_style(StyleDeclaration::Background(palette.preview.clone()))
+        .with_style(StyleDeclaration::BorderColor(palette.divider));
+    if id == theme::CUSTOM_THEME_ID {
+        body = body.with_child(ElementDef::new(Tag::Span).with_class("theme-chip-pattern"));
+    }
+    body = body
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("tcs-glyph")
+                .with_style(StyleDeclaration::Color(palette.glyph))
+                .with_text(if id == theme::CUSTOM_THEME_ID {
+                    "+"
+                } else {
+                    "\u{276F}"
+                }),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("theme-chip-copy")
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("tcs-name")
+                        .with_style(StyleDeclaration::Color(palette.text))
+                        .with_text(label),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("tcs-sub")
+                        .with_style(StyleDeclaration::Color(palette.text_dim))
+                        .with_text(meta),
+                ),
+        );
+    let pin = ElementDef::new(Tag::Span)
+        .with_class("theme-chip-pin")
+        .with_style(StyleDeclaration::Background(Background::Color(
+            palette.pin_background,
         )))
-        .with_child(set_card("layout", None).with_child(settings_page_field(
-            "Sidebar width",
-            Some("Width of the workspace sidebar."),
-            readout_with_unit(&format!("{:.0}", state.sidebar_width), "px"),
-        )))
-        .with_child(set_card("preview", None).with_child(build_appearance_preview()))
+        .with_style(StyleDeclaration::Color(palette.pin_foreground))
+        .with_text("✓");
+
+    let mut chip = ElementDef::new(Tag::Button)
+        .with_class("theme-chip")
+        .with_class(id)
+        .with_style(StyleDeclaration::TextAlign(TextAlign::Left))
+        .with_style(StyleDeclaration::Overflow(Overflow::Hidden))
+        .with_child(pin)
+        .with_child(body)
+        .with_child(build_theme_swatch_strip(swatches));
+    if !active {
+        chip = chip.with_child(ElementDef::new(Tag::Div).with_class("theme-chip-top-hairline"));
+    }
+    if active {
+        chip = chip.with_class("active");
+    }
+    chip
+}
+
+fn build_theme_swatch_strip(swatches: &[String]) -> ElementDef {
+    let mut strip = ElementDef::new(Tag::Div).with_class("theme-chip-foot");
+    for color in swatches {
+        let mut swatch = ElementDef::new(Tag::Span);
+        if let Some(color) = theme::parse_hex_color(color) {
+            swatch = swatch.with_style(StyleDeclaration::Background(Background::Color(color)));
+        }
+        strip = strip.with_child(swatch);
+    }
+    strip
+}
+
+#[derive(Clone, Debug)]
+struct ThemeChipPalette {
+    preview: Background,
+    divider: Color,
+    text: Color,
+    text_dim: Color,
+    glyph: Color,
+    pin_background: Color,
+    pin_foreground: Color,
+}
+
+fn theme_chip_palette(id: &str, custom: &theme::CustomTheme) -> ThemeChipPalette {
+    let solid = |preview, divider, text, text_dim, accent, accent_on| ThemeChipPalette {
+        preview: Background::Color(preview),
+        divider,
+        text,
+        text_dim,
+        glyph: accent,
+        pin_background: accent,
+        pin_foreground: accent_on,
+    };
+
+    match id {
+        "catppuccin" => solid(
+            Color::rgb(0x1e, 0x1e, 0x2e),
+            Color::rgb(0x11, 0x11, 0x1b),
+            Color::rgb(0xcd, 0xd6, 0xf4),
+            Color::rgb(0x66, 0x6f, 0x86),
+            Color::rgb(0xcb, 0xa6, 0xf7),
+            Color::rgb(0x1e, 0x1e, 0x2e),
+        ),
+        "tokyo-night" => solid(
+            Color::rgb(0x1a, 0x1b, 0x26),
+            Color::rgb(0x16, 0x16, 0x1e),
+            Color::rgb(0xc0, 0xca, 0xf5),
+            Color::rgb(0x48, 0x51, 0x6c),
+            Color::rgb(0x7a, 0xa2, 0xf7),
+            Color::rgb(0x1a, 0x1b, 0x26),
+        ),
+        "nord" => solid(
+            Color::rgb(0x2e, 0x34, 0x40),
+            Color::rgb(0x24, 0x29, 0x33),
+            Color::rgb(0xec, 0xef, 0xf4),
+            Color::rgb(0x6c, 0x75, 0x87),
+            Color::rgb(0x88, 0xc0, 0xd0),
+            Color::rgb(0x2e, 0x34, 0x40),
+        ),
+        "dracula" => solid(
+            Color::rgb(0x28, 0x2a, 0x36),
+            Color::rgb(0x21, 0x22, 0x2c),
+            Color::rgb(0xf8, 0xf8, 0xf2),
+            Color::rgb(0x62, 0x72, 0xa4),
+            Color::rgb(0xbd, 0x93, 0xf9),
+            Color::rgb(0x28, 0x2a, 0x36),
+        ),
+        "everforest" => solid(
+            Color::rgb(0x27, 0x2e, 0x33),
+            Color::rgb(0x1e, 0x23, 0x26),
+            Color::rgb(0xd3, 0xc6, 0xaa),
+            Color::rgb(0x85, 0x92, 0x89),
+            Color::rgb(0xa7, 0xc0, 0x80),
+            Color::rgb(0x2d, 0x35, 0x3b),
+        ),
+        "rose-pine" => solid(
+            Color::rgb(0x1f, 0x1d, 0x2e),
+            Color::rgb(0x19, 0x17, 0x24),
+            Color::rgb(0xe0, 0xde, 0xf4),
+            Color::rgb(0x90, 0x8c, 0xaa),
+            Color::rgb(0xeb, 0xbc, 0xba),
+            Color::rgb(0x23, 0x21, 0x36),
+        ),
+        "gruvbox" => solid(
+            Color::rgb(0x28, 0x28, 0x28),
+            Color::rgb(0x1d, 0x20, 0x21),
+            Color::rgb(0xeb, 0xdb, 0xb2),
+            Color::rgb(0xa8, 0x99, 0x84),
+            Color::rgb(0xfa, 0xbd, 0x2f),
+            Color::rgb(0x28, 0x28, 0x28),
+        ),
+        "kanagawa" => solid(
+            Color::rgb(0x1f, 0x1f, 0x28),
+            Color::rgb(0x16, 0x16, 0x1d),
+            Color::rgb(0xdc, 0xd7, 0xba),
+            Color::rgb(0x72, 0x71, 0x69),
+            Color::rgb(0x7e, 0x9c, 0xd8),
+            Color::rgb(0x1f, 0x1f, 0x28),
+        ),
+        theme::CUSTOM_THEME_ID => ThemeChipPalette {
+            preview: Background::LinearGradient(LinearGradient {
+                angle_deg: 135.0,
+                stops: smallvec![
+                    GradientStop {
+                        color: custom.accent,
+                        position: GradientStopPosition::Percent(0.0),
+                    },
+                    GradientStop {
+                        color: custom.accent_soft,
+                        position: GradientStopPosition::Percent(1.0),
+                    },
+                ],
+                repeating: false,
+            }),
+            divider: custom.background,
+            text: custom.background,
+            text_dim: Color::rgba(
+                custom.background.r,
+                custom.background.g,
+                custom.background.b,
+                179,
+            ),
+            glyph: custom.background,
+            pin_background: custom.accent,
+            pin_foreground: custom.background,
+        },
+        _ => solid(
+            Color::rgb(0x1c, 0x18, 0x12),
+            Color::rgb(0x14, 0x11, 0x0c),
+            Color::rgb(0xeb, 0xdc, 0xb6),
+            Color::rgb(0x6f, 0x5a, 0x33),
+            Color::rgb(0xd4, 0xa3, 0x48),
+            Color::rgb(0x1c, 0x18, 0x12),
+        ),
+    }
+}
+
+fn custom_theme_swatches(custom: &theme::CustomTheme) -> [String; 5] {
+    [
+        theme::color_to_hex(custom.accent),
+        theme::color_to_hex(custom.accent_soft),
+        theme::color_to_hex(custom.background),
+        theme::color_to_hex(custom.foreground),
+        theme::color_to_hex(custom.surface),
+    ]
+}
+
+fn build_custom_theme_editor(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let mut grid = ElementDef::new(Tag::Div).with_class("custom-editor-grid");
+    for slot in theme::custom_theme_slots() {
+        grid = grid.with_child(custom_color_field(*slot, state, shared));
+    }
+
+    let reset_state = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("custom-editor")
+        .with_class("open")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("custom-editor-head")
+                .with_child(ElementDef::new(Tag::Span).with_text("Custom palette"))
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("name-meta")
+                        .with_text("hex edits apply live"),
+                ),
+        )
+        .with_child(grid)
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("custom-editor-actions")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_text("Five colors define the look; syntax colors stay practical."),
+                )
+                .with_child(ElementDef::new(Tag::Span).with_class("spacer"))
+                .with_child(
+                    ElementDef::new(Tag::Button)
+                        .with_class("btn")
+                        .with_class("ghost")
+                        .with_text("reset custom")
+                        .on_click(move || {
+                            mutate_with(&reset_state, |st| {
+                                crate::state::reset_custom_theme(st);
+                            });
+                        }),
+                ),
+        )
+}
+
+fn custom_color_field(
+    slot: theme::CustomThemeSlot,
+    state: &UiSnapshot,
+    shared: &SharedState,
+) -> ElementDef {
+    let color = theme::custom_theme_color(&state.custom_theme, slot);
+    let hex = theme::color_to_hex(color);
+    let edit_state = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("color-field")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("color-swatch")
+                .with_style(StyleDeclaration::Background(Background::Color(color))),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("color-field-meta")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("color-field-label")
+                        .with_text(slot.label()),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("color-field-value")
+                        .with_text(hex.clone()),
+                ),
+        )
+        .with_child(
+            ElementDef::new(Tag::Input)
+                .with_class("input-text")
+                .with_class("color-input")
+                .with_placeholder(hex.clone())
+                .on_change(move |value| {
+                    mutate_with(&edit_state, |st| {
+                        crate::state::mutate_custom_theme_color(st, slot, value);
+                    });
+                }),
+        )
 }
 
 fn set_card(name: &str, meta: Option<&str>) -> ElementDef {
@@ -223,7 +686,7 @@ fn set_card(name: &str, meta: Option<&str>) -> ElementDef {
         head = head.with_child(
             ElementDef::new(Tag::Span)
                 .with_class("name-meta")
-                .with_text(format!("\u{00b7} {meta}")),
+                .with_text(meta),
         );
     }
     ElementDef::new(Tag::Div)
@@ -232,11 +695,28 @@ fn set_card(name: &str, meta: Option<&str>) -> ElementDef {
         .with_child(head)
 }
 
-fn settings_page_field(label: &str, desc: Option<&str>, control: ElementDef) -> ElementDef {
+fn scaled_config_font_px(base_px: f32, config_font_size_pt: u32) -> Option<f32> {
+    if config_font_size_pt == DEFAULT_CONFIG_FONT_SIZE_PT {
+        None
+    } else {
+        Some(base_px * config_font_size_pt as f32 / DEFAULT_CONFIG_FONT_SIZE_PT as f32)
+    }
+}
+
+fn settings_page_field(
+    label: &str,
+    desc: Option<&str>,
+    control: ElementDef,
+    config_font_size_pt: u32,
+) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("setting-row")
         .with_class("set-field")
-        .with_child(setting_meta(label, desc))
+        .with_child(setting_meta_with_config_font(
+            label,
+            desc,
+            config_font_size_pt,
+        ))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("set-control")
@@ -260,38 +740,82 @@ fn readout_with_unit(value: &str, unit: &str) -> ElementDef {
         )
 }
 
-fn build_appearance_preview() -> ElementDef {
+fn build_appearance_preview(state: &UiSnapshot) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("preview-tile")
-        .with_child(preview_line(vec![
-            preview_span("prompt", "\u{276F} "),
-            preview_span("path", "~/code/main/dashboard "),
-            preview_span("branch", "(main)"),
-        ]))
-        .with_child(preview_line(vec![
-            preview_span("prompt", "\u{276F} "),
-            preview_span("cmd", "npm run dev"),
-        ]))
-        .with_child(preview_line(vec![preview_span(
-            "azure",
-            "\u{2192} vite v5.4.0 ready in 312 ms",
-        )]))
-        .with_child(preview_line(vec![preview_span(
-            "sage",
-            "\u{2713} recompiled in 84ms",
-        )]))
-        .with_child(preview_line(vec![preview_span(
-            "rust",
-            "\u{2717} src/lib/format.test.ts (2)",
-        )]))
-        .with_child(preview_line(vec![preview_span(
-            "muted",
-            "  expected 42 to be 41",
-        )]))
-        .with_child(preview_line(vec![
-            preview_span("prompt", "\u{276F} "),
-            ElementDef::new(Tag::Span).with_class("cur"),
-        ]))
+        .with_style(StyleDeclaration::FontSize(
+            state.terminal_font_size_pt as f32,
+        ))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("preview-head")
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("tm-traffic")
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("tl-dot")
+                                .with_class("tl-close"),
+                        )
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("tl-dot")
+                                .with_class("tl-min"),
+                        )
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("tl-dot")
+                                .with_class("tl-zoom"),
+                        ),
+                )
+                .with_child(ElementDef::new(Tag::Span).with_text("~/code/main/dashboard — zsh")),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("preview-body")
+                .with_child(preview_line(vec![
+                    preview_span("prompt", "\u{276F} "),
+                    preview_span("path", "~/code/main/dashboard "),
+                    preview_span("branch", "(main)"),
+                ]))
+                .with_child(preview_line(vec![
+                    preview_span("prompt", "\u{276F} "),
+                    preview_span("cmd", "npm run dev"),
+                ]))
+                .with_child(preview_line(vec![
+                    preview_span("azure", "\u{2192} vite v5.4.0  ready in "),
+                    preview_span("num", "312"),
+                    preview_span("azure", " ms"),
+                ]))
+                .with_child(preview_line(vec![
+                    preview_span("muted", "  \u{279C}  local:   "),
+                    preview_span("azure", "http://localhost:4040/"),
+                ]))
+                .with_child(preview_line(vec![
+                    preview_span("sage", "\u{2713} recompiled in "),
+                    preview_span("num", "84"),
+                    preview_span("sage", "ms "),
+                    preview_span("muted", "\u{2014} 4 modules"),
+                ]))
+                .with_child(preview_line(vec![preview_span(
+                    "rust",
+                    "\u{2717} src/lib/format.test.ts (2)",
+                )]))
+                .with_child(preview_line(vec![
+                    preview_span("muted", "    expected "),
+                    preview_span("num", "42"),
+                    preview_span("muted", " to be "),
+                    preview_span("num", "41"),
+                ]))
+                .with_child(preview_line(vec![
+                    preview_span("agent-tag", "claude"),
+                    preview_span("violet", "patching format.ts..."),
+                ]))
+                .with_child(preview_line(vec![
+                    preview_span("prompt", "\u{276F} "),
+                    ElementDef::new(Tag::Span).with_class("cur"),
+                ])),
+        )
 }
 
 fn preview_line(parts: Vec<ElementDef>) -> ElementDef {
@@ -308,19 +832,42 @@ fn preview_span(class: &str, text: &str) -> ElementDef {
 
 fn build_settings_page_savebar(shared: &SharedState) -> ElementDef {
     let close_state = shared.clone();
+    let reset_state = shared.clone();
     ElementDef::new(Tag::Div)
         .with_class("set-page-savebar")
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("saved")
-                .with_text("changes apply immediately"),
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("saved-dot")
+                        .with_class("status-running"),
+                )
+                .with_child(ElementDef::new(Tag::Span).with_text("changes apply immediately")),
         )
         .with_child(ElementDef::new(Tag::Span).with_class("spacer"))
         .with_child(
             ElementDef::new(Tag::Button)
                 .with_class("btn")
                 .with_class("ghost")
-                .with_text("close")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("btn-label")
+                        .with_text("reset"),
+                )
+                .on_click(move || {
+                    mutate_with(&reset_state, |st| dispatch(st, "appearance.reset"));
+                }),
+        )
+        .with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("btn")
+                .with_class("primary")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("btn-label")
+                        .with_text("done"),
+                )
                 .on_click(move || {
                     mutate_with(&close_state, |st| dispatch(st, "modal.close"));
                 }),
@@ -418,11 +965,27 @@ fn build_modal_content(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
 // -- section builders -------------------------------------------------------
 
 fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    section_shell("appearance").with_child(setting_row(
-        "Font size",
-        "Terminal output size in points",
-        font_stepper(state.font_size_pt, shared),
-    ))
+    section_shell("appearance")
+        .with_child(setting_row(
+            "Config font size",
+            "Settings and app chrome text size in points",
+            font_stepper(
+                state.config_font_size_pt,
+                "config_font.dec",
+                "config_font.inc",
+                shared,
+            ),
+        ))
+        .with_child(setting_row(
+            "Terminal font size",
+            "Terminal output size in points",
+            font_stepper(
+                state.terminal_font_size_pt,
+                "terminal_font.dec",
+                "terminal_font.inc",
+                shared,
+            ),
+        ))
 }
 
 fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -1019,23 +1582,51 @@ fn section_shell(title: &str) -> ElementDef {
 }
 
 fn setting_meta(label: &str, desc: Option<&str>) -> ElementDef {
+    setting_meta_impl(label, desc, None)
+}
+
+fn setting_meta_with_config_font(
+    label: &str,
+    desc: Option<&str>,
+    config_font_size_pt: u32,
+) -> ElementDef {
+    setting_meta_impl(
+        label,
+        desc,
+        Some((
+            scaled_config_font_px(11.0, config_font_size_pt),
+            scaled_config_font_px(10.0, config_font_size_pt),
+        )),
+    )
+}
+
+fn setting_meta_impl(
+    label: &str,
+    desc: Option<&str>,
+    font_sizes: Option<(Option<f32>, Option<f32>)>,
+) -> ElementDef {
+    let mut label_el = ElementDef::new(Tag::Span)
+        .with_class("setting-label")
+        .with_class("set-label")
+        .with_text(label);
+    if let Some((Some(label_px), _)) = font_sizes {
+        label_el = label_el.with_style(StyleDeclaration::FontSize(label_px));
+    }
+
     let mut meta = ElementDef::new(Tag::Div)
         .with_class("setting-meta")
         .with_style(StyleDeclaration::Display(Display::Flex))
         .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("setting-label")
-                .with_class("set-label")
-                .with_text(label),
-        );
+        .with_child(label_el);
     if let Some(desc) = desc {
-        meta = meta.with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("setting-desc")
-                .with_class("set-desc")
-                .with_text(desc),
-        );
+        let mut desc_el = ElementDef::new(Tag::Span)
+            .with_class("setting-desc")
+            .with_class("set-desc")
+            .with_text(desc);
+        if let Some((_, Some(desc_px))) = font_sizes {
+            desc_el = desc_el.with_style(StyleDeclaration::FontSize(desc_px));
+        }
+        meta = meta.with_child(desc_el);
     }
     meta
 }
@@ -1076,18 +1667,52 @@ fn stepper(value: &str, callbacks: StepCallbacks) -> ElementDef {
         .with_child(inc)
 }
 
-fn font_stepper(value: u32, shared: &SharedState) -> ElementDef {
+fn font_stepper(
+    value: u32,
+    dec_command: &'static str,
+    inc_command: &'static str,
+    shared: &SharedState,
+) -> ElementDef {
+    command_stepper(value.to_string(), dec_command, inc_command, shared)
+}
+
+fn command_stepper(
+    value: String,
+    dec_command: &'static str,
+    inc_command: &'static str,
+    shared: &SharedState,
+) -> ElementDef {
     let dec_shared = shared.clone();
     let inc_shared = shared.clone();
     let callbacks = StepCallbacks {
         on_dec: Box::new(move || {
-            mutate_with(&dec_shared, |st| dispatch(st, "font.dec"));
+            mutate_with(&dec_shared, |st| dispatch(st, dec_command));
         }),
         on_inc: Box::new(move || {
-            mutate_with(&inc_shared, |st| dispatch(st, "font.inc"));
+            mutate_with(&inc_shared, |st| dispatch(st, inc_command));
         }),
     };
-    stepper(&value.to_string(), callbacks)
+    stepper(&value, callbacks)
+}
+
+fn density_segmented(active: UiDensity, shared: &SharedState) -> ElementDef {
+    let mut segmented = ElementDef::new(Tag::Div).with_class("input-segmented");
+    for density in UiDensity::all() {
+        let s = shared.clone();
+        let command = format!("appearance.density:{}", density.id());
+        let mut button = ElementDef::new(Tag::Button)
+            .with_class("seg-btn")
+            .with_text(density.label())
+            .on_click(move || {
+                let command = command.clone();
+                mutate_with(&s, move |st| dispatch(st, &command));
+            });
+        if density == active {
+            button = button.with_class("active");
+        }
+        segmented = segmented.with_child(button);
+    }
+    segmented
 }
 
 fn pill(base: &str, modifier: Option<&str>, text: &str) -> ElementDef {
@@ -1122,8 +1747,10 @@ mod tests {
     use super::*;
     use crate::state::{seed_state, SettingsSection};
     use std::sync::{Arc, Mutex};
-    use unshit::core::element::{ElementContent, ElementTree};
-    use unshit::core::style::types::TextAlign;
+    use unshit::core::element::{ElementContent, ElementTree, LayoutRect};
+    use unshit::core::style::types::{
+        Background, Color, CssPosition, Dimension, FontWeight, Overflow, TextAlign,
+    };
     use unshit_test::TestHarness;
 
     fn make_shared() -> SharedState {
@@ -1198,32 +1825,200 @@ mod tests {
         let shared = make_shared();
         let el = build_settings_page(&snap, &shared);
 
-        assert_eq!(count_with_class(&el, "set-card"), 3);
+        assert_eq!(count_with_class(&el, "set-card"), 4);
         assert!(has_class_anywhere(&el, "stepper"));
         assert!(has_class_anywhere(&el, "set-inline-control"));
         assert!(has_class_anywhere(&el, "input-num"));
+        assert!(has_class_anywhere(&el, "input-segmented"));
         assert!(has_class_anywhere(&el, "preview-tile"));
-        assert!(!has_class_anywhere(&el, "input-segmented"));
+        assert!(has_class_anywhere(&el, "preview-head"));
+        assert!(has_class_anywhere(&el, "preview-body"));
+        assert!(has_class_anywhere(&el, "theme-picker"));
+        assert!(has_class_anywhere(&el, "agent-tag"));
+        assert!(has_class_anywhere(&el, "cur"));
         assert!(!has_class_anywhere(&el, "color-swatches"));
         assert!(!has_class_anywhere(&el, "toggle"));
         let text = collect_text_recursive(&el);
-        assert!(text.contains("Font size"));
+        assert!(text.contains("Theme"));
+        assert!(text.contains(
+            "Themes, density, and the visual feel of the terminal. Changes apply immediately."
+        ));
+        assert!(text.contains("ptyd up · session"));
+        assert!(text.contains("\u{2318}"));
+        assert!(text.contains('F'));
+        assert!(has_class_anywhere(&el, "kbd-command"));
+        assert!(has_class_anywhere(&el, "kbd-key"));
+        assert!(text.contains("Config font size"));
+        assert!(text.contains("Density"));
+        assert!(text.contains("Vertical padding inside lists and panes"));
+        assert!(text.contains("compact"));
+        assert!(text.contains("cozy"));
+        assert!(text.contains("comfy"));
+        assert!(text.contains("Wheel scroll step"));
+        assert!(text.contains("Pixels moved per wheel notch"));
+        assert!(text.contains("Smooth scroll duration"));
+        assert!(text.contains("Animation time after wheel input"));
+        assert!(text.contains("Terminal font size"));
+        assert!(text.contains("Settings and app chrome text size"));
         assert!(text.contains("Terminal output size"));
         assert!(text.contains("Sidebar width"));
         assert!(text.contains("Width of the workspace sidebar"));
+        assert!(text.contains("syntax tints across the whole app"));
+        assert!(text.contains("~/code/main/dashboard"));
+        assert!(text.contains("patching format.ts"));
         assert!(text.contains("changes apply immediately"));
-        for stripped in [
-            "Theme",
-            "Accent",
-            "Scanline overlay",
-            "Background grain",
-            "Tab bar density",
-        ] {
+        for stripped in ["Accent", "Scanline overlay", "Background grain"] {
             assert!(
                 !text.contains(stripped),
                 "settings page should not render unapplied/fake setting {stripped:?}"
             );
         }
+    }
+
+    #[test]
+    fn settings_page_appearance_has_theme_picker() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let el = build_settings_page(&snap, &shared);
+        let picker = find_first_with_class(&el, "theme-picker")
+            .expect("theme page should include a theme picker");
+        assert!(
+            !picker.children.is_empty(),
+            "theme picker should have at least one chip"
+        );
+        assert!(count_with_class(&picker, "theme-chip") >= 2);
+        let theme_row =
+            find_first_with_class(&el, "theme-chip").expect("theme picker should render chips");
+        assert!(
+            theme_row.classes.contains(&"theme-chip".to_string()),
+            "theme picker chip should have theme-chip class"
+        );
+    }
+
+    #[test]
+    fn appearance_page_density_control_updates_density_immediately() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let el = build_settings_page(&snap, &shared);
+        let segmented =
+            find_first_with_class(&el, "input-segmented").expect("density segmented control");
+
+        assert_eq!(segmented.children.len(), UiDensity::all().len());
+        assert!(segmented.children[1]
+            .classes
+            .contains(&"active".to_string()));
+        (segmented.children[2].on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().ui_density, UiDensity::Comfy);
+    }
+
+    #[test]
+    fn appearance_page_scroll_controls_update_tuning_immediately() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let el = build_settings_page(&snap, &shared);
+        let mut steppers = Vec::new();
+        collect_with_class(&el, "stepper", &mut steppers);
+        let wheel_stepper = steppers
+            .iter()
+            .copied()
+            .find(|stepper| {
+                collect_text_recursive(stepper)
+                    .contains(&crate::state::DEFAULT_SCROLL_LINE_PX.to_string())
+            })
+            .expect("wheel scroll stepper");
+        let duration_stepper = steppers
+            .iter()
+            .copied()
+            .find(|stepper| {
+                collect_text_recursive(stepper).contains(&format!(
+                    "{} ms",
+                    crate::state::DEFAULT_SMOOTH_SCROLL_DURATION_MS
+                ))
+            })
+            .expect("smooth duration stepper");
+
+        (wheel_stepper.children[2].on_click.as_ref().unwrap())();
+        assert_eq!(
+            shared.lock().unwrap().scroll_line_px,
+            crate::state::DEFAULT_SCROLL_LINE_PX + 4
+        );
+        (duration_stepper.children[0].on_click.as_ref().unwrap())();
+        assert_eq!(
+            shared.lock().unwrap().smooth_scroll_duration_ms,
+            crate::state::DEFAULT_SMOOTH_SCROLL_DURATION_MS - 10
+        );
+    }
+
+    #[test]
+    fn appearance_page_theme_picker_click_updates_theme_immediately() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let first_render = build_settings_page(&snap, &shared);
+        let picker = find_first_with_class(&first_render, "theme-picker")
+            .expect("theme picker should exist");
+        let dracula_chip = picker.children.iter().find(|chip| {
+            chip.classes
+                .iter()
+                .any(|class_name| class_name == "dracula")
+        });
+        let dracula_chip = dracula_chip.expect("Dracula chip should exist");
+        (dracula_chip.on_click.as_ref().unwrap())();
+        let active = shared.lock().unwrap().theme.clone();
+        assert_eq!(active, "dracula");
+
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let second_render = build_settings_page(&snap, &shared);
+        let second_picker = find_first_with_class(&second_render, "theme-picker")
+            .expect("theme picker should re-render");
+        let active = second_picker
+            .children
+            .iter()
+            .find(|chip| chip.classes.iter().any(|c| c == "active"));
+        assert!(
+            active
+                .and_then(|chip| {
+                    chip.classes
+                        .iter()
+                        .find(|class_name| *class_name == "dracula")
+                        .map(|_| ())
+                })
+                .is_some(),
+            "active theme chip should update to Dracula after click"
+        );
+    }
+
+    #[test]
+    fn appearance_page_custom_theme_chip_opens_editor_and_updates_color() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let first_render = build_settings_page(&snap, &shared);
+        let picker = find_first_with_class(&first_render, "theme-picker")
+            .expect("theme picker should exist");
+        let custom_chip = picker
+            .children
+            .iter()
+            .find(|chip| chip.classes.iter().any(|class_name| class_name == "custom"))
+            .expect("custom chip should exist");
+        assert!(has_class_anywhere(custom_chip, "theme-chip-pattern"));
+
+        (custom_chip.on_click.as_ref().unwrap())();
+        assert_eq!(shared.lock().unwrap().theme, theme::CUSTOM_THEME_ID);
+
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let second_render = build_settings_page(&snap, &shared);
+        assert!(has_class_anywhere(&second_render, "custom-editor"));
+        assert_eq!(
+            count_with_class(&second_render, "color-field"),
+            theme::custom_theme_slots().len()
+        );
+
+        let color_input =
+            find_first_with_class(&second_render, "color-input").expect("color input");
+        (color_input.on_change.as_ref().unwrap())("#123456");
+        assert_eq!(
+            theme::color_to_hex(shared.lock().unwrap().custom_theme.accent),
+            "#123456"
+        );
     }
 
     #[test]
@@ -1238,6 +2033,7 @@ mod tests {
                 root: ElementDef::new(Tag::Div)
                     .with_class("app")
                     .with_class("settings")
+                    .with_class("theme-amber")
                     .with_child(build_settings_page(&tree_snap, &tree_shared)),
             },
             1280.0,
@@ -1254,6 +2050,8 @@ mod tests {
             ".input-num",
             ".set-unit",
             ".preview-tile",
+            ".theme-picker",
+            ".theme-chip-screen",
             ".set-page-savebar",
         ] {
             let snap = harness.query(selector).expect(selector);
@@ -1284,24 +2082,1002 @@ mod tests {
     }
 
     #[test]
+    fn settings_page_theme_picker_is_compact_and_scrollable() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_class("theme-amber")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            900.0,
+            700.0,
+        );
+        harness.step();
+
+        let content = harness
+            .query(".set-page-content")
+            .expect("settings page content should exist");
+        assert_eq!(
+            content.computed_style.overflow,
+            Overflow::Scroll,
+            "settings page content must remain wheel-scrollable"
+        );
+
+        let chips = harness.query_all(".theme-chip");
+        assert_eq!(chips.len(), theme::themes().len() + 1);
+        assert_eq!(
+            chips
+                .first()
+                .expect("theme picker should render chips")
+                .computed_style
+                .overflow,
+            Overflow::Hidden,
+            "theme chip should clip pattern and selected pin like the Claude design"
+        );
+
+        let bodies = harness.query_all(".theme-chip-screen");
+        assert_eq!(bodies.len(), theme::themes().len() + 1);
+        let first_body = bodies
+            .first()
+            .expect("theme chip should render a visible body row");
+        assert!(
+            first_body.layout_rect.width > 100.0 && first_body.layout_rect.height > 40.0,
+            "theme chip body should be visible, got {:?}",
+            first_body.layout_rect
+        );
+
+        let labels = harness.query_all(".tcs-name");
+        assert_eq!(labels.len(), theme::themes().len() + 1);
+        let first_label = labels
+            .first()
+            .expect("theme chip should render a visible label");
+        assert!(
+            first_label.layout_rect.width > 0.0 && first_label.layout_rect.height > 0.0,
+            "theme chip label should have non-zero layout, got {:?}",
+            first_label.layout_rect
+        );
+
+        let pins = harness.query_all(".theme-chip-pin");
+        assert_eq!(pins.len(), theme::themes().len() + 1);
+        let active_pin = harness
+            .query(".theme-chip.active .theme-chip-pin")
+            .expect("active theme chip pin");
+        assert_eq!(
+            active_pin.computed_style.position,
+            CssPosition::Absolute,
+            "selected checkmark should be absolutely positioned like the Claude design"
+        );
+        assert!(
+            active_pin.computed_style.border_radius.top_left >= 5.0,
+            "selected checkmark should render rounded, got {:?}",
+            active_pin.computed_style.border_radius
+        );
+
+        let first_y = chips
+            .first()
+            .expect("theme picker should render chips")
+            .layout_rect
+            .y;
+        let first_row = chips
+            .iter()
+            .filter(|chip| (chip.layout_rect.y - first_y).abs() < 1.0)
+            .count();
+        assert!(
+            first_row >= 2,
+            "theme chips should use multiple columns instead of one clipped vertical list"
+        );
+    }
+
+    #[test]
+    fn theme_picker_layout_does_not_depend_on_set_field_class() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div).with_class("app").with_child(
+                    ElementDef::new(Tag::Div).with_class("set-card").with_child(
+                        ElementDef::new(Tag::Div)
+                            .with_class("setting-row")
+                            .with_class("theme-field")
+                            .with_child(
+                                ElementDef::new(Tag::Div)
+                                    .with_class("setting-meta")
+                                    .with_child(
+                                        ElementDef::new(Tag::Div)
+                                            .with_class("set-label")
+                                            .with_text("Color theme"),
+                                    )
+                                    .with_child(
+                                        ElementDef::new(Tag::Div)
+                                            .with_class("set-desc")
+                                            .with_text("Choose an appearance preset."),
+                                    ),
+                            )
+                            .with_child(
+                                ElementDef::new(Tag::Div)
+                                    .with_class("set-control")
+                                    .with_child(build_theme_picker(&tree_snap, &tree_shared)),
+                            ),
+                    ),
+                ),
+            },
+            1321.0,
+            415.0,
+        );
+        let can_render = harness.try_with_gpu();
+        harness.step();
+
+        let picker = harness.query(".theme-picker").expect("theme picker");
+        assert!(
+            picker.layout_rect.width > 700.0,
+            "target-style theme-field markup should give the picker full width, got {:?}",
+            picker.layout_rect
+        );
+
+        let amber = harness.query(".theme-chip.amber").expect("amber chip");
+        let catppuccin = harness
+            .query(".theme-chip.catppuccin")
+            .expect("catppuccin chip");
+        assert!(
+            amber.layout_rect.width > 180.0 && catppuccin.layout_rect.x > amber.layout_rect.x,
+            "theme chips should render as visible cards, got amber {:?}, catppuccin {:?}",
+            amber.layout_rect,
+            catppuccin.layout_rect
+        );
+
+        let amber_label = harness.query(".theme-chip.amber .tcs-name").expect("label");
+        assert!(
+            amber_label.layout_rect.width > 0.0 && amber_label.layout_rect.height > 0.0,
+            "theme chip label should not collapse, got {:?}",
+            amber_label.layout_rect
+        );
+
+        if can_render {
+            let pixels = harness.render();
+            assert!(
+                rect_has_near_rgb(
+                    &pixels,
+                    1321,
+                    415,
+                    amber_label.layout_rect,
+                    Color::rgb(0xeb, 0xdc, 0xb6),
+                    48,
+                ),
+                "theme chip label should paint readable text, got {:?}",
+                amber_label.layout_rect
+            );
+        }
+    }
+
+    #[test]
+    fn settings_page_target_viewport_has_visible_scrollbar_geometry() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            925.0,
+            540.0,
+        );
+        harness.step();
+
+        let content = harness
+            .query(".set-page-content")
+            .expect("settings page content");
+        let (vertical, _) = unshit::core::scroll::compute_scrollbar_geometry(
+            harness.arena(),
+            content.node_id,
+            content.layout_rect.x,
+            content.layout_rect.y,
+        );
+
+        let vertical = vertical.unwrap_or_else(|| {
+            panic!(
+                "target viewport should expose a vertical scrollbar, content rect {:?}",
+                content.layout_rect
+            )
+        });
+        assert!(
+            (vertical.track_x - 913.0).abs() <= 1.0
+                && (vertical.track_y - 52.0).abs() <= 1.0
+                && (vertical.track_w - 12.0).abs() <= 0.1
+                && vertical.thumb_h >= 120.0,
+            "target viewport scrollbar should match the browser-like right edge, got {:?}",
+            vertical
+        );
+    }
+
+    #[test]
+    fn settings_page_target_viewport_scrollbar_is_visible_at_rest() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let width = 925u32;
+        let height = 540u32;
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            width as f32,
+            height as f32,
+        );
+        if !harness.try_with_gpu() {
+            return;
+        }
+        harness.step();
+
+        let pixels = harness.render();
+        let page_sample = pixel_at(&pixels, width, 904, 120);
+        let thumb_sample = pixel_at(&pixels, width, 918, 120);
+        let page_luma =
+            u16::from(page_sample[0]) + u16::from(page_sample[1]) + u16::from(page_sample[2]);
+        let thumb_luma =
+            u16::from(thumb_sample[0]) + u16::from(thumb_sample[1]) + u16::from(thumb_sample[2]);
+        assert!(
+            thumb_luma > page_luma + 2 && thumb_luma < 100,
+            "idle settings scrollbar should be visible but subdued, page={page_sample:?}, thumb={thumb_sample:?}"
+        );
+    }
+
+    #[test]
+    fn settings_page_target_viewport_matches_claude_body_geometry() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            925.0,
+            540.0,
+        );
+        harness.step();
+
+        let card = harness
+            .query(".settings-page .set-card")
+            .expect("theme card");
+        assert!(
+            (card.layout_rect.x - 272.0).abs() <= 1.0
+                && (card.layout_rect.width - 607.0).abs() <= 1.0,
+            "target viewport theme card should match Claude geometry, got {:?}",
+            card.layout_rect
+        );
+
+        let amber = harness
+            .query(".theme-chip.amber")
+            .expect("amber theme chip");
+        assert!(
+            (amber.layout_rect.x - 290.0).abs() <= 1.0
+                && (amber.layout_rect.width - 285.0).abs() <= 1.0,
+            "target viewport chip width should match Claude two-column picker, got {:?}",
+            amber.layout_rect
+        );
+
+        let catppuccin = harness
+            .query(".theme-chip.catppuccin")
+            .expect("catppuccin theme chip");
+        assert!(
+            (catppuccin.layout_rect.x - 587.0).abs() <= 1.0
+                && (catppuccin.layout_rect.width - 285.0).abs() <= 1.0,
+            "second theme chip should align with Claude target, got {:?}",
+            catppuccin.layout_rect
+        );
+    }
+
+    #[test]
+    fn settings_page_savebar_is_pinned_in_target_viewport() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            925.0,
+            540.0,
+        );
+        harness.step();
+
+        let content = harness
+            .query(".set-page-content")
+            .expect("settings page content");
+        let savebar = harness
+            .query(".set-page-savebar")
+            .expect("settings page savebar");
+        assert_eq!(savebar.computed_style.position, CssPosition::Absolute);
+        let saved_dot = harness
+            .query(".set-page-savebar .saved-dot")
+            .expect("savebar saved dot");
+        assert!(
+            saved_dot.computed_style.border_radius.top_left >= 3.0,
+            "savebar status dot should render rounded, got {:?}",
+            saved_dot.computed_style.border_radius
+        );
+
+        let content_bottom = content.layout_rect.y + content.layout_rect.height;
+        let savebar_bottom = savebar.layout_rect.y + savebar.layout_rect.height;
+        assert!(
+            (content_bottom - savebar_bottom).abs() <= 1.0,
+            "savebar should pin to content bottom: content {:?}, savebar {:?}",
+            content.layout_rect,
+            savebar.layout_rect
+        );
+    }
+
+    fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let idx = ((y as usize) * width as usize + x as usize) * 4;
+        [
+            pixels[idx],
+            pixels[idx + 1],
+            pixels[idx + 2],
+            pixels[idx + 3],
+        ]
+    }
+
+    fn near_rgb(actual: [u8; 4], expected: Color, tolerance: u8) -> bool {
+        [actual[0], actual[1], actual[2]]
+            .into_iter()
+            .zip([expected.r, expected.g, expected.b])
+            .all(|(a, e)| a.abs_diff(e) <= tolerance)
+    }
+
+    fn rect_has_near_rgb(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        rect: LayoutRect,
+        expected: Color,
+        tolerance: u8,
+    ) -> bool {
+        let x0 = rect.x.floor().max(0.0) as u32;
+        let y0 = rect.y.floor().max(0.0) as u32;
+        let x1 = (rect.x + rect.width).ceil().clamp(0.0, width as f32) as u32;
+        let y1 = (rect.y + rect.height).ceil().clamp(0.0, height as f32) as u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if near_rgb(pixel_at(pixels, width, x, y), expected, tolerance) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn settings_page_theme_chip_styles_resolve_to_visible_preview_and_text() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            900.0,
+            700.0,
+        );
+        harness.step();
+
+        let amber_screen = harness
+            .query(".theme-chip.amber .theme-chip-screen")
+            .expect("amber chip screen");
+        assert_eq!(
+            amber_screen.computed_style.background,
+            Background::Color(Color::rgb(0x1c, 0x18, 0x12)),
+            "amber chip preview must use Claude target base surface"
+        );
+
+        let catppuccin_screen = harness
+            .query(".theme-chip.catppuccin .theme-chip-screen")
+            .expect("catppuccin chip screen");
+        assert_eq!(
+            catppuccin_screen.computed_style.background,
+            Background::Color(Color::rgb(0x1e, 0x1e, 0x2e)),
+            "theme chip previews should use each target theme base color, not the brighter row color"
+        );
+
+        let catppuccin_sub = harness
+            .query(".theme-chip.catppuccin .tcs-sub")
+            .expect("catppuccin chip subtitle");
+        assert_eq!(
+            catppuccin_sub.computed_style.color,
+            Color::rgb(0x66, 0x6f, 0x86),
+            "catppuccin chip subtitle should match the measured Claude preview tone"
+        );
+
+        let amber_name = harness
+            .query(".theme-chip.amber .tcs-name")
+            .expect("amber chip name");
+        assert_eq!(
+            amber_name.computed_style.color,
+            Color::rgb(0xeb, 0xdc, 0xb6),
+            "amber chip label must be bright enough to read"
+        );
+        assert_eq!(
+            amber_name.computed_style.font_weight,
+            FontWeight::W(700),
+            "theme chip label should use the filled Claude target weight"
+        );
+        let header_blurb = harness
+            .query(".set-page-header .blurb")
+            .expect("settings header blurb");
+        assert_eq!(
+            header_blurb.computed_style.color,
+            Color::rgb(0xb8, 0xa2, 0x75),
+            "settings header blurb should use the brighter secondary text token"
+        );
+        let theme_label = harness
+            .query(".theme-field .set-label")
+            .expect("theme field label");
+        assert_eq!(
+            theme_label.computed_style.font_weight,
+            FontWeight::W(700),
+            "settings labels should use the filled Claude target weight"
+        );
+        let active_nav = harness
+            .query(".set-page-nav-item.active")
+            .expect("active settings nav item");
+        assert_eq!(
+            active_nav.computed_style.font_weight,
+            FontWeight::W(700),
+            "settings nav labels should use the heavier Claude target weight"
+        );
+        assert_eq!(
+            active_nav.computed_style.background,
+            Background::Color(Color::TRANSPARENT),
+            "active nav item uses a shifted background layer so the text and stripe stay aligned"
+        );
+        let active_nav_bg = harness
+            .arena()
+            .children(active_nav.node_id)
+            .iter()
+            .filter_map(|child| harness.arena().get(*child))
+            .find(|child| {
+                child.synthetic
+                    && child.computed_style.position == CssPosition::Absolute
+                    && child.computed_style.background
+                        == Background::Color(Color::rgb(0x29, 0x23, 0x1a))
+            })
+            .expect(
+                "active nav item should draw its browser-matched background as a shifted layer",
+            );
+        assert!(
+            matches!(active_nav_bg.computed_style.top, Some(Dimension::Px(y)) if (y - 4.0).abs() <= 0.01)
+        );
+        assert!(
+            matches!(active_nav_bg.computed_style.bottom, Some(Dimension::Px(y)) if (y + 3.0).abs() <= 0.01)
+        );
+        assert_eq!(
+            active_nav_bg.computed_style.z_index, -1,
+            "active nav background should paint behind icon/text and the accent stripe"
+        );
+        let custom_screen = harness
+            .query(".theme-chip.custom .theme-chip-screen")
+            .expect("custom chip screen");
+        assert!(
+            matches!(
+                custom_screen.computed_style.background,
+                Background::LinearGradient(_)
+            ),
+            "custom chip preview should use the accent gradient"
+        );
+        let custom_name = harness
+            .query(".theme-chip.custom .tcs-name")
+            .expect("custom chip name");
+        assert_eq!(
+            custom_name.computed_style.color,
+            Color::rgb(0x0e, 0x16, 0x20),
+            "custom chip text should match the dark Claude accent-on foreground over the gradient"
+        );
+        let tokyo_sub = harness
+            .query(".theme-chip.tokyo-night .tcs-sub")
+            .expect("tokyo night chip subtitle");
+        assert_eq!(
+            tokyo_sub.computed_style.color,
+            Color::rgb(0x48, 0x51, 0x6c),
+            "tokyo night subtitle uses the browser-matched contrast compensation"
+        );
+        assert!(
+            harness
+                .query(".theme-chip.amber.active .theme-chip-top-hairline")
+                .is_none(),
+            "active chip should not draw the inactive browser hairline"
+        );
+        let inactive_hairline = harness
+            .query(".theme-chip.catppuccin .theme-chip-top-hairline")
+            .expect("inactive theme chip hairline");
+        assert_eq!(
+            inactive_hairline.computed_style.position,
+            CssPosition::Absolute
+        );
+        assert_eq!(
+            inactive_hairline.computed_style.background,
+            Background::Color(Color::rgb(0x34, 0x2b, 0x1e)),
+            "inactive chip top hairline should match the Claude/browser edge color"
+        );
+        assert!(
+            matches!(inactive_hairline.computed_style.height, Dimension::Px(h) if (h - 1.0).abs() <= 0.01)
+        );
+        assert!(
+            matches!(inactive_hairline.computed_style.left, Some(Dimension::Px(x)) if (x - 4.0).abs() <= 0.01)
+        );
+        assert!(
+            matches!(inactive_hairline.computed_style.right, Some(Dimension::Px(x)) if (x - 1.0).abs() <= 0.01)
+        );
+        assert!(
+            matches!(inactive_hairline.computed_style.top, Some(Dimension::Px(y)) if (y + 1.0).abs() <= 0.01)
+        );
+        for head in harness.query_all(".settings-page .set-card-head") {
+            assert_eq!(
+                head.computed_style.border_width.bottom, 0.0,
+                "settings card header uses a pseudo separator so content geometry does not shift"
+            );
+            let separator = harness
+                .arena()
+                .children(head.node_id)
+                .iter()
+                .filter_map(|child| harness.arena().get(*child))
+                .find(|child| {
+                    child.synthetic
+                        && child.computed_style.position == CssPosition::Absolute
+                        && child.computed_style.background
+                            == Background::Color(Color::rgb(0x24, 0x1e, 0x15))
+                })
+                .expect("settings card header separator pseudo should stay visible");
+            assert!(
+                matches!(separator.computed_style.height, Dimension::Px(h) if (h - 1.0).abs() <= 0.01)
+            );
+            assert!(
+                matches!(separator.computed_style.bottom, Some(Dimension::Px(y)) if (y + 2.0).abs() <= 0.01)
+            );
+            assert_eq!(
+                separator.layout_rect.height, 1.0,
+                "settings card header separator should render as a target hairline"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_page_config_font_size_scales_body_labels_immediately() {
+        let mut state = seed_state();
+        state.settings_section = SettingsSection::Appearance;
+        state.config_font_size_pt = 15;
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            925.0,
+            540.0,
+        );
+        harness.step();
+
+        let body = harness.query(".set-page-body").expect("settings page body");
+        let expected_body = 12.0 * 15.0 / DEFAULT_CONFIG_FONT_SIZE_PT as f32;
+        assert!(
+            (body.computed_style.font_size - expected_body).abs() <= 0.01,
+            "config font 15pt should scale page body relative to the app default, got {}",
+            body.computed_style.font_size
+        );
+
+        let label = harness
+            .query(".theme-field .set-label")
+            .expect("theme field label");
+        let expected_label = 11.0 * 15.0 / DEFAULT_CONFIG_FONT_SIZE_PT as f32;
+        assert!(
+            (label.computed_style.font_size - expected_label).abs() <= 0.01,
+            "config font should scale setting labels immediately, got {}",
+            label.computed_style.font_size
+        );
+
+        let desc = harness
+            .query(".theme-field .set-desc")
+            .expect("theme field description");
+        let expected_desc = 10.0 * 15.0 / DEFAULT_CONFIG_FONT_SIZE_PT as f32;
+        assert!(
+            (desc.computed_style.font_size - expected_desc).abs() <= 0.01,
+            "config font should scale setting descriptions immediately, got {}",
+            desc.computed_style.font_size
+        );
+    }
+
+    #[test]
+    fn settings_page_theme_chip_preview_paints_in_renderer() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let width = 925u32;
+        let height = 540u32;
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            width as f32,
+            height as f32,
+        );
+        if !harness.try_with_gpu() {
+            return;
+        }
+        harness.step();
+
+        let screen = harness
+            .query(".theme-chip.amber .theme-chip-screen")
+            .expect("amber chip screen");
+        let x = (screen.layout_rect.x + screen.layout_rect.width * 0.82)
+            .round()
+            .clamp(0.0, (width - 1) as f32) as u32;
+        let y = (screen.layout_rect.y + screen.layout_rect.height - 10.0)
+            .round()
+            .clamp(0.0, (height - 1) as f32) as u32;
+        let pixels = harness.render();
+        let sample = pixel_at(&pixels, width, x, y);
+        assert!(
+            near_rgb(sample, Color::rgb(0x1c, 0x18, 0x12), 8),
+            "amber preview should paint at ({x}, {y}), got {sample:?}"
+        );
+
+        let active_pin = harness
+            .query(".theme-chip.amber.active .theme-chip-pin")
+            .expect("active amber chip pin");
+        let pin_x = (active_pin.layout_rect.x + active_pin.layout_rect.width * 0.5)
+            .round()
+            .clamp(0.0, (width - 1) as f32) as u32;
+        let pin_y = (active_pin.layout_rect.y + active_pin.layout_rect.height * 0.5)
+            .round()
+            .clamp(0.0, (height - 1) as f32) as u32;
+        let pin_sample = pixel_at(&pixels, width, pin_x, pin_y);
+        assert!(
+            near_rgb(pin_sample, Color::rgb(0x1c, 0x18, 0x12), 8),
+            "browser target keeps the active checkmark behind the preview surface at ({pin_x}, {pin_y}), got {pin_sample:?}"
+        );
+
+        let amber_name = harness
+            .query(".theme-chip.amber .tcs-name")
+            .expect("amber chip label");
+        assert!(
+            rect_has_near_rgb(
+                &pixels,
+                width,
+                height,
+                amber_name.layout_rect,
+                Color::rgb(0xeb, 0xdc, 0xb6),
+                48,
+            ),
+            "amber theme label should paint readable text, label rect {:?}",
+            amber_name.layout_rect
+        );
+
+        let amber_chip = harness.query(".theme-chip.amber").expect("amber chip");
+        assert_eq!(
+            amber_chip.computed_style.outline_width, 1.0,
+            "active theme chip should keep a browser-style outline above its children"
+        );
+        assert_eq!(
+            amber_chip.computed_style.outline_color,
+            Color::rgb(0xd4, 0xa3, 0x48),
+            "active amber chip outline should use the amber accent"
+        );
+        let outline_x = (amber_chip.layout_rect.x + 4.0)
+            .round()
+            .clamp(0.0, (width - 1) as f32) as u32;
+        let outline_y = (amber_chip.layout_rect.y - 1.0)
+            .round()
+            .clamp(0.0, (height - 1) as f32) as u32;
+        let outline_sample = pixel_at(&pixels, width, outline_x, outline_y);
+        assert!(
+            near_rgb(outline_sample, Color::rgb(0xd4, 0xa3, 0x48), 80),
+            "active theme chip should paint an amber outline at ({outline_x}, {outline_y}), got {outline_sample:?}"
+        );
+        let border_x = (amber_chip.layout_rect.x + amber_chip.layout_rect.width - 1.0)
+            .round()
+            .clamp(0.0, (width - 1) as f32) as u32;
+        let border_y = (amber_chip.layout_rect.y + amber_chip.layout_rect.height - 4.0)
+            .round()
+            .clamp(0.0, (height - 1) as f32) as u32;
+        let border = pixel_at(&pixels, width, border_x, border_y);
+        assert!(
+            near_rgb(border, Color::rgb(0xa8, 0x8b, 0xb8), 12),
+            "target footer swatch should remain visible at ({border_x}, {border_y}), got {border:?}"
+        );
+    }
+
+    #[test]
+    fn settings_page_custom_theme_chip_gradient_paints_in_renderer() {
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let width = 925u32;
+        let height = 900u32;
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            width as f32,
+            height as f32,
+        );
+        if !harness.try_with_gpu() {
+            return;
+        }
+        harness.step();
+
+        let screen = harness
+            .query(".theme-chip.custom .theme-chip-screen")
+            .expect("custom chip screen");
+        let x = (screen.layout_rect.x + screen.layout_rect.width * 0.58)
+            .round()
+            .clamp(0.0, (width - 1) as f32) as u32;
+        let y = (screen.layout_rect.y + screen.layout_rect.height * 0.48)
+            .round()
+            .clamp(0.0, (height - 1) as f32) as u32;
+        let pixels = harness.render();
+        let sample = pixel_at(&pixels, width, x, y);
+        assert!(
+            sample[0] > 100 && sample[1] > 180 && sample[2] > 210,
+            "custom chip should paint a bright cyan gradient at ({x}, {y}), got {sample:?}"
+        );
+
+        let custom_name = harness
+            .query(".theme-chip.custom .tcs-name")
+            .expect("custom chip label");
+        assert!(
+            rect_has_near_rgb(
+                &pixels,
+                width,
+                height,
+                custom_name.layout_rect,
+                Color::rgb(0x0e, 0x16, 0x20),
+                48,
+            ),
+            "custom chip label should paint dark accent-on text over the gradient, label rect {:?}",
+            custom_name.layout_rect
+        );
+    }
+
+    #[test]
     fn settings_page_styles_match_design_system_geometry_and_effects() {
         let css = include_str!("../../assets/styles.css");
+        let css_lf = css.replace("\r\n", "\n");
+        assert!(
+            css_lf.contains("JetBrainsMono-Bold.ttf\") format(\"truetype\");\n  font-weight: 700;")
+        );
         assert!(css.contains("grid-template-columns: 240px minmax(0, 1fr);"));
-        assert!(css.contains("max-width: 820px;"));
-        assert!(css.contains("backdrop-filter: blur(6px);"));
+        assert!(css.contains("max-width: 920px;"));
+        assert!(css.contains("backdrop-filter: blur(8px);"));
+        assert!(css.contains(".app.theme-amber .set-page-savebar { background: #171411;"));
+        assert!(css.contains(".set-page-savebar .btn.ghost"));
+        assert!(
+            css_lf.contains(".set-page-savebar .btn.ghost {\n  position: relative;\n  left: -1px;")
+        );
+        assert!(css.contains(".set-page-nav-item.active::before"));
+        assert!(css.contains(".set-page-nav .group:first-child"));
+        assert!(css_lf.contains(
+            ".set-page-nav .group {\n  padding: 12px 12px 4px;\n  color: var(--fg-tertiary);\n  font: var(--type-meta);\n  letter-spacing: 1.4px;"
+        ));
+        assert!(css.contains(".app.theme-amber .set-page-header { background: linear-gradient(180deg, rgba(34, 29, 22, 0.62), rgba(34, 29, 22, 0.165) 72%, rgba(28, 24, 18, 0.08)); border-color: #241e15; }"));
+        assert!(
+            css_lf.contains(".set-page-rail-head .title {\n  position: relative;\n  top: -1px;")
+        );
+        assert!(css_lf.contains(".set-page-rail-head .sub {\n  position: relative;\n  top: -1px;"));
+        assert!(css_lf.contains(".set-page-foot span {\n  position: relative;\n  top: 1px;"));
+        assert!(
+            css_lf.contains(".set-page-foot .status-running {\n  box-shadow: 0 0 2px var(--sage);")
+        );
+        assert!(css_lf.contains(
+            ".set-page-savebar .saved {\n  display: flex;\n  position: relative;\n  top: -1px;"
+        ));
+        assert!(css.contains("color: #8ba05c;"));
+        assert!(css.contains(".set-page-nav-item.active svg"));
+        assert!(css_lf.contains(
+            ".set-page-nav-item.active {\n  background: transparent;\n  color: var(--amber-100);\n  font-weight: 700;\n  z-index: 0;"
+        ));
+        assert!(css_lf.contains(
+            ".app.settings .settings-page .set-page-nav-item.active {\n  background: transparent;"
+        ));
+        assert!(css_lf.contains(
+            ".set-page-nav-item.active::after {\n  content: '';\n  position: absolute;\n  left: 0;\n  right: 0;\n  top: 4px;\n  bottom: -3px;"
+        ));
+        assert!(css_lf.contains(
+            ".set-page-nav-item.active::before {\n  content: '';\n  position: absolute;"
+        ));
+        assert!(css.contains(".app.theme-amber .settings-page .set-page-nav-item.active::before { background: #d4a348; }"));
+        assert!(css.contains(".app.theme-amber .settings-page .set-desc { color: #6f5a33; }"));
+        assert!(css.contains(".app.theme-amber .settings-page .set-label { color: #ebdcb6; }"));
+        assert!(css.contains(".theme-chip.catppuccin .tcs-sub { color: #666f86; }"));
+        assert!(css.contains(".theme-chip.tokyo-night .tcs-sub { color: #48516c; }"));
+        assert!(css.contains(".settings-page .set-card-head"));
+        assert!(css.contains("padding: 9px 14px 9px 15px;"));
+        assert!(css_lf
+            .contains(".settings-page .set-card-head {\n  position: relative;\n  display: flex;"));
+        assert!(css.contains("border-bottom: none;"));
+        assert!(css_lf.contains(
+            ".settings-page .set-card-head::after {\n  content: '';\n  position: absolute;"
+        ));
+        assert!(css.contains("bottom: -2px;"));
+        assert!(css.contains("background: var(--border-hair);"));
+        assert!(css
+            .contains(".app.theme-amber .set-card { background: #221d16; border-color: #241e15;"));
+        assert!(css.contains("width: 101%;"));
+        assert!(css.contains("gap: 14px 12px;"));
+        assert!(css.contains("padding: 7px 0 2px;"));
+        assert!(css.contains("padding: 0;"));
+        assert!(css.contains("box-shadow: inset 0 0 0 1px var(--border-soft);"));
+        assert!(css_lf.contains(
+            ".theme-chip-top-hairline {\n  position: absolute;\n  left: 4px;\n  right: 1px;\n  top: -1px;"
+        ));
+        assert!(css.contains("padding: 5px 16px;"));
+        assert!(css.contains("outline-color: var(--theme-chip-accent);"));
+        assert!(css.contains("outline-width: 1px;"));
+        assert!(css_lf.contains(
+            ".theme-chip.amber.active { border-color: #221d16; box-shadow: inset 0 0 0 1px #d4a348; }"
+        ));
+        assert!(css.contains("gap: 10px;"));
+        assert!(css.contains("font: 600 24px/1 var(--font-mono);"));
+        assert!(css.contains("font: 700 12px/1.35 var(--font-mono);"));
+        assert!(css.contains("font: 600 10px/1.35 var(--font-mono);"));
+        assert!(css_lf
+            .contains(".theme-chip-foot {\n  position: relative;\n  left: 1px;\n  display: flex;"));
+        assert!(css_lf.contains(".tcs-sub {\n  position: relative;\n  top: -2px;"));
+        assert!(css_lf.contains(
+            ".settings-page .set-card-head .name-meta {\n  position: relative;\n  left: 4px;\n  top: -1px;"
+        ));
+        assert!(css.contains("margin-top: 0;"));
+        assert!(css.contains("letter-spacing: 0.2px;"));
+        assert!(css_lf.contains(
+            ".set-page-savebar .btn.primary {\n  min-height: 27px;\n  background: #d4a348;\n  border-color: #d4a348;\n  color: #746445;\n  border-radius: 4px;"
+        ));
+        assert!(css.contains("box-shadow: 0 0 6px rgba(212, 163, 72, 0.2);"));
+        assert!(css.contains(".app.settings .settings-titlebar .titlebar-left"));
+        assert!(css.contains("top: -1px;"));
+        assert!(css.contains(".settings-tb-breadcrumb"));
+        assert!(css.contains("padding-left: 11px;"));
+        assert!(css_lf.contains(".set-page-nav-item svg {\n  position: relative;\n  top: 3px;"));
+        assert!(css_lf.contains(
+            ".set-page-nav-item.nav-notifications svg,\n.set-page-nav-item.nav-danger-zone svg {\n  top: -1px;"
+        ));
+        assert!(css_lf.contains(".set-page-nav-item.nav-keybinds svg {\n  top: 1px;"));
+        assert!(css_lf.contains(".set-page-nav-item.nav-shell svg {\n  top: 1px;"));
+        assert!(
+            css_lf.contains(".set-page-nav-item.nav-sessions svg {\n  left: -1px;\n  top: 2px;")
+        );
+        assert!(css_lf
+            .contains(".set-page-nav-item.nav-shell span {\n  position: relative;\n  top: 2px;"));
+        assert!(css_lf.contains(
+            ".set-page-nav-item.nav-sessions span {\n  position: relative;\n  top: 1px;"
+        ));
+        assert!(css_lf.contains(
+            ".set-page-nav-item.nav-keybinds span {\n  position: relative;\n  top: 1px;"
+        ));
+        assert!(css.contains(".brand-term"));
+        assert!(css.contains(".app.settings .settings-titlebar .brand-term"));
+        assert!(css.contains("left: 6px;"));
+        assert!(css.contains("color: #e4d2a6;"));
+        assert!(
+            css_lf.contains(".app.settings .settings-titlebar .brand-name {\n  display: flex;\n  flex-direction: row;\n  gap: 0;\n  color: #d1bd94;")
+        );
+        assert!(css_lf.contains(
+            ".app.settings .settings-titlebar .brand-name .dot {\n  position: relative;\n  left: 4px;"
+        ));
+        assert!(css_lf.contains(
+            ".app.settings .settings-titlebar .brand-mark {\n  position: relative;\n  top: 3px;"
+        ));
+        assert!(css.contains("font-size: 14px;"));
+        assert!(css.contains("padding-right: 8px;"));
+        assert!(
+            css_lf.contains(".settings-titlebar-help svg {\n  position: relative;\n  left: 2px;")
+        );
+        assert!(css.contains("letter-spacing: 1.4px;"));
+        assert!(css_lf.contains(
+            ".app.settings .statusbar {\n  grid-column: 1;\n  grid-row: 3;\n  padding-left: 8px;"
+        ));
+        assert!(css.contains(".app.settings .settings-statusbar .sb-cell"));
+        assert!(css.contains("height: 14px;"));
+        assert!(css.contains(".app.settings .settings-statusbar .sb-cell.sage"));
+        assert!(css.contains("padding-right: 16px;"));
+        assert!(css.contains(".app.settings .settings-statusbar .statusbar-right .sb-cell.amber"));
+        assert!(css.contains("padding-right: 11px;"));
+        assert!(css.contains("color: #e0a342;"));
+        assert!(css.contains(".settings-page .set-label"));
+        assert!(css.contains("left: 2px;"));
+        assert!(css_lf.contains(
+            ".settings-page .set-label {\n  position: relative;\n  left: 2px;\n  top: 2px;"
+        ));
+        assert!(css_lf.contains(
+            ".settings-page .set-label {\n  position: relative;\n  left: 2px;\n  top: 2px;\n  color: var(--fg-primary);\n  font: var(--type-label);\n  font-weight: 700;\n  letter-spacing: 0.2px;"
+        ));
+        assert!(css_lf.contains(
+            ".set-page-rail-head .title {\n  position: relative;\n  top: -1px;\n  color: var(--amber-50);\n  font: var(--type-h1);\n  font-weight: 700;"
+        ));
+        assert!(css.contains(".set-page-header .page-title"));
+        assert!(css.contains("left: -1px;"));
+        assert!(css.contains(".set-page-header .blurb"));
+        assert!(css.contains(".set-page-search-input"));
+        assert!(css.contains("top: 3px;"));
+        assert!(css_lf.contains(
+            ".set-page-search .kbd {\n  display: flex;\n  align-items: center;\n  gap: 0;\n  position: relative;\n  left: 3px;\n  top: 1px;"
+        ));
+        assert!(css.contains("font: var(--type-kbd);"));
+        assert!(css_lf.contains(".set-page-search .kbd-command {\n  font-size: 12px;"));
+        assert!(css_lf.contains(".set-page-search .kbd-key {\n  font-size: 10px;"));
         assert!(css.contains(".kbd-table"));
         assert!(css.contains(".kbd-binding"));
         assert!(
             css.contains(".preview-tile") && css.contains("border: 1px solid var(--border-hair);")
         );
+        assert!(css_lf.contains(".settings-page .set-card::before {\n  content: '';"));
+        assert!(css.contains("right: -14px;"));
+        assert!(css.contains("width: 15px;"));
     }
 
     #[test]
     fn settings_page_nav_item_click_changes_section() {
         let shared = make_shared();
-        let rail = build_settings_page_rail(SettingsSection::Appearance, &shared);
+        let snap = make_snapshot_section(SettingsSection::Appearance);
+        let rail = build_settings_page_rail(&snap, &shared);
         let nav = &rail.children[2];
         let shell = &nav.children[2];
+        let keybinds = &nav.children[5];
+        let notifications = &nav.children[6];
+        let danger = &nav.children[7];
+
+        assert!(shell.classes.contains(&"nav-shell".to_string()));
+        assert!(keybinds.classes.contains(&"nav-keybinds".to_string()));
+        assert!(notifications
+            .classes
+            .contains(&"nav-notifications".to_string()));
+        assert!(danger.classes.contains(&"nav-danger-zone".to_string()));
 
         (shell.on_click.as_ref().unwrap())();
 
@@ -1319,10 +3095,11 @@ mod tests {
 
         assert!(el.classes.contains(&"set-page-savebar".to_string()));
         assert!(text.contains("changes apply immediately"));
-        assert!(text.contains("close"));
+        assert!(text.contains("reset"));
+        assert!(text.contains("done"));
+        assert!(has_class_anywhere(&el, "saved-dot"));
         assert!(!text.contains("2 unsaved changes"));
         assert!(!text.contains("discard"));
-        assert!(!text.contains("reset to defaults"));
         assert!(!text.contains("save changes"));
     }
 
@@ -1473,11 +3250,15 @@ mod tests {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
-        // title + font row; fake theme/config rows are intentionally absent.
-        assert_eq!(el.children.len(), 2);
+        // title + separate config and terminal font rows.
+        assert_eq!(el.children.len(), 3);
         assert_eq!(
             text_of(&el.children[1].children[0].children[0]),
-            Some("Font size")
+            Some("Config font size")
+        );
+        assert_eq!(
+            text_of(&el.children[2].children[0].children[0]),
+            Some("Terminal font size")
         );
     }
 
@@ -1486,10 +3267,11 @@ mod tests {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
-        let font_row = &el.children[1];
-        let stepper = &font_row.children[1];
-        assert!(stepper.classes.contains(&"stepper".to_string()));
-        assert_eq!(stepper.children.len(), 3);
+        for row in [&el.children[1], &el.children[2]] {
+            let stepper = &row.children[1];
+            assert!(stepper.classes.contains(&"stepper".to_string()));
+            assert_eq!(stepper.children.len(), 3);
+        }
     }
 
     // -- build_shell_section ----------------------------------------------------
@@ -1501,6 +3283,15 @@ mod tests {
         root.children
             .iter()
             .find_map(|c| find_first_with_class(c, class))
+    }
+
+    fn collect_with_class<'a>(root: &'a ElementDef, class: &str, out: &mut Vec<&'a ElementDef>) {
+        if root.classes.iter().any(|c| c == class) {
+            out.push(root);
+        }
+        for child in &root.children {
+            collect_with_class(child, class, out);
+        }
     }
 
     fn count_with_class(root: &ElementDef, class: &str) -> usize {
@@ -1857,27 +3648,42 @@ mod tests {
     #[test]
     fn font_dec_button_decreases_font_size() {
         let shared = make_shared();
-        let initial = shared.lock().unwrap().font_size_pt;
+        let initial = shared.lock().unwrap().terminal_font_size_pt;
         let snap = make_snapshot();
         let el = build_appearance_section(&snap, &shared);
-        let stepper = &el.children[1].children[1];
+        let stepper = &el.children[2].children[1];
         let dec_btn = &stepper.children[0];
         (dec_btn.on_click.as_ref().unwrap())();
-        let after = shared.lock().unwrap().font_size_pt;
+        let after = shared.lock().unwrap().terminal_font_size_pt;
         assert!(after <= initial);
     }
 
     #[test]
     fn font_inc_button_increases_font_size() {
         let shared = make_shared();
-        let initial = shared.lock().unwrap().font_size_pt;
+        let initial = shared.lock().unwrap().terminal_font_size_pt;
+        let snap = make_snapshot();
+        let el = build_appearance_section(&snap, &shared);
+        let stepper = &el.children[2].children[1];
+        let inc_btn = &stepper.children[2];
+        (inc_btn.on_click.as_ref().unwrap())();
+        let after = shared.lock().unwrap().terminal_font_size_pt;
+        assert!(after >= initial);
+    }
+
+    #[test]
+    fn config_font_buttons_change_config_font_size_only() {
+        let shared = make_shared();
+        let terminal_initial = shared.lock().unwrap().terminal_font_size_pt;
+        let config_initial = shared.lock().unwrap().config_font_size_pt;
         let snap = make_snapshot();
         let el = build_appearance_section(&snap, &shared);
         let stepper = &el.children[1].children[1];
         let inc_btn = &stepper.children[2];
         (inc_btn.on_click.as_ref().unwrap())();
-        let after = shared.lock().unwrap().font_size_pt;
-        assert!(after >= initial);
+        let guard = shared.lock().unwrap();
+        assert!(guard.config_font_size_pt >= config_initial);
+        assert_eq!(guard.terminal_font_size_pt, terminal_initial);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -67,6 +68,22 @@ impl AppSession {
         logs: Option<&AppLogFiles>,
         diagnostics: Option<&DiagnosticLaunchConfig>,
     ) -> Result<Self, String> {
+        Self::launch_with_logs_and_env(
+            exe_path,
+            workspace_root,
+            logs,
+            diagnostics,
+            &BTreeMap::new(),
+        )
+    }
+
+    pub fn launch_with_logs_and_env(
+        exe_path: &Path,
+        workspace_root: &Path,
+        logs: Option<&AppLogFiles>,
+        diagnostics: Option<&DiagnosticLaunchConfig>,
+        extra_env: &BTreeMap<&str, String>,
+    ) -> Result<Self, String> {
         if !exe_path.is_file() {
             return Err(format!("missing built binary: {}", exe_path.display()));
         }
@@ -75,6 +92,9 @@ impl AppSession {
         let mut command = Command::new(exe_path);
         command.current_dir(workspace_root);
         apply_diagnostics_env(&mut command, diagnostics);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         if let Some(logs) = logs {
             let stdout = File::create(&logs.stdout_path).map_err(|e| {
                 format!(

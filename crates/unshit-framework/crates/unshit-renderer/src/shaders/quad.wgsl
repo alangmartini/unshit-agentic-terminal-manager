@@ -403,10 +403,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Composite border OVER background (CSS-like alpha blending)
         let ba = in.border_color.a * border_factor;
         let one_minus_ba = 1.0 - ba;
-        let result_a = ba + in.color.a * one_minus_ba;
+        let result_a = ba + base_color.a * one_minus_ba;
         let result_rgb = select(
             vec3(0.0),
-            (in.border_color.rgb * ba + in.color.rgb * in.color.a * one_minus_ba) / result_a,
+            (in.border_color.rgb * ba + base_color.rgb * base_color.a * one_minus_ba) / result_a,
             result_a > 0.001
         );
         rect_color = vec4(result_rgb, result_a);

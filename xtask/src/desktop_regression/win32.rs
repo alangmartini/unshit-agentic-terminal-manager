@@ -129,8 +129,8 @@ mod imp {
         SetCursorPos, SetForegroundWindow, SetProcessDPIAware, SetProcessDpiAwarenessContext,
         SetWindowPos, ShowWindow, GW_HWNDFIRST, GW_HWNDNEXT, GW_OWNER, INPUT, INPUT_KEYBOARD,
         KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_RESTORE, VK_CONTROL, VK_LEFT,
-        VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE,
+        MOUSEEVENTF_WHEEL, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_RESTORE,
+        VK_CONTROL, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE,
     };
     use winapi::um::winuser::{GetClientRect, IsZoomed, PostMessageW, HWND_TOPMOST};
 
@@ -139,6 +139,7 @@ mod imp {
     };
 
     const VK_D: u16 = 0x44;
+    const VK_F: u16 = 0x46;
 
     pub fn find_window_for_process(
         process_id: u32,
@@ -307,6 +308,16 @@ mod imp {
         Ok(())
     }
 
+    pub fn mouse_wheel(x: i32, y: i32, wheel_delta: i32) -> Result<(), String> {
+        unsafe {
+            SetCursorPos(x, y);
+            thread::sleep(Duration::from_millis(30));
+            mouse_event(MOUSEEVENTF_WHEEL, 0, 0, wheel_delta as u32, 0);
+        }
+        thread::sleep(Duration::from_millis(20));
+        Ok(())
+    }
+
     fn show_and_click(handle: WindowHandle, click_x: i32, click_y: i32) -> Result<(), String> {
         unsafe {
             ShowWindow(hwnd(handle), SW_RESTORE);
@@ -410,6 +421,18 @@ mod imp {
 
     pub fn send_ctrl_d() -> Result<(), String> {
         send_key_combo(VK_CONTROL as u16, VK_D as u16)
+    }
+
+    pub fn send_ctrl_shift_f() -> Result<(), String> {
+        send_keyboard_input(VK_CONTROL as u16, 0, 0)?;
+        send_keyboard_input(VK_SHIFT as u16, 0, 0)?;
+        send_keyboard_input(VK_F, 0, 0)?;
+        thread::sleep(Duration::from_millis(20));
+        send_keyboard_input(VK_F, 0, KEYEVENTF_KEYUP)?;
+        thread::sleep(Duration::from_millis(20));
+        send_keyboard_input(VK_SHIFT as u16, 0, KEYEVENTF_KEYUP)?;
+        send_keyboard_input(VK_CONTROL as u16, 0, KEYEVENTF_KEYUP)?;
+        Ok(())
     }
 
     fn send_key_combo(modifier_vk: u16, vk: u16) -> Result<(), String> {
@@ -646,6 +669,10 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn mouse_wheel(_x: i32, _y: i32, _wheel_delta: i32) -> Result<(), String> {
+        Err(unsupported())
+    }
+
     pub fn left_edge_drag(
         _handle: WindowHandle,
         _from_x: i32,
@@ -660,6 +687,10 @@ mod imp {
     }
 
     pub fn send_ctrl_d() -> Result<(), String> {
+        Err(unsupported())
+    }
+
+    pub fn send_ctrl_shift_f() -> Result<(), String> {
         Err(unsupported())
     }
 
@@ -730,6 +761,10 @@ pub fn mouse_click(x: i32, y: i32, button: Option<&str>) -> Result<(), String> {
     imp::mouse_click(x, y, button)
 }
 
+pub fn mouse_wheel(x: i32, y: i32, wheel_delta: i32) -> Result<(), String> {
+    imp::mouse_wheel(x, y, wheel_delta)
+}
+
 pub fn left_edge_drag(
     handle: WindowHandle,
     from_x: i32,
@@ -745,6 +780,10 @@ pub fn send_win_left() -> Result<(), String> {
 
 pub fn send_ctrl_d() -> Result<(), String> {
     imp::send_ctrl_d()
+}
+
+pub fn send_ctrl_shift_f() -> Result<(), String> {
+    imp::send_ctrl_shift_f()
 }
 
 pub fn verify_snap_capture_ready(

@@ -12,6 +12,7 @@ pub mod quick_prompt;
 pub mod shell;
 pub mod state;
 pub mod terminal;
+pub mod theme;
 pub mod ui;
 
 use std::{path::PathBuf, sync::Arc};
@@ -20,7 +21,7 @@ use unshit::app::{App, AppConfig, FontSource};
 use unshit::core::element::*;
 use unshit::core::event::DragPhase;
 use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::Dimension;
+use unshit::core::style::types::{Background, Dimension};
 use unshit::core::trace::{
     append_terminal_trace_line, terminal_trace_enabled, terminal_trace_file_path,
 };
@@ -39,6 +40,12 @@ use crate::ui::titlebar::build_titlebar;
 use crate::ui::toasts::build_toast_overlay;
 
 const STYLES: &str = include_str!("../assets/styles.css");
+const JETBRAINS_MONO_REGULAR: &[u8] =
+    include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf");
+const JETBRAINS_MONO_SEMIBOLD: &[u8] =
+    include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-SemiBold.ttf");
+const JETBRAINS_MONO_BOLD: &[u8] =
+    include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Bold.ttf");
 const ENV_PTYD_SOCKET: &str = "TM_PTYD_SOCKET";
 const ENV_PARITY_SHELL_PROGRAM: &str = "TM_PARITY_SHELL_PROGRAM";
 const ENV_PARITY_SHELL_ARGS_JSON: &str = "TM_PARITY_SHELL_ARGS_JSON";
@@ -164,10 +171,20 @@ fn snapshot_terminal_for_render(
     terminal: &mut crate::terminal::Terminal,
     pane_id: u32,
     is_active: bool,
+    theme_id: &str,
+    custom_theme: &crate::theme::CustomTheme,
+    force_full_repaint: bool,
 ) -> unshit::core::cell_grid::CellGrid {
     let mut grid = terminal.display_grid();
     if !is_active {
         grid.set_cursor_visible(false);
+    }
+    if !parity_windows_terminal_colors_enabled() {
+        let palette = crate::theme::terminal_palette_for(theme_id, custom_theme);
+        crate::theme::apply_terminal_palette_to_grid(&mut grid, &palette);
+        if force_full_repaint {
+            grid.mark_all_dirty();
+        }
     }
     if terminal_trace_enabled() && is_active {
         let rows = grid.debug_rows(4, 96);
@@ -186,13 +203,39 @@ fn snapshot_terminal_for_render(
     grid
 }
 
+fn custom_theme_active(snap: &UiSnapshot) -> bool {
+    crate::theme::resolve_theme_id(&snap.theme) == crate::theme::CUSTOM_THEME_ID
+}
+
+fn with_custom_base_style(mut el: ElementDef, snap: &UiSnapshot) -> ElementDef {
+    if custom_theme_active(snap) {
+        el = el
+            .with_style(StyleDeclaration::Background(Background::Color(
+                snap.custom_theme.background,
+            )))
+            .with_style(StyleDeclaration::Color(snap.custom_theme.foreground));
+    }
+    el
+}
+
+fn with_custom_surface_style(mut el: ElementDef, snap: &UiSnapshot) -> ElementDef {
+    if custom_theme_active(snap) {
+        el = el
+            .with_style(StyleDeclaration::Background(Background::Color(
+                snap.custom_theme.surface,
+            )))
+            .with_style(StyleDeclaration::Color(snap.custom_theme.foreground));
+    }
+    el
+}
+
 fn build_tree(
     snap: &UiSnapshot,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
     window_events: Option<unshit::app::EventSink>,
 ) -> ElementTree {
-    let sidebar = build_sidebar(snap, shared)
+    let sidebar = with_custom_surface_style(build_sidebar(snap, shared), snap)
         .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
         .with_style(StyleDeclaration::MinWidth(Dimension::Px(
             snap.sidebar_width,
@@ -224,20 +267,29 @@ fn build_tree(
             }
         });
 
+    let titlebar = with_custom_surface_style(build_titlebar(snap, shared, window_events), snap);
     let mut root = ElementDef::new(Tag::Div)
         .with_class("app")
+        .with_class(crate::theme::theme_class_name(&snap.theme))
+        .with_class(format!("density-{}", snap.ui_density.id()))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("ambient-layer")
                 .with_class("rust-glow"),
         )
-        .with_child(build_titlebar(snap, shared, window_events));
+        .with_child(titlebar);
+    root = with_custom_base_style(root, snap);
+    let config_font_scale =
+        snap.config_font_size_pt as f32 / crate::state::DEFAULT_CONFIG_FONT_SIZE_PT as f32;
+    if (config_font_scale - 1.0).abs() >= 0.001 {
+        root = root.with_style(StyleDeclaration::FontScale(config_font_scale));
+    }
 
     if snap.settings_open {
         root = root
             .with_class("settings")
             .with_child(build_settings_page(snap, shared))
-            .with_child(build_statusbar(snap));
+            .with_child(with_custom_surface_style(build_statusbar(snap), snap));
     } else {
         root = root.with_child(
             ElementDef::new(Tag::Div)
@@ -250,7 +302,7 @@ fn build_tree(
                         .with_class("role-main")
                         .with_child(build_tabbar(snap, shared))
                         .with_child(build_terminal_grid(snap, shared, grids))
-                        .with_child(build_statusbar(snap)),
+                        .with_child(with_custom_surface_style(build_statusbar(snap), snap)),
                 ),
         );
     }
@@ -286,6 +338,9 @@ fn user_shortcut_bindings() -> Vec<(String, String)> {
 fn terminal_font_sources_from_value(value: Option<std::ffi::OsString>) -> Vec<FontSource> {
     let mut fonts = vec![
         FontSource::System("JetBrains Mono".to_string()),
+        FontSource::Bytes(Arc::from(JETBRAINS_MONO_REGULAR)),
+        FontSource::Bytes(Arc::from(JETBRAINS_MONO_SEMIBOLD)),
+        FontSource::Bytes(Arc::from(JETBRAINS_MONO_BOLD)),
         FontSource::System("Berkeley Mono".to_string()),
         FontSource::System("SF Mono".to_string()),
         FontSource::System("Menlo".to_string()),
@@ -454,7 +509,7 @@ fn unix_epoch_millis_now() -> u64 {
 fn apply_parity_shell_override(state: &mut crate::state::AppState, spec: crate::shell::ShellSpec) {
     *state = seed_state();
     state.default_shell = spec;
-    state.font_size_pt = parity_font_size_pt_from_env();
+    state.terminal_font_size_pt = parity_font_size_pt_from_env();
     state.sidebar_collapsed = true;
     state.sidebar_width = 48.0;
 }
@@ -661,7 +716,7 @@ fn main() {
     // the PTY once to the correct dimensions.
     {
         let mut guard = shared.lock().unwrap();
-        let font_size = crate::state::CSS_BASE_FONT_SIZE * guard.scale_factor;
+        let font_size = guard.terminal_font_size_pt as f32 * guard.scale_factor;
         let line_height = font_size * crate::state::CSS_LINE_HEIGHT;
         guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
     }
@@ -683,8 +738,9 @@ fn main() {
         // (4) + pane-body horizontal padding(24) = 284.  tabbar(38) +
         // statusbar(24) + pane-header(27) + pane borders/margins(4) +
         // pane-body vertical padding(16) = 109.
-        let cell_w_est = crate::state::CSS_BASE_FONT_SIZE * guard.cell_width_ratio;
-        let cell_h_est = crate::state::CSS_BASE_FONT_SIZE * crate::state::CSS_LINE_HEIGHT;
+        let terminal_font_size = guard.terminal_font_size_pt as f32;
+        let cell_w_est = terminal_font_size * guard.cell_width_ratio;
+        let cell_h_est = terminal_font_size * crate::state::CSS_LINE_HEIGHT;
         let init_cols = ((1280.0_f32 - 284.0) / cell_w_est).max(1.0) as u16;
         let init_rows = ((800.0_f32 - 109.0) / cell_h_est).max(1.0) as u16;
         log::info!(
@@ -770,8 +826,12 @@ fn main() {
     let sub_shared = shared.clone();
     let raw_key_shared = shared.clone();
     let frame_metrics_shared = shared.clone();
-    let window_event_sink = Arc::new(std::sync::OnceLock::new());
+    let scroll_metrics_shared = shared.clone();
+    let scroll_tuning_shared = shared.clone();
+    let window_event_sink: Arc<std::sync::OnceLock<unshit::app::EventSink>> =
+        Arc::new(std::sync::OnceLock::new());
     let tree_window_event_sink = window_event_sink.clone();
+    let fps_window_event_sink = window_event_sink.clone();
 
     let mut app = App::new(
         AppConfig {
@@ -790,18 +850,26 @@ fn main() {
                 move |combo: &unshit::core::shortcut::KeyCombo| -> bool {
                     use unshit::core::event::Key;
                     let mut guard = raw_key_shared.lock().expect("state mutex poisoned");
-                    // Only intercept while a keybind is being recorded. Escape
-                    // cancels; any other combo commits via keybind.set.
-                    let Some(action) = guard.keybinds.recording else {
-                        return false;
-                    };
-                    if combo.key == Key::Escape && combo.modifiers.is_empty() {
-                        dispatch(&mut guard, "keybind.cancel_record");
+                    // Recording mode owns the next key. Outside recording,
+                    // plain Escape closes settings directly so repeated
+                    // settings open/close cycles do not depend on shortcut
+                    // resolver state.
+                    if let Some(action) = guard.keybinds.recording {
+                        if combo.key == Key::Escape && combo.modifiers.is_empty() {
+                            dispatch(&mut guard, "keybind.cancel_record");
+                        } else {
+                            let cmd = format!("keybind.set:{}:{}", action.id(), combo);
+                            dispatch(&mut guard, &cmd);
+                        }
+                        true
+                    } else if guard.settings_open
+                        && combo.key == Key::Escape
+                        && combo.modifiers.is_empty()
+                    {
+                        dispatch(&mut guard, "modal.close")
                     } else {
-                        let cmd = format!("keybind.set:{}:{}", action.id(), combo);
-                        dispatch(&mut guard, &cmd);
+                        false
                     }
-                    true
                 },
             )),
             // Approach 1: on_cell_metrics fires once after the first render
@@ -809,6 +877,7 @@ fn main() {
             on_scale_factor: Some(Arc::new(move |scale: f32| {
                 let mut guard = scale_shared.lock_recover();
                 guard.scale_factor = scale;
+                crate::state::sync_terminal_size_to_font_metrics(&mut guard);
             })),
             on_window_maximized: Some(Arc::new(move |maximized: bool| {
                 let mut guard = window_state_shared.lock_recover();
@@ -881,10 +950,28 @@ fn main() {
             })),
             on_frame_metrics: Some(Box::new(move |m| {
                 crate::bench::record_frame(m);
-                crate::ui::fps_overlay::record_frame(m);
+                let fps_visible = crate::ui::fps_overlay::record_frame(m);
+                if fps_visible {
+                    if let Some(sink) = fps_window_event_sink.get() {
+                        let _ = sink.send(unshit::app::ExternalEvent::RequestRebuild);
+                    }
+                }
                 if diagnostics_enabled {
                     let mut guard = frame_metrics_shared.lock_recover();
                     record_diagnostic_renderer_frame(&mut guard, unix_epoch_millis_now());
+                }
+            })),
+            on_scroll_telemetry: diagnostics_enabled.then(|| {
+                Box::new(move |sample: &unshit::app::ScrollTelemetry| {
+                    let mut guard = scroll_metrics_shared.lock_recover();
+                    guard.record_diagnostic_scroll_sample(sample);
+                }) as Box<dyn Fn(&unshit::app::ScrollTelemetry) + Send>
+            }),
+            scroll_tuning: Some(Arc::new(move || {
+                let guard = scroll_tuning_shared.lock_recover();
+                unshit::app::ScrollTuning {
+                    line_scroll_px: guard.scroll_line_px as f32,
+                    smooth_scroll_duration_ms: guard.smooth_scroll_duration_ms as u64,
                 }
             })),
             #[cfg(feature = "input-latency-histogram")]
@@ -897,12 +984,13 @@ fn main() {
             // it. The parser thread writing to any single terminal holds
             // only that terminal's mutex, so it never contends with this
             // closure on the state lock.
-            let (snap, active_id, handles): (
+            let (snap, active_id, handles, force_terminal_theme_repaint): (
                 crate::state::UiSnapshot,
                 u32,
                 Vec<(u32, crate::state::SharedTerminal)>,
+                bool,
             ) = {
-                let guard = tree_shared.lock_recover();
+                let mut guard = tree_shared.lock_recover();
                 let snap = guard.ui_snapshot();
                 let active_id = guard.active_pane.0;
                 let handles: Vec<_> = guard
@@ -910,7 +998,9 @@ fn main() {
                     .iter()
                     .map(|(&id, t)| (id, t.clone()))
                     .collect();
-                (snap, active_id, handles)
+                let force_terminal_theme_repaint =
+                    crate::state::take_terminal_theme_repaint_request(&mut guard);
+                (snap, active_id, handles, force_terminal_theme_repaint)
             };
 
             // State mutex is released; take each per-terminal lock
@@ -923,7 +1013,14 @@ fn main() {
                 .into_iter()
                 .map(|(id, handle)| {
                     let mut t = handle.lock_recover();
-                    let grid = snapshot_terminal_for_render(&mut t, id, id == active_id);
+                    let grid = snapshot_terminal_for_render(
+                        &mut t,
+                        id,
+                        id == active_id,
+                        &snap.theme,
+                        &snap.custom_theme,
+                        force_terminal_theme_repaint,
+                    );
                     (id, grid)
                 })
                 .collect();
@@ -970,6 +1067,7 @@ mod tests {
     use crate::state::{seed_state, SettingsSection};
     use crate::terminal::Terminal;
     use std::sync::{Arc, Mutex};
+    use unshit::core::style::types::{Background, Color};
     use unshit_test::TestHarness;
 
     #[test]
@@ -1000,6 +1098,20 @@ mod tests {
         assert!(
             jetbrains < berkeley && berkeley < consolas,
             "font stack should follow the design-system order: JetBrains Mono, Berkeley Mono, then platform fallbacks"
+        );
+    }
+
+    #[test]
+    fn stylesheet_registers_bundled_jetbrains_mono_faces() {
+        let stylesheet = unshit::core::style::parse::CompiledStylesheet::parse(STYLES);
+        let jetbrains_faces = stylesheet
+            .font_faces
+            .iter()
+            .filter(|face| face.family == "JetBrains Mono")
+            .count();
+        assert_eq!(
+            jetbrains_faces, 3,
+            "regular, semibold, and bold font faces should be available to the renderer"
         );
     }
 
@@ -1116,6 +1228,19 @@ mod tests {
         assert_eq!(
             count, 1,
             "override should not duplicate an existing fallback"
+        );
+    }
+
+    #[test]
+    fn renderer_font_sources_bundle_jetbrains_weights() {
+        let fonts = terminal_font_sources_from_value(None);
+        let bundled = fonts
+            .iter()
+            .filter(|font| matches!(font, FontSource::Bytes(_)))
+            .count();
+        assert_eq!(
+            bundled, 3,
+            "regular, semibold, and bold weights must be bundled"
         );
     }
 
@@ -1302,7 +1427,7 @@ mod tests {
         assert_eq!(state.active_workspace, 0);
         assert_eq!(state.default_shell, parity_shell);
         assert_eq!(
-            state.font_size_pt, WINDOWS_TERMINAL_PARITY_FONT_SIZE_PT,
+            state.terminal_font_size_pt, WINDOWS_TERMINAL_PARITY_FONT_SIZE_PT,
             "parity mode should match Windows Terminal's 12pt-equivalent terminal font size"
         );
         assert!(
@@ -1393,6 +1518,392 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stylesheet_has_app_theme_classes_for_picker() {
+        for theme in crate::theme::themes() {
+            assert!(
+                STYLES.contains(&format!(".app.theme-{}", theme.id)),
+                "stylesheet should include app class for theme {}",
+                theme.id
+            );
+            assert!(
+                STYLES.contains(&format!(".theme-chip.{}", theme.id)),
+                "stylesheet should include picker swatch for theme {}",
+                theme.id
+            );
+        }
+        assert!(STYLES.contains(".app.theme-custom"));
+        assert!(STYLES.contains(".theme-chip.custom"));
+        assert!(STYLES.contains(".custom-editor"));
+        assert!(STYLES.contains(".theme-picker"));
+        assert!(STYLES.contains(".theme-chip"));
+        assert!(STYLES.contains(".theme-chip.active"));
+    }
+
+    #[test]
+    fn settings_route_reflects_selected_theme_colors_after_rebuild() {
+        let mut state = seed_state();
+        state.settings_open = true;
+        state.settings_section = SettingsSection::Appearance;
+        state.theme = "catppuccin".to_string();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let build_shared = shared.clone();
+        let grids = std::collections::HashMap::new();
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &build_shared, &grids, None)
+            },
+            900.0,
+            700.0,
+        );
+
+        shared.lock().unwrap().theme = "dracula".to_string();
+        let rebuild_shared = shared.clone();
+        let rebuild_grids = std::collections::HashMap::new();
+        harness.rebuild(move || {
+            let snap = rebuild_shared.lock().unwrap().ui_snapshot();
+            build_tree(&snap, &rebuild_shared, &rebuild_grids, None)
+        });
+
+        let page = harness
+            .query(".settings-page")
+            .expect("settings page exists");
+        assert_eq!(
+            page.computed_style.background,
+            Background::Color(Color::rgb(0x28, 0x2a, 0x36)),
+            "changing AppState.theme should visibly restyle the settings route"
+        );
+        let content = harness
+            .query(".set-page-content")
+            .expect("settings content exists");
+        assert_eq!(
+            content.computed_style.background,
+            Background::Color(Color::rgb(0x28, 0x2a, 0x36)),
+            "theme background must reach the scrollable settings surface"
+        );
+    }
+
+    #[test]
+    fn settings_route_amber_surfaces_match_target_void_and_gradient() {
+        let mut state = seed_state();
+        state.settings_open = true;
+        state.settings_section = SettingsSection::Appearance;
+        state.theme = "amber".to_string();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let build_shared = shared.clone();
+        let grids = std::collections::HashMap::new();
+        let harness = TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &build_shared, &grids, None)
+            },
+            925.0,
+            540.0,
+        );
+
+        for selector in [".titlebar", ".statusbar"] {
+            let node = harness.query(selector).expect(selector);
+            assert_eq!(
+                node.computed_style.background,
+                Background::Color(Color::rgb(0x14, 0x11, 0x0c)),
+                "{selector} should use the Claude target void surface"
+            );
+        }
+
+        let savebar = harness.query(".set-page-savebar").expect("savebar");
+        assert_eq!(
+            savebar.computed_style.background,
+            Background::Color(Color::rgb(0x17, 0x14, 0x11)),
+            "savebar should use the current Claude target footer surface"
+        );
+
+        let header = harness.query(".set-page-header").expect("settings header");
+        assert!(
+            matches!(
+                header.computed_style.background,
+                Background::LinearGradient(_)
+            ),
+            "settings header should keep the subtle Claude gradient, got {:?}",
+            header.computed_style.background
+        );
+    }
+
+    #[test]
+    fn settings_route_short_viewport_paints_theme_chip_content() {
+        let mut state = seed_state();
+        state.settings_open = true;
+        state.settings_section = SettingsSection::Appearance;
+        state.theme = "amber".to_string();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let build_shared = shared.clone();
+        let grids = std::collections::HashMap::new();
+        let width = 1321u32;
+        let height = 415u32;
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &build_shared, &grids, None)
+            },
+            width as f32,
+            height as f32,
+        );
+        if !harness.try_with_gpu() {
+            return;
+        }
+        harness.step();
+
+        let screen = harness
+            .query(".theme-chip.amber .theme-chip-screen")
+            .expect("amber chip screen");
+        assert!(
+            screen.layout_rect.width > 100.0 && screen.layout_rect.height > 40.0,
+            "amber chip screen should be laid out in short viewport, got {:?}",
+            screen.layout_rect
+        );
+
+        let pixels = harness.render();
+        let sample_x = (screen.layout_rect.x + screen.layout_rect.width * 0.5)
+            .round()
+            .clamp(0.0, (width - 1) as f32) as u32;
+        let sample_y = (screen.layout_rect.y + screen.layout_rect.height * 0.72)
+            .round()
+            .clamp(0.0, (height - 1) as f32) as u32;
+        let idx = ((sample_y * width + sample_x) * 4) as usize;
+        let sample = [
+            pixels[idx],
+            pixels[idx + 1],
+            pixels[idx + 2],
+            pixels[idx + 3],
+        ];
+        assert!(
+            sample[0].abs_diff(0x1c) <= 10
+                && sample[1].abs_diff(0x18) <= 10
+                && sample[2].abs_diff(0x12) <= 10,
+            "amber chip screen should paint its dark preview at ({sample_x}, {sample_y}), got {sample:?}"
+        );
+
+        let name = harness
+            .query(".theme-chip.amber .tcs-name")
+            .expect("amber chip label");
+        let x0 = name.layout_rect.x.floor().max(0.0) as u32;
+        let y0 = name.layout_rect.y.floor().max(0.0) as u32;
+        let x1 = (name.layout_rect.x + name.layout_rect.width)
+            .ceil()
+            .clamp(0.0, width as f32) as u32;
+        let y1 = (name.layout_rect.y + name.layout_rect.height)
+            .ceil()
+            .clamp(0.0, height as f32) as u32;
+        let mut saw_label_pixel = false;
+        'scan: for y in y0..y1 {
+            for x in x0..x1 {
+                let i = ((y * width + x) * 4) as usize;
+                if pixels[i].abs_diff(0xeb) <= 55
+                    && pixels[i + 1].abs_diff(0xdc) <= 55
+                    && pixels[i + 2].abs_diff(0xb6) <= 55
+                {
+                    saw_label_pixel = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(
+            saw_label_pixel,
+            "amber chip label should paint readable text in short viewport, got {:?}",
+            name.layout_rect
+        );
+    }
+
+    #[test]
+    fn settings_route_visual_dump_when_requested() {
+        let Some(path) = std::env::var_os("TM_SETTINGS_ROUTE_VISUAL_DUMP") else {
+            return;
+        };
+        let width = std::env::var("TM_SETTINGS_ROUTE_VISUAL_WIDTH")
+            .ok()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .unwrap_or(924);
+        let height = std::env::var("TM_SETTINGS_ROUTE_VISUAL_HEIGHT")
+            .ok()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .unwrap_or(540);
+
+        let mut state = seed_state();
+        state.settings_open = true;
+        state.settings_section = SettingsSection::Appearance;
+        state.theme = "amber".to_string();
+        state.active_tab = 2;
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let build_shared = shared.clone();
+        let grids = std::collections::HashMap::new();
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &build_shared, &grids, None)
+            },
+            width as f32,
+            height as f32,
+        );
+        if !harness.try_with_gpu() {
+            return;
+        }
+        harness.step();
+        if let Some(scroll_y) = std::env::var("TM_SETTINGS_ROUTE_VISUAL_SCROLL_Y")
+            .ok()
+            .and_then(|raw| raw.parse::<f32>().ok())
+        {
+            harness.mouse_wheel(width as f32 * 0.5, height as f32 * 0.5, 0.0, -scroll_y);
+            harness.step();
+        }
+        let screenshot = harness.screenshot();
+        screenshot.save(path).expect("save screenshot");
+    }
+
+    #[test]
+    fn main_route_reflects_selected_theme_colors_after_rebuild() {
+        let mut state = seed_state();
+        let active_pane = state.active_pane.0;
+        state.theme = "catppuccin".to_string();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let build_shared = shared.clone();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(active_pane, unshit::core::cell_grid::CellGrid::new(24, 80));
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &build_shared, &grids, None)
+            },
+            1280.0,
+            800.0,
+        );
+
+        shared.lock().unwrap().theme = "dracula".to_string();
+        let rebuild_shared = shared.clone();
+        let mut rebuild_grids = std::collections::HashMap::new();
+        rebuild_grids.insert(active_pane, unshit::core::cell_grid::CellGrid::new(24, 80));
+        harness.rebuild(move || {
+            let snap = rebuild_shared.lock().unwrap().ui_snapshot();
+            build_tree(&snap, &rebuild_shared, &rebuild_grids, None)
+        });
+
+        let sidebar = harness.query(".sidebar").expect("sidebar exists");
+        assert_eq!(
+            sidebar.computed_style.background,
+            Background::Color(Color::rgb(0x21, 0x22, 0x2c)),
+            "changing AppState.theme should visibly restyle the sidebar"
+        );
+    }
+
+    #[test]
+    fn font_settings_restyle_immediately_after_rebuild() {
+        let mut state = seed_state();
+        let active_pane = state.active_pane.0;
+        state.config_font_size_pt = 16;
+        state.terminal_font_size_pt = 13;
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let build_shared = shared.clone();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(active_pane, unshit::core::cell_grid::CellGrid::new(24, 80));
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &build_shared, &grids, None)
+            },
+            1280.0,
+            800.0,
+        );
+        harness.step();
+
+        let breadcrumb = harness
+            .query(".titlebar-breadcrumb")
+            .expect("titlebar breadcrumb exists");
+        assert!(
+            breadcrumb.computed_style.font_size > 12.5,
+            "config font size should scale app chrome text"
+        );
+        let terminal = harness
+            .query(".terminal-content")
+            .expect("terminal content exists");
+        assert!(
+            (terminal.computed_style.font_size - 13.0).abs() < 0.01,
+            "config font size must not scale terminal text"
+        );
+
+        shared.lock().unwrap().terminal_font_size_pt = 18;
+        let rebuild_shared = shared.clone();
+        let mut rebuild_grids = std::collections::HashMap::new();
+        rebuild_grids.insert(active_pane, unshit::core::cell_grid::CellGrid::new(24, 80));
+        harness.rebuild(move || {
+            let snap = rebuild_shared.lock().unwrap().ui_snapshot();
+            build_tree(&snap, &rebuild_shared, &rebuild_grids, None)
+        });
+        let terminal = harness
+            .query(".terminal-content")
+            .expect("terminal content exists after rebuild");
+        assert!(
+            (terminal.computed_style.font_size - 18.0).abs() < 0.01,
+            "terminal font size should restyle on the next rebuild"
+        );
+    }
+
+    #[test]
+    fn snapshot_terminal_for_render_applies_active_terminal_theme_palette() {
+        let mut terminal = Terminal::new(1, 4);
+        terminal.process_bytes(b"\x1b[31mR\x1b[0mD");
+
+        let themed = snapshot_terminal_for_render(
+            &mut terminal,
+            0,
+            true,
+            "dracula",
+            &crate::theme::default_custom_theme(),
+            false,
+        );
+        let palette = crate::theme::terminal_palette("dracula");
+
+        assert_eq!(
+            themed.get_cell(0, 0).expect("red cell").fg,
+            palette.ansi[1],
+            "SGR red should render through the active theme ANSI palette"
+        );
+        assert_eq!(
+            themed.get_cell(0, 1).expect("default cell").fg,
+            palette.default_fg,
+            "default text should render through the active theme foreground"
+        );
+    }
+
+    #[test]
+    fn snapshot_terminal_for_render_can_force_full_theme_repaint() {
+        let mut terminal = Terminal::new(2, 4);
+        terminal.process_bytes(b"x");
+        terminal.grid_mut().clear_dirty();
+
+        let themed = snapshot_terminal_for_render(
+            &mut terminal,
+            0,
+            true,
+            "dracula",
+            &crate::theme::default_custom_theme(),
+            true,
+        );
+
+        assert!(
+            themed.line_damage().iter().all(|ld| !ld.is_clean()),
+            "forced theme repaint should damage every displayed row"
+        );
+        assert!(
+            themed.dirty_flags().iter().all(|dirty| *dirty),
+            "forced theme repaint should mark every displayed cell dirty"
+        );
+    }
+
     /// Regression test for the clipboard paste keybind feature.
     ///
     /// Both Ctrl+V (Windows convention) and Ctrl+Shift+V (Linux
@@ -1455,7 +1966,14 @@ mod tests {
 
         // Step 1: previous-frame snapshot (establishes the starting
         // state for the race).
-        let _snap_previous_frame = snapshot_terminal_for_render(&mut terminal, 0, true);
+        let _snap_previous_frame = snapshot_terminal_for_render(
+            &mut terminal,
+            0,
+            true,
+            "catppuccin",
+            &crate::theme::default_custom_theme(),
+            false,
+        );
 
         // Step 2: a PTY chunk lands after the previous snapshot but
         // before the next frame, writing row 1.
@@ -1471,7 +1989,14 @@ mod tests {
         // Step 4: the next frame snapshots the live grid. Before the
         // fix, row 1's damage was wiped by step 3 and this clone
         // reported the row as clean.
-        let snap_next_frame = snapshot_terminal_for_render(&mut terminal, 0, true);
+        let snap_next_frame = snapshot_terminal_for_render(
+            &mut terminal,
+            0,
+            true,
+            "catppuccin",
+            &crate::theme::default_custom_theme(),
+            false,
+        );
 
         let row1 = snap_next_frame
             .line_damage_for(1)
@@ -1537,13 +2062,34 @@ mod tests {
         let mut terminal = Terminal::new(10, 40);
 
         terminal.process_bytes(b"alpha");
-        let _s1 = snapshot_terminal_for_render(&mut terminal, 0, true);
+        let _s1 = snapshot_terminal_for_render(
+            &mut terminal,
+            0,
+            true,
+            "catppuccin",
+            &crate::theme::default_custom_theme(),
+            false,
+        );
 
         terminal.process_bytes(b"\r\nbeta");
-        let _s2 = snapshot_terminal_for_render(&mut terminal, 0, true);
+        let _s2 = snapshot_terminal_for_render(
+            &mut terminal,
+            0,
+            true,
+            "catppuccin",
+            &crate::theme::default_custom_theme(),
+            false,
+        );
 
         terminal.process_bytes(b"\r\ngamma");
-        let s3 = snapshot_terminal_for_render(&mut terminal, 0, true);
+        let s3 = snapshot_terminal_for_render(
+            &mut terminal,
+            0,
+            true,
+            "catppuccin",
+            &crate::theme::default_custom_theme(),
+            false,
+        );
 
         for row in 0..=2 {
             let ld = s3

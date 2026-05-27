@@ -17,6 +17,7 @@ unshit-core = { version = "0.1.0", path = "../unshit-core" }
 wgpu = { workspace = true }
 winit = { workspace = true }
 cosmic-text = { workspace = true }
+swash = { workspace = true }
 lyon = { workspace = true }
 bytemuck = { workspace = true }
 rustc-hash = { workspace = true }

@@ -60,13 +60,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let tex = textureSample(atlas_texture, atlas_sampler, in.uv);
 
-    // Gamma correction: boost coverage to match Windows Terminal weight.
-    // DirectWrite rasterizes for sRGB compositing (gamma ~1.8). Applying
-    // inverse gamma thickens stems so light-on-dark text looks solid.
-    let gamma = 1.0 / 1.8;
-    let cr = pow(tex.r, gamma);
-    let cg = pow(tex.g, gamma);
-    let cb = pow(tex.b, gamma);
+    // Match the grayscale UI text weight while preserving restrained RGB coverage.
+    let gray = max(tex.r, max(tex.g, tex.b));
+    let chroma = 0.8077;
+    let gamma = 0.8330;
+    let cr = pow(mix(gray, tex.r, chroma), gamma) * 0.9997;
+    let cg = min(pow(mix(gray, tex.g, chroma), gamma) * 1.0032, 1.0);
+    let cb = pow(mix(gray, tex.b, chroma), gamma);
 
     // Per-channel subpixel blending (ClearType-style).
     let r = in.color.r * cr;

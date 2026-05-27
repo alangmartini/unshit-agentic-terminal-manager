@@ -96,6 +96,13 @@ pub fn icon_search() -> SvgNode {
     )
 }
 
+pub fn icon_magnifier() -> SvgNode {
+    group(
+        root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Miter),
+        vec![circle(7.0, 7.0, 4.5), path_d("M10.5 10.5l3 3")],
+    )
+}
+
 pub fn icon_sidebar_toggle() -> SvgNode {
     group(
         root_attrs(1.4, StrokeLineCap::Butt, StrokeLineJoin::Miter),
@@ -119,18 +126,39 @@ pub fn icon_plus() -> SvgNode {
 
 pub fn icon_chevrons() -> SvgNode {
     group(
-        root_attrs(1.6, StrokeLineCap::Round, StrokeLineJoin::Miter),
-        vec![path_d("M4 7l4-3l4 3M4 9l4 3l4-3")],
+        root_attrs(1.2, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![path_d("M5 4l4 4l-4 4M9 4l4 4l-4 4")],
     )
 }
 
 pub fn icon_terminal() -> SvgNode {
     group(
-        root_attrs(1.5, StrokeLineCap::Round, StrokeLineJoin::Round),
+        root_attrs(1.2, StrokeLineCap::Round, StrokeLineJoin::Round),
         vec![
             rect(2.0, 3.0, 12.0, 10.0, 1.0),
             path_d("M5 7l2 1.5L5 10M8 10h3"),
         ],
+    )
+}
+
+pub fn icon_settings_nav_grid() -> SvgNode {
+    group(
+        root_attrs(1.2, StrokeLineCap::Butt, StrokeLineJoin::Miter),
+        vec![path_d("M3 3h4v4H3zM9 3h4v4H9zM3 9h4v4H3zM9 9h4v4H9z")],
+    )
+}
+
+pub fn icon_settings_nav_terminal() -> SvgNode {
+    group(
+        root_attrs(1.2, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![path_d("M2.5 4.5h11v7h-11zM4.5 6.5l2 1.5-2 1.5M7.5 10h3")],
+    )
+}
+
+pub fn icon_settings_nav_close() -> SvgNode {
+    group(
+        root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Miter),
+        vec![path_d("M4.5 4.5l7 7M11.5 4.5l-7 7")],
     )
 }
 
@@ -157,8 +185,15 @@ pub fn icon_git_branch() -> SvgNode {
 
 pub fn icon_folder() -> SvgNode {
     group(
-        root_attrs(1.5, StrokeLineCap::Round, StrokeLineJoin::Round),
-        vec![path_d("M2 5h12v8H2zM2 5l6-3l6 3")],
+        root_attrs(1.4, StrokeLineCap::Butt, StrokeLineJoin::Miter),
+        vec![
+            line(2.5, 5.5, 6.4, 5.5),
+            line(6.4, 5.5, 7.9, 6.8),
+            line(7.9, 6.8, 13.5, 6.8),
+            line(13.5, 6.8, 13.5, 12.0),
+            line(13.5, 12.0, 2.5, 12.0),
+            line(2.5, 12.0, 2.5, 5.5),
+        ],
     )
 }
 
@@ -192,12 +227,22 @@ pub fn icon_split_v() -> SvgNode {
 
 pub fn icon_grid() -> SvgNode {
     group(
-        root_attrs(1.4, StrokeLineCap::Butt, StrokeLineJoin::Miter),
+        root_attrs(1.2, StrokeLineCap::Butt, StrokeLineJoin::Miter),
         vec![
-            rect(2.0, 3.0, 12.0, 10.0, 1.0),
-            line(8.0, 3.0, 8.0, 13.0),
-            line(2.0, 8.0, 14.0, 8.0),
+            rect(3.0, 3.0, 4.0, 4.0, 0.0),
+            rect(9.0, 3.0, 4.0, 4.0, 0.0),
+            rect(3.0, 9.0, 4.0, 4.0, 0.0),
+            rect(9.0, 9.0, 4.0, 4.0, 0.0),
         ],
+    )
+}
+
+pub fn icon_bell() -> SvgNode {
+    group(
+        root_attrs(1.2, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![path_d(
+            "M8 2.5c2.5 0 4 1.5 4 4v2.4l1 1.6H3l1-1.6V6.5c0-2.5 1.5-4 4-4zM6.7 12.2h2.6",
+        )],
     )
 }
 
@@ -216,6 +261,16 @@ pub fn icon_settings() -> SvgNode {
             path_d(
                 "M8 1.5v1.5M8 13v1.5M14.5 8H13M3 8H1.5M12.6 3.4l-1 1M4.4 11.6l-1 1M12.6 12.6l-1-1M4.4 4.4l-1-1",
             ),
+        ],
+    )
+}
+
+pub fn icon_help() -> SvgNode {
+    group(
+        root_attrs(1.2, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![
+            circle(8.0, 8.0, 5.5),
+            path_d("M6.5 6.5a1.5 1.5 0 112.5 1.1c-.4.3-1 .6-1 1.4M8 11.3v.1"),
         ],
     )
 }
@@ -363,6 +418,13 @@ mod tests {
     }
 
     #[test]
+    fn icon_magnifier_builds() {
+        let node = icon_magnifier();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2); // circle + path
+    }
+
+    #[test]
     fn icon_sidebar_toggle_builds() {
         let node = icon_sidebar_toggle();
         assert!(matches!(node.primitive, SvgPrimitive::Group));
@@ -395,6 +457,7 @@ mod tests {
         let node = icon_terminal();
         assert!(matches!(node.primitive, SvgPrimitive::Group));
         assert_eq!(node.children.len(), 2); // rect + path
+        assert_eq!(node.attrs.stroke_width, Some(1.2));
     }
 
     #[test]
@@ -423,7 +486,26 @@ mod tests {
     fn icon_folder_builds() {
         let node = icon_folder();
         assert!(matches!(node.primitive, SvgPrimitive::Group));
-        assert_eq!(node.children.len(), 1);
+        assert_eq!(node.children.len(), 6);
+        assert_eq!(node.attrs.stroke_width, Some(1.4));
+        assert_eq!(node.attrs.stroke_linecap, Some(StrokeLineCap::Butt));
+        assert_eq!(node.attrs.stroke_linejoin, Some(StrokeLineJoin::Miter));
+        assert!(node
+            .children
+            .iter()
+            .all(|child| matches!(child.primitive, SvgPrimitive::Line { .. })));
+        assert!(
+            matches!(
+                node.children[3].primitive,
+                SvgPrimitive::Line {
+                    x1: 13.5,
+                    y1: 6.8,
+                    x2: 13.5,
+                    y2: 12.0
+                }
+            ),
+            "folder right side should be an explicit line so it survives nav-size rasterization"
+        );
     }
 
     #[test]
@@ -464,7 +546,7 @@ mod tests {
     fn icon_grid_builds() {
         let node = icon_grid();
         assert!(matches!(node.primitive, SvgPrimitive::Group));
-        assert_eq!(node.children.len(), 3); // rect + 2 lines
+        assert_eq!(node.children.len(), 4);
     }
 
     #[test]
@@ -475,8 +557,22 @@ mod tests {
     }
 
     #[test]
+    fn icon_bell_builds() {
+        let node = icon_bell();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
     fn icon_settings_builds() {
         let node = icon_settings();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 2); // circle + path
+    }
+
+    #[test]
+    fn icon_help_builds() {
+        let node = icon_help();
         assert!(matches!(node.primitive, SvgPrimitive::Group));
         assert_eq!(node.children.len(), 2); // circle + path
     }

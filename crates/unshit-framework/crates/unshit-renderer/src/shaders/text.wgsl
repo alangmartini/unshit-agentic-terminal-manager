@@ -58,6 +58,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    let alpha = textureSample(atlas_texture, atlas_sampler, in.uv).r;
-    return vec4(in.color.rgb, in.color.a * alpha);
+    let coverage = textureSample(atlas_texture, atlas_sampler, in.uv).r;
+    let dims = vec2<f32>(textureDimensions(atlas_texture, 0));
+    let texel_x = vec2<f32>(1.0 / dims.x, 0.0);
+    let left = textureSample(atlas_texture, atlas_sampler, in.uv - texel_x).r;
+    let right = textureSample(atlas_texture, atlas_sampler, in.uv + texel_x).r;
+
+    // Browser text has a restrained RGB fringe, but the pipeline uses normal
+    // alpha blending. Use max channel coverage as alpha and pre-divide color
+    // so the existing blend state can approximate per-channel coverage.
+    let chroma = 0.15;
+    let red = pow(mix(coverage, left, chroma), 0.88);
+    let green = pow(coverage, 0.88);
+    let blue = pow(mix(coverage, right, chroma), 0.88);
+    let alpha = max(red, max(green, blue));
+    let rgb = in.color.rgb * vec3(red, green, blue) / max(alpha, 0.001);
+    return vec4(rgb, in.color.a * alpha);
 }

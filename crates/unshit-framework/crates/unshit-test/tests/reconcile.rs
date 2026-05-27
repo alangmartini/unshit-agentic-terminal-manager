@@ -1,4 +1,6 @@
 use unshit_core::element::*;
+use unshit_core::style::parse::StyleDeclaration;
+use unshit_core::style::types::Color;
 use unshit_test::TestHarness;
 
 // ---------------------------------------------------------------------------
@@ -106,6 +108,41 @@ fn test_reconcile_updates_text() {
     assert_eq!(snap.content, ElementContent::Text("World".into()));
     assert!(snap.layout_rect.width > 0.0, "layout width should be non-zero");
     assert!(snap.layout_rect.height > 0.0, "layout height should be non-zero");
+}
+
+#[test]
+fn test_reconcile_updates_inline_font_scale_for_descendants() {
+    let css = r#"
+    .root { display: flex; flex-direction: column; width: 100%; height: 100%; }
+    .label { font-size: 10px; width: 100px; height: 24px; }
+    "#;
+    let mut scale = 1.0_f32;
+    let mut h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_style(StyleDeclaration::FontScale(scale))
+                .with_child(ElementDef::new(Tag::Span).with_class("label").with_text("scaled")),
+        },
+        800.0,
+        600.0,
+    );
+    h.step();
+    assert!((h.query(".label").unwrap().computed_style.font_size - 10.0).abs() < 0.01);
+
+    scale = 1.5;
+    h.rebuild(|| ElementTree {
+        root: ElementDef::new(Tag::Div)
+            .with_class("root")
+            .with_style(StyleDeclaration::FontScale(scale))
+            .with_child(ElementDef::new(Tag::Span).with_class("label").with_text("scaled")),
+    });
+
+    assert!(
+        (h.query(".label").unwrap().computed_style.font_size - 15.0).abs() < 0.01,
+        "inline font scale changes should recascade through descendants"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +368,44 @@ fn test_reconcile_class_change() {
     // New class should be present
     let snap = h.query(".new").expect("element with class 'new' exists");
     assert!(snap.classes.contains(&"new".to_string()));
+}
+
+#[test]
+fn test_reconcile_ancestor_class_change_restyles_descendant_selectors() {
+    let css = r#"
+        .root { display: flex; width: 100%; height: 100%; }
+        .theme-amber .label { color: #d4a348; width: 100px; height: 20px; }
+        .theme-hacker .label { color: #39ff88; width: 100px; height: 20px; }
+    "#;
+
+    let mut h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_class("theme-amber")
+                .with_child(ElementDef::new(Tag::Span).with_class("label").with_text("theme")),
+        },
+        800.0,
+        600.0,
+    );
+
+    let before = h.query(".label").expect("label exists before rebuild");
+    assert_eq!(before.computed_style.color, Color::rgb(0xd4, 0xa3, 0x48));
+
+    h.rebuild(|| ElementTree {
+        root: ElementDef::new(Tag::Div)
+            .with_class("root")
+            .with_class("theme-hacker")
+            .with_child(ElementDef::new(Tag::Span).with_class("label").with_text("theme")),
+    });
+
+    let after = h.query(".label").expect("label exists after rebuild");
+    assert_eq!(
+        after.computed_style.color,
+        Color::rgb(0x39, 0xff, 0x88),
+        "descendant selectors must recascade when an ancestor class changes"
+    );
 }
 
 // ---------------------------------------------------------------------------

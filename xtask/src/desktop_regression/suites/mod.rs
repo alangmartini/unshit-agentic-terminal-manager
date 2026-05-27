@@ -12,8 +12,9 @@ pub const ENV_FORCE_FAILURE: &str = "TM_DESKTOP_REGRESSION_FORCE_FAILURE";
 
 pub mod edge_resize_stability;
 pub(crate) mod observability;
-pub mod split_divider_stability;
 pub mod post_resize_glitches;
+pub mod settings_scroll;
+pub mod split_divider_stability;
 pub mod titlebar_window_controls;
 
 pub struct SuiteContext<'a> {
@@ -51,6 +52,9 @@ pub fn execute_suite(suite_id: &str, context: &SuiteContext<'_>) -> SuiteExecuti
         "edge-resize-stability" => edge_resize_stability::run(context),
         "split-divider-stability" => split_divider_stability::run(context),
         "post-resize-glitches" => post_resize_glitches::run(context),
+        settings_scroll::SMOOTHNESS_SUITE_ID => settings_scroll::run_smoothness(context),
+        settings_scroll::OPTIONS_SUITE_ID => settings_scroll::run_options(context),
+        settings_scroll::FPS_SUITE_ID => settings_scroll::run_fps_overlay(context),
         "titlebar-window-controls" => titlebar_window_controls::run(context),
         other => SuiteExecutionRecord::failed(
             other,

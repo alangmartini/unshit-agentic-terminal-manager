@@ -1,7 +1,7 @@
 use crate::dirty::DirtyFlags;
 use crate::element::{ElementContent, InputType, Tag};
 use crate::id::NodeId;
-use crate::style::types::{FontWeight, WhiteSpace};
+use crate::style::types::{apply_text_transform, FontWeight, WhiteSpace};
 use crate::tree::NodeArena;
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Weight};
 use rustc_hash::FxHashMap;
@@ -47,18 +47,24 @@ pub fn font_weight_number(weight: FontWeight) -> u16 {
 
 pub fn cosmic_font_weight(weight: FontWeight) -> Weight {
     let numeric = font_weight_number(weight);
-    #[cfg(target_os = "windows")]
-    let numeric = if numeric == 500 { 400 } else { numeric };
     Weight(numeric)
 }
 
 pub fn cosmic_font_family(font_family: &str) -> Family<'_> {
     let family = normalize_font_family_token(font_family.trim());
     if font_family.contains(',') {
+        let mut first_generic = None;
         for token in font_family.split(',').map(|part| normalize_font_family_token(part.trim())) {
             if let Some(generic) = generic_font_family(token) {
-                return generic;
+                if first_generic.is_none() {
+                    first_generic = Some(generic);
+                }
+            } else if !token.is_empty() {
+                return Family::Name(token);
             }
+        }
+        if let Some(generic) = first_generic {
+            return generic;
         }
     }
     if family.is_empty() {
@@ -254,7 +260,7 @@ pub fn sync_element_to_taffy(
             ) && !element.has_children()
         };
 
-        let measure_text = if input_needs_text_measure {
+        let raw_measure_text = if input_needs_text_measure {
             input_text.clone()
         } else {
             match &element.content {
@@ -262,6 +268,9 @@ pub fn sync_element_to_taffy(
                 _ => String::new(),
             }
         };
+        let measure_text =
+            apply_text_transform(&raw_measure_text, element.computed_style.text_transform)
+                .into_owned();
 
         if is_new {
             let taffy_node = if is_text_leaf {
@@ -855,18 +864,23 @@ mod tests {
     }
 
     #[test]
-    fn cosmic_font_family_prefers_generic_fallback_in_css_list() {
+    fn cosmic_font_family_prefers_first_concrete_family_in_css_list() {
         let family = "'JetBrains Mono', 'Berkeley Mono', 'SF Mono', Menlo, Consolas, monospace";
+        assert!(matches!(cosmic_font_family(family), Family::Name("JetBrains Mono")));
+    }
+
+    #[test]
+    fn cosmic_font_family_uses_generic_when_list_has_no_concrete_family() {
+        let family = "monospace";
         #[cfg(target_os = "windows")]
         assert!(matches!(cosmic_font_family(family), Family::Name("Consolas")));
         #[cfg(not(target_os = "windows"))]
         assert!(matches!(cosmic_font_family(family), Family::Monospace));
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn cosmic_font_weight_maps_medium_to_regular_for_windows_fallback() {
-        assert_eq!(cosmic_font_weight(FontWeight::W(500)), Weight(400));
+    fn cosmic_font_weight_preserves_medium_weight() {
+        assert_eq!(cosmic_font_weight(FontWeight::W(500)), Weight(500));
     }
 
     /// SVG elements with CSS-assigned pixel dimensions (from a `svg`

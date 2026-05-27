@@ -639,6 +639,16 @@ impl CellGrid {
         }
     }
 
+    /// Mark every cell and every row as dirty without changing line identity.
+    ///
+    /// This is for presentation-only invalidations such as a theme change:
+    /// the terminal content has not changed, but retained paint caches must
+    /// re-emit the full grid with the new styling.
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty.fill(true);
+        Self::mark_all_lines_fully_damaged(&mut self.line_damage, self.cols);
+    }
+
     /// Debug helper: render a row range as plain text, substituting empty cells
     /// with spaces so logs can compare terminal/parser output across stages.
     pub fn debug_row_string(&self, row: usize, start_col: usize, len: usize) -> String {
@@ -1229,6 +1239,37 @@ mod tests {
                 ld.last_dirty_col, last_col,
                 "row {row} last_dirty_col must be cols-1 after mark_all",
             );
+        }
+    }
+
+    #[test]
+    fn mark_all_dirty_invalidates_every_cell_and_row_without_resetting_identity() {
+        let rows = 3;
+        let cols = 5;
+        let mut g = CellGrid::new(rows, cols);
+        let original_ids = g.line_ids().to_vec();
+        g.clear_dirty();
+        assert!(
+            g.line_damage().iter().all(LineDamage::is_clean),
+            "precondition: clear_dirty should leave rows clean"
+        );
+
+        g.mark_all_dirty();
+
+        assert!(
+            g.dirty_flags().iter().all(|dirty| *dirty),
+            "every cell should be dirty after full presentation invalidation"
+        );
+        assert_eq!(
+            g.line_ids(),
+            original_ids.as_slice(),
+            "presentation invalidation must not reset stable line identity"
+        );
+        let last_col = CellGrid::last_col_u16(cols);
+        for (row, ld) in g.line_damage().iter().enumerate() {
+            assert!(!ld.is_clean(), "row {row} should be damaged");
+            assert_eq!(ld.first_dirty_col, 0, "row {row} first col");
+            assert_eq!(ld.last_dirty_col, last_col, "row {row} last col");
         }
     }
 

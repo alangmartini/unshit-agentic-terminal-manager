@@ -23,6 +23,7 @@ wgpu = "24.0"
 taffy = "0.7"
 cssparser = "0.34"
 cosmic-text = "0.12"
+swash = "0.1.19"
 lyon = "1.0"
 bumpalo = { version = "3.16", features = ["collections"] }
 smallvec = "1.13"

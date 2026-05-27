@@ -1,0 +1,47 @@
+[
+  {
+    "id": "amber",
+    "label": "Amber",
+    "description": "Original warm amber terminal palette."
+  },
+  {
+    "id": "catppuccin",
+    "label": "Catppuccin",
+    "description": "Mocha-inspired pastel terminal palette."
+  },
+  {
+    "id": "tokyo-night",
+    "label": "Tokyo Night",
+    "description": "Deep navy palette with clean blue and violet accents."
+  },
+  {
+    "id": "nord",
+    "label": "Nord",
+    "description": "Arctic, low-clutter palette for focused sessions."
+  },
+  {
+    "id": "dracula",
+    "label": "Dracula",
+    "description": "High-contrast classic with vivid ANSI colors."
+  },
+  {
+    "id": "everforest",
+    "label": "Everforest",
+    "description": "Muted green and warm neutrals for long-running work."
+  },
+  {
+    "id": "rose-pine",
+    "label": "Rosé Pine",
+    "description": "Moon variant with soft rose, pine, and iris tones."
+  },
+  {
+    "id": "gruvbox",
+    "label": "Gruvbox",
+    "description": "Retro warm dark-hard palette."
+  },
+  {
+    "id": "kanagawa",
+    "label": "Kanagawa",
+    "description": "Muted ink palette inspired by the great wave."
+  }
+]

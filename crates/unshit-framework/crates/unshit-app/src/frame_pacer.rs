@@ -31,9 +31,10 @@ pub enum PaceDecision {
 /// Coalescing frame pacer. The interval is derived from the active
 /// monitor's refresh rate via [`Self::with_refresh_rate_mhz`]; the legacy
 /// 8ms default (matching Ghostty's default and close to Kitty's 10ms input
-/// batch interval) is kept as a fallback when the monitor does not report
-/// a refresh rate. The interval is a ceiling on paint rate; actual paints
-/// may be rarer when there is nothing to redraw.
+/// batch interval) is kept as a fallback and as the slowest interactive
+/// cadence when the platform reports a low or bogus refresh rate. The
+/// interval is a ceiling on paint rate; actual paints may be rarer when
+/// there is nothing to redraw.
 pub struct FramePacer {
     /// Minimum interval between two consecutive paints.
     min_interval: Duration,
@@ -99,7 +100,9 @@ impl FramePacer {
         if mhz == 120_000 && interval > Self::TIMER_COMPENSATED_120HZ_INTERVAL {
             return Self::TIMER_COMPENSATED_120HZ_INTERVAL;
         }
-        if interval < Self::MIN_DERIVED_INTERVAL {
+        if interval > Self::DEFAULT_MIN_INTERVAL {
+            Self::DEFAULT_MIN_INTERVAL
+        } else if interval < Self::MIN_DERIVED_INTERVAL {
             Self::MIN_DERIVED_INTERVAL
         } else {
             interval
@@ -374,6 +377,15 @@ mod tests {
         let pacer = FramePacer::with_refresh_rate_mhz(0);
         assert_eq!(pacer.min_interval(), FramePacer::DEFAULT_MIN_INTERVAL);
         assert_eq!(pacer.min_interval(), FramePacer::new().min_interval());
+    }
+
+    #[test]
+    fn with_refresh_rate_mhz_low_reports_do_not_slow_interactive_pacing() {
+        let pacer = FramePacer::with_refresh_rate_mhz(24_000);
+        assert_eq!(pacer.min_interval(), FramePacer::DEFAULT_MIN_INTERVAL);
+
+        let pacer = FramePacer::with_refresh_rate_mhz(60_000);
+        assert_eq!(pacer.min_interval(), FramePacer::DEFAULT_MIN_INTERVAL);
     }
 
     #[test]

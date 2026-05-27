@@ -1,4 +1,5 @@
 use crate::id::NodeId;
+use crate::layout::TextMeasureCtx;
 use crate::style::types::Overflow;
 use crate::tree::NodeArena;
 
@@ -6,9 +7,11 @@ use crate::tree::NodeArena;
 // Constants (shared with renderer)
 // ---------------------------------------------------------------------------
 
-pub const SCROLLBAR_WIDTH: f32 = 6.0;
-pub const SCROLLBAR_INSET: f32 = 2.0;
+pub const SCROLLBAR_WIDTH: f32 = 12.0;
+pub const SCROLLBAR_INSET: f32 = 0.0;
+pub const SCROLLBAR_BUTTON_SIZE: f32 = 18.0;
 pub const MIN_THUMB_SIZE: f32 = 24.0;
+pub const THUMB_SIZE_SCALE: f32 = 1.16;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -68,15 +71,16 @@ pub struct ScrollbarVisualState {
 }
 
 impl ScrollbarVisualState {
-    /// Returns thumb opacity for a given scrollbar: 0.6 if dragging, 0.5 if
-    /// hovered, 0.3 otherwise. The caller builds the full `[r, g, b, a]` color.
+    /// Returns thumb opacity for a given scrollbar. The thumb stays visible at
+    /// rest so scrollable regions advertise that more content exists.
+    /// The caller builds the full `[r, g, b, a]` color.
     pub fn thumb_alpha(&self, node_id: NodeId, axis: ScrollbarAxis) -> f32 {
         if self.dragging_node == Some(node_id) && self.dragging_axis == Some(axis) {
-            0.6
+            0.52
         } else if self.hovered_node == Some(node_id) && self.hovered_axis == Some(axis) {
-            0.5
+            0.34
         } else {
-            0.3
+            0.004
         }
     }
 
@@ -95,6 +99,53 @@ impl ScrollbarVisualState {
     pub fn clear_drag(&mut self) {
         self.dragging_node = None;
         self.dragging_axis = None;
+    }
+}
+
+#[cfg(test)]
+mod visual_state_tests {
+    use super::*;
+
+    fn node(index: u32) -> NodeId {
+        NodeId { index, generation: 0 }
+    }
+
+    #[test]
+    fn scrollbar_thumb_has_resting_visibility() {
+        let state = ScrollbarVisualState::default();
+
+        assert!(
+            state.thumb_alpha(node(1), ScrollbarAxis::Vertical) > 0.0,
+            "scrollbar thumb should remain visible when content overflows"
+        );
+        assert_eq!(
+            state.thumb_alpha(node(1), ScrollbarAxis::Vertical),
+            0.004,
+            "resting settings scrollbar should stay visible but extremely subdued"
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_gets_stronger_while_interacting() {
+        let target = node(1);
+        let hovered = ScrollbarVisualState {
+            hovered_node: Some(target),
+            hovered_axis: Some(ScrollbarAxis::Vertical),
+            dragging_node: None,
+            dragging_axis: None,
+        };
+        let dragging = ScrollbarVisualState {
+            dragging_node: Some(target),
+            dragging_axis: Some(ScrollbarAxis::Vertical),
+            ..hovered
+        };
+
+        let resting = ScrollbarVisualState::default().thumb_alpha(target, ScrollbarAxis::Vertical);
+        let hover_alpha = hovered.thumb_alpha(target, ScrollbarAxis::Vertical);
+        let drag_alpha = dragging.thumb_alpha(target, ScrollbarAxis::Vertical);
+
+        assert!(hover_alpha > resting);
+        assert!(drag_alpha > hover_alpha);
     }
 }
 
@@ -129,6 +180,89 @@ pub fn content_extents(arena: &NodeArena, node_id: NodeId) -> (f32, f32) {
     (content_max_x, content_max_y)
 }
 
+/// Compute the maximum scroll offsets for a node from its laid out content.
+pub fn compute_max_scroll(
+    arena: &NodeArena,
+    taffy: &taffy::TaffyTree<TextMeasureCtx>,
+    node_id: NodeId,
+) -> (f32, f32) {
+    let Some(element) = arena.get(node_id) else {
+        return (0.0, 0.0);
+    };
+
+    let container_w = element.layout_rect.width;
+    let container_h = element.layout_rect.height;
+
+    let content_size = element
+        .taffy_node
+        .and_then(|tn| taffy.layout(tn).ok())
+        .map(|layout| (layout.content_size.width, layout.content_size.height))
+        .unwrap_or((0.0, 0.0));
+
+    ((content_size.0 - container_w).max(0.0), (content_size.1 - container_h).max(0.0))
+}
+
+fn mark_scroll_paint_dirty(arena: &mut NodeArena, node_id: NodeId) {
+    crate::build::mark_paint_dirty(arena, node_id);
+    crate::build::mark_node_paint_dirty(arena, node_id);
+}
+
+/// Set scroll offsets and dirty cached paint if the visual position changed.
+pub fn set_scroll_position(arena: &mut NodeArena, node_id: NodeId, x: f32, y: f32) -> bool {
+    let changed = if let Some(element) = arena.get_mut(node_id) {
+        let changed = element.scroll_x != x || element.scroll_y != y;
+        if changed {
+            element.scroll_x = x;
+            element.scroll_y = y;
+        }
+        changed
+    } else {
+        false
+    };
+
+    if changed {
+        mark_scroll_paint_dirty(arena, node_id);
+    }
+
+    changed
+}
+
+/// Apply wheel-style deltas to a scroll container and dirty affected paint.
+pub fn scroll_by(
+    arena: &mut NodeArena,
+    taffy: &taffy::TaffyTree<TextMeasureCtx>,
+    node_id: NodeId,
+    delta_x: f32,
+    delta_y: f32,
+) -> bool {
+    let max_scroll = compute_max_scroll(arena, taffy, node_id);
+    let Some(element) = arena.get(node_id) else {
+        return false;
+    };
+
+    let next_x = (element.scroll_x - delta_x).clamp(0.0, max_scroll.0);
+    let next_y = (element.scroll_y - delta_y).clamp(0.0, max_scroll.1);
+    set_scroll_position(arena, node_id, next_x, next_y)
+}
+
+/// Set one scrollbar axis from drag/track interaction and dirty affected paint.
+pub fn set_axis_scroll_position(
+    arena: &mut NodeArena,
+    node_id: NodeId,
+    axis: ScrollbarAxis,
+    value: f32,
+) -> bool {
+    let Some(element) = arena.get(node_id) else {
+        return false;
+    };
+    let (next_x, next_y) = match axis {
+        ScrollbarAxis::Vertical => (element.scroll_x, value),
+        ScrollbarAxis::Horizontal => (value, element.scroll_y),
+    };
+
+    set_scroll_position(arena, node_id, next_x, next_y)
+}
+
 // ---------------------------------------------------------------------------
 // Geometry computation
 // ---------------------------------------------------------------------------
@@ -158,13 +292,15 @@ pub fn compute_scrollbar_geometry(
         let max_scroll_y = content_max_y - container_h;
         let scroll_ratio = if max_scroll_y > 0.0 { element.scroll_y / max_scroll_y } else { 0.0 };
 
-        let thumb_h =
-            (container_h / content_max_y * container_h).max(MIN_THUMB_SIZE).min(container_h);
-        let track_h = container_h;
+        let visual_track_h = (container_h - SCROLLBAR_BUTTON_SIZE * 2.0).max(SCROLLBAR_WIDTH);
+        let thumb_h = (container_h / content_max_y * container_h * THUMB_SIZE_SCALE)
+            .max(MIN_THUMB_SIZE)
+            .min(visual_track_h);
+        let track_h = visual_track_h;
         let thumb_y_offset = scroll_ratio * (track_h - thumb_h);
 
         let track_x = render_x + container_w - SCROLLBAR_WIDTH - SCROLLBAR_INSET;
-        let track_y = render_y;
+        let track_y = render_y + SCROLLBAR_BUTTON_SIZE;
 
         Some(ScrollbarGeometry {
             axis: ScrollbarAxis::Vertical,
@@ -188,12 +324,14 @@ pub fn compute_scrollbar_geometry(
         let max_scroll_x = content_max_x - container_w;
         let scroll_ratio = if max_scroll_x > 0.0 { element.scroll_x / max_scroll_x } else { 0.0 };
 
-        let thumb_w =
-            (container_w / content_max_x * container_w).max(MIN_THUMB_SIZE).min(container_w);
-        let track_w = container_w;
+        let visual_track_w = (container_w - SCROLLBAR_BUTTON_SIZE * 2.0).max(SCROLLBAR_WIDTH);
+        let thumb_w = (container_w / content_max_x * container_w * THUMB_SIZE_SCALE)
+            .max(MIN_THUMB_SIZE)
+            .min(visual_track_w);
+        let track_w = visual_track_w;
         let thumb_x_offset = scroll_ratio * (track_w - thumb_w);
 
-        let track_x = render_x;
+        let track_x = render_x + SCROLLBAR_BUTTON_SIZE;
         let track_y = render_y + container_h - SCROLLBAR_WIDTH - SCROLLBAR_INSET;
 
         Some(ScrollbarGeometry {

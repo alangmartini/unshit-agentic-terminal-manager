@@ -21,7 +21,8 @@ const SUITES: &[SuiteMetadata] = &[
         id: "split-divider-stability",
         title: "Split divider stability",
         tags: &["windows", "split", "resize", "layout", "black-box"],
-        coverage: "Pane divider drag stability and terminal-grid size settling after split divider drag.",
+        coverage:
+            "Pane divider drag stability and terminal-grid size settling after split divider drag.",
         observability_needs: &[
             "win32-window-bounds",
             "screenshots",
@@ -40,6 +41,40 @@ const SUITES: &[SuiteMetadata] = &[
             "screenshots",
             "renderer-state",
             "layout-state",
+        ],
+        supported_platforms: &["windows"],
+    },
+    SuiteMetadata {
+        id: "settings-scroll-smoothness",
+        title: "Settings scroll smoothness",
+        tags: &["windows", "settings", "scroll", "performance"],
+        coverage: "Settings route wheel-scroll responsiveness and frame cadence during scroll.",
+        observability_needs: &[
+            "diagnostic-config",
+            "renderer-frame-counter",
+            "win32-input",
+            "screenshots",
+        ],
+        supported_platforms: &["windows"],
+    },
+    SuiteMetadata {
+        id: "settings-scroll-options",
+        title: "Settings scroll options",
+        tags: &["windows", "settings", "scroll", "configuration"],
+        coverage: "Appearance settings expose wheel step and smooth scroll duration controls.",
+        observability_needs: &["diagnostic-config", "screenshots"],
+        supported_platforms: &["windows"],
+    },
+    SuiteMetadata {
+        id: "fps-overlay-scroll-updates",
+        title: "FPS overlay updates during scroll",
+        tags: &["windows", "settings", "scroll", "performance", "hud"],
+        coverage: "Ctrl+Shift+F overlay keeps recording and rebuilding while settings scrolls.",
+        observability_needs: &[
+            "diagnostic-config",
+            "renderer-frame-counter",
+            "win32-input",
+            "screenshots",
         ],
         supported_platforms: &["windows"],
     },
@@ -87,10 +122,13 @@ mod tests {
         let ids: Vec<_> = all_suites().iter().map(|suite| suite.id).collect();
         assert_eq!(
             ids,
-        vec![
+            vec![
                 "edge-resize-stability",
                 "split-divider-stability",
                 "post-resize-glitches",
+                "settings-scroll-smoothness",
+                "settings-scroll-options",
+                "fps-overlay-scroll-updates",
                 "titlebar-window-controls"
             ]
         );

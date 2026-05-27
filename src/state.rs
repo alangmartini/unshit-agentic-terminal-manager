@@ -3,16 +3,29 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::terminal::Terminal;
+use crate::theme;
 
 pub const MAX_COLS: usize = 4;
 pub const MAX_ROWS: usize = 4;
 pub const MIN_FONT_SIZE: u32 = 8;
 pub const MAX_FONT_SIZE: u32 = 32;
+pub const DEFAULT_CONFIG_FONT_SIZE_PT: u32 = 13;
+pub const DEFAULT_TERMINAL_FONT_SIZE_PT: u32 = 13;
+pub const DEFAULT_UI_DENSITY: UiDensity = UiDensity::Cozy;
+pub const DEFAULT_SCROLL_LINE_PX: u32 = 100;
+pub const MIN_SCROLL_LINE_PX: u32 = 16;
+pub const MAX_SCROLL_LINE_PX: u32 = 160;
+pub const SCROLL_LINE_PX_STEP: i32 = 4;
+pub const DEFAULT_SMOOTH_SCROLL_DURATION_MS: u32 = 180;
+pub const MIN_SMOOTH_SCROLL_DURATION_MS: u32 = 16;
+pub const MAX_SMOOTH_SCROLL_DURATION_MS: u32 = 300;
+pub const SMOOTH_SCROLL_DURATION_STEP_MS: i32 = 10;
 /// Minimum flex-grow ratio for any pane (prevents collapsing below ~10%).
 pub const MIN_PANE_RATIO: f32 = 0.1;
 pub const MIN_SIDEBAR_WIDTH: f32 = 150.0;
 pub const MAX_SIDEBAR_WIDTH: f32 = 500.0;
 const DIAGNOSTIC_PTY_EVENT_LIMIT: usize = 32;
+const DIAGNOSTIC_SCROLL_SAMPLE_LIMIT: usize = 96;
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
@@ -140,6 +153,40 @@ impl SettingsSection {
             SettingsSection::Notifications,
             SettingsSection::DangerZone,
         ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiDensity {
+    Compact,
+    Cozy,
+    Comfy,
+}
+
+impl UiDensity {
+    pub fn id(self) -> &'static str {
+        match self {
+            UiDensity::Compact => "compact",
+            UiDensity::Cozy => "cozy",
+            UiDensity::Comfy => "comfy",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.id()
+    }
+
+    pub fn all() -> [UiDensity; 3] {
+        [UiDensity::Compact, UiDensity::Cozy, UiDensity::Comfy]
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "compact" => Some(UiDensity::Compact),
+            "cozy" => Some(UiDensity::Cozy),
+            "comfy" => Some(UiDensity::Comfy),
+            _ => None,
+        }
     }
 }
 
@@ -439,6 +486,45 @@ pub struct ResizeDragSnapshot {
     pub container_size: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiagnosticScrollSample {
+    pub phase: &'static str,
+    pub elapsed_ms: f32,
+    pub duration_ms: f32,
+    pub start_x: f32,
+    pub start_y: f32,
+    pub scroll_x: f32,
+    pub scroll_y: f32,
+    pub target_x: f32,
+    pub target_y: f32,
+    pub velocity_y: f32,
+    pub progress_y: f32,
+}
+
+impl DiagnosticScrollSample {
+    fn from_telemetry(telemetry: &unshit::app::ScrollTelemetry) -> Self {
+        let phase = match telemetry.phase {
+            unshit::app::ScrollTelemetryPhase::Started => "started",
+            unshit::app::ScrollTelemetryPhase::Frame => "frame",
+            unshit::app::ScrollTelemetryPhase::Completed => "completed",
+            unshit::app::ScrollTelemetryPhase::Instant => "instant",
+        };
+        Self {
+            phase,
+            elapsed_ms: telemetry.elapsed_ms,
+            duration_ms: telemetry.duration_ms,
+            start_x: telemetry.start_x,
+            start_y: telemetry.start_y,
+            scroll_x: telemetry.scroll_x,
+            scroll_y: telemetry.scroll_y,
+            target_x: telemetry.target_x,
+            target_y: telemetry.target_y,
+            velocity_y: telemetry.velocity_y,
+            progress_y: telemetry.progress_y,
+        }
+    }
+}
+
 pub struct AppState {
     pub workspaces: Vec<Workspace>,
     pub active_workspace: usize,
@@ -449,7 +535,16 @@ pub struct AppState {
     pub settings_open: bool,
     pub settings_section: SettingsSection,
     pub theme: String,
-    pub font_size_pt: u32,
+    pub custom_theme: theme::CustomTheme,
+    /// Theme id that was last published to visible terminal grids. Empty
+    /// forces the first terminal route render to invalidate retained grid
+    /// paint, and settings renders deliberately do not update it.
+    pub last_terminal_theme_painted: String,
+    pub config_font_size_pt: u32,
+    pub terminal_font_size_pt: u32,
+    pub ui_density: UiDensity,
+    pub scroll_line_px: u32,
+    pub smooth_scroll_duration_ms: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
@@ -508,6 +603,9 @@ pub struct AppState {
     /// milliseconds. Kept as an integer so snapshot formatting owns the
     /// string representation.
     pub diagnostic_last_present_unix_ms: Option<u64>,
+    /// Recent smooth-scroll motion samples emitted by the framework while
+    /// diagnostics are enabled. Content-free: positions and timings only.
+    pub diagnostic_scroll_samples: VecDeque<DiagnosticScrollSample>,
     /// Recent PTY liveness observations. These are intentionally content-free:
     /// only event kind, pane/session identifiers, and byte counts are stored.
     pub diagnostic_pty_recent_events: VecDeque<String>,
@@ -535,6 +633,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn record_diagnostic_scroll_sample(&mut self, telemetry: &unshit::app::ScrollTelemetry) {
+        if matches!(telemetry.phase, unshit::app::ScrollTelemetryPhase::Started) {
+            self.diagnostic_scroll_samples.clear();
+        }
+        if self.diagnostic_scroll_samples.len() == DIAGNOSTIC_SCROLL_SAMPLE_LIMIT {
+            self.diagnostic_scroll_samples.pop_front();
+        }
+        self.diagnostic_scroll_samples
+            .push_back(DiagnosticScrollSample::from_telemetry(telemetry));
+    }
+
     /// Clone everything except the non-Clone PTY manager and terminals.
     /// UI builders call this to get a snapshot for rendering.
     pub fn ui_snapshot(&self) -> UiSnapshot {
@@ -608,7 +717,12 @@ impl AppState {
             settings_open: self.settings_open,
             settings_section: self.settings_section,
             theme: self.theme.clone(),
-            font_size_pt: self.font_size_pt,
+            custom_theme: self.custom_theme,
+            config_font_size_pt: self.config_font_size_pt,
+            terminal_font_size_pt: self.terminal_font_size_pt,
+            ui_density: self.ui_density,
+            scroll_line_px: self.scroll_line_px,
+            smooth_scroll_duration_ms: self.smooth_scroll_duration_ms,
             toggles: self.toggles.clone(),
             palette_open: self.palette_open,
             sidebar_collapsed: self.sidebar_collapsed,
@@ -633,6 +747,7 @@ impl AppState {
             active_terminal_rows,
             sessions: self.sessions.clone(),
             sessions_stale: self.sessions_stale,
+            diagnostic_scroll_samples: self.diagnostic_scroll_samples.iter().cloned().collect(),
             toasts: self
                 .toasts
                 .iter()
@@ -677,7 +792,12 @@ pub struct UiSnapshot {
     pub settings_open: bool,
     pub settings_section: SettingsSection,
     pub theme: String,
-    pub font_size_pt: u32,
+    pub custom_theme: theme::CustomTheme,
+    pub config_font_size_pt: u32,
+    pub terminal_font_size_pt: u32,
+    pub ui_density: UiDensity,
+    pub scroll_line_px: u32,
+    pub smooth_scroll_duration_ms: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
     pub sidebar_collapsed: bool,
@@ -716,6 +836,8 @@ pub struct UiSnapshot {
     /// Mirrors `AppState::sessions_stale`. `true` when the most recent
     /// `list_sessions` RPC failed and the cached rows may be stale.
     pub sessions_stale: bool,
+    /// Recent smooth-scroll samples from framework diagnostics.
+    pub diagnostic_scroll_samples: Vec<DiagnosticScrollSample>,
     /// Flat projection of the live `ToastStore`. Push order preserved.
     pub toasts: Vec<ToastView>,
     /// Mirror of `AppState::default_shell` so settings UI can render
@@ -856,8 +978,14 @@ pub fn seed_state() -> AppState {
         active_pane: PaneId(1),
         settings_open: false,
         settings_section: SettingsSection::Appearance,
-        theme: "amber".to_string(),
-        font_size_pt: 13,
+        theme: theme::default_theme_id().to_string(),
+        custom_theme: theme::default_custom_theme(),
+        last_terminal_theme_painted: String::new(),
+        config_font_size_pt: DEFAULT_CONFIG_FONT_SIZE_PT,
+        terminal_font_size_pt: DEFAULT_TERMINAL_FONT_SIZE_PT,
+        ui_density: DEFAULT_UI_DENSITY,
+        scroll_line_px: DEFAULT_SCROLL_LINE_PX,
+        smooth_scroll_duration_ms: DEFAULT_SMOOTH_SCROLL_DURATION_MS,
         toggles,
         palette_open: false,
         sidebar_collapsed: false,
@@ -889,6 +1017,7 @@ pub fn seed_state() -> AppState {
         sessions_stale: false,
         diagnostic_frame_counter: 0,
         diagnostic_last_present_unix_ms: None,
+        diagnostic_scroll_samples: VecDeque::new(),
         diagnostic_pty_recent_events: VecDeque::new(),
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
         toast_meta: BTreeMap::new(),
@@ -2080,9 +2209,133 @@ pub fn apply_ratio_delta(
     ratios[after_idx] = new_after;
 }
 
-pub fn mutate_font_size_delta(state: &mut AppState, delta: i32) {
-    let next = state.font_size_pt as i32 + delta;
-    state.font_size_pt = (next.clamp(MIN_FONT_SIZE as i32, MAX_FONT_SIZE as i32)) as u32;
+fn adjusted_font_size(current: u32, delta: i32) -> u32 {
+    let next = current as i32 + delta;
+    (next.clamp(MIN_FONT_SIZE as i32, MAX_FONT_SIZE as i32)) as u32
+}
+
+fn adjusted_scroll_value(current: u32, delta: i32, min: u32, max: u32) -> u32 {
+    let next = current as i32 + delta;
+    (next.clamp(min as i32, max as i32)) as u32
+}
+
+pub fn mutate_config_font_size_delta(state: &mut AppState, delta: i32) {
+    state.config_font_size_pt = adjusted_font_size(state.config_font_size_pt, delta);
+}
+
+pub fn mutate_terminal_font_size_delta(state: &mut AppState, delta: i32) {
+    let next = adjusted_font_size(state.terminal_font_size_pt, delta);
+    if next != state.terminal_font_size_pt {
+        state.terminal_font_size_pt = next;
+        sync_terminal_size_to_font_metrics(state);
+    }
+}
+
+pub fn mutate_ui_density(state: &mut AppState, density: UiDensity) -> bool {
+    if state.ui_density == density {
+        return false;
+    }
+    state.ui_density = density;
+    true
+}
+
+pub fn mutate_scroll_line_px_delta(state: &mut AppState, delta: i32) -> bool {
+    let next = adjusted_scroll_value(
+        state.scroll_line_px,
+        delta,
+        MIN_SCROLL_LINE_PX,
+        MAX_SCROLL_LINE_PX,
+    );
+    if next == state.scroll_line_px {
+        return false;
+    }
+    state.scroll_line_px = next;
+    true
+}
+
+pub fn mutate_smooth_scroll_duration_delta(state: &mut AppState, delta: i32) -> bool {
+    let next = adjusted_scroll_value(
+        state.smooth_scroll_duration_ms,
+        delta,
+        MIN_SMOOTH_SCROLL_DURATION_MS,
+        MAX_SMOOTH_SCROLL_DURATION_MS,
+    );
+    if next == state.smooth_scroll_duration_ms {
+        return false;
+    }
+    state.smooth_scroll_duration_ms = next;
+    true
+}
+
+pub fn mutate_theme(state: &mut AppState, theme_id: &str) -> bool {
+    let resolved = theme::resolve_theme_id(theme_id).to_string();
+    if state.theme == resolved {
+        return false;
+    }
+    state.theme = resolved;
+    true
+}
+
+pub fn mutate_custom_theme_color(
+    state: &mut AppState,
+    slot: theme::CustomThemeSlot,
+    raw_hex: &str,
+) -> bool {
+    let Some(color) = theme::parse_hex_color(raw_hex) else {
+        return false;
+    };
+    if theme::custom_theme_color(&state.custom_theme, slot) == color
+        && state.theme == theme::CUSTOM_THEME_ID
+    {
+        return false;
+    }
+    theme::set_custom_theme_color(&mut state.custom_theme, slot, color);
+    state.theme = theme::CUSTOM_THEME_ID.to_string();
+    state.last_terminal_theme_painted.clear();
+    true
+}
+
+pub fn reset_custom_theme(state: &mut AppState) -> bool {
+    let default = theme::default_custom_theme();
+    if state.custom_theme == default && state.theme == theme::CUSTOM_THEME_ID {
+        return false;
+    }
+    state.custom_theme = default;
+    state.theme = theme::CUSTOM_THEME_ID.to_string();
+    state.last_terminal_theme_painted.clear();
+    true
+}
+
+pub fn reset_appearance(state: &mut AppState) -> bool {
+    let changed = state.theme != theme::default_theme_id()
+        || state.custom_theme != theme::default_custom_theme()
+        || state.config_font_size_pt != DEFAULT_CONFIG_FONT_SIZE_PT
+        || state.terminal_font_size_pt != DEFAULT_TERMINAL_FONT_SIZE_PT
+        || state.ui_density != DEFAULT_UI_DENSITY
+        || state.scroll_line_px != DEFAULT_SCROLL_LINE_PX
+        || state.smooth_scroll_duration_ms != DEFAULT_SMOOTH_SCROLL_DURATION_MS;
+    state.theme = theme::default_theme_id().to_string();
+    state.custom_theme = theme::default_custom_theme();
+    state.config_font_size_pt = DEFAULT_CONFIG_FONT_SIZE_PT;
+    state.terminal_font_size_pt = DEFAULT_TERMINAL_FONT_SIZE_PT;
+    state.ui_density = DEFAULT_UI_DENSITY;
+    state.scroll_line_px = DEFAULT_SCROLL_LINE_PX;
+    state.smooth_scroll_duration_ms = DEFAULT_SMOOTH_SCROLL_DURATION_MS;
+    sync_terminal_size_to_font_metrics(state);
+    state.last_terminal_theme_painted.clear();
+    changed
+}
+
+pub fn take_terminal_theme_repaint_request(state: &mut AppState) -> bool {
+    if state.settings_open {
+        return false;
+    }
+    let resolved = theme::resolve_theme_id(&state.theme);
+    if state.last_terminal_theme_painted == resolved {
+        return false;
+    }
+    state.last_terminal_theme_painted = resolved.to_string();
+    true
 }
 
 /// Kill every daemon session tagged with the workspace at `ws_idx` and
@@ -2329,6 +2582,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             if state.settings_open {
                 state.settings_open = false;
+                state.keybinds.cancel_recording();
+                state.keybinds.error = None;
                 changed = true;
             }
             if state.confirm_dialog.is_some() {
@@ -2689,16 +2944,40 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             crate::persist::save_workspaces(state);
             true
         }
-        "font.inc" => {
-            let old = state.font_size_pt;
-            mutate_font_size_delta(state, 1);
-            old != state.font_size_pt
+        "font.inc" | "terminal_font.inc" => {
+            let old = state.terminal_font_size_pt;
+            mutate_terminal_font_size_delta(state, 1);
+            old != state.terminal_font_size_pt
         }
-        "font.dec" => {
-            let old = state.font_size_pt;
-            mutate_font_size_delta(state, -1);
-            old != state.font_size_pt
+        "font.dec" | "terminal_font.dec" => {
+            let old = state.terminal_font_size_pt;
+            mutate_terminal_font_size_delta(state, -1);
+            old != state.terminal_font_size_pt
         }
+        "config_font.inc" => {
+            let old = state.config_font_size_pt;
+            mutate_config_font_size_delta(state, 1);
+            old != state.config_font_size_pt
+        }
+        "config_font.dec" => {
+            let old = state.config_font_size_pt;
+            mutate_config_font_size_delta(state, -1);
+            old != state.config_font_size_pt
+        }
+        "scroll.line_px.inc" => mutate_scroll_line_px_delta(state, SCROLL_LINE_PX_STEP),
+        "scroll.line_px.dec" => mutate_scroll_line_px_delta(state, -SCROLL_LINE_PX_STEP),
+        "scroll.duration.inc" => {
+            mutate_smooth_scroll_duration_delta(state, SMOOTH_SCROLL_DURATION_STEP_MS)
+        }
+        "scroll.duration.dec" => {
+            mutate_smooth_scroll_duration_delta(state, -SMOOTH_SCROLL_DURATION_STEP_MS)
+        }
+        other if other.starts_with("appearance.density:") => {
+            let id = &other["appearance.density:".len()..];
+            UiDensity::from_id(id).is_some_and(|density| mutate_ui_density(state, density))
+        }
+        "theme.custom.reset" => reset_custom_theme(state),
+        "appearance.reset" => reset_appearance(state),
         "palette.toggle" => {
             state.palette_open = !state.palette_open;
             true
@@ -3458,6 +3737,32 @@ pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
     }
 }
 
+/// Re-publish terminal cell metrics and resize live PTYs after a terminal font
+/// size or display scale change. This uses the current measured width ratio as
+/// a fast estimate; the renderer will publish exact glyph metrics on paint.
+pub fn sync_terminal_size_to_font_metrics(state: &mut AppState) -> Option<(u16, u16)> {
+    let scale_factor = state.scale_factor.max(1e-3);
+    let font_size = state.terminal_font_size_pt as f32 * scale_factor;
+    let line_height = font_size * CSS_LINE_HEIGHT;
+    state.cell_width_ratio = measure_cell_width_ratio_at(font_size, line_height);
+    let (cell_w, cell_h) = pre_publish_cell_metrics(
+        state.terminal_font_size_pt,
+        scale_factor,
+        state.cell_width_ratio,
+    );
+    if state.last_grid_width <= 0.0 || state.last_grid_height <= 0.0 {
+        return None;
+    }
+    let (cols, rows) = compute_pty_dimensions(
+        state.last_grid_width,
+        state.last_grid_height,
+        cell_w,
+        cell_h,
+    );
+    resize_all_terminals(state, cols, rows);
+    Some((cols, rows))
+}
+
 /// Measure the actual monospace cell_width / font_size ratio using cosmic-text
 /// at a specific (DPI-scaled) font size. Because glyph hinting can produce
 /// different advance widths at different pixel sizes, the measurement must be
@@ -3500,8 +3805,8 @@ pub fn measure_cell_width_ratio_at(font_size: f32, line_height: f32) -> f32 {
 }
 
 /// Default terminal font-size in CSS px. Must match the `.terminal-content`
-/// fallback in assets/styles.css and the seeded `font_size_pt` value.
-pub const CSS_BASE_FONT_SIZE: f32 = 13.0;
+/// fallback in assets/styles.css and the seeded terminal font-size value.
+pub const CSS_BASE_FONT_SIZE: f32 = DEFAULT_TERMINAL_FONT_SIZE_PT as f32;
 
 /// CSS line-height for `.terminal-content`. Must match
 /// `.terminal-content { line-height: 1.25; }` in assets/styles.css.
@@ -3511,8 +3816,12 @@ pub const CSS_LINE_HEIGHT: f32 = 1.25;
 
 /// Pre-publish cell metrics to the global atomics so that `on_resize` handlers
 /// can compute correct PTY dimensions on the very first frame.
-pub fn pre_publish_cell_metrics(scale_factor: f32, cell_width_ratio: f32) -> (f32, f32) {
-    let font_size = CSS_BASE_FONT_SIZE * scale_factor;
+pub fn pre_publish_cell_metrics(
+    terminal_font_size_pt: u32,
+    scale_factor: f32,
+    cell_width_ratio: f32,
+) -> (f32, f32) {
+    let font_size = terminal_font_size_pt as f32 * scale_factor;
     let cell_w = font_size * cell_width_ratio;
     let cell_h = font_size * CSS_LINE_HEIGHT;
     unshit::core::cell_grid::CellGrid::publish_cell_metrics(cell_w, cell_h);
@@ -3588,8 +3897,14 @@ mod tests {
             active_pane: PaneId(1),
             settings_open: false,
             settings_section: SettingsSection::Appearance,
-            theme: "amber".to_string(),
-            font_size_pt: 13,
+            theme: crate::theme::default_theme_id().to_string(),
+            custom_theme: crate::theme::default_custom_theme(),
+            last_terminal_theme_painted: String::new(),
+            config_font_size_pt: DEFAULT_CONFIG_FONT_SIZE_PT,
+            terminal_font_size_pt: DEFAULT_TERMINAL_FONT_SIZE_PT,
+            ui_density: DEFAULT_UI_DENSITY,
+            scroll_line_px: DEFAULT_SCROLL_LINE_PX,
+            smooth_scroll_duration_ms: DEFAULT_SMOOTH_SCROLL_DURATION_MS,
             toggles: BTreeMap::new(),
             palette_open: false,
             sidebar_collapsed: false,
@@ -3619,6 +3934,7 @@ mod tests {
             sessions_stale: false,
             diagnostic_frame_counter: 0,
             diagnostic_last_present_unix_ms: None,
+            diagnostic_scroll_samples: VecDeque::new(),
             diagnostic_pty_recent_events: VecDeque::new(),
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
             toast_meta: BTreeMap::new(),
@@ -3942,35 +4258,74 @@ mod tests {
     // -- Font size ------------------------------------------------------------
 
     #[test]
-    fn font_size_increments() {
+    fn terminal_font_size_increments() {
         let mut state = test_state();
-        state.font_size_pt = 13;
-        mutate_font_size_delta(&mut state, 1);
-        assert_eq!(state.font_size_pt, 14);
+        state.terminal_font_size_pt = 13;
+        mutate_terminal_font_size_delta(&mut state, 1);
+        assert_eq!(state.terminal_font_size_pt, 14);
     }
 
     #[test]
-    fn font_size_clamps_at_max() {
+    fn terminal_font_size_clamps_at_max() {
         let mut state = test_state();
-        state.font_size_pt = MAX_FONT_SIZE;
-        mutate_font_size_delta(&mut state, 1);
-        assert_eq!(state.font_size_pt, MAX_FONT_SIZE);
+        state.terminal_font_size_pt = MAX_FONT_SIZE;
+        mutate_terminal_font_size_delta(&mut state, 1);
+        assert_eq!(state.terminal_font_size_pt, MAX_FONT_SIZE);
     }
 
     #[test]
-    fn font_size_clamps_at_min() {
+    fn terminal_font_size_clamps_at_min() {
         let mut state = test_state();
-        state.font_size_pt = MIN_FONT_SIZE;
-        mutate_font_size_delta(&mut state, -1);
-        assert_eq!(state.font_size_pt, MIN_FONT_SIZE);
+        state.terminal_font_size_pt = MIN_FONT_SIZE;
+        mutate_terminal_font_size_delta(&mut state, -1);
+        assert_eq!(state.terminal_font_size_pt, MIN_FONT_SIZE);
     }
 
     #[test]
-    fn font_size_large_delta_clamps() {
+    fn config_font_size_large_delta_clamps() {
         let mut state = test_state();
-        state.font_size_pt = 13;
-        mutate_font_size_delta(&mut state, 100);
-        assert_eq!(state.font_size_pt, MAX_FONT_SIZE);
+        state.config_font_size_pt = 13;
+        mutate_config_font_size_delta(&mut state, 100);
+        assert_eq!(state.config_font_size_pt, MAX_FONT_SIZE);
+    }
+
+    #[test]
+    fn scroll_line_px_delta_uses_step_and_clamps() {
+        let mut state = test_state();
+        state.scroll_line_px = DEFAULT_SCROLL_LINE_PX;
+        assert!(mutate_scroll_line_px_delta(&mut state, SCROLL_LINE_PX_STEP));
+        assert_eq!(state.scroll_line_px, DEFAULT_SCROLL_LINE_PX + 4);
+
+        state.scroll_line_px = MAX_SCROLL_LINE_PX;
+        assert!(!mutate_scroll_line_px_delta(
+            &mut state,
+            SCROLL_LINE_PX_STEP
+        ));
+        assert_eq!(state.scroll_line_px, MAX_SCROLL_LINE_PX);
+    }
+
+    #[test]
+    fn smooth_scroll_duration_delta_uses_step_and_clamps() {
+        let mut state = test_state();
+        state.smooth_scroll_duration_ms = DEFAULT_SMOOTH_SCROLL_DURATION_MS;
+        assert!(mutate_smooth_scroll_duration_delta(
+            &mut state,
+            -SMOOTH_SCROLL_DURATION_STEP_MS
+        ));
+        assert_eq!(
+            state.smooth_scroll_duration_ms,
+            DEFAULT_SMOOTH_SCROLL_DURATION_MS - 10
+        );
+
+        state.smooth_scroll_duration_ms = MIN_SMOOTH_SCROLL_DURATION_MS;
+        assert!(!mutate_smooth_scroll_duration_delta(
+            &mut state,
+            -SMOOTH_SCROLL_DURATION_STEP_MS
+        ));
+        assert_eq!(
+            state.smooth_scroll_duration_ms,
+            MIN_SMOOTH_SCROLL_DURATION_MS
+        );
     }
 
     // -- dispatch -------------------------------------------------------------
@@ -4125,6 +4480,61 @@ mod tests {
 
         // Closing again returns false (already closed)
         assert!(!dispatch(&mut state, "modal.close"));
+    }
+
+    #[test]
+    fn dispatch_modal_open_close_can_repeat_settings_route() {
+        let mut state = test_state();
+
+        assert!(dispatch(&mut state, "modal.open"));
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!state.settings_open);
+
+        assert!(dispatch(&mut state, "modal.open"));
+        assert!(state.settings_open);
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!state.settings_open);
+    }
+
+    #[test]
+    fn modal_close_clears_keybind_recording_state() {
+        let mut state = test_state();
+        state.settings_open = true;
+        state
+            .keybinds
+            .start_recording(crate::keybinds::KeybindAction::NewTerminal);
+        state.keybinds.error = Some(crate::keybinds::KeybindError {
+            action: crate::keybinds::KeybindAction::NewTerminal,
+            kind: crate::keybinds::KeybindErrorKind::InvalidCombo {
+                combo: "bad".to_string(),
+                message: "bad combo".to_string(),
+            },
+        });
+
+        assert!(dispatch(&mut state, "modal.close"));
+
+        assert!(!state.settings_open);
+        assert!(state.keybinds.recording.is_none());
+        assert!(state.keybinds.error.is_none());
+    }
+
+    #[test]
+    fn terminal_theme_repaint_request_waits_for_terminal_route() {
+        let mut state = test_state();
+        state.last_terminal_theme_painted = "amber".to_string();
+        state.theme = "dracula".to_string();
+        state.settings_open = true;
+
+        assert!(
+            !take_terminal_theme_repaint_request(&mut state),
+            "settings route should not consume terminal repaint request"
+        );
+        assert_eq!(state.last_terminal_theme_painted, "amber");
+
+        state.settings_open = false;
+        assert!(take_terminal_theme_repaint_request(&mut state));
+        assert_eq!(state.last_terminal_theme_painted, "dracula");
+        assert!(!take_terminal_theme_repaint_request(&mut state));
     }
 
     #[test]
@@ -4551,26 +4961,112 @@ mod tests {
     #[test]
     fn dispatch_font_inc_dec() {
         let mut state = test_state();
-        state.font_size_pt = 13;
+        state.terminal_font_size_pt = 13;
 
         assert!(dispatch(&mut state, "font.inc"));
-        assert_eq!(state.font_size_pt, 14);
+        assert_eq!(state.terminal_font_size_pt, 14);
 
         assert!(dispatch(&mut state, "font.dec"));
-        assert_eq!(state.font_size_pt, 13);
+        assert_eq!(state.terminal_font_size_pt, 13);
+    }
+
+    #[test]
+    fn dispatch_config_font_inc_dec() {
+        let mut state = test_state();
+        state.config_font_size_pt = 13;
+
+        assert!(dispatch(&mut state, "config_font.inc"));
+        assert_eq!(state.config_font_size_pt, 14);
+
+        assert!(dispatch(&mut state, "config_font.dec"));
+        assert_eq!(state.config_font_size_pt, 13);
+    }
+
+    #[test]
+    fn dispatch_scroll_tuning_inc_dec() {
+        let mut state = test_state();
+        state.scroll_line_px = DEFAULT_SCROLL_LINE_PX;
+        state.smooth_scroll_duration_ms = DEFAULT_SMOOTH_SCROLL_DURATION_MS;
+
+        assert!(dispatch(&mut state, "scroll.line_px.inc"));
+        assert_eq!(state.scroll_line_px, DEFAULT_SCROLL_LINE_PX + 4);
+        assert!(dispatch(&mut state, "scroll.line_px.dec"));
+        assert_eq!(state.scroll_line_px, DEFAULT_SCROLL_LINE_PX);
+
+        assert!(dispatch(&mut state, "scroll.duration.inc"));
+        assert_eq!(
+            state.smooth_scroll_duration_ms,
+            DEFAULT_SMOOTH_SCROLL_DURATION_MS + 10
+        );
+        assert!(dispatch(&mut state, "scroll.duration.dec"));
+        assert_eq!(
+            state.smooth_scroll_duration_ms,
+            DEFAULT_SMOOTH_SCROLL_DURATION_MS
+        );
+    }
+
+    #[test]
+    fn dispatch_density_updates_ui_density() {
+        let mut state = test_state();
+        assert_eq!(state.ui_density, DEFAULT_UI_DENSITY);
+
+        assert!(dispatch(&mut state, "appearance.density:compact"));
+        assert_eq!(state.ui_density, UiDensity::Compact);
+        assert!(!dispatch(&mut state, "appearance.density:compact"));
+        assert!(!dispatch(&mut state, "appearance.density:huge"));
+    }
+
+    #[test]
+    fn custom_theme_color_edit_selects_custom_theme() {
+        let mut state = test_state();
+        assert!(mutate_custom_theme_color(
+            &mut state,
+            crate::theme::CustomThemeSlot::Accent,
+            "#123456"
+        ));
+        assert_eq!(state.theme, crate::theme::CUSTOM_THEME_ID);
+        assert_eq!(
+            crate::theme::color_to_hex(state.custom_theme.accent),
+            "#123456"
+        );
+        assert!(state.last_terminal_theme_painted.is_empty());
+    }
+
+    #[test]
+    fn dispatch_appearance_reset_restores_theme_and_font_defaults() {
+        let mut state = test_state();
+        state.theme = crate::theme::CUSTOM_THEME_ID.to_string();
+        state.custom_theme.accent = unshit::core::style::types::Color::rgb(18, 52, 86);
+        state.config_font_size_pt = 18;
+        state.terminal_font_size_pt = 20;
+        state.ui_density = UiDensity::Comfy;
+        state.scroll_line_px = 96;
+        state.smooth_scroll_duration_ms = 160;
+
+        assert!(dispatch(&mut state, "appearance.reset"));
+        assert_eq!(state.theme, crate::theme::default_theme_id());
+        assert_eq!(state.custom_theme, crate::theme::default_custom_theme());
+        assert_eq!(state.config_font_size_pt, DEFAULT_CONFIG_FONT_SIZE_PT);
+        assert_eq!(state.terminal_font_size_pt, DEFAULT_TERMINAL_FONT_SIZE_PT);
+        assert_eq!(state.ui_density, DEFAULT_UI_DENSITY);
+        assert_eq!(state.scroll_line_px, DEFAULT_SCROLL_LINE_PX);
+        assert_eq!(
+            state.smooth_scroll_duration_ms,
+            DEFAULT_SMOOTH_SCROLL_DURATION_MS
+        );
     }
 
     #[test]
     fn dispatch_font_inc_at_max_returns_false() {
         let mut state = test_state();
-        state.font_size_pt = MAX_FONT_SIZE;
+        state.terminal_font_size_pt = MAX_FONT_SIZE;
         assert!(!dispatch(&mut state, "font.inc"));
     }
 
     #[test]
     fn dispatch_font_dec_at_min_returns_false() {
         let mut state = test_state();
-        state.font_size_pt = MIN_FONT_SIZE;
+        state.terminal_font_size_pt = MIN_FONT_SIZE;
         assert!(!dispatch(&mut state, "font.dec"));
     }
 
@@ -4588,6 +5084,7 @@ mod tests {
 
     #[test]
     fn dispatch_fps_overlay_toggle_flips_visibility_and_emit_flag() {
+        let _guard = crate::ui::fps_overlay::global_state_test_lock();
         // Reset to a known starting state since the overlay lives in
         // a process global. Both the visible flag and the FrameProbe
         // emit flag must move in lock step on every dispatch.
@@ -5475,13 +5972,21 @@ mod tests {
     #[test]
     fn ui_snapshot_copies_fields() {
         let mut state = test_state();
-        state.font_size_pt = 20;
+        state.config_font_size_pt = 15;
+        state.terminal_font_size_pt = 20;
+        state.scroll_line_px = 72;
+        state.smooth_scroll_duration_ms = 60;
         state.theme = "dracula".to_string();
+        state.custom_theme.accent = unshit::core::style::types::Color::rgb(18, 52, 86);
         state.sidebar_collapsed = true;
 
         let snap = state.ui_snapshot();
-        assert_eq!(snap.font_size_pt, 20);
+        assert_eq!(snap.config_font_size_pt, 15);
+        assert_eq!(snap.terminal_font_size_pt, 20);
+        assert_eq!(snap.scroll_line_px, 72);
+        assert_eq!(snap.smooth_scroll_duration_ms, 60);
         assert_eq!(snap.theme, "dracula");
+        assert_eq!(snap.custom_theme.accent, state.custom_theme.accent);
         assert!(snap.sidebar_collapsed);
     }
 
@@ -5495,7 +6000,14 @@ mod tests {
         assert_eq!(state.panes.len(), 1);
         assert_eq!(state.active_tab, 0);
         assert_eq!(state.active_workspace, 0);
-        assert_eq!(state.font_size_pt, 13);
+        assert_eq!(state.scroll_line_px, DEFAULT_SCROLL_LINE_PX);
+        assert_eq!(
+            state.smooth_scroll_duration_ms,
+            DEFAULT_SMOOTH_SCROLL_DURATION_MS
+        );
+        assert_eq!(state.config_font_size_pt, DEFAULT_CONFIG_FONT_SIZE_PT);
+        assert_eq!(state.terminal_font_size_pt, DEFAULT_TERMINAL_FONT_SIZE_PT);
+        assert_eq!(state.custom_theme, crate::theme::default_custom_theme());
         assert!(!state.settings_open);
         assert!(!state.sidebar_collapsed);
         assert!(!state.palette_open);
@@ -5507,12 +6019,12 @@ mod tests {
     fn mutate_with_applies_closure() {
         let shared: SharedState = std::sync::Arc::new(std::sync::Mutex::new(test_state()));
         let result = mutate_with(&shared, |st| {
-            st.font_size_pt = 25;
-            st.font_size_pt
+            st.terminal_font_size_pt = 25;
+            st.terminal_font_size_pt
         });
         assert_eq!(result, 25);
         let guard = shared.lock().unwrap();
-        assert_eq!(guard.font_size_pt, 25);
+        assert_eq!(guard.terminal_font_size_pt, 25);
     }
 
     // -- mutate_split_right ---------------------------------------------------
@@ -7408,7 +7920,7 @@ mod tests {
     fn pre_publish_sets_nonzero_global_metrics() {
         use unshit::core::cell_grid::CellGrid;
         CellGrid::publish_cell_metrics(0.0, 0.0);
-        let (cell_w, cell_h) = pre_publish_cell_metrics(1.0, 0.6);
+        let (cell_w, cell_h) = pre_publish_cell_metrics(DEFAULT_TERMINAL_FONT_SIZE_PT, 1.0, 0.6);
         assert!(cell_w > 0.0, "cell_w must be positive, got {}", cell_w);
         assert!(cell_h > 0.0, "cell_h must be positive, got {}", cell_h);
     }
@@ -7416,8 +7928,8 @@ mod tests {
     #[test]
     fn pre_publish_scales_with_dpi() {
         let ratio = 0.6_f32;
-        let (w1, h1) = pre_publish_cell_metrics(1.0, ratio);
-        let (w2, h2) = pre_publish_cell_metrics(2.0, ratio);
+        let (w1, h1) = pre_publish_cell_metrics(DEFAULT_TERMINAL_FONT_SIZE_PT, 1.0, ratio);
+        let (w2, h2) = pre_publish_cell_metrics(DEFAULT_TERMINAL_FONT_SIZE_PT, 2.0, ratio);
         assert!(
             (w2 - w1 * 2.0).abs() < 0.001_f32,
             "cell_w at 2x should be double: {} vs {}",
@@ -7469,7 +7981,7 @@ mod tests {
         // disagrees with the renderer, causing visible row-height gaps.
         let scale = 1.0_f32;
         let ratio = 0.6_f32;
-        let (_, cell_h) = pre_publish_cell_metrics(scale, ratio);
+        let (_, cell_h) = pre_publish_cell_metrics(DEFAULT_TERMINAL_FONT_SIZE_PT, scale, ratio);
         let expected = CSS_BASE_FONT_SIZE * scale * CSS_LINE_HEIGHT;
         assert!(
             (cell_h - expected).abs() < f32::EPSILON,
@@ -7483,7 +7995,7 @@ mod tests {
     fn default_terminal_font_size_matches_cell_metric_constant() {
         let state = seed_state();
         assert_eq!(
-            state.font_size_pt as f32, CSS_BASE_FONT_SIZE,
+            state.terminal_font_size_pt as f32, CSS_BASE_FONT_SIZE,
             "default terminal font size and initial cell metric estimate must stay in sync"
         );
     }

@@ -194,6 +194,7 @@ pub fn resolve_all_styles_with_transitions(
         if let Some(h) = element.resize_override_height {
             resolved_style.height = Dimension::Px(h);
         }
+        resolved_style.apply_font_size_scale();
 
         // If the new style declares transitions and we have a previous style to diff against,
         // start transitions for changed properties.
@@ -355,6 +356,7 @@ pub fn resolve_dirty_styles_with_transitions(
             if let Some(h) = element.resize_override_height {
                 resolved_style.height = Dimension::Px(h);
             }
+            resolved_style.apply_font_size_scale();
 
             // If the new style declares transitions and we have a previous style to diff against,
             // start transitions for changed properties.

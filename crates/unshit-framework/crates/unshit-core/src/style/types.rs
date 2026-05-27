@@ -990,6 +990,41 @@ pub enum ContentValue {
     Attr(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextTransform {
+    #[default]
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
+pub fn apply_text_transform(text: &str, transform: TextTransform) -> std::borrow::Cow<'_, str> {
+    match transform {
+        TextTransform::None => std::borrow::Cow::Borrowed(text),
+        TextTransform::Uppercase => std::borrow::Cow::Owned(text.to_ascii_uppercase()),
+        TextTransform::Lowercase => std::borrow::Cow::Owned(text.to_ascii_lowercase()),
+        TextTransform::Capitalize => {
+            let mut out = String::with_capacity(text.len());
+            let mut word_start = true;
+            for ch in text.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    if word_start {
+                        out.push(ch.to_ascii_uppercase());
+                        word_start = false;
+                    } else {
+                        out.push(ch);
+                    }
+                } else {
+                    out.push(ch);
+                    word_start = true;
+                }
+            }
+            std::borrow::Cow::Owned(out)
+        }
+    }
+}
+
 impl Default for ContentValue {
     fn default() -> Self {
         ContentValue::Normal
@@ -1087,11 +1122,18 @@ pub struct ComputedStyle {
     // Text
     pub color: Color,
     pub font_size: f32,
+    /// Inherited runtime text scale applied to explicit font-size declarations.
+    pub font_size_scale: f32,
+    /// True when `font_size` came from a declaration on this element rather
+    /// than from the parent. Used so inherited scaled text is not multiplied
+    /// again as the cascade walks down the tree.
+    pub font_size_explicit: bool,
     pub font_weight: FontWeight,
     pub font_family: String,
     pub line_height: f32,
     pub letter_spacing: f32,
     pub text_align: TextAlign,
+    pub text_transform: TextTransform,
     pub text_decoration: TextDecoration,
     pub text_decoration_color: Option<Color>,
     pub white_space: WhiteSpace,
@@ -1203,11 +1245,14 @@ impl Default for ComputedStyle {
             backdrop_filter: None,
             color: Color::BLACK,
             font_size: 16.0,
+            font_size_scale: 1.0,
+            font_size_explicit: true,
             font_weight: FontWeight::Normal,
             font_family: String::new(),
             line_height: 1.2,
             letter_spacing: 0.0,
             text_align: TextAlign::Left,
+            text_transform: TextTransform::None,
             text_decoration: TextDecoration::None,
             text_decoration_color: None,
             white_space: WhiteSpace::Normal,
@@ -1239,11 +1284,14 @@ impl ComputedStyle {
     pub fn inherit_from(&mut self, parent: &ComputedStyle) {
         self.color = parent.color;
         self.font_size = parent.font_size;
+        self.font_size_scale = parent.font_size_scale;
+        self.font_size_explicit = false;
         self.font_weight = parent.font_weight;
         self.font_family = parent.font_family.clone();
         self.line_height = parent.line_height;
         self.letter_spacing = parent.letter_spacing;
         self.text_align = parent.text_align;
+        self.text_transform = parent.text_transform;
         self.text_decoration = parent.text_decoration;
         self.text_decoration_color = parent.text_decoration_color;
         self.white_space = parent.white_space;
@@ -1544,6 +1592,16 @@ fn grid_placement_to_taffy(p: GridPlacement) -> taffy::GridPlacement {
 }
 
 impl ComputedStyle {
+    /// Apply the inherited runtime font scale once to this element's own
+    /// declared font size. Inherited font sizes are already effective values
+    /// from the parent and must not be multiplied again.
+    pub fn apply_font_size_scale(&mut self) {
+        if self.font_size_explicit {
+            self.font_size *= self.font_size_scale;
+        }
+        self.font_size_explicit = true;
+    }
+
     /// Scale all dimensional properties (sizes, spacing, fonts) by a factor.
     /// Used to convert logical CSS pixels to physical pixels for HiDPI displays.
     pub fn scale_by(&mut self, s: f32) {
@@ -1724,5 +1782,15 @@ mod tests {
         let style = ComputedStyle { align_self: AlignSelf::Center, ..Default::default() };
         let taffy_style = style.to_taffy_style(800.0, 600.0);
         assert_eq!(taffy_style.align_self, Some(taffy::AlignSelf::Center));
+    }
+
+    #[test]
+    fn text_transform_helpers_match_ascii_css_cases() {
+        assert_eq!(
+            apply_text_transform("settings · appearance", TextTransform::Uppercase),
+            "SETTINGS · APPEARANCE"
+        );
+        assert_eq!(apply_text_transform("SETTINGS", TextTransform::Lowercase), "settings");
+        assert_eq!(apply_text_transform("danger zone", TextTransform::Capitalize), "Danger Zone");
     }
 }

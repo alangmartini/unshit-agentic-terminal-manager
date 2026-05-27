@@ -353,15 +353,6 @@ fn scroll_up_only_damages_new_bottom_row_issue_62_non_regression() {
     assert_eq!(bottom.last_dirty_col, last_col);
 }
 
-fn assert_all_rows_fully_damaged(g: &CellGrid) {
-    let last_col = g.cols().saturating_sub(1) as u16;
-    for (row, ld) in g.line_damage().iter().enumerate() {
-        assert!(!ld.is_clean(), "row {row} must be damaged");
-        assert_eq!(ld.first_dirty_col, 0, "row {row} first_dirty_col");
-        assert_eq!(ld.last_dirty_col, last_col, "row {row} last_dirty_col");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // resize
 // ---------------------------------------------------------------------------

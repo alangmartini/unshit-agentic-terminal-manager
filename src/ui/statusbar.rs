@@ -3,11 +3,49 @@ use unshit::core::element::*;
 use crate::state::{TabStatus, UiSnapshot};
 
 pub fn build_statusbar(state: &UiSnapshot) -> ElementDef {
+    if state.settings_open {
+        return build_settings_statusbar(state);
+    }
+
     ElementDef::new(Tag::Div)
         .with_class("statusbar")
         .with_class("role-footer")
         .with_child(build_statusbar_left(state))
         .with_child(build_statusbar_right(state))
+}
+
+fn build_settings_statusbar(state: &UiSnapshot) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("statusbar")
+        .with_class("settings-statusbar")
+        .with_class("role-footer")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("statusbar-left")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("sb-cell")
+                        .with_class("sage")
+                        .with_text("ready"),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("sb-cell")
+                        .with_class("dim")
+                        .with_text(format!("theme: {}", state.theme)),
+                ),
+        )
+        .with_child(ElementDef::new(Tag::Span).with_class("sb-spacer"))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("statusbar-right")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("sb-cell")
+                        .with_class("amber")
+                        .with_text(state.settings_section.label()),
+                ),
+        )
 }
 
 fn build_statusbar_left(state: &UiSnapshot) -> ElementDef {
@@ -147,8 +185,13 @@ mod tests {
             active_pane: PaneId(1),
             settings_open: false,
             settings_section: SettingsSection::Appearance,
-            theme: "amber".into(),
-            font_size_pt: 13,
+            theme: crate::theme::default_theme_id().into(),
+            custom_theme: crate::theme::default_custom_theme(),
+            config_font_size_pt: crate::state::DEFAULT_CONFIG_FONT_SIZE_PT,
+            terminal_font_size_pt: crate::state::DEFAULT_TERMINAL_FONT_SIZE_PT,
+            ui_density: crate::state::DEFAULT_UI_DENSITY,
+            scroll_line_px: crate::state::DEFAULT_SCROLL_LINE_PX,
+            smooth_scroll_duration_ms: crate::state::DEFAULT_SMOOTH_SCROLL_DURATION_MS,
             toggles: BTreeMap::new(),
             palette_open: false,
             sidebar_collapsed: false,
@@ -163,6 +206,7 @@ mod tests {
             active_terminal_rows: 24,
             sessions: Vec::new(),
             sessions_stale: false,
+            diagnostic_scroll_samples: Vec::new(),
             toasts: Vec::new(),
             cpu_pct: 0.0,
             mem_gb: 0.0,
@@ -177,6 +221,17 @@ mod tests {
             default_shell: crate::shell::ShellSpec::default(),
             quick_prompt: None,
         }
+    }
+
+    fn collect_text(el: &ElementDef) -> String {
+        let mut out = String::new();
+        if let ElementContent::Text(text) = &el.content {
+            out.push_str(text);
+        }
+        for child in &el.children {
+            out.push_str(&collect_text(child));
+        }
+        out
     }
 
     #[test]
@@ -197,6 +252,24 @@ mod tests {
         let snap = snapshot_from_seed();
         let elem = build_statusbar(&snap);
         assert_eq!(elem.children.len(), 2);
+    }
+
+    #[test]
+    fn settings_statusbar_matches_theme_design_cells() {
+        let mut snap = minimal_snapshot();
+        snap.settings_open = true;
+        snap.settings_section = SettingsSection::Appearance;
+        snap.theme = "amber".into();
+
+        let elem = build_statusbar(&snap);
+
+        assert!(elem.classes.contains(&"settings-statusbar".to_string()));
+        assert_eq!(elem.children.len(), 3);
+        let left = &elem.children[0];
+        assert_eq!(collect_text(&left.children[0]), "ready");
+        assert_eq!(collect_text(&left.children[1]), "theme: amber");
+        let right = &elem.children[2];
+        assert_eq!(collect_text(&right.children[0]), "appearance");
     }
 
     #[test]

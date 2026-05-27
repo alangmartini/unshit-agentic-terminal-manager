@@ -12,6 +12,10 @@ pub fn build_titlebar(
     shared: &SharedState,
     window_events: Option<EventSink>,
 ) -> ElementDef {
+    if state.settings_open {
+        return build_settings_titlebar(state);
+    }
+
     let search_state = shared.clone();
     let sidebar_state = shared.clone();
     let settings_state = shared.clone();
@@ -190,11 +194,94 @@ pub fn build_titlebar(
         )
 }
 
+fn build_settings_titlebar(state: &UiSnapshot) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("titlebar")
+        .with_class("settings-titlebar")
+        .with_class("role-header")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("titlebar-left")
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("tm-traffic")
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("tl-dot")
+                                .with_class("tl-close"),
+                        )
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("tl-dot")
+                                .with_class("tl-min"),
+                        )
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("tl-dot")
+                                .with_class("tl-zoom"),
+                        ),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("brand")
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("brand-mark")
+                                .with_text("\u{25C6}"),
+                        )
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("brand-name")
+                                .with_child(ElementDef::new(Tag::Span).with_text("unshit"))
+                                .with_child(
+                                    ElementDef::new(Tag::Span).with_class("dot").with_text("."),
+                                )
+                                .with_child(
+                                    ElementDef::new(Tag::Span)
+                                        .with_class("brand-term")
+                                        .with_text("term"),
+                                ),
+                        ),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("settings-tb-breadcrumb")
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("settings-tb-crumb")
+                                .with_text("settings"),
+                        )
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("settings-tb-sep")
+                                .with_text("/"),
+                        )
+                        .with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("settings-tb-crumb")
+                                .with_class("active")
+                                .with_text(state.settings_section.label()),
+                        ),
+                ),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("titlebar-right")
+                .with_class("settings-titlebar-spacer")
+                .with_child(
+                    ElementDef::new(Tag::Button)
+                        .with_class("settings-titlebar-help")
+                        .with_child(svg_icon(icon_help())),
+                ),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{seed_state, SharedState};
+    use crate::state::{seed_state, SettingsSection, SharedState};
     use std::sync::{Arc, Mutex};
+    use unshit::core::style::types::{Background, Color};
     use unshit_test::TestHarness;
 
     fn test_shared() -> SharedState {
@@ -203,6 +290,17 @@ mod tests {
 
     fn test_snapshot() -> UiSnapshot {
         seed_state().ui_snapshot()
+    }
+
+    fn collect_text(el: &ElementDef) -> String {
+        let mut out = String::new();
+        if let ElementContent::Text(text) = &el.content {
+            out.push_str(text);
+        }
+        for child in &el.children {
+            out.push_str(&collect_text(child));
+        }
+        out
     }
 
     #[test]
@@ -415,5 +513,73 @@ mod tests {
 
         let close = harness.query(".win-close").expect("close button");
         assert_eq!(close.layout_rect.height, 34.0);
+    }
+
+    #[test]
+    fn settings_titlebar_matches_theme_design_chrome() {
+        let shared = test_shared();
+        let mut snap = test_snapshot();
+        snap.settings_open = true;
+        snap.settings_section = SettingsSection::Appearance;
+
+        let el = build_titlebar(&snap, &shared, None);
+
+        assert!(el.classes.contains(&"settings-titlebar".to_string()));
+        assert_eq!(el.children.len(), 2);
+        let left = &el.children[0];
+        assert!(left.children[0].classes.contains(&"tm-traffic".to_string()));
+        assert_eq!(left.children[0].children.len(), 3);
+        assert_eq!(collect_text(&left.children[1]), "\u{25C6}unshit.term");
+        assert!(left.children[1].children[1].children[2]
+            .classes
+            .contains(&"brand-term".to_string()));
+        let breadcrumb = &left.children[2];
+        assert!(breadcrumb
+            .classes
+            .contains(&"settings-tb-breadcrumb".to_string()));
+        assert_eq!(collect_text(&breadcrumb.children[0]), "settings");
+        assert_eq!(collect_text(&breadcrumb.children[1]), "/");
+        assert_eq!(collect_text(&breadcrumb.children[2]), "appearance");
+        assert!(el.children[1]
+            .classes
+            .contains(&"settings-titlebar-spacer".to_string()));
+        assert!(el.children[1].children[0]
+            .classes
+            .contains(&"settings-titlebar-help".to_string()));
+    }
+
+    #[test]
+    fn settings_titlebar_traffic_dots_resolve_round() {
+        let shared = test_shared();
+        let mut snap = test_snapshot();
+        snap.settings_open = true;
+        snap.settings_section = SettingsSection::Appearance;
+        let tree_shared = shared.clone();
+        let tree_snap = snap.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_child(build_titlebar(&tree_snap, &tree_shared, None)),
+            },
+            924.0,
+            540.0,
+        );
+        harness.step();
+
+        let dot = harness.query(".tl-dot").expect("traffic dot");
+        assert!(
+            dot.computed_style.border_radius.top_left >= 5.0,
+            "traffic dots should render round, got {:?}",
+            dot.computed_style.border_radius
+        );
+        assert_eq!(dot.computed_style.border_width.top, 0.0);
+        let close = harness.query(".tl-close").expect("close traffic dot");
+        assert_eq!(
+            close.computed_style.background,
+            Background::Color(Color::rgb(0xe3, 0x63, 0x63))
+        );
     }
 }

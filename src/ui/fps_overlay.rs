@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use serde_json::json;
 use unshit::app::FrameMetrics;
 use unshit::core::element::*;
 
@@ -35,6 +36,12 @@ pub struct FpsOverlayState {
     /// Rolling window of `total_us` samples in microseconds. The
     /// VecDeque lets eviction of the oldest sample be O(1).
     pub samples_us: VecDeque<u64>,
+    /// Monotonic counter incremented every time frame metrics are recorded.
+    pub recorded_generation: u64,
+    /// Monotonic counter incremented every time the visible overlay is built.
+    pub rendered_generation: u64,
+    /// Sample count shown by the most recent visible overlay build.
+    pub rendered_sample_count: u32,
     /// Wall-clock instant of the last recorded frame. Used to compute
     /// the window-based current fps without a system clock call inside
     /// the renderer.
@@ -47,6 +54,9 @@ impl FpsOverlayState {
             visible: false,
             last: FrameMetrics::default(),
             samples_us: VecDeque::with_capacity(WINDOW_CAPACITY),
+            recorded_generation: 0,
+            rendered_generation: 0,
+            rendered_sample_count: 0,
             last_frame_at: None,
         }
     }
@@ -61,6 +71,7 @@ impl FpsOverlayState {
         self.samples_us.push_back(metrics.total_us);
         self.last = metrics.clone();
         self.last_frame_at = Some(now);
+        self.recorded_generation = self.recorded_generation.saturating_add(1);
     }
 
     /// Quantile snapshot from the current window. Returns zeros for an
@@ -118,13 +129,24 @@ fn state() -> &'static Mutex<FpsOverlayState> {
     STATE.get_or_init(|| Mutex::new(FpsOverlayState::new()))
 }
 
+#[cfg(test)]
+static GLOBAL_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_STATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 /// Called from the framework's `on_frame_metrics` callback every
 /// rendered frame. Cheap enough to run unconditionally: a single mutex
 /// acquisition, a clone of `FrameMetrics`, and a ring buffer push. The
 /// overlay reads from this same state when it builds.
-pub fn record_frame(metrics: &FrameMetrics) {
+pub fn record_frame(metrics: &FrameMetrics) -> bool {
     let mut s = state().lock().unwrap_or_else(|p| p.into_inner());
     s.record(metrics, Instant::now());
+    s.visible
 }
 
 /// Flip the overlay's visibility. Returns the new value. Side effect:
@@ -143,6 +165,26 @@ pub fn toggle_visible() -> bool {
 /// keep the lock during element construction.
 pub fn snapshot() -> FpsOverlayState {
     state().lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+fn mark_rendered(sample_count: u32) {
+    let mut s = state().lock().unwrap_or_else(|p| p.into_inner());
+    s.rendered_generation = s.rendered_generation.saturating_add(1);
+    s.rendered_sample_count = sample_count;
+}
+
+pub fn diagnostic_json() -> serde_json::Value {
+    let snap = snapshot();
+    let q = snap.quantiles();
+    json!({
+        "visible": snap.visible,
+        "recorded_generation": snap.recorded_generation,
+        "rendered_generation": snap.rendered_generation,
+        "recorded_sample_count": q.count,
+        "rendered_sample_count": snap.rendered_sample_count,
+        "current_fps": snap.current_fps(),
+        "last_total_us": snap.last.total_us,
+    })
 }
 
 /// Format a microsecond duration for the overlay. Sub millisecond
@@ -166,6 +208,7 @@ pub fn build_fps_overlay() -> ElementDef {
     }
 
     let q = snap.quantiles();
+    mark_rendered(q.count);
     let fps = snap.current_fps();
     let m = &snap.last;
 
@@ -236,14 +279,6 @@ pub(crate) fn reset_for_test() {
 mod tests {
     use super::*;
 
-    static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        GLOBAL_STATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
-
     fn metrics_with(total_us: u64) -> FrameMetrics {
         FrameMetrics {
             total_us,
@@ -272,6 +307,7 @@ mod tests {
         s.record(&metrics_with(8_333), Instant::now());
         assert_eq!(s.samples_us.len(), 1);
         assert_eq!(s.last.total_us, 8_333);
+        assert_eq!(s.recorded_generation, 1);
     }
 
     #[test]
@@ -360,6 +396,9 @@ mod tests {
             ..FrameMetrics::default()
         });
         let el = build_fps_overlay();
+        let diagnostic = diagnostic_json();
+        assert_eq!(diagnostic["rendered_generation"], 1);
+        assert_eq!(diagnostic["rendered_sample_count"], 1);
         assert!(el.classes.iter().any(|c| c == "fps-overlay"));
         let row_count = el
             .children
@@ -381,10 +420,35 @@ mod tests {
     fn record_frame_module_function_updates_global_state() {
         let _guard = global_state_test_lock();
         reset_for_test();
-        record_frame(&metrics_with(4_000));
+        assert!(!record_frame(&metrics_with(4_000)));
         let snap = snapshot();
         assert_eq!(snap.last.total_us, 4_000);
         assert_eq!(snap.samples_us.len(), 1);
+        reset_for_test();
+    }
+
+    #[test]
+    fn record_frame_returns_visible_state_for_rebuild_driver() {
+        let _guard = global_state_test_lock();
+        reset_for_test();
+        toggle_visible();
+        assert!(record_frame(&metrics_with(4_000)));
+        reset_for_test();
+    }
+
+    #[test]
+    fn diagnostic_json_exposes_overlay_counters() {
+        let _guard = global_state_test_lock();
+        reset_for_test();
+        toggle_visible();
+        record_frame(&metrics_with(4_000));
+        build_fps_overlay();
+        let diagnostic = diagnostic_json();
+        assert_eq!(diagnostic["visible"], true);
+        assert_eq!(diagnostic["recorded_generation"], 1);
+        assert_eq!(diagnostic["rendered_generation"], 1);
+        assert_eq!(diagnostic["recorded_sample_count"], 1);
+        assert_eq!(diagnostic["rendered_sample_count"], 1);
         reset_for_test();
     }
 }
