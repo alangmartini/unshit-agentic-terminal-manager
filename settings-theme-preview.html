@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Settings Theme Preview</title>
+  <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+  <div id="app" class="app settings theme-amber">
+    <div class="titlebar">
+      <div class="titlebar-left">
+        <div class="tm-traffic">
+          <span class="tl-dot tl-close"></span>
+          <span class="tl-dot tl-min"></span>
+          <span class="tl-dot tl-zoom"></span>
+        </div>
+        <div class="brand">
+          <span class="brand-mark">&#9670;</span>
+          <span class="brand-name">unshit<span class="dot">.</span>term</span>
+        </div>
+        <div class="titlebar-breadcrumb">
+          <span class="crumb">settings</span>
+          <span class="sep">/</span>
+          <span class="crumb active">appearance</span>
+        </div>
+      </div>
+      <div class="titlebar-right">
+        <button class="icon-btn tight" type="button" aria-label="Preview button">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10M8 3v10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="settings-page" id="settings-page">
+      <div class="set-page-rail">
+        <div class="set-page-rail-head">
+          <span class="title">settings</span>
+          <span class="sub">v0.1.0</span>
+        </div>
+        <div class="set-page-search">
+          <div>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m10.5 10.5 3 3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          </div>
+          <input class="set-page-search-input" placeholder="find a setting...">
+          <span class="kbd">Ctrl F</span>
+        </div>
+        <div class="set-page-nav">
+          <div class="group">workspace</div>
+          <button class="set-page-nav-item active" type="button">
+            <div><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h4v4H3zM9 3h4v4H9zM3 9h4v4H3zM9 9h4v4H9z" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></div>
+            <span>Appearance</span>
+          </button>
+          <button class="set-page-nav-item" type="button">
+            <div><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4.5h11v7h-11zM4.5 6.5l2 1.5-2 1.5M7.5 10h3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+            <span>Shell</span>
+          </button>
+          <button class="set-page-nav-item" type="button">
+            <div><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 5.5h4l1.2 1.4h5.8v5.1h-11z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg></div>
+            <span>Sessions</span>
+          </button>
+          <div class="group">automation</div>
+          <button class="set-page-nav-item" type="button">
+            <div><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5 4 4 4-4 4M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+            <span>Keybinds</span>
+          </button>
+          <button class="set-page-nav-item" type="button">
+            <div><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5c2.5 0 4 1.5 4 4v2.4l1 1.6H3l1-1.6V6.5c0-2.5 1.5-4 4-4zM6.7 12.2h2.6" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+            <span>Notifications</span>
+          </button>
+          <button class="set-page-nav-item" type="button">
+            <div><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 4.5 7 7M11.5 4.5l-7 7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></div>
+            <span>Danger Zone</span>
+          </button>
+        </div>
+        <div class="set-page-foot">
+          <span class="dot status-running"></span>
+          <span>ptyd up</span>
+        </div>
+      </div>
+
+      <div class="set-page-content">
+        <div class="set-page-header">
+          <div class="crumb">settings &middot; Appearance</div>
+          <div class="page-title">Appearance</div>
+          <div class="blurb">Themes, font sizes, sidebar width, preview.</div>
+        </div>
+
+        <div class="set-page-body" style="width: 100%; max-width: 920px;">
+          <div class="set-page-section">
+            <div class="set-card" style="width: 100%;">
+              <div class="set-card-head">
+                <span class="name">appearance</span>
+              </div>
+              <div class="setting-row set-field theme-field">
+                <div class="setting-meta">
+                  <div class="set-label">Theme</div>
+                  <div class="set-desc">Choose an appearance preset.</div>
+                </div>
+                <div class="set-control">
+                  <div class="theme-picker">
+                    <button class="theme-chip amber active" type="button" data-theme="amber">
+                      <div class="theme-chip-main theme-chip-screen" style="background:#29231a;border-bottom-color:#241e15;">
+                        <span class="tcs-glyph" style="color:#d4a348;">&#10095;</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#ebdcb6;">Amber</div>
+                          <div class="tcs-sub" style="color:#857149;">ember on walnut &middot; default</div>
+                        </div>
+                        <span class="theme-chip-pin" style="background:#d4a348;color:#1c1812;">&#10003;</span>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#d4a348;"></span><span style="background:#8ba85c;"></span><span style="background:#c9553a;"></span><span style="background:#6aa2ad;"></span><span style="background:#a88bb8;"></span></div>
+                    </button>
+                    <button class="theme-chip catppuccin" type="button" data-theme="catppuccin">
+                      <div class="theme-chip-main theme-chip-screen" style="background:#313244;border-bottom-color:#11111b;">
+                        <span class="tcs-glyph" style="color:#cba6f7;">&#10095;</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#cdd6f4;">Catppuccin</div>
+                          <div class="tcs-sub" style="color:#a6adc8;">mocha &middot; soothing pastels</div>
+                        </div>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#cba6f7;"></span><span style="background:#a6e3a1;"></span><span style="background:#f38ba8;"></span><span style="background:#89b4fa;"></span><span style="background:#fab387;"></span></div>
+                    </button>
+                    <button class="theme-chip tokyo-night" type="button" data-theme="tokyo-night">
+                      <div class="theme-chip-main theme-chip-screen" style="background:#24283b;border-bottom-color:#16161e;">
+                        <span class="tcs-glyph" style="color:#7aa2f7;">&#10095;</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#c0caf5;">Tokyo Night</div>
+                          <div class="tcs-sub" style="color:#9aa5ce;">neon-lit nightscape</div>
+                        </div>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#7aa2f7;"></span><span style="background:#9ece6a;"></span><span style="background:#f7768e;"></span><span style="background:#7dcfff;"></span><span style="background:#bb9af7;"></span></div>
+                    </button>
+                    <button class="theme-chip nord" type="button" data-theme="nord">
+                      <div class="theme-chip-main theme-chip-screen" style="background:#434c5e;border-bottom-color:#2e3440;">
+                        <span class="tcs-glyph" style="color:#88c0d0;">&#10095;</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#eceff4;">Nord</div>
+                          <div class="tcs-sub" style="color:#d8dee9;">arctic &middot; frost and aurora</div>
+                        </div>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#88c0d0;"></span><span style="background:#a3be8c;"></span><span style="background:#bf616a;"></span><span style="background:#81a1c1;"></span><span style="background:#b48ead;"></span></div>
+                    </button>
+                    <button class="theme-chip dracula" type="button" data-theme="dracula">
+                      <div class="theme-chip-main theme-chip-screen" style="background:#343746;border-bottom-color:#191a21;">
+                        <span class="tcs-glyph" style="color:#bd93f9;">&#10095;</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#f8f8f2;">Dracula</div>
+                          <div class="tcs-sub" style="color:#a7adc8;">high contrast &middot; neon vampire</div>
+                        </div>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#bd93f9;"></span><span style="background:#50fa7b;"></span><span style="background:#ff5555;"></span><span style="background:#8be9fd;"></span><span style="background:#ff79c6;"></span></div>
+                    </button>
+                    <button class="theme-chip everforest" type="button" data-theme="everforest">
+                      <div class="theme-chip-main theme-chip-screen" style="background:#3d484d;border-bottom-color:#232a2e;">
+                        <span class="tcs-glyph" style="color:#a7c080;">&#10095;</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#d3c6aa;">Everforest</div>
+                          <div class="tcs-sub" style="color:#9da9a0;">dark hard &middot; mossy forest</div>
+                        </div>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#a7c080;"></span><span style="background:#e67e80;"></span><span style="background:#7fbbb3;"></span><span style="background:#dbbc7f;"></span><span style="background:#d699b6;"></span></div>
+                    </button>
+                    <button class="theme-chip rose-pine" type="button" data-theme="rose-pine">
+                      <div class="theme-chip-main theme-chip-screen" style="background:#393552;border-bottom-color:#191724;">
+                        <span class="tcs-glyph" style="color:#c4a7e7;">&#10095;</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#e0def4;">Rose Pine</div>
+                          <div class="tcs-sub" style="color:#908caa;">soho cottage &middot; all natural</div>
+                        </div>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#ebbcba;"></span><span style="background:#c4a7e7;"></span><span style="background:#eb6f92;"></span><span style="background:#9ccfd8;"></span><span style="background:#f6c177;"></span></div>
+                    </button>
+                    <button class="theme-chip gruvbox" type="button" data-theme="gruvbox">
+                      <div class="theme-chip-main theme-chip-screen" style="background:#3c3836;border-bottom-color:#232527;">
+                        <span class="tcs-glyph" style="color:#fabd2f;">&#10095;</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#ebdbb2;">Gruvbox</div>
+                          <div class="tcs-sub" style="color:#a89984;">retro warm &middot; dark hard</div>
+                        </div>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#fabd2f;"></span><span style="background:#b8bb26;"></span><span style="background:#fb4934;"></span><span style="background:#83a598;"></span><span style="background:#fe8019;"></span></div>
+                    </button>
+                    <button class="theme-chip kanagawa" type="button" data-theme="kanagawa">
+                      <div class="theme-chip-main theme-chip-screen" style="background:#363646;border-bottom-color:#1a1a22;">
+                        <span class="tcs-glyph" style="color:#7e9cd8;">&#10095;</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#dcd7ba;">Kanagawa</div>
+                          <div class="tcs-sub" style="color:#a6a69c;">the great wave &middot; muted ink</div>
+                        </div>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#7e9cd8;"></span><span style="background:#98bb6c;"></span><span style="background:#e46876;"></span><span style="background:#7fb4ca;"></span><span style="background:#957fb8;"></span></div>
+                    </button>
+                    <button class="theme-chip custom" type="button" data-theme="custom">
+                      <div class="theme-chip-main theme-chip-screen" style="background:linear-gradient(135deg,#7dd3fc 0%,#a5f3fc 100%);border-bottom-color:#101a25;">
+                        <span class="tcs-glyph" style="color:#7dd3fc;">+</span>
+                        <div class="theme-chip-copy">
+                          <div class="tcs-name" style="color:#e6edf3;">Custom</div>
+                          <div class="tcs-sub" style="color:#8ea4b3;">pick your own</div>
+                        </div>
+                      </div>
+                      <div class="theme-chip-foot"><span style="background:#7dd3fc;"></span><span style="background:#a5f3fc;"></span><span style="background:#0e1620;"></span><span style="background:#e6edf3;"></span><span style="background:#16202c;"></span></div>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-card" style="width: 100%;">
+              <div class="set-card-head">
+                <span class="name">interface</span>
+              </div>
+              <div class="setting-row set-field">
+                <div class="setting-meta">
+                  <div class="set-label">Config font size</div>
+                  <div class="set-desc">Settings and app chrome text size in points.</div>
+                </div>
+                <div class="set-control">
+                  <div class="stepper">
+                    <button class="stepper-btn" type="button">&minus;</button>
+                    <span class="stepper-val tnum">12</span>
+                    <button class="stepper-btn" type="button">+</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-card" style="width: 100%;">
+              <div class="set-card-head">
+                <span class="name">terminal</span>
+              </div>
+              <div class="setting-row set-field">
+                <div class="setting-meta">
+                  <div class="set-label">Terminal font size</div>
+                  <div class="set-desc">Terminal output size in points.</div>
+                </div>
+                <div class="set-control">
+                  <div class="stepper">
+                    <button class="stepper-btn" type="button">&minus;</button>
+                    <span class="stepper-val tnum">12</span>
+                    <button class="stepper-btn" type="button">+</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-card" style="width: 100%;">
+              <div class="set-card-head">
+                <span class="name">layout</span>
+              </div>
+              <div class="setting-row set-field">
+                <div class="setting-meta">
+                  <div class="set-label">Sidebar width</div>
+                  <div class="set-desc">Width of the workspace sidebar.</div>
+                </div>
+                <div class="set-control">
+                  <div class="set-inline-control">
+                    <div class="input-text input-num">252</div>
+                    <span class="set-unit">px</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-card" style="width: 100%;">
+              <div class="set-card-head">
+                <span class="name">preview</span>
+              </div>
+              <div class="preview-tile">
+                <div class="preview-line"><span class="prompt">&rsaquo; </span><span class="path">~/code/main/dashboard </span><span class="branch">(main)</span></div>
+                <div class="preview-line"><span class="prompt">&rsaquo; </span><span class="cmd">npm run dev</span></div>
+                <div class="preview-line"><span class="azure">&rarr; vite v5.4.0 ready in 312 ms</span></div>
+                <div class="preview-line"><span class="sage">&#10003; recompiled in 84ms</span></div>
+                <div class="preview-line"><span class="rust">&#10007; src/lib/format.test.ts (2)</span></div>
+                <div class="preview-line"><span class="muted">  expected 42 to be 41</span></div>
+                <div class="preview-line"><span class="prompt">&rsaquo; </span><span class="cur"></span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="set-page-savebar">
+            <span class="saved">changes apply immediately</span>
+            <span class="spacer"></span>
+            <button class="btn ghost" type="button">close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="statusbar">
+      <div class="statusbar-left">
+        <span class="sb-cell sage">ready</span>
+        <span class="sb-cell dim">theme preview</span>
+      </div>
+      <span class="sb-spacer"></span>
+      <div class="statusbar-right">
+        <span class="sb-cell amber">Appearance</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const app = document.getElementById("app");
+    const chips = [...document.querySelectorAll(".theme-chip[data-theme]")];
+
+    chips.forEach((chip) => {
+      chip.addEventListener("click", () => {
+        const theme = chip.dataset.theme;
+        app.className = `app settings theme-${theme}`;
+        chips.forEach((candidate) => {
+          candidate.classList.toggle("active", candidate === chip);
+          candidate.querySelector(".theme-chip-pin")?.remove();
+        });
+        const pin = document.createElement("span");
+        const styles = getComputedStyle(chip);
+        pin.className = "theme-chip-pin";
+        pin.textContent = "✓";
+        pin.style.background = styles.getPropertyValue("--theme-chip-accent").trim() || "#d4a348";
+        pin.style.color = getComputedStyle(app).getPropertyValue("--accent-on").trim() || "#1c1812";
+        chip.querySelector(".theme-chip-screen")?.appendChild(pin);
+      });
+    });
+  </script>
+</body>
+</html>

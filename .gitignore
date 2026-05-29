@@ -1,4 +1,5 @@
 /target
+target-codex/
 Cargo.lock
 *.swp
 *.swo
@@ -9,6 +10,8 @@ prototype/
 .omx/
 bench*.json
 artifacts/
+.codex/
+*.remoteapp.rdp
 .claude/*
 !.claude/skills/
 !.claude/commands/

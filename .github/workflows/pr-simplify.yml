@@ -26,6 +26,9 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      # Codex sandbox may run cargo; keep its writes off the developer's
+      # ~/.cargo (see pr-review.yml for the multi-incident root-cause note).
+      CARGO_HOME: C:\Users\Alan Beelink\actions-runner\.cargo-runner
 
     steps:
       - name: Add Codex CLI to PATH
@@ -144,25 +147,60 @@ jobs:
         run: |
           $before = git rev-parse HEAD
           $prompt = @'
-            Run the code-simplification and code-review-and-quality passes for PR #${{ github.event.pull_request.number }}.
+            Run two passes for PR #${{ github.event.pull_request.number }}:
+            1. Behavior-preserving simplification of code touched by this PR.
+            2. A thermo-nuclear code quality review (directives below).
 
-            Scope:
+            Scope (applies to both passes):
             - Compare this PR branch against `${{ github.event.pull_request.base.ref }}`.
-            - Simplify and review only code touched by this PR, plus directly adjacent helper code when needed.
+            - Touch only code introduced or modified by this PR, plus directly adjacent helper code when restructuring requires it.
             - Preserve behavior exactly. Do not add features.
             - Do not touch generated artifacts, target directories, or unrelated files.
-            - Review for correctness, simplicity/readability, architecture, security, performance, and missing tests.
             - Do not repair pre-existing CI-only formatting, clippy, or test failures. The PR Quality Gate repair job owns failing checks.
 
-            If useful simplifications exist:
-            - Apply the smallest behavior-preserving edits.
+            ## Pass 1 - Behavior-preserving simplification
+
+            Apply the smallest behavior-preserving edits that meaningfully reduce complexity in the diff.
+
+            ## Pass 2 - Thermo-nuclear code quality review
+
+            Adapted from `cursor/plugins` `thermo-nuclear-code-quality-review` skill.
+
+            Perform a deep code quality audit of this PR's changes. Rethink how to structure / implement the changes to meaningfully improve code quality without impacting behavior. Work to improve abstractions, modularity, reduce spaghetti code, improve succinctness and legibility. Be ambitious - if there is a clear path to improving the implementation that involves restructuring some of the codebase, go for it. Be extremely thorough and rigorous. Measure twice, cut once.
+
+            Non-negotiable standards:
+            0. Be ambitious about structural simplification. Look for "code judo" moves that delete whole branches, helpers, modes, conditionals, or layers - not just rearrange them. Prefer the solution that makes the code feel inevitable in hindsight.
+            1. Do not let this PR push a file from under 1000 lines to over 1000 lines without a very strong reason. Prefer extracting helpers, subcomponents, modules, or local abstractions. If the diff crosses that threshold, explicitly ask whether the code should be decomposed first.
+            2. Reject random spaghetti growth in existing code. Be highly suspicious of new ad-hoc conditionals, scattered special cases, or one-off branches inserted into unrelated flows. Push the logic into a dedicated abstraction, helper, state machine, policy object, or separate module instead of tangling an existing path.
+            3. Bias toward cleaning the design, not just accepting working code. Strongly prefer simplifications that remove moving pieces altogether over refactors that merely spread the same complexity around.
+            4. Prefer direct, boring, maintainable code over hacky or magical code. Flag thin abstractions, identity wrappers, or pass-through helpers that add indirection without buying clarity.
+            5. Push hard on type and boundary cleanliness when they affect maintainability. Question unnecessary optionality, casts, or silent fallbacks that paper over unclear invariants.
+            6. Keep logic in the canonical layer and reuse existing helpers. Call out feature logic leaking into shared paths or implementation details leaking through APIs.
+            7. Treat unnecessary sequential orchestration and non-atomic updates as design smells when a cleaner structure is obvious.
+
+            For every meaningful change, ask:
+            - Is there a "code judo" move that would make this dramatically simpler?
+            - Can this change be reframed so fewer concepts, branches, or helper layers are needed?
+            - Did the diff add branching complexity where a better abstraction should exist?
+            - Did this change enlarge a file or component past a healthy size boundary?
+            - Are there repeated conditionals that signal a missing model or missing helper?
+            - Is this abstraction actually earning its keep, or is it just a wrapper?
+            - Is this logic living in the canonical layer, or did the diff leak details across a boundary?
+
+            Prioritize findings in this order: structural regressions, missed dramatic simplifications, spaghetti/branching growth, boundary/abstraction/type-contract problems, file-size/decomposition concerns, modularity/abstraction issues, legibility. Do not flood the review with low-value nits; prefer a small number of high-conviction comments. Do not approve merely because behavior seems correct.
+
+            ## Action rules (apply to both passes)
+
+            If useful simplifications or actionable thermo-nuclear restructurings exist that you can apply safely:
+            - Make the smallest edits that capture the win.
             - Run the smallest relevant verification. For Rust code, include `cargo fmt --check` and `cargo clippy -- -D warnings`; run focused tests or `cargo test --all` when the change is broad.
-            - Commit with message `refactor: simplify PR changes [agent-simplify]`.
+            - Commit with message `refactor: simplify PR changes [agent-simplify]` for behavior-preserving simplifications, or `fix: address agentic review findings [agent-simplify]` for review-driven fixes.
             - Push to this PR branch.
 
-            If required review findings exist:
-            - If you can safely fix them within this PR scope, make the smallest fix, run relevant verification, commit with message `fix: address agentic review findings [agent-simplify]`, and push.
-            - If you cannot safely fix them, leave the tree unchanged, comment on the PR with the required findings and verification status, and exit non-zero so this workflow does not approve the PR.
+            If required review findings exist that you cannot safely fix within this PR scope:
+            - Leave the tree unchanged.
+            - Comment on the PR with the required findings (structural regressions, missed code-judo moves, spaghetti growth, boundary leaks, file-size explosions, etc.) and verification status.
+            - Exit non-zero so this workflow does not approve the PR.
 
             If no useful simplification and no required review findings exist:
             - Leave the tree unchanged.
@@ -219,7 +257,7 @@ jobs:
           }
           $body = @{
             event = "APPROVE"
-            body = "Agentic simplify and review found no required changes."
+            body = "Agentic simplify + thermo-nuclear code quality review found no required changes."
           } | ConvertTo-Json
           $uri = "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews"
           Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body -ContentType "application/json"

@@ -23,6 +23,12 @@ jobs:
     timeout-minutes: 20
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
+      # Self-hosted runner shares $USERPROFILE with the developer. Without
+      # this redirect, Swatinem/rust-cache@v2 wipes ~/.cargo/bin on cache
+      # restore, deleting the dev box's rustup proxy shims every PR run
+      # (4-incident streak May 5-13, 2026, root-caused via NTFS audit on
+      # ~/.cargo/bin and ~/.rustup -- see unshit-test-framework/scripts/).
+      CARGO_HOME: C:\Users\Alan Beelink\actions-runner\.cargo-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -64,6 +70,10 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      # Same rationale as rust-checks: keep cargo state off the developer's
+      # ~/.cargo. Codex runs with --sandbox danger-full-access, so any cargo
+      # install it triggers would otherwise pollute / wipe the dev shims too.
+      CARGO_HOME: C:\Users\Alan Beelink\actions-runner\.cargo-runner
 
     steps:
       - name: Add Codex CLI to PATH
@@ -241,6 +251,9 @@ jobs:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/rust-terminal-manager')
     runs-on: [self-hosted, Windows, X64, local-windows]
     timeout-minutes: 25
+    env:
+      # See rust-checks job for the why. cargo-llvm-cov installs here too.
+      CARGO_HOME: C:\Users\Alan Beelink\actions-runner\.cargo-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -259,7 +272,7 @@ jobs:
       - name: Install cargo-llvm-cov
         shell: powershell
         run: |
-          $cargoLlvmCov = "$env:USERPROFILE\.cargo\bin\cargo-llvm-cov.exe"
+          $cargoLlvmCov = "$env:CARGO_HOME\bin\cargo-llvm-cov.exe"
           if (-not (Test-Path $cargoLlvmCov)) {
             cargo install cargo-llvm-cov --locked
           }
@@ -268,7 +281,7 @@ jobs:
         shell: powershell
         run: |
           $toolchainBin = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin"
-          $env:PATH = "$toolchainBin;$env:USERPROFILE\.cargo\bin;$env:PATH"
+          $env:PATH = "$toolchainBin;$env:CARGO_HOME\bin;$env:PATH"
           cargo llvm-cov --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
