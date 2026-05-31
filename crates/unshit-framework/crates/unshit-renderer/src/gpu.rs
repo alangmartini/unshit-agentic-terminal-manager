@@ -114,6 +114,16 @@ fn surface_config_usages(surface_usages: wgpu::TextureUsages) -> wgpu::TextureUs
     usages
 }
 
+fn choose_present_mode(present_modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    if present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        wgpu::PresentMode::Mailbox
+    } else if present_modes.contains(&wgpu::PresentMode::Immediate) {
+        wgpu::PresentMode::Immediate
+    } else {
+        wgpu::PresentMode::AutoNoVsync
+    }
+}
+
 /// Texture-format capabilities the backdrop-filter path needs. The format
 /// must permit the offscreen ping-pong textures to be created with all of
 /// these usages (`ensure_backdrop_textures` allocates them with
@@ -301,11 +311,12 @@ impl GpuContext {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
-        } else {
-            wgpu::PresentMode::Fifo
-        };
+        let present_mode = choose_present_mode(&surface_caps.present_modes);
+        log::info!(
+            "surface present modes: {:?}; selected {:?}",
+            surface_caps.present_modes,
+            present_mode
+        );
 
         let alpha_mode = surface_caps
             .alpha_modes
@@ -2107,5 +2118,23 @@ mod tests {
         let surface_caps = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
         let configured_target = surface_config_usages(surface_caps);
         assert!(!probe_backdrop_filter_support_inner(BACKDROP_FORMAT_USAGES, configured_target));
+    }
+
+    #[test]
+    fn choose_present_mode_prefers_mailbox_when_available() {
+        let modes = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
+        assert_eq!(choose_present_mode(&modes), wgpu::PresentMode::Mailbox);
+    }
+
+    #[test]
+    fn choose_present_mode_uses_immediate_before_fifo() {
+        let modes = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Immediate];
+        assert_eq!(choose_present_mode(&modes), wgpu::PresentMode::Immediate);
+    }
+
+    #[test]
+    fn choose_present_mode_avoids_hard_fifo_fallback() {
+        let modes = [wgpu::PresentMode::Fifo];
+        assert_eq!(choose_present_mode(&modes), wgpu::PresentMode::AutoNoVsync);
     }
 }
