@@ -589,6 +589,82 @@ fn custom_theme_swatches(custom: &theme::CustomTheme) -> [String; 5] {
     ]
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AppearancePreviewPalette {
+    background: Color,
+    chrome: Color,
+    border: Color,
+    text: Color,
+    dim: Color,
+    accent: Color,
+    command: Color,
+    azure: Color,
+    sage: Color,
+    rust: Color,
+    violet: Color,
+    number: Color,
+    badge_background: Color,
+    cursor: Color,
+}
+
+fn appearance_preview_palette(state: &UiSnapshot) -> AppearancePreviewPalette {
+    let active = theme::resolve_theme_id(&state.theme);
+    let terminal = theme::terminal_palette_for(active, &state.custom_theme);
+
+    if active == theme::CUSTOM_THEME_ID {
+        let violet = terminal.ansi[5];
+        return AppearancePreviewPalette {
+            background: state.custom_theme.background,
+            chrome: state.custom_theme.surface,
+            border: state.custom_theme.surface,
+            text: state.custom_theme.foreground,
+            dim: Color::rgba(
+                state.custom_theme.foreground.r,
+                state.custom_theme.foreground.g,
+                state.custom_theme.foreground.b,
+                178,
+            ),
+            accent: state.custom_theme.accent,
+            command: state.custom_theme.foreground,
+            azure: terminal.ansi[6],
+            sage: terminal.ansi[2],
+            rust: terminal.ansi[1],
+            violet,
+            number: terminal.ansi[3],
+            badge_background: Color::rgba(violet.r, violet.g, violet.b, 46),
+            cursor: state.custom_theme.accent_soft,
+        };
+    }
+
+    let chip = theme_chip_palette(active, &state.custom_theme);
+    let background = match chip.preview {
+        Background::Color(color) => color,
+        _ => terminal.default_fg,
+    };
+
+    AppearancePreviewPalette {
+        background,
+        chrome: chip.divider,
+        border: chip.divider,
+        text: terminal.default_fg,
+        dim: chip.text_dim,
+        accent: chip.glyph,
+        command: chip.text,
+        azure: terminal.ansi[6],
+        sage: terminal.ansi[2],
+        rust: terminal.ansi[1],
+        violet: terminal.ansi[5],
+        number: terminal.ansi[3],
+        badge_background: Color::rgba(
+            terminal.ansi[5].r,
+            terminal.ansi[5].g,
+            terminal.ansi[5].b,
+            46,
+        ),
+        cursor: terminal.ansi[3],
+    }
+}
+
 fn build_custom_theme_editor(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let mut grid = ElementDef::new(Tag::Div).with_class("custom-editor-grid");
     for slot in theme::custom_theme_slots() {
@@ -741,14 +817,25 @@ fn readout_with_unit(value: &str, unit: &str) -> ElementDef {
 }
 
 fn build_appearance_preview(state: &UiSnapshot) -> ElementDef {
+    let palette = appearance_preview_palette(state);
     ElementDef::new(Tag::Div)
         .with_class("preview-tile")
+        .with_style(StyleDeclaration::Background(Background::Color(
+            palette.background,
+        )))
+        .with_style(StyleDeclaration::BorderColor(palette.border))
+        .with_style(StyleDeclaration::Color(palette.text))
         .with_style(StyleDeclaration::FontSize(
             state.terminal_font_size_pt as f32,
         ))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("preview-head")
+                .with_style(StyleDeclaration::Background(Background::Color(
+                    palette.chrome,
+                )))
+                .with_style(StyleDeclaration::BorderColor(palette.border))
+                .with_style(StyleDeclaration::Color(palette.dim))
                 .with_child(
                     ElementDef::new(Tag::Div)
                         .with_class("tm-traffic")
@@ -774,46 +861,49 @@ fn build_appearance_preview(state: &UiSnapshot) -> ElementDef {
             ElementDef::new(Tag::Div)
                 .with_class("preview-body")
                 .with_child(preview_line(vec![
-                    preview_span("prompt", "\u{276F} "),
-                    preview_span("path", "~/code/main/dashboard "),
-                    preview_span("branch", "(main)"),
+                    preview_span(&palette, "prompt", "\u{276F} "),
+                    preview_span(&palette, "path", "~/code/main/dashboard "),
+                    preview_span(&palette, "branch", "(main)"),
                 ]))
                 .with_child(preview_line(vec![
-                    preview_span("prompt", "\u{276F} "),
-                    preview_span("cmd", "npm run dev"),
+                    preview_span(&palette, "prompt", "\u{276F} "),
+                    preview_span(&palette, "cmd", "npm run dev"),
                 ]))
                 .with_child(preview_line(vec![
-                    preview_span("azure", "\u{2192} vite v5.4.0  ready in "),
-                    preview_span("num", "312"),
-                    preview_span("azure", " ms"),
+                    preview_span(&palette, "azure", "\u{2192} vite v5.4.0  ready in "),
+                    preview_span(&palette, "num", "312"),
+                    preview_span(&palette, "azure", " ms"),
                 ]))
                 .with_child(preview_line(vec![
-                    preview_span("muted", "  \u{279C}  local:   "),
-                    preview_span("azure", "http://localhost:4040/"),
+                    preview_span(&palette, "muted", "  \u{279C}  local:   "),
+                    preview_span(&palette, "azure", "http://localhost:4040/"),
                 ]))
                 .with_child(preview_line(vec![
-                    preview_span("sage", "\u{2713} recompiled in "),
-                    preview_span("num", "84"),
-                    preview_span("sage", "ms "),
-                    preview_span("muted", "\u{2014} 4 modules"),
+                    preview_span(&palette, "sage", "\u{2713} recompiled in "),
+                    preview_span(&palette, "num", "84"),
+                    preview_span(&palette, "sage", "ms "),
+                    preview_span(&palette, "muted", "\u{2014} 4 modules"),
                 ]))
                 .with_child(preview_line(vec![preview_span(
+                    &palette,
                     "rust",
                     "\u{2717} src/lib/format.test.ts (2)",
                 )]))
                 .with_child(preview_line(vec![
-                    preview_span("muted", "    expected "),
-                    preview_span("num", "42"),
-                    preview_span("muted", " to be "),
-                    preview_span("num", "41"),
+                    preview_span(&palette, "muted", "    expected "),
+                    preview_span(&palette, "num", "42"),
+                    preview_span(&palette, "muted", " to be "),
+                    preview_span(&palette, "num", "41"),
                 ]))
                 .with_child(preview_line(vec![
-                    preview_span("agent-tag", "claude"),
-                    preview_span("violet", "patching format.ts..."),
+                    preview_span(&palette, "agent-tag", "claude"),
+                    preview_span(&palette, "violet", "patching format.ts..."),
                 ]))
                 .with_child(preview_line(vec![
-                    preview_span("prompt", "\u{276F} "),
-                    ElementDef::new(Tag::Span).with_class("cur"),
+                    preview_span(&palette, "prompt", "\u{276F} "),
+                    ElementDef::new(Tag::Span).with_class("cur").with_style(
+                        StyleDeclaration::Background(Background::Color(palette.cursor)),
+                    ),
                 ])),
         )
 }
@@ -826,8 +916,29 @@ fn preview_line(parts: Vec<ElementDef>) -> ElementDef {
     line
 }
 
-fn preview_span(class: &str, text: &str) -> ElementDef {
-    ElementDef::new(Tag::Span).with_class(class).with_text(text)
+fn preview_span(palette: &AppearancePreviewPalette, class: &str, text: &str) -> ElementDef {
+    let color = match class {
+        "prompt" => palette.accent,
+        "path" | "azure" => palette.azure,
+        "branch" | "sage" => palette.sage,
+        "cmd" => palette.command,
+        "rust" => palette.rust,
+        "violet" => palette.violet,
+        "muted" => palette.dim,
+        "num" => palette.number,
+        "agent-tag" => palette.violet,
+        _ => palette.text,
+    };
+    let mut span = ElementDef::new(Tag::Span)
+        .with_class(class)
+        .with_style(StyleDeclaration::Color(color))
+        .with_text(text);
+    if class == "agent-tag" {
+        span = span.with_style(StyleDeclaration::Background(Background::Color(
+            palette.badge_background,
+        )));
+    }
+    span
 }
 
 fn build_settings_page_savebar(shared: &SharedState) -> ElementDef {
@@ -2671,6 +2782,69 @@ mod tests {
                 "settings card header separator should render as a target hairline"
             );
         }
+    }
+
+    #[test]
+    fn settings_preview_restyles_when_theme_changes() {
+        let mut state = seed_state();
+        state.settings_section = SettingsSection::Appearance;
+        state.theme = "amber".to_string();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let build_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                ElementTree {
+                    root: ElementDef::new(Tag::Div)
+                        .with_class("app")
+                        .with_class(crate::theme::theme_class_name(&snap.theme))
+                        .with_class("settings")
+                        .with_child(build_settings_page(&snap, &build_shared)),
+                }
+            },
+            900.0,
+            700.0,
+        );
+
+        shared.lock().unwrap().theme = "dracula".to_string();
+        let rebuild_shared = shared.clone();
+        harness.rebuild(move || {
+            let snap = rebuild_shared.lock().unwrap().ui_snapshot();
+            ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class(crate::theme::theme_class_name(&snap.theme))
+                    .with_class("settings")
+                    .with_child(build_settings_page(&snap, &rebuild_shared)),
+            }
+        });
+
+        let preview = harness.query(".preview-tile").expect("preview tile");
+        assert_eq!(
+            preview.computed_style.background,
+            Background::Color(Color::rgb(0x28, 0x2a, 0x36)),
+            "theme preview background should follow the selected theme"
+        );
+        assert_eq!(
+            preview.computed_style.color,
+            Color::rgb(0xf8, 0xf8, 0xf2),
+            "theme preview text should follow the selected theme"
+        );
+
+        let preview_head = harness.query(".preview-head").expect("preview head");
+        assert_eq!(
+            preview_head.computed_style.background,
+            Background::Color(Color::rgb(0x21, 0x22, 0x2c)),
+            "theme preview chrome should follow the selected theme"
+        );
+
+        let prompt = harness.query(".preview-tile .prompt").expect("prompt");
+        assert_eq!(
+            prompt.computed_style.color,
+            Color::rgb(0xbd, 0x93, 0xf9),
+            "theme preview prompt should follow the selected theme accent"
+        );
     }
 
     #[test]
