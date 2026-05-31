@@ -90,6 +90,7 @@ pub struct Terminal {
     /// see a real terminal and pick their full-feature rendering path
     /// instead of falling back to a defensive minimal layout.
     pending_response: Vec<u8>,
+    synchronized_output_active: bool,
 }
 
 const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
@@ -335,6 +336,7 @@ impl Terminal {
             scroll_top: 0,
             scroll_bot: rows,
             pending_response: Vec::new(),
+            synchronized_output_active: false,
         }
     }
 
@@ -343,6 +345,10 @@ impl Terminal {
     /// PTY back to the running TUI.
     pub fn take_pending_response(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_response)
+    }
+
+    pub fn synchronized_output_active(&self) -> bool {
+        self.synchronized_output_active
     }
 
     /// Feed raw bytes (from PTY output) through the VTE parser.
@@ -1303,7 +1309,8 @@ impl<'a> Perform for Performer<'a> {
 
             // -- DEC private mode set/reset (CSI ? Pn h / l) -------------------
             //
-            // We currently care about the alt-screen modes only:
+            // We currently care about cursor visibility and the alt-screen modes:
+            //     25: show/hide the terminal-owned cursor
             //   1049: save cursor + switch to alt screen (combined op)
             //   1047: switch to alt screen without explicit save (legacy)
             //     47: ditto, the original DEC alt-screen mode
@@ -1311,20 +1318,29 @@ impl<'a> Perform for Performer<'a> {
             // `?1049h/l` is the canonical "this is a TUI app" sequence
             // emitted by xterm-derived clients. We forward all three
             // variants to the same handler since many TUIs still send
-            // the older aliases. Other private modes (mouse reporting,
-            // bracketed paste, application keypad, etc.) are ignored
-            // here; the daemon owns those semantics.
+            // the older aliases. `?25l` is equally important for TUI
+            // prompts that hide the hardware cursor while drawing their
+            // own input cursor; ignoring it produces a brief double cursor.
+            // Other private modes (mouse reporting, bracketed paste,
+            // application keypad, etc.) are ignored here; the daemon owns
+            // those semantics.
             'h' if intermediates == [b'?'] => {
                 for &mode in &pv {
-                    if matches!(mode, 47 | 1047 | 1049) {
-                        t.enter_alt_screen();
+                    match mode {
+                        25 => t.grid.set_cursor_visible(true),
+                        2026 => t.synchronized_output_active = true,
+                        47 | 1047 | 1049 => t.enter_alt_screen(),
+                        _ => {}
                     }
                 }
             }
             'l' if intermediates == [b'?'] => {
                 for &mode in &pv {
-                    if matches!(mode, 47 | 1047 | 1049) {
-                        t.exit_alt_screen();
+                    match mode {
+                        25 => t.grid.set_cursor_visible(false),
+                        2026 => t.synchronized_output_active = false,
+                        47 | 1047 | 1049 => t.exit_alt_screen(),
+                        _ => {}
                     }
                 }
             }
@@ -3207,6 +3223,55 @@ mod tests {
             display.cursor_visible(),
             "cursor should be visible when at bottom"
         );
+    }
+
+    #[test]
+    fn dec_private_25_toggles_cursor_visibility() {
+        let mut term = Terminal::new(3, 5);
+        assert!(term.grid().cursor_visible());
+
+        term.process_bytes(b"\x1b[?25l");
+        assert!(
+            !term.grid().cursor_visible(),
+            "CSI ?25l must hide the terminal-owned cursor"
+        );
+
+        term.process_bytes(b"\x1b[?25h");
+        assert!(
+            term.grid().cursor_visible(),
+            "CSI ?25h must restore the terminal-owned cursor"
+        );
+    }
+
+    #[test]
+    fn synchronized_output_mode_tracks_dec_private_2026() {
+        let mut term = Terminal::new(3, 5);
+        assert!(!term.synchronized_output_active());
+
+        term.process_bytes(b"\x1b[?2026h");
+        assert!(
+            term.synchronized_output_active(),
+            "CSI ?2026h must enter synchronized output mode"
+        );
+
+        term.process_bytes(b"\x1b[?2026l");
+        assert!(
+            !term.synchronized_output_active(),
+            "CSI ?2026l must leave synchronized output mode"
+        );
+    }
+
+    #[test]
+    fn combined_private_modes_update_cursor_and_sync_output() {
+        let mut term = Terminal::new(3, 5);
+
+        term.process_bytes(b"\x1b[?25;2026l");
+        assert!(!term.grid().cursor_visible());
+        assert!(!term.synchronized_output_active());
+
+        term.process_bytes(b"\x1b[?25;2026h");
+        assert!(term.grid().cursor_visible());
+        assert!(term.synchronized_output_active());
     }
 
     #[test]

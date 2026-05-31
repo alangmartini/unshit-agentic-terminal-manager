@@ -23,6 +23,10 @@ fn preview_bytes(bytes: &[u8], limit: usize) -> String {
     preview
 }
 
+fn should_emit_terminal_rebuild(synchronized_output_active: bool) -> bool {
+    !synchronized_output_active
+}
+
 pub fn register_reader(pane_id: u32, reader: Box<dyn Read + Send>) {
     let mut guard = PENDING_READERS.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
@@ -112,7 +116,7 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
 
                     let mut batched = 1u32;
                     let mut total_bytes = data.len();
-                    let pending_response = {
+                    let (pending_response, synchronized_output_active) = {
                         let mut terminal = terminal_handle.lock_recover();
                         terminal.process_bytes(&data);
                         while let Ok(more) = rx.try_recv() {
@@ -135,7 +139,10 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                                 rows.get(3).cloned().unwrap_or_default(),
                             ));
                         }
-                        terminal.take_pending_response()
+                        (
+                            terminal.take_pending_response(),
+                            terminal.synchronized_output_active(),
+                        )
                     };
                     {
                         let mut guard = shared.lock_recover();
@@ -173,7 +180,9 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                     if batched > 1 {
                         log::debug!("pty-{}: batched {} chunks into 1 rebuild", pane_id, batched);
                     }
-                    yield ExternalEvent::RequestRebuild;
+                    if should_emit_terminal_rebuild(synchronized_output_active) {
+                        yield ExternalEvent::RequestRebuild;
+                    }
                 }
             })
         },
@@ -183,11 +192,11 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
 /// Cursor focus, toast bookkeeping, and deferred PTY spawn subscription.
 ///
 /// Runs every 500 ms. Each tick:
-///   * Sets `cursor_visible` to "this pane owns the focused cursor" for
-///     the active pane and clears it on the others. The actual blink
-///     animation is now driven by the renderer's global blink phase
-///     clock (#135 Phase 1, item 2), so this flag is one shot per focus
-///     change rather than a 2 Hz toggle.
+///   * Tracks active-pane changes without mutating terminal-owned cursor
+///     visibility. TUI cursor visibility (`CSI ?25h/l`) stays in the
+///     terminal grid; active/inactive pane masking happens on the render
+///     snapshot clone. The actual blink animation is driven by the
+///     renderer's global blink phase clock (#135 Phase 1, item 2).
 ///   * Advances toast lifetimes and drains fire and forget PTY write
 ///     errors into user visible toasts.
 ///   * Spawns any deferred PTYs once the renderer publishes valid cell
@@ -212,26 +221,21 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                     {
                         let mut guard = shared.lock_recover();
 
-                        // Per pane cursor focus: the active pane shows the
-                        // cursor (the renderer animates the blink phase
-                        // from a global clock); inactive panes never do.
-                        // This loop only mutates state when focus actually
-                        // changes, so steady state is a no op.
+                        // Cursor visibility belongs to the terminal stream:
+                        // `CSI ?25l` must be able to hide the cursor while a
+                        // TUI draws its own prompt cursor. Render snapshots
+                        // hide inactive panes by cloning the grid and clearing
+                        // the clone's cursor flag, so focus tracking here only
+                        // requests a rebuild if a missed active-pane transition
+                        // needs to be reflected in the tree.
                         let active_id = guard.active_pane.0;
                         let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
                         let signature = (active_id, win_focused);
                         if last_focus_signature != Some(signature) {
-                            for (&id, terminal_handle) in guard.terminals.iter() {
-                                let mut terminal = terminal_handle.lock_recover();
-                                let should_show = id == active_id;
-                                if terminal.grid().cursor_visible() != should_show {
-                                    terminal.grid_mut().set_cursor_visible(should_show);
-                                }
-                            }
                             last_focus_signature = Some(signature);
-                            // A focus change is observable in the tree
-                            // (e.g. focused pane border styling), so
-                            // promote this tick to a full rebuild.
+                            // A pane focus change is observable in the tree
+                            // (e.g. focused pane border styling and cursor
+                            // masking), so promote this tick to a rebuild.
                             needs_rebuild = true;
                         }
 
@@ -548,4 +552,19 @@ pub fn build_subscriptions(shared: &SharedState) -> Vec<Subscription> {
     }
 
     subs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_updates_rebuild_when_not_in_synchronized_output() {
+        assert!(should_emit_terminal_rebuild(false));
+    }
+
+    #[test]
+    fn terminal_updates_do_not_rebuild_mid_synchronized_output_frame() {
+        assert!(!should_emit_terminal_rebuild(true));
+    }
 }

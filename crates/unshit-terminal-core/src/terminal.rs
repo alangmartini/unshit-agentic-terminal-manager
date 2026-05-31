@@ -132,6 +132,7 @@ pub struct Terminal {
     scroll_top: usize,
     scroll_bot: usize,
     pending_response: Vec<u8>,
+    synchronized_output_active: bool,
 }
 
 impl Terminal {
@@ -158,11 +159,16 @@ impl Terminal {
             scroll_top: 0,
             scroll_bot: rows,
             pending_response: Vec::new(),
+            synchronized_output_active: false,
         }
     }
 
     pub fn take_pending_response(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_response)
+    }
+
+    pub fn synchronized_output_active(&self) -> bool {
+        self.synchronized_output_active
     }
 
     pub fn process_bytes(&mut self, bytes: &[u8]) {
@@ -511,6 +517,7 @@ impl Perform for Performer<'_> {
                     for code in &pv {
                         match *code {
                             25 => t.grid.set_cursor_visible(on),
+                            2026 => t.synchronized_output_active = on,
                             47 | 1047 | 1049 if on => t.enter_alt_screen(),
                             47 | 1047 | 1049 => t.exit_alt_screen(),
                             _ => {}
@@ -1096,6 +1103,31 @@ mod tests {
         assert!(!t.grid().cursor_visible());
         t.process_bytes(b"\x1b[?25h");
         assert!(t.grid().cursor_visible());
+    }
+
+    #[test]
+    fn synchronized_output_mode_tracks_dec_private_2026() {
+        let mut t = Terminal::new(3, 5, 10);
+        assert!(!t.synchronized_output_active());
+
+        t.process_bytes(b"\x1b[?2026h");
+        assert!(t.synchronized_output_active());
+
+        t.process_bytes(b"\x1b[?2026l");
+        assert!(!t.synchronized_output_active());
+    }
+
+    #[test]
+    fn combined_private_modes_update_cursor_and_sync_output() {
+        let mut t = Terminal::new(3, 5, 10);
+
+        t.process_bytes(b"\x1b[?25;2026l");
+        assert!(!t.grid().cursor_visible());
+        assert!(!t.synchronized_output_active());
+
+        t.process_bytes(b"\x1b[?25;2026h");
+        assert!(t.grid().cursor_visible());
+        assert!(t.synchronized_output_active());
     }
 
     #[test]

@@ -1904,6 +1904,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn snapshot_terminal_for_render_respects_terminal_cursor_hide() {
+        let mut terminal = Terminal::new(1, 4);
+        terminal.process_bytes(b"\x1b[?25l");
+
+        let active = snapshot_terminal_for_render(
+            &mut terminal,
+            0,
+            true,
+            "catppuccin",
+            &crate::theme::default_custom_theme(),
+            false,
+        );
+
+        assert!(
+            !active.cursor_visible(),
+            "active snapshot must not re-show a cursor hidden by CSI ?25l"
+        );
+    }
+
+    #[test]
+    fn snapshot_terminal_for_render_hides_inactive_clone_without_mutating_live_cursor() {
+        let mut terminal = Terminal::new(1, 4);
+        assert!(terminal.grid().cursor_visible());
+
+        let inactive = snapshot_terminal_for_render(
+            &mut terminal,
+            0,
+            false,
+            "catppuccin",
+            &crate::theme::default_custom_theme(),
+            false,
+        );
+
+        assert!(
+            !inactive.cursor_visible(),
+            "inactive snapshot should hide the rendered cursor"
+        );
+        assert!(
+            terminal.grid().cursor_visible(),
+            "inactive masking must not overwrite terminal-owned cursor visibility"
+        );
+    }
+
     /// Regression test for the clipboard paste keybind feature.
     ///
     /// Both Ctrl+V (Windows convention) and Ctrl+Shift+V (Linux
