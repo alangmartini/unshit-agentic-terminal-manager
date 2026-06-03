@@ -616,15 +616,23 @@ fn main() {
 
     let mut initial_state = seed_state();
     if let Some(persisted) = persist::load_workspaces() {
-        if !persisted.workspaces.is_empty() {
+        if persisted.has_layout() {
+            // Full layout restore: rebuild every workspace's tab/pane tree
+            // and the live fields so the startup reattach below can rejoin
+            // each surviving daemon session keyed by `(workspace, pane)`.
+            crate::state::restore_layout(&mut initial_state, &persisted);
+        } else if !persisted.workspaces.is_empty() {
+            // Legacy config (predates layout persistence): restore only the
+            // workspace metadata and keep the seeded default terminal.
             initial_state.workspaces = persisted
                 .workspaces
-                .into_iter()
+                .iter()
                 .enumerate()
                 .map(|(i, entry)| {
-                    let mut ws = new_workspace((i + 1) as u32, entry.name, entry.path);
+                    let mut ws =
+                        new_workspace((i + 1) as u32, entry.name.clone(), entry.path.clone());
                     ws.collapsed = entry.collapsed;
-                    ws.shell = entry.shell;
+                    ws.shell = entry.shell.clone();
                     ws
                 })
                 .collect();
@@ -813,6 +821,98 @@ fn main() {
         }
     }
 
+    // Reattach (or fresh-spawn) every *other* restored pane. The block
+    // above brings up only the active pane (it must exist first so the
+    // renderer can publish cell metrics). A restored layout can carry many
+    // more panes across tabs and workspaces; each keeps a live terminal in
+    // the runtime, so rejoin them here. A cache hit replays the surviving
+    // daemon session's snapshot; a miss (the shell exited while we were
+    // gone, or an upgrade) spawns a fresh shell in that pane.
+    {
+        let mut guard = shared.lock().unwrap();
+        let terminal_font_size = guard.terminal_font_size_pt as f32;
+        let cell_w_est = terminal_font_size * guard.cell_width_ratio;
+        let cell_h_est = terminal_font_size * crate::state::CSS_LINE_HEIGHT;
+        let init_cols = ((1280.0_f32 - 284.0) / cell_w_est).max(1.0) as u16;
+        let init_rows = ((800.0_f32 - 109.0) / cell_h_est).max(1.0) as u16;
+        let active_pane_id = guard.active_pane.0;
+
+        // Snapshot the reattach targets up front so the immutable borrow of
+        // `guard.workspaces` is released before we mutate `pty_manager` /
+        // `terminals`. The active workspace's live tabs are mirrored into
+        // `workspaces[active].tabs` by `restore_layout`, so iterating
+        // `workspaces` covers every pane.
+        let targets: Vec<(u32, u32, Option<std::path::PathBuf>, Option<crate::shell::ShellSpec>)> =
+            guard
+                .workspaces
+                .iter()
+                .flat_map(|ws| {
+                    let ws_num = ws.num;
+                    let cwd = ws.path.clone();
+                    let shell = crate::shell::resolve(Some(&ws.shell), Some(&guard.default_shell));
+                    ws.tabs
+                        .iter()
+                        .flat_map(|tab| tab.panes.iter().flatten())
+                        .filter(|pane| pane.id.0 != active_pane_id)
+                        .map(move |pane| (ws_num, pane.id.0, cwd.clone(), shell.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
+        for (workspace_id, pane_id, cwd, shell) in targets {
+            if guard.terminals.contains_key(&pane_id) {
+                continue;
+            }
+            match guard.pty_manager.attach_or_spawn(
+                pane_id,
+                workspace_id,
+                init_cols,
+                init_rows,
+                cwd.as_deref(),
+                shell.as_ref(),
+            ) {
+                Ok((Some(snapshot), reader)) => {
+                    let rows = snapshot.grid.rows();
+                    let cols = snapshot.grid.cols();
+                    let mut terminal = crate::terminal::Terminal::new(rows, cols);
+                    terminal.apply_snapshot(&snapshot);
+                    guard
+                        .terminals
+                        .insert(pane_id, std::sync::Arc::new(std::sync::Mutex::new(terminal)));
+                    crate::bridge::register_reader(pane_id, reader);
+                    log::info!(
+                        "reattached background pane {} (workspace {}) to surviving session ({}x{})",
+                        pane_id,
+                        workspace_id,
+                        cols,
+                        rows
+                    );
+                }
+                Ok((None, reader)) => {
+                    let terminal =
+                        crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
+                    guard
+                        .terminals
+                        .insert(pane_id, std::sync::Arc::new(std::sync::Mutex::new(terminal)));
+                    crate::bridge::register_reader(pane_id, reader);
+                    log::info!(
+                        "background pane {} (workspace {}) had no surviving session; spawned fresh",
+                        pane_id,
+                        workspace_id
+                    );
+                }
+                Err(e) => {
+                    log::error!(
+                        "failed to reattach/spawn background pane {} (workspace {}): {}",
+                        pane_id,
+                        workspace_id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     if let Some(cfg) = bench_config {
         crate::bench::start(cfg, shared.clone());
     }
@@ -917,6 +1017,9 @@ fn main() {
                     }
                     crate::state::CloseAction::KeepRunning => {
                         if let Ok(mut guard) = close_shared.lock() {
+                            // Persist the live layout so the relaunch
+                            // reattaches every surviving daemon session.
+                            crate::persist::save_workspaces(&guard);
                             guard.terminals.clear();
                         }
                         finalize_profiler();
@@ -925,6 +1028,7 @@ fn main() {
                     crate::state::CloseAction::KillAll => {
                         if let Ok(mut guard) = close_shared.lock() {
                             crate::state::mutate_kill_all_terminals(&mut guard);
+                            crate::persist::save_workspaces(&guard);
                         }
                         finalize_profiler();
                         std::process::exit(0);
