@@ -1436,6 +1436,185 @@ pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace
     }
 }
 
+/// Rebuild the full workspace + tab + pane layout from a persisted
+/// snapshot, replacing whatever `seed_state` produced. Hydrates the live
+/// tab fields for the active workspace, restores `next_id` above every
+/// restored pane id, and guarantees the active workspace has at least one
+/// live pane (seeding a fresh default tab when the persisted active
+/// workspace was empty). The caller reattaches each restored pane to its
+/// surviving daemon session afterwards (see `main.rs`).
+pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::PersistedState) {
+    if persisted.workspaces.is_empty() {
+        return;
+    }
+    let mut max_pane_id = 0u32;
+    let active_idx = persisted.active_workspace.min(persisted.workspaces.len() - 1);
+    let mut workspaces = Vec::with_capacity(persisted.workspaces.len());
+    for (i, entry) in persisted.workspaces.iter().enumerate() {
+        let mut ws = new_workspace((i + 1) as u32, entry.name.clone(), entry.path.clone());
+        ws.collapsed = entry.collapsed;
+        ws.shell = entry.shell.clone();
+        let tabs: Vec<TerminalTab> = entry
+            .tabs
+            .iter()
+            .filter_map(|pt| terminal_tab_from_persisted(pt, &mut max_pane_id))
+            .collect();
+        ws.active_tab = if tabs.is_empty() {
+            0
+        } else {
+            entry.active_tab.min(tabs.len() - 1)
+        };
+        ws.terminals_expanded = !tabs.is_empty();
+        if let Some(sub) = ws.subtabs.get_mut(0) {
+            sub.count = Some(tabs.len() as u32);
+            sub.active = i == active_idx;
+        }
+        ws.tabs = tabs;
+        workspaces.push(ws);
+    }
+
+    state.workspaces = workspaces;
+    state.active_workspace = active_idx;
+    load_workspace_state(state);
+
+    // The render/PTY bootstrap assumes the active workspace always has a
+    // live pane. If the persisted active workspace had no tabs (upgrade,
+    // or the user closed them all before quitting), seed a fresh one.
+    if state.panes.iter().flatten().next().is_none() {
+        seed_default_tab(state, &mut max_pane_id);
+    }
+
+    state.next_id = max_pane_id.saturating_add(1).max(2);
+}
+
+/// Convert one persisted tab into a live `TerminalTab`, tracking the
+/// largest pane id seen. Returns `None` for a malformed tab with no panes
+/// so it is dropped rather than producing an unselectable ghost tab.
+fn terminal_tab_from_persisted(
+    pt: &crate::persist::PersistedTab,
+    max_pane_id: &mut u32,
+) -> Option<TerminalTab> {
+    let panes: Vec<Vec<Pane>> = pt
+        .panes
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|pp| {
+                    *max_pane_id = (*max_pane_id).max(pp.id);
+                    Pane {
+                        id: PaneId(pp.id),
+                        title: if pp.title.is_empty() {
+                            "shell".to_string()
+                        } else {
+                            pp.title.clone()
+                        },
+                        subtitle: if pp.subtitle.is_empty() {
+                            "bash".to_string()
+                        } else {
+                            pp.subtitle.clone()
+                        },
+                        pid: 0,
+                        cpu: 0.0,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| !row.is_empty())
+        .collect();
+    if panes.is_empty() {
+        return None;
+    }
+
+    let row_ratios = normalized_row_ratios(&panes, &pt.row_ratios);
+    let col_ratios = normalized_col_ratios(&panes, &pt.col_ratios);
+    let active_pane = panes
+        .iter()
+        .flatten()
+        .map(|p| p.id)
+        .find(|id| id.0 == pt.active_pane)
+        .unwrap_or_else(|| panes[0][0].id);
+
+    Some(TerminalTab {
+        id: pt.id.clone(),
+        name: if pt.name.is_empty() {
+            "shell".to_string()
+        } else {
+            pt.name.clone()
+        },
+        subtitle: if pt.subtitle.is_empty() {
+            "bash".to_string()
+        } else {
+            pt.subtitle.clone()
+        },
+        status: TabStatus::Running,
+        panes,
+        active_pane,
+        row_ratios,
+        col_ratios,
+    })
+}
+
+/// Coerce persisted row ratios to the restored grid shape, falling back
+/// to equal weights when the saved data is missing or malformed.
+fn normalized_row_ratios(panes: &[Vec<Pane>], saved: &[f32]) -> Vec<f32> {
+    if saved.len() == panes.len() && saved.iter().all(|r| r.is_finite() && *r > 0.0) {
+        saved.to_vec()
+    } else {
+        vec![1.0; panes.len()]
+    }
+}
+
+fn normalized_col_ratios(panes: &[Vec<Pane>], saved: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    let well_formed = saved.len() == panes.len()
+        && saved.iter().zip(panes.iter()).all(|(row, panes_row)| {
+            row.len() == panes_row.len() && row.iter().all(|r| r.is_finite() && *r > 0.0)
+        });
+    if well_formed {
+        saved.to_vec()
+    } else {
+        panes.iter().map(|row| vec![1.0; row.len()]).collect()
+    }
+}
+
+/// Seed a single fresh default tab/pane into the active workspace's live
+/// fields (and its stored copy), using `max_pane_id + 1` so the id never
+/// collides with a restored pane. Bumps `max_pane_id`.
+fn seed_default_tab(state: &mut AppState, max_pane_id: &mut u32) {
+    let id_num = max_pane_id.saturating_add(1);
+    *max_pane_id = id_num;
+    let pane = Pane {
+        id: PaneId(id_num),
+        title: "shell".to_string(),
+        subtitle: "bash".to_string(),
+        pid: 0,
+        cpu: 0.0,
+    };
+    let tab = TerminalTab {
+        id: format!("t{}", id_num),
+        name: "shell".to_string(),
+        subtitle: "bash".to_string(),
+        status: TabStatus::Running,
+        panes: vec![vec![pane.clone()]],
+        active_pane: PaneId(id_num),
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+    state.tabs = vec![tab.clone()];
+    state.active_tab = 0;
+    state.panes = vec![vec![pane]];
+    state.active_pane = PaneId(id_num);
+    state.row_ratios = vec![1.0];
+    state.col_ratios = vec![vec![1.0]];
+    if let Some(ws) = state.workspaces.get_mut(state.active_workspace) {
+        ws.tabs = vec![tab];
+        ws.active_tab = 0;
+        ws.terminals_expanded = true;
+        if let Some(sub) = ws.subtabs.get_mut(0) {
+            sub.count = Some(1);
+        }
+    }
+}
+
 pub fn mutate_add_workspace(state: &mut AppState) {
     mutate_add_workspace_with_path(state, None);
 }
@@ -2635,6 +2814,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                     unreachable!("filtered above")
                 }
             }
+            crate::persist::save_workspaces(state);
             true
         }
         "dialog.cancel" => {
@@ -2665,8 +2845,13 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if remember {
                 state.toggles.insert(ToggleKey::RememberCloseChoice, true);
                 state.toggles.insert(ToggleKey::KillAllOnClose, false);
-                crate::persist::save_workspaces(state);
             }
+            // Always persist the live layout (not just when "remember" is
+            // ticked): the daemon keeps these sessions alive, so the next
+            // launch must restore the same tabs/panes to reattach them.
+            // Without this, keep-running dropped the layout and the relaunch
+            // showed a fresh terminal instead of the surviving session.
+            crate::persist::save_workspaces(state);
             // Drop local readers; daemon sessions remain alive. The UI
             // callback follows up with `process::exit(0)`.
             state.terminals.clear();
@@ -2681,9 +2866,12 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             if remember {
                 state.toggles.insert(ToggleKey::RememberCloseChoice, true);
                 state.toggles.insert(ToggleKey::KillAllOnClose, true);
-                crate::persist::save_workspaces(state);
             }
             mutate_kill_all_terminals(state);
+            // The layout is now empty; persisting it means the relaunch
+            // starts fresh instead of restoring panes whose sessions were
+            // just killed.
+            crate::persist::save_workspaces(state);
             true
         }
         "app.close.reset_preference" => {
@@ -2867,15 +3055,18 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             mutate_add_quick_prompt_tab(state, &prompt, &target.path, &shell_spec);
             crate::quick_prompt::images::cleanup_session(&session_hex);
             state.quick_prompt = None;
+            crate::persist::save_workspaces(state);
             true
         }
         "tab.new" => {
             mutate_add_tab(state);
+            crate::persist::save_workspaces(state);
             true
         }
         "tab.close.active" => {
             let idx = state.active_tab;
             mutate_close_tab(state, idx);
+            crate::persist::save_workspaces(state);
             true
         }
         "tab.next" => {
@@ -2900,14 +3091,17 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "pane.split_right" => {
             mutate_split_right(state, state.active_pane);
+            crate::persist::save_workspaces(state);
             true
         }
         "pane.split_down" => {
             mutate_split_down(state, state.active_pane);
+            crate::persist::save_workspaces(state);
             true
         }
         "pane.close" => {
             mutate_close_pane(state, state.active_pane);
+            crate::persist::save_workspaces(state);
             true
         }
         "pane.focus_left" => {
@@ -2927,14 +3121,18 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             true
         }
         other if other.starts_with("pane.extract_to_tab:") => {
-            dispatch_pane_extract_to_tab(state, other)
+            persist_layout_if(dispatch_pane_extract_to_tab(state, other), state)
         }
         other if other.starts_with("drag.start_pane:") => dispatch_drag_start_pane(state, other),
         other if other.starts_with("drag.start_tab:") => dispatch_drag_start_tab(state, other),
         other if other.starts_with("drag.update:") => dispatch_drag_update(state, other),
-        "drag.end" => dispatch_drag_end(state),
-        other if other.starts_with("pane.drop_split:") => dispatch_pane_drop_split(state, other),
-        other if other.starts_with("tab.reorder:") => dispatch_tab_reorder(state, other),
+        "drag.end" => persist_layout_if(dispatch_drag_end(state), state),
+        other if other.starts_with("pane.drop_split:") => {
+            persist_layout_if(dispatch_pane_drop_split(state, other), state)
+        }
+        other if other.starts_with("tab.reorder:") => {
+            persist_layout_if(dispatch_tab_reorder(state, other), state)
+        }
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
             true
@@ -3037,6 +3235,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 if idx < state.workspaces.len() {
                     mutate_switch_workspace(state, idx);
                     mutate_add_tab(state);
+                    crate::persist::save_workspaces(state);
                     return true;
                 }
             }
@@ -3453,6 +3652,17 @@ fn dispatch_drag_start_tab(state: &mut AppState, cmd: &str) -> bool {
 ///
 /// Returns `true` iff a drag was actually in progress. Drops that hit
 /// nothing still clear the drag state and return `true`.
+/// Persist the workspace layout when `changed` is true, then forward the
+/// flag. Used to wrap the drag/drop/reorder/extract dispatch helpers so a
+/// rearranged layout survives a relaunch without each helper having to
+/// know about persistence.
+fn persist_layout_if(changed: bool, state: &AppState) -> bool {
+    if changed {
+        crate::persist::save_workspaces(state);
+    }
+    changed
+}
+
 fn dispatch_drag_end(state: &mut AppState) -> bool {
     match state.drag.clone() {
         crate::drag::DragState::DraggingPane {
@@ -8490,6 +8700,88 @@ mod tests {
             state.tabs.is_empty(),
             "a newly created workspace must start with no tabs"
         );
+    }
+
+    #[test]
+    fn restore_layout_round_trips_tabs_panes_and_next_id() {
+        // Original: ws0 has tab1(pane 1) and a second tab carrying a
+        // right-split (panes 2 and 3, with pane 3 active).
+        let mut original = seed_state();
+        mutate_add_tab(&mut original);
+        let split_target = original.active_pane;
+        mutate_split_right(&mut original, split_target);
+        let expected_active = original.active_pane;
+        let persisted = crate::persist::PersistedState::from_state(&original);
+
+        let mut restored = seed_state();
+        restore_layout(&mut restored, &persisted);
+
+        assert_eq!(restored.active_workspace, 0);
+        assert_eq!(restored.tabs.len(), 2);
+        assert_eq!(restored.active_tab, 1, "active tab selection must survive");
+        // The active (split) tab restores both panes in one row.
+        assert_eq!(restored.panes.len(), 1);
+        let ids: Vec<u32> = restored.panes[0].iter().map(|p| p.id.0).collect();
+        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(restored.active_pane, expected_active);
+        // next_id advances past every restored pane id (max is 3) so new
+        // panes never collide with a restored one.
+        assert_eq!(restored.next_id, 4);
+        // The first tab keeps its original pane.
+        assert_eq!(restored.tabs[0].panes[0][0].id, PaneId(1));
+    }
+
+    #[test]
+    fn restore_layout_seeds_default_when_active_workspace_empty() {
+        use crate::persist::{PersistedPane, PersistedState, PersistedTab, PersistedWorkspace};
+        let persisted = PersistedState {
+            workspaces: vec![
+                PersistedWorkspace {
+                    name: "main".into(),
+                    path: None,
+                    collapsed: false,
+                    shell: crate::shell::ShellSpec::default(),
+                    tabs: vec![],
+                    active_tab: 0,
+                },
+                PersistedWorkspace {
+                    name: "api".into(),
+                    path: None,
+                    collapsed: false,
+                    shell: crate::shell::ShellSpec::default(),
+                    tabs: vec![PersistedTab {
+                        id: "t9".into(),
+                        name: String::new(),
+                        subtitle: String::new(),
+                        panes: vec![vec![PersistedPane {
+                            id: 9,
+                            title: String::new(),
+                            subtitle: String::new(),
+                        }]],
+                        active_pane: 9,
+                        row_ratios: vec![1.0],
+                        col_ratios: vec![vec![1.0]],
+                    }],
+                    active_tab: 0,
+                },
+            ],
+            active_workspace: 0,
+            ..Default::default()
+        };
+
+        let mut state = seed_state();
+        restore_layout(&mut state, &persisted);
+
+        // The active workspace (idx 0) had no tabs, so a fresh default pane
+        // is seeded with an id past every restored pane (max was 9).
+        assert_eq!(state.active_workspace, 0);
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 1);
+        assert_eq!(state.active_pane, PaneId(10));
+        assert_eq!(state.next_id, 11);
+        // The non-active workspace retains its restored pane.
+        assert_eq!(state.workspaces[1].tabs[0].panes[0][0].id, PaneId(9));
     }
 
     #[test]
