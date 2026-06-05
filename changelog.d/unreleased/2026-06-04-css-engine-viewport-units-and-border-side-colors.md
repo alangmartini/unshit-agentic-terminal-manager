@@ -15,6 +15,21 @@
   unchanged. This makes the design's top-anchored overlays (`.cp-scrim` /
   `.quick-prompt-overlay` `padding-top: 12vh`/`14vh`) lay out as authored
   instead of dropping the declaration and pinning to the top.
+- Coverage diagnostic: `CompiledStylesheet` now records every declaration the
+  parser could not type (`dropped: Vec<DroppedDeclaration>`) instead of silently
+  discarding it. A dev-build log summarizes them on startup, and the new
+  `stylesheet_coverage` guardrail test fails the build if the app stylesheet
+  grows a gap outside the documented inventory — so the next unsupported
+  property surfaces immediately, not when a screenshot looks wrong.
+
+## Fixed
+
+- A comment between `:root` declarations (especially one containing `:`) broke
+  collection of the custom property immediately after it, because the
+  custom-property pre-scan split the block on `;`/`:` without stripping
+  comments. This silently dropped `--cp-accent`, so the command-palette prompt
+  glyph and active-row rail fell back instead of rendering amber. The pre-scan
+  now strips comments first. (Caught by the new coverage guardrail.)
 
 ## Notes
 

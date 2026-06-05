@@ -9,6 +9,31 @@ use crate::style::types::*;
 use cssparser::{Parser, ParserInput, Token};
 use smallvec::SmallVec;
 
+/// A declaration the parser could not turn into a typed `StyleDeclaration` and
+/// therefore silently discarded — either an unrecognized property or a value
+/// the property's parser rejected (e.g. a viewport unit on a px-only pathway,
+/// or `calc()`). Collected so callers can surface engine gaps instead of
+/// discovering them when something renders wrong. Custom-property definitions
+/// (`--name: ...`) are recorded too; consumers that only care about real
+/// property gaps should filter those out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedDeclaration {
+    /// Raw selector text of the rule the declaration appeared in.
+    pub selector: String,
+    /// Property name (text before the first `:`).
+    pub property: String,
+    /// Raw value text (after the first `:`, sans trailing `;`).
+    pub value: String,
+}
+
+impl DroppedDeclaration {
+    /// True for custom-property definitions (`--name: ...`), which are not a
+    /// per-property engine gap (they are handled by parse-time var resolution).
+    pub fn is_custom_property(&self) -> bool {
+        self.property.starts_with("--")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CompiledStylesheet {
     pub rules: Vec<CompiledRule>,
@@ -20,6 +45,10 @@ pub struct CompiledStylesheet {
     /// the CSS spec). One table is shared across the whole stylesheet so the
     /// animation driver can resolve names at tick time.
     pub keyframes: HashMap<String, KeyframesRule>,
+    /// Declarations the parser discarded (see `DroppedDeclaration`). Empty for
+    /// a fully-supported stylesheet; used by the dev-mode warning and the
+    /// `stylesheet_coverage` guardrail test to surface engine gaps.
+    pub dropped: Vec<DroppedDeclaration>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +334,7 @@ impl CompiledStylesheet {
         let mut rules = Vec::new();
         let mut font_faces = Vec::new();
         let mut keyframes: HashMap<String, KeyframesRule> = HashMap::new();
+        let mut dropped: Vec<DroppedDeclaration> = Vec::new();
         let mut source_order = 0u32;
 
         while !parser.is_exhausted() {
@@ -357,7 +387,7 @@ impl CompiledStylesheet {
             // selector like `.a, .b { ... }` returns one rule per sub
             // selector; each gets its own source_order so cascade order
             // matches the declaration order browsers use.
-            if let Ok(mut new_rules) = parse_rule(&mut parser, source_order) {
+            if let Ok(mut new_rules) = parse_rule(&mut parser, source_order, &mut dropped) {
                 source_order += new_rules.len() as u32;
                 rules.append(&mut new_rules);
             }
@@ -367,7 +397,7 @@ impl CompiledStylesheet {
             a.specificity.cmp(&b.specificity).then(a.source_order.cmp(&b.source_order))
         });
 
-        CompiledStylesheet { rules, custom_properties, font_faces, keyframes }
+        CompiledStylesheet { rules, custom_properties, font_faces, keyframes, dropped }
     }
 }
 
@@ -546,7 +576,30 @@ fn skip_to_semicolon(parser: &mut Parser) {
 /// Extract custom property declarations (--name: value) from :root and * rules.
 /// Scans the raw CSS text to find rule blocks with :root or * selectors,
 /// then parses `--name: value;` declarations within them.
+/// Remove `/* ... */` comments from CSS text. Used before the naive
+/// brace/`;`-splitting in `extract_custom_properties`, which would otherwise
+/// glue a comment to the following declaration (a comment containing `:` or
+/// sitting before a `--custom` property silently breaks that property's
+/// collection). The full rule parser uses cssparser, which strips comments
+/// itself, so this is only needed for the custom-property pre-scan.
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            // Unterminated comment: drop the remainder, matching CSS tokenizing.
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn extract_custom_properties(css: &str) -> HashMap<String, String> {
+    let css = strip_css_comments(css);
+    let css = css.as_str();
     let mut props = HashMap::new();
     let mut search_start = 0;
 
@@ -710,7 +763,11 @@ fn find_top_level_comma(s: &str) -> Option<usize> {
     None
 }
 
-fn parse_rule(parser: &mut Parser, source_order: u32) -> Result<Vec<CompiledRule>, ()> {
+fn parse_rule(
+    parser: &mut Parser,
+    source_order: u32,
+    dropped: &mut Vec<DroppedDeclaration>,
+) -> Result<Vec<CompiledRule>, ()> {
     let selector_str = collect_selector_text(parser)?;
     // Split comma-separated selector groups (`.a, .b, .c`) into individual
     // selectors. Each becomes its own compiled rule with a shared copy of
@@ -740,18 +797,28 @@ fn parse_rule(parser: &mut Parser, source_order: u32) -> Result<Vec<CompiledRule
         return Err(());
     }
 
+    let selector_for_diag = selector_str.as_str();
     let declarations = parser
         .parse_nested_block(|parser| {
             let mut decls = Vec::new();
             while !parser.is_exhausted() {
+                let start = parser.position();
                 if let Ok(parsed) = parse_declaration(parser) {
                     decls.extend(parsed);
                 } else {
+                    // The declaration could not be typed. Drain to the next
+                    // semicolon (unchanged behavior) and record the raw text so
+                    // callers can see which CSS the engine silently discarded.
                     while let Ok(token) = parser.next() {
                         if matches!(token, Token::Semicolon) {
                             break;
                         }
                     }
+                    record_dropped_declaration(
+                        dropped,
+                        selector_for_diag,
+                        parser.slice_from(start),
+                    );
                 }
             }
             Ok(decls)
@@ -768,6 +835,41 @@ fn parse_rule(parser: &mut Parser, source_order: u32) -> Result<Vec<CompiledRule
             source_order: source_order + i as u32,
         })
         .collect())
+}
+
+/// Record a declaration the parser failed to type. `raw` is the source slice
+/// from the start of the declaration up to (and possibly including) its
+/// terminating semicolon.
+fn record_dropped_declaration(out: &mut Vec<DroppedDeclaration>, selector: &str, raw: &str) {
+    let raw = raw.trim().trim_end_matches(';').trim();
+    if raw.is_empty() {
+        return;
+    }
+    let (property, value) = match raw.split_once(':') {
+        Some((p, v)) => (p.trim(), v.trim()),
+        None => (raw, ""),
+    };
+    // Only record real authored declarations: a CSS property name is an
+    // identifier (`letters/digits/-`, optionally `--`-prefixed). This drops the
+    // fragments a value parser can leave behind when it consumes only part of a
+    // multi-value declaration (e.g. the trailing layer of a multi-layer
+    // `background`), which are parser-state artifacts, not authored properties.
+    if !is_css_property_name(property) {
+        return;
+    }
+    out.push(DroppedDeclaration {
+        selector: selector.trim().to_string(),
+        property: property.to_string(),
+        value: value.to_string(),
+    });
+}
+
+fn is_css_property_name(s: &str) -> bool {
+    match s.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '-' => {}
+        _ => return false,
+    }
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn split_top_level_commas(s: &str) -> Vec<&str> {
@@ -4550,6 +4652,54 @@ mod tests {
         assert_eq!(style.padding_src.right, Dimension::Vh(2.0));
         assert_eq!(style.padding_src.bottom, Dimension::Px(1.0));
         assert_eq!(style.padding_src.left, Dimension::Vh(2.0));
+    }
+
+    #[test]
+    fn test_strip_css_comments() {
+        assert_eq!(strip_css_comments("a /* x */ b"), "a  b");
+        assert_eq!(strip_css_comments("/* only */"), "");
+        assert_eq!(strip_css_comments("no comment"), "no comment");
+        // Unterminated comment drops the remainder, matching CSS tokenizing.
+        assert_eq!(strip_css_comments("a /* unterminated"), "a ");
+    }
+
+    #[test]
+    fn test_comment_with_colon_does_not_break_following_custom_property() {
+        // A comment between :root declarations — especially one containing `:` —
+        // must not break collection of the custom property after it. Regression
+        // for the naive `;`-split in extract_custom_properties.
+        let css = concat!(
+            ":root {\n",
+            "  --a: #111111;\n",
+            "  /* note: this comment has a colon and precedes --accent */\n",
+            "  --accent: #abcdef;\n",
+            "}\n",
+            ".x { color: var(--accent); }\n",
+        );
+        let sheet = CompiledStylesheet::parse(css);
+        assert_eq!(sheet.custom_properties.get("--accent").map(String::as_str), Some("#abcdef"));
+        assert!(
+            !sheet.dropped.iter().any(|d| d.property == "color"),
+            "color: var(--accent) should resolve, got drops: {:?}",
+            sheet.dropped
+        );
+        let has_resolved_color =
+            sheet.rules.iter().flat_map(|r| &r.declarations).any(
+                |d| matches!(d, StyleDeclaration::Color(c) if *c == Color::rgb(0xab, 0xcd, 0xef)),
+            );
+        assert!(has_resolved_color, "resolved color should be applied to .x");
+    }
+
+    #[test]
+    fn test_dropped_declarations_are_recorded() {
+        let sheet = CompiledStylesheet::parse(".x { text-overflow: ellipsis; color: #ffffff; }");
+        assert!(
+            sheet.dropped.iter().any(|d| d.property == "text-overflow" && d.value == "ellipsis"),
+            "unrecognized property should be recorded: {:?}",
+            sheet.dropped
+        );
+        // Valid declarations are not recorded as dropped.
+        assert!(!sheet.dropped.iter().any(|d| d.property == "color"));
     }
 
     #[test]

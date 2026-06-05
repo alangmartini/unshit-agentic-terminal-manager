@@ -1553,6 +1553,26 @@ impl ApplicationHandler for AppHandler {
         }
 
         let stylesheet = CompiledStylesheet::parse(&self.app.config.css);
+        // Dev aid: surface declarations the engine could not type and silently
+        // dropped (unrecognized property, or a value its parser rejected). The
+        // enforcing guardrail is the app's `stylesheet_coverage` test; this is a
+        // low-noise debug summary so a new gap is visible during `cargo run`.
+        if !stylesheet.dropped.is_empty() {
+            let custom = stylesheet.dropped.iter().filter(|d| d.is_custom_property()).count();
+            let mut props: Vec<&str> = stylesheet
+                .dropped
+                .iter()
+                .filter(|d| !d.is_custom_property())
+                .map(|d| d.property.as_str())
+                .collect();
+            props.sort_unstable();
+            props.dedup();
+            log::debug!(
+                "stylesheet: {} dropped declaration(s) the engine does not understand \
+                 ({custom} custom-property defs); unsupported properties: {props:?}",
+                stylesheet.dropped.len(),
+            );
+        }
         let mut font_system = FontSystem::new();
         let font_report =
             crate::font::load_custom_fonts(&mut font_system, &self.app.config.fonts, &stylesheet);
