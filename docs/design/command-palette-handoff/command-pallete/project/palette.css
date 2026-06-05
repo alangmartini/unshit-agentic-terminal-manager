@@ -1,0 +1,286 @@
+/* ============================================================
+   COMMAND PALETTE — terminal.mgr
+   Extends the kit's .pal vocabulary: typed modes, preview pane,
+   fuzzy-match highlight, density + accent + glow knobs.
+   All tokens from /colors_and_type.css.
+   ============================================================ */
+
+/* Accent + glow are driven by CSS vars set on .cp-scrim so Tweaks
+   can repaint the whole palette by swapping two values. */
+.cp-scrim {
+  --cp-accent: var(--amber-300);
+  --cp-accent-soft: rgba(212, 163, 72, .12);
+  --cp-accent-bright: var(--amber-100);
+  --cp-glow: .55;
+  --cp-row-py: 7px;
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(10, 8, 6, .62);
+  backdrop-filter: blur(5px);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 12vh;
+  animation: cpFade .14s var(--ease-out);
+}
+@keyframes cpFade { from { opacity: .5; } }
+@keyframes cpLift { from { opacity: .55; transform: translateY(10px) scale(.992); } }
+
+.cp {
+  width: var(--cp-w, 560px);
+  max-width: calc(100vw - 48px);
+  background: linear-gradient(180deg, var(--bg-elevated), var(--bg-subtle));
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-lg);
+  box-shadow:
+    var(--shadow-lg),
+    0 0 0 1px rgba(0, 0, 0, .3),
+    0 0 40px rgba(212, 163, 72, calc(.12 * var(--cp-glow)));
+  overflow: hidden;
+  animation: cpLift .16s var(--ease-out);
+  display: flex; flex-direction: column;
+  max-height: 72vh;
+}
+
+/* ---- Input row ---- */
+.cp-input {
+  display: flex; align-items: center; gap: 8px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border-hair);
+  flex-shrink: 0;
+}
+.cp-prompt {
+  color: var(--cp-accent);
+  font-weight: 600;
+  text-shadow: 0 0 8px rgba(212, 163, 72, calc(.6 * var(--cp-glow)));
+  flex-shrink: 0;
+}
+.cp-mode-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  font: var(--type-label);
+  padding: 2px 8px 2px 7px;
+  border-radius: var(--r-sm);
+  white-space: nowrap;
+  flex-shrink: 0;
+  border: 1px solid transparent;
+  letter-spacing: .01em;
+}
+.cp-mode-chip svg { width: 11px; height: 11px; }
+.cp-mode-chip .x { opacity: .5; font-size: 11px; margin-left: 1px; }
+.cp-mode-chip.m-actions { color: var(--amber-100); background: rgba(212,163,72,.12); border-color: rgba(212,163,72,.32); }
+.cp-mode-chip.m-agents  { color: var(--violet);    background: rgba(168,139,184,.12); border-color: rgba(168,139,184,.32); }
+.cp-mode-chip.m-nav     { color: var(--azure);     background: rgba(106,162,173,.12); border-color: rgba(106,162,173,.32); }
+.cp-mode-chip.m-search  { color: var(--sage);      background: rgba(139,168,92,.12);  border-color: rgba(139,168,92,.3); }
+
+.cp-input input {
+  background: transparent; border: none; outline: none;
+  color: var(--fg-primary); font: var(--type-body);
+  flex: 1; min-width: 0;
+  caret-color: var(--cp-accent);
+}
+.cp-input input::placeholder { color: var(--fg-muted); }
+.cp-esc {
+  font: var(--type-kbd); color: var(--fg-tertiary);
+  border: 1px solid var(--border-hair);
+  background: var(--bg-base);
+  padding: 2px 6px; border-radius: var(--r-sm);
+  flex-shrink: 0;
+}
+
+/* ---- Body: list (+ optional preview) ---- */
+.cp-body { display: flex; min-height: 0; flex: 1; }
+.cp-list {
+  flex: 1; min-width: 0;
+  overflow-y: auto; overflow-x: hidden;
+  padding: 6px 0 6px;
+  position: relative;
+}
+.cp.has-preview .cp-list {
+  flex: 0 0 56%;
+  border-right: 1px solid var(--border-hair);
+}
+
+.cp-group-title {
+  display: flex; align-items: center; gap: 8px;
+  font: var(--type-meta);
+  text-transform: uppercase; letter-spacing: .13em;
+  color: var(--fg-tertiary);
+  padding: 9px 16px 4px;
+}
+.cp-group-title .rule { flex: 1; height: 1px; background: var(--border-hair); }
+.cp-group-title .gcount { color: var(--fg-muted); letter-spacing: .05em; }
+
+.cp-item {
+  display: grid;
+  grid-template-columns: 16px 1fr auto;
+  gap: 11px; align-items: center;
+  padding: var(--cp-row-py) 14px var(--cp-row-py) 13px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+  scroll-margin: 8px;
+}
+.cp-item:hover { background: var(--bg-hover); }
+.cp-item.active {
+  background: var(--cp-accent-soft);
+  border-left-color: var(--cp-accent);
+  box-shadow: inset 0 0 22px rgba(212, 163, 72, calc(.05 * var(--cp-glow)));
+}
+.cp-ic { color: var(--fg-tertiary); display: flex; align-items: center; justify-content: center; }
+.cp-item.active .cp-ic { color: var(--cp-accent); filter: drop-shadow(0 0 5px rgba(212,163,72,calc(.5 * var(--cp-glow)))); }
+.cp-ic .dot { width: 7px; height: 7px; }
+.cp-ic.run .dot { animation: pulse 2s ease-in-out infinite; }
+
+.cp-main { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.cp-label {
+  color: var(--fg-secondary);
+  font: var(--type-label);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cp-item.active .cp-label { color: var(--fg-primary); }
+.cp-label .hl { color: var(--cp-accent-bright); font-weight: 600; }
+.cp-sub {
+  font: var(--type-meta);
+  color: var(--fg-tertiary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cp-sub .path { color: var(--azure); }
+.cp-sub .branch { color: var(--sage); }
+
+.cp-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.cp-tag {
+  font: var(--type-meta); font-size: 9px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .1em;
+  padding: 1px 6px; border-radius: var(--r-sm);
+}
+.cp-tag.running { color: var(--sage);  background: rgba(139,168,92,.12);  border: 1px solid rgba(139,168,92,.28); }
+.cp-tag.error   { color: var(--rust);  background: rgba(201,85,58,.12);   border: 1px solid rgba(201,85,58,.3); }
+.cp-tag.waiting { color: var(--ember); background: rgba(208,110,44,.12);  border: 1px solid rgba(208,110,44,.3); }
+.cp-tag.idle    { color: var(--azure); background: rgba(106,162,173,.12); border: 1px solid rgba(106,162,173,.3); }
+.cp-tag.stopped { color: var(--fg-tertiary); background: var(--bg-elevated); border: 1px solid var(--border-hair); }
+.cp-tag.agent   { color: var(--violet); background: rgba(168,139,184,.12); border: 1px solid rgba(168,139,184,.3); }
+.cp-meta { font: var(--type-meta); color: var(--fg-tertiary); }
+.cp-kbd { display: flex; gap: 2px; }
+
+/* compact density */
+.cp.compact { --cp-row-py: 4px; }
+.cp.compact .cp-sub { display: none; }
+.cp.compact .cp-group-title { padding-top: 6px; }
+
+/* ---- Empty / no results ---- */
+.cp-empty {
+  padding: 34px 16px 38px;
+  text-align: center;
+  color: var(--fg-tertiary);
+  font: var(--type-body);
+}
+.cp-empty .big { color: var(--fg-secondary); margin-bottom: 4px; }
+.cp-empty .dim { color: var(--fg-muted); font: var(--type-meta); }
+
+/* ---- Preview pane ---- */
+.cp-preview {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column;
+  background:
+    radial-gradient(ellipse 70% 50% at 50% 0%, rgba(212,163,72,.02), transparent 70%),
+    var(--bg-base);
+  overflow: hidden;
+}
+.cp-pv-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 11px 14px 9px;
+  border-bottom: 1px solid var(--border-hair);
+  flex-shrink: 0;
+}
+.cp-pv-ic {
+  width: 26px; height: 26px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-md);
+  color: var(--cp-accent);
+  background: var(--bg-subtle);
+}
+.cp-pv-titles { min-width: 0; flex: 1; }
+.cp-pv-title { font: var(--type-h2); color: var(--fg-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cp-pv-kicker { font: var(--type-meta); color: var(--fg-tertiary); text-transform: uppercase; letter-spacing: .12em; }
+.cp-pv-body { padding: 12px 14px; overflow: auto; flex: 1; min-height: 0; }
+.cp-pv-desc { font: var(--type-body); color: var(--fg-secondary); margin-bottom: 12px; }
+
+.cp-pv-rows { display: flex; flex-direction: column; gap: 0; }
+.cp-pv-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border-hair);
+  font: var(--type-meta);
+}
+.cp-pv-row:last-child { border-bottom: none; }
+.cp-pv-k { color: var(--fg-tertiary); }
+.cp-pv-v { color: var(--fg-secondary); }
+.cp-pv-v.path { color: var(--azure); }
+.cp-pv-v.branch { color: var(--sage); }
+.cp-pv-v.amber { color: var(--amber-100); }
+
+/* mini terminal inside preview */
+.cp-pv-term {
+  background: var(--bg-void);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--r-md);
+  padding: 8px 10px;
+  margin-top: 4px;
+  font: var(--type-meta);
+  line-height: 1.55;
+  overflow: hidden;
+}
+.cp-pv-term .tline { white-space: pre-wrap; word-break: break-word; }
+.cp-pv-term .t-prompt .prompt { color: var(--cp-accent); }
+.cp-pv-term .t-cmd { color: var(--fg-primary); }
+.cp-pv-term .t-info { color: var(--azure); }
+.cp-pv-term .t-success { color: var(--sage); }
+.cp-pv-term .t-error { color: var(--rust); }
+.cp-pv-term .t-dim { color: var(--fg-tertiary); }
+.cp-pv-term .t-agent { color: var(--violet); }
+.cp-pv-term .t-hit { color: var(--fg-secondary); }
+.cp-pv-term .t-hit .hl { color: var(--amber-100); background: rgba(212,163,72,.16); border-radius: 2px; }
+
+.cp-pv-run {
+  margin-top: auto;
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 14px;
+  border-top: 1px solid var(--border-hair);
+  font: var(--type-meta); color: var(--fg-tertiary);
+  flex-shrink: 0;
+}
+.cp-pv-run .spacer { flex: 1; }
+
+/* ---- Footer ---- */
+.cp-foot {
+  display: flex; align-items: center; gap: 14px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border-hair);
+  background: var(--bg-void);
+  font: var(--type-meta); color: var(--fg-tertiary);
+  flex-shrink: 0;
+}
+.cp-foot .fh { display: flex; align-items: center; gap: 5px; }
+.cp-foot .spacer { flex: 1; }
+.cp-foot .count { color: var(--fg-secondary); }
+.cp-foot .count b { color: var(--amber-100); font-weight: 600; }
+
+/* ---- mode hint row (zero-query) ---- */
+.cp-modes {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  padding: 8px 14px 10px;
+  border-bottom: 1px solid var(--border-hair);
+}
+.cp-mode-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: var(--type-meta);
+  padding: 3px 8px; border-radius: var(--r-sm);
+  border: 1px solid var(--border-soft);
+  background: var(--bg-base);
+  color: var(--fg-tertiary);
+  cursor: pointer;
+  transition: var(--dur-fast) var(--ease-std);
+}
+.cp-mode-pill:hover { border-color: var(--border-strong); color: var(--fg-secondary); background: var(--bg-hover); }
+.cp-mode-pill .pfx { color: var(--cp-accent); font-weight: 600; }
+
+@media (prefers-reduced-motion: reduce) {
+  .cp-scrim, .cp { animation: none; }
+}

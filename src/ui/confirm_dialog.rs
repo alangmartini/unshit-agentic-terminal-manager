@@ -12,12 +12,14 @@
 //! buffer before clearing the dialog.
 //! The modal overlay itself blocks clicks to everything behind it.
 
+use std::collections::BTreeSet;
+
 use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{AlignItems, CssPosition, Dimension, JustifyContent};
 
 use crate::state::{dispatch, mutate_with, ConfirmDialog, SharedState, UiSnapshot};
-use crate::ui::icons::{icon_close, svg_icon};
+use crate::ui::icons::{icon_check, icon_close, svg_icon};
 
 /// Build the confirmation modal overlay. Returns an empty hidden div
 /// when no dialog is active so the caller can always include this in
@@ -48,9 +50,14 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
             "Kill everything",
             shared,
         ),
-        ConfirmDialog::CloseApp { count, remember } => build_close_app_card(
+        ConfirmDialog::CloseApp {
+            count,
+            remember,
+            kept_pane_ids,
+        } => build_close_app_card(
             *count,
             *remember,
+            kept_pane_ids,
             close_dialog_entries(snap),
             shared,
         ),
@@ -91,9 +98,10 @@ fn build_simple_confirm_card(
     shared: &SharedState,
 ) -> ElementDef {
     let cancel_shared = shared.clone();
-    let cancel = ElementDef::new(Tag::Div)
+    let cancel = ElementDef::new(Tag::Button)
         .with_class("confirm-dialog-button")
         .with_class("cancel")
+        .with_class("ghost")
         .on_click(move || {
             mutate_with(&cancel_shared, |st| {
                 dispatch(st, "dialog.cancel");
@@ -115,6 +123,7 @@ fn build_simple_confirm_card(
     ElementDef::new(Tag::Div)
         .with_class("confirm-dialog-card")
         .with_class("confirm-dialog-simple-card")
+        .on_click(|| {})
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("confirm-dialog-title")
@@ -135,17 +144,17 @@ fn build_simple_confirm_card(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CloseDialogEntry {
+    pane_id: u32,
     label: String,
     path: String,
     meta: String,
     agent: Option<&'static str>,
 }
 
-const MAX_VISIBLE_CLOSE_SESSIONS: usize = 8;
-
 fn build_close_app_card(
     count: usize,
     remember: bool,
+    kept_pane_ids: &BTreeSet<u32>,
     entries: Vec<CloseDialogEntry>,
     shared: &SharedState,
 ) -> ElementDef {
@@ -155,6 +164,10 @@ fn build_close_app_card(
         entries.into_iter().take(count).collect()
     };
     let agent_count = entries.iter().filter(|entry| entry.agent.is_some()).count();
+    let kept_count = entries
+        .iter()
+        .filter(|entry| kept_pane_ids.contains(&entry.pane_id))
+        .count();
 
     let cancel_shared = shared.clone();
     let cancel = ElementDef::new(Tag::Button)
@@ -169,6 +182,13 @@ fn build_close_app_card(
         .with_child(ElementDef::new(Tag::Span).with_text("cancel".to_string()));
 
     let keep_shared = shared.clone();
+    let keep_label = if count == 0 {
+        "quit".to_string()
+    } else if kept_count == count {
+        "keep running".to_string()
+    } else {
+        "keep selected".to_string()
+    };
     let keep_running = ElementDef::new(Tag::Button)
         .with_class("confirm-dialog-button")
         .with_class("secondary")
@@ -178,7 +198,7 @@ fn build_close_app_card(
             });
             crate::shutdown_now();
         })
-        .with_child(ElementDef::new(Tag::Span).with_text("keep running".to_string()))
+        .with_child(ElementDef::new(Tag::Span).with_text(keep_label))
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("kbd")
@@ -212,12 +232,10 @@ fn build_close_app_card(
                 dispatch(st, "dialog.toggle_remember");
             });
         })
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("cd-box")
-                .with_class("confirm-dialog-checkbox-box")
-                .with_text(if remember { "\u{2713}" } else { "" }.to_string()),
-        )
+        .with_child(build_check_box(
+            "cd-box confirm-dialog-checkbox-box",
+            remember,
+        ))
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("confirm-dialog-checkbox-label")
@@ -226,13 +244,14 @@ fn build_close_app_card(
 
     let mut body = ElementDef::new(Tag::Div)
         .with_class("cd-body")
-        .with_child(build_close_blurb(count, agent_count));
-    body = body.with_child(build_close_session_list(entries, count));
+        .with_child(build_close_blurb(count, agent_count, kept_count));
+    body = body.with_child(build_close_session_list(entries, kept_pane_ids, shared));
     body = body.with_child(checkbox);
 
     ElementDef::new(Tag::Div)
         .with_class("cd-panel")
         .with_class("confirm-dialog-close-card")
+        .on_click(|| {})
         .with_child(build_close_header(shared))
         .with_child(body)
         .with_child(
@@ -275,7 +294,7 @@ fn build_close_header(shared: &SharedState) -> ElementDef {
         )
 }
 
-fn build_close_blurb(count: usize, agent_count: usize) -> ElementDef {
+fn build_close_blurb(count: usize, agent_count: usize, kept_count: usize) -> ElementDef {
     let session_word = if count == 1 { "session" } else { "sessions" };
     let mut blurb = ElementDef::new(Tag::Div)
         .with_class("cd-blurb")
@@ -301,6 +320,11 @@ fn build_close_blurb(count: usize, agent_count: usize) -> ElementDef {
     }
     let suffix = if count == 0 {
         ". ptyd has no live sessions for this window.".to_string()
+    } else if kept_count < count {
+        format!(
+            ". {kept_count} selected will stay alive; {} unselected will be killed.",
+            count - kept_count
+        )
     } else {
         ". ptyd will keep them alive in the background unless you kill them.".to_string()
     };
@@ -311,7 +335,11 @@ fn build_close_blurb(count: usize, agent_count: usize) -> ElementDef {
     )
 }
 
-fn build_close_session_list(entries: Vec<CloseDialogEntry>, count: usize) -> ElementDef {
+fn build_close_session_list(
+    entries: Vec<CloseDialogEntry>,
+    kept_pane_ids: &BTreeSet<u32>,
+    shared: &SharedState,
+) -> ElementDef {
     let mut list = ElementDef::new(Tag::Div).with_class("cd-list");
     if entries.is_empty() {
         return list.with_child(
@@ -319,7 +347,7 @@ fn build_close_session_list(entries: Vec<CloseDialogEntry>, count: usize) -> Ele
                 .with_class("cd-row")
                 .with_child(
                     ElementDef::new(Tag::Span)
-                        .with_class("dot")
+                        .with_class("cd-keep-box")
                         .with_class("status-idle"),
                 )
                 .with_child(
@@ -343,44 +371,21 @@ fn build_close_session_list(entries: Vec<CloseDialogEntry>, count: usize) -> Ele
         );
     }
 
-    let visible_count = entries.len().min(MAX_VISIBLE_CLOSE_SESSIONS);
-    for entry in entries.iter().take(visible_count) {
-        list = list.with_child(build_close_session_row(entry));
-    }
-    if count > visible_count {
-        list = list.with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("cd-row")
-                .with_class("cd-row-more")
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("dot")
-                        .with_class("status-idle"),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("cd-label")
-                        .with_text(format!("{} more", count - visible_count)),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("cd-meta")
-                        .with_class("path")
-                        .with_text("daemon".to_string()),
-                )
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("cd-meta")
-                        .with_class("dim")
-                        .with_class("tnum")
-                        .with_text("live".to_string()),
-                ),
-        );
+    for entry in entries.iter() {
+        list = list.with_child(build_close_session_row(
+            entry,
+            kept_pane_ids.contains(&entry.pane_id),
+            shared,
+        ));
     }
     list
 }
 
-fn build_close_session_row(entry: &CloseDialogEntry) -> ElementDef {
+fn build_close_session_row(
+    entry: &CloseDialogEntry,
+    kept: bool,
+    shared: &SharedState,
+) -> ElementDef {
     let status_class = if entry.agent.is_some() {
         "status-agent"
     } else {
@@ -400,13 +405,22 @@ fn build_close_session_row(entry: &CloseDialogEntry) -> ElementDef {
             .with_text(entry.path.clone())
     };
 
+    let toggle_shared = shared.clone();
+    let command = format!("dialog.toggle_keep:{}", entry.pane_id);
     ElementDef::new(Tag::Div)
         .with_class("cd-row")
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("dot")
-                .with_class(status_class),
-        )
+        .with_class("cd-row-selectable")
+        .with_class(if kept { "kept" } else { "not-kept" })
+        .on_click(move || {
+            let cmd = command.clone();
+            mutate_with(&toggle_shared, |st| {
+                dispatch(st, &cmd);
+            });
+        })
+        .with_child(build_check_box(
+            &format!("cd-keep-box {status_class}"),
+            kept,
+        ))
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("cd-label")
@@ -420,6 +434,14 @@ fn build_close_session_row(entry: &CloseDialogEntry) -> ElementDef {
                 .with_class("tnum")
                 .with_text(entry.meta.clone()),
         )
+}
+
+fn build_check_box(classes: &str, checked: bool) -> ElementDef {
+    let mut box_el = ElementDef::new(Tag::Span).with_class(classes);
+    if checked {
+        box_el = box_el.with_child(svg_icon(icon_check()).with_class("cd-check-icon"));
+    }
+    box_el
 }
 
 fn close_dialog_entries(snap: &UiSnapshot) -> Vec<CloseDialogEntry> {
@@ -439,6 +461,7 @@ fn close_dialog_entries(snap: &UiSnapshot) -> Vec<CloseDialogEntry> {
             };
             for pane in panes.iter().flatten() {
                 out.push(CloseDialogEntry {
+                    pane_id: pane.id.0,
                     label: pane.title.clone(),
                     path: path.clone(),
                     meta: close_entry_meta(pane),
@@ -537,7 +560,7 @@ fn build_rename_session_card(
         .with_child(ElementDef::new(Tag::Span).with_text("Cancel".to_string()));
 
     let save_shared = shared.clone();
-    let save = ElementDef::new(Tag::Div)
+    let save = ElementDef::new(Tag::Button)
         .with_class("confirm-dialog-button")
         .with_class("primary")
         .on_click(move || {
@@ -550,7 +573,9 @@ fn build_rename_session_card(
     let mut card = ElementDef::new(Tag::Div)
         .with_class("confirm-dialog-card")
         .with_class("confirm-dialog-simple-card")
+        .with_class("confirm-dialog-rename-card")
         .with_id(format!("confirm-dialog-rename-{pane_id}"))
+        .on_click(|| {})
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("confirm-dialog-title")
@@ -592,6 +617,14 @@ mod tests {
         Arc::new(Mutex::new(seed_state()))
     }
 
+    fn close_app_dialog(count: usize, remember: bool, kept_pane_ids: &[u32]) -> ConfirmDialog {
+        ConfirmDialog::CloseApp {
+            count,
+            remember,
+            kept_pane_ids: kept_pane_ids.iter().copied().collect(),
+        }
+    }
+
     #[test]
     fn hidden_when_no_dialog_active() {
         let snap = shared().lock().unwrap().ui_snapshot();
@@ -619,10 +652,7 @@ mod tests {
         let s = shared();
         {
             let mut guard = s.lock().unwrap();
-            guard.confirm_dialog = Some(ConfirmDialog::CloseApp {
-                count: 3,
-                remember: false,
-            });
+            guard.confirm_dialog = Some(close_app_dialog(3, false, &[1, 2, 3]));
         }
         let snap = s.lock().unwrap().ui_snapshot();
         let el = build_confirm_dialog_overlay(&snap, &s);
@@ -642,10 +672,7 @@ mod tests {
         let s = shared();
         {
             let mut guard = s.lock().unwrap();
-            guard.confirm_dialog = Some(ConfirmDialog::CloseApp {
-                count: 0,
-                remember: true,
-            });
+            guard.confirm_dialog = Some(close_app_dialog(0, true, &[]));
         }
         let snap = s.lock().unwrap().ui_snapshot();
         let el = build_confirm_dialog_overlay(&snap, &s);
@@ -674,10 +701,7 @@ mod tests {
                     cpu: 0.0,
                 },
             ]];
-            guard.confirm_dialog = Some(ConfirmDialog::CloseApp {
-                count: 2,
-                remember: false,
-            });
+            guard.confirm_dialog = Some(close_app_dialog(2, false, &[7, 8]));
         }
         let snap = s.lock().unwrap().ui_snapshot();
         let el = build_confirm_dialog_overlay(&snap, &s);
@@ -706,6 +730,7 @@ mod tests {
     fn close_app_dialog_lists_reasonable_session_counts_without_more_row() {
         let entries = (0..6)
             .map(|idx| CloseDialogEntry {
+                pane_id: idx,
                 label: format!("shell-{idx}"),
                 path: "~/main".to_string(),
                 meta: "bash".to_string(),
@@ -713,7 +738,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let el = build_close_session_list(entries, 6);
+        let kept_pane_ids = (0..6).collect();
+        let el = build_close_session_list(entries, &kept_pane_ids, &shared());
         let text = normalized_text(&el);
         assert!(text.contains("shell-0"));
         assert!(text.contains("shell-5"));
@@ -721,14 +747,41 @@ mod tests {
     }
 
     #[test]
+    fn close_app_dialog_rows_render_keep_checkboxes() {
+        let entries = vec![
+            CloseDialogEntry {
+                pane_id: 1,
+                label: "keep".to_string(),
+                path: "~/main".to_string(),
+                meta: "bash".to_string(),
+                agent: None,
+            },
+            CloseDialogEntry {
+                pane_id: 2,
+                label: "kill".to_string(),
+                path: "~/main".to_string(),
+                meta: "bash".to_string(),
+                agent: None,
+            },
+        ];
+        let kept_pane_ids = BTreeSet::from([1]);
+        let el = build_close_session_list(entries, &kept_pane_ids, &shared());
+        let rows = find_all_by_class(&el, "cd-row-selectable");
+
+        assert_eq!(rows.len(), 2);
+        assert!(has_class(rows[0], "kept"));
+        assert!(has_class(rows[1], "not-kept"));
+        assert!(has_class_anywhere(rows[0], "cd-keep-box"));
+        assert!(has_class_anywhere(rows[0], "cd-check-icon"));
+        assert!(!has_class_anywhere(rows[1], "cd-check-icon"));
+    }
+
+    #[test]
     fn close_app_dialog_styles_have_visible_layout_with_stylesheet() {
         let s = shared();
         {
             let mut guard = s.lock().unwrap();
-            guard.confirm_dialog = Some(ConfirmDialog::CloseApp {
-                count: 1,
-                remember: true,
-            });
+            guard.confirm_dialog = Some(close_app_dialog(1, true, &[1]));
         }
         let snap = s.lock().unwrap().ui_snapshot();
         let tree_snap = snap.clone();
@@ -851,6 +904,61 @@ mod tests {
     }
 
     #[test]
+    fn rename_dialog_styles_show_light_caret_and_save_hover_feedback() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                pane_id: 3,
+                buffer: "old".into(),
+                error: None,
+            });
+        }
+        let tree_shared = s.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || {
+                let snap = tree_shared.lock().unwrap().ui_snapshot();
+                ElementTree {
+                    root: ElementDef::new(Tag::Div)
+                        .with_class("app")
+                        .with_child(build_confirm_dialog_overlay(&snap, &tree_shared)),
+                }
+            },
+            1280.0,
+            800.0,
+        );
+        harness.step();
+
+        let input = harness
+            .query(".confirm-dialog-input")
+            .expect("rename input should render");
+        assert_eq!(
+            input.computed_style.caret_color,
+            Color::rgb(0xf6, 0xd9, 0x88)
+        );
+
+        let save_before = harness
+            .query(".primary")
+            .expect("save button before hover")
+            .computed_style
+            .background
+            .clone();
+        harness.hover_on(".primary");
+        let save_after = harness
+            .query(".primary")
+            .expect("save button after hover")
+            .computed_style
+            .background
+            .clone();
+        assert_ne!(
+            save_after, save_before,
+            "save button hover must use a concrete background change"
+        );
+        assert_eq!(save_after, Background::Color(Color::rgb(0xd4, 0xa3, 0x48)));
+    }
+
+    #[test]
     fn rename_dialog_input_on_change_updates_buffer_in_state() {
         let s = shared();
         {
@@ -877,6 +985,42 @@ mod tests {
             }
             other => panic!("expected RenameSession dialog, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rename_dialog_input_click_keeps_dialog_open() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                pane_id: 3,
+                buffer: String::new(),
+                error: None,
+            });
+        }
+        let tree_shared = s.clone();
+        let mut harness = TestHarness::new(
+            crate::STYLES,
+            move || {
+                let snap = tree_shared.lock().unwrap().ui_snapshot();
+                ElementTree {
+                    root: build_confirm_dialog_overlay(&snap, &tree_shared),
+                }
+            },
+            800.0,
+            600.0,
+        );
+        harness.step();
+
+        harness.click_on(".confirm-dialog-input");
+
+        assert!(
+            matches!(
+                s.lock().unwrap().confirm_dialog,
+                Some(ConfirmDialog::RenameSession { .. })
+            ),
+            "clicking inside the rename input must not hit the backdrop cancel handler"
+        );
     }
 
     #[test]
@@ -963,10 +1107,7 @@ mod tests {
         let s = shared();
         {
             let mut guard = s.lock().unwrap();
-            guard.confirm_dialog = Some(ConfirmDialog::CloseApp {
-                count: 0,
-                remember: false,
-            });
+            guard.confirm_dialog = Some(close_app_dialog(0, false, &[]));
         }
         let snap = s.lock().unwrap().ui_snapshot();
         let el = build_confirm_dialog_overlay(&snap, &s);
@@ -976,6 +1117,35 @@ mod tests {
             s.lock().unwrap().confirm_dialog,
             Some(ConfirmDialog::CloseApp { remember: true, .. })
         ));
+    }
+
+    #[test]
+    fn close_app_dialog_session_row_click_toggles_keep_selection() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.panes = vec![vec![crate::state::Pane {
+                id: crate::state::PaneId(1),
+                title: "shell".into(),
+                subtitle: "bash".into(),
+                pid: 0,
+                cpu: 0.0,
+            }]];
+            guard.confirm_dialog = Some(close_app_dialog(1, false, &[1]));
+        }
+        let snap = s.lock().unwrap().ui_snapshot();
+        let el = build_confirm_dialog_overlay(&snap, &s);
+        let row = find_by_class(&el, "cd-row-selectable").expect("selectable row");
+
+        (row.on_click.as_ref().unwrap())();
+
+        let guard = s.lock().unwrap();
+        match guard.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::CloseApp { kept_pane_ids, .. }) => {
+                assert!(!kept_pane_ids.contains(&1));
+            }
+            other => panic!("expected CloseApp dialog, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1071,6 +1241,17 @@ mod tests {
             return Some(el);
         }
         el.children.iter().find_map(|c| find_by_class(c, class))
+    }
+
+    fn find_all_by_class<'a>(el: &'a ElementDef, class: &str) -> Vec<&'a ElementDef> {
+        let mut out = Vec::new();
+        if has_class(el, class) {
+            out.push(el);
+        }
+        for child in &el.children {
+            out.extend(find_all_by_class(child, class));
+        }
+        out
     }
 
     fn text_anywhere(el: &ElementDef) -> String {

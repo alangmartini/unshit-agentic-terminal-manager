@@ -1,0 +1,203 @@
+/* ============================================================
+   UNSHIT TERMINAL MANAGER — DESIGN TOKENS
+   Warm amber retro-terminal aesthetic. CRT-on-walnut.
+
+   Source of truth for: surfaces, borders, text, accent ramps,
+   spacing, type, radii, shadows, motion. Mirror of styles.css
+   in the source repo, structured for reuse across slides,
+   prototypes, and downstream surfaces.
+   ============================================================ */
+
+/* ============================================================
+   FONTS
+   Primary: JetBrains Mono (Google Fonts)
+   Fallback chain matches the source repo: Berkeley Mono > SF Mono
+   > Menlo > Consolas > generic monospace.
+   ============================================================ */
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap");
+
+:root {
+  /* ============================================================
+     SURFACES — warm walnut darks, never neutral grey.
+     Walnut undertone is what makes the amber feel like ember
+     embedded in wood, not neon on chrome.
+     ============================================================ */
+  --bg-void:       #14110c;   /* darkest — titlebar, statusbar, modal scrim */
+  --bg-base:       #1c1812;   /* canvas — terminal body */
+  --bg-subtle:     #221d16;   /* sidebar, tabbar */
+  --bg-elevated:   #29231a;   /* active row, pane header in focus */
+  --bg-hover:      #342c20;   /* hover state */
+  --bg-selected:   #3e3425;   /* selected row in lists */
+  --bg-overlay:    rgba(12, 10, 7, 0.72);
+
+  /* ============================================================
+     BORDERS — five-step ramp from invisible to focused.
+     Hair lines almost vanish into surfaces; focus glows amber.
+     ============================================================ */
+  --border-hair:    #241e15;
+  --border-soft:    #342b1e;
+  --border-default: #4a3e2a;
+  --border-strong:  #6a5939;
+  --border-focus:   #d4a348;
+
+  /* ============================================================
+     TEXT — five-step warm cream ramp.
+     Primary is parchment-cream, not white. Ghost is for disabled
+     glyphs that need to occupy space without reading.
+     ============================================================ */
+  --fg-primary:   #ebdcb6;
+  --fg-secondary: #b8a275;
+  --fg-tertiary:  #857149;
+  --fg-muted:     #4e422b;
+  --fg-ghost:     #2f2819;
+
+  /* ============================================================
+     AMBER RAMP — primary accent. Used for active states, focus
+     rings, prompt arrows, primary buttons, brand mark, links.
+     Never use raw amber-50 on light surfaces.
+     ============================================================ */
+  --amber-50:  #fdf1cf;
+  --amber-100: #f6d988;
+  --amber-200: #e8b955;
+  --amber-300: #d4a348;
+  --amber-400: #b8852c;
+  --amber-500: #8a6020;
+  --amber-600: #5c3f12;
+
+  /* ============================================================
+     SECONDARY ACCENTS — used semantically, not decoratively.
+     sage = success / running     rust = error / killed
+     ember = warm warn / spawning azure = info / paths
+     violet = rare, currently used in tab-status-error highlights
+     ============================================================ */
+  --ember:  #d06e2c;
+  --sage:   #8ba85c;
+  --rust:   #c9553a;
+  --azure:  #6aa2ad;
+  --violet: #a88bb8;
+
+  /* ============================================================
+     GLOWS — scoped halos that sell the CRT-ember illusion.
+     ALWAYS pair with the matching color. Never glow neutrals.
+     ============================================================ */
+  --glow-amber:   0 0 18px rgba(212, 163, 72, 0.18);
+  --glow-amber-s: 0 0 8px rgba(212, 163, 72, 0.25);
+  --glow-sage:    0 0 6px rgba(139, 168, 92, 0.45);
+  --glow-rust:    0 0 6px rgba(201, 85, 58, 0.45);
+
+  /* ============================================================
+     SPACING — 4px base, but the ramp is intentionally tight at
+     the small end. UI is dense; use sp-3/sp-4 for most gaps.
+     ============================================================ */
+  --sp-0: 0;
+  --sp-1: 2px;
+  --sp-2: 4px;
+  --sp-3: 6px;
+  --sp-4: 8px;
+  --sp-5: 12px;
+  --sp-6: 16px;
+  --sp-7: 20px;
+  --sp-8: 24px;
+  --sp-10: 32px;
+
+  /* ============================================================
+     SIZING — chrome heights. Titlebar is shorter than typical
+     macOS chrome (34px) — terminal density requires it.
+     ============================================================ */
+  --titlebar-h:  34px;
+  --sidebar-w:   252px;
+  --tabbar-h:    38px;
+  --statusbar-h: 24px;
+  --resizer:     4px;
+
+  /* ============================================================
+     TYPE — every surface is mono. There is NO sans-serif fallback
+     by design. Body copy, UI labels, terminal output: all mono.
+     ============================================================ */
+  --font-mono: 'JetBrains Mono', 'Berkeley Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+  --t-xs:  10px;
+  --t-sm:  11px;
+  --t-md:  12px;
+  --t-lg:  13px;
+  --t-xl:  14px;
+  --t-2xl: 16px;
+
+  /* ============================================================
+     RADII — small. Nothing rounder than 8px lives in the chrome.
+     The terminal aesthetic is squarish; round corners are reserved
+     for buttons, badges, and pill controls.
+     ============================================================ */
+  --r-sm: 2px;
+  --r-md: 3px;
+  --r-lg: 6px;
+  --r-xl: 8px;
+
+  /* ============================================================
+     SHADOWS — heavy and warm. shadow-lg is reserved for modals.
+     ============================================================ */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 14px 40px rgba(0, 0, 0, 0.65);
+
+  /* ============================================================
+     MOTION — fast and decisive. Default 200ms with ease-std.
+     ============================================================ */
+  --ease-std: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-out: cubic-bezier(0, 0, 0, 1);
+  --dur-fast: 120ms;
+  --dur-norm: 200ms;
+  --dur-slow: 320ms;
+
+  /* ============================================================
+     SEMANTIC TYPE ROLES — apply to elements directly.
+     `font: var(--type-h1)` etc. Mono throughout.
+     ============================================================ */
+  --type-display: 600 var(--t-2xl)/1.3 var(--font-mono);
+  --type-h1:      600 var(--t-xl)/1.4  var(--font-mono);
+  --type-h2:      600 var(--t-lg)/1.4  var(--font-mono);
+  --type-body:    400 var(--t-md)/1.55 var(--font-mono);
+  --type-label:   500 var(--t-sm)/1.4  var(--font-mono);
+  --type-meta:    400 var(--t-xs)/1.4  var(--font-mono);
+  --type-kbd:     500 var(--t-xs)/1    var(--font-mono);
+}
+
+/* ============================================================
+   BASE — apply on body to inherit warm cream + mono throughout.
+   ============================================================ */
+html, body {
+  background: var(--bg-base);
+  color: var(--fg-primary);
+  font: var(--type-body);
+  font-feature-settings: 'calt' 1, 'liga' 1, 'zero' 1, 'ss02' 1;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular numerics class for status-bar style data */
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* ============================================================
+   AMBIENT BACKGROUND — two layered effects sell the CRT illusion:
+   1. Warm radial gradients (top-right + bottom-left) for ember
+      bias.
+   2. 2px-on-1px scanline pattern at 22% opacity, multiplied
+      against surfaces.
+   Apply to body via ::before and ::after pseudo-elements.
+   ============================================================ */
+.bg-ambient::before {
+  content: '';
+  position: fixed; inset: 0; pointer-events: none; z-index: 0;
+  background:
+    radial-gradient(ellipse 60% 40% at 85% 0%, rgba(212, 163, 72, 0.035), transparent 70%),
+    radial-gradient(ellipse 80% 50% at 10% 100%, rgba(138, 96, 32, 0.025), transparent 70%);
+}
+.bg-ambient::after {
+  content: '';
+  position: fixed; inset: 0; pointer-events: none; z-index: 0;
+  background-image: repeating-linear-gradient(
+    0deg, transparent 0, transparent 2px,
+    rgba(0,0,0,0.12) 2px, rgba(0,0,0,0.12) 3px);
+  opacity: 0.22;
+  mix-blend-mode: multiply;
+}

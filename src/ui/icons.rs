@@ -282,6 +282,13 @@ pub fn icon_close() -> SvgNode {
     )
 }
 
+pub fn icon_check() -> SvgNode {
+    group(
+        root_attrs(1.8, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![path_d("M3.5 8.2l3 3l6-6.5")],
+    )
+}
+
 pub fn icon_window_minimize() -> SvgNode {
     group(
         root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Miter),
@@ -580,6 +587,13 @@ mod tests {
     #[test]
     fn icon_close_builds() {
         let node = icon_close();
+        assert!(matches!(node.primitive, SvgPrimitive::Group));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn icon_check_builds() {
+        let node = icon_check();
         assert!(matches!(node.primitive, SvgPrimitive::Group));
         assert_eq!(node.children.len(), 1);
     }

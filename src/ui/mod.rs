@@ -1,3 +1,4 @@
+pub mod command_palette;
 pub mod confirm_dialog;
 pub mod drag_overlay;
 pub mod fps_overlay;

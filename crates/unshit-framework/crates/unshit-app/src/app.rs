@@ -499,6 +499,15 @@ const EASE_IN_OUT_Y1: f32 = 0.0;
 const EASE_IN_OUT_X2: f32 = 0.58;
 const EASE_IN_OUT_Y2: f32 = 1.0;
 
+fn should_check_shortcut_during_keyboard_capture(combo: &unshit_core::shortcut::KeyCombo) -> bool {
+    combo.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META)
+        || matches!(combo.key, Key::F(_))
+}
+
+fn consume_raw_key_hook(config: &AppConfig, combo: &unshit_core::shortcut::KeyCombo) -> bool {
+    config.on_raw_key.as_ref().is_some_and(|f| f(combo))
+}
+
 fn spawn_smooth_scroll_waker(
     event_tx: flume::Sender<ExternalEvent>,
     proxy_cell: Arc<OnceLock<EventLoopProxy>>,
@@ -2531,45 +2540,43 @@ impl ApplicationHandler for AppHandler {
                                     e.captures_keyboard = false;
                                 }
                                 state.window.request_redraw();
+                            } else if consume_raw_key_hook(&self.app.config, &combo) {
+                                state.needs_rebuild = true;
+                                state.window.request_redraw();
                             } else {
-                                // When a command-level modifier (Ctrl/Alt/Meta) is held,
-                                // check registered shortcuts before forwarding to the
-                                // capture handler. This lets app hotkeys (Ctrl+T, etc.)
-                                // work even when the terminal pane is focused. Plain
-                                // keys and Shift-only combos bypass this check so normal
-                                // typing and Shift+PageUp/Down still reach the terminal.
-                                let has_command_modifier = combo
-                                    .modifiers
-                                    .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META);
-
-                                let shortcut_handled = if has_command_modifier {
-                                    let was_chord_pending =
-                                        state.shortcut_resolver.is_chord_pending();
-                                    let matched = state.shortcut_resolver.process_key(
-                                        combo,
-                                        &state.interaction,
-                                        &state.arena,
-                                    );
-                                    if let Some(command) = matched {
-                                        dispatch_command(
-                                            state,
-                                            &command,
-                                            self.app.config.on_command.as_ref(),
+                                // Command-level modifiers and function keys are app
+                                // shortcuts even while a terminal captures keyboard input.
+                                // Plain text keys still bypass this so normal typing and
+                                // Shift+PageUp/Down reach the terminal.
+                                let shortcut_handled =
+                                    if should_check_shortcut_during_keyboard_capture(&combo) {
+                                        let was_chord_pending =
+                                            state.shortcut_resolver.is_chord_pending();
+                                        let matched = state.shortcut_resolver.process_key(
+                                            combo,
+                                            &state.interaction,
+                                            &state.arena,
                                         );
-                                        true
-                                    } else if state.shortcut_resolver.is_chord_pending()
-                                        && !was_chord_pending
-                                    {
-                                        // Entered chord state (e.g. Ctrl+K as chord
-                                        // leader). Consume the key; don't forward.
-                                        state.window.request_redraw();
-                                        true
+                                        if let Some(command) = matched {
+                                            dispatch_command(
+                                                state,
+                                                &command,
+                                                self.app.config.on_command.as_ref(),
+                                            );
+                                            true
+                                        } else if state.shortcut_resolver.is_chord_pending()
+                                            && !was_chord_pending
+                                        {
+                                            // Entered chord state (e.g. Ctrl+K as chord
+                                            // leader). Consume the key; don't forward.
+                                            state.window.request_redraw();
+                                            true
+                                        } else {
+                                            false
+                                        }
                                     } else {
                                         false
-                                    }
-                                } else {
-                                    false
-                                };
+                                    };
 
                                 if !shortcut_handled {
                                     // No shortcut match: forward to the capture handler.
@@ -2593,7 +2600,20 @@ impl ApplicationHandler for AppHandler {
                             }
                         }
                     } else {
-                        // Normal keyboard handling: clipboard, then select, then text input, then shortcuts
+                        // Normal keyboard handling: raw app hook, clipboard, select,
+                        // text input, then shortcuts.
+                        let combo =
+                            key_combo_from_winit(&event.logical_key, &state.modifiers_state);
+                        let consumed_by_raw = combo
+                            .as_ref()
+                            .map(|combo| consume_raw_key_hook(&self.app.config, combo))
+                            .unwrap_or(false);
+                        if consumed_by_raw {
+                            state.needs_rebuild = true;
+                            state.window.request_redraw();
+                            return;
+                        }
+
                         let focused_is_input = state
                             .arena
                             .get(state.interaction.focused)
@@ -2625,24 +2645,8 @@ impl ApplicationHandler for AppHandler {
                         };
 
                         if !handled_by_input {
-                            if let Some(combo) =
-                                key_combo_from_winit(&event.logical_key, &state.modifiers_state)
-                            {
-                                // Raw-key hook: app can consume the event
-                                // before it reaches the shortcut resolver
-                                // (used by Settings' "record a new binding"
-                                // flow).
-                                let consumed_by_raw = self
-                                    .app
-                                    .config
-                                    .on_raw_key
-                                    .as_ref()
-                                    .map(|f| f(&combo))
-                                    .unwrap_or(false);
-                                if consumed_by_raw {
-                                    state.needs_rebuild = true;
-                                    state.window.request_redraw();
-                                } else if combo.key == Key::Escape
+                            if let Some(combo) = combo {
+                                if combo.key == Key::Escape
                                     && state.shortcut_resolver.is_chord_pending()
                                 {
                                     // Cancel chord on Escape
@@ -3655,6 +3659,16 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32), decorations: bool)
         state.interaction.hovered = new_hover;
         apply_cursor_icon(&*state.window, &state.arena, new_hover);
         state.mark_restyle_pseudo_change(old_hover, new_hover);
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Move,
+            x: pos.0,
+            y: pos.1,
+            button: MouseButton::None,
+            modifiers: Modifiers::empty(),
+        });
+        if dispatch_mouse_move_event(&state.arena, new_hover, &event) {
+            state.needs_rebuild = true;
+        }
         state.window.request_redraw();
     }
 
@@ -3679,6 +3693,23 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32), decorations: bool)
             }
         }
     }
+}
+
+fn dispatch_mouse_move_event(arena: &NodeArena, start: NodeId, event: &Event) -> bool {
+    let mut node = start;
+    while !node.is_dangling() {
+        let Some(element) = arena.get(node) else {
+            break;
+        };
+        for (event_type, handler) in &element.handlers {
+            if *event_type == EventType::MouseMove {
+                handler(event);
+                return true;
+            }
+        }
+        node = element.parent;
+    }
+    false
 }
 
 fn update_focus_context(state: &mut AppState) {
@@ -4988,6 +5019,74 @@ mod tests {
         // the speculative-frame behavior and idle CPU profile both move,
         // so callers should understand the intent.
         assert_eq!(ACTIVITY_WINDOW, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn keyboard_capture_shortcut_gate_allows_function_keys() {
+        use unshit_core::shortcut::KeyCombo;
+
+        assert!(should_check_shortcut_during_keyboard_capture(&KeyCombo::plain(Key::F(2))));
+        assert!(should_check_shortcut_during_keyboard_capture(&KeyCombo::new(
+            Key::Char('t'),
+            Modifiers::CTRL
+        )));
+        assert!(!should_check_shortcut_during_keyboard_capture(&KeyCombo::plain(Key::Char('a'))));
+    }
+
+    #[test]
+    fn raw_key_hook_can_consume_plain_navigation_keys() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use unshit_core::shortcut::KeyCombo;
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_hook = called.clone();
+        let config = AppConfig {
+            on_raw_key: Some(Arc::new(move |combo| {
+                called_for_hook.store(true, Ordering::SeqCst);
+                combo.key == Key::ArrowDown && combo.modifiers.is_empty()
+            })),
+            ..AppConfig::default()
+        };
+
+        assert!(consume_raw_key_hook(&config, &KeyCombo::plain(Key::ArrowDown)));
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mouse_move_event_walks_to_ancestor_handler() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_handler = called.clone();
+        let mut arena = NodeArena::new();
+        let mut parent = Element::new(Tag::Div);
+        parent.handlers.push((
+            EventType::MouseMove,
+            Arc::new(move |_| {
+                called_for_handler.store(true, Ordering::SeqCst);
+                None
+            }),
+        ));
+        let parent_id = arena.alloc(parent);
+        let child_id = arena.alloc(Element::new(Tag::Span));
+        arena.append_child(parent_id, child_id);
+
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Move,
+            x: 1.0,
+            y: 1.0,
+            button: MouseButton::None,
+            modifiers: Modifiers::empty(),
+        });
+
+        assert!(dispatch_mouse_move_event(&arena, child_id, &event));
+        assert!(called.load(Ordering::SeqCst));
     }
 
     #[test]

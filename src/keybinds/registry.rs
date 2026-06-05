@@ -55,7 +55,7 @@ fn alias_bindings() -> Vec<(String, String)> {
             KeybindAction::SplitRight.dispatch_command().to_string(),
         ),
         (
-            "Ctrl+Shift+P".to_string(),
+            "Ctrl+K".to_string(),
             KeybindAction::CommandPalette.dispatch_command().to_string(),
         ),
         (
@@ -155,6 +155,11 @@ mod tests {
     }
 
     #[test]
+    fn f2_renames_active_session() {
+        assert_eq!(find("F2").as_deref(), Some("session.rename_active"));
+    }
+
+    #[test]
     fn ctrl_shift_w_closes_active_tab() {
         // Ctrl+Shift+W forcibly closes the whole tab regardless of how
         // many panes it holds.
@@ -179,7 +184,17 @@ mod tests {
 
     #[test]
     fn palette_alias_registered() {
-        assert_eq!(find("Ctrl+Shift+P").as_deref(), Some("palette.toggle"));
+        assert_eq!(find("Ctrl+K").as_deref(), Some("palette.toggle"));
+    }
+
+    #[test]
+    fn ctrl_shift_p_registered_once_as_palette_default() {
+        let matches = pairs()
+            .into_iter()
+            .filter(|(combo, cmd)| combo == "Ctrl+Shift+P" && cmd == "palette.toggle")
+            .count();
+
+        assert_eq!(matches, 1);
     }
 
     #[test]

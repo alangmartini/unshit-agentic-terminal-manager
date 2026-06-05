@@ -32,6 +32,7 @@ pub enum KeybindAction {
     PrevTab,
     CommandPalette,
     QuickPromptOpen,
+    RenameSession,
     ToggleSidebar,
     OpenSettings,
     ZoomIn,
@@ -55,6 +56,7 @@ impl KeybindAction {
         Self::PrevTab,
         Self::CommandPalette,
         Self::QuickPromptOpen,
+        Self::RenameSession,
         Self::ToggleSidebar,
         Self::OpenSettings,
         Self::ZoomIn,
@@ -78,6 +80,7 @@ impl KeybindAction {
             Self::PrevTab => "prev_tab",
             Self::CommandPalette => "command_palette",
             Self::QuickPromptOpen => "quick_prompt_open",
+            Self::RenameSession => "rename_session",
             Self::ToggleSidebar => "toggle_sidebar",
             Self::OpenSettings => "open_settings",
             Self::ZoomIn => "zoom_in",
@@ -107,6 +110,7 @@ impl KeybindAction {
             Self::PrevTab => "Previous tab",
             Self::CommandPalette => "Command palette",
             Self::QuickPromptOpen => "Quick prompt",
+            Self::RenameSession => "Rename session",
             Self::ToggleSidebar => "Toggle sidebar",
             Self::OpenSettings => "Settings",
             Self::ZoomIn => "Zoom in",
@@ -134,6 +138,7 @@ impl KeybindAction {
             Self::PrevTab => "tab.prev",
             Self::CommandPalette => "palette.toggle",
             Self::QuickPromptOpen => "quick_prompt.open",
+            Self::RenameSession => "session.rename_active",
             Self::ToggleSidebar => "sidebar.toggle",
             Self::OpenSettings => "modal.open",
             Self::ZoomIn => "font.inc",
@@ -156,8 +161,9 @@ impl KeybindAction {
             Self::FocusDown => "Ctrl+Down",
             Self::NextTab => "Ctrl+Tab",
             Self::PrevTab => "Ctrl+Shift+Tab",
-            Self::CommandPalette => "Ctrl+K",
+            Self::CommandPalette => "Ctrl+Shift+P",
             Self::QuickPromptOpen => "Ctrl+Shift+Q",
+            Self::RenameSession => "F2",
             Self::ToggleSidebar => "Ctrl+B",
             Self::OpenSettings => "Ctrl+,",
             Self::ZoomIn => "Ctrl+=",
@@ -178,8 +184,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_has_eighteen_variants() {
-        assert_eq!(KeybindAction::ALL.len(), 18);
+    fn all_has_nineteen_variants() {
+        assert_eq!(KeybindAction::ALL.len(), 19);
     }
 
     #[test]
@@ -227,6 +233,14 @@ mod tests {
                 )
             });
         }
+    }
+
+    #[test]
+    fn command_palette_default_combo_is_ctrl_shift_p() {
+        assert_eq!(
+            KeybindAction::CommandPalette.default_combo_str(),
+            "Ctrl+Shift+P"
+        );
     }
 
     #[test]
@@ -301,6 +315,10 @@ mod tests {
         assert_eq!(
             KeybindAction::QuickPromptOpen.dispatch_command(),
             "quick_prompt.open"
+        );
+        assert_eq!(
+            KeybindAction::RenameSession.dispatch_command(),
+            "session.rename_active"
         );
         assert_eq!(
             KeybindAction::ToggleSidebar.dispatch_command(),

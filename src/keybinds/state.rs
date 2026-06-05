@@ -135,6 +135,15 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_effective_uses_ctrl_shift_p_default() {
+        let state = KeybindsState::default();
+        assert_eq!(
+            state.effective(KeybindAction::CommandPalette),
+            combo("Ctrl+Shift+P")
+        );
+    }
+
+    #[test]
     fn effective_returns_override_when_set() {
         let mut state = KeybindsState::default();
         state
@@ -144,6 +153,20 @@ mod tests {
             state.effective(KeybindAction::NewTerminal),
             combo("Ctrl+Shift+T")
         );
+    }
+
+    #[test]
+    fn command_palette_override_remains_editable() {
+        let mut state = KeybindsState::default();
+        state
+            .set(KeybindAction::CommandPalette, combo("Alt+P"))
+            .unwrap();
+
+        assert_eq!(
+            state.effective(KeybindAction::CommandPalette),
+            combo("Alt+P")
+        );
+        assert!(state.overrides.contains_key(&KeybindAction::CommandPalette));
     }
 
     #[test]

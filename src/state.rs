@@ -90,8 +90,15 @@ pub enum ConfirmDialog {
     /// Window close intent awaiting a decision between keep-running,
     /// kill-all, or cancel. `remember` is the live checkbox value: when
     /// true, the clicked action is also persisted via the close toggles
-    /// so the next close can skip the prompt.
-    CloseApp { count: usize, remember: bool },
+    /// so the next close can skip the prompt. `kept_pane_ids` tracks
+    /// which session rows the user selected to leave alive when choosing
+    /// keep-running; unselected panes are killed before the layout is
+    /// persisted for relaunch.
+    CloseApp {
+        count: usize,
+        remember: bool,
+        kept_pane_ids: BTreeSet<u32>,
+    },
     /// Rename dialog for the session backing `pane_id`. `buffer` is
     /// the live text in the input, updated on every keystroke so the
     /// commit handler can read it without pulling values out of the UI.
@@ -547,6 +554,8 @@ pub struct AppState {
     pub smooth_scroll_duration_ms: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub palette_query: String,
+    pub palette_active: usize,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Last window maximized state reported by the framework.
@@ -725,6 +734,8 @@ impl AppState {
             smooth_scroll_duration_ms: self.smooth_scroll_duration_ms,
             toggles: self.toggles.clone(),
             palette_open: self.palette_open,
+            palette_query: self.palette_query.clone(),
+            palette_active: self.palette_active,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
             window_maximized: self.window_maximized,
@@ -800,6 +811,8 @@ pub struct UiSnapshot {
     pub smooth_scroll_duration_ms: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub palette_query: String,
+    pub palette_active: usize,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Mirrors `AppState::window_maximized` so titlebar controls can
@@ -988,6 +1001,8 @@ pub fn seed_state() -> AppState {
         smooth_scroll_duration_ms: DEFAULT_SMOOTH_SCROLL_DURATION_MS,
         toggles,
         palette_open: false,
+        palette_query: String::new(),
+        palette_active: 0,
         sidebar_collapsed: false,
         sidebar_width: 252.0,
         window_maximized: false,
@@ -1448,7 +1463,9 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
         return;
     }
     let mut max_pane_id = 0u32;
-    let active_idx = persisted.active_workspace.min(persisted.workspaces.len() - 1);
+    let active_idx = persisted
+        .active_workspace
+        .min(persisted.workspaces.len() - 1);
     let mut workspaces = Vec::with_capacity(persisted.workspaces.len());
     for (i, entry) in persisted.workspaces.iter().enumerate() {
         let mut ws = new_workspace((i + 1) as u32, entry.name.clone(), entry.path.clone());
@@ -2579,6 +2596,129 @@ fn toggle_on(state: &AppState, key: ToggleKey) -> bool {
     state.toggles.get(&key).copied().unwrap_or(false)
 }
 
+fn close_app_pane_ids(state: &AppState) -> BTreeSet<u32> {
+    let mut ids = BTreeSet::new();
+    for (workspace_idx, workspace) in state.workspaces.iter().enumerate() {
+        let tabs = if workspace_idx == state.active_workspace {
+            &state.tabs
+        } else {
+            &workspace.tabs
+        };
+        for (tab_idx, tab) in tabs.iter().enumerate() {
+            let panes = if workspace_idx == state.active_workspace && tab_idx == state.active_tab {
+                &state.panes
+            } else {
+                &tab.panes
+            };
+            for pane in panes.iter().flatten() {
+                ids.insert(pane.id.0);
+            }
+        }
+    }
+    if state.workspaces.is_empty() {
+        for pane in state.panes.iter().flatten() {
+            ids.insert(pane.id.0);
+        }
+    }
+    ids
+}
+
+fn positive_ratio(v: f32) -> Option<f32> {
+    (v.is_finite() && v > 0.0).then_some(v)
+}
+
+fn retain_tab_panes(tab: &mut TerminalTab, kept_pane_ids: &BTreeSet<u32>) -> bool {
+    let old_panes = std::mem::take(&mut tab.panes);
+    let old_row_ratios = std::mem::take(&mut tab.row_ratios);
+    let old_col_ratios = std::mem::take(&mut tab.col_ratios);
+
+    let mut panes = Vec::new();
+    let mut row_ratios = Vec::new();
+    let mut col_ratios = Vec::new();
+
+    for (row_idx, row) in old_panes.into_iter().enumerate() {
+        let mut kept_row = Vec::new();
+        let mut kept_col_ratios = Vec::new();
+        for (col_idx, pane) in row.into_iter().enumerate() {
+            if kept_pane_ids.contains(&pane.id.0) {
+                kept_col_ratios.push(
+                    old_col_ratios
+                        .get(row_idx)
+                        .and_then(|row| row.get(col_idx))
+                        .copied()
+                        .and_then(positive_ratio)
+                        .unwrap_or(1.0),
+                );
+                kept_row.push(pane);
+            }
+        }
+        if !kept_row.is_empty() {
+            panes.push(kept_row);
+            row_ratios.push(
+                old_row_ratios
+                    .get(row_idx)
+                    .copied()
+                    .and_then(positive_ratio)
+                    .unwrap_or(1.0),
+            );
+            col_ratios.push(kept_col_ratios);
+        }
+    }
+
+    if panes.is_empty() {
+        return false;
+    }
+    if !panes
+        .iter()
+        .flatten()
+        .any(|pane| pane.id == tab.active_pane)
+    {
+        tab.active_pane = panes[0][0].id;
+    }
+    tab.panes = panes;
+    tab.row_ratios = row_ratios;
+    tab.col_ratios = col_ratios;
+    true
+}
+
+fn prune_close_layout_to_kept_panes(state: &mut AppState, kept_pane_ids: &BTreeSet<u32>) {
+    if state.workspaces.is_empty() {
+        save_tab_state(state);
+        state
+            .tabs
+            .retain_mut(|tab| retain_tab_panes(tab, kept_pane_ids));
+        if state.tabs.is_empty() {
+            state.active_tab = 0;
+            state.panes.clear();
+            state.active_pane = PaneId(0);
+            state.row_ratios.clear();
+            state.col_ratios.clear();
+        } else {
+            state.active_tab = state.active_tab.min(state.tabs.len() - 1);
+            load_tab_state(state);
+        }
+        return;
+    }
+
+    save_workspace_state(state);
+    for workspace in state.workspaces.iter_mut() {
+        workspace
+            .tabs
+            .retain_mut(|tab| retain_tab_panes(tab, kept_pane_ids));
+        if workspace.tabs.is_empty() {
+            workspace.active_tab = 0;
+            workspace.terminals_expanded = false;
+        } else {
+            workspace.active_tab = workspace.active_tab.min(workspace.tabs.len() - 1);
+            workspace.terminals_expanded = true;
+        }
+        if let Some(subtab) = workspace.subtabs.get_mut(0) {
+            subtab.count = Some(workspace.tabs.len() as u32);
+        }
+    }
+    load_workspace_state(state);
+}
+
 /// Resolve the close-button click against the persisted preference
 /// toggles. If no preference has been remembered, populate
 /// `state.confirm_dialog` with a `CloseApp` dialog and return
@@ -2594,9 +2734,11 @@ pub fn resolve_close_action(state: &mut AppState) -> CloseAction {
             CloseAction::KeepRunning
         }
     } else {
+        let kept_pane_ids = close_app_pane_ids(state);
         state.confirm_dialog = Some(ConfirmDialog::CloseApp {
-            count: state.terminals.len(),
+            count: kept_pane_ids.len(),
             remember: false,
+            kept_pane_ids,
         });
         CloseAction::Prompt
     }
@@ -2722,33 +2864,210 @@ pub fn mutate_rename_pane(state: &mut AppState, pane_id: u32, name: &str) {
         trimmed.to_string()
     };
 
-    for row in state.panes.iter_mut() {
-        for pane in row.iter_mut() {
-            if pane.id.0 == pane_id {
-                pane.title = new_title.clone();
-            }
-        }
-    }
-    if let Some(tab) = state.tabs.get_mut(state.active_tab) {
-        for row in tab.panes.iter_mut() {
-            for pane in row.iter_mut() {
-                if pane.id.0 == pane_id {
-                    pane.title = new_title.clone();
-                }
-            }
-        }
+    rename_panes_in_rows(&mut state.panes, pane_id, &new_title);
+    for tab in state.tabs.iter_mut() {
+        rename_pane_in_tab(tab, pane_id, &new_title);
     }
     for ws in state.workspaces.iter_mut() {
         for tab in ws.tabs.iter_mut() {
-            for row in tab.panes.iter_mut() {
-                for pane in row.iter_mut() {
-                    if pane.id.0 == pane_id {
-                        pane.title = new_title.clone();
-                    }
-                }
+            rename_pane_in_tab(tab, pane_id, &new_title);
+        }
+    }
+}
+
+fn rename_panes_in_rows(rows: &mut [Vec<Pane>], pane_id: u32, new_title: &str) -> bool {
+    let mut renamed = false;
+    for row in rows.iter_mut() {
+        for pane in row.iter_mut() {
+            if pane.id.0 == pane_id {
+                pane.title = new_title.to_string();
+                renamed = true;
             }
         }
     }
+    renamed
+}
+
+fn rename_pane_in_tab(tab: &mut TerminalTab, pane_id: u32, new_title: &str) -> bool {
+    let renamed = rename_panes_in_rows(&mut tab.panes, pane_id, new_title);
+    if renamed && tab_title_follows_pane(tab, pane_id) {
+        tab.name = new_title.to_string();
+    }
+    renamed
+}
+
+fn tab_title_follows_pane(tab: &TerminalTab, pane_id: u32) -> bool {
+    tab.active_pane.0 == pane_id || tab.panes.iter().flatten().count() == 1
+}
+
+fn pane_title_by_id(state: &AppState, pane_id: u32) -> Option<String> {
+    state
+        .panes
+        .iter()
+        .flatten()
+        .find(|p| p.id.0 == pane_id)
+        .map(|p| p.title.clone())
+        .or_else(|| {
+            state
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter().flatten())
+                .find(|p| p.id.0 == pane_id)
+                .map(|p| p.title.clone())
+        })
+        .or_else(|| {
+            state
+                .workspaces
+                .iter()
+                .flat_map(|ws| ws.tabs.iter())
+                .flat_map(|tab| tab.panes.iter().flatten())
+                .find(|p| p.id.0 == pane_id)
+                .map(|p| p.title.clone())
+        })
+}
+
+fn open_command_palette(state: &mut AppState) {
+    state.ctx_menu = None;
+    if let Some(qp) = state.quick_prompt.take() {
+        crate::quick_prompt::images::cleanup_session(&qp.session_hex);
+    }
+    state.palette_open = true;
+    clear_palette_query(state);
+}
+
+fn close_command_palette(state: &mut AppState) -> bool {
+    let changed =
+        state.palette_open || !state.palette_query.is_empty() || state.palette_active != 0;
+    state.palette_open = false;
+    clear_palette_query(state);
+    changed
+}
+
+fn palette_flattened_items(state: &AppState) -> Vec<crate::command_palette::PaletteItem> {
+    let snap = state.ui_snapshot();
+    crate::command_palette::build_palette_results(&snap, &state.palette_query)
+        .groups
+        .into_iter()
+        .flat_map(|group| group.items)
+        .collect()
+}
+
+fn palette_result_count(state: &AppState) -> usize {
+    palette_flattened_items(state).len()
+}
+
+fn reset_palette_selection(state: &mut AppState) {
+    state.palette_active = 0;
+}
+
+fn clear_palette_query(state: &mut AppState) {
+    state.palette_query.clear();
+    reset_palette_selection(state);
+}
+
+fn set_palette_query(state: &mut AppState, query: String) {
+    state.palette_query = crate::command_palette::sanitize_palette_query(&query);
+    reset_palette_selection(state);
+}
+
+fn palette_push_query_char(state: &mut AppState, ch: char) -> bool {
+    let mut candidate = state.palette_query.clone();
+    candidate.push(ch);
+    state.palette_query = crate::command_palette::sanitize_palette_query(&candidate);
+    true
+}
+
+fn palette_backspace_query(state: &mut AppState) -> bool {
+    state.palette_query.pop();
+    reset_palette_selection(state);
+    true
+}
+
+fn palette_delete_query(state: &mut AppState) -> bool {
+    reset_palette_selection(state);
+    true
+}
+
+fn palette_text_modifiers(modifiers: unshit::core::event::Modifiers) -> bool {
+    use unshit::core::event::Modifiers;
+    !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META)
+}
+
+pub fn dispatch_palette_key(
+    state: &mut AppState,
+    combo: &unshit::core::shortcut::KeyCombo,
+) -> bool {
+    use unshit::core::event::{Key, Modifiers};
+
+    if !state.palette_open {
+        return false;
+    }
+
+    match (combo.key, combo.modifiers) {
+        (Key::ArrowDown, modifiers) if modifiers.is_empty() => {
+            dispatch(state, "palette.select_next")
+        }
+        (Key::Char('n'), Modifiers::CTRL) => dispatch(state, "palette.select_next"),
+        (Key::ArrowUp, modifiers) if modifiers.is_empty() => dispatch(state, "palette.select_prev"),
+        (Key::Char('p'), Modifiers::CTRL) => dispatch(state, "palette.select_prev"),
+        (Key::Enter, modifiers) if modifiers.is_empty() => {
+            dispatch(state, "palette.execute_active")
+        }
+        (Key::Escape, modifiers) if modifiers.is_empty() => dispatch(state, "palette.escape"),
+        (Key::Backspace, modifiers) if palette_text_modifiers(modifiers) => {
+            palette_backspace_query(state)
+        }
+        (Key::Delete, modifiers) if palette_text_modifiers(modifiers) => {
+            palette_delete_query(state)
+        }
+        (Key::Space, modifiers) if palette_text_modifiers(modifiers) => {
+            palette_push_query_char(state, ' ')
+        }
+        (Key::Char(ch), modifiers) if palette_text_modifiers(modifiers) => {
+            palette_push_query_char(state, ch)
+        }
+        _ => true,
+    }
+}
+
+fn is_palette_safe_dispatch(command: &str) -> bool {
+    matches!(
+        command,
+        "session.rename_active"
+            | "pane.split_right"
+            | "pane.split_down"
+            | "tab.new"
+            | "pane.close"
+            | "sidebar.toggle"
+            | "modal.open"
+            | "quick_prompt.open"
+    ) || command.starts_with("workspace.switch:")
+        || command.starts_with("terminal.focus:")
+}
+
+fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
+    if !state.palette_open {
+        return false;
+    }
+
+    let Some(item) = palette_flattened_items(state)
+        .into_iter()
+        .find(|item| item.enabled && item.id == item_id)
+    else {
+        return false;
+    };
+    let Some(command) = item.dispatch else {
+        return false;
+    };
+    if !is_palette_safe_dispatch(&command) {
+        return false;
+    }
+
+    let handled = dispatch(state, &command);
+    if handled {
+        close_command_palette(state);
+    }
+    handled
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
@@ -2767,6 +3086,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             if state.confirm_dialog.is_some() {
                 state.confirm_dialog = None;
+                changed = true;
+            }
+            if close_command_palette(state) {
                 changed = true;
             }
             // Esc with the autocomplete popup open dismisses just the
@@ -2836,16 +3158,48 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 false
             }
         }
+        command if command.starts_with("dialog.toggle_keep:") => {
+            let Some(raw_id) = command.strip_prefix("dialog.toggle_keep:") else {
+                return false;
+            };
+            let Ok(pane_id) = raw_id.parse::<u32>() else {
+                return false;
+            };
+            if let Some(ConfirmDialog::CloseApp { kept_pane_ids, .. }) =
+                state.confirm_dialog.as_mut()
+            {
+                if kept_pane_ids.contains(&pane_id) {
+                    kept_pane_ids.remove(&pane_id);
+                } else {
+                    kept_pane_ids.insert(pane_id);
+                }
+                true
+            } else {
+                false
+            }
+        }
         "app.close.keep_running" => {
-            let remember = matches!(
-                state.confirm_dialog,
-                Some(ConfirmDialog::CloseApp { remember: true, .. })
-            );
+            let all_pane_ids = close_app_pane_ids(state);
+            let (remember, kept_pane_ids) = match state.confirm_dialog.as_ref() {
+                Some(ConfirmDialog::CloseApp {
+                    remember,
+                    kept_pane_ids,
+                    ..
+                }) => (*remember, kept_pane_ids.clone()),
+                _ => (false, all_pane_ids.clone()),
+            };
+            let kill_pane_ids: Vec<u32> =
+                all_pane_ids.difference(&kept_pane_ids).copied().collect();
             state.confirm_dialog = None;
             if remember {
                 state.toggles.insert(ToggleKey::RememberCloseChoice, true);
                 state.toggles.insert(ToggleKey::KillAllOnClose, false);
             }
+            for pane_id in kill_pane_ids {
+                state.pty_manager.destroy(pane_id);
+                state.terminals.remove(&pane_id);
+            }
+            prune_close_layout_to_kept_panes(state, &kept_pane_ids);
             // Always persist the live layout (not just when "remember" is
             // ticked): the daemon keeps these sessions alive, so the next
             // launch must restore the same tabs/panes to reattach them.
@@ -3177,8 +3531,86 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         "theme.custom.reset" => reset_custom_theme(state),
         "appearance.reset" => reset_appearance(state),
         "palette.toggle" => {
-            state.palette_open = !state.palette_open;
+            if state.palette_open {
+                close_command_palette(state);
+            } else {
+                open_command_palette(state);
+            }
             true
+        }
+        "palette.close" => close_command_palette(state),
+        other if other.starts_with("palette.query:") => {
+            if !state.palette_open {
+                return false;
+            }
+            set_palette_query(state, other["palette.query:".len()..].to_string());
+            true
+        }
+        "palette.select_next" => {
+            if !state.palette_open {
+                return false;
+            }
+            let count = palette_result_count(state);
+            if count == 0 {
+                return false;
+            }
+            state.palette_active = (state.palette_active + 1) % count;
+            true
+        }
+        "palette.select_prev" => {
+            if !state.palette_open {
+                return false;
+            }
+            let count = palette_result_count(state);
+            if count == 0 {
+                return false;
+            }
+            state.palette_active = if state.palette_active == 0 {
+                count - 1
+            } else {
+                (state.palette_active - 1) % count
+            };
+            true
+        }
+        other if other.starts_with("palette.hover:") => {
+            if !state.palette_open {
+                return false;
+            }
+            let Ok(index) = other["palette.hover:".len()..].parse::<usize>() else {
+                return false;
+            };
+            if index >= palette_result_count(state) {
+                return false;
+            }
+            if state.palette_active == index {
+                return false;
+            }
+            state.palette_active = index;
+            true
+        }
+        "palette.escape" => {
+            if !state.palette_open {
+                return false;
+            }
+            if !state.palette_query.is_empty() {
+                clear_palette_query(state);
+                true
+            } else {
+                close_command_palette(state)
+            }
+        }
+        "palette.execute_active" => {
+            if !state.palette_open {
+                return false;
+            }
+            let items = palette_flattened_items(state);
+            let Some(item_id) = items.get(state.palette_active).map(|item| item.id.clone()) else {
+                return false;
+            };
+            execute_palette_item(state, &item_id)
+        }
+        other if other.starts_with("palette.execute:") => {
+            execute_palette_item(state, &other["palette.execute:".len()..])
         }
         "fps_overlay.toggle" => {
             // Flip the in-app FPS overlay (Phase 0 of the 120fps perf
@@ -3349,16 +3781,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             crate::persist::save_workspaces(state);
             true
         }
+        "session.rename_active" => {
+            let pane_id = state.active_pane.0;
+            dispatch(state, &format!("tab.request_rename:{pane_id}"))
+        }
         other if other.starts_with("tab.request_rename:") => {
             if let Ok(pane_num) = other["tab.request_rename:".len()..].parse::<u32>() {
                 state.ctx_menu = None;
-                let current = state
-                    .panes
-                    .iter()
-                    .flat_map(|row| row.iter())
-                    .find(|p| p.id.0 == pane_num)
-                    .map(|p| p.title.clone())
-                    .unwrap_or_default();
+                let current = pane_title_by_id(state, pane_num).unwrap_or_default();
                 state.confirm_dialog = Some(ConfirmDialog::RenameSession {
                     pane_id: pane_num,
                     buffer: current,
@@ -4117,6 +4547,8 @@ mod tests {
             smooth_scroll_duration_ms: DEFAULT_SMOOTH_SCROLL_DURATION_MS,
             toggles: BTreeMap::new(),
             palette_open: false,
+            palette_query: String::new(),
+            palette_active: 0,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
             window_maximized: false,
@@ -5293,6 +5725,463 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_palette_open_close_and_query_reset_selection() {
+        let mut state = test_state();
+        state.palette_query = "> split".to_string();
+        state.palette_active = 4;
+
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(state.palette_open);
+        assert_eq!(state.palette_query, "");
+        assert_eq!(state.palette_active, 0);
+
+        state.palette_query = "@ agent".to_string();
+        state.palette_active = 2;
+        let parsed = crate::command_palette::parse_palette_query(&state.palette_query);
+        assert_eq!(parsed.mode, crate::command_palette::PaletteMode::Agents);
+
+        assert!(dispatch(&mut state, "palette.query:> rename"));
+        assert_eq!(state.palette_query, "> rename");
+        assert_eq!(state.palette_active, 0);
+
+        state.palette_active = 3;
+        assert!(dispatch(&mut state, "palette.close"));
+        assert!(!state.palette_open);
+        assert_eq!(state.palette_query, "");
+        assert_eq!(state.palette_active, 0);
+    }
+
+    #[test]
+    fn dispatch_palette_query_caps_and_sanitizes_external_input() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+
+        let long_query = format!("palette.query:>\trename\n{}\u{202e}", "x".repeat(400));
+        assert!(dispatch(&mut state, &long_query));
+
+        assert!(
+            state.palette_query.chars().count() <= crate::command_palette::PALETTE_QUERY_MAX_CHARS
+        );
+        assert!(!state.palette_query.chars().any(char::is_control));
+        assert!(!state.palette_query.contains('\u{202e}'));
+        assert_eq!(
+            crate::command_palette::parse_palette_query(&state.palette_query).mode,
+            crate::command_palette::PaletteMode::Actions
+        );
+    }
+
+    #[test]
+    fn dispatch_palette_selection_wraps_current_results() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(dispatch(&mut state, "palette.query:>"));
+
+        assert_eq!(state.palette_active, 0);
+        assert!(dispatch(&mut state, "palette.select_prev"));
+        assert_eq!(
+            state.palette_active,
+            crate::command_palette::SAFE_ACTIONS.len() - 1
+        );
+        assert!(dispatch(&mut state, "palette.select_next"));
+        assert_eq!(state.palette_active, 0);
+
+        state.palette_active = crate::command_palette::SAFE_ACTIONS.len() - 1;
+        assert!(dispatch(&mut state, "palette.select_next"));
+        assert_eq!(state.palette_active, 0);
+    }
+
+    #[test]
+    fn dispatch_palette_escape_clears_query_then_closes() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(dispatch(&mut state, "palette.query:rename"));
+        state.palette_active = 2;
+
+        assert!(dispatch(&mut state, "palette.escape"));
+        assert!(state.palette_open);
+        assert_eq!(state.palette_query, "");
+        assert_eq!(state.palette_active, 0);
+
+        assert!(dispatch(&mut state, "palette.escape"));
+        assert!(!state.palette_open);
+    }
+
+    #[test]
+    fn dispatch_palette_execute_rename_current_terminal_opens_rename_dialog() {
+        let mut state = test_state();
+        state.palette_open = true;
+
+        assert!(dispatch(
+            &mut state,
+            "palette.execute:rename_current_terminal"
+        ));
+
+        assert!(!state.palette_open);
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::RenameSession {
+                pane_id,
+                buffer,
+                error,
+            }) => {
+                assert_eq!(*pane_id, state.active_pane.0);
+                assert_eq!(buffer, "shell");
+                assert!(error.is_none());
+            }
+            other => panic!("expected RenameSession dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_palette_execute_active_runs_current_selection_and_closes() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(dispatch(&mut state, "palette.query:> open_settings"));
+
+        assert!(dispatch(&mut state, "palette.execute_active"));
+
+        assert!(!state.palette_open);
+        assert!(state.settings_open);
+    }
+
+    #[test]
+    fn dispatch_palette_executes_all_safe_actions_and_closes() {
+        let mut state = test_state();
+        state.palette_open = true;
+        assert!(dispatch(&mut state, "palette.execute:split_pane_right"));
+        assert!(!state.palette_open);
+        assert_eq!(state.panes.iter().flatten().count(), 2);
+
+        let mut state = test_state();
+        state.palette_open = true;
+        assert!(dispatch(&mut state, "palette.execute:split_pane_down"));
+        assert!(!state.palette_open);
+        assert_eq!(state.panes.len(), 2);
+
+        let mut state = test_state();
+        state.palette_open = true;
+        assert!(dispatch(&mut state, "palette.execute:new_terminal"));
+        assert!(!state.palette_open);
+        assert_eq!(state.tabs.len(), 2);
+
+        let mut state = test_state();
+        mutate_split_right(&mut state, PaneId(1));
+        state.palette_open = true;
+        assert!(dispatch(&mut state, "palette.execute:close_pane"));
+        assert!(!state.palette_open);
+        assert_eq!(state.panes.iter().flatten().count(), 1);
+
+        let mut state = test_state();
+        state.palette_open = true;
+        assert!(dispatch(&mut state, "palette.execute:toggle_sidebar"));
+        assert!(!state.palette_open);
+        assert!(state.sidebar_collapsed);
+
+        let mut state = test_state();
+        state.palette_open = true;
+        assert!(dispatch(&mut state, "palette.execute:open_settings"));
+        assert!(!state.palette_open);
+        assert!(state.settings_open);
+    }
+
+    #[test]
+    fn dispatch_palette_refuses_unknown_and_destructive_ids_without_closing() {
+        let mut state = test_state();
+        state.palette_open = true;
+
+        assert!(!dispatch(&mut state, "palette.execute:kill_session"));
+        assert!(!dispatch(&mut state, "palette.execute:session.kill:1"));
+        assert!(!dispatch(&mut state, "palette.execute:missing"));
+        assert!(state.palette_open);
+    }
+
+    #[test]
+    fn dispatch_palette_navigation_ids_must_come_from_real_snapshot_rows() {
+        let mut state = two_workspace_state();
+        state.palette_open = true;
+        state.palette_query = ": beta".to_string();
+
+        assert!(dispatch(&mut state, "palette.execute:workspace:1"));
+        assert!(!state.palette_open);
+        assert_eq!(state.active_workspace, 1);
+
+        let mut state = two_workspace_state();
+        state.palette_open = true;
+        state.palette_query = ": pane 8".to_string();
+        assert!(dispatch(&mut state, "palette.execute:terminal:1:8"));
+        assert!(!state.palette_open);
+        assert_eq!(state.active_workspace, 1);
+        assert_eq!(state.active_pane, PaneId(8));
+
+        let mut state = two_workspace_state();
+        state.palette_open = true;
+        state.palette_query = ":".to_string();
+        assert!(!dispatch(&mut state, "palette.execute:terminal:1:999"));
+        assert!(state.palette_open);
+    }
+
+    #[test]
+    fn dispatch_palette_agent_terminal_ids_must_come_from_real_snapshot_rows() {
+        let mut state = two_workspace_state();
+        state.workspaces[1].tabs[0].subtitle = "codex.cmd".to_string();
+        state.workspaces[1].tabs[0].panes[0][1].subtitle = "codex.cmd".to_string();
+        state.palette_open = true;
+        state.palette_query = "@ codex".to_string();
+
+        assert!(dispatch(&mut state, "palette.execute:agent-terminal:1:8"));
+        assert!(!state.palette_open);
+        assert_eq!(state.active_workspace, 1);
+        assert_eq!(state.active_pane, PaneId(8));
+
+        let mut state = two_workspace_state();
+        state.palette_open = true;
+        state.palette_query = "@".to_string();
+
+        assert!(!dispatch(&mut state, "palette.execute:agent-terminal:1:8"));
+        assert!(state.palette_open);
+    }
+
+    #[test]
+    fn palette_key_down_and_ctrl_n_select_next_result() {
+        use unshit::core::event::{Key, Modifiers};
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(dispatch(&mut state, "palette.query:>"));
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::ArrowDown)
+        ));
+        assert_eq!(state.palette_active, 1);
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::new(Key::Char('n'), Modifiers::CTRL)
+        ));
+        assert_eq!(state.palette_active, 2);
+    }
+
+    #[test]
+    fn palette_key_up_and_ctrl_p_select_previous_result() {
+        use unshit::core::event::{Key, Modifiers};
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(dispatch(&mut state, "palette.query:>"));
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::ArrowUp)
+        ));
+        assert_eq!(
+            state.palette_active,
+            crate::command_palette::SAFE_ACTIONS.len() - 1
+        );
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::new(Key::Char('p'), Modifiers::CTRL)
+        ));
+        assert_eq!(
+            state.palette_active,
+            crate::command_palette::SAFE_ACTIONS.len() - 2
+        );
+    }
+
+    #[test]
+    fn palette_key_enter_executes_selected_result() {
+        use unshit::core::event::Key;
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(dispatch(&mut state, "palette.query:>"));
+        state.palette_active = crate::command_palette::SAFE_ACTIONS
+            .iter()
+            .position(|action| action.id == "open_settings")
+            .expect("open settings action");
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::Enter)
+        ));
+
+        assert!(!state.palette_open);
+        assert!(state.settings_open);
+    }
+
+    #[test]
+    fn palette_key_escape_clears_query_before_closing() {
+        use unshit::core::event::Key;
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(dispatch(&mut state, "palette.query:rename"));
+        state.palette_active = 2;
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::Escape)
+        ));
+        assert!(state.palette_open);
+        assert_eq!(state.palette_query, "");
+        assert_eq!(state.palette_active, 0);
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::Escape)
+        ));
+        assert!(!state.palette_open);
+    }
+
+    #[test]
+    fn palette_key_plain_text_edits_query_without_focused_input() {
+        use unshit::core::event::{Key, Modifiers};
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+
+        for ch in ['r', 'e', 'n', 'a', 'm', 'e'] {
+            assert!(dispatch_palette_key(
+                &mut state,
+                &KeyCombo::plain(Key::Char(ch))
+            ));
+        }
+        assert_eq!(state.palette_query, "rename");
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::Backspace)
+        ));
+        assert_eq!(state.palette_query, "renam");
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::new(Key::Char('>'), Modifiers::SHIFT)
+        ));
+        assert_eq!(state.palette_query, "renam>");
+        assert!(state.palette_open);
+    }
+
+    #[test]
+    fn palette_key_plain_space_supports_multi_term_query() {
+        use unshit::core::event::Key;
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+
+        for ch in "open settings".chars() {
+            let combo = if ch == ' ' {
+                KeyCombo::plain(Key::Space)
+            } else {
+                KeyCombo::plain(Key::Char(ch))
+            };
+            assert!(dispatch_palette_key(&mut state, &combo));
+        }
+
+        assert_eq!(state.palette_query, "open settings");
+        let results = crate::command_palette::build_palette_results(
+            &state.ui_snapshot(),
+            &state.palette_query,
+        );
+        let first = results
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .next()
+            .expect("matching command");
+        assert_eq!(first.id, "open_settings");
+    }
+
+    #[test]
+    fn palette_key_consumes_global_shortcuts_while_open() {
+        use unshit::core::event::{Key, Modifiers};
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        let tabs_before = state.tabs.len();
+        let pane_rows_before = state.panes.len();
+
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::new(Key::Char('v'), Modifiers::CTRL)
+        ));
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::new(Key::Char('w'), Modifiers::CTRL)
+        ));
+
+        assert!(state.palette_open);
+        assert_eq!(state.tabs.len(), tabs_before);
+        assert_eq!(state.panes.len(), pane_rows_before);
+        assert!(state.toasts.is_empty());
+    }
+
+    #[test]
+    fn palette_key_typing_then_enter_executes_matching_command() {
+        use unshit::core::event::Key;
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+
+        for ch in "rename".chars() {
+            assert!(dispatch_palette_key(
+                &mut state,
+                &KeyCombo::plain(Key::Char(ch))
+            ));
+        }
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::Enter)
+        ));
+
+        assert!(!state.palette_open);
+        assert!(matches!(
+            state.confirm_dialog,
+            Some(ConfirmDialog::RenameSession { pane_id: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn palette_hover_moves_active_selection_to_real_row() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(dispatch(&mut state, "palette.query:>"));
+
+        assert!(dispatch(&mut state, "palette.hover:3"));
+        assert_eq!(state.palette_active, 3);
+        assert!(!dispatch(&mut state, "palette.hover:999"));
+        assert_eq!(state.palette_active, 3);
+    }
+
+    #[test]
+    fn dispatch_session_rename_active_opens_current_pane_rename_dialog() {
+        let mut state = test_state();
+
+        assert!(dispatch(&mut state, "session.rename_active"));
+
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::RenameSession {
+                pane_id,
+                buffer,
+                error,
+            }) => {
+                assert_eq!(*pane_id, 1);
+                assert_eq!(buffer, "shell");
+                assert!(error.is_none());
+            }
+            other => panic!("expected RenameSession dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn dispatch_fps_overlay_toggle_flips_visibility_and_emit_flag() {
         let _guard = crate::ui::fps_overlay::global_state_test_lock();
         // Reset to a known starting state since the overlay lives in
@@ -5571,19 +6460,34 @@ mod tests {
 
     // -- F7 close-app prompt --------------------------------------------------
 
+    fn close_app_dialog(count: usize, remember: bool, kept_pane_ids: &[u32]) -> ConfirmDialog {
+        ConfirmDialog::CloseApp {
+            count,
+            remember,
+            kept_pane_ids: kept_pane_ids.iter().copied().collect(),
+        }
+    }
+
     #[test]
     fn resolve_close_action_with_no_preference_opens_prompt_and_vetoes() {
         let mut state = seed_state();
         assert!(!toggle_on(&state, ToggleKey::RememberCloseChoice));
         let action = resolve_close_action(&mut state);
         assert_eq!(action, CloseAction::Prompt);
-        assert!(matches!(
-            state.confirm_dialog,
+        match state.confirm_dialog.as_ref() {
             Some(ConfirmDialog::CloseApp {
-                remember: false,
+                remember,
+                kept_pane_ids,
                 ..
-            })
-        ));
+            }) => {
+                assert!(!remember);
+                assert!(
+                    kept_pane_ids.contains(&state.active_pane.0),
+                    "seeded pane should start selected to keep alive"
+                );
+            }
+            other => panic!("expected CloseApp dialog, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5612,10 +6516,7 @@ mod tests {
     #[test]
     fn dialog_toggle_remember_flips_checkbox_on_close_app_dialog() {
         let mut state = seed_state();
-        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
-            count: 2,
-            remember: false,
-        });
+        state.confirm_dialog = Some(close_app_dialog(2, false, &[1, 2]));
         assert!(dispatch(&mut state, "dialog.toggle_remember"));
         assert!(matches!(
             state.confirm_dialog,
@@ -5632,20 +6533,39 @@ mod tests {
     }
 
     #[test]
+    fn dialog_toggle_keep_flips_selected_pane_on_close_app_dialog() {
+        let mut state = seed_state();
+        state.confirm_dialog = Some(close_app_dialog(2, false, &[1, 2]));
+        assert!(dispatch(&mut state, "dialog.toggle_keep:2"));
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::CloseApp { kept_pane_ids, .. }) => {
+                assert!(kept_pane_ids.contains(&1));
+                assert!(!kept_pane_ids.contains(&2));
+            }
+            other => panic!("expected CloseApp dialog, got {other:?}"),
+        }
+        assert!(dispatch(&mut state, "dialog.toggle_keep:2"));
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::CloseApp { kept_pane_ids, .. }) => {
+                assert!(kept_pane_ids.contains(&2));
+            }
+            other => panic!("expected CloseApp dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn dialog_toggle_remember_without_close_app_is_noop() {
         let mut state = seed_state();
         assert!(!dispatch(&mut state, "dialog.toggle_remember"));
         state.confirm_dialog = Some(ConfirmDialog::KillAll { count: 1 });
         assert!(!dispatch(&mut state, "dialog.toggle_remember"));
+        assert!(!dispatch(&mut state, "dialog.toggle_keep:1"));
     }
 
     #[test]
     fn close_keep_running_without_remember_clears_dialog_and_terminals_only() {
         let mut state = seed_state();
-        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
-            count: 0,
-            remember: false,
-        });
+        state.confirm_dialog = Some(close_app_dialog(0, false, &[1]));
         assert!(dispatch(&mut state, "app.close.keep_running"));
         assert!(state.confirm_dialog.is_none());
         assert!(state.terminals.is_empty());
@@ -5658,22 +6578,58 @@ mod tests {
     #[test]
     fn close_keep_running_with_remember_persists_preference() {
         let mut state = seed_state();
-        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
-            count: 0,
-            remember: true,
-        });
+        state.confirm_dialog = Some(close_app_dialog(0, true, &[1]));
         assert!(dispatch(&mut state, "app.close.keep_running"));
         assert!(toggle_on(&state, ToggleKey::RememberCloseChoice));
         assert!(!toggle_on(&state, ToggleKey::KillAllOnClose));
     }
 
     #[test]
+    fn close_keep_running_kills_unselected_and_prunes_layout() {
+        let mut state = seed_state();
+        state.panes = vec![vec![
+            Pane {
+                id: PaneId(1),
+                title: "keep".into(),
+                subtitle: "bash".into(),
+                pid: 0,
+                cpu: 0.0,
+            },
+            Pane {
+                id: PaneId(2),
+                title: "kill".into(),
+                subtitle: "bash".into(),
+                pid: 0,
+                cpu: 0.0,
+            },
+        ]];
+        state.active_pane = PaneId(2);
+        state.row_ratios = vec![1.0];
+        state.col_ratios = vec![vec![0.4, 0.6]];
+        state.tabs[0].panes = state.panes.clone();
+        state.tabs[0].active_pane = PaneId(2);
+        state.tabs[0].row_ratios = state.row_ratios.clone();
+        state.tabs[0].col_ratios = state.col_ratios.clone();
+        state.confirm_dialog = Some(close_app_dialog(2, false, &[1]));
+
+        assert!(dispatch(&mut state, "app.close.keep_running"));
+
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 1);
+        assert_eq!(state.panes[0][0].id, PaneId(1));
+        assert_eq!(state.active_pane, PaneId(1));
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].panes[0][0].id, PaneId(1));
+        assert_eq!(
+            state.workspaces[state.active_workspace].tabs[0].panes[0][0].id,
+            PaneId(1)
+        );
+    }
+
+    #[test]
     fn close_kill_and_quit_with_remember_persists_preference_and_empties() {
         let mut state = seed_state();
-        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
-            count: 0,
-            remember: true,
-        });
+        state.confirm_dialog = Some(close_app_dialog(0, true, &[1]));
         assert!(dispatch(&mut state, "app.close.kill_and_quit"));
         assert!(toggle_on(&state, ToggleKey::RememberCloseChoice));
         assert!(toggle_on(&state, ToggleKey::KillAllOnClose));
@@ -5700,10 +6656,7 @@ mod tests {
     #[test]
     fn dialog_confirm_on_close_app_is_noop_and_keeps_dialog_open() {
         let mut state = seed_state();
-        state.confirm_dialog = Some(ConfirmDialog::CloseApp {
-            count: 0,
-            remember: false,
-        });
+        state.confirm_dialog = Some(close_app_dialog(0, false, &[1]));
         assert!(!dispatch(&mut state, "dialog.confirm"));
         assert!(
             state.confirm_dialog.is_some(),
@@ -5757,6 +6710,36 @@ mod tests {
             }) => {
                 assert_eq!(*pane_id, 9999);
                 assert!(buffer.is_empty());
+            }
+            other => panic!("expected RenameSession dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_request_rename_reads_title_from_saved_tab_pane() {
+        let mut state = seed_state();
+        state.tabs.push(TerminalTab {
+            id: "inactive-tab".into(),
+            name: "inactive".into(),
+            subtitle: "bash".into(),
+            status: TabStatus::Running,
+            panes: vec![vec![Pane {
+                id: PaneId(77),
+                title: "saved-pane-title".into(),
+                subtitle: "bash".into(),
+                pid: 0,
+                cpu: 0.0,
+            }]],
+            active_pane: PaneId(77),
+            row_ratios: vec![1.0],
+            col_ratios: vec![vec![1.0]],
+        });
+
+        assert!(dispatch(&mut state, "tab.request_rename:77"));
+
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::RenameSession { buffer, .. }) => {
+                assert_eq!(buffer, "saved-pane-title");
             }
             other => panic!("expected RenameSession dialog, got {other:?}"),
         }
@@ -6093,6 +7076,65 @@ mod tests {
         }];
         mutate_rename_pane(&mut state, 9, "new-name");
         assert_eq!(state.workspaces[1].tabs[0].panes[0][0].title, "new-name");
+    }
+
+    #[test]
+    fn mutate_rename_pane_updates_tab_titles_and_sidebar_entries() {
+        let mut state = seed_state();
+        let pane_id = state.active_pane.0;
+        state.workspaces[state.active_workspace].tabs = state.tabs.clone();
+
+        mutate_rename_pane(&mut state, pane_id, "build-watch");
+
+        assert_eq!(state.panes[0][0].title, "build-watch");
+        assert_eq!(state.tabs[state.active_tab].name, "build-watch");
+        assert_eq!(
+            state.workspaces[state.active_workspace].tabs[state.active_tab].name,
+            "build-watch"
+        );
+
+        let snap = state.ui_snapshot();
+        assert_eq!(snap.tabs[snap.active_tab].name, "build-watch");
+        let active_entry = snap.workspaces[snap.active_workspace]
+            .terminal_entries
+            .iter()
+            .find(|entry| entry.pane_id.0 == pane_id)
+            .expect("renamed active pane entry");
+        assert_eq!(active_entry.name, "build-watch");
+    }
+
+    #[test]
+    fn mutate_rename_pane_updates_inactive_saved_tab_title() {
+        let mut state = seed_state();
+        state.workspaces[1].tabs = vec![TerminalTab {
+            id: "ws2-t1".into(),
+            name: "old-tab".into(),
+            subtitle: "bash".into(),
+            status: TabStatus::Running,
+            panes: vec![vec![Pane {
+                id: PaneId(9),
+                title: "old-pane".into(),
+                subtitle: "bash".into(),
+                pid: 0,
+                cpu: 0.0,
+            }]],
+            active_pane: PaneId(9),
+            row_ratios: vec![1.0],
+            col_ratios: vec![vec![1.0]],
+        }];
+
+        mutate_rename_pane(&mut state, 9, "api-server");
+
+        let tab = &state.workspaces[1].tabs[0];
+        assert_eq!(tab.name, "api-server");
+        assert_eq!(tab.panes[0][0].title, "api-server");
+        let snap = state.ui_snapshot();
+        let entry = snap.workspaces[1]
+            .terminal_entries
+            .iter()
+            .find(|entry| entry.pane_id == PaneId(9))
+            .expect("inactive workspace entry");
+        assert_eq!(entry.name, "api-server");
     }
 
     #[test]

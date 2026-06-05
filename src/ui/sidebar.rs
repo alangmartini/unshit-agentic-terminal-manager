@@ -282,6 +282,7 @@ fn build_terminal_entry(
     let glyph = if is_last { "\u{2514}" } else { "\u{251C}" };
 
     let click_shared = shared.clone();
+    let ctx_shared = shared.clone();
     let ws_idx = workspace_index;
     let pane_id = entry.pane_id;
     let mut row = ElementDef::new(Tag::Div)
@@ -291,6 +292,24 @@ fn build_terminal_entry(
         .on_click(move || {
             mutate_with(&click_shared, |st| {
                 crate::state::dispatch(st, &format!("terminal.focus:{}:{}", ws_idx, pane_id.0));
+            });
+        })
+        .on_context_menu(move |x, y| {
+            mutate_with(&ctx_shared, |st| {
+                let same_pane = matches!(
+                    st.ctx_menu.as_ref().map(|m| &m.target),
+                    Some(crate::state::CtxMenuTarget::Tab { pane_id: id }) if *id == pane_id.0
+                );
+                if same_pane {
+                    st.ctx_menu = None;
+                } else {
+                    let sf = st.scale_factor;
+                    st.ctx_menu = Some(CtxMenu {
+                        x: x / sf,
+                        y: y / sf,
+                        target: crate::state::CtxMenuTarget::Tab { pane_id: pane_id.0 },
+                    });
+                }
             });
         })
         .with_child(
@@ -539,13 +558,8 @@ fn build_tab_ctx_menu(
     // session they are about to rename / kill. Fall back to the pane
     // id if no matching pane is found, which only happens if the menu
     // races a tab close.
-    let header = snap
-        .panes
-        .iter()
-        .flat_map(|row| row.iter())
-        .find(|p| p.id.0 == pane_id)
-        .map(|p| p.title.clone())
-        .unwrap_or_else(|| format!("pane {pane_id}"));
+    let header =
+        pane_title_from_snapshot(snap, pane_id).unwrap_or_else(|| format!("pane {pane_id}"));
 
     ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
@@ -562,6 +576,29 @@ fn build_tab_ctx_menu(
             shared,
             format!("tab.request_rename:{}", pane_id),
         ))
+}
+
+fn pane_title_from_snapshot(snap: &UiSnapshot, pane_id: u32) -> Option<String> {
+    snap.panes
+        .iter()
+        .flatten()
+        .find(|p| p.id.0 == pane_id)
+        .map(|p| p.title.clone())
+        .or_else(|| {
+            snap.tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter().flatten())
+                .find(|p| p.id.0 == pane_id)
+                .map(|p| p.title.clone())
+        })
+        .or_else(|| {
+            snap.workspaces
+                .iter()
+                .flat_map(|ws| ws.tabs.iter())
+                .flat_map(|tab| tab.panes.iter().flatten())
+                .find(|p| p.id.0 == pane_id)
+                .map(|p| p.title.clone())
+        })
 }
 
 #[cfg(test)]
@@ -861,6 +898,96 @@ mod tests {
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(has_class(branch_tag, "muted"));
+    }
+
+    #[test]
+    fn terminal_entry_right_click_opens_rename_context_menu() {
+        let shared = make_shared();
+        let entry = TerminalEntry {
+            name: "shell".to_string(),
+            branch: "main".to_string(),
+            branch_muted: false,
+            branch_error: false,
+            pane_id: crate::state::PaneId(42),
+        };
+        let row = build_terminal_entry(0, &entry, true, true, &shared);
+
+        (row.on_context_menu.as_ref().expect("context menu"))(120.0, 80.0);
+
+        let guard = shared.lock().unwrap();
+        match guard.ctx_menu.as_ref().map(|menu| &menu.target) {
+            Some(crate::state::CtxMenuTarget::Tab { pane_id }) => {
+                assert_eq!(*pane_id, 42);
+            }
+            other => panic!("expected pane context menu target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_entry_name_uses_body_sized_text_with_stylesheet() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.workspaces[0].terminals_expanded = true;
+            guard.panes[0][0].title = "fasdfgasdf".to_string();
+        }
+        let state = shared.lock().unwrap().ui_snapshot();
+        let tree_shared = shared.clone();
+        let tree_state = state.clone();
+        let css = format!(
+            "{}\n.sidebar-test-root {{ display: flex; width: 252px; height: 720px; }}",
+            include_str!("../../assets/styles.css")
+        );
+        let mut harness = TestHarness::new(
+            &css,
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("sidebar-test-root")
+                    .with_child(build_sidebar(&tree_state, &tree_shared)),
+            },
+            1280.0,
+            720.0,
+        );
+        harness.step();
+
+        let name = harness
+            .query(".terminal-entry-name")
+            .expect("terminal entry name should render");
+        assert!(
+            name.computed_style.font_size >= 12.0,
+            "terminal entry labels should not render as tiny meta text, got {}",
+            name.computed_style.font_size
+        );
+    }
+
+    #[test]
+    fn tab_ctx_menu_header_uses_saved_pane_title() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.tabs.push(crate::state::TerminalTab {
+                id: "saved-tab".into(),
+                name: "saved-tab".into(),
+                subtitle: "bash".into(),
+                status: crate::state::TabStatus::Running,
+                panes: vec![vec![crate::state::Pane {
+                    id: crate::state::PaneId(77),
+                    title: "saved-pane-title".into(),
+                    subtitle: "bash".into(),
+                    pid: 0,
+                    cpu: 0.0,
+                }]],
+                active_pane: crate::state::PaneId(77),
+                row_ratios: vec![1.0],
+                col_ratios: vec![vec![1.0]],
+            });
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 77);
+        let header = find_by_class(&menu, "ctx-menu-header").expect("ctx menu header");
+
+        assert_eq!(text_of(header), Some("saved-pane-title"));
     }
 
     #[test]

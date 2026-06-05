@@ -111,7 +111,7 @@ pub fn build_terminal_grid(
                 .and_then(|r| r.get(col_idx))
                 .copied()
                 .unwrap_or(1.0);
-            let capture_keyboard = is_active && !state.settings_open;
+            let capture_keyboard = is_active && !state.settings_open && !state.palette_open;
             let pane_el = build_pane(
                 pane,
                 is_active,
@@ -1289,6 +1289,26 @@ mod tests {
         assert!(
             !content.captures_keyboard,
             "active pane must not capture keyboard while settings modal is open"
+        );
+    }
+
+    #[test]
+    fn active_pane_does_not_capture_keyboard_when_palette_open() {
+        let mut state = seed_state();
+        state.palette_open = true;
+        let pane = state.panes[0][0].clone();
+        state.active_pane = pane.id;
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane.id.0, CellGrid::new(24, 80));
+
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        let content = find_terminal_content(&el)
+            .expect("terminal-content element should exist when grid is present");
+        assert!(
+            !content.captures_keyboard,
+            "active pane must not capture keyboard while command palette is open"
         );
     }
 

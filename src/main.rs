@@ -1,5 +1,6 @@
 pub mod bench;
 pub mod bridge;
+pub mod command_palette;
 pub mod daemon;
 pub mod diagnostics;
 pub mod drag;
@@ -320,6 +321,9 @@ fn build_tree(
         root: root
             .with_child(build_ctx_menu_overlay(snap, shared))
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
+                snap, shared,
+            ))
+            .with_child(crate::ui::command_palette::build_command_palette_overlay(
                 snap, shared,
             ))
             .with_child(crate::quick_prompt::build_quick_prompt_overlay(
@@ -842,22 +846,26 @@ fn main() {
         // `terminals`. The active workspace's live tabs are mirrored into
         // `workspaces[active].tabs` by `restore_layout`, so iterating
         // `workspaces` covers every pane.
-        let targets: Vec<(u32, u32, Option<std::path::PathBuf>, Option<crate::shell::ShellSpec>)> =
-            guard
-                .workspaces
-                .iter()
-                .flat_map(|ws| {
-                    let ws_num = ws.num;
-                    let cwd = ws.path.clone();
-                    let shell = crate::shell::resolve(Some(&ws.shell), Some(&guard.default_shell));
-                    ws.tabs
-                        .iter()
-                        .flat_map(|tab| tab.panes.iter().flatten())
-                        .filter(|pane| pane.id.0 != active_pane_id)
-                        .map(move |pane| (ws_num, pane.id.0, cwd.clone(), shell.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
+        let targets: Vec<(
+            u32,
+            u32,
+            Option<std::path::PathBuf>,
+            Option<crate::shell::ShellSpec>,
+        )> = guard
+            .workspaces
+            .iter()
+            .flat_map(|ws| {
+                let ws_num = ws.num;
+                let cwd = ws.path.clone();
+                let shell = crate::shell::resolve(Some(&ws.shell), Some(&guard.default_shell));
+                ws.tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.iter().flatten())
+                    .filter(|pane| pane.id.0 != active_pane_id)
+                    .map(move |pane| (ws_num, pane.id.0, cwd.clone(), shell.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         for (workspace_id, pane_id, cwd, shell) in targets {
             if guard.terminals.contains_key(&pane_id) {
@@ -876,9 +884,10 @@ fn main() {
                     let cols = snapshot.grid.cols();
                     let mut terminal = crate::terminal::Terminal::new(rows, cols);
                     terminal.apply_snapshot(&snapshot);
-                    guard
-                        .terminals
-                        .insert(pane_id, std::sync::Arc::new(std::sync::Mutex::new(terminal)));
+                    guard.terminals.insert(
+                        pane_id,
+                        std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+                    );
                     crate::bridge::register_reader(pane_id, reader);
                     log::info!(
                         "reattached background pane {} (workspace {}) to surviving session ({}x{})",
@@ -891,9 +900,10 @@ fn main() {
                 Ok((None, reader)) => {
                     let terminal =
                         crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
-                    guard
-                        .terminals
-                        .insert(pane_id, std::sync::Arc::new(std::sync::Mutex::new(terminal)));
+                    guard.terminals.insert(
+                        pane_id,
+                        std::sync::Arc::new(std::sync::Mutex::new(terminal)),
+                    );
                     crate::bridge::register_reader(pane_id, reader);
                     log::info!(
                         "background pane {} (workspace {}) had no surviving session; spawned fresh",
@@ -961,6 +971,8 @@ fn main() {
                             let cmd = format!("keybind.set:{}:{}", action.id(), combo);
                             dispatch(&mut guard, &cmd);
                         }
+                        true
+                    } else if crate::state::dispatch_palette_key(&mut guard, combo) {
                         true
                     } else if guard.settings_open
                         && combo.key == Key::Escape

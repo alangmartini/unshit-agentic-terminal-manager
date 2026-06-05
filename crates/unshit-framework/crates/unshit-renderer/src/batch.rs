@@ -98,7 +98,10 @@ use unshit_core::style::types::{
     FontWeight, GradientStopPosition, Layer, LinearGradient, Overflow, RadialGradient, RadialShape,
     RenderTarget, TextAlign, TextDecoration, Visibility, WhiteSpace,
 };
-use unshit_core::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, SvgTransform, ViewBox};
+use unshit_core::svg::types::{
+    PathCommand, StrokeLineCap, StrokeLineJoin, SvgAttrs, SvgNode, SvgPaint, SvgPrimitive,
+    SvgTransform, ViewBox,
+};
 use unshit_core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 use unshit_core::tree::NodeArena;
 
@@ -1759,47 +1762,21 @@ fn walk_for_batch(
             }
             InputType::Checkbox | InputType::Radio => {
                 // Both are rendered as a small square/circle (the outer box is
-                // already drawn by the quad pass via CSS).  We just draw the
-                // checkmark glyph or a filled dot when checked.
+                // already drawn by the quad pass via CSS). Checked state uses
+                // vector geometry instead of font glyphs so centering is based
+                // on the control box, not font baseline metrics.
                 if input.checked {
-                    let glyph = if input.input_type == InputType::Checkbox {
-                        "\u{2713}" // checkmark
-                    } else {
-                        "\u{25CF}" // black circle
-                    };
-                    let mut fg = style.color;
-                    fg.a = (fg.a as f32 * opacity) as u8;
-                    let (gw, gh) = measure_text_with_style_cached(
-                        glyph,
-                        &style.font_family,
-                        style.font_weight,
-                        style.font_size,
-                        style.line_height,
-                        style.letter_spacing,
-                        Some(content_w),
-                        font_system,
-                        Some(measure_cache),
-                    );
-                    let gx = render_x + (rect.width - gw) * 0.5;
-                    let gy = render_y + (rect.height - gh) * 0.5;
-                    emit_text_glyphs_cached(
-                        glyph,
-                        gx,
-                        gy,
-                        Some(content_w),
-                        style.font_size,
-                        style.line_height,
-                        style.letter_spacing,
-                        &style.font_family,
-                        style.font_weight,
-                        &fg,
+                    emit_checked_input_marker(
+                        input.input_type,
+                        render_x,
+                        render_y,
+                        rect.width,
+                        rect.height,
+                        style.color,
+                        opacity,
                         clip_rect,
+                        svg_cache,
                         batch.layer_mut(effective_layer),
-                        atlas,
-                        font_system,
-                        rasterizer,
-                        shaped_cache,
-                        Some(&mut node_glyph_keys),
                     );
                 }
             }
@@ -2638,6 +2615,84 @@ fn walk_for_batch(
             parent_keys.insert(key);
         }
     }
+}
+
+fn input_marker_node(input_type: InputType) -> SvgNode {
+    let attrs = match input_type {
+        InputType::Checkbox => SvgAttrs {
+            view_box: Some(ViewBox::new(0.0, 0.0, 16.0, 16.0)),
+            fill: Some(SvgPaint::None),
+            stroke: Some(SvgPaint::Current),
+            stroke_width: Some(1.8),
+            stroke_linecap: Some(StrokeLineCap::Round),
+            stroke_linejoin: Some(StrokeLineJoin::Round),
+            ..Default::default()
+        },
+        InputType::Radio => SvgAttrs {
+            view_box: Some(ViewBox::new(0.0, 0.0, 16.0, 16.0)),
+            fill: Some(SvgPaint::Current),
+            stroke: Some(SvgPaint::None),
+            ..Default::default()
+        },
+        _ => SvgAttrs::default(),
+    };
+
+    let primitive = match input_type {
+        InputType::Checkbox => SvgPrimitive::Path {
+            d: "M3.5 8.2l3 3l6-6.5".to_string(),
+            commands: vec![
+                PathCommand::MoveTo { x: 3.5, y: 8.2 },
+                PathCommand::LineTo { x: 6.5, y: 11.2 },
+                PathCommand::LineTo { x: 12.5, y: 4.7 },
+            ],
+        },
+        InputType::Radio => SvgPrimitive::Circle { cx: 8.0, cy: 8.0, r: 4.25 },
+        _ => SvgPrimitive::Group,
+    };
+
+    SvgNode { primitive, attrs, children: Vec::new() }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_checked_input_marker(
+    input_type: InputType,
+    render_x: f32,
+    render_y: f32,
+    width: f32,
+    height: f32,
+    current_color: Color,
+    opacity: f32,
+    clip_rect: [f32; 4],
+    svg_cache: &mut SvgTessCache,
+    batch: &mut FrameBatch,
+) {
+    if !matches!(input_type, InputType::Checkbox | InputType::Radio) {
+        return;
+    }
+
+    let marker_size = width.min(height).max(0.0) * 0.78;
+    if marker_size <= 0.0 {
+        return;
+    }
+    let marker_x = render_x + (width - marker_size) * 0.5;
+    let marker_y = render_y + (height - marker_size) * 0.5;
+    let node = input_marker_node(input_type);
+
+    emit_svg_node(
+        &node,
+        &SvgAttrs::default(),
+        SvgTransform::IDENTITY,
+        node.attrs.view_box.unwrap_or_default(),
+        marker_x,
+        marker_y,
+        marker_size,
+        marker_size,
+        current_color,
+        opacity,
+        clip_rect,
+        svg_cache,
+        batch,
+    );
 }
 
 /// Walk an `SvgNode` tree, accumulate the SVG presentation cascade and
@@ -5290,6 +5345,62 @@ mod tests {
         assert_eq!(left, 14.0);
         assert_eq!(center, 54.0);
         assert_eq!(right, 94.0);
+    }
+
+    #[test]
+    fn checked_checkbox_marker_uses_centered_svg_not_text_glyph() {
+        let mut batch = FrameBatch::new();
+        let mut svg_cache = SvgTessCache::with_capacity(8);
+
+        emit_checked_input_marker(
+            InputType::Checkbox,
+            10.0,
+            20.0,
+            20.0,
+            20.0,
+            Color::WHITE,
+            1.0,
+            [0.0, 0.0, 100.0, 100.0],
+            &mut svg_cache,
+            &mut batch,
+        );
+
+        assert_eq!(batch.svg_draws.len(), 1);
+        assert!(batch.glyph_instances.is_empty());
+        let draw = &batch.svg_draws[0];
+        assert_eq!(draw.scale[0], draw.scale[1]);
+        let marker_center_x = draw.translate[0] + draw.scale[0] * 8.0;
+        let marker_center_y = draw.translate[1] + draw.scale[1] * 8.0;
+        assert!((marker_center_x - 20.0).abs() < 0.001);
+        assert!((marker_center_y - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn checked_radio_marker_uses_centered_svg_not_text_glyph() {
+        let mut batch = FrameBatch::new();
+        let mut svg_cache = SvgTessCache::with_capacity(8);
+
+        emit_checked_input_marker(
+            InputType::Radio,
+            4.0,
+            6.0,
+            16.0,
+            24.0,
+            Color::WHITE,
+            1.0,
+            [0.0, 0.0, 100.0, 100.0],
+            &mut svg_cache,
+            &mut batch,
+        );
+
+        assert_eq!(batch.svg_draws.len(), 1);
+        assert!(batch.glyph_instances.is_empty());
+        let draw = &batch.svg_draws[0];
+        assert_eq!(draw.scale[0], draw.scale[1]);
+        let marker_center_x = draw.translate[0] + draw.scale[0] * 8.0;
+        let marker_center_y = draw.translate[1] + draw.scale[1] * 8.0;
+        assert!((marker_center_x - 12.0).abs() < 0.001);
+        assert!((marker_center_y - 18.0).abs() < 0.001);
     }
 
     /// Regression guard for issue #147: a clean idle frame must keep the

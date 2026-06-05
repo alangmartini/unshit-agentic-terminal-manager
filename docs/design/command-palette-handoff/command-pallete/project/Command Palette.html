@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>terminal.mgr — command palette</title>
+  <link rel="stylesheet" href="colors_and_type.css">
+  <link rel="stylesheet" href="shell/kit.css">
+  <link rel="stylesheet" href="palette.css">
+  <style>
+    html, body { margin: 0; height: 100vh; overflow: hidden; background: var(--bg-void); }
+    #icons { display: none; }
+
+    /* execution toast — lands in the lower-right, terminal-receipt style */
+    .cp-toast {
+      position: fixed; right: 16px; bottom: 34px; z-index: 80;
+      display: flex; align-items: center; gap: 9px;
+      background: linear-gradient(180deg, var(--bg-elevated), var(--bg-subtle));
+      border: 1px solid var(--border-default);
+      border-left: 2px solid var(--amber-300);
+      border-radius: var(--r-md);
+      box-shadow: var(--shadow-md), 0 0 24px rgba(212,163,72,.1);
+      padding: 9px 13px;
+      font: var(--type-label); color: var(--fg-primary);
+      animation: toastIn .2s var(--ease-out);
+    }
+    .cp-toast .prompt { color: var(--amber-300); font-weight: 600; text-shadow: 0 0 8px rgba(212,163,72,.5); }
+    .cp-toast .dim { color: var(--fg-tertiary); font: var(--type-meta); }
+    @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } }
+    @media (prefers-reduced-motion: reduce) { .cp-toast { animation: none; } }
+  </style>
+</head>
+<body>
+  <div id="icons"></div>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script>
+    // Inline the icon sprite so <use href="#id"/> resolves.
+    fetch("assets/icons/icons.svg").then(r => r.text()).then(t => {
+      document.getElementById("icons").innerHTML = t;
+    });
+  </script>
+
+  <script type="text/babel" src="shell/titlebar.jsx"></script>
+  <script type="text/babel" src="shell/sidebar.jsx"></script>
+  <script type="text/babel" src="shell/panes.jsx"></script>
+  <script type="text/babel" src="shell/statusbar.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="command-palette.jsx"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+      "width": 760,
+      "density": "compact",
+      "accent": "amber",
+      "glow": 0.45,
+      "preview": false,
+      "footer": false
+    }/*EDITMODE-END*/;
+
+    function App() {
+      const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+      const [open, setOpen] = useState(true);
+      const [toast, setToast] = useState(null);
+      const toastTimer = useRef(null);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === "k" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); setOpen(o => !o); }
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, []);
+
+      // Wire the titlebar search box to open the palette.
+      useEffect(() => {
+        const t0 = setTimeout(() => {
+          const s = document.querySelector(".tm-search");
+          if (s) { s.style.cursor = "pointer"; s.onclick = () => setOpen(true); }
+        }, 60);
+        return () => clearTimeout(t0);
+      }, []);
+
+      const flash = (label) => {
+        setToast(label);
+        clearTimeout(toastTimer.current);
+        toastTimer.current = setTimeout(() => setToast(null), 2200);
+      };
+
+      const onExecute = (item) => {
+        const d = item.data;
+        if (item.kind === "action")  flash(d.label);
+        else if (item.kind === "session") flash("jumped to " + d.label);
+        else if (item.kind === "agent")   flash("attached to " + d.label.split(" ")[0]);
+        else if (item.kind === "ws")       flash("opened " + d.label);
+        else if (item.kind === "hit")      flash("revealed in " + d.sess);
+      };
+
+      const tweaks = { width: t.width, density: t.density, accent: t.accent, glow: t.glow, preview: t.preview, footer: t.footer };
+
+      return (
+        <div className="tm-app" data-screen-label="Terminal Manager">
+          <Titlebar />
+          <Sidebar />
+          <TabStrip />
+          <div className="tm-content"><PaneGrid /></div>
+          <Statusbar />
+
+          {open && <CommandPalette onClose={() => setOpen(false)} onExecute={onExecute} tweaks={tweaks} />}
+
+          {toast && (
+            <div className="cp-toast">
+              <span className="prompt">❯</span>
+              <span>{toast}</span>
+              <span className="dim">· done</span>
+            </div>
+          )}
+
+          <TweaksPanel>
+            <TweakSection label="Layout" />
+            <TweakSlider label="Width" value={t.width} min={440} max={760} step={20} unit="px" onChange={(v) => setTweak('width', v)} />
+            <TweakToggle label="Preview pane" value={t.preview} onChange={(v) => setTweak('preview', v)} />
+            <TweakToggle label="Footer hints" value={t.footer} onChange={(v) => setTweak('footer', v)} />
+            <TweakRadio label="Density" value={t.density} options={['compact', 'comfortable']} onChange={(v) => setTweak('density', v)} />
+            <TweakSection label="Accent" />
+            <TweakSelect label="Active color" value={t.accent} options={['amber', 'sage', 'azure', 'violet']} onChange={(v) => setTweak('accent', v)} />
+            <TweakSlider label="Glow" value={t.glow} min={0} max={1} step={0.05} onChange={(v) => setTweak('glow', v)} />
+            <TweakSection label="Palette" />
+            <TweakButton label="Open palette (⌘K)" onClick={() => setOpen(true)} />
+          </TweaksPanel>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

@@ -85,7 +85,19 @@
   --accent-a70:  rgba(232, 185, 85, 0.7);
   --accent-a72:  rgba(232, 185, 85, 0.72);
 
-  
+  /* Command-palette accent tokens. These MUST live in :root: the framework
+   * resolves var() at stylesheet-parse time and only collects custom
+   * properties declared on :root/* (see unshit-core style/parse.rs
+   * extract_custom_properties). Declaring them on .cp-scrim left every
+   * `var(--cp-*)` consumer (active-row background/rail, row padding, prompt
+   * color, keycap accents) unresolved, so those declarations were dropped. */
+  --cp-accent:        var(--amber-300);
+  --cp-accent-soft:   rgba(212, 163, 72, 0.12);
+  --cp-accent-bright: var(--amber-100);
+  --cp-glow:          0.55;
+  --cp-row-py:        4px;
+
+
   --sp-0: 0;
   --sp-1: 2px;
   --sp-2: 4px;
@@ -2028,9 +2040,10 @@ input, select {
   gap: var(--sp-3);
   padding: var(--sp-1) var(--sp-6) var(--sp-1) 64px;
   color: var(--fg-secondary);
-  font-size: var(--t-sm);
+  font: var(--type-body);
+  line-height: 1.4;
   transition: background var(--dur-fast), color var(--dur-fast);
-  cursor: default;
+  cursor: pointer;
 }
 
 .terminal-entry:hover {
@@ -2518,7 +2531,7 @@ input, select {
 
 .pane-title {
   color: var(--fg-secondary);
-  font-size: var(--t-xs);
+  font-size: var(--t-sm);
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
@@ -3070,6 +3083,531 @@ body.dragging-pane {
   display: none;
 }
 
+.command-palette-hidden,
+.cp-hidden {
+  display: none;
+}
+
+.cp-scrim {
+  --cp-accent: var(--amber-300);
+  --cp-accent-soft: rgba(212, 163, 72, 0.12);
+  --cp-accent-bright: var(--amber-100);
+  --cp-glow: 0.55;
+  --cp-row-py: 7px;
+  position: fixed;
+  inset: 0;
+  z-index: 340;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+  background: rgba(10, 8, 6, 0.62);
+  backdrop-filter: blur(5px);
+}
+
+.cp {
+  /* The scrim (`.cp-scrim`) flex-centers this card horizontally and offsets it
+   * `12vh` from the top via its `padding-top` — both now honored by the engine
+   * (viewport units in the padding pathway; flex centering in a fixed/inset:0
+   * container always worked). No positioning hacks needed. */
+  width: 760px;
+  max-width: calc(100vw - 48px);
+  max-height: 72vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, var(--bg-elevated), var(--bg-subtle));
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-xl);
+  box-shadow:
+    var(--shadow-lg),
+    0 0 0 1px rgba(0, 0, 0, 0.30),
+    0 0 40px rgba(212, 163, 72, 0.054);
+}
+
+.cp.compact {
+  --cp-row-py: 4px;
+}
+
+.cp-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border-hair);
+  flex-shrink: 0;
+}
+
+.cp-prompt {
+  color: var(--cp-accent);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  text-shadow: 0 0 8px rgba(212, 163, 72, 0.32);
+  flex-shrink: 0;
+}
+
+.cp-query-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fg-primary);
+  caret-color: var(--cp-accent);
+  font: var(--type-body);
+}
+
+.cp-query-input::placeholder,
+.cp-query-input.placeholder {
+  color: var(--fg-muted);
+}
+
+.cp-query-input:focus {
+  outline: none;
+}
+
+.cp-mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--amber-100);
+  font: var(--type-label);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.cp-mode-chip svg {
+  width: 11px;
+  height: 11px;
+}
+
+.cp-mode-chip.m-actions {
+  background: rgba(212, 163, 72, 0.12);
+  border-color: rgba(212, 163, 72, 0.32);
+}
+
+.cp-mode-chip.m-agents {
+  color: var(--violet);
+  background: rgba(168, 139, 184, 0.12);
+  border-color: rgba(168, 139, 184, 0.32);
+}
+
+.cp-mode-chip.m-nav {
+  color: var(--azure);
+  background: rgba(106, 162, 173, 0.12);
+  border-color: rgba(106, 162, 173, 0.32);
+}
+
+.cp-mode-chip.m-search {
+  color: var(--sage);
+  background: rgba(139, 168, 92, 0.12);
+  border-color: rgba(139, 168, 92, 0.30);
+}
+
+.cp-esc,
+.kbd {
+  padding: 2px 6px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--r-sm);
+  color: var(--fg-tertiary);
+  font: var(--type-kbd);
+  white-space: nowrap;
+}
+
+.cp-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 14px 10px;
+  border-bottom: 1px solid var(--border-hair);
+}
+
+.cp-mode-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  color: var(--fg-tertiary);
+  cursor: pointer;
+  font: var(--type-meta);
+}
+
+.cp-mode-pill:hover {
+  background: var(--bg-hover);
+  color: var(--fg-secondary);
+  border-color: var(--border-strong);
+}
+
+.cp-mode-pill .pfx {
+  color: var(--cp-accent);
+  font-weight: 700;
+}
+
+.cp-body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+}
+
+.cp:not(.has-preview) .cp-body {
+  flex: 0 1 auto;
+}
+
+.cp-list {
+  flex: 1;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 6px 0;
+}
+
+.cp:not(.has-preview) .cp-list {
+  max-height: calc(72vh - 46px);
+}
+
+.cp.has-preview .cp-list {
+  flex: 0 0 56%;
+  border-right: 1px solid var(--border-hair);
+}
+
+.cp-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px 4px;
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+}
+
+.cp.compact .cp-group-title {
+  padding-top: 6px;
+}
+
+.cp-group-title .rule {
+  flex: 1;
+  height: 1px;
+  background: var(--border-hair);
+}
+
+.cp-group-title .gcount {
+  color: var(--fg-muted);
+  letter-spacing: 0.05em;
+}
+
+.cp-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  padding: var(--cp-row-py) 14px var(--cp-row-py) 13px;
+  border-left: 2px solid transparent;
+  color: var(--fg-secondary);
+  cursor: pointer;
+  scroll-margin: 8px;
+}
+
+.cp-item:hover {
+  background: var(--bg-hover);
+}
+
+.cp-item.disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.cp-item.disabled:hover {
+  background: transparent;
+}
+
+.cp-item.disabled .cp-label {
+  color: var(--fg-tertiary);
+}
+
+.cp-item.active {
+  background: var(--cp-accent-soft);
+  /* Only the color is overridden; the 2px width comes from `.cp-item`'s
+   * `border-left: 2px solid transparent`. */
+  border-left-color: var(--cp-accent);
+  box-shadow: inset 0 0 22px rgba(212, 163, 72, 0.03);
+}
+
+.cp-ic {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-tertiary);
+}
+
+.cp-item.active .cp-ic {
+  color: var(--cp-accent);
+  filter: drop-shadow(0 0 5px rgba(212, 163, 72, 0.28));
+}
+
+.cp-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.cp-label {
+  overflow: hidden;
+  color: var(--fg-secondary);
+  font: var(--type-label);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cp-item.active .cp-label {
+  color: var(--fg-primary);
+}
+
+.cp-sub {
+  overflow: hidden;
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cp.compact .cp-sub {
+  display: none;
+}
+
+.cp-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.cp-kbd {
+  display: flex;
+  gap: 2px;
+}
+
+.cp-meta {
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+}
+
+.cp-tag {
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  font: var(--type-meta);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.cp-tag.running {
+  color: var(--sage);
+  background: rgba(139, 168, 92, 0.12);
+  border: 1px solid rgba(139, 168, 92, 0.28);
+}
+
+.cp-tag.error {
+  color: var(--rust);
+  background: rgba(201, 85, 58, 0.12);
+  border: 1px solid rgba(201, 85, 58, 0.30);
+}
+
+.cp-tag.waiting {
+  color: var(--ember);
+  background: rgba(208, 110, 44, 0.12);
+  border: 1px solid rgba(208, 110, 44, 0.30);
+}
+
+.cp-tag.idle,
+.cp-tag.stopped {
+  color: var(--fg-tertiary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-hair);
+}
+
+.cp-empty {
+  padding: 34px 16px 38px;
+  color: var(--fg-tertiary);
+  font: var(--type-body);
+  text-align: center;
+}
+
+.cp-empty .big {
+  margin-bottom: 4px;
+  color: var(--fg-secondary);
+}
+
+.cp-empty .dim {
+  color: var(--fg-muted);
+  font: var(--type-meta);
+}
+
+.cp-preview {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 70% 50% at 50% 0%, rgba(212, 163, 72, 0.02), transparent 70%),
+    var(--bg-base);
+}
+
+.cp-pv-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px 9px;
+  border-bottom: 1px solid var(--border-hair);
+  flex-shrink: 0;
+}
+
+.cp-pv-ic {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-md);
+  color: var(--cp-accent);
+}
+
+.cp-pv-titles {
+  min-width: 0;
+  flex: 1;
+}
+
+.cp-pv-title {
+  overflow: hidden;
+  color: var(--fg-primary);
+  font: var(--type-h2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cp-pv-kicker {
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.cp-pv-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 14px;
+}
+
+.cp-pv-desc {
+  margin-bottom: 12px;
+  color: var(--fg-secondary);
+  font: var(--type-body);
+}
+
+.cp-pv-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.cp-pv-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border-hair);
+  font: var(--type-meta);
+}
+
+.cp-pv-row:last-child {
+  border-bottom: none;
+}
+
+.cp-pv-k {
+  color: var(--fg-tertiary);
+}
+
+.cp-pv-v {
+  color: var(--fg-secondary);
+}
+
+.cp-pv-run {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  border-top: 1px solid var(--border-hair);
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+  flex-shrink: 0;
+}
+
+.cp-pv-run .spacer {
+  flex: 1;
+}
+
+.cp-pv-run.disabled {
+  color: var(--fg-muted);
+}
+
+.cp-foot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border-hair);
+  background: var(--bg-void);
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+  flex-shrink: 0;
+}
+
+.cp-foot .fh {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.cp-foot .spacer {
+  flex: 1;
+}
+
+.cp-foot .count {
+  color: var(--fg-secondary);
+}
+
+@media (max-width: 720px) {
+  .cp {
+    width: calc(100vw - 24px);
+    max-width: calc(100vw - 24px);
+  }
+
+  .cp.has-preview .cp-list {
+    flex-basis: 100%;
+    border-right: none;
+  }
+
+  .cp-preview {
+    display: none;
+  }
+}
+
 /* Backdrop. Heavier blur and darker scrim than the previous 4px so the
  * overlay reads as the only thing on screen, matching the focus-mode
  * power user expectation for a Cmd-K style command launcher. */
@@ -3456,6 +3994,8 @@ body.dragging-pane {
 
 .confirm-dialog-simple-card .confirm-dialog-button:hover {
   background: var(--bg-hover);
+  border-color: var(--border-strong);
+  color: var(--amber-50);
 }
 
 .confirm-dialog-simple-card .confirm-dialog-button.danger {
@@ -3465,8 +4005,8 @@ body.dragging-pane {
 }
 
 .confirm-dialog-simple-card .confirm-dialog-button.danger:hover {
-  background: var(--rust);
-  filter: brightness(1.1);
+  background: #df6749;
+  border-color: #df6749;
 }
 
 .confirm-dialog-simple-card .confirm-dialog-button.primary {
@@ -3476,8 +4016,32 @@ body.dragging-pane {
 }
 
 .confirm-dialog-simple-card .confirm-dialog-button.primary:hover {
-  background: var(--amber-400);
-  filter: brightness(1.1);
+  background: var(--amber-300);
+  border-color: var(--amber-300);
+  color: #120d06;
+  box-shadow: 0 0 0 1px var(--accent-a35), var(--glow-amber-s);
+}
+
+.confirm-dialog-rename-card {
+  background: var(--bg-base);
+  border-color: var(--border-default);
+  padding: 22px 26px;
+}
+
+.confirm-dialog-rename-card .confirm-dialog-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.confirm-dialog-rename-card .confirm-dialog-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  font: var(--type-label);
+  border-radius: var(--r-md);
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast),
+              box-shadow var(--dur-fast);
 }
 
 .confirm-dialog-input {
@@ -3490,11 +4054,14 @@ body.dragging-pane {
   border: 1px solid var(--border-default);
   border-radius: 4px;
   color: var(--fg-primary);
+  cursor: text;
+  caret-color: var(--amber-100);
 }
 
 .confirm-dialog-input:focus {
   border-color: var(--amber-400);
   outline: none;
+  box-shadow: 0 0 0 1px var(--accent-a35);
 }
 
 .session-row-actions {
@@ -3622,12 +4189,13 @@ body.dragging-pane {
   background: var(--bg-subtle);
   font: var(--type-body);
   font-size: 11px;
-  overflow: hidden;
+  max-height: 240px;
+  overflow: auto;
 }
 
 .cd-row {
   display: grid;
-  grid-template-columns: 9px minmax(0, 1fr) auto auto;
+  grid-template-columns: 12px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 8px;
   padding: 6px 10px;
@@ -3635,16 +4203,50 @@ body.dragging-pane {
   color: var(--fg-secondary);
 }
 
+.cd-row-selectable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.cd-row-selectable:hover {
+  background: var(--bg-hover);
+}
+
+.cd-row.not-kept .cd-label,
+.cd-row.not-kept .cd-meta {
+  color: var(--fg-tertiary);
+}
+
 .cd-row:last-child {
   border-bottom: none;
 }
 
-.cd-list .dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  display: inline-block;
+.cd-keep-box {
+  width: 12px;
+  height: 12px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
+  color: var(--bg-base);
+  font-size: 9px;
+  line-height: 1;
+}
+
+.cd-check-icon {
+  width: 10px;
+  height: 10px;
+  display: block;
+  flex-shrink: 0;
+}
+
+.cd-row.not-kept .cd-keep-box {
+  background: transparent;
+  box-shadow: none;
+  border-color: var(--border-strong);
+  color: transparent;
 }
 
 .cd-label {

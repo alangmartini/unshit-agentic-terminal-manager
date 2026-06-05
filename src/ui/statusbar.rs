@@ -194,6 +194,8 @@ mod tests {
             smooth_scroll_duration_ms: crate::state::DEFAULT_SMOOTH_SCROLL_DURATION_MS,
             toggles: BTreeMap::new(),
             palette_open: false,
+            palette_query: String::new(),
+            palette_active: 0,
             sidebar_collapsed: false,
             sidebar_width: 252.0,
             window_maximized: false,
