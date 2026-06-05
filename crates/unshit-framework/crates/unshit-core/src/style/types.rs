@@ -318,6 +318,63 @@ impl LengthOrPercent {
     }
 }
 
+/// Per-corner `border-radius` values that retain their CSS unit (px / percent)
+/// until paint, when the element box is known. `ComputedStyle.border_radius`
+/// (resolved f32 `Corners`) stays the value the transition / scale code reads;
+/// `border_radius_src: CornersDim` is the source of truth the renderer resolves
+/// against the box so circular forms (`border-radius: 50%`) round correctly.
+///
+/// This mirrors the `padding` / `padding_src` dual-write: the f32 mirror holds
+/// 0 for percent corners (paint resolves the real value from this source), which
+/// is harmless for the only mirror consumers — transition lerp and DPI scaling,
+/// both of which only ever see pure-px radii in the current corpus.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CornersDim {
+    pub top_left: LengthOrPercent,
+    pub top_right: LengthOrPercent,
+    pub bottom_right: LengthOrPercent,
+    pub bottom_left: LengthOrPercent,
+}
+
+impl CornersDim {
+    pub const ZERO: CornersDim = CornersDim {
+        top_left: LengthOrPercent::Px(0.0),
+        top_right: LengthOrPercent::Px(0.0),
+        bottom_right: LengthOrPercent::Px(0.0),
+        bottom_left: LengthOrPercent::Px(0.0),
+    };
+
+    /// Lift a resolved f32 `Corners` into the unit-preserving form (all px).
+    pub fn from_px(c: Corners) -> Self {
+        Self {
+            top_left: LengthOrPercent::Px(c.top_left),
+            top_right: LengthOrPercent::Px(c.top_right),
+            bottom_right: LengthOrPercent::Px(c.bottom_right),
+            bottom_left: LengthOrPercent::Px(c.bottom_left),
+        }
+    }
+
+    /// Resolve each corner against a reference length to produce the
+    /// `[top_left, top_right, bottom_right, bottom_left]` pixel array the quad
+    /// SDF shader consumes. CSS resolves a `border-radius` percentage against
+    /// the box; callers pass `min(width, height)` so a `50%` radius stays
+    /// circular on non-square boxes.
+    pub fn resolve(self, reference: f32) -> [f32; 4] {
+        [
+            self.top_left.resolve(reference),
+            self.top_right.resolve(reference),
+            self.bottom_right.resolve(reference),
+            self.bottom_left.resolve(reference),
+        ]
+    }
+}
+
+impl Default for CornersDim {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 impl RadialGradient {
     /// Resolve this gradient against a box of `(width, height)` to produce
     /// a center and a pair of radii in element local pixels.
@@ -652,6 +709,7 @@ pub enum JustifyContent {
     Start,
     End,
     Center,
+    Stretch,
     SpaceBetween,
     SpaceAround,
     SpaceEvenly,
@@ -709,6 +767,17 @@ pub enum FontWeight {
     Normal,
     Bold,
     W(u16),
+}
+
+/// CSS `font-style`. `Oblique` is treated the same as `Italic` by the text
+/// pipeline (both request a slanted face and fall back to the render-time
+/// skew when no slanted face resolves).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum FontStyle {
+    #[default]
+    Normal,
+    Italic,
+    Oblique,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1126,7 +1195,8 @@ pub struct ComputedStyle {
     pub margin_auto: EdgeAutoFlags,
     pub row_gap: f32,
     pub column_gap: f32,
-    pub overflow: Overflow,
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
     pub box_sizing: BoxSizing,
     pub aspect_ratio: Option<f32>,
     pub object_fit: ObjectFit,
@@ -1156,6 +1226,11 @@ pub struct ComputedStyle {
     pub border_color: Color,
     pub border_width: Edges,
     pub border_radius: Corners,
+    /// Unit-preserving source for `border_radius`, resolved against the element
+    /// box at paint time. Always kept in sync with `border_radius` by the
+    /// cascade (px corners write both; percent corners write here and leave the
+    /// f32 mirror at 0).
+    pub border_radius_src: CornersDim,
     pub opacity: f32,
     pub box_shadow: SmallVec<[BoxShadow; 2]>,
     /// Optional `backdrop-filter` value. `None` means the element does not
@@ -1172,6 +1247,7 @@ pub struct ComputedStyle {
     /// again as the cascade walks down the tree.
     pub font_size_explicit: bool,
     pub font_weight: FontWeight,
+    pub font_style: FontStyle,
     pub font_family: String,
     pub line_height: f32,
     pub letter_spacing: f32,
@@ -1260,7 +1336,8 @@ impl Default for ComputedStyle {
             margin_auto: EdgeAutoFlags::NONE,
             row_gap: 0.0,
             column_gap: 0.0,
-            overflow: Overflow::Visible,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
             box_sizing: BoxSizing::BorderBox,
             aspect_ratio: None,
             object_fit: ObjectFit::Fill,
@@ -1284,6 +1361,7 @@ impl Default for ComputedStyle {
             border_color: Color::TRANSPARENT,
             border_width: Edges::ZERO,
             border_radius: Corners::ZERO,
+            border_radius_src: CornersDim::ZERO,
             opacity: 1.0,
             box_shadow: SmallVec::new(),
             backdrop_filter: None,
@@ -1292,6 +1370,7 @@ impl Default for ComputedStyle {
             font_size_scale: 1.0,
             font_size_explicit: true,
             font_weight: FontWeight::Normal,
+            font_style: FontStyle::Normal,
             font_family: String::new(),
             line_height: 1.2,
             letter_spacing: 0.0,
@@ -1331,6 +1410,7 @@ impl ComputedStyle {
         self.font_size_scale = parent.font_size_scale;
         self.font_size_explicit = false;
         self.font_weight = parent.font_weight;
+        self.font_style = parent.font_style;
         self.font_family = parent.font_family.clone();
         self.line_height = parent.line_height;
         self.letter_spacing = parent.letter_spacing;
@@ -1405,9 +1485,9 @@ impl ComputedStyle {
                 width: taffy::LengthPercentage::Length(self.column_gap),
                 height: taffy::LengthPercentage::Length(self.row_gap),
             },
-            overflow: {
-                let o = overflow_to_taffy(self.overflow);
-                taffy::Point { x: o, y: o }
+            overflow: taffy::Point {
+                x: overflow_to_taffy(self.overflow_x),
+                y: overflow_to_taffy(self.overflow_y),
             },
             position: match self.position {
                 CssPosition::Static | CssPosition::Relative => taffy::Position::Relative,
@@ -1490,6 +1570,7 @@ fn justify_content_to_taffy(value: JustifyContent, display: Display) -> taffy::J
         JustifyContent::Start => taffy::JustifyContent::FlexStart,
         JustifyContent::End => taffy::JustifyContent::FlexEnd,
         JustifyContent::Center => taffy::JustifyContent::Center,
+        JustifyContent::Stretch => taffy::JustifyContent::Stretch,
         JustifyContent::SpaceBetween => taffy::JustifyContent::SpaceBetween,
         JustifyContent::SpaceAround => taffy::JustifyContent::SpaceAround,
         JustifyContent::SpaceEvenly => taffy::JustifyContent::SpaceEvenly,
@@ -1711,6 +1792,7 @@ impl ComputedStyle {
         // Borders
         self.border_width = scale_edges(self.border_width, s);
         self.border_radius = scale_corners(self.border_radius, s);
+        self.border_radius_src = scale_corners_dim(self.border_radius_src, s);
 
         // Box shadow
         for shadow in &mut self.box_shadow {
@@ -1756,6 +1838,24 @@ fn scale_corners(c: Corners, s: f32) -> Corners {
         top_right: c.top_right * s,
         bottom_right: c.bottom_right * s,
         bottom_left: c.bottom_left * s,
+    }
+}
+
+fn scale_corner_dim(c: LengthOrPercent, s: f32) -> LengthOrPercent {
+    match c {
+        LengthOrPercent::Px(v) => LengthOrPercent::Px(v * s),
+        // Percent corners resolve against the (already-scaled) box at paint
+        // time, so they are scale-independent.
+        other => other,
+    }
+}
+
+fn scale_corners_dim(c: CornersDim, s: f32) -> CornersDim {
+    CornersDim {
+        top_left: scale_corner_dim(c.top_left, s),
+        top_right: scale_corner_dim(c.top_right, s),
+        bottom_right: scale_corner_dim(c.bottom_right, s),
+        bottom_left: scale_corner_dim(c.bottom_left, s),
     }
 }
 
@@ -1887,6 +1987,21 @@ mod tests {
         let style = ComputedStyle { display: Display::Flex, ..Default::default() };
         let taffy_style = style.to_taffy_style(800.0, 600.0);
         assert_eq!(taffy_style.justify_content, Some(taffy::JustifyContent::FlexStart));
+    }
+
+    #[test]
+    fn justify_content_stretch_maps_to_taffy_stretch() {
+        assert_eq!(
+            justify_content_to_taffy(JustifyContent::Stretch, Display::Flex),
+            taffy::JustifyContent::Stretch
+        );
+        let style = ComputedStyle {
+            display: Display::Flex,
+            justify_content: JustifyContent::Stretch,
+            ..Default::default()
+        };
+        let taffy_style = style.to_taffy_style(800.0, 600.0);
+        assert_eq!(taffy_style.justify_content, Some(taffy::JustifyContent::Stretch));
     }
 
     #[test]

@@ -510,6 +510,7 @@ fn declaration_property(decl: &StyleDeclaration) -> Option<TransitionProperty> {
         StyleDeclaration::BoxShadowList(_) => TransitionProperty::BoxShadow,
         StyleDeclaration::LetterSpacing(_) => TransitionProperty::LetterSpacing,
         StyleDeclaration::LineHeight(_) => TransitionProperty::LineHeight,
+        StyleDeclaration::TransformTranslateX(_) => TransitionProperty::Transform,
         _ => return None,
     })
 }
@@ -612,6 +613,9 @@ fn extract_frame_value(frame: &Keyframe, prop: TransitionProperty) -> Option<Ani
             }
             (TransitionProperty::LineHeight, StyleDeclaration::LineHeight(v)) => {
                 Some(AnimatableValue::Float(*v))
+            }
+            (TransitionProperty::Transform, StyleDeclaration::TransformTranslateX(v)) => {
+                Some(AnimatableValue::TransformX(*v))
             }
             _ => None,
         };

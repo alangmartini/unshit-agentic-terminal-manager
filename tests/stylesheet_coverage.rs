@@ -22,37 +22,21 @@ const STYLES: &str = include_str!("../assets/styles.css");
 /// should be a conscious, reviewed decision.
 const KNOWN_UNSUPPORTED: &[&str] = &[
     // Fully unimplemented properties.
-    "appearance",
-    "-webkit-appearance",
-    "-webkit-font-smoothing",
-    "border-collapse",
-    "border-style",
-    "caret-color",
     "filter", // non-backdrop filter (drop-shadow/brightness/none)
-    "font-feature-settings",
-    "font-style",
-    "font-variant-numeric",
     "mix-blend-mode",
-    "overflow-x", // only the `overflow` shorthand is supported
-    "overflow-y",
     "scroll-margin",
-    "scrollbar-width",
     "text-overflow",
-    "text-shadow",
     "vertical-align",
     "word-break",
     // Partially supported — common values work, but the stylesheet uses a form
     // the parser rejects (masking note: a regression on the *supported* form of
     // these would not be caught here).
-    "background", // `none` and multi-layer radial gradients drop
+    "background", // `none` + first multi-layer paint work; some `ellipse <size>
+    // at <pos>` radial-gradient forms still drop (gradient parser gap)
     "background-position",
-    "background-repeat",
     "background-size",
-    "border-radius",   // `50%` (percent) drops; px works
-    "justify-content", // an unsupported keyword form drops; center/etc. work
-    "outline",         // the `outline` shorthand drops; outline-width/-offset work
-    "transform",       // only translateX(); scale/rotate/translateY drop
-    "transition",      // multi-property shorthand drops; single-property works
+    "text-shadow", // `none` is accepted; real shadow lists drop (no shadow paint)
+    "transform",   // only translateX(); scale/rotate/translateY drop
 ];
 
 /// A dropped declaration is "expected" if its property is a known gap, or its

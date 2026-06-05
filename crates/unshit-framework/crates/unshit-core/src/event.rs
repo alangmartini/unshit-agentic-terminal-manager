@@ -603,7 +603,9 @@ fn find_resize_grip_recursive(
 
     // Check this element: must have resize != None and overflow != Visible (per CSS spec)
     let style = &element.computed_style;
-    if style.resize == CssResize::None || style.overflow == Overflow::Visible {
+    if style.resize == CssResize::None
+        || (style.overflow_x == Overflow::Visible && style.overflow_y == Overflow::Visible)
+    {
         return None;
     }
 
@@ -924,7 +926,8 @@ mod tests {
         let mut elem = Element::new(Tag::Div);
         elem.layout_rect = LayoutRect { x, y, width: w, height: h };
         elem.computed_style.resize = resize;
-        elem.computed_style.overflow = overflow;
+        elem.computed_style.overflow_x = overflow;
+        elem.computed_style.overflow_y = overflow;
         arena.alloc(elem)
     }
 

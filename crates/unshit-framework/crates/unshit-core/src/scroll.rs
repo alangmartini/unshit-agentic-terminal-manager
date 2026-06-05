@@ -102,53 +102,6 @@ impl ScrollbarVisualState {
     }
 }
 
-#[cfg(test)]
-mod visual_state_tests {
-    use super::*;
-
-    fn node(index: u32) -> NodeId {
-        NodeId { index, generation: 0 }
-    }
-
-    #[test]
-    fn scrollbar_thumb_has_resting_visibility() {
-        let state = ScrollbarVisualState::default();
-
-        assert!(
-            state.thumb_alpha(node(1), ScrollbarAxis::Vertical) > 0.0,
-            "scrollbar thumb should remain visible when content overflows"
-        );
-        assert_eq!(
-            state.thumb_alpha(node(1), ScrollbarAxis::Vertical),
-            0.004,
-            "resting settings scrollbar should stay visible but extremely subdued"
-        );
-    }
-
-    #[test]
-    fn scrollbar_thumb_gets_stronger_while_interacting() {
-        let target = node(1);
-        let hovered = ScrollbarVisualState {
-            hovered_node: Some(target),
-            hovered_axis: Some(ScrollbarAxis::Vertical),
-            dragging_node: None,
-            dragging_axis: None,
-        };
-        let dragging = ScrollbarVisualState {
-            dragging_node: Some(target),
-            dragging_axis: Some(ScrollbarAxis::Vertical),
-            ..hovered
-        };
-
-        let resting = ScrollbarVisualState::default().thumb_alpha(target, ScrollbarAxis::Vertical);
-        let hover_alpha = hovered.thumb_alpha(target, ScrollbarAxis::Vertical);
-        let drag_alpha = dragging.thumb_alpha(target, ScrollbarAxis::Vertical);
-
-        assert!(hover_alpha > resting);
-        assert!(drag_alpha > hover_alpha);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Content extent computation (extracted from batch.rs)
 // ---------------------------------------------------------------------------
@@ -280,7 +233,11 @@ pub fn compute_scrollbar_geometry(
         return (None, None);
     };
 
-    if element.computed_style.overflow != Overflow::Scroll {
+    // The vertical scrollbar is driven by `overflow-y`, the horizontal one by
+    // `overflow-x`. Bail only when neither axis scrolls.
+    let scroll_x = element.computed_style.overflow_x == Overflow::Scroll;
+    let scroll_y = element.computed_style.overflow_y == Overflow::Scroll;
+    if !scroll_x && !scroll_y {
         return (None, None);
     }
 
@@ -288,7 +245,7 @@ pub fn compute_scrollbar_geometry(
     let container_w = element.layout_rect.width;
     let container_h = element.layout_rect.height;
 
-    let v_geom = if content_max_y > container_h + 1.0 {
+    let v_geom = if scroll_y && content_max_y > container_h + 1.0 {
         let max_scroll_y = content_max_y - container_h;
         let scroll_ratio = if max_scroll_y > 0.0 { element.scroll_y / max_scroll_y } else { 0.0 };
 
@@ -320,7 +277,7 @@ pub fn compute_scrollbar_geometry(
         None
     };
 
-    let h_geom = if content_max_x > container_w + 1.0 {
+    let h_geom = if scroll_x && content_max_x > container_w + 1.0 {
         let max_scroll_x = content_max_x - container_w;
         let scroll_ratio = if max_scroll_x > 0.0 { element.scroll_x / max_scroll_x } else { 0.0 };
 
@@ -441,8 +398,11 @@ fn find_scrollbar_recursive(
         return None;
     }
 
-    // If this node has overflow:scroll, check its scrollbars first (they draw on top)
-    if element.computed_style.overflow == Overflow::Scroll {
+    // If this node has overflow:scroll on either axis, check its scrollbars
+    // first (they draw on top)
+    if element.computed_style.overflow_x == Overflow::Scroll
+        || element.computed_style.overflow_y == Overflow::Scroll
+    {
         let (v_geom, h_geom) = compute_scrollbar_geometry(arena, node_id, render_x, render_y);
         if let Some(hit) = scrollbar_hit_test(v_geom.as_ref(), h_geom.as_ref(), node_id, x, y) {
             return Some(hit);
@@ -477,7 +437,9 @@ pub fn find_scroll_container(arena: &NodeArena, start: NodeId) -> Option<NodeId>
     let mut current = start;
     while !current.is_dangling() {
         if let Some(element) = arena.get(current) {
-            if element.computed_style.overflow == Overflow::Scroll {
+            if element.computed_style.overflow_x == Overflow::Scroll
+                || element.computed_style.overflow_y == Overflow::Scroll
+            {
                 return Some(current);
             }
             current = element.parent;
@@ -529,4 +491,51 @@ pub fn scroll_from_track_click(geom: &ScrollbarGeometry, cursor_pos: f32) -> f32
     let thumb_pos = cursor_pos - track_start - thumb_length / 2.0;
     let scroll_ratio = thumb_pos / available;
     (scroll_ratio * geom.max_scroll).clamp(0.0, geom.max_scroll)
+}
+
+#[cfg(test)]
+mod visual_state_tests {
+    use super::*;
+
+    fn node(index: u32) -> NodeId {
+        NodeId { index, generation: 0 }
+    }
+
+    #[test]
+    fn scrollbar_thumb_has_resting_visibility() {
+        let state = ScrollbarVisualState::default();
+
+        assert!(
+            state.thumb_alpha(node(1), ScrollbarAxis::Vertical) > 0.0,
+            "scrollbar thumb should remain visible when content overflows"
+        );
+        assert_eq!(
+            state.thumb_alpha(node(1), ScrollbarAxis::Vertical),
+            0.004,
+            "resting settings scrollbar should stay visible but extremely subdued"
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_gets_stronger_while_interacting() {
+        let target = node(1);
+        let hovered = ScrollbarVisualState {
+            hovered_node: Some(target),
+            hovered_axis: Some(ScrollbarAxis::Vertical),
+            dragging_node: None,
+            dragging_axis: None,
+        };
+        let dragging = ScrollbarVisualState {
+            dragging_node: Some(target),
+            dragging_axis: Some(ScrollbarAxis::Vertical),
+            ..hovered
+        };
+
+        let resting = ScrollbarVisualState::default().thumb_alpha(target, ScrollbarAxis::Vertical);
+        let hover_alpha = hovered.thumb_alpha(target, ScrollbarAxis::Vertical);
+        let drag_alpha = dragging.thumb_alpha(target, ScrollbarAxis::Vertical);
+
+        assert!(hover_alpha > resting);
+        assert!(drag_alpha > hover_alpha);
+    }
 }

@@ -95,8 +95,8 @@ use unshit_core::layout::{
 use unshit_core::scroll::{self, ScrollbarVisualState};
 use unshit_core::style::types::{
     apply_text_transform, Background, Color, CssPosition, CssResize, Display, FilterFunction,
-    FontWeight, GradientStopPosition, Layer, LinearGradient, Overflow, RadialGradient, RadialShape,
-    RenderTarget, TextAlign, TextDecoration, Visibility, WhiteSpace,
+    FontStyle, FontWeight, GradientStopPosition, Layer, LinearGradient, Overflow, RadialGradient,
+    RadialShape, RenderTarget, TextAlign, TextDecoration, Visibility, WhiteSpace,
 };
 use unshit_core::svg::types::{
     PathCommand, StrokeLineCap, StrokeLineJoin, SvgAttrs, SvgNode, SvgPaint, SvgPrimitive,
@@ -703,6 +703,7 @@ struct ShapedCacheKey {
     text_hash: u64,
     font_family_hash: u64,
     font_weight: u16,
+    font_style: FontStyle,
     font_size_tenths: i32,
     line_height_tenths: i32,
     letter_spacing_tenths: i32,
@@ -977,10 +978,12 @@ impl BatchCache {
 }
 
 impl ShapedTextCache {
+    #[allow(clippy::too_many_arguments)]
     fn make_key(
         text: &str,
         font_family: &str,
         font_weight: FontWeight,
+        font_style: FontStyle,
         font_size: f32,
         line_height: f32,
         letter_spacing: f32,
@@ -993,6 +996,7 @@ impl ShapedTextCache {
             text_hash: hasher.finish(),
             font_family_hash: shape_cache_font_id(font_family),
             font_weight: font_weight_number(font_weight),
+            font_style,
             font_size_tenths: (font_size * 10.0) as i32,
             line_height_tenths: (line_height * 10.0) as i32,
             letter_spacing_tenths: (letter_spacing * 10.0) as i32,
@@ -1403,6 +1407,12 @@ fn walk_for_batch(
 
     let rect = element.layout_rect;
 
+    // Resolve `border-radius` against the box. Percent corners (`50%` circular
+    // avatars) resolve against `min(width, height)` so they stay circular on
+    // non-square boxes (CSS resolves radius percentages against the box). Pure
+    // px corners pass through unchanged, so this also covers the f32 fast path.
+    let border_radius = style.border_radius_src.resolve(rect.width.min(rect.height));
+
     // CSS `transform: translateX(...)` is applied here as a pure render
     // space offset. The layout rect keeps its in flow position so siblings
     // and hit testing are unaffected; only the painted position shifts.
@@ -1519,12 +1529,24 @@ fn walk_for_batch(
     let is_visible = style.visibility == Visibility::Visible;
     let opacity = style.opacity;
 
-    let clips_children = style.overflow != Overflow::Visible;
+    // Per-axis clipping: `overflow-x` clips the horizontal extent (left/right)
+    // and `overflow-y` clips the vertical extent (top/bottom) independently.
+    let clips_x = style.overflow_x != Overflow::Visible;
+    let clips_y = style.overflow_y != Overflow::Visible;
+    let clips_children = clips_x || clips_y;
     let child_clip = if clips_children {
-        let new_x = render_x.max(clip_rect[0]);
-        let new_y = render_y.max(clip_rect[1]);
-        let new_right = (render_x + rect.width).min(clip_rect[0] + clip_rect[2]);
-        let new_bottom = (render_y + rect.height).min(clip_rect[1] + clip_rect[3]);
+        // Start from the inherited clip rect, then tighten only the axes this
+        // element actually clips.
+        let (mut new_x, mut new_right) = (clip_rect[0], clip_rect[0] + clip_rect[2]);
+        let (mut new_y, mut new_bottom) = (clip_rect[1], clip_rect[1] + clip_rect[3]);
+        if clips_x {
+            new_x = render_x.max(clip_rect[0]);
+            new_right = (render_x + rect.width).min(clip_rect[0] + clip_rect[2]);
+        }
+        if clips_y {
+            new_y = render_y.max(clip_rect[1]);
+            new_bottom = (render_y + rect.height).min(clip_rect[1] + clip_rect[3]);
+        }
         [new_x, new_y, (new_right - new_x).max(0.0), (new_bottom - new_y).max(0.0)]
     } else {
         clip_rect
@@ -1553,7 +1575,7 @@ fn walk_for_batch(
             color: [0.0; 4], // no fill
             border_color: oc,
             border_width: outline_border,
-            border_radius: style.border_radius.to_array(),
+            border_radius,
             clip_rect,
             shadow_color: [0.0; 4],
             shadow_offset: [0.0; 2],
@@ -1634,7 +1656,7 @@ fn walk_for_batch(
                 color: [0.0; 4],
                 border_color: [0.0; 4],
                 border_width: [0.0; 4],
-                border_radius: style.border_radius.to_array(),
+                border_radius,
                 clip_rect,
                 shadow_color: sc,
                 shadow_offset: [shadow.offset_x, shadow.offset_y],
@@ -1691,7 +1713,7 @@ fn walk_for_batch(
                 color: bg,
                 border_color: bc,
                 border_width: style.border_width.to_array(),
-                border_radius: style.border_radius.to_array(),
+                border_radius,
                 clip_rect,
                 shadow_color: [0.0; 4],
                 shadow_offset: [0.0; 2],
@@ -1724,7 +1746,7 @@ fn walk_for_batch(
                 color: [0.0; 4],
                 border_color: [0.0; 4],
                 border_width: [0.0; 4],
-                border_radius: style.border_radius.to_array(),
+                border_radius,
                 clip_rect,
                 shadow_color: sc,
                 shadow_offset: [shadow.offset_x, shadow.offset_y],
@@ -1875,6 +1897,7 @@ fn walk_for_batch(
                         display_text,
                         &style.font_family,
                         style.font_weight,
+                        style.font_style,
                         style.font_size,
                         style.line_height,
                         style.letter_spacing,
@@ -1902,6 +1925,7 @@ fn walk_for_batch(
                         style.letter_spacing,
                         &style.font_family,
                         style.font_weight,
+                        style.font_style,
                         &text_color,
                         clip_rect,
                         batch.layer_mut(effective_layer),
@@ -1928,6 +1952,7 @@ fn walk_for_batch(
                             value_text.as_ref(),
                             &style.font_family,
                             style.font_weight,
+                            style.font_style,
                             style.font_size,
                             style.line_height,
                             style.letter_spacing,
@@ -1963,6 +1988,7 @@ fn walk_for_batch(
                             &prefix,
                             &style.font_family,
                             style.font_weight,
+                            style.font_style,
                             style.font_size,
                             style.line_height,
                             style.letter_spacing,
@@ -1984,6 +2010,7 @@ fn walk_for_batch(
                         caret_source.as_ref(),
                         &style.font_family,
                         style.font_weight,
+                        style.font_style,
                         style.font_size,
                         style.line_height,
                         style.letter_spacing,
@@ -2062,6 +2089,7 @@ fn walk_for_batch(
                     text,
                     &style.font_family,
                     style.font_weight,
+                    style.font_style,
                     style.font_size,
                     style.line_height,
                     style.letter_spacing,
@@ -2163,6 +2191,7 @@ fn walk_for_batch(
                     style.letter_spacing,
                     &style.font_family,
                     style.font_weight,
+                    style.font_style,
                     &text_color,
                     clip_rect,
                     batch.layer_mut(effective_layer),
@@ -2215,7 +2244,7 @@ fn walk_for_batch(
                 let instance = ImageInstance {
                     pos: [render_x, render_y],
                     size: [rect.width, rect.height],
-                    border_radius: style.border_radius.to_array(),
+                    border_radius,
                     opacity,
                     _pad: [0.0; 3],
                     clip_rect,
@@ -2452,7 +2481,7 @@ fn walk_for_batch(
 
     // Overlay scrollbar rendering.
     // Emitted after children so the scrollbar draws on top of content.
-    if style.overflow == Overflow::Scroll {
+    if style.overflow_x == Overflow::Scroll || style.overflow_y == Overflow::Scroll {
         let (v_geom, h_geom) =
             scroll::compute_scrollbar_geometry(arena, node_id, render_x, render_y);
 
@@ -2509,7 +2538,9 @@ fn walk_for_batch(
 
     // Resize grip indicator.
     // Per CSS spec, `resize` only works when `overflow` is not `visible`.
-    if style.resize != CssResize::None && style.overflow != Overflow::Visible {
+    if style.resize != CssResize::None
+        && (style.overflow_x != Overflow::Visible || style.overflow_y != Overflow::Visible)
+    {
         const GRIP_SIZE: f32 = 12.0;
         const DOT_SIZE: f32 = 2.0;
         const GRIP_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.35];
@@ -2801,6 +2832,7 @@ fn emit_text_glyphs_cached(
     letter_spacing: f32,
     font_family: &str,
     font_weight: FontWeight,
+    font_style: FontStyle,
     color: &Color,
     clip_rect: [f32; 4],
     batch: &mut FrameBatch,
@@ -2814,6 +2846,7 @@ fn emit_text_glyphs_cached(
         text,
         font_family,
         font_weight,
+        font_style,
         font_size,
         line_height,
         letter_spacing,
@@ -2856,7 +2889,12 @@ fn emit_text_glyphs_cached(
     let metrics = Metrics::new(font_size, font_size * line_height);
     let mut buffer = Buffer::new(font_system, metrics);
     buffer.set_size(font_system, max_width.map(|w| w.max(1.0)), None);
-    buffer.set_text(font_system, text, text_attrs(font_family, font_weight), Shaping::Advanced);
+    buffer.set_text(
+        font_system,
+        text,
+        text_attrs(font_family, font_weight, font_style),
+        Shaping::Advanced,
+    );
     buffer.shape_until_scroll(font_system, false);
 
     let mut cached_glyphs = Vec::new();
@@ -4757,6 +4795,7 @@ fn emit_select_node(
             letter_spacing,
             &style.font_family,
             style.font_weight,
+            style.font_style,
             &fg_color,
             clip,
             content_layer,
@@ -4784,6 +4823,7 @@ fn emit_select_node(
             letter_spacing,
             &style.font_family,
             style.font_weight,
+            style.font_style,
             &fg_color,
             clip,
             content_layer,
@@ -4883,6 +4923,7 @@ fn emit_select_node(
                 letter_spacing,
                 &style.font_family,
                 style.font_weight,
+                style.font_style,
                 &check_color,
                 item_clip,
                 overlay_layer,
@@ -4905,6 +4946,7 @@ fn emit_select_node(
             letter_spacing,
             &style.font_family,
             style.font_weight,
+            style.font_style,
             &text_color,
             item_clip,
             overlay_layer,
@@ -7332,19 +7374,55 @@ mod tests {
     }
 
     fn shaped_key_for(text: &str) -> ShapedCacheKey {
-        ShapedTextCache::make_key(text, "", FontWeight::Normal, 14.0, 1.2, 0.0, None)
+        ShapedTextCache::make_key(
+            text,
+            "",
+            FontWeight::Normal,
+            FontStyle::Normal,
+            14.0,
+            1.2,
+            0.0,
+            None,
+        )
     }
 
     #[test]
     fn shaped_text_cache_key_includes_font_family_and_weight() {
-        let regular =
-            ShapedTextCache::make_key("keep", "Consolas", FontWeight::Normal, 11.0, 1.4, 0.0, None);
-        let semibold =
-            ShapedTextCache::make_key("keep", "Consolas", FontWeight::W(600), 11.0, 1.4, 0.0, None);
+        let regular = ShapedTextCache::make_key(
+            "keep",
+            "Consolas",
+            FontWeight::Normal,
+            FontStyle::Normal,
+            11.0,
+            1.4,
+            0.0,
+            None,
+        );
+        let semibold = ShapedTextCache::make_key(
+            "keep",
+            "Consolas",
+            FontWeight::W(600),
+            FontStyle::Normal,
+            11.0,
+            1.4,
+            0.0,
+            None,
+        );
         let other_family = ShapedTextCache::make_key(
             "keep",
             "JetBrains Mono",
             FontWeight::Normal,
+            FontStyle::Normal,
+            11.0,
+            1.4,
+            0.0,
+            None,
+        );
+        let italic = ShapedTextCache::make_key(
+            "keep",
+            "Consolas",
+            FontWeight::Normal,
+            FontStyle::Italic,
             11.0,
             1.4,
             0.0,
@@ -7353,6 +7431,7 @@ mod tests {
 
         assert!(regular != semibold);
         assert!(regular != other_family);
+        assert!(regular != italic, "italic must shape to a distinct cache key");
     }
 
     #[test]

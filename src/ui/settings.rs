@@ -429,7 +429,8 @@ fn build_theme_chip(
         .with_class("theme-chip")
         .with_class(id)
         .with_style(StyleDeclaration::TextAlign(TextAlign::Left))
-        .with_style(StyleDeclaration::Overflow(Overflow::Hidden))
+        .with_style(StyleDeclaration::OverflowX(Overflow::Hidden))
+        .with_style(StyleDeclaration::OverflowY(Overflow::Hidden))
         .with_child(pin)
         .with_child(body)
         .with_child(build_theme_swatch_strip(swatches));
@@ -1061,7 +1062,8 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_style(StyleDeclaration::FlexDirection(FlexDirection::Column))
         .with_style(StyleDeclaration::FlexGrow(1.0))
         .with_style(StyleDeclaration::FlexBasis(Dimension::Auto))
-        .with_style(StyleDeclaration::Overflow(Overflow::Scroll))
+        .with_style(StyleDeclaration::OverflowX(Overflow::Scroll))
+        .with_style(StyleDeclaration::OverflowY(Overflow::Scroll))
         .with_style(StyleDeclaration::MinHeight(Dimension::Px(0.0)))
         .with_child(section)
 }
@@ -2216,7 +2218,7 @@ mod tests {
             .query(".set-page-content")
             .expect("settings page content should exist");
         assert_eq!(
-            content.computed_style.overflow,
+            content.computed_style.overflow_y,
             Overflow::Scroll,
             "settings page content must remain wheel-scrollable"
         );
@@ -2228,7 +2230,7 @@ mod tests {
                 .first()
                 .expect("theme picker should render chips")
                 .computed_style
-                .overflow,
+                .overflow_x,
             Overflow::Hidden,
             "theme chip should clip pattern and selected pin like the Claude design"
         );

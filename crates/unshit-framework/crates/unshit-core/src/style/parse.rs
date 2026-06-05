@@ -207,7 +207,8 @@ pub enum StyleDeclaration {
     Gap(f32),
     RowGap(f32),
     ColumnGap(f32),
-    Overflow(Overflow),
+    OverflowX(Overflow),
+    OverflowY(Overflow),
     Background(types::Background),
     BorderColor(Color),
     BorderWidth(Edges),
@@ -223,6 +224,11 @@ pub enum StyleDeclaration {
     /// to last-writer-wins, which no current stylesheet relies on.
     BorderSideColor(BorderSide, Color),
     BorderRadius(Corners),
+    /// `border-radius` authored with percent corners (`50%` circular avatars),
+    /// kept unresolved per corner so the renderer can resolve them against the
+    /// element box at paint time. Pure-`px` radii keep the `BorderRadius` f32
+    /// fast path above (preserving transition / scale behavior).
+    BorderRadiusDim(CornersDim),
     Opacity(f32),
     BoxShadowList(SmallVec<[ParsedBoxShadow; 2]>),
     BackdropFilter(types::BackdropFilter),
@@ -235,6 +241,7 @@ pub enum StyleDeclaration {
     /// preserving the stylesheet's relative text hierarchy.
     FontScale(f32),
     FontWeight(FontWeight),
+    FontStyle(FontStyle),
     FontFamily(String),
     LineHeight(f32),
     LetterSpacing(f32),
@@ -1266,9 +1273,10 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             let val = parser.expect_ident().map_err(|_| ())?;
             StyleDeclaration::JustifyContent(match val.as_ref() {
                 "normal" => JustifyContent::Normal,
-                "flex-start" | "start" => JustifyContent::Start,
-                "flex-end" | "end" => JustifyContent::End,
+                "flex-start" | "start" | "left" => JustifyContent::Start,
+                "flex-end" | "end" | "right" => JustifyContent::End,
                 "center" => JustifyContent::Center,
+                "stretch" => JustifyContent::Stretch,
                 "space-between" => JustifyContent::SpaceBetween,
                 "space-around" => JustifyContent::SpaceAround,
                 "space-evenly" => JustifyContent::SpaceEvenly,
@@ -1340,7 +1348,30 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "column-gap" => StyleDeclaration::ColumnGap(parse_px(parser)?),
         "overflow" => {
             let val = parser.expect_ident().map_err(|_| ())?;
-            StyleDeclaration::Overflow(match val.as_ref() {
+            let v = match val.as_ref() {
+                "visible" => Overflow::Visible,
+                "hidden" => Overflow::Hidden,
+                "scroll" | "auto" => Overflow::Scroll,
+                _ => return Err(()),
+            };
+            // The `overflow` shorthand sets both axes.
+            return Ok(smallvec::smallvec![
+                StyleDeclaration::OverflowX(v),
+                StyleDeclaration::OverflowY(v),
+            ]);
+        }
+        "overflow-x" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            StyleDeclaration::OverflowX(match val.as_ref() {
+                "visible" => Overflow::Visible,
+                "hidden" => Overflow::Hidden,
+                "scroll" | "auto" => Overflow::Scroll,
+                _ => return Err(()),
+            })
+        }
+        "overflow-y" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            StyleDeclaration::OverflowY(match val.as_ref() {
                 "visible" => Overflow::Visible,
                 "hidden" => Overflow::Hidden,
                 "scroll" | "auto" => Overflow::Scroll,
@@ -1416,19 +1447,51 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             let y = parse_pos_value(parser).unwrap_or(x);
             StyleDeclaration::ObjectPosition(types::ObjectPosition { x, y })
         }
-        "background" => match parser.try_parse(|p| parse_linear_gradient(p)) {
-            Ok(gradient) => {
-                StyleDeclaration::Background(types::Background::LinearGradient(gradient))
+        "background" => {
+            // `background: none` clears the background. The default `Background`
+            // is already transparent, so map it to a transparent color.
+            if parser
+                .try_parse(|p| {
+                    let id = p.expect_ident().map_err(|_| ())?;
+                    if id.eq_ignore_ascii_case("none") {
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                })
+                .is_ok()
+            {
+                let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
+                return Ok(smallvec::smallvec![StyleDeclaration::Background(
+                    types::Background::Color(Color::TRANSPARENT)
+                )]);
             }
-            Err(_) => match parser.try_parse(|p| parse_radial_gradient(p)) {
-                Ok(gradient) => {
-                    StyleDeclaration::Background(types::Background::RadialGradient(gradient))
+
+            let paint = match parser.try_parse(|p| parse_linear_gradient(p)) {
+                Ok(gradient) => types::Background::LinearGradient(gradient),
+                Err(_) => match parser.try_parse(|p| parse_radial_gradient(p)) {
+                    Ok(gradient) => types::Background::RadialGradient(gradient),
+                    Err(_) => types::Background::Color(parse_color(parser)?),
+                },
+            };
+            // `ComputedStyle` holds a single background. For a comma-separated
+            // multi-layer value, keep the first paintable layer and drain the
+            // remaining layers (true N-layer paint is out of scope).
+            while parser.try_parse(cssparser::Parser::expect_comma).is_ok() {
+                // Consume the rest of this layer up to the next comma or end.
+                while !parser.is_exhausted() {
+                    let state = parser.state();
+                    if parser.try_parse(cssparser::Parser::expect_comma).is_ok() {
+                        parser.reset(&state);
+                        break;
+                    }
+                    if parser.next().is_err() {
+                        break;
+                    }
                 }
-                Err(_) => {
-                    StyleDeclaration::Background(types::Background::Color(parse_color(parser)?))
-                }
-            },
-        },
+            }
+            StyleDeclaration::Background(paint)
+        }
         // `background-image` only accepts image sources (gradients, url()),
         // never solid colors. We currently honor the gradient path and
         // defer other image sources to later work.
@@ -1468,7 +1531,32 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "border-left-color" => {
             StyleDeclaration::BorderSideColor(BorderSide::Left, parse_color(parser)?)
         }
-        "border-radius" => StyleDeclaration::BorderRadius(parse_corners(parser)?),
+        "border-radius" => {
+            let corners = parse_corners_dim(parser)?;
+            match all_px_corners(corners) {
+                // Pure-px keeps the f32 fast path (paint + transitions unchanged).
+                Some(px) => StyleDeclaration::BorderRadius(px),
+                None => StyleDeclaration::BorderRadiusDim(corners),
+            }
+        }
+        "border-style" => {
+            // Standalone border-style. There is no dashed/dotted border
+            // renderer, so non-`none` line styles are accepted-and-ignored.
+            // `none`/`hidden` collapse the border to zero width.
+            let val = parser.expect_ident().map_err(|_| ())?;
+            match val.as_ref() {
+                "none" | "hidden" => {
+                    let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
+                    return Ok(smallvec::smallvec![StyleDeclaration::BorderWidth(Edges::all(0.0))]);
+                }
+                "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset"
+                | "outset" => {
+                    let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
+                    return Ok(SmallVec::new());
+                }
+                _ => return Err(()),
+            }
+        }
         "opacity" => StyleDeclaration::Opacity(parse_number(parser)?),
         "color" => StyleDeclaration::Color(parse_color(parser)?),
         "font" => return parse_font_shorthand(parser),
@@ -1485,6 +1573,16 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 _ => return Err(()),
             };
             StyleDeclaration::FontWeight(w)
+        }
+        "font-style" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            let style = match val.as_ref() {
+                "normal" => FontStyle::Normal,
+                "italic" => FontStyle::Italic,
+                "oblique" => FontStyle::Oblique,
+                _ => return Err(()),
+            };
+            StyleDeclaration::FontStyle(style)
         }
         "font-family" => {
             let family = parse_font_family_list(parser)?;
@@ -1662,13 +1760,68 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
             }
         }
         "outline" => {
-            let width = parse_px(parser)?;
-            let color = parse_color(parser)?;
-            let _ = parser.try_parse(|p| p.expect_semicolon());
-            return Ok(smallvec::smallvec![
-                StyleDeclaration::OutlineWidth(width),
-                StyleDeclaration::OutlineColor(color),
-            ]);
+            // Order-independent shorthand, mirroring `parse_border_shorthand`:
+            // try width (px), color, then a style keyword that is swallowed.
+            // `none`/`hidden` force width 0.
+            let mut width = None;
+            let mut color = None;
+            let mut style_none = false;
+            let mut consumed = false;
+
+            while !parser.is_exhausted() {
+                let state = parser.state();
+                if parser.try_parse(cssparser::Parser::expect_semicolon).is_ok() {
+                    parser.reset(&state);
+                    break;
+                }
+
+                if width.is_none() {
+                    if let Ok(w) = parser.try_parse(|p| parse_px(p)) {
+                        width = Some(w);
+                        consumed = true;
+                        continue;
+                    }
+                }
+
+                if color.is_none() {
+                    if let Ok(c) = parser.try_parse(|p| parse_color(p)) {
+                        color = Some(c);
+                        consumed = true;
+                        continue;
+                    }
+                }
+
+                if let Ok(ident) = parser.try_parse(|p| p.expect_ident().map(|s| s.to_string())) {
+                    match ident.as_str() {
+                        "none" | "hidden" => {
+                            style_none = true;
+                            consumed = true;
+                        }
+                        "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset"
+                        | "outset" => {
+                            consumed = true;
+                        }
+                        _ => return Err(()),
+                    }
+                    continue;
+                }
+
+                return Err(());
+            }
+
+            if !consumed {
+                return Err(());
+            }
+
+            let resolved_width = if style_none { 0.0 } else { width.unwrap_or(0.0) };
+            let mut decls = SmallVec::<[StyleDeclaration; 2]>::new();
+            decls.push(StyleDeclaration::OutlineWidth(resolved_width));
+            if let Some(color) = color {
+                decls.push(StyleDeclaration::OutlineColor(color));
+            }
+
+            let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
+            return Ok(decls);
         }
         "outline-color" => StyleDeclaration::OutlineColor(parse_color(parser)?),
         "outline-width" => StyleDeclaration::OutlineWidth(parse_px(parser)?),
@@ -1941,6 +2094,37 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "mask-image" => {
             let gradient = parse_mask_image(parser)?;
             StyleDeclaration::MaskImage(gradient)
+        }
+
+        // `text-shadow`: the only value the engine understands is `none`
+        // (clear). A real shadow list has no render target yet, so it returns
+        // `Err(())` and drops — keeping the guardrail honest about the gap
+        // rather than silently swallowing a shadow as a no-op.
+        "text-shadow" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            if val.eq_ignore_ascii_case("none") {
+                let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
+                return Ok(SmallVec::new());
+            }
+            return Err(());
+        }
+
+        // Inert no-op accepts: recognized-but-ignored properties that have no
+        // render target in this engine. Accepting them is honest CSS
+        // forward-compat (mirrors the `backdrop-filter: none` no-op). Each
+        // validates that at least one token is present, then drains to `;`.
+        "appearance"
+        | "-webkit-appearance"
+        | "-webkit-font-smoothing"
+        | "border-collapse"
+        | "background-repeat"
+        | "font-feature-settings"
+        | "font-variant-numeric"
+        | "scrollbar-width" => {
+            // Require a value so an empty declaration still errors.
+            parser.next().map_err(|_| ())?;
+            while parser.next().is_ok() {}
+            return Ok(SmallVec::new());
         }
 
         _ => return Err(()),
@@ -2465,23 +2649,40 @@ fn parse_margin_value(parser: &mut Parser) -> Result<(f32, bool), ()> {
     parse_px(parser).map(|v| (v, false))
 }
 
-fn parse_corners(parser: &mut Parser) -> Result<Corners, ()> {
-    let values = parse_px_list(parser);
-    match values.len() {
-        1 => Ok(Corners::all(values[0])),
-        2 => Ok(Corners {
-            top_left: values[0],
-            top_right: values[1],
-            bottom_right: values[0],
-            bottom_left: values[1],
-        }),
-        4 => Ok(Corners {
-            top_left: values[0],
-            top_right: values[1],
-            bottom_right: values[2],
-            bottom_left: values[3],
-        }),
+/// Parse a `border-radius` value as a unit-preserving `CornersDim`, accepting
+/// both `px` and `%` corners. Applies the CSS 1/2/4-value expansion
+/// (`tl tr br bl`). The dispatch site collapses a pure-px result back to the
+/// f32 `Corners` fast path so transitions and DPI scaling are unchanged.
+fn parse_corners_dim(parser: &mut Parser) -> Result<CornersDim, ()> {
+    let mut values: Vec<LengthOrPercent> = Vec::with_capacity(4);
+    while values.len() < 4 {
+        match parser.try_parse(parse_length_or_percent) {
+            Ok(v) => values.push(v),
+            Err(_) => break,
+        }
+    }
+    match values.as_slice() {
+        [a] => Ok(CornersDim { top_left: *a, top_right: *a, bottom_right: *a, bottom_left: *a }),
+        [a, b] => Ok(CornersDim { top_left: *a, top_right: *b, bottom_right: *a, bottom_left: *b }),
+        [a, b, c, d] => {
+            Ok(CornersDim { top_left: *a, top_right: *b, bottom_right: *c, bottom_left: *d })
+        }
         _ => Err(()),
+    }
+}
+
+/// Collapse a `CornersDim` to the resolved f32 `Corners` when every corner is
+/// `px`; otherwise `None`, so the caller emits the unit-preserving
+/// `BorderRadiusDim`.
+fn all_px_corners(c: CornersDim) -> Option<Corners> {
+    match c {
+        CornersDim {
+            top_left: LengthOrPercent::Px(top_left),
+            top_right: LengthOrPercent::Px(top_right),
+            bottom_right: LengthOrPercent::Px(bottom_right),
+            bottom_left: LengthOrPercent::Px(bottom_left),
+        } => Some(Corners { top_left, top_right, bottom_right, bottom_left }),
+        _ => None,
     }
 }
 
@@ -3354,8 +3555,13 @@ fn parse_transition_shorthand(parser: &mut Parser) -> Result<SmallVec<[Transitio
     }
 
     loop {
-        let def = parse_single_transition(parser)?;
-        defs.push(def);
+        // A well-formed entry whose property name is not (yet) animatable is
+        // skipped (`Ok(None)`) rather than failing the whole comma list, so the
+        // remaining, supported properties still transition. A genuinely
+        // malformed entry (bad duration/timing) still propagates as an error.
+        if let Some(def) = parse_single_transition(parser)? {
+            defs.push(def);
+        }
 
         // Try to consume a comma for the next entry.
         if parser.try_parse(cssparser::Parser::expect_comma).is_err() {
@@ -3367,10 +3573,16 @@ fn parse_transition_shorthand(parser: &mut Parser) -> Result<SmallVec<[Transitio
 }
 
 /// Parse a single transition entry: `<property> <duration> [<timing-function>] [<delay>]`
-fn parse_single_transition(parser: &mut Parser) -> Result<TransitionDef, ()> {
+///
+/// Returns `Ok(None)` when the entry is otherwise well-formed but names a
+/// property the transition machinery does not animate (e.g. `left`). The
+/// entry's tokens are still fully consumed so the parser cursor lands on the
+/// following comma, letting the caller continue with the rest of the list
+/// instead of dropping the entire `transition` declaration.
+fn parse_single_transition(parser: &mut Parser) -> Result<Option<TransitionDef>, ()> {
     // Property name.
     let prop_name = parser.expect_ident().map_err(|_| ())?.to_string();
-    let property = TransitionProperty::from_str(&prop_name).ok_or(())?;
+    let property = TransitionProperty::from_str(&prop_name);
 
     // Duration (required).
     let duration = parse_time_value(parser)?;
@@ -3381,7 +3593,12 @@ fn parse_single_transition(parser: &mut Parser) -> Result<TransitionDef, ()> {
     // Delay (optional, defaults to 0).
     let delay = parser.try_parse(parse_time_value).unwrap_or(Duration::ZERO);
 
-    Ok(TransitionDef { property, duration, timing_function, delay })
+    // Unknown / not-yet-animatable property: tokens consumed, entry skipped.
+    let Some(property) = property else {
+        return Ok(None);
+    };
+
+    Ok(Some(TransitionDef { property, duration, timing_function, delay }))
 }
 
 /// Parse a time value: `0.3s`, `300ms`, or `0` (treated as 0s).
@@ -4266,7 +4483,8 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         }
         StyleDeclaration::RowGap(v) => style.row_gap = *v,
         StyleDeclaration::ColumnGap(v) => style.column_gap = *v,
-        StyleDeclaration::Overflow(v) => style.overflow = *v,
+        StyleDeclaration::OverflowX(v) => style.overflow_x = *v,
+        StyleDeclaration::OverflowY(v) => style.overflow_y = *v,
         StyleDeclaration::Resize(v) => style.resize = *v,
         StyleDeclaration::BoxSizing(v) => style.box_sizing = *v,
         StyleDeclaration::AspectRatio(v) => style.aspect_ratio = *v,
@@ -4284,7 +4502,27 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         // Single stored border_color; correct because every consuming rule
         // gives width to exactly one side (see the BorderSideColor doc).
         StyleDeclaration::BorderSideColor(_side, v) => style.border_color = *v,
-        StyleDeclaration::BorderRadius(v) => style.border_radius = *v,
+        StyleDeclaration::BorderRadius(v) => {
+            style.border_radius = *v;
+            style.border_radius_src = CornersDim::from_px(*v);
+        }
+        StyleDeclaration::BorderRadiusDim(v) => {
+            // Percent corners resolve to 0 in the f32 mirror (paint has no box);
+            // the renderer resolves the real value from border_radius_src. Px
+            // corners still write through so the mirror stays usable for
+            // transition lerp / DPI scaling of pure-px radii.
+            let px_or_zero = |c: LengthOrPercent| match c {
+                LengthOrPercent::Px(px) => px,
+                LengthOrPercent::Percent(_) => 0.0,
+            };
+            style.border_radius = Corners {
+                top_left: px_or_zero(v.top_left),
+                top_right: px_or_zero(v.top_right),
+                bottom_right: px_or_zero(v.bottom_right),
+                bottom_left: px_or_zero(v.bottom_left),
+            };
+            style.border_radius_src = *v;
+        }
         StyleDeclaration::Opacity(v) => style.opacity = *v,
         StyleDeclaration::BoxShadowList(v) => {
             let mut out: SmallVec<[types::BoxShadow; 2]> = SmallVec::with_capacity(v.len());
@@ -4312,6 +4550,7 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         }
         StyleDeclaration::FontScale(v) => style.font_size_scale = v.clamp(0.25, 4.0),
         StyleDeclaration::FontWeight(v) => style.font_weight = *v,
+        StyleDeclaration::FontStyle(v) => style.font_style = *v,
         StyleDeclaration::FontFamily(v) => style.font_family = v.clone(),
         StyleDeclaration::LineHeight(v) => style.line_height = *v,
         StyleDeclaration::LetterSpacing(v) => style.letter_spacing = *v,
@@ -4419,6 +4658,114 @@ mod tests {
     }
 
     #[test]
+    fn test_border_radius_percent_parses_to_corners_dim() {
+        // `50%` must survive parsing as a unit-preserving CornersDim (the f32
+        // fast path would silently drop it, the original engine gap).
+        let decls = parse_decls(".x { border-radius: 50%; }");
+        let corners = decls
+            .iter()
+            .find_map(|d| match d {
+                StyleDeclaration::BorderRadiusDim(c) => Some(*c),
+                _ => None,
+            })
+            .expect("border-radius: 50% should parse to BorderRadiusDim");
+        // 50% becomes the unit fraction 0.5 on every corner.
+        let half = LengthOrPercent::Percent(0.5);
+        assert_eq!(
+            corners,
+            CornersDim { top_left: half, top_right: half, bottom_right: half, bottom_left: half }
+        );
+        // Resolving against a 40x40 box yields 20px on every corner.
+        assert_eq!(corners.resolve(40.0_f32.min(40.0)), [20.0, 20.0, 20.0, 20.0]);
+    }
+
+    #[test]
+    fn test_border_radius_percent_apply_zeroes_f32_mirror() {
+        // The f32 `border_radius` mirror has no box at apply time, so percent
+        // corners resolve to 0 there; the real value lives in border_radius_src.
+        let decls = parse_decls(".x { border-radius: 50%; }");
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+        assert_eq!(style.border_radius, Corners::ZERO);
+        assert_eq!(
+            style.border_radius_src,
+            CornersDim {
+                top_left: LengthOrPercent::Percent(0.5),
+                top_right: LengthOrPercent::Percent(0.5),
+                bottom_right: LengthOrPercent::Percent(0.5),
+                bottom_left: LengthOrPercent::Percent(0.5),
+            }
+        );
+        // Paint-time resolution against a 40x40 box is circular: 20px corners.
+        assert_eq!(style.border_radius_src.resolve(40.0), [20.0, 20.0, 20.0, 20.0]);
+    }
+
+    #[test]
+    fn test_overflow_per_axis_longhands_set_independent_fields() {
+        // The axes genuinely differ in the real stylesheet, so each longhand
+        // must write only its own field. `auto` maps to `Scroll`.
+        let decls = parse_decls(".x { overflow-x: hidden; overflow-y: auto; }");
+        assert_eq!(
+            decls,
+            vec![
+                StyleDeclaration::OverflowX(Overflow::Hidden),
+                StyleDeclaration::OverflowY(Overflow::Scroll),
+            ]
+        );
+
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+        assert_eq!(style.overflow_x, Overflow::Hidden);
+        assert_eq!(style.overflow_y, Overflow::Scroll);
+    }
+
+    #[test]
+    fn test_overflow_shorthand_sets_both_axes() {
+        // The `overflow` shorthand expands to both per-axis longhands.
+        let decls = parse_decls(".x { overflow: hidden; }");
+        assert_eq!(
+            decls,
+            vec![
+                StyleDeclaration::OverflowX(Overflow::Hidden),
+                StyleDeclaration::OverflowY(Overflow::Hidden),
+            ]
+        );
+
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+        assert_eq!(style.overflow_x, Overflow::Hidden);
+        assert_eq!(style.overflow_y, Overflow::Hidden);
+    }
+
+    #[test]
+    fn test_border_radius_px_takes_f32_fast_path() {
+        // Pure-px radii keep the f32 `BorderRadius` variant so transitions and
+        // DPI scaling behave exactly as before.
+        let decls = parse_decls(".x { border-radius: 6px; }");
+        let radius = decls.iter().find_map(|d| match d {
+            StyleDeclaration::BorderRadius(c) => Some(*c),
+            _ => None,
+        });
+        assert_eq!(radius, Some(Corners::all(6.0)));
+        // It must NOT also emit the unit-preserving variant.
+        assert!(!decls.iter().any(|d| matches!(d, StyleDeclaration::BorderRadiusDim(_))));
+
+        // Apply keeps both the f32 mirror and the src in sync (all-px).
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+        assert_eq!(style.border_radius, Corners::all(6.0));
+        assert_eq!(style.border_radius_src, CornersDim::from_px(Corners::all(6.0)));
+    }
+
+    #[test]
     fn test_font_shorthand_expands_to_supported_longhands() {
         let decls = parse_decls(r#".x { font: 600 13px/1.4 "JetBrains Mono", monospace; }"#);
         let mut style = ComputedStyle::default();
@@ -4430,6 +4777,36 @@ mod tests {
         assert!((style.font_size - 13.0).abs() < 0.01);
         assert!((style.line_height - 1.4).abs() < 0.01);
         assert_eq!(style.font_family, "JetBrains Mono, monospace");
+    }
+
+    #[test]
+    fn test_font_style_parses_and_applies() {
+        let decls = parse_decls(".x { font-style: italic; }");
+        assert_eq!(decls.as_slice(), [StyleDeclaration::FontStyle(FontStyle::Italic)]);
+
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+        assert_eq!(style.font_style, FontStyle::Italic);
+    }
+
+    #[test]
+    fn test_font_style_oblique_and_normal() {
+        let oblique = parse_decls(".x { font-style: oblique; }");
+        assert_eq!(oblique.as_slice(), [StyleDeclaration::FontStyle(FontStyle::Oblique)]);
+
+        let normal = parse_decls(".x { font-style: normal; }");
+        assert_eq!(normal.as_slice(), [StyleDeclaration::FontStyle(FontStyle::Normal)]);
+    }
+
+    #[test]
+    fn test_font_style_inherits() {
+        let mut parent = ComputedStyle::default();
+        parent.font_style = FontStyle::Italic;
+        let mut child = ComputedStyle::default();
+        child.inherit_from(&parent);
+        assert_eq!(child.font_style, FontStyle::Italic);
     }
 
     #[test]
@@ -4798,6 +5175,58 @@ mod tests {
         assert!((defs[1].duration.as_secs_f32() - 0.2).abs() < 0.01);
         assert_eq!(defs[1].timing_function, TimingFunction::EaseOut);
         assert!((defs[1].delay.as_secs_f32() - 0.05).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_transition_multi_property_with_transform_not_dropped() {
+        // Regression: a transition list that names `transform` used to drop the
+        // ENTIRE declaration because `transform` was absent from
+        // `TransitionProperty::from_str`, erroring `parse_single_transition` and
+        // discarding the whole comma list. The list must now survive and contain
+        // both the background-color and the transform entry.
+        let decls =
+            parse_decls(".x { transition: background-color 0.2s ease, transform 0.2s ease; }");
+        let defs = decls
+            .iter()
+            .find_map(|d| match d {
+                StyleDeclaration::Transition(v) => Some(v),
+                _ => None,
+            })
+            .expect("multi-property transition naming `transform` must not drop");
+
+        assert_eq!(defs.len(), 2);
+
+        // background-color maps onto the Background transition property.
+        assert_eq!(defs[0].property, TransitionProperty::Background);
+        assert!((defs[0].duration.as_secs_f32() - 0.2).abs() < 0.01);
+        assert_eq!(defs[0].timing_function, TimingFunction::Ease);
+
+        // transform is now a first-class animatable property (translateX).
+        assert_eq!(defs[1].property, TransitionProperty::Transform);
+        assert!((defs[1].duration.as_secs_f32() - 0.2).abs() < 0.01);
+        assert_eq!(defs[1].timing_function, TimingFunction::Ease);
+    }
+
+    #[test]
+    fn test_transition_skips_unanimatable_property_keeps_rest() {
+        // `left` is not animatable, but it must NOT drop the whole declaration:
+        // the well-formed `background` entry has to survive. Mirrors the real
+        // stylesheet form `.toggle::after { transition: left ..., background ... }`.
+        let decls = parse_decls(
+            ".x { transition: left 120ms cubic-bezier(0.22, 0.61, 0.36, 1), background 120ms cubic-bezier(0.22, 0.61, 0.36, 1); }",
+        );
+        let defs = decls
+            .iter()
+            .find_map(|d| match d {
+                StyleDeclaration::Transition(v) => Some(v),
+                _ => None,
+            })
+            .expect("declaration with an unanimatable property must not drop");
+
+        // Only the `background` entry survives; `left` is silently skipped.
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].property, TransitionProperty::Background);
+        assert!((defs[0].duration.as_secs_f32() - 0.12).abs() < 0.01);
     }
 
     #[test]
@@ -7383,5 +7812,165 @@ mod tests {
             parse_single_color("oklch(0.5 0.1 60) garbage").is_some(),
             "parse_color must stop at the oklch() call and leave trailing tokens untouched"
         );
+    }
+
+    // --- parse-arms cluster -------------------------------------------------
+
+    #[test]
+    fn outline_shorthand_is_order_independent() {
+        // width color style, in canonical and shuffled order.
+        for css in [
+            ".x { outline: 1px solid #abcdef; }",
+            ".x { outline: solid #abcdef 1px; }",
+            ".x { outline: #abcdef 1px solid; }",
+        ] {
+            let decls = parse_decls(css);
+            assert!(
+                decls.contains(&StyleDeclaration::OutlineWidth(1.0)),
+                "{css} should yield outline-width 1px: {decls:?}"
+            );
+            assert!(
+                decls.iter().any(|d| matches!(d, StyleDeclaration::OutlineColor(_))),
+                "{css} should yield an outline-color: {decls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn outline_none_collapses_to_zero_width() {
+        let decls = parse_decls(".x { outline: none; }");
+        assert_eq!(decls, vec![StyleDeclaration::OutlineWidth(0.0)]);
+    }
+
+    #[test]
+    fn outline_resolves_var_color_from_stylesheet() {
+        // Mirrors the real stylesheet form `outline: 1px solid var(...)`.
+        let sheet = CompiledStylesheet::parse(
+            ".x { outline: 1px solid var(--border-focus); } :root { --border-focus: #112233; }",
+        );
+        let resolved = sheet.rules.iter().find(|r| !r.declarations.is_empty()).unwrap();
+        assert!(resolved.declarations.contains(&StyleDeclaration::OutlineWidth(1.0)));
+        assert!(resolved
+            .declarations
+            .iter()
+            .any(|d| matches!(d, StyleDeclaration::OutlineColor(_))));
+    }
+
+    #[test]
+    fn outline_style_only_defaults_width_to_zero() {
+        // No explicit width and a non-none style keyword -> width 0.
+        let decls = parse_decls(".x { outline: solid #abcdef; }");
+        assert!(decls.contains(&StyleDeclaration::OutlineWidth(0.0)), "{decls:?}");
+        assert!(decls.iter().any(|d| matches!(d, StyleDeclaration::OutlineColor(_))));
+    }
+
+    #[test]
+    fn background_none_is_transparent() {
+        let decls = parse_decls(".x { background: none; }");
+        assert_eq!(
+            decls,
+            vec![StyleDeclaration::Background(types::Background::Color(Color::TRANSPARENT))]
+        );
+    }
+
+    #[test]
+    fn background_multi_layer_keeps_first_paintable() {
+        // Two radial gradient layers: keep the first, drain the rest.
+        let decls = parse_decls(
+            ".x { background: radial-gradient(circle at 0% 0%, #ff0000, transparent), \
+             radial-gradient(circle at 100% 100%, #00ff00, transparent); }",
+        );
+        assert_eq!(decls.len(), 1, "only one background layer is retained: {decls:?}");
+        assert!(matches!(
+            decls[0],
+            StyleDeclaration::Background(types::Background::RadialGradient(_))
+        ));
+    }
+
+    #[test]
+    fn justify_content_stretch_parses() {
+        let decls = parse_decls(".x { justify-content: stretch; }");
+        assert_eq!(decls, vec![StyleDeclaration::JustifyContent(JustifyContent::Stretch)]);
+    }
+
+    #[test]
+    fn justify_content_left_right_alias_to_start_end() {
+        assert_eq!(
+            parse_decls(".x { justify-content: left; }"),
+            vec![StyleDeclaration::JustifyContent(JustifyContent::Start)]
+        );
+        assert_eq!(
+            parse_decls(".x { justify-content: right; }"),
+            vec![StyleDeclaration::JustifyContent(JustifyContent::End)]
+        );
+    }
+
+    #[test]
+    fn border_style_none_collapses_width() {
+        assert_eq!(
+            parse_decls(".x { border-style: none; }"),
+            vec![StyleDeclaration::BorderWidth(Edges::all(0.0))]
+        );
+        assert_eq!(
+            parse_decls(".x { border-style: hidden; }"),
+            vec![StyleDeclaration::BorderWidth(Edges::all(0.0))]
+        );
+    }
+
+    #[test]
+    fn border_style_line_styles_are_accepted_but_inert() {
+        // Accepted (no longer drops) but yields no declaration.
+        assert_eq!(parse_decls(".x { border-style: solid; }"), Vec::<StyleDeclaration>::new());
+        assert_eq!(parse_decls(".x { border-style: dashed; }"), Vec::<StyleDeclaration>::new());
+    }
+
+    #[test]
+    fn border_style_garbage_still_drops() {
+        let sheet = CompiledStylesheet::parse(".x { border-style: bogus; }");
+        assert!(
+            sheet.dropped.iter().any(|d| d.property == "border-style"),
+            "an invalid border-style keyword must still drop"
+        );
+    }
+
+    #[test]
+    fn text_shadow_none_is_accepted_inert() {
+        assert_eq!(parse_decls(".x { text-shadow: none; }"), Vec::<StyleDeclaration>::new());
+    }
+
+    #[test]
+    fn text_shadow_real_shadow_still_drops() {
+        // A real shadow list must drop, keeping the guardrail honest.
+        let sheet = CompiledStylesheet::parse(".x { text-shadow: 0 1px 2px #000; }");
+        assert!(
+            sheet.dropped.iter().any(|d| d.property == "text-shadow"),
+            "a real text-shadow value must still drop"
+        );
+    }
+
+    #[test]
+    fn inert_noop_accepts_are_recognized_but_empty() {
+        for css in [
+            ".x { appearance: none; }",
+            ".x { -webkit-appearance: none; }",
+            ".x { -webkit-font-smoothing: antialiased; }",
+            ".x { border-collapse: collapse; }",
+            ".x { background-repeat: no-repeat; }",
+            ".x { font-feature-settings: 'calt' 1, 'liga' 1; }",
+            ".x { font-variant-numeric: tabular-nums; }",
+            ".x { scrollbar-width: none; }",
+        ] {
+            let sheet = CompiledStylesheet::parse(css);
+            assert!(
+                sheet.dropped.iter().all(|d| d.is_custom_property()),
+                "{css} should be accepted (not dropped): {:?}",
+                sheet.dropped
+            );
+            assert_eq!(
+                parse_decls(css),
+                Vec::<StyleDeclaration>::new(),
+                "{css} should yield no declarations"
+            );
+        }
     }
 }
