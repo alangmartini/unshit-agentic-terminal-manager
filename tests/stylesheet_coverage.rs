@@ -29,7 +29,6 @@ const KNOWN_UNSUPPORTED: &[&str] = &[
     "filter", // non-backdrop filter (drop-shadow/brightness/none)
     "mix-blend-mode",
     "scroll-margin",
-    "text-overflow",
     "vertical-align",
     "word-break",
     // Partially supported — common values work, but the stylesheet uses a form

@@ -250,6 +250,7 @@ pub enum StyleDeclaration {
     TextDecoration(TextDecoration),
     TextDecorationColor(Color),
     WhiteSpace(types::WhiteSpace),
+    TextOverflow(types::TextOverflow),
     Cursor(CursorStyle),
     Visibility(Visibility),
     PointerEvents(PointerEvents),
@@ -1628,6 +1629,14 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 "pre" => types::WhiteSpace::Pre,
                 "pre-wrap" => types::WhiteSpace::PreWrap,
                 "pre-line" => types::WhiteSpace::PreLine,
+                _ => return Err(()),
+            })
+        }
+        "text-overflow" => {
+            let val = parser.expect_ident().map_err(|_| ())?;
+            StyleDeclaration::TextOverflow(match val.as_ref() {
+                "clip" => types::TextOverflow::Clip,
+                "ellipsis" => types::TextOverflow::Ellipsis,
                 _ => return Err(()),
             })
         }
@@ -4559,6 +4568,7 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::TextDecoration(v) => style.text_decoration = *v,
         StyleDeclaration::TextDecorationColor(v) => style.text_decoration_color = Some(*v),
         StyleDeclaration::WhiteSpace(v) => style.white_space = *v,
+        StyleDeclaration::TextOverflow(v) => style.text_overflow = *v,
         StyleDeclaration::Cursor(v) => style.cursor = *v,
         StyleDeclaration::Visibility(v) => style.visibility = *v,
         StyleDeclaration::PointerEvents(v) => style.pointer_events = *v,
@@ -5069,9 +5079,12 @@ mod tests {
 
     #[test]
     fn test_dropped_declarations_are_recorded() {
-        let sheet = CompiledStylesheet::parse(".x { text-overflow: ellipsis; color: #ffffff; }");
+        // `mix-blend-mode` is a still-unsupported property (see the
+        // stylesheet-coverage KNOWN_UNSUPPORTED inventory), so the parser drops
+        // it. (`text-overflow` used to serve here but is now supported.)
+        let sheet = CompiledStylesheet::parse(".x { mix-blend-mode: multiply; color: #ffffff; }");
         assert!(
-            sheet.dropped.iter().any(|d| d.property == "text-overflow" && d.value == "ellipsis"),
+            sheet.dropped.iter().any(|d| d.property == "mix-blend-mode" && d.value == "multiply"),
             "unrecognized property should be recorded: {:?}",
             sheet.dropped
         );

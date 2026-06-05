@@ -90,13 +90,14 @@ use unshit_core::element::{ElementContent, InputType, Tag};
 use unshit_core::event::TextSelection;
 use unshit_core::id::NodeId;
 use unshit_core::layout::{
-    font_weight_number, measure_text_with_style_cached, text_attrs, TextMeasureCache,
+    font_weight_number, measure_text_with_style_cached, text_attrs, truncate_text_with_ellipsis,
+    TextMeasureCache,
 };
 use unshit_core::scroll::{self, ScrollbarVisualState};
 use unshit_core::style::types::{
     apply_text_transform, Background, Color, CssPosition, CssResize, Display, FilterFunction,
     FontStyle, FontWeight, GradientStopPosition, Layer, LinearGradient, Overflow, RadialGradient,
-    RadialShape, RenderTarget, TextAlign, TextDecoration, Visibility, WhiteSpace,
+    RadialShape, RenderTarget, TextAlign, TextDecoration, TextOverflow, Visibility, WhiteSpace,
 };
 use unshit_core::svg::types::{
     PathCommand, StrokeLineCap, StrokeLineJoin, SvgAttrs, SvgNode, SvgPaint, SvgPrimitive,
@@ -2071,7 +2072,7 @@ fn walk_for_batch(
         match &element.content {
             ElementContent::Text(ref raw_text) if is_visible && !raw_text.is_empty() => {
                 let transformed_text = apply_text_transform(raw_text, style.text_transform);
-                let text = transformed_text.as_ref();
+                let mut text = transformed_text.as_ref();
                 let mut text_color = style.color;
                 text_color.a = (text_color.a as f32 * opacity) as u8;
 
@@ -2085,7 +2086,7 @@ fn walk_for_batch(
                         Some(content_w)
                     };
 
-                let (text_w, text_h) = measure_text_with_style_cached(
+                let (mut text_w, mut text_h) = measure_text_with_style_cached(
                     text,
                     &style.font_family,
                     style.font_weight,
@@ -2097,6 +2098,49 @@ fn walk_for_batch(
                     font_system,
                     Some(measure_cache),
                 );
+
+                // `text-overflow: ellipsis` on a non-wrapping run that overflows
+                // its content box: truncate on a grapheme-cluster boundary and
+                // append an ellipsis BEFORE we emit glyphs, so the clip rect no
+                // longer does the cutting. Truncating first means the
+                // (re)measure below keys the cache on the truncated string, so a
+                // truncated run can neither be served from nor pollute the
+                // full-run cache entry (and vice versa). `Clip` stays a no-op.
+                let truncated_holder: String;
+                if style.text_overflow == TextOverflow::Ellipsis
+                    && matches!(style.white_space, WhiteSpace::Nowrap)
+                    && text_w > content_w
+                    && content_w > 0.0
+                {
+                    if let Some(truncated) = truncate_text_with_ellipsis(
+                        text,
+                        &style.font_family,
+                        style.font_weight,
+                        style.font_style,
+                        style.font_size,
+                        style.line_height,
+                        style.letter_spacing,
+                        content_w,
+                        font_system,
+                    ) {
+                        truncated_holder = truncated;
+                        text = truncated_holder.as_str();
+                        let (tw, th) = measure_text_with_style_cached(
+                            text,
+                            &style.font_family,
+                            style.font_weight,
+                            style.font_style,
+                            style.font_size,
+                            style.line_height,
+                            style.letter_spacing,
+                            text_max_w,
+                            font_system,
+                            Some(measure_cache),
+                        );
+                        text_w = tw;
+                        text_h = th;
+                    }
+                }
                 let y_offset = ((content_h - text_h) * 0.5).max(0.0);
 
                 let text_x = aligned_text_x(

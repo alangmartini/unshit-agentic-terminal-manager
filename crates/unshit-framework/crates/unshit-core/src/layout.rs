@@ -478,6 +478,187 @@ pub fn measure_text_with_style_cached(
     result
 }
 
+/// The ellipsis character appended to truncated text. A single Unicode
+/// horizontal-ellipsis glyph (U+2026). It is composed onto each candidate prefix
+/// and the whole run is re-measured via [`painted_run_width`], so its advance is
+/// always accounted for in the run's own font and shaping context.
+const ELLIPSIS: &str = "\u{2026}";
+
+/// Measure the run's PAINTED right edge for `text` in the given font, using the
+/// EXACT formula the renderer paints with (mirror of `emit_text_glyphs_cached`
+/// in `unshit-renderer/src/batch.rs`, the per-glyph positioning loop):
+///
+/// ```text
+/// max over glyphs of  glyph.x + (glyph_index as f32) * letter_spacing + glyph.w
+/// ```
+///
+/// where `glyph_index` is enumerated PER layout run (it resets at each run),
+/// exactly as the renderer does via `run.glyphs.iter().enumerate()`. The text is
+/// shaped single-line (`max_width = None`) so it never wraps.
+///
+/// This is the source of truth for "does it fit", because the clip rect cuts on
+/// painted positions, not on cosmic-text's `line_w` advance metric.
+#[allow(clippy::too_many_arguments)]
+fn painted_run_width(
+    text: &str,
+    font_family: &str,
+    font_weight: FontWeight,
+    font_style: FontStyle,
+    font_size: f32,
+    line_height: f32,
+    letter_spacing: f32,
+    font_system: &mut FontSystem,
+) -> f32 {
+    let buffer = shaped_buffer(
+        text,
+        font_family,
+        font_weight,
+        font_style,
+        font_size,
+        line_height,
+        None,
+        font_system,
+    );
+    let mut right_edge = 0.0f32;
+    for run in buffer.layout_runs() {
+        for (glyph_index, glyph) in run.glyphs.iter().enumerate() {
+            let edge = glyph.x + glyph_index as f32 * letter_spacing + glyph.w;
+            right_edge = right_edge.max(edge);
+        }
+    }
+    right_edge
+}
+
+/// Truncate `text` so the result PLUS an appended ellipsis fits within
+/// `content_w`, cutting only on a grapheme-cluster boundary (never mid-byte,
+/// never inside a combining sequence / emoji / ligature).
+///
+/// The fit decision is made authoritatively by measuring what is actually
+/// PAINTED (via [`painted_run_width`], which mirrors the renderer's per-glyph
+/// positioning formula), over LOGICAL byte prefixes of `text`. We never derive
+/// a logical cut from a visual-order glyph walk: under bidi/RTL the visual order
+/// is non-monotonic in source byte offset, so a visual-order cut byte can jump
+/// near the end of the string and retain almost everything. Measuring the
+/// composed (`prefix + ellipsis`) painted width per logical prefix is correct
+/// for LTR, RTL, bidi, combining marks, ZWJ emoji, and any `letter_spacing`,
+/// because it measures the exact run the renderer will paint and only ever
+/// returns a valid logical prefix.
+///
+/// Algorithm:
+///   1. Shape the source run once and collect the distinct glyph `.start` byte
+///      offsets. These are valid grapheme-cluster boundaries in LOGICAL order.
+///      Sort ascending and append `text.len()` so the full string is also a
+///      candidate, plus `0` so the ellipsis-only result is considered.
+///   2. For each boundary `b` (ascending), compose `&text[..b] + ELLIPSIS` and
+///      measure its painted right edge. Keep the LARGEST `b` whose composed
+///      painted width `<= content_w`. We do NOT break early on the first
+///      non-fit: bidi can make composed widths slightly non-monotonic, so every
+///      boundary is evaluated and the maximum fitting one is taken.
+///
+/// Returns `None` when no truncation is needed or possible:
+///   - the full run already fits (`content_w` is wide enough — the gate should
+///     prevent this, but we are defensive), or
+///   - not even the ellipsis alone fits (caller falls back to clip behavior),
+///   - the text is empty.
+///
+/// When `Some(s)` is returned, `s` is strictly a valid LOGICAL prefix of the
+/// input with the ellipsis appended, and its painted width fits `content_w`.
+///
+/// Limitation (accepted): for RTL runs this truncates the LOGICAL tail rather
+/// than the CSS-perfect VISUAL-left end. Fit is always guaranteed and the result
+/// is always a valid prefix + ellipsis, which is the correctness bar here.
+#[allow(clippy::too_many_arguments)]
+pub fn truncate_text_with_ellipsis(
+    text: &str,
+    font_family: &str,
+    font_weight: FontWeight,
+    font_style: FontStyle,
+    font_size: f32,
+    line_height: f32,
+    letter_spacing: f32,
+    content_w: f32,
+    font_system: &mut FontSystem,
+) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+
+    // Defensive: if the full text already fits as painted, no truncation needed.
+    // (The renderer gate already guarantees text_w > content_w before calling
+    // us, but the gate measures via `line_w` advance, which can differ slightly
+    // from the painted edge — re-check against the painted edge here.)
+    let full_w = painted_run_width(
+        text,
+        font_family,
+        font_weight,
+        font_style,
+        font_size,
+        line_height,
+        letter_spacing,
+        font_system,
+    );
+    if full_w <= content_w {
+        return None;
+    }
+
+    // Collect LOGICAL cluster boundaries: shape the source run once and gather
+    // the distinct glyph `.start` byte offsets. Each `.start` is a
+    // grapheme-cluster boundary in the source string, so slicing at one can
+    // never split a multi-byte cluster (combining marks / emoji / ligature).
+    let mut boundaries: Vec<usize> = {
+        let buffer = shaped_buffer(
+            text,
+            font_family,
+            font_weight,
+            font_style,
+            font_size,
+            line_height,
+            None,
+            font_system,
+        );
+        let mut set: Vec<usize> = vec![0];
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                set.push(glyph.start.min(text.len()));
+            }
+        }
+        set.push(text.len());
+        set.sort_unstable();
+        set.dedup();
+        set
+    };
+    // We never want to "truncate" to the full string itself (it does not fit),
+    // but keeping it out of the candidate set avoids a redundant measure.
+    boundaries.retain(|&b| b < text.len());
+
+    // For each boundary (ascending), compose `prefix + ellipsis` and measure its
+    // PAINTED right edge. Keep the largest boundary whose composed run fits.
+    // Do NOT break early on the first non-fit: bidi can make composed widths
+    // slightly non-monotonic in `b`, so evaluate all boundaries.
+    let mut best: Option<String> = None;
+    for &b in &boundaries {
+        let composed = format!("{}{ELLIPSIS}", &text[..b]);
+        let composed_w = painted_run_width(
+            &composed,
+            font_family,
+            font_weight,
+            font_style,
+            font_size,
+            line_height,
+            letter_spacing,
+            font_system,
+        );
+        if composed_w <= content_w {
+            best = Some(composed);
+        }
+    }
+
+    // `best` is None only when even the ellipsis-only composed run (b == 0) does
+    // not fit, i.e. content_w is narrower than the ellipsis itself; the caller
+    // then falls back to a hard clip.
+    best
+}
+
 /// Pixel bounds of a single glyph cluster within a text layout.
 #[derive(Clone, Debug)]
 pub struct GlyphRange {
@@ -1152,6 +1333,231 @@ mod tests {
             child_dirty.contains(DirtyFlags::PAINT),
             "child PAINT must survive; got {:?}",
             child_dirty
+        );
+    }
+
+    // ---- text-overflow: ellipsis truncation -------------------------------
+
+    /// The horizontal-ellipsis char the truncation helper appends.
+    const TEST_ELLIPSIS: &str = "\u{2026}";
+
+    /// Convenience: unconstrained single-line advance of `text` in the test
+    /// font (cosmic-text's `line_w` advance metric). Used only to size content
+    /// widths relative to a string's natural width.
+    fn run_w(text: &str, font_system: &mut FontSystem) -> f32 {
+        measure_text_with_style_cached(
+            text,
+            "Consolas",
+            FontWeight::Normal,
+            FontStyle::Normal,
+            14.0,
+            1.2,
+            0.0,
+            None,
+            font_system,
+            None,
+        )
+        .0
+    }
+
+    /// INDEPENDENT painted right-edge computation for `text` at `letter_spacing`,
+    /// re-deriving the renderer formula inline so the matrix below never calls
+    /// the implementation's own `painted_run_width` (avoids a circular check).
+    ///
+    /// Mirrors `emit_text_glyphs_cached` in `unshit-renderer/src/batch.rs`:
+    /// `max over glyphs of glyph.x + glyph_index*letter_spacing + glyph.w`, with
+    /// `glyph_index` enumerated PER layout run.
+    fn independent_painted_edge(
+        text: &str,
+        font_size: f32,
+        line_height: f32,
+        letter_spacing: f32,
+        font_system: &mut FontSystem,
+    ) -> f32 {
+        let metrics = Metrics::new(font_size, font_size * line_height);
+        let mut buffer = Buffer::new(font_system, metrics);
+        buffer.set_size(font_system, None, None);
+        buffer.set_text(
+            font_system,
+            text,
+            text_attrs("Consolas", FontWeight::Normal, FontStyle::Normal),
+            Shaping::Advanced,
+        );
+        buffer.shape_until_scroll(font_system, false);
+        let mut edge = 0.0f32;
+        for run in buffer.layout_runs() {
+            for (glyph_index, glyph) in run.glyphs.iter().enumerate() {
+                edge = edge.max(glyph.x + glyph_index as f32 * letter_spacing + glyph.w);
+            }
+        }
+        edge
+    }
+
+    /// THE MATRIX. For a cross product of {LTR ASCII, pure RTL Arabic, bidi
+    /// mixed, combining-mark string} x {letter_spacing 0,2,6} x several content
+    /// widths, assert the FIT INVARIANT using the INDEPENDENT painted-edge
+    /// computation above:
+    ///   - the painted right edge of the returned composed run is <=
+    ///     content_w + 0.5 (the clip rect cuts on painted positions), and
+    ///   - the returned text minus the trailing ellipsis is a byte-exact LOGICAL
+    ///     prefix of the input.
+    ///
+    /// These cells genuinely fail against the OLD visual-order algorithm: the
+    /// bidi cell's visual-order cut byte jumps near the end (retaining almost
+    /// everything, overflowing content_w by several x), and the
+    /// combining-mark + letter_spacing cells mis-reserve per-glyph spacing the
+    /// renderer paints per-glyph-index, so the composed ellipsis lands past the
+    /// clip rect.
+    #[test]
+    fn ellipsis_fit_invariant_matrix() {
+        let mut font_system = FontSystem::new();
+
+        let inputs: [&str; 4] = [
+            // pure-LTR long ASCII
+            "The quick brown fox jumps over the lazy dog 1234567890",
+            // pure-RTL Arabic
+            "مرحبا بالعالم هذا اختبار طويل",
+            // bidi mixed (Arabic + Latin filename): visual order is
+            // non-monotonic in source byte offset.
+            "مرحبا-document-final-version-2026.txt",
+            // combining marks: base 'a'/'b'/'c' each + combining acute (U+0301),
+            // so char_count != glyph_count.
+            "a\u{301}b\u{301}c\u{301}a\u{301}b\u{301}c\u{301}a\u{301}b\u{301}c\u{301}a\u{301}b\u{301}c\u{301}",
+        ];
+
+        for text in inputs {
+            for letter_spacing in [0.0f32, 2.0, 6.0] {
+                // Natural painted width at this letter_spacing, so content
+                // fractions land cuts at varied boundaries.
+                let natural =
+                    independent_painted_edge(text, 14.0, 1.2, letter_spacing, &mut font_system);
+                for frac in [0.2f32, 0.35, 0.5, 0.65, 0.8] {
+                    let content_w = natural * frac;
+                    let Some(result) = truncate_text_with_ellipsis(
+                        text,
+                        "Consolas",
+                        FontWeight::Normal,
+                        FontStyle::Normal,
+                        14.0,
+                        1.2,
+                        letter_spacing,
+                        content_w,
+                        &mut font_system,
+                    ) else {
+                        // None means even the ellipsis alone did not fit; that is
+                        // a valid fall-back-to-clip outcome, nothing to assert.
+                        continue;
+                    };
+
+                    // Invariant 1: painted right edge fits content_w (epsilon).
+                    let painted = independent_painted_edge(
+                        &result,
+                        14.0,
+                        1.2,
+                        letter_spacing,
+                        &mut font_system,
+                    );
+                    assert!(
+                        painted <= content_w + 0.5,
+                        "painted edge {painted} must fit content_w {content_w} (eps 0.5) for \
+                         text={text:?} ls={letter_spacing} frac={frac} result={result:?}"
+                    );
+
+                    // Invariant 2: returned text minus ellipsis is a byte-exact
+                    // logical prefix of the input.
+                    assert!(
+                        result.ends_with(TEST_ELLIPSIS),
+                        "result must end in the ellipsis; got {result:?}"
+                    );
+                    let retained = result.strip_suffix(TEST_ELLIPSIS).unwrap();
+                    assert!(
+                        text.starts_with(retained),
+                        "retained {retained:?} must be a byte-exact LOGICAL prefix of \
+                         {text:?} (ls={letter_spacing} frac={frac})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// When `content_w` is narrower than the ellipsis itself, no prefix (not
+    /// even the empty one) can fit, so the helper returns None and the caller
+    /// falls back to a hard clip.
+    #[test]
+    fn ellipsis_returns_none_when_even_ellipsis_does_not_fit() {
+        let mut font_system = FontSystem::new();
+        let text = "The quick brown fox";
+        let ellipsis_w = independent_painted_edge(TEST_ELLIPSIS, 14.0, 1.2, 0.0, &mut font_system);
+        // Strictly narrower than the ellipsis glyph itself.
+        let content_w = ellipsis_w * 0.5;
+        let result = truncate_text_with_ellipsis(
+            text,
+            "Consolas",
+            FontWeight::Normal,
+            FontStyle::Normal,
+            14.0,
+            1.2,
+            0.0,
+            content_w,
+            &mut font_system,
+        );
+        assert!(
+            result.is_none(),
+            "content_w narrower than the ellipsis must return None (hard-clip fallback); \
+             got {result:?}"
+        );
+    }
+
+    /// (d) A run that already fits is returned unchanged (None) with NO ellipsis.
+    #[test]
+    fn ellipsis_noop_when_text_already_fits() {
+        let mut font_system = FontSystem::new();
+        let text = "short";
+        let full_w = run_w(text, &mut font_system);
+        // Give generous room so the full run plus reserved ellipsis budget fits.
+        let content_w = full_w * 4.0 + 100.0;
+        let result = truncate_text_with_ellipsis(
+            text,
+            "Consolas",
+            FontWeight::Normal,
+            FontStyle::Normal,
+            14.0,
+            1.2,
+            0.0,
+            content_w,
+            &mut font_system,
+        );
+        assert!(
+            result.is_none(),
+            "a run that already fits must return None (no truncation, no ellipsis); got {result:?}"
+        );
+    }
+
+    /// (e) Regression guard for the Clip default: `text-overflow: clip` is the
+    /// initial value and the renderer only calls the truncation helper for
+    /// `Ellipsis`. This asserts the helper is purely additive — the Clip path
+    /// never invokes it, so the default `ComputedStyle` carries `Clip` and the
+    /// helper is not reachable for clip styles.
+    #[test]
+    fn text_overflow_default_is_clip_noop() {
+        use crate::style::types::{ComputedStyle, TextOverflow};
+        let style = ComputedStyle::default();
+        assert_eq!(
+            style.text_overflow,
+            TextOverflow::Clip,
+            "default text-overflow must be Clip so existing hard-clip behavior is unchanged"
+        );
+        // text-overflow does not inherit: a child must not pick up a parent's
+        // Ellipsis. Build a parent with Ellipsis and confirm inherit_from leaves
+        // the child at its own (default Clip) value.
+        let mut parent = ComputedStyle::default();
+        parent.text_overflow = TextOverflow::Ellipsis;
+        let mut child = ComputedStyle::default();
+        child.inherit_from(&parent);
+        assert_eq!(
+            child.text_overflow,
+            TextOverflow::Clip,
+            "text-overflow must NOT inherit from the parent"
         );
     }
 }

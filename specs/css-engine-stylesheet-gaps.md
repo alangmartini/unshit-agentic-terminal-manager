@@ -21,7 +21,12 @@ table row here.
   `overflow-x/-y`, `outline` shorthand, `font-style`, `justify-content: stretch`,
   `background: none`, `transition` transform coverage, and 9 recognized-but-inert
   accepts. Inventory shrank from ~28 to the entries below.
-- **Tier 2 — deferred:** the table below. Each is genuinely renderer-,
+- **Tier 2 — `text-overflow: ellipsis` landed 2026-06-05** (the top tier-2
+  candidate): grapheme-cluster-correct truncation that measures the *painted*
+  composed (`prefix + …`) width over *logical* prefixes, so the fit holds for
+  LTR / RTL / bidi / combining-mark text at any letter-spacing. See
+  `changelog.d/unreleased/2026-06-05-text-overflow-ellipsis.md`.
+- **Tier 2 — still deferred:** the table below. Each is genuinely renderer-,
   text-layout-, value-evaluator-, or cascade-bound — not a one-line parse arm.
 
 ## Enforcement coverage (what the guardrail does / does not catch)
@@ -39,7 +44,6 @@ table row here.
 | Property / form | Drops today | Class | Effort | Value |
 |---|---|---|---|---|
 | `transform: scale/rotate/translateY` | `scale/rotate/translateY` drop; only `translateX` is applied | renderer (affine) | L | H |
-| `text-overflow: ellipsis` | no truncation hook; clip rect cuts glyphs mid-pixel | text-layout | L | H |
 | `text-shadow` (non-`none`) | `none` accepted; real shadow lists drop | small-render | M | M |
 | `filter: drop-shadow(...)` | no element `filter` field; only `backdrop-filter` blur exists | renderer (offscreen) | L | M |
 | `word-break: break-word` | no `set_wrap` control in the shaper | text-layout | M | M |
@@ -69,14 +73,17 @@ propagation) with no shader change — but `transform` only leaves
 `KNOWN_UNSUPPORTED` once `scale` + `rotate` also land. Couples with the
 `transition` transform animation already wired in tier 1.
 
-### `text-overflow: ellipsis`  — text-layout (top tier-2 candidate)
-Most common dropped property in the stylesheet (8+ sites; it is the canonical
-`DroppedDeclaration` test). Add a `text_overflow: TextOverflow` (Clip/Ellipsis)
-field + a `"text-overflow"` arm, then the real work: measure the shaped run
-against `content_w`, find the break cluster, truncate, and append `…` before
-glyph emission — `layout.rs` measure + the emit site `batch.rs:~2061-2174`. No
-GPU change. Do **not** add a parse-noop: that would mask the missing ellipsis on
-the many list rows that use it.
+### `text-overflow: ellipsis`  — LANDED 2026-06-05
+`TextOverflow {Clip, Ellipsis}` field + non-inheriting parse arm; the render gate
+(`Ellipsis && white-space:nowrap && overflow`) calls
+`layout::truncate_text_with_ellipsis`, which iterates **logical** cluster
+boundaries and keeps the largest prefix whose **painted** composed width
+(`painted_run_width`, the renderer's exact `glyph.x + idx*letter_spacing + glyph.w`)
+fits `content_w`. This is correct for LTR/RTL/bidi/combining + any letter-spacing
+(the original visual-order walk overflowed bidi by up to ~5×). Accepted limitation:
+RTL truncates the logical tail rather than the CSS-perfect visual-left end (fit is
+always guaranteed). Sub-pixel atlas-bitmap overhang vs the advance-based fit
+formula is a universal, pre-existing concern covered by a 0.5px epsilon.
 
 ### `text-shadow` (real, non-`none`)  — small-render
 `none` is already accepted (tier 1). Sharp/offset shadows: re-emit the glyph run
@@ -161,7 +168,9 @@ cascade item, but it touches the core resolution model.
 
 ## Open questions
 
-- Order after `transform`: is `text-overflow: ellipsis` (high value, text-layout)
-  or cascade-aware custom properties (enables real theme token overrides) the
-  next priority? Both are large; pick based on whether theming or list-row
-  truncation is more user-visible next.
+- `text-overflow: ellipsis` (the prior top candidate) is now landed. The next
+  decision is between **cascade-aware custom properties** (largest drop category —
+  473 / 77% — and unlocks real per-theme token overrides, but touches the core
+  resolution model) and the **`transform` affine matrix** (highest *visible*
+  micro-interaction value: press `scale`, chevron/mark `rotate`). Pick based on
+  whether theming throughput or interaction polish is the priority cycle.

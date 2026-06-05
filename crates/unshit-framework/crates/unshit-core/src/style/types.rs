@@ -761,6 +761,18 @@ pub enum WhiteSpace {
     PreLine,
 }
 
+/// CSS `text-overflow`. Controls how text that overflows its container's
+/// content box is signaled when it cannot wrap (`white-space: nowrap`).
+/// `Clip` hard-cuts at the clip rect (the default); `Ellipsis` truncates on a
+/// grapheme-cluster boundary and appends an ellipsis so the cut never lands
+/// mid-glyph. This property is NOT inherited (per the CSS spec).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TextOverflow {
+    #[default]
+    Clip,
+    Ellipsis,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FontWeight {
     #[default]
@@ -1256,6 +1268,7 @@ pub struct ComputedStyle {
     pub text_decoration: TextDecoration,
     pub text_decoration_color: Option<Color>,
     pub white_space: WhiteSpace,
+    pub text_overflow: TextOverflow,
 
     // Input / Cursor
     pub caret_color: Color,
@@ -1379,6 +1392,7 @@ impl Default for ComputedStyle {
             text_decoration: TextDecoration::None,
             text_decoration_color: None,
             white_space: WhiteSpace::Normal,
+            text_overflow: TextOverflow::Clip,
             caret_color: Color::BLACK,
             caret_shape: CursorShape::default(),
             caret_blink_rate: 530,
