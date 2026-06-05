@@ -1355,7 +1355,10 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
                 "scroll" | "auto" => Overflow::Scroll,
                 _ => return Err(()),
             };
-            // The `overflow` shorthand sets both axes.
+            // The `overflow` shorthand sets both axes. parse_rule's declaration
+            // loop does not auto-drain on success, so an early return must consume
+            // the terminating `;` or the next declaration is lost.
+            let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
             return Ok(smallvec::smallvec![
                 StyleDeclaration::OverflowX(v),
                 StyleDeclaration::OverflowY(v),
@@ -2130,9 +2133,14 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         | "font-feature-settings"
         | "font-variant-numeric"
         | "scrollbar-width" => {
-            // Require a value so an empty declaration still errors.
+            // Require a value so an empty declaration still errors, then drain
+            // ONLY to this declaration's terminator (not the rest of the block).
             parser.next().map_err(|_| ())?;
-            while parser.next().is_ok() {}
+            while let Ok(token) = parser.next() {
+                if matches!(token, Token::Semicolon) {
+                    break;
+                }
+            }
             return Ok(SmallVec::new());
         }
 
