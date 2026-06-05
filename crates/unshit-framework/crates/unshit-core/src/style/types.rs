@@ -473,6 +473,46 @@ pub enum Dimension {
     Vw(f32),
 }
 
+/// Per-side edge values that retain their CSS unit (px / percent / vh / vw)
+/// until layout, when the viewport is known. `ComputedStyle.padding` (resolved
+/// f32 `Edges`) stays the value the renderer / hit-test / transition code reads;
+/// `padding_src: EdgesDim` is the source of truth `to_taffy_style` resolves so
+/// viewport-relative padding (e.g. `padding-top: 12vh`) lays out correctly.
+/// The f32 mirror holds 0 for non-px units (paint has no viewport), which is
+/// harmless for the only consumers today — content-less full-viewport scrims.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgesDim {
+    pub top: Dimension,
+    pub right: Dimension,
+    pub bottom: Dimension,
+    pub left: Dimension,
+}
+
+impl EdgesDim {
+    pub const ZERO: EdgesDim = EdgesDim {
+        top: Dimension::Px(0.0),
+        right: Dimension::Px(0.0),
+        bottom: Dimension::Px(0.0),
+        left: Dimension::Px(0.0),
+    };
+
+    /// Lift a resolved f32 `Edges` into the unit-preserving form (all px).
+    pub fn from_px(e: Edges) -> Self {
+        Self {
+            top: Dimension::Px(e.top),
+            right: Dimension::Px(e.right),
+            bottom: Dimension::Px(e.bottom),
+            left: Dimension::Px(e.left),
+        }
+    }
+}
+
+impl Default for EdgesDim {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Display {
     #[default]
@@ -1079,6 +1119,9 @@ pub struct ComputedStyle {
     pub max_width: Dimension,
     pub max_height: Dimension,
     pub padding: Edges,
+    /// Unit-preserving source for `padding`, resolved against the viewport in
+    /// `to_taffy_style`. Always kept in sync with `padding` by the cascade.
+    pub padding_src: EdgesDim,
     pub margin: Edges,
     pub margin_auto: EdgeAutoFlags,
     pub row_gap: f32,
@@ -1212,6 +1255,7 @@ impl Default for ComputedStyle {
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             padding: Edges::ZERO,
+            padding_src: EdgesDim::ZERO,
             margin: Edges::ZERO,
             margin_auto: EdgeAutoFlags::NONE,
             row_gap: 0.0,
@@ -1355,7 +1399,7 @@ impl ComputedStyle {
                 width: dim_to_taffy(self.max_width, viewport_w, viewport_h),
                 height: dim_to_taffy(self.max_height, viewport_w, viewport_h),
             },
-            padding: edges_to_taffy_rect(self.padding),
+            padding: edges_dim_to_taffy_rect(self.padding_src, viewport_w, viewport_h),
             margin: edges_to_taffy_rect_auto(self.margin, self.margin_auto),
             gap: taffy::Size {
                 width: taffy::LengthPercentage::Length(self.column_gap),
@@ -1473,12 +1517,34 @@ fn dim_to_taffy(d: Dimension, viewport_w: f32, viewport_h: f32) -> taffy::Dimens
     }
 }
 
-fn edges_to_taffy_rect(e: Edges) -> taffy::Rect<taffy::LengthPercentage> {
+/// Resolve a single edge `Dimension` into a taffy `LengthPercentage`.
+/// Percent stays native (taffy resolves it against the containing block);
+/// vh/vw resolve against the viewport here, exactly like `dim_to_taffy`.
+fn dim_to_length_percentage(
+    d: Dimension,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> taffy::LengthPercentage {
+    match d {
+        // Padding/edge values have no `auto`; treat it as zero.
+        Dimension::Auto => taffy::LengthPercentage::Length(0.0),
+        Dimension::Px(v) => taffy::LengthPercentage::Length(v),
+        Dimension::Percent(v) => taffy::LengthPercentage::Percent(v / 100.0),
+        Dimension::Vh(v) => taffy::LengthPercentage::Length(v / 100.0 * viewport_h),
+        Dimension::Vw(v) => taffy::LengthPercentage::Length(v / 100.0 * viewport_w),
+    }
+}
+
+fn edges_dim_to_taffy_rect(
+    e: EdgesDim,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> taffy::Rect<taffy::LengthPercentage> {
     taffy::Rect {
-        left: taffy::LengthPercentage::Length(e.left),
-        right: taffy::LengthPercentage::Length(e.right),
-        top: taffy::LengthPercentage::Length(e.top),
-        bottom: taffy::LengthPercentage::Length(e.bottom),
+        left: dim_to_length_percentage(e.left, viewport_w, viewport_h),
+        right: dim_to_length_percentage(e.right, viewport_w, viewport_h),
+        top: dim_to_length_percentage(e.top, viewport_w, viewport_h),
+        bottom: dim_to_length_percentage(e.bottom, viewport_w, viewport_h),
     }
 }
 
@@ -1613,8 +1679,12 @@ impl ComputedStyle {
         self.max_width = scale_dim(self.max_width, s);
         self.max_height = scale_dim(self.max_height, s);
 
-        // Spacing
+        // Spacing. Scale both the resolved f32 mirror and the unit-preserving
+        // source; scale_dim leaves vh/vw/percent untouched (they resolve against
+        // the already-physical viewport in to_taffy_style), matching the f32
+        // mirror which stays 0 for those units.
         self.padding = scale_edges(self.padding, s);
+        self.padding_src = scale_edges_dim(self.padding_src, s);
         self.margin = scale_edges(self.margin, s);
         self.row_gap *= s;
         self.column_gap *= s;
@@ -1669,6 +1739,15 @@ fn scale_dim(d: Dimension, s: f32) -> Dimension {
 
 fn scale_edges(e: Edges, s: f32) -> Edges {
     Edges { top: e.top * s, right: e.right * s, bottom: e.bottom * s, left: e.left * s }
+}
+
+fn scale_edges_dim(e: EdgesDim, s: f32) -> EdgesDim {
+    EdgesDim {
+        top: scale_dim(e.top, s),
+        right: scale_dim(e.right, s),
+        bottom: scale_dim(e.bottom, s),
+        left: scale_dim(e.left, s),
+    }
 }
 
 fn scale_corners(c: Corners, s: f32) -> Corners {
@@ -1760,6 +1839,39 @@ mod tests {
         let taffy_style = style.to_taffy_style(1000.0, 500.0);
         // 80vh of a 500px-tall viewport = 400px.
         assert_eq!(taffy_style.max_size.height, taffy::Dimension::Length(400.0));
+    }
+
+    #[test]
+    fn to_taffy_style_resolves_vh_padding_against_viewport() {
+        let mut style = ComputedStyle::default();
+        style.padding_src = EdgesDim { top: Dimension::Vh(12.0), ..EdgesDim::ZERO };
+        let taffy_style = style.to_taffy_style(800.0, 1000.0);
+        // 12vh of a 1000px-tall viewport = 120px.
+        assert_eq!(taffy_style.padding.top, taffy::LengthPercentage::Length(120.0));
+        assert_eq!(taffy_style.padding.left, taffy::LengthPercentage::Length(0.0));
+    }
+
+    #[test]
+    fn to_taffy_style_maps_percent_padding_to_taffy_percent() {
+        let mut style = ComputedStyle::default();
+        style.padding_src = EdgesDim::ZERO;
+        style.padding_src.left = Dimension::Percent(10.0);
+        let taffy_style = style.to_taffy_style(800.0, 600.0);
+        assert_eq!(taffy_style.padding.left, taffy::LengthPercentage::Percent(0.10));
+    }
+
+    #[test]
+    fn scale_by_scales_px_padding_src_but_leaves_vh_for_the_viewport() {
+        let mut style = ComputedStyle::default();
+        style.padding_src =
+            EdgesDim { top: Dimension::Vh(50.0), ..EdgesDim::from_px(Edges::all(8.0)) };
+        style.scale_by(2.0);
+        // px source scales with HiDPI...
+        assert_eq!(style.padding_src.left, Dimension::Px(16.0));
+        // ...vh stays unit-relative and resolves against the physical viewport.
+        assert_eq!(style.padding_src.top, Dimension::Vh(50.0));
+        let taffy_style = style.to_taffy_style(800.0, 600.0);
+        assert_eq!(taffy_style.padding.top, taffy::LengthPercentage::Length(300.0));
     }
 
     #[test]

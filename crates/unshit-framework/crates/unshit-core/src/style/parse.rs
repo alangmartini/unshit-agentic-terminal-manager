@@ -160,6 +160,11 @@ pub enum StyleDeclaration {
     PaddingRight(f32),
     PaddingBottom(f32),
     PaddingLeft(f32),
+    /// Padding authored with viewport/percent units (`vh`/`vw`/`%`), kept
+    /// unresolved per side (`[top, right, bottom, left]`, `None` = leave that
+    /// side untouched) so `to_taffy_style` can resolve it against the viewport.
+    /// Pure-`px` padding keeps the f32 fast path above.
+    PaddingDim([Option<Dimension>; 4]),
     Margin(Edges),
     MarginWithAuto(Edges, EdgeAutoFlags),
     MarginTop(f32),
@@ -182,6 +187,12 @@ pub enum StyleDeclaration {
     /// which is lossy through the shorthand `border-width` value, so
     /// each side has its own declaration slot.
     BorderSideWidth(BorderSide, f32),
+    /// Per-side `border-<side>-color` longhand. The engine stores a single
+    /// `border_color`, so every side writes that one field; this is visually
+    /// exact whenever only one side has a non-zero width (the case for every
+    /// authored consumer). Differently-colored adjacent sides would collapse
+    /// to last-writer-wins, which no current stylesheet relies on.
+    BorderSideColor(BorderSide, Color),
     BorderRadius(Corners),
     Opacity(f32),
     BoxShadowList(SmallVec<[ParsedBoxShadow; 2]>),
@@ -1190,11 +1201,18 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         "min-height" => StyleDeclaration::MinHeight(parse_dimension(parser)?),
         "max-width" => StyleDeclaration::MaxWidth(parse_dimension(parser)?),
         "max-height" => StyleDeclaration::MaxHeight(parse_dimension(parser)?),
-        "padding" => StyleDeclaration::Padding(parse_edges(parser)?),
-        "padding-top" => StyleDeclaration::PaddingTop(parse_px(parser)?),
-        "padding-right" => StyleDeclaration::PaddingRight(parse_px(parser)?),
-        "padding-bottom" => StyleDeclaration::PaddingBottom(parse_px(parser)?),
-        "padding-left" => StyleDeclaration::PaddingLeft(parse_px(parser)?),
+        "padding" => {
+            let dims = expand_edge_dims(&parse_dimension_list(parser))?;
+            match all_px_edges(dims) {
+                // Pure-px keeps the f32 fast path (paint + transitions unchanged).
+                Some(edges) => StyleDeclaration::Padding(edges),
+                None => StyleDeclaration::PaddingDim(dims.map(Some)),
+            }
+        }
+        "padding-top" => parse_padding_longhand(parser, 0)?,
+        "padding-right" => parse_padding_longhand(parser, 1)?,
+        "padding-bottom" => parse_padding_longhand(parser, 2)?,
+        "padding-left" => parse_padding_longhand(parser, 3)?,
         "margin" => {
             let (edges, auto) = parse_margin_edges(parser)?;
             if auto.any() {
@@ -1335,6 +1353,18 @@ fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 
         }
         "border-left-width" => {
             StyleDeclaration::BorderSideWidth(BorderSide::Left, parse_px(parser)?)
+        }
+        "border-top-color" => {
+            StyleDeclaration::BorderSideColor(BorderSide::Top, parse_color(parser)?)
+        }
+        "border-right-color" => {
+            StyleDeclaration::BorderSideColor(BorderSide::Right, parse_color(parser)?)
+        }
+        "border-bottom-color" => {
+            StyleDeclaration::BorderSideColor(BorderSide::Bottom, parse_color(parser)?)
+        }
+        "border-left-color" => {
+            StyleDeclaration::BorderSideColor(BorderSide::Left, parse_color(parser)?)
         }
         "border-radius" => StyleDeclaration::BorderRadius(parse_corners(parser)?),
         "opacity" => StyleDeclaration::Opacity(parse_number(parser)?),
@@ -2232,6 +2262,47 @@ fn parse_edges(parser: &mut Parser) -> Result<Edges, ()> {
         4 => Ok(Edges { top: values[0], right: values[1], bottom: values[2], left: values[3] }),
         _ => Err(()),
     }
+}
+
+/// Expand a CSS 1–4 value edge list into `[top, right, bottom, left]`.
+fn expand_edge_dims(dims: &[Dimension]) -> Result<[Dimension; 4], ()> {
+    Ok(match *dims {
+        [a] => [a, a, a, a],
+        [a, b] => [a, b, a, b],
+        [a, b, c] => [a, b, c, b],
+        [a, b, c, d] => [a, b, c, d],
+        _ => return Err(()),
+    })
+}
+
+/// If every edge is `px`, collapse to a resolved `Edges` (the f32 fast path);
+/// otherwise `None`, so the caller emits the unit-preserving `PaddingDim`.
+fn all_px_edges(d: [Dimension; 4]) -> Option<Edges> {
+    match d {
+        [Dimension::Px(top), Dimension::Px(right), Dimension::Px(bottom), Dimension::Px(left)] => {
+            Some(Edges { top, right, bottom, left })
+        }
+        _ => None,
+    }
+}
+
+/// Parse one padding longhand value: `px` keeps the f32 fast-path variant
+/// (preserving transition behavior); any viewport/percent unit becomes a
+/// single-side `PaddingDim`. `side` is the `[top, right, bottom, left]` index.
+fn parse_padding_longhand(parser: &mut Parser, side: usize) -> Result<StyleDeclaration, ()> {
+    Ok(match parse_dimension(parser)? {
+        Dimension::Px(v) => match side {
+            0 => StyleDeclaration::PaddingTop(v),
+            1 => StyleDeclaration::PaddingRight(v),
+            2 => StyleDeclaration::PaddingBottom(v),
+            _ => StyleDeclaration::PaddingLeft(v),
+        },
+        other => {
+            let mut arr = [None; 4];
+            arr[side] = Some(other);
+            StyleDeclaration::PaddingDim(arr)
+        }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -4001,11 +4072,52 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         StyleDeclaration::MinHeight(v) => style.min_height = *v,
         StyleDeclaration::MaxWidth(v) => style.max_width = *v,
         StyleDeclaration::MaxHeight(v) => style.max_height = *v,
-        StyleDeclaration::Padding(v) => style.padding = *v,
-        StyleDeclaration::PaddingTop(v) => style.padding.top = *v,
-        StyleDeclaration::PaddingRight(v) => style.padding.right = *v,
-        StyleDeclaration::PaddingBottom(v) => style.padding.bottom = *v,
-        StyleDeclaration::PaddingLeft(v) => style.padding.left = *v,
+        // Padding writes both the resolved f32 mirror (paint/hit-test/transition)
+        // and the unit-preserving source (layout, via to_taffy_style).
+        StyleDeclaration::Padding(v) => {
+            style.padding = *v;
+            style.padding_src = EdgesDim::from_px(*v);
+        }
+        StyleDeclaration::PaddingTop(v) => {
+            style.padding.top = *v;
+            style.padding_src.top = Dimension::Px(*v);
+        }
+        StyleDeclaration::PaddingRight(v) => {
+            style.padding.right = *v;
+            style.padding_src.right = Dimension::Px(*v);
+        }
+        StyleDeclaration::PaddingBottom(v) => {
+            style.padding.bottom = *v;
+            style.padding_src.bottom = Dimension::Px(*v);
+        }
+        StyleDeclaration::PaddingLeft(v) => {
+            style.padding.left = *v;
+            style.padding_src.left = Dimension::Px(*v);
+        }
+        StyleDeclaration::PaddingDim(sides) => {
+            // Non-px units resolve to 0 in the f32 mirror (paint has no viewport);
+            // to_taffy_style resolves the real value from padding_src.
+            let px_or_zero = |d: Dimension| match d {
+                Dimension::Px(v) => v,
+                _ => 0.0,
+            };
+            if let Some(d) = sides[0] {
+                style.padding.top = px_or_zero(d);
+                style.padding_src.top = d;
+            }
+            if let Some(d) = sides[1] {
+                style.padding.right = px_or_zero(d);
+                style.padding_src.right = d;
+            }
+            if let Some(d) = sides[2] {
+                style.padding.bottom = px_or_zero(d);
+                style.padding_src.bottom = d;
+            }
+            if let Some(d) = sides[3] {
+                style.padding.left = px_or_zero(d);
+                style.padding_src.left = d;
+            }
+        }
         StyleDeclaration::Margin(v) => {
             style.margin = *v;
             style.margin_auto = EdgeAutoFlags::NONE;
@@ -4067,6 +4179,9 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
             BorderSide::Bottom => style.border_width.bottom = *v,
             BorderSide::Left => style.border_width.left = *v,
         },
+        // Single stored border_color; correct because every consuming rule
+        // gives width to exactly one side (see the BorderSideColor doc).
+        StyleDeclaration::BorderSideColor(_side, v) => style.border_color = *v,
         StyleDeclaration::BorderRadius(v) => style.border_radius = *v,
         StyleDeclaration::Opacity(v) => style.opacity = *v,
         StyleDeclaration::BoxShadowList(v) => {
@@ -4342,6 +4457,99 @@ mod tests {
         assert_eq!(style.border_width.right, 0.0);
         assert_eq!(style.border_width.left, 0.0);
         assert_eq!(style.border_color, Color::rgb(0xc9, 0x55, 0x3a));
+    }
+
+    #[test]
+    fn test_border_side_color_longhand_sets_color_and_preserves_width() {
+        // `border-bottom-color` was previously unrecognized and silently
+        // dropped. It must set the (single) border_color and leave the width
+        // from the base `border-bottom` declaration intact.
+        let decls =
+            parse_decls(".x { border-bottom: 1px solid #111111; border-bottom-color: #c9553a; }");
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.border_width.bottom, 1.0);
+        assert_eq!(style.border_color, Color::rgb(0xc9, 0x55, 0x3a));
+    }
+
+    #[test]
+    fn test_border_side_color_transparent_keeps_width() {
+        // `.setting-row:hover { border-bottom-color: transparent }` must zero
+        // only the color (hiding the divider) while keeping the 1px width.
+        let decls = parse_decls(
+            ".x { border-bottom: 1px solid #111111; border-bottom-color: transparent; }",
+        );
+        let mut style = ComputedStyle::default();
+        for decl in &decls {
+            apply_declaration(&mut style, decl);
+        }
+
+        assert_eq!(style.border_width.bottom, 1.0);
+        assert_eq!(style.border_color, Color::TRANSPARENT);
+    }
+
+    #[test]
+    fn test_all_four_border_side_color_arms_parse() {
+        for side in ["top", "right", "bottom", "left"] {
+            let css = format!(".x {{ border-{side}-color: #00ff00; }}");
+            let decls = parse_decls(&css);
+            assert!(
+                decls.iter().any(|d| matches!(d, StyleDeclaration::BorderSideColor(_, _))),
+                "border-{side}-color should not be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_padding_px_keeps_f32_fast_path_and_mirrors_src() {
+        let decls = parse_decls(".x { padding: 16px; }");
+        assert!(decls.iter().any(|d| matches!(d, StyleDeclaration::Padding(_))));
+        let mut style = ComputedStyle::default();
+        for d in &decls {
+            apply_declaration(&mut style, d);
+        }
+        assert_eq!(style.padding, Edges::all(16.0));
+        assert_eq!(style.padding_src, EdgesDim::from_px(Edges::all(16.0)));
+    }
+
+    #[test]
+    fn test_padding_unitless_zero_uses_px_fast_path() {
+        // `padding: 0` (unitless) must still parse via the f32 fast path.
+        let decls = parse_decls(".x { padding: 0; }");
+        assert!(decls.iter().any(|d| matches!(d, StyleDeclaration::Padding(_))));
+    }
+
+    #[test]
+    fn test_padding_top_vh_is_no_longer_dropped() {
+        // Previously `padding-top: 12vh` routed through parse_px which rejects
+        // vh, dropping the whole declaration. Now it parses to PaddingDim and
+        // keeps the unit in padding_src (f32 mirror stays 0 for paint).
+        let decls = parse_decls(".x { padding-top: 12vh; }");
+        assert!(decls.iter().any(|d| matches!(d, StyleDeclaration::PaddingDim(_))));
+        let mut style = ComputedStyle::default();
+        for d in &decls {
+            apply_declaration(&mut style, d);
+        }
+        assert_eq!(style.padding.top, 0.0);
+        assert_eq!(style.padding_src.top, Dimension::Vh(12.0));
+        // untouched sides stay at the default px(0)
+        assert_eq!(style.padding_src.left, Dimension::Px(0.0));
+    }
+
+    #[test]
+    fn test_padding_mixed_px_and_vh_shorthand_preserves_per_side_units() {
+        let decls = parse_decls(".x { padding: 1px 2vh; }");
+        let mut style = ComputedStyle::default();
+        for d in &decls {
+            apply_declaration(&mut style, d);
+        }
+        assert_eq!(style.padding_src.top, Dimension::Px(1.0));
+        assert_eq!(style.padding_src.right, Dimension::Vh(2.0));
+        assert_eq!(style.padding_src.bottom, Dimension::Px(1.0));
+        assert_eq!(style.padding_src.left, Dimension::Vh(2.0));
     }
 
     #[test]
