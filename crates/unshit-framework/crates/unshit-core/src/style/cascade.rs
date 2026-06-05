@@ -13,7 +13,18 @@ pub fn resolve_style(
     active: Option<NodeId>,
     focused: NodeId,
 ) -> ComputedStyle {
-    resolve_style_with_pseudo(arena, stylesheet, node_id, hovered, active, focused, false, None)
+    let active_root_scope = active_root_scope_for(arena, stylesheet, node_id);
+    resolve_style_with_pseudo(
+        arena,
+        stylesheet,
+        node_id,
+        hovered,
+        active,
+        focused,
+        false,
+        None,
+        active_root_scope,
+    )
 }
 
 /// Variant that passes through `focus_via_keyboard` for `:focus-visible`.
@@ -25,6 +36,7 @@ pub fn resolve_style_fv(
     active: Option<NodeId>,
     focused: NodeId,
     focus_via_keyboard: bool,
+    active_root_scope: Option<ScopeKey>,
 ) -> ComputedStyle {
     resolve_style_with_pseudo(
         arena,
@@ -35,7 +47,60 @@ pub fn resolve_style_fv(
         focused,
         focus_via_keyboard,
         None,
+        active_root_scope,
     )
+}
+
+/// Determine the active root token scope for a cascade rooted anywhere in the
+/// tree: walk from `node_id` to the true document root (the node with a dangling
+/// parent), then return the first non-base [`TokenScope`] whose selector matches
+/// that root via the same `selector_matches` path the rule cascade uses (the
+/// `.app.theme-*` scope whose classes the root carries).
+///
+/// This is computed ONCE per cascade pass and threaded down, so it stays correct
+/// even when a hover/focus restyle narrows the cascade to a non-root subtree
+/// (the active theme is a property of the document root, not the subtree root).
+/// O(depth) once per pass; O(1) per element thereafter.
+pub fn active_root_scope_for(
+    arena: &NodeArena,
+    stylesheet: &CompiledStylesheet,
+    node_id: NodeId,
+) -> Option<ScopeKey> {
+    let scopes = &stylesheet.token_scopes;
+    // No non-base scopes => no theme to activate; skip the walk entirely.
+    if scopes.non_base().is_empty() {
+        return None;
+    }
+
+    // Walk to the true document root.
+    let mut root_id = node_id;
+    while let Some(el) = arena.get(root_id) {
+        if el.parent.is_dangling() {
+            break;
+        }
+        root_id = el.parent;
+    }
+    let root = arena.get(root_id)?;
+
+    // First non-base scope whose selector matches the root wins (source order).
+    for scope in scopes.non_base() {
+        let Some(chain) = scope.selector.as_ref() else {
+            continue;
+        };
+        if selector_matches(
+            chain,
+            root,
+            arena,
+            root_id,
+            NodeId::DANGLING,
+            None,
+            NodeId::DANGLING,
+            false,
+        ) {
+            return Some(scope.key);
+        }
+    }
+    None
 }
 
 /// Resolve styles for `node_id`. When `pseudo_target` is `Some(pe)`, this
@@ -43,6 +108,7 @@ pub fn resolve_style_fv(
 /// pseudo element, and those rules are matched against the host element.
 /// When `None`, pseudo element rules are skipped so they never leak onto the
 /// host's computed style.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_style_with_pseudo(
     arena: &NodeArena,
     stylesheet: &CompiledStylesheet,
@@ -52,6 +118,7 @@ pub fn resolve_style_with_pseudo(
     focused: NodeId,
     focus_via_keyboard: bool,
     pseudo_target: Option<PseudoElement>,
+    active_root_scope: Option<ScopeKey>,
 ) -> ComputedStyle {
     let Some(element) = arena.get(node_id) else {
         return ComputedStyle::default();
@@ -66,6 +133,46 @@ pub fn resolve_style_with_pseudo(
     }
 
     apply_user_agent_defaults(&mut style, element.tag);
+
+    // Build this element's ordered token-resolution environment ONCE, before the
+    // rule loop, so every `Deferred` declaration that matches resolves its
+    // `var()` against the same specificity-ordered scopes:
+    //   [ self widget scope (if the element carries one),
+    //     active root theme scope (a property of the document root),
+    //     :root base ].
+    // Almost always this is exactly `[:root]` or `[:root, theme]`; the self slot
+    // only appears for the handful of widget elements (e.g. `.theme-chip.<name>`)
+    // that carry their own token class. The self-scope match is cheap (a few
+    // class comparisons against the element) and is skipped entirely when the
+    // stylesheet declares no non-base scopes.
+    let self_scope_vars = self_scope_vars_for(
+        stylesheet,
+        element,
+        arena,
+        node_id,
+        hovered,
+        active,
+        focused,
+        focus_via_keyboard,
+        active_root_scope,
+    );
+    let has_self_scope = self_scope_vars.is_some();
+    let env = ScopeEnv::new(
+        self_scope_vars,
+        active_root_scope.and_then(|k| stylesheet.token_scopes.vars_for(k)),
+        stylesheet.token_scopes.base_vars(),
+    );
+    // Stable-within-a-parse identity for the deferred memo: a process-unique id
+    // assigned at parse time. It changes on re-parse / hot reload (and is immune
+    // to allocator address reuse), so the memo self-invalidates and never serves
+    // a stale entry for a different stylesheet.
+    let stylesheet_id = stylesheet.parse_id;
+    // Deferred declarations that fail to resolve+re-parse are routed here so the
+    // gap stays visible (mirrors the parse-time `dropped` sink). The cascade has
+    // no shared sink, so this is per-element and discarded; a malformed scoped
+    // var() still routes to `dropped` at parse time when it is a custom-property
+    // definition, and the live path here drops it rather than silently applying.
+    let mut deferred_dropped = Vec::new();
 
     for rule in &stylesheet.rules {
         let rule_pseudo = rule.selector.pseudo_element();
@@ -83,12 +190,93 @@ pub fn resolve_style_with_pseudo(
             focus_via_keyboard,
         ) {
             for decl in &rule.declarations {
-                apply_declaration(&mut style, decl);
+                match decl {
+                    StyleDeclaration::Deferred { property, raw_value, scope_hint } => {
+                        apply_deferred_against_env_memoized(
+                            &mut style,
+                            property,
+                            raw_value,
+                            *scope_hint,
+                            &env,
+                            &mut deferred_dropped,
+                            stylesheet_id,
+                            active_root_scope,
+                            has_self_scope,
+                        );
+                    }
+                    _ => apply_declaration(&mut style, decl),
+                }
             }
         }
     }
 
     style
+}
+
+/// Find the widget self-scope var map for `element`: the highest-specificity
+/// non-base [`TokenScope`] whose selector matches the element ITSELF (e.g.
+/// `.theme-chip.dracula` on a theme chip). The active root theme scope is
+/// excluded here — it is matched against the document root, not the element, and
+/// is supplied separately to the env. Returns `None` for the overwhelmingly
+/// common element that carries no widget token class.
+#[allow(clippy::too_many_arguments)]
+fn self_scope_vars_for<'a>(
+    stylesheet: &'a CompiledStylesheet,
+    element: &Element,
+    arena: &NodeArena,
+    node_id: NodeId,
+    hovered: NodeId,
+    active: Option<NodeId>,
+    focused: NodeId,
+    focus_via_keyboard: bool,
+    active_root_scope: Option<ScopeKey>,
+) -> Option<&'a std::collections::HashMap<String, String>> {
+    let scopes = &stylesheet.token_scopes;
+    let non_base = scopes.non_base();
+    if non_base.is_empty() {
+        return None;
+    }
+    // Perf gate: a widget self scope can only match this element if the element
+    // carries one of the classes that some non-base scope selector keys on. The
+    // union of those classes is precomputed once at parse time, so this is a few
+    // cheap hash lookups. The overwhelmingly common element shares none of them,
+    // letting us skip the `O(non_base scopes)` `selector_matches` walk entirely.
+    if !scopes.element_may_have_self_scope(&element.classes) {
+        return None;
+    }
+    // Highest specificity first so a more-specific widget scope wins; ties break
+    // on later source order (the cascade's tiebreak).
+    let mut best: Option<&TokenScope> = None;
+    for scope in non_base {
+        // The active root scope is handled separately (matched on the root).
+        if Some(scope.key) == active_root_scope {
+            continue;
+        }
+        let Some(chain) = scope.selector.as_ref() else {
+            continue;
+        };
+        if selector_matches(
+            chain,
+            element,
+            arena,
+            node_id,
+            hovered,
+            active,
+            focused,
+            focus_via_keyboard,
+        ) {
+            let wins = match best {
+                None => true,
+                Some(b) => {
+                    (scope.specificity, scope.source_order) >= (b.specificity, b.source_order)
+                }
+            };
+            if wins {
+                best = Some(scope);
+            }
+        }
+    }
+    best.map(|s| s.vars.as_ref())
 }
 
 fn apply_user_agent_defaults(style: &mut ComputedStyle, tag: Tag) {

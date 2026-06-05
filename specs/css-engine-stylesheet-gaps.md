@@ -26,18 +26,26 @@ table row here.
   composed (`prefix + …`) width over *logical* prefixes, so the fit holds for
   LTR / RTL / bidi / combining-mark text at any letter-spacing. See
   `changelog.d/unreleased/2026-06-05-text-overflow-ellipsis.md`.
+- **Tier 2 — cascade-aware custom properties landed 2026-06-05** (the largest
+  drop category, **579 → 0**): `var()` now resolves *per element* against the
+  active scope chain (`[self-widget scope, active .app.theme-* root, :root]`)
+  instead of a global parse-time `:root`-only textual pass, so theme-block
+  `--token` overrides apply — including multi-level base-scope aliases
+  (`--cp-accent: var(--amber-300)` picks up a theme's `--amber-300`). See
+  `changelog.d/unreleased/2026-06-05-cascade-aware-custom-properties.md`.
 - **Tier 2 — still deferred:** the table below. Each is genuinely renderer-,
-  text-layout-, value-evaluator-, or cascade-bound — not a one-line parse arm.
+  text-layout-, or value-evaluator-bound — not a one-line parse arm.
 
 ## Enforcement coverage (what the guardrail does / does not catch)
 
 - **Caught (build fails on a new gap):** every per-property entry in
   `KNOWN_UNSUPPORTED`, plus any new `calc()` value (`is_known_gap` matches
   `value.contains("calc(")`) and `inherit` (`value == "inherit"`).
-- **NOT caught (by design):** custom-property definitions on non-`:root`
-  selectors (every `.app.theme-*` token override) are *counted but not failed*
-  (`custom_count`). A new theme custom-property override will not fail the build.
-  This is the cascade-aware-custom-properties gap (last row).
+- **Now enforced (was the cascade gap):** `.app.theme-*` / `.theme-chip.*`
+  `--token` overrides resolve through the cascade and no longer drop.
+  `cascade_golden`'s `custom_property_drop_count_is_frozen` asserts the count
+  stays `0`, and a scoped `var()` that cannot resolve is surfaced into `dropped`
+  by a parse-time coverage pass, so the guardrail catches it.
 
 ## Deferred inventory
 
@@ -54,7 +62,6 @@ table row here.
 | `scroll-margin` | no scroll-snap / anchor consumer | parse (inert) | S | L |
 | `calc()` (value form) | no evaluator in leaf parsers | value-form | L | M |
 | `inherit` (value form) | no per-property cascade keyword | value-form (cascade) | M | M |
-| `.app.theme-*` `--token` overrides | `var()` is a global parse-time substitution seeded only from `:root` | cascade | L | M |
 
 ## Plans (highest value first)
 
@@ -134,23 +141,40 @@ once. Mixed-unit calc that must survive to layout needs a
 `lerp_dimension` (`transition.rs:~271`) — the biggest structural change in the
 set.
 
-### `inherit` / cascade-aware custom properties  — cascade
-`inherit` (and `initial`/`unset`): intercept the keyword right after
-`expect_colon` (before the property match, `parse.rs:~1172`), emit a
-`StyleDeclaration::Inherit(PropertyId)` marker, and resolve it in the cascade by
-copying the named field from the parent (the cascade already has the parent via
-`inherit_from`; a `PropertyId` enum + per-property plumbing are missing).
-Cascade-aware custom properties: today `var()` is a global parse-time text
-substitution seeded only from `:root` (`extract_custom_properties` /
-`resolve_var_references`, `parse.rs:~600/664`), so `.app.theme-*` token overrides
-are dropped and theming uses concrete declarations. Resolving `var()` per element
-during the cascade would let theme blocks override tokens — the highest-value
-cascade item, but it touches the core resolution model.
+### `inherit` (and `initial` / `unset`)  — cascade
+Intercept the keyword right after `expect_colon` (before the property match,
+`parse.rs`), emit a `StyleDeclaration::Inherit(PropertyId)` marker, and resolve it
+in the cascade by copying the named field from the parent (the cascade has the
+parent via `inherit_from`; a `PropertyId` enum + per-property plumbing are
+missing).
+
+### cascade-aware custom properties  — LANDED 2026-06-05
+`var()` is no longer a global `:root`-only parse-time substitution. Token-declaring
+blocks are collected into per-scope `TokenScopes` (raw values, **not**
+pre-flattened); `var()`-bearing declarations are captured as
+`StyleDeclaration::Deferred` carriers and resolved per element at cascade time
+against an ordered `ScopeEnv` (`[self-widget scope, active .app.theme-* root,
+:root]`), unwinding token→token references multi-level against the same env
+(cycle-guarded), then re-parsed through the existing leaf parsers. Theme-block
+overrides now apply (drops 579 → 0); a parse-time coverage pass routes
+unresolvable scoped `var()` into `dropped` for the guardrail.
+Follow-ups (non-blocking): **(a) perf** — the self-scope walk gate is conservative
+(disabled when any token scope has a class-free terminal, which this stylesheet
+has), so every element currently pays the scope walk per cascade pass; a cleaner
+gate is to build the `ScopeEnv` only for elements whose matched rules contain a
+`Deferred` declaration. **(b)** the `var(` capture gate doesn't catch `var()`
+immediately after `)`. **(c)** retiring the ~690 hand-authored concrete clones,
+one theme per commit (the engine no longer depends on them).
 
 ## Commands
 
 - Guardrail: `cargo test --test stylesheet_coverage`
+- Cascade golden + var resolution: `cargo test --test cascade_golden`,
+  `cargo test -p unshit-core --test token_scopes`,
+  `cargo test -p unshit-test --test scoped_var_resolution`
 - Core engine tests: `cargo test -p unshit-core`
+- UI / interaction tests (**MUST run** — overflow/scroll regressions hide here and
+  are invisible to the other gates): `cargo test -p unshit-test`
 - Lint (the strict form that compiles test targets):
   `cargo clippy -p unshit-core -p unshit-renderer --all-targets -- -D warnings`
 - Visual smoke: `./scripts/palette-shot.ps1`
@@ -168,9 +192,11 @@ cascade item, but it touches the core resolution model.
 
 ## Open questions
 
-- `text-overflow: ellipsis` (the prior top candidate) is now landed. The next
-  decision is between **cascade-aware custom properties** (largest drop category —
-  473 / 77% — and unlocks real per-theme token overrides, but touches the core
-  resolution model) and the **`transform` affine matrix** (highest *visible*
-  micro-interaction value: press `scale`, chevron/mark `rotate`). Pick based on
-  whether theming throughput or interaction polish is the priority cycle.
+- `text-overflow: ellipsis` and cascade-aware custom properties are now landed
+  (the latter cleared the largest drop category). The next high-value pick is the
+  **`transform` affine matrix** (press `scale`, chevron/mark `rotate` — highest
+  visible micro-interaction value) vs a bounded win like real `text-shadow` or
+  `word-break`. Separately, two cascade follow-ups remain: the perf gate (build
+  `ScopeEnv` only when an element has a `Deferred` declaration) and Stage 5 clone
+  retirement (delete the ~690 hand-authored per-theme concrete declarations, one
+  theme per commit).

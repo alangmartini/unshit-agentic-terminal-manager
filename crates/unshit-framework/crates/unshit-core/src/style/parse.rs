@@ -49,6 +49,144 @@ pub struct CompiledStylesheet {
     /// a fully-supported stylesheet; used by the dev-mode warning and the
     /// `stylesheet_coverage` guardrail test to surface engine gaps.
     pub dropped: Vec<DroppedDeclaration>,
+    /// Cascade-aware custom-property collection. Every block that declares at
+    /// least one `--name:` becomes a [`TokenScope`] here (with `:root`/`*`
+    /// collapsed into the base scope 0). Consumed by the cascade (Stage 3): a
+    /// `Deferred` declaration resolves its `var()` against the matching scopes,
+    /// so themed `--token` overrides win per element.
+    pub token_scopes: TokenScopes,
+    /// Process-unique id assigned at [`Self::parse`] time. Used as the
+    /// invalidation key for the cascade's deferred-resolution memo so a re-parse
+    /// (hot reload, or just a different stylesheet) can never serve a stale memo
+    /// entry — and, unlike a heap address, it is immune to allocator ABA reuse.
+    /// `0` for a `Default` (never-parsed) stylesheet, which the memo treats as
+    /// "uncached".
+    pub parse_id: u64,
+}
+
+/// Interned handle for a token scope's selector text. The value is the scope's
+/// stable index into [`TokenScopes::scopes`], assigned in source order at
+/// collection time. Two scopes that share the exact trimmed selector text
+/// share one key (the first occurrence wins; later declarations merge into it),
+/// so callers can compare scopes cheaply by key instead of re-parsing
+/// selector strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ScopeKey(pub u32);
+
+/// One CSS block that declared at least one custom property (`--name: value`).
+///
+/// The base scope (key 0) is the collapse of every `:root` and `*` block. Every
+/// other selector that carries `--token` declarations (each `.app.theme-*`
+/// block, each `.theme-chip.<name>` block, etc.) gets its own scope.
+///
+/// `vars` holds the scope's tokens with their values stored RAW (verbatim CSS
+/// text), including any `var()` cross-token references. References are NOT
+/// pre-flattened: a base-scope alias like `--cp-accent: var(--amber-300)` stays
+/// raw so a theme's `--amber-300` override propagates to every consumer that
+/// reaches the alias. Token->token references are unwound LAZILY and
+/// MULTI-LEVEL at use time by `flatten_token_value_env`, looking each name up in
+/// the element's full `ScopeEnv` (highest-specificity scope first) every pass.
+#[derive(Debug, Clone)]
+pub struct TokenScope {
+    /// Stable interned handle for this scope (its index in `scopes`).
+    pub key: ScopeKey,
+    /// Trimmed raw selector text of the block, e.g. `".app.theme-dracula"`.
+    /// The base scope uses the literal `":root"`.
+    pub selector_text: String,
+    /// CSS specificity of `selector_text` (ids, classes, tags). The base scope
+    /// records `:root`'s specificity. Used by later stages to order overlapping
+    /// scope overrides; unused this stage.
+    pub specificity: (u16, u16, u16),
+    /// Source order of the FIRST block that contributed to this scope, counting
+    /// every brace-delimited block (custom-property-bearing or not) from the top
+    /// of the stylesheet. Ties in specificity break on this, matching the
+    /// cascade's specificity+source-order ordering.
+    pub source_order: u32,
+    /// Parsed selector chain for `selector_text`, used by the cascade to match
+    /// the scope against an element via the SAME `selector_matches` path the
+    /// rule cascade uses (so a theme scope `.app.theme-dracula` matches a root
+    /// carrying both classes, and a widget scope `.theme-chip.dracula` matches
+    /// the element itself). `None` for the base `:root`/`*` scope (never matched
+    /// positionally — it is always active) and for any selector that fails to
+    /// parse.
+    pub selector: Option<SelectorChain>,
+    /// Pre-flattened `--name -> resolved value` map for this scope (see the
+    /// type doc). Shared via `Arc` so later stages can clone the handle cheaply.
+    pub vars: Arc<HashMap<String, String>>,
+}
+
+/// Cascade-aware custom-property scopes collected from the stylesheet. Scope 0
+/// is the base (`:root`/`*` collapsed); the rest follow in source order.
+#[derive(Debug, Clone, Default)]
+pub struct TokenScopes {
+    pub scopes: Vec<TokenScope>,
+    /// Union of every class name that appears in the TERMINAL compound (the part
+    /// matched against the element itself) of a NON-base (widget) scope's
+    /// selector. Precomputed once at collection time so the cascade can cheaply
+    /// gate the per-element self-scope walk: an element whose classes do not
+    /// intersect this set cannot match any widget scope's terminal compound, so
+    /// the `O(non_base scopes)` `selector_matches` walk is skipped entirely (the
+    /// overwhelmingly common case). Empty when there are no non-base scopes.
+    pub widget_scope_classes: std::collections::HashSet<String>,
+    /// True if at least one non-base scope's selector has a TERMINAL compound
+    /// with NO class part (e.g. an id-only or tag-only terminal). Such a scope
+    /// could match an element that shares none of [`Self::widget_scope_classes`],
+    /// so the class-intersection gate is UNSAFE and must be disabled (the
+    /// self-scope walk runs for every element). False for the common all-class
+    /// stylesheet, keeping the gate live.
+    pub widget_scope_gate_unsafe: bool,
+}
+
+impl TokenScopes {
+    /// The base scope (`:root`/`*`), if any block declared custom properties.
+    pub fn base(&self) -> Option<&TokenScope> {
+        self.scopes.first()
+    }
+
+    /// True if `element_classes` could match some widget (non-base) self scope's
+    /// terminal compound, so the cascade must run the self-scope walk. When
+    /// false, the element cannot match any widget self scope and the walk is
+    /// skipped. Conservatively returns true (never skips) when a non-base scope
+    /// has a class-free terminal compound (the gate is then unsafe). Always
+    /// false when there are no non-base scopes.
+    pub fn element_may_have_self_scope(&self, element_classes: &[String]) -> bool {
+        if self.widget_scope_classes.is_empty() && !self.widget_scope_gate_unsafe {
+            return false;
+        }
+        if self.widget_scope_gate_unsafe {
+            return true;
+        }
+        element_classes.iter().any(|c| self.widget_scope_classes.contains(c))
+    }
+
+    /// Look up a scope by its exact trimmed selector text.
+    pub fn by_selector(&self, selector: &str) -> Option<&TokenScope> {
+        self.scopes.iter().find(|s| s.selector_text == selector)
+    }
+
+    /// The base (`:root`/`*`) pre-flattened var map, or `None` when the
+    /// stylesheet declared no base custom properties.
+    pub fn base_vars(&self) -> Option<&HashMap<String, String>> {
+        self.base().map(|s| s.vars.as_ref())
+    }
+
+    /// The non-base scopes (every `.app.theme-*`, widget scope, etc.) in source
+    /// order. The cascade matches these against an element's classes to pick the
+    /// active root theme scope and any widget self scope.
+    pub fn non_base(&self) -> &[TokenScope] {
+        // Scope 0 is the base when present; if there is no base scope at all the
+        // first scope is already a non-base one, so guard on `base()`.
+        if self.base().is_some() {
+            self.scopes.get(1..).unwrap_or(&[])
+        } else {
+            &self.scopes
+        }
+    }
+
+    /// The var map for a scope key, if the key is in range.
+    pub fn vars_for(&self, key: ScopeKey) -> Option<&HashMap<String, String>> {
+        self.scopes.get(key.0 as usize).map(|s| s.vars.as_ref())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +305,30 @@ pub enum BorderSide {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StyleDeclaration {
+    /// A declaration whose value still contains `var(` at the moment
+    /// [`parse_declaration`] sees it, captured verbatim instead of being typed
+    /// eagerly. The concrete value is resolved PER ELEMENT in the cascade against
+    /// that element's active token scopes, and only then re-parsed into a real
+    /// typed declaration (see [`apply_deferred_against_env`]).
+    ///
+    /// `raw_value` is the source text after the `:` (sans trailing `;`), kept as
+    /// a `Box<str>` rather than a `Vec<Token>` so the variant dodges the
+    /// cssparser token-lifetime hazard and keeps [`StyleDeclaration`] cheap to
+    /// `Clone` (the declaration vec is cloned once per grouped selector).
+    ///
+    /// `scope_hint` is the [`ScopeKey`] of the block this declaration was written
+    /// in, threaded through [`parse_rule`]; it is a diagnostic/backstop label for
+    /// the resolve, not the primary source — the element's [`ScopeEnv`] encodes
+    /// its active scopes in specificity order.
+    ///
+    /// Stage 3 deleted the global parse-time `var()` substitution, so this is now
+    /// the LIVE carrier for every `var(`-bearing declaration in a production
+    /// parse (declarations with no `var(` keep the typed fast path).
+    Deferred {
+        property: Box<str>,
+        raw_value: Box<str>,
+        scope_hint: ScopeKey,
+    },
     Content(ContentValue),
     Display(Display),
     FlexDirection(FlexDirection),
@@ -335,9 +497,20 @@ pub enum StyleDeclaration {
 impl CompiledStylesheet {
     pub fn parse(css: &str) -> Self {
         let custom_properties = extract_custom_properties(css);
-        let resolved_css = resolve_var_references(css, &custom_properties);
+        // Cascade-aware scope collection. Drives per-element var() resolution in
+        // the cascade (Stage 3): every `--token` block — `:root` AND the
+        // `.app.theme-*` / widget scopes — is collected here so a themed
+        // override can win at apply time.
+        let token_scopes = collect_token_scopes(css);
 
-        let mut input = ParserInput::new(&resolved_css);
+        // The global parse-time `resolve_var_references` textual pass is GONE.
+        // `var(`-bearing declarations now reach `parse_declaration` with `var(`
+        // intact and become `StyleDeclaration::Deferred` carriers, resolved
+        // per element against its active token scopes during the cascade (see
+        // `resolve_deferred_against_env`). Declarations with no `var(` keep the
+        // byte-for-byte typed fast path. `:root`-only consumers that still need
+        // the flat map read `custom_properties` above.
+        let mut input = ParserInput::new(css);
         let mut parser = Parser::new(&mut input);
         let mut rules = Vec::new();
         let mut font_faces = Vec::new();
@@ -395,7 +568,9 @@ impl CompiledStylesheet {
             // selector like `.a, .b { ... }` returns one rule per sub
             // selector; each gets its own source_order so cascade order
             // matches the declaration order browsers use.
-            if let Ok(mut new_rules) = parse_rule(&mut parser, source_order, &mut dropped) {
+            if let Ok(mut new_rules) =
+                parse_rule(&mut parser, source_order, &mut dropped, &token_scopes)
+            {
                 source_order += new_rules.len() as u32;
                 rules.append(&mut new_rules);
             }
@@ -405,7 +580,33 @@ impl CompiledStylesheet {
             a.specificity.cmp(&b.specificity).then(a.source_order.cmp(&b.source_order))
         });
 
-        CompiledStylesheet { rules, custom_properties, font_faces, keyframes, dropped }
+        // Coverage pass for cascade-time `var()` resolution failures. The live
+        // per-element cascade applies `Deferred` carriers against an element's
+        // `ScopeEnv` and routes any failure to a per-element sink that is then
+        // discarded (it has no shared `dropped` list — see
+        // `resolve_style_with_pseudo`). So a malformed/cyclic scoped `var()`
+        // would silently mis-render with no signal to the
+        // `stylesheet_coverage` guardrail. This dry-run resolves every `Deferred`
+        // carrier against the base scope AND each collected theme/widget scope and
+        // records any value that cannot resolve (an unresolved `var()` with no
+        // token and no fallback, or a re-parse failure) into `dropped`, so the
+        // gap is visible at parse time without slowing the per-element path.
+        record_deferred_coverage_drops(&rules, &token_scopes, &mut dropped);
+
+        // Process-unique id (starts at 1 so a `Default` stylesheet's `0` is
+        // distinguishable) for the cascade's deferred-resolution memo invalidation.
+        static PARSE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let parse_id = PARSE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        CompiledStylesheet {
+            rules,
+            custom_properties,
+            font_faces,
+            keyframes,
+            dropped,
+            token_scopes,
+            parse_id,
+        }
     }
 }
 
@@ -649,6 +850,266 @@ fn extract_custom_properties(css: &str) -> HashMap<String, String> {
     props
 }
 
+/// Parse the `--name: value;` declarations out of a block's inner text (the
+/// span between its braces). Returns the raw, unresolved values exactly as
+/// authored, keyed by full property name (`--name`). Mirrors the naive
+/// `;`/`:`-split that `extract_custom_properties` uses on `:root`, so the two
+/// agree on what counts as a custom-property declaration. Non-custom
+/// declarations (e.g. `background: ...`) are ignored.
+fn parse_block_custom_props(block: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for decl in block.split(';') {
+        let decl = decl.trim();
+        if decl.is_empty() {
+            continue;
+        }
+        if let Some(colon_pos) = decl.find(':') {
+            let name = decl[..colon_pos].trim();
+            let value = decl[colon_pos + 1..].trim();
+            if name.starts_with("--") {
+                out.insert(name.to_string(), value.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Resolve `var(--name)` references inside a single token value against `props`,
+/// iterating so a value that resolves to another `var()` keeps unwinding. Reuses
+/// [`resolve_var_once`] (the same single-pass substitution the global resolver
+/// uses) and bounds the work with a `visited` cycle guard: the moment a value
+/// stops changing, or a name reappears on the resolution path, we stop. Used by
+/// the per-scope pre-flatten; does not touch the global resolve.
+fn flatten_token_value(raw: &str, props: &HashMap<String, String>) -> String {
+    let mut value = raw.to_string();
+    // Cap iterations as a hard backstop (mirrors `resolve_var_references`'s
+    // fixed bound); the `visited` set is the real cycle guard below.
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..32 {
+        if !value.contains("var(") {
+            break;
+        }
+        // If this exact text has been seen before, a cycle (or a fixed point we
+        // cannot make progress on) is in play: stop and keep what we have.
+        if !visited.insert(value.clone()) {
+            break;
+        }
+        match resolve_var_once(&value, props) {
+            Some(next) => value = next,
+            None => break,
+        }
+    }
+    value
+}
+
+/// Cascade-aware custom-property collection.
+///
+/// Walks EVERY brace-delimited block in source order using the same naive
+/// brace-walker as [`extract_custom_properties`] (`strip_css_comments` +
+/// `find_matching_brace`). For each block whose inner text declares at least one
+/// `--name:` property, the block's trimmed selector text is interned as a
+/// [`ScopeKey`] and that block's `--name -> raw value` map is recorded.
+///
+/// `:root` and `*` blocks collapse into scope 0 (the base): their declarations
+/// merge (later blocks override earlier ones, matching the cascade). Every other
+/// custom-property-bearing selector gets its own scope.
+///
+/// Token values are stored RAW (not pre-flattened): a `var()` cross-token
+/// reference such as `--cp-accent: var(--amber-300)` is kept verbatim so a theme
+/// that overrides `--amber-300` is seen by every consumer reaching it through
+/// the alias. The reference is unwound lazily and multi-level at use time
+/// against the element's `ScopeEnv` (see `flatten_token_value_env`).
+fn collect_token_scopes(css: &str) -> TokenScopes {
+    let css = strip_css_comments(css);
+    let css = css.as_str();
+
+    // Raw (unflattened) per-scope maps, in collection order. Index 0 is reserved
+    // for the base (:root/*) scope; it is created lazily on first encounter.
+    struct RawScope {
+        selector_text: String,
+        specificity: (u16, u16, u16),
+        source_order: u32,
+        vars: HashMap<String, String>,
+    }
+    let mut raw_scopes: Vec<RawScope> = Vec::new();
+    // Selector text -> index into `raw_scopes`, so repeat selectors merge.
+    let mut by_selector: HashMap<String, usize> = HashMap::new();
+    // The base scope (`:root`/`*`) shares one slot regardless of which literal
+    // selector introduced it; this is its index once created.
+    let mut base_index: Option<usize> = None;
+
+    // `source_order` counts EVERY block (custom-property-bearing or not), so it
+    // lines up with the cascade's block ordering even when some blocks declare
+    // no tokens.
+    let mut block_order: u32 = 0;
+    let mut search_start = 0;
+
+    while search_start < css.len() {
+        let brace_open = match css[search_start..].find('{') {
+            Some(pos) => search_start + pos,
+            None => break,
+        };
+        let selector = css[search_start..brace_open].trim();
+        let brace_close = match find_matching_brace(&css[brace_open..]) {
+            Some(pos) => brace_open + pos,
+            None => break,
+        };
+
+        let this_order = block_order;
+        block_order += 1;
+
+        let block = &css[brace_open + 1..brace_close];
+        let props = parse_block_custom_props(block);
+        if !props.is_empty() {
+            let is_base = selector == ":root" || selector == "*";
+            if is_base {
+                let idx = match base_index {
+                    Some(idx) => idx,
+                    None => {
+                        let idx = raw_scopes.len();
+                        raw_scopes.push(RawScope {
+                            // Canonicalize the base scope's label to `:root`
+                            // even if `*` introduced it first.
+                            selector_text: ":root".to_string(),
+                            specificity: selector_specificity(":root"),
+                            source_order: this_order,
+                            vars: HashMap::new(),
+                        });
+                        base_index = Some(idx);
+                        idx
+                    }
+                };
+                // Later base declarations override earlier ones.
+                raw_scopes[idx].vars.extend(props);
+            } else {
+                let key = selector.to_string();
+                match by_selector.get(&key) {
+                    Some(&idx) => {
+                        // Same selector seen again: merge, later wins.
+                        raw_scopes[idx].vars.extend(props);
+                    }
+                    None => {
+                        let idx = raw_scopes.len();
+                        raw_scopes.push(RawScope {
+                            selector_text: key.clone(),
+                            specificity: selector_specificity(selector),
+                            source_order: this_order,
+                            vars: props,
+                        });
+                        by_selector.insert(key, idx);
+                    }
+                }
+            }
+        }
+
+        search_start = brace_close + 1;
+    }
+
+    // Ensure the base scope is index 0 so callers can rely on `scopes[0]` /
+    // `TokenScopes::base()` being the base. If a non-base scope was collected
+    // before any `:root`/`*` block (unusual but legal), move the base to front.
+    if let Some(base_idx) = base_index {
+        if base_idx != 0 {
+            let base = raw_scopes.remove(base_idx);
+            raw_scopes.insert(0, base);
+        }
+    }
+
+    // Class names in the TERMINAL compound of each NON-base scope selector, for
+    // the cascade's self-scope perf gate (see `TokenScopes::widget_scope_classes`).
+    // `gate_unsafe` is set if any non-base scope has a class-free terminal, which
+    // makes the class-intersection gate unsound (it must then not skip).
+    let mut widget_scope_classes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut widget_scope_gate_unsafe = false;
+
+    let scopes: Vec<TokenScope> = raw_scopes
+        .into_iter()
+        .enumerate()
+        .map(|(i, raw)| {
+            let is_base = i == 0 && base_index.is_some();
+            // Store RAW token values verbatim — do NOT eagerly concretize a
+            // cross-token `var()` reference here. A base-scope alias such as
+            // `--cp-accent: var(--amber-300)` must stay raw so a theme that
+            // overrides `--amber-300` is seen by every consumer that reaches it
+            // through the alias: the value is resolved LAZILY and MULTI-LEVEL at
+            // use time against the element's full `ScopeEnv` (highest-specificity
+            // scope first, then `:root`, then the var() fallback) by
+            // `flatten_token_value_env`, which keeps unwinding token->token refs
+            // against the same env each pass. Pre-flattening here would bind the
+            // alias to `:root`'s `--amber-300` and silently break theme overrides.
+            let vars: HashMap<String, String> = raw.vars.clone();
+            // The base scope is always active and never matched positionally, so
+            // it carries no parsed selector. Every other scope parses its
+            // selector once here so the cascade can reuse `selector_matches`.
+            let selector =
+                if is_base { None } else { parse_selector_string(&raw.selector_text).ok() };
+            // Feed the self-scope perf gate from each non-base scope selector's
+            // TERMINAL compound (the part matched against the element itself). A
+            // self-scope match requires the element to carry that compound's
+            // classes, so an element sharing none of them cannot match. A scope
+            // whose terminal carries no class (id-only/tag-only) makes the gate
+            // unsafe. The active root theme scope is matched on the root, not the
+            // element, so over-including its classes here only widens the gate
+            // (harmless); the base `:root`/`*` is never a widget scope.
+            if !is_base {
+                if let Some(chain) = selector.as_ref() {
+                    if !collect_terminal_classes(chain, &mut widget_scope_classes) {
+                        widget_scope_gate_unsafe = true;
+                    }
+                } else {
+                    // Selector failed to parse: cannot reason about its terminal,
+                    // so disable the gate to stay correct.
+                    widget_scope_gate_unsafe = true;
+                }
+            }
+            TokenScope {
+                key: ScopeKey(i as u32),
+                selector_text: raw.selector_text,
+                specificity: raw.specificity,
+                source_order: raw.source_order,
+                selector,
+                vars: Arc::new(vars),
+            }
+        })
+        .collect();
+
+    TokenScopes { scopes, widget_scope_classes, widget_scope_gate_unsafe }
+}
+
+/// Collect the `Class(name)` parts of `chain`'s TERMINAL compound (the last
+/// compound selector — the part `selector_matches` tests against the element
+/// itself) into `out`. Returns `true` if that terminal compound has at least one
+/// class part; `false` if it is class-free (id-only / tag-only / universal), in
+/// which case the class-intersection self-scope gate cannot be applied safely.
+/// `:not(.cls)` in the terminal counts as a positive class constraint only when
+/// it is the sole signal — to stay conservative it is NOT treated as a required
+/// class (a `:not` does not require the element to CARRY the class), so a
+/// terminal whose only class-like part is a `:not` is reported as class-free.
+fn collect_terminal_classes(
+    chain: &SelectorChain,
+    out: &mut std::collections::HashSet<String>,
+) -> bool {
+    let Some((parts, _)) = chain.parts.last() else {
+        return false;
+    };
+    let mut found = false;
+    for part in parts {
+        if let SelectorPart::Class(name) = part {
+            out.insert(name.clone());
+            found = true;
+        }
+    }
+    found
+}
+
+/// Specificity of a raw selector string, for [`TokenScope::specificity`]. Parses
+/// the selector with the same path the rule parser uses and reuses
+/// [`compute_specificity`]; an unparseable selector falls back to `(0, 0, 0)`.
+fn selector_specificity(selector: &str) -> (u16, u16, u16) {
+    parse_selector_string(selector).map(|chain| compute_specificity(&chain)).unwrap_or((0, 0, 0))
+}
+
 /// Find the position of the matching closing brace, starting from a '{'.
 fn find_matching_brace(s: &str) -> Option<usize> {
     let mut depth = 0;
@@ -665,24 +1126,6 @@ fn find_matching_brace(s: &str) -> Option<usize> {
         }
     }
     None
-}
-
-/// Replace all `var(--name)` and `var(--name, fallback)` occurrences in the CSS text.
-/// Iterates to handle variables whose values themselves contain var() references.
-fn resolve_var_references(css: &str, props: &HashMap<String, String>) -> String {
-    if !css.contains("var(") {
-        return css.to_string();
-    }
-
-    let mut result = css.to_string();
-    for _ in 0..10 {
-        match resolve_var_once(&result, props) {
-            Some(new_css) => result = new_css,
-            None => break,
-        }
-    }
-
-    result
 }
 
 /// Single pass of var() substitution. Returns None if no substitutions were made.
@@ -739,6 +1182,35 @@ fn resolve_var_once(css: &str, props: &HashMap<String, String>) -> Option<String
     }
 }
 
+/// True if `value` contains a real `var(` FUNCTION call (not a substring of a
+/// longer identifier like `myvar(` or a path like `url(.../myvar(1).png)`).
+///
+/// CSS function names are `ident(`, so a `var(` is a function only when the byte
+/// immediately before `var` is a value boundary: the start of the value,
+/// whitespace, an opening `(` (nested inside another function), or a `,`
+/// (a comma-separated list item). Any other preceding byte (a letter, digit, or
+/// `-`/`_`) means `var` is the tail of a longer identifier, so it is NOT a
+/// `var()` call. The check stays a cheap byte scan over the typical no-`var(`
+/// fast path: it only does the boundary test at each `var(` occurrence.
+fn contains_var_function(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = value[search_from..].find("var(") {
+        let pos = search_from + rel;
+        let boundary = match pos.checked_sub(1).map(|i| bytes[i]) {
+            None => true, // `var(` at the very start of the value
+            Some(b) => {
+                b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' || b == b'(' || b == b','
+            }
+        };
+        if boundary {
+            return true;
+        }
+        search_from = pos + 4; // past this (non-function) "var(" occurrence
+    }
+    false
+}
+
 /// Extract content inside balanced parentheses. Returns (content, rest_after_close_paren).
 fn extract_balanced_parens(s: &str) -> Option<(&str, &str)> {
     let mut depth = 1;
@@ -775,8 +1247,17 @@ fn parse_rule(
     parser: &mut Parser,
     source_order: u32,
     dropped: &mut Vec<DroppedDeclaration>,
+    token_scopes: &TokenScopes,
 ) -> Result<Vec<CompiledRule>, ()> {
     let selector_str = collect_selector_text(parser)?;
+    // ScopeKey of the block these declarations lexically live in. A grouped
+    // selector (`.a, .b { ... }`) shares one block, so the hint is resolved from
+    // the full, trimmed selector text. Selectors without their own
+    // custom-property scope (the common case) fall back to the base scope (key
+    // 0). Threaded into `parse_declaration` so any `Deferred` it captures knows
+    // which scope's token overrides to layer over `:root` later.
+    let scope_hint =
+        token_scopes.by_selector(selector_str.trim()).map(|s| s.key).unwrap_or(ScopeKey(0));
     // Split comma-separated selector groups (`.a, .b, .c`) into individual
     // selectors. Each becomes its own compiled rule with a shared copy of
     // the declarations, matching CSS grouped selector semantics.
@@ -811,7 +1292,7 @@ fn parse_rule(
             let mut decls = Vec::new();
             while !parser.is_exhausted() {
                 let start = parser.position();
-                if let Ok(parsed) = parse_declaration(parser) {
+                if let Ok(parsed) = parse_declaration(parser, scope_hint) {
                     decls.extend(parsed);
                 } else {
                     // The declaration could not be typed. Drain to the next
@@ -878,6 +1359,83 @@ fn is_css_property_name(s: &str) -> bool {
         _ => return false,
     }
     s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Parse-time coverage pass for cascade-time `var()` resolution failures.
+///
+/// The live cascade resolves each [`StyleDeclaration::Deferred`] carrier against
+/// the matched element's [`ScopeEnv`] and routes any failure into a per-element
+/// sink that is discarded — so a malformed/cyclic scoped `var()` mis-renders with
+/// no signal the `stylesheet_coverage` guardrail can observe. This dry-run
+/// resolves every `Deferred` carrier against the base scope AND each collected
+/// non-base scope (used as the active root), and records any carrier that FAILS
+/// to resolve+re-parse under EVERY tested env into `dropped`, so the gap is
+/// visible at parse time. Recording only carriers that fail under every env keeps
+/// a value that any real theme resolves (the common case) from being flagged.
+///
+/// De-duped on `(property, raw_value)`: a carrier that fails for many scopes is
+/// recorded once. The recorded `value` is the resolved (concrete-as-far-as-
+/// possible) text, so the guardrail's known-gap classifier can see it.
+fn record_deferred_coverage_drops(
+    rules: &[CompiledRule],
+    token_scopes: &TokenScopes,
+    dropped: &mut Vec<DroppedDeclaration>,
+) {
+    let base = token_scopes.base_vars();
+    let non_base = token_scopes.non_base();
+    // A stylesheet with no token scopes at all still has `:root`-less carriers
+    // (e.g. `var()` with a fallback), so always include the base (possibly None)
+    // env. Track which carriers we have already recorded.
+    let mut seen: std::collections::HashSet<(Box<str>, Box<str>)> =
+        std::collections::HashSet::new();
+
+    for rule in rules {
+        for decl in &rule.declarations {
+            let StyleDeclaration::Deferred { property, raw_value, .. } = decl else {
+                continue;
+            };
+            let key = (Box::<str>::from(property.as_ref()), Box::<str>::from(raw_value.as_ref()));
+            if seen.contains(&key) {
+                continue;
+            }
+
+            // Resolve against the base-only env and against each non-base scope
+            // as the active root. The carrier is a coverage failure only if it
+            // fails under EVERY tested env (a value some theme resolves is fine).
+            let mut failure: Option<String> = None;
+            let mut any_ok = false;
+
+            let base_env = ScopeEnv::new(None, None, base);
+            match resolve_deferred_to_decls(property, raw_value, &base_env) {
+                Ok(_) => any_ok = true,
+                Err(resolved) => failure = Some(resolved),
+            }
+
+            if !any_ok {
+                for scope in non_base {
+                    let env = ScopeEnv::new(None, Some(scope.vars.as_ref()), base);
+                    match resolve_deferred_to_decls(property, raw_value, &env) {
+                        Ok(_) => {
+                            any_ok = true;
+                            break;
+                        }
+                        Err(resolved) => failure = Some(resolved),
+                    }
+                }
+            }
+
+            if !any_ok {
+                if let Some(resolved) = failure {
+                    seen.insert(key);
+                    record_dropped_declaration(
+                        dropped,
+                        "<deferred coverage>",
+                        &format!("{property}: {resolved}"),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn split_top_level_commas(s: &str) -> Vec<&str> {
@@ -1175,9 +1733,53 @@ fn compute_specificity(chain: &SelectorChain) -> (u16, u16, u16) {
     (ids, classes, tags)
 }
 
-fn parse_declaration(parser: &mut Parser) -> Result<SmallVec<[StyleDeclaration; 2]>, ()> {
+fn parse_declaration(
+    parser: &mut Parser,
+    scope_hint: ScopeKey,
+) -> Result<SmallVec<[StyleDeclaration; 2]>, ()> {
     let property = parser.expect_ident().map_err(|_| ())?.to_string();
     parser.expect_colon().map_err(|_| ())?;
+
+    // Custom-property DEFINITIONS (`--name: value`) are collected separately
+    // into `token_scopes` at parse time (see `collect_token_scopes`), so the
+    // typed declaration path does not represent them. Consume the value to keep
+    // the parser positioned at the next declaration and return no declarations —
+    // crucially WITHOUT routing to `dropped`. Before Stage 3 these reached the
+    // typed `match` below, failed every arm, and were recorded as dropped
+    // (the historical "custom-property drop count"); now that var() resolution
+    // is per-scope the definitions are live in the cascade, so dropping them
+    // would be both wrong and noisy.
+    if property.starts_with("--") {
+        skip_to_semicolon(parser);
+        return Ok(smallvec::smallvec![]);
+    }
+
+    // Fast path for values that carry a `var(`: capture the raw value verbatim
+    // as a `Deferred` carrier instead of running the typed match (which has no
+    // var() awareness). The concrete value is resolved per element and re-parsed
+    // later in the cascade (see `apply_deferred_against_env`).
+    //
+    // This is BEFORE the typed match on purpose. To peek the value text without
+    // committing the tokens to a typed parse, snapshot the parser state at the
+    // start of the value, drain to the end of the declaration to slice the raw
+    // value, then `reset` back so the typed match below sees an untouched value
+    // on the (overwhelmingly common) no-`var(` path. Stage 3 deleted the global
+    // resolve, so this branch is LIVE in production for every `var(`-bearing
+    // value; the no-`var(` path keeps the byte-for-byte typed fast path.
+    let value_state = parser.state();
+    let value_start = parser.position();
+    skip_to_semicolon(parser);
+    let value_text = parser.slice_from(value_start);
+    if contains_var_function(value_text) {
+        let raw_value = value_text.trim().trim_end_matches(';').trim();
+        return Ok(smallvec::smallvec![StyleDeclaration::Deferred {
+            property: property.into_boxed_str(),
+            raw_value: raw_value.into(),
+            scope_hint,
+        }]);
+    }
+    // No `var(`: rewind the value so the typed match re-reads it from scratch.
+    parser.reset(&value_state);
 
     let decl = match property.as_str() {
         "display" => {
@@ -3740,7 +4342,10 @@ fn parse_keyframes(parser: &mut Parser) -> Result<KeyframesRule, ()> {
                 .parse_nested_block(|block| {
                     let mut decls = Vec::new();
                     while !block.is_exhausted() {
-                        if let Ok(parsed) = parse_declaration(block) {
+                        // Keyframe blocks have no custom-property scope of their
+                        // own; any Deferred captured here is hinted at the base
+                        // scope (key 0).
+                        if let Ok(parsed) = parse_declaration(block, ScopeKey(0)) {
                             decls.extend(parsed);
                         } else {
                             while let Ok(tok) = block.next() {
@@ -4658,7 +5263,347 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         // CSS `mask-image: linear-gradient(...)`. Only the linear gradient
         // form is supported; see `parse_mask_image`.
         StyleDeclaration::MaskImage(g) => style.mask_image = Some(g.clone()),
+
+        // A `Deferred` carrier cannot be applied here: resolving its `var()`
+        // needs the element's token scope env and any drop must be routed to a
+        // `dropped` sink, neither of which this signature carries. The cascade
+        // intercepts `Deferred` BEFORE calling `apply_declaration` and routes it
+        // through `apply_deferred_against_env` (which has that context), so this
+        // arm is a no-op safety net only — reached if a `Deferred` is ever fed to
+        // the bare apply path (e.g. via `style_overrides`), in which case
+        // silently skipping it is safer than mis-typing it.
+        StyleDeclaration::Deferred { .. } => {}
     }
+}
+
+/// Apply a [`StyleDeclaration::Deferred`] carrier: resolve its `var()` value,
+/// re-parse the resulting concrete text into a real typed declaration, and apply
+/// that. This is the apply path the bare [`apply_declaration`] cannot provide,
+/// because it needs the custom-property table (`props`) to resolve `var()` and
+/// the stylesheet's `dropped` sink to record values the re-parse rejects.
+///
+/// Resolution this stage is `:root`-only — i.e. identical to the current global
+/// behavior — so `props` is the flat `:root` custom-property map; `scope_hint`
+/// is carried for the later stage that resolves per matching scope and is unused
+/// here beyond being echoed into any `DroppedDeclaration`.
+///
+/// If the resolved text still cannot be typed (an engine gap, or an unresolved
+/// `var()` with no fallback), the declaration is routed into `dropped` rather
+/// than silently swallowed, mirroring the eager parser's drop path.
+pub fn apply_deferred_declaration(
+    style: &mut ComputedStyle,
+    property: &str,
+    raw_value: &str,
+    scope_hint: ScopeKey,
+    props: &HashMap<String, String>,
+    dropped: &mut Vec<DroppedDeclaration>,
+) {
+    // Resolve var() against :root (current global behavior). `flatten_token_value`
+    // iterates with a cycle guard, leaving any unresolvable `var(` in place.
+    let resolved = flatten_token_value(raw_value, props);
+
+    // Re-parse the concrete `property: value` text as a one-declaration sheet.
+    let decl_text = format!("{property}: {resolved}");
+    let mut input = ParserInput::new(&decl_text);
+    let mut parser = Parser::new(&mut input);
+    // `scope_hint` does not change the re-parse itself: the resolved text has no
+    // `var(` left (or an unresolvable one that will route to `dropped`), so the
+    // typed match runs. Pass the base scope to satisfy the signature.
+    match parse_declaration(&mut parser, ScopeKey(0)) {
+        Ok(decls) if !decls.iter().any(|d| matches!(d, StyleDeclaration::Deferred { .. })) => {
+            for decl in &decls {
+                apply_declaration(style, decl);
+            }
+        }
+        // Either the re-parse failed outright, or it round-tripped back to a
+        // `Deferred` (an unresolved `var(` survived). Route to `dropped` so the
+        // gap is visible instead of being swallowed.
+        _ => {
+            record_dropped_declaration(
+                dropped,
+                &deferred_scope_label(scope_hint),
+                &format!("{property}: {resolved}"),
+            );
+        }
+    }
+}
+
+/// Best-effort diagnostic label for a dropped `Deferred` value. The carrier only
+/// stores a [`ScopeKey`], not selector text, so the drop records the key. This
+/// keeps the routed `DroppedDeclaration` non-empty and traceable without
+/// plumbing the full scope table into the apply path.
+fn deferred_scope_label(scope: ScopeKey) -> String {
+    format!("<deferred scope {}>", scope.0)
+}
+
+/// The ordered token-resolution environment for ONE element. Holds borrowed
+/// handles to the pre-flattened `--name -> value` maps of the scopes that are
+/// active for the element, ordered HIGHEST SPECIFICITY FIRST (a widget self
+/// scope like `.theme-chip.dracula`, then the active root theme `.app.theme-*`,
+/// then the `:root` base). Token lookups walk the list in order and take the
+/// first hit, so an override in a more-specific scope wins — exactly the cascade
+/// the browser would apply to a custom property.
+///
+/// Almost always this is `[:root]` or `[:root, theme]`; the self-scope slot only
+/// appears for the handful of widget elements that carry their own token class.
+///
+/// The maps hold RAW token values (token->token references are NOT pre-flattened
+/// by `collect_token_scopes`), so a lookup can return a value that is itself a
+/// `var()` reference or carries a `var()` fallback. `flatten_token_value_env`
+/// keeps unwinding those references against this same ordered env each pass —
+/// MULTI-LEVEL resolution — so a token redefined on the active theme propagates
+/// to every consumer, including those that reach it through a base-scope alias.
+#[derive(Clone, Copy, Default)]
+pub struct ScopeEnv<'a> {
+    /// Up to three borrowed scope maps, highest-specificity-first. A fixed-size
+    /// array (not a `Vec`) so building an env is allocation-free per element.
+    maps: [Option<&'a HashMap<String, String>>; 3],
+}
+
+impl<'a> ScopeEnv<'a> {
+    /// Build the env for an element from its active scopes, highest-specificity
+    /// first. `self_scope` is the element's own widget token scope (if any);
+    /// `root_scope` is the active `.app.theme-*` root scope (if any); `base` is
+    /// the `:root` base map. `None` slots are skipped on lookup.
+    pub fn new(
+        self_scope: Option<&'a HashMap<String, String>>,
+        root_scope: Option<&'a HashMap<String, String>>,
+        base: Option<&'a HashMap<String, String>>,
+    ) -> Self {
+        ScopeEnv { maps: [self_scope, root_scope, base] }
+    }
+
+    /// Look up a custom-property name across the env, highest-specificity first.
+    fn get(&self, name: &str) -> Option<&'a String> {
+        self.maps.iter().flatten().find_map(|m| m.get(name))
+    }
+
+    /// Fully resolve `raw`'s `var()` references against this env, unwinding
+    /// token->token references MULTI-LEVEL against the same ordered env each pass
+    /// (highest-specificity scope first, then `:root`, then the var() fallback),
+    /// with a cycle guard. Any `var()` that cannot resolve (no token + no
+    /// fallback) is left as a literal `var(...)` in the result. This is the
+    /// public entry point onto the use-time resolver the cascade applies to a
+    /// `Deferred` carrier; exposed for tests and callers that need the resolved
+    /// token text directly.
+    pub fn resolve_value(raw: &str, env: &ScopeEnv) -> String {
+        flatten_token_value_env(raw, env)
+    }
+}
+
+/// Resolve `var(--name[, fallback])` references in `raw` against the ordered
+/// `env`, iterating so a fallback that is itself a `var()` keeps unwinding. The
+/// name/fallback split reuses [`find_top_level_comma`]; the substitution reuses
+/// the same single-pass shape as [`resolve_var_once`] but resolves names through
+/// the env's specificity-ordered lookup instead of a single flat map. Any name
+/// the env cannot resolve (and that has no fallback) is left as a literal
+/// `var(...)` so the re-parse fails and the value routes to `dropped`.
+fn flatten_token_value_env(raw: &str, env: &ScopeEnv) -> String {
+    let mut value = raw.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..32 {
+        if !value.contains("var(") {
+            break;
+        }
+        // Cycle / fixed-point guard: if the exact text repeats, stop.
+        if !visited.insert(value.clone()) {
+            break;
+        }
+        match resolve_var_once_env(&value, env) {
+            Some(next) => value = next,
+            None => break,
+        }
+    }
+    value
+}
+
+/// Single env-aware pass of `var()` substitution. Mirrors [`resolve_var_once`]
+/// but resolves each name through [`ScopeEnv::get`] (specificity-ordered) rather
+/// than a single flat map. Returns `None` when nothing changed.
+fn resolve_var_once_env(css: &str, env: &ScopeEnv) -> Option<String> {
+    let prefix = "var(";
+    let _ = css.find(prefix)?;
+
+    let mut result = String::with_capacity(css.len());
+    let mut remaining = css;
+    let mut changed = false;
+
+    while let Some(pos) = remaining.find(prefix) {
+        result.push_str(&remaining[..pos]);
+        let after_var = &remaining[pos + prefix.len()..];
+
+        if let Some((var_content, rest)) = extract_balanced_parens(after_var) {
+            let var_content = var_content.trim();
+
+            let (var_name, fallback) = if let Some(comma_pos) = find_top_level_comma(var_content) {
+                let name = var_content[..comma_pos].trim();
+                let fb = var_content[comma_pos + 1..].trim();
+                (name, Some(fb))
+            } else {
+                (var_content, None)
+            };
+
+            if let Some(value) = env.get(var_name) {
+                result.push_str(value);
+                changed = true;
+            } else if let Some(fb) = fallback {
+                result.push_str(fb);
+                changed = true;
+            } else {
+                // Unresolvable, no fallback: keep the literal var() so the
+                // re-parse fails and the value routes to `dropped`.
+                result.push_str(prefix);
+                result.push_str(var_content);
+                result.push(')');
+            }
+
+            remaining = rest;
+        } else {
+            result.push_str(prefix);
+            remaining = after_var;
+        }
+    }
+
+    result.push_str(remaining);
+    changed.then_some(result)
+}
+
+/// Apply a [`StyleDeclaration::Deferred`] carrier against an element's ordered
+/// token [`ScopeEnv`]. This is the cascade's live apply path (Stage 3): resolve
+/// `var()` against the element's active scopes (self > theme > `:root`), re-parse
+/// the concrete text into a typed declaration, and apply it. A re-parse failure
+/// (engine gap, or an unresolved `var()` with no fallback) routes into `dropped`
+/// rather than being silently swallowed.
+///
+/// `scope_hint` is the [`ScopeKey`] of the block the declaration was authored in;
+/// it is a backstop label for any drop and a tiebreaker, not the primary resolve
+/// source — the env already encodes the element's active scopes in specificity
+/// order.
+pub fn apply_deferred_against_env(
+    style: &mut ComputedStyle,
+    property: &str,
+    raw_value: &str,
+    scope_hint: ScopeKey,
+    env: &ScopeEnv,
+    dropped: &mut Vec<DroppedDeclaration>,
+) {
+    match resolve_deferred_to_decls(property, raw_value, env) {
+        Ok(decls) => {
+            for decl in &decls {
+                apply_declaration(style, decl);
+            }
+        }
+        Err(resolved) => {
+            record_dropped_declaration(
+                dropped,
+                &deferred_scope_label(scope_hint),
+                &format!("{property}: {resolved}"),
+            );
+        }
+    }
+}
+
+/// Resolve a deferred `property: raw_value` against `env` and re-parse the
+/// concrete text into typed declarations. `Ok(decls)` is the typed result (empty
+/// only if the value typed to nothing); `Err(resolved_text)` means the resolved
+/// text could not be typed (engine gap, or an unresolved `var()` with no
+/// fallback) — the caller routes it to `dropped`. Factored out of
+/// [`apply_deferred_against_env`] so the cascade can MEMOIZE this (the expensive
+/// part: a string substitution plus a cssparser re-parse) per
+/// `(active_root_scope, property, raw_value)` when no self scope is involved.
+fn resolve_deferred_to_decls(
+    property: &str,
+    raw_value: &str,
+    env: &ScopeEnv,
+) -> Result<SmallVec<[StyleDeclaration; 2]>, String> {
+    let resolved = flatten_token_value_env(raw_value, env);
+    let decl_text = format!("{property}: {resolved}");
+    let mut input = ParserInput::new(&decl_text);
+    let mut parser = Parser::new(&mut input);
+    match parse_declaration(&mut parser, ScopeKey(0)) {
+        Ok(decls) if !decls.iter().any(|d| matches!(d, StyleDeclaration::Deferred { .. })) => {
+            Ok(decls)
+        }
+        _ => Err(resolved),
+    }
+}
+
+thread_local! {
+    /// Per-thread memo for the cascade's deferred-declaration apply. Keyed by
+    /// `(stylesheet identity, active_root_scope, property, raw_value)` and only
+    /// used when the element has NO self widget scope (the overwhelmingly common
+    /// case, where the env is purely `[active_root_scope, :root]` — both pass-wide
+    /// globals, so the resolved typed declarations are identical for every
+    /// element that matches the same rule). The `stylesheet identity` (a pointer
+    /// taken at the call site) changes on re-parse / hot reload, so a stale entry
+    /// can never be served for a different stylesheet; when it changes we clear
+    /// the memo so it cannot grow unbounded across reloads.
+    static DEFERRED_MEMO: std::cell::RefCell<DeferredMemo> =
+        std::cell::RefCell::new(DeferredMemo::default());
+}
+
+#[derive(Default)]
+struct DeferredMemo {
+    stylesheet_id: u64,
+    /// `(active_root_scope, property, raw_value) -> Ok(typed decls) | Err(resolved)`.
+    /// The same `Result` shape `resolve_deferred_to_decls` returns, so the apply
+    /// path is identical on a hit.
+    map: HashMap<(u32, Box<str>, Box<str>), Result<SmallVec<[StyleDeclaration; 2]>, String>>,
+}
+
+/// Apply a deferred declaration through the per-pass memo. `stylesheet_id` is a
+/// stable-within-a-parse identity (the stylesheet's process-unique `parse_id`);
+/// `active_root_scope` is the pass-wide theme key.
+/// `has_self_scope` is true when the element carries its own widget token scope —
+/// in that case the resolution depends on per-element state and the memo is
+/// BYPASSED (resolved fresh) to stay correct. The common path (no self scope)
+/// hits the memo, so steady-state cost is ~ a `HashMap` lookup plus the same
+/// apply the concrete-decl path already does.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_deferred_against_env_memoized(
+    style: &mut ComputedStyle,
+    property: &str,
+    raw_value: &str,
+    scope_hint: ScopeKey,
+    env: &ScopeEnv,
+    dropped: &mut Vec<DroppedDeclaration>,
+    stylesheet_id: u64,
+    active_root_scope: Option<ScopeKey>,
+    has_self_scope: bool,
+) {
+    if has_self_scope {
+        // Self scope is per-element; do not memoize against the pass-wide key.
+        apply_deferred_against_env(style, property, raw_value, scope_hint, env, dropped);
+        return;
+    }
+
+    let scope_key = active_root_scope.map(|k| k.0).unwrap_or(u32::MAX);
+    DEFERRED_MEMO.with(|cell| {
+        let mut memo = cell.borrow_mut();
+        if memo.stylesheet_id != stylesheet_id {
+            memo.stylesheet_id = stylesheet_id;
+            memo.map.clear();
+        }
+        let key = (scope_key, Box::from(property), Box::from(raw_value));
+        let entry = memo
+            .map
+            .entry(key)
+            .or_insert_with(|| resolve_deferred_to_decls(property, raw_value, env));
+        match entry {
+            Ok(decls) => {
+                for decl in decls.iter() {
+                    apply_declaration(style, decl);
+                }
+            }
+            Err(resolved) => {
+                record_dropped_declaration(
+                    dropped,
+                    &deferred_scope_label(scope_hint),
+                    &format!("{property}: {resolved}"),
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -4673,6 +5618,59 @@ mod tests {
             return vec![];
         }
         sheet.rules[0].declarations.clone()
+    }
+
+    /// Apply a rule's declarations to a fresh [`ComputedStyle`] the way the
+    /// cascade does for a `:root`-base element: concrete declarations apply
+    /// directly, and `Deferred` carriers resolve against the stylesheet's BASE
+    /// token scope (`:root`/`*`) before re-parsing. This is the post-Stage-3
+    /// stand-in for the old "var() resolved at parse time" behavior the unit
+    /// tests below exercise: the resolution simply moved from parse time into
+    /// this base-scope env apply.
+    fn apply_rule_with_base_env(
+        sheet: &CompiledStylesheet,
+        decls: &[StyleDeclaration],
+    ) -> ComputedStyle {
+        let env = ScopeEnv::new(None, None, sheet.token_scopes.base_vars());
+        let mut style = ComputedStyle::default();
+        let mut dropped = Vec::new();
+        for decl in decls {
+            match decl {
+                StyleDeclaration::Deferred { property, raw_value, scope_hint } => {
+                    apply_deferred_against_env(
+                        &mut style,
+                        property,
+                        raw_value,
+                        *scope_hint,
+                        &env,
+                        &mut dropped,
+                    );
+                }
+                _ => apply_declaration(&mut style, decl),
+            }
+        }
+        style
+    }
+
+    /// Find the first non-empty rule whose selector carries `class`, returning
+    /// its declarations. Panics if no such rule exists.
+    fn rule_decls_for_class<'a>(
+        sheet: &'a CompiledStylesheet,
+        class: &str,
+    ) -> &'a [StyleDeclaration] {
+        sheet
+            .rules
+            .iter()
+            .find(|rule| {
+                !rule.declarations.is_empty()
+                    && rule.selector.parts.iter().any(|(parts, _)| {
+                        parts
+                            .iter()
+                            .any(|part| matches!(part, SelectorPart::Class(c) if c == class))
+                    })
+            })
+            .map(|r| r.declarations.as_slice())
+            .unwrap_or_else(|| panic!("expected a .{class} rule with declarations"))
     }
 
     #[test]
@@ -4866,17 +5864,11 @@ mod tests {
             }
             "#,
         );
-        let decls = sheet
-            .rules
-            .iter()
-            .find(|rule| !rule.declarations.is_empty())
-            .expect("font rule")
-            .declarations
-            .clone();
-        let mut style = ComputedStyle::default();
-        for decl in &decls {
-            apply_declaration(&mut style, decl);
-        }
+        // `--type-body` itself nests `var(--t-md)`/`var(--font-mono)`; the base
+        // scope pre-flattens those, and `.x { font: var(--type-body) }` defers
+        // then resolves against the base env.
+        let decls = rule_decls_for_class(&sheet, "x").to_vec();
+        let style = apply_rule_with_base_env(&sheet, &decls);
 
         assert_eq!(style.font_weight, FontWeight::W(400));
         assert!((style.font_size - 12.0).abs() < 0.01);
@@ -4896,23 +5888,8 @@ mod tests {
             .set-page-nav-item { font: var(--type-label); }
             "#,
         );
-        let decls = sheet
-            .rules
-            .iter()
-            .find(|rule| {
-                rule.selector.parts.iter().any(|(parts, _)| {
-                    parts.iter().any(
-                        |part| matches!(part, SelectorPart::Class(class) if class == "set-page-nav-item"),
-                    )
-                })
-            })
-            .expect("expected .set-page-nav-item rule")
-            .declarations
-            .clone();
-        let mut style = ComputedStyle::default();
-        for decl in &decls {
-            apply_declaration(&mut style, decl);
-        }
+        let decls = rule_decls_for_class(&sheet, "set-page-nav-item").to_vec();
+        let style = apply_rule_with_base_env(&sheet, &decls);
 
         assert_eq!(style.font_weight, FontWeight::W(500));
         assert!((style.font_size - 11.0).abs() < 0.01);
@@ -5073,16 +6050,18 @@ mod tests {
         );
         let sheet = CompiledStylesheet::parse(css);
         assert_eq!(sheet.custom_properties.get("--accent").map(String::as_str), Some("#abcdef"));
-        assert!(
-            !sheet.dropped.iter().any(|d| d.property == "color"),
-            "color: var(--accent) should resolve, got drops: {:?}",
-            sheet.dropped
+        // `--accent` must also reach the base TOKEN SCOPE (not just the flat
+        // custom_properties map) so the cascade can resolve it: the comment with
+        // a colon before it must not break that collection.
+        assert_eq!(
+            sheet.token_scopes.base_vars().and_then(|m| m.get("--accent")).map(String::as_str),
+            Some("#abcdef"),
         );
-        let has_resolved_color =
-            sheet.rules.iter().flat_map(|r| &r.declarations).any(
-                |d| matches!(d, StyleDeclaration::Color(c) if *c == Color::rgb(0xab, 0xcd, 0xef)),
-            );
-        assert!(has_resolved_color, "resolved color should be applied to .x");
+        // `.x { color: var(--accent) }` defers, then resolves to #abcdef against
+        // the base env — and nothing is dropped.
+        let decls = rule_decls_for_class(&sheet, "x").to_vec();
+        let style = apply_rule_with_base_env(&sheet, &decls);
+        assert_eq!(style.color, Color::rgb(0xab, 0xcd, 0xef), "resolved color should apply to .x");
     }
 
     #[test]
@@ -5908,30 +6887,19 @@ mod tests {
 
     #[test]
     fn test_linear_gradient_with_var_reference_resolves() {
-        // var(--accent) in a stop color goes through the text level
-        // resolver before the gradient parser runs, so by the time
-        // parse_linear_gradient sees the tokens they already contain the
-        // expanded value.
+        // var(--accent) in a stop color now defers; the cascade resolves it
+        // against the base env, substitutes the expanded value into the gradient
+        // text, and the gradient parser runs on the concrete text.
         let css = r#"
             :root { --accent: #ff00aa; }
             .x { background: linear-gradient(90deg, transparent, var(--accent) 50%, transparent); }
         "#;
         let sheet = CompiledStylesheet::parse(css);
-        // :root has no class rule, skip it; look for the second rule.
-        let rule = sheet
-            .rules
-            .iter()
-            .find(|r| {
-                !r.declarations.is_empty()
-                    && matches!(
-                        r.declarations.first(),
-                        Some(StyleDeclaration::Background(types::Background::LinearGradient(_)))
-                    )
-            })
-            .expect("expected a gradient rule");
-        let g = match rule.declarations.first() {
-            Some(StyleDeclaration::Background(types::Background::LinearGradient(g))) => g,
-            _ => panic!("expected LinearGradient"),
+        let decls = rule_decls_for_class(&sheet, "x").to_vec();
+        let style = apply_rule_with_base_env(&sheet, &decls);
+        let g = match style.background {
+            types::Background::LinearGradient(g) => g,
+            other => panic!("expected LinearGradient, got {other:?}"),
         };
         assert_eq!(g.stops.len(), 3);
         assert_eq!(g.stops[1].color, types::Color::rgba(0xff, 0x00, 0xaa, 0xff));
@@ -7865,16 +8833,21 @@ mod tests {
 
     #[test]
     fn outline_resolves_var_color_from_stylesheet() {
-        // Mirrors the real stylesheet form `outline: 1px solid var(...)`.
+        // Mirrors the real stylesheet form `outline: 1px solid var(...)`. The
+        // `var(`-bearing value now defers and resolves in the cascade against the
+        // base scope, so resolve through the base-env apply rather than expecting
+        // a typed declaration straight out of `parse()`.
         let sheet = CompiledStylesheet::parse(
             ".x { outline: 1px solid var(--border-focus); } :root { --border-focus: #112233; }",
         );
-        let resolved = sheet.rules.iter().find(|r| !r.declarations.is_empty()).unwrap();
-        assert!(resolved.declarations.contains(&StyleDeclaration::OutlineWidth(1.0)));
-        assert!(resolved
-            .declarations
-            .iter()
-            .any(|d| matches!(d, StyleDeclaration::OutlineColor(_))));
+        let decls = rule_decls_for_class(&sheet, "x").to_vec();
+        let style = apply_rule_with_base_env(&sheet, &decls);
+        assert!(
+            (style.outline_width - 1.0).abs() < 0.01,
+            "outline-width 1px, got {}",
+            style.outline_width
+        );
+        assert_eq!(style.outline_color, Color::rgb(0x11, 0x22, 0x33));
     }
 
     #[test]
@@ -7993,5 +8966,481 @@ mod tests {
                 "{css} should yield no declarations"
             );
         }
+    }
+
+    // --- Stage 1: cascade-aware token-scope collection (additive) ------------
+
+    #[test]
+    fn token_scopes_collapse_root_and_star_into_base() {
+        // `:root` and `*` both feed scope 0; later declarations override.
+        let css = r#"
+            :root { --a: 1; --b: 2; }
+            * { --b: 3; --c: 4; }
+            .x { --a: 9; }
+        "#;
+        let scopes = collect_token_scopes(css);
+        let base = scopes.base().expect("a base scope");
+        assert_eq!(base.key, ScopeKey(0));
+        assert_eq!(base.selector_text, ":root");
+        assert_eq!(base.vars.get("--a").map(String::as_str), Some("1"));
+        // `*`'s --b overrides :root's --b (later block wins on merge).
+        assert_eq!(base.vars.get("--b").map(String::as_str), Some("3"));
+        assert_eq!(base.vars.get("--c").map(String::as_str), Some("4"));
+        // `.x` is its own scope, not merged into base.
+        let x = scopes.by_selector(".x").expect(".x scope");
+        assert_eq!(x.vars.get("--a").map(String::as_str), Some("9"));
+        assert!(base.vars.get("--a").map(String::as_str) != Some("9"));
+        // Exactly two scopes: base + .x.
+        assert_eq!(scopes.scopes.len(), 2);
+    }
+
+    #[test]
+    fn token_scopes_record_specificity_and_source_order() {
+        // source_order counts EVERY block, including the no-token `.plain` one,
+        // so the third block (`#id.cls`) records source_order == 2.
+        let css = r#"
+            :root { --a: 1; }
+            .plain { color: red; }
+            #id.cls { --a: 2; }
+        "#;
+        let scopes = collect_token_scopes(css);
+        let base = scopes.base().unwrap();
+        // `:root` parses to a Universal part (see parse_simple_selector), which
+        // contributes nothing to specificity.
+        assert_eq!(base.specificity, (0, 0, 0));
+        assert_eq!(base.source_order, 0);
+
+        let scoped = scopes.by_selector("#id.cls").expect("#id.cls scope");
+        // 1 id + 1 class.
+        assert_eq!(scoped.specificity, (1, 1, 0));
+        // Block index 2 (`:root`=0, `.plain`=1, `#id.cls`=2).
+        assert_eq!(scoped.source_order, 2);
+    }
+
+    #[test]
+    fn token_scopes_store_cross_token_refs_raw_not_preflattened() {
+        // A base alias `--accent: var(--amber)` must be stored RAW (not eagerly
+        // concretized to `#aaa`), so a theme that overrides `--amber` is seen by
+        // every consumer reaching `--accent` through the alias. The resolution
+        // is done lazily at use time against the element's `ScopeEnv`.
+        let css = r#"
+            :root { --amber: #aaa; --accent: var(--amber); }
+            .theme { --amber: #bbb; }
+        "#;
+        let scopes = collect_token_scopes(css);
+        let base = scopes.base().unwrap();
+        // RAW: the cross-token reference is kept verbatim.
+        assert_eq!(base.vars.get("--accent").map(String::as_str), Some("var(--amber)"));
+
+        let theme = scopes.by_selector(".theme").unwrap();
+        // The scope only declares --amber (concrete); stored as-is.
+        assert_eq!(theme.vars.get("--amber").map(String::as_str), Some("#bbb"));
+
+        // Use-time resolution: resolving `var(--accent)` against [theme, base]
+        // must reach the THEME's --amber (#bbb), proving the two-level alias
+        // propagates the theme override.
+        let env = ScopeEnv::new(None, Some(theme.vars.as_ref()), Some(base.vars.as_ref()));
+        assert_eq!(flatten_token_value_env("var(--accent)", &env), "#bbb");
+        // With no theme active, it falls back to the base --amber (#aaa).
+        let base_only = ScopeEnv::new(None, None, Some(base.vars.as_ref()));
+        assert_eq!(flatten_token_value_env("var(--accent)", &base_only), "#aaa");
+    }
+
+    #[test]
+    fn token_scopes_two_level_alias_propagates_theme_override() {
+        // Mirrors styles.css: `:root` defines `--cp-accent: var(--amber-300)`,
+        // a theme overrides ONLY `--amber-300` (NOT --cp-accent). A consumer of
+        // `var(--cp-accent)` under the theme must resolve to the theme amber,
+        // proving the override propagates through the base-scope alias.
+        let css = r#"
+            :root { --amber-300: #d4a348; --cp-accent: var(--amber-300); }
+            .app.theme-dracula { --amber-300: #bd93f9; }
+        "#;
+        let scopes = collect_token_scopes(css);
+        let base = scopes.base().unwrap();
+        let dracula = scopes.by_selector(".app.theme-dracula").unwrap();
+        // Stored raw.
+        assert_eq!(base.vars.get("--cp-accent").map(String::as_str), Some("var(--amber-300)"));
+        // Resolving `var(--cp-accent)` against [dracula, base] reaches the theme
+        // amber even though dracula never redefines --cp-accent itself.
+        let env = ScopeEnv::new(None, Some(dracula.vars.as_ref()), Some(base.vars.as_ref()));
+        assert_eq!(
+            flatten_token_value_env("var(--cp-accent)", &env),
+            "#bd93f9",
+            "theme override of the inner token must propagate through the base alias"
+        );
+    }
+
+    #[test]
+    fn token_scopes_preflatten_cycle_guard_terminates() {
+        // A -> B -> A is a cycle; the flatten must terminate and leave the
+        // unresolvable var() text in place rather than spin.
+        let css = r#"
+            :root { --a: var(--b); --b: var(--a); }
+        "#;
+        let scopes = collect_token_scopes(css);
+        let base = scopes.base().unwrap();
+        let a = base.vars.get("--a").map(String::as_str).unwrap();
+        // Whatever the fixed point is, it still contains an unresolved var()
+        // (no infinite loop, no panic).
+        assert!(a.contains("var("), "cyclic token should retain a var(): got {a:?}");
+    }
+
+    #[test]
+    fn token_scopes_empty_without_custom_props() {
+        let css = ".a { color: red; } .b { display: flex; }";
+        let scopes = collect_token_scopes(css);
+        assert!(scopes.scopes.is_empty());
+        assert!(scopes.base().is_none());
+    }
+
+    // ---- Defect 3: var( gate must only fire on a real var() function -------
+
+    #[test]
+    fn contains_var_function_matches_only_real_var_calls() {
+        // Real var() functions at every value boundary.
+        assert!(contains_var_function("var(--x)"));
+        assert!(contains_var_function("  var(--x)"));
+        assert!(contains_var_function("1px solid var(--x)"));
+        assert!(contains_var_function("rgba(0,0,0,var(--a))")); // after '('
+        assert!(contains_var_function("a, var(--x)")); // after ','
+        assert!(contains_var_function("calc(var(--x) + 1px)"));
+        // NOT a var() function: `var` is the tail of a longer identifier.
+        assert!(!contains_var_function("myvar(1)"));
+        assert!(!contains_var_function("url(.../myvar(1).png)"));
+        assert!(!contains_var_function("foovar(--x)"));
+        assert!(!contains_var_function("0px")); // no var at all
+                                                // A real var() later in a string that also contains a fake one.
+        assert!(contains_var_function("myvar(1) var(--x)"));
+        assert!(!contains_var_function("url(myvar(1).png) novar(2)"));
+    }
+
+    #[test]
+    fn fake_var_substring_is_not_deferred() {
+        // `myvar(` is not a var() call, so the declaration must NOT take the
+        // Deferred fast path — it falls through to the typed match (where this
+        // unsupported `background` form simply errors). Either way, no Deferred
+        // carrier is produced. Call `parse_declaration` directly so an Err on the
+        // typed path is tolerated; the assertion is purely "not Deferred".
+        let mut input = ParserInput::new("background: url(./myvar(1).png)");
+        let mut parser = Parser::new(&mut input);
+        let result = parse_declaration(&mut parser, ScopeKey(0));
+        let has_deferred = result
+            .map(|decls| decls.iter().any(|d| matches!(d, StyleDeclaration::Deferred { .. })))
+            .unwrap_or(false);
+        assert!(!has_deferred, "a 'myvar(' / url(... myvar(...)) substring must not be deferred");
+    }
+
+    // ---- Defect 4: self-scope perf gate -----------------------------------
+
+    #[test]
+    fn widget_scope_classes_gate_skips_non_widget_elements() {
+        // `.theme-chip.dracula` is a widget scope keyed on classes; `.app` and
+        // `.cp-mode-pill` are NOT widget-scope terminal classes here.
+        let css = r#"
+            :root { --x: 1; }
+            .app.theme-dracula { --x: 2; }
+            .theme-chip.dracula { --x: 3; }
+        "#;
+        let scopes = collect_token_scopes(css);
+        // Terminal classes of the non-base scopes: theme-dracula, app, dracula,
+        // theme-chip (the theme root's classes are over-included, harmless).
+        assert!(scopes.widget_scope_classes.contains("theme-chip"));
+        assert!(scopes.widget_scope_classes.contains("dracula"));
+        assert!(!scopes.widget_scope_gate_unsafe, "all terminals carry a class");
+        // An element with a widget class may have a self scope.
+        assert!(scopes.element_may_have_self_scope(&["theme-chip".to_string()]));
+        // An element with none of the widget classes is gated out.
+        assert!(!scopes.element_may_have_self_scope(&["cp-mode-pill".to_string()]));
+        assert!(!scopes.element_may_have_self_scope(&[]));
+    }
+
+    #[test]
+    fn widget_scope_gate_disabled_for_classless_terminal_scope() {
+        // An id-only scope terminal makes the class-intersection gate unsound, so
+        // it must fall back to always running the self-scope walk.
+        let css = r#"
+            :root { --x: 1; }
+            #widget { --x: 2; }
+        "#;
+        let scopes = collect_token_scopes(css);
+        assert!(scopes.widget_scope_gate_unsafe, "an id-only terminal disables the gate");
+        // Always returns true so the cascade never wrongly skips the walk.
+        assert!(scopes.element_may_have_self_scope(&[]));
+        assert!(scopes.element_may_have_self_scope(&["anything".to_string()]));
+    }
+
+    // ---- Defect 2: cascade-time var() failures reach the drop sink --------
+
+    #[test]
+    fn coverage_pass_records_malformed_scoped_var_into_dropped() {
+        // A scoped var() that no scope defines and that has no fallback cannot
+        // resolve under ANY env, so the parse-time coverage pass must record it
+        // into `dropped` where the stylesheet_coverage guardrail can see it.
+        let sheet = CompiledStylesheet::parse(
+            ":root { --known: #00ff00; } .widget { color: var(--missing); }",
+        );
+        assert!(
+            sheet
+                .dropped
+                .iter()
+                .any(|d| d.property == "color" && d.value.contains("var(--missing)")),
+            "an unresolvable scoped var() must reach the dropped sink: {:?}",
+            sheet.dropped
+        );
+    }
+
+    #[test]
+    fn coverage_pass_does_not_drop_a_theme_resolvable_var() {
+        // --accent is unresolvable under :root alone but IS defined by a theme
+        // scope; resolving under that scope succeeds, so it must NOT be recorded
+        // as a coverage failure.
+        let sheet = CompiledStylesheet::parse(
+            ".app.theme-dracula { --accent: #bd93f9; } .widget { color: var(--accent); }",
+        );
+        assert!(
+            !sheet.dropped.iter().any(|d| d.property == "color"),
+            "a var() that some theme scope resolves must not be flagged: {:?}",
+            sheet.dropped
+        );
+    }
+
+    // ---- Stage 2: deferred declaration carrier ----------------------------
+
+    /// Parse a single `property: value` declaration via the scoped
+    /// `parse_declaration` path directly, BYPASSING the global
+    /// `resolve_var_references` pass that `CompiledStylesheet::parse` runs. This
+    /// is the only way to reach a `var(`-carrying value with the current global
+    /// resolve in place, so it exercises the `Deferred` carrier in isolation.
+    fn parse_one_decl_scoped(text: &str, scope: ScopeKey) -> SmallVec<[StyleDeclaration; 2]> {
+        let mut input = ParserInput::new(text);
+        let mut parser = Parser::new(&mut input);
+        parse_declaration(&mut parser, scope).expect("declaration should parse")
+    }
+
+    #[test]
+    fn deferred_carrier_is_produced_when_global_resolve_bypassed() {
+        // With the global resolve bypassed, a value that still contains `var(`
+        // is captured verbatim as a Deferred carrier rather than typed eagerly.
+        let decls = parse_one_decl_scoped("color: var(--accent)", ScopeKey(7));
+        assert_eq!(
+            decls.as_slice(),
+            [StyleDeclaration::Deferred {
+                property: "color".into(),
+                raw_value: "var(--accent)".into(),
+                scope_hint: ScopeKey(7),
+            }]
+        );
+    }
+
+    #[test]
+    fn deferred_apply_reparses_to_same_typed_decl_as_eager_path() {
+        // The eager path: a concrete `color: red` types to `Color(..)` and sets
+        // `style.color`.
+        let mut eager = ComputedStyle::default();
+        for decl in &parse_one_decl_scoped("color: red", ScopeKey(0)) {
+            apply_declaration(&mut eager, decl);
+        }
+
+        // The deferred path: `color: var(--accent)` captures a carrier, which
+        // resolves `--accent: red` against :root and re-parses to the SAME
+        // typed declaration, producing the SAME computed style.
+        let deferred = parse_one_decl_scoped("color: var(--accent)", ScopeKey(0));
+        let StyleDeclaration::Deferred { property, raw_value, scope_hint } = &deferred[0] else {
+            panic!("expected a Deferred carrier, got {:?}", deferred[0]);
+        };
+
+        let mut props = HashMap::new();
+        props.insert("--accent".to_string(), "red".to_string());
+        let mut dropped = Vec::new();
+        let mut applied = ComputedStyle::default();
+        apply_deferred_declaration(
+            &mut applied,
+            property,
+            raw_value,
+            *scope_hint,
+            &props,
+            &mut dropped,
+        );
+
+        // Same resolved color, and nothing routed to dropped on the happy path.
+        assert_eq!(applied.color, eager.color);
+        assert!(dropped.is_empty(), "a resolvable deferred decl must not drop: {dropped:?}");
+
+        // And the re-parse yields the exact same typed declaration the eager
+        // path produced for `color: red`.
+        let reparsed = parse_one_decl_scoped("color: red", ScopeKey(0));
+        let resolved_concrete = parse_one_decl_scoped("color: red", ScopeKey(0));
+        assert_eq!(reparsed.as_slice(), resolved_concrete.as_slice());
+        assert!(matches!(reparsed.as_slice(), [StyleDeclaration::Color(_)]));
+    }
+
+    #[test]
+    fn deferred_apply_routes_unresolvable_var_to_dropped() {
+        // An unresolved `var(` (no matching token, no fallback) cannot be typed:
+        // re-parse round-trips back to Deferred, so it must route to `dropped`
+        // rather than be silently swallowed.
+        let mut style = ComputedStyle::default();
+        let mut dropped = Vec::new();
+        let props = HashMap::new(); // empty: --missing resolves to nothing
+        apply_deferred_declaration(
+            &mut style,
+            "color",
+            "var(--missing)",
+            ScopeKey(3),
+            &props,
+            &mut dropped,
+        );
+        assert_eq!(dropped.len(), 1, "unresolvable deferred must route to dropped");
+        assert_eq!(dropped[0].property, "color");
+    }
+
+    #[test]
+    fn deferred_apply_routes_unparseable_value_to_dropped() {
+        // The var() resolves to a concrete value, but the value is not something
+        // the property's parser accepts (an engine gap). It must route to
+        // `dropped`, not be swallowed.
+        let mut style = ComputedStyle::default();
+        let mut dropped = Vec::new();
+        let mut props = HashMap::new();
+        props.insert("--bad".to_string(), "definitely-not-a-color".to_string());
+        apply_deferred_declaration(
+            &mut style,
+            "color",
+            "var(--bad)",
+            ScopeKey(0),
+            &props,
+            &mut dropped,
+        );
+        assert_eq!(dropped.len(), 1, "unparseable resolved value must route to dropped");
+        assert_eq!(dropped[0].property, "color");
+    }
+
+    #[test]
+    fn no_var_value_is_typed_eagerly_not_deferred() {
+        // The fast-check must not mis-route a plain value: the snapshot/reset
+        // dance leaves a no-`var(` value typed exactly as before.
+        let decls = parse_one_decl_scoped("display: flex", ScopeKey(0));
+        assert_eq!(decls.as_slice(), [StyleDeclaration::Display(Display::Flex)]);
+    }
+
+    #[test]
+    fn deferred_carrier_is_produced_in_production_parse_after_flip() {
+        // Stage 3 deleted the global resolve, so a `var(`-bearing declaration now
+        // reaches the parser with `var(` intact and is captured as a Deferred
+        // carrier (resolved per element in the cascade). The carrier's scope_hint
+        // points at the block it was authored in (here `.x`, which has no token
+        // scope of its own, so the base scope 0).
+        let sheet =
+            CompiledStylesheet::parse(":root { --accent: #112233; } .x { color: var(--accent); }");
+        let deferred: Vec<_> = sheet
+            .rules
+            .iter()
+            .flat_map(|r| r.declarations.iter())
+            .filter(|d| matches!(d, StyleDeclaration::Deferred { .. }))
+            .collect();
+        assert_eq!(deferred.len(), 1, "production parse must defer the var() declaration now");
+        let StyleDeclaration::Deferred { property, raw_value, .. } = deferred[0] else {
+            unreachable!()
+        };
+        assert_eq!(property.as_ref(), "color");
+        assert_eq!(raw_value.as_ref(), "var(--accent)");
+
+        // The custom-property DEFINITION `--accent` is collected, not dropped.
+        assert!(
+            !sheet.dropped.iter().any(|d| d.property == "--accent"),
+            "custom-property definitions must not drop after the flip: {:?}",
+            sheet.dropped
+        );
+    }
+
+    // ---- Stage 3: env-aware deferred apply (per-scope resolution) ----------
+
+    #[test]
+    fn env_resolves_token_highest_specificity_first() {
+        // The env is [self, root_theme, base]; a token defined in more than one
+        // active scope resolves to the highest-specificity (earliest) hit.
+        let base: HashMap<String, String> =
+            [("--c".to_string(), "#000000".to_string())].into_iter().collect();
+        let theme: HashMap<String, String> =
+            [("--c".to_string(), "#111111".to_string())].into_iter().collect();
+        let widget: HashMap<String, String> =
+            [("--c".to_string(), "#bd93f9".to_string())].into_iter().collect();
+
+        // Self scope present: it wins.
+        let env = ScopeEnv::new(Some(&widget), Some(&theme), Some(&base));
+        let mut style = ComputedStyle::default();
+        let mut dropped = Vec::new();
+        apply_deferred_against_env(
+            &mut style,
+            "color",
+            "var(--c)",
+            ScopeKey(2),
+            &env,
+            &mut dropped,
+        );
+        assert_eq!(style.color, Color::rgb(0xbd, 0x93, 0xf9));
+        assert!(dropped.is_empty());
+
+        // No self scope: the root theme wins over base.
+        let env = ScopeEnv::new(None, Some(&theme), Some(&base));
+        let mut style = ComputedStyle::default();
+        apply_deferred_against_env(
+            &mut style,
+            "color",
+            "var(--c)",
+            ScopeKey(1),
+            &env,
+            &mut dropped,
+        );
+        assert_eq!(style.color, Color::rgb(0x11, 0x11, 0x11));
+
+        // Only base: base value.
+        let env = ScopeEnv::new(None, None, Some(&base));
+        let mut style = ComputedStyle::default();
+        apply_deferred_against_env(
+            &mut style,
+            "color",
+            "var(--c)",
+            ScopeKey(0),
+            &env,
+            &mut dropped,
+        );
+        assert_eq!(style.color, Color::rgb(0x00, 0x00, 0x00));
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn env_uses_fallback_then_routes_unresolvable_to_dropped() {
+        let base: HashMap<String, String> = HashMap::new();
+        // Fallback is honored when no scope defines the name.
+        let env = ScopeEnv::new(None, None, Some(&base));
+        let mut style = ComputedStyle::default();
+        let mut dropped = Vec::new();
+        apply_deferred_against_env(
+            &mut style,
+            "color",
+            "var(--missing, #00ff00)",
+            ScopeKey(0),
+            &env,
+            &mut dropped,
+        );
+        assert_eq!(style.color, Color::rgb(0x00, 0xff, 0x00));
+        assert!(dropped.is_empty(), "a fallback-resolved var must not drop");
+
+        // No definition and no fallback: routes to dropped, does not apply.
+        let mut style = ComputedStyle::default();
+        apply_deferred_against_env(
+            &mut style,
+            "color",
+            "var(--missing)",
+            ScopeKey(3),
+            &env,
+            &mut dropped,
+        );
+        assert_eq!(dropped.len(), 1, "an unresolvable scoped var must route to dropped");
+        assert_eq!(dropped[0].property, "color");
+        // The bogus value did not apply.
+        assert_eq!(style.color, ComputedStyle::default().color);
     }
 }

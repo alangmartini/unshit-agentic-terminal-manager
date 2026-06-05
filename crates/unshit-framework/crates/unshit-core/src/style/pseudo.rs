@@ -258,6 +258,7 @@ fn resolve_pseudo_slot(
     focused: NodeId,
     table: &mut PseudoSideTable,
 ) {
+    let active_root_scope = cascade::active_root_scope_for(arena, stylesheet, host);
     let pseudo_style = cascade::resolve_style_with_pseudo(
         arena,
         stylesheet,
@@ -267,6 +268,7 @@ fn resolve_pseudo_slot(
         focused,
         false,
         Some(slot),
+        active_root_scope,
     );
 
     // If the cascade did not produce a content value with a visible box, tear

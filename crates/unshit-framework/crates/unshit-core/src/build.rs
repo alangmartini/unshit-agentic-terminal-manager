@@ -7,6 +7,7 @@ use crate::layout::{self, TextMeasureCache, TextMeasureCtx};
 use crate::style::animation::AnimationDriver;
 use crate::style::cascade;
 use crate::style::parse::CompiledStylesheet;
+use crate::style::parse::ScopeKey;
 use crate::style::pseudo::{self, PseudoSideTable};
 use crate::style::transition::{self, ActiveTransitions};
 use crate::style::types::Dimension;
@@ -158,6 +159,7 @@ pub fn resolve_pseudo_elements(
 ///
 /// For post-reconcile cascades where only specific nodes changed, use
 /// `resolve_dirty_styles_with_transitions` which short-circuits clean subtrees.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_all_styles_with_transitions(
     arena: &mut NodeArena,
     stylesheet: &CompiledStylesheet,
@@ -167,7 +169,41 @@ pub fn resolve_all_styles_with_transitions(
     focused: NodeId,
     focus_via_keyboard: bool,
     now: Option<Instant>,
+    active_transitions: Option<&mut ActiveTransitions>,
+) {
+    // The active root theme scope is a property of the document root, so it is
+    // identical for every node in this pass; compute it once at the entry and
+    // thread it through the recursion (O(1) per element thereafter). Cheap
+    // (`None`) for stylesheets without theme scopes.
+    let active_root_scope = cascade::active_root_scope_for(arena, stylesheet, node_id);
+    resolve_all_styles_with_transitions_scoped(
+        arena,
+        stylesheet,
+        node_id,
+        hovered,
+        active,
+        focused,
+        focus_via_keyboard,
+        now,
+        active_transitions,
+        active_root_scope,
+    );
+}
+
+/// Recursion body of [`resolve_all_styles_with_transitions`]. Carries the
+/// pass-wide `active_root_scope` so it is not recomputed per node.
+#[allow(clippy::too_many_arguments)]
+fn resolve_all_styles_with_transitions_scoped(
+    arena: &mut NodeArena,
+    stylesheet: &CompiledStylesheet,
+    node_id: NodeId,
+    hovered: NodeId,
+    active: Option<NodeId>,
+    focused: NodeId,
+    focus_via_keyboard: bool,
+    now: Option<Instant>,
     mut active_transitions: Option<&mut ActiveTransitions>,
+    active_root_scope: Option<ScopeKey>,
 ) {
     let mut resolved_style = cascade::resolve_style_fv(
         arena,
@@ -177,6 +213,7 @@ pub fn resolve_all_styles_with_transitions(
         active,
         focused,
         focus_via_keyboard,
+        active_root_scope,
     );
     let sel_style =
         cascade::resolve_selection_style(arena, stylesheet, node_id, hovered, active, focused);
@@ -247,7 +284,7 @@ pub fn resolve_all_styles_with_transitions(
         // We can't pass `active_transitions` directly in a loop due to borrow rules,
         // so we use a raw pointer trick or just handle it differently.
         // Actually, Option<&mut T> can be reborrowed:
-        resolve_all_styles_with_transitions(
+        resolve_all_styles_with_transitions_scoped(
             arena,
             stylesheet,
             child_id,
@@ -257,6 +294,7 @@ pub fn resolve_all_styles_with_transitions(
             focus_via_keyboard,
             now,
             None, // Children track themselves individually.
+            active_root_scope,
         );
         // After resolving child, check if it has active transitions and track it.
         if let Some(ref mut at) = active_transitions {
@@ -294,6 +332,7 @@ pub fn resolve_all_styles_with_transitions(
 /// Do NOT use this when hover/focus/active state has changed because
 /// pseudo-class selectors can match any node in the tree; use
 /// `resolve_all_styles_with_transitions` in that case.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_dirty_styles_with_transitions(
     arena: &mut NodeArena,
     stylesheet: &CompiledStylesheet,
@@ -303,7 +342,39 @@ pub fn resolve_dirty_styles_with_transitions(
     focused: NodeId,
     focus_via_keyboard: bool,
     now: Option<Instant>,
+    active_transitions: Option<&mut ActiveTransitions>,
+) {
+    // Active root theme scope is pass-wide (a property of the document root);
+    // compute once at the entry and thread through recursion.
+    let active_root_scope = cascade::active_root_scope_for(arena, stylesheet, node_id);
+    resolve_dirty_styles_with_transitions_scoped(
+        arena,
+        stylesheet,
+        node_id,
+        hovered,
+        active,
+        focused,
+        focus_via_keyboard,
+        now,
+        active_transitions,
+        active_root_scope,
+    );
+}
+
+/// Recursion body of [`resolve_dirty_styles_with_transitions`]. Carries the
+/// pass-wide `active_root_scope` so it is not recomputed per node.
+#[allow(clippy::too_many_arguments)]
+fn resolve_dirty_styles_with_transitions_scoped(
+    arena: &mut NodeArena,
+    stylesheet: &CompiledStylesheet,
+    node_id: NodeId,
+    hovered: NodeId,
+    active: Option<NodeId>,
+    focused: NodeId,
+    focus_via_keyboard: bool,
+    now: Option<Instant>,
     mut active_transitions: Option<&mut ActiveTransitions>,
+    active_root_scope: Option<ScopeKey>,
 ) {
     // Short-circuit: if this node has no style work anywhere in its subtree,
     // skip it entirely.
@@ -333,6 +404,7 @@ pub fn resolve_dirty_styles_with_transitions(
             active,
             focused,
             focus_via_keyboard,
+            active_root_scope,
         ))
     } else {
         None
@@ -399,7 +471,7 @@ pub fn resolve_dirty_styles_with_transitions(
 
     // We need to reborrow for recursion since active_transitions is &mut.
     for &child_id in &children {
-        resolve_dirty_styles_with_transitions(
+        resolve_dirty_styles_with_transitions_scoped(
             arena,
             stylesheet,
             child_id,
@@ -409,6 +481,7 @@ pub fn resolve_dirty_styles_with_transitions(
             focus_via_keyboard,
             now,
             None, // Children track themselves individually.
+            active_root_scope,
         );
         // After resolving child, check if it has active transitions and track it.
         if let Some(ref mut at) = active_transitions {
