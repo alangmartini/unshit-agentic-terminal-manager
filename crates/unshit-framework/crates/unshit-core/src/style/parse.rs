@@ -482,10 +482,10 @@ pub enum StyleDeclaration {
     // Bell / notification
     BellStyle(types::BellStyle),
 
-    /// `transform: translateX(<length-percentage>)`. Other transform
-    /// functions are parsed as an error today; see
-    /// `parse_transform_translate_x` for the shortlist of accepted forms.
-    TransformTranslateX(types::TransformX),
+    /// `transform: <function-list>` (translate / scale / rotate). See
+    /// `parse_transform` for the accepted forms; composed into an affine by
+    /// the renderer.
+    Transform(types::Transform),
 
     /// `mask-image: linear-gradient(...)`. Any non gradient mask source
     /// (url, image(), none) parses to an error today. The linear gradient
@@ -2690,14 +2690,13 @@ fn parse_declaration(
             })
         }
 
-        // CSS `transform`. Today the parser recognises only a single
-        // `translateX(<length-percentage>)` entry. Every other transform
-        // function (`translate`, `translateY`, `scale`, `rotate`,
-        // `matrix`, ...) returns an error so the cascade drops the
-        // declaration while other, supported declarations on the same
-        // selector continue to apply. See `parse_transform_translate_x`.
-        "transform" => match parse_transform_translate_x(parser) {
-            Some(tx) => StyleDeclaration::TransformTranslateX(tx),
+        // CSS `transform`: a `translate*` / `scale*` / `rotate` function
+        // list, or the `none` keyword. Unsupported forms (`matrix`, `skew`,
+        // 3D functions) return an error so the cascade drops only this
+        // declaration while other declarations on the same selector still
+        // apply. See `parse_transform`.
+        "transform" => match parse_transform(parser) {
+            Some(t) => StyleDeclaration::Transform(t),
             None => return Err(()),
         },
 
@@ -3548,56 +3547,139 @@ fn parse_mask_image(parser: &mut Parser) -> Result<types::LinearGradient, ()> {
     parse_linear_gradient(parser)
 }
 
-/// Parse `transform: translateX(<length-percentage>)` and return the
-/// resolved `TransformX` value. Other transform functions (including
-/// `translate`, `translateY`, `scale`, `rotate`, `matrix`, and the plain
-/// `none` keyword) return `None` today so the declaration is dropped from
-/// the cascade and logged via the caller's error path.
-fn parse_transform_translate_x(parser: &mut Parser) -> Option<types::TransformX> {
-    // The input is a single function token like `translateX(50px)`. Peek
-    // the function name first.
-    let fn_name = match parser.next() {
-        Ok(Token::Function(name)) => name.clone(),
-        Ok(Token::Ident(id)) if id.as_ref().eq_ignore_ascii_case("none") => {
-            // `transform: none` is the CSS default. Returning `None` drops
-            // the declaration entirely, which leaves `transform_translate_x`
-            // at its default of `None` in the cascade. That matches the
-            // semantics of `none`.
-            return None;
-        }
-        _ => return None,
-    };
+/// Parse a CSS `transform` value into a decomposed [`types::Transform`].
+///
+/// Accepts the `none` keyword (returns [`types::Transform::IDENTITY`], which
+/// still overrides a less-specific transform in the cascade) and a
+/// whitespace-separated list of the functions the app stylesheet uses:
+/// `translateX`/`translateY`/`translate`, `scale`/`scaleX`/`scaleY`, and
+/// `rotate`. Returns `None` (so the caller drops the declaration and the
+/// coverage guardrail flags it) when ANY function in the list is unsupported
+/// (`matrix`, `skew`, 3D, ...) or malformed — partial application of a list
+/// would silently mis-render, so the whole declaration is rejected.
+///
+/// Components accumulate across the list: later `translate*` overwrite the
+/// matching axis, `scale*` overwrite the matching axis, and `rotate` adds.
+/// The renderer composes them in the canonical `Translate · Rotate · Scale`
+/// order, which matches the only multi-function form authored
+/// (`translateY(..) scale(..)`).
+fn parse_transform(parser: &mut Parser) -> Option<types::Transform> {
+    let mut t = types::Transform::IDENTITY;
+    let mut saw_any = false;
 
-    // TODO: accept scale(), rotate(), translate(), translateY(), matrix()
-    // here as real transforms instead of dropping them silently.
-    if !fn_name.as_ref().eq_ignore_ascii_case("translateX") {
-        // Drain the block so the outer parser stays consistent with the
-        // cssparser block invariant: once we see a Function token we must
-        // consume the matching close paren via parse_nested_block.
-        let _ = parser.parse_nested_block(|p| -> Result<(), cssparser::ParseError<'_, ()>> {
-            drain_tokens(p);
+    loop {
+        // Pull the next item: the `none` keyword (an explicit identity that
+        // still overrides a less-specific transform), a transform function, or
+        // EOF. `next()` returns `Err` at the end of the value, ending the list.
+        // The token borrow is released as the match yields the owned name.
+        let fn_name = match parser.next() {
+            Ok(Token::Ident(id)) if id.as_ref().eq_ignore_ascii_case("none") => {
+                return Some(types::Transform::IDENTITY);
+            }
+            Ok(Token::Function(name)) => name.clone(),
+            // The declaration value parser includes the trailing `;`; that (or
+            // EOF) ends the function list.
+            Ok(Token::Semicolon) => break,
+            // Any other token means the value is not a clean function list —
+            // reject so the coverage guardrail surfaces it.
+            Ok(_) => return None,
+            Err(_) => break,
+        };
+        saw_any = true;
+
+        // Each function is its own nested block. On an unsupported or
+        // malformed function we still must drain the block to keep the outer
+        // parser's `()` balanced, then reject the whole declaration.
+        let parsed = parser.parse_nested_block(|p| -> Result<(), cssparser::ParseError<'_, ()>> {
+            let name = fn_name.as_ref();
+            if name.eq_ignore_ascii_case("translatex") {
+                t.translate_x = Some(parse_translate_len(p)?);
+            } else if name.eq_ignore_ascii_case("translatey") {
+                t.translate_y = Some(parse_translate_len(p)?);
+            } else if name.eq_ignore_ascii_case("translate") {
+                // `translate(tx)` or `translate(tx, ty)`.
+                t.translate_x = Some(parse_translate_len(p)?);
+                if p.try_parse(|p| p.expect_comma()).is_ok() {
+                    t.translate_y = Some(parse_translate_len(p)?);
+                }
+            } else if name.eq_ignore_ascii_case("scale") {
+                // `scale(s)` uniform, or `scale(sx, sy)`.
+                let sx = parse_scale_factor(p)?;
+                let sy = if p.try_parse(|p| p.expect_comma()).is_ok() {
+                    parse_scale_factor(p)?
+                } else {
+                    sx
+                };
+                t.scale_x = sx;
+                t.scale_y = sy;
+            } else if name.eq_ignore_ascii_case("scalex") {
+                t.scale_x = parse_scale_factor(p)?;
+            } else if name.eq_ignore_ascii_case("scaley") {
+                t.scale_y = parse_scale_factor(p)?;
+            } else if name.eq_ignore_ascii_case("rotate") {
+                t.rotate += parse_angle_rad(p)?;
+            } else {
+                // Unsupported function (matrix, skew, perspective, 3D...).
+                drain_tokens(p);
+                return Err(p.new_custom_error(()));
+            }
             Ok(())
         });
-        return None;
+        parsed.ok()?;
     }
 
-    // Parse the inner `<length-percentage>` argument.
-    parser
-        .parse_nested_block(|p| -> Result<types::TransformX, cssparser::ParseError<'_, ()>> {
-            match p.next() {
-                Ok(Token::Percentage { unit_value, .. }) => {
-                    Ok(types::TransformX::Percent(*unit_value))
-                }
-                Ok(Token::Dimension { value, unit, .. })
-                    if unit.as_ref().eq_ignore_ascii_case("px") =>
-                {
-                    Ok(types::TransformX::Px(*value))
-                }
-                Ok(Token::Number { value, .. }) if *value == 0.0 => Ok(types::TransformX::Px(0.0)),
-                _ => Err(p.new_custom_error(())),
+    if saw_any {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+/// Parse a `<length-percentage>` translate argument (`px`, `%`, or a bare
+/// `0`) into a [`types::TransformX`].
+fn parse_translate_len<'i>(
+    p: &mut Parser<'i, '_>,
+) -> Result<types::TransformX, cssparser::ParseError<'i, ()>> {
+    match p.next() {
+        Ok(Token::Percentage { unit_value, .. }) => Ok(types::TransformX::Percent(*unit_value)),
+        Ok(Token::Dimension { value, unit, .. }) if unit.as_ref().eq_ignore_ascii_case("px") => {
+            Ok(types::TransformX::Px(*value))
+        }
+        Ok(Token::Number { value, .. }) if *value == 0.0 => Ok(types::TransformX::Px(0.0)),
+        _ => Err(p.new_custom_error(())),
+    }
+}
+
+/// Parse a unitless `<number>` (a `scale` factor).
+fn parse_scale_factor<'i>(p: &mut Parser<'i, '_>) -> Result<f32, cssparser::ParseError<'i, ()>> {
+    match p.next() {
+        Ok(Token::Number { value, .. }) => Ok(*value),
+        _ => Err(p.new_custom_error(())),
+    }
+}
+
+/// Parse an `<angle>` (`deg`, `rad`, `grad`, `turn`, or a bare `0`) into
+/// radians.
+fn parse_angle_rad<'i>(p: &mut Parser<'i, '_>) -> Result<f32, cssparser::ParseError<'i, ()>> {
+    use std::f32::consts::PI;
+    match p.next() {
+        Ok(Token::Dimension { value, unit, .. }) => {
+            let u = unit.as_ref();
+            if u.eq_ignore_ascii_case("deg") {
+                Ok(value.to_radians())
+            } else if u.eq_ignore_ascii_case("rad") {
+                Ok(*value)
+            } else if u.eq_ignore_ascii_case("grad") {
+                Ok(value * PI / 200.0)
+            } else if u.eq_ignore_ascii_case("turn") {
+                Ok(value * 2.0 * PI)
+            } else {
+                Err(p.new_custom_error(()))
             }
-        })
-        .ok()
+        }
+        Ok(Token::Number { value, .. }) if *value == 0.0 => Ok(0.0),
+        _ => Err(p.new_custom_error(())),
+    }
 }
 
 /// Parse a single `<length-percentage>` token for the radial gradient grammar.
@@ -5256,9 +5338,9 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
         // Bell / notification
         StyleDeclaration::BellStyle(v) => style.bell_style = *v,
 
-        // CSS `transform: translateX(...)`. Replaces any prior value on the
-        // same element so later declarations win (standard cascade rule).
-        StyleDeclaration::TransformTranslateX(v) => style.transform_translate_x = Some(*v),
+        // CSS `transform`. Replaces any prior value on the same element so
+        // later declarations win (standard cascade rule).
+        StyleDeclaration::Transform(v) => style.transform = *v,
 
         // CSS `mask-image: linear-gradient(...)`. Only the linear gradient
         // form is supported; see `parse_mask_image`.

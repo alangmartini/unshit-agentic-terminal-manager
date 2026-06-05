@@ -1,7 +1,7 @@
 use unshit::core::element::*;
 use unshit::core::event::{DragPhase, Event, EventType, Key, KeyEventKind, Modifiers};
 use unshit::core::style::parse::StyleDeclaration;
-use unshit::core::style::types::TransformX;
+use unshit::core::style::types::{Transform, TransformX};
 
 use crate::state::{
     apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with,
@@ -423,9 +423,10 @@ fn build_pane_body(
             .with_persistent_buffer(true);
         let content_x_offset = terminal_content_x_offset();
         if content_x_offset.abs() > f32::EPSILON {
-            grid_el = grid_el.with_style(StyleDeclaration::TransformTranslateX(TransformX::Px(
-                content_x_offset,
-            )));
+            grid_el = grid_el.with_style(StyleDeclaration::Transform(Transform {
+                translate_x: Some(TransformX::Px(content_x_offset)),
+                ..Transform::IDENTITY
+            }));
         }
 
         // A tab_index is required so the element is focusable; without it the

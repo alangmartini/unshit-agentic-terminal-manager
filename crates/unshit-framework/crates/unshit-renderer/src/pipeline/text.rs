@@ -14,6 +14,14 @@ pub struct GlyphInstance {
     pub uv_max: [f32; 2],
     pub color: [f32; 4],
     pub clip_rect: [f32; 4],
+    /// CSS `transform` linear part as a 2x2 DELTA from identity
+    /// (`[a-1, b, c, d-1]`); see [`crate::pipeline::quad::QuadInstance::xform`].
+    /// Zero is the identity, so a glyph run inherits its element's transform
+    /// (rotating / scaling about the element's center) and untransformed runs
+    /// pay nothing.
+    pub xform: [f32; 4],
+    /// Translation part `[e, f]` of the transform affine, in screen pixels.
+    pub xform_translate: [f32; 2],
 }
 
 #[repr(C)]
@@ -149,6 +157,8 @@ impl TextPipeline {
             3 => Float32x2,  // uv_max
             4 => Float32x4,  // color
             5 => Float32x4,  // clip_rect
+            6 => Float32x4,  // xform (2x2 linear delta-from-identity: a-1,b,c,d-1)
+            7 => Float32x2,  // xform_translate (e, f)
         ];
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -270,8 +280,9 @@ mod tests {
     /// GlyphInstance size matches the wgpu layout expectation.
     #[test]
     fn glyph_instance_has_expected_size() {
-        // 2 + 2 + 2 + 2 + 4 + 4 floats = 16 floats = 64 bytes.
-        assert_eq!(std::mem::size_of::<GlyphInstance>(), 64);
+        // 2 + 2 + 2 + 2 + 4 + 4 (= 16) + xform 4 + xform_translate 2
+        // = 22 floats = 88 bytes.
+        assert_eq!(std::mem::size_of::<GlyphInstance>(), 88);
     }
 
     #[test]

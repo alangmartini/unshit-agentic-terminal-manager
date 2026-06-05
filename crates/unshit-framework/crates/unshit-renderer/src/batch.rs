@@ -787,18 +787,24 @@ pub struct BatchRange {
 pub struct BatchCacheSignature {
     pub render_rect: [f32; 4],
     pub clip_rect: [f32; 4],
+    /// The node's composed CSS-transform affine in delta-from-identity encoding
+    /// (`[a-1, b, c, d-1, e, f]`), so the identity is all-zero (matching
+    /// `Default`). Included so a node re-emits when its own or any ancestor's
+    /// transform changes — the cached instances bake an absolute matrix.
+    pub xform: [f32; 6],
 }
 
 impl BatchCacheSignature {
-    pub fn new(render_rect: [f32; 4], clip_rect: [f32; 4]) -> Self {
-        Self { render_rect, clip_rect }
+    pub fn new(render_rect: [f32; 4], clip_rect: [f32; 4], xform: [f32; 6]) -> Self {
+        Self { render_rect, clip_rect, xform }
     }
 
     fn matches(self, other: Self) -> bool {
         self.render_rect
             .iter()
             .chain(self.clip_rect.iter())
-            .zip(other.render_rect.iter().chain(other.clip_rect.iter()))
+            .chain(self.xform.iter())
+            .zip(other.render_rect.iter().chain(other.clip_rect.iter()).chain(other.xform.iter()))
             .all(|(a, b)| (*a - *b).abs() <= 0.01)
     }
 }
@@ -1301,6 +1307,7 @@ pub fn build_render_batch(
         None,
         line_cache.as_deref_mut(),
         &cursor_blink_force_dirty,
+        Affine2::IDENTITY,
     );
 
     // Process deferred portal nodes with fresh viewport clip
@@ -1330,6 +1337,7 @@ pub fn build_render_batch(
             None,
             line_cache.as_deref_mut(),
             &cursor_blink_force_dirty,
+            Affine2::IDENTITY,
         );
     }
 }
@@ -1355,6 +1363,120 @@ pub fn clear_paint_flags_subtree(arena: &mut NodeArena, node_id: NodeId) {
     }
     if let Some(element) = arena.get_mut(node_id) {
         element.dirty.remove(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT);
+    }
+}
+
+/// Identity values for the per-instance transform affine. The instance encodes
+/// the 2x2 linear part as a delta from identity (`a-1, b, c, d-1`) so all-zero
+/// is the identity; every instance literal is constructed with these and the
+/// real transform is stamped onto a transformed node's own instances after
+/// emit (see [`stamp_xform_quads`] / the stamping in `walk_for_batch`).
+const IDENTITY_XFORM: [f32; 4] = [0.0; 4];
+const IDENTITY_XFORM_TRANSLATE: [f32; 2] = [0.0; 2];
+
+/// A 2x3 affine transform `x' = a*x + c*y + e`, `y' = b*x + d*y + f`, in
+/// screen pixels. Used to compose CSS `transform`s down the paint subtree.
+#[derive(Clone, Copy)]
+struct Affine2 {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+impl Affine2 {
+    const IDENTITY: Affine2 = Affine2 { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+
+    fn is_identity(self) -> bool {
+        self.a == 1.0
+            && self.b == 0.0
+            && self.c == 0.0
+            && self.d == 1.0
+            && self.e == 0.0
+            && self.f == 0.0
+    }
+
+    /// `self ∘ other`: the affine that applies `other` first, then `self`.
+    fn compose(self, o: Affine2) -> Affine2 {
+        Affine2 {
+            a: self.a * o.a + self.c * o.b,
+            b: self.b * o.a + self.d * o.b,
+            c: self.a * o.c + self.c * o.d,
+            d: self.b * o.c + self.d * o.d,
+            e: self.a * o.e + self.c * o.f + self.e,
+            f: self.b * o.e + self.d * o.f + self.f,
+        }
+    }
+
+    /// The 2x2 linear part as a delta from identity (`[a-1, b, c, d-1]`), the
+    /// `QuadInstance::xform` / `GlyphInstance::xform` encoding.
+    fn xform_delta(self) -> [f32; 4] {
+        [self.a - 1.0, self.b, self.c, self.d - 1.0]
+    }
+
+    /// The translation part `[e, f]`.
+    fn xform_translate(self) -> [f32; 2] {
+        [self.e, self.f]
+    }
+
+    /// Six floats for the batch cache signature, in the same delta-from-identity
+    /// encoding as the instance, so the identity hashes to all-zero and matches
+    /// the derived `Default`.
+    fn signature(self) -> [f32; 6] {
+        [self.a - 1.0, self.b, self.c, self.d - 1.0, self.e, self.f]
+    }
+}
+
+/// Build the screen-space affine for a CSS `transform` about the element's
+/// center (transform-origin defaults to `50% 50%`; the app never authors
+/// another origin). Returns the identity for an identity transform so callers
+/// keep the matrix-free fast path. `render_x`/`render_y` are the element's
+/// painted top-left; `w`/`h` its border-box size.
+fn element_affine(
+    t: &unshit_core::style::types::Transform,
+    render_x: f32,
+    render_y: f32,
+    w: f32,
+    h: f32,
+) -> Affine2 {
+    if t.is_identity() {
+        return Affine2::IDENTITY;
+    }
+    let ox = render_x + w * 0.5;
+    let oy = render_y + h * 0.5;
+    let (sin, cos) = t.rotate.sin_cos();
+    // Linear part = Rotate · Scale (a point is scaled, then rotated), matching
+    // the canonical `Translate · Rotate · Scale` compose order.
+    let a = t.scale_x * cos;
+    let b = t.scale_x * sin;
+    let c = -t.scale_y * sin;
+    let d = t.scale_y * cos;
+    let tx = t.translate_x.map(|v| v.resolve(w)).unwrap_or(0.0);
+    let ty = t.translate_y.map(|v| v.resolve(h)).unwrap_or(0.0);
+    // p' = O + L·(p - O) + T  =>  p' = L·p + (O - L·O + T). The translate is
+    // applied in screen space (outermost), correct for the canonical order.
+    let e = ox - (a * ox + c * oy) + tx;
+    let f = oy - (b * ox + d * oy) + ty;
+    Affine2 { a, b, c, d, e, f }
+}
+
+/// Stamp a transform onto a contiguous run of just-emitted quads (a node's own
+/// primitives). No-op encoding identity is never passed here (callers gate on
+/// `is_identity`).
+fn stamp_xform_quads(quads: &mut [QuadInstance], xform: [f32; 4], translate: [f32; 2]) {
+    for q in quads {
+        q.xform = xform;
+        q.xform_translate = translate;
+    }
+}
+
+/// Stamp a transform onto a contiguous run of just-emitted glyphs.
+fn stamp_xform_glyphs(glyphs: &mut [GlyphInstance], xform: [f32; 4], translate: [f32; 2]) {
+    for g in glyphs {
+        g.xform = xform;
+        g.xform_translate = translate;
     }
 }
 
@@ -1384,6 +1506,7 @@ fn walk_for_batch(
     parent_glyph_keys: Option<&mut FxHashSet<GlyphKey>>,
     mut line_cache: Option<&mut LineQuadCache>,
     cursor_blink_force_dirty: &FxHashSet<NodeId>,
+    parent_xform: Affine2,
 ) {
     let Some(element) = arena.get(node_id) else {
         return;
@@ -1414,17 +1537,31 @@ fn walk_for_batch(
     // px corners pass through unchanged, so this also covers the f32 fast path.
     let border_radius = style.border_radius_src.resolve(rect.width.min(rect.height));
 
-    // CSS `transform: translateX(...)` is applied here as a pure render
-    // space offset. The layout rect keeps its in flow position so siblings
-    // and hit testing are unaffected; only the painted position shifts.
-    // Transform offsets propagate down into child scroll offsets so the
-    // whole subtree translates together.
-    let transform_dx = style.transform_translate_x.map(|t| t.resolve(rect.width)).unwrap_or(0.0);
-
-    let render_x = rect.x - scroll_offset_x + transform_dx;
+    let render_x = rect.x - scroll_offset_x;
     let render_y = rect.y - scroll_offset_y;
-    let cache_signature =
-        BatchCacheSignature::new([render_x, render_y, rect.width, rect.height], clip_rect);
+
+    // CSS `transform` is applied at paint time as a screen-space affine that
+    // does not disturb layout (siblings and hit-testing keep the in-flow
+    // position). This element's transform is composed about its center with the
+    // inherited subtree transform; the result is baked into every primitive
+    // this node emits (stamped after emit) and threaded to children so the
+    // whole subtree transforms together. The identity case stays matrix-free.
+    let node_xform = parent_xform.compose(element_affine(
+        &style.transform,
+        render_x,
+        render_y,
+        rect.width,
+        rect.height,
+    ));
+
+    // The transform is part of the cache signature so a node re-emits when its
+    // own OR any ancestor's transform changes (an ancestor change alters
+    // `node_xform` here even when the node's content is otherwise clean).
+    let cache_signature = BatchCacheSignature::new(
+        [render_x, render_y, rect.width, rect.height],
+        clip_rect,
+        node_xform.signature(),
+    );
 
     // Damage-aware skip: if neither PAINT nor SUBTREE_PAINT is set, replay the
     // previously cached primitive instances and skip the entire subtree.
@@ -1557,12 +1694,9 @@ fn walk_for_batch(
     } else {
         (scroll_offset_x, scroll_offset_y)
     };
-    // Propagate the transform offset to children so the whole subtree
-    // moves with the translated element. A child's render_x is computed as
-    // `rect.x - scroll_offset_x`, so subtracting `transform_dx` from the
-    // scroll offset effectively adds it to the child's render position,
-    // matching the shift we already applied to this element's own paint.
-    let child_scroll_x = child_scroll_x - transform_dx;
+    // (CSS `transform` — including translate — now propagates to the subtree
+    // via `node_xform` baked into each instance's affine, not via the child
+    // scroll offset.)
 
     if is_visible && style.outline_width > 0.0 && style.outline_color.a > 0 {
         let expand = style.outline_width + style.outline_offset;
@@ -1589,6 +1723,8 @@ fn walk_for_batch(
             mask_stops_01: EMPTY_MASK_STOPS,
             mask_stops_23: EMPTY_MASK_STOPS,
             mask_params: EMPTY_MASK_PARAMS,
+            xform: IDENTITY_XFORM,
+            xform_translate: IDENTITY_XFORM_TRANSLATE,
         });
     }
 
@@ -1670,6 +1806,8 @@ fn walk_for_batch(
                 mask_stops_01: EMPTY_MASK_STOPS,
                 mask_stops_23: EMPTY_MASK_STOPS,
                 mask_params: EMPTY_MASK_PARAMS,
+                xform: IDENTITY_XFORM,
+                xform_translate: IDENTITY_XFORM_TRANSLATE,
             });
         }
 
@@ -1727,6 +1865,8 @@ fn walk_for_batch(
                 mask_stops_01,
                 mask_stops_23,
                 mask_params,
+                xform: IDENTITY_XFORM,
+                xform_translate: IDENTITY_XFORM_TRANSLATE,
             });
         }
 
@@ -1760,6 +1900,8 @@ fn walk_for_batch(
                 mask_stops_01: EMPTY_MASK_STOPS,
                 mask_stops_23: EMPTY_MASK_STOPS,
                 mask_params: EMPTY_MASK_PARAMS,
+                xform: IDENTITY_XFORM,
+                xform_translate: IDENTITY_XFORM_TRANSLATE,
             });
         }
     }
@@ -1835,6 +1977,8 @@ fn walk_for_batch(
                     mask_stops_01: EMPTY_MASK_STOPS,
                     mask_stops_23: EMPTY_MASK_STOPS,
                     mask_params: EMPTY_MASK_PARAMS,
+                    xform: IDENTITY_XFORM,
+                    xform_translate: IDENTITY_XFORM_TRANSLATE,
                 });
 
                 // Thumb position.
@@ -1868,6 +2012,8 @@ fn walk_for_batch(
                     mask_stops_01: EMPTY_MASK_STOPS,
                     mask_stops_23: EMPTY_MASK_STOPS,
                     mask_params: EMPTY_MASK_PARAMS,
+                    xform: IDENTITY_XFORM,
+                    xform_translate: IDENTITY_XFORM_TRANSLATE,
                 });
             }
             InputType::Text | InputType::Password | InputType::Number => {
@@ -2064,6 +2210,8 @@ fn walk_for_batch(
                         mask_stops_01: EMPTY_MASK_STOPS,
                         mask_stops_23: EMPTY_MASK_STOPS,
                         mask_params: EMPTY_MASK_PARAMS,
+                        xform: IDENTITY_XFORM,
+                        xform_translate: IDENTITY_XFORM_TRANSLATE,
                     });
                 }
             }
@@ -2218,6 +2366,8 @@ fn walk_for_batch(
                                         mask_stops_01: EMPTY_MASK_STOPS,
                                         mask_stops_23: EMPTY_MASK_STOPS,
                                         mask_params: EMPTY_MASK_PARAMS,
+                                        xform: IDENTITY_XFORM,
+                                        xform_translate: IDENTITY_XFORM_TRANSLATE,
                                     },
                                 );
                             }
@@ -2281,6 +2431,8 @@ fn walk_for_batch(
                         mask_stops_01: EMPTY_MASK_STOPS,
                         mask_stops_23: EMPTY_MASK_STOPS,
                         mask_params: EMPTY_MASK_PARAMS,
+                        xform: IDENTITY_XFORM,
+                        xform_translate: IDENTITY_XFORM_TRANSLATE,
                     });
                 }
             }
@@ -2436,6 +2588,17 @@ fn walk_for_batch(
         let gend = lb.glyph_instances.len();
         let _ = flush_span(&mut lb.draw_spans, DrawKind::Quad, quad_cursor, qend);
         let _ = flush_span(&mut lb.draw_spans, DrawKind::Glyph, glyph_cursor, gend);
+        // Bake this node's own CSS transform onto the primitives it emitted
+        // before recursing (background / border / shadow / text / grid).
+        // Children compose their own transform during recursion; this node's
+        // post-children scrollbar/grip quads are stamped below. Identity nodes
+        // keep the matrix-free fast path (instances stay at the zero default).
+        if !node_xform.is_identity() {
+            let xf = node_xform.xform_delta();
+            let xt = node_xform.xform_translate();
+            stamp_xform_quads(&mut lb.quad_instances[quad_start..qend], xf, xt);
+            stamp_xform_glyphs(&mut lb.glyph_instances[glyph_start..gend], xf, xt);
+        }
     }
 
     // Collect children into a Vec so we can sort by z-index.
@@ -2501,6 +2664,7 @@ fn walk_for_batch(
             Some(&mut node_glyph_keys),
             line_cache.as_deref_mut(),
             cursor_blink_force_dirty,
+            node_xform,
         );
     }
 
@@ -2554,6 +2718,8 @@ fn walk_for_batch(
                     mask_stops_01: EMPTY_MASK_STOPS,
                     mask_stops_23: EMPTY_MASK_STOPS,
                     mask_params: EMPTY_MASK_PARAMS,
+                    xform: IDENTITY_XFORM,
+                    xform_translate: IDENTITY_XFORM_TRANSLATE,
                 });
             };
 
@@ -2621,6 +2787,8 @@ fn walk_for_batch(
                 mask_stops_01: EMPTY_MASK_STOPS,
                 mask_stops_23: EMPTY_MASK_STOPS,
                 mask_params: EMPTY_MASK_PARAMS,
+                xform: IDENTITY_XFORM,
+                xform_translate: IDENTITY_XFORM_TRANSLATE,
             });
         }
     }
@@ -2630,6 +2798,16 @@ fn walk_for_batch(
         let lb = batch.layer_mut(effective_layer);
         let qend = lb.quad_instances.len();
         let _ = flush_span(&mut lb.draw_spans, DrawKind::Quad, quad_cursor, qend);
+        // Bake the transform onto this node's post-children own quads
+        // (scrollbar track/thumb, resize grip), which sit in `[quad_cursor,
+        // qend)`. Children's instances are already stamped and excluded.
+        if !node_xform.is_identity() {
+            stamp_xform_quads(
+                &mut lb.quad_instances[quad_cursor..qend],
+                node_xform.xform_delta(),
+                node_xform.xform_translate(),
+            );
+        }
     }
 
     // Snapshot primitives and draw spans into the pending cache.
@@ -2922,6 +3100,8 @@ fn emit_text_glyphs_cached(
                     uv_max: [atlas_entry.uv_rect[2], atlas_entry.uv_rect[3]],
                     color: color_linear,
                     clip_rect,
+                    xform: IDENTITY_XFORM,
+                    xform_translate: IDENTITY_XFORM_TRANSLATE,
                 });
             }
             return;
@@ -2991,6 +3171,8 @@ fn emit_text_glyphs_cached(
                 uv_max: [entry.uv_rect[2], entry.uv_rect[3]],
                 color: color_linear,
                 clip_rect,
+                xform: IDENTITY_XFORM,
+                xform_translate: IDENTITY_XFORM_TRANSLATE,
             });
         }
     }
@@ -3252,6 +3434,8 @@ fn push_terminal_quad(
         mask_stops_01: EMPTY_MASK_STOPS,
         mask_stops_23: EMPTY_MASK_STOPS,
         mask_params: EMPTY_MASK_PARAMS,
+        xform: IDENTITY_XFORM,
+        xform_translate: IDENTITY_XFORM_TRANSLATE,
     });
 }
 
@@ -3900,6 +4084,8 @@ fn emit_grid_row_backgrounds(
             mask_stops_01: EMPTY_MASK_STOPS,
             mask_stops_23: EMPTY_MASK_STOPS,
             mask_params: EMPTY_MASK_PARAMS,
+            xform: IDENTITY_XFORM,
+            xform_translate: IDENTITY_XFORM_TRANSLATE,
         });
     }
 }
@@ -4265,6 +4451,8 @@ fn emit_grid_cells(
                 mask_stops_01: EMPTY_MASK_STOPS,
                 mask_stops_23: EMPTY_MASK_STOPS,
                 mask_params: EMPTY_MASK_PARAMS,
+                xform: IDENTITY_XFORM,
+                xform_translate: IDENTITY_XFORM_TRANSLATE,
             });
         }
     }
@@ -4426,6 +4614,8 @@ fn emit_grid_cell_glyph(
         uv_max: [resolved.entry.uv_rect[2], resolved.entry.uv_rect[3]],
         color: fg_linear,
         clip_rect,
+        xform: IDENTITY_XFORM,
+        xform_translate: IDENTITY_XFORM_TRANSLATE,
     });
 
     true
@@ -4917,6 +5107,8 @@ fn emit_select_node(
         mask_stops_01: EMPTY_MASK_STOPS,
         mask_stops_23: EMPTY_MASK_STOPS,
         mask_params: EMPTY_MASK_PARAMS,
+        xform: IDENTITY_XFORM,
+        xform_translate: IDENTITY_XFORM_TRANSLATE,
     });
 
     // Per-option rows
@@ -4947,6 +5139,8 @@ fn emit_select_node(
                 mask_stops_01: EMPTY_MASK_STOPS,
                 mask_stops_23: EMPTY_MASK_STOPS,
                 mask_params: EMPTY_MASK_PARAMS,
+                xform: IDENTITY_XFORM,
+                xform_translate: IDENTITY_XFORM_TRANSLATE,
             });
         }
 
@@ -5369,6 +5563,88 @@ fn rasterize_grid_glyph_for_atlas(
             "",
             FontWeight::Normal,
         )
+    }
+}
+
+#[cfg(test)]
+mod transform_affine_tests {
+    use super::*;
+    use unshit_core::style::types::{Transform, TransformX};
+
+    fn approx(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-4, "expected {b}, got {a}");
+    }
+
+    #[test]
+    fn identity_transform_is_matrix_free() {
+        let m = element_affine(&Transform::IDENTITY, 10.0, 20.0, 100.0, 50.0);
+        assert!(m.is_identity());
+        // Delta encoding of the identity is all-zero (matches the instance and
+        // cache-signature defaults).
+        assert_eq!(m.xform_delta(), [0.0; 4]);
+        assert_eq!(m.xform_translate(), [0.0; 2]);
+        assert_eq!(m.signature(), [0.0; 6]);
+    }
+
+    #[test]
+    fn compose_with_identity_is_a_noop() {
+        let t = Transform { scale_x: 2.0, scale_y: 2.0, ..Transform::IDENTITY };
+        let m = element_affine(&t, 0.0, 0.0, 100.0, 100.0);
+        let l = Affine2::IDENTITY.compose(m);
+        let r = m.compose(Affine2::IDENTITY);
+        for (a, b) in m.signature().iter().zip(l.signature().iter()) {
+            approx(*a, *b);
+        }
+        for (a, b) in m.signature().iter().zip(r.signature().iter()) {
+            approx(*a, *b);
+        }
+    }
+
+    #[test]
+    fn scale_about_center_fixes_the_center_point() {
+        // A box at (20,20) size 40x40 has center (40,40). `scale(0.5)` about the
+        // center must leave the center fixed and halve offsets from it.
+        let t = Transform { scale_x: 0.5, scale_y: 0.5, ..Transform::IDENTITY };
+        let m = element_affine(&t, 20.0, 20.0, 40.0, 40.0);
+        // Center stays put.
+        approx(m.a * 40.0 + m.c * 40.0 + m.e, 40.0);
+        approx(m.b * 40.0 + m.d * 40.0 + m.f, 40.0);
+        // The left edge (x=20) moves halfway toward the center (-> 30).
+        approx(m.a * 20.0 + m.c * 20.0 + m.e, 30.0);
+    }
+
+    #[test]
+    fn rotate_90_about_center_maps_right_to_bottom() {
+        // 90deg clockwise (screen space, y-down) about center (50,50): a point
+        // to the right of center maps to below center.
+        let t = Transform { rotate: std::f32::consts::PI / 2.0, ..Transform::IDENTITY };
+        let m = element_affine(&t, 0.0, 0.0, 100.0, 100.0);
+        // (90, 50) is 40px right of center -> should land 40px below center
+        // at (50, 90).
+        approx(m.a * 90.0 + m.c * 50.0 + m.e, 50.0);
+        approx(m.b * 90.0 + m.d * 50.0 + m.f, 90.0);
+    }
+
+    #[test]
+    fn translate_y_is_origin_independent() {
+        let t = Transform { translate_y: Some(TransformX::Px(-12.0)), ..Transform::IDENTITY };
+        let m = element_affine(&t, 7.0, 7.0, 33.0, 33.0);
+        // Pure translate: linear part is identity, only the y offset is set.
+        approx(m.a, 1.0);
+        approx(m.d, 1.0);
+        approx(m.e, 0.0);
+        approx(m.f, -12.0);
+    }
+
+    #[test]
+    fn nested_scales_multiply() {
+        // A child scaled 0.5 under a parent scaled 0.5 paints at 0.25 overall.
+        let half = Transform { scale_x: 0.5, scale_y: 0.5, ..Transform::IDENTITY };
+        let parent = element_affine(&half, 0.0, 0.0, 100.0, 100.0);
+        let child = element_affine(&half, 0.0, 0.0, 100.0, 100.0);
+        let composed = parent.compose(child);
+        approx(composed.a, 0.25);
+        approx(composed.d, 0.25);
     }
 }
 
@@ -5975,8 +6251,10 @@ mod tests {
         // forward.
         let mut cache = BatchCache::new();
         let id = NodeId::DANGLING;
-        let old_sig = BatchCacheSignature::new([0.0, 680.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0]);
-        let new_sig = BatchCacheSignature::new([0.0, 888.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0]);
+        let old_sig =
+            BatchCacheSignature::new([0.0, 680.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0], [0.0; 6]);
+        let new_sig =
+            BatchCacheSignature::new([0.0, 888.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0], [0.0; 6]);
 
         cache.begin_frame();
         cache.record_with_signature(
@@ -6146,6 +6424,8 @@ mod tests {
             mask_stops_01: EMPTY_MASK_STOPS,
             mask_stops_23: EMPTY_MASK_STOPS,
             mask_params: EMPTY_MASK_PARAMS,
+            xform: IDENTITY_XFORM,
+            xform_translate: IDENTITY_XFORM_TRANSLATE,
         };
         batch.quad_instances.push(dummy_quad);
 
@@ -7966,6 +8246,8 @@ mod tests {
                 uv_max: [1.0; 2],
                 color: [1.0; 4],
                 clip_rect: [0.0; 4],
+                xform: IDENTITY_XFORM,
+                xform_translate: IDENTITY_XFORM_TRANSLATE,
             })
             .collect();
         let keys: Vec<GlyphKey> = (0..cols)
@@ -8056,6 +8338,8 @@ mod tests {
                 uv_max: [1.0; 2],
                 color: [1.0; 4],
                 clip_rect: [0.0; 4],
+                xform: IDENTITY_XFORM,
+                xform_translate: IDENTITY_XFORM_TRANSLATE,
             })
             .collect();
 

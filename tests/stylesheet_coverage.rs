@@ -39,7 +39,6 @@ const KNOWN_UNSUPPORTED: &[&str] = &[
     "background-position",
     "background-size",
     "text-shadow", // `none` is accepted; real shadow lists drop (no shadow paint)
-    "transform",   // only translateX(); scale/rotate/translateY drop
 ];
 
 /// A dropped declaration is "expected" if its property is a known gap, or its

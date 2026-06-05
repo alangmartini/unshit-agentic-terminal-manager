@@ -135,9 +135,8 @@ pub enum TransitionProperty {
     MaxWidth,
     MinHeight,
     MaxHeight,
-    /// CSS `transform`. Only the render-animatable `translateX` component is
-    /// interpolated today (see `extract_value`); other transform components
-    /// (`translateY`, `scale`, `rotate`, ...) are not yet animatable and snap.
+    /// CSS `transform`. The full transform (translate / scale / rotate) is
+    /// interpolated component-wise (see `lerp_transform`).
     Transform,
 }
 
@@ -199,8 +198,9 @@ pub enum AnimatableValue {
     Dimension(Dimension),
     Background(Background),
     BoxShadow(SmallVec<[BoxShadow; 2]>),
-    /// The render-animatable `translateX` component of `transform`.
-    TransformX(TransformX),
+    /// The full `transform` (translate / scale / rotate), interpolated
+    /// component-wise.
+    Transform(Transform),
 }
 
 impl AnimatableValue {
@@ -228,8 +228,8 @@ impl AnimatableValue {
             (AnimatableValue::BoxShadow(a), AnimatableValue::BoxShadow(b)) => {
                 AnimatableValue::BoxShadow(lerp_box_shadow_list(a, b, t))
             }
-            (AnimatableValue::TransformX(a), AnimatableValue::TransformX(b)) => {
-                AnimatableValue::TransformX(lerp_transform_x(a, b, t))
+            (AnimatableValue::Transform(a), AnimatableValue::Transform(b)) => {
+                AnimatableValue::Transform(lerp_transform(a, b, t))
             }
             // Mismatched types: snap to `other` at t >= 0.5.
             _ => {
@@ -315,6 +315,33 @@ fn lerp_transform_x(a: &TransformX, b: &TransformX, t: f32) -> TransformX {
                 *a
             }
         }
+    }
+}
+
+/// Interpolate one translate axis, treating an absent component as the
+/// identity (`0px`) so e.g. `translateY(8px)` -> none animates back to zero.
+fn lerp_translate_opt(a: Option<TransformX>, b: Option<TransformX>, t: f32) -> Option<TransformX> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => {
+            let av = a.unwrap_or(TransformX::Px(0.0));
+            let bv = b.unwrap_or(TransformX::Px(0.0));
+            Some(lerp_transform_x(&av, &bv, t))
+        }
+    }
+}
+
+/// Interpolate two `Transform`s component-wise. This matches CSS transition
+/// behavior for matching function lists (the common case here: scale<->scale,
+/// translate<->translate, rotate<->rotate), and degrades gracefully to
+/// independent per-component lerps for mismatched lists.
+fn lerp_transform(a: &Transform, b: &Transform, t: f32) -> Transform {
+    Transform {
+        translate_x: lerp_translate_opt(a.translate_x, b.translate_x, t),
+        translate_y: lerp_translate_opt(a.translate_y, b.translate_y, t),
+        scale_x: lerp_f32(a.scale_x, b.scale_x, t),
+        scale_y: lerp_f32(a.scale_y, b.scale_y, t),
+        rotate: lerp_f32(a.rotate, b.rotate, t),
     }
 }
 
@@ -540,12 +567,9 @@ pub fn extract_value(style: &ComputedStyle, prop: TransitionProperty) -> Animata
         TransitionProperty::MaxWidth => AnimatableValue::Dimension(style.max_width),
         TransitionProperty::MinHeight => AnimatableValue::Dimension(style.min_height),
         TransitionProperty::MaxHeight => AnimatableValue::Dimension(style.max_height),
-        // Only the render-animatable `translateX` component is interpolated.
-        // An absent transform is the identity (zero pixel offset), matching the
-        // renderer's `unwrap_or(0.0)` fallback.
-        TransitionProperty::Transform => {
-            AnimatableValue::TransformX(style.transform_translate_x.unwrap_or(TransformX::Px(0.0)))
-        }
+        // The full transform (translate / scale / rotate) interpolates
+        // component-wise. An absent transform is the identity.
+        TransitionProperty::Transform => AnimatableValue::Transform(style.transform),
         // All is handled by expanding to individual properties.
         TransitionProperty::All => AnimatableValue::Float(0.0),
     }
@@ -589,8 +613,8 @@ pub fn apply_value(style: &mut ComputedStyle, prop: TransitionProperty, value: &
         (TransitionProperty::MaxWidth, AnimatableValue::Dimension(v)) => style.max_width = *v,
         (TransitionProperty::MinHeight, AnimatableValue::Dimension(v)) => style.min_height = *v,
         (TransitionProperty::MaxHeight, AnimatableValue::Dimension(v)) => style.max_height = *v,
-        (TransitionProperty::Transform, AnimatableValue::TransformX(v)) => {
-            style.transform_translate_x = Some(*v);
+        (TransitionProperty::Transform, AnimatableValue::Transform(v)) => {
+            style.transform = *v;
         }
         _ => {}
     }
@@ -636,7 +660,7 @@ fn values_equal(a: &AnimatableValue, b: &AnimatableValue) -> bool {
         (AnimatableValue::Dimension(a), AnimatableValue::Dimension(b)) => a == b,
         (AnimatableValue::Background(a), AnimatableValue::Background(b)) => a == b,
         (AnimatableValue::BoxShadow(a), AnimatableValue::BoxShadow(b)) => a == b,
-        (AnimatableValue::TransformX(a), AnimatableValue::TransformX(b)) => a == b,
+        (AnimatableValue::Transform(a), AnimatableValue::Transform(b)) => a == b,
         _ => false,
     }
 }
@@ -1124,29 +1148,28 @@ mod tests {
 
     #[test]
     fn test_transform_extract_apply_round_trip() {
-        // `transform` (translateX) is now a first-class animatable property.
-        // Extract pulls the render-animatable component; apply writes it back.
+        // `transform` is a first-class animatable property: extract pulls the
+        // whole `Transform`, apply writes it back.
         let mut style = ComputedStyle::default();
-        assert!(style.transform_translate_x.is_none());
+        assert!(style.transform.is_identity());
 
-        // Absent transform extracts as the identity (zero px offset).
+        // Absent transform extracts as the identity.
         match extract_value(&style, TransitionProperty::Transform) {
-            AnimatableValue::TransformX(TransformX::Px(v)) => assert_eq!(v, 0.0),
-            other => panic!("expected TransformX(Px(0.0)), got {:?}", other),
+            AnimatableValue::Transform(t) => assert!(t.is_identity()),
+            other => panic!("expected Transform(IDENTITY), got {:?}", other),
         }
 
         // Apply an interpolated value back onto the style.
-        apply_value(
-            &mut style,
-            TransitionProperty::Transform,
-            &AnimatableValue::TransformX(TransformX::Px(24.0)),
-        );
-        assert_eq!(style.transform_translate_x, Some(TransformX::Px(24.0)));
+        let target = Transform { translate_x: Some(TransformX::Px(24.0)), ..Transform::IDENTITY };
+        apply_value(&mut style, TransitionProperty::Transform, &AnimatableValue::Transform(target));
+        assert_eq!(style.transform.translate_x, Some(TransformX::Px(24.0)));
 
         // Round-trips back out.
         match extract_value(&style, TransitionProperty::Transform) {
-            AnimatableValue::TransformX(TransformX::Px(v)) => assert_eq!(v, 24.0),
-            other => panic!("expected TransformX(Px(24.0)), got {:?}", other),
+            AnimatableValue::Transform(t) => {
+                assert_eq!(t.translate_x, Some(TransformX::Px(24.0)))
+            }
+            other => panic!("expected Transform with translate_x, got {:?}", other),
         }
     }
 
@@ -1172,10 +1195,11 @@ mod tests {
 
     #[test]
     fn test_start_transitions_transform_translatex() {
-        // A `transition: transform ...` def animates the translateX component.
+        // A `transition: transform ...` def animates the transform.
         let old = ComputedStyle::default();
         let mut new = ComputedStyle::default();
-        new.transform_translate_x = Some(TransformX::Px(40.0));
+        new.transform =
+            Transform { translate_x: Some(TransformX::Px(40.0)), ..Transform::IDENTITY };
 
         let defs = vec![TransitionDef {
             property: TransitionProperty::Transform,

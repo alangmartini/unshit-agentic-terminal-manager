@@ -709,6 +709,8 @@ mod tests {
             mask_stops_01: [0.0; 4],
             mask_stops_23: [0.0; 4],
             mask_params: [0.0; 4],
+            xform: [0.0; 4],
+            xform_translate: [0.0; 2],
         };
         let line_id: u64 = 9;
         cache.store(node, line_id, 42, sig, vec![quad], vec![], vec![], vec![], 0);

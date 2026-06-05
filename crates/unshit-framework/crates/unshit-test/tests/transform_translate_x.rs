@@ -10,7 +10,7 @@
 
 use unshit_core::element::*;
 use unshit_core::style::parse::{apply_declaration, StyleDeclaration};
-use unshit_core::style::types::{ComputedStyle, TransformX};
+use unshit_core::style::types::{ComputedStyle, Transform, TransformX};
 use unshit_test::TestHarness;
 
 fn try_with_gpu(h: TestHarness) -> Option<TestHarness> {
@@ -40,7 +40,8 @@ fn parse_translate_x_px_populates_declaration() {
         .query(".shift")
         .expect("shift exists")
         .computed_style
-        .transform_translate_x
+        .transform
+        .translate_x
         .expect("transform parsed");
     assert_eq!(tx, TransformX::Px(50.0));
 }
@@ -62,7 +63,8 @@ fn parse_translate_x_percent_populates_declaration() {
         .query(".shift")
         .expect("shift exists")
         .computed_style
-        .transform_translate_x
+        .transform
+        .translate_x
         .expect("transform parsed");
     assert_eq!(tx, TransformX::Percent(0.5));
 }
@@ -83,7 +85,8 @@ fn parse_translate_x_negative_px() {
         .query(".shift")
         .expect("shift exists")
         .computed_style
-        .transform_translate_x
+        .transform
+        .translate_x
         .expect("transform parsed");
     assert_eq!(tx, TransformX::Px(-25.0));
 }
@@ -100,21 +103,28 @@ fn transform_x_resolve_resolves_px_and_percent() {
 #[test]
 fn apply_declaration_sets_transform_translate_x() {
     // apply_declaration wires the parsed StyleDeclaration into the
-    // computed style. A fresh style starts with `None` and must come out
-    // as `Some(Px(10))` after application.
+    // computed style. A fresh style starts at identity and must come out
+    // with `translate_x = Some(Px(10))` after application.
     let mut style = ComputedStyle::default();
-    assert!(style.transform_translate_x.is_none());
-    apply_declaration(&mut style, &StyleDeclaration::TransformTranslateX(TransformX::Px(10.0)));
-    assert_eq!(style.transform_translate_x, Some(TransformX::Px(10.0)));
+    assert!(style.transform.is_identity());
+    apply_declaration(
+        &mut style,
+        &StyleDeclaration::Transform(Transform {
+            translate_x: Some(TransformX::Px(10.0)),
+            ..Transform::IDENTITY
+        }),
+    );
+    assert_eq!(style.transform.translate_x, Some(TransformX::Px(10.0)));
 }
 
 #[test]
 fn parse_unsupported_transform_function_drops_declaration() {
-    // `transform: scale(2)` is not supported today. The declaration is
-    // dropped rather than panicking, so other declarations on the same
+    // `skewX(...)` is not supported (only translate/scale/rotate are). A list
+    // containing an unsupported function drops the WHOLE declaration rather
+    // than panicking or partially applying, so other declarations on the same
     // selector still apply.
     let css = r#"
-        .unsupported { color: #ff0000; transform: scale(2); }
+        .unsupported { color: #ff0000; transform: skewX(10deg); }
     "#;
     let h = TestHarness::new(
         css,
@@ -123,7 +133,7 @@ fn parse_unsupported_transform_function_drops_declaration() {
         100.0,
     );
     let style = h.query(".unsupported").expect("element").computed_style;
-    assert!(style.transform_translate_x.is_none());
+    assert!(style.transform.is_identity());
     // Color should still be red because apply_declaration keeps running
     // even though the transform entry failed.
     assert_eq!(style.color.r, 255);
@@ -189,8 +199,8 @@ fn translate_x_does_not_shift_sibling_layout() {
         b.layout_rect.x,
     );
     // The transform parse must have landed on `.a` but not on `.b`.
-    assert_eq!(a.computed_style.transform_translate_x, Some(TransformX::Px(50.0)));
-    assert_eq!(b.computed_style.transform_translate_x, None);
+    assert_eq!(a.computed_style.transform.translate_x, Some(TransformX::Px(50.0)));
+    assert!(b.computed_style.transform.is_identity());
 }
 
 #[test]

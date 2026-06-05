@@ -31,6 +31,8 @@ struct QuadInstance {
     @location(23) mask_stops_01: vec4<f32>,
     @location(24) mask_stops_23: vec4<f32>,
     @location(25) mask_params: vec4<f32>,
+    @location(26) xform: vec4<f32>,
+    @location(27) xform_translate: vec2<f32>,
 };
 
 struct VertexOutput {
@@ -86,7 +88,18 @@ fn vs_main(
     let expanded_pos = instance.pos - vec2(expand);
     let expanded_size = instance.size + vec2(expand * 2.0);
 
-    let pixel_pos = expanded_pos + corner * expanded_size;
+    let local_pixel_pos = expanded_pos + corner * expanded_size;
+    // Apply the CSS `transform` affine to the screen-space position. The 2x2
+    // linear part is stored as a delta from identity (`a-1,b,c,d-1`) so an
+    // all-zero instance is the identity and pays nothing. Local (in-quad)
+    // coordinates stay untransformed, so the border-radius SDF and gradient
+    // projection rotate / scale with the quad, while the ancestor clip test
+    // (which reads `pixel_pos`) sees the final on-screen position.
+    let xform_m = mat2x2<f32>(
+        instance.xform.x + 1.0, instance.xform.y,
+        instance.xform.z, instance.xform.w + 1.0,
+    );
+    let pixel_pos = xform_m * local_pixel_pos + instance.xform_translate;
     let ndc = vec2(
         (pixel_pos.x / uniforms.viewport.x) * 2.0 - 1.0,
         1.0 - (pixel_pos.y / uniforms.viewport.y) * 2.0,

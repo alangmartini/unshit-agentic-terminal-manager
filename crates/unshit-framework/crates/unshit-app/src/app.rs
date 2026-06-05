@@ -3377,6 +3377,8 @@ impl ApplicationHandler for AppHandler {
                             mask_stops_01: [0.0, 0.0, 0.0, 0.0],
                             mask_stops_23: [0.0, 0.0, 0.0, 0.0],
                             mask_params: [0.0, 0.0, 0.0, 0.0],
+                            xform: [0.0; 4],
+                            xform_translate: [0.0; 2],
                         },
                     );
                 }

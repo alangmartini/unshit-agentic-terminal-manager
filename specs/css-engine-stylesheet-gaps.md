@@ -33,6 +33,15 @@ table row here.
   `--token` overrides apply — including multi-level base-scope aliases
   (`--cp-accent: var(--amber-300)` picks up a theme's `--amber-300`). See
   `changelog.d/unreleased/2026-06-05-cascade-aware-custom-properties.md`.
+- **Tier 2 — `transform` (full affine) landed 2026-06-05** (the highest-value
+  remaining gap): `scale` / `rotate` / `translateX` / `translateY` and the
+  combined `translateY(..) scale(..)` now compose into a per-element 2x3 affine
+  about the box center, baked into every emitted instance and propagated to the
+  subtree; both transitions and keyframes (modal-in `translateY+scale`, cd-lift)
+  interpolate it component-wise. The renderer separates `local_pos` (in-quad
+  border-radius / gradient, left untransformed) from `pixel_pos` (transformed,
+  drives NDC + ancestor clip), so the fragment shaders are unchanged. See
+  `changelog.d/unreleased/2026-06-05-css-transform-affine.md`.
 - **Tier 2 — still deferred:** the table below. Each is genuinely renderer-,
   text-layout-, or value-evaluator-bound — not a one-line parse arm.
 
@@ -51,8 +60,7 @@ table row here.
 
 | Property / form | Drops today | Class | Effort | Value |
 |---|---|---|---|---|
-| `transform: scale/rotate/translateY` | `scale/rotate/translateY` drop; only `translateX` is applied | renderer (affine) | L | H |
-| `text-shadow` (non-`none`) | `none` accepted; real shadow lists drop | small-render | M | M |
+| `text-shadow` (non-`none`) | `none` accepted; real shadow lists drop | renderer (offscreen blur) | L | M |
 | `filter: drop-shadow(...)` | no element `filter` field; only `backdrop-filter` blur exists | renderer (offscreen) | L | M |
 | `word-break: break-word` | no `set_wrap` control in the shaper | text-layout | M | M |
 | `mix-blend-mode: multiply` | blend is baked per-pipeline, not per-instance | renderer (blend) | L | L |
@@ -65,20 +73,24 @@ table row here.
 
 ## Plans (highest value first)
 
-### `transform: scale` / `rotate` / `translateY`  — renderer (affine)
-The paint path applies only a scalar x-offset (`transform_dx`, `batch.rs:~1411`);
-`QuadInstance` / `GlyphInstance` carry no transform matrix. Needs a `mat2x2` /
-`[f32;6]` instance field threaded through `QuadInstance` + the vertex attr array
-(`pipeline/quad.rs`) + the WGSL `QuadInstance`/`VertexOutput`/`vs_main` (transform
-the corner before NDC), a parallel `GlyphInstance`/text-shader change, a
-`transform-origin` field, and rework of the per-fragment `clip_rect` test +
-gradient projection (`quad.wgsl:~142`), which assume an axis-aligned quad
-(rotation breaks both). **Quick win inside this cluster:** `translateY` is a
-scalar `dy` symmetric to the existing `dx` (add `transform_translate_y`, a
-`transform_dy` at `batch.rs:~1411` applied to `render_y`, child-scroll-y
-propagation) with no shader change — but `transform` only leaves
-`KNOWN_UNSUPPORTED` once `scale` + `rotate` also land. Couples with the
-`transition` transform animation already wired in tier 1.
+### `transform` (full affine)  — LANDED 2026-06-05
+`scale` / `rotate` / `translateX` / `translateY` (+ the combined
+`translateY(..) scale(..)`) compose into a per-element 2x3 affine about the box
+center (transform-origin defaults to `50% 50%`; none is authored). The matrix is
+threaded down the paint recursion (`parent_xform`), composed per node, and baked
+into each emitted instance via a delta-from-identity `xform: [f32;4]` +
+`xform_translate: [f32;2]` (zero = identity, so untransformed elements stay on
+the matrix-free fast path). The original triage feared a clip-rect + gradient
+rework, but the shader already separates `local_pos` (in-quad math, untransformed
+— rotates/scales *with* the quad) from `pixel_pos` (transformed → NDC + the
+axis-aligned ancestor clip), so **the fragment shaders are unchanged**; only the
+four vertex shaders transform `pixel_pos`. The cache signature gained the affine
+so an ancestor transform change re-emits descendants. The old scalar
+`transform_dx` render-offset mechanism was retired. **Accepted limitation:**
+descendant `overflow` clipping is computed in the element's untransformed space,
+so a *rotated* clipping ancestor may mis-clip mid-animation (exact at rest, since
+animated transforms rest at identity). See
+`changelog.d/unreleased/2026-06-05-css-transform-affine.md`.
 
 ### `text-overflow: ellipsis`  — LANDED 2026-06-05
 `TextOverflow {Clip, Ellipsis}` field + non-inheriting parse arm; the render gate
@@ -92,13 +104,19 @@ RTL truncates the logical tail rather than the CSS-perfect visual-left end (fit 
 always guaranteed). Sub-pixel atlas-bitmap overhang vs the advance-based fit
 formula is a universal, pre-existing concern covered by a 0.5px epsilon.
 
-### `text-shadow` (real, non-`none`)  — small-render
-`none` is already accepted (tier 1). Sharp/offset shadows: re-emit the glyph run
-at an offset with the shadow color before the main run (second
-`emit_text_glyphs_cached` at `batch.rs:~2156`), reusing atlas coverage — no
-shader change. Needs a `text_shadow` field + `parse_text_shadow_list` modeled on
-`parse_box_shadow_list` (`parse.rs:~3229`). Blurred shadows are large-render
-(offscreen + blur).
+### `text-shadow` (real, non-`none`)  — renderer (offscreen blur)
+`none` is already accepted (tier 1). **Correction (was mis-scoped as a cheap
+"sharp re-emit"):** every `text-shadow` the app actually authors is a *zero-offset
+blurred glow* — `0 0 8px …` (workspace name), `0 0 6px var(--accent-a35)` (the
+prompt), `0 0 8px …` (search highlight). A sharp re-emit at offset `(0,0)` with no
+blur would draw the shadow glyphs exactly behind the main glyphs (fully occluded)
+and render *nothing* of the intended halo — i.e. a masking no-op the Boundaries
+below forbid. So for this stylesheet `text-shadow` is the **large-render** path:
+an offscreen alpha pass of the glyph run + a separable blur + composite under the
+text (the same machinery `filter: drop-shadow` needs). A `text_shadow` field +
+`parse_text_shadow_list` (modeled on `parse_box_shadow_list`, `parse.rs:~3229`)
+is the easy part; the blur pass is the work. Sharp/offset shadows (none authored
+here) would be the cheap re-emit, but are not what unblocks the app.
 
 ### `filter: drop-shadow(...)`  — renderer (offscreen)
 Drop-shadow over arbitrary content needs an offscreen-of-own-content alpha pass +
@@ -158,13 +176,19 @@ against an ordered `ScopeEnv` (`[self-widget scope, active .app.theme-* root,
 (cycle-guarded), then re-parsed through the existing leaf parsers. Theme-block
 overrides now apply (drops 579 → 0); a parse-time coverage pass routes
 unresolvable scoped `var()` into `dropped` for the guardrail.
-Follow-ups (non-blocking): **(a) perf** — the self-scope walk gate is conservative
-(disabled when any token scope has a class-free terminal, which this stylesheet
-has), so every element currently pays the scope walk per cascade pass; a cleaner
-gate is to build the `ScopeEnv` only for elements whose matched rules contain a
-`Deferred` declaration. **(b)** the `var(` capture gate doesn't catch `var()`
-immediately after `)`. **(c)** retiring the ~690 hand-authored concrete clones,
-one theme per commit (the engine no longer depends on them).
+Follow-ups (non-blocking): **(a) perf** — *corrected:* the self-scope walk gate
+is **already live** on this stylesheet, not defeated. Every non-base token scope
+(`.app.theme-*`, `.theme-chip.<name>`) has a class-bearing terminal compound, so
+`widget_scope_gate_unsafe` is `false` (asserted by `parse.rs`'s
+`widget_scope_classes_gate_skips_non_widget_elements` test) and
+`element_may_have_self_scope` returns `false` for the overwhelming majority of
+elements, skipping the walk. The earlier claim that "every element pays the scope
+walk" was wrong; the cleaner Deferred-gated `ScopeEnv` build is a marginal tidy-up,
+not a fix. **(b)** the `var(` capture gate doesn't catch `var()` immediately after
+`)`. **(c)** *corrected:* the ~690 "hand-authored concrete clones" are a
+pre-Stage-3 artifact already retired — only ~16 concrete per-theme declarations
+remain and none are redundant (the cascade golden confirms current output is
+correct), so there is effectively no clone-retirement work left.
 
 ## Commands
 
@@ -192,11 +216,18 @@ one theme per commit (the engine no longer depends on them).
 
 ## Open questions
 
-- `text-overflow: ellipsis` and cascade-aware custom properties are now landed
-  (the latter cleared the largest drop category). The next high-value pick is the
-  **`transform` affine matrix** (press `scale`, chevron/mark `rotate` — highest
-  visible micro-interaction value) vs a bounded win like real `text-shadow` or
-  `word-break`. Separately, two cascade follow-ups remain: the perf gate (build
-  `ScopeEnv` only when an element has a `Deferred` declaration) and Stage 5 clone
-  retirement (delete the ~690 hand-authored per-theme concrete declarations, one
-  theme per commit).
+- `text-overflow: ellipsis`, cascade-aware custom properties, and the full
+  `transform` affine are now landed — the three highest-value gaps. What remains
+  in the inventory is genuinely lower-value or genuinely large:
+  - **`word-break: break-word`** (M/M) is the only remaining *tractable* gap with
+    real (if narrow, single-use) value — one `.term-line` use; the trap is the
+    shape/measure cache key (a missed field silently serves stale shaping).
+  - **`text-shadow`** is NOT a cheap win for this app (every authored value is a
+    zero-offset blur glow → offscreen-blur path; see its plan). Same bucket as
+    `filter: drop-shadow`.
+  - The remaining table entries are all L-value (`mix-blend-mode`,
+    `vertical-align`, `background-position/size`, `scroll-margin`) or large
+    value-form work (`calc()`, `inherit`).
+- The two cascade "follow-ups" both evaporated under inspection (see the
+  cascade-aware section): the perf gate is already live, and the clone retirement
+  is already done. Neither is pending work.

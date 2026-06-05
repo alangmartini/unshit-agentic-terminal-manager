@@ -68,6 +68,19 @@ pub struct QuadInstance {
     /// fragment alpha untouched. Values of `>= 2` enable mask alpha
     /// modulation of the final rect color.
     pub mask_params: [f32; 4],
+
+    /// CSS `transform` linear part, as a 2x2 DELTA from identity:
+    /// `[a - 1, b, c, d - 1]` where the affine is `x' = a*x + c*y`,
+    /// `y' = b*x + d*y` (column-major: `a, b` is the first column). Stored as
+    /// a delta so an all-zero instance — including zero-initialized buffer
+    /// growth — is the identity transform. The vertex shader reconstructs
+    /// `mat2x2(a, b, c, d)` and applies it to the screen-space position
+    /// before NDC; the in-quad math (border radius, gradient) stays in the
+    /// untransformed local space, so it rotates/scales with the quad.
+    pub xform: [f32; 4],
+    /// Translation part `[e, f]` of the transform affine, in screen pixels
+    /// (added after the linear part). Zero is no translation.
+    pub xform_translate: [f32; 2],
 }
 
 #[repr(C)]
@@ -159,6 +172,8 @@ impl QuadPipeline {
             23 => Float32x4, // mask_stops_01 (alpha0, pos0, alpha1, pos1)
             24 => Float32x4, // mask_stops_23 (alpha2, pos2, alpha3, pos3)
             25 => Float32x4, // mask_params (angle_rad, 0, 0, stop_count)
+            26 => Float32x4, // xform (2x2 linear delta-from-identity: a-1,b,c,d-1)
+            27 => Float32x2, // xform_translate (e, f)
         ];
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
