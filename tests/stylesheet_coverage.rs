@@ -20,6 +20,10 @@ const STYLES: &str = include_str!("../assets/styles.css");
 /// today). Tracked so a *new* gap is caught while the existing backlog does not
 /// fail the build. Shrinking this list as features land is the goal; growing it
 /// should be a conscious, reviewed decision.
+///
+/// The narrative plan for each entry (why it drops, effort, and how to close it)
+/// lives in `specs/css-engine-stylesheet-gaps.md`. When an item lands, remove it
+/// from both this list and that spec.
 const KNOWN_UNSUPPORTED: &[&str] = &[
     // Fully unimplemented properties.
     "filter", // non-backdrop filter (drop-shadow/brightness/none)
