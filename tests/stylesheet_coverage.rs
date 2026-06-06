@@ -42,12 +42,14 @@ const KNOWN_UNSUPPORTED: &[&str] = &[
 
 /// A dropped declaration is "expected" if its property is a known gap, or its
 /// value uses a value form the engine does not support yet:
-///   - `calc()` — no evaluator (e.g. `max-width: calc(100vw - 48px)`),
 ///   - the `inherit` keyword (e.g. `color: inherit`).
+///
+/// `calc()` is now supported for length values (resolving `px`/`vw`/`vh`), so
+/// it is no longer a blanket allowance; a `calc()` that still drops (e.g. on an
+/// unsupported property, or a `percent + length` form taffy can't represent)
+/// must be covered by its property's `KNOWN_UNSUPPORTED` entry.
 fn is_known_gap(d: &DroppedDeclaration) -> bool {
-    KNOWN_UNSUPPORTED.contains(&d.property.as_str())
-        || d.value.contains("calc(")
-        || d.value == "inherit"
+    KNOWN_UNSUPPORTED.contains(&d.property.as_str()) || d.value == "inherit"
 }
 
 #[test]

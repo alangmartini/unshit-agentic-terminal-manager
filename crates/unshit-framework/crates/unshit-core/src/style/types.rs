@@ -590,6 +590,26 @@ pub enum Dimension {
     Vh(f32),
     /// Viewport width unit: 1vw = 1% of viewport width.
     Vw(f32),
+    /// A `calc()` expression reduced to a linear combination of a constant and
+    /// viewport fractions: `px + vw/100 * viewport_w + vh/100 * viewport_h`.
+    /// Resolves to an absolute pixel length against the viewport at layout time
+    /// (taffy never sees it). Percentage-of-container terms are intentionally
+    /// excluded — taffy cannot represent `length + percent`, and the app authors
+    /// no such form on a supported property; the parser rejects them.
+    Calc {
+        px: f32,
+        vw: f32,
+        vh: f32,
+    },
+}
+
+impl Dimension {
+    /// Resolve a `Calc` (or any dimension with viewport units) to absolute
+    /// pixels given the viewport. Returns `None` for `Auto`/`Percent`, which
+    /// need taffy's container-relative resolution.
+    pub fn calc_to_px(px: f32, vw: f32, vh: f32, viewport_w: f32, viewport_h: f32) -> f32 {
+        px + vw / 100.0 * viewport_w + vh / 100.0 * viewport_h
+    }
 }
 
 /// Per-side edge values that retain their CSS unit (px / percent / vh / vw)
@@ -1675,6 +1695,9 @@ fn dim_to_taffy(d: Dimension, viewport_w: f32, viewport_h: f32) -> taffy::Dimens
         // convert to a pixel length.
         Dimension::Vh(v) => taffy::Dimension::Length(v / 100.0 * viewport_h),
         Dimension::Vw(v) => taffy::Dimension::Length(v / 100.0 * viewport_w),
+        Dimension::Calc { px, vw, vh } => {
+            taffy::Dimension::Length(Dimension::calc_to_px(px, vw, vh, viewport_w, viewport_h))
+        }
     }
 }
 
@@ -1693,6 +1716,9 @@ fn dim_to_length_percentage(
         Dimension::Percent(v) => taffy::LengthPercentage::Percent(v / 100.0),
         Dimension::Vh(v) => taffy::LengthPercentage::Length(v / 100.0 * viewport_h),
         Dimension::Vw(v) => taffy::LengthPercentage::Length(v / 100.0 * viewport_w),
+        Dimension::Calc { px, vw, vh } => taffy::LengthPercentage::Length(Dimension::calc_to_px(
+            px, vw, vh, viewport_w, viewport_h,
+        )),
     }
 }
 
@@ -1720,6 +1746,9 @@ fn opt_dim_to_taffy_auto(
         Some(Dimension::Percent(v)) => taffy::LengthPercentageAuto::Percent(v / 100.0),
         Some(Dimension::Vh(v)) => taffy::LengthPercentageAuto::Length(v / 100.0 * viewport_h),
         Some(Dimension::Vw(v)) => taffy::LengthPercentageAuto::Length(v / 100.0 * viewport_w),
+        Some(Dimension::Calc { px, vw, vh }) => taffy::LengthPercentageAuto::Length(
+            Dimension::calc_to_px(px, vw, vh, viewport_w, viewport_h),
+        ),
     }
 }
 
@@ -1895,7 +1924,10 @@ impl ComputedStyle {
 fn scale_dim(d: Dimension, s: f32) -> Dimension {
     match d {
         Dimension::Px(v) => Dimension::Px(v * s),
-        other => other, // Auto and Percent are scale-independent
+        // Only the constant px term scales; viewport fractions are
+        // scale-independent (like Percent / Vw / Vh).
+        Dimension::Calc { px, vw, vh } => Dimension::Calc { px: px * s, vw, vh },
+        other => other, // Auto, Percent, Vw, Vh are scale-independent
     }
 }
 
@@ -2019,6 +2051,19 @@ mod tests {
         let taffy_style = style.to_taffy_style(1000.0, 500.0);
         // 80vh of a 500px-tall viewport = 400px.
         assert_eq!(taffy_style.max_size.height, taffy::Dimension::Length(400.0));
+    }
+
+    #[test]
+    fn to_taffy_style_resolves_calc_against_viewport() {
+        // `calc(100vw - 48px)` at a 1000px-wide viewport = 952px.
+        let mut style = ComputedStyle::default();
+        style.max_width = Dimension::Calc { px: -48.0, vw: 100.0, vh: 0.0 };
+        let taffy_style = style.to_taffy_style(1000.0, 500.0);
+        assert_eq!(taffy_style.max_size.width, taffy::Dimension::Length(952.0));
+        // `calc(72vh - 46px)` at a 500px-tall viewport = 360 - 46 = 314px.
+        style.max_height = Dimension::Calc { px: -46.0, vw: 0.0, vh: 72.0 };
+        let taffy_style = style.to_taffy_style(1000.0, 500.0);
+        assert_eq!(taffy_style.max_size.height, taffy::Dimension::Length(314.0));
     }
 
     #[test]

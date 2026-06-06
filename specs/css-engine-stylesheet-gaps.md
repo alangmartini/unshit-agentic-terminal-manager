@@ -49,14 +49,22 @@ table row here.
   offsets behind the text, summing into a glow — sidestepping both the heavy
   offscreen-blur path and the atlas-padding limit. See
   `changelog.d/unreleased/2026-06-06-css-text-shadow.md`.
+- **Tier 2 — `calc()` (length values) landed 2026-06-06** (the last item with
+  real layout impact): a recursive-descent parser evaluates the calc type
+  algebra and reduces a length expression to `Dimension::Calc { px, vw, vh }`,
+  resolved against the viewport at layout time. Lights up the modal
+  `max-width`/`max-height`, responsive `width`, and the row negative margins.
+  See `changelog.d/unreleased/2026-06-06-css-calc.md`.
 - **Tier 2 — still deferred:** the table below. Each is genuinely renderer-,
-  text-layout-, or value-evaluator-bound — not a one-line parse arm.
+  text-layout-, or value-evaluator-bound — and (per the Open questions) each is
+  now either a no-op in this app or niche/L-value.
 
 ## Enforcement coverage (what the guardrail does / does not catch)
 
 - **Caught (build fails on a new gap):** every per-property entry in
-  `KNOWN_UNSUPPORTED`, plus any new `calc()` value (`is_known_gap` matches
-  `value.contains("calc(")`) and `inherit` (`value == "inherit"`).
+  `KNOWN_UNSUPPORTED`, plus the `inherit` value form (`value == "inherit"`).
+  `calc()` is no longer a blanket allowance (it is supported for length values);
+  a `calc()` that still drops must be covered by its property's entry.
 - **Now enforced (was the cascade gap):** `.app.theme-*` / `.theme-chip.*`
   `--token` overrides resolve through the cascade and no longer drop.
   `cascade_golden`'s `custom_property_drop_count_is_frozen` asserts the count
@@ -74,8 +82,7 @@ table row here.
 | `background-position` / `background-size` | single `Background` field; gradients fill the box | small-render | M | L |
 | `background` (`ellipse <size> at <pos>`) | radial-gradient parser rejects this form | parse (gradient) | M | L |
 | `scroll-margin` | no scroll-snap / anchor consumer | parse (inert) | S | L |
-| `calc()` (value form) | no evaluator in leaf parsers | value-form | L | M |
-| `inherit` (value form) | no per-property cascade keyword | value-form (cascade) | M | M |
+| `inherit` (value form) | no per-property cascade keyword | value-form (cascade) | M | — (no-op here) |
 
 ## Plans (highest value first)
 
@@ -161,14 +168,18 @@ the existing radial branch.
 value). `scroll-margin` has no consumer (no scroll-snap/anchor system), so even a
 field would be inert — clears a diagnostic only.
 
-### `calc()`  — value-form
-Add `parse_calc` via `parser.parse_nested_block` as a `try_parse` branch inside
-the leaf parsers (`parse_px` / `parse_dimension`) so every property benefits at
-once. Mixed-unit calc that must survive to layout needs a
-`Dimension::Calc(Box<CalcExpr>)` variant threaded through every `*_to_taffy`
-(`dim_to_taffy`, `types.rs:~1507`), `scale_dim` (`types.rs:~1733`), and
-`lerp_dimension` (`transition.rs:~271`) — the biggest structural change in the
-set.
+### `calc()` (length values)  — LANDED 2026-06-06
+A recursive-descent parser (`parse_calc_terms` + `calc_sum`/`calc_product`/
+`calc_value`/`calc_combine`) enforces the calc type algebra and reduces a length
+expression to a linear `CalcTerms { px, percent, vw, vh }`, hooked via `try_parse`
+into both leaf parsers: `parse_dimension` → `Dimension::Calc { px, vw, vh }` (or
+`Px`/`Percent` when pure), `parse_px` → a constant `f32` for px-only calc (the
+`var()` margin case). `Dimension::Calc` resolves to an absolute px in
+`dim_to_taffy` / `dim_to_length_percentage` / `opt_dim_to_taffy_auto` against the
+viewport (taffy never sees it), with `scale_dim` / `lerp_dimension` arms.
+**Accepted limitation:** `percent + length` calc is rejected (taffy can't
+represent it; the only such form is on the unsupported `background-position`).
+See `changelog.d/unreleased/2026-06-06-css-calc.md`.
 
 ### `inherit` (and `initial` / `unset`)  — cascade
 Intercept the keyword right after `expect_colon` (before the property match,
@@ -227,24 +238,26 @@ correct), so there is effectively no clone-retirement work left.
 
 ## Open questions
 
-- `text-overflow: ellipsis`, cascade-aware custom properties, the full
-  `transform` affine, and `text-shadow` are now landed — every gap that had
-  real **visible** value in this stylesheet. What remains is genuinely
-  lower-value or genuinely large:
-  - **`inherit`** (value form, M/M) is the best remaining pick: it currently
-    *drops*, so authored `inherit` values render wrong today — implementing it
-    fixes real (if subtle) cascade bugs. Bounded: intercept the keyword, emit a
-    per-property marker, copy the parent's field in the cascade.
-  - **`word-break: break-word`** would parse cleanly but is a **no-op** in this
-    app — its only use (`.term-line`) is rendered by the fixed-width CellGrid,
-    which bypasses the text engine entirely (it would future-proof flow-text
-    wrapping but change nothing visible). Treat as low priority.
-  - **`filter: drop-shadow`** could now reuse the `text-shadow` stacked-tap idea
-    for the offset+blur of arbitrary content, but no element-`filter` field
-    exists yet.
-  - The remaining table entries are all L-value (`mix-blend-mode`,
-    `vertical-align`, `background-position/size`, `scroll-margin`) or large
-    value-form work (`calc()`).
+- **The engine now renders this stylesheet faithfully.** Every gap with real
+  visible or layout impact is landed: `text-overflow: ellipsis`, cascade-aware
+  custom properties, the full `transform` affine, `text-shadow`, and `calc()`
+  for length values. There is no remaining gap that visibly changes this app.
+- What's left in the inventory is, for *this* stylesheet, either a confirmed
+  **no-op** or **niche/L-value** — i.e. there is no obvious "next gap":
+  - **`inherit`** — *confirmed no-op here.* All 9 uses are form-element resets
+    on naturally-inherited properties (`font-family`/`font-size`/`color`), and
+    the engine's only UA form default is button `text-align: center` (no UA
+    font/color override to counteract), so the elements already inherit; dropping
+    `inherit` changes nothing.
+  - **`word-break: break-word`** — *no-op here.* Its only use (`.term-line`) is
+    CellGrid-rendered, bypassing the text engine.
+  - **`filter: drop-shadow`** — real but needs an element-`filter` field first;
+    could then reuse the `text-shadow` stacked-tap idea for the offset+blur.
+  - The rest are L-value (`mix-blend-mode`, `vertical-align`,
+    `background-position/size`, `scroll-margin`).
+- So the honest next step is no longer a CSS gap — it's product/feature work
+  (the repo's `BACKLOG.md` / `SPEC.md`), unless a *new* stylesheet authoring
+  surfaces a gap (the `stylesheet_coverage` guardrail will flag it).
 - The two cascade "follow-ups" both evaporated under inspection (see the
   cascade-aware section): the perf gate is already live, and the clone retirement
   is already done. Neither is pending work.

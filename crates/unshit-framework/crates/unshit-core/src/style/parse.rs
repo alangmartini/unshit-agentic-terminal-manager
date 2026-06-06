@@ -3030,7 +3030,199 @@ fn parse_content_value(parser: &mut Parser) -> Result<ContentValue, ()> {
     }
 }
 
+/// A `calc()` expression reduced to a linear combination of a constant and
+/// relative units. Length-valued calc resolves to `px + percent%·container +
+/// vw·viewport_w/100 + vh·viewport_h/100`.
+#[derive(Clone, Copy, Default)]
+struct CalcTerms {
+    px: f32,
+    percent: f32,
+    vw: f32,
+    vh: f32,
+}
+
+impl CalcTerms {
+    fn add(self, o: CalcTerms) -> CalcTerms {
+        CalcTerms {
+            px: self.px + o.px,
+            percent: self.percent + o.percent,
+            vw: self.vw + o.vw,
+            vh: self.vh + o.vh,
+        }
+    }
+    fn sub(self, o: CalcTerms) -> CalcTerms {
+        CalcTerms {
+            px: self.px - o.px,
+            percent: self.percent - o.percent,
+            vw: self.vw - o.vw,
+            vh: self.vh - o.vh,
+        }
+    }
+    fn scale(self, s: f32) -> CalcTerms {
+        CalcTerms { px: self.px * s, percent: self.percent * s, vw: self.vw * s, vh: self.vh * s }
+    }
+}
+
+/// A value inside `calc()`: either a dimensionless number or a length. The CSS
+/// calc type algebra: `length ± length`, `length × number`, `length ÷ number`,
+/// `number op number`; `length × length`, `length + number`, etc. are invalid.
+enum CalcVal {
+    Num(f32),
+    Len(CalcTerms),
+}
+
+/// Parse `calc( <sum> )` into a length `CalcTerms`. Errors (so the caller drops
+/// or falls through) on a non-`calc` token, a malformed expression, an
+/// unsupported unit (e.g. `em`), or a result that is a bare number rather than
+/// a length. Always invoked under `try_parse`, so a partial consume is rolled
+/// back by the caller.
+fn parse_calc_terms(parser: &mut Parser) -> Result<CalcTerms, ()> {
+    let name = parser.expect_function().map_err(|_| ())?;
+    if !name.as_ref().eq_ignore_ascii_case("calc") {
+        return Err(());
+    }
+    parser
+        .parse_nested_block(|p| -> Result<CalcTerms, cssparser::ParseError<'_, ()>> {
+            let val = calc_sum(p)?;
+            p.expect_exhausted()?;
+            match val {
+                CalcVal::Len(t) => Ok(t),
+                CalcVal::Num(_) => Err(p.new_custom_error(())),
+            }
+        })
+        .map_err(|_| ())
+}
+
+/// `<product> ( ('+' | '-') <product> )*`
+fn calc_sum<'i>(p: &mut Parser<'i, '_>) -> Result<CalcVal, cssparser::ParseError<'i, ()>> {
+    let mut acc = calc_product(p)?;
+    loop {
+        let op = p.try_parse(|p| match p.next()? {
+            Token::Delim('+') => Ok('+'),
+            Token::Delim('-') => Ok('-'),
+            _ => Err(p.new_custom_error::<(), ()>(())),
+        });
+        match op {
+            Ok('+') => acc = calc_combine(acc, calc_product(p)?, '+', p)?,
+            Ok('-') => acc = calc_combine(acc, calc_product(p)?, '-', p)?,
+            _ => break,
+        }
+    }
+    Ok(acc)
+}
+
+/// `<value> ( ('*' | '/') <value> )*`
+fn calc_product<'i>(p: &mut Parser<'i, '_>) -> Result<CalcVal, cssparser::ParseError<'i, ()>> {
+    let mut acc = calc_value(p)?;
+    loop {
+        let op = p.try_parse(|p| match p.next()? {
+            Token::Delim('*') => Ok('*'),
+            Token::Delim('/') => Ok('/'),
+            _ => Err(p.new_custom_error::<(), ()>(())),
+        });
+        match op {
+            Ok('*') => acc = calc_combine(acc, calc_value(p)?, '*', p)?,
+            Ok('/') => acc = calc_combine(acc, calc_value(p)?, '/', p)?,
+            _ => break,
+        }
+    }
+    Ok(acc)
+}
+
+/// A length token, a number, a parenthesized sub-expression, or a nested
+/// `calc()`.
+fn calc_value<'i>(p: &mut Parser<'i, '_>) -> Result<CalcVal, cssparser::ParseError<'i, ()>> {
+    match p.next()?.clone() {
+        Token::Number { value, .. } => Ok(CalcVal::Num(value)),
+        Token::Dimension { value, ref unit, .. } => {
+            let u = unit.as_ref();
+            if u.eq_ignore_ascii_case("px") {
+                Ok(CalcVal::Len(CalcTerms { px: value, ..Default::default() }))
+            } else if u.eq_ignore_ascii_case("vw") {
+                Ok(CalcVal::Len(CalcTerms { vw: value, ..Default::default() }))
+            } else if u.eq_ignore_ascii_case("vh") {
+                Ok(CalcVal::Len(CalcTerms { vh: value, ..Default::default() }))
+            } else {
+                Err(p.new_custom_error(()))
+            }
+        }
+        Token::Percentage { unit_value, .. } => {
+            Ok(CalcVal::Len(CalcTerms { percent: unit_value * 100.0, ..Default::default() }))
+        }
+        Token::ParenthesisBlock => p.parse_nested_block(calc_sum),
+        Token::Function(ref name) if name.eq_ignore_ascii_case("calc") => {
+            p.parse_nested_block(calc_sum)
+        }
+        _ => Err(p.new_custom_error(())),
+    }
+}
+
+/// Apply a binary calc operator, enforcing the calc type algebra.
+fn calc_combine<'i>(
+    a: CalcVal,
+    b: CalcVal,
+    op: char,
+    p: &Parser<'i, '_>,
+) -> Result<CalcVal, cssparser::ParseError<'i, ()>> {
+    let err = || p.new_custom_error(());
+    Ok(match op {
+        '+' | '-' => {
+            let sign = if op == '+' { 1.0 } else { -1.0 };
+            match (a, b) {
+                (CalcVal::Len(x), CalcVal::Len(y)) => {
+                    CalcVal::Len(if sign > 0.0 { x.add(y) } else { x.sub(y) })
+                }
+                (CalcVal::Num(x), CalcVal::Num(y)) => CalcVal::Num(x + sign * y),
+                _ => return Err(err()),
+            }
+        }
+        '*' => match (a, b) {
+            (CalcVal::Num(x), CalcVal::Num(y)) => CalcVal::Num(x * y),
+            (CalcVal::Len(t), CalcVal::Num(n)) | (CalcVal::Num(n), CalcVal::Len(t)) => {
+                CalcVal::Len(t.scale(n))
+            }
+            _ => return Err(err()), // length × length is invalid
+        },
+        '/' => match (a, b) {
+            (CalcVal::Num(x), CalcVal::Num(y)) if y != 0.0 => CalcVal::Num(x / y),
+            (CalcVal::Len(t), CalcVal::Num(n)) if n != 0.0 => CalcVal::Len(t.scale(1.0 / n)),
+            // Division by zero or by a length is invalid.
+            _ => return Err(err()),
+        },
+        _ => return Err(err()),
+    })
+}
+
+/// Interpret a parsed `calc()` as a [`Dimension`]. Pure-`px` collapses to
+/// `Px`, pure-`percent` to `Percent`; a `px`/`vw`/`vh` mix becomes
+/// `Dimension::Calc`. A `percent` term mixed with any other term is rejected —
+/// taffy cannot represent `length + percent`, and the app authors no such form
+/// on a supported property.
+fn calc_terms_to_dimension(t: CalcTerms) -> Result<Dimension, ()> {
+    let has_relative = t.vw != 0.0 || t.vh != 0.0;
+    if t.percent != 0.0 {
+        if t.px != 0.0 || has_relative {
+            return Err(());
+        }
+        return Ok(Dimension::Percent(t.percent));
+    }
+    if has_relative {
+        Ok(Dimension::Calc { px: t.px, vw: t.vw, vh: t.vh })
+    } else {
+        Ok(Dimension::Px(t.px))
+    }
+}
+
 fn parse_px(parser: &mut Parser) -> Result<f32, ()> {
+    // `calc()` that reduces to a constant px (e.g. `calc(var(--sp-3) * -1)`
+    // after var resolution). Relative units can't become a constant on the px
+    // pathway, so reject them here.
+    if let Ok(t) = parser.try_parse(|p| parse_calc_terms(p)) {
+        if t.percent == 0.0 && t.vw == 0.0 && t.vh == 0.0 {
+            return Ok(t.px);
+        }
+        return Err(());
+    }
     match parser.next().map_err(|_| ())? {
         Token::Dimension { value, unit, .. } => {
             // Viewport relative units cannot resolve without layout context.
@@ -3124,6 +3316,9 @@ fn parse_backdrop_filter(parser: &mut Parser) -> Result<Option<types::BackdropFi
 }
 
 fn parse_dimension(parser: &mut Parser) -> Result<Dimension, ()> {
+    if let Ok(t) = parser.try_parse(|p| parse_calc_terms(p)) {
+        return calc_terms_to_dimension(t);
+    }
     match parser.next().map_err(|_| ())? {
         Token::Ident(ref s) if s.as_ref() == "auto" => Ok(Dimension::Auto),
         Token::Dimension { value, unit, .. } => match unit.as_ref() {
@@ -6633,6 +6828,70 @@ mod tests {
         assert!(matches!(&decls[1], StyleDeclaration::Right(d) if *d == pct50));
         assert!(matches!(&decls[2], StyleDeclaration::Bottom(d) if *d == pct50));
         assert!(matches!(&decls[3], StyleDeclaration::Left(d) if *d == pct50));
+    }
+
+    #[test]
+    fn test_parse_calc_vw_minus_px() {
+        // The app's modal: `max-width: calc(100vw - 48px)`.
+        let decls = parse_decls(".x { max-width: calc(100vw - 48px); }");
+        assert_eq!(
+            decls,
+            vec![StyleDeclaration::MaxWidth(Dimension::Calc { px: -48.0, vw: 100.0, vh: 0.0 })]
+        );
+    }
+
+    #[test]
+    fn test_parse_calc_vh_minus_px() {
+        let decls = parse_decls(".x { max-height: calc(72vh - 46px); }");
+        assert_eq!(
+            decls,
+            vec![StyleDeclaration::MaxHeight(Dimension::Calc { px: -46.0, vw: 0.0, vh: 72.0 })]
+        );
+    }
+
+    #[test]
+    fn test_parse_calc_with_parens_and_division() {
+        // Precedence + parens: ((100vw - 48px) / 2) = 50vw - 24px.
+        let decls = parse_decls(".x { width: calc((100vw - 48px) / 2); }");
+        assert_eq!(
+            decls,
+            vec![StyleDeclaration::Width(Dimension::Calc { px: -24.0, vw: 50.0, vh: 0.0 })]
+        );
+    }
+
+    #[test]
+    fn test_parse_calc_pure_px_collapses_to_px() {
+        // A px-only calc reduces to a plain Px (no Calc wrapper).
+        let decls = parse_decls(".x { width: calc(20px + 4px); }");
+        assert_eq!(decls, vec![StyleDeclaration::Width(Dimension::Px(24.0))]);
+    }
+
+    #[test]
+    fn test_parse_calc_constant_on_px_pathway() {
+        // The margin form after var() resolution: `calc(12px * -1)` = -12px.
+        // Margin uses the px pathway (parse_px), which folds constant calc.
+        let decls = parse_decls(".x { margin: 0 calc(12px * -1); }");
+        let m = decls
+            .iter()
+            .find_map(|d| match d {
+                StyleDeclaration::Margin(e) => Some(*e),
+                _ => None,
+            })
+            .expect("margin parsed");
+        assert_eq!(m.right, -12.0);
+        assert_eq!(m.left, -12.0);
+        assert_eq!(m.top, 0.0);
+    }
+
+    #[test]
+    fn test_parse_calc_percent_mix_rejected() {
+        // `calc(100% - 14px)` mixes percent + length, which taffy cannot
+        // represent — it must drop rather than mis-render.
+        let sheet = CompiledStylesheet::parse(".x { width: calc(100% - 14px); }");
+        assert!(
+            sheet.dropped.iter().any(|d| d.property == "width"),
+            "a percent+length calc must drop"
+        );
     }
 
     #[test]

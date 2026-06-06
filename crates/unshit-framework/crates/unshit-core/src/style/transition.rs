@@ -286,6 +286,14 @@ fn lerp_dimension(a: &Dimension, b: &Dimension, t: f32) -> Dimension {
         }
         (Dimension::Vh(a_v), Dimension::Vh(b_v)) => Dimension::Vh(lerp_f32(*a_v, *b_v, t)),
         (Dimension::Vw(a_v), Dimension::Vw(b_v)) => Dimension::Vw(lerp_f32(*a_v, *b_v, t)),
+        (
+            Dimension::Calc { px: a_px, vw: a_vw, vh: a_vh },
+            Dimension::Calc { px: b_px, vw: b_vw, vh: b_vh },
+        ) => Dimension::Calc {
+            px: lerp_f32(*a_px, *b_px, t),
+            vw: lerp_f32(*a_vw, *b_vw, t),
+            vh: lerp_f32(*a_vh, *b_vh, t),
+        },
         _ => {
             if t >= 0.5 {
                 *b
