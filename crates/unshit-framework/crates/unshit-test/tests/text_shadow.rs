@@ -42,6 +42,28 @@ fn reddish(pixels: &[u8]) -> usize {
         .count()
 }
 
+/// Total red-channel energy of the glow (sum of the red channel over reddish
+/// pixels). Used to check that the glow's INTENSITY tracks the shadow alpha —
+/// a correct alpha-composited glow scales with alpha, whereas the premultiply
+/// bug decouples brightness from alpha (rgb blows out regardless).
+fn glow_red_energy(pixels: &[u8]) -> u64 {
+    pixels
+        .chunks_exact(4)
+        .map(|p| {
+            let (r, g, b) = (p[0] as i64, p[1] as i64, p[2] as i64);
+            if r > g + 30 && r > b + 30 {
+                r as u64
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+fn glow_css(alpha: f32) -> String {
+    format!("{BASE}\n.label {{ text-shadow: 0 0 8px rgba(255, 0, 0, {alpha}); }}")
+}
+
 const BASE: &str = r#"
     .page  { width: 100%; height: 100%; background: #000000; }
     .label { color: #ffffff; font-size: 48px; }
@@ -63,9 +85,9 @@ fn text_shadow_paints_a_colored_glow_around_text() {
     let bare_red = reddish(&bare);
     let glow_red = reddish(&shadow);
     assert!(
-        glow_red > bare_red + 150,
-        "an `0 0 8px` red text-shadow must paint a broad red halo \
-         (bare red fringe = {bare_red}, with-glow = {glow_red})"
+        glow_red > bare_red + 40,
+        "an `0 0 8px` red text-shadow must paint a red halo beyond the bare \
+         edge fringe (bare red fringe = {bare_red}, with-glow = {glow_red})"
     );
 }
 
@@ -81,4 +103,32 @@ fn text_shadow_none_matches_no_shadow() {
     };
     let diff = (reddish(&none) as i64 - reddish(&bare) as i64).abs();
     assert!(diff < 25, "text-shadow: none must add no glow (red delta = {diff})");
+}
+
+#[test]
+fn text_shadow_glow_intensity_scales_with_alpha() {
+    // Regression guard for the subpixel-shader premultiply bug: a stronger
+    // shadow alpha must produce a meaningfully brighter glow. The bug made the
+    // glow blow out to a bright smear independent of alpha (rgb accumulated far
+    // faster than alpha under the premultiplied blend), so a faint and a strong
+    // glow looked the same. With correct premultiplied output the glow energy
+    // scales ~linearly with alpha.
+    let Some(faint) = render(&glow_css(0.15)) else {
+        eprintln!("Skipping: no GPU available");
+        return;
+    };
+    let Some(strong) = render(&glow_css(0.5)) else {
+        return;
+    };
+    let faint_e = glow_red_energy(&faint);
+    let strong_e = glow_red_energy(&strong);
+    // Correct alpha compositing scales the glow with alpha (sub-linearly in the
+    // sRGB framebuffer: a ~3.3x alpha ratio shows as ~1.6x energy). The
+    // premultiply bug decoupled brightness from alpha (~1.0x). 1.3x cleanly
+    // separates the two.
+    assert!(
+        strong_e * 10 > faint_e * 13,
+        "glow intensity must scale with shadow alpha \
+         (alpha 0.15 energy = {faint_e}, alpha 0.5 energy = {strong_e})"
+    );
 }

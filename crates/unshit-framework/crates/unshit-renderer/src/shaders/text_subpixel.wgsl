@@ -78,10 +78,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let cg = min(pow(mix(gray, tex.g, chroma), gamma) * 1.0032, 1.0);
     let cb = pow(mix(gray, tex.b, chroma), gamma);
 
-    // Per-channel subpixel blending (ClearType-style).
-    let r = in.color.r * cr;
-    let g = in.color.g * cg;
-    let b = in.color.b * cb;
+    // Per-channel subpixel blending (ClearType-style). The pipeline blends
+    // premultiplied (src = One, dst = OneMinusSrcAlpha), so the output color
+    // must be premultiplied by BOTH coverage and the source alpha. Folding in
+    // `in.color.a` is a no-op for opaque text (the overwhelming case) but is
+    // essential for translucent runs — notably the stacked low-alpha copies of
+    // a `text-shadow` glow, which otherwise accumulate rgb far faster than
+    // alpha and blow out to a bright smear.
     let a = in.color.a * max(cr, max(cg, cb));
+    let r = in.color.r * cr * in.color.a;
+    let g = in.color.g * cg * in.color.a;
+    let b = in.color.b * cb * in.color.a;
     return vec4(r, g, b, a);
 }
