@@ -38,7 +38,6 @@ const KNOWN_UNSUPPORTED: &[&str] = &[
     // at <pos>` radial-gradient forms still drop (gradient parser gap)
     "background-position",
     "background-size",
-    "text-shadow", // `none` is accepted; real shadow lists drop (no shadow paint)
 ];
 
 /// A dropped declaration is "expected" if its property is a known gap, or its

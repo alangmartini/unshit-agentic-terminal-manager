@@ -124,6 +124,18 @@ pub struct BoxShadow {
     pub inset: bool,
 }
 
+/// A single CSS `text-shadow` layer (`<offset-x> <offset-y> <blur>? <color>?`).
+/// Simpler than [`BoxShadow`]: no spread and no inset. The renderer paints it
+/// as a colored glow behind the text (see the stacked-tap emit in the batch
+/// builder).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur_radius: f32,
+    pub color: Color,
+}
+
 /// Individual CSS filter function entry stored inside `BackdropFilter`.
 ///
 /// Only `Blur` is honored by the renderer today. The enum is open so other
@@ -1295,6 +1307,9 @@ pub struct ComputedStyle {
     pub border_radius_src: CornersDim,
     pub opacity: f32,
     pub box_shadow: SmallVec<[BoxShadow; 2]>,
+    /// CSS `text-shadow` layers (empty = none). Painted as a colored glow
+    /// behind the element's text.
+    pub text_shadow: SmallVec<[TextShadow; 2]>,
     /// Optional `backdrop-filter` value. `None` means the element does not
     /// request a backdrop filter and the renderer stays on its fast path.
     pub backdrop_filter: Option<BackdropFilter>,
@@ -1427,6 +1442,7 @@ impl Default for ComputedStyle {
             border_radius_src: CornersDim::ZERO,
             opacity: 1.0,
             box_shadow: SmallVec::new(),
+            text_shadow: SmallVec::new(),
             backdrop_filter: None,
             color: Color::BLACK,
             font_size: 16.0,

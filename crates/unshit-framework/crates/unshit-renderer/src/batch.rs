@@ -97,7 +97,8 @@ use unshit_core::scroll::{self, ScrollbarVisualState};
 use unshit_core::style::types::{
     apply_text_transform, Background, Color, CssPosition, CssResize, Display, FilterFunction,
     FontStyle, FontWeight, GradientStopPosition, Layer, LinearGradient, Overflow, RadialGradient,
-    RadialShape, RenderTarget, TextAlign, TextDecoration, TextOverflow, Visibility, WhiteSpace,
+    RadialShape, RenderTarget, TextAlign, TextDecoration, TextOverflow, TextShadow, Visibility,
+    WhiteSpace,
 };
 use unshit_core::svg::types::{
     PathCommand, StrokeLineCap, StrokeLineJoin, SvgAttrs, SvgNode, SvgPaint, SvgPrimitive,
@@ -2075,6 +2076,7 @@ fn walk_for_batch(
                         style.font_style,
                         &text_color,
                         clip_rect,
+                        &style.text_shadow,
                         batch.layer_mut(effective_layer),
                         atlas,
                         font_system,
@@ -2388,6 +2390,7 @@ fn walk_for_batch(
                     style.font_style,
                     &text_color,
                     clip_rect,
+                    &style.text_shadow,
                     batch.layer_mut(effective_layer),
                     atlas,
                     font_system,
@@ -3044,6 +3047,50 @@ fn emit_svg_node(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// One tap of the stacked-tap text-shadow glow: a relative offset and its
+/// normalized Gaussian weight.
+struct ShadowTap {
+    dx: f32,
+    dy: f32,
+    weight: f32,
+}
+
+/// Gaussian-weighted sample points approximating a `blur`-radius glow with no
+/// render target: the glyph run is re-drawn once per tap, offset by `(dx, dy)`
+/// in the shadow color at `weight * alpha`, and the overlapping copies sum into
+/// a soft halo. Points are placed on a Vogel (sunflower) spiral for even disc
+/// coverage out to ~`blur`, weighted by a Gaussian with `sigma = blur/2`;
+/// weights are normalized to sum to 1 so the accumulated glow peaks near the
+/// shadow's own alpha. A `blur` of ~0 collapses to a single sharp copy.
+fn gaussian_disc_taps(blur: f32) -> Vec<ShadowTap> {
+    if blur <= 0.5 {
+        return vec![ShadowTap { dx: 0.0, dy: 0.0, weight: 1.0 }];
+    }
+    // Scale tap count with the radius (denser discs need more points to stay
+    // gap-free), bounded so a huge blur can't explode the instance count.
+    let n = ((blur * 4.0) as usize).clamp(8, 48);
+    let sigma = (blur * 0.5).max(0.5);
+    // Golden angle in radians.
+    const GOLDEN: f32 = 2.399_963_2;
+    let mut taps = Vec::with_capacity(n);
+    let mut total = 0.0_f32;
+    for i in 0..n {
+        let frac = (i as f32 + 0.5) / n as f32;
+        let r = blur * frac.sqrt();
+        let theta = i as f32 * GOLDEN;
+        let w = (-(r * r) / (2.0 * sigma * sigma)).exp();
+        total += w;
+        taps.push(ShadowTap { dx: r * theta.cos(), dy: r * theta.sin(), weight: w });
+    }
+    if total > 0.0 {
+        for t in taps.iter_mut() {
+            t.weight /= total;
+        }
+    }
+    taps
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_text_glyphs_cached(
     text: &str,
     x: f32,
@@ -3057,6 +3104,7 @@ fn emit_text_glyphs_cached(
     font_style: FontStyle,
     color: &Color,
     clip_rect: [f32; 4],
+    text_shadow: &[TextShadow],
     batch: &mut FrameBatch,
     atlas: &mut GlyphAtlas,
     font_system: &mut FontSystem,
@@ -3076,10 +3124,16 @@ fn emit_text_glyphs_cached(
     );
     let color_linear = color.to_linear_f32();
 
-    // Check if we have a cached shaped result. If any atlas key is missing,
-    // invalidate this shaped entry and rebuild so glyphs are never silently
-    // dropped on atlas churn. `get_or_promote` moves a hit from `previous`
-    // into `current` so it survives the next `finish_frame` swap.
+    // Resolve the run's glyph layout into `laid_out` (relative position + atlas
+    // entry per glyph), ensuring every atlas entry is resident. The text-shadow
+    // glow needs the WHOLE layout up front (it re-draws the run behind the
+    // text), so we collect first, then emit shadows, then the main run.
+    let mut laid_out: Vec<(f32, f32, GlyphEntry)> = Vec::new();
+    let mut from_cache = false;
+
+    // `get_or_promote` moves a hit from `previous` into `current` so it survives
+    // the next `finish_frame` swap. If any atlas key is missing, drop the shaped
+    // entry and reshape so glyphs are never silently lost on atlas churn.
     if let Some(entry) = shaped_cache.buf.get_or_promote(&cache_key).cloned() {
         let atlas_ready = entry.glyphs.iter().all(|cg| atlas.cache.contains_key(&cg.atlas_key));
         if atlas_ready {
@@ -3093,91 +3147,123 @@ fn emit_text_glyphs_cached(
                 if let Some(keys) = glyph_keys_out.as_deref_mut() {
                     keys.insert(cg.atlas_key);
                 }
+                laid_out.push((cg.rel_x, cg.rel_y, atlas_entry));
+            }
+            from_cache = true;
+        } else {
+            shaped_cache.buf.remove(&cache_key);
+        }
+    }
+
+    if !from_cache {
+        // Cache miss: shape text, rasterize, and populate the shaped cache.
+        let metrics = Metrics::new(font_size, font_size * line_height);
+        let mut buffer = Buffer::new(font_system, metrics);
+        buffer.set_size(font_system, max_width.map(|w| w.max(1.0)), None);
+        buffer.set_text(
+            font_system,
+            text,
+            text_attrs(font_family, font_weight, font_style),
+            Shaping::Advanced,
+        );
+        buffer.shape_until_scroll(font_system, false);
+
+        let mut cached_glyphs = Vec::new();
+        for run in buffer.layout_runs() {
+            let run_y = run.line_y;
+            for (glyph_idx, glyph) in run.glyphs.iter().enumerate() {
+                let ls_offset = glyph_idx as f32 * letter_spacing;
+                let physical = glyph.physical((ls_offset, 0.0), 1.0);
+
+                let key = GlyphKey {
+                    font_id: atlas_text_font_namespace(
+                        &physical.cache_key,
+                        font_family,
+                        font_weight,
+                    ),
+                    glyph_id: physical.cache_key.glyph_id,
+                    font_size_tenths: (font_size * 10.0) as u16,
+                    subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
+                        | (physical.cache_key.y_bin as u8),
+                };
+
+                let entry = if let Some(entry) = atlas.cache.get(&key).copied() {
+                    atlas.touch(&key);
+                    entry
+                } else {
+                    let raster_result = rasterize_swash_for_atlas(
+                        rasterizer,
+                        font_system,
+                        &physical,
+                        atlas,
+                        key,
+                        font_family,
+                        font_weight,
+                    );
+                    match raster_result {
+                        Some(entry) => entry,
+                        None => continue,
+                    }
+                };
+
+                let rel_x = physical.x as f32 + entry.offset[0];
+                let rel_y = run_y + physical.y as f32 + entry.offset[1];
+
+                cached_glyphs.push(CachedGlyph { rel_x, rel_y, atlas_key: key });
+                if let Some(keys) = glyph_keys_out.as_deref_mut() {
+                    keys.insert(key);
+                }
+                laid_out.push((rel_x, rel_y, entry));
+            }
+        }
+        shaped_cache.buf.insert(cache_key, ShapedTextEntry { glyphs: cached_glyphs });
+    }
+
+    // `text-shadow` glow: stacked Gaussian-weighted offset copies of the run in
+    // the shadow color, emitted BEHIND the main text (so it draws on top). One
+    // set of taps per shadow layer.
+    for shadow in text_shadow {
+        let scol = shadow.color.to_linear_f32();
+        if scol[3] <= 0.0 {
+            continue;
+        }
+        let taps = gaussian_disc_taps(shadow.blur_radius);
+        for tap in &taps {
+            let a = scol[3] * tap.weight;
+            if a <= 0.000_8 {
+                continue;
+            }
+            let tap_color = [scol[0], scol[1], scol[2], a];
+            let ox = shadow.offset_x + tap.dx;
+            let oy = shadow.offset_y + tap.dy;
+            for (rel_x, rel_y, entry) in &laid_out {
                 batch.glyph_instances.push(GlyphInstance {
-                    pos: [x + cg.rel_x, y + cg.rel_y],
-                    size: atlas_entry.size,
-                    uv_min: [atlas_entry.uv_rect[0], atlas_entry.uv_rect[1]],
-                    uv_max: [atlas_entry.uv_rect[2], atlas_entry.uv_rect[3]],
-                    color: color_linear,
+                    pos: [x + rel_x + ox, y + rel_y + oy],
+                    size: entry.size,
+                    uv_min: [entry.uv_rect[0], entry.uv_rect[1]],
+                    uv_max: [entry.uv_rect[2], entry.uv_rect[3]],
+                    color: tap_color,
                     clip_rect,
                     xform: IDENTITY_XFORM,
                     xform_translate: IDENTITY_XFORM_TRANSLATE,
                 });
             }
-            return;
-        }
-        shaped_cache.buf.remove(&cache_key);
-    }
-
-    // Cache miss: shape text and populate cache
-    let metrics = Metrics::new(font_size, font_size * line_height);
-    let mut buffer = Buffer::new(font_system, metrics);
-    buffer.set_size(font_system, max_width.map(|w| w.max(1.0)), None);
-    buffer.set_text(
-        font_system,
-        text,
-        text_attrs(font_family, font_weight, font_style),
-        Shaping::Advanced,
-    );
-    buffer.shape_until_scroll(font_system, false);
-
-    let mut cached_glyphs = Vec::new();
-
-    for run in buffer.layout_runs() {
-        let run_y = run.line_y;
-        for (glyph_idx, glyph) in run.glyphs.iter().enumerate() {
-            let ls_offset = glyph_idx as f32 * letter_spacing;
-            let physical = glyph.physical((ls_offset, 0.0), 1.0);
-
-            let key = GlyphKey {
-                font_id: atlas_text_font_namespace(&physical.cache_key, font_family, font_weight),
-                glyph_id: physical.cache_key.glyph_id,
-                font_size_tenths: (font_size * 10.0) as u16,
-                subpixel_bin: ((physical.cache_key.x_bin as u8) << 2)
-                    | (physical.cache_key.y_bin as u8),
-            };
-
-            let entry = if let Some(entry) = atlas.cache.get(&key).copied() {
-                atlas.touch(&key);
-                entry
-            } else {
-                let raster_result = rasterize_swash_for_atlas(
-                    rasterizer,
-                    font_system,
-                    &physical,
-                    atlas,
-                    key,
-                    font_family,
-                    font_weight,
-                );
-                match raster_result {
-                    Some(entry) => entry,
-                    None => continue,
-                }
-            };
-
-            let rel_x = physical.x as f32 + entry.offset[0];
-            let rel_y = run_y + physical.y as f32 + entry.offset[1];
-
-            cached_glyphs.push(CachedGlyph { rel_x, rel_y, atlas_key: key });
-            if let Some(keys) = glyph_keys_out.as_deref_mut() {
-                keys.insert(key);
-            }
-
-            batch.glyph_instances.push(GlyphInstance {
-                pos: [x + rel_x, y + rel_y],
-                size: entry.size,
-                uv_min: [entry.uv_rect[0], entry.uv_rect[1]],
-                uv_max: [entry.uv_rect[2], entry.uv_rect[3]],
-                color: color_linear,
-                clip_rect,
-                xform: IDENTITY_XFORM,
-                xform_translate: IDENTITY_XFORM_TRANSLATE,
-            });
         }
     }
 
-    shaped_cache.buf.insert(cache_key, ShapedTextEntry { glyphs: cached_glyphs });
+    // Main text run, on top of any shadow.
+    for (rel_x, rel_y, entry) in &laid_out {
+        batch.glyph_instances.push(GlyphInstance {
+            pos: [x + rel_x, y + rel_y],
+            size: entry.size,
+            uv_min: [entry.uv_rect[0], entry.uv_rect[1]],
+            uv_max: [entry.uv_rect[2], entry.uv_rect[3]],
+            color: color_linear,
+            clip_rect,
+            xform: IDENTITY_XFORM,
+            xform_translate: IDENTITY_XFORM_TRANSLATE,
+        });
+    }
 }
 
 /// Hash a font family name into the stable `font_id` used by
@@ -5032,6 +5118,7 @@ fn emit_select_node(
             style.font_style,
             &fg_color,
             clip,
+            &[],
             content_layer,
             atlas,
             font_system,
@@ -5060,6 +5147,7 @@ fn emit_select_node(
             style.font_style,
             &fg_color,
             clip,
+            &[],
             content_layer,
             atlas,
             font_system,
@@ -5164,6 +5252,7 @@ fn emit_select_node(
                 style.font_style,
                 &check_color,
                 item_clip,
+                &[],
                 overlay_layer,
                 atlas,
                 font_system,
@@ -5187,6 +5276,7 @@ fn emit_select_node(
             style.font_style,
             &text_color,
             item_clip,
+            &[],
             overlay_layer,
             atlas,
             font_system,

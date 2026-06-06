@@ -42,6 +42,13 @@ table row here.
   border-radius / gradient, left untransformed) from `pixel_pos` (transformed,
   drives NDC + ancestor clip), so the fragment shaders are unchanged. See
   `changelog.d/unreleased/2026-06-05-css-transform-affine.md`.
+- **Tier 2 — `text-shadow` (colored glow) landed 2026-06-06** (the last
+  visible-value item): the app's three authored glows (active workspace name,
+  prompt, search highlight) render as soft colored halos. Done **without render
+  targets** — the glyph run is re-drawn on a Gaussian-weighted disc of small
+  offsets behind the text, summing into a glow — sidestepping both the heavy
+  offscreen-blur path and the atlas-padding limit. See
+  `changelog.d/unreleased/2026-06-06-css-text-shadow.md`.
 - **Tier 2 — still deferred:** the table below. Each is genuinely renderer-,
   text-layout-, or value-evaluator-bound — not a one-line parse arm.
 
@@ -60,7 +67,6 @@ table row here.
 
 | Property / form | Drops today | Class | Effort | Value |
 |---|---|---|---|---|
-| `text-shadow` (non-`none`) | `none` accepted; real shadow lists drop | renderer (offscreen blur) | L | M |
 | `filter: drop-shadow(...)` | no element `filter` field; only `backdrop-filter` blur exists | renderer (offscreen) | L | M |
 | `word-break: break-word` | no `set_wrap` control in the shaper | text-layout | M | M |
 | `mix-blend-mode: multiply` | blend is baked per-pipeline, not per-instance | renderer (blend) | L | L |
@@ -104,19 +110,24 @@ RTL truncates the logical tail rather than the CSS-perfect visual-left end (fit 
 always guaranteed). Sub-pixel atlas-bitmap overhang vs the advance-based fit
 formula is a universal, pre-existing concern covered by a 0.5px epsilon.
 
-### `text-shadow` (real, non-`none`)  — renderer (offscreen blur)
-`none` is already accepted (tier 1). **Correction (was mis-scoped as a cheap
-"sharp re-emit"):** every `text-shadow` the app actually authors is a *zero-offset
-blurred glow* — `0 0 8px …` (workspace name), `0 0 6px var(--accent-a35)` (the
-prompt), `0 0 8px …` (search highlight). A sharp re-emit at offset `(0,0)` with no
-blur would draw the shadow glyphs exactly behind the main glyphs (fully occluded)
-and render *nothing* of the intended halo — i.e. a masking no-op the Boundaries
-below forbid. So for this stylesheet `text-shadow` is the **large-render** path:
-an offscreen alpha pass of the glyph run + a separable blur + composite under the
-text (the same machinery `filter: drop-shadow` needs). A `text_shadow` field +
-`parse_text_shadow_list` (modeled on `parse_box_shadow_list`, `parse.rs:~3229`)
-is the easy part; the blur pass is the work. Sharp/offset shadows (none authored
-here) would be the cheap re-emit, but are not what unblocks the app.
+### `text-shadow` (real, non-`none`)  — LANDED 2026-06-06
+Every authored value is a *zero-offset blurred glow* (`0 0 8px …` workspace name,
+`0 0 6px var(--accent-a35)` prompt, `0 0 8px …` search highlight), so a sharp
+re-emit would render nothing (occluded) — the originally-scoped "cheap re-emit"
+was a non-starter, and the offscreen alpha-pass + separable blur path was heavy
+(new render targets, single-sample pipeline duplicates, `gpu.rs` orchestration)
+*and* the in-shader wide-kernel path was blocked by the atlas's 1px inter-glyph
+padding. The landed approach is neither: a **stacked-tap glow** with no render
+target and no shader change. The glyph run is re-drawn behind the text once per
+tap, taps placed on a Gaussian-weighted Vogel disc out to the blur radius, in the
+shadow color at `alpha * weight` (weights sum to 1); overlapping copies sum into a
+soft halo. The offset is applied to the quad position (not the atlas UVs), so each
+copy samples its own glyph entry — no padding bleed. `TextShadow` type +
+`parse_text_shadow_list` mirror box-shadow; `var()` resolves via the Deferred
+path. **Accepted limitation:** a close approximation, not a pixel-exact Gaussian
+(imperceptible at the app's 0.2–0.32 alphas); for a very large blur the discrete
+taps would be visible, so tap count scales with radius and blur is clamped to
+`[0, 64]`.
 
 ### `filter: drop-shadow(...)`  — renderer (offscreen)
 Drop-shadow over arbitrary content needs an offscreen-of-own-content alpha pass +
@@ -216,18 +227,24 @@ correct), so there is effectively no clone-retirement work left.
 
 ## Open questions
 
-- `text-overflow: ellipsis`, cascade-aware custom properties, and the full
-  `transform` affine are now landed — the three highest-value gaps. What remains
-  in the inventory is genuinely lower-value or genuinely large:
-  - **`word-break: break-word`** (M/M) is the only remaining *tractable* gap with
-    real (if narrow, single-use) value — one `.term-line` use; the trap is the
-    shape/measure cache key (a missed field silently serves stale shaping).
-  - **`text-shadow`** is NOT a cheap win for this app (every authored value is a
-    zero-offset blur glow → offscreen-blur path; see its plan). Same bucket as
-    `filter: drop-shadow`.
+- `text-overflow: ellipsis`, cascade-aware custom properties, the full
+  `transform` affine, and `text-shadow` are now landed — every gap that had
+  real **visible** value in this stylesheet. What remains is genuinely
+  lower-value or genuinely large:
+  - **`inherit`** (value form, M/M) is the best remaining pick: it currently
+    *drops*, so authored `inherit` values render wrong today — implementing it
+    fixes real (if subtle) cascade bugs. Bounded: intercept the keyword, emit a
+    per-property marker, copy the parent's field in the cascade.
+  - **`word-break: break-word`** would parse cleanly but is a **no-op** in this
+    app — its only use (`.term-line`) is rendered by the fixed-width CellGrid,
+    which bypasses the text engine entirely (it would future-proof flow-text
+    wrapping but change nothing visible). Treat as low priority.
+  - **`filter: drop-shadow`** could now reuse the `text-shadow` stacked-tap idea
+    for the offset+blur of arbitrary content, but no element-`filter` field
+    exists yet.
   - The remaining table entries are all L-value (`mix-blend-mode`,
     `vertical-align`, `background-position/size`, `scroll-margin`) or large
-    value-form work (`calc()`, `inherit`).
+    value-form work (`calc()`).
 - The two cascade "follow-ups" both evaporated under inspection (see the
   cascade-aware section): the perf gate is already live, and the clone retirement
   is already done. Neither is pending work.

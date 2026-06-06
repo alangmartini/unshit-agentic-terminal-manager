@@ -292,6 +292,17 @@ pub struct ParsedBoxShadow {
     pub inset: bool,
 }
 
+/// A parsed `text-shadow` layer before color resolution. `color` is `None`
+/// when omitted; the resolver fills it from the element's `color` at apply
+/// time (CSS `currentColor` default), exactly like [`ParsedBoxShadow`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParsedTextShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur_radius: f32,
+    pub color: Option<Color>,
+}
+
 /// Identifies one edge of a box for per-side longhand CSS properties
 /// (e.g. `border-top-width`). Kept separate from the geometric `Edges`
 /// struct so the parser can carry the side tag in a declaration.
@@ -393,6 +404,7 @@ pub enum StyleDeclaration {
     BorderRadiusDim(CornersDim),
     Opacity(f32),
     BoxShadowList(SmallVec<[ParsedBoxShadow; 2]>),
+    TextShadowList(SmallVec<[ParsedTextShadow; 2]>),
     BackdropFilter(types::BackdropFilter),
     Color(Color),
     FontSize(f32),
@@ -2709,18 +2721,9 @@ fn parse_declaration(
             StyleDeclaration::MaskImage(gradient)
         }
 
-        // `text-shadow`: the only value the engine understands is `none`
-        // (clear). A real shadow list has no render target yet, so it returns
-        // `Err(())` and drops — keeping the guardrail honest about the gap
-        // rather than silently swallowing a shadow as a no-op.
-        "text-shadow" => {
-            let val = parser.expect_ident().map_err(|_| ())?;
-            if val.eq_ignore_ascii_case("none") {
-                let _ = parser.try_parse(cssparser::Parser::expect_semicolon);
-                return Ok(SmallVec::new());
-            }
-            return Err(());
-        }
+        // `text-shadow`: `none` (empty list) or one or more comma-separated
+        // glow layers. Painted as a colored blur behind the text.
+        "text-shadow" => StyleDeclaration::TextShadowList(parse_text_shadow_list(parser)?),
 
         // Inert no-op accepts: recognized-but-ignored properties that have no
         // render target in this engine. Accepting them is honest CSS
@@ -4225,6 +4228,59 @@ fn parse_single_box_shadow(parser: &mut Parser) -> Result<ParsedBoxShadow, ()> {
     Ok(ParsedBoxShadow { offset_x, offset_y, blur_radius, spread_radius, color, inset })
 }
 
+/// Parse `text-shadow`: `none` (empty list) or a comma-separated list of
+/// layers. Mirrors [`parse_box_shadow_list`].
+fn parse_text_shadow_list(parser: &mut Parser) -> Result<SmallVec<[ParsedTextShadow; 2]>, ()> {
+    let mut layers: SmallVec<[ParsedTextShadow; 2]> = SmallVec::new();
+
+    // `text-shadow: none` produces an empty list.
+    if parser
+        .try_parse(|p| {
+            let ident = p.expect_ident().map_err(|_| ())?;
+            if ident.as_ref().eq_ignore_ascii_case("none") {
+                Ok(())
+            } else {
+                Err(())
+            }
+        })
+        .is_ok()
+    {
+        return Ok(layers);
+    }
+
+    loop {
+        layers.push(parse_single_text_shadow(parser)?);
+        if parser.try_parse(cssparser::Parser::expect_comma).is_err() {
+            break;
+        }
+    }
+
+    Ok(layers)
+}
+
+/// Parse one `text-shadow` layer: `<color>? <offset-x> <offset-y> <blur>?`.
+/// Per the CSS spec the color may appear before OR after the lengths; there is
+/// no spread or inset. Omitted color stays `None` (resolved to the element
+/// color at apply time).
+fn parse_single_text_shadow(parser: &mut Parser) -> Result<ParsedTextShadow, ()> {
+    // Color may lead.
+    let mut color = parser.try_parse(|p| parse_color(p)).ok();
+
+    // Required offsets.
+    let offset_x = parse_px(parser)?;
+    let offset_y = parse_px(parser)?;
+
+    // Optional blur (defaults to 0).
+    let blur_radius = parser.try_parse(|p| parse_px(p)).unwrap_or(0.0);
+
+    // Color may trail instead of lead.
+    if color.is_none() {
+        color = parser.try_parse(|p| parse_color(p)).ok();
+    }
+
+    Ok(ParsedTextShadow { offset_x, offset_y, blur_radius, color })
+}
+
 // ---------------------------------------------------------------------------
 // Transition parsing
 // ---------------------------------------------------------------------------
@@ -5245,6 +5301,22 @@ pub fn apply_declaration(style: &mut ComputedStyle, decl: &StyleDeclaration) {
                 });
             }
             style.box_shadow = out;
+        }
+        StyleDeclaration::TextShadowList(v) => {
+            let mut out: SmallVec<[types::TextShadow; 2]> = SmallVec::with_capacity(v.len());
+            for layer in v.iter() {
+                // Omitted color defaults to the element's `color` (CSS
+                // `currentColor`). Blur is clamped non-negative and bounded so a
+                // pathological radius can't blow up the stacked-tap glow.
+                let color = layer.color.unwrap_or(style.color);
+                out.push(types::TextShadow {
+                    offset_x: layer.offset_x,
+                    offset_y: layer.offset_y,
+                    blur_radius: layer.blur_radius.clamp(0.0, 64.0),
+                    color,
+                });
+            }
+            style.text_shadow = out;
         }
         StyleDeclaration::BackdropFilter(v) => style.backdrop_filter = Some(v.clone()),
         StyleDeclaration::Color(v) => style.color = *v,
@@ -9009,19 +9081,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn text_shadow_none_is_accepted_inert() {
-        assert_eq!(parse_decls(".x { text-shadow: none; }"), Vec::<StyleDeclaration>::new());
+    fn get_text_shadow_list(decls: &[StyleDeclaration]) -> SmallVec<[ParsedTextShadow; 2]> {
+        decls
+            .iter()
+            .find_map(|d| match d {
+                StyleDeclaration::TextShadowList(v) => Some(v.clone()),
+                _ => None,
+            })
+            .expect("declaration should contain a text-shadow list")
     }
 
     #[test]
-    fn text_shadow_real_shadow_still_drops() {
-        // A real shadow list must drop, keeping the guardrail honest.
-        let sheet = CompiledStylesheet::parse(".x { text-shadow: 0 1px 2px #000; }");
-        assert!(
-            sheet.dropped.iter().any(|d| d.property == "text-shadow"),
-            "a real text-shadow value must still drop"
-        );
+    fn text_shadow_none_clears_to_empty_list() {
+        // `none` is a real (empty) list declaration that clears any earlier
+        // text-shadow, mirroring `box-shadow: none`.
+        let list = get_text_shadow_list(&parse_decls(".x { text-shadow: none; }"));
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn text_shadow_glow_parses() {
+        // The app's workspace-name glow: a zero-offset blurred glow.
+        let list = get_text_shadow_list(&parse_decls(
+            ".x { text-shadow: 0 0 8px rgba(246,217,136,0.2); }",
+        ));
+        assert_eq!(list.len(), 1);
+        let s = list[0];
+        assert_eq!((s.offset_x, s.offset_y, s.blur_radius), (0.0, 0.0, 8.0));
+        let c = s.color.expect("explicit color should parse");
+        assert_eq!((c.r, c.g, c.b), (246, 217, 136));
+    }
+
+    #[test]
+    fn text_shadow_color_may_lead_or_be_omitted() {
+        // Color-first form is valid CSS.
+        let lead = get_text_shadow_list(&parse_decls(".x { text-shadow: #ff0000 1px 2px 3px; }"));
+        assert_eq!(lead.len(), 1);
+        assert_eq!((lead[0].offset_x, lead[0].offset_y, lead[0].blur_radius), (1.0, 2.0, 3.0));
+        assert_eq!(lead[0].color.map(|c| (c.r, c.g, c.b)), Some((255, 0, 0)));
+        // Omitted color stays None (resolved to currentColor at apply).
+        let bare = get_text_shadow_list(&parse_decls(".x { text-shadow: 1px 1px; }"));
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].blur_radius, 0.0);
+        assert!(bare[0].color.is_none());
+    }
+
+    #[test]
+    fn text_shadow_omitted_color_defaults_to_current_color() {
+        let mut style = ComputedStyle::default();
+        // The default `color` is opaque black; an omitted shadow color must
+        // resolve to it (CSS `currentColor`).
+        for d in &parse_decls(".x { text-shadow: 0 0 4px; }") {
+            apply_declaration(&mut style, d);
+        }
+        assert_eq!(style.text_shadow.len(), 1);
+        assert_eq!(style.text_shadow[0].color, style.color);
+        assert_eq!(style.text_shadow[0].blur_radius, 4.0);
     }
 
     #[test]
