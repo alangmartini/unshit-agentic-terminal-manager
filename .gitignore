@@ -1,6 +1,5 @@
 /target
 target-codex/
-Cargo.lock
 *.swp
 *.swo
 *~
@@ -15,3 +14,9 @@ artifacts/
 .claude/*
 !.claude/skills/
 !.claude/commands/
+
+# Release / installer output
+/dist/
+*.msi
+# Intermediate icon rasters (the committed source of truth is packaging/app.ico)
+packaging/source-*.png
