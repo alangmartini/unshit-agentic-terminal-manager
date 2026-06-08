@@ -514,7 +514,7 @@ fn build_pane_body(
                         // Shift+PageUp: scroll back half a page.
                         if has_shift && no_ctrl && no_alt && kb.key == Key::PageUp {
                             mutate_with(&kbd_shared, |st| {
-                                crate::state::clear_terminal_selection(st, kbd_pane_id.0);
+                                crate::state::mark_terminal_selection_dirty(st, kbd_pane_id.0);
                                 if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
                                     let mut terminal = handle.lock_recover();
                                     let half = (terminal.grid().rows() / 2).max(1);
@@ -527,7 +527,7 @@ fn build_pane_body(
                         // Shift+PageDown: scroll forward half a page.
                         if has_shift && no_ctrl && no_alt && kb.key == Key::PageDown {
                             mutate_with(&kbd_shared, |st| {
-                                crate::state::clear_terminal_selection(st, kbd_pane_id.0);
+                                crate::state::mark_terminal_selection_dirty(st, kbd_pane_id.0);
                                 if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
                                     let mut terminal = handle.lock_recover();
                                     let half = (terminal.grid().rows() / 2).max(1);
@@ -599,11 +599,10 @@ fn build_pane_body(
                         };
                         if lines != 0 {
                             mutate_with(&scroll_shared, |st| {
-                                // Selection coordinates are display-relative;
-                                // scrolling slides content under them, so drop
-                                // the selection rather than leave a stale
-                                // highlight on unrelated rows.
-                                crate::state::clear_terminal_selection(st, scroll_pane_id.0);
+                                // The selection is anchored to absolute lines,
+                                // so it survives the scroll; force a repaint so
+                                // the highlight redraws at its new display rows.
+                                crate::state::mark_terminal_selection_dirty(st, scroll_pane_id.0);
                                 if let Some(handle) = st.terminals.get(&scroll_pane_id.0) {
                                     let mut terminal = handle.lock_recover();
                                     if lines > 0 {

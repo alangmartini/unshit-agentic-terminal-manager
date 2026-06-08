@@ -77,21 +77,24 @@ pub enum SelectMode {
     Line,
 }
 
-/// A mouse text selection over a terminal pane, in visible (display-grid)
-/// coordinates: `(row, col)`. The same coordinate space the pointer reports
-/// and that [`crate::terminal::Terminal::selection_text`] reads.
+/// A mouse text selection over a terminal pane, in *absolute line*
+/// coordinates: `(abs_line, col)`. `abs_line` is the terminal's stable
+/// buffer index (see [`crate::terminal::Terminal::abs_line_at_display`]), so
+/// the selection stays pinned to its text as the view scrolls and as output
+/// streams. [`crate::terminal::Terminal::selection_text`] reads the same
+/// coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TermSelection {
     /// Where the selection was anchored (mouse-down / fixed end).
-    pub anchor: (usize, usize),
+    pub anchor: (u64, usize),
     /// The moving end (latest mouse position).
-    pub focus: (usize, usize),
+    pub focus: (u64, usize),
     pub mode: SelectMode,
 }
 
 impl TermSelection {
     /// A collapsed selection anchored at `cell`.
-    pub fn new(cell: (usize, usize), mode: SelectMode) -> Self {
+    pub fn new(cell: (u64, usize), mode: SelectMode) -> Self {
         Self {
             anchor: cell,
             focus: cell,
@@ -99,8 +102,8 @@ impl TermSelection {
         }
     }
 
-    /// `(start, end)` ordered row-major so `start <= end`.
-    pub fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+    /// `(start, end)` ordered so `start <= end` (line-major).
+    pub fn ordered(&self) -> ((u64, usize), (u64, usize)) {
         if self.anchor <= self.focus {
             (self.anchor, self.focus)
         } else {
@@ -123,7 +126,7 @@ impl TermSelection {
 pub struct TerminalClick {
     pub pane: u32,
     pub at: std::time::Instant,
-    pub cell: (usize, usize),
+    pub cell: (u64, usize),
     /// 1 = cell, 2 = word, 3 = line. Wraps 3 -> 1 on a fourth click.
     pub count: u8,
 }
@@ -131,50 +134,21 @@ pub struct TerminalClick {
 /// Maximum gap between two presses for them to count as a multi-click.
 pub const MULTI_CLICK_MS: u128 = 400;
 
-/// Paint [`SELECTION_BG`] over every cell in `sel`'s linear range on a
-/// display-grid clone. No-op for an empty selection. Operates on the
-/// per-frame clone so the live terminal buffer is never mutated; callers
-/// force-damage the affected rows so the renderer's line cache re-emits
-/// them (see the render path in `main.rs`).
+/// Paint [`SELECTION_BG`] over `sel`'s visible cells on a display-grid clone.
+/// No-op for an empty selection. The terminal maps the selection's absolute
+/// line coordinates to current display rows (lines scrolled out of view are
+/// skipped), so this operates only on the per-frame clone and never mutates
+/// the live buffer. Callers force-damage the affected pane so the renderer's
+/// line cache re-emits the rows (see the render path in `main.rs`).
 pub fn apply_selection_highlight(
     grid: &mut unshit::core::cell_grid::CellGrid,
+    terminal: &crate::terminal::Terminal,
     sel: &TermSelection,
 ) {
     if sel.is_empty() {
         return;
     }
-    let rows = grid.rows();
-    let cols = grid.cols();
-    if rows == 0 || cols == 0 {
-        return;
-    }
-    let (start, end) = sel.ordered();
-    let last_row = rows - 1;
-    let last_col = cols - 1;
-    let start_row = start.0.min(last_row);
-    let end_row = end.0.min(last_row);
-    for row in start_row..=end_row {
-        let c0 = if row == start_row {
-            start.1.min(last_col)
-        } else {
-            0
-        };
-        let c1 = if row == end_row {
-            end.1.min(last_col)
-        } else {
-            last_col
-        };
-        for col in c0..=c1 {
-            if let Some(mut cell) = grid.get_cell(row, col).copied() {
-                cell.bg = SELECTION_BG;
-                // Clearing INVERSE keeps the highlight bg from being swapped
-                // back out with the fg in the renderer's inverse path.
-                cell.attrs
-                    .remove(unshit::core::cell_grid::CellAttrs::INVERSE);
-                grid.set_cell(row, col, cell);
-            }
-        }
-    }
+    terminal.paint_selection(grid, sel.anchor, sel.focus, SELECTION_BG);
 }
 
 #[derive(Clone, Debug)]
@@ -4148,7 +4122,7 @@ fn dispatch_terminal_copy(state: &mut AppState) -> bool {
 /// The visible highlighted range of a selection, or `None` when it paints
 /// nothing (a collapsed `Cell`-mode selection). Two selections with the same
 /// span produce identical pixels.
-fn selection_highlight_span(sel: &TermSelection) -> Option<((usize, usize), (usize, usize))> {
+fn selection_highlight_span(sel: &TermSelection) -> Option<((u64, usize), (u64, usize))> {
     if sel.is_empty() {
         None
     } else {
@@ -4177,6 +4151,16 @@ pub fn set_terminal_selection(state: &mut AppState, pane: u32, sel: TermSelectio
 /// nothing selected.
 pub fn clear_terminal_selection(state: &mut AppState, pane: u32) {
     if state.terminal_selections.remove(&pane).is_some() {
+        state.terminal_selection_repaint.insert(pane);
+    }
+}
+
+/// Force a one-frame repaint of `pane`'s selection highlight without changing
+/// the selection. Used when the view scrolls: the selection is anchored to
+/// absolute lines and stays valid, but the highlight must be re-emitted at
+/// the display rows the content now occupies.
+pub fn mark_terminal_selection_dirty(state: &mut AppState, pane: u32) {
+    if state.terminal_selections.contains_key(&pane) {
         state.terminal_selection_repaint.insert(pane);
     }
 }
@@ -4220,18 +4204,19 @@ pub fn terminal_cell_at(
     local_y: f32,
     x_offset: f32,
     cell_w_scale: f32,
-) -> Option<(usize, usize)> {
+) -> Option<(u64, usize)> {
     let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w() * cell_w_scale;
     let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
     let handle = state.terminals.get(&pane)?;
-    let (rows, cols) = {
-        let t = handle.lock_recover();
-        (t.grid().rows(), t.grid().cols())
-    };
-    cell_from_local(local_x, local_y, cell_w, cell_h, x_offset, cols, rows)
+    let t = handle.lock_recover();
+    let (rows, cols) = (t.grid().rows(), t.grid().cols());
+    let (row, col) = cell_from_local(local_x, local_y, cell_w, cell_h, x_offset, cols, rows)?;
+    // Promote the visible row to a stable absolute line so the selection
+    // survives scrolling and output.
+    Some((t.abs_line_at_display(row), col))
 }
 
-fn terminal_word_bounds(state: &AppState, pane: u32, cell: (usize, usize)) -> (usize, usize) {
+fn terminal_word_bounds(state: &AppState, pane: u32, cell: (u64, usize)) -> (usize, usize) {
     state
         .terminals
         .get(&pane)
@@ -4239,7 +4224,7 @@ fn terminal_word_bounds(state: &AppState, pane: u32, cell: (usize, usize)) -> (u
         .unwrap_or((cell.1, cell.1))
 }
 
-fn terminal_line_bounds(state: &AppState, pane: u32, cell: (usize, usize)) -> (usize, usize) {
+fn terminal_line_bounds(state: &AppState, pane: u32, cell: (u64, usize)) -> (usize, usize) {
     state
         .terminals
         .get(&pane)
@@ -4247,14 +4232,14 @@ fn terminal_line_bounds(state: &AppState, pane: u32, cell: (usize, usize)) -> (u
         .unwrap_or((cell.1, cell.1))
 }
 
-/// Handle a left mouse-down on `pane`'s terminal at visible `cell`. Places a
+/// Handle a left mouse-down on `pane`'s terminal at absolute `cell`. Places a
 /// fresh anchor, extends from the existing anchor on `shift`, or promotes to
 /// word / line selection on the second / third consecutive press of the same
 /// cell within [`MULTI_CLICK_MS`].
 pub fn handle_terminal_mouse_down(
     state: &mut AppState,
     pane: u32,
-    cell: (usize, usize),
+    cell: (u64, usize),
     shift: bool,
     now: std::time::Instant,
 ) {
@@ -4313,10 +4298,10 @@ pub fn handle_terminal_mouse_down(
     set_terminal_selection(state, pane, sel);
 }
 
-/// Extend `pane`'s selection focus to `cell` during a drag. Seeds a fresh
-/// cell selection if a drag somehow arrives without a prior mouse-down
+/// Extend `pane`'s selection focus to absolute `cell` during a drag. Seeds a
+/// fresh cell selection if a drag somehow arrives without a prior mouse-down
 /// anchor.
-pub fn handle_terminal_drag(state: &mut AppState, pane: u32, cell: (usize, usize)) {
+pub fn handle_terminal_drag(state: &mut AppState, pane: u32, cell: (u64, usize)) {
     if let Some(mut sel) = state.terminal_selections.get(&pane).copied() {
         sel.focus = cell;
         set_terminal_selection(state, pane, sel);
@@ -7754,18 +7739,17 @@ mod tests {
 
     #[test]
     fn apply_selection_highlight_paints_only_selected_cells() {
-        use unshit::core::cell_grid::{Cell, CellGrid};
-        let mut grid = CellGrid::new(2, 5);
-        for col in 0..5 {
-            grid.set_cell(0, col, Cell::with_char('a'));
-            grid.set_cell(1, col, Cell::with_char('b'));
-        }
+        let mut term = crate::terminal::Terminal::new(2, 5);
+        term.process_bytes(b"aaaaa\r\nbbbbb");
+        let mut grid = term.display_grid();
+        // Absolute line 0 == display row 0 on a fresh terminal with no
+        // scrollback; select cols 1..=3 of it.
         let sel = TermSelection {
             anchor: (0, 1),
             focus: (0, 3),
             mode: SelectMode::Cell,
         };
-        apply_selection_highlight(&mut grid, &sel);
+        apply_selection_highlight(&mut grid, &term, &sel);
 
         // Selected cells (row 0, cols 1..=3) carry the selection bg.
         for col in 1..=3 {
@@ -7779,11 +7763,15 @@ mod tests {
 
     #[test]
     fn apply_selection_highlight_skips_empty_selection() {
-        use unshit::core::cell_grid::{Cell, CellGrid};
-        let mut grid = CellGrid::new(1, 3);
-        grid.set_cell(0, 0, Cell::with_char('x'));
+        let mut term = crate::terminal::Terminal::new(1, 3);
+        term.process_bytes(b"xyz");
+        let mut grid = term.display_grid();
         let before = *grid.get_cell(0, 0).unwrap();
-        apply_selection_highlight(&mut grid, &TermSelection::new((0, 0), SelectMode::Cell));
+        apply_selection_highlight(
+            &mut grid,
+            &term,
+            &TermSelection::new((0, 0), SelectMode::Cell),
+        );
         assert_eq!(
             *grid.get_cell(0, 0).unwrap(),
             before,

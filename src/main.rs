@@ -1160,9 +1160,11 @@ fn main() {
                     );
                     // Paint the selection highlight onto the per-frame clone
                     // (never the live buffer). Applied after the palette so
-                    // the selection bg wins over the themed cell bg.
+                    // the selection bg wins over the themed cell bg. The
+                    // terminal maps the selection's absolute lines to current
+                    // display rows, so it tracks content as the view scrolls.
                     if let Some(sel) = selections.get(&id) {
-                        crate::state::apply_selection_highlight(&mut grid, sel);
+                        crate::state::apply_selection_highlight(&mut grid, &t, sel);
                     }
                     // Force a full repaint of this pane the frame its selection
                     // changed (added / moved / cleared) so the renderer's line
