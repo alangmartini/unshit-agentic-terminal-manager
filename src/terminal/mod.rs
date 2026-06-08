@@ -96,12 +96,11 @@ pub struct Terminal {
     /// wrapped in `ESC[200~` / `ESC[201~` so readline/editors can tell
     /// a paste from typed input. Reset by `CSI ? 2004 l`.
     bracketed_paste: bool,
-    /// Monotonic counter bumped whenever the live screen scrolls content
-    /// (output pushing lines up, or a region scroll). Mouse selections are
-    /// display-relative, so a scroll slides the text out from under them;
-    /// the bridge compares this across a PTY batch and drops the selection
-    /// when it changed.
-    scroll_generation: u64,
+    /// Count of scrollback lines permanently evicted off the top (when the
+    /// buffer exceeds `MAX_SCROLLBACK`). Added to a line's index within the
+    /// live `scrollback ++ screen` buffer to form a stable *absolute* line
+    /// id that selections anchor to, so they survive scrolling and output.
+    evicted_lines: u64,
 }
 
 const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
@@ -349,7 +348,7 @@ impl Terminal {
             pending_response: Vec::new(),
             synchronized_output_active: false,
             bracketed_paste: false,
-            scroll_generation: 0,
+            evicted_lines: 0,
         }
     }
 
@@ -741,6 +740,14 @@ impl Terminal {
     }
 
     // -- selection / clipboard -----------------------------------------------
+    //
+    // Selections are stored in *absolute line* coordinates: an index into
+    // the conceptual `scrollback ++ screen` buffer, offset by the number of
+    // lines that have been permanently evicted off the top of scrollback.
+    // A content line keeps its absolute index for life (until evicted), so a
+    // selection stays pinned to its text as the view scrolls and as output
+    // pushes lines into scrollback — no display-relative drift, no need to
+    // clear the selection just because the screen moved.
 
     /// Whether the running program enabled bracketed paste mode via
     /// DECSET 2004. `terminal.paste` wraps the payload in
@@ -749,31 +756,63 @@ impl Terminal {
         self.bracketed_paste
     }
 
-    /// Monotonic count of live-screen scrolls. The bridge samples this
-    /// before and after feeding a PTY chunk; a change means content slid
-    /// under any active selection, so the selection must be dropped.
-    pub fn scroll_generation(&self) -> u64 {
-        self.scroll_generation
+    /// Absolute index of the virtual line currently shown at display row 0.
+    fn top_abs_line(&self) -> u64 {
+        let top_virtual = self.scrollback.len().saturating_sub(self.scroll_offset);
+        self.evicted_lines + top_virtual as u64
     }
 
-    /// The cell currently shown at display coordinate `(display_row, col)`,
-    /// honoring the scrollback view offset. This is the same coordinate
-    /// space the pointer selects in: it mirrors [`Terminal::display_grid`]'s
-    /// row composition. Returns `None` when out of bounds.
-    fn visible_cell(&self, display_row: usize, col: usize) -> Option<Cell> {
-        if display_row >= self.rows || col >= self.cols {
+    /// Smallest still-addressable absolute line (the oldest line retained in
+    /// scrollback). Lines below this have been evicted and are gone.
+    pub fn first_abs_line(&self) -> u64 {
+        self.evicted_lines
+    }
+
+    /// One past the largest addressable absolute line.
+    fn end_abs_line(&self) -> u64 {
+        self.evicted_lines + (self.scrollback.len() + self.rows) as u64
+    }
+
+    /// Absolute line index for the cell currently shown at `display_row`.
+    /// The same mapping [`Terminal::display_grid`] uses, lifted into absolute
+    /// space so the result is stable as the buffer scrolls.
+    pub fn abs_line_at_display(&self, display_row: usize) -> u64 {
+        self.top_abs_line() + display_row as u64
+    }
+
+    /// Display row currently showing absolute line `abs`, or `None` when it
+    /// is scrolled out of the viewport (above the top or below the bottom).
+    fn display_row_of_abs(&self, abs: u64) -> Option<usize> {
+        let top = self.top_abs_line();
+        if abs < top {
             return None;
         }
-        if self.scroll_offset == 0 {
-            return self.grid.get_cell(display_row, col).copied();
+        let d = (abs - top) as usize;
+        if d < self.rows {
+            Some(d)
+        } else {
+            None
         }
+    }
+
+    /// The cell at absolute `(abs, col)`, reading from scrollback or the live
+    /// screen as appropriate. `None` when the line was evicted or is out of
+    /// bounds.
+    fn cell_at_abs(&self, abs: u64, col: usize) -> Option<Cell> {
+        if col >= self.cols || abs < self.evicted_lines {
+            return None;
+        }
+        let virtual_line = (abs - self.evicted_lines) as usize;
         let sb_len = self.scrollback.len();
-        let virtual_line = sb_len.saturating_sub(self.scroll_offset) + display_row;
         if virtual_line < sb_len {
             self.scrollback[virtual_line].get(col).copied()
         } else {
             let screen_row = virtual_line - sb_len;
-            self.grid.get_cell(screen_row, col).copied()
+            if screen_row < self.rows {
+                self.grid.get_cell(screen_row, col).copied()
+            } else {
+                None
+            }
         }
     }
 
@@ -785,16 +824,15 @@ impl Terminal {
         ch.is_alphanumeric() || "_./-~+:@%".contains(ch)
     }
 
-    /// Inclusive `[start_col, end_col]` column span of the word at
-    /// `(display_row, col)`. A click on a non-word cell selects just that
-    /// cell. Coordinates are in the visible (display) space.
-    pub fn word_bounds_at(&self, display_row: usize, col: usize) -> (usize, usize) {
+    /// Inclusive `[start_col, end_col]` column span of the word at absolute
+    /// `(abs_line, col)`. A click on a non-word cell selects just that cell.
+    pub fn word_bounds_at(&self, abs_line: u64, col: usize) -> (usize, usize) {
         if self.cols == 0 {
             return (0, 0);
         }
         let col = col.min(self.cols - 1);
         let ch_at = |c: usize| {
-            self.visible_cell(display_row, c)
+            self.cell_at_abs(abs_line, c)
                 .map(|cell| if cell.ch == '\0' { ' ' } else { cell.ch })
                 .unwrap_or(' ')
         };
@@ -813,43 +851,100 @@ impl Terminal {
         (start, end)
     }
 
-    /// Inclusive `[start_col, end_col]` span covering the whole visible row,
-    /// used by triple-click line selection. Trailing blanks are trimmed by
+    /// Inclusive `[start_col, end_col]` span covering a whole line, used by
+    /// triple-click line selection. Trailing blanks are trimmed by
     /// [`Terminal::selection_text`] at copy time.
-    pub fn line_bounds_at(&self, _display_row: usize) -> (usize, usize) {
+    pub fn line_bounds_at(&self, _abs_line: u64) -> (usize, usize) {
         (0, self.cols.saturating_sub(1))
     }
 
-    /// Plain text for the selection spanning visible coordinates `a`..`b`
-    /// (order-independent). Linear (stream) selection: the first row runs
-    /// from its start column to end of line, interior rows are full, and the
-    /// last row runs from line start to its end column. Wide-character
+    /// Paint `bg` over every visible cell of the selection spanning absolute
+    /// coordinates `anchor`..`focus` (order-independent) on `grid`, which
+    /// must be the [`Terminal::display_grid`] clone for the current view.
+    /// Lines scrolled out of the viewport are skipped; the selection itself
+    /// is unchanged. No-op when anchor == focus (collapsed).
+    pub fn paint_selection(
+        &self,
+        grid: &mut CellGrid,
+        anchor: (u64, usize),
+        focus: (u64, usize),
+        bg: Color,
+    ) {
+        if self.rows == 0 || self.cols == 0 || anchor == focus {
+            return;
+        }
+        let (start, end) = if anchor <= focus {
+            (anchor, focus)
+        } else {
+            (focus, anchor)
+        };
+        let last_col = self.cols - 1;
+        // Only the on-screen portion of the selection needs painting.
+        let vis_top = self.top_abs_line();
+        let vis_bot = vis_top + (self.rows.saturating_sub(1)) as u64;
+        let from = start.0.max(vis_top);
+        let to = end.0.min(vis_bot);
+        let mut abs = from;
+        while abs <= to {
+            if let Some(row) = self.display_row_of_abs(abs) {
+                let c0 = if abs == start.0 {
+                    start.1.min(last_col)
+                } else {
+                    0
+                };
+                let c1 = if abs == end.0 {
+                    end.1.min(last_col)
+                } else {
+                    last_col
+                };
+                for col in c0..=c1 {
+                    if let Some(mut cell) = grid.get_cell(row, col).copied() {
+                        cell.bg = bg;
+                        cell.attrs.remove(CellAttrs::INVERSE);
+                        grid.set_cell(row, col, cell);
+                    }
+                }
+            }
+            abs += 1;
+        }
+    }
+
+    /// Plain text for the selection spanning absolute coordinates `a`..`b`
+    /// (order-independent), read straight from the buffer so it is correct
+    /// regardless of the current scroll position. Linear (stream) selection:
+    /// the first line runs from its start column to end of line, interior
+    /// lines are full, the last runs to its end column. Wide-character
     /// continuation cells are skipped, empty cells become spaces, trailing
-    /// whitespace is trimmed per line, and rows join with `\n`.
-    pub fn selection_text(&self, a: (usize, usize), b: (usize, usize)) -> String {
+    /// whitespace is trimmed per line, and lines join with `\n`.
+    pub fn selection_text(&self, a: (u64, usize), b: (u64, usize)) -> String {
         if self.rows == 0 || self.cols == 0 {
             return String::new();
         }
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        let last_row = self.rows - 1;
         let last_col = self.cols - 1;
-        let start_row = start.0.min(last_row);
-        let end_row = end.0.min(last_row);
-        let mut lines: Vec<String> = Vec::with_capacity(end_row - start_row + 1);
-        for row in start_row..=end_row {
-            let c0 = if row == start_row {
+        // Clamp to the addressable range so an evicted top or an
+        // out-of-range bottom does not emit blank padding lines.
+        let start_abs = start.0.max(self.first_abs_line());
+        let end_abs = end.0.min(self.end_abs_line().saturating_sub(1));
+        if start_abs > end_abs {
+            return String::new();
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let mut abs = start_abs;
+        while abs <= end_abs {
+            let c0 = if abs == start.0 {
                 start.1.min(last_col)
             } else {
                 0
             };
-            let c1 = if row == end_row {
+            let c1 = if abs == end.0 {
                 end.1.min(last_col)
             } else {
                 last_col
             };
             let mut s = String::new();
             for col in c0..=c1 {
-                if let Some(cell) = self.visible_cell(row, col) {
+                if let Some(cell) = self.cell_at_abs(abs, col) {
                     if cell.wide_continuation {
                         continue;
                     }
@@ -857,6 +952,7 @@ impl Terminal {
                 }
             }
             lines.push(s.trim_end_matches(' ').to_string());
+            abs += 1;
         }
         lines.join("\n")
     }
@@ -901,7 +997,6 @@ impl Terminal {
         if self.rows == 0 || self.scroll_bot <= self.scroll_top {
             return;
         }
-        self.scroll_generation = self.scroll_generation.wrapping_add(1);
         let top = self.scroll_top;
         let bot = self.scroll_bot;
 
@@ -914,6 +1009,11 @@ impl Terminal {
             self.scrollback.push_back(row);
             if self.scrollback.len() > MAX_SCROLLBACK {
                 self.scrollback.pop_front();
+                // A line left the buffer for good; bump the absolute-line
+                // base so existing selection anchors stay pinned to the
+                // right text (their absolute index is unaffected; indices
+                // into the live buffer all shift down by one).
+                self.evicted_lines += 1;
             }
         }
 
@@ -940,7 +1040,6 @@ impl Terminal {
         if self.rows == 0 || self.scroll_bot <= self.scroll_top {
             return;
         }
-        self.scroll_generation = self.scroll_generation.wrapping_add(1);
         let top = self.scroll_top;
         let bot = self.scroll_bot;
         let move_count = bot - top - 1;
@@ -3419,24 +3518,46 @@ mod tests {
     }
 
     #[test]
-    fn scroll_generation_bumps_when_output_scrolls_screen() {
-        let mut term = Terminal::new(2, 5);
-        let before = term.scroll_generation();
-        // Three lines on a two-row screen forces at least one scroll_up.
-        term.process_bytes(b"a\r\nb\r\nc");
-        assert!(
-            term.scroll_generation() > before,
-            "a live-screen scroll must bump the generation"
-        );
+    fn selection_text_reads_absolute_lines_across_scrollback() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"line0\r\nline1\r\nline2\r\nline3");
+        // line0/line1 scrolled into scrollback (off the live screen), but
+        // selection_text addresses them by absolute line regardless of view.
+        assert_eq!(term.selection_text((0, 0), (0, 4)), "line0");
+        assert_eq!(term.selection_text((3, 0), (3, 4)), "line3");
+        // The live view shows the last two absolute lines.
+        assert_eq!(term.abs_line_at_display(0), 2);
+        assert_eq!(term.abs_line_at_display(1), 3);
+        // Scrolling the view back does not change which absolute line maps
+        // to a given display row's content; line0 becomes visible at row 0.
+        term.scroll_view_up(2);
+        assert_eq!(term.abs_line_at_display(0), 0);
+        assert_eq!(term.selection_text((0, 0), (0, 4)), "line0");
     }
 
     #[test]
-    fn scroll_generation_steady_without_scroll() {
-        let mut term = Terminal::new(4, 10);
-        let before = term.scroll_generation();
-        // Output that fits on screen must not bump the generation.
-        term.process_bytes(b"hello");
-        assert_eq!(term.scroll_generation(), before);
+    fn paint_selection_follows_content_when_view_scrolls() {
+        use unshit::core::style::types::Color;
+        let bg = Color::rgb(1, 2, 3);
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"line0\r\nline1\r\nline2\r\nline3");
+        // Select absolute line 0 ("line0"), which is currently scrolled out
+        // of the live view: nothing should paint.
+        let mut live = term.display_grid();
+        term.paint_selection(&mut live, (0, 0), (0, 4), bg);
+        assert!(
+            (0..10)
+                .all(|c| live.get_cell(0, c).unwrap().bg != bg
+                    && live.get_cell(1, c).unwrap().bg != bg),
+            "an off-screen selection must not paint the live view"
+        );
+        // Scroll line0 into view at display row 0; now it paints there.
+        term.scroll_view_up(2);
+        let mut scrolled = term.display_grid();
+        term.paint_selection(&mut scrolled, (0, 0), (0, 4), bg);
+        for c in 0..=4 {
+            assert_eq!(scrolled.get_cell(0, c).unwrap().bg, bg, "col {c} of line0");
+        }
     }
 
     #[test]

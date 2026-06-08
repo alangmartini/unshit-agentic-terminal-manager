@@ -116,11 +116,8 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
 
                     let mut batched = 1u32;
                     let mut total_bytes = data.len();
-                    let (pending_response, synchronized_output_active, scrolled) = {
+                    let (pending_response, synchronized_output_active) = {
                         let mut terminal = terminal_handle.lock_recover();
-                        // Sample the scroll counter so we can drop a stale
-                        // selection if this batch slid the screen under it.
-                        let scroll_gen_before = terminal.scroll_generation();
                         terminal.process_bytes(&data);
                         while let Ok(more) = rx.try_recv() {
                             total_bytes += more.len();
@@ -145,17 +142,10 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                         (
                             terminal.take_pending_response(),
                             terminal.synchronized_output_active(),
-                            terminal.scroll_generation() != scroll_gen_before,
                         )
                     };
                     {
                         let mut guard = shared.lock_recover();
-                        // Output that scrolled the live screen moved content
-                        // out from under any display-relative selection on
-                        // this pane, so drop it rather than copy stale text.
-                        if scrolled {
-                            crate::state::clear_terminal_selection(&mut guard, pane_id);
-                        }
                         record_diagnostic_pty_event(
                             &mut guard,
                             format!(
