@@ -683,7 +683,10 @@ fn build_workspace_ctx_menu(
         .with_child(m_menu_row(
             svg_icon(icon_diamond()),
             "Set active",
-            Some("\u{23CE}"),
+            // The design's mac glyphs (⏎ / ⌘) render as artifacts in the
+            // Windows DirectWrite/Consolas UI path; mirror the affordance with
+            // the app's own legible key notation (palette uses ↵ for Enter).
+            Some("\u{21B5}"),
             false,
             false,
             shared,
@@ -693,7 +696,7 @@ fn build_workspace_ctx_menu(
         .with_child(m_menu_row(
             svg_icon(icon_collapse()),
             collapse_label,
-            Some("\u{2318}."),
+            Some("Ctrl ."),
             false,
             false,
             shared,
