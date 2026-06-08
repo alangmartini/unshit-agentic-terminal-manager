@@ -2881,11 +2881,11 @@ body.dragging-pane {
   min-width: 180px;
   max-height: 92vh;
   overflow: auto;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border-soft);
-  border-radius: 6px;
-  padding: 4px 0;
-  box-shadow: var(--shadow-lg);
+  background: linear-gradient(180deg, #2b251b, #221d15);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  padding: 5px;
+  box-shadow: var(--shadow-lg), 0 0 28px rgba(212, 163, 72, 0.07);
   z-index: 201;
 }
 
@@ -2944,6 +2944,166 @@ body.dragging-pane {
 .ctx-menu-item.active,
 .tm-menu-item.active {
   color: var(--amber-200);
+}
+
+/* ---- Workspace context menu — design #2 (submenu flyout) ----
+   Layered on top of the legacy .ctx-menu-* classes (which the menu rows
+   still carry for structural tests). These rules come later in source so
+   they win on equal specificity. */
+
+.m-menu {
+  width: 222px;
+  min-width: 0;
+  max-height: none;
+  overflow: visible;
+}
+
+.m-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 9px 9px;
+  border-bottom: 1px solid var(--border-hair);
+  margin-bottom: 4px;
+  font-size: 10px;
+  color: var(--fg-tertiary);
+}
+.m-head-ic {
+  width: 14px;
+  height: 14px;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+}
+.m-head-ic svg { width: 14px; height: 14px; }
+.m-head .nm {
+  color: var(--fg-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.m-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  border-radius: var(--r-sm);
+  color: var(--fg-secondary);
+  cursor: pointer;
+  position: relative;
+}
+.m-row:hover { background: var(--bg-hover); color: var(--fg-primary); }
+.m-row .m-ic {
+  width: 14px;
+  height: 14px;
+  color: var(--fg-tertiary);
+  flex-shrink: 0;
+}
+.m-row .m-ic svg { width: 14px; height: 14px; }
+.m-row:hover .m-ic { color: var(--amber-200); }
+.m-row .m-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.m-row .m-chev {
+  color: var(--fg-tertiary);
+  font-size: 14px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.m-row.active {
+  background: rgba(212, 163, 72, 0.12);
+  color: var(--amber-100);
+  box-shadow: inset 2px 0 0 var(--amber-300);
+}
+.m-row.active .m-ic,
+.m-row.active .m-chev { color: var(--amber-200); }
+
+.m-row.danger { color: var(--rust); }
+.m-row.danger .m-ic { color: var(--rust); }
+.m-row.danger:hover { background: rgba(201, 85, 58, 0.12); color: #e2694c; }
+.m-row.danger:hover .m-ic { color: #e2694c; }
+
+.m-kbd {
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  background: var(--bg-void);
+  border: 1px solid var(--border-hair);
+  border-radius: 2px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+.m-row:hover .m-kbd { color: var(--fg-secondary); border-color: var(--border-soft); }
+
+.m-section {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  color: var(--fg-tertiary);
+  padding: 7px 9px 4px;
+}
+
+.m-danger {
+  margin-top: 5px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-hair);
+  background: linear-gradient(180deg, rgba(201, 85, 58, 0.045), transparent 80%);
+  border-radius: 0 0 var(--r-sm) var(--r-sm);
+}
+
+.m-sub-anchor { position: relative; }
+/* While the flyout is open (anchor hovered), light the trigger row with the
+   amber active treatment, matching the design. Scoped to the dedicated
+   trigger class so the shell rows inside the flyout are unaffected. */
+.m-sub-anchor:hover .m-sub-trigger {
+  background: rgba(212, 163, 72, 0.12);
+  color: var(--amber-100);
+  box-shadow: inset 2px 0 0 var(--amber-300);
+}
+.m-sub-anchor:hover .m-sub-trigger .m-ic,
+.m-sub-anchor:hover .m-sub-trigger .m-chev { color: var(--amber-200); }
+.m-flyout {
+  position: absolute;
+  /* The style engine resolves percentage insets to 0, so the design's
+     calc(100% + 7px) collapses onto the menu. Anchor width is the menu's
+     210px content box, so a fixed 217px lands the flyout 7px past the
+     menu's right edge. */
+  left: 217px;
+  top: -5px;
+  width: 198px;
+  display: none;
+  flex-direction: column;
+  background: linear-gradient(180deg, #2b251b, #221d15);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg), 0 0 28px rgba(212, 163, 72, 0.07);
+  padding: 5px;
+  z-index: 5;
+}
+.m-sub-anchor:hover .m-flyout { display: flex; }
+.m-flyout.flip { left: auto; right: 217px; }
+
+.m-shell .sh-name-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-width: 0;
+  overflow: visible;
+}
+.m-shell .sh-name { color: var(--fg-secondary); white-space: nowrap; }
+.m-shell:hover .sh-name { color: var(--fg-primary); }
+.m-shell .sh-path { color: var(--fg-muted); white-space: nowrap; }
+.m-shell .sh-star {
+  color: var(--amber-300);
+  white-space: nowrap;
+  flex-shrink: 0;
+  /* A definite box (padding + transparent border) makes the flex layout
+     reserve space and paint this trailing sibling, like the kbd badge. */
+  padding: 0 2px;
+  border: 1px solid transparent;
 }
 
 /* ---- Shell tab ---- */

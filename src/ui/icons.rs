@@ -141,6 +141,51 @@ pub fn icon_terminal() -> SvgNode {
     )
 }
 
+/// Diamond outline — "Set active" affordance in the workspace context menu.
+pub fn icon_diamond() -> SvgNode {
+    group(
+        root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![path_d("M8 2.5l5.5 5.5L8 13.5 2.5 8z")],
+    )
+}
+
+/// Circle with a slash — "Kill all terminals" destructive affordance.
+pub fn icon_ban() -> SvgNode {
+    group(
+        root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Miter),
+        vec![circle(8.0, 8.0, 5.5), path_d("M4.2 4.2l7.6 7.6")],
+    )
+}
+
+/// Trash can — "Remove workspace" destructive affordance.
+pub fn icon_trash() -> SvgNode {
+    group(
+        root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![path_d("M3 4.5h10M6.2 4.5V3h3.6v1.5M4.6 4.5l.6 8.5h5.6l.6-8.5")],
+    )
+}
+
+/// Double chevron pointing inward — "Collapse" / "Expand" affordance.
+pub fn icon_collapse() -> SvgNode {
+    group(
+        root_attrs(1.6, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![path_d("M4 7l4-3l4 3M4 9l4 3l4-3")],
+    )
+}
+
+/// Shell glyph for the spawn-shell flyout rows. Same family as
+/// [`icon_terminal`] but with a slightly thinner stroke so the dense
+/// flyout list reads cleanly.
+pub fn icon_shell() -> SvgNode {
+    group(
+        root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![
+            rect(2.0, 3.0, 12.0, 10.0, 1.0),
+            path_d("M4.5 6.5L6.5 8L4.5 9.5M7.5 10h4"),
+        ],
+    )
+}
+
 pub fn icon_settings_nav_grid() -> SvgNode {
     group(
         root_attrs(1.2, StrokeLineCap::Butt, StrokeLineJoin::Miter),
