@@ -29,6 +29,7 @@ pub fn key_combo_from_winit(
             NamedKey::PageUp => Key::PageUp,
             NamedKey::PageDown => Key::PageDown,
             NamedKey::Delete => Key::Delete,
+            NamedKey::Insert => Key::Insert,
             NamedKey::F1 => Key::F(1),
             NamedKey::F2 => Key::F(2),
             NamedKey::F3 => Key::F(3),

@@ -1,5 +1,7 @@
 use unshit::core::element::*;
-use unshit::core::event::{DragPhase, Event, EventType, Key, KeyEventKind, Modifiers};
+use unshit::core::event::{
+    DragPhase, Event, EventType, Key, KeyEventKind, Modifiers, MouseButton, MouseEventKind,
+};
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{Transform, TransformX};
 
@@ -12,9 +14,16 @@ use crate::ui::icons::*;
 
 const ENV_PARITY_LINE_HEIGHT: &str = "TM_PARITY_LINE_HEIGHT";
 const ENV_PARITY_CONTENT_X_OFFSET: &str = "TM_PARITY_CONTENT_X_OFFSET";
+const ENV_PARITY_CELL_WIDTH_SCALE: &str = "TM_PARITY_CELL_WIDTH_SCALE";
 const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
 const WINDOWS_TERMINAL_PARITY_LINE_HEIGHT: f32 = 1.15;
 const WINDOWS_TERMINAL_PARITY_CONTENT_X_OFFSET: f32 = 3.0;
+/// Must mirror the renderer's `WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE`
+/// (unshit-renderer `batch.rs`): under the Windows-Terminal parity profile
+/// each column is drawn at `cell_w * 0.996`, but the published cell metric
+/// is the unscaled width, so the pointer->cell hit-test must re-apply this
+/// scale to land on the column the renderer actually drew.
+const WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE: f32 = 0.996;
 
 /// Returns `true` when the pane grid contains exactly one pane (one row with
 /// one column). In that case the tab bar already displays the pane title and
@@ -60,6 +69,32 @@ fn terminal_content_x_offset_from_values(
 fn terminal_content_x_offset() -> f32 {
     terminal_content_x_offset_from_values(
         std::env::var_os(ENV_PARITY_CONTENT_X_OFFSET),
+        crate::truthy_env_value(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)),
+    )
+}
+
+fn terminal_cell_width_scale_from_values(
+    value: Option<std::ffi::OsString>,
+    wt_profile: bool,
+) -> f32 {
+    value
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| (0.95..=1.05).contains(v))
+        .unwrap_or(if wt_profile {
+            WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE
+        } else {
+            1.0
+        })
+}
+
+/// The per-column advance scale the renderer used to lay out cells. The
+/// selection hit-test divides the pointer by `cell_w * scale` so it matches
+/// the column positions actually drawn. Mirrors the renderer's
+/// `parity_terminal_cell_width_scale`.
+fn terminal_cell_width_scale() -> f32 {
+    terminal_cell_width_scale_from_values(
+        std::env::var_os(ENV_PARITY_CELL_WIDTH_SCALE),
         crate::truthy_env_value(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)),
     )
 }
@@ -453,9 +488,33 @@ fn build_pane_body(
                         let no_ctrl = !kb.modifiers.contains(Modifiers::CTRL);
                         let no_alt = !kb.modifiers.contains(Modifiers::ALT);
 
+                        // Ctrl+C with a live selection copies instead of
+                        // interrupting; with no selection it falls through to
+                        // `encode_key` -> 0x03 so the shell still receives
+                        // SIGINT. Ctrl+Shift+C is a global shortcut
+                        // (`terminal.copy`) and never reaches this handler.
+                        if kb.modifiers.contains(Modifiers::CTRL)
+                            && !has_shift
+                            && no_alt
+                            && kb.key == Key::Char('c')
+                        {
+                            let copied = mutate_with(&kbd_shared, |st| {
+                                if crate::state::active_pane_has_selection(st) {
+                                    crate::state::dispatch(st, "terminal.copy");
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            if copied {
+                                return None;
+                            }
+                        }
+
                         // Shift+PageUp: scroll back half a page.
                         if has_shift && no_ctrl && no_alt && kb.key == Key::PageUp {
                             mutate_with(&kbd_shared, |st| {
+                                crate::state::clear_terminal_selection(st, kbd_pane_id.0);
                                 if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
                                     let mut terminal = handle.lock_recover();
                                     let half = (terminal.grid().rows() / 2).max(1);
@@ -468,6 +527,7 @@ fn build_pane_body(
                         // Shift+PageDown: scroll forward half a page.
                         if has_shift && no_ctrl && no_alt && kb.key == Key::PageDown {
                             mutate_with(&kbd_shared, |st| {
+                                crate::state::clear_terminal_selection(st, kbd_pane_id.0);
                                 if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
                                     let mut terminal = handle.lock_recover();
                                     let half = (terminal.grid().rows() / 2).max(1);
@@ -490,6 +550,9 @@ fn build_pane_body(
                         if let Some(bytes) = crate::terminal::keys::encode_key(kb) {
                             let byte_count = bytes.len();
                             mutate_with(&kbd_shared, |st| {
+                                // Typing dismisses any text selection so the
+                                // highlight does not linger over moving output.
+                                crate::state::clear_terminal_selection(st, kbd_pane_id.0);
                                 match st.pty_manager.write(kbd_pane_id.0, &bytes) {
                                     Ok(()) => record_diagnostic_pty_event(
                                         st,
@@ -536,6 +599,11 @@ fn build_pane_body(
                         };
                         if lines != 0 {
                             mutate_with(&scroll_shared, |st| {
+                                // Selection coordinates are display-relative;
+                                // scrolling slides content under them, so drop
+                                // the selection rather than leave a stale
+                                // highlight on unrelated rows.
+                                crate::state::clear_terminal_selection(st, scroll_pane_id.0);
                                 if let Some(handle) = st.terminals.get(&scroll_pane_id.0) {
                                     let mut terminal = handle.lock_recover();
                                     if lines > 0 {
@@ -573,17 +641,126 @@ fn build_pane_body(
                     if cell_w > 0.0 && cell_h > 0.0 {
                         let cols = (w / cell_w).max(1.0) as u16;
                         let rows = (h / cell_h).max(1.0) as u16;
-                        if let Some(handle) = st.terminals.get(&resize_pane_id.0) {
-                            handle
-                                .lock()
-                                .expect("terminal mutex poisoned")
-                                .resize_viewport_growth(rows as usize, cols as usize);
+                        let dims_changed = if let Some(handle) = st.terminals.get(&resize_pane_id.0)
+                        {
+                            let mut terminal = handle.lock().expect("terminal mutex poisoned");
+                            let changed = terminal.grid().rows() != rows as usize
+                                || terminal.grid().cols() != cols as usize;
+                            terminal.resize_viewport_growth(rows as usize, cols as usize);
+                            changed
+                        } else {
+                            false
+                        };
+                        // A resize reflows the grid, so any selection's
+                        // display coordinates no longer map to the text the
+                        // user highlighted. Drop it rather than silently
+                        // copy clamped/truncated content.
+                        if dims_changed {
+                            crate::state::clear_terminal_selection(st, resize_pane_id.0);
                         }
                         st.pty_manager.resize(resize_pane_id.0, cols, rows);
                     }
                 });
             });
         }
+
+        // -- Text selection (mouse) -----------------------------------------
+        // Registered for every pane with a grid so the user can select in any
+        // visible pane (clicking also focuses it via the pane's on_click).
+        //
+        // MouseDown places the anchor and resolves double/triple-click
+        // (word/line) and Shift+click (extend) using the press coordinates
+        // and modifiers. on_drag extends the focus; the framework captures
+        // the pointer during a drag so moves past the pane edge still arrive.
+        let sel_down_shared = shared.clone();
+        let sel_down_pane = pane_id;
+        grid_el = grid_el.on(
+            EventType::MouseDown,
+            move |event: &Event| -> Option<Box<dyn std::any::Any>> {
+                if let Event::Mouse(me) = event {
+                    if me.kind == MouseEventKind::Down && me.button == MouseButton::Left {
+                        let shift = me.modifiers.contains(Modifiers::SHIFT);
+                        let (lx, ly) = (me.local_x, me.local_y);
+                        mutate_with(&sel_down_shared, |st| {
+                            // Focus the pane on press. A click-DRAG has its
+                            // trailing click suppressed by the framework, so
+                            // relying on the pane's on_click would leave a
+                            // selection made in an inactive pane uncopyable
+                            // (copy reads the active pane).
+                            let ws_idx = st.active_workspace;
+                            crate::state::dispatch(
+                                st,
+                                &format!("terminal.focus:{}:{}", ws_idx, sel_down_pane.0),
+                            );
+                            let x_offset = terminal_content_x_offset();
+                            let scale = terminal_cell_width_scale();
+                            if let Some(cell) = crate::state::terminal_cell_at(
+                                st,
+                                sel_down_pane.0,
+                                lx,
+                                ly,
+                                x_offset,
+                                scale,
+                            ) {
+                                crate::state::handle_terminal_mouse_down(
+                                    st,
+                                    sel_down_pane.0,
+                                    cell,
+                                    shift,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                        });
+                    }
+                }
+                None
+            },
+        );
+
+        let sel_drag_shared = shared.clone();
+        let sel_drag_pane = pane_id;
+        grid_el = grid_el.on_drag(move |ev| {
+            if ev.button != MouseButton::Left {
+                return;
+            }
+            let (lx, ly) = (ev.local_x, ev.local_y);
+            match ev.phase {
+                DragPhase::Start | DragPhase::Update => {
+                    mutate_with(&sel_drag_shared, |st| {
+                        let x_offset = terminal_content_x_offset();
+                        let scale = terminal_cell_width_scale();
+                        if let Some(cell) = crate::state::terminal_cell_at(
+                            st,
+                            sel_drag_pane.0,
+                            lx,
+                            ly,
+                            x_offset,
+                            scale,
+                        ) {
+                            crate::state::handle_terminal_drag(st, sel_drag_pane.0, cell);
+                        }
+                    });
+                }
+                DragPhase::End => {
+                    mutate_with(&sel_drag_shared, |st| {
+                        crate::state::finish_terminal_drag(st, sel_drag_pane.0);
+                    });
+                }
+            }
+        });
+
+        // Right-click pastes into this pane (classic Windows console
+        // behavior). Focus the pane first so the paste targets it even when
+        // it was not the active pane.
+        let paste_shared = shared.clone();
+        let paste_pane = pane_id;
+        grid_el = grid_el.on_context_menu(move |_x, _y| {
+            mutate_with(&paste_shared, |st| {
+                let ws_idx = st.active_workspace;
+                crate::state::dispatch(st, &format!("terminal.focus:{}:{}", ws_idx, paste_pane.0));
+                crate::state::dispatch(st, "terminal.paste");
+            });
+        });
 
         body = body.with_child(grid_el);
     } else {
@@ -1151,8 +1328,43 @@ mod tests {
         grids.insert(1, CellGrid::new(24, 80));
         let el = build_pane_body(PaneId(1), false, 13, &shared, &grids);
         let grid_el = &el.children[0];
-        assert!(grid_el.handlers.is_empty());
+        // Inactive panes still register mouse selection handlers (so the user
+        // can select / copy in any visible pane) but must NOT capture the
+        // keyboard or scroll, and must not register a PTY resize handler.
+        assert!(
+            !grid_el
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::KeyboardCapture || *et == EventType::Scroll),
+            "inactive pane must not capture keyboard or scroll"
+        );
         assert!(grid_el.on_resize.is_none());
+    }
+
+    #[test]
+    fn pane_body_grid_registers_selection_handlers() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        // Selection works in any visible pane, so the handlers are present
+        // even when the pane is inactive (capture_keyboard = false).
+        let el = build_pane_body(PaneId(1), false, 13, &shared, &grids);
+        let grid_el = &el.children[0];
+        assert!(
+            grid_el
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::MouseDown),
+            "grid must register a MouseDown selection handler"
+        );
+        assert!(
+            grid_el.on_drag.is_some(),
+            "grid must register an on_drag selection handler"
+        );
+        assert!(
+            grid_el.on_context_menu.is_some(),
+            "grid must register a right-click paste handler"
+        );
     }
 
     #[test]
@@ -1505,6 +1717,8 @@ mod tests {
             phase: DragPhase::Start,
             x: 100.0,
             y: 200.0,
+            local_x: 100.0,
+            local_y: 200.0,
             delta_x: 0.0,
             delta_y: 0.0,
             total_delta_x: 0.0,
@@ -1541,6 +1755,8 @@ mod tests {
             phase: DragPhase::Start,
             x: 0.0,
             y: 0.0,
+            local_x: 0.0,
+            local_y: 0.0,
             delta_x: 0.0,
             delta_y: 0.0,
             total_delta_x: 0.0,
@@ -1552,6 +1768,8 @@ mod tests {
             phase: DragPhase::Update,
             x: 321.0,
             y: 54.0,
+            local_x: 321.0,
+            local_y: 54.0,
             delta_x: 5.0,
             delta_y: 2.0,
             total_delta_x: 321.0,
@@ -1606,6 +1824,8 @@ mod tests {
             phase,
             x,
             y,
+            local_x: x,
+            local_y: y,
             delta_x: 0.0,
             delta_y: 0.0,
             total_delta_x: 0.0,

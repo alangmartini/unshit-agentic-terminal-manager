@@ -68,19 +68,24 @@ fn alias_bindings() -> Vec<(String, String)> {
 /// Non-editable system shortcuts. These don't appear in Settings >
 /// Keybinds; they're hard-wired.
 ///
-/// `Ctrl+V` and `Ctrl+Shift+V` both dispatch `terminal.paste` so the
-/// user can paste clipboard text into the focused PTY using either
-/// the conventional Windows binding or the Linux-terminal convention
-/// where `Ctrl+Shift+V` sidesteps the shell's `Ctrl+V` literal-input
-/// handling. Paste is a system binding rather than an editable action
-/// because rebinding it would risk leaving the user with no way to
-/// paste at all.
+/// `Ctrl+V`, `Ctrl+Shift+V`, and `Shift+Insert` all dispatch
+/// `terminal.paste` so the user can paste clipboard text into the focused
+/// PTY using the conventional Windows binding, the Linux-terminal
+/// convention where `Ctrl+Shift+V` sidesteps the shell's `Ctrl+V`
+/// literal-input handling, or the classic `Shift+Insert`. `Ctrl+Shift+C`
+/// dispatches `terminal.copy` (the unconditional copy; a bare `Ctrl+C`
+/// only copies when a selection exists and is handled in the terminal's
+/// keyboard handler so it still sends an interrupt otherwise). These are
+/// system bindings rather than editable actions because rebinding them
+/// would risk leaving the user with no way to copy or paste at all.
 fn system_bindings() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![
         ("Escape".to_string(), "modal.close".to_string()),
         ("Ctrl+Shift+F".to_string(), "fps_overlay.toggle".to_string()),
         ("Ctrl+V".to_string(), "terminal.paste".to_string()),
         ("Ctrl+Shift+V".to_string(), "terminal.paste".to_string()),
+        ("Shift+Insert".to_string(), "terminal.paste".to_string()),
+        ("Ctrl+Shift+C".to_string(), "terminal.copy".to_string()),
     ];
     for i in 0..TAB_SWITCH_COUNT {
         out.push((format!("Ctrl+{}", i + 1), format!("tab.switch:{}", i)));

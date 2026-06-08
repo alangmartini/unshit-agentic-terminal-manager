@@ -11,6 +11,25 @@ use unshit_core::scroll::{self, ScrollbarAxis, ScrollbarPart};
 
 use crate::TestHarness;
 
+/// Cursor position relative to a node's content box (padding box origin),
+/// mirroring the production app's `local_pointer_coords` so simulated drags
+/// carry the same `local_x`/`local_y` the real input pipeline would. Falls
+/// back to the window coordinates when the node is missing.
+fn drag_local_coords(
+    arena: &unshit_core::tree::NodeArena,
+    node: NodeId,
+    x: f32,
+    y: f32,
+) -> (f32, f32) {
+    if let Some(el) = arena.get(node) {
+        let r = el.layout_rect;
+        let p = &el.computed_style.padding;
+        (x - r.x - p.left, y - r.y - p.top)
+    } else {
+        (x, y)
+    }
+}
+
 impl TestHarness {
     /// Simulate mouse movement to (x, y). Updates hover state and marks
     /// restyle if the hovered element changed.
@@ -44,10 +63,13 @@ impl TestHarness {
                         self.interaction.drag_last_pos = origin;
 
                         // Dispatch DragStart
+                        let (local_x, local_y) = drag_local_coords(&self.arena, handler_node, x, y);
                         let event = DragEvent {
                             phase: DragPhase::Start,
                             x,
                             y,
+                            local_x,
+                            local_y,
                             delta_x: dx,
                             delta_y: dy,
                             total_delta_x: dx,
@@ -73,10 +95,13 @@ impl TestHarness {
             if let Some(handler_node) = self.interaction.drag_target {
                 let origin = self.interaction.drag_origin.unwrap_or((x, y));
                 let last = self.interaction.drag_last_pos;
+                let (local_x, local_y) = drag_local_coords(&self.arena, handler_node, x, y);
                 let event = DragEvent {
                     phase: DragPhase::Update,
                     x,
                     y,
+                    local_x,
+                    local_y,
                     delta_x: x - last.0,
                     delta_y: y - last.1,
                     total_delta_x: x - origin.0,
@@ -228,10 +253,13 @@ impl TestHarness {
             if let Some(handler_node) = self.interaction.drag_target {
                 let origin = self.interaction.drag_origin.unwrap_or((x, y));
                 let last = self.interaction.drag_last_pos;
+                let (local_x, local_y) = drag_local_coords(&self.arena, handler_node, x, y);
                 let event = DragEvent {
                     phase: DragPhase::End,
                     x,
                     y,
+                    local_x,
+                    local_y,
                     delta_x: x - last.0,
                     delta_y: y - last.1,
                     total_delta_x: x - origin.0,

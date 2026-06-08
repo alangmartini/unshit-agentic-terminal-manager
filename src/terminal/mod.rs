@@ -91,6 +91,17 @@ pub struct Terminal {
     /// instead of falling back to a defensive minimal layout.
     pending_response: Vec<u8>,
     synchronized_output_active: bool,
+    /// Whether the running program enabled bracketed paste mode via
+    /// DECSET 2004 (`CSI ? 2004 h`). When set, pasted text should be
+    /// wrapped in `ESC[200~` / `ESC[201~` so readline/editors can tell
+    /// a paste from typed input. Reset by `CSI ? 2004 l`.
+    bracketed_paste: bool,
+    /// Monotonic counter bumped whenever the live screen scrolls content
+    /// (output pushing lines up, or a region scroll). Mouse selections are
+    /// display-relative, so a scroll slides the text out from under them;
+    /// the bridge compares this across a PTY batch and drops the selection
+    /// when it changed.
+    scroll_generation: u64,
 }
 
 const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
@@ -337,6 +348,8 @@ impl Terminal {
             scroll_bot: rows,
             pending_response: Vec::new(),
             synchronized_output_active: false,
+            bracketed_paste: false,
+            scroll_generation: 0,
         }
     }
 
@@ -727,6 +740,127 @@ impl Terminal {
         view
     }
 
+    // -- selection / clipboard -----------------------------------------------
+
+    /// Whether the running program enabled bracketed paste mode via
+    /// DECSET 2004. `terminal.paste` wraps the payload in
+    /// `ESC[200~`/`ESC[201~` when this is set.
+    pub fn bracketed_paste_active(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// Monotonic count of live-screen scrolls. The bridge samples this
+    /// before and after feeding a PTY chunk; a change means content slid
+    /// under any active selection, so the selection must be dropped.
+    pub fn scroll_generation(&self) -> u64 {
+        self.scroll_generation
+    }
+
+    /// The cell currently shown at display coordinate `(display_row, col)`,
+    /// honoring the scrollback view offset. This is the same coordinate
+    /// space the pointer selects in: it mirrors [`Terminal::display_grid`]'s
+    /// row composition. Returns `None` when out of bounds.
+    fn visible_cell(&self, display_row: usize, col: usize) -> Option<Cell> {
+        if display_row >= self.rows || col >= self.cols {
+            return None;
+        }
+        if self.scroll_offset == 0 {
+            return self.grid.get_cell(display_row, col).copied();
+        }
+        let sb_len = self.scrollback.len();
+        let virtual_line = sb_len.saturating_sub(self.scroll_offset) + display_row;
+        if virtual_line < sb_len {
+            self.scrollback[virtual_line].get(col).copied()
+        } else {
+            let screen_row = virtual_line - sb_len;
+            self.grid.get_cell(screen_row, col).copied()
+        }
+    }
+
+    /// True when `ch` counts as part of a word for double-click selection.
+    /// Includes alphanumerics plus the punctuation that commonly appears in
+    /// identifiers and paths so double-clicking a path or flag grabs the
+    /// whole token rather than a fragment.
+    fn is_word_char(ch: char) -> bool {
+        ch.is_alphanumeric() || "_./-~+:@%".contains(ch)
+    }
+
+    /// Inclusive `[start_col, end_col]` column span of the word at
+    /// `(display_row, col)`. A click on a non-word cell selects just that
+    /// cell. Coordinates are in the visible (display) space.
+    pub fn word_bounds_at(&self, display_row: usize, col: usize) -> (usize, usize) {
+        if self.cols == 0 {
+            return (0, 0);
+        }
+        let col = col.min(self.cols - 1);
+        let ch_at = |c: usize| {
+            self.visible_cell(display_row, c)
+                .map(|cell| if cell.ch == '\0' { ' ' } else { cell.ch })
+                .unwrap_or(' ')
+        };
+        let here = ch_at(col);
+        if !Self::is_word_char(here) {
+            return (col, col);
+        }
+        let mut start = col;
+        while start > 0 && Self::is_word_char(ch_at(start - 1)) {
+            start -= 1;
+        }
+        let mut end = col;
+        while end + 1 < self.cols && Self::is_word_char(ch_at(end + 1)) {
+            end += 1;
+        }
+        (start, end)
+    }
+
+    /// Inclusive `[start_col, end_col]` span covering the whole visible row,
+    /// used by triple-click line selection. Trailing blanks are trimmed by
+    /// [`Terminal::selection_text`] at copy time.
+    pub fn line_bounds_at(&self, _display_row: usize) -> (usize, usize) {
+        (0, self.cols.saturating_sub(1))
+    }
+
+    /// Plain text for the selection spanning visible coordinates `a`..`b`
+    /// (order-independent). Linear (stream) selection: the first row runs
+    /// from its start column to end of line, interior rows are full, and the
+    /// last row runs from line start to its end column. Wide-character
+    /// continuation cells are skipped, empty cells become spaces, trailing
+    /// whitespace is trimmed per line, and rows join with `\n`.
+    pub fn selection_text(&self, a: (usize, usize), b: (usize, usize)) -> String {
+        if self.rows == 0 || self.cols == 0 {
+            return String::new();
+        }
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let last_row = self.rows - 1;
+        let last_col = self.cols - 1;
+        let start_row = start.0.min(last_row);
+        let end_row = end.0.min(last_row);
+        let mut lines: Vec<String> = Vec::with_capacity(end_row - start_row + 1);
+        for row in start_row..=end_row {
+            let c0 = if row == start_row {
+                start.1.min(last_col)
+            } else {
+                0
+            };
+            let c1 = if row == end_row {
+                end.1.min(last_col)
+            } else {
+                last_col
+            };
+            let mut s = String::new();
+            for col in c0..=c1 {
+                if let Some(cell) = self.visible_cell(row, col) {
+                    if cell.wide_continuation {
+                        continue;
+                    }
+                    s.push(if cell.ch == '\0' { ' ' } else { cell.ch });
+                }
+            }
+            lines.push(s.trim_end_matches(' ').to_string());
+        }
+        lines.join("\n")
+    }
+
     // -- helpers --------------------------------------------------------------
 
     fn clear_pending_wrap(&mut self) {
@@ -767,6 +901,7 @@ impl Terminal {
         if self.rows == 0 || self.scroll_bot <= self.scroll_top {
             return;
         }
+        self.scroll_generation = self.scroll_generation.wrapping_add(1);
         let top = self.scroll_top;
         let bot = self.scroll_bot;
 
@@ -805,6 +940,7 @@ impl Terminal {
         if self.rows == 0 || self.scroll_bot <= self.scroll_top {
             return;
         }
+        self.scroll_generation = self.scroll_generation.wrapping_add(1);
         let top = self.scroll_top;
         let bot = self.scroll_bot;
         let move_count = bot - top - 1;
@@ -1321,13 +1457,15 @@ impl<'a> Perform for Performer<'a> {
             // the older aliases. `?25l` is equally important for TUI
             // prompts that hide the hardware cursor while drawing their
             // own input cursor; ignoring it produces a brief double cursor.
-            // Other private modes (mouse reporting, bracketed paste,
-            // application keypad, etc.) are ignored here; the daemon owns
-            // those semantics.
+            // Other private modes (mouse reporting, application keypad,
+            // etc.) are ignored here; the daemon owns those semantics.
+            // Bracketed paste (2004) is tracked locally so `terminal.paste`
+            // can wrap pasted bodies in `ESC[200~`/`ESC[201~`.
             'h' if intermediates == [b'?'] => {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(true),
+                        2004 => t.bracketed_paste = true,
                         2026 => t.synchronized_output_active = true,
                         47 | 1047 | 1049 => t.enter_alt_screen(),
                         _ => {}
@@ -1338,6 +1476,7 @@ impl<'a> Perform for Performer<'a> {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(false),
+                        2004 => t.bracketed_paste = false,
                         2026 => t.synchronized_output_active = false,
                         47 | 1047 | 1049 => t.exit_alt_screen(),
                         _ => {}
@@ -3259,6 +3398,99 @@ mod tests {
             !term.synchronized_output_active(),
             "CSI ?2026l must leave synchronized output mode"
         );
+    }
+
+    #[test]
+    fn bracketed_paste_mode_tracks_dec_private_2004() {
+        let mut term = Terminal::new(3, 5);
+        assert!(!term.bracketed_paste_active());
+
+        term.process_bytes(b"\x1b[?2004h");
+        assert!(
+            term.bracketed_paste_active(),
+            "CSI ?2004h must enable bracketed paste mode"
+        );
+
+        term.process_bytes(b"\x1b[?2004l");
+        assert!(
+            !term.bracketed_paste_active(),
+            "CSI ?2004l must disable bracketed paste mode"
+        );
+    }
+
+    #[test]
+    fn scroll_generation_bumps_when_output_scrolls_screen() {
+        let mut term = Terminal::new(2, 5);
+        let before = term.scroll_generation();
+        // Three lines on a two-row screen forces at least one scroll_up.
+        term.process_bytes(b"a\r\nb\r\nc");
+        assert!(
+            term.scroll_generation() > before,
+            "a live-screen scroll must bump the generation"
+        );
+    }
+
+    #[test]
+    fn scroll_generation_steady_without_scroll() {
+        let mut term = Terminal::new(4, 10);
+        let before = term.scroll_generation();
+        // Output that fits on screen must not bump the generation.
+        term.process_bytes(b"hello");
+        assert_eq!(term.scroll_generation(), before);
+    }
+
+    #[test]
+    fn selection_text_single_row_trims_trailing_blanks() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        // Selecting the whole row trims the trailing blank cells.
+        assert_eq!(term.selection_text((0, 0), (0, 9)), "hello");
+        // A sub-range returns exactly the spanned columns (inclusive).
+        assert_eq!(term.selection_text((0, 0), (0, 3)), "hell");
+    }
+
+    #[test]
+    fn selection_text_is_order_independent() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"abcdef");
+        assert_eq!(
+            term.selection_text((0, 4), (0, 1)),
+            term.selection_text((0, 1), (0, 4)),
+        );
+        assert_eq!(term.selection_text((0, 1), (0, 4)), "bcde");
+    }
+
+    #[test]
+    fn selection_text_multi_row_joins_with_newline() {
+        let mut term = Terminal::new(3, 10);
+        term.process_bytes(b"line1\r\nline2");
+        // First row runs to end of line (trailing blanks trimmed), last row
+        // stops at the end column.
+        assert_eq!(term.selection_text((0, 0), (1, 4)), "line1\nline2");
+    }
+
+    #[test]
+    fn word_bounds_selects_whole_token() {
+        let mut term = Terminal::new(2, 20);
+        term.process_bytes(b"foo bar baz");
+        assert_eq!(term.word_bounds_at(0, 1), (0, 2), "inside 'foo'");
+        assert_eq!(term.word_bounds_at(0, 4), (4, 6), "inside 'bar'");
+        // A click on the separating space selects just that cell.
+        assert_eq!(term.word_bounds_at(0, 3), (3, 3), "on the space");
+    }
+
+    #[test]
+    fn word_bounds_includes_path_punctuation() {
+        let mut term = Terminal::new(2, 30);
+        term.process_bytes(b"see /usr/local/bin here");
+        // The path token spans the slashes, not just one segment.
+        assert_eq!(term.word_bounds_at(0, 8), (4, 17));
+    }
+
+    #[test]
+    fn line_bounds_cover_full_row() {
+        let term = Terminal::new(2, 12);
+        assert_eq!(term.line_bounds_at(0), (0, 11));
     }
 
     #[test]

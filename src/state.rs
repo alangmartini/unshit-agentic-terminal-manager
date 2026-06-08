@@ -54,6 +54,129 @@ impl<T> MutexExt<T> for Mutex<T> {
     }
 }
 
+/// Background color painted over selected terminal cells. A muted blue that
+/// keeps the amber/white default foreground legible without an extra
+/// contrast pass. Applied to the per-frame display-grid clone, never to the
+/// live terminal buffer.
+pub const SELECTION_BG: unshit::core::style::types::Color = unshit::core::style::types::Color {
+    r: 38,
+    g: 79,
+    b: 120,
+    a: 255,
+};
+
+/// How a terminal selection was seeded, which controls whether a collapsed
+/// (single-cell) range counts as "nothing selected".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectMode {
+    /// Click-drag: a collapsed anchor==focus range selects nothing.
+    Cell,
+    /// Double-click word: a single-cell word is still a real selection.
+    Word,
+    /// Triple-click line.
+    Line,
+}
+
+/// A mouse text selection over a terminal pane, in visible (display-grid)
+/// coordinates: `(row, col)`. The same coordinate space the pointer reports
+/// and that [`crate::terminal::Terminal::selection_text`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermSelection {
+    /// Where the selection was anchored (mouse-down / fixed end).
+    pub anchor: (usize, usize),
+    /// The moving end (latest mouse position).
+    pub focus: (usize, usize),
+    pub mode: SelectMode,
+}
+
+impl TermSelection {
+    /// A collapsed selection anchored at `cell`.
+    pub fn new(cell: (usize, usize), mode: SelectMode) -> Self {
+        Self {
+            anchor: cell,
+            focus: cell,
+            mode,
+        }
+    }
+
+    /// `(start, end)` ordered row-major so `start <= end`.
+    pub fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+
+    /// True when nothing is actually selected: a `Cell`-mode range whose
+    /// anchor and focus are the same cell (a click without a drag). `Word`
+    /// and `Line` selections are always real, even a single-character word.
+    pub fn is_empty(&self) -> bool {
+        self.mode == SelectMode::Cell && self.anchor == self.focus
+    }
+}
+
+/// Tracks consecutive left-clicks on a terminal so a second/third press on
+/// the same cell promotes the selection to word / line. Reset when the
+/// pane, cell, or timing window changes.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalClick {
+    pub pane: u32,
+    pub at: std::time::Instant,
+    pub cell: (usize, usize),
+    /// 1 = cell, 2 = word, 3 = line. Wraps 3 -> 1 on a fourth click.
+    pub count: u8,
+}
+
+/// Maximum gap between two presses for them to count as a multi-click.
+pub const MULTI_CLICK_MS: u128 = 400;
+
+/// Paint [`SELECTION_BG`] over every cell in `sel`'s linear range on a
+/// display-grid clone. No-op for an empty selection. Operates on the
+/// per-frame clone so the live terminal buffer is never mutated; callers
+/// force-damage the affected rows so the renderer's line cache re-emits
+/// them (see the render path in `main.rs`).
+pub fn apply_selection_highlight(
+    grid: &mut unshit::core::cell_grid::CellGrid,
+    sel: &TermSelection,
+) {
+    if sel.is_empty() {
+        return;
+    }
+    let rows = grid.rows();
+    let cols = grid.cols();
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    let (start, end) = sel.ordered();
+    let last_row = rows - 1;
+    let last_col = cols - 1;
+    let start_row = start.0.min(last_row);
+    let end_row = end.0.min(last_row);
+    for row in start_row..=end_row {
+        let c0 = if row == start_row {
+            start.1.min(last_col)
+        } else {
+            0
+        };
+        let c1 = if row == end_row {
+            end.1.min(last_col)
+        } else {
+            last_col
+        };
+        for col in c0..=c1 {
+            if let Some(mut cell) = grid.get_cell(row, col).copied() {
+                cell.bg = SELECTION_BG;
+                // Clearing INVERSE keeps the highlight bg from being swapped
+                // back out with the fg in the renderer's inverse path.
+                cell.attrs
+                    .remove(unshit::core::cell_grid::CellAttrs::INVERSE);
+                grid.set_cell(row, col, cell);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CtxMenu {
     pub x: f32,
@@ -301,45 +424,67 @@ pub fn prune_toast_metadata(state: &mut AppState) {
 ///
 /// Returns the normalised string. Empty input yields an empty string.
 ///
-/// TODO(bracketed-paste): once the daemon publishes per-session
-/// bracketed-paste-mode state, wrap pasted bodies in `\x1b[200~ ..
-/// \x1b[201~` when the focused session has DECSET 2004 active so
-/// shells / readline implementations can distinguish typing from
-/// pastes. Tracked alongside the paste feature; out of scope here.
+/// When the focused pane has DECSET 2004 active, `dispatch_terminal_paste`
+/// wraps the body returned here in `\x1b[200~ .. \x1b[201~`; the marker
+/// scrub below is what makes that wrap safe against forged terminators.
 pub fn normalize_pasted_text(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
 
     // All transforms target ASCII-only sequences (CR, LF, ESC[20{0,1}~)
-    // and never alter the ASCII subset of UTF-8. Operate on the byte
-    // slice so we can detect the 6-byte bracketed-paste markers without
-    // building a dedicated state machine, then push the surviving spans
-    // back to a String via `from_utf8` on contiguous slices to preserve
-    // multi-byte UTF-8 sequences intact (a naive `b as char` push would
-    // truncate UTF-8 continuation bytes to Latin-1, mangling non-ASCII
-    // text).
-    let bytes = text.as_bytes();
+    // and never alter the ASCII subset of UTF-8. Operate on bytes so we can
+    // detect the 6-byte bracketed-paste markers without a dedicated state
+    // machine, preserving multi-byte UTF-8 sequences intact (a naive
+    // `b as char` push would truncate continuation bytes to Latin-1).
+
+    // 1. Strip bracketed-paste markers to a FIXED POINT. A single forward
+    //    pass is not enough: deleting an inner marker splices its
+    //    neighbours together and can forge a brand-new marker across the
+    //    join — e.g. `\x1b[2` + `\x1b[201~` + `01~` collapses to a valid
+    //    `\x1b[201~`. A hostile clipboard payload could use that to inject
+    //    an early end-of-paste terminator and have the shell execute the
+    //    suffix. Re-scan until a whole pass removes nothing, so no
+    //    reassembled marker can survive into the wrapped body.
+    let is_marker = |b: &[u8], i: usize| -> bool {
+        i + 5 < b.len()
+            && b[i] == 0x1b
+            && b[i + 1] == b'['
+            && b[i + 2] == b'2'
+            && b[i + 3] == b'0'
+            && (b[i + 4] == b'0' || b[i + 4] == b'1')
+            && b[i + 5] == b'~'
+    };
+    let mut bytes = text.as_bytes().to_vec();
+    loop {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        let mut removed = false;
+        while i < bytes.len() {
+            if is_marker(&bytes, i) {
+                i += 6;
+                removed = true;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        bytes = out;
+        // Each pass strictly shrinks `bytes` when it removes anything, so
+        // the loop terminates in at most len/6 iterations.
+        if !removed {
+            break;
+        }
+    }
+
+    // 2. Newline canonicalisation (runs after the scrub; it never produces
+    //    ESC markers). CRLF collapses to a single CR; bare LF promotes to
+    //    CR; bare CR passes through. POSIX shells expect `\r` (Enter)
+    //    between commands.
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        // Match `\x1b[200~` and `\x1b[201~` (6 bytes each). Skip them
-        // entirely so a clipboard payload cannot prematurely end a
-        // future bracketed-paste wrap.
-        if b == 0x1b
-            && i + 5 < bytes.len()
-            && bytes[i + 1] == b'['
-            && bytes[i + 2] == b'2'
-            && bytes[i + 3] == b'0'
-            && (bytes[i + 4] == b'0' || bytes[i + 4] == b'1')
-            && bytes[i + 5] == b'~'
-        {
-            i += 6;
-            continue;
-        }
-        // Newline canonicalisation. CRLF collapses to a single CR;
-        // bare LF promotes to CR; bare CR passes through.
         if b == b'\r' {
             out.push(b'\r');
             if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
@@ -354,11 +499,10 @@ pub fn normalize_pasted_text(text: &str) -> String {
             i += 1;
             continue;
         }
-        // Pass through everything else as raw bytes so multi-byte
-        // UTF-8 sequences round-trip unchanged.
         out.push(b);
         i += 1;
     }
+
     // The transforms preserve UTF-8 validity (only ASCII bytes are
     // matched/dropped/replaced). Falling back to a lossy decode would
     // mask a bug; debug builds catch the impossible case.
@@ -631,6 +775,16 @@ pub struct AppState {
     /// arboard handles can corrupt the heap on Windows; see the
     /// regression in `unshit-app::clipboard`).
     pub clipboard: Arc<unshit::app::ClipboardContext>,
+    /// Active mouse text selection per pane, keyed by pane id. In visible
+    /// (display-grid) coordinates. Absent / collapsed means nothing is
+    /// selected. Drives the copy actions and the render-time highlight.
+    pub terminal_selections: std::collections::HashMap<u32, TermSelection>,
+    /// Panes whose selection changed since the last frame and therefore
+    /// need a forced full repaint so the renderer's line cache re-emits the
+    /// rows that gained or lost the highlight. Drained each render.
+    pub terminal_selection_repaint: std::collections::HashSet<u32>,
+    /// Last left-press on a terminal, for double/triple-click promotion.
+    pub terminal_click: Option<TerminalClick>,
     /// App wide default shell. Empty means "let the daemon's own
     /// `default_shell()` decide". Per workspace overrides land in
     /// Task 6 and take precedence via `shell::resolve`.
@@ -1037,6 +1191,9 @@ pub fn seed_state() -> AppState {
         toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
         toast_meta: BTreeMap::new(),
         clipboard: Arc::new(unshit::app::ClipboardContext::new()),
+        terminal_selections: std::collections::HashMap::new(),
+        terminal_selection_repaint: std::collections::HashSet::new(),
+        terminal_click: None,
         default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
         quick_prompt: None,
     }
@@ -3623,6 +3780,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             true
         }
         "terminal.paste" => dispatch_terminal_paste(state),
+        "terminal.copy" => dispatch_terminal_copy(state),
         other if other.starts_with("tab.switch:") => {
             if let Ok(index) = other["tab.switch:".len()..].parse::<usize>() {
                 if index < state.tabs.len() && state.active_tab != index {
@@ -3901,7 +4059,25 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
         return true;
     }
     let byte_count = payload.len();
-    if let Err(e) = state.pty_manager.write(pane_id, payload.as_bytes()) {
+    // Wrap the body in bracketed-paste markers when the running program
+    // enabled DECSET 2004 so readline / editors can tell a paste from typed
+    // input. `normalize_pasted_text` already scrubbed any embedded markers,
+    // so a hostile clipboard payload cannot forge an early terminator.
+    let bracketed = state
+        .terminals
+        .get(&pane_id)
+        .map(|t| t.lock_recover().bracketed_paste_active())
+        .unwrap_or(false);
+    let bytes: Vec<u8> = if bracketed {
+        let mut b = Vec::with_capacity(payload.len() + 12);
+        b.extend_from_slice(b"\x1b[200~");
+        b.extend_from_slice(payload.as_bytes());
+        b.extend_from_slice(b"\x1b[201~");
+        b
+    } else {
+        payload.into_bytes()
+    };
+    if let Err(e) = state.pty_manager.write(pane_id, &bytes) {
         // Synchronous lookup error from the fire-and-forget queue
         // (e.g. worker channel closed). Async failures land on the
         // bridge's `take_write_errors` drain via the cursor-blink
@@ -3920,6 +4096,243 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
         );
     }
     true
+}
+
+/// True when the active pane has a real (non-collapsed) text selection.
+/// Lets the terminal keyboard handler decide whether a bare `Ctrl+C`
+/// should copy or fall through to the shell as an interrupt (`0x03`).
+pub fn active_pane_has_selection(state: &AppState) -> bool {
+    state
+        .terminal_selections
+        .get(&state.active_pane.0)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
+/// Copy the active pane's selection to the system clipboard, then clear it.
+/// Returns `false` (no-op) when there is no real selection so callers can
+/// fall through to other handling. Used by both the `Ctrl+Shift+C` shortcut
+/// and the conditional `Ctrl+C`-with-selection path.
+fn dispatch_terminal_copy(state: &mut AppState) -> bool {
+    let pane_id = state.active_pane.0;
+    let sel = match state.terminal_selections.get(&pane_id).copied() {
+        Some(sel) if !sel.is_empty() => sel,
+        _ => return false,
+    };
+    let text = match state.terminals.get(&pane_id) {
+        Some(handle) => {
+            let term = handle.lock_recover();
+            let (start, end) = sel.ordered();
+            term.selection_text(start, end)
+        }
+        None => return false,
+    };
+    if text.is_empty() {
+        clear_terminal_selection(state, pane_id);
+        return true;
+    }
+    if let Err(e) = state.clipboard.write_text(&text) {
+        log::warn!("terminal.copy: clipboard write failed: {e}");
+        push_error_toast(state, format!("copy failed: {e}"));
+        return true;
+    }
+    record_diagnostic_pty_event(
+        state,
+        format!("copy pane={pane_id} chars={}", text.chars().count()),
+    );
+    // Windows Terminal clears the selection once it has been copied.
+    clear_terminal_selection(state, pane_id);
+    true
+}
+
+/// The visible highlighted range of a selection, or `None` when it paints
+/// nothing (a collapsed `Cell`-mode selection). Two selections with the same
+/// span produce identical pixels.
+fn selection_highlight_span(sel: &TermSelection) -> Option<((usize, usize), (usize, usize))> {
+    if sel.is_empty() {
+        None
+    } else {
+        Some(sel.ordered())
+    }
+}
+
+/// Replace `pane`'s selection, flagging a forced repaint only when the
+/// painted region actually changes. A plain click (collapsed -> collapsed)
+/// therefore does not force a full-pane repaint, while a drag that grows the
+/// range or a click that clears a prior highlight does.
+pub fn set_terminal_selection(state: &mut AppState, pane: u32, sel: TermSelection) {
+    let prev_span = state
+        .terminal_selections
+        .get(&pane)
+        .and_then(selection_highlight_span);
+    let next_span = selection_highlight_span(&sel);
+    state.terminal_selections.insert(pane, sel);
+    if prev_span != next_span {
+        state.terminal_selection_repaint.insert(pane);
+    }
+}
+
+/// Drop `pane`'s selection (if any) and flag it for a forced repaint so the
+/// highlight is cleared on the next frame. No-op flag churn when there was
+/// nothing selected.
+pub fn clear_terminal_selection(state: &mut AppState, pane: u32) {
+    if state.terminal_selections.remove(&pane).is_some() {
+        state.terminal_selection_repaint.insert(pane);
+    }
+}
+
+/// Pure element-local pointer → visible cell mapping. `x_offset` is the
+/// content translate applied to the grid (Windows-Terminal parity). The
+/// result is clamped into `[0, cols)` x `[0, rows)`. Returns `None` only
+/// when the grid is degenerate or cell metrics are unavailable.
+pub fn cell_from_local(
+    local_x: f32,
+    local_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    x_offset: f32,
+    cols: usize,
+    rows: usize,
+) -> Option<(usize, usize)> {
+    if cols == 0 || rows == 0 || cell_w <= 0.0 || cell_h <= 0.0 {
+        return None;
+    }
+    let x = (local_x - x_offset).max(0.0);
+    let y = local_y.max(0.0);
+    // `as usize` truncates toward zero, i.e. floor for the non-negative
+    // values above; clamp the right/bottom overrun onto the last cell.
+    let col = ((x / cell_w) as usize).min(cols - 1);
+    let row = ((y / cell_h) as usize).min(rows - 1);
+    Some((row, col))
+}
+
+/// Map an element-local pointer position to a visible cell in `pane`'s
+/// terminal using the renderer's published cell metrics. `cell_w_scale` is
+/// the renderer's per-cell advance scale (Windows-Terminal parity draws each
+/// column at `cell_w * 0.996`; 1.0 otherwise) — the published metric is the
+/// unscaled width, so the caller passes the scale to match the column
+/// positions the renderer actually drew. Returns `None` when metrics aren't
+/// ready yet or the pane has no terminal.
+pub fn terminal_cell_at(
+    state: &AppState,
+    pane: u32,
+    local_x: f32,
+    local_y: f32,
+    x_offset: f32,
+    cell_w_scale: f32,
+) -> Option<(usize, usize)> {
+    let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w() * cell_w_scale;
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let handle = state.terminals.get(&pane)?;
+    let (rows, cols) = {
+        let t = handle.lock_recover();
+        (t.grid().rows(), t.grid().cols())
+    };
+    cell_from_local(local_x, local_y, cell_w, cell_h, x_offset, cols, rows)
+}
+
+fn terminal_word_bounds(state: &AppState, pane: u32, cell: (usize, usize)) -> (usize, usize) {
+    state
+        .terminals
+        .get(&pane)
+        .map(|h| h.lock_recover().word_bounds_at(cell.0, cell.1))
+        .unwrap_or((cell.1, cell.1))
+}
+
+fn terminal_line_bounds(state: &AppState, pane: u32, cell: (usize, usize)) -> (usize, usize) {
+    state
+        .terminals
+        .get(&pane)
+        .map(|h| h.lock_recover().line_bounds_at(cell.0))
+        .unwrap_or((cell.1, cell.1))
+}
+
+/// Handle a left mouse-down on `pane`'s terminal at visible `cell`. Places a
+/// fresh anchor, extends from the existing anchor on `shift`, or promotes to
+/// word / line selection on the second / third consecutive press of the same
+/// cell within [`MULTI_CLICK_MS`].
+pub fn handle_terminal_mouse_down(
+    state: &mut AppState,
+    pane: u32,
+    cell: (usize, usize),
+    shift: bool,
+    now: std::time::Instant,
+) {
+    // Shift+click extends the live selection from its existing anchor.
+    if shift {
+        if let Some(mut sel) = state.terminal_selections.get(&pane).copied() {
+            sel.focus = cell;
+            set_terminal_selection(state, pane, sel);
+            state.terminal_click = Some(TerminalClick {
+                pane,
+                at: now,
+                cell,
+                count: 1,
+            });
+            return;
+        }
+        // No live selection: fall through to a fresh single-cell anchor.
+    }
+
+    let count = match state.terminal_click {
+        Some(prev)
+            if prev.pane == pane
+                && prev.cell == cell
+                && now.duration_since(prev.at).as_millis() <= MULTI_CLICK_MS =>
+        {
+            prev.count % 3 + 1
+        }
+        _ => 1,
+    };
+    state.terminal_click = Some(TerminalClick {
+        pane,
+        at: now,
+        cell,
+        count,
+    });
+
+    let sel = match count {
+        2 => {
+            let (s, e) = terminal_word_bounds(state, pane, cell);
+            TermSelection {
+                anchor: (cell.0, s),
+                focus: (cell.0, e),
+                mode: SelectMode::Word,
+            }
+        }
+        3 => {
+            let (s, e) = terminal_line_bounds(state, pane, cell);
+            TermSelection {
+                anchor: (cell.0, s),
+                focus: (cell.0, e),
+                mode: SelectMode::Line,
+            }
+        }
+        _ => TermSelection::new(cell, SelectMode::Cell),
+    };
+    set_terminal_selection(state, pane, sel);
+}
+
+/// Extend `pane`'s selection focus to `cell` during a drag. Seeds a fresh
+/// cell selection if a drag somehow arrives without a prior mouse-down
+/// anchor.
+pub fn handle_terminal_drag(state: &mut AppState, pane: u32, cell: (usize, usize)) {
+    if let Some(mut sel) = state.terminal_selections.get(&pane).copied() {
+        sel.focus = cell;
+        set_terminal_selection(state, pane, sel);
+    } else {
+        set_terminal_selection(state, pane, TermSelection::new(cell, SelectMode::Cell));
+    }
+}
+
+/// Finish a drag: drop a collapsed (empty) selection so a click-without-drag
+/// leaves no stale highlight.
+pub fn finish_terminal_drag(state: &mut AppState, pane: u32) {
+    if let Some(sel) = state.terminal_selections.get(&pane).copied() {
+        if sel.is_empty() {
+            clear_terminal_selection(state, pane);
+        }
+    }
 }
 
 /// Parse `shell.set_default:<json>` and apply. The json must
@@ -4581,6 +4994,9 @@ mod tests {
             toasts: unshit::core::toast::ToastStore::with_capacity(3, 8),
             toast_meta: BTreeMap::new(),
             clipboard: Arc::new(unshit::app::ClipboardContext::new()),
+            terminal_selections: std::collections::HashMap::new(),
+            terminal_selection_repaint: std::collections::HashSet::new(),
+            terminal_click: None,
             default_shell: crate::shell::ShellSpec::default(),
             quick_prompt: None,
         }
@@ -7279,6 +7695,185 @@ mod tests {
         assert_eq!(guard.terminal_font_size_pt, 25);
     }
 
+    // -- text selection -------------------------------------------------------
+
+    #[test]
+    fn cell_from_local_maps_and_floors() {
+        // 10px wide, 20px tall cells, no offset.
+        assert_eq!(
+            cell_from_local(0.0, 0.0, 10.0, 20.0, 0.0, 80, 24),
+            Some((0, 0))
+        );
+        // 95/10 -> col 9, 45/20 -> row 2.
+        assert_eq!(
+            cell_from_local(95.0, 45.0, 10.0, 20.0, 0.0, 80, 24),
+            Some((2, 9))
+        );
+    }
+
+    #[test]
+    fn cell_from_local_clamps_and_applies_offset() {
+        // Far overrun clamps onto the last cell.
+        assert_eq!(
+            cell_from_local(1.0e5, 1.0e5, 10.0, 20.0, 0.0, 80, 24),
+            Some((23, 79))
+        );
+        // The content x-offset shifts the cell origin right: x=13 with a 3px
+        // offset lands 10px into the content -> col 1.
+        assert_eq!(
+            cell_from_local(13.0, 0.0, 10.0, 20.0, 3.0, 80, 24),
+            Some((0, 1))
+        );
+        // Negative local (left of content) clamps to column 0.
+        assert_eq!(
+            cell_from_local(-5.0, -5.0, 10.0, 20.0, 0.0, 80, 24),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn cell_from_local_rejects_degenerate_inputs() {
+        assert_eq!(cell_from_local(5.0, 5.0, 10.0, 20.0, 0.0, 0, 24), None);
+        assert_eq!(cell_from_local(5.0, 5.0, 0.0, 20.0, 0.0, 80, 24), None);
+    }
+
+    #[test]
+    fn term_selection_empty_and_ordering() {
+        // A collapsed cell selection is empty; word/line are never empty.
+        assert!(TermSelection::new((1, 2), SelectMode::Cell).is_empty());
+        assert!(!TermSelection::new((1, 2), SelectMode::Word).is_empty());
+
+        let sel = TermSelection {
+            anchor: (2, 5),
+            focus: (1, 1),
+            mode: SelectMode::Cell,
+        };
+        assert!(!sel.is_empty());
+        assert_eq!(sel.ordered(), ((1, 1), (2, 5)));
+    }
+
+    #[test]
+    fn apply_selection_highlight_paints_only_selected_cells() {
+        use unshit::core::cell_grid::{Cell, CellGrid};
+        let mut grid = CellGrid::new(2, 5);
+        for col in 0..5 {
+            grid.set_cell(0, col, Cell::with_char('a'));
+            grid.set_cell(1, col, Cell::with_char('b'));
+        }
+        let sel = TermSelection {
+            anchor: (0, 1),
+            focus: (0, 3),
+            mode: SelectMode::Cell,
+        };
+        apply_selection_highlight(&mut grid, &sel);
+
+        // Selected cells (row 0, cols 1..=3) carry the selection bg.
+        for col in 1..=3 {
+            assert_eq!(grid.get_cell(0, col).unwrap().bg, SELECTION_BG, "col {col}");
+        }
+        // Cells outside the range are untouched.
+        assert_ne!(grid.get_cell(0, 0).unwrap().bg, SELECTION_BG);
+        assert_ne!(grid.get_cell(0, 4).unwrap().bg, SELECTION_BG);
+        assert_ne!(grid.get_cell(1, 2).unwrap().bg, SELECTION_BG);
+    }
+
+    #[test]
+    fn apply_selection_highlight_skips_empty_selection() {
+        use unshit::core::cell_grid::{Cell, CellGrid};
+        let mut grid = CellGrid::new(1, 3);
+        grid.set_cell(0, 0, Cell::with_char('x'));
+        let before = *grid.get_cell(0, 0).unwrap();
+        apply_selection_highlight(&mut grid, &TermSelection::new((0, 0), SelectMode::Cell));
+        assert_eq!(
+            *grid.get_cell(0, 0).unwrap(),
+            before,
+            "empty selection is a no-op"
+        );
+    }
+
+    #[test]
+    fn mouse_down_promotes_through_cell_word_line_on_repeat_clicks() {
+        use std::time::Duration;
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0);
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Cell);
+
+        // Second press on the same cell within the window -> word.
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0 + Duration::from_millis(50));
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Word);
+
+        // Third -> line.
+        handle_terminal_mouse_down(
+            &mut st,
+            pane,
+            (0, 0),
+            false,
+            t0 + Duration::from_millis(100),
+        );
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Line);
+
+        // A press after the multi-click window resets to a fresh cell anchor.
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0 + Duration::from_secs(2));
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Cell);
+    }
+
+    #[test]
+    fn shift_click_extends_existing_selection_anchor() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        handle_terminal_mouse_down(&mut st, pane, (1, 2), false, t0);
+        // Shift+click keeps the anchor and moves the focus.
+        handle_terminal_mouse_down(
+            &mut st,
+            pane,
+            (3, 7),
+            true,
+            t0 + std::time::Duration::from_secs(2),
+        );
+        let sel = st.terminal_selections[&pane];
+        assert_eq!(sel.anchor, (1, 2));
+        assert_eq!(sel.focus, (3, 7));
+    }
+
+    #[test]
+    fn selection_repaint_flag_tracks_visible_change() {
+        let mut st = test_state();
+        // A collapsed cell selection paints nothing, so a plain click must
+        // not force a full-pane repaint.
+        set_terminal_selection(&mut st, 1, TermSelection::new((0, 0), SelectMode::Cell));
+        assert!(
+            !st.terminal_selection_repaint.contains(&1),
+            "collapsed click must not force a repaint"
+        );
+        assert!(
+            !active_pane_has_selection(&st),
+            "collapsed cell is not a selection"
+        );
+
+        // Growing to a real range changes the painted span -> repaint.
+        set_terminal_selection(
+            &mut st,
+            1,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 4),
+                mode: SelectMode::Cell,
+            },
+        );
+        assert!(st.terminal_selection_repaint.contains(&1));
+        assert!(active_pane_has_selection(&st));
+
+        // Clearing a painted selection -> repaint to erase the highlight.
+        st.terminal_selection_repaint.clear();
+        clear_terminal_selection(&mut st, 1);
+        assert!(!st.terminal_selections.contains_key(&1));
+        assert!(st.terminal_selection_repaint.contains(&1));
+    }
+
     // -- mutate_split_right ---------------------------------------------------
 
     #[test]
@@ -9934,6 +10529,26 @@ mod tests {
         // the normalisation contract.
         let input = "ok\x1b[200~before-end\x1b[201~after";
         assert_eq!(super::normalize_pasted_text(input), "okbefore-endafter");
+    }
+
+    #[test]
+    fn normalize_pasted_text_scrubs_reassembled_split_markers() {
+        // Paste-injection regression: a single forward pass would delete the
+        // inner marker and splice its neighbours into a brand-new terminator
+        // (`\x1b[2` + `\x1b[201~` + `01~` -> `\x1b[201~`). The scrub must run
+        // to a fixed point so no marker survives into the wrapped body.
+        let input = "\x1b[2\x1b[201~01~payload";
+        let out = super::normalize_pasted_text(input);
+        assert!(
+            !out.contains("\x1b[201~") && !out.contains("\x1b[200~"),
+            "no bracketed-paste marker may survive, got {out:?}"
+        );
+        assert_eq!(out, "payload");
+
+        // Nested start markers must also fully collapse.
+        let nested = "\x1b[200\x1b[200~~rm -rf";
+        let out = super::normalize_pasted_text(nested);
+        assert!(!out.contains("\x1b[200~"), "got {out:?}");
     }
 
     #[test]
