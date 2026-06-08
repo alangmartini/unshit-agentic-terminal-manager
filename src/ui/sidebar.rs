@@ -430,20 +430,140 @@ fn ctx_menu_section_header(label: &str) -> ElementDef {
         .with_text(label.to_string())
 }
 
-fn ctx_menu_item_active(label: &str, shared: &SharedState, command: String) -> ElementDef {
-    ctx_menu_item(label, shared, command).with_class("active")
+/// One action row in the workspace context menu, matching design #2
+/// ("submenu flyout"): leading icon, label, then either a keyboard hint
+/// badge or a submenu chevron on the trailing edge. Carries the legacy
+/// `ctx-menu-item` class so existing structural tests keep matching.
+fn m_menu_row(
+    icon: ElementDef,
+    label: &str,
+    kbd: Option<&str>,
+    chevron: bool,
+    danger: bool,
+    shared: &SharedState,
+    command: String,
+) -> ElementDef {
+    let s = shared.clone();
+    let mut row = ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-item")
+        .with_class("m-row")
+        .on_click(move || {
+            mutate_with(&s, |st| {
+                crate::state::dispatch(st, &command);
+            });
+        })
+        .with_child(icon.with_class("m-ic"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("ctx-menu-item-label")
+                .with_class("m-label")
+                .with_text(label.to_string()),
+        );
+    if danger {
+        row = row.with_class("danger");
+    }
+    if let Some(k) = kbd {
+        row = row.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("m-kbd")
+                .with_text(k.to_string()),
+        );
+    }
+    if chevron {
+        row = row.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("m-chev")
+                .with_text("\u{203A}".to_string()),
+        );
+    }
+    row
 }
 
-fn workspace_ctx_shell_items(
+/// Favourite shell stems — these get a star in the spawn flyout, matching
+/// the design. Only the first occurrence of each stem is starred so a
+/// second `bash` install (a common Windows case) stays unstarred.
+const FAVOURITE_SHELL_STEMS: &[&str] = &["pwsh", "cmd", "bash"];
+
+/// One shell row inside the "New terminal" flyout. Splits the discovered
+/// label into a bright stem and a dimmed `(path)` suffix and appends a
+/// star for favourites. Keeps `ctx-menu-item` so the existing shell tests
+/// continue to match by class and text.
+fn flyout_shell_row(
+    label: &str,
+    is_active: bool,
+    is_fav: bool,
+    shared: &SharedState,
+    command: String,
+) -> ElementDef {
+    let (name, suffix) = match label.split_once(" (") {
+        Some((stem, rest)) => (stem.to_string(), format!(" ({rest}")),
+        None => (label.to_string(), String::new()),
+    };
+
+    // Stem, dimmed path, and favourite star are flat text siblings inside the
+    // name slot. The layout engine only paints interior text spans reliably
+    // here (a bare span placed directly on the row, or a star nested a level
+    // deeper, is dropped), so the star rides alongside the path span — which
+    // provably renders — and gets nudged right with left padding.
+    let mut name_slot = ElementDef::new(Tag::Div)
+        .with_class("m-label")
+        .with_class("sh-name-wrap")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("sh-name")
+                .with_text(name),
+        );
+    if !suffix.is_empty() {
+        name_slot = name_slot.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("sh-path")
+                .with_text(suffix),
+        );
+    }
+
+    let s = shared.clone();
+    let mut row = ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-item")
+        .with_class("m-row")
+        .with_class("m-shell")
+        .on_click(move || {
+            mutate_with(&s, |st| {
+                crate::state::dispatch(st, &command);
+            });
+        })
+        .with_child(svg_icon(icon_shell()).with_class("m-ic"))
+        .with_child(name_slot);
+    if is_fav {
+        // The star is the row's trailing child, right-aligned by the flex:1
+        // name slot — the same structure as the keyboard-hint badge, which
+        // the layout engine paints reliably (a bare trailing span does not;
+        // it needs a definite box from padding to reserve flex space).
+        row = row.with_class("fav").with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("sh-star")
+                .with_text("\u{2605}".to_string()),
+        );
+    }
+    if is_active {
+        row = row.with_class("active");
+    }
+    row
+}
+
+/// Build the contents of the spawn-shell flyout: a `Shell` section header,
+/// one row per installed shell, and an optional "Use app default" reset
+/// when the workspace carries a shell override.
+fn workspace_flyout_shell_items(
     ws_idx: usize,
     current: &crate::shell::ShellSpec,
     installed: &[std::path::PathBuf],
     shared: &SharedState,
 ) -> Vec<ElementDef> {
     let mut items: Vec<ElementDef> = Vec::new();
-    items.push(ctx_menu_section_header("Shell"));
+    items.push(ctx_menu_section_header("Shell").with_class("m-section"));
 
     let labels = crate::shell::label_installed_shells(installed);
+    let mut seen_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (path, label) in installed.iter().zip(labels.iter()) {
         let program = path.display().to_string();
         let spec = crate::shell::ShellSpec {
@@ -453,17 +573,23 @@ fn workspace_ctx_shell_items(
         let json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
         let command = format!("shell.set_workspace:{ws_idx}:{json}");
         let is_active = !current.program.is_empty() && current.program == program;
-        let item = if is_active {
-            ctx_menu_item_active(label, shared, command)
-        } else {
-            ctx_menu_item(label, shared, command)
-        };
-        items.push(item);
+
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let first_of_stem = seen_stems.insert(stem.clone());
+        let is_fav = first_of_stem && FAVOURITE_SHELL_STEMS.contains(&stem.as_str());
+
+        items.push(flyout_shell_row(label, is_active, is_fav, shared, command));
     }
 
     if !current.is_empty() {
-        items.push(ctx_menu_item(
+        items.push(flyout_shell_row(
             "Use app default",
+            false,
+            false,
             shared,
             format!("shell.clear_workspace:{ws_idx}"),
         ));
@@ -490,58 +616,90 @@ fn build_workspace_ctx_menu(
     let can_remove = snap.workspaces.len() > 1;
     let collapse_label = if is_collapsed { "Expand" } else { "Collapse" };
 
-    let mut menu = ElementDef::new(Tag::Div)
+    // Header: terminal glyph + workspace name (dim, meta-sized).
+    let header = ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-header")
+        .with_class("m-head")
+        .with_child(svg_icon(icon_terminal()).with_class("m-head-ic"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("nm")
+                .with_text(ws_name),
+        );
+
+    // "New terminal" is a submenu anchor: hovering reveals the shell flyout
+    // that pops out to the side. Clicking the row still spawns a terminal
+    // with the workspace's resolved default shell.
+    let mut flyout = ElementDef::new(Tag::Div).with_class("m-flyout");
+    for item in workspace_flyout_shell_items(ws_idx, &current_shell, installed, shared) {
+        flyout = flyout.with_child(item);
+    }
+    let sub_anchor = ElementDef::new(Tag::Div)
+        .with_class("m-sub-anchor")
+        .with_child(
+            m_menu_row(
+                svg_icon(icon_plus()),
+                "New terminal",
+                None,
+                true,
+                false,
+                shared,
+                format!("workspace.new_terminal:{ws_idx}"),
+            )
+            .with_class("m-sub-trigger"),
+        )
+        .with_child(flyout);
+
+    // Danger zone: grouped and fenced behind a top border + faint rust wash.
+    let mut danger = ElementDef::new(Tag::Div)
+        .with_class("m-danger")
+        .with_child(m_menu_row(
+            svg_icon(icon_ban()),
+            "Kill all terminals",
+            None,
+            false,
+            true,
+            shared,
+            format!("workspace.request_kill_all:{ws_idx}"),
+        ));
+    if can_remove {
+        danger = danger.with_child(m_menu_row(
+            svg_icon(icon_trash()),
+            "Remove workspace",
+            None,
+            false,
+            true,
+            shared,
+            format!("workspace.remove:{ws_idx}"),
+        ));
+    }
+
+    ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
+        .with_class("m-menu")
         .with_style(StyleDeclaration::Left(Dimension::Px(x)))
         .with_style(StyleDeclaration::Top(Dimension::Px(y)))
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("ctx-menu-header")
-                .with_text(ws_name),
-        )
-        .with_child(ctx_menu_separator())
-        .with_child(ctx_menu_item(
+        .with_child(header)
+        .with_child(m_menu_row(
+            svg_icon(icon_diamond()),
             "Set active",
+            Some("\u{23CE}"),
+            false,
+            false,
             shared,
-            format!("workspace.switch:{}", ws_idx),
+            format!("workspace.switch:{ws_idx}"),
         ))
-        .with_child(ctx_menu_item(
-            "New terminal",
-            shared,
-            format!("workspace.new_terminal:{}", ws_idx),
-        ))
-        .with_child(ctx_menu_item(
+        .with_child(sub_anchor)
+        .with_child(m_menu_row(
+            svg_icon(icon_collapse()),
             collapse_label,
+            Some("\u{2318}."),
+            false,
+            false,
             shared,
-            format!("workspace.collapse:{}", ws_idx),
-        ));
-
-    menu = menu.with_child(ctx_menu_separator()).with_child(
-        ctx_menu_item(
-            "Kill all terminals in workspace",
-            shared,
-            format!("workspace.request_kill_all:{}", ws_idx),
-        )
-        .with_class("danger"),
-    );
-
-    if can_remove {
-        menu = menu.with_child(ctx_menu_separator()).with_child(
-            ctx_menu_item(
-                "Remove workspace",
-                shared,
-                format!("workspace.remove:{}", ws_idx),
-            )
-            .with_class("danger"),
-        );
-    }
-
-    menu = menu.with_child(ctx_menu_separator());
-    for item in workspace_ctx_shell_items(ws_idx, &current_shell, installed, shared) {
-        menu = menu.with_child(item);
-    }
-
-    menu
+            format!("workspace.collapse:{ws_idx}"),
+        ))
+        .with_child(danger)
 }
 
 fn build_tab_ctx_menu(
@@ -1433,7 +1591,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_ctx_menu_keeps_remove_workspace_above_long_shell_list() {
+    fn workspace_ctx_menu_groups_danger_and_nests_shells_in_flyout() {
+        // Design #2 moves the shell list into a hover flyout hanging off the
+        // "New terminal" submenu, and fences the destructive actions into a
+        // grouped danger zone (kill above remove).
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed: Vec<std::path::PathBuf> = (0..16)
@@ -1442,9 +1603,13 @@ mod tests {
         let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
         let items = collect_with_class(&menu, "ctx-menu-item");
 
+        let new_terminal_idx = items
+            .iter()
+            .position(|el| item_text_contains(el, "New terminal"))
+            .expect("new terminal submenu row must be present");
         let kill_idx = items
             .iter()
-            .position(|el| item_text_contains(el, "Kill all terminals in workspace"))
+            .position(|el| item_text_contains(el, "Kill all terminals"))
             .expect("kill workspace terminals item must be present");
         let remove_idx = items
             .iter()
@@ -1457,11 +1622,72 @@ mod tests {
 
         assert!(
             kill_idx < remove_idx,
-            "remove action should stay grouped after kill action"
+            "danger actions should stay grouped with kill above remove"
         );
         assert!(
-            remove_idx < first_shell_idx,
-            "remove workspace must stay visible before long shell lists"
+            new_terminal_idx < first_shell_idx,
+            "shells must hang off the New terminal submenu"
+        );
+
+        // The shell list lives inside the hover flyout, not the root menu.
+        let flyout = find_by_class(&menu, "m-flyout").expect("submenu flyout must exist");
+        assert!(
+            item_text_contains(flyout, "shell0"),
+            "shell rows must render inside the flyout"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_rows_carry_icons_and_kbd_hints() {
+        // Each action row leads with an icon (m-ic) and the navigational
+        // rows expose a keyboard hint badge, matching design #2.
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed = fake_installed();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+
+        let set_active = collect_with_class(&menu, "ctx-menu-item")
+            .into_iter()
+            .find(|el| item_text_contains(el, "Set active"))
+            .expect("Set active row must exist");
+        assert!(
+            find_by_class(set_active, "m-ic").is_some(),
+            "Set active row must carry a leading icon"
+        );
+        assert!(
+            find_by_class(set_active, "m-kbd").is_some(),
+            "Set active row must carry a keyboard hint badge"
+        );
+
+        // The header carries the terminal glyph + workspace name.
+        let head = find_by_class(&menu, "m-head").expect("menu header");
+        assert!(find_by_class(head, "m-head-ic").is_some());
+    }
+
+    #[test]
+    fn workspace_ctx_menu_marks_favourite_shells_with_star() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed = vec![
+            std::path::PathBuf::from("/usr/bin/pwsh"),
+            std::path::PathBuf::from("/usr/bin/zsh"),
+        ];
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let pwsh = collect_with_class(&menu, "m-shell")
+            .into_iter()
+            .find(|el| item_text_contains(el, "pwsh"))
+            .expect("pwsh shell row");
+        let zsh = collect_with_class(&menu, "m-shell")
+            .into_iter()
+            .find(|el| item_text_contains(el, "zsh"))
+            .expect("zsh shell row");
+        assert!(
+            has_class(pwsh, "fav") && find_by_class(pwsh, "sh-star").is_some(),
+            "pwsh is a favourite and must be starred"
+        );
+        assert!(
+            !has_class(zsh, "fav"),
+            "zsh is not in the favourite set and must not be starred"
         );
     }
 
