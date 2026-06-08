@@ -58,8 +58,16 @@ pub enum Event {
 #[derive(Clone, Debug)]
 pub struct MouseEvent {
     pub kind: MouseEventKind,
+    /// Cursor position in window coordinates.
     pub x: f32,
     pub y: f32,
+    /// Cursor position relative to the content box (padding box origin) of
+    /// the element the event is dispatched to. Equal to `x`/`y` when no
+    /// target element is known (e.g. synthetic events). Lets grid/canvas
+    /// handlers map a pointer to a cell without re-deriving the element's
+    /// absolute rect app-side.
+    pub local_x: f32,
+    pub local_y: f32,
     pub button: MouseButton,
     pub modifiers: Modifiers,
 }
@@ -112,6 +120,7 @@ pub enum Key {
     PageUp,
     PageDown,
     Delete,
+    Insert,
     F(u8),
     Unknown,
 }
@@ -136,6 +145,7 @@ impl Key {
             "pageup" => Some(Key::PageUp),
             "pagedown" => Some(Key::PageDown),
             "delete" | "del" => Some(Key::Delete),
+            "insert" | "ins" => Some(Key::Insert),
             other => {
                 // Try F-key pattern: "f1" through "f12"
                 if let Some(n_str) = other.strip_prefix('f') {
@@ -176,6 +186,7 @@ impl fmt::Display for Key {
             Key::PageUp => write!(f, "PageUp"),
             Key::PageDown => write!(f, "PageDown"),
             Key::Delete => write!(f, "Delete"),
+            Key::Insert => write!(f, "Insert"),
             Key::F(n) => write!(f, "F{}", n),
             Key::Unknown => write!(f, "Unknown"),
         }
@@ -259,6 +270,13 @@ pub struct DragEvent {
     /// Current cursor position (absolute, in window coordinates).
     pub x: f32,
     pub y: f32,
+    /// Current cursor position relative to the content box (padding box
+    /// origin) of the element whose `on_drag` handler is receiving the
+    /// event. Equal to `x`/`y` when the target rect is unknown. Lets a
+    /// grid/canvas map a drag to a cell without re-deriving its absolute
+    /// rect from layout state.
+    pub local_x: f32,
+    pub local_y: f32,
     /// Movement since the last DragUpdate (or since DragStart for the first update).
     pub delta_x: f32,
     pub delta_y: f32,
@@ -867,6 +885,14 @@ pub fn dispatch_context_menu(arena: &NodeArena, hovered: NodeId, x: f32, y: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_insert_round_trips_name_and_display() {
+        assert_eq!(Key::from_name("insert"), Some(Key::Insert));
+        assert_eq!(Key::from_name("ins"), Some(Key::Insert));
+        assert_eq!(Key::from_name("INSERT"), Some(Key::Insert));
+        assert_eq!(Key::Insert.to_string(), "Insert");
+    }
 
     #[test]
     fn test_ime_event_enabled_variant() {

@@ -2027,10 +2027,14 @@ impl ApplicationHandler for AppHandler {
                     if let Some(handler_node) = state.interaction.drag_target {
                         let origin = state.interaction.drag_origin.unwrap_or(pos);
                         let last = state.interaction.drag_last_pos;
+                        let (local_x, local_y) =
+                            local_pointer_coords(&state.arena, handler_node, pos.0, pos.1);
                         let event = DragEvent {
                             phase: DragPhase::Update,
                             x: pos.0,
                             y: pos.1,
+                            local_x,
+                            local_y,
                             delta_x: pos.0 - last.0,
                             delta_y: pos.1 - last.1,
                             total_delta_x: pos.0 - origin.0,
@@ -2059,10 +2063,14 @@ impl ApplicationHandler for AppHandler {
                             state.interaction.drag_last_pos = origin;
 
                             // Dispatch DragStart
+                            let (local_x, local_y) =
+                                local_pointer_coords(&state.arena, handler_node, pos.0, pos.1);
                             let event = DragEvent {
                                 phase: DragPhase::Start,
                                 x: pos.0,
                                 y: pos.1,
+                                local_x,
+                                local_y,
                                 delta_x: dx,
                                 delta_y: dy,
                                 total_delta_x: dx,
@@ -2238,6 +2246,40 @@ impl ApplicationHandler for AppHandler {
                                     state.window.request_redraw();
                                 }
 
+                                // Dispatch a MouseDown along the hovered chain so
+                                // grid/canvas widgets (e.g. the terminal) can place
+                                // a selection anchor with the press coordinates and
+                                // modifiers a Click event cannot carry. Additive:
+                                // no built-in element registers a MouseDown handler,
+                                // so existing widgets are unaffected. `local_*` is
+                                // relative to the hovered leaf, which is the grid
+                                // element itself (it has no child cell nodes).
+                                if !state.interaction.hovered.is_dangling() {
+                                    let (lx, ly) = local_pointer_coords(
+                                        &state.arena,
+                                        state.interaction.hovered,
+                                        sb_pos.0,
+                                        sb_pos.1,
+                                    );
+                                    let md = Event::Mouse(MouseEvent {
+                                        kind: MouseEventKind::Down,
+                                        x: sb_pos.0,
+                                        y: sb_pos.1,
+                                        local_x: lx,
+                                        local_y: ly,
+                                        button: MouseButton::Left,
+                                        modifiers: modifiers_from_winit(&state.modifiers_state),
+                                    });
+                                    if dispatch_mouse_button_event(
+                                        &state.arena,
+                                        state.interaction.hovered,
+                                        EventType::MouseDown,
+                                        &md,
+                                    ) {
+                                        state.needs_rebuild = true;
+                                    }
+                                }
+
                                 // Click-to-position cursor in text input
                                 if let Some(element) = state.arena.get(new_focused) {
                                     use unshit_core::element::InputType;
@@ -2396,10 +2438,18 @@ impl ApplicationHandler for AppHandler {
                                 if let Some(handler_node) = state.interaction.drag_target {
                                     let origin = state.interaction.drag_origin.unwrap_or(pos);
                                     let last = state.interaction.drag_last_pos;
+                                    let (local_x, local_y) = local_pointer_coords(
+                                        &state.arena,
+                                        handler_node,
+                                        pos.0,
+                                        pos.1,
+                                    );
                                     let event = DragEvent {
                                         phase: DragPhase::End,
                                         x: pos.0,
                                         y: pos.1,
+                                        local_x,
+                                        local_y,
                                         delta_x: pos.0 - last.0,
                                         delta_y: pos.1 - last.1,
                                         total_delta_x: pos.0 - origin.0,
@@ -2487,10 +2537,14 @@ impl ApplicationHandler for AppHandler {
                     if let Some(handler_node) = state.interaction.drag_target {
                         let origin = state.interaction.drag_origin.unwrap_or(pos);
                         let last = state.interaction.drag_last_pos;
+                        let (local_x, local_y) =
+                            local_pointer_coords(&state.arena, handler_node, pos.0, pos.1);
                         let event = DragEvent {
                             phase: DragPhase::End,
                             x: pos.0,
                             y: pos.1,
+                            local_x,
+                            local_y,
                             delta_x: pos.0 - last.0,
                             delta_y: pos.1 - last.1,
                             total_delta_x: pos.0 - origin.0,
@@ -3681,10 +3735,13 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32), decorations: bool)
         state.interaction.hovered = new_hover;
         apply_cursor_icon(&*state.window, &state.arena, new_hover);
         state.mark_restyle_pseudo_change(old_hover, new_hover);
+        let (local_x, local_y) = local_pointer_coords(&state.arena, new_hover, pos.0, pos.1);
         let event = Event::Mouse(MouseEvent {
             kind: MouseEventKind::Move,
             x: pos.0,
             y: pos.1,
+            local_x,
+            local_y,
             button: MouseButton::None,
             modifiers: Modifiers::empty(),
         });
@@ -3732,6 +3789,68 @@ fn dispatch_mouse_move_event(arena: &NodeArena, start: NodeId, event: &Event) ->
         node = element.parent;
     }
     false
+}
+
+/// Cursor position relative to a node's content box (padding box origin),
+/// in the same coordinate space the renderer lays cells out in. Falls back
+/// to the raw window coordinates when the node is missing so callers always
+/// get a usable value. Mirrors the built-in text-input hit-test convention
+/// (`pos - rect - padding`) so grid/canvas handlers can divide by the
+/// published cell metrics to recover a cell index.
+fn local_pointer_coords(arena: &NodeArena, node: NodeId, x: f32, y: f32) -> (f32, f32) {
+    if let Some(el) = arena.get(node) {
+        let r = el.layout_rect;
+        let p = &el.computed_style.padding;
+        (x - r.x - p.left, y - r.y - p.top)
+    } else {
+        (x, y)
+    }
+}
+
+/// Walk up from `start` to find the nearest element with a handler for
+/// `event_type` (used for `MouseDown`/`MouseUp`), invoke it, and report
+/// whether one fired. Mirrors [`dispatch_mouse_move_event`] but matches an
+/// arbitrary button event type so press/release reach grid handlers that
+/// need the press coordinates and modifiers a `Click` cannot carry.
+fn dispatch_mouse_button_event(
+    arena: &NodeArena,
+    start: NodeId,
+    event_type: EventType,
+    event: &Event,
+) -> bool {
+    let mut node = start;
+    while !node.is_dangling() {
+        let Some(element) = arena.get(node) else {
+            break;
+        };
+        for (et, handler) in &element.handlers {
+            if *et == event_type {
+                handler(event);
+                return true;
+            }
+        }
+        node = element.parent;
+    }
+    false
+}
+
+/// Convert the renderer's tracked winit modifier state into the framework's
+/// `Modifiers` bitflags so pointer events can carry the live modifier set.
+fn modifiers_from_winit(state: &winit::keyboard::ModifiersState) -> Modifiers {
+    let mut m = Modifiers::empty();
+    if state.shift_key() {
+        m |= Modifiers::SHIFT;
+    }
+    if state.control_key() {
+        m |= Modifiers::CTRL;
+    }
+    if state.alt_key() {
+        m |= Modifiers::ALT;
+    }
+    if state.meta_key() {
+        m |= Modifiers::META;
+    }
+    m
 }
 
 fn update_focus_context(state: &mut AppState) {
@@ -3914,6 +4033,7 @@ fn handle_text_input(state: &mut AppState, event: &winit::event::KeyEvent) -> bo
         let key = match named {
             NamedKey::Backspace => Some(unshit_core::event::Key::Backspace),
             NamedKey::Delete => Some(unshit_core::event::Key::Delete),
+            NamedKey::Insert => Some(unshit_core::event::Key::Insert),
             NamedKey::ArrowLeft => Some(unshit_core::event::Key::ArrowLeft),
             NamedKey::ArrowRight => Some(unshit_core::event::Key::ArrowRight),
             NamedKey::ArrowUp => Some(unshit_core::event::Key::ArrowUp),
@@ -5103,6 +5223,8 @@ mod tests {
             kind: MouseEventKind::Move,
             x: 1.0,
             y: 1.0,
+            local_x: 1.0,
+            local_y: 1.0,
             button: MouseButton::None,
             modifiers: Modifiers::empty(),
         });

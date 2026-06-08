@@ -1100,11 +1100,20 @@ fn main() {
             // it. The parser thread writing to any single terminal holds
             // only that terminal's mutex, so it never contends with this
             // closure on the state lock.
-            let (snap, active_id, handles, force_terminal_theme_repaint): (
+            let (
+                snap,
+                active_id,
+                handles,
+                force_terminal_theme_repaint,
+                selections,
+                selection_repaint,
+            ): (
                 crate::state::UiSnapshot,
                 u32,
                 Vec<(u32, crate::state::SharedTerminal)>,
                 bool,
+                std::collections::HashMap<u32, crate::state::TermSelection>,
+                std::collections::HashSet<u32>,
             ) = {
                 let mut guard = tree_shared.lock_recover();
                 let snap = guard.ui_snapshot();
@@ -1116,7 +1125,19 @@ fn main() {
                     .collect();
                 let force_terminal_theme_repaint =
                     crate::state::take_terminal_theme_repaint_request(&mut guard);
-                (snap, active_id, handles, force_terminal_theme_repaint)
+                // Snapshot active selections and drain the per-pane
+                // selection-changed set so the highlight below can force a
+                // one-frame repaint of panes whose selection just changed.
+                let selections = guard.terminal_selections.clone();
+                let selection_repaint = std::mem::take(&mut guard.terminal_selection_repaint);
+                (
+                    snap,
+                    active_id,
+                    handles,
+                    force_terminal_theme_repaint,
+                    selections,
+                    selection_repaint,
+                )
             };
 
             // State mutex is released; take each per-terminal lock
@@ -1129,7 +1150,7 @@ fn main() {
                 .into_iter()
                 .map(|(id, handle)| {
                     let mut t = handle.lock_recover();
-                    let grid = snapshot_terminal_for_render(
+                    let mut grid = snapshot_terminal_for_render(
                         &mut t,
                         id,
                         id == active_id,
@@ -1137,6 +1158,20 @@ fn main() {
                         &snap.custom_theme,
                         force_terminal_theme_repaint,
                     );
+                    // Paint the selection highlight onto the per-frame clone
+                    // (never the live buffer). Applied after the palette so
+                    // the selection bg wins over the themed cell bg.
+                    if let Some(sel) = selections.get(&id) {
+                        crate::state::apply_selection_highlight(&mut grid, sel);
+                    }
+                    // Force a full repaint of this pane the frame its selection
+                    // changed (added / moved / cleared) so the renderer's line
+                    // cache re-emits the rows whose highlight just changed. A
+                    // static selection re-applies the same bg each frame and
+                    // needs no extra damage.
+                    if selection_repaint.contains(&id) {
+                        grid.mark_all_dirty();
+                    }
                     (id, grid)
                 })
                 .collect();

@@ -80,6 +80,10 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
         Key::PageUp => Some(encode_modified_tilde(b"5", has_shift, has_alt, has_ctrl)),
         Key::PageDown => Some(encode_modified_tilde(b"6", has_shift, has_alt, has_ctrl)),
         Key::Delete => Some(encode_modified_tilde(b"3", has_shift, has_alt, has_ctrl)),
+        // Insert is `\x1b[2~`. Shift+Insert is intercepted as paste by the
+        // global shortcut before reaching here, so a plain Insert still
+        // reaches the shell as the standard CSI-tilde sequence.
+        Key::Insert => Some(encode_modified_tilde(b"2", has_shift, has_alt, has_ctrl)),
 
         // -- Function keys (F1 through F12) ------------------------------------
         Key::F(n) => encode_fkey(n, has_shift, has_alt, has_ctrl),

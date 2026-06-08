@@ -492,6 +492,8 @@ mod tests {
             kind: MouseEventKind::Move,
             x: 0.0,
             y: 0.0,
+            local_x: 0.0,
+            local_y: 0.0,
             button: MouseButton::None,
             modifiers: Modifiers::empty(),
         }));
