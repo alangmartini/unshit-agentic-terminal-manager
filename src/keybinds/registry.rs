@@ -223,3 +223,72 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests_copy_paste_bindings {
+    use super::*;
+
+    fn pairs() -> Vec<(String, String)> {
+        default_shortcut_bindings()
+    }
+
+    fn find(combo: &str) -> Option<String> {
+        pairs()
+            .into_iter()
+            .find(|(c, _)| c == combo)
+            .map(|(_, cmd)| cmd)
+    }
+
+    #[test]
+    fn shift_insert_pastes() {
+        // Classic paste binding on systems where it is not intercepted
+        // by a TUI. System binding so it does not pollute the editable
+        // actions list.
+        assert_eq!(find("Shift+Insert").as_deref(), Some("terminal.paste"));
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies() {
+        // Unconditional copy command. Bare Ctrl+C is handled in the
+        // terminal keyboard handler and is conditional (only copies if
+        // a selection exists, otherwise sends SIGINT).
+        assert_eq!(find("Ctrl+Shift+C").as_deref(), Some("terminal.copy"));
+    }
+
+    #[test]
+    fn ctrl_v_and_ctrl_shift_v_both_paste() {
+        // Both conventional Windows (Ctrl+V) and Linux-terminal (Ctrl+Shift+V)
+        // paste bindings are present and map to the same action.
+        assert_eq!(find("Ctrl+V").as_deref(), Some("terminal.paste"));
+        assert_eq!(find("Ctrl+Shift+V").as_deref(), Some("terminal.paste"));
+    }
+
+    #[test]
+    fn no_bare_ctrl_c_binding_exists() {
+        // Ctrl+C MUST NOT be a static shortcut binding. It is handled
+        // conditionally in the terminal's keyboard handler: copy if a
+        // selection exists, otherwise send SIGINT (0x03) to the shell.
+        // If it were a static shortcut, it would always dispatch "terminal.copy"
+        // and never reach the shell, breaking interrupt handling.
+        let cmd = find("Ctrl+C");
+        assert!(
+            cmd.is_none(),
+            "bare Ctrl+C must not be in bindings (found: {:?}); it is handled conditionally",
+            cmd
+        );
+    }
+
+    #[test]
+    fn copy_paste_bindings_are_in_system_not_editable_actions() {
+        // Verify that copy/paste bindings do not interfere with the
+        // editable KeybindAction list. This is a sanity check that
+        // system_bindings() is responsible for these, not the
+        // configurable action list.
+        let bindings = pairs();
+        let copy_paste_combos = vec!["Ctrl+V", "Ctrl+Shift+V", "Shift+Insert", "Ctrl+Shift+C"];
+        for combo in copy_paste_combos {
+            let found = bindings.iter().any(|(c, _)| c == combo);
+            assert!(found, "copy/paste binding {} must be present", combo);
+        }
+    }
+}

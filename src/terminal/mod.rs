@@ -862,7 +862,11 @@ impl Terminal {
     /// coordinates `anchor`..`focus` (order-independent) on `grid`, which
     /// must be the [`Terminal::display_grid`] clone for the current view.
     /// Lines scrolled out of the viewport are skipped; the selection itself
-    /// is unchanged. No-op when anchor == focus (collapsed).
+    /// is unchanged. The range is inclusive on both ends, so `anchor == focus`
+    /// paints exactly one cell — whether a collapsed range should highlight is
+    /// the caller's decision (`apply_selection_highlight` filters out an empty
+    /// `Cell` selection via `is_empty`, while a single-character word selection
+    /// legitimately reaches here and must paint).
     pub fn paint_selection(
         &self,
         grid: &mut CellGrid,
@@ -870,7 +874,7 @@ impl Terminal {
         focus: (u64, usize),
         bg: Color,
     ) {
-        if self.rows == 0 || self.cols == 0 || anchor == focus {
+        if self.rows == 0 || self.cols == 0 {
             return;
         }
         let (start, end) = if anchor <= focus {
@@ -4195,5 +4199,789 @@ mod tests {
             scrollback_before,
             "narrowed-region scrolls must not push to scrollback",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_selection_clipboard_comprehensive {
+    use super::*;
+    use unshit::core::style::types::Color;
+
+    // Helper: extract text from a range of cells in a single row.
+    fn read_range(term: &Terminal, abs_line: u64, col_start: usize, col_end: usize) -> String {
+        let mut s = String::new();
+        for c in col_start..=col_end {
+            if let Some(cell) = term.cell_at_abs(abs_line, c) {
+                s.push(if cell.ch == '\0' { ' ' } else { cell.ch });
+            }
+        }
+        s
+    }
+
+    // ---- selection_text tests ----
+
+    #[test]
+    fn selection_text_empty_grid_returns_empty() {
+        let term = Terminal::new(0, 0);
+        let result = term.selection_text((0, 0), (0, 0));
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn selection_text_1x1_grid_single_cell() {
+        let mut term = Terminal::new(1, 1);
+        term.process_bytes(b"X");
+        assert_eq!(term.selection_text((0, 0), (0, 0)), "X");
+    }
+
+    #[test]
+    fn selection_text_clamped_start_below_first_abs_line() {
+        // Evict some lines, then select a range that overlaps evicted area.
+        let mut term = Terminal::new(2, 5);
+        // Write 3 lines in a 2-row terminal to push one into scrollback.
+        term.process_bytes(b"old0\r\nline1\r\nline2");
+        // Evict the scrollback line by feeding MAX_SCROLLBACK more content.
+        for i in 0..MAX_SCROLLBACK {
+            let line = format!("x{}\r\n", i);
+            term.process_bytes(line.as_bytes());
+        }
+        let first_abs = term.first_abs_line();
+        // Try to select starting before first_abs_line (saturating so the
+        // u64 does not underflow): should clamp and return the selection from
+        // first_abs_line onward without padding lines for the evicted range.
+        let result = term.selection_text((first_abs.saturating_sub(10), 0), (first_abs + 1, 3));
+        assert!(!result.contains("\n\n"));
+    }
+
+    #[test]
+    fn selection_text_clamped_end_beyond_buffer() {
+        let mut term = Terminal::new(2, 8);
+        term.process_bytes(b"line0\r\nline1");
+        let end_abs = term.end_abs_line();
+        // Select beyond the end: should clamp gracefully.
+        let result = term.selection_text((0, 0), (end_abs + 100, 9));
+        // Should not panic, result should not be excessively padded.
+        assert!(result.len() < 100);
+    }
+
+    #[test]
+    fn selection_text_zero_width_returns_single_cell() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        // A zero-width (anchor==focus) range is one inclusive cell. Copy
+        // callers gate on TermSelection::is_empty, so selection_text itself
+        // returns that single cell — which is what makes a single-character
+        // word (double-click) copy the character.
+        assert_eq!(term.selection_text((0, 3), (0, 3)), "l");
+    }
+
+    #[test]
+    fn selection_text_sub_range_within_row() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"0123456789");
+        assert_eq!(term.selection_text((0, 2), (0, 5)), "2345");
+    }
+
+    #[test]
+    fn selection_text_sub_range_inclusive_endpoints() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"abc");
+        // [0, 0] should select just 'a', [0, 2] should select 'a', 'b', 'c'.
+        assert_eq!(term.selection_text((0, 0), (0, 0)), "a");
+        assert_eq!(term.selection_text((0, 0), (0, 2)), "abc");
+    }
+
+    #[test]
+    fn selection_text_full_row_with_trailing_blanks_trims() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"text");
+        // Selecting the whole row (including trailing blanks) should trim.
+        assert_eq!(term.selection_text((0, 0), (0, 9)), "text");
+    }
+
+    #[test]
+    fn selection_text_multirow_first_line_partial() {
+        let mut term = Terminal::new(3, 10);
+        term.process_bytes(b"line0xxxx\r\nline1xxxx\r\nline2");
+        // Select from col 2 of line0 to col 3 of line1.
+        let result = term.selection_text((0, 2), (1, 3));
+        // First line: [2..eol] -> "ne0xxxx"; last line: [0..3] -> "line".
+        assert_eq!(result, "ne0xxxx\nline");
+    }
+
+    #[test]
+    fn selection_text_multirow_interior_lines_full() {
+        let mut term = Terminal::new(5, 10);
+        term.process_bytes(b"line0\r\nline1\r\nline2\r\nline3\r\nline4");
+        // Select line0[0..eol], full line1, line2[0..4].
+        let result = term.selection_text((0, 0), (2, 4));
+        assert!(result.contains("line0"));
+        assert!(result.contains("line1"));
+        assert!(result.contains("line"));
+    }
+
+    #[test]
+    fn selection_text_order_independence_same_line() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"abcdefghij");
+        let ab = term.selection_text((0, 1), (0, 4));
+        let ba = term.selection_text((0, 4), (0, 1));
+        assert_eq!(ab, ba);
+        assert_eq!(ab, "bcde");
+    }
+
+    #[test]
+    fn selection_text_order_independence_multirow() {
+        let mut term = Terminal::new(3, 10);
+        term.process_bytes(b"line0\r\nline1\r\nline2");
+        let forward = term.selection_text((0, 2), (1, 3));
+        let backward = term.selection_text((1, 3), (0, 2));
+        assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn selection_text_wide_continuation_skipped() {
+        // Wide CJK characters occupy 2 cells: primary + wide_continuation.
+        // They should appear once in the selected text, not twice.
+        let mut term = Terminal::new(2, 10);
+        // Lay out a wide char (primary + continuation) followed by 'b'
+        // directly in the grid (no trailing process_bytes that would
+        // overwrite the manually placed cells at the cursor).
+        let cell = |ch, cont| Cell {
+            ch,
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+            attrs: CellAttrs::empty(),
+            wide_continuation: cont,
+        };
+        term.grid.set_cell(0, 1, cell('世', false));
+        term.grid.set_cell(0, 2, cell('\0', true));
+        term.grid.set_cell(0, 3, cell('b', false));
+        // The continuation cell is skipped entirely, so the wide char appears
+        // once: "世b", NOT "世 b" (the '\0' is not turned into a space).
+        let result = term.selection_text((0, 1), (0, 3));
+        assert_eq!(result, "世b");
+    }
+
+    #[test]
+    fn selection_text_null_char_becomes_space() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"text");
+        // Null out col 0 AFTER writing the text (process_bytes would
+        // otherwise overwrite a pre-placed cell at the cursor).
+        let blank_cell = Cell {
+            ch: '\0',
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+            attrs: CellAttrs::empty(),
+            wide_continuation: false,
+        };
+        term.grid.set_cell(0, 0, blank_cell);
+        // A non-continuation '\0' renders as a space: "text" -> " ext".
+        let result = term.selection_text((0, 0), (0, 3));
+        assert_eq!(result, " ext");
+    }
+
+    #[test]
+    fn selection_text_across_scrollback_boundary() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"old\r\nnew");
+        // old scrolled to scrollback[0], new on screen row 0.
+        // abs line 0 is "old", abs line 1 is "new".
+        let result = term.selection_text((0, 0), (1, 4));
+        assert_eq!(result, "old\nnew");
+    }
+
+    #[test]
+    fn selection_text_no_padding_blank_lines_evicted_top() {
+        let mut term = Terminal::new(2, 3);
+        term.process_bytes(b"A\r\nB\r\nC");
+        // Evict to max.
+        for _ in 0..MAX_SCROLLBACK {
+            term.process_bytes(b"x\r\n");
+        }
+        let first = term.first_abs_line();
+        // Select from before first_abs_line to well after: should clamp
+        // and not pad the result with blank lines.
+        let result = term.selection_text((first.saturating_sub(100), 0), (first + 10, 2));
+        // Count leading/trailing newlines: should not have large runs.
+        let mut leading_newlines = 0;
+        for c in result.chars() {
+            if c == '\n' {
+                leading_newlines += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(leading_newlines, 0, "should not pad with blank lines");
+    }
+
+    #[test]
+    fn selection_text_scrollback_content_stable_after_scroll() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"line0\r\nline1\r\nline2");
+        // line0 is in scrollback, line1/line2 on screen.
+        let text_at_0 = term.selection_text((0, 0), (0, 4));
+        // Scroll back to view line0.
+        term.scroll_view_up(1);
+        let text_after_scroll = term.selection_text((0, 0), (0, 4));
+        // Text should be identical (by absolute line).
+        assert_eq!(text_at_0, text_after_scroll);
+    }
+
+    #[test]
+    fn selection_text_scrollback_content_stable_after_new_output() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"line0\r\nline1\r\nline2");
+        let text_before = term.selection_text((0, 0), (0, 4));
+        // More output pushes line0 deeper into scrollback.
+        term.process_bytes(b"\r\nline3");
+        let text_after = term.selection_text((0, 0), (0, 4));
+        // Text is still the same.
+        assert_eq!(text_before, text_after);
+    }
+
+    // ---- word_bounds_at tests ----
+
+    #[test]
+    fn word_bounds_empty_grid() {
+        let term = Terminal::new(0, 0);
+        assert_eq!(term.word_bounds_at(0, 0), (0, 0));
+    }
+
+    #[test]
+    fn word_bounds_1x1_grid_alphanumeric() {
+        let mut term = Terminal::new(1, 1);
+        term.process_bytes(b"a");
+        assert_eq!(term.word_bounds_at(0, 0), (0, 0));
+    }
+
+    #[test]
+    fn word_bounds_word_in_middle() {
+        let mut term = Terminal::new(2, 20);
+        term.process_bytes(b"hello world test");
+        // Click inside "hello" at col 2.
+        assert_eq!(term.word_bounds_at(0, 2), (0, 4));
+        // Click inside "world" at col 8.
+        assert_eq!(term.word_bounds_at(0, 8), (6, 10));
+    }
+
+    #[test]
+    fn word_bounds_at_col_0() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        assert_eq!(term.word_bounds_at(0, 0), (0, 4));
+    }
+
+    #[test]
+    fn word_bounds_at_last_col_in_word() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        // Click at the 'o' (col 4).
+        assert_eq!(term.word_bounds_at(0, 4), (0, 4));
+    }
+
+    #[test]
+    fn word_bounds_on_whitespace_selects_cell_only() {
+        let mut term = Terminal::new(2, 20);
+        term.process_bytes(b"hello world");
+        // Space at col 5.
+        assert_eq!(term.word_bounds_at(0, 5), (5, 5));
+    }
+
+    #[test]
+    fn word_bounds_path_like_token_slash() {
+        let mut term = Terminal::new(2, 30);
+        term.process_bytes(b"check /usr/bin/bash here");
+        // Click inside /usr/bin/bash at col 8.
+        let (start, end) = term.word_bounds_at(0, 8);
+        assert!(start <= 8 && 8 <= end);
+        let path = read_range(&term, 0, start, end);
+        assert!(path.contains("/"));
+    }
+
+    #[test]
+    fn word_bounds_path_token_with_dots() {
+        let mut term = Terminal::new(2, 30);
+        term.process_bytes(b"../foo.bar/baz.rs");
+        // Click inside the token.
+        let (start, end) = term.word_bounds_at(0, 5);
+        let token = read_range(&term, 0, start, end);
+        // Should span the whole path including dots and slashes.
+        assert!(token.contains("."));
+    }
+
+    #[test]
+    fn word_bounds_token_with_tilde() {
+        let mut term = Terminal::new(2, 30);
+        term.process_bytes(b"~/home/user");
+        let (start, end) = term.word_bounds_at(0, 2);
+        let token = read_range(&term, 0, start, end);
+        assert!(token.contains("~"));
+    }
+
+    #[test]
+    fn word_bounds_token_with_hyphen() {
+        let mut term = Terminal::new(2, 30);
+        term.process_bytes(b"my-lib-name");
+        let (start, end) = term.word_bounds_at(0, 5);
+        let token = read_range(&term, 0, start, end);
+        assert_eq!(token, "my-lib-name");
+    }
+
+    #[test]
+    fn word_bounds_token_with_colon() {
+        let mut term = Terminal::new(2, 30);
+        term.process_bytes(b"user@host:22");
+        let (start, end) = term.word_bounds_at(0, 5);
+        let token = read_range(&term, 0, start, end);
+        assert!(token.contains(":"));
+    }
+
+    #[test]
+    fn word_bounds_single_char_word() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"a b c");
+        assert_eq!(term.word_bounds_at(0, 0), (0, 0));
+        assert_eq!(term.word_bounds_at(0, 2), (2, 2));
+    }
+
+    #[test]
+    fn word_bounds_nonword_char_selects_only_that_cell() {
+        let mut term = Terminal::new(2, 20);
+        term.process_bytes(b"hello(world)");
+        // Parenthesis at col 5.
+        assert_eq!(term.word_bounds_at(0, 5), (5, 5));
+        // Parenthesis at col 11.
+        assert_eq!(term.word_bounds_at(0, 11), (11, 11));
+    }
+
+    #[test]
+    fn word_bounds_punctuation_boundary() {
+        let mut term = Terminal::new(2, 20);
+        term.process_bytes(b"hello,world");
+        // 'o' in hello -> word ends before the comma.
+        let (_s1, e1) = term.word_bounds_at(0, 4);
+        // 'w' in world -> word starts after the comma.
+        let (s2, _e2) = term.word_bounds_at(0, 6);
+        // The comma is not a word char, so the two words do not overlap.
+        assert!(e1 < s2);
+    }
+
+    #[test]
+    fn word_bounds_col_clamped_to_grid() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"hello");
+        // Request col 10 (beyond grid): should clamp to col 4 (last col).
+        let (start, end) = term.word_bounds_at(0, 10);
+        // Should select the 'o' at col 4.
+        assert!(start <= 4 && 4 <= end);
+    }
+
+    #[test]
+    fn word_bounds_empty_line() {
+        let mut term = Terminal::new(2, 10);
+        // Line 1 is blank.
+        term.process_bytes(b"hello\r\n");
+        // Click on the blank line.
+        assert_eq!(term.word_bounds_at(1, 0), (0, 0));
+    }
+
+    // ---- line_bounds_at tests ----
+
+    #[test]
+    fn line_bounds_full_row() {
+        let term = Terminal::new(2, 12);
+        assert_eq!(term.line_bounds_at(0), (0, 11));
+    }
+
+    #[test]
+    fn line_bounds_1col_grid() {
+        let term = Terminal::new(2, 1);
+        assert_eq!(term.line_bounds_at(0), (0, 0));
+    }
+
+    #[test]
+    fn line_bounds_large_grid() {
+        let term = Terminal::new(10, 200);
+        assert_eq!(term.line_bounds_at(5), (0, 199));
+    }
+
+    #[test]
+    fn line_bounds_unused_abs_line_param() {
+        // line_bounds_at ignores the abs_line parameter (always returns full row).
+        let term = Terminal::new(2, 10);
+        assert_eq!(term.line_bounds_at(0), (0, 9));
+        assert_eq!(term.line_bounds_at(999), (0, 9));
+    }
+
+    // ---- paint_selection tests ----
+
+    #[test]
+    fn paint_selection_empty_grid_is_noop() {
+        let term = Terminal::new(0, 0);
+        let mut grid = term.display_grid();
+        // Should not panic.
+        term.paint_selection(&mut grid, (0, 0), (0, 5), Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn paint_selection_collapsed_anchor_focus_is_noop() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        let mut grid = term.display_grid();
+        let bg_before = grid.get_cell(0, 0).unwrap().bg;
+        term.paint_selection(&mut grid, (0, 2), (0, 2), Color::rgb(100, 100, 100));
+        let bg_after = grid.get_cell(0, 0).unwrap().bg;
+        assert_eq!(bg_before, bg_after);
+    }
+
+    #[test]
+    fn paint_selection_single_cell() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        let mut grid = term.display_grid();
+        let bg = Color::rgb(200, 100, 50);
+        term.paint_selection(&mut grid, (0, 0), (0, 0), bg);
+        assert_eq!(grid.get_cell(0, 0).unwrap().bg, bg);
+    }
+
+    #[test]
+    fn paint_selection_single_row_range() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        let mut grid = term.display_grid();
+        let bg = Color::rgb(100, 150, 200);
+        term.paint_selection(&mut grid, (0, 1), (0, 3), bg);
+        // Cells 1, 2, 3 should have the color.
+        assert_eq!(grid.get_cell(0, 1).unwrap().bg, bg);
+        assert_eq!(grid.get_cell(0, 2).unwrap().bg, bg);
+        assert_eq!(grid.get_cell(0, 3).unwrap().bg, bg);
+        // Cell 0 should not.
+        assert_ne!(grid.get_cell(0, 0).unwrap().bg, bg);
+    }
+
+    #[test]
+    fn paint_selection_multirow_first_line_partial() {
+        let mut term = Terminal::new(3, 10);
+        term.process_bytes(b"line0\r\nline1\r\nline2");
+        let mut grid = term.display_grid();
+        let bg = Color::rgb(150, 150, 150);
+        // Select from (0, 2) to (1, 3).
+        term.paint_selection(&mut grid, (0, 2), (1, 3), bg);
+        // Row 0: cells 2..9 should be painted.
+        for c in 2..10 {
+            assert_eq!(grid.get_cell(0, c).unwrap().bg, bg, "row 0 col {}", c);
+        }
+        // Row 1: cells 0..3 should be painted.
+        for c in 0..=3 {
+            assert_eq!(grid.get_cell(1, c).unwrap().bg, bg, "row 1 col {}", c);
+        }
+        // Row 2 should not be painted.
+        assert_ne!(grid.get_cell(2, 0).unwrap().bg, bg);
+    }
+
+    #[test]
+    fn paint_selection_multirow_all_interior_lines() {
+        let mut term = Terminal::new(5, 10);
+        term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3\r\nL4");
+        let mut grid = term.display_grid();
+        let bg = Color::rgb(50, 100, 150);
+        // Select entire rows 1 and 2.
+        term.paint_selection(&mut grid, (1, 0), (2, 9), bg);
+        // Row 1 and 2 fully painted.
+        for r in 1..=2 {
+            for c in 0..10 {
+                assert_eq!(grid.get_cell(r, c).unwrap().bg, bg, "({}, {})", r, c);
+            }
+        }
+    }
+
+    #[test]
+    fn paint_selection_order_independent() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        let bg = Color::rgb(75, 75, 75);
+        let mut grid1 = term.display_grid();
+        term.paint_selection(&mut grid1, (0, 1), (0, 3), bg);
+        let mut grid2 = term.display_grid();
+        term.paint_selection(&mut grid2, (0, 3), (0, 1), bg);
+        // Both should have the same cells painted.
+        for c in 0..10 {
+            assert_eq!(
+                grid1.get_cell(0, c).unwrap().bg,
+                grid2.get_cell(0, c).unwrap().bg,
+                "col {}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn paint_selection_off_screen_above_is_noop() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3");
+        // L0/L1 scrolled into scrollback; live view shows L2/L3.
+        let mut grid = term.display_grid();
+        let bg = Color::rgb(80, 80, 80);
+        // Select L0 (abs line 0), which is not visible.
+        term.paint_selection(&mut grid, (0, 0), (0, 9), bg);
+        // Nothing should be painted.
+        for r in 0..2 {
+            for c in 0..10 {
+                assert_ne!(grid.get_cell(r, c).unwrap().bg, bg, "({}, {})", r, c);
+            }
+        }
+    }
+
+    #[test]
+    fn paint_selection_off_screen_below_is_noop() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"L0\r\nL1");
+        // Only 2 lines in the buffer.
+        let mut grid = term.display_grid();
+        let bg = Color::rgb(80, 80, 80);
+        // Select lines 5..6 (well beyond).
+        term.paint_selection(&mut grid, (5, 0), (6, 9), bg);
+        // Nothing should be painted.
+        for r in 0..2 {
+            for c in 0..10 {
+                assert_ne!(grid.get_cell(r, c).unwrap().bg, bg);
+            }
+        }
+    }
+
+    #[test]
+    fn paint_selection_partially_scrolled_paints_visible_slice() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"line0\r\nline1\r\nline2\r\nline3");
+        // line0/line1 in scrollback, line2/line3 on screen.
+        let mut grid = term.display_grid();
+        let bg = Color::rgb(120, 120, 120);
+        // Select line0 (abs line 0) to line2 (abs line 2).
+        // Only line2 (displayed at row 0) should paint.
+        term.paint_selection(&mut grid, (0, 0), (2, 5), bg);
+        // Row 0 (line2) should be painted from col 0..5.
+        for c in 0..=5 {
+            assert_eq!(grid.get_cell(0, c).unwrap().bg, bg, "row 0 col {}", c);
+        }
+        // Row 1 (line3) should not be painted (selection ends at line2).
+        assert_ne!(grid.get_cell(1, 0).unwrap().bg, bg);
+    }
+
+    #[test]
+    fn paint_selection_clears_inverse_attr() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        // Manually set INVERSE on a cell.
+        let mut cell = term.grid.get_cell(0, 1).copied().unwrap();
+        cell.attrs.insert(CellAttrs::INVERSE);
+        term.grid.set_cell(0, 1, cell);
+        let mut grid = term.display_grid();
+        assert!(grid
+            .get_cell(0, 1)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::INVERSE));
+        let bg = Color::rgb(200, 200, 200);
+        term.paint_selection(&mut grid, (0, 1), (0, 1), bg);
+        // INVERSE should be cleared on the painted cell.
+        assert!(!grid
+            .get_cell(0, 1)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::INVERSE));
+    }
+
+    #[test]
+    fn paint_selection_other_attrs_preserved() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        // Manually set BOLD on a cell.
+        let mut cell = term.grid.get_cell(0, 2).copied().unwrap();
+        cell.attrs.insert(CellAttrs::BOLD);
+        term.grid.set_cell(0, 2, cell);
+        let mut grid = term.display_grid();
+        assert!(grid.get_cell(0, 2).unwrap().attrs.contains(CellAttrs::BOLD));
+        let bg = Color::rgb(200, 200, 200);
+        term.paint_selection(&mut grid, (0, 2), (0, 2), bg);
+        // BOLD should still be there.
+        assert!(grid.get_cell(0, 2).unwrap().attrs.contains(CellAttrs::BOLD));
+    }
+
+    #[test]
+    fn paint_selection_non_selected_cells_untouched() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"hello");
+        let mut grid = term.display_grid();
+        let original_bg = grid.get_cell(0, 0).unwrap().bg;
+        let paint_bg = Color::rgb(100, 100, 100);
+        term.paint_selection(&mut grid, (0, 2), (0, 4), paint_bg);
+        // Unselected cells should keep their original bg.
+        assert_eq!(grid.get_cell(0, 0).unwrap().bg, original_bg);
+        assert_eq!(grid.get_cell(0, 1).unwrap().bg, original_bg);
+        assert_eq!(grid.get_cell(0, 5).unwrap().bg, original_bg);
+    }
+
+    // ---- bracketed paste mode tests ----
+
+    #[test]
+    fn bracketed_paste_default_off() {
+        let term = Terminal::new(3, 5);
+        assert!(!term.bracketed_paste_active());
+    }
+
+    #[test]
+    fn bracketed_paste_csi_2004h_enables() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?2004h");
+        assert!(term.bracketed_paste_active());
+    }
+
+    #[test]
+    fn bracketed_paste_csi_2004l_disables() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?2004h");
+        assert!(term.bracketed_paste_active());
+        term.process_bytes(b"\x1b[?2004l");
+        assert!(!term.bracketed_paste_active());
+    }
+
+    #[test]
+    fn bracketed_paste_toggle_multiple_times() {
+        let mut term = Terminal::new(3, 5);
+        for _ in 0..3 {
+            assert!(!term.bracketed_paste_active());
+            term.process_bytes(b"\x1b[?2004h");
+            assert!(term.bracketed_paste_active());
+            term.process_bytes(b"\x1b[?2004l");
+        }
+        assert!(!term.bracketed_paste_active());
+    }
+
+    #[test]
+    fn bracketed_paste_interleaved_with_cursor_hide() {
+        let mut term = Terminal::new(3, 5);
+        // ?25h SHOWS the cursor (h = set), ?2004h enables bracketed paste.
+        term.process_bytes(b"\x1b[?25;2004h");
+        assert!(term.bracketed_paste_active());
+        assert!(term.grid().cursor_visible());
+        // ?25l HIDES the cursor (l = reset), ?2004l disables bracketed paste.
+        term.process_bytes(b"\x1b[?25;2004l");
+        assert!(!term.bracketed_paste_active());
+        assert!(!term.grid().cursor_visible());
+    }
+
+    #[test]
+    fn bracketed_paste_independent_from_sync_output() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?2004h");
+        assert!(term.bracketed_paste_active());
+        assert!(!term.synchronized_output_active());
+        term.process_bytes(b"\x1b[?2026h");
+        assert!(term.bracketed_paste_active());
+        assert!(term.synchronized_output_active());
+        term.process_bytes(b"\x1b[?2004l");
+        assert!(!term.bracketed_paste_active());
+        assert!(term.synchronized_output_active());
+    }
+
+    // ---- absolute line mapping tests ----
+
+    #[test]
+    fn first_abs_line_at_start() {
+        let term = Terminal::new(3, 5);
+        assert_eq!(term.first_abs_line(), 0);
+    }
+
+    #[test]
+    fn first_abs_line_after_scrollback() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"L0\r\nL1\r\nL2");
+        // L0 scrolled to scrollback.
+        assert_eq!(term.first_abs_line(), 0);
+    }
+
+    #[test]
+    fn abs_line_at_display_row_0_bottom() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"L0\r\nL1");
+        // At bottom, display row 0 shows L0 (abs line 0).
+        assert_eq!(term.abs_line_at_display(0), 0);
+    }
+
+    #[test]
+    fn abs_line_at_display_stable_after_scroll_view_up() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3");
+        // L0/L1 scrolled, display rows show L2/L3 (abs 2, 3).
+        assert_eq!(term.abs_line_at_display(0), 2);
+        assert_eq!(term.abs_line_at_display(1), 3);
+        term.scroll_view_up(1);
+        // Now display row 0 shows L1 (abs 1), row 1 shows L2 (abs 2).
+        assert_eq!(term.abs_line_at_display(0), 1);
+        assert_eq!(term.abs_line_at_display(1), 2);
+    }
+
+    #[test]
+    fn abs_line_at_display_stable_after_scroll_view_down() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3");
+        term.scroll_view_up(2);
+        assert_eq!(term.abs_line_at_display(0), 0);
+        term.scroll_view_down(1);
+        assert_eq!(term.abs_line_at_display(0), 1);
+    }
+
+    #[test]
+    fn abs_line_at_display_stable_after_reset_scroll() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3");
+        term.scroll_view_up(2);
+        term.reset_scroll();
+        // Back at bottom.
+        assert_eq!(term.abs_line_at_display(0), 2);
+    }
+
+    #[test]
+    fn selection_text_stable_across_scroll_view_up_down() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"old\r\nnew");
+        let text_initial = term.selection_text((0, 0), (0, 2));
+        term.scroll_view_up(1);
+        let text_scrolled_up = term.selection_text((0, 0), (0, 2));
+        term.scroll_view_down(1);
+        let text_back = term.selection_text((0, 0), (0, 2));
+        assert_eq!(text_initial, text_scrolled_up);
+        assert_eq!(text_initial, text_back);
+    }
+
+    #[test]
+    fn selection_text_survives_new_output_pushing_into_scrollback() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"L0\r\nL1\r\nL2");
+        let text_at_0 = term.selection_text((0, 0), (0, 1));
+        // More output pushes L0 deeper.
+        term.process_bytes(b"\r\nL3\r\nL4");
+        let text_still_0 = term.selection_text((0, 0), (0, 1));
+        assert_eq!(text_at_0, text_still_0);
+    }
+
+    #[test]
+    fn paint_selection_survives_scroll_view_changes() {
+        let mut term = Terminal::new(2, 5);
+        term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3");
+        // Select L0 (abs line 0) — off-screen.
+        let bg = Color::rgb(99, 99, 99);
+        let mut grid = term.display_grid();
+        term.paint_selection(&mut grid, (0, 0), (0, 2), bg);
+        // Should not paint at live view (L0 not visible).
+        assert_ne!(grid.get_cell(0, 0).unwrap().bg, bg);
+        // Scroll back to view L0.
+        term.scroll_view_up(2);
+        let mut grid2 = term.display_grid();
+        term.paint_selection(&mut grid2, (0, 0), (0, 2), bg);
+        // Now it should paint at display row 0.
+        assert_eq!(grid2.get_cell(0, 0).unwrap().bg, bg);
     }
 }

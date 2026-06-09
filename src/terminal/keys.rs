@@ -215,7 +215,7 @@ mod tests {
     use super::*;
 
     /// Build a simple key-press event for testing.
-    fn key_event(key: Key, modifiers: Modifiers) -> KeyboardEvent {
+    pub(super) fn key_event(key: Key, modifiers: Modifiers) -> KeyboardEvent {
         KeyboardEvent {
             key,
             kind: KeyEventKind::Pressed,
@@ -632,5 +632,67 @@ mod tests {
     #[test]
     fn f0_returns_none() {
         assert!(encode_key(&key_event(Key::F(0), Modifiers::empty())).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests_insert_and_copy_regression {
+    use super::tests::key_event;
+    use super::*;
+
+    // -- Insert key encoding (CSI-tilde with optional modifier) ----------------
+
+    #[test]
+    fn insert_plain() {
+        let result = encode_key(&key_event(Key::Insert, Modifiers::empty()));
+        // Insert: \x1b[2~
+        assert_eq!(result, Some(b"\x1b[2~".to_vec()));
+    }
+
+    #[test]
+    fn insert_with_shift() {
+        let result = encode_key(&key_event(Key::Insert, Modifiers::SHIFT));
+        // Insert code=2, Shift modifier=2: \x1b[2;2~
+        assert_eq!(result, Some(b"\x1b[2;2~".to_vec()));
+    }
+
+    #[test]
+    fn insert_with_ctrl() {
+        let result = encode_key(&key_event(Key::Insert, Modifiers::CTRL));
+        // Insert code=2, Ctrl modifier=5: \x1b[2;5~
+        assert_eq!(result, Some(b"\x1b[2;5~".to_vec()));
+    }
+
+    #[test]
+    fn insert_with_alt() {
+        let result = encode_key(&key_event(Key::Insert, Modifiers::ALT));
+        // Insert code=2, Alt modifier=3: \x1b[2;3~
+        assert_eq!(result, Some(b"\x1b[2;3~".to_vec()));
+    }
+
+    #[test]
+    fn insert_with_shift_ctrl() {
+        let result = encode_key(&key_event(Key::Insert, Modifiers::SHIFT | Modifiers::CTRL));
+        // Insert code=2, Shift+Ctrl modifier=6: \x1b[2;6~
+        assert_eq!(result, Some(b"\x1b[2;6~".to_vec()));
+    }
+
+    // -- Regression: Ctrl+C and Ctrl+V must remain control codes ---------------
+    // The selection/clipboard logic intercepts at the shortcut level
+    // and is NOT part of encode_key. These must still reach the terminal
+    // as raw control codes so shells receive them correctly.
+
+    #[test]
+    fn ctrl_c_is_interrupt_not_copy() {
+        let result = encode_key(&key_event(Key::Char('c'), Modifiers::CTRL));
+        // Ctrl+C MUST encode to SIGINT (0x03), not be a "copy" command.
+        assert_eq!(result, Some(vec![0x03]));
+    }
+
+    #[test]
+    fn ctrl_v_is_literal_input_not_paste() {
+        let result = encode_key(&key_event(Key::Char('v'), Modifiers::CTRL));
+        // Ctrl+V MUST encode to 0x16 (SYN/literal-next), not a "paste" command.
+        assert_eq!(result, Some(vec![0x16]));
     }
 }
