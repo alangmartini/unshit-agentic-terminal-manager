@@ -161,7 +161,9 @@ pub fn icon_ban() -> SvgNode {
 pub fn icon_trash() -> SvgNode {
     group(
         root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Round),
-        vec![path_d("M3 4.5h10M6.2 4.5V3h3.6v1.5M4.6 4.5l.6 8.5h5.6l.6-8.5")],
+        vec![path_d(
+            "M3 4.5h10M6.2 4.5V3h3.6v1.5M4.6 4.5l.6 8.5h5.6l.6-8.5",
+        )],
     )
 }
 

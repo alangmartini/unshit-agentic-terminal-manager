@@ -55,9 +55,9 @@ fn refresh_pacer_from_source_updates_pacer_when_rate_changes() {
     refresh_pacer_from_source(&mut pacer, &faster);
     assert_eq!(pacer.min_interval(), Duration::from_nanos(4_166_666));
 
-    // And back to 60Hz.
+    // And back to 60Hz. Low reported rates must not slow the interactive
+    // cadence below the framework fallback.
     let slower = FakeSource(Some(60_000));
     refresh_pacer_from_source(&mut pacer, &slower);
-    // 1e12 / 60_000 = 16_666_666 ns.
-    assert_eq!(pacer.min_interval(), Duration::from_nanos(16_666_666));
+    assert_eq!(pacer.min_interval(), FramePacer::DEFAULT_MIN_INTERVAL);
 }
