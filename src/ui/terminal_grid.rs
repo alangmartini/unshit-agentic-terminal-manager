@@ -1863,3 +1863,524 @@ mod tests {
         assert!(!is_single_pane(&empty), "empty grid is not single pane");
     }
 }
+
+#[cfg(test)]
+mod tests_mouse_selection_copy_paste {
+    use super::*;
+    use crate::state::{seed_state, PaneId, SelectMode, TermSelection};
+    use std::sync::{Arc, Mutex};
+    use unshit::core::cell_grid::CellGrid;
+    use unshit::core::event::{
+        DragEvent, DragPhase, Event, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn make_shared() -> SharedState {
+        Arc::new(Mutex::new(seed_state()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Parity helper: terminal_cell_width_scale_from_values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn terminal_cell_width_scale_windows_terminal_profile_default() {
+        let got = terminal_cell_width_scale_from_values(None, true);
+        assert!(
+            (got - WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE).abs() < f32::EPSILON,
+            "wt_profile=true, no override should return WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE (0.996)"
+        );
+    }
+
+    #[test]
+    fn terminal_cell_width_scale_default_when_not_windows_terminal_profile() {
+        let got = terminal_cell_width_scale_from_values(None, false);
+        assert!(
+            (got - 1.0).abs() < f32::EPSILON,
+            "wt_profile=false, no override should return 1.0"
+        );
+    }
+
+    #[test]
+    fn terminal_cell_width_scale_accepts_in_range_override() {
+        let got =
+            terminal_cell_width_scale_from_values(Some(std::ffi::OsString::from("1.01")), true);
+        assert!(
+            (got - 1.01).abs() < f32::EPSILON,
+            "in-range override (1.01) should be accepted"
+        );
+        let got2 =
+            terminal_cell_width_scale_from_values(Some(std::ffi::OsString::from("0.95")), false);
+        assert!(
+            (got2 - 0.95).abs() < f32::EPSILON,
+            "in-range override (0.95) should be accepted"
+        );
+    }
+
+    #[test]
+    fn terminal_cell_width_scale_rejects_out_of_range_override() {
+        for value in ["0.5", "2.0", "abc"] {
+            let got_wt =
+                terminal_cell_width_scale_from_values(Some(std::ffi::OsString::from(value)), true);
+            assert!(
+                (got_wt - WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE).abs() < f32::EPSILON,
+                "out-of-range override {:?} with wt_profile=true should fall back to parity default",
+                value
+            );
+            let got_no_wt =
+                terminal_cell_width_scale_from_values(Some(std::ffi::OsString::from(value)), false);
+            assert!(
+                (got_no_wt - 1.0).abs() < f32::EPSILON,
+                "out-of-range override {:?} with wt_profile=false should fall back to 1.0",
+                value
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler registration: both active and inactive panes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pane_body_registers_mousedown_handler_active() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_el = &el.children[0];
+        assert!(
+            grid_el
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::MouseDown),
+            "active pane grid must register MouseDown handler"
+        );
+    }
+
+    #[test]
+    fn pane_body_registers_mousedown_handler_inactive() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), false, 13, &shared, &grids);
+        let grid_el = &el.children[0];
+        assert!(
+            grid_el
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::MouseDown),
+            "inactive pane grid must also register MouseDown handler for selection"
+        );
+    }
+
+    #[test]
+    fn pane_body_registers_ondrag_handler_both_active_and_inactive() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el_active = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_active = &el_active.children[0];
+        assert!(
+            grid_active.on_drag.is_some(),
+            "active pane grid must have on_drag handler"
+        );
+
+        let el_inactive = build_pane_body(PaneId(1), false, 13, &shared, &grids);
+        let grid_inactive = &el_inactive.children[0];
+        assert!(
+            grid_inactive.on_drag.is_some(),
+            "inactive pane grid must also have on_drag handler"
+        );
+    }
+
+    #[test]
+    fn pane_body_registers_oncontext_menu_handler_both_active_and_inactive() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el_active = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_active = &el_active.children[0];
+        assert!(
+            grid_active.on_context_menu.is_some(),
+            "active pane grid must have on_context_menu handler"
+        );
+
+        let el_inactive = build_pane_body(PaneId(1), false, 13, &shared, &grids);
+        let grid_inactive = &el_inactive.children[0];
+        assert!(
+            grid_inactive.on_context_menu.is_some(),
+            "inactive pane grid must also have on_context_menu handler"
+        );
+    }
+
+    #[test]
+    fn active_pane_keyboard_capture_scroll_resize_inactive_pane_none() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el_active = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_active = &el_active.children[0];
+        assert!(
+            grid_active
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::KeyboardCapture),
+            "active pane must register KeyboardCapture handler"
+        );
+        assert!(
+            grid_active
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::Scroll),
+            "active pane must register Scroll handler"
+        );
+        assert!(
+            grid_active.on_resize.is_some(),
+            "active pane must register on_resize handler"
+        );
+
+        let el_inactive = build_pane_body(PaneId(1), false, 13, &shared, &grids);
+        let grid_inactive = &el_inactive.children[0];
+        assert!(
+            !grid_inactive
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::KeyboardCapture),
+            "inactive pane must NOT register KeyboardCapture handler"
+        );
+        assert!(
+            !grid_inactive
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::Scroll),
+            "inactive pane must NOT register Scroll handler"
+        );
+        assert!(
+            grid_inactive.on_resize.is_none(),
+            "inactive pane must NOT register on_resize handler"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler behavior: MouseDown focus-on-press and anchor placement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mousedown_handler_focuses_pane_on_press() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(99); // Initially different pane
+        }
+        // Publish cell metrics so terminal_cell_at can convert coordinates
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.terminals.insert(
+                1,
+                Arc::new(Mutex::new(crate::terminal::Terminal::new(24, 80))),
+            );
+        }
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_el = &el.children[0];
+
+        let handler = grid_el
+            .handlers
+            .iter()
+            .find(|(et, _)| *et == EventType::MouseDown)
+            .map(|(_, h)| h.clone())
+            .expect("MouseDown handler must be present");
+
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down,
+            x: 100.0,
+            y: 100.0,
+            local_x: 50.0,
+            local_y: 50.0,
+            button: MouseButton::Left,
+            modifiers: Modifiers::empty(),
+        });
+
+        (handler)(&event);
+
+        let guard = shared.lock().unwrap();
+        assert_eq!(
+            guard.active_pane,
+            PaneId(1),
+            "MouseDown on inactive pane must focus it"
+        );
+    }
+
+    #[test]
+    fn mousedown_handler_places_selection_anchor() {
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(1);
+            guard.terminals.insert(
+                1,
+                Arc::new(Mutex::new(crate::terminal::Terminal::new(24, 80))),
+            );
+        }
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_el = &el.children[0];
+
+        let handler = grid_el
+            .handlers
+            .iter()
+            .find(|(et, _)| *et == EventType::MouseDown)
+            .map(|(_, h)| h.clone())
+            .expect("MouseDown handler must be present");
+
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down,
+            x: 100.0,
+            y: 100.0,
+            local_x: 50.0,
+            local_y: 50.0,
+            button: MouseButton::Left,
+            modifiers: Modifiers::empty(),
+        });
+
+        (handler)(&event);
+
+        let guard = shared.lock().unwrap();
+        assert!(
+            guard.terminal_selections.contains_key(&1),
+            "MouseDown must create a selection for pane 1"
+        );
+        let sel = guard.terminal_selections.get(&1).unwrap();
+        assert_eq!(
+            sel.mode,
+            SelectMode::Cell,
+            "First click should create a Cell-mode selection"
+        );
+        assert!(
+            sel.anchor == sel.focus,
+            "Click without drag should have anchor == focus (collapsed)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler behavior: on_drag extends selection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ondrag_handler_extends_selection_on_update() {
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(1);
+            guard.terminals.insert(
+                1,
+                Arc::new(Mutex::new(crate::terminal::Terminal::new(24, 80))),
+            );
+        }
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_el = &el.children[0];
+
+        let on_drag = grid_el
+            .on_drag
+            .clone()
+            .expect("on_drag handler must be present");
+
+        // Start the drag from cell (0,0)
+        let start = DragEvent {
+            phase: DragPhase::Start,
+            x: 100.0,
+            y: 100.0,
+            local_x: 50.0,
+            local_y: 50.0,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            total_delta_x: 0.0,
+            total_delta_y: 0.0,
+            button: MouseButton::Left,
+        };
+        on_drag(&start);
+
+        // Before update, place an anchor via mousedown
+        {
+            let mut guard = shared.lock().unwrap();
+            guard
+                .terminal_selections
+                .insert(1, TermSelection::new((0, 0), SelectMode::Cell));
+        }
+
+        // Drag to cell (0,5)
+        let update = DragEvent {
+            phase: DragPhase::Update,
+            x: 150.0,
+            y: 100.0,
+            local_x: 100.0,
+            local_y: 50.0,
+            delta_x: 50.0,
+            delta_y: 0.0,
+            total_delta_x: 50.0,
+            total_delta_y: 0.0,
+            button: MouseButton::Left,
+        };
+        on_drag(&update);
+
+        let guard = shared.lock().unwrap();
+        let sel = guard
+            .terminal_selections
+            .get(&1)
+            .expect("selection must exist after drag update");
+        // The focus should have moved to a different column
+        // (exact cell depends on metrics, but it should differ from anchor)
+        assert!(
+            !sel.is_empty(),
+            "A drag with movement should create a non-empty (non-collapsed) selection"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler behavior: KeyboardCapture with Ctrl+C and selection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn keyboard_capture_ctrl_c_with_selection_clears_selection() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(1);
+            guard.terminals.insert(
+                1,
+                Arc::new(Mutex::new(crate::terminal::Terminal::new(24, 80))),
+            );
+            // Seed a non-empty selection
+            guard.terminal_selections.insert(
+                1,
+                TermSelection {
+                    anchor: (0, 0),
+                    focus: (0, 10),
+                    mode: SelectMode::Cell,
+                },
+            );
+        }
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_el = &el.children[0];
+
+        let handler = grid_el
+            .handlers
+            .iter()
+            .find(|(et, _)| *et == EventType::KeyboardCapture)
+            .map(|(_, h)| h.clone())
+            .expect("KeyboardCapture handler must be present");
+
+        let event = Event::Keyboard(unshit::core::event::KeyboardEvent {
+            kind: unshit::core::event::KeyEventKind::Pressed,
+            key: unshit::core::event::Key::Char('c'),
+            modifiers: Modifiers::CTRL,
+            text: None,
+        });
+
+        let result = (handler)(&event);
+        assert!(
+            result.is_none(),
+            "Ctrl+C with selection should return None (consumed by copy handler)"
+        );
+
+        let guard = shared.lock().unwrap();
+        assert!(
+            !guard.terminal_selections.contains_key(&1),
+            "After Ctrl+C copy, selection should be cleared"
+        );
+    }
+
+    #[test]
+    fn keyboard_capture_ctrl_c_no_selection_falls_through() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(1);
+            guard.terminals.insert(
+                1,
+                Arc::new(Mutex::new(crate::terminal::Terminal::new(24, 80))),
+            );
+            // No selection
+        }
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_el = &el.children[0];
+
+        let handler = grid_el
+            .handlers
+            .iter()
+            .find(|(et, _)| *et == EventType::KeyboardCapture)
+            .map(|(_, h)| h.clone())
+            .expect("KeyboardCapture handler must be present");
+
+        let event = Event::Keyboard(unshit::core::event::KeyboardEvent {
+            kind: unshit::core::event::KeyEventKind::Pressed,
+            key: unshit::core::event::Key::Char('c'),
+            modifiers: Modifiers::CTRL,
+            text: None,
+        });
+
+        // Without a selection, Ctrl+C falls through to key encoding (the
+        // handler returns None either way); the contract we verify is that no
+        // copy happened, i.e. state did not gain/keep a selection.
+        let _ = (handler)(&event);
+        let guard = shared.lock().unwrap();
+        assert!(
+            !guard.terminal_selections.contains_key(&1),
+            "Ctrl+C without selection should not create/change selection"
+        );
+    }
+
+    // Note: Ctrl+Shift+C is handled by the global shortcut resolver
+    // (-> terminal.copy) and never reaches this KeyboardCapture handler, so
+    // there is no in-handler "ignore Ctrl+Shift+C" behavior to assert — the
+    // bare-Ctrl+C-with/without-selection cases above are the real contract.
+
+    // -----------------------------------------------------------------------
+    // Handler behavior: on_context_menu dispatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oncontext_menu_handler_dispatches_focus_and_paste() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(99); // Different pane
+        }
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let grid_el = &el.children[0];
+
+        let handler = grid_el
+            .on_context_menu
+            .clone()
+            .expect("on_context_menu handler must be present");
+
+        (handler)(100.0, 200.0);
+
+        let guard = shared.lock().unwrap();
+        assert_eq!(
+            guard.active_pane,
+            PaneId(1),
+            "on_context_menu must focus the pane"
+        );
+        // Note: the actual paste operation is dispatched via the dispatch system.
+        // We verify the focus change happened, which proves the closure was invoked.
+    }
+}

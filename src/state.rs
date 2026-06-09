@@ -4897,7 +4897,7 @@ mod tests {
     /// `ClipboardContext` must hold this guard for the duration of
     /// its clipboard interaction. Recovers a poisoned guard so a
     /// single panicking test does not lock the whole suite out.
-    fn clipboard_access_guard() -> MutexGuard<'static, ()> {
+    pub(super) fn clipboard_access_guard() -> MutexGuard<'static, ()> {
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
         match GUARD.get_or_init(|| Mutex::new(())).lock() {
             Ok(g) => g,
@@ -4907,7 +4907,7 @@ mod tests {
 
     /// Build a minimal AppState for testing tab/dispatch logic.
     /// Avoids PTY spawning by providing empty panes and terminals directly.
-    fn test_state() -> AppState {
+    pub(super) fn test_state() -> AppState {
         let pane = Pane {
             id: PaneId(1),
             title: "shell".to_string(),
@@ -10660,5 +10660,834 @@ mod tests {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
         assert!(dispatch(&mut state, "terminal.paste"));
+    }
+}
+
+#[cfg(test)]
+mod tests_mouse_selection_copy_paste {
+    use super::tests::{clipboard_access_guard, test_state};
+    use super::*;
+    use std::time::Duration;
+
+    // -------- cell_from_local tests --------
+
+    #[test]
+    fn cell_from_local_origin_maps_to_zero() {
+        assert_eq!(
+            cell_from_local(0.0, 0.0, 10.0, 20.0, 0.0, 80, 24),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn cell_from_local_floors_within_cell() {
+        // 95 / 10 = 9.5 -> col 9 (floors)
+        // 45 / 20 = 2.25 -> row 2 (floors)
+        assert_eq!(
+            cell_from_local(95.0, 45.0, 10.0, 20.0, 0.0, 80, 24),
+            Some((2, 9))
+        );
+    }
+
+    #[test]
+    fn cell_from_local_right_overrun_clamps_to_last_col() {
+        // Far-right overrun should clamp onto the last column.
+        assert_eq!(
+            cell_from_local(1.0e5, 0.0, 10.0, 20.0, 0.0, 80, 24),
+            Some((0, 79))
+        );
+    }
+
+    #[test]
+    fn cell_from_local_bottom_overrun_clamps_to_last_row() {
+        // Far-bottom overrun should clamp onto the last row.
+        assert_eq!(
+            cell_from_local(0.0, 1.0e5, 10.0, 20.0, 0.0, 80, 24),
+            Some((23, 0))
+        );
+    }
+
+    #[test]
+    fn cell_from_local_applies_x_offset() {
+        // With x_offset=3, local_x=13 maps to 13-3=10 pixels into content
+        // 10 / 10 = col 1
+        assert_eq!(
+            cell_from_local(13.0, 0.0, 10.0, 20.0, 3.0, 80, 24),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn cell_from_local_negative_coord_clamps_to_origin() {
+        // Negative local coordinates clamp to (0, 0)
+        assert_eq!(
+            cell_from_local(-5.0, -10.0, 10.0, 20.0, 0.0, 80, 24),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn cell_from_local_zero_cols_returns_none() {
+        assert_eq!(cell_from_local(5.0, 5.0, 10.0, 20.0, 0.0, 0, 24), None);
+    }
+
+    #[test]
+    fn cell_from_local_zero_rows_returns_none() {
+        assert_eq!(cell_from_local(5.0, 5.0, 10.0, 20.0, 0.0, 80, 0), None);
+    }
+
+    #[test]
+    fn cell_from_local_zero_cell_width_returns_none() {
+        assert_eq!(cell_from_local(5.0, 5.0, 0.0, 20.0, 0.0, 80, 24), None);
+    }
+
+    #[test]
+    fn cell_from_local_zero_cell_height_returns_none() {
+        assert_eq!(cell_from_local(5.0, 5.0, 10.0, 0.0, 0.0, 80, 24), None);
+    }
+
+    #[test]
+    fn cell_from_local_negative_cell_width_returns_none() {
+        assert_eq!(cell_from_local(5.0, 5.0, -10.0, 20.0, 0.0, 80, 24), None);
+    }
+
+    // -------- terminal_cell_at tests --------
+
+    #[test]
+    fn terminal_cell_at_no_terminal_returns_none() {
+        let st = test_state();
+        // No terminal registered for pane 1
+        let result = terminal_cell_at(&st, 1, 0.0, 0.0, 0.0, 1.0);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn terminal_cell_at_with_real_terminal_maps_to_absolute_line() {
+        let mut st = test_state();
+        let pane = 1u32;
+        // Create a 24x80 terminal and publish cell metrics.
+        st.terminals.insert(
+            pane,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::terminal::Terminal::new(
+                24, 80,
+            ))),
+        );
+        unshit::core::cell_grid::CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        // On a fresh terminal with no scrollback, display row N == absolute line N.
+        let result = terminal_cell_at(&st, pane, 0.0, 0.0, 0.0, 1.0);
+        assert_eq!(result, Some((0, 0)));
+    }
+
+    #[test]
+    fn terminal_cell_at_applies_cell_w_scale() {
+        let mut st = test_state();
+        let pane = 1u32;
+        st.terminals.insert(
+            pane,
+            std::sync::Arc::new(std::sync::Mutex::new(crate::terminal::Terminal::new(
+                24, 80,
+            ))),
+        );
+        unshit::core::cell_grid::CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        // With scale=0.996 the effective cell width is 9.96, so 19.92 lands on
+        // the left edge of column 2 (19.92 / 9.96 == 2.0). Without the scale
+        // (divisor 10.0) the same x would map to column 1, so this pins the
+        // scale's effect on the hit-test.
+        let result = terminal_cell_at(&st, pane, 19.92, 0.0, 0.0, 0.996);
+        assert_eq!(result, Some((0, 2)));
+        let unscaled = terminal_cell_at(&st, pane, 19.92, 0.0, 0.0, 1.0);
+        assert_eq!(unscaled, Some((0, 1)));
+    }
+
+    #[test]
+    fn terminal_cell_at_after_scrolling_maps_to_different_absolute_line() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let mut term = crate::terminal::Terminal::new(3, 5);
+        // Write 5 lines of output to build scrollback
+        term.process_bytes(b"line0\r\nline1\r\nline2\r\nline3\r\nline4");
+        st.terminals
+            .insert(pane, std::sync::Arc::new(std::sync::Mutex::new(term)));
+        unshit::core::cell_grid::CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        // At scroll_offset 0, display row 0 == absolute line ~2 (top of scrollback)
+        let abs_at_top = terminal_cell_at(&st, pane, 0.0, 0.0, 0.0, 1.0);
+        assert!(abs_at_top.is_some());
+
+        // After scrolling, the same pixel should map to a different absolute line.
+        // (This is verified by the terminal's scroll_view and abs_line_at_display logic;
+        // we just verify that terminal_cell_at propagates the mapping correctly.)
+        let handle = st.terminals.get(&pane).unwrap();
+        let mut t = handle.lock_recover();
+        if t.scrollback_len() > 0 {
+            t.scroll_view_up(1);
+        }
+        drop(t);
+        let abs_after_scroll = terminal_cell_at(&st, pane, 0.0, 0.0, 0.0, 1.0);
+        if let (Some((abs_before, _)), Some((abs_after, _))) = (abs_at_top, abs_after_scroll) {
+            if abs_before != abs_after {
+                // Scrollback exists and scroll changed the mapping.
+                assert_ne!(abs_before, abs_after);
+            }
+        }
+    }
+
+    // -------- TermSelection tests --------
+
+    #[test]
+    fn term_selection_cell_mode_collapsed_is_empty() {
+        let sel = TermSelection::new((5, 10), SelectMode::Cell);
+        assert!(sel.is_empty());
+    }
+
+    #[test]
+    fn term_selection_word_mode_single_cell_not_empty() {
+        let sel = TermSelection::new((5, 10), SelectMode::Word);
+        assert!(!sel.is_empty());
+    }
+
+    #[test]
+    fn term_selection_line_mode_single_cell_not_empty() {
+        let sel = TermSelection::new((5, 10), SelectMode::Line);
+        assert!(!sel.is_empty());
+    }
+
+    #[test]
+    fn term_selection_ordered_with_reversed_anchor_focus() {
+        let sel = TermSelection {
+            anchor: (2, 5),
+            focus: (1, 1),
+            mode: SelectMode::Cell,
+        };
+        assert_eq!(sel.ordered(), ((1, 1), (2, 5)));
+    }
+
+    #[test]
+    fn term_selection_ordered_with_forward_anchor_focus() {
+        let sel = TermSelection {
+            anchor: (1, 1),
+            focus: (2, 5),
+            mode: SelectMode::Cell,
+        };
+        assert_eq!(sel.ordered(), ((1, 1), (2, 5)));
+    }
+
+    #[test]
+    fn term_selection_ordered_across_multiple_lines() {
+        let sel = TermSelection {
+            anchor: (10, 50),
+            focus: (5, 20),
+            mode: SelectMode::Cell,
+        };
+        // (5, 20) is earlier in line-major order
+        assert_eq!(sel.ordered(), ((5, 20), (10, 50)));
+    }
+
+    // -------- set_terminal_selection and repaint flag tests --------
+
+    #[test]
+    fn set_terminal_selection_collapsed_to_collapsed_no_repaint() {
+        let mut st = test_state();
+        let pane = 1u32;
+        set_terminal_selection(&mut st, pane, TermSelection::new((0, 0), SelectMode::Cell));
+        assert!(!st.terminal_selection_repaint.contains(&pane));
+    }
+
+    #[test]
+    fn set_terminal_selection_none_to_range_flags_repaint() {
+        let mut st = test_state();
+        let pane = 1u32;
+        assert!(!st.terminal_selections.contains_key(&pane));
+        set_terminal_selection(
+            &mut st,
+            pane,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 5),
+                mode: SelectMode::Cell,
+            },
+        );
+        assert!(st.terminal_selection_repaint.contains(&pane));
+    }
+
+    #[test]
+    fn set_terminal_selection_range_to_moved_range_flags_repaint() {
+        let mut st = test_state();
+        let pane = 1u32;
+        set_terminal_selection(
+            &mut st,
+            pane,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 5),
+                mode: SelectMode::Cell,
+            },
+        );
+        st.terminal_selection_repaint.clear();
+        // Move focus to a different position
+        set_terminal_selection(
+            &mut st,
+            pane,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 10),
+                mode: SelectMode::Cell,
+            },
+        );
+        assert!(st.terminal_selection_repaint.contains(&pane));
+    }
+
+    #[test]
+    fn set_terminal_selection_range_to_identical_range_no_repaint() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let sel = TermSelection {
+            anchor: (0, 0),
+            focus: (0, 5),
+            mode: SelectMode::Cell,
+        };
+        set_terminal_selection(&mut st, pane, sel);
+        st.terminal_selection_repaint.clear();
+        // Set the exact same selection again
+        set_terminal_selection(&mut st, pane, sel);
+        assert!(!st.terminal_selection_repaint.contains(&pane));
+    }
+
+    #[test]
+    fn set_terminal_selection_range_to_collapsed_flags_repaint() {
+        let mut st = test_state();
+        let pane = 1u32;
+        set_terminal_selection(
+            &mut st,
+            pane,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 5),
+                mode: SelectMode::Cell,
+            },
+        );
+        st.terminal_selection_repaint.clear();
+        // Collapse to a single cell
+        set_terminal_selection(&mut st, pane, TermSelection::new((0, 0), SelectMode::Cell));
+        assert!(st.terminal_selection_repaint.contains(&pane));
+    }
+
+    #[test]
+    fn clear_terminal_selection_removes_and_flags_repaint() {
+        let mut st = test_state();
+        let pane = 1u32;
+        set_terminal_selection(
+            &mut st,
+            pane,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 5),
+                mode: SelectMode::Cell,
+            },
+        );
+        st.terminal_selection_repaint.clear();
+        clear_terminal_selection(&mut st, pane);
+        assert!(!st.terminal_selections.contains_key(&pane));
+        assert!(st.terminal_selection_repaint.contains(&pane));
+    }
+
+    #[test]
+    fn clear_terminal_selection_no_prior_selection_no_flag_churn() {
+        let mut st = test_state();
+        let pane = 1u32;
+        assert!(!st.terminal_selections.contains_key(&pane));
+        clear_terminal_selection(&mut st, pane);
+        assert!(!st.terminal_selection_repaint.contains(&pane));
+    }
+
+    #[test]
+    fn mark_terminal_selection_dirty_flags_when_selection_exists() {
+        let mut st = test_state();
+        let pane = 1u32;
+        set_terminal_selection(
+            &mut st,
+            pane,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 5),
+                mode: SelectMode::Cell,
+            },
+        );
+        st.terminal_selection_repaint.clear();
+        mark_terminal_selection_dirty(&mut st, pane);
+        assert!(st.terminal_selection_repaint.contains(&pane));
+    }
+
+    #[test]
+    fn mark_terminal_selection_dirty_no_flag_when_none() {
+        let mut st = test_state();
+        let pane = 1u32;
+        mark_terminal_selection_dirty(&mut st, pane);
+        assert!(!st.terminal_selection_repaint.contains(&pane));
+    }
+
+    // -------- handle_terminal_mouse_down: multi-click promotion --------
+
+    #[test]
+    fn handle_terminal_mouse_down_first_click_cell_mode() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0);
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Cell);
+    }
+
+    #[test]
+    fn handle_terminal_mouse_down_second_click_promotes_to_word() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0);
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0 + Duration::from_millis(50));
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Word);
+    }
+
+    #[test]
+    fn handle_terminal_mouse_down_third_click_promotes_to_line() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0);
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0 + Duration::from_millis(50));
+        handle_terminal_mouse_down(
+            &mut st,
+            pane,
+            (0, 0),
+            false,
+            t0 + Duration::from_millis(100),
+        );
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Line);
+    }
+
+    #[test]
+    fn handle_terminal_mouse_down_fourth_click_wraps_to_cell() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        for i in 0..4 {
+            handle_terminal_mouse_down(
+                &mut st,
+                pane,
+                (0, 0),
+                false,
+                t0 + Duration::from_millis(50 * i),
+            );
+        }
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Cell);
+    }
+
+    #[test]
+    fn handle_terminal_mouse_down_click_after_window_resets_to_cell() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0);
+        // Press again way after the window expires (400ms)
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0 + Duration::from_secs(2));
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Cell);
+    }
+
+    #[test]
+    fn handle_terminal_mouse_down_different_cell_resets_count() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0);
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0 + Duration::from_millis(50));
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Word);
+        // Click on a different cell within the window
+        handle_terminal_mouse_down(
+            &mut st,
+            pane,
+            (0, 1),
+            false,
+            t0 + Duration::from_millis(100),
+        );
+        assert_eq!(st.terminal_selections[&pane].mode, SelectMode::Cell);
+    }
+
+    #[test]
+    fn handle_terminal_mouse_down_different_pane_resets_count() {
+        let mut st = test_state();
+        let pane1 = 1u32;
+        let pane2 = 2u32;
+        let t0 = std::time::Instant::now();
+        handle_terminal_mouse_down(&mut st, pane1, (0, 0), false, t0);
+        handle_terminal_mouse_down(
+            &mut st,
+            pane1,
+            (0, 0),
+            false,
+            t0 + Duration::from_millis(50),
+        );
+        assert_eq!(st.terminal_selections[&pane1].mode, SelectMode::Word);
+        // Click on a different pane within the window
+        handle_terminal_mouse_down(
+            &mut st,
+            pane2,
+            (0, 0),
+            false,
+            t0 + Duration::from_millis(100),
+        );
+        assert_eq!(st.terminal_selections[&pane2].mode, SelectMode::Cell);
+    }
+
+    #[test]
+    fn handle_terminal_mouse_down_shift_click_extends_anchor() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        // Initial click at (1, 2)
+        handle_terminal_mouse_down(&mut st, pane, (1, 2), false, t0);
+        // Shift+click at (3, 7) keeps anchor and moves focus
+        handle_terminal_mouse_down(&mut st, pane, (3, 7), true, t0 + Duration::from_secs(2));
+        let sel = st.terminal_selections[&pane];
+        assert_eq!(sel.anchor, (1, 2));
+        assert_eq!(sel.focus, (3, 7));
+    }
+
+    #[test]
+    fn handle_terminal_mouse_down_shift_click_without_prior_starts_fresh() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        // Shift+click with no prior selection starts a fresh anchor
+        handle_terminal_mouse_down(&mut st, pane, (2, 3), true, t0);
+        let sel = st.terminal_selections[&pane];
+        assert_eq!(sel.anchor, (2, 3));
+        assert_eq!(sel.focus, (2, 3));
+        assert_eq!(sel.mode, SelectMode::Cell);
+    }
+
+    // -------- handle_terminal_drag and finish_terminal_drag --------
+
+    #[test]
+    fn handle_terminal_drag_extends_focus() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        handle_terminal_mouse_down(&mut st, pane, (1, 1), false, t0);
+        handle_terminal_drag(&mut st, pane, (3, 5));
+        let sel = st.terminal_selections[&pane];
+        assert_eq!(sel.anchor, (1, 1));
+        assert_eq!(sel.focus, (3, 5));
+    }
+
+    #[test]
+    fn handle_terminal_drag_seeds_without_prior_anchor() {
+        let mut st = test_state();
+        let pane = 1u32;
+        // Drag without a prior mouse-down (edge case)
+        handle_terminal_drag(&mut st, pane, (5, 10));
+        let sel = st.terminal_selections[&pane];
+        assert_eq!(sel.anchor, (5, 10));
+        assert_eq!(sel.focus, (5, 10));
+        assert!(sel.is_empty());
+    }
+
+    #[test]
+    fn finish_terminal_drag_drops_collapsed_selection() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        // A click without a drag leaves a collapsed selection
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0);
+        finish_terminal_drag(&mut st, pane);
+        assert!(!st.terminal_selections.contains_key(&pane));
+    }
+
+    #[test]
+    fn finish_terminal_drag_keeps_non_collapsed_selection() {
+        let mut st = test_state();
+        let pane = 1u32;
+        let t0 = std::time::Instant::now();
+        // A drag that extends the selection
+        handle_terminal_mouse_down(&mut st, pane, (0, 0), false, t0);
+        handle_terminal_drag(&mut st, pane, (0, 5));
+        finish_terminal_drag(&mut st, pane);
+        assert!(st.terminal_selections.contains_key(&pane));
+        assert!(!st.terminal_selections[&pane].is_empty());
+    }
+
+    // -------- active_pane_has_selection --------
+
+    #[test]
+    fn active_pane_has_selection_true_for_real_range() {
+        let mut st = test_state();
+        assert_eq!(st.active_pane.0, 1);
+        set_terminal_selection(
+            &mut st,
+            1,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 5),
+                mode: SelectMode::Cell,
+            },
+        );
+        assert!(active_pane_has_selection(&st));
+    }
+
+    #[test]
+    fn active_pane_has_selection_false_for_collapsed() {
+        let mut st = test_state();
+        set_terminal_selection(&mut st, 1, TermSelection::new((0, 0), SelectMode::Cell));
+        assert!(!active_pane_has_selection(&st));
+    }
+
+    #[test]
+    fn active_pane_has_selection_false_for_non_active_pane() {
+        let mut st = test_state();
+        // active_pane is 1, but set selection on pane 2
+        set_terminal_selection(
+            &mut st,
+            2,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 5),
+                mode: SelectMode::Cell,
+            },
+        );
+        assert!(!active_pane_has_selection(&st));
+    }
+
+    #[test]
+    fn active_pane_has_selection_false_when_none() {
+        let st = test_state();
+        assert!(!active_pane_has_selection(&st));
+    }
+
+    // -------- dispatch_terminal_copy (via dispatch) --------
+
+    #[test]
+    fn dispatch_terminal_copy_returns_true_with_selection_and_terminal() {
+        let _lock = clipboard_access_guard();
+        let mut st = test_state();
+        let pane = 1u32;
+        // Create a real terminal with text
+        let mut term = crate::terminal::Terminal::new(2, 5);
+        term.process_bytes(b"hello\r\nworld");
+        st.terminals
+            .insert(pane, std::sync::Arc::new(std::sync::Mutex::new(term)));
+        // Set a real selection
+        set_terminal_selection(
+            &mut st,
+            pane,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 4),
+                mode: SelectMode::Cell,
+            },
+        );
+        assert!(active_pane_has_selection(&st));
+        // Dispatch copy
+        let result = dispatch(&mut st, "terminal.copy");
+        assert!(result);
+        // Selection should be cleared
+        assert!(!active_pane_has_selection(&st));
+    }
+
+    #[test]
+    fn dispatch_terminal_copy_returns_false_with_no_selection() {
+        let _lock = clipboard_access_guard();
+        let mut st = test_state();
+        let pane = 1u32;
+        let mut term = crate::terminal::Terminal::new(2, 5);
+        term.process_bytes(b"hello");
+        st.terminals
+            .insert(pane, std::sync::Arc::new(std::sync::Mutex::new(term)));
+        // No selection set
+        let result = dispatch(&mut st, "terminal.copy");
+        assert!(!result);
+    }
+
+    #[test]
+    fn dispatch_terminal_copy_returns_false_with_collapsed_selection() {
+        let _lock = clipboard_access_guard();
+        let mut st = test_state();
+        let pane = 1u32;
+        let mut term = crate::terminal::Terminal::new(2, 5);
+        term.process_bytes(b"hello");
+        st.terminals
+            .insert(pane, std::sync::Arc::new(std::sync::Mutex::new(term)));
+        // Collapsed selection (empty in Cell mode)
+        set_terminal_selection(&mut st, pane, TermSelection::new((0, 0), SelectMode::Cell));
+        let result = dispatch(&mut st, "terminal.copy");
+        assert!(!result);
+    }
+
+    #[test]
+    fn dispatch_terminal_copy_clears_selection_after_success() {
+        let _lock = clipboard_access_guard();
+        let mut st = test_state();
+        let pane = 1u32;
+        let mut term = crate::terminal::Terminal::new(1, 5);
+        term.process_bytes(b"hello");
+        st.terminals
+            .insert(pane, std::sync::Arc::new(std::sync::Mutex::new(term)));
+        set_terminal_selection(
+            &mut st,
+            pane,
+            TermSelection {
+                anchor: (0, 0),
+                focus: (0, 4),
+                mode: SelectMode::Cell,
+            },
+        );
+        let _ = dispatch(&mut st, "terminal.copy");
+        // Verify selection is cleared by checking active_pane_has_selection
+        assert!(!active_pane_has_selection(&st));
+    }
+
+    // -------- normalize_pasted_text comprehensive tests --------
+
+    #[test]
+    fn normalize_pasted_text_crlf_to_cr() {
+        assert_eq!(
+            normalize_pasted_text("hello\r\nworld\r\n"),
+            "hello\rworld\r"
+        );
+    }
+
+    #[test]
+    fn normalize_pasted_text_lf_to_cr() {
+        assert_eq!(normalize_pasted_text("alpha\nbeta\n"), "alpha\rbeta\r");
+    }
+
+    #[test]
+    fn normalize_pasted_text_cr_passthrough() {
+        assert_eq!(normalize_pasted_text("old\rmac\r"), "old\rmac\r");
+    }
+
+    #[test]
+    fn normalize_pasted_text_preserves_unicode() {
+        assert_eq!(normalize_pasted_text("café 🦀"), "café 🦀");
+    }
+
+    #[test]
+    fn normalize_pasted_text_strips_bracketed_paste_markers() {
+        let input = "ok\x1b[200~before-end\x1b[201~after";
+        let output = normalize_pasted_text(input);
+        assert_eq!(output, "okbefore-endafter");
+        assert!(!output.contains("\x1b[200~"));
+        assert!(!output.contains("\x1b[201~"));
+    }
+
+    #[test]
+    fn normalize_pasted_text_scrubs_reassembled_split_markers_regression() {
+        // REGRESSION: A naive single pass would splice neighbours into a new marker.
+        // `\x1b[2` + `\x1b[201~` + `01~` -> `\x1b[201~` without fixed-point iteration.
+        let input = "\x1b[2\x1b[201~01~payload";
+        let output = normalize_pasted_text(input);
+        assert!(
+            !output.contains("\x1b[201~"),
+            "end marker escaped: {output:?}"
+        );
+        assert!(
+            !output.contains("\x1b[200~"),
+            "start marker escaped: {output:?}"
+        );
+        assert_eq!(output, "payload");
+    }
+
+    #[test]
+    fn normalize_pasted_text_nested_markers_fully_collapse() {
+        let input = "\x1b[200\x1b[200~~rm -rf";
+        let output = normalize_pasted_text(input);
+        assert!(
+            !output.contains("\x1b[200~"),
+            "nested marker survived: {output:?}"
+        );
+        assert_eq!(output, "rm -rf");
+    }
+
+    #[test]
+    fn normalize_pasted_text_adjacent_split_markers_collapse() {
+        // Multiple separate splits that reassemble across deletions.
+        let input = "\x1b[20\x1b[2001~0~test";
+        let output = normalize_pasted_text(input);
+        assert!(!output.contains("\x1b[200~"));
+        assert!(!output.contains("\x1b[201~"));
+    }
+
+    #[test]
+    fn normalize_pasted_text_markers_at_boundaries() {
+        // Marker at the very start.
+        let input1 = "\x1b[200~content";
+        let output1 = normalize_pasted_text(input1);
+        assert_eq!(output1, "content");
+
+        // Marker at the very end.
+        let input2 = "content\x1b[201~";
+        let output2 = normalize_pasted_text(input2);
+        assert_eq!(output2, "content");
+
+        // Markers at both boundaries.
+        let input3 = "\x1b[200~middle\x1b[201~";
+        let output3 = normalize_pasted_text(input3);
+        assert_eq!(output3, "middle");
+    }
+
+    #[test]
+    fn normalize_pasted_text_truncated_marker_prefix_preserved() {
+        // Lone ESC is not part of a marker (needs ESC + '[').
+        assert_eq!(normalize_pasted_text("\x1b"), "\x1b");
+        // ESC + '[' is still not a marker (needs 20{0,1}~).
+        assert_eq!(normalize_pasted_text("\x1b["), "\x1b[");
+        // ESC + '[' + '2' + '0' is still not complete.
+        assert_eq!(normalize_pasted_text("\x1b[20"), "\x1b[20");
+        // ESC + '[' + '2' + '0' + '0' is still not complete.
+        assert_eq!(normalize_pasted_text("\x1b[200"), "\x1b[200");
+        // ESC + '[' + '2' + '0' + '0' + '{0,1}' is the full marker; only it gets stripped.
+        // All the prefixes survive as partial real escape codes.
+    }
+
+    #[test]
+    fn normalize_pasted_text_empty_input() {
+        assert_eq!(normalize_pasted_text(""), "");
+    }
+
+    #[test]
+    fn normalize_pasted_text_only_markers_becomes_empty() {
+        let input = "\x1b[200~\x1b[201~";
+        let output = normalize_pasted_text(input);
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn normalize_pasted_text_multiple_separate_markers() {
+        let input = "a\x1b[200~b\x1b[201~c\x1b[200~d\x1b[201~e";
+        let output = normalize_pasted_text(input);
+        assert_eq!(output, "abcde");
+        assert!(!output.contains("\x1b[200~"));
+        assert!(!output.contains("\x1b[201~"));
+    }
+
+    #[test]
+    fn normalize_pasted_text_utf8_adjacent_to_markers() {
+        // Multi-byte UTF-8 (café) adjacent to markers should survive intact.
+        let input = "\x1b[200~café\x1b[201~🦀";
+        let output = normalize_pasted_text(input);
+        assert_eq!(output, "café🦀");
+    }
+
+    #[test]
+    fn normalize_pasted_text_crlf_mixed_with_markers() {
+        let input = "line1\r\n\x1b[200~line2\r\nline3\x1b[201~line4\r\n";
+        let output = normalize_pasted_text(input);
+        // CRLF collapses to CR; markers strip.
+        assert_eq!(output, "line1\rline2\rline3line4\r");
+    }
+
+    #[test]
+    fn normalize_pasted_text_noop_when_plain() {
+        // Plain text with no markers or special newlines should be unchanged.
+        assert_eq!(normalize_pasted_text("ls -al"), "ls -al");
     }
 }

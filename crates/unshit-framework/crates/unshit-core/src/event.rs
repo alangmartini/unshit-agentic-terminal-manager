@@ -1122,3 +1122,400 @@ mod tests {
         assert_eq!(info.node_id, child);
     }
 }
+
+#[cfg(test)]
+mod tests_mouse_selection_support {
+    use super::*;
+
+    // =========================================================================
+    // Key::Insert Tests
+    // =========================================================================
+
+    #[test]
+    fn key_insert_from_name_lowercase() {
+        assert_eq!(Key::from_name("insert"), Some(Key::Insert));
+    }
+
+    #[test]
+    fn key_insert_from_name_abbreviation() {
+        assert_eq!(Key::from_name("ins"), Some(Key::Insert));
+    }
+
+    #[test]
+    fn key_insert_from_name_uppercase() {
+        assert_eq!(Key::from_name("INSERT"), Some(Key::Insert));
+    }
+
+    #[test]
+    fn key_insert_from_name_with_whitespace_trim() {
+        assert_eq!(Key::from_name(" insert "), Some(Key::Insert));
+        assert_eq!(Key::from_name("\tINSERT\n"), Some(Key::Insert));
+    }
+
+    #[test]
+    fn key_insert_display_string() {
+        assert_eq!(Key::Insert.to_string(), "Insert");
+    }
+
+    #[test]
+    fn key_insert_round_trip_display_to_from_name() {
+        let inserted_str = Key::Insert.to_string();
+        let parsed = Key::from_name(&inserted_str);
+        assert_eq!(parsed, Some(Key::Insert));
+    }
+
+    #[test]
+    fn key_insert_neighbors_delete_still_works() {
+        assert_eq!(Key::from_name("delete"), Some(Key::Delete));
+        assert_eq!(Key::from_name("del"), Some(Key::Delete));
+        assert_eq!(Key::Delete.to_string(), "Delete");
+    }
+
+    #[test]
+    fn key_insert_neighbors_fkey_still_works() {
+        assert_eq!(Key::from_name("f1"), Some(Key::F(1)));
+        assert_eq!(Key::from_name("F12"), Some(Key::F(12)));
+        assert_eq!(Key::F(1).to_string(), "F1");
+    }
+
+    #[test]
+    fn key_insert_from_name_rejects_unrelated() {
+        assert_eq!(Key::from_name("insertion"), None);
+        assert_eq!(Key::from_name("inserty"), None);
+        assert_eq!(Key::from_name("f13"), None);
+        assert_eq!(Key::from_name("unknown_key"), None);
+    }
+
+    // =========================================================================
+    // DragEvent Tests
+    // =========================================================================
+
+    #[test]
+    fn drag_event_construct_all_fields() {
+        let event = DragEvent {
+            phase: DragPhase::Start,
+            x: 100.5,
+            y: 200.5,
+            local_x: 50.5,
+            local_y: 75.5,
+            delta_x: 10.0,
+            delta_y: 20.0,
+            total_delta_x: 30.0,
+            total_delta_y: 40.0,
+            button: MouseButton::Left,
+        };
+        assert_eq!(event.phase, DragPhase::Start);
+        assert_eq!(event.x, 100.5);
+        assert_eq!(event.y, 200.5);
+        assert_eq!(event.local_x, 50.5);
+        assert_eq!(event.local_y, 75.5);
+        assert_eq!(event.delta_x, 10.0);
+        assert_eq!(event.delta_y, 20.0);
+        assert_eq!(event.total_delta_x, 30.0);
+        assert_eq!(event.total_delta_y, 40.0);
+        assert_eq!(event.button, MouseButton::Left);
+    }
+
+    #[test]
+    fn drag_event_is_copy() {
+        let event1 = DragEvent {
+            phase: DragPhase::Update,
+            x: 150.0,
+            y: 250.0,
+            local_x: 60.0,
+            local_y: 85.0,
+            delta_x: 5.0,
+            delta_y: 15.0,
+            total_delta_x: 35.0,
+            total_delta_y: 45.0,
+            button: MouseButton::Right,
+        };
+        let event2 = event1; // Copy semantics
+        assert_eq!(event1.x, event2.x);
+        assert_eq!(event1.local_x, event2.local_x);
+    }
+
+    #[test]
+    fn drag_event_is_clone() {
+        let event1 = DragEvent {
+            phase: DragPhase::End,
+            x: 200.0,
+            y: 300.0,
+            local_x: 70.0,
+            local_y: 95.0,
+            delta_x: 8.0,
+            delta_y: 12.0,
+            total_delta_x: 28.0,
+            total_delta_y: 38.0,
+            button: MouseButton::Middle,
+        };
+        let event2 = event1.clone();
+        assert_eq!(event1.phase, event2.phase);
+        assert_eq!(event1.local_y, event2.local_y);
+        assert_eq!(event1.total_delta_x, event2.total_delta_x);
+    }
+
+    #[test]
+    fn drag_event_debug_format() {
+        let event = DragEvent {
+            phase: DragPhase::Start,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            delta_x: 10.0,
+            delta_y: 20.0,
+            total_delta_x: 30.0,
+            total_delta_y: 40.0,
+            button: MouseButton::Left,
+        };
+        let debug_str = format!("{:?}", event);
+        // Should contain key field names
+        assert!(debug_str.contains("phase"));
+        assert!(debug_str.contains("Start"));
+        assert!(debug_str.contains("local_x"));
+    }
+
+    // =========================================================================
+    // MouseEvent Tests
+    // =========================================================================
+
+    #[test]
+    fn mouse_event_construct_all_fields() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down,
+            x: 150.0,
+            y: 250.0,
+            local_x: 60.0,
+            local_y: 85.0,
+            button: MouseButton::Left,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.kind, MouseEventKind::Down);
+        assert_eq!(event.x, 150.0);
+        assert_eq!(event.y, 250.0);
+        assert_eq!(event.local_x, 60.0);
+        assert_eq!(event.local_y, 85.0);
+        assert_eq!(event.button, MouseButton::Left);
+        assert_eq!(event.modifiers, Modifiers::empty());
+    }
+
+    #[test]
+    fn mouse_event_kind_down() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            button: MouseButton::Left,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.kind, MouseEventKind::Down);
+    }
+
+    #[test]
+    fn mouse_event_kind_up() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Up,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            button: MouseButton::Left,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.kind, MouseEventKind::Up);
+    }
+
+    #[test]
+    fn mouse_event_kind_move() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Move,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            button: MouseButton::None,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.kind, MouseEventKind::Move);
+    }
+
+    #[test]
+    fn mouse_event_kind_enter() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Enter,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            button: MouseButton::None,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.kind, MouseEventKind::Enter);
+    }
+
+    #[test]
+    fn mouse_event_kind_leave() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Leave,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            button: MouseButton::None,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.kind, MouseEventKind::Leave);
+    }
+
+    #[test]
+    fn mouse_event_button_left() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            button: MouseButton::Left,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.button, MouseButton::Left);
+    }
+
+    #[test]
+    fn mouse_event_button_right() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            button: MouseButton::Right,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.button, MouseButton::Right);
+    }
+
+    #[test]
+    fn mouse_event_button_middle() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            button: MouseButton::Middle,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.button, MouseButton::Middle);
+    }
+
+    #[test]
+    fn mouse_event_button_none() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Move,
+            x: 100.0,
+            y: 200.0,
+            local_x: 50.0,
+            local_y: 75.0,
+            button: MouseButton::None,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.button, MouseButton::None);
+    }
+
+    #[test]
+    fn mouse_event_local_coordinates_preserved() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down,
+            x: 500.5,
+            y: 600.5,
+            local_x: 123.75,
+            local_y: 456.25,
+            button: MouseButton::Left,
+            modifiers: Modifiers::empty(),
+        };
+        assert_eq!(event.local_x, 123.75);
+        assert_eq!(event.local_y, 456.25);
+    }
+
+    // =========================================================================
+    // Modifiers Helper Tests
+    // =========================================================================
+
+    #[test]
+    fn modifiers_parse_name_ctrl() {
+        assert_eq!(Modifiers::parse_name("ctrl"), Some(Modifiers::CTRL));
+        assert_eq!(Modifiers::parse_name("control"), Some(Modifiers::CTRL));
+    }
+
+    #[test]
+    fn modifiers_parse_name_shift() {
+        assert_eq!(Modifiers::parse_name("shift"), Some(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn modifiers_parse_name_alt() {
+        assert_eq!(Modifiers::parse_name("alt"), Some(Modifiers::ALT));
+    }
+
+    #[test]
+    fn modifiers_parse_name_meta() {
+        assert_eq!(Modifiers::parse_name("meta"), Some(Modifiers::META));
+        assert_eq!(Modifiers::parse_name("super"), Some(Modifiers::META));
+        assert_eq!(Modifiers::parse_name("cmd"), Some(Modifiers::META));
+        assert_eq!(Modifiers::parse_name("command"), Some(Modifiers::META));
+    }
+
+    #[test]
+    fn modifiers_parse_name_case_insensitive() {
+        assert_eq!(Modifiers::parse_name("CTRL"), Some(Modifiers::CTRL));
+        assert_eq!(Modifiers::parse_name("ShIfT"), Some(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn modifiers_parse_name_with_whitespace() {
+        assert_eq!(Modifiers::parse_name(" ctrl "), Some(Modifiers::CTRL));
+        assert_eq!(Modifiers::parse_name("\tshift\n"), Some(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn modifiers_parse_name_invalid() {
+        assert_eq!(Modifiers::parse_name("invalid"), None);
+        assert_eq!(Modifiers::parse_name("option"), None);
+        assert_eq!(Modifiers::parse_name(""), None);
+    }
+
+    #[test]
+    fn modifiers_display_single() {
+        assert_eq!(Modifiers::CTRL.to_string(), "Ctrl+");
+        assert_eq!(Modifiers::SHIFT.to_string(), "Shift+");
+        assert_eq!(Modifiers::ALT.to_string(), "Alt+");
+        assert_eq!(Modifiers::META.to_string(), "Meta+");
+    }
+
+    #[test]
+    fn modifiers_display_multiple() {
+        let combined = Modifiers::CTRL | Modifiers::SHIFT;
+        let display = combined.to_string();
+        assert!(display.contains("Ctrl+"));
+        assert!(display.contains("Shift+"));
+    }
+
+    #[test]
+    fn modifiers_display_all_four() {
+        let all = Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT | Modifiers::META;
+        let display = all.to_string();
+        assert!(display.contains("Ctrl+"));
+        assert!(display.contains("Alt+"));
+        assert!(display.contains("Shift+"));
+        assert!(display.contains("Meta+"));
+    }
+
+    #[test]
+    fn modifiers_display_empty() {
+        assert_eq!(Modifiers::empty().to_string(), "");
+    }
+}
