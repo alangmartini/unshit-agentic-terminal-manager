@@ -1924,8 +1924,8 @@ fn parse_declaration(
         "height" => StyleDeclaration::Height(parse_dimension(parser)?),
         "min-width" => StyleDeclaration::MinWidth(parse_dimension(parser)?),
         "min-height" => StyleDeclaration::MinHeight(parse_dimension(parser)?),
-        "max-width" => StyleDeclaration::MaxWidth(parse_dimension(parser)?),
-        "max-height" => StyleDeclaration::MaxHeight(parse_dimension(parser)?),
+        "max-width" => StyleDeclaration::MaxWidth(parse_max_dimension(parser)?),
+        "max-height" => StyleDeclaration::MaxHeight(parse_max_dimension(parser)?),
         "padding" => {
             let dims = expand_edge_dims(&parse_dimension_list(parser))?;
             match all_px_edges(dims) {
@@ -3331,6 +3331,20 @@ fn parse_dimension(parser: &mut Parser) -> Result<Dimension, ()> {
         Token::Number { value, .. } => Ok(Dimension::Px(*value)),
         _ => Err(()),
     }
+}
+
+fn parse_max_dimension(parser: &mut Parser) -> Result<Dimension, ()> {
+    if parser
+        .try_parse(|p| match p.next().map_err(|_| ())? {
+            Token::Ident(ref s) if s.as_ref().eq_ignore_ascii_case("none") => Ok(()),
+            _ => Err(()),
+        })
+        .is_ok()
+    {
+        return Ok(Dimension::Auto);
+    }
+
+    parse_dimension(parser)
 }
 
 fn parse_px_list(parser: &mut Parser) -> Vec<f32> {
@@ -6847,6 +6861,25 @@ mod tests {
             decls,
             vec![StyleDeclaration::MaxHeight(Dimension::Calc { px: -46.0, vw: 0.0, vh: 72.0 })]
         );
+    }
+
+    #[test]
+    fn test_parse_max_size_none() {
+        let decls = parse_decls(".x { max-width: none; max-height: none; }");
+        assert_eq!(
+            decls,
+            vec![
+                StyleDeclaration::MaxWidth(Dimension::Auto),
+                StyleDeclaration::MaxHeight(Dimension::Auto)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_none_stays_scoped_to_max_size() {
+        let sheet = CompiledStylesheet::parse(".x { width: none; height: none; }");
+        assert!(sheet.dropped.iter().any(|d| d.property == "width" && d.value == "none"));
+        assert!(sheet.dropped.iter().any(|d| d.property == "height" && d.value == "none"));
     }
 
     #[test]
