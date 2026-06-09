@@ -6479,12 +6479,16 @@ body.dragging-pane {
   box-shadow: 0 1px 0 var(--border-default), 0 0 6px var(--accent-a10);
 }
 
-.keybind-key:not(:first-child)::before {
-  content: "+";
+/* The "+" between key pills is a real span emitted by combo_cell(), not a
+   ::before pseudo: text-content pseudos attach a synthetic child to the
+   pill, which disables text measurement on the pill (only childless leaves
+   are measured) and collapses the chip to min-width. */
+.keybind-plus {
   color: var(--fg-muted);
+  font-family: var(--font-mono);
   font-size: var(--t-xs);
+  font-weight: 600;
   line-height: 1;
-  margin-right: 3px;
 }
 
 .keybind-footer {

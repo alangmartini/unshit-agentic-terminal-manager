@@ -1420,7 +1420,17 @@ fn combo_cell(
                 .with_text("press keys... (esc to cancel)"),
         );
     } else {
-        for part in combo_parts(combo) {
+        // The "+" separators are real elements rather than `::before` pseudo
+        // content: a text-content pseudo would become a child of the pill,
+        // which stops the layout engine from measuring the pill's own text
+        // (text is only measured on childless leaves), collapsing the chip
+        // to min-width and letting the label spill out.
+        for (i, part) in combo_parts(combo).into_iter().enumerate() {
+            if i > 0 {
+                btn = btn.with_child(
+                    ElementDef::new(Tag::Span).with_class("keybind-plus").with_text("+"),
+                );
+            }
             btn = btn.with_child(pill("keybind-key", None, &part));
         }
     }
@@ -3601,8 +3611,95 @@ mod tests {
         // cell: [setting_meta, combo_cell, (maybe reset)]
         let combo_cell = &first_row.children[1];
         assert!(combo_cell.classes.contains(&"keybind-cell".to_string()));
-        // Default NewTerminal is Ctrl+T so we expect 2 pills.
-        assert_eq!(combo_cell.children.len(), 2);
+        // Default NewTerminal is Ctrl+T: two pills joined by a "+" separator.
+        assert_eq!(combo_cell.children.len(), 3);
+        assert!(combo_cell.children[0].classes.contains(&"keybind-key".to_string()));
+        assert_eq!(text_of(&combo_cell.children[0]), Some("Ctrl"));
+        assert!(combo_cell.children[1].classes.contains(&"keybind-plus".to_string()));
+        assert_eq!(text_of(&combo_cell.children[1]), Some("+"));
+        assert!(combo_cell.children[2].classes.contains(&"keybind-key".to_string()));
+        assert_eq!(text_of(&combo_cell.children[2]), Some("T"));
+    }
+
+    #[test]
+    fn keybind_plus_separator_is_a_real_element_not_a_pseudo() {
+        let css = include_str!("../../assets/styles.css");
+        // Regression: a text-content ::before on .keybind-key attaches a
+        // synthetic child to the pill, which disables text measurement
+        // (only childless leaves are measured), collapsing chips to
+        // min-width so labels like "Shift" overflow. Keep the separator a
+        // real span styled via .keybind-plus.
+        assert!(!css.contains(".keybind-key:not(:first-child)::before"));
+        assert!(css.contains(".keybind-plus {"));
+    }
+
+    #[test]
+    fn keybind_pills_grow_to_fit_their_text_with_stylesheet() {
+        let snap = make_snapshot_section(SettingsSection::Keybinds);
+        let shared = make_shared();
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_class("theme-amber")
+                    .with_child(build_settings_page(&tree_snap, &tree_shared)),
+            },
+            1280.0,
+            800.0,
+        );
+        harness.step();
+
+        let pills = harness.query_all(".keybind-key");
+        assert!(!pills.is_empty(), "keybinds page should render key pills");
+
+        for pill in &pills {
+            // Pills must stay childless text leaves: any child (e.g.
+            // synthetic pseudo content) disables text measurement, so the
+            // box collapses to min-width and the label spills out.
+            assert!(
+                harness.arena().children(pill.node_id).is_empty(),
+                "pill {:?} must not have children",
+                pill.content
+            );
+
+            let ElementContent::Text(ref text) = pill.content else {
+                panic!("pill should hold text content, got {:?}", pill.content);
+            };
+            let style = pill.computed_style.clone();
+            let (text_w, _) = unshit::core::layout::measure_text_with_style_cached(
+                text,
+                &style.font_family,
+                style.font_weight,
+                style.font_style,
+                style.font_size,
+                style.line_height,
+                style.letter_spacing,
+                None,
+                harness.font_system_mut(),
+                None,
+            );
+            let content_w = pill.layout_rect.width - style.padding.left - style.padding.right;
+            assert!(
+                content_w + 0.5 >= text_w,
+                "\"{text}\" pill content box ({content_w}px) must fit its label ({text_w}px), rect {:?}",
+                pill.layout_rect
+            );
+        }
+
+        // The "+" separators between pills must lay out as visible elements.
+        let plusses = harness.query_all(".keybind-plus");
+        assert!(!plusses.is_empty(), "multi-key combos should render + separators");
+        for plus in &plusses {
+            assert!(
+                plus.layout_rect.width > 0.0 && plus.layout_rect.height > 0.0,
+                "+ separator should have non-zero layout, got {:?}",
+                plus.layout_rect
+            );
+        }
     }
 
     #[test]
