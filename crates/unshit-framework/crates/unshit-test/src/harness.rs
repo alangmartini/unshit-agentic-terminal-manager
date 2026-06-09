@@ -605,6 +605,12 @@ pub(crate) fn scale_all_styles(arena: &mut NodeArena, node_id: NodeId, scale: f3
     let children = arena.children(node_id);
 
     if let Some(element) = arena.get_mut(node_id) {
+        // Mirror unshit-core's build::scale_all_styles: anonymous text
+        // boxes copy their host's already-scaled style in the layout sync,
+        // so scaling the stored copy here would double-scale.
+        if element.anonymous {
+            return;
+        }
         element.computed_style.scale_by(scale);
     }
 

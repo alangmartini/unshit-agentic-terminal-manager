@@ -402,7 +402,10 @@ fn walk_tree(
 
     while let Some(node_id) = stack.pop() {
         if let Some(elem) = arena.get(node_id) {
-            if predicate(node_id, elem) {
+            // Anonymous text boxes mirror their host's text; matching them
+            // would make every text locator on a mixed-content host resolve
+            // twice. The host (which keeps its content) is the match.
+            if !elem.anonymous && predicate(node_id, elem) {
                 results.push(node_id);
             }
             let children = arena.children(node_id);

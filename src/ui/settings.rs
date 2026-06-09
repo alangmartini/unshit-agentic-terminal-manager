@@ -1421,10 +1421,10 @@ fn combo_cell(
         );
     } else {
         // The "+" separators are real elements rather than `::before` pseudo
-        // content: a text-content pseudo would become a child of the pill,
-        // which stops the layout engine from measuring the pill's own text
-        // (text is only measured on childless leaves), collapsing the chip
-        // to min-width and letting the label spill out.
+        // content. The framework now measures text+pseudo hosts correctly
+        // (via anonymous text boxes), so this is a stylistic choice: real
+        // spans keep the pills plain childless text leaves and the combo
+        // structure explicit in one place.
         for (i, part) in combo_parts(combo).into_iter().enumerate() {
             if i > 0 {
                 btn = btn.with_child(
@@ -3624,11 +3624,10 @@ mod tests {
     #[test]
     fn keybind_plus_separator_is_a_real_element_not_a_pseudo() {
         let css = include_str!("../../assets/styles.css");
-        // Regression: a text-content ::before on .keybind-key attaches a
-        // synthetic child to the pill, which disables text measurement
-        // (only childless leaves are measured), collapsing chips to
-        // min-width so labels like "Shift" overflow. Keep the separator a
-        // real span styled via .keybind-plus.
+        // Pins the chosen structure: the "+" separators are real spans
+        // emitted by combo_cell (styled via .keybind-plus), not pseudo
+        // content. (The engine measures text+pseudo hosts correctly via
+        // anonymous text boxes; this keeps the combo structure explicit.)
         assert!(!css.contains(".keybind-key:not(:first-child)::before"));
         assert!(css.contains(".keybind-plus {"));
     }
@@ -3657,9 +3656,8 @@ mod tests {
         assert!(!pills.is_empty(), "keybinds page should render key pills");
 
         for pill in &pills {
-            // Pills must stay childless text leaves: any child (e.g.
-            // synthetic pseudo content) disables text measurement, so the
-            // box collapses to min-width and the label spills out.
+            // Pills are plain childless text leaves by design (separators
+            // are sibling spans, not pseudo children).
             assert!(
                 harness.arena().children(pill.node_id).is_empty(),
                 "pill {:?} must not have children",

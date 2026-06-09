@@ -1528,6 +1528,36 @@ impl ComputedStyle {
         self.user_select = parent.user_select;
     }
 
+    /// Build the computed style for an anonymous text box from its host's
+    /// style. The anonymous child carries the host's text when the host has
+    /// both text content and element children, so it must render the text
+    /// exactly as the host would have: everything `inherit_from` copies,
+    /// plus the painter-read properties inheritance misses (`opacity` is
+    /// applied per emitting node, not composed down to descendants;
+    /// `text_shadow` and `text_overflow` are non-inherited but read by the
+    /// text draw). Box properties stay at their defaults (zero
+    /// padding/border/margin, transparent background) so the text box adds
+    /// no inset of its own, and it flexes to fill the host's content box
+    /// (`flex_grow: 1`) while remaining shrinkable below its text's
+    /// min-content size (`flex_shrink: 1`, `min_width: 0`) so `text-align`
+    /// and `text-overflow: ellipsis` keep working against the host's
+    /// content width.
+    ///
+    /// NOTE for maintainers: if you add an inherited property or a property
+    /// the text painter reads off the emitting node, update this derivation
+    /// alongside `inherit_from`.
+    pub fn derive_anonymous_text(host: &ComputedStyle) -> ComputedStyle {
+        let mut style = ComputedStyle::default();
+        style.inherit_from(host);
+        style.opacity = host.opacity;
+        style.text_shadow = host.text_shadow.clone();
+        style.text_overflow = host.text_overflow;
+        style.flex_grow = 1.0;
+        style.flex_shrink = 1.0;
+        style.min_width = Dimension::Px(0.0);
+        style
+    }
+
     pub fn to_taffy_style(&self, viewport_w: f32, viewport_h: f32) -> taffy::Style {
         taffy::Style {
             display: match self.display {

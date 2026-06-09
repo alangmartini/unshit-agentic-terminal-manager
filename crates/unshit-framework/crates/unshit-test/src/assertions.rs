@@ -400,6 +400,11 @@ impl TestHarness {
 
     fn collect_text_recursive(&self, node_id: unshit_core::id::NodeId, out: &mut String) {
         if let Some(element) = self.arena.get(node_id) {
+            // Anonymous text boxes mirror their host's text; skip them so
+            // mixed-content hosts don't report their text twice.
+            if element.anonymous {
+                return;
+            }
             if let ElementContent::Text(ref text) = element.content {
                 out.push_str(text);
             }

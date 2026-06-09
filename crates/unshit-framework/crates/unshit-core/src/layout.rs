@@ -1,7 +1,8 @@
 use crate::dirty::DirtyFlags;
-use crate::element::{ElementContent, InputType, Tag};
+use crate::element::{Element, ElementContent, InputType, Tag};
 use crate::id::NodeId;
-use crate::style::types::{apply_text_transform, FontStyle, FontWeight, WhiteSpace};
+use crate::style::parse::PseudoElement;
+use crate::style::types::{apply_text_transform, ComputedStyle, FontStyle, FontWeight, WhiteSpace};
 use crate::tree::NodeArena;
 use cosmic_text::{
     Attrs, Buffer, CacheKeyFlags, Family, FontSystem, Metrics, Shaping, Style, Weight,
@@ -250,6 +251,25 @@ pub fn sync_element_to_taffy(
 
     let is_new = element.taffy_node.is_none();
 
+    // Maintain the anonymous text box BEFORE the taffy sync and the child
+    // snapshot below, so a child created here is registered and attached in
+    // this same pass. This is the single mutation point for anonymous text
+    // children: every pipeline (app rebuild/restyle/init, test harness)
+    // funnels through this function, and every structural or stylistic
+    // change that can alter the outcome marks the host LAYOUT or CHILDREN
+    // dirty (reconcile content change: LAYOUT; pseudo add/remove:
+    // CHILDREN|LAYOUT; cascade restyle: LAYOUT).
+    if !element.synthetic
+        && !element.anonymous
+        && (is_new || element.dirty.intersects(DirtyFlags::LAYOUT | DirtyFlags::CHILDREN))
+    {
+        sync_anonymous_text_child(arena, taffy, node_id);
+    }
+
+    let Some(element) = arena.get(node_id) else {
+        return;
+    };
+
     if is_new || element.dirty.contains(DirtyFlags::LAYOUT) {
         let mut style = element.computed_style.to_taffy_style(viewport_w, viewport_h);
         // Hidden inputs have zero layout footprint.
@@ -330,6 +350,16 @@ pub fn sync_element_to_taffy(
                     white_space: element.computed_style.white_space,
                 };
                 taffy.set_node_context(taffy_node, Some(ctx)).unwrap();
+            } else if taffy.get_node_context(taffy_node).is_some() {
+                // A former text leaf may have gained children (e.g. an
+                // anonymous text box now owns the measurement); clear the
+                // stale measure context. taffy ignores contexts on nodes
+                // with children, but a stale context would spring back to
+                // life if the node ever became a leaf again. Gated on a
+                // present context: set_node_context triggers a mark_dirty
+                // walk to the root, which the common container case (never
+                // had a context) must not pay on every restyle frame.
+                taffy.set_node_context(taffy_node, None).unwrap();
             }
         }
     }
@@ -347,6 +377,239 @@ pub fn sync_element_to_taffy(
         let taffy_node = element.taffy_node.unwrap();
         taffy.set_children(taffy_node, &taffy_children).unwrap();
     }
+}
+
+/// Returns true when `element` must own an anonymous text box: it carries
+/// non-empty text of its own AND has at least one child other than the
+/// (possible) anonymous box itself, so taffy would never call its measure
+/// function (taffy only measures childless leaves). Inputs measure their
+/// own value/placeholder text and Select consumes its children into
+/// `select_state`; synthetic and anonymous nodes can never be hosts.
+fn wants_anon_text_child(arena: &NodeArena, element: &Element, anon: Option<NodeId>) -> bool {
+    if element.synthetic
+        || element.anonymous
+        || matches!(element.tag, Tag::Input | Tag::Select)
+        || !matches!(&element.content, ElementContent::Text(t) if !t.is_empty())
+    {
+        return false;
+    }
+    // Any child besides the anonymous box itself?
+    let mut child = element.first_child;
+    while !child.is_dangling() {
+        if Some(child) != anon {
+            return true;
+        }
+        child = arena.get(child).map(|e| e.next_sibling).unwrap_or(NodeId::DANGLING);
+    }
+    false
+}
+
+/// Create, update, or tear down the anonymous text box of `host_id` so that
+/// exactly the hosts matched by [`wants_anon_text_child`] own one, its text
+/// mirrors the host's content, and its style is freshly derived from the
+/// host's (already cascaded and DPI-scaled) computed style. The host's
+/// `computed_style` is the only style source for the anonymous child: the
+/// cascade and `scale_all_styles` skip anonymous nodes, and transition /
+/// animation ticks refresh the derivation through
+/// [`refresh_anon_text_style`]. Only called from `sync_element_to_taffy`,
+/// which immediately re-snapshots children and runs the taffy child sync —
+/// calling this in isolation would leave a fresh box with no taffy node.
+fn sync_anonymous_text_child(
+    arena: &mut NodeArena,
+    taffy: &mut TaffyTree<TextMeasureCtx>,
+    host_id: NodeId,
+) {
+    let Some(host) = arena.get(host_id) else {
+        return;
+    };
+
+    let had_handle = host.anon_text_child.is_some();
+    // Validate the stored child id: reconcile can dealloc whole subtrees
+    // without notifying anyone, and generational ids make stale reads safe.
+    let stored = host.anon_text_child.filter(|&id| {
+        arena.get(id).map(|e| e.anonymous && e.parent == host_id).unwrap_or(false)
+    });
+
+    let needs = wants_anon_text_child(arena, host, stored);
+
+    match (needs, stored) {
+        (false, None) => {
+            if had_handle {
+                // Stale handle left behind by an external teardown.
+                if let Some(h) = arena.get_mut(host_id) {
+                    h.anon_text_child = None;
+                }
+            }
+        }
+        (false, Some(anon_id)) => {
+            remove_anon_text_child(arena, taffy, host_id, anon_id);
+        }
+        (true, None) => {
+            create_anon_text_child(arena, host_id);
+        }
+        (true, Some(anon_id)) => {
+            update_anon_text_child(arena, host_id, anon_id);
+        }
+    }
+}
+
+fn create_anon_text_child(arena: &mut NodeArena, host_id: NodeId) {
+    let (text, derived) = {
+        let host = arena.get(host_id).unwrap();
+        let text = match &host.content {
+            ElementContent::Text(t) => t.clone(),
+            _ => unreachable!("wants_anon_text_child checked content"),
+        };
+        (text, ComputedStyle::derive_anonymous_text(&host.computed_style))
+    };
+
+    let mut elem = Element::new(Tag::Span);
+    elem.parent = host_id;
+    elem.content = ElementContent::Text(text);
+    elem.computed_style = derived;
+    elem.synthetic = true;
+    elem.anonymous = true;
+    // Explicit creation flags: LAYOUT so the sync registers the taffy leaf,
+    // PAINT so the batch emits it, CONTENT for persistent-buffer parity
+    // with the pseudo resolver. Deliberately NOT the `Element::new`
+    // defaults: no STYLE (the cascade skips anonymous nodes, and a stray
+    // STYLE flag would trip the app's style-work gate) and no CHILDREN
+    // (text boxes are leaves).
+    elem.dirty = DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::CONTENT;
+    let anon_id = arena.alloc(elem);
+
+    link_anon_text_child(arena, host_id, anon_id);
+
+    if let Some(host) = arena.get_mut(host_id) {
+        host.anon_text_child = Some(anon_id);
+        host.dirty |= DirtyFlags::CHILDREN | DirtyFlags::LAYOUT | DirtyFlags::PAINT;
+    }
+    // The host's cached batch range baked its directly-painted text; make
+    // sure the replay gate cannot serve it.
+    crate::build::mark_node_paint_dirty(arena, host_id);
+}
+
+fn update_anon_text_child(arena: &mut NodeArena, host_id: NodeId, anon_id: NodeId) {
+    // The common case on blanket-LAYOUT restyle frames is "nothing
+    // changed"; compare the text by reference before allocating a clone.
+    let text_changed = {
+        let host_text = match arena.get(host_id).map(|h| &h.content) {
+            Some(ElementContent::Text(t)) => t,
+            _ => unreachable!("wants_anon_text_child checked content"),
+        };
+        !matches!(arena.get(anon_id).map(|a| &a.content),
+            Some(ElementContent::Text(t)) if t == host_text)
+    };
+
+    let derived =
+        ComputedStyle::derive_anonymous_text(&arena.get(host_id).unwrap().computed_style);
+
+    let mut changed = false;
+    if text_changed {
+        let text = match &arena.get(host_id).unwrap().content {
+            ElementContent::Text(t) => t.clone(),
+            _ => unreachable!("wants_anon_text_child checked content"),
+        };
+        if let Some(anon) = arena.get_mut(anon_id) {
+            anon.content = ElementContent::Text(text);
+            anon.dirty |= DirtyFlags::LAYOUT | DirtyFlags::CONTENT | DirtyFlags::PAINT;
+            changed = true;
+        }
+    }
+    if let Some(anon) = arena.get_mut(anon_id) {
+        if anon.computed_style != derived {
+            anon.computed_style = derived;
+            anon.dirty |= DirtyFlags::LAYOUT | DirtyFlags::PAINT;
+            changed = true;
+        }
+    }
+    if changed {
+        crate::build::mark_node_paint_dirty(arena, anon_id);
+    }
+}
+
+fn remove_anon_text_child(
+    arena: &mut NodeArena,
+    taffy: &mut TaffyTree<TextMeasureCtx>,
+    host_id: NodeId,
+    anon_id: NodeId,
+) {
+    // Free the taffy node first so no stale handle is left behind
+    // (mirrors `remove_pseudo_node`).
+    if let Some(elem) = arena.get(anon_id) {
+        if let Some(tn) = elem.taffy_node {
+            let _ = taffy.remove(tn);
+        }
+    }
+
+    arena.remove_child(host_id, anon_id);
+    arena.dealloc(anon_id);
+
+    if let Some(host) = arena.get_mut(host_id) {
+        host.anon_text_child = None;
+        host.dirty |= DirtyFlags::CHILDREN | DirtyFlags::LAYOUT | DirtyFlags::PAINT;
+    }
+    // The host reverts to painting its own text; invalidate cached ranges.
+    crate::build::mark_node_paint_dirty(arena, host_id);
+}
+
+/// Link a freshly allocated anonymous text box into the host's child list:
+/// after any leading ::before / ::placeholder pseudo nodes and before
+/// everything else (user children and ::after), matching browser anonymous
+/// box order. Unknown synthetic kinds are treated as a boundary (the box is
+/// inserted before them), which fails safe to "text before decoration".
+fn link_anon_text_child(arena: &mut NodeArena, host_id: NodeId, anon_id: NodeId) {
+    let mut cursor = arena.get(host_id).map(|h| h.first_child).unwrap_or(NodeId::DANGLING);
+    while !cursor.is_dangling() {
+        let Some(child) = arena.get(cursor) else {
+            break;
+        };
+        let leading_pseudo = child.synthetic
+            && matches!(
+                child.pseudo_slot,
+                Some(PseudoElement::Before) | Some(PseudoElement::Placeholder)
+            );
+        if !leading_pseudo {
+            break;
+        }
+        cursor = child.next_sibling;
+    }
+
+    if cursor.is_dangling() {
+        arena.append_child(host_id, anon_id);
+    } else {
+        arena.insert_child_before(host_id, anon_id, cursor);
+    }
+}
+
+/// Re-derive an anonymous text box's style from its host's current computed
+/// style. Called from transition/animation ticks, which mutate host styles
+/// on PAINT-only frames where the layout sync (the normal derivation point)
+/// never runs. Without this, an anonymous box's color/opacity/font would
+/// freeze at the value captured on the last layout frame.
+///
+/// Paint-only by design: the box's taffy measure context intentionally
+/// keeps the transition's TARGET values (written by the cascade on the
+/// transition-start frame), exactly like a plain childless text leaf, so
+/// final layout is correct without per-tick relayout.
+///
+/// Fully self-contained damage-wise: on a change it marks the box PAINT
+/// and propagates SUBTREE_PAINT up the ancestor chain. Returns the box's
+/// id when a change was applied (for tests/observability).
+pub fn refresh_anon_text_style(arena: &mut NodeArena, host_id: NodeId) -> Option<NodeId> {
+    let host = arena.get(host_id)?;
+    let anon_id = host.anon_text_child?;
+    if !arena.get(anon_id).map(|e| e.anonymous && e.parent == host_id).unwrap_or(false) {
+        return None;
+    }
+    let derived = ComputedStyle::derive_anonymous_text(&arena.get(host_id)?.computed_style);
+    if arena.get(anon_id)?.computed_style == derived {
+        return None;
+    }
+    let anon = arena.get_mut(anon_id)?;
+    anon.computed_style = derived;
+    crate::build::mark_node_paint_dirty(arena, anon_id);
+    Some(anon_id)
 }
 
 /// Create a cosmic-text Buffer with text shaped and ready for layout iteration.
@@ -948,6 +1211,15 @@ pub fn text_hit_at(
     font_system: &mut FontSystem,
 ) -> Option<(NodeId, usize)> {
     let element = arena.get(node_id)?;
+    // When the host's text lives in an anonymous text box, the box owns the
+    // hit math (the host's rect includes pseudo/user children and would
+    // yield wrong wrap widths and offsets) and the returned NodeId, so text
+    // selection anchors to the node whose text arm paints the highlight.
+    if let Some(anon_id) = element.anon_text_child {
+        if arena.get(anon_id).map(|e| e.anonymous).unwrap_or(false) {
+            return text_hit_at(arena, anon_id, cursor_x, cursor_y, font_system);
+        }
+    }
     let text = match &element.content {
         ElementContent::Text(t) if !t.is_empty() => t,
         _ => return None,
@@ -1040,21 +1312,26 @@ fn find_nearest_text_in_subtree(
         return Some(result);
     }
 
-    // If this element has text, compute distance for "nearest" fallback
-    if let ElementContent::Text(ref text) = element.content {
-        if !text.is_empty() {
-            let rect = element.layout_rect;
-            let center_y = rect.y + rect.height * 0.5;
-            let dist = (cursor_y - center_y).abs();
+    // If this element has text, compute distance for "nearest" fallback.
+    // Hosts whose text lives in an anonymous box are skipped: the box is a
+    // child of this subtree and provides the candidate with correct rect
+    // math and the text-owning NodeId.
+    if element.anon_text_child.is_none() {
+        if let ElementContent::Text(ref text) = element.content {
+            if !text.is_empty() {
+                let rect = element.layout_rect;
+                let center_y = rect.y + rect.height * 0.5;
+                let dist = (cursor_y - center_y).abs();
 
-            let is_closer = best.as_ref().is_none_or(|(_, _, d)| dist < *d);
-            if is_closer {
-                let clamped_x = cursor_x.clamp(rect.x, rect.x + rect.width);
-                let clamped_y = cursor_y.clamp(rect.y, rect.y + rect.height);
-                if let Some((_, offset)) =
-                    text_hit_at(arena, node_id, clamped_x, clamped_y, font_system)
-                {
-                    *best = Some((node_id, offset, dist));
+                let is_closer = best.as_ref().is_none_or(|(_, _, d)| dist < *d);
+                if is_closer {
+                    let clamped_x = cursor_x.clamp(rect.x, rect.x + rect.width);
+                    let clamped_y = cursor_y.clamp(rect.y, rect.y + rect.height);
+                    if let Some((_, offset)) =
+                        text_hit_at(arena, node_id, clamped_x, clamped_y, font_system)
+                    {
+                        *best = Some((node_id, offset, dist));
+                    }
                 }
             }
         }

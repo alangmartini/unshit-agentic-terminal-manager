@@ -162,6 +162,11 @@ fn collect_text_for_node(harness: &TestHarness, node_id: NodeId) -> String {
 
 fn collect_text_recursive(harness: &TestHarness, node_id: NodeId, out: &mut String) {
     if let Some(element) = harness.arena().get(node_id) {
+        // Anonymous text boxes mirror their host's text; including them
+        // would double every mixed-content host's text ("HelloHello").
+        if element.anonymous {
+            return;
+        }
         if let ElementContent::Text(ref text) = element.content {
             out.push_str(text);
         }

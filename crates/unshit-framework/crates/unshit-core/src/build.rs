@@ -205,6 +205,14 @@ fn resolve_all_styles_with_transitions_scoped(
     mut active_transitions: Option<&mut ActiveTransitions>,
     active_root_scope: Option<ScopeKey>,
 ) {
+    // Anonymous text boxes are invisible to the cascade: their style is
+    // derived from their host's computed style by the layout sync (the
+    // single writer; see `layout::sync_anonymous_text_child`). Rule-matching
+    // them here would stomp the derivation with `span`/`*` matches and
+    // could even register transitions on them.
+    if arena.get(node_id).map(|e| e.anonymous).unwrap_or(false) {
+        return;
+    }
     let mut resolved_style = cascade::resolve_style_fv(
         arena,
         stylesheet,
@@ -376,6 +384,11 @@ fn resolve_dirty_styles_with_transitions_scoped(
     mut active_transitions: Option<&mut ActiveTransitions>,
     active_root_scope: Option<ScopeKey>,
 ) {
+    // Anonymous text boxes are invisible to the cascade (see the matching
+    // skip in `resolve_all_styles_with_transitions_scoped`).
+    if arena.get(node_id).map(|e| e.anonymous).unwrap_or(false) {
+        return;
+    }
     // Short-circuit: if this node has no style work anywhere in its subtree,
     // skip it entirely.
     let needs_style_work = arena
@@ -566,6 +579,11 @@ pub fn tick_all_transitions(
     // with the interpolated style values.
     for &nid in &ticked_nodes {
         mark_node_paint_dirty(arena, nid);
+        // Ticks run on PAINT-only frames where the layout sync (the normal
+        // derivation point for anonymous text boxes) never runs; refresh
+        // the box's style copy here or its color/opacity/font would freeze
+        // at the value captured on the last layout frame.
+        crate::layout::refresh_anon_text_style(arena, nid);
     }
 
     active.has_active()
@@ -611,6 +629,8 @@ pub fn tick_all_animations(
     let ticked = driver.tick(arena, stylesheet, now);
     for &nid in &ticked {
         mark_node_paint_dirty(arena, nid);
+        // Same anonymous-text-box refresh as in `tick_all_transitions`.
+        crate::layout::refresh_anon_text_style(arena, nid);
     }
 }
 
@@ -623,6 +643,11 @@ pub fn scale_all_styles(arena: &mut NodeArena, node_id: NodeId, scale: f32) {
     let children = arena.children(node_id);
 
     if let Some(element) = arena.get_mut(node_id) {
+        // Anonymous text boxes copy their host's ALREADY-SCALED style in
+        // the layout sync; scaling the stored copy here would double-scale.
+        if element.anonymous {
+            return;
+        }
         element.computed_style.scale_by(scale);
     }
 

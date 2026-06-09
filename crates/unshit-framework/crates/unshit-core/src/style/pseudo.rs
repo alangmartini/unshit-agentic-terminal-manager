@@ -320,6 +320,7 @@ fn resolve_pseudo_slot(
             elem.content = element_content;
             elem.computed_style = pseudo_style;
             elem.synthetic = true;
+            elem.pseudo_slot = Some(slot);
             let new_id = arena.alloc(elem);
 
             match slot {

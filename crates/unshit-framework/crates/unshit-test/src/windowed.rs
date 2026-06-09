@@ -463,7 +463,7 @@ impl WindowedTest {
     pub fn query(&self, selector: &str) -> Option<crate::ElementSnapshot> {
         let state = self.state.as_ref()?;
         for (node_id, element) in state.arena.iter() {
-            if matches_selector(selector, element) {
+            if !element.anonymous && matches_selector(selector, element) {
                 return Some(snapshot_from(node_id, element));
             }
         }
@@ -478,7 +478,7 @@ impl WindowedTest {
         state
             .arena
             .iter()
-            .filter(|(_, element)| matches_selector(selector, element))
+            .filter(|(_, element)| !element.anonymous && matches_selector(selector, element))
             .map(|(node_id, element)| snapshot_from(node_id, element))
             .collect()
     }

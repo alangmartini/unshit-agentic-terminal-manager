@@ -301,6 +301,27 @@ pub struct Element {
     // synthesized child) and must not participate in user tree reconciliation.
     pub synthetic: bool,
 
+    // Which pseudo element slot a synthetic node was allocated for, stamped
+    // by the pseudo resolver. Used by the anonymous text box linker to keep
+    // a deterministic child order (::before/::placeholder, anonymous text,
+    // user children, ::after). None for user nodes and anonymous text boxes.
+    pub pseudo_slot: Option<crate::style::parse::PseudoElement>,
+
+    // Anonymous text box marker. When true this element is a framework
+    // generated text child that carries its host's text for layout, paint,
+    // and hit testing because the host has both text content and element
+    // children (browser-style anonymous box). Always also `synthetic`.
+    // Anonymous nodes are skipped by the cascade and DPI scaling: their
+    // computed_style is derived from the host's style by the layout sync
+    // (the single writer) via `ComputedStyle::derive_anonymous_text`.
+    pub anonymous: bool,
+
+    // When this element owns an anonymous text box, the child's id. This is
+    // the single source of truth that the renderer (suppress host text
+    // paint) and text hit testing (redirect into the child) gate on. Dies
+    // with the element; generational NodeIds make stale reads safe.
+    pub anon_text_child: Option<NodeId>,
+
     // Memo key for subtree memoization. When present and matching the new
     // definition's memo_key, the entire subtree is skipped during reconciliation.
     pub memo_key: Option<u64>,
@@ -363,6 +384,9 @@ impl Element {
             cursor_state: CursorState::default(),
             selection_style: None,
             synthetic: false,
+            pseudo_slot: None,
+            anonymous: false,
+            anon_text_child: None,
             memo_key: None,
             node_ref: None,
             style_overrides: SmallVec::new(),

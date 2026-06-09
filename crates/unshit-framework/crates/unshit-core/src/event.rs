@@ -457,6 +457,15 @@ fn hit_test_in_layer(
     scroll_offset_y: f32,
 ) -> Option<NodeId> {
     let element = arena.get(node_id)?;
+
+    // Anonymous text boxes are transparent to hit testing: the host stays
+    // the hover/click/cursor target exactly as when it painted the text
+    // itself. Text-position math goes through `layout::text_hit_at`, which
+    // redirects from the host into the box.
+    if element.anonymous {
+        return None;
+    }
+
     let rect = element.layout_rect;
     let render_x = rect.x - scroll_offset_x;
     let render_y = rect.y - scroll_offset_y;

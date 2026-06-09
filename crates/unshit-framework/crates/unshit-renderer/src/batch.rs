@@ -2219,8 +2219,30 @@ fn walk_for_batch(
             }
         }
     } else {
+        // When the element's text lives in an anonymous text box (the host
+        // has both text and element children), the box paints the text as a
+        // regular child; suppress the host's own text arm so glyphs are not
+        // emitted twice. Field-gated on purpose: if synthesis ever misses a
+        // host, this degrades to the host painting (possibly mis-measured)
+        // text rather than the text vanishing.
+        #[cfg(debug_assertions)]
+        if let ElementContent::Text(t) = &element.content {
+            debug_assert!(
+                t.is_empty()
+                    || !element.has_children()
+                    || matches!(element.tag, Tag::Input | Tag::Select)
+                    || element.synthetic
+                    || element.anon_text_child.is_some(),
+                "text-bearing element with children has no anonymous text box; \
+                 its text will not be measured by layout (tag {:?}, text {:?})",
+                element.tag,
+                t
+            );
+        }
         match &element.content {
-            ElementContent::Text(ref raw_text) if is_visible && !raw_text.is_empty() => {
+            ElementContent::Text(ref raw_text)
+                if is_visible && !raw_text.is_empty() && element.anon_text_child.is_none() =>
+            {
                 let transformed_text = apply_text_transform(raw_text, style.text_transform);
                 let mut text = transformed_text.as_ref();
                 let mut text_color = style.color;
