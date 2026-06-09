@@ -3379,12 +3379,17 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
         }
         "modal.open" => {
-            if !state.settings_open {
-                state.settings_open = true;
-                true
+            if state.settings_open {
+                // Re-pressing the settings hotkey while open closes the
+                // page (toggle behavior), with the same cleanup as
+                // modal.close.
+                state.settings_open = false;
+                state.keybinds.cancel_recording();
+                state.keybinds.error = None;
             } else {
-                false
+                state.settings_open = true;
             }
+            true
         }
         "quick_prompt.open" => {
             if let Some(qp) = state.quick_prompt.take() {
@@ -5515,9 +5520,12 @@ mod tests {
         assert!(dispatch(&mut state, "modal.open"));
         assert!(state.settings_open);
 
-        // Opening again returns false (already open)
-        assert!(!dispatch(&mut state, "modal.open"));
+        // Dispatching again while open toggles the page closed
+        assert!(dispatch(&mut state, "modal.open"));
+        assert!(!state.settings_open);
 
+        assert!(dispatch(&mut state, "modal.open"));
+        assert!(state.settings_open);
         assert!(dispatch(&mut state, "modal.close"));
         assert!(!state.settings_open);
 
