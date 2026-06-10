@@ -40,6 +40,35 @@ pub enum KeybindAction {
     Fullscreen,
 }
 
+/// Display groups for the Keybinds settings page, in render order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeybindGroup {
+    Panes,
+    Tabs,
+    Navigation,
+    Application,
+}
+
+impl KeybindGroup {
+    /// Every group, in display order.
+    pub const ALL: &'static [KeybindGroup] = &[
+        Self::Panes,
+        Self::Tabs,
+        Self::Navigation,
+        Self::Application,
+    ];
+
+    /// Section heading shown on the Keybinds settings page.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Panes => "Panes",
+            Self::Tabs => "Tabs & Sessions",
+            Self::Navigation => "Navigation",
+            Self::Application => "Application",
+        }
+    }
+}
+
 impl KeybindAction {
     /// Every variant, in display order.
     pub const ALL: &'static [KeybindAction] = &[
@@ -116,6 +145,55 @@ impl KeybindAction {
             Self::ZoomIn => "Zoom in",
             Self::ZoomOut => "Zoom out",
             Self::Fullscreen => "Fullscreen",
+        }
+    }
+
+    /// One-line description shown under the label in the Settings UI.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::NewTerminal => "Open a new terminal tab",
+            Self::CloseTab => "Close the current tab",
+            Self::SplitRight => "Open a new pane to the right",
+            Self::SplitDown => "Open a new pane below",
+            Self::Unsplit => "Close the focused split",
+            Self::FocusLeft => "Move focus to the pane on the left",
+            Self::FocusRight => "Move focus to the pane on the right",
+            Self::FocusUp => "Move focus to the pane above",
+            Self::FocusDown => "Move focus to the pane below",
+            Self::NextTab => "Switch to the next tab",
+            Self::PrevTab => "Switch to the previous tab",
+            Self::CommandPalette => "Open the fuzzy command runner",
+            Self::QuickPromptOpen => "Open the quick prompt",
+            Self::RenameSession => "Edit the active session label",
+            Self::ToggleSidebar => "Show or hide the workspace sidebar",
+            Self::OpenSettings => "Open the settings window",
+            Self::ZoomIn => "Increase the terminal font size",
+            Self::ZoomOut => "Decrease the terminal font size",
+            Self::Fullscreen => "Toggle the fullscreen window",
+        }
+    }
+
+    /// Section the action is listed under on the Keybinds settings page.
+    pub fn group(self) -> KeybindGroup {
+        match self {
+            Self::SplitRight
+            | Self::SplitDown
+            | Self::Unsplit
+            | Self::FocusLeft
+            | Self::FocusRight
+            | Self::FocusUp
+            | Self::FocusDown => KeybindGroup::Panes,
+            Self::NewTerminal
+            | Self::CloseTab
+            | Self::NextTab
+            | Self::PrevTab
+            | Self::RenameSession => KeybindGroup::Tabs,
+            Self::CommandPalette | Self::QuickPromptOpen => KeybindGroup::Navigation,
+            Self::ToggleSidebar
+            | Self::OpenSettings
+            | Self::ZoomIn
+            | Self::ZoomOut
+            | Self::Fullscreen => KeybindGroup::Application,
         }
     }
 

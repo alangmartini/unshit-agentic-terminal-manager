@@ -35,6 +35,10 @@ pub struct KeybindsState {
     /// Last validation failure, cleared on the next successful set or
     /// when the user starts a new recording.
     pub error: Option<KeybindError>,
+    /// Live filter text from the Keybinds page toolbar. Matched
+    /// case-insensitively against action labels, descriptions, and combo
+    /// key names. Not persisted.
+    pub filter: String,
 }
 
 impl KeybindsState {
@@ -44,6 +48,7 @@ impl KeybindsState {
             overrides,
             recording: None,
             error: None,
+            filter: String::new(),
         }
     }
 

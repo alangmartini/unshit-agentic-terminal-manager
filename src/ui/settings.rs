@@ -213,7 +213,9 @@ fn settings_section_desc(active: SettingsSection) -> &'static str {
             "Themes, density, and the visual feel of the terminal. Changes apply immediately."
         }
         SettingsSection::Shell => "Default shell, font, scrollback.",
-        SettingsSection::Keybinds => "Every binding, grouped.",
+        SettingsSection::Keybinds => {
+            "Click any shortcut to rebind it. Press a new combination, or Esc to cancel."
+        }
         SettingsSection::Sessions => "Daemon sessions and workspace attachment.",
         SettingsSection::Notifications => "Desktop notifications and focused panes.",
         SettingsSection::DangerZone => "Destructive session and close behavior.",
@@ -1311,15 +1313,148 @@ fn shell_args_input(
 }
 
 fn build_keybinds_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    use crate::keybinds::KeybindGroup;
+
     let mut section = section_shell("keybinds")
         .with_child(keybind_restart_banner())
         .with_child(keybind_error_banner(state.keybinds.error.as_ref()));
 
-    for action in KeybindAction::ALL {
-        section = section.with_child(editable_keybind_row(*action, state, shared));
+    let filter = state.keybinds.filter.trim().to_lowercase();
+    let total = KeybindAction::ALL.len();
+    let mut visible_total = 0usize;
+    let mut groups: Vec<ElementDef> = Vec::new();
+
+    for group in KeybindGroup::ALL {
+        let actions: Vec<KeybindAction> = KeybindAction::ALL
+            .iter()
+            .copied()
+            .filter(|a| a.group() == *group)
+            .filter(|a| keybind_matches_filter(*a, state, &filter))
+            .collect();
+        if actions.is_empty() {
+            continue;
+        }
+        visible_total += actions.len();
+        groups.push(keybind_group(*group, &actions, state, shared));
+    }
+
+    section = section.with_child(keybind_toolbar(state, shared, visible_total, total));
+
+    if visible_total == 0 {
+        section = section.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("kb-empty")
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("big")
+                        .with_text(format!("No commands match \u{201c}{}\u{201d}", filter)),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Div).with_text("Try a different command or key."),
+                ),
+        );
+    } else {
+        for g in groups {
+            section = section.with_child(g);
+        }
     }
 
     section.with_child(keybind_footer(shared))
+}
+
+/// Case-insensitive match against label, description, and key names.
+fn keybind_matches_filter(action: KeybindAction, state: &UiSnapshot, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let combo = state.keybinds.effective(action);
+    let hay = format!(
+        "{} {} {}",
+        action.label(),
+        action.description(),
+        combo_parts(combo).join(" ")
+    )
+    .to_lowercase();
+    hay.contains(filter)
+}
+
+fn keybind_toolbar(
+    state: &UiSnapshot,
+    shared: &SharedState,
+    visible: usize,
+    total: usize,
+) -> ElementDef {
+    let s = shared.clone();
+    let count = if state.keybinds.filter.trim().is_empty() {
+        format!("{total} commands")
+    } else {
+        format!("{visible} of {total}")
+    };
+    ElementDef::new(Tag::Div)
+        .with_class("kb-toolbar")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("kb-filter")
+                .with_child(svg_icon(icon_magnifier()))
+                .with_child(
+                    ElementDef::new(Tag::Input)
+                        .with_id("kb-search")
+                        .with_class("kb-filter-input")
+                        .with_placeholder("filter commands or keys...")
+                        .on_change(move |value| {
+                            let value = value.to_string();
+                            mutate_with(&s, |st| {
+                                st.keybinds.filter = value.clone();
+                            });
+                        }),
+                ),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("kb-count")
+                .with_text(count),
+        )
+}
+
+fn keybind_group(
+    group: crate::keybinds::KeybindGroup,
+    actions: &[KeybindAction],
+    state: &UiSnapshot,
+    shared: &SharedState,
+) -> ElementDef {
+    let head = ElementDef::new(Tag::Div)
+        .with_class("kb-group-head")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("kb-group-title")
+                .with_text(group.title()),
+        )
+        .with_child(ElementDef::new(Tag::Span).with_class("kb-group-rule"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("kb-group-count")
+                .with_text(actions.len().to_string()),
+        );
+
+    let mut list = ElementDef::new(Tag::Div).with_class("kb-list");
+    for action in actions {
+        list = list.with_child(keybind_row(*action, state, shared));
+    }
+
+    ElementDef::new(Tag::Div)
+        .with_class("kb-group")
+        .with_child(head)
+        .with_child(list)
+}
+
+fn keybind_group_icon(group: crate::keybinds::KeybindGroup) -> SvgNode {
+    use crate::keybinds::KeybindGroup;
+    match group {
+        KeybindGroup::Panes => icon_split_panes(),
+        KeybindGroup::Tabs => icon_tab_folder(),
+        KeybindGroup::Navigation => icon_chevrons(),
+        KeybindGroup::Application => icon_app_target(),
+    }
 }
 
 fn build_notifications_section(shared: &SharedState) -> ElementDef {
@@ -1371,11 +1506,7 @@ fn keybind_error_banner(err: Option<&KeybindError>) -> ElementDef {
     }
 }
 
-fn editable_keybind_row(
-    action: KeybindAction,
-    state: &UiSnapshot,
-    shared: &SharedState,
-) -> ElementDef {
+fn keybind_row(action: KeybindAction, state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let is_recording = state.keybinds.recording == Some(action);
     let is_overridden = state.keybinds.overrides.contains_key(&action);
     let has_error = state
@@ -1386,10 +1517,31 @@ fn editable_keybind_row(
         .unwrap_or(false);
     let combo = state.keybinds.effective(action);
 
+    let meta = ElementDef::new(Tag::Div)
+        .with_class("kb-row-meta")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("kb-row-name")
+                .with_text(action.label()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("kb-row-desc")
+                .with_text(action.description()),
+        );
+
     let mut row = ElementDef::new(Tag::Div)
-        .with_class("keybind-row")
-        .with_child(setting_meta(action.label(), None))
-        .with_child(combo_cell(action, combo, is_recording, has_error, shared));
+        .with_class("kb-row")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("kb-row-icon")
+                .with_svg(keybind_group_icon(action.group())),
+        )
+        .with_child(meta)
+        .with_child(keybind_binding(action, combo, is_recording, has_error, shared));
+    if is_recording {
+        row = row.with_class("recording");
+    }
 
     if is_overridden {
         row = row.with_child(reset_row_button(action, shared));
@@ -1398,14 +1550,16 @@ fn editable_keybind_row(
     row
 }
 
-fn combo_cell(
+/// The clickable binding button: keycaps joined by "+", with an edit pencil
+/// that fades in on row hover; flips to a recording label while capturing.
+fn keybind_binding(
     action: KeybindAction,
     combo: KeyCombo,
     is_recording: bool,
     has_error: bool,
     shared: &SharedState,
 ) -> ElementDef {
-    let mut btn = ElementDef::new(Tag::Button).with_class("keybind-cell");
+    let mut btn = ElementDef::new(Tag::Button).with_class("kb-binding");
     if is_recording {
         btn = btn.with_class("recording");
     }
@@ -1416,23 +1570,31 @@ fn combo_cell(
     if is_recording {
         btn = btn.with_child(
             ElementDef::new(Tag::Span)
-                .with_class("keybind-recording-label")
-                .with_text("press keys... (esc to cancel)"),
+                .with_class("rec-label")
+                .with_child(ElementDef::new(Tag::Span).with_class("rec-dot"))
+                .with_child(
+                    ElementDef::new(Tag::Span).with_text("press keys... (esc to cancel)"),
+                ),
         );
     } else {
         // The "+" separators are real elements rather than `::before` pseudo
         // content. The framework now measures text+pseudo hosts correctly
         // (via anonymous text boxes), so this is a stylistic choice: real
-        // spans keep the pills plain childless text leaves and the combo
+        // spans keep the keycaps plain childless text leaves and the combo
         // structure explicit in one place.
+        let mut keys = ElementDef::new(Tag::Span).with_class("keys");
         for (i, part) in combo_parts(combo).into_iter().enumerate() {
             if i > 0 {
-                btn = btn.with_child(
-                    ElementDef::new(Tag::Span).with_class("keybind-plus").with_text("+"),
-                );
+                keys = keys
+                    .with_child(ElementDef::new(Tag::Span).with_class("plus").with_text("+"));
             }
-            btn = btn.with_child(pill("keybind-key", None, &part));
+            keys = keys.with_child(pill("keycap", None, &part));
         }
+        btn = btn.with_child(keys).with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("edit-pencil")
+                .with_svg(icon_pencil()),
+        );
     }
 
     let s = shared.clone();
@@ -1858,7 +2020,7 @@ fn keybind_footer(shared: &SharedState) -> ElementDef {
             ElementDef::new(Tag::Button)
                 .with_class("btn")
                 .with_class("ghost")
-                .with_text("reset to defaults")
+                .with_text("restore defaults")
                 .on_click(move || {
                     mutate_with(&s, |st| dispatch(st, "keybind.reset_all"));
                 }),
@@ -3590,14 +3752,79 @@ mod tests {
 
     // -- build_keybinds_section -------------------------------------------------
 
+    /// Find the kb-row whose name label equals `name`.
+    fn find_kb_row<'a>(el: &'a ElementDef, name: &str) -> Option<&'a ElementDef> {
+        if el.classes.contains(&"kb-row".to_string()) {
+            let named = el
+                .children
+                .iter()
+                .find(|c| c.classes.contains(&"kb-row-meta".to_string()))
+                .and_then(|meta| meta.children.first())
+                .and_then(|n| text_of(n));
+            if named == Some(name) {
+                return Some(el);
+            }
+        }
+        el.children.iter().find_map(|c| find_kb_row(c, name))
+    }
+
     #[test]
-    fn keybinds_section_has_banner_one_row_per_action_and_footer() {
+    fn keybinds_section_has_toolbar_groups_rows_and_footer() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_keybinds_section(&snap, &shared);
-        // title + restart banner + error banner + one row per action + footer
-        let expected = 4 + KeybindAction::ALL.len();
-        assert_eq!(el.children.len(), expected);
+        // children: [title, restart banner, error banner, toolbar, group x4, footer]
+        assert_eq!(el.children.len(), 9);
+        assert!(el.children[3].classes.contains(&"kb-toolbar".to_string()));
+        assert_eq!(count_with_class(&el, "kb-group"), 4);
+        assert_eq!(count_with_class(&el, "kb-row"), KeybindAction::ALL.len());
+        // Every row carries an icon, a name, and a description.
+        assert_eq!(count_with_class(&el, "kb-row-icon"), KeybindAction::ALL.len());
+        assert_eq!(count_with_class(&el, "kb-row-desc"), KeybindAction::ALL.len());
+    }
+
+    #[test]
+    fn keybinds_toolbar_shows_filter_and_count() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_keybinds_section(&snap, &shared);
+        let toolbar = &el.children[3];
+        let filter = &toolbar.children[0];
+        assert!(filter.classes.contains(&"kb-filter".to_string()));
+        assert!(find_first_with_class(filter, "kb-filter-input").is_some());
+        let count = &toolbar.children[1];
+        assert!(count.classes.contains(&"kb-count".to_string()));
+        assert_eq!(
+            text_of(count),
+            Some(format!("{} commands", KeybindAction::ALL.len()).as_str())
+        );
+    }
+
+    #[test]
+    fn keybinds_filter_narrows_rows_and_count() {
+        let mut state = seed_state();
+        state.keybinds.filter = "palette".to_string();
+        let snap = state.ui_snapshot();
+        let shared = Arc::new(Mutex::new(state));
+        let el = build_keybinds_section(&snap, &shared);
+        assert_eq!(count_with_class(&el, "kb-row"), 1);
+        assert!(find_kb_row(&el, "Command palette").is_some());
+        let count = find_first_with_class(&el, "kb-count").unwrap();
+        assert_eq!(
+            text_of(count),
+            Some(format!("1 of {}", KeybindAction::ALL.len()).as_str())
+        );
+    }
+
+    #[test]
+    fn keybinds_filter_with_no_matches_shows_empty_state() {
+        let mut state = seed_state();
+        state.keybinds.filter = "zzz-no-such-command".to_string();
+        let snap = state.ui_snapshot();
+        let shared = Arc::new(Mutex::new(state));
+        let el = build_keybinds_section(&snap, &shared);
+        assert_eq!(count_with_class(&el, "kb-row"), 0);
+        assert!(find_first_with_class(&el, "kb-empty").is_some());
     }
 
     #[test]
@@ -3605,31 +3832,36 @@ mod tests {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_keybinds_section(&snap, &shared);
-        // children: [title, restart_banner, error_banner, row0, row1, ..., footer]
-        let first_row = &el.children[3];
-        assert!(first_row.classes.contains(&"keybind-row".to_string()));
-        // cell: [setting_meta, combo_cell, (maybe reset)]
-        let combo_cell = &first_row.children[1];
-        assert!(combo_cell.classes.contains(&"keybind-cell".to_string()));
-        // Default NewTerminal is Ctrl+T: two pills joined by a "+" separator.
-        assert_eq!(combo_cell.children.len(), 3);
-        assert!(combo_cell.children[0].classes.contains(&"keybind-key".to_string()));
-        assert_eq!(text_of(&combo_cell.children[0]), Some("Ctrl"));
-        assert!(combo_cell.children[1].classes.contains(&"keybind-plus".to_string()));
-        assert_eq!(text_of(&combo_cell.children[1]), Some("+"));
-        assert!(combo_cell.children[2].classes.contains(&"keybind-key".to_string()));
-        assert_eq!(text_of(&combo_cell.children[2]), Some("T"));
+        let row = find_kb_row(&el, "New terminal").expect("New terminal row");
+        // row: [icon, meta, binding]
+        assert_eq!(row.children.len(), 3);
+        assert!(row.children[0].classes.contains(&"kb-row-icon".to_string()));
+        let binding = &row.children[2];
+        assert!(binding.classes.contains(&"kb-binding".to_string()));
+        // binding: [keys, edit-pencil]
+        let keys = &binding.children[0];
+        assert!(keys.classes.contains(&"keys".to_string()));
+        // Default NewTerminal is Ctrl+T: two keycaps joined by a "+".
+        assert_eq!(keys.children.len(), 3);
+        assert!(keys.children[0].classes.contains(&"keycap".to_string()));
+        assert_eq!(text_of(&keys.children[0]), Some("Ctrl"));
+        assert!(keys.children[1].classes.contains(&"plus".to_string()));
+        assert_eq!(text_of(&keys.children[1]), Some("+"));
+        assert!(keys.children[2].classes.contains(&"keycap".to_string()));
+        assert_eq!(text_of(&keys.children[2]), Some("T"));
+        assert!(binding.children[1].classes.contains(&"edit-pencil".to_string()));
     }
 
     #[test]
     fn keybind_plus_separator_is_a_real_element_not_a_pseudo() {
         let css = include_str!("../../assets/styles.css");
         // Pins the chosen structure: the "+" separators are real spans
-        // emitted by combo_cell (styled via .keybind-plus), not pseudo
+        // emitted by keybind_binding (styled via .plus), not pseudo
         // content. (The engine measures text+pseudo hosts correctly via
         // anonymous text boxes; this keeps the combo structure explicit.)
-        assert!(!css.contains(".keybind-key:not(:first-child)::before"));
-        assert!(css.contains(".keybind-plus {"));
+        assert!(!css.contains(".keycap:not(:first-child)::before"));
+        assert!(css.contains(".plus {"));
+        assert!(css.contains(".keycap {"));
     }
 
     #[test]
@@ -3652,8 +3884,8 @@ mod tests {
         );
         harness.step();
 
-        let pills = harness.query_all(".keybind-key");
-        assert!(!pills.is_empty(), "keybinds page should render key pills");
+        let pills = harness.query_all(".keycap");
+        assert!(!pills.is_empty(), "keybinds page should render keycaps");
 
         for pill in &pills {
             // Pills are plain childless text leaves by design (separators
@@ -3689,7 +3921,7 @@ mod tests {
         }
 
         // The "+" separators between pills must lay out as visible elements.
-        let plusses = harness.query_all(".keybind-plus");
+        let plusses = harness.query_all(".plus");
         assert!(!plusses.is_empty(), "multi-key combos should render + separators");
         for plus in &plusses {
             assert!(
@@ -3708,7 +3940,7 @@ mod tests {
         let footer = el.children.last().unwrap();
         assert!(footer.classes.contains(&"keybind-footer".to_string()));
         let btn = &footer.children[0];
-        assert_eq!(text_of(btn), Some("reset to defaults"));
+        assert_eq!(text_of(btn), Some("restore defaults"));
     }
 
     #[test]
@@ -3724,11 +3956,10 @@ mod tests {
         let snap = state.ui_snapshot();
         let shared = Arc::new(Mutex::new(state));
         let el = build_keybinds_section(&snap, &shared);
-        // NewTerminal is the first row (index 3 after title + 2 banners).
-        let first_row = &el.children[3];
-        // With override: [meta, combo_cell, reset_btn] -> 3 children.
-        assert_eq!(first_row.children.len(), 3);
-        let reset = &first_row.children[2];
+        let row = find_kb_row(&el, "New terminal").expect("New terminal row");
+        // With override: [icon, meta, binding, reset_btn] -> 4 children.
+        assert_eq!(row.children.len(), 4);
+        let reset = &row.children[3];
         assert!(reset.classes.contains(&"keybind-reset".to_string()));
     }
 
@@ -3741,12 +3972,17 @@ mod tests {
         let snap = state.ui_snapshot();
         let shared = Arc::new(Mutex::new(state));
         let el = build_keybinds_section(&snap, &shared);
-        let first_row = &el.children[3];
-        let combo_cell = &first_row.children[1];
-        assert!(combo_cell.classes.contains(&"recording".to_string()));
-        assert_eq!(combo_cell.children.len(), 1);
+        let row = find_kb_row(&el, "New terminal").expect("New terminal row");
+        assert!(row.classes.contains(&"recording".to_string()));
+        let binding = &row.children[2];
+        assert!(binding.classes.contains(&"recording".to_string()));
+        // binding: [rec-label [rec-dot, text]]
+        assert_eq!(binding.children.len(), 1);
+        let rec = &binding.children[0];
+        assert!(rec.classes.contains(&"rec-label".to_string()));
+        assert!(rec.children[0].classes.contains(&"rec-dot".to_string()));
         assert_eq!(
-            text_of(&combo_cell.children[0]),
+            text_of(&rec.children[1]),
             Some("press keys... (esc to cancel)")
         );
     }

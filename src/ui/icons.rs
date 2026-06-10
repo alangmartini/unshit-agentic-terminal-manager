@@ -131,6 +131,41 @@ pub fn icon_chevrons() -> SvgNode {
     )
 }
 
+/// Split panes — group icon for the Keybinds "Panes" section.
+pub fn icon_split_panes() -> SvgNode {
+    group(
+        root_attrs(1.2, StrokeLineCap::Butt, StrokeLineJoin::Miter),
+        vec![rect(2.5, 3.5, 11.0, 9.0, 0.0), line(8.0, 3.5, 8.0, 12.5)],
+    )
+}
+
+/// Tab/folder outline — group icon for the Keybinds "Tabs & Sessions" section.
+pub fn icon_tab_folder() -> SvgNode {
+    group(
+        root_attrs(1.2, StrokeLineCap::Butt, StrokeLineJoin::Round),
+        vec![path_d("M2.5 5.5h4l1 -1.4h6v8.4h-11z")],
+    )
+}
+
+/// Circled dot — group icon for the Keybinds "Application" section.
+pub fn icon_app_target() -> SvgNode {
+    let mut dot = circle(8.0, 8.0, 1.6);
+    dot.attrs.fill = Some(SvgPaint::Current);
+    dot.attrs.stroke = Some(SvgPaint::None);
+    group(
+        root_attrs(1.2, StrokeLineCap::Butt, StrokeLineJoin::Miter),
+        vec![circle(8.0, 8.0, 5.5), dot],
+    )
+}
+
+/// Pencil — rebind affordance on keybind rows.
+pub fn icon_pencil() -> SvgNode {
+    group(
+        root_attrs(1.2, StrokeLineCap::Butt, StrokeLineJoin::Round),
+        vec![path_d("M10.5 3.5l2 2L6 12l-2.6 .6L4 10z")],
+    )
+}
+
 pub fn icon_terminal() -> SvgNode {
     group(
         root_attrs(1.2, StrokeLineCap::Round, StrokeLineJoin::Round),

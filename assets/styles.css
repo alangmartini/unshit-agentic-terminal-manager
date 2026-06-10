@@ -6425,11 +6425,85 @@ body.dragging-pane {
 /* KEYBIND ROWS                                                 */
 /* ============================================================ */
 
-.keybind-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+.kb-toolbar {
+  display: flex;
   align-items: center;
   gap: var(--sp-5);
+  margin-bottom: var(--sp-5);
+}
+
+.kb-filter {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4);
+  background: rgba(20, 17, 12, 0.6);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  color: var(--fg-muted);
+}
+
+.kb-filter svg {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+}
+
+.kb-filter-input {
+  flex: 1;
+  height: 22px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--fg-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+}
+
+.kb-count {
+  color: var(--fg-tertiary);
+  font: var(--type-meta);
+  white-space: nowrap;
+}
+
+.kb-group {
+  margin-bottom: var(--sp-6);
+}
+
+.kb-group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  margin: var(--sp-5) 0 var(--sp-2);
+}
+
+.kb-group-title {
+  color: var(--amber-300);
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  font-weight: 600;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.kb-group-rule {
+  flex: 1;
+  height: 1px;
+  background: var(--border-hair);
+}
+
+.kb-group-count {
+  color: var(--fg-muted);
+  font: var(--type-meta);
+}
+
+.kb-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-4);
   min-height: 46px;
   padding: var(--sp-3);
   margin: 0 calc(var(--sp-3) * -1);
@@ -6438,22 +6512,50 @@ body.dragging-pane {
   transition: color var(--dur-fast) var(--ease-std), background var(--dur-fast) var(--ease-std), border-color var(--dur-fast) var(--ease-std), box-shadow var(--dur-fast) var(--ease-std), opacity var(--dur-fast) var(--ease-std), transform var(--dur-fast) var(--ease-std);
 }
 
-.keybind-row:last-of-type {
+.kb-row:last-of-type {
   border-bottom: none;
 }
 
-.keybind-row:hover {
+.kb-row:hover {
   background: rgba(41, 35, 26, 0.58);
 }
 
-.keybind-keys {
+.kb-row-icon {
   display: flex;
   align-items: center;
-  gap: 3px;
-  flex-shrink: 0;
+  justify-content: center;
+  color: var(--fg-tertiary);
 }
 
-.keybind-key {
+.kb-row-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+.kb-row:hover .kb-row-icon {
+  color: var(--amber-300);
+}
+
+.kb-row-name {
+  color: var(--fg-primary);
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+  font-weight: 600;
+}
+
+.kb-row-desc {
+  margin-top: 2px;
+  color: var(--fg-tertiary);
+  font-size: var(--t-xs);
+}
+
+.keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.keycap {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -6473,22 +6575,54 @@ body.dragging-pane {
   box-shadow: 0 1px 0 var(--border-soft);
 }
 
-.keybind-row:hover .keybind-key {
+.kb-row:hover .keycap {
   border-color: var(--border-strong);
   color: var(--amber-100);
   box-shadow: 0 1px 0 var(--border-default), 0 0 6px var(--accent-a10);
 }
 
-/* The "+" between key pills is a real span emitted by combo_cell(). (The
+/* The "+" between keycaps is a real span emitted by keybind_binding(). (The
    engine also supports text-content pseudos on text-bearing elements via
    anonymous text boxes; real spans are kept here so the combo structure
-   stays explicit in combo_cell.) */
-.keybind-plus {
+   stays explicit in one place.) */
+.plus {
   color: var(--fg-muted);
   font-family: var(--font-mono);
   font-size: var(--t-xs);
   font-weight: 600;
   line-height: 1;
+}
+
+.edit-pencil {
+  display: flex;
+  align-items: center;
+  margin-left: var(--sp-2);
+  color: var(--fg-muted);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-std);
+}
+
+.edit-pencil svg {
+  width: 11px;
+  height: 11px;
+}
+
+.kb-row:hover .edit-pencil {
+  opacity: 1;
+}
+
+.kb-empty {
+  padding: var(--sp-10) var(--sp-6);
+  color: var(--fg-tertiary);
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+  text-align: center;
+}
+
+.kb-empty .big {
+  margin-bottom: var(--sp-3);
+  color: var(--fg-secondary);
+  font-size: var(--t-md);
 }
 
 .keybind-footer {
@@ -6523,7 +6657,7 @@ body.dragging-pane {
   display: none;
 }
 
-.keybind-cell {
+.kb-binding {
   display: inline-flex;
   align-items: center;
   gap: 3px;
@@ -6534,26 +6668,37 @@ body.dragging-pane {
   cursor: pointer;
 }
 
-.keybind-row:hover .keybind-cell {
+.kb-row:hover .kb-binding {
   border-color: var(--border-soft);
 }
 
-.keybind-cell.recording {
+.kb-binding.recording {
   border-style: solid;
   border-color: var(--amber-100);
   background: var(--accent-a08);
 }
 
-.keybind-cell.conflict {
+.kb-binding.conflict {
   border-style: solid;
   border-color: rgb(220, 80, 80);
 }
 
-.keybind-recording-label {
+.rec-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
   color: var(--amber-100);
   font-family: var(--font-mono);
   font-size: var(--t-xs);
   font-style: italic;
+}
+
+.rec-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber-100);
+  box-shadow: 0 0 6px var(--accent-a40);
 }
 
 .keybind-reset {
