@@ -120,13 +120,20 @@ pub fn build_subtree_bump<'a>(
     build_subtree(&owned, arena, taffy, parent, pending_mounts)
 }
 
+/// Returns the NodeId that is live for `new_def` after reconciliation.
+/// This is `node_id` itself except on the tag-change path, where the old
+/// subtree is deallocated and a freshly built replacement takes its place.
+/// Callers that record child ids (notably `reconcile_children`) must use
+/// the returned id, not the one they passed in — the passed-in id may be
+/// dead, and stitching sibling links through a dead id silently truncates
+/// the child chain.
 fn reconcile_inner(
     arena: &mut NodeArena,
     taffy: &mut TaffyTree<TextMeasureCtx>,
     node_id: NodeId,
     new_def: &ElementDef,
     pending_mounts: &mut PendingMounts,
-) {
+) -> NodeId {
     let existing_tag = arena.get(node_id).map(|e| e.tag);
 
     match existing_tag {
@@ -163,13 +170,14 @@ fn reconcile_inner(
                     parent.last_child = new_id;
                 }
             }
+            new_id
         }
         Some(_) => {
             // Before updating: check the memo fence. If the new definition carries
             // a memo_key that matches the live element's memo_key, the entire
             // subtree is considered up-to-date and we skip all diffing.
             if memo_hit(arena, node_id, new_def) {
-                return;
+                return node_id;
             }
             // Tags match: update properties in place.
             update_element_properties(arena, node_id, new_def);
@@ -178,9 +186,11 @@ fn reconcile_inner(
             if new_def.tag != Tag::Select {
                 reconcile_children(arena, taffy, node_id, &new_def.children, pending_mounts);
             }
+            node_id
         }
         None => {
             // Node not found (stale id). Nothing to do.
+            node_id
         }
     }
 }
@@ -414,8 +424,10 @@ fn reconcile_children(
         if let Some(rkey) = reconciliation_key(def) {
             if let Some(&old_id) = keyed_old.get(rkey) {
                 // Keyed match: reconcile handles memo check internally.
-                reconcile_inner(arena, taffy, old_id, def, pending_mounts);
-                matched_user.push(old_id);
+                // Stitch the id reconcile reports as live — on a tag change
+                // the matched node is replaced and `old_id` is dead.
+                let live_id = reconcile_inner(arena, taffy, old_id, def, pending_mounts);
+                matched_user.push(live_id);
                 used_old.insert(old_id);
                 found = true;
             }
@@ -425,9 +437,10 @@ fn reconcile_children(
                 let candidate = unkeyed_old[unkeyed_idx];
                 unkeyed_idx += 1;
                 if !used_old.contains(&candidate) {
-                    // reconcile handles memo check internally.
-                    reconcile_inner(arena, taffy, candidate, def, pending_mounts);
-                    matched_user.push(candidate);
+                    // reconcile handles memo check internally. Stitch the
+                    // live id (see keyed branch above).
+                    let live_id = reconcile_inner(arena, taffy, candidate, def, pending_mounts);
+                    matched_user.push(live_id);
                     used_old.insert(candidate);
                     found = true;
                     break;
@@ -819,6 +832,80 @@ mod tests {
         dealloc_subtree(&mut arena, &mut taffy, root_id);
 
         assert!(nr.get().is_none(), "NodeRef must be cleared after dealloc");
+    }
+
+    /// Regression: when an unkeyed child match crosses a tag change, the
+    /// reconciler deallocates the matched node and builds a replacement.
+    /// The child chain must stitch the replacement id, not the dead one —
+    /// stitching the dead id silently truncates the sibling chain (the
+    /// "blank content column after closing settings" bug).
+    #[test]
+    fn unkeyed_tag_change_keeps_replacement_in_child_chain() {
+        let mut arena = NodeArena::new();
+        let mut taffy = TaffyTree::new();
+        let mut pending = Vec::new();
+
+        // Old tree: parent with [Div, Span, Div].
+        let old_def = ElementDef::new(Tag::Div)
+            .with_child(ElementDef::new(Tag::Div).with_class("a"))
+            .with_child(ElementDef::new(Tag::Span).with_class("b"))
+            .with_child(ElementDef::new(Tag::Div).with_class("c"));
+        let parent_id =
+            build_subtree(&old_def, &mut arena, &mut taffy, NodeId::DANGLING, &mut pending);
+
+        // New tree: same shape but the middle child is now a Div (tag change).
+        let new_def = ElementDef::new(Tag::Div)
+            .with_child(ElementDef::new(Tag::Div).with_class("a"))
+            .with_child(ElementDef::new(Tag::Div).with_class("b2"))
+            .with_child(ElementDef::new(Tag::Div).with_class("c"));
+        reconcile(&mut arena, &mut taffy, parent_id, &new_def);
+
+        // Walk the live chain: all three children must be present and live.
+        let mut classes: Vec<String> = Vec::new();
+        let mut child = arena.get(parent_id).unwrap().first_child;
+        while let Some(c) = arena.get(child) {
+            classes.push(c.classes.first().cloned().unwrap_or_default());
+            assert_eq!(c.parent, parent_id, "child must point back at parent");
+            child = c.next_sibling;
+        }
+        assert_eq!(
+            classes,
+            vec!["a".to_string(), "b2".to_string(), "c".to_string()],
+            "tag-changed middle child must remain in the stitched chain"
+        );
+        // last_child must also be live and correct.
+        let last = arena.get(parent_id).unwrap().last_child;
+        assert_eq!(arena.get(last).and_then(|e| e.classes.first().cloned()), Some("c".to_string()));
+    }
+
+    /// Same regression for keyed children: a keyed match whose tag changed
+    /// must stitch the replacement node.
+    #[test]
+    fn keyed_tag_change_keeps_replacement_in_child_chain() {
+        let mut arena = NodeArena::new();
+        let mut taffy = TaffyTree::new();
+        let mut pending = Vec::new();
+
+        let old_def = ElementDef::new(Tag::Div)
+            .with_child(ElementDef::new(Tag::Span).with_id("x"))
+            .with_child(ElementDef::new(Tag::Div).with_class("tail"));
+        let parent_id =
+            build_subtree(&old_def, &mut arena, &mut taffy, NodeId::DANGLING, &mut pending);
+
+        let new_def = ElementDef::new(Tag::Div)
+            .with_child(ElementDef::new(Tag::Button).with_id("x"))
+            .with_child(ElementDef::new(Tag::Div).with_class("tail"));
+        reconcile(&mut arena, &mut taffy, parent_id, &new_def);
+
+        let first = arena.get(parent_id).unwrap().first_child;
+        let first_el = arena.get(first).expect("keyed child must be live");
+        assert_eq!(first_el.tag, Tag::Button, "keyed child must be the replacement");
+        let second = first_el.next_sibling;
+        assert_eq!(
+            arena.get(second).and_then(|e| e.classes.first().cloned()),
+            Some("tail".to_string()),
+            "sibling after the replaced node must still be reachable"
+        );
     }
 
     // Damage-aware rendering tests (SUBTREE_PAINT propagation)
