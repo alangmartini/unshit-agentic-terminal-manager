@@ -15,6 +15,13 @@ pub fn build_statusbar(state: &UiSnapshot) -> ElementDef {
 }
 
 fn build_settings_statusbar(state: &UiSnapshot) -> ElementDef {
+    // Section-aware detail cell: keybinds shows the binding count, other
+    // sections the active theme.
+    let detail = if state.settings_section == crate::state::SettingsSection::Keybinds {
+        format!("{} bindings", crate::keybinds::KeybindAction::ALL.len())
+    } else {
+        format!("theme: {}", state.theme)
+    };
     ElementDef::new(Tag::Div)
         .with_class("statusbar")
         .with_class("settings-statusbar")
@@ -32,7 +39,7 @@ fn build_settings_statusbar(state: &UiSnapshot) -> ElementDef {
                     ElementDef::new(Tag::Span)
                         .with_class("sb-cell")
                         .with_class("dim")
-                        .with_text(format!("theme: {}", state.theme)),
+                        .with_text(detail),
                 ),
         )
         .with_child(ElementDef::new(Tag::Span).with_class("sb-spacer"))

@@ -41,7 +41,7 @@ pub fn build_settings_page(state: &UiSnapshot, shared: &SharedState) -> ElementD
                 .with_class("set-page-content")
                 .with_child(build_settings_page_header(state.settings_section))
                 .with_child(build_settings_page_body(state, shared))
-                .with_child(build_settings_page_savebar(shared)),
+                .with_child(build_settings_page_savebar(state.settings_section, shared)),
         )
 }
 
@@ -944,9 +944,15 @@ fn preview_span(palette: &AppearancePreviewPalette, class: &str, text: &str) -> 
     span
 }
 
-fn build_settings_page_savebar(shared: &SharedState) -> ElementDef {
+fn build_settings_page_savebar(section: SettingsSection, shared: &SharedState) -> ElementDef {
     let close_state = shared.clone();
     let reset_state = shared.clone();
+    // Per-section reset affordance: keybinds restore their defaults; other
+    // sections reset appearance settings.
+    let (reset_label, reset_cmd) = match section {
+        SettingsSection::Keybinds => ("restore defaults", "keybind.reset_all"),
+        _ => ("reset", "appearance.reset"),
+    };
     ElementDef::new(Tag::Div)
         .with_class("set-page-savebar")
         .with_child(
@@ -967,10 +973,10 @@ fn build_settings_page_savebar(shared: &SharedState) -> ElementDef {
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("btn-label")
-                        .with_text("reset"),
+                        .with_text(reset_label),
                 )
                 .on_click(move || {
-                    mutate_with(&reset_state, |st| dispatch(st, "appearance.reset"));
+                    mutate_with(&reset_state, |st| dispatch(st, reset_cmd));
                 }),
         )
         .with_child(
@@ -1315,8 +1321,10 @@ fn shell_args_input(
 fn build_keybinds_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     use crate::keybinds::KeybindGroup;
 
-    let mut section = section_shell("keybinds")
-        .with_child(keybind_restart_banner())
+    // No set-card shell: keybind groups sit directly on the page body, as
+    // in the design mockup.
+    let mut section = ElementDef::new(Tag::Div)
+        .with_class("kb-page")
         .with_child(keybind_error_banner(state.keybinds.error.as_ref()));
 
     let filter = state.keybinds.filter.trim().to_lowercase();
@@ -1359,7 +1367,7 @@ fn build_keybinds_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
         }
     }
 
-    section.with_child(keybind_footer(shared))
+    section
 }
 
 /// Case-insensitive match against label, description, and key names.
@@ -1407,7 +1415,8 @@ fn keybind_toolbar(
                                 st.keybinds.filter = value.clone();
                             });
                         }),
-                ),
+                )
+                .with_child(ElementDef::new(Tag::Span).with_class("kbd").with_text("/")),
         )
         .with_child(
             ElementDef::new(Tag::Span)
@@ -1475,12 +1484,6 @@ fn build_notifications_section(shared: &SharedState) -> ElementDef {
         "sends a notification targeted at the active workspace and terminal",
         test_notification,
     ))
-}
-
-fn keybind_restart_banner() -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("keybind-banner")
-        .with_text("keybind changes take effect after restarting the app")
 }
 
 fn keybind_error_banner(err: Option<&KeybindError>) -> ElementDef {
@@ -2010,21 +2013,6 @@ fn pill(base: &str, modifier: Option<&str>, text: &str) -> ElementDef {
 
 fn svg_icon(svg: SvgNode) -> ElementDef {
     ElementDef::new(Tag::Div).with_svg(svg)
-}
-
-fn keybind_footer(shared: &SharedState) -> ElementDef {
-    let s = shared.clone();
-    ElementDef::new(Tag::Div)
-        .with_class("keybind-footer")
-        .with_child(
-            ElementDef::new(Tag::Button)
-                .with_class("btn")
-                .with_class("ghost")
-                .with_text("restore defaults")
-                .on_click(move || {
-                    mutate_with(&s, |st| dispatch(st, "keybind.reset_all"));
-                }),
-        )
 }
 
 #[cfg(test)]
@@ -3438,7 +3426,7 @@ mod tests {
     #[test]
     fn settings_page_savebar_matches_immediate_apply_actions() {
         let shared = make_shared();
-        let el = build_settings_page_savebar(&shared);
+        let el = build_settings_page_savebar(SettingsSection::Appearance, &shared);
         let text = collect_text_recursive(&el);
 
         assert!(el.classes.contains(&"set-page-savebar".to_string()));
@@ -3566,9 +3554,10 @@ mod tests {
         let snap = make_snapshot_section(SettingsSection::Keybinds);
         let shared = make_shared();
         let el = build_modal_body(&snap, &shared);
+        // The keybinds section renders without a set-card shell.
         let section = &el.children[0];
-        let title = &section.children[0];
-        assert_eq!(text_of(title), Some("keybinds"));
+        assert!(section.classes.contains(&"kb-page".to_string()));
+        assert!(has_class_anywhere(section, "kb-toolbar"));
     }
 
     #[test]
@@ -3773,9 +3762,11 @@ mod tests {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_keybinds_section(&snap, &shared);
-        // children: [title, restart banner, error banner, toolbar, group x4, footer]
-        assert_eq!(el.children.len(), 9);
-        assert!(el.children[3].classes.contains(&"kb-toolbar".to_string()));
+        // children: [error banner, toolbar, group x4] — no card shell, no
+        // restart banner, per the design mockup.
+        assert_eq!(el.children.len(), 6);
+        assert!(el.classes.contains(&"kb-page".to_string()));
+        assert!(el.children[1].classes.contains(&"kb-toolbar".to_string()));
         assert_eq!(count_with_class(&el, "kb-group"), 4);
         assert_eq!(count_with_class(&el, "kb-row"), KeybindAction::ALL.len());
         // Every row carries an icon, a name, and a description.
@@ -3788,10 +3779,12 @@ mod tests {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_keybinds_section(&snap, &shared);
-        let toolbar = &el.children[3];
+        let toolbar = &el.children[1];
         let filter = &toolbar.children[0];
         assert!(filter.classes.contains(&"kb-filter".to_string()));
         assert!(find_first_with_class(filter, "kb-filter-input").is_some());
+        // "/" focus hint inside the filter box.
+        assert!(filter.children.iter().any(|c| c.classes.contains(&"kbd".to_string())));
         let count = &toolbar.children[1];
         assert!(count.classes.contains(&"kb-count".to_string()));
         assert_eq!(
@@ -3933,14 +3926,21 @@ mod tests {
     }
 
     #[test]
-    fn keybinds_footer_has_reset_to_defaults() {
-        let snap = make_snapshot();
+    fn keybinds_savebar_offers_restore_defaults() {
+        let snap = make_snapshot_section(SettingsSection::Keybinds);
         let shared = make_shared();
-        let el = build_keybinds_section(&snap, &shared);
-        let footer = el.children.last().unwrap();
-        assert!(footer.classes.contains(&"keybind-footer".to_string()));
-        let btn = &footer.children[0];
-        assert_eq!(text_of(btn), Some("restore defaults"));
+        let page = build_settings_page(&snap, &shared);
+        let savebar = find_first_with_class(&page, "set-page-savebar").expect("savebar");
+        let labels: Vec<&str> = savebar
+            .children
+            .iter()
+            .filter_map(|c| find_first_with_class(c, "btn-label").or(Some(c)))
+            .filter_map(text_of)
+            .collect();
+        assert!(
+            labels.contains(&"restore defaults"),
+            "keybinds savebar must offer restore defaults, got {labels:?}"
+        );
     }
 
     #[test]
@@ -3998,7 +3998,7 @@ mod tests {
         let snap = state.ui_snapshot();
         let shared = Arc::new(Mutex::new(state));
         let el = build_keybinds_section(&snap, &shared);
-        let error_banner = &el.children[2];
+        let error_banner = &el.children[0];
         assert!(error_banner
             .classes
             .contains(&"keybind-banner-error".to_string()));

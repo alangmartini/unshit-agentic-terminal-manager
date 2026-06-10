@@ -6428,19 +6428,19 @@ body.dragging-pane {
 .kb-toolbar {
   display: flex;
   align-items: center;
-  gap: var(--sp-5);
-  margin-bottom: var(--sp-5);
+  gap: var(--sp-6);
+  margin-bottom: var(--sp-7);
 }
 
 .kb-filter {
   display: flex;
   align-items: center;
   flex: 1;
-  gap: var(--sp-3);
-  padding: var(--sp-2) var(--sp-4);
+  gap: var(--sp-4);
+  padding: var(--sp-5) var(--sp-6);
   background: rgba(20, 17, 12, 0.6);
   border: 1px solid var(--border-soft);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-md);
   color: var(--fg-muted);
 }
 
@@ -6452,38 +6452,43 @@ body.dragging-pane {
 
 .kb-filter-input {
   flex: 1;
-  height: 22px;
+  height: 18px;
   padding: 0;
   background: transparent;
   border: none;
   color: var(--fg-secondary);
   font-family: var(--font-mono);
-  font-size: var(--t-sm);
+  font-size: var(--t-md);
+}
+
+.kb-filter .kbd {
+  flex-shrink: 0;
 }
 
 .kb-count {
   color: var(--fg-tertiary);
-  font: var(--type-meta);
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
   white-space: nowrap;
 }
 
 .kb-group {
-  margin-bottom: var(--sp-6);
+  margin-bottom: var(--sp-8);
 }
 
 .kb-group-head {
   display: flex;
   align-items: center;
-  gap: var(--sp-4);
-  margin: var(--sp-5) 0 var(--sp-2);
+  gap: var(--sp-5);
+  margin: 0 0 var(--sp-4);
 }
 
 .kb-group-title {
   color: var(--amber-300);
   font-family: var(--font-mono);
-  font-size: var(--t-xs);
+  font-size: var(--t-sm);
   font-weight: 600;
-  letter-spacing: 1.4px;
+  letter-spacing: 2.2px;
   text-transform: uppercase;
   white-space: nowrap;
 }
@@ -6496,19 +6501,25 @@ body.dragging-pane {
 
 .kb-group-count {
   color: var(--fg-muted);
-  font: var(--type-meta);
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+}
+
+.kb-list {
+  background: rgba(34, 29, 22, 0.4);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--r-md);
+  overflow: hidden;
 }
 
 .kb-row {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) auto;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
   align-items: center;
-  gap: var(--sp-4);
-  min-height: 46px;
-  padding: var(--sp-3);
-  margin: 0 calc(var(--sp-3) * -1);
-  border-bottom: 1px solid rgba(74, 62, 42, 0.3);
-  border-radius: var(--r-sm);
+  gap: var(--sp-6);
+  min-height: 64px;
+  padding: var(--sp-5) var(--sp-7);
+  border-bottom: 1px solid rgba(74, 62, 42, 0.25);
   transition: color var(--dur-fast) var(--ease-std), background var(--dur-fast) var(--ease-std), border-color var(--dur-fast) var(--ease-std), box-shadow var(--dur-fast) var(--ease-std), opacity var(--dur-fast) var(--ease-std), transform var(--dur-fast) var(--ease-std);
 }
 
@@ -6528,8 +6539,8 @@ body.dragging-pane {
 }
 
 .kb-row-icon svg {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
 }
 
 .kb-row:hover .kb-row-icon {
@@ -6539,46 +6550,35 @@ body.dragging-pane {
 .kb-row-name {
   color: var(--fg-primary);
   font-family: var(--font-mono);
-  font-size: var(--t-sm);
+  font-size: var(--t-lg);
   font-weight: 600;
 }
 
 .kb-row-desc {
-  margin-top: 2px;
+  margin-top: 3px;
   color: var(--fg-tertiary);
-  font-size: var(--t-xs);
+  font-size: var(--t-md);
 }
 
+/* The whole combo renders as ONE keycap-style chip (the .kb-binding button)
+   containing plain-text key names joined by dim "+" separators. */
 .keys {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
+  gap: 5px;
 }
 
 .keycap {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 22px;
-  height: 22px;
-  padding: 0 var(--sp-2);
   white-space: nowrap;
-  background: rgba(20, 17, 12, 0.82);
-  border: 1px solid var(--border-soft);
-  border-bottom-width: 2px;
-  border-radius: var(--r-sm);
-  color: var(--fg-secondary);
+  color: var(--fg-primary);
   font-family: var(--font-mono);
-  font-size: var(--t-xs);
+  font-size: var(--t-sm);
   font-weight: 600;
   line-height: 1;
-  box-shadow: 0 1px 0 var(--border-soft);
 }
 
 .kb-row:hover .keycap {
-  border-color: var(--border-strong);
   color: var(--amber-100);
-  box-shadow: 0 1px 0 var(--border-default), 0 0 6px var(--accent-a10);
 }
 
 /* The "+" between keycaps is a real span emitted by keybind_binding(). (The
@@ -6588,7 +6588,7 @@ body.dragging-pane {
 .plus {
   color: var(--fg-muted);
   font-family: var(--font-mono);
-  font-size: var(--t-xs);
+  font-size: var(--t-sm);
   font-weight: 600;
   line-height: 1;
 }
@@ -6660,16 +6660,19 @@ body.dragging-pane {
 .kb-binding {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  padding: var(--sp-2) var(--sp-3);
-  background: transparent;
-  border: 1px dashed transparent;
-  border-radius: var(--r-sm);
+  gap: var(--sp-2);
+  padding: 6px 10px;
+  background: rgba(20, 17, 12, 0.82);
+  border: 1px solid var(--border-soft);
+  border-bottom-width: 2px;
+  border-radius: var(--r-md);
+  box-shadow: 0 1px 0 var(--border-soft);
   cursor: pointer;
 }
 
 .kb-row:hover .kb-binding {
-  border-color: var(--border-soft);
+  border-color: var(--border-strong);
+  box-shadow: 0 1px 0 var(--border-default), 0 0 6px var(--accent-a10);
 }
 
 .kb-binding.recording {
