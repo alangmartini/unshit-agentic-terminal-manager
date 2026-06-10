@@ -74,9 +74,7 @@ fn pill_tree(classes: &'static [&'static str], text: &'static str) -> impl Fn() 
         for c in classes {
             pill = pill.with_class(*c);
         }
-        ElementTree {
-            root: ElementDef::new(Tag::Div).with_class("root").with_child(pill),
-        }
+        ElementTree { root: ElementDef::new(Tag::Div).with_class("root").with_child(pill) }
     }
 }
 
@@ -352,7 +350,8 @@ fn hit_test_returns_host_not_anon() {
 /// paints the highlight), via the text_hit_at redirect.
 #[test]
 fn selection_anchors_to_anon_box() {
-    let mut h = TestHarness::new(css(), pill_tree(&["with-plus"], "Select this text"), 800.0, 400.0);
+    let mut h =
+        TestHarness::new(css(), pill_tree(&["with-plus"], "Select this text"), 800.0, 400.0);
     h.step();
 
     let pill_id = h.query(".pill").expect("pill").node_id;
@@ -364,10 +363,7 @@ fn selection_anchors_to_anon_box() {
     let sel = h.text_selection().expect("selection exists");
     assert_eq!(sel.anchor_element, anon_id, "selection anchor must be the anonymous box");
     assert_eq!(sel.focus_element, anon_id, "selection focus must be the anonymous box");
-    assert!(
-        sel.focus_offset > sel.anchor_offset,
-        "drag must select a forward range: {sel:?}"
-    );
+    assert!(sel.focus_offset > sel.anchor_offset, "drag must select a forward range: {sel:?}");
 }
 
 /// Text locators must resolve to the host exactly once — the anonymous box

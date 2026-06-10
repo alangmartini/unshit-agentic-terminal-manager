@@ -51,12 +51,8 @@ pub enum KeybindGroup {
 
 impl KeybindGroup {
     /// Every group, in display order.
-    pub const ALL: &'static [KeybindGroup] = &[
-        Self::Panes,
-        Self::Tabs,
-        Self::Navigation,
-        Self::Application,
-    ];
+    pub const ALL: &'static [KeybindGroup] =
+        &[Self::Panes, Self::Tabs, Self::Navigation, Self::Application];
 
     /// Section heading shown on the Keybinds settings page.
     pub fn title(self) -> &'static str {

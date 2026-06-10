@@ -426,9 +426,9 @@ fn sync_anonymous_text_child(
     let had_handle = host.anon_text_child.is_some();
     // Validate the stored child id: reconcile can dealloc whole subtrees
     // without notifying anyone, and generational ids make stale reads safe.
-    let stored = host.anon_text_child.filter(|&id| {
-        arena.get(id).map(|e| e.anonymous && e.parent == host_id).unwrap_or(false)
-    });
+    let stored = host
+        .anon_text_child
+        .filter(|&id| arena.get(id).map(|e| e.anonymous && e.parent == host_id).unwrap_or(false));
 
     let needs = wants_anon_text_child(arena, host, stored);
 
@@ -501,8 +501,7 @@ fn update_anon_text_child(arena: &mut NodeArena, host_id: NodeId, anon_id: NodeI
             Some(ElementContent::Text(t)) if t == host_text)
     };
 
-    let derived =
-        ComputedStyle::derive_anonymous_text(&arena.get(host_id).unwrap().computed_style);
+    let derived = ComputedStyle::derive_anonymous_text(&arena.get(host_id).unwrap().computed_style);
 
     let mut changed = false;
     if text_changed {

@@ -1357,9 +1357,7 @@ fn build_keybinds_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
                         .with_class("big")
                         .with_text(format!("No commands match \u{201c}{}\u{201d}", filter)),
                 )
-                .with_child(
-                    ElementDef::new(Tag::Div).with_text("Try a different command or key."),
-                ),
+                .with_child(ElementDef::new(Tag::Div).with_text("Try a different command or key.")),
         );
     } else {
         for g in groups {
@@ -1541,7 +1539,13 @@ fn keybind_row(action: KeybindAction, state: &UiSnapshot, shared: &SharedState) 
                 .with_svg(keybind_group_icon(action.group())),
         )
         .with_child(meta)
-        .with_child(keybind_binding(action, combo, is_recording, has_error, shared));
+        .with_child(keybind_binding(
+            action,
+            combo,
+            is_recording,
+            has_error,
+            shared,
+        ));
     if is_recording {
         row = row.with_class("recording");
     }
@@ -1575,9 +1579,7 @@ fn keybind_binding(
             ElementDef::new(Tag::Span)
                 .with_class("rec-label")
                 .with_child(ElementDef::new(Tag::Span).with_class("rec-dot"))
-                .with_child(
-                    ElementDef::new(Tag::Span).with_text("press keys... (esc to cancel)"),
-                ),
+                .with_child(ElementDef::new(Tag::Span).with_text("press keys... (esc to cancel)")),
         );
     } else {
         // The "+" separators are real elements rather than `::before` pseudo
@@ -1588,8 +1590,8 @@ fn keybind_binding(
         let mut keys = ElementDef::new(Tag::Span).with_class("keys");
         for (i, part) in combo_parts(combo).into_iter().enumerate() {
             if i > 0 {
-                keys = keys
-                    .with_child(ElementDef::new(Tag::Span).with_class("plus").with_text("+"));
+                keys =
+                    keys.with_child(ElementDef::new(Tag::Span).with_class("plus").with_text("+"));
             }
             keys = keys.with_child(pill("keycap", None, &part));
         }
@@ -3770,8 +3772,14 @@ mod tests {
         assert_eq!(count_with_class(&el, "kb-group"), 4);
         assert_eq!(count_with_class(&el, "kb-row"), KeybindAction::ALL.len());
         // Every row carries an icon, a name, and a description.
-        assert_eq!(count_with_class(&el, "kb-row-icon"), KeybindAction::ALL.len());
-        assert_eq!(count_with_class(&el, "kb-row-desc"), KeybindAction::ALL.len());
+        assert_eq!(
+            count_with_class(&el, "kb-row-icon"),
+            KeybindAction::ALL.len()
+        );
+        assert_eq!(
+            count_with_class(&el, "kb-row-desc"),
+            KeybindAction::ALL.len()
+        );
     }
 
     #[test]
@@ -3784,7 +3792,10 @@ mod tests {
         assert!(filter.classes.contains(&"kb-filter".to_string()));
         assert!(find_first_with_class(filter, "kb-filter-input").is_some());
         // "/" focus hint inside the filter box.
-        assert!(filter.children.iter().any(|c| c.classes.contains(&"kbd".to_string())));
+        assert!(filter
+            .children
+            .iter()
+            .any(|c| c.classes.contains(&"kbd".to_string())));
         let count = &toolbar.children[1];
         assert!(count.classes.contains(&"kb-count".to_string()));
         assert_eq!(
@@ -3842,7 +3853,9 @@ mod tests {
         assert_eq!(text_of(&keys.children[1]), Some("+"));
         assert!(keys.children[2].classes.contains(&"keycap".to_string()));
         assert_eq!(text_of(&keys.children[2]), Some("T"));
-        assert!(binding.children[1].classes.contains(&"edit-pencil".to_string()));
+        assert!(binding.children[1]
+            .classes
+            .contains(&"edit-pencil".to_string()));
     }
 
     #[test]
@@ -3915,7 +3928,10 @@ mod tests {
 
         // The "+" separators between pills must lay out as visible elements.
         let plusses = harness.query_all(".plus");
-        assert!(!plusses.is_empty(), "multi-key combos should render + separators");
+        assert!(
+            !plusses.is_empty(),
+            "multi-key combos should render + separators"
+        );
         for plus in &plusses {
             assert!(
                 plus.layout_rect.width > 0.0 && plus.layout_rect.height > 0.0,
