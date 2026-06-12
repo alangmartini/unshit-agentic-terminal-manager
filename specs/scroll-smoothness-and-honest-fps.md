@@ -167,6 +167,16 @@ Goal: scroll distance is exactly proportional to input; no quantization amplific
 
 Exit criteria: gate H5 property tests pass (N notches = exactly N x configured px; fractional sequences sum exactly); wheel-trace replay from Phase 0 shows no amplification on the user's device.
 
+#### Phase 2 results (recorded 2026-06-12)
+
+All three steps landed, and step 3 (scoped invalidation) proved feasible-now rather than deferred:
+
+1. `Terminal::scroll_view_by_lines` implements trunc-and-carry fractional accumulation (`src/terminal/mod.rs`); the wheel handler passes raw fractional lines with no per-event rounding and no >= 1-row floor. Carry is discarded on boundary clamp, on carry pinned into a boundary, on every snap-to-live path (PTY output, snapshot restore, ED 3), and non-finite deltas are rejected. Covered by 13 unit tests including a 200-step fixed-seed property walk (gate H5's test clause).
+2. `normalize_wheel_line_delta` divides unconditionally by the OS notch size, queried per event (matching winit's per-event multiply, so mid-session settings changes stay in sync): `SPI_GETWHEELSCROLLLINES` for the vertical axis, `SPI_GETWHEELSCROLLCHARS` for the horizontal axis, `WHEEL_PAGESCROLL` sentinel and failure fall back to 3.0; non-Windows divides by 1.0. Behavior note: a Windows "wheel scroll lines" preference other than the default 3 is now neutralized by design (one detent = exactly `line_scroll_px`); the app's own scroll-speed setting is the speed knob, per gate H5 proportionality.
+3. Scoped invalidation shipped as `ScrollGridPatch`: a Scroll handler may return a same-dimensions grid content patch; the dispatch applies it as a paint-only arena content swap (mirroring the reconciler's `grid_content_paint_only` classification) and no longer sets global `needs_rebuild`, so wheel-over-terminal no longer forces full rebuilds nor ejects smooth-scroll animations from the fast-paint path. Dimension mismatch or non-patch returns fall back to the legacy full rebuild.
+
+Standard-wheel feel change: one notch was ceil(6.15) = 7 rows instantly; now trunc with carry = 6 rows on most notches, 7 on ~every 7th, long-run average exactly 6.15 rows/notch (proportional). Workspace green: 3746+ tests, 0 failed. Deferred per Phase 0: the wheel-trace replay clause of the exit criteria runs with the Phase 5 suite; the end-to-end dispatch-glue test also lands with Phase 5's terminal-scroll suite.
+
 ### Phase 3: Animated terminal scrolling (the browser feel)
 
 Goal: a wheel notch produces motion, not a jump; sub-row precision end to end.

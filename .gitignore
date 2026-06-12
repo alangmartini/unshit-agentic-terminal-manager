@@ -10,7 +10,7 @@ prototype/
 bench*.json
 artifacts/
 # Scratch perf-measurement captures (the blessed numbers live in specs/)
-phase0-*
+phase[0-9]-*
 .playwright-mcp/
 .codex/
 *.remoteapp.rdp

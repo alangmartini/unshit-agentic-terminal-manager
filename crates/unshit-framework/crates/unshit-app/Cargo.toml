@@ -30,6 +30,9 @@ futures-core = { workspace = true, optional = true }
 notify = { version = "6", optional = true }
 hdrhistogram = { version = "7.5", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+winapi = { workspace = true, features = ["winuser"] }
+
 [features]
 default = ["clipboard", "hot-reload"]
 clipboard = ["dep:arboard"]

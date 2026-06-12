@@ -59,6 +59,11 @@ pub struct Terminal {
     scrollback: VecDeque<Vec<Cell>>,
     /// How many lines the user has scrolled back (0 = at bottom / live).
     scroll_offset: usize,
+    /// Fractional wheel-scroll carry in lines. `scroll_view_by_lines`
+    /// applies whole lines to `scroll_offset` and parks the sub-line
+    /// remainder here so touchpads and high-resolution wheels track
+    /// their input 1:1 instead of rounding every event to a full line.
+    scroll_accum_lines: f32,
     /// When the alternate screen buffer is active, this holds the
     /// previously-active main screen so it can be swapped back on exit
     /// (DEC private mode 1049 / 47 / 1047). `None` means the main
@@ -338,6 +343,7 @@ impl Terminal {
             title: String::new(),
             scrollback: VecDeque::new(),
             scroll_offset: 0,
+            scroll_accum_lines: 0.0,
             alt_grid: None,
             alt_saved_cursor: (0, 0),
             alt_saved_fg: default_fg(),
@@ -369,8 +375,9 @@ impl Terminal {
     /// helper can borrow `&mut self` without conflicting with the parser's
     /// own `&mut self` requirement.
     pub fn process_bytes(&mut self, bytes: &[u8]) {
-        // New output from the PTY snaps the view back to the live screen.
-        self.scroll_offset = 0;
+        // New output from the PTY snaps the view back to the live screen
+        // (and discards any fractional wheel carry along with it).
+        self.reset_scroll();
 
         let mut parser = std::mem::take(&mut self.parser);
         for &byte in bytes {
@@ -625,7 +632,7 @@ impl Terminal {
             let converted: Vec<Cell> = line.iter().map(|c| core_cell_to_ui(*c)).collect();
             self.scrollback.push_back(converted);
         }
-        self.scroll_offset = 0;
+        self.reset_scroll();
     }
 
     /// The current window title (set via OSC 0 or OSC 2).
@@ -661,9 +668,58 @@ impl Terminal {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
+    /// Scroll the view by a possibly fractional number of lines,
+    /// carrying the sub-line remainder over to the next call.
+    ///
+    /// Positive `delta_lines` scrolls up (toward older history),
+    /// negative scrolls down (toward the live screen). Whole lines are
+    /// applied immediately via `scroll_view_up` / `scroll_view_down`;
+    /// the fraction accumulates so a sequence of small wheel deltas
+    /// sums to exactly its total instead of rounding per event. When
+    /// the view clamps at either end of the scrollback the carry is
+    /// discarded so pent-up remainder cannot rubber-band a later
+    /// gesture; likewise, sub-line carry pointing into a boundary the
+    /// view is already pinned against is discarded so it cannot swallow
+    /// or amplify a later reversal. Non-finite deltas are ignored.
+    /// Returns the signed number of lines actually applied.
+    pub fn scroll_view_by_lines(&mut self, delta_lines: f32) -> i32 {
+        if !delta_lines.is_finite() {
+            return 0;
+        }
+        self.scroll_accum_lines += delta_lines;
+        // Defense in depth: a finite delta should never push the
+        // accumulator non-finite, but never let a poisoned value persist.
+        if !self.scroll_accum_lines.is_finite() {
+            self.scroll_accum_lines = 0.0;
+        }
+        let whole = self.scroll_accum_lines.trunc() as i32;
+        self.scroll_accum_lines -= whole as f32;
+        let before = self.scroll_offset;
+        if whole > 0 {
+            self.scroll_view_up(whole as usize);
+        } else if whole < 0 {
+            self.scroll_view_down(whole.unsigned_abs() as usize);
+        }
+        let applied = self.scroll_offset as i64 - before as i64;
+        if applied != whole as i64 {
+            self.scroll_accum_lines = 0.0;
+        }
+        // Sub-line carry pressing into a pinned boundary is dead input:
+        // negative carry at the bottom (offset 0) or positive carry at
+        // the top (offset == scrollback len) can never be applied, so
+        // discard it rather than let it offset the next gesture.
+        if (self.scroll_offset == 0 && self.scroll_accum_lines < 0.0)
+            || (self.scroll_offset == self.scrollback.len() && self.scroll_accum_lines > 0.0)
+        {
+            self.scroll_accum_lines = 0.0;
+        }
+        applied as i32
+    }
+
     /// Snap the view back to the live screen.
     pub fn reset_scroll(&mut self) {
         self.scroll_offset = 0;
+        self.scroll_accum_lines = 0.0;
     }
 
     /// Build a `CellGrid` representing what should be displayed.
@@ -1343,7 +1399,7 @@ impl<'a> Perform for Performer<'a> {
                     3 => {
                         t.clear_region(0, 0, t.rows.saturating_sub(1), t.cols.saturating_sub(1));
                         t.scrollback.clear();
-                        t.scroll_offset = 0;
+                        t.reset_scroll();
                     }
                     _ => {}
                 }
@@ -3404,6 +3460,178 @@ mod tests {
         term.scroll_view_up(2);
         term.reset_scroll();
         assert_eq!(term.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_view_by_lines_applies_exact_multiples_immediately() {
+        let mut term = term_with_scrollback();
+        assert_eq!(term.scroll_view_by_lines(2.0), 2);
+        assert_eq!(term.scroll_offset(), 2);
+        assert_eq!(term.scroll_view_by_lines(-2.0), -2);
+        assert_eq!(term.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_view_by_lines_accumulates_sub_line_deltas() {
+        let mut term = term_with_scrollback();
+        assert_eq!(term.scroll_view_by_lines(0.3), 0);
+        assert_eq!(term.scroll_view_by_lines(0.3), 0);
+        // 0.3 + 0.3 + 0.5 crosses one whole line, leaving ~0.1 carry.
+        assert_eq!(term.scroll_view_by_lines(0.5), 1);
+        assert_eq!(term.scroll_offset(), 1);
+        // The ~0.1 carry plus 0.5 stays below the next whole line.
+        assert_eq!(term.scroll_view_by_lines(0.5), 0);
+        assert_eq!(term.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn scroll_view_by_lines_sign_change_consumes_carry() {
+        let mut term = term_with_scrollback();
+        assert_eq!(term.scroll_view_by_lines(0.7), 0);
+        // The opposite-direction nudge eats into the carry (now ~0.5)
+        // without moving the view.
+        assert_eq!(term.scroll_view_by_lines(-0.2), 0);
+        assert_eq!(term.scroll_offset(), 0);
+        // ~0.5 carry plus 0.6 crosses a whole line.
+        assert_eq!(term.scroll_view_by_lines(0.6), 1);
+        assert_eq!(term.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn scroll_view_by_lines_tracks_fractional_sums_over_random_sequence() {
+        // Enough history that a 200-step walk bounded by +/-3 lines per
+        // step (at most +/-600 total) can never clamp when started from
+        // the midpoint of the scrollback.
+        let mut term = Terminal::new(3, 5);
+        let mut fill = String::new();
+        for _ in 0..2000 {
+            fill.push_str("x\r\n");
+        }
+        term.process_bytes(fill.as_bytes());
+        let start = term.scrollback_len() / 2;
+        assert!(start > 600, "walk needs head room, got {start}");
+        term.scroll_view_up(start);
+
+        // Deterministic LCG (Numerical Recipes constants) mapped to
+        // [-3.0, 3.0) so the sequence is identical on every run.
+        let mut state: u32 = 0xDEAD_BEEF;
+        let mut next_delta = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / (1u32 << 24) as f32 * 6.0 - 3.0
+        };
+
+        // Mirror the accumulator math independently: every call must
+        // apply exactly the whole part of the running fractional sum.
+        let mut expected_carry = 0.0f32;
+        let mut total_applied = 0i64;
+        for step in 0..200 {
+            let delta = next_delta();
+            expected_carry += delta;
+            let expected_whole = expected_carry.trunc() as i32;
+            expected_carry -= expected_whole as f32;
+            let applied = term.scroll_view_by_lines(delta);
+            assert_eq!(applied, expected_whole, "step {step} delta {delta}");
+            total_applied += i64::from(applied);
+        }
+        assert!(expected_carry.abs() < 1.0);
+        assert_eq!(
+            term.scroll_offset() as i64,
+            start as i64 + total_applied,
+            "offset must equal the start plus every applied whole line"
+        );
+    }
+
+    #[test]
+    fn scroll_view_by_lines_clamp_at_top_discards_carry() {
+        let mut term = term_with_scrollback();
+        let max = term.scrollback_len();
+        // Requests 5 whole lines but only `max` exist: the view clamps
+        // and the 0.9 carry is discarded.
+        assert_eq!(term.scroll_view_by_lines(5.9), max as i32);
+        assert_eq!(term.scroll_offset(), max);
+        // Were the 0.9 carry still pending, two -0.5 nudges would sum
+        // to -0.1 and the view would rubber-band in place.
+        assert_eq!(term.scroll_view_by_lines(-0.5), 0);
+        assert_eq!(term.scroll_view_by_lines(-0.5), -1);
+        assert_eq!(term.scroll_offset(), max - 1);
+    }
+
+    #[test]
+    fn scroll_view_by_lines_clamp_at_bottom_discards_carry() {
+        let mut term = term_with_scrollback();
+        // Already at the live screen: the down-scroll clamps at zero and
+        // the -0.5 carry is discarded.
+        assert_eq!(term.scroll_view_by_lines(-2.5), 0);
+        assert_eq!(term.scroll_offset(), 0);
+        // Were the -0.5 carry still pending, two +0.5 nudges would sum
+        // to 0.5 and never cross a whole line.
+        assert_eq!(term.scroll_view_by_lines(0.5), 0);
+        assert_eq!(term.scroll_view_by_lines(0.5), 1);
+        assert_eq!(term.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn reset_scroll_discards_fractional_carry() {
+        let mut term = term_with_scrollback();
+        assert_eq!(term.scroll_view_by_lines(0.9), 0);
+        term.reset_scroll();
+        // Were the 0.9 carry still pending, this 0.5 would cross a line.
+        assert_eq!(term.scroll_view_by_lines(0.5), 0);
+        assert_eq!(term.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn process_bytes_snap_to_live_discards_fractional_carry() {
+        let mut term = term_with_scrollback();
+        // Park a fractional carry while scrolled back (off the boundary
+        // so the pinned-boundary discard cannot eat it first).
+        term.scroll_view_up(1);
+        assert_eq!(term.scroll_view_by_lines(0.6), 0);
+        // New output snaps the view to the live screen.
+        term.process_bytes(b"FFFF\r\n");
+        assert_eq!(term.scroll_offset(), 0);
+        // Were the 0.6 carry still pending, this 0.5 would cross a line.
+        assert_eq!(term.scroll_view_by_lines(0.5), 0);
+        assert_eq!(term.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn pinned_at_bottom_discards_sub_line_carry_into_boundary() {
+        let mut term = term_with_scrollback();
+        assert_eq!(term.scroll_offset(), 0);
+        // Three downward sub-line nudges while already pinned at the
+        // bottom are dead input: each carry is discarded immediately.
+        assert_eq!(term.scroll_view_by_lines(-0.4), 0);
+        assert_eq!(term.scroll_view_by_lines(-0.4), 0);
+        assert_eq!(term.scroll_view_by_lines(-0.4), 0);
+        // The reversal behaves as if the carry were zero: 0.5 neither
+        // jumps a line instantly nor gets swallowed by -1.2 of dead carry.
+        assert_eq!(term.scroll_view_by_lines(0.5), 0);
+        assert_eq!(term.scroll_view_by_lines(0.5), 1);
+        assert_eq!(term.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn scroll_view_by_lines_nan_delta_is_ignored() {
+        let mut term = term_with_scrollback();
+        assert_eq!(term.scroll_view_by_lines(0.4), 0);
+        assert_eq!(term.scroll_view_by_lines(f32::NAN), 0);
+        // Subsequent calls are not poisoned: the 0.4 carry survives and
+        // 0.4 + 0.6 crosses exactly one line.
+        assert_eq!(term.scroll_view_by_lines(0.6), 1);
+        assert_eq!(term.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn scroll_view_by_lines_infinite_delta_is_ignored_and_carry_stays_finite() {
+        let mut term = term_with_scrollback();
+        assert_eq!(term.scroll_view_by_lines(f32::NEG_INFINITY), 0);
+        assert_eq!(term.scroll_offset(), 0);
+        // The accumulator stayed finite: half-line nudges still sum up
+        // normally instead of being absorbed by -inf.
+        assert_eq!(term.scroll_view_by_lines(0.5), 0);
+        assert_eq!(term.scroll_view_by_lines(0.5), 1);
+        assert_eq!(term.scroll_offset(), 1);
     }
 
     #[test]

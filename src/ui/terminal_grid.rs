@@ -438,6 +438,34 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
         )
 }
 
+/// Fresh display snapshot for the wheel-scroll patch path.
+///
+/// Mirrors what `tree_fn` produces per pane (`snapshot_terminal_for_render`
+/// plus the selection highlight in `main.rs`): clone the display grid, hide
+/// the cursor on inactive panes, apply the theme palette, and paint the
+/// selection highlight at its new display rows. Full damage is forced
+/// because every visible row may have shifted, and the renderer's
+/// damage-splice path must not narrow the re-emit to stale PTY damage.
+fn scrolled_pane_snapshot(
+    st: &crate::state::AppState,
+    terminal: &crate::terminal::Terminal,
+    pane: u32,
+) -> unshit::core::cell_grid::CellGrid {
+    let mut grid = terminal.display_grid();
+    if st.active_pane.0 != pane {
+        grid.set_cursor_visible(false);
+    }
+    if !crate::truthy_env_value(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)) {
+        let palette = crate::theme::terminal_palette_for(&st.theme, &st.custom_theme);
+        crate::theme::apply_terminal_palette_to_grid(&mut grid, &palette);
+    }
+    if let Some(sel) = st.terminal_selections.get(&pane) {
+        crate::state::apply_selection_highlight(&mut grid, terminal, sel);
+    }
+    grid.mark_all_dirty();
+    grid
+}
+
 fn build_pane_body(
     pane_id: PaneId,
     capture_keyboard: bool,
@@ -580,8 +608,16 @@ fn build_pane_body(
             // delta_y > 0 = wheel up (toward older history).
             // delta_y < 0 = wheel down (toward live screen).
             // The framework converts LineDelta to pixels (line_height ~40px),
-            // so divide by cell_h to get terminal lines. Minimum 1 line per
-            // notch so small deltas still move.
+            // so divide by cell_h to get terminal lines. Fractional lines
+            // carry over inside the terminal's accumulator, so touchpads and
+            // high-resolution wheels track their input 1:1 instead of every
+            // event rounding away from zero to at least one line.
+            //
+            // The handler returns a `ScrollGridPatch` so the framework
+            // applies the fresh display snapshot as a paint-only content
+            // patch on this node instead of scheduling a full tree rebuild
+            // (which would also eject concurrent smooth-scroll animations
+            // from the fast-paint path).
             let scroll_shared = shared.clone();
             let scroll_pane_id = pane_id;
             grid_el = grid_el.on(
@@ -591,28 +627,26 @@ fn build_pane_body(
                         use unshit::core::cell_grid::CellGrid;
                         let cell_h = CellGrid::global_cell_h().max(1.0);
                         let raw_lines = se.delta_y / cell_h;
-                        // Round away from zero so even a small notch scrolls 1 line.
-                        let lines = if raw_lines > 0.0 {
-                            raw_lines.ceil() as i32
-                        } else {
-                            raw_lines.floor() as i32
-                        };
-                        if lines != 0 {
+                        let grid = if raw_lines != 0.0 {
                             mutate_with(&scroll_shared, |st| {
-                                // The selection is anchored to absolute lines,
-                                // so it survives the scroll; force a repaint so
-                                // the highlight redraws at its new display rows.
-                                crate::state::mark_terminal_selection_dirty(st, scroll_pane_id.0);
-                                if let Some(handle) = st.terminals.get(&scroll_pane_id.0) {
-                                    let mut terminal = handle.lock_recover();
-                                    if lines > 0 {
-                                        terminal.scroll_view_up(lines as usize);
-                                    } else {
-                                        terminal.scroll_view_down((-lines) as usize);
-                                    }
+                                let handle = st.terminals.get(&scroll_pane_id.0)?.clone();
+                                let mut terminal = handle.lock_recover();
+                                if terminal.scroll_view_by_lines(raw_lines) == 0 {
+                                    return None;
                                 }
-                            });
-                        }
+                                // The selection is anchored to absolute
+                                // lines, so it survives the scroll; the
+                                // snapshot below repaints the highlight at
+                                // its new display rows, and the flag keeps
+                                // the next full rebuild's damage honest if
+                                // the framework falls back to one.
+                                crate::state::mark_terminal_selection_dirty(st, scroll_pane_id.0);
+                                Some(scrolled_pane_snapshot(st, &terminal, scroll_pane_id.0))
+                            })
+                        } else {
+                            None
+                        };
+                        return Some(Box::new(unshit::app::app::ScrollGridPatch { grid }));
                     }
                     None
                 },
@@ -2058,6 +2092,101 @@ mod tests_mouse_selection_copy_paste {
             grid_inactive.on_resize.is_none(),
             "inactive pane must NOT register on_resize handler"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler behavior: wheel scroll returns a ScrollGridPatch so the
+    // framework repaints the pane without a full tree rebuild (spec
+    // scroll-smoothness-and-honest-fps, Phase 2 step 3)
+    // -----------------------------------------------------------------------
+
+    fn scroll_handler_for_pane(shared: &SharedState, pane: u32) -> EventHandler {
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane, CellGrid::new(3, 5));
+        let el = build_pane_body(PaneId(pane), true, 13, shared, &grids);
+        el.children[0]
+            .handlers
+            .iter()
+            .find(|(et, _)| *et == EventType::Scroll)
+            .map(|(_, h)| h.clone())
+            .expect("Scroll handler must be present")
+    }
+
+    fn wheel_event(delta_y: f32) -> Event {
+        Event::Scroll(unshit::core::event::ScrollEvent {
+            delta_x: 0.0,
+            delta_y,
+            x: 0.0,
+            y: 0.0,
+        })
+    }
+
+    #[test]
+    fn wheel_scroll_returns_grid_patch_with_scrolled_rows() {
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(1);
+            // 3-row terminal fed 4 lines: exactly one line ("AAAA") in
+            // scrollback, so any upward wheel clamps at offset 1.
+            let mut term = crate::terminal::Terminal::new(3, 5);
+            term.process_bytes(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+            guard.terminals.insert(1, Arc::new(Mutex::new(term)));
+        }
+        let handler = scroll_handler_for_pane(&shared, 1);
+
+        let cell_h = CellGrid::global_cell_h().max(1.0);
+        let patch = (handler)(&wheel_event(cell_h * 2.0))
+            .expect("scroll handler must return a value")
+            .downcast::<unshit::app::app::ScrollGridPatch>()
+            .expect("scroll handler must return a ScrollGridPatch");
+
+        let grid = patch
+            .grid
+            .expect("an applied scroll must carry a fresh display grid");
+        assert_eq!(
+            grid.get_cell(0, 0).map(|c| c.ch),
+            Some('A'),
+            "display row 0 must show the scrollback line after the wheel"
+        );
+        assert!(
+            (0..3).all(|row| grid.line_damage_for(row).is_some_and(|d| !d.is_clean())),
+            "the patch snapshot must carry full damage"
+        );
+        let guard = shared.lock().unwrap();
+        let term = guard.terminals.get(&1).unwrap().lock().unwrap();
+        assert_eq!(term.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn wheel_scroll_with_no_movement_returns_empty_patch() {
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(1);
+            // No scrollback: an upward wheel cannot move the view.
+            guard.terminals.insert(
+                1,
+                Arc::new(Mutex::new(crate::terminal::Terminal::new(3, 5))),
+            );
+        }
+        let handler = scroll_handler_for_pane(&shared, 1);
+
+        let cell_h = CellGrid::global_cell_h().max(1.0);
+        let patch = (handler)(&wheel_event(cell_h * 2.0))
+            .expect("scroll handler must return a value")
+            .downcast::<unshit::app::app::ScrollGridPatch>()
+            .expect("scroll handler must return a ScrollGridPatch");
+
+        assert!(
+            patch.grid.is_none(),
+            "a consumed wheel that moves nothing must not request a repaint"
+        );
+        let guard = shared.lock().unwrap();
+        let term = guard.terminals.get(&1).unwrap().lock().unwrap();
+        assert_eq!(term.scroll_offset(), 0);
     }
 
     // -----------------------------------------------------------------------

@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use unshit_core::build::{
-    build_tree_from_def, dispatch_resize_callbacks, mark_layout_dirty, mark_paint_dirty,
-    resolve_all_styles, resolve_all_styles_with_transitions, run_layout_pipeline, scale_all_styles,
-    sync_all_animations, tick_all_animations, tick_all_transitions,
+    build_tree_from_def, dispatch_resize_callbacks, mark_layout_dirty, mark_node_paint_dirty,
+    mark_paint_dirty, resolve_all_styles, resolve_all_styles_with_transitions, run_layout_pipeline,
+    scale_all_styles, sync_all_animations, tick_all_animations, tick_all_transitions,
 };
 use unshit_core::dirty::DirtyFlags;
 use unshit_core::element::*;
@@ -527,6 +527,8 @@ const BROWSER_INITIAL_SLOPE_MIN: f32 = 0.25;
 const BROWSER_INITIAL_SLOPE_MAX: f32 = 0.95;
 const SMOOTH_SCROLL_WAKE_INTERVAL: Duration = Duration::from_millis(8);
 const SMOOTH_SCROLL_WAKE_GRACE: Duration = Duration::from_millis(48);
+/// Fallback lines-per-notch when the OS setting cannot be queried. Matches
+/// the Windows default of 3 wheel-scroll lines per detent.
 const WHEEL_LINE_DELTA_PER_NOTCH: f32 = 3.0;
 const EASE_IN_OUT_X1: f32 = 0.42;
 const EASE_IN_OUT_Y1: f32 = 0.0;
@@ -650,27 +652,140 @@ fn cubic_bezier_axis_derivative(t: f32, p1: f32, p2: f32) -> f32 {
     3.0 * inv * inv * p1 + 6.0 * inv * t * (p2 - p1) + 3.0 * t * t * (1.0 - p2)
 }
 
+/// Opt-in return payload for element `Scroll` handlers (boxed as the
+/// handler's `Box<dyn Any>` result): fresh grid content for the handling
+/// node.
+///
+/// The wheel dispatch downcasts a consumed Scroll handler's return value to
+/// this type. On a match it writes the grid straight into the retained arena
+/// and paint-dirties the node instead of setting the global `needs_rebuild`,
+/// so app-managed scroll surfaces (e.g. terminal scrollback) repaint at
+/// content-change cost and a concurrently animating smooth scroll stays on
+/// the fast-paint path. `grid: None` means "event consumed, nothing visible
+/// changed" and schedules no work at all. Handlers returning any other value
+/// (or `None`) keep the legacy behavior: a full rebuild on the next frame.
+pub struct ScrollGridPatch {
+    pub grid: Option<unshit_core::cell_grid::CellGrid>,
+}
+
+/// Write a Scroll handler's freshly snapshotted grid onto the handling node,
+/// mirroring the reconciler's `grid_content_paint_only` classification: a
+/// same-dimensions content swap sets PAINT on the node plus SUBTREE_PAINT on
+/// its ancestors and skips style and layout entirely. Returns `false` when
+/// the node is gone, its content is not a grid, or the dimensions differ;
+/// those cases can affect layout and must go through a full rebuild.
+fn apply_scroll_grid_patch(
+    arena: &mut NodeArena,
+    node_id: NodeId,
+    grid: unshit_core::cell_grid::CellGrid,
+) -> bool {
+    let dims_match = matches!(
+        arena.get(node_id).map(|element| &element.content),
+        Some(ElementContent::Grid(old)) if old.rows() == grid.rows() && old.cols() == grid.cols()
+    );
+    if !dims_match {
+        return false;
+    }
+    if let Some(element) = arena.get_mut(node_id) {
+        element.content = ElementContent::Grid(grid);
+    }
+    mark_node_paint_dirty(arena, node_id);
+    true
+}
+
 fn wheel_scroll_delta_pixels(
     delta: winit::event::MouseScrollDelta,
     scale_factor: f32,
     zoom_factor: f32,
     tuning: ScrollTuning,
+    chars_per_notch: f32,
+    lines_per_notch: f32,
 ) -> (f32, f32, bool) {
     match delta {
         winit::event::MouseScrollDelta::LineDelta(x, y) => {
             let line_px = tuning.sanitized().line_scroll_px * scale_factor * zoom_factor;
-            (normalize_wheel_line_delta(x) * line_px, normalize_wheel_line_delta(y) * line_px, true)
+            (
+                normalize_wheel_line_delta(x, chars_per_notch) * line_px,
+                normalize_wheel_line_delta(y, lines_per_notch) * line_px,
+                true,
+            )
         }
         winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32, false),
     }
 }
 
-fn normalize_wheel_line_delta(value: f32) -> f32 {
-    if value.abs() >= WHEEL_LINE_DELTA_PER_NOTCH {
-        value / WHEEL_LINE_DELTA_PER_NOTCH
+/// Converts a winit `LineDelta` value into wheel notches by dividing
+/// unconditionally by the platform's per-axis units-per-notch (lines for the
+/// vertical axis, chars for the horizontal axis), so a full detent maps to
+/// 1.0 and sub-notch fragments from high-resolution wheels scale
+/// proportionally instead of being amplified. Non-finite or non-positive
+/// divisors fall back to `WHEEL_LINE_DELTA_PER_NOTCH`.
+fn normalize_wheel_line_delta(value: f32, units_per_notch: f32) -> f32 {
+    let units = if units_per_notch.is_finite() && units_per_notch > 0.0 {
+        units_per_notch
     } else {
-        value
+        WHEEL_LINE_DELTA_PER_NOTCH
+    };
+    value / units
+}
+
+/// Lines-per-notch the OS applies to a single vertical wheel detent,
+/// re-queried on every event.
+///
+/// Windows scales `WM_MOUSEWHEEL` into `LineDelta` lines using the user's
+/// "wheel scroll lines" setting (`SPI_GETWHEELSCROLLLINES`, default 3), so
+/// one detent arrives as e.g. `LineDelta(0.0, 3.0)`. The vendored winit
+/// backend re-queries this setting on every `WM_MOUSEWHEEL`, so the divisor
+/// must be re-queried per event too or a mid-session settings change would
+/// desync multiplier and divisor. Falls back to `WHEEL_LINE_DELTA_PER_NOTCH`
+/// when the query fails, reports 0, or reports the `WHEEL_PAGESCROLL`
+/// page-scroll sentinel. Non-Windows winit backends already deliver ~1 line
+/// per notch.
+#[cfg(windows)]
+fn lines_per_notch() -> f32 {
+    use winapi::um::winuser::{SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, WHEEL_PAGESCROLL};
+    let mut lines: u32 = 0;
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, (&mut lines as *mut u32).cast(), 0)
+    };
+    if ok == 0 || lines == 0 || lines == WHEEL_PAGESCROLL {
+        WHEEL_LINE_DELTA_PER_NOTCH
+    } else {
+        lines as f32
     }
+}
+
+#[cfg(not(windows))]
+fn lines_per_notch() -> f32 {
+    1.0
+}
+
+/// Chars-per-notch the OS applies to a single horizontal wheel detent,
+/// re-queried on every event.
+///
+/// Windows scales `WM_MOUSEHWHEEL` into horizontal `LineDelta` values using
+/// the "wheel scroll chars" setting (`SPI_GETWHEELSCROLLCHARS`, default 3),
+/// not the lines setting, so the horizontal axis needs its own divisor.
+/// Same fallbacks as [`lines_per_notch`]: query failure, 0, or the
+/// `WHEEL_PAGESCROLL` sentinel map to `WHEEL_LINE_DELTA_PER_NOTCH`.
+/// Non-Windows winit backends already deliver ~1 unit per notch.
+#[cfg(windows)]
+fn chars_per_notch() -> f32 {
+    use winapi::um::winuser::{SystemParametersInfoW, SPI_GETWHEELSCROLLCHARS, WHEEL_PAGESCROLL};
+    let mut chars: u32 = 0;
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETWHEELSCROLLCHARS, 0, (&mut chars as *mut u32).cast(), 0)
+    };
+    if ok == 0 || chars == 0 || chars == WHEEL_PAGESCROLL {
+        WHEEL_LINE_DELTA_PER_NOTCH
+    } else {
+        chars as f32
+    }
+}
+
+#[cfg(not(windows))]
+fn chars_per_notch() -> f32 {
+    1.0
 }
 
 fn dominant_delta(delta: (f32, f32)) -> f32 {
@@ -2966,6 +3081,8 @@ impl ApplicationHandler for AppHandler {
                         state.scale_factor,
                         state.zoom_factor,
                         scroll_tuning,
+                        chars_per_notch(),
+                        lines_per_notch(),
                     );
                     let duration_delta = unscaled_scroll_delta(
                         (delta_x, delta_y),
@@ -3061,6 +3178,12 @@ impl ApplicationHandler for AppHandler {
                     // Dispatch Scroll event to element handlers. Walk from the
                     // hovered element up to the root, firing the first handler
                     // found (bubble semantics).
+                    //
+                    // A handler that returns a boxed [`ScrollGridPatch`] opts
+                    // into scoped invalidation: its fresh grid is written onto
+                    // the handling node and only paint-dirtied, so the wheel
+                    // event repaints without a full tree rebuild. Any other
+                    // return value keeps the legacy full-rebuild behavior.
                     let pos = state.interaction.last_cursor_pos;
                     let scroll_evt =
                         unshit_core::event::Event::Scroll(unshit_core::event::ScrollEvent {
@@ -3071,17 +3194,35 @@ impl ApplicationHandler for AppHandler {
                         });
                     let mut node = state.interaction.hovered;
                     while let Some(element) = state.arena.get(node) {
-                        let mut handled = false;
-                        for (et, handler) in &element.handlers {
-                            if *et == unshit_core::event::EventType::Scroll {
-                                handler(&scroll_evt);
-                                handled = true;
-                                state.needs_rebuild = true;
-                                state.window.request_redraw();
-                                break;
+                        let handler = element
+                            .handlers
+                            .iter()
+                            .find(|(et, _)| *et == unshit_core::event::EventType::Scroll)
+                            .map(|(_, handler)| handler.clone());
+                        if let Some(handler) = handler {
+                            match handler(&scroll_evt)
+                                .and_then(|value| value.downcast::<ScrollGridPatch>().ok())
+                            {
+                                Some(patch) => {
+                                    if let Some(grid) = patch.grid {
+                                        if apply_scroll_grid_patch(&mut state.arena, node, grid) {
+                                            state.window.request_redraw();
+                                        } else {
+                                            // Node gone, non-grid content, or
+                                            // dimensions changed underneath the
+                                            // handler: fall back to a rebuild.
+                                            state.needs_rebuild = true;
+                                            state.window.request_redraw();
+                                        }
+                                    }
+                                    // `grid: None`: consumed with no visual
+                                    // change; schedule nothing.
+                                }
+                                None => {
+                                    state.needs_rebuild = true;
+                                    state.window.request_redraw();
+                                }
                             }
-                        }
-                        if handled {
                             break;
                         }
                         let parent = element.parent;
@@ -5465,6 +5606,8 @@ mod tests {
             1.0,
             1.0,
             ScrollTuning::default(),
+            1.0,
+            1.0,
         );
 
         assert_eq!(dx, DEFAULT_WHEEL_LINE_SCROLL_PX);
@@ -5479,6 +5622,8 @@ mod tests {
             1.0,
             1.0,
             ScrollTuning { line_scroll_px: 72.0, smooth_scroll_duration_ms: 80 },
+            1.0,
+            1.0,
         );
 
         assert_eq!(dx, 72.0);
@@ -5493,9 +5638,26 @@ mod tests {
             1.5,
             1.0,
             ScrollTuning::default(),
+            3.0,
+            3.0,
         );
 
         assert_eq!(dy, -DEFAULT_WHEEL_LINE_SCROLL_PX * 1.5);
+        assert!(smooth);
+    }
+
+    #[test]
+    fn sub_notch_line_delta_scales_proportionally_instead_of_amplifying() {
+        let (_, dy, smooth) = wheel_scroll_delta_pixels(
+            winit::event::MouseScrollDelta::LineDelta(0.0, -0.6),
+            1.0,
+            1.0,
+            ScrollTuning::default(),
+            3.0,
+            3.0,
+        );
+
+        assert!((dy - -0.2 * DEFAULT_WHEEL_LINE_SCROLL_PX).abs() < 0.001);
         assert!(smooth);
     }
 
@@ -5508,11 +5670,88 @@ mod tests {
             1.0,
             1.0,
             ScrollTuning::default(),
+            3.0,
+            3.0,
         );
 
         assert_eq!(dx, 3.0);
         assert_eq!(dy, -14.0);
         assert!(!smooth);
+    }
+
+    #[test]
+    fn normalize_wheel_line_delta_divides_unconditionally_by_lines_per_notch() {
+        assert_eq!(normalize_wheel_line_delta(3.0, 3.0), 1.0);
+        assert_eq!(normalize_wheel_line_delta(-3.0, 3.0), -1.0);
+        assert!((normalize_wheel_line_delta(1.0, 3.0) - 1.0 / 3.0).abs() < 1e-6);
+        assert!((normalize_wheel_line_delta(0.6, 3.0) - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fragmented_sub_notch_events_sum_to_one_notch() {
+        let notches: f32 = (0..5).map(|_| normalize_wheel_line_delta(0.6, 3.0)).sum();
+        assert!((notches - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn one_line_per_notch_platforms_pass_line_deltas_through() {
+        assert_eq!(normalize_wheel_line_delta(1.0, 1.0), 1.0);
+        assert_eq!(normalize_wheel_line_delta(-0.25, 1.0), -0.25);
+    }
+
+    #[test]
+    fn invalid_lines_per_notch_falls_back_to_default_notch_size() {
+        assert_eq!(normalize_wheel_line_delta(3.0, 0.0), 1.0);
+        assert_eq!(normalize_wheel_line_delta(3.0, -2.0), 1.0);
+        assert_eq!(normalize_wheel_line_delta(3.0, f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn lines_per_notch_is_positive_and_finite() {
+        let lines = lines_per_notch();
+        assert!(lines.is_finite() && lines > 0.0);
+    }
+
+    #[test]
+    fn chars_per_notch_is_positive_and_finite() {
+        let chars = chars_per_notch();
+        assert!(chars.is_finite() && chars > 0.0);
+    }
+
+    #[test]
+    fn horizontal_wheel_delta_is_normalized_by_chars_per_notch() {
+        // One horizontal detent arrives as 3 chars; lines-per-notch is
+        // deliberately different so any axis mix-up would be visible.
+        let (dx, dy, smooth) = wheel_scroll_delta_pixels(
+            winit::event::MouseScrollDelta::LineDelta(3.0, 0.0),
+            1.0,
+            1.0,
+            ScrollTuning::default(),
+            3.0,
+            10.0,
+        );
+
+        assert_eq!(dx, DEFAULT_WHEEL_LINE_SCROLL_PX);
+        assert_eq!(dy, 0.0);
+        assert!(smooth);
+    }
+
+    #[test]
+    fn asymmetric_per_axis_divisors_normalize_each_axis_independently() {
+        // chars-per-notch 3 and lines-per-notch 10: one detent on each
+        // axis must normalize to exactly one browser step per axis.
+        let (dx, dy, smooth) = wheel_scroll_delta_pixels(
+            winit::event::MouseScrollDelta::LineDelta(3.0, -10.0),
+            1.0,
+            1.0,
+            ScrollTuning::default(),
+            3.0,
+            10.0,
+        );
+
+        assert_eq!(dx, DEFAULT_WHEEL_LINE_SCROLL_PX);
+        assert_eq!(dy, -DEFAULT_WHEEL_LINE_SCROLL_PX);
+        assert!(smooth);
     }
 
     #[test]
@@ -5830,5 +6069,69 @@ mod tests {
         c.observe(true);
         c.observe(true);
         assert_eq!(c.rebuild_request_count, u32::MAX);
+    }
+
+    /// Build a root div with one grid child, clear the initial dirty flags,
+    /// and return (arena, root, grid child).
+    fn arena_with_grid_child(rows: usize, cols: usize) -> (NodeArena, NodeId, NodeId) {
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let def = ElementDef::new(Tag::Div).with_child(
+            ElementDef::new(Tag::Div).with_grid(unshit_core::cell_grid::CellGrid::new(rows, cols)),
+        );
+        let root = build_tree_from_def(&def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let child = arena.children(root)[0];
+        for id in [root, child] {
+            arena.get_mut(id).unwrap().dirty = DirtyFlags::empty();
+        }
+        (arena, root, child)
+    }
+
+    #[test]
+    fn scroll_grid_patch_swaps_content_and_paint_dirties_only() {
+        use unshit_core::cell_grid::{Cell, CellGrid};
+        let (mut arena, root, child) = arena_with_grid_child(3, 4);
+        let mut fresh = CellGrid::new(3, 4);
+        fresh.set_cell(0, 0, Cell::with_char('x'));
+
+        assert!(apply_scroll_grid_patch(&mut arena, child, fresh.clone()));
+
+        match &arena.get(child).unwrap().content {
+            ElementContent::Grid(grid) => assert_eq!(grid, &fresh),
+            _ => panic!("expected grid content on the patched node"),
+        }
+        let child_dirty = arena.get(child).unwrap().dirty;
+        assert!(child_dirty.contains(DirtyFlags::PAINT));
+        assert!(!child_dirty.contains(DirtyFlags::STYLE));
+        assert!(!child_dirty.contains(DirtyFlags::LAYOUT));
+        assert!(
+            arena.get(root).unwrap().dirty.contains(DirtyFlags::SUBTREE_PAINT),
+            "ancestors must be SUBTREE_PAINT so the batch walk reaches the node"
+        );
+    }
+
+    #[test]
+    fn scroll_grid_patch_rejects_dimension_changes() {
+        use unshit_core::cell_grid::CellGrid;
+        let (mut arena, _root, child) = arena_with_grid_child(3, 4);
+
+        assert!(!apply_scroll_grid_patch(&mut arena, child, CellGrid::new(5, 4)));
+
+        match &arena.get(child).unwrap().content {
+            ElementContent::Grid(grid) => assert_eq!((grid.rows(), grid.cols()), (3, 4)),
+            _ => panic!("expected grid content to be left untouched"),
+        }
+        assert!(!arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT));
+    }
+
+    #[test]
+    fn scroll_grid_patch_rejects_non_grid_and_missing_nodes() {
+        use unshit_core::cell_grid::CellGrid;
+        let (mut arena, root, _child) = arena_with_grid_child(3, 4);
+
+        assert!(!apply_scroll_grid_patch(&mut arena, root, CellGrid::new(3, 4)));
+        assert!(!arena.get(root).unwrap().dirty.contains(DirtyFlags::PAINT));
+
+        assert!(!apply_scroll_grid_patch(&mut arena, NodeId::DANGLING, CellGrid::new(3, 4)));
     }
 }
