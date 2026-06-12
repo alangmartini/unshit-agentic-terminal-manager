@@ -4215,10 +4215,12 @@ pub fn terminal_cell_at(
     let handle = state.terminals.get(&pane)?;
     let t = handle.lock_recover();
     let (rows, cols) = (t.grid().rows(), t.grid().cols());
-    let (row, col) = cell_from_local(local_x, local_y, cell_w, cell_h, x_offset, cols, rows)?;
-    // Promote the visible row to a stable absolute line so the selection
-    // survives scrolling and output.
-    Some((t.abs_line_at_display(row), col))
+    let (_, col) = cell_from_local(local_x, local_y, cell_w, cell_h, x_offset, cols, rows)?;
+    // Promote the pointer's pixel row to a stable absolute line so the
+    // selection survives scrolling and output. The terminal owns the
+    // y mapping because a sub-row scroll fraction shifts the content by
+    // a fraction of a cell (and exposes the overscan line at the top).
+    Some((t.view_pixel_to_abs_line(local_y, cell_h), col))
 }
 
 fn terminal_word_bounds(state: &AppState, pane: u32, cell: (u64, usize)) -> (usize, usize) {
@@ -7750,8 +7752,9 @@ mod tests {
         let mut term = crate::terminal::Terminal::new(2, 5);
         term.process_bytes(b"aaaaa\r\nbbbbb");
         let mut grid = term.display_grid();
-        // Absolute line 0 == display row 0 on a fresh terminal with no
-        // scrollback; select cols 1..=3 of it.
+        // Absolute line 0 == viewport row 0 on a fresh terminal with no
+        // scrollback, which sits at grid row 1 below the overscan row;
+        // select cols 1..=3 of it.
         let sel = TermSelection {
             anchor: (0, 1),
             focus: (0, 3),
@@ -7759,14 +7762,14 @@ mod tests {
         };
         apply_selection_highlight(&mut grid, &term, &sel);
 
-        // Selected cells (row 0, cols 1..=3) carry the selection bg.
+        // Selected cells (grid row 1, cols 1..=3) carry the selection bg.
         for col in 1..=3 {
-            assert_eq!(grid.get_cell(0, col).unwrap().bg, SELECTION_BG, "col {col}");
+            assert_eq!(grid.get_cell(1, col).unwrap().bg, SELECTION_BG, "col {col}");
         }
         // Cells outside the range are untouched.
-        assert_ne!(grid.get_cell(0, 0).unwrap().bg, SELECTION_BG);
-        assert_ne!(grid.get_cell(0, 4).unwrap().bg, SELECTION_BG);
-        assert_ne!(grid.get_cell(1, 2).unwrap().bg, SELECTION_BG);
+        assert_ne!(grid.get_cell(1, 0).unwrap().bg, SELECTION_BG);
+        assert_ne!(grid.get_cell(1, 4).unwrap().bg, SELECTION_BG);
+        assert_ne!(grid.get_cell(2, 2).unwrap().bg, SELECTION_BG);
     }
 
     #[test]

@@ -1,9 +1,15 @@
+use crate::animation_waker::AnimationWaker;
 use crate::clipboard::ClipboardContext;
 use crate::event_sink::{EventSink, ExternalEvent};
 use crate::notification::{AttentionUrgency, BellConfig, BellState};
+use crate::scroll_motion::{
+    browser_like_initial_slope, browser_like_wheel_duration, dominant_delta, ScrollMotion,
+    SMOOTH_SCROLL_EPSILON,
+};
 use crate::shortcut::{key_combo_from_winit, ShortcutResolver};
 use crate::window;
 use cosmic_text::{FontSystem, SwashCache};
+use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -268,6 +274,10 @@ pub struct App {
     event_tx: flume::Sender<ExternalEvent>,
     event_rx: flume::Receiver<ExternalEvent>,
     proxy_cell: Arc<OnceLock<EventLoopProxy>>,
+    /// The single persistent animation waker shared by every animation
+    /// producer (container smooth scroll, grid-animation hooks). Replaces
+    /// the per-wheel-notch waker threads; see [`crate::animation_waker`].
+    animation_waker: AnimationWaker,
     canvas_registry: CanvasRegistry,
     clipboard: Arc<ClipboardContext>,
     #[cfg(feature = "async")]
@@ -390,7 +400,14 @@ struct AppState {
     event_log_start: Instant,
     scrollbar_visual: ScrollbarVisualState,
     smooth_scroll: Option<SmoothScroll>,
-    smooth_scroll_next_frame: Option<Instant>,
+    /// Framework-driven per-node grid animations, registered by Scroll
+    /// handlers through [`ScrollGridPatch::animation`] and ticked at the
+    /// shared animation cadence. See [`tick_grid_animations`].
+    grid_animations: HashMap<NodeId, GridAnimationHook>,
+    /// Shared due-gate for all animation sources (container smooth scroll
+    /// and grid animations): the earliest instant the next animation frame
+    /// may paint. `None` when no animation is active.
+    animation_next_frame: Option<Instant>,
     force_animation_paint: bool,
     active_transitions: ActiveTransitions,
     animation_driver: AnimationDriver,
@@ -518,22 +535,11 @@ fn resize_direction_cursor_icon(direction: ResizeDirection) -> CursorIcon {
 /// keystrokes or PTY chunks without keeping the CPU warm after activity
 /// stops. Matches Ghostty's active-renderer-window concept.
 pub(crate) const ACTIVITY_WINDOW: Duration = Duration::from_millis(250);
-const SMOOTH_SCROLL_EPSILON: f32 = 0.5;
-const BROWSER_WHEEL_RAMP_START_PX: f32 = 100.0;
-const BROWSER_WHEEL_RAMP_END_PX: f32 = 400.0;
-const BROWSER_MIN_DURATION_RATIO: f32 = 0.52;
-const BROWSER_DURATION_RAMP_EXPONENT: f32 = 1.35;
-const BROWSER_INITIAL_SLOPE_MIN: f32 = 0.25;
-const BROWSER_INITIAL_SLOPE_MAX: f32 = 0.95;
 const SMOOTH_SCROLL_WAKE_INTERVAL: Duration = Duration::from_millis(8);
 const SMOOTH_SCROLL_WAKE_GRACE: Duration = Duration::from_millis(48);
 /// Fallback lines-per-notch when the OS setting cannot be queried. Matches
 /// the Windows default of 3 wheel-scroll lines per detent.
 const WHEEL_LINE_DELTA_PER_NOTCH: f32 = 3.0;
-const EASE_IN_OUT_X1: f32 = 0.42;
-const EASE_IN_OUT_Y1: f32 = 0.0;
-const EASE_IN_OUT_X2: f32 = 0.58;
-const EASE_IN_OUT_Y2: f32 = 1.0;
 
 fn should_check_shortcut_during_keyboard_capture(combo: &unshit_core::shortcut::KeyCombo) -> bool {
     combo.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META)
@@ -542,25 +548,6 @@ fn should_check_shortcut_during_keyboard_capture(combo: &unshit_core::shortcut::
 
 fn consume_raw_key_hook(config: &AppConfig, combo: &unshit_core::shortcut::KeyCombo) -> bool {
     config.on_raw_key.as_ref().is_some_and(|f| f(combo))
-}
-
-fn spawn_smooth_scroll_waker(
-    event_tx: flume::Sender<ExternalEvent>,
-    proxy_cell: Arc<OnceLock<EventLoopProxy>>,
-    duration: Duration,
-) {
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + duration + SMOOTH_SCROLL_WAKE_GRACE;
-        while Instant::now() <= deadline {
-            std::thread::sleep(SMOOTH_SCROLL_WAKE_INTERVAL);
-            if event_tx.send(ExternalEvent::RequestAnimationFrame).is_err() {
-                break;
-            }
-            if let Some(proxy) = proxy_cell.get() {
-                proxy.wake_up();
-            }
-        }
-    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -581,75 +568,38 @@ impl SmoothScroll {
         (position, complete)
     }
 
-    fn position_velocity_at(self, now: Instant) -> ((f32, f32), f32, f32, bool) {
-        let elapsed = now.saturating_duration_since(self.started_at);
-        if self.duration.is_zero() {
-            return ((self.target_x, self.target_y), 0.0, 0.0, true);
+    /// The horizontal axis as a shared 1-D [`ScrollMotion`].
+    fn motion_x(self) -> ScrollMotion {
+        ScrollMotion {
+            start: self.start_x,
+            target: self.target_x,
+            started_at: self.started_at,
+            duration: self.duration,
+            initial_slope: self.initial_slope,
         }
-        let complete = elapsed >= self.duration;
-        let duration_secs = self.duration.as_secs_f32();
-        let (progress, progress_velocity) = if complete {
-            (1.0, 0.0)
-        } else {
-            browser_scroll_ease(elapsed.as_secs_f32() / duration_secs, self.initial_slope)
-        };
-        let x = self.start_x + (self.target_x - self.start_x) * progress;
-        let y = self.start_y + (self.target_y - self.start_y) * progress;
-        let vx = (self.target_x - self.start_x) * progress_velocity / duration_secs;
-        let vy = (self.target_y - self.start_y) * progress_velocity / duration_secs;
+    }
+
+    /// The vertical axis as a shared 1-D [`ScrollMotion`].
+    fn motion_y(self) -> ScrollMotion {
+        ScrollMotion {
+            start: self.start_y,
+            target: self.target_y,
+            started_at: self.started_at,
+            duration: self.duration,
+            initial_slope: self.initial_slope,
+        }
+    }
+
+    /// Sample both axes by delegating to the shared
+    /// [`crate::scroll_motion::ScrollMotion`] sampler, so container smooth
+    /// scrolling and app-managed grid scrolling run one curve
+    /// implementation. Both axes share `started_at`/`duration`, so either
+    /// axis' completion flag describes the whole scroll.
+    fn position_velocity_at(self, now: Instant) -> ((f32, f32), f32, f32, bool) {
+        let (x, vx, complete) = self.motion_x().sample(now);
+        let (y, vy, _) = self.motion_y().sample(now);
         ((x, y), vx, vy, complete)
     }
-}
-
-fn browser_scroll_ease(x: f32, initial_slope: f32) -> (f32, f32) {
-    let y1 = EASE_IN_OUT_Y1 + EASE_IN_OUT_X1 * initial_slope.clamp(-1000.0, 1000.0);
-    let x = x.clamp(0.0, 1.0);
-    cubic_bezier_y_and_velocity(x, EASE_IN_OUT_X1, y1, EASE_IN_OUT_X2, EASE_IN_OUT_Y2)
-}
-
-fn cubic_bezier_y_and_velocity(x: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> (f32, f32) {
-    let mut t = x;
-    for _ in 0..6 {
-        let current_x = cubic_bezier_axis(t, x1, x2);
-        let dx = cubic_bezier_axis_derivative(t, x1, x2);
-        if dx.abs() < 0.000_001 {
-            break;
-        }
-        let next = t - (current_x - x) / dx;
-        if !(0.0..=1.0).contains(&next) {
-            break;
-        }
-        t = next;
-    }
-    let mut lo = 0.0;
-    let mut hi = 1.0;
-    for _ in 0..8 {
-        let current_x = cubic_bezier_axis(t, x1, x2);
-        if (current_x - x).abs() <= 0.000_01 {
-            break;
-        }
-        if current_x < x {
-            lo = t;
-        } else {
-            hi = t;
-        }
-        t = (lo + hi) * 0.5;
-    }
-    let y = cubic_bezier_axis(t, y1, y2);
-    let dx = cubic_bezier_axis_derivative(t, x1, x2);
-    let dy = cubic_bezier_axis_derivative(t, y1, y2);
-    let velocity = if dx.abs() < 0.000_001 { 0.0 } else { dy / dx };
-    (y, velocity)
-}
-
-fn cubic_bezier_axis(t: f32, p1: f32, p2: f32) -> f32 {
-    let inv = 1.0 - t;
-    3.0 * inv * inv * t * p1 + 3.0 * inv * t * t * p2 + t * t * t
-}
-
-fn cubic_bezier_axis_derivative(t: f32, p1: f32, p2: f32) -> f32 {
-    let inv = 1.0 - t;
-    3.0 * inv * inv * p1 + 6.0 * inv * t * (p2 - p1) + 3.0 * t * t * (1.0 - p2)
 }
 
 /// Opt-in return payload for element `Scroll` handlers (boxed as the
@@ -664,8 +614,55 @@ fn cubic_bezier_axis_derivative(t: f32, p1: f32, p2: f32) -> f32 {
 /// the fast-paint path. `grid: None` means "event consumed, nothing visible
 /// changed" and schedules no work at all. Handlers returning any other value
 /// (or `None`) keep the legacy behavior: a full rebuild on the next frame.
+///
+/// `animation` additionally registers (or replaces, extending the shared
+/// waker's deadline) a framework-driven [`GridAnimationHook`] on the
+/// handling node, so the surface keeps repainting at the animation cadence
+/// after the event without owning a timer.
+#[derive(Default)]
 pub struct ScrollGridPatch {
     pub grid: Option<unshit_core::cell_grid::CellGrid>,
+    /// Registers (or replaces) a framework-driven animation on the handling
+    /// node. `None` leaves any in-flight animation untouched.
+    pub animation: Option<GridAnimationHook>,
+}
+
+/// A node-scoped grid animation driven by the framework's animation tick.
+///
+/// The framework owns *when* to sample (the shared animation cadence, the
+/// same one container smooth scrolling uses, so a future vblank-anchored
+/// clock upgrades both at once); the app owns *what* a sample means: `tick`
+/// receives the frame's injected timestamp and returns fresh grid content
+/// or [`GridTick::Idle`]. Hooks are keyed by node — re-registering on the
+/// same node replaces the previous hook, which is exactly what a new wheel
+/// notch retargeting an in-flight animation wants.
+pub struct GridAnimationHook {
+    /// Drop-dead time for the hook (animation end plus grace). Past this
+    /// instant the framework gives the sampler one final settling tick
+    /// (so the underlying animation can land on its target rather than
+    /// strand mid-flight) and then unregisters it unconditionally, so a
+    /// buggy or stuck sampler cannot keep the cadence hot forever.
+    pub deadline: Instant,
+    /// Timestamp-injectable sampler, called once per animation frame on
+    /// the UI thread. Must be cheap and must not re-enter the framework.
+    pub tick: Arc<dyn Fn(Instant) -> GridTick + Send + Sync>,
+}
+
+/// One animation-frame step of a [`GridAnimationHook`].
+pub enum GridTick {
+    /// The animation advanced: repaint the node with this grid and keep
+    /// the hook registered.
+    Continue(unshit_core::cell_grid::CellGrid),
+    /// Final frame: repaint the node with this grid and unregister the
+    /// hook. Hooks whose underlying animation was cancelled out from
+    /// under them (a snap-to-live, a takeover by another input device)
+    /// should also return `Done` so the framework quiesces immediately
+    /// rather than idling against the deadline.
+    Done(unshit_core::cell_grid::CellGrid),
+    /// Nothing changed visually this tick (e.g. the sampled position
+    /// rounded to the same sub-row fraction); keep the hook registered
+    /// and schedule no paint work.
+    Idle,
 }
 
 /// Write a Scroll handler's freshly snapshotted grid onto the handling node,
@@ -788,47 +785,9 @@ fn chars_per_notch() -> f32 {
     1.0
 }
 
-fn dominant_delta(delta: (f32, f32)) -> f32 {
-    if delta.0.abs() > delta.1.abs() {
-        delta.0
-    } else {
-        delta.1
-    }
-}
-
 fn unscaled_scroll_delta(delta: (f32, f32), scale_factor: f32, zoom_factor: f32) -> (f32, f32) {
     let factor = (scale_factor * zoom_factor).max(0.01);
     (delta.0 / factor, delta.1 / factor)
-}
-
-fn browser_like_wheel_duration(delta: (f32, f32), tuning: ScrollTuning) -> Duration {
-    let tuning = tuning.sanitized();
-    let max_ms = tuning.smooth_scroll_duration_ms as f32;
-    let min_ms = (max_ms * BROWSER_MIN_DURATION_RATIO).max(16.0);
-    let distance = dominant_delta(delta).abs();
-    let duration_ms = if distance <= BROWSER_WHEEL_RAMP_START_PX {
-        max_ms
-    } else if distance >= BROWSER_WHEEL_RAMP_END_PX {
-        min_ms
-    } else {
-        let t = (distance - BROWSER_WHEEL_RAMP_START_PX)
-            / (BROWSER_WHEEL_RAMP_END_PX - BROWSER_WHEEL_RAMP_START_PX);
-        min_ms + (max_ms - min_ms) * (1.0 - t).powf(BROWSER_DURATION_RAMP_EXPONENT)
-    };
-    Duration::from_millis(duration_ms.round() as u64)
-}
-
-fn browser_like_initial_slope(delta: (f32, f32)) -> f32 {
-    let distance = dominant_delta(delta).abs();
-    if distance <= BROWSER_WHEEL_RAMP_START_PX {
-        return BROWSER_INITIAL_SLOPE_MIN;
-    }
-    if distance >= BROWSER_WHEEL_RAMP_END_PX {
-        return BROWSER_INITIAL_SLOPE_MAX;
-    }
-    let t = (distance - BROWSER_WHEEL_RAMP_START_PX)
-        / (BROWSER_WHEEL_RAMP_END_PX - BROWSER_WHEEL_RAMP_START_PX);
-    BROWSER_INITIAL_SLOPE_MIN + (BROWSER_INITIAL_SLOPE_MAX - BROWSER_INITIAL_SLOPE_MIN) * t.sqrt()
 }
 
 fn next_smooth_scroll(
@@ -949,18 +908,132 @@ fn tick_smooth_scroll(
         let pos = state.interaction.last_cursor_pos;
         handle_normal_hover(state, pos, decorations);
         state.smooth_scroll = None;
-        state.smooth_scroll_next_frame = None;
+        // The frame gate is shared with grid animations; only drop it when
+        // no animation source remains.
+        if state.grid_animations.is_empty() {
+            state.animation_next_frame = None;
+        }
     }
 }
 
-fn can_fast_paint_smooth_scroll(state: &AppState) -> bool {
-    state.smooth_scroll.is_some()
+/// Advance every registered grid animation by one tick, apply the fresh
+/// grids as paint-only patches, and unregister hooks that reported `Done`
+/// or whose deadline passed.
+///
+/// `apply_patches` is `false` on frames that are about to run a full tree
+/// rebuild: the rebuilt snapshot reflects the advanced animation state
+/// anyway, so applying the patch would only duplicate compose work. Hook
+/// lifecycle (deadline expiry, `Done` unregistration) still advances.
+///
+/// Returns whether any hook reported a visual change. Kept as a thin
+/// wrapper over [`tick_grid_animations_core`] so the lifecycle rules are
+/// unit-testable without an [`AppState`].
+fn tick_grid_animations(state: &mut AppState, now: Instant, apply_patches: bool) -> bool {
+    if state.grid_animations.is_empty() {
+        return false;
+    }
+    let (visual_change, rebuild_required) =
+        tick_grid_animations_core(&mut state.arena, &mut state.grid_animations, now, apply_patches);
+    if rebuild_required {
+        state.needs_rebuild = true;
+    }
+    if state.smooth_scroll.is_none() && state.grid_animations.is_empty() {
+        state.animation_next_frame = None;
+    }
+    visual_change
+}
+
+/// Core of [`tick_grid_animations`]: returns
+/// `(visual_change, rebuild_required)`.
+fn tick_grid_animations_core(
+    arena: &mut NodeArena,
+    grid_animations: &mut HashMap<NodeId, GridAnimationHook>,
+    now: Instant,
+    apply_patches: bool,
+) -> (bool, bool) {
+    let mut visual_change = false;
+    let mut rebuild_required = false;
+    let mut finished: Vec<NodeId> = Vec::new();
+    // Snapshot the hooks before ticking: the samplers run app code and the
+    // patch application needs the arena, so the map cannot stay borrowed.
+    #[allow(clippy::type_complexity)]
+    let ticks: Vec<(NodeId, Instant, Arc<dyn Fn(Instant) -> GridTick + Send + Sync>)> =
+        grid_animations
+            .iter()
+            .map(|(node_id, hook)| (*node_id, hook.deadline, Arc::clone(&hook.tick)))
+            .collect();
+    for (node_id, deadline, tick) in ticks {
+        let node_alive = arena.get(node_id).is_some();
+        if now > deadline {
+            // Deadline expiry (a frame gap longer than the grace at the
+            // motion's end, or a sampler that never reported `Done`).
+            // The hook still gets one final sample so the app-side
+            // animation settles on its target instead of stranding
+            // mid-flight with the last sampled position on screen; the
+            // settled frame is painted when the node still exists.
+            if let GridTick::Continue(grid) | GridTick::Done(grid) = tick(now) {
+                if node_alive {
+                    visual_change = true;
+                    if apply_patches && !apply_scroll_grid_patch(arena, node_id, grid) {
+                        rebuild_required = true;
+                    }
+                }
+            }
+            finished.push(node_id);
+            continue;
+        }
+        let (grid, done) = match tick(now) {
+            GridTick::Idle => continue,
+            GridTick::Continue(grid) => (grid, false),
+            GridTick::Done(grid) => (grid, true),
+        };
+        if done {
+            finished.push(node_id);
+        }
+        if node_alive {
+            visual_change = true;
+            if apply_patches && !apply_scroll_grid_patch(arena, node_id, grid) {
+                // The grid's dimensions changed underneath the animation
+                // (or the node no longer holds grid content): fall back to
+                // a full rebuild. Live hooks stay registered so the
+                // animation resumes against the rebuilt tree.
+                rebuild_required = true;
+            }
+        } else {
+            // The node vanished mid-flight (reconcile re-keyed or removed
+            // it, e.g. a tab switch while a wheel animation runs). The
+            // hook keeps ticking blind so the app-side animation advances
+            // to completion instead of stranding, and each advanced
+            // sample requests a rebuild: if the surface is (or becomes)
+            // visible again under a fresh node, the rebuilt snapshot
+            // carries the up-to-date position. The deadline still bounds
+            // the hook's lifetime.
+            rebuild_required = true;
+        }
+    }
+    for node_id in finished {
+        grid_animations.remove(&node_id);
+    }
+    (visual_change, rebuild_required)
+}
+
+/// Whether any framework-driven animation is in flight: a container smooth
+/// scroll or at least one registered grid-animation hook. Every tick-site
+/// and control-flow predicate that used to test `smooth_scroll.is_some()`
+/// goes through this so both animation kinds share the fast-paint path,
+/// the pacer bypass, and the wake cadence.
+fn animations_active(state: &AppState) -> bool {
+    state.smooth_scroll.is_some() || !state.grid_animations.is_empty()
+}
+
+fn can_fast_paint_animations(state: &AppState) -> bool {
+    animations_active(state)
         && !state.needs_rebuild
         && !state.needs_restyle
         && !state.needs_relayout
 }
 
-fn fast_paint_smooth_scroll_frame(
+fn fast_paint_animation_frame(
     state: &mut AppState,
     frame_start: Instant,
     decorations: bool,
@@ -969,7 +1042,20 @@ fn fast_paint_smooth_scroll_frame(
 ) {
     let mut metrics = FrameMetrics::default();
 
+    // A container smooth scroll repositions on every sample (including its
+    // final pin-to-target frame), so its mere presence at entry means this
+    // frame changes pixels. Grid hooks report per-tick whether anything
+    // moved; when every hook is idle (e.g. the sampled position rounded to
+    // the same device pixel) and no canvas wants a repaint, skip the batch
+    // build and the GPU present entirely — the previous frame is still
+    // correct. Lifecycle (deadline expiry, `Done`) advanced above, and the
+    // callers keep scheduling the next animation tick regardless.
+    let container_scroll_active = state.smooth_scroll.is_some();
     tick_smooth_scroll(state, frame_start, decorations, on_scroll_telemetry);
+    let grid_visual_change = tick_grid_animations(state, frame_start, true);
+    if !container_scroll_active && !grid_visual_change && !state.gpu.any_canvas_needs_repaint() {
+        return;
+    }
 
     state.gpu.glyph_atlas.advance_frame();
 
@@ -1491,13 +1577,19 @@ impl AppState {
 impl App {
     pub fn new(config: AppConfig, tree_fn: impl Fn() -> ElementTree + 'static) -> Self {
         let (event_tx, event_rx) = flume::unbounded();
+        let proxy_cell: Arc<OnceLock<EventLoopProxy>> = Arc::new(OnceLock::new());
         Self {
             config,
             tree_fn: Box::new(tree_fn),
             state: None,
+            animation_waker: AnimationWaker::new(
+                event_tx.clone(),
+                Arc::clone(&proxy_cell),
+                SMOOTH_SCROLL_WAKE_INTERVAL,
+            ),
             event_tx,
             event_rx,
-            proxy_cell: Arc::new(OnceLock::new()),
+            proxy_cell,
             canvas_registry: CanvasRegistry::new(),
             clipboard: Arc::new(ClipboardContext::new()),
             #[cfg(feature = "async")]
@@ -1749,9 +1841,9 @@ impl ApplicationHandler for AppHandler {
             // during the next [`ACTIVITY_WINDOW`].
             state.mark_activity(Instant::now());
         }
-        if saw_animation_frame && can_fast_paint_smooth_scroll(state) {
+        if saw_animation_frame && can_fast_paint_animations(state) {
             let frame_start = Instant::now();
-            let due = state.smooth_scroll_next_frame.unwrap_or(frame_start);
+            let due = state.animation_next_frame.unwrap_or(frame_start);
             if frame_start < due {
                 _event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
                 if coalescer.saw_event {
@@ -1760,23 +1852,28 @@ impl ApplicationHandler for AppHandler {
                 return;
             }
             state.force_animation_paint = false;
-            fast_paint_smooth_scroll_frame(
+            fast_paint_animation_frame(
                 state,
                 frame_start,
                 self.app.config.decorations,
                 self.app.config.on_scroll_telemetry.as_deref(),
                 self.app.config.on_frame_metrics.as_deref(),
             );
-            if state.smooth_scroll.is_some() {
-                state.smooth_scroll_next_frame = Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
+            if animations_active(state) {
+                state.animation_next_frame = Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
                 _event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             } else {
                 _event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             }
-        } else if saw_animation_frame && state.smooth_scroll.is_none() && !coalescer.saw_event {
+        } else if saw_animation_frame && !animations_active(state) && !coalescer.saw_event {
             state.force_animation_paint = false;
             _event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-        } else if saw_animation_frame && state.smooth_scroll.is_some() {
+        } else if saw_animation_frame && animations_active(state) {
+            // An animation is in flight but cannot fast paint (a rebuild,
+            // restyle, or relayout is pending, e.g. from PTY output).
+            // Route the frame through the full pipeline rather than
+            // swallowing it, or animation frames would stall for as long
+            // as the dirty state persists.
             state.window.request_redraw();
             _event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
         } else {
@@ -2020,7 +2117,8 @@ impl ApplicationHandler for AppHandler {
             event_log_start: Instant::now(),
             scrollbar_visual: ScrollbarVisualState::default(),
             smooth_scroll: None,
-            smooth_scroll_next_frame: None,
+            grid_animations: HashMap::new(),
+            animation_next_frame: None,
             force_animation_paint: false,
             active_transitions: ActiveTransitions::default(),
             animation_driver: AnimationDriver::new(),
@@ -3119,11 +3217,9 @@ impl ApplicationHandler for AppHandler {
                                     browser_like_initial_slope(duration_delta),
                                 );
                                 if state.smooth_scroll.is_some() {
-                                    state.smooth_scroll_next_frame = Some(scroll_started_at);
-                                    spawn_smooth_scroll_waker(
-                                        self.app.event_tx.clone(),
-                                        Arc::clone(&self.app.proxy_cell),
-                                        duration,
+                                    state.animation_next_frame = Some(scroll_started_at);
+                                    self.app.animation_waker.extend_until(
+                                        scroll_started_at + duration + SMOOTH_SCROLL_WAKE_GRACE,
                                     );
                                     if let Some(scroll) = state.smooth_scroll {
                                         emit_scroll_telemetry(
@@ -3184,6 +3280,21 @@ impl ApplicationHandler for AppHandler {
                     // the handling node and only paint-dirtied, so the wheel
                     // event repaints without a full tree rebuild. Any other
                     // return value keeps the legacy full-rebuild behavior.
+                    //
+                    // The event carries the same animation parameters the
+                    // container smooth-scroll path computed above (duration
+                    // and initial-slope ramps for this delta), so app-managed
+                    // scroll surfaces animate with bit-identical feel.
+                    let (smooth_duration_ms, smooth_initial_slope) = if smooth_scroll {
+                        (
+                            browser_like_wheel_duration(duration_delta, scroll_tuning)
+                                .as_secs_f32()
+                                * 1000.0,
+                            browser_like_initial_slope(duration_delta),
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    };
                     let pos = state.interaction.last_cursor_pos;
                     let scroll_evt =
                         unshit_core::event::Event::Scroll(unshit_core::event::ScrollEvent {
@@ -3191,6 +3302,9 @@ impl ApplicationHandler for AppHandler {
                             delta_y,
                             x: pos.0,
                             y: pos.1,
+                            animate: smooth_scroll,
+                            smooth_duration_ms,
+                            smooth_initial_slope,
                         });
                     let mut node = state.interaction.hovered;
                     while let Some(element) = state.arena.get(node) {
@@ -3216,7 +3330,20 @@ impl ApplicationHandler for AppHandler {
                                         }
                                     }
                                     // `grid: None`: consumed with no visual
-                                    // change; schedule nothing.
+                                    // change; schedule nothing (unless an
+                                    // animation hook below wants frames).
+                                    if let Some(hook) = patch.animation {
+                                        // Register (or replace) the node's
+                                        // grid animation and keep the shared
+                                        // waker alive through its deadline
+                                        // (which already includes grace).
+                                        self.app.animation_waker.extend_until(hook.deadline);
+                                        if state.animation_next_frame.is_none() {
+                                            state.animation_next_frame = Some(Instant::now());
+                                        }
+                                        state.grid_animations.insert(node, hook);
+                                        state.window.request_redraw();
+                                    }
                                 }
                                 None => {
                                     state.needs_rebuild = true;
@@ -3281,22 +3408,22 @@ impl ApplicationHandler for AppHandler {
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
                 let force_animation_paint = std::mem::take(&mut state.force_animation_paint);
-                let smooth_scroll_active = state.smooth_scroll.is_some();
-                if state.smooth_scroll.is_some() && can_fast_paint_smooth_scroll(state) {
-                    let due = state.smooth_scroll_next_frame.unwrap_or(frame_start);
+                let animation_active = animations_active(state);
+                if animation_active && can_fast_paint_animations(state) {
+                    let due = state.animation_next_frame.unwrap_or(frame_start);
                     if frame_start < due && !force_animation_paint {
                         event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
                         return;
                     }
-                    fast_paint_smooth_scroll_frame(
+                    fast_paint_animation_frame(
                         state,
                         frame_start,
                         self.app.config.decorations,
                         self.app.config.on_scroll_telemetry.as_deref(),
                         self.app.config.on_frame_metrics.as_deref(),
                     );
-                    if state.smooth_scroll.is_some() {
-                        state.smooth_scroll_next_frame =
+                    if animations_active(state) {
+                        state.animation_next_frame =
                             Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
                         event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
                     } else {
@@ -3316,7 +3443,9 @@ impl ApplicationHandler for AppHandler {
                 // most one paint per frame_pacer.min_interval. When the
                 // pacer says wait, schedule a WaitUntil and bail out so
                 // the event loop sleeps until the coalescing deadline.
-                if !(force_animation_paint || smooth_scroll_active) {
+                // Bypassed while any animation is active so rebuild frames
+                // during an animation are not deferred to pacer cadence.
+                if !(force_animation_paint || animation_active) {
                     match state.frame_pacer.on_redraw_requested(frame_start) {
                         crate::frame_pacer::PaceDecision::PaintNow => {}
                         crate::frame_pacer::PaceDecision::WaitUntil(deadline) => {
@@ -3337,6 +3466,14 @@ impl ApplicationHandler for AppHandler {
                     self.app.config.decorations,
                     self.app.config.on_scroll_telemetry.as_deref(),
                 );
+                // Grid animations advance on the slow path too, BEFORE the
+                // rebuild below, so a rebuilt snapshot reflects the animated
+                // position and reconcile classifies the grid swap as
+                // paint-only. On rebuild frames the per-node patch apply is
+                // skipped (`tree_fn` recomposes every pane anyway); on
+                // restyle/relayout-only frames the patches are applied so
+                // the animated content still reaches this frame's batch.
+                tick_grid_animations(state, frame_start, !state.needs_rebuild);
 
                 // Advance LRU frame counter at the start of each rendered frame.
                 state.gpu.glyph_atlas.advance_frame();
@@ -3763,9 +3900,8 @@ impl ApplicationHandler for AppHandler {
                 // When any source is active we set WaitUntil to the minimum
                 // wake time across all sources, so the event loop sleeps
                 // between frames instead of busy-polling.
-                if state.smooth_scroll.is_some() {
-                    state.smooth_scroll_next_frame =
-                        Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
+                if animations_active(state) {
+                    state.animation_next_frame = Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
                     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
                 } else {
                     let mut next_wake: Option<Instant> = None;
@@ -3863,24 +3999,23 @@ impl ApplicationHandler for AppHandler {
         };
 
         let now = Instant::now();
-        if state.smooth_scroll.is_some() {
-            if can_fast_paint_smooth_scroll(state) {
-                let due = state.smooth_scroll_next_frame.unwrap_or(now);
+        if animations_active(state) {
+            if can_fast_paint_animations(state) {
+                let due = state.animation_next_frame.unwrap_or(now);
                 let wait = due.saturating_duration_since(now).min(SMOOTH_SCROLL_WAKE_INTERVAL);
                 if !wait.is_zero() {
                     std::thread::sleep(wait);
                 }
                 let frame_start = Instant::now();
-                fast_paint_smooth_scroll_frame(
+                fast_paint_animation_frame(
                     state,
                     frame_start,
                     self.app.config.decorations,
                     self.app.config.on_scroll_telemetry.as_deref(),
                     self.app.config.on_frame_metrics.as_deref(),
                 );
-                if state.smooth_scroll.is_some() {
-                    state.smooth_scroll_next_frame =
-                        Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
+                if animations_active(state) {
+                    state.animation_next_frame = Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
                     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
                 } else {
                     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
@@ -3888,7 +4023,7 @@ impl ApplicationHandler for AppHandler {
             } else {
                 state.window.request_redraw();
                 let next_frame = now + SMOOTH_SCROLL_WAKE_INTERVAL;
-                state.smooth_scroll_next_frame = Some(next_frame);
+                state.animation_next_frame = Some(next_frame);
                 event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             }
             return;
@@ -5032,6 +5167,7 @@ fn handle_select_keyboard(state: &mut AppState, event: &winit::event::KeyEvent) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scroll_motion::browser_scroll_ease;
 
     #[test]
     fn default_app_config_uses_dark_theme() {
@@ -6133,5 +6269,273 @@ mod tests {
         assert!(!arena.get(root).unwrap().dirty.contains(DirtyFlags::PAINT));
 
         assert!(!apply_scroll_grid_patch(&mut arena, NodeId::DANGLING, CellGrid::new(3, 4)));
+    }
+
+    // === Grid animation hooks (scroll smoothness Phase 3, Stage F) ===
+
+    #[test]
+    fn default_scroll_grid_patch_is_consumed_no_change() {
+        let patch = ScrollGridPatch::default();
+        assert!(patch.grid.is_none());
+        assert!(patch.animation.is_none());
+    }
+
+    /// A hook whose sampler returns a fixed sequence of `GridTick`s and
+    /// counts invocations, plus the timestamps it was called with.
+    fn counting_hook(
+        deadline: Instant,
+        results: Vec<fn(usize) -> GridTick>,
+    ) -> (GridAnimationHook, Arc<std::sync::Mutex<Vec<Instant>>>) {
+        let calls: Arc<std::sync::Mutex<Vec<Instant>>> = Arc::default();
+        let calls_in_hook = Arc::clone(&calls);
+        let hook = GridAnimationHook {
+            deadline,
+            tick: Arc::new(move |now| {
+                let mut guard = calls_in_hook.lock().unwrap();
+                let index = guard.len();
+                guard.push(now);
+                results[index.min(results.len() - 1)](index)
+            }),
+        };
+        (hook, calls)
+    }
+
+    fn fresh_grid_tick(_: usize) -> GridTick {
+        use unshit_core::cell_grid::{Cell, CellGrid};
+        let mut grid = CellGrid::new(3, 4);
+        grid.set_cell(0, 0, Cell::with_char('x'));
+        GridTick::Continue(grid)
+    }
+
+    fn done_grid_tick(_: usize) -> GridTick {
+        GridTick::Done(unshit_core::cell_grid::CellGrid::new(3, 4))
+    }
+
+    fn idle_tick(_: usize) -> GridTick {
+        GridTick::Idle
+    }
+
+    fn wrong_dims_tick(_: usize) -> GridTick {
+        GridTick::Continue(unshit_core::cell_grid::CellGrid::new(5, 9))
+    }
+
+    #[test]
+    fn grid_animation_continue_applies_paint_only_and_keeps_hook() {
+        let (mut arena, root, child) = arena_with_grid_child(3, 4);
+        let now = Instant::now();
+        let (hook, calls) = counting_hook(now + Duration::from_secs(1), vec![fresh_grid_tick]);
+        let mut animations = HashMap::new();
+        animations.insert(child, hook);
+
+        let sample_time = now + Duration::from_millis(8);
+        let (visual_change, rebuild_required) =
+            tick_grid_animations_core(&mut arena, &mut animations, sample_time, true);
+
+        assert!(visual_change);
+        assert!(!rebuild_required);
+        assert!(animations.contains_key(&child), "Continue keeps the hook registered");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[sample_time],
+            "the sampler receives the injected frame timestamp exactly once"
+        );
+        // The patch landed paint-only: content swapped, PAINT on the node,
+        // SUBTREE_PAINT on ancestors, no style/layout work.
+        match &arena.get(child).unwrap().content {
+            ElementContent::Grid(grid) => assert_eq!(grid.get_cell(0, 0).map(|c| c.ch), Some('x')),
+            _ => panic!("expected grid content"),
+        }
+        let dirty = arena.get(child).unwrap().dirty;
+        assert!(dirty.contains(DirtyFlags::PAINT));
+        assert!(!dirty.contains(DirtyFlags::STYLE));
+        assert!(!dirty.contains(DirtyFlags::LAYOUT));
+        assert!(arena.get(root).unwrap().dirty.contains(DirtyFlags::SUBTREE_PAINT));
+    }
+
+    #[test]
+    fn grid_animation_done_applies_and_unregisters() {
+        let (mut arena, _root, child) = arena_with_grid_child(3, 4);
+        let now = Instant::now();
+        let (hook, calls) = counting_hook(now + Duration::from_secs(1), vec![done_grid_tick]);
+        let mut animations = HashMap::new();
+        animations.insert(child, hook);
+
+        let (visual_change, rebuild_required) =
+            tick_grid_animations_core(&mut arena, &mut animations, now, true);
+
+        assert!(visual_change);
+        assert!(!rebuild_required);
+        assert!(animations.is_empty(), "Done unregisters the hook");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT));
+    }
+
+    #[test]
+    fn grid_animation_idle_changes_nothing_and_keeps_hook() {
+        let (mut arena, _root, child) = arena_with_grid_child(3, 4);
+        let now = Instant::now();
+        let (hook, _calls) = counting_hook(now + Duration::from_secs(1), vec![idle_tick]);
+        let mut animations = HashMap::new();
+        animations.insert(child, hook);
+
+        let (visual_change, rebuild_required) =
+            tick_grid_animations_core(&mut arena, &mut animations, now, true);
+
+        assert!(!visual_change);
+        assert!(!rebuild_required);
+        assert!(animations.contains_key(&child));
+        assert!(!arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT));
+    }
+
+    #[test]
+    fn grid_animation_dims_mismatch_requests_rebuild_but_keeps_hook() {
+        let (mut arena, _root, child) = arena_with_grid_child(3, 4);
+        let now = Instant::now();
+        let (hook, _calls) = counting_hook(now + Duration::from_secs(1), vec![wrong_dims_tick]);
+        let mut animations = HashMap::new();
+        animations.insert(child, hook);
+
+        let (visual_change, rebuild_required) =
+            tick_grid_animations_core(&mut arena, &mut animations, now, true);
+
+        assert!(visual_change);
+        assert!(rebuild_required, "a dims mismatch must fall back to a full rebuild");
+        assert!(
+            animations.contains_key(&child),
+            "the hook survives the rebuild so the animation resumes afterwards"
+        );
+        // The mismatched grid was rejected: the node keeps its old dims.
+        match &arena.get(child).unwrap().content {
+            ElementContent::Grid(grid) => assert_eq!((grid.rows(), grid.cols()), (3, 4)),
+            _ => panic!("expected grid content"),
+        }
+    }
+
+    #[test]
+    fn grid_animation_expired_deadline_settles_with_one_final_tick() {
+        // A frame gap past the deadline must not strand the app-side
+        // animation mid-flight: the hook gets exactly one final sample
+        // (which lets the app settle on its target) and its frame is
+        // painted before the hook is unregistered.
+        let (mut arena, _root, child) = arena_with_grid_child(3, 4);
+        let now = Instant::now();
+        let (hook, calls) = counting_hook(now, vec![fresh_grid_tick]);
+        let mut animations = HashMap::new();
+        animations.insert(child, hook);
+
+        let sample_time = now + Duration::from_millis(1);
+        let (visual_change, rebuild_required) =
+            tick_grid_animations_core(&mut arena, &mut animations, sample_time, true);
+
+        assert!(visual_change, "the settling frame is a visual change");
+        assert!(!rebuild_required);
+        assert!(animations.is_empty(), "expired hooks are unregistered");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[sample_time],
+            "expired hooks are sampled exactly once so the animation settles"
+        );
+        match &arena.get(child).unwrap().content {
+            ElementContent::Grid(grid) => assert_eq!(grid.get_cell(0, 0).map(|c| c.ch), Some('x')),
+            _ => panic!("expected grid content"),
+        }
+        assert!(arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT));
+    }
+
+    #[test]
+    fn grid_animation_dangling_node_keeps_ticking_blind_until_done() {
+        // A vanished node (reconcile re-keyed or unmounted it mid-flight)
+        // must not strand the app-side animation: the hook keeps sampling
+        // without painting, requests a rebuild so a re-mounted surface
+        // shows the advanced position, and unregisters on `Done`.
+        let (mut arena, _root, child) = arena_with_grid_child(3, 4);
+        let now = Instant::now();
+        let (hook, calls) =
+            counting_hook(now + Duration::from_secs(1), vec![fresh_grid_tick, done_grid_tick]);
+        let mut animations = HashMap::new();
+        animations.insert(NodeId::DANGLING, hook);
+
+        let (visual_change, rebuild_required) =
+            tick_grid_animations_core(&mut arena, &mut animations, now, true);
+
+        assert!(!visual_change, "nothing on screen changed");
+        assert!(rebuild_required, "the advanced sample needs a rebuild to become visible");
+        assert!(animations.contains_key(&NodeId::DANGLING), "the hook survives to settle");
+        assert!(!arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT));
+
+        let later = now + Duration::from_millis(8);
+        let (visual_change, _) =
+            tick_grid_animations_core(&mut arena, &mut animations, later, true);
+
+        assert!(!visual_change);
+        assert!(animations.is_empty(), "Done unregisters the blind hook");
+        assert_eq!(calls.lock().unwrap().as_slice(), &[now, later]);
+    }
+
+    #[test]
+    fn grid_animation_expired_deadline_with_dangling_node_still_settles() {
+        let (mut arena, _root, child) = arena_with_grid_child(3, 4);
+        let now = Instant::now();
+        let (hook, calls) = counting_hook(now, vec![fresh_grid_tick]);
+        let mut animations = HashMap::new();
+        animations.insert(NodeId::DANGLING, hook);
+
+        let sample_time = now + Duration::from_millis(1);
+        let (visual_change, rebuild_required) =
+            tick_grid_animations_core(&mut arena, &mut animations, sample_time, true);
+
+        assert!(!visual_change, "no node to paint");
+        assert!(!rebuild_required, "the hook is gone; the next rebuild composes fresh anyway");
+        assert!(animations.is_empty());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[sample_time],
+            "the settling sample still runs so the app-side animation lands"
+        );
+        assert!(!arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT));
+    }
+
+    #[test]
+    fn grid_animation_sample_only_advances_lifecycle_without_patching() {
+        // Rebuild-bound frames tick hooks with `apply_patches = false`:
+        // the sampler still advances (and `Done` still unregisters) but
+        // the arena is left for the rebuild to recompose.
+        let (mut arena, _root, child) = arena_with_grid_child(3, 4);
+        let now = Instant::now();
+        let (hook, calls) = counting_hook(now + Duration::from_secs(1), vec![done_grid_tick]);
+        let mut animations = HashMap::new();
+        animations.insert(child, hook);
+
+        let (visual_change, rebuild_required) =
+            tick_grid_animations_core(&mut arena, &mut animations, now, false);
+
+        assert!(visual_change);
+        assert!(!rebuild_required);
+        assert!(animations.is_empty(), "Done unregisters even without applying");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(
+            !arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT),
+            "sample-only ticks must not touch the arena"
+        );
+    }
+
+    #[test]
+    fn grid_animation_runs_to_done_over_multiple_ticks() {
+        let (mut arena, _root, child) = arena_with_grid_child(3, 4);
+        let now = Instant::now();
+        let (hook, calls) = counting_hook(
+            now + Duration::from_secs(1),
+            vec![fresh_grid_tick, fresh_grid_tick, done_grid_tick],
+        );
+        let mut animations = HashMap::new();
+        animations.insert(child, hook);
+
+        for frame in 0..3 {
+            let tick_time = now + Duration::from_millis(8 * (frame + 1));
+            tick_grid_animations_core(&mut arena, &mut animations, tick_time, true);
+        }
+
+        assert!(animations.is_empty(), "the third tick's Done must unregister");
+        assert_eq!(calls.lock().unwrap().len(), 3);
     }
 }

@@ -790,13 +790,15 @@ pub struct BatchCacheSignature {
     pub clip_rect: [f32; 4],
     /// The node's composed CSS-transform affine in delta-from-identity encoding
     /// (`[a-1, b, c, d-1, e, f]`), so the identity is all-zero (matching
-    /// `Default`). Included so a node re-emits when its own or any ancestor's
-    /// transform changes — the cached instances bake an absolute matrix.
-    pub xform: [f32; 6],
+    /// `Default`), plus a seventh slot carrying a grid's fractional render
+    /// offset (see `grid_aware_xform_signature`; zero for non-grid nodes).
+    /// Included so a node re-emits when its own or any ancestor's transform
+    /// changes — the cached instances bake an absolute matrix.
+    pub xform: [f32; 7],
 }
 
 impl BatchCacheSignature {
-    pub fn new(render_rect: [f32; 4], clip_rect: [f32; 4], xform: [f32; 6]) -> Self {
+    pub fn new(render_rect: [f32; 4], clip_rect: [f32; 4], xform: [f32; 7]) -> Self {
         Self { render_rect, clip_rect, xform }
     }
 
@@ -1390,6 +1392,13 @@ struct Affine2 {
 impl Affine2 {
     const IDENTITY: Affine2 = Affine2 { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
 
+    /// A pure translation. Used to slide a grid's emitted primitives by its
+    /// fractional scroll offset before composing with the node's own
+    /// CSS transform.
+    fn translate(x: f32, y: f32) -> Affine2 {
+        Affine2 { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y }
+    }
+
     fn is_identity(self) -> bool {
         self.a == 1.0
             && self.b == 0.0
@@ -1481,6 +1490,65 @@ fn stamp_xform_glyphs(glyphs: &mut [GlyphInstance], xform: [f32; 4], translate: 
     }
 }
 
+/// The transform applied to grid-emitted primitives: the grid's fractional
+/// render offset is a content-space translate applied before the node's own
+/// CSS transform, so the cells slide vertically inside the (untranslated)
+/// content box and then transform with the subtree. Identity when the offset
+/// is zero and the node has no transform.
+fn grid_content_xform(node_xform: Affine2, render_offset_y: f32) -> Affine2 {
+    node_xform.compose(Affine2::translate(0.0, render_offset_y))
+}
+
+/// Cache-signature transform for a node: the composed CSS transform, plus a
+/// grid's fractional render offset in a dedicated seventh slot. The offset
+/// is stamped onto the grid-emitted primitives only (stamping it onto
+/// `node_xform` would also shift the node's own background, visible under
+/// the parity profile's `.terminal-content` background), so it does not ride
+/// `node_xform.signature()` and must be an explicit signature component or
+/// batch-cache replay could show a stale offset. The slot is dedicated (not
+/// summed into the translation column) so a `(translation, offset)` pair can
+/// never alias another pair with the same sum.
+fn grid_aware_xform_signature(
+    content: &unshit_core::element::ElementContent,
+    node_xform: Affine2,
+) -> [f32; 7] {
+    let [a, b, c, d, e, f] = node_xform.signature();
+    let offset = match content {
+        unshit_core::element::ElementContent::Grid(grid) => grid.render_offset_y(),
+        _ => 0.0,
+    };
+    [a, b, c, d, e, f, offset]
+}
+
+/// Intersect two `[x, y, w, h]` clip rectangles. Used to tighten a grid's
+/// inherited clip to its own content box when an overscan row is present:
+/// the overscan row spills above the content box and the offset-displaced
+/// bottom row spills below into the pane padding; both must be cut at the
+/// content-box edges. Degenerate (non-overlapping) intersections clamp to
+/// zero size.
+fn intersect_clip_rect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let x = a[0].max(b[0]);
+    let y = a[1].max(b[1]);
+    let right = (a[0] + a[2]).min(b[0] + b[2]);
+    let bottom = (a[1] + a[3]).min(b[1] + b[3]);
+    [x, y, (right - x).max(0.0), (bottom - y).max(0.0)]
+}
+
+/// Pending-resize decision for a grid node: the dims the renderer computed
+/// from the element's content box are published only when they differ from
+/// the grid's current dims, measured against [`CellGrid::viewport_rows`].
+/// Overscan rows are presentation-only; comparing against `rows()` would
+/// publish a resize for every overscan grid on every frame, and the app
+/// applies pending resizes to the PTY (a 100ms poll on the bridge), looping
+/// the PTY through resize forever.
+fn grid_pending_resize_dims(grid: &CellGrid, cols: u16, rows: u16) -> Option<(u16, u16)> {
+    if cols as usize != grid.cols() || rows as usize != grid.viewport_rows() {
+        Some((cols, rows))
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk_for_batch(
     arena: &NodeArena,
@@ -1558,10 +1626,13 @@ fn walk_for_batch(
     // The transform is part of the cache signature so a node re-emits when its
     // own OR any ancestor's transform changes (an ancestor change alters
     // `node_xform` here even when the node's content is otherwise clean).
+    // Grid nodes additionally fold their fractional render offset into the
+    // signature (see `grid_aware_xform_signature`) so cache replay can never
+    // show a stale offset.
     let cache_signature = BatchCacheSignature::new(
         [render_x, render_y, rect.width, rect.height],
         clip_rect,
-        node_xform.signature(),
+        grid_aware_xform_signature(&element.content, node_xform),
     );
 
     // Damage-aware skip: if neither PAINT nor SUBTREE_PAINT is set, replay the
@@ -1664,6 +1735,13 @@ fn walk_for_batch(
     // Running cursors for draw span tracking. Updated after each flush.
     let mut quad_cursor = quad_start;
     let glyph_cursor = glyph_start;
+
+    // Grid content with a fractional scroll offset records the range of
+    // primitives the grid arm emitted (`(quad_start, glyph_start, offset)`)
+    // so the flush block below can stamp a vertical translate onto exactly
+    // that range. The node's own background/border stay untranslated: only
+    // the grid cells slide (see `ElementContent::Grid` arm).
+    let mut grid_offset_stamp: Option<(usize, usize, f32)> = None;
 
     let is_visible = style.visibility == Visibility::Visible;
     let opacity = style.opacity;
@@ -2535,35 +2613,73 @@ fn walk_for_batch(
                 // Compute grid dimensions from element size and cell metrics,
                 // then publish a pending resize when they differ from the
                 // current grid. This eliminates the timing gap where the
-                // layout resize handler reads stale cell metrics.
+                // layout resize handler reads stale cell metrics. The
+                // comparison uses `viewport_rows()` so a grid carrying an
+                // overscan row (rows + 1) does not publish a PTY resize
+                // every frame (see `grid_pending_resize_dims`).
                 let content_w = rect.width - style.padding.left - style.padding.right;
                 let content_h = rect.height - style.padding.top - style.padding.bottom;
                 let cols = (content_w / cell_w).max(1.0) as u16;
                 let rows = (content_h / cell_h).max(1.0) as u16;
-                if cols as usize != grid.cols() || rows as usize != grid.rows() {
+                if let Some((cols, rows)) = grid_pending_resize_dims(grid, cols, rows) {
                     unshit_core::cell_grid::CellGrid::publish_pending_resize(cols, rows);
                 }
                 let render_cell_w = cell_w * parity_terminal_cell_width_scale();
 
+                // Overscan grids clip to the content box on both axes: the
+                // overscan row spills above the box and the offset-displaced
+                // bottom row spills below into the pane padding. The clip is
+                // constant per pane per frame, keeping each row's
+                // `LineGeometrySig` stable across animation ticks.
+                let grid_clip = if grid.overscan_rows() > 0 {
+                    intersect_clip_rect(
+                        clip_rect,
+                        [
+                            render_x + style.padding.left,
+                            render_y + style.padding.top,
+                            content_w,
+                            content_h,
+                        ],
+                    )
+                } else {
+                    clip_rect
+                };
+
+                // The experimental fragment path has no overscan/offset
+                // support; fall through to `emit_grid_cells` for overscan
+                // grids. The path is off by default.
                 #[cfg(feature = "grid-fragment-shader")]
-                let routed_to_fragment = try_record_grid_for_fragment_path(
-                    crate::grid_fragment_upload::runtime_flag_enabled(),
-                    batch.layer_mut(effective_layer),
-                    node_id,
-                    render_x + style.padding.left,
-                    render_y + style.padding.top,
-                    render_cell_w,
-                    cell_h,
-                    cols as u32,
-                    rows as u32,
-                    style.font_size,
-                    opacity,
-                    clip_rect,
-                );
+                let routed_to_fragment = grid.overscan_rows() == 0
+                    && try_record_grid_for_fragment_path(
+                        crate::grid_fragment_upload::runtime_flag_enabled(),
+                        batch.layer_mut(effective_layer),
+                        node_id,
+                        render_x + style.padding.left,
+                        render_y + style.padding.top,
+                        render_cell_w,
+                        cell_h,
+                        cols as u32,
+                        rows as u32,
+                        style.font_size,
+                        opacity,
+                        clip_rect,
+                    );
                 #[cfg(not(feature = "grid-fragment-shader"))]
                 let routed_to_fragment = false;
 
                 if !routed_to_fragment {
+                    // Record the grid-emitted primitive range so the flush
+                    // block can stamp the fractional scroll offset onto
+                    // exactly these instances (cells, cursor, decorations)
+                    // without moving the node's own background.
+                    if grid.render_offset_y() != 0.0 {
+                        let lb = batch.layer_mut(effective_layer);
+                        grid_offset_stamp = Some((
+                            lb.quad_instances.len(),
+                            lb.glyph_instances.len(),
+                            grid.render_offset_y(),
+                        ));
+                    }
                     emit_grid_cells(
                         grid,
                         render_x + style.padding.left,
@@ -2572,7 +2688,7 @@ fn walk_for_batch(
                         cell_h,
                         style.font_size,
                         opacity,
-                        clip_rect,
+                        grid_clip,
                         batch.layer_mut(effective_layer),
                         atlas,
                         font_system,
@@ -2623,6 +2739,20 @@ fn walk_for_batch(
             let xt = node_xform.xform_translate();
             stamp_xform_quads(&mut lb.quad_instances[quad_start..qend], xf, xt);
             stamp_xform_glyphs(&mut lb.glyph_instances[glyph_start..gend], xf, xt);
+        }
+        // Re-stamp the grid-emitted sub-range with the fractional scroll
+        // offset composed under the node transform. Runs after the node
+        // stamp above so the grid range ends up with `node_xform ∘
+        // translate(0, offset)` while the node's own background keeps the
+        // plain `node_xform`. The clip rect stays in fixed screen space;
+        // the shaders clip the translated fragments against it, containing
+        // the overscan/bottom spill.
+        if let Some((grid_quad_start, grid_glyph_start, offset_y)) = grid_offset_stamp {
+            let grid_xform = grid_content_xform(node_xform, offset_y);
+            let xf = grid_xform.xform_delta();
+            let xt = grid_xform.xform_translate();
+            stamp_xform_quads(&mut lb.quad_instances[grid_quad_start..qend], xf, xt);
+            stamp_xform_glyphs(&mut lb.glyph_instances[grid_glyph_start..gend], xf, xt);
         }
     }
 
@@ -6364,9 +6494,9 @@ mod tests {
         let mut cache = BatchCache::new();
         let id = NodeId::DANGLING;
         let old_sig =
-            BatchCacheSignature::new([0.0, 680.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0], [0.0; 6]);
+            BatchCacheSignature::new([0.0, 680.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0], [0.0; 7]);
         let new_sig =
-            BatchCacheSignature::new([0.0, 888.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0], [0.0; 6]);
+            BatchCacheSignature::new([0.0, 888.0, 853.0, 24.0], [0.0, 0.0, 853.0, 912.0], [0.0; 7]);
 
         cache.begin_frame();
         cache.record_with_signature(
@@ -8952,6 +9082,149 @@ mod tests {
             &mut row_quads,
         );
         assert!(row_quads.is_empty(), "a blank row must emit zero bg quads");
+    }
+
+    // -- Sub-row grid render offset + overscan (scroll smoothness Phase 3) --
+
+    #[test]
+    fn intersect_clip_rect_tightens_both_edges() {
+        // Inherited clip is taller than the grid content box on both ends;
+        // the intersection must cut the overscan spill above and the
+        // displaced bottom-row spill below.
+        let inherited = [0.0, 0.0, 800.0, 600.0];
+        let content_box = [10.0, 50.0, 400.0, 300.0];
+        assert_eq!(intersect_clip_rect(inherited, content_box), content_box);
+        // Symmetric: a content box wider than the inherited clip keeps the
+        // inherited bounds.
+        assert_eq!(intersect_clip_rect(content_box, inherited), content_box);
+    }
+
+    #[test]
+    fn intersect_clip_rect_partial_overlap_and_degenerate() {
+        let a = [0.0, 0.0, 100.0, 100.0];
+        let b = [50.0, 60.0, 100.0, 100.0];
+        assert_eq!(intersect_clip_rect(a, b), [50.0, 60.0, 50.0, 40.0]);
+
+        let disjoint = [500.0, 500.0, 10.0, 10.0];
+        let clipped = intersect_clip_rect(a, disjoint);
+        assert_eq!(clipped[2], 0.0, "non-overlapping rects clamp width to zero");
+        assert_eq!(clipped[3], 0.0, "non-overlapping rects clamp height to zero");
+    }
+
+    #[test]
+    fn overscan_grid_does_not_publish_pending_resize() {
+        // A grid composed as viewport_rows + 1 with one overscan row must
+        // compare equal against the renderer-computed viewport dims, or
+        // every frame would publish a PTY resize (applied by the app's
+        // bridge on a 100ms poll, looping forever).
+        let mut grid = unshit_core::cell_grid::CellGrid::new(25, 80);
+        grid.set_overscan_rows(1);
+        assert_eq!(grid_pending_resize_dims(&grid, 80, 24), None);
+        // Dim changes still publish, against the viewport row count.
+        assert_eq!(grid_pending_resize_dims(&grid, 80, 30), Some((80, 30)));
+        assert_eq!(grid_pending_resize_dims(&grid, 120, 24), Some((120, 24)));
+    }
+
+    #[test]
+    fn plain_grid_pending_resize_matches_legacy_behavior() {
+        let grid = unshit_core::cell_grid::CellGrid::new(24, 80);
+        assert_eq!(grid_pending_resize_dims(&grid, 80, 24), None);
+        assert_eq!(grid_pending_resize_dims(&grid, 80, 25), Some((80, 25)));
+    }
+
+    #[test]
+    fn grid_content_xform_translates_emitted_instances_vertically() {
+        // Identity node transform: the grid range must be stamped with a
+        // pure vertical translate equal to the render offset.
+        let xform = grid_content_xform(Affine2::IDENTITY, -12.0);
+        assert!(!xform.is_identity());
+        assert_eq!(xform.xform_delta(), [0.0; 4], "linear part stays identity");
+        assert_eq!(xform.xform_translate(), [0.0, -12.0]);
+
+        use bytemuck::Zeroable;
+        let mut quads = vec![QuadInstance::zeroed(); 2];
+        let mut glyphs = vec![GlyphInstance::zeroed(); 2];
+        stamp_xform_quads(&mut quads, xform.xform_delta(), xform.xform_translate());
+        stamp_xform_glyphs(&mut glyphs, xform.xform_delta(), xform.xform_translate());
+        for q in &quads {
+            assert_eq!(q.xform_translate, [0.0, -12.0]);
+        }
+        for g in &glyphs {
+            assert_eq!(g.xform_translate, [0.0, -12.0]);
+        }
+    }
+
+    #[test]
+    fn grid_content_xform_composes_under_the_node_transform() {
+        // With a node transform present, the offset is applied first (in
+        // content space) and the node transform second: a 2x vertical
+        // scale doubles the offset's screen-space effect.
+        let scale = Affine2 { a: 1.0, b: 0.0, c: 0.0, d: 2.0, e: 0.0, f: 0.0 };
+        let xform = grid_content_xform(scale, -10.0);
+        assert_eq!(xform.xform_translate(), [0.0, -20.0]);
+        assert_eq!(xform.xform_delta(), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn grid_render_offset_changes_the_batch_cache_signature() {
+        use unshit_core::cell_grid::CellGrid;
+        use unshit_core::element::ElementContent;
+
+        let mut grid = CellGrid::new(3, 4);
+        grid.set_render_offset_y(-7.5);
+        let with_offset = ElementContent::Grid(grid.clone());
+        grid.set_render_offset_y(0.0);
+        let without_offset = ElementContent::Grid(grid);
+
+        let rect = [0.0, 0.0, 100.0, 50.0];
+        let clip = [0.0, 0.0, 800.0, 600.0];
+        let sig_with = BatchCacheSignature::new(
+            rect,
+            clip,
+            grid_aware_xform_signature(&with_offset, Affine2::IDENTITY),
+        );
+        let sig_without = BatchCacheSignature::new(
+            rect,
+            clip,
+            grid_aware_xform_signature(&without_offset, Affine2::IDENTITY),
+        );
+
+        assert!(
+            !sig_with.matches(sig_without),
+            "a pure render-offset change must invalidate batch-cache replay"
+        );
+        assert!(sig_with.matches(sig_with), "the signature is stable for an unchanged offset");
+    }
+
+    #[test]
+    fn non_grid_content_keeps_the_plain_xform_signature() {
+        let content = ElementContent::Text("hi".to_string());
+        let signature = grid_aware_xform_signature(&content, Affine2::IDENTITY);
+        assert_eq!(signature[..6], Affine2::IDENTITY.signature());
+        assert_eq!(signature[6], 0.0, "non-grid nodes carry a zero offset slot");
+    }
+
+    #[test]
+    fn render_offset_slot_never_aliases_a_translation_change() {
+        // A node whose transform translation moved by +N while its grid
+        // offset moved by -N must NOT produce an equal signature: the
+        // offset lives in a dedicated slot, not summed into `f`.
+        use unshit_core::cell_grid::CellGrid;
+        use unshit_core::element::ElementContent;
+
+        let mut grid = CellGrid::new(3, 4);
+        grid.set_render_offset_y(-10.0);
+        let shifted_grid = ElementContent::Grid(grid.clone());
+        grid.set_render_offset_y(0.0);
+        let plain_grid = ElementContent::Grid(grid);
+
+        let translated = Affine2 { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: -10.0 };
+        let sig_offset = grid_aware_xform_signature(&shifted_grid, Affine2::IDENTITY);
+        let sig_translation = grid_aware_xform_signature(&plain_grid, translated);
+        assert_ne!(
+            sig_offset, sig_translation,
+            "a (translation, offset) pair must never alias another pair with the same sum"
+        );
     }
 
     // Fragment shader routing tests (issue #96 step 2)

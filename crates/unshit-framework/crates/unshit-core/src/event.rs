@@ -234,12 +234,28 @@ impl fmt::Display for Modifiers {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ScrollEvent {
     pub delta_x: f32,
     pub delta_y: f32,
     pub x: f32,
     pub y: f32,
+    /// `true` when the input came from a stepped wheel (`LineDelta`),
+    /// whose discrete notches should be animated toward their target;
+    /// `false` for precision devices (`PixelDelta` touchpads), which
+    /// already deliver continuous motion and must track 1:1. Filled by
+    /// the framework's wheel dispatch; defaults to `false` so test
+    /// constructors and synthetic events keep the instant path.
+    pub animate: bool,
+    /// Suggested animation duration in milliseconds for this event's
+    /// delta, computed by the framework from the same browser-calibrated
+    /// ramp the built-in smooth-scroll containers use
+    /// (`browser_like_wheel_duration`), so app-managed scroll surfaces
+    /// animate with bit-identical feel. `0.0` when `animate` is `false`.
+    pub smooth_duration_ms: f32,
+    /// Suggested initial ease-curve slope for this event's delta
+    /// (`browser_like_initial_slope`); pairs with `smooth_duration_ms`.
+    pub smooth_initial_slope: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +917,17 @@ mod tests {
         assert_eq!(Key::from_name("ins"), Some(Key::Insert));
         assert_eq!(Key::from_name("INSERT"), Some(Key::Insert));
         assert_eq!(Key::Insert.to_string(), "Insert");
+    }
+
+    #[test]
+    fn default_scroll_event_keeps_the_instant_path() {
+        // Synthetic events (tests, programmatic scrolls) that fill only
+        // the delta/position fields must behave like precision-device
+        // input: no animation, no suggested curve parameters.
+        let event = ScrollEvent::default();
+        assert!(!event.animate);
+        assert_eq!(event.smooth_duration_ms, 0.0);
+        assert_eq!(event.smooth_initial_slope, 0.0);
     }
 
     #[test]

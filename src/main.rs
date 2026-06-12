@@ -2024,13 +2024,15 @@ mod tests {
         );
         let palette = crate::theme::terminal_palette("dracula");
 
+        // Display snapshots carry one overscan row above the viewport,
+        // so live row 0 sits at grid row 1.
         assert_eq!(
-            themed.get_cell(0, 0).expect("red cell").fg,
+            themed.get_cell(1, 0).expect("red cell").fg,
             palette.ansi[1],
             "SGR red should render through the active theme ANSI palette"
         );
         assert_eq!(
-            themed.get_cell(0, 1).expect("default cell").fg,
+            themed.get_cell(1, 1).expect("default cell").fg,
             palette.default_fg,
             "default text should render through the active theme foreground"
         );
@@ -2199,8 +2201,10 @@ mod tests {
             false,
         );
 
+        // Live row 1 sits at grid row 2 (one overscan row above the
+        // viewport in every display snapshot).
         let row1 = snap_next_frame
-            .line_damage_for(1)
+            .line_damage_for(2)
             .expect("row 1 damage entry must exist");
         assert!(
             !row1.is_clean(),
@@ -2212,7 +2216,7 @@ mod tests {
 
         // Sanity: the freshly written cells actually live on row 1.
         let cell = snap_next_frame
-            .get_cell(1, 0)
+            .get_cell(2, 0)
             .expect("row 1 col 0 must exist");
         assert_eq!(
             cell.ch, 's',
@@ -2292,7 +2296,8 @@ mod tests {
             false,
         );
 
-        for row in 0..=2 {
+        // Live rows 0..=2 sit at grid rows 1..=3 below the overscan row.
+        for row in 1..=3 {
             let ld = s3
                 .line_damage_for(row)
                 .unwrap_or_else(|| panic!("damage entry for row {}", row));

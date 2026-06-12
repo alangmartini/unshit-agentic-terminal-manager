@@ -322,6 +322,23 @@ pub struct CellGrid {
     /// Cell width in physical pixels as computed by the renderer.
     measured_cell_w: f32,
     measured_cell_h: f32,
+    /// Vertical paint-time translation (physical pixels) the renderer
+    /// applies to every primitive this grid emits. Used for sub-row
+    /// scroll positions: the producer composes the grid with one extra
+    /// row above the viewport (see `overscan_rows`) and sets this to
+    /// `-(1.0 - fraction) * cell_h`, so the grid contents slide down by
+    /// `fraction` of a row while the overscan row covers the gap at the
+    /// top. `0.0` (the default) keeps the offset-free fast path. Rides
+    /// the derived `PartialEq`, so a pure offset change makes
+    /// `old != new` and is detected by reconcile as a content change.
+    render_offset_y: f32,
+    /// Number of rows at the top of the grid that exist only to cover
+    /// the gap opened by `render_offset_y`; they are not part of the
+    /// logical viewport. Consumers that derive viewport geometry (the
+    /// renderer's pending-resize publication in particular) must compare
+    /// against [`Self::viewport_rows`], not [`Self::rows`]. Only `0`
+    /// and `1` are produced today.
+    overscan_rows: u8,
 }
 
 impl CellGrid {
@@ -459,6 +476,8 @@ impl CellGrid {
             cursor_visible: true,
             measured_cell_w: 0.0,
             measured_cell_h: 0.0,
+            render_offset_y: 0.0,
+            overscan_rows: 0,
         }
     }
 
@@ -468,6 +487,76 @@ impl CellGrid {
 
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    /// Rows that belong to the logical viewport: [`Self::rows`] minus the
+    /// overscan rows prepended for sub-row scrolling. This is the row
+    /// count that must be compared against externally computed viewport
+    /// dimensions (e.g. the renderer's pending-resize check); comparing
+    /// `rows()` would re-publish a resize every frame for overscan grids.
+    pub fn viewport_rows(&self) -> usize {
+        self.rows.saturating_sub(self.overscan_rows as usize)
+    }
+
+    /// The grid's vertical paint-time translation in physical pixels.
+    /// See the field docs on `render_offset_y`.
+    pub fn render_offset_y(&self) -> f32 {
+        self.render_offset_y
+    }
+
+    /// Set the vertical paint-time translation. Producers snapping the
+    /// value to whole device pixels avoid vertical subpixel shimmer in
+    /// the glyph path; the renderer applies the value verbatim.
+    pub fn set_render_offset_y(&mut self, offset_y: f32) {
+        self.render_offset_y = offset_y;
+    }
+
+    /// Number of overscan rows at the top of the grid. See the field
+    /// docs on `overscan_rows`.
+    pub fn overscan_rows(&self) -> u8 {
+        self.overscan_rows
+    }
+
+    /// Declare how many of the grid's top rows are overscan. Callers
+    /// composing a sub-row-scrolled snapshot set this to `1` after
+    /// [`Self::insert_overscan_row_top`] (or after composing the extra
+    /// row themselves).
+    pub fn set_overscan_rows(&mut self, overscan_rows: u8) {
+        self.overscan_rows = overscan_rows;
+    }
+
+    /// Prepend one row at the top of the grid, shifting every existing
+    /// row down by one index. Cells, per-cell dirty bits, per-row damage,
+    /// and stable `line_ids` all move with their content, so the shifted
+    /// rows keep their identity: line-quad cache replay and the damage
+    /// splice fast path survive the prepend exactly as they survive a
+    /// scroll rotation.
+    ///
+    /// The new row 0 is filled from `cells` (truncated or padded with
+    /// default cells to `cols`; `None` leaves it blank), is marked fully
+    /// damaged, and takes the caller-provided `line_id`. The id is passed
+    /// in rather than allocated so producers can hand the row a stable
+    /// identity across snapshots (e.g. derived from the absolute
+    /// scrollback line index, namespaced to avoid colliding with this
+    /// grid's own monotonic ids); a snapshot whose overscan content did
+    /// not change then still compares equal to its predecessor.
+    ///
+    /// The cursor moves down with the content it sits on. Callers are
+    /// responsible for declaring the row via [`Self::set_overscan_rows`].
+    pub fn insert_overscan_row_top(&mut self, cells: Option<&[Cell]>, line_id: u64) {
+        let mut new_row = vec![Cell::default(); self.cols];
+        if let Some(src) = cells {
+            let n = src.len().min(self.cols);
+            new_row[..n].copy_from_slice(&src[..n]);
+        }
+        self.cells.splice(0..0, new_row);
+        self.dirty.splice(0..0, std::iter::repeat_n(true, self.cols));
+        let mut damage = LineDamage::default();
+        damage.mark_range(0, Self::last_col_u16(self.cols));
+        self.line_damage.insert(0, damage);
+        self.line_ids.insert(0, line_id);
+        self.rows += 1;
+        self.cursor_row = (self.cursor_row + 1).min(self.rows.saturating_sub(1));
     }
 
     /// Access the underlying cell slice (read-only).
@@ -1623,5 +1712,131 @@ mod tests {
         // 530 ms matches `unshit_core::cursor::CursorState::default()`
         // so the input cursor and the terminal cursor stay in lockstep.
         assert_eq!(CURSOR_BLINK_HALF_CYCLE_MS, 530);
+    }
+
+    // -- Sub-row scroll offset + overscan row (scroll smoothness Phase 3) ----
+
+    #[test]
+    fn new_grid_has_no_render_offset_or_overscan() {
+        let g = CellGrid::new(3, 4);
+        assert_eq!(g.render_offset_y(), 0.0);
+        assert_eq!(g.overscan_rows(), 0);
+        assert_eq!(g.viewport_rows(), 3);
+    }
+
+    #[test]
+    fn viewport_rows_excludes_overscan_rows() {
+        let mut g = CellGrid::new(4, 4);
+        g.set_overscan_rows(1);
+        assert_eq!(g.rows(), 4);
+        assert_eq!(g.viewport_rows(), 3);
+    }
+
+    #[test]
+    fn partial_eq_detects_offset_only_change() {
+        // Reconcile relies on the derived PartialEq to classify a pure
+        // fractional-offset change as `grid_content_paint_only`: the grid
+        // dims are stable but `old != new` must hold.
+        let a = CellGrid::new(3, 4);
+        let mut b = a.clone();
+        assert_eq!(a, b, "identical grids must compare equal");
+
+        b.set_render_offset_y(-12.0);
+        assert_ne!(a, b, "a render_offset_y change alone must break equality");
+
+        let mut c = a.clone();
+        c.set_overscan_rows(1);
+        assert_ne!(a, c, "an overscan_rows change alone must break equality");
+    }
+
+    #[test]
+    fn insert_overscan_row_top_shifts_content_identity_and_damage() {
+        let mut g = CellGrid::new(3, 4);
+        for r in 0..3 {
+            let ch = (b'A' + r as u8) as char;
+            for c in 0..4 {
+                g.set_cell(r, c, Cell::with_char(ch));
+            }
+        }
+        g.clear_dirty();
+        // Leave a narrow damage window on row 1 so the shift is visible.
+        g.set_cell(1, 2, Cell::with_char('x'));
+        let ids_before: Vec<u64> = g.line_ids().to_vec();
+        let row1_damage_before = *g.line_damage_for(1).unwrap();
+
+        let overscan = [Cell::with_char('s'), Cell::with_char('b')];
+        g.insert_overscan_row_top(Some(&overscan), 999);
+
+        assert_eq!(g.rows(), 4, "prepend grows the grid by one row");
+        // Shifted rows keep their content at row index + 1.
+        assert_eq!(g.get_cell(1, 0).unwrap().ch, 'A');
+        assert_eq!(g.get_cell(2, 2).unwrap().ch, 'x');
+        assert_eq!(g.get_cell(3, 0).unwrap().ch, 'C');
+        // Stable identity moves with the content.
+        assert_eq!(g.line_id(0), Some(999), "new row takes the caller-provided id");
+        assert_eq!(g.line_id(1), Some(ids_before[0]));
+        assert_eq!(g.line_id(2), Some(ids_before[1]));
+        assert_eq!(g.line_id(3), Some(ids_before[2]));
+        // Damage moves with the content: the clean rows stay clean, the
+        // narrow window on old row 1 is now at row 2 unchanged.
+        assert!(g.line_damage_for(1).unwrap().is_clean());
+        assert_eq!(*g.line_damage_for(2).unwrap(), row1_damage_before);
+        assert!(g.line_damage_for(3).unwrap().is_clean());
+        // The new row is fully damaged and carries the provided cells
+        // (padded with default cells past the source slice).
+        let ld0 = g.line_damage_for(0).unwrap();
+        assert!(!ld0.is_clean());
+        assert_eq!(ld0.first_dirty_col, 0);
+        assert_eq!(ld0.last_dirty_col, 3);
+        assert_eq!(g.get_cell(0, 0).unwrap().ch, 's');
+        assert_eq!(g.get_cell(0, 1).unwrap().ch, 'b');
+        assert_eq!(g.get_cell(0, 2).unwrap(), &Cell::default());
+        // Per-cell dirty bits exist for the new row.
+        assert!(g.dirty_flags()[..4].iter().all(|d| *d));
+    }
+
+    #[test]
+    fn insert_overscan_row_top_without_cells_is_blank() {
+        let mut g = CellGrid::new(2, 3);
+        g.insert_overscan_row_top(None, 7);
+        assert_eq!(g.rows(), 3);
+        for col in 0..3 {
+            assert_eq!(g.get_cell(0, col).unwrap(), &Cell::default());
+        }
+    }
+
+    #[test]
+    fn insert_overscan_row_top_moves_cursor_with_content() {
+        let mut g = CellGrid::new(3, 4);
+        g.set_cursor(1, 2);
+        g.insert_overscan_row_top(None, 42);
+        assert_eq!(
+            (g.cursor_row(), g.cursor_col()),
+            (2, 2),
+            "the cursor must stay on the screen line it was on"
+        );
+    }
+
+    #[test]
+    fn insert_overscan_row_top_with_stable_id_keeps_snapshots_equal() {
+        // The live-path contract: two snapshots of unchanged content,
+        // each prepending the same overscan row under the same stable id,
+        // must compare equal so reconcile schedules no paint work.
+        let mut base = CellGrid::new(2, 3);
+        base.set_cell(0, 0, Cell::with_char('a'));
+        base.clear_dirty();
+        let overscan = [Cell::with_char('s')];
+
+        let mut snap_a = base.clone();
+        snap_a.insert_overscan_row_top(Some(&overscan), 0x8000_0000_0000_0001);
+        snap_a.set_overscan_rows(1);
+        snap_a.set_render_offset_y(-20.0);
+
+        let mut snap_b = base.clone();
+        snap_b.insert_overscan_row_top(Some(&overscan), 0x8000_0000_0000_0001);
+        snap_b.set_overscan_rows(1);
+        snap_b.set_render_offset_y(-20.0);
+
+        assert_eq!(snap_a, snap_b);
     }
 }

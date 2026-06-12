@@ -6,7 +6,9 @@
 //! 256-color and true-color SGR, erase operations, and window title (OSC).
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
+use unshit::app::scroll_motion::ScrollMotion;
 use unshit::core::cell_grid::{color_256, Cell, CellAttrs, CellGrid, ANSI_16};
 use unshit::core::style::types::Color;
 use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
@@ -16,6 +18,13 @@ pub mod keys;
 
 /// Maximum number of scrollback lines retained per terminal.
 const MAX_SCROLLBACK: usize = 10_000;
+
+/// High-bit namespace for the overscan row's stable line id in
+/// [`Terminal::display_grid`] snapshots. The id is derived from the
+/// overscan line's absolute index so an unchanged overscan row keeps its
+/// identity across snapshots, and the namespace bit keeps it from
+/// colliding with the grid's own monotonic line ids.
+const OVERSCAN_LINE_ID_NAMESPACE: u64 = 1 << 63;
 
 fn preview_bytes(bytes: &[u8], limit: usize) -> String {
     let mut preview = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]).into_owned();
@@ -63,7 +72,29 @@ pub struct Terminal {
     /// applies whole lines to `scroll_offset` and parks the sub-line
     /// remainder here so touchpads and high-resolution wheels track
     /// their input 1:1 instead of rounding every event to a full line.
+    /// While no animation is in flight this carry is also the rendered
+    /// sub-row fraction (see `fractional_view_position`).
     scroll_accum_lines: f32,
+    /// Active wheel-scroll animation in bottom-anchored pixel space:
+    /// `0.0` = live bottom, positive = scrolled back
+    /// (`px = lines_scrolled_back * cell_h`). `None` when idle. Exactly
+    /// one fractional-position owner exists at a time: while this is
+    /// `Some`, `scroll_accum_lines` is zero and the rendered fraction
+    /// lives in `scroll_view_fraction`; collapsing the animation hands
+    /// the fraction back to the carry.
+    scroll_anim: Option<ScrollMotion>,
+    /// Cell height (physical px) the active animation's pixel space was
+    /// built against. Sampling, retargeting, and PTY anchoring rescale
+    /// the motion when the renderer's cell height changes mid-flight
+    /// (Ctrl+wheel zoom, terminal font-size change), so the line-space
+    /// position stays continuous instead of jumping by the zoom ratio.
+    scroll_anim_cell_h: f32,
+    /// Rendered sub-row fraction in `[0, 1)`: how far the viewport top
+    /// has scrolled past `scroll_offset` toward `scroll_offset + 1`.
+    /// Written by `sample_scroll_animation` each animation tick; zero
+    /// whenever `scroll_anim` is `None` (the non-animating fraction is
+    /// derived from `scroll_accum_lines` instead).
+    scroll_view_fraction: f32,
     /// When the alternate screen buffer is active, this holds the
     /// previously-active main screen so it can be swapped back on exit
     /// (DEC private mode 1049 / 47 / 1047). `None` means the main
@@ -344,6 +375,9 @@ impl Terminal {
             scrollback: VecDeque::new(),
             scroll_offset: 0,
             scroll_accum_lines: 0.0,
+            scroll_anim: None,
+            scroll_anim_cell_h: 0.0,
+            scroll_view_fraction: 0.0,
             alt_grid: None,
             alt_saved_cursor: (0, 0),
             alt_saved_fg: default_fg(),
@@ -375,9 +409,16 @@ impl Terminal {
     /// helper can borrow `&mut self` without conflicting with the parser's
     /// own `&mut self` requirement.
     pub fn process_bytes(&mut self, bytes: &[u8]) {
-        // New output from the PTY snaps the view back to the live screen
-        // (and discards any fractional wheel carry along with it).
-        self.reset_scroll();
+        // Gate S3 (scroll-smoothness spec): new PTY output no longer
+        // snaps a scrolled-back view to the live screen. At the live
+        // bottom the view follows output exactly as before (only the
+        // dead fractional carry is discarded, matching the old
+        // `reset_scroll`); when the user is reading scrollback the view
+        // stays anchored instead — `scroll_up` bumps `scroll_offset`
+        // per pushed line so the same content stays on screen.
+        if self.live_bottom_intent() {
+            self.scroll_accum_lines = 0.0;
+        }
 
         let mut parser = std::mem::take(&mut self.parser);
         for &byte in bytes {
@@ -423,6 +464,14 @@ impl Terminal {
     /// emulator stays consistent with the daemon during a resize
     /// round-trip. Column-only resizes do not touch scrollback.
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        // A viewport reflow invalidates the animation's notion of "rows
+        // from the bottom"; freeze the view at its current sample (the
+        // resize forces a full rebuild anyway). Same-dimension calls
+        // (the resize handler republishing unchanged metrics) must not
+        // disturb an in-flight animation.
+        if rows != self.rows || cols != self.cols {
+            self.collapse_scroll_animation();
+        }
         let old_rows = self.rows;
         let scroll_region_was_full_screen = self.region_is_full_screen();
 
@@ -515,6 +564,7 @@ impl Terminal {
             return;
         }
 
+        self.collapse_scroll_animation();
         let alt_active = self.alt_grid.is_some();
         let scroll_region_was_full_screen = self.region_is_full_screen();
         self.grid.resize(rows, cols);
@@ -658,13 +708,20 @@ impl Terminal {
     }
 
     /// Scroll the view backward (toward older history) by `n` lines.
+    /// Cancels any in-flight wheel animation first (collapsing it to
+    /// its last rendered sample) so a direct whole-line jump and the
+    /// animation sampler never fight over `scroll_offset`.
     pub fn scroll_view_up(&mut self, n: usize) {
+        self.collapse_scroll_animation();
         let max = self.scrollback.len();
         self.scroll_offset = (self.scroll_offset + n).min(max);
     }
 
     /// Scroll the view forward (toward live screen) by `n` lines.
+    /// Cancels any in-flight wheel animation first, like
+    /// [`Terminal::scroll_view_up`].
     pub fn scroll_view_down(&mut self, n: usize) {
+        self.collapse_scroll_animation();
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
@@ -686,6 +743,11 @@ impl Terminal {
         if !delta_lines.is_finite() {
             return 0;
         }
+        // Precision-device takeover: a touchpad delta cancels any
+        // in-flight wheel animation, folding its sampled fraction into
+        // the carry so the rendered position is unchanged and the two
+        // fractional-position owners can never double-apply.
+        self.collapse_scroll_animation();
         self.scroll_accum_lines += delta_lines;
         // Defense in depth: a finite delta should never push the
         // accumulator non-finite, but never let a poisoned value persist.
@@ -716,20 +778,325 @@ impl Terminal {
         applied as i32
     }
 
-    /// Snap the view back to the live screen.
+    /// Snap the view back to the live screen, cancelling any in-flight
+    /// wheel animation and discarding every fractional remainder.
     pub fn reset_scroll(&mut self) {
         self.scroll_offset = 0;
         self.scroll_accum_lines = 0.0;
+        self.scroll_anim = None;
+        self.scroll_view_fraction = 0.0;
+    }
+
+    // -- animated wheel scrolling (sub-row precision) -------------------------
+    //
+    // A wheel notch no longer teleports the view by whole rows: the
+    // handler retargets a `ScrollMotion` in bottom-anchored pixel space
+    // (`scroll_animate_by_px`) and the framework's animation tick
+    // samples it (`sample_scroll_animation`) into the integer
+    // `scroll_offset` plus a sub-row `scroll_view_fraction` that
+    // `display_grid` renders as a fractional translation. Invariant:
+    // exactly one fractional-position owner at a time — the animation
+    // (`scroll_view_fraction`) or the touchpad carry
+    // (`scroll_accum_lines`); collapse hands the value across.
+
+    /// Cancel any in-flight wheel animation by collapsing it to its
+    /// most recent sample: `scroll_offset` already holds the sampled
+    /// whole rows, so the sampled fraction moves into the touchpad
+    /// carry and the rendered position is unchanged. Idempotent.
+    fn collapse_scroll_animation(&mut self) {
+        if self.scroll_anim.take().is_some() {
+            self.scroll_accum_lines = self.scroll_view_fraction;
+            self.scroll_view_fraction = 0.0;
+        }
+    }
+
+    /// Rescale the active animation's pixel space when the renderer's
+    /// cell height changed mid-flight (zoom / font-size change). Both
+    /// endpoints scale by the same ratio, so the sampled position is
+    /// exactly preserved in line space.
+    fn rescale_scroll_animation(&mut self, cell_h: f32) {
+        if let Some(motion) = self.scroll_anim.as_mut() {
+            if self.scroll_anim_cell_h > 0.0 && cell_h > 0.0 && self.scroll_anim_cell_h != cell_h {
+                let ratio = cell_h / self.scroll_anim_cell_h;
+                motion.start *= ratio;
+                motion.target *= ratio;
+                self.scroll_anim_cell_h = cell_h;
+            }
+        }
+    }
+
+    /// The rendered scroll position as `(whole_rows, fraction)` with
+    /// `fraction` in `[0, 1)`: the viewport top sits `fraction` rows
+    /// above the `whole_rows` viewport. While animating this is the
+    /// last sample; otherwise the touchpad carry is normalized into a
+    /// forward fraction (a negative carry borrows from `scroll_offset`)
+    /// so precision devices get true sub-row tracking too.
+    pub fn fractional_view_position(&self) -> (usize, f32) {
+        if self.scroll_anim.is_some() {
+            return (self.scroll_offset, self.scroll_view_fraction);
+        }
+        let carry = self.scroll_accum_lines;
+        if carry > 0.0 {
+            if self.scroll_offset >= self.scrollback.len() {
+                // Positive carry pinned at the top of scrollback is dead
+                // input (no line above exists to reveal).
+                (self.scroll_offset, 0.0)
+            } else {
+                (self.scroll_offset, carry)
+            }
+        } else if carry < 0.0 && self.scroll_offset >= 1 {
+            (self.scroll_offset - 1, 1.0 + carry)
+        } else {
+            (self.scroll_offset, 0.0)
+        }
+    }
+
+    /// `true` when the rendered view is anywhere but the live bottom
+    /// (whole rows, a sub-row fraction, or an in-flight animation).
+    /// Drives snap-to-live-on-keypress.
+    pub fn is_view_scrolled(&self) -> bool {
+        if self.scroll_anim.is_some() {
+            return true;
+        }
+        let (offset, fraction) = self.fractional_view_position();
+        offset > 0 || fraction > 0.0
+    }
+
+    /// The rendered position quantized to whole device pixels:
+    /// `(whole_rows, render_offset_px)`, where the second component is
+    /// exactly the paint-time translation `display_grid` emits (see
+    /// [`Self::render_offset_px`]). Two equal values paint identically,
+    /// so this is the change detector for animation ticks and the
+    /// instant wheel path.
+    pub fn rendered_scroll_px(&self, cell_h: f32) -> (usize, i64) {
+        let (offset, fraction) = self.fractional_view_position();
+        (offset, Self::render_offset_px(fraction, cell_h))
+    }
+
+    /// The vertical paint-time translation for a sub-row `fraction`, in
+    /// whole device pixels: `round((fraction - 1) * cell_h)`. The whole
+    /// offset is rounded (not just the animated component) so the
+    /// translated primitives stay pixel-aligned even when `cell_h`
+    /// itself is fractional — pixel-snapped cell quads and the glyph
+    /// rasterizer's subpixel bins are chosen at the pre-translation
+    /// position, so a fractional residue in the offset would displace
+    /// every snapped edge and glyph off its rasterized phase on every
+    /// frame, idle included.
+    fn render_offset_px(fraction: f32, cell_h: f32) -> i64 {
+        ((fraction - 1.0) * cell_h).round() as i64
+    }
+
+    /// Start or retarget the wheel-scroll animation by `delta_px`
+    /// pixels (positive scrolls toward older history, matching
+    /// `scroll_view_by_lines`). Compounds off the previous target with
+    /// velocity continuity (`ScrollMotion::retarget`), clamps the
+    /// target to `[0, scrollback_len * cell_h]`, and folds any parked
+    /// touchpad carry into the start position on takeover. Returns
+    /// `true` when an animation is (still) in flight or a collapsed
+    /// retarget needs one settling repaint; `false` means nothing will
+    /// change. Non-finite parameters are rejected.
+    pub fn scroll_animate_by_px(
+        &mut self,
+        delta_px: f32,
+        now: Instant,
+        duration: Duration,
+        initial_slope: f32,
+        cell_h: f32,
+    ) -> bool {
+        if !delta_px.is_finite()
+            || !initial_slope.is_finite()
+            || !cell_h.is_finite()
+            || cell_h <= 0.0
+        {
+            return false;
+        }
+        self.rescale_scroll_animation(cell_h);
+        let max_px = self.scrollback.len() as f32 * cell_h;
+        let had_anim = self.scroll_anim.is_some();
+        let current = match self.scroll_anim {
+            Some(motion) => motion.sample(now).0.clamp(0.0, max_px),
+            None => {
+                // Takeover from the idle/touchpad state: normalize the
+                // carry into the rendered (offset, fraction) pair so the
+                // animation starts from exactly the position on screen,
+                // then transfer ownership of the fraction to the motion.
+                let (offset, fraction) = self.fractional_view_position();
+                self.scroll_offset = offset;
+                self.scroll_view_fraction = fraction;
+                self.scroll_accum_lines = 0.0;
+                ((offset as f32 + fraction) * cell_h).clamp(0.0, max_px)
+            }
+        };
+        match ScrollMotion::retarget(
+            self.scroll_anim,
+            current,
+            -delta_px,
+            max_px,
+            now,
+            duration,
+            initial_slope,
+        ) {
+            Some(motion) => {
+                self.scroll_anim = Some(motion);
+                self.scroll_anim_cell_h = cell_h;
+                true
+            }
+            None => {
+                // Epsilon no-op: the compounded target collapses onto
+                // the current position. Settle there; an in-flight
+                // animation still needs one repaint at the settled
+                // position before it quiesces.
+                self.scroll_anim = None;
+                self.settle_scroll_position_px(current, cell_h);
+                had_anim
+            }
+        }
+    }
+
+    /// Write a bottom-anchored pixel position into the non-animating
+    /// state: whole rows go to `scroll_offset`, the sub-row remainder
+    /// becomes the carry so `fractional_view_position` keeps rendering
+    /// it. Caller must have cleared `scroll_anim`.
+    fn settle_scroll_position_px(&mut self, pos_px: f32, cell_h: f32) {
+        let sb_len = self.scrollback.len();
+        let lines = pos_px / cell_h;
+        let whole = (lines.floor().max(0.0) as usize).min(sb_len);
+        self.scroll_offset = whole;
+        self.scroll_accum_lines = if whole >= sb_len {
+            0.0
+        } else {
+            (lines - whole as f32).clamp(0.0, 1.0 - f32::EPSILON)
+        };
+        self.scroll_view_fraction = 0.0;
+    }
+
+    /// Advance the wheel animation to `now`, mapping the eased pixel
+    /// position to `(scroll_offset, scroll_view_fraction)`. Returns
+    /// `None` when no animation is in flight (e.g. cancelled by a
+    /// takeover or snap-to-live), else `Some((changed, finished))`
+    /// where `changed` means the device-pixel rendering moved and
+    /// `finished` means the motion completed and its resting sub-row
+    /// fraction was handed to the carry (the final frame paints
+    /// identical pixels from the non-animating state). Pure in the
+    /// injected timestamp.
+    pub fn sample_scroll_animation(&mut self, now: Instant, cell_h: f32) -> Option<(bool, bool)> {
+        let motion = self.scroll_anim?;
+        if !cell_h.is_finite() || cell_h <= 0.0 {
+            return Some((false, false));
+        }
+        self.rescale_scroll_animation(cell_h);
+        let motion = self.scroll_anim.unwrap_or(motion);
+        let sb_len = self.scrollback.len();
+        let max_px = sb_len as f32 * cell_h;
+        let (raw_pos, _, finished) = motion.sample(now);
+        let pos = raw_pos.clamp(0.0, max_px);
+        let before = self.rendered_scroll_px(cell_h);
+        if finished {
+            self.scroll_anim = None;
+            self.settle_scroll_position_px(pos, cell_h);
+        } else {
+            let lines = pos / cell_h;
+            let whole = (lines.floor().max(0.0) as usize).min(sb_len);
+            self.scroll_offset = whole;
+            self.scroll_view_fraction = if whole >= sb_len {
+                0.0
+            } else {
+                (lines - whole as f32).clamp(0.0, 1.0 - f32::EPSILON)
+            };
+        }
+        let after = self.rendered_scroll_px(cell_h);
+        Some((before != after, finished))
+    }
+
+    /// Whether the user's intent is "follow the live output": at the
+    /// rendered live bottom with no animation, or an animation whose
+    /// target is the live bottom (a downward fling must be able to land
+    /// even while output streams). Anything else is reading intent and
+    /// PTY output anchors the viewport instead of snapping it.
+    ///
+    /// "At the live bottom" is judged in device pixels, not exact
+    /// floats: a landing that left a sub-half-pixel residue (float error
+    /// in `settle_scroll_position_px`, an epsilon-collapsed retarget)
+    /// renders identically to the live bottom, so it must not silently
+    /// disable follow-output. The residue itself is dead input and is
+    /// discarded by `process_bytes` on the next output chunk.
+    fn live_bottom_intent(&self) -> bool {
+        /// Anything below half a device pixel rounds to "no offset".
+        const HALF_DEVICE_PX: f32 = 0.5;
+        if let Some(motion) = self.scroll_anim {
+            return motion.target.abs() < HALF_DEVICE_PX;
+        }
+        let (offset, fraction) = self.fractional_view_position();
+        if offset != 0 {
+            return false;
+        }
+        if fraction == 0.0 {
+            return true;
+        }
+        // Convert the line-space fraction to pixels with the best cell
+        // height available (the animation's, else the renderer's
+        // published metric); without one, fall back to the exact check.
+        let cell_h = if self.scroll_anim_cell_h > 0.0 {
+            self.scroll_anim_cell_h
+        } else {
+            CellGrid::global_cell_h()
+        };
+        cell_h > 0.0 && fraction * cell_h < HALF_DEVICE_PX
     }
 
     /// Build a `CellGrid` representing what should be displayed.
     ///
-    /// When `scroll_offset == 0` this is just a clone of the live grid.
-    /// When scrolled back, the grid is composed from scrollback lines and
-    /// the upper portion of the live screen, with the cursor hidden.
+    /// Snapshots are always `(rows + 1, cols)`: one overscan row above
+    /// the viewport (declared via `overscan_rows`) plus a vertical
+    /// paint-time translation `render_offset_y = -(1 - fraction) *
+    /// cell_h` (snapped to whole device pixels), so sub-row scroll
+    /// positions render as a fractional slide with the overscan row
+    /// covering the gap at the top. The constant shape keeps the
+    /// framework's paint-only grid patches and the reconciler's
+    /// grid-content fast path dimension-stable across live/scrolled
+    /// states.
+    ///
+    /// At the live bottom the snapshot is a clone of the live grid with
+    /// the newest scrollback line prepended (preserving the
+    /// damage-splice fast path); when scrolled back it is composed from
+    /// scrollback lines and the upper portion of the live screen, with
+    /// the cursor hidden.
     pub fn display_grid(&self) -> CellGrid {
-        if self.scroll_offset == 0 {
-            let view = self.grid.clone();
+        let (offset, fraction) = self.fractional_view_position();
+        // Producer half of the renderer contract: the offset is in
+        // physical pixels, and the WHOLE offset is snapped to a whole
+        // device pixel (`render_offset_px`). Cell-background quads are
+        // pixel-snapped and glyph subpixel bins are chosen at the
+        // pre-translation position, so any fractional residue in the
+        // offset (e.g. an exact `-cell_h` base with a fractional cell
+        // height) would shift every snapped edge and glyph off its
+        // rasterized phase — on every frame, idle included. A whole-pixel
+        // offset keeps the final positions on the same pixel grid the
+        // primitives were snapped/binned for; at a zero fraction the rows
+        // land within half a device pixel of the offset-free layout. When
+        // cell metrics have not been published yet (headless tests, the
+        // instant before the first ever frame) the fraction is
+        // necessarily zero and the offset degrades to 0.
+        let cell_h = CellGrid::global_cell_h();
+        let render_offset_y = if cell_h > 0.0 {
+            Self::render_offset_px(fraction, cell_h) as f32
+        } else {
+            0.0
+        };
+
+        if offset == 0 && fraction == 0.0 {
+            let mut view = self.grid.clone();
+            let (overscan_cells, overscan_id) = match self.scrollback.back() {
+                Some(row) => (
+                    Some(row.as_slice()),
+                    OVERSCAN_LINE_ID_NAMESPACE
+                        | (self.evicted_lines + self.scrollback.len() as u64 - 1),
+                ),
+                None => (None, OVERSCAN_LINE_ID_NAMESPACE),
+            };
+            view.insert_overscan_row_top(overscan_cells, overscan_id);
+            view.set_overscan_rows(1);
+            view.set_render_offset_y(render_offset_y);
             if terminal_trace_enabled() {
                 let rows = view.debug_rows(4, 96);
                 append_terminal_trace_line(&format!(
@@ -746,14 +1113,17 @@ impl Terminal {
             return view;
         }
 
-        let mut view = CellGrid::new(self.rows, self.cols);
+        let mut view = CellGrid::new(self.rows + 1, self.cols);
         let sb_len = self.scrollback.len();
+        // Virtual index (into scrollback ++ screen) of the viewport's
+        // top line. Display row 0 is the overscan line above it, blank
+        // when the view is pinned at the oldest line.
+        let base = sb_len.saturating_sub(offset);
 
-        for display_row in 0..self.rows {
-            // Virtual line index into (scrollback ++ screen).
-            // At offset 0 the view starts at sb_len (the screen top).
-            // At offset N it starts N lines earlier.
-            let virtual_line = sb_len.saturating_sub(self.scroll_offset) + display_row;
+        for display_row in 0..self.rows + 1 {
+            let Some(virtual_line) = (base + display_row).checked_sub(1) else {
+                continue;
+            };
 
             if virtual_line < sb_len {
                 // This row comes from scrollback.
@@ -779,6 +1149,8 @@ impl Terminal {
 
         // Hide cursor when scrolled back.
         view.set_cursor_visible(false);
+        view.set_overscan_rows(1);
+        view.set_render_offset_y(render_offset_y);
         if terminal_trace_enabled() {
             let rows = view.debug_rows(4, 96);
             append_terminal_trace_line(&format!(
@@ -812,10 +1184,39 @@ impl Terminal {
         self.bracketed_paste
     }
 
-    /// Absolute index of the virtual line currently shown at display row 0.
+    /// Absolute index of the virtual line currently shown at display
+    /// row 0 (the viewport top, not the overscan row). Uses the
+    /// normalized rendered offset so it agrees with `display_grid` even
+    /// when a negative touchpad carry borrows a row.
     fn top_abs_line(&self) -> u64 {
-        let top_virtual = self.scrollback.len().saturating_sub(self.scroll_offset);
+        let (offset, _) = self.fractional_view_position();
+        let top_virtual = self.scrollback.len().saturating_sub(offset);
         self.evicted_lines + top_virtual as u64
+    }
+
+    /// Map an element-local pixel `y_px` to the absolute line rendered
+    /// there, accounting for the sub-row fraction: the content is
+    /// displaced down by `fraction * cell_h`, so
+    /// `abs = top_abs_line() + floor(y/cell_h - fraction)`, which
+    /// resolves to the partially visible overscan line for small `y`
+    /// while scrolled to a fraction. Clamped to the rows actually on
+    /// screen and to the addressable line range.
+    pub fn view_pixel_to_abs_line(&self, y_px: f32, cell_h: f32) -> u64 {
+        let top = self.top_abs_line();
+        if !y_px.is_finite() || !cell_h.is_finite() || cell_h <= 0.0 {
+            return top;
+        }
+        let (_, fraction) = self.fractional_view_position();
+        let min_rel = if fraction > 0.0 { -1.0 } else { 0.0 };
+        let max_rel = self.rows.saturating_sub(1) as f32;
+        let rel = (y_px.max(0.0) / cell_h - fraction)
+            .floor()
+            .clamp(min_rel, max_rel);
+        if rel < 0.0 {
+            top.saturating_sub(1).max(self.first_abs_line())
+        } else {
+            top + rel as u64
+        }
     }
 
     /// Smallest still-addressable absolute line (the oldest line retained in
@@ -834,21 +1235,6 @@ impl Terminal {
     /// space so the result is stable as the buffer scrolls.
     pub fn abs_line_at_display(&self, display_row: usize) -> u64 {
         self.top_abs_line() + display_row as u64
-    }
-
-    /// Display row currently showing absolute line `abs`, or `None` when it
-    /// is scrolled out of the viewport (above the top or below the bottom).
-    fn display_row_of_abs(&self, abs: u64) -> Option<usize> {
-        let top = self.top_abs_line();
-        if abs < top {
-            return None;
-        }
-        let d = (abs - top) as usize;
-        if d < self.rows {
-            Some(d)
-        } else {
-            None
-        }
     }
 
     /// The cell at absolute `(abs, col)`, reading from scrollback or the live
@@ -940,13 +1326,22 @@ impl Terminal {
         };
         let last_col = self.cols - 1;
         // Only the on-screen portion of the selection needs painting.
-        let vis_top = self.top_abs_line();
-        let vis_bot = vis_top + (self.rows.saturating_sub(1)) as u64;
+        // An overscan grid carries one extra (partially visible) line
+        // above the viewport at row 0; paint it too so a sub-row scroll
+        // position never clips the highlight at the top edge.
+        let overscan = grid.overscan_rows() as u64;
+        let top = self.top_abs_line();
+        let vis_top = top.saturating_sub(overscan).max(self.first_abs_line());
+        let vis_bot = top + (self.rows.saturating_sub(1)) as u64;
         let from = start.0.max(vis_top);
         let to = end.0.min(vis_bot);
         let mut abs = from;
         while abs <= to {
-            if let Some(row) = self.display_row_of_abs(abs) {
+            // Grid row for `abs`: the viewport top renders at grid row
+            // `overscan`, lines above it (only the overscan line) at
+            // smaller indices.
+            let row = (abs + overscan).checked_sub(top).map(|r| r as usize);
+            if let Some(row) = row.filter(|&r| r < grid.rows()) {
                 let c0 = if abs == start.0 {
                     start.1.min(last_col)
                 } else {
@@ -1075,6 +1470,26 @@ impl Terminal {
                 // into the live buffer all shift down by one).
                 self.evicted_lines += 1;
             }
+            // Gate S3: a reader parked in scrollback keeps their view
+            // anchored while output streams. Each pushed line moves the
+            // viewport one line further from the live bottom, so bump
+            // the offset (clamped at the top of scrollback, where
+            // eviction is allowed to consume the view) and shift an
+            // in-flight animation's pixel space by one row so its
+            // sampled displacement stays continuous in content space.
+            // A live-bottom intent (including a downward fling whose
+            // target is the live edge) keeps today's follow behavior.
+            if !self.live_bottom_intent() {
+                self.scroll_offset = (self.scroll_offset + 1).min(self.scrollback.len());
+                if let Some(motion) = self.scroll_anim.as_mut() {
+                    let cell_h = self.scroll_anim_cell_h;
+                    if cell_h > 0.0 {
+                        let max_px = self.scrollback.len() as f32 * cell_h;
+                        motion.start += cell_h;
+                        motion.target = (motion.target + cell_h).min(max_px);
+                    }
+                }
+            }
         }
 
         // Shift rows [top+1, bot) up into [top, bot-1) and blank row bot-1.
@@ -1162,6 +1577,14 @@ impl Terminal {
         if self.alt_grid.is_some() {
             return;
         }
+        // A scrolled-back view (or an in-flight wheel animation) must not
+        // survive into the alt screen: `display_grid` composes scrollback
+        // above the live grid regardless of alt mode, so a TUI launched
+        // while the user reads scrollback would render shifted down under
+        // stale shell output. The gate-S3 anchoring in `process_bytes`
+        // deliberately stopped snapping on output, so the snap happens
+        // here, at the buffer switch, instead.
+        self.reset_scroll();
         self.clear_pending_wrap();
         self.alt_saved_cursor = (self.cursor_row, self.cursor_col);
         self.alt_saved_fg = self.fg;
@@ -1188,6 +1611,11 @@ impl Terminal {
         let Some(mut main) = self.alt_grid.take() else {
             return;
         };
+        // Mirror `enter_alt_screen`: a view scrolled while the TUI owned
+        // the screen (wheel over `less`, etc.) snaps back to the live
+        // prompt on exit rather than dropping the user at a stale
+        // scrollback position.
+        self.reset_scroll();
         std::mem::swap(&mut self.grid, &mut main);
         // `main` now holds the discarded alt-buffer contents and is
         // dropped here.
@@ -3442,16 +3870,81 @@ mod tests {
     }
 
     #[test]
-    fn process_bytes_resets_scroll_offset() {
+    fn process_bytes_at_bottom_stays_live() {
         let mut term = term_with_scrollback();
-        term.scroll_view_up(2);
-        assert!(term.scroll_offset() > 0);
-        term.process_bytes(b"X");
+        assert_eq!(term.scroll_offset(), 0);
+        term.process_bytes(b"FFFF\r\nGGGG");
         assert_eq!(
             term.scroll_offset(),
             0,
-            "new output should snap scroll to bottom"
+            "a live-bottom view must keep following output"
         );
+        // The viewport shows the newest lines, exactly as before.
+        assert_eq!(term.display_grid().get_cell(3, 0).unwrap().ch, 'G');
+    }
+
+    #[test]
+    fn process_bytes_scrolled_back_anchors_viewport() {
+        let mut term = term_with_scrollback();
+        term.scroll_view_up(2);
+        let top_before = term.abs_line_at_display(0);
+        let top_content = term.display_grid().get_cell(1, 0).unwrap().ch;
+        // Two more lines scroll off the live screen.
+        term.process_bytes(b"\r\nFFFF\r\nGGGG");
+        assert_eq!(
+            term.abs_line_at_display(0),
+            top_before,
+            "output must not shift a scrolled-back viewport (gate S3)"
+        );
+        assert_eq!(
+            term.display_grid().get_cell(1, 0).unwrap().ch,
+            top_content,
+            "the rendered top line must be unchanged across paints"
+        );
+        assert!(
+            term.scroll_offset() > 2,
+            "the offset grew to hold the anchor"
+        );
+    }
+
+    #[test]
+    fn enter_alt_screen_snaps_scrolled_back_view_to_live() {
+        // Launching a TUI (?1049h) while reading scrollback must not
+        // render scrollback above the alt screen: the anchoring gate
+        // (S3) stopped snapping on output, so the buffer switch snaps.
+        let mut term = term_with_scrollback();
+        term.scroll_view_up(2);
+        term.process_bytes(b"\x1b[?1049h");
+        assert_eq!(term.scroll_offset(), 0, "alt-screen entry snaps to live");
+        assert!(!term.is_view_scrolled());
+        // The viewport shows the (blank) alt screen, not scrollback.
+        assert_eq!(term.display_grid().get_cell(1, 0).unwrap().ch, '\0');
+    }
+
+    #[test]
+    fn enter_alt_screen_cancels_in_flight_wheel_animation() {
+        let mut term = term_with_scrollback();
+        let t0 = Instant::now();
+        assert!(term.scroll_animate_by_px(40.0, t0, Duration::from_millis(180), 0.25, 20.0));
+        term.process_bytes(b"\x1b[?1049h");
+        assert!(
+            term.scroll_anim.is_none(),
+            "the wheel animation is cancelled"
+        );
+        assert_eq!(term.fractional_view_position(), (0, 0.0));
+    }
+
+    #[test]
+    fn exit_alt_screen_snaps_scrolled_view_to_live() {
+        let mut term = term_with_scrollback();
+        term.process_bytes(b"\x1b[?1049h");
+        // Scroll back over the TUI (the main screen's scrollback is
+        // still addressable), then exit: the view lands on the live
+        // prompt, not a stale scrollback position.
+        term.scroll_view_up(2);
+        term.process_bytes(b"\x1b[?1049l");
+        assert_eq!(term.scroll_offset(), 0, "alt-screen exit snaps to live");
+        assert!(!term.is_view_scrolled());
     }
 
     #[test]
@@ -3581,18 +4074,571 @@ mod tests {
     }
 
     #[test]
-    fn process_bytes_snap_to_live_discards_fractional_carry() {
+    fn process_bytes_at_bottom_discards_dead_negative_carry() {
         let mut term = term_with_scrollback();
-        // Park a fractional carry while scrolled back (off the boundary
-        // so the pinned-boundary discard cannot eat it first).
-        term.scroll_view_up(1);
-        assert_eq!(term.scroll_view_by_lines(0.6), 0);
-        // New output snaps the view to the live screen.
+        // A negative carry at the live bottom renders as position 0
+        // (dead input; only reachable defensively), and new output
+        // discards it exactly like the old snap-to-live did.
+        term.scroll_accum_lines = -0.4;
+        assert_eq!(term.fractional_view_position(), (0, 0.0));
         term.process_bytes(b"FFFF\r\n");
         assert_eq!(term.scroll_offset(), 0);
-        // Were the 0.6 carry still pending, this 0.5 would cross a line.
+        assert_eq!(term.scroll_accum_lines, 0.0);
+        // Were the -0.4 still pending, 0.5 + 0.5 would not cross a line.
         assert_eq!(term.scroll_view_by_lines(0.5), 0);
-        assert_eq!(term.scroll_offset(), 0);
+        assert_eq!(term.scroll_view_by_lines(0.5), 1);
+    }
+
+    #[test]
+    fn process_bytes_with_sub_row_carry_anchors_instead_of_snapping() {
+        let mut term = term_with_scrollback();
+        // A positive carry at offset 0 is a rendered sub-row position
+        // (reading intent), so output anchors rather than snaps.
+        assert_eq!(term.scroll_view_by_lines(0.6), 0);
+        let (offset, fraction) = term.fractional_view_position();
+        assert_eq!((offset, fraction), (0, 0.6));
+        // The newline scrolls exactly one line into scrollback.
+        term.process_bytes(b"\r\nFFFF");
+        let (offset, fraction) = term.fractional_view_position();
+        assert_eq!(offset, 1, "one pushed line bumps the anchor by one row");
+        assert!(
+            (fraction - 0.6).abs() < 1e-6,
+            "the sub-row fraction survives"
+        );
+    }
+
+    // -- animated wheel scrolling tests (Phase 3 Stage T) ---------------------
+
+    const CELL_H: f32 = 20.0;
+
+    /// 3x5 terminal with `lines` numbered lines pushed into scrollback.
+    fn term_with_deep_scrollback(lines: usize) -> Terminal {
+        let mut term = Terminal::new(3, 5);
+        let mut fill = String::new();
+        for i in 0..lines {
+            fill.push_str(&format!("{}\r\n", i % 10));
+        }
+        fill.push_str("end");
+        term.process_bytes(fill.as_bytes());
+        term
+    }
+
+    #[test]
+    fn scroll_animate_target_accumulates_exactly_per_notch() {
+        // Gate H5 at the target level: N notches move the animation
+        // target by exactly N * delta_px (wheel-train compounding off
+        // the previous target, no per-event rounding).
+        let mut term = term_with_deep_scrollback(100);
+        let t0 = Instant::now();
+        let d = Duration::from_millis(180);
+        for n in 1..=3 {
+            assert!(term.scroll_animate_by_px(
+                120.0,
+                t0 + Duration::from_millis(20 * n as u64),
+                d,
+                0.25,
+                CELL_H
+            ));
+            assert_eq!(term.scroll_anim.unwrap().target, 120.0 * n as f32);
+        }
+    }
+
+    #[test]
+    fn scroll_animate_target_clamps_to_scrollback_extent() {
+        let mut term = term_with_deep_scrollback(10);
+        let sb_len = term.scrollback_len();
+        let max_px = sb_len as f32 * CELL_H;
+        let t0 = Instant::now();
+        assert!(term.scroll_animate_by_px(
+            max_px * 4.0,
+            t0,
+            Duration::from_millis(180),
+            0.25,
+            CELL_H
+        ));
+        assert_eq!(term.scroll_anim.unwrap().target, max_px);
+        // Completion pins exactly to the top: whole offset, no fraction.
+        let (changed, finished) = term
+            .sample_scroll_animation(t0 + Duration::from_millis(200), CELL_H)
+            .unwrap();
+        assert!(changed && finished);
+        assert_eq!(term.fractional_view_position(), (sb_len, 0.0));
+        assert!(term.scroll_anim.is_none());
+    }
+
+    #[test]
+    fn scroll_animate_downward_at_live_bottom_is_a_no_op() {
+        let mut term = term_with_deep_scrollback(10);
+        assert!(!term.scroll_animate_by_px(
+            -100.0,
+            Instant::now(),
+            Duration::from_millis(180),
+            0.25,
+            CELL_H
+        ));
+        assert!(term.scroll_anim.is_none());
+        assert_eq!(term.fractional_view_position(), (0, 0.0));
+    }
+
+    #[test]
+    fn scroll_animate_rejects_non_finite_inputs() {
+        let mut term = term_with_deep_scrollback(10);
+        let now = Instant::now();
+        let d = Duration::from_millis(180);
+        assert!(!term.scroll_animate_by_px(f32::NAN, now, d, 0.25, CELL_H));
+        assert!(!term.scroll_animate_by_px(f32::INFINITY, now, d, 0.25, CELL_H));
+        assert!(!term.scroll_animate_by_px(100.0, now, d, f32::NAN, CELL_H));
+        assert!(!term.scroll_animate_by_px(100.0, now, d, 0.25, 0.0));
+        assert!(!term.scroll_animate_by_px(100.0, now, d, 0.25, f32::NAN));
+        assert!(term.scroll_anim.is_none());
+        assert_eq!(term.fractional_view_position(), (0, 0.0));
+    }
+
+    #[test]
+    fn scroll_animate_folds_parked_touchpad_carry_into_start() {
+        let mut term = term_with_deep_scrollback(50);
+        assert_eq!(term.scroll_view_by_lines(0.5), 0);
+        let t0 = Instant::now();
+        assert!(term.scroll_animate_by_px(40.0, t0, Duration::from_millis(180), 0.25, CELL_H));
+        let motion = term.scroll_anim.unwrap();
+        assert_eq!(
+            motion.start,
+            0.5 * CELL_H,
+            "carry folds into the start position"
+        );
+        assert_eq!(motion.target, 0.5 * CELL_H + 40.0);
+        assert_eq!(
+            term.scroll_accum_lines, 0.0,
+            "the motion now owns the fraction"
+        );
+    }
+
+    #[test]
+    fn sample_scroll_animation_maps_px_to_whole_rows_plus_fraction() {
+        let mut term = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        // Slope 0 over 100ms: the symmetric ease puts the midpoint at
+        // exactly 50% of the 50px distance = 1.25 lines.
+        assert!(term.scroll_animate_by_px(50.0, t0, Duration::from_millis(100), 0.0, CELL_H));
+        let (changed, finished) = term
+            .sample_scroll_animation(t0 + Duration::from_millis(50), CELL_H)
+            .unwrap();
+        assert!(changed && !finished);
+        let (offset, fraction) = term.fractional_view_position();
+        assert_eq!(offset, 1);
+        assert!((fraction - 0.25).abs() < 1e-3, "fraction was {fraction}");
+    }
+
+    #[test]
+    fn animation_completion_lands_exactly_on_target_with_resting_fraction() {
+        let mut term = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        // 50px = 2.5 lines: the resting position is fractional.
+        assert!(term.scroll_animate_by_px(50.0, t0, Duration::from_millis(100), 0.25, CELL_H));
+        let just_before = term
+            .sample_scroll_animation(t0 + Duration::from_millis(99), CELL_H)
+            .unwrap();
+        assert!(!just_before.1);
+        let rendered_before_done = term.rendered_scroll_px(CELL_H);
+        let (_, finished) = term
+            .sample_scroll_animation(t0 + Duration::from_millis(100), CELL_H)
+            .unwrap();
+        assert!(finished);
+        assert!(term.scroll_anim.is_none());
+        // The resting fraction was handed to the carry: the view renders
+        // 2.5 lines back from the non-animating state.
+        assert_eq!(term.scroll_offset(), 2);
+        assert!((term.scroll_accum_lines - 0.5).abs() < 1e-6);
+        assert_eq!(term.rendered_scroll_px(CELL_H), (2, -10));
+        // No end-of-fling jerk: the final px position equals the target,
+        // which the pre-completion samples were converging to.
+        assert!(rendered_before_done.0 <= 2);
+        // A follow-up sample reports no animation.
+        assert!(term
+            .sample_scroll_animation(t0 + Duration::from_millis(120), CELL_H)
+            .is_none());
+    }
+
+    #[test]
+    fn wheel_retarget_mid_flight_is_velocity_continuous() {
+        let mut term = term_with_deep_scrollback(100);
+        let t0 = Instant::now();
+        let d = Duration::from_millis(180);
+        assert!(term.scroll_animate_by_px(120.0, t0, d, 0.25, CELL_H));
+        let first = term.scroll_anim.unwrap();
+        let t1 = t0 + Duration::from_millis(40);
+        let (mid_pos, _, _) = first.sample(t1);
+        assert!(term.scroll_animate_by_px(120.0, t1, d, 0.25, CELL_H));
+        let second = term.scroll_anim.unwrap();
+        assert_eq!(
+            second.start, mid_pos,
+            "the retarget starts from the sampled position"
+        );
+        assert_eq!(
+            second.target, 240.0,
+            "the retarget compounds off the previous target"
+        );
+        assert!(
+            second.initial_slope > 0.25,
+            "in-flight velocity must carry into the new curve"
+        );
+    }
+
+    #[test]
+    fn epsilon_retarget_collapses_animation_with_one_settling_repaint() {
+        let mut term = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        let d = Duration::from_millis(180);
+        assert!(term.scroll_animate_by_px(100.0, t0, d, 0.25, CELL_H));
+        // An equal-and-opposite notch at the same instant collapses the
+        // compounded target back onto the current position (epsilon
+        // no-op): the animation clears but one repaint is still due.
+        assert!(term.scroll_animate_by_px(-100.0, t0, d, 0.25, CELL_H));
+        assert!(term.scroll_anim.is_none());
+        assert_eq!(term.fractional_view_position(), (0, 0.0));
+        // And with no animation at all, the same call reports nothing.
+        assert!(!term.scroll_animate_by_px(-100.0, t0, d, 0.25, CELL_H));
+    }
+
+    #[test]
+    fn one_notch_renders_at_least_twelve_distinct_positions_at_8ms_cadence() {
+        // Gate H4 at the terminal level: a single notch sampled on the
+        // 8ms animation cadence must pass through >= 12 distinct
+        // device-pixel positions and land exactly on its target.
+        use unshit::app::scroll_motion::{browser_like_initial_slope, browser_like_wheel_duration};
+        let mut term = term_with_deep_scrollback(100);
+        let delta = (0.0, 120.0);
+        let duration = browser_like_wheel_duration(delta, unshit::app::ScrollTuning::default());
+        let slope = browser_like_initial_slope(delta);
+        let cell_h = 40.0;
+        let t0 = Instant::now();
+        assert!(term.scroll_animate_by_px(120.0, t0, duration, slope, cell_h));
+
+        let mut positions = vec![term.rendered_scroll_px(cell_h)];
+        let mut tick = t0;
+        loop {
+            tick += Duration::from_millis(8);
+            let (_, finished) = term.sample_scroll_animation(tick, cell_h).unwrap();
+            let rendered = term.rendered_scroll_px(cell_h);
+            if positions.last() != Some(&rendered) {
+                positions.push(rendered);
+            }
+            if finished {
+                break;
+            }
+        }
+        assert!(
+            positions.len() >= 12,
+            "expected >= 12 distinct rendered positions per notch, got {}",
+            positions.len()
+        );
+        assert_eq!(
+            term.fractional_view_position(),
+            (3, 0.0),
+            "120px at cell_h 40 must land exactly 3 lines back"
+        );
+    }
+
+    #[test]
+    fn touchpad_takeover_collapses_animation_to_current_sample() {
+        let mut term = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        assert!(term.scroll_animate_by_px(50.0, t0, Duration::from_millis(100), 0.0, CELL_H));
+        term.sample_scroll_animation(t0 + Duration::from_millis(50), CELL_H);
+        let (offset, fraction) = term.fractional_view_position();
+        // A touchpad delta cancels the animation and continues from the
+        // sampled position exactly.
+        term.scroll_view_by_lines(0.2);
+        assert!(term.scroll_anim.is_none());
+        let (offset2, fraction2) = term.fractional_view_position();
+        assert_eq!(offset2, offset);
+        assert!((fraction2 - (fraction + 0.2)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn page_jump_mid_animation_collapses_then_applies_whole_lines() {
+        let mut term = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        assert!(term.scroll_animate_by_px(50.0, t0, Duration::from_millis(100), 0.0, CELL_H));
+        term.sample_scroll_animation(t0 + Duration::from_millis(50), CELL_H);
+        let (offset, fraction) = term.fractional_view_position();
+        term.scroll_view_up(5);
+        assert!(
+            term.scroll_anim.is_none(),
+            "a direct jump cancels the animation"
+        );
+        let (offset2, fraction2) = term.fractional_view_position();
+        assert_eq!(offset2, offset + 5);
+        assert!(
+            (fraction2 - fraction).abs() < 1e-6,
+            "the sampled fraction survives the jump"
+        );
+    }
+
+    #[test]
+    fn reset_scroll_cancels_animation_and_fraction() {
+        let mut term = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        assert!(term.scroll_animate_by_px(50.0, t0, Duration::from_millis(100), 0.0, CELL_H));
+        term.sample_scroll_animation(t0 + Duration::from_millis(50), CELL_H);
+        term.reset_scroll();
+        assert!(term.scroll_anim.is_none());
+        assert_eq!(term.fractional_view_position(), (0, 0.0));
+        assert!(term
+            .sample_scroll_animation(t0 + Duration::from_millis(60), CELL_H)
+            .is_none());
+    }
+
+    #[test]
+    fn zoom_mid_flight_rescales_animation_in_line_space() {
+        // R1: a cell-height change mid-animation rescales the motion's
+        // pixel space so the line-space position stays continuous.
+        let mut term = term_with_deep_scrollback(50);
+        let mut control = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        let d = Duration::from_millis(100);
+        assert!(term.scroll_animate_by_px(50.0, t0, d, 0.0, CELL_H));
+        assert!(control.scroll_animate_by_px(50.0, t0, d, 0.0, CELL_H));
+        let t1 = t0 + Duration::from_millis(50);
+        // Zoom doubles the cell height for the test terminal only.
+        term.sample_scroll_animation(t1, CELL_H * 2.0);
+        control.sample_scroll_animation(t1, CELL_H);
+        let (offset, fraction) = term.fractional_view_position();
+        let (c_offset, c_fraction) = control.fractional_view_position();
+        assert_eq!(offset, c_offset);
+        assert!((fraction - c_fraction).abs() < 1e-3);
+        let motion = term.scroll_anim.unwrap();
+        assert_eq!(
+            motion.target, 100.0,
+            "the target scaled with the zoom ratio"
+        );
+    }
+
+    #[test]
+    fn pty_output_anchors_animated_view_by_shifting_motion() {
+        let mut term = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        assert!(term.scroll_animate_by_px(100.0, t0, Duration::from_millis(100), 0.0, CELL_H));
+        let t1 = t0 + Duration::from_millis(50);
+        term.sample_scroll_animation(t1, CELL_H);
+        let top_before = term.abs_line_at_display(0);
+        let target_before = term.scroll_anim.unwrap().target;
+        // One line of output while reading scrollback.
+        term.process_bytes(b"\r\nX");
+        assert_eq!(
+            term.abs_line_at_display(0),
+            top_before,
+            "anchoring must keep the same content at the viewport top"
+        );
+        let motion = term.scroll_anim.unwrap();
+        assert_eq!(motion.target, target_before + CELL_H);
+        // Re-sampling at the same timestamp reproduces the anchored view.
+        term.sample_scroll_animation(t1, CELL_H);
+        assert_eq!(term.abs_line_at_display(0), top_before);
+    }
+
+    #[test]
+    fn sub_half_pixel_landing_keeps_follow_output() {
+        // A wheel train that nets out to less than half a device pixel
+        // off the live bottom renders identically to the live bottom, so
+        // PTY output must keep following instead of anchoring; the dead
+        // residue is discarded by the next output chunk.
+        let mut term = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        let d = Duration::from_millis(100);
+        assert!(term.scroll_animate_by_px(20.4, t0, d, 0.0, CELL_H));
+        term.sample_scroll_animation(t0 + d, CELL_H);
+        assert!(term.scroll_animate_by_px(-20.0, t0 + d, d, 0.0, CELL_H));
+        term.sample_scroll_animation(t0 + d + d, CELL_H);
+        assert!(term.scroll_anim.is_none());
+        let (offset, fraction) = term.fractional_view_position();
+        assert_eq!(offset, 0);
+        assert!(
+            fraction > 0.0 && fraction * CELL_H < 0.5,
+            "the landing left a sub-half-pixel residue, fraction = {fraction}"
+        );
+        term.process_bytes(b"\r\nX");
+        assert_eq!(term.scroll_offset(), 0, "follow-output stays enabled");
+        assert_eq!(
+            term.scroll_accum_lines, 0.0,
+            "the dead residue is discarded"
+        );
+    }
+
+    #[test]
+    fn render_offset_is_whole_device_pixels_for_fractional_cell_heights() {
+        // The paint-time translation must always be a whole device pixel,
+        // even when the cell height is fractional (e.g. 14pt * 1.25 line
+        // height = 17.5px): cell quads are pixel-snapped and glyph
+        // subpixel bins chosen at the pre-translation position, so a
+        // fractional offset would knock every frame (idle included) off
+        // its rasterized phase. `render_offset_px` returning i64 makes
+        // wholeness structural; this pins the rounding of the whole
+        // offset, not just the animated component.
+        assert_eq!(Terminal::render_offset_px(0.0, 17.5), -18);
+        assert_eq!(Terminal::render_offset_px(0.5, 17.5), -9);
+        assert_eq!(Terminal::render_offset_px(0.0, 20.0), -20);
+        // The change detector and the painted offset share one
+        // quantization, so equal detector values paint identically.
+        let mut term = term_with_deep_scrollback(10);
+        term.scroll_view_by_lines(0.5);
+        let (_, px) = term.rendered_scroll_px(17.5);
+        assert_eq!(px, Terminal::render_offset_px(0.5, 17.5));
+    }
+
+    #[test]
+    fn anchoring_survives_eviction_at_scrollback_capacity() {
+        let mut term = Terminal::new(2, 3);
+        for _ in 0..MAX_SCROLLBACK {
+            term.scrollback.push_back(vec![Cell::default(); 3]);
+        }
+        term.process_bytes(b"A\r\nB");
+        // Pushes above capacity evict from the front.
+        assert_eq!(term.scrollback_len(), MAX_SCROLLBACK);
+        term.scroll_view_up(10);
+        let top_before = term.abs_line_at_display(0);
+        let row_content = term.display_grid().get_cell(1, 0).unwrap().ch;
+        term.process_bytes(b"\r\nC\r\nD");
+        assert_eq!(term.scrollback_len(), MAX_SCROLLBACK);
+        assert_eq!(
+            term.abs_line_at_display(0),
+            top_before,
+            "the anchor survives eviction until the view is pinned at the top"
+        );
+        assert_eq!(term.display_grid().get_cell(1, 0).unwrap().ch, row_content);
+        assert_eq!(term.scroll_offset(), 12);
+    }
+
+    #[test]
+    fn anchoring_pinned_at_top_lets_eviction_consume_the_view() {
+        let mut term = Terminal::new(2, 3);
+        for _ in 0..MAX_SCROLLBACK {
+            term.scrollback.push_back(vec![Cell::default(); 3]);
+        }
+        term.process_bytes(b"A\r\nB");
+        term.scroll_view_up(MAX_SCROLLBACK * 2);
+        assert_eq!(term.scroll_offset(), MAX_SCROLLBACK);
+        let top_before = term.abs_line_at_display(0);
+        term.process_bytes(b"\r\nC");
+        // Content above was destroyed; the clamped offset means the view
+        // advances one line (nothing else is possible).
+        assert_eq!(term.scroll_offset(), MAX_SCROLLBACK);
+        assert_eq!(term.abs_line_at_display(0), top_before + 1);
+    }
+
+    #[test]
+    fn downward_fling_to_live_skips_anchoring() {
+        let mut term = term_with_deep_scrollback(50);
+        term.scroll_view_up(5);
+        let t0 = Instant::now();
+        // Fling toward the live bottom: target clamps to 0.
+        assert!(term.scroll_animate_by_px(
+            -10.0 * CELL_H,
+            t0,
+            Duration::from_millis(100),
+            0.0,
+            CELL_H
+        ));
+        assert_eq!(term.scroll_anim.unwrap().target, 0.0);
+        let offset_before = term.scroll_offset();
+        term.process_bytes(b"\r\nX");
+        assert_eq!(
+            term.scroll_offset(),
+            offset_before,
+            "output must not anchor a fling whose stated intent is the live bottom"
+        );
+        assert_eq!(term.scroll_anim.unwrap().target, 0.0);
+        // The fling still lands at the live screen.
+        let (_, finished) = term
+            .sample_scroll_animation(t0 + Duration::from_millis(120), CELL_H)
+            .unwrap();
+        assert!(finished);
+        assert_eq!(term.fractional_view_position(), (0, 0.0));
+    }
+
+    #[test]
+    fn wheel_then_touchpad_position_is_exact_clamped_sum() {
+        let mut term = term_with_deep_scrollback(50);
+        let t0 = Instant::now();
+        // 45px notch = 2.25 lines, run to completion.
+        assert!(term.scroll_animate_by_px(45.0, t0, Duration::from_millis(100), 0.25, CELL_H));
+        term.sample_scroll_animation(t0 + Duration::from_millis(150), CELL_H);
+        // Touchpad adds half a line.
+        term.scroll_view_by_lines(0.5);
+        let (offset, fraction) = term.fractional_view_position();
+        assert_eq!(offset, 2);
+        assert!(
+            (fraction - 0.75).abs() < 1e-5,
+            "2.25 + 0.5 lines must render as (2, 0.75), got (2, {fraction})"
+        );
+    }
+
+    #[test]
+    fn fractional_view_position_normalizes_negative_carry() {
+        let mut term = term_with_deep_scrollback(50);
+        term.scroll_view_up(2);
+        assert_eq!(term.scroll_view_by_lines(-0.25), 0);
+        assert_eq!(
+            term.scroll_offset(),
+            2,
+            "whole offset is untouched by a sub-line delta"
+        );
+        let (offset, fraction) = term.fractional_view_position();
+        assert_eq!(offset, 1, "a negative carry borrows a row from the offset");
+        assert!((fraction - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn is_view_scrolled_covers_rows_fractions_and_animations() {
+        let mut term = term_with_deep_scrollback(50);
+        assert!(!term.is_view_scrolled());
+        term.scroll_view_by_lines(0.5);
+        assert!(
+            term.is_view_scrolled(),
+            "a sub-row fraction counts as scrolled"
+        );
+        term.reset_scroll();
+        assert!(!term.is_view_scrolled());
+        assert!(term.scroll_animate_by_px(
+            50.0,
+            Instant::now(),
+            Duration::from_millis(180),
+            0.25,
+            CELL_H
+        ));
+        assert!(
+            term.is_view_scrolled(),
+            "an in-flight animation counts as scrolled"
+        );
+    }
+
+    #[test]
+    fn view_pixel_to_abs_line_maps_whole_and_fractional_positions() {
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3");
+        // Live bottom: top abs line is 2.
+        assert_eq!(term.view_pixel_to_abs_line(0.0, CELL_H), 2);
+        assert_eq!(term.view_pixel_to_abs_line(CELL_H * 1.5, CELL_H), 3);
+        // Below the last row clamps onto it; negative clamps to the top.
+        assert_eq!(term.view_pixel_to_abs_line(CELL_H * 10.0, CELL_H), 3);
+        assert_eq!(term.view_pixel_to_abs_line(-5.0, CELL_H), 2);
+        // Degenerate metrics fall back to the top line.
+        assert_eq!(term.view_pixel_to_abs_line(35.0, 0.0), 2);
+
+        // Scrolled half a row back (offset 1, fraction 0.5): the content
+        // is displaced down, exposing the overscan line (abs 0) at the
+        // top edge.
+        term.scroll_view_up(1);
+        term.scroll_view_by_lines(0.5);
+        let (offset, fraction) = term.fractional_view_position();
+        assert_eq!((offset, fraction), (1, 0.5));
+        assert_eq!(
+            term.view_pixel_to_abs_line(0.0, CELL_H),
+            0,
+            "overscan line at the top edge"
+        );
+        assert_eq!(term.view_pixel_to_abs_line(CELL_H * 0.6, CELL_H), 1);
+        assert_eq!(term.view_pixel_to_abs_line(CELL_H * 1.6, CELL_H), 2);
     }
 
     #[test]
@@ -3639,10 +4685,13 @@ mod tests {
         let term = term_with_scrollback();
         let live = term.grid().clone();
         let display = term.display_grid();
+        // One overscan row is prepended above the viewport, so the live
+        // rows appear shifted down by one grid index (the renderer's
+        // `render_offset_y` translation puts them back).
         for row in 0..term.rows {
             for col in 0..term.cols {
                 let live_cell = live.get_cell(row, col).unwrap();
-                let disp_cell = display.get_cell(row, col).unwrap();
+                let disp_cell = display.get_cell(row + 1, col).unwrap();
                 assert_eq!(
                     live_cell.ch, disp_cell.ch,
                     "display_grid at bottom should match live grid at ({},{})",
@@ -3653,23 +4702,83 @@ mod tests {
     }
 
     #[test]
+    fn display_grid_always_has_one_overscan_row() {
+        let mut term = term_with_scrollback();
+        // Live and scrolled snapshots keep the same (rows + 1) shape so
+        // paint-only grid patches never see a dimension change.
+        let live = term.display_grid();
+        assert_eq!(live.rows(), term.rows + 1);
+        assert_eq!(live.overscan_rows(), 1);
+        term.scroll_view_up(1);
+        let scrolled = term.display_grid();
+        assert_eq!(scrolled.rows(), term.rows + 1);
+        assert_eq!(scrolled.overscan_rows(), 1);
+    }
+
+    #[test]
+    fn display_grid_live_overscan_row_is_newest_scrollback_line() {
+        let term = term_with_scrollback();
+        // Scrollback holds AAAA, BBBB; the overscan row above the live
+        // viewport must be the newest one (BBBB).
+        let display = term.display_grid();
+        assert_eq!(display.get_cell(0, 0).unwrap().ch, 'B');
+    }
+
+    #[test]
+    fn display_grid_live_overscan_row_is_blank_without_scrollback() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"XXXX");
+        let display = term.display_grid();
+        assert_eq!(display.get_cell(0, 0).unwrap().ch, '\0');
+        assert_eq!(display.get_cell(1, 0).unwrap().ch, 'X');
+    }
+
+    #[test]
     fn display_grid_scrolled_shows_scrollback_content() {
         let mut term = term_with_scrollback();
         // Scroll all the way back (2 lines of scrollback).
         term.scroll_view_up(2);
         let display = term.display_grid();
 
-        // Row 0 should show the first scrollback line (AAAA).
+        // Row 0 is the overscan row; pinned at the top of scrollback no
+        // line above exists, so it is blank.
         let ch = display.get_cell(0, 0).unwrap().ch;
-        assert_eq!(ch, 'A', "scrolled-back row 0 should be 'A', got '{}'", ch);
+        assert_eq!(ch, '\0', "overscan row at the top must be blank");
 
-        // Row 1 should show the second scrollback line (BBBB).
+        // Viewport row 0 (grid row 1) shows the first scrollback line.
         let ch = display.get_cell(1, 0).unwrap().ch;
-        assert_eq!(ch, 'B', "scrolled-back row 1 should be 'B', got '{}'", ch);
+        assert_eq!(
+            ch, 'A',
+            "scrolled-back viewport row 0 should be 'A', got '{}'",
+            ch
+        );
 
-        // Row 2 should show the first screen row (CCCC).
+        // Viewport row 1 shows the second scrollback line (BBBB).
         let ch = display.get_cell(2, 0).unwrap().ch;
-        assert_eq!(ch, 'C', "scrolled-back row 2 should be 'C', got '{}'", ch);
+        assert_eq!(
+            ch, 'B',
+            "scrolled-back viewport row 1 should be 'B', got '{}'",
+            ch
+        );
+
+        // Viewport row 2 shows the first screen row (CCCC).
+        let ch = display.get_cell(3, 0).unwrap().ch;
+        assert_eq!(
+            ch, 'C',
+            "scrolled-back viewport row 2 should be 'C', got '{}'",
+            ch
+        );
+    }
+
+    #[test]
+    fn display_grid_partially_scrolled_overscan_row_holds_line_above() {
+        let mut term = term_with_scrollback();
+        // Offset 1 of 2: the overscan row above the viewport is the
+        // older scrollback line (AAAA).
+        term.scroll_view_up(1);
+        let display = term.display_grid();
+        assert_eq!(display.get_cell(0, 0).unwrap().ch, 'A');
+        assert_eq!(display.get_cell(1, 0).unwrap().ch, 'B');
     }
 
     #[test]
@@ -3774,21 +4883,41 @@ mod tests {
         let mut term = Terminal::new(2, 10);
         term.process_bytes(b"line0\r\nline1\r\nline2\r\nline3");
         // Select absolute line 0 ("line0"), which is currently scrolled out
-        // of the live view: nothing should paint.
+        // of the live view (and out of the overscan row, which shows
+        // line1): nothing should paint.
         let mut live = term.display_grid();
         term.paint_selection(&mut live, (0, 0), (0, 4), bg);
         assert!(
-            (0..10)
-                .all(|c| live.get_cell(0, c).unwrap().bg != bg
-                    && live.get_cell(1, c).unwrap().bg != bg),
+            (0..10).all(|c| (0..3).all(|r| live.get_cell(r, c).unwrap().bg != bg)),
             "an off-screen selection must not paint the live view"
         );
-        // Scroll line0 into view at display row 0; now it paints there.
+        // Scroll line0 into view at viewport row 0 (grid row 1); now it
+        // paints there.
         term.scroll_view_up(2);
         let mut scrolled = term.display_grid();
         term.paint_selection(&mut scrolled, (0, 0), (0, 4), bg);
         for c in 0..=4 {
-            assert_eq!(scrolled.get_cell(0, c).unwrap().bg, bg, "col {c} of line0");
+            assert_eq!(scrolled.get_cell(1, c).unwrap().bg, bg, "col {c} of line0");
+        }
+    }
+
+    #[test]
+    fn paint_selection_paints_partially_visible_overscan_line() {
+        use unshit::core::style::types::Color;
+        let bg = Color::rgb(9, 8, 7);
+        let mut term = Terminal::new(2, 10);
+        term.process_bytes(b"line0\r\nline1\r\nline2\r\nline3");
+        // At the live bottom the overscan row shows line1 (the newest
+        // scrollback line); selecting it must paint grid row 0 so a
+        // sub-row scroll position never clips the highlight.
+        let mut grid = term.display_grid();
+        term.paint_selection(&mut grid, (1, 0), (1, 4), bg);
+        for c in 0..=4 {
+            assert_eq!(
+                grid.get_cell(0, c).unwrap().bg,
+                bg,
+                "col {c} of overscan line1"
+            );
         }
     }
 
@@ -4871,7 +6000,8 @@ mod tests_selection_clipboard_comprehensive {
         let mut grid = term.display_grid();
         let bg = Color::rgb(200, 100, 50);
         term.paint_selection(&mut grid, (0, 0), (0, 0), bg);
-        assert_eq!(grid.get_cell(0, 0).unwrap().bg, bg);
+        // Line 0 renders at grid row 1 (row 0 is the overscan row).
+        assert_eq!(grid.get_cell(1, 0).unwrap().bg, bg);
     }
 
     #[test]
@@ -4881,12 +6011,12 @@ mod tests_selection_clipboard_comprehensive {
         let mut grid = term.display_grid();
         let bg = Color::rgb(100, 150, 200);
         term.paint_selection(&mut grid, (0, 1), (0, 3), bg);
-        // Cells 1, 2, 3 should have the color.
-        assert_eq!(grid.get_cell(0, 1).unwrap().bg, bg);
-        assert_eq!(grid.get_cell(0, 2).unwrap().bg, bg);
-        assert_eq!(grid.get_cell(0, 3).unwrap().bg, bg);
+        // Cells 1, 2, 3 of line 0 (grid row 1) should have the color.
+        assert_eq!(grid.get_cell(1, 1).unwrap().bg, bg);
+        assert_eq!(grid.get_cell(1, 2).unwrap().bg, bg);
+        assert_eq!(grid.get_cell(1, 3).unwrap().bg, bg);
         // Cell 0 should not.
-        assert_ne!(grid.get_cell(0, 0).unwrap().bg, bg);
+        assert_ne!(grid.get_cell(1, 0).unwrap().bg, bg);
     }
 
     #[test]
@@ -4895,18 +6025,19 @@ mod tests_selection_clipboard_comprehensive {
         term.process_bytes(b"line0\r\nline1\r\nline2");
         let mut grid = term.display_grid();
         let bg = Color::rgb(150, 150, 150);
-        // Select from (0, 2) to (1, 3).
+        // Select from (0, 2) to (1, 3). Lines render at grid row + 1
+        // because of the overscan row.
         term.paint_selection(&mut grid, (0, 2), (1, 3), bg);
-        // Row 0: cells 2..9 should be painted.
+        // Line 0 (grid row 1): cells 2..9 should be painted.
         for c in 2..10 {
-            assert_eq!(grid.get_cell(0, c).unwrap().bg, bg, "row 0 col {}", c);
+            assert_eq!(grid.get_cell(1, c).unwrap().bg, bg, "line 0 col {}", c);
         }
-        // Row 1: cells 0..3 should be painted.
+        // Line 1 (grid row 2): cells 0..3 should be painted.
         for c in 0..=3 {
-            assert_eq!(grid.get_cell(1, c).unwrap().bg, bg, "row 1 col {}", c);
+            assert_eq!(grid.get_cell(2, c).unwrap().bg, bg, "line 1 col {}", c);
         }
-        // Row 2 should not be painted.
-        assert_ne!(grid.get_cell(2, 0).unwrap().bg, bg);
+        // Line 2 (grid row 3) should not be painted.
+        assert_ne!(grid.get_cell(3, 0).unwrap().bg, bg);
     }
 
     #[test]
@@ -4915,10 +6046,9 @@ mod tests_selection_clipboard_comprehensive {
         term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3\r\nL4");
         let mut grid = term.display_grid();
         let bg = Color::rgb(50, 100, 150);
-        // Select entire rows 1 and 2.
+        // Select entire lines 1 and 2 (grid rows 2 and 3).
         term.paint_selection(&mut grid, (1, 0), (2, 9), bg);
-        // Row 1 and 2 fully painted.
-        for r in 1..=2 {
+        for r in 2..=3 {
             for c in 0..10 {
                 assert_eq!(grid.get_cell(r, c).unwrap().bg, bg, "({}, {})", r, c);
             }
@@ -4986,15 +6116,24 @@ mod tests_selection_clipboard_comprehensive {
         // line0/line1 in scrollback, line2/line3 on screen.
         let mut grid = term.display_grid();
         let bg = Color::rgb(120, 120, 120);
-        // Select line0 (abs line 0) to line2 (abs line 2).
-        // Only line2 (displayed at row 0) should paint.
+        // Select line0 (abs line 0) to line2 (abs line 2). line1 sits on
+        // the partially visible overscan row (grid row 0) and paints in
+        // full as an interior line; line2 (grid row 1) paints its
+        // partial range; line0 stays off screen.
         term.paint_selection(&mut grid, (0, 0), (2, 5), bg);
-        // Row 0 (line2) should be painted from col 0..5.
-        for c in 0..=5 {
-            assert_eq!(grid.get_cell(0, c).unwrap().bg, bg, "row 0 col {}", c);
+        for c in 0..10 {
+            assert_eq!(
+                grid.get_cell(0, c).unwrap().bg,
+                bg,
+                "overscan line1 col {}",
+                c
+            );
         }
-        // Row 1 (line3) should not be painted (selection ends at line2).
-        assert_ne!(grid.get_cell(1, 0).unwrap().bg, bg);
+        for c in 0..=5 {
+            assert_eq!(grid.get_cell(1, c).unwrap().bg, bg, "line2 col {}", c);
+        }
+        // line3 (grid row 2) should not be painted (selection ends at line2).
+        assert_ne!(grid.get_cell(2, 0).unwrap().bg, bg);
     }
 
     #[test]
@@ -5006,8 +6145,9 @@ mod tests_selection_clipboard_comprehensive {
         cell.attrs.insert(CellAttrs::INVERSE);
         term.grid.set_cell(0, 1, cell);
         let mut grid = term.display_grid();
+        // Line 0 renders at grid row 1 (row 0 is the overscan row).
         assert!(grid
-            .get_cell(0, 1)
+            .get_cell(1, 1)
             .unwrap()
             .attrs
             .contains(CellAttrs::INVERSE));
@@ -5015,7 +6155,7 @@ mod tests_selection_clipboard_comprehensive {
         term.paint_selection(&mut grid, (0, 1), (0, 1), bg);
         // INVERSE should be cleared on the painted cell.
         assert!(!grid
-            .get_cell(0, 1)
+            .get_cell(1, 1)
             .unwrap()
             .attrs
             .contains(CellAttrs::INVERSE));
@@ -5030,11 +6170,12 @@ mod tests_selection_clipboard_comprehensive {
         cell.attrs.insert(CellAttrs::BOLD);
         term.grid.set_cell(0, 2, cell);
         let mut grid = term.display_grid();
-        assert!(grid.get_cell(0, 2).unwrap().attrs.contains(CellAttrs::BOLD));
+        // Line 0 renders at grid row 1 (row 0 is the overscan row).
+        assert!(grid.get_cell(1, 2).unwrap().attrs.contains(CellAttrs::BOLD));
         let bg = Color::rgb(200, 200, 200);
         term.paint_selection(&mut grid, (0, 2), (0, 2), bg);
         // BOLD should still be there.
-        assert!(grid.get_cell(0, 2).unwrap().attrs.contains(CellAttrs::BOLD));
+        assert!(grid.get_cell(1, 2).unwrap().attrs.contains(CellAttrs::BOLD));
     }
 
     #[test]
@@ -5199,17 +6340,17 @@ mod tests_selection_clipboard_comprehensive {
     fn paint_selection_survives_scroll_view_changes() {
         let mut term = Terminal::new(2, 5);
         term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3");
-        // Select L0 (abs line 0) — off-screen.
+        // Select L0 (abs line 0) — off-screen (the overscan row shows L1).
         let bg = Color::rgb(99, 99, 99);
         let mut grid = term.display_grid();
         term.paint_selection(&mut grid, (0, 0), (0, 2), bg);
         // Should not paint at live view (L0 not visible).
-        assert_ne!(grid.get_cell(0, 0).unwrap().bg, bg);
+        assert!((0..3).all(|r| grid.get_cell(r, 0).unwrap().bg != bg));
         // Scroll back to view L0.
         term.scroll_view_up(2);
         let mut grid2 = term.display_grid();
         term.paint_selection(&mut grid2, (0, 0), (0, 2), bg);
-        // Now it should paint at display row 0.
-        assert_eq!(grid2.get_cell(0, 0).unwrap().bg, bg);
+        // Now it should paint at viewport row 0 (grid row 1).
+        assert_eq!(grid2.get_cell(1, 0).unwrap().bg, bg);
     }
 }

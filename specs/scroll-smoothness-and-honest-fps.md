@@ -189,6 +189,16 @@ Goal: a wheel notch produces motion, not a jump; sub-row precision end to end.
 
 Exit criteria: gate H4 passes (>= 12 distinct presented positions per notch); side-by-side manual comparison against VS Code judged acceptable by the user; settings-scroll suite still green.
 
+#### Phase 3 results (recorded 2026-06-12)
+
+All five items landed. The terminal owns a retargetable `ScrollMotion` in bottom-anchored pixel space (`scroll_animate_by_px` / `sample_scroll_animation`, `src/terminal/mod.rs`), shared with the container smooth scroll via the extracted `unshit-app/src/scroll_motion.rs` (bit-identical curve/duration/slope ramps, injectable timestamps for Phase 4). Sub-row positions render as a constant-shape `(rows + 1, cols)` snapshot with one overscan row plus a paint-time translation (`render_offset_y`) stamped onto grid-emitted primitives only (`batch.rs`); the offset is snapped to whole device pixels as a unit so pixel-snapped cell quads and glyph subpixel bins stay on their rasterized phase even with fractional cell heights. Animation frames ride the Phase 2 paint-only patch path via framework `GridAnimationHook`s ticked at the shared animation cadence (Phase 4's vblank clock upgrades both animation kinds at one site), and the per-notch waker threads were replaced by one persistent deadline-extended thread (`animation_waker.rs`). Hooks settle rather than strand: deadline expiry runs one final sample, and a hook whose node vanished mid-flight (the keyed pane subtree was rebuilt, e.g. a tab switch) keeps ticking blind until its motion lands. Gate S3 anchoring: PTY output no longer snaps a scrolled-back view; `scroll_up` shifts the offset (and any in-flight motion) per pushed line, and alt-screen entry/exit restores the snap so a TUI launched while reading scrollback never composes scrollback above the alt screen.
+
+Scope notes against the plan:
+
+* **Item 5's "cover with a suite case (gate S3)" is re-scoped to Phase 5 item 3.** The anchoring semantics are unit-covered (`process_bytes_scrolled_back_anchors_viewport`, `pty_output_anchors_animated_view_by_shifting_motion`, the alt-screen snap tests), but the end-to-end check (scroll back, stream PTY output, assert the viewport-top line across paints) belongs in the terminal-scroll desktop-regression suite Phase 5 item 3 creates; building that suite's scaffolding solely for S3 in this phase would duplicate it.
+* **H4 is verified as sampled motion, not yet as presented positions.** The unit gate (`one_notch_renders_at_least_twelve_distinct_positions_at_8ms_cadence`) drives the real sampler at a simulated perfect 8ms cadence; presented-position verification (the Phase 1 timestamp ring plus per-frame `rendered_scroll_px` deltas during a real notch) is consciously deferred to the Phase 5 terminal-scroll suite, where H4/H5/H6/S3 are asserted against the running app.
+* **The experimental `grid-fragment-shader` path no longer applies to terminal grids.** Every terminal snapshot now carries an overscan row and the fragment path has no overscan/offset support, so routing falls through to `emit_grid_cells` unconditionally; the path is de-facto retired for terminal grids unless it learns overscan.
+
 ### Phase 4: Vblank-anchored pacing and presentation
 
 Goal: exactly one frame per display refresh while animating; cadence derived from the display, not Instant math.
@@ -208,7 +218,7 @@ Goal: a janky-at-high-reported-fps build fails CI/xtask.
 
 1. Settings-scroll suite: assert the interval distribution during the 14-tick burst (not just a mean floor): interval p99 <= 1.5x display period, gap stddev <= 2ms, dropped ratio < 2%, using the Phase 1 diagnostics timestamp ring. Apply the max-gap check to the burst phase; tighten 18ms to period + scheduling epsilon (~10ms at 120Hz).
 2. Add per-presented-frame scroll displacement variance (the most direct jank proxy without photon capture): stddev of per-frame scroll_y delta during constant-velocity burst below a threshold.
-3. New terminal-scroll suite mirroring the settings suite: notch proportionality (H5), animation frame count (H4), sub-row offsets present (H6).
+3. New terminal-scroll suite mirroring the settings suite: notch proportionality (H5), animation frame count (H4), sub-row offsets present (H6), and scrolled-back viewport anchoring under streaming PTY output (S3, re-scoped here from Phase 3 item 5).
 4. Resolve the `specs/120fps.md` enforcement debt: bless `src/bench.rs` as the harness, add a threshold-checking xtask wrapper that fails when work p99 or the new interval metrics regress beyond a committed `tests/fixtures/perf_baseline.json`. (Amend `specs/120fps.md` section 8 to point here.)
 5. Document the manual PresentMon protocol (capture command, columns, pass thresholds) in `docs/` or this spec's appendix so any future "it feels janky" report has a 5-minute ground-truth procedure.
 
