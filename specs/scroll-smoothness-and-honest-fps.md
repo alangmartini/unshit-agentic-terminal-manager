@@ -109,6 +109,23 @@ Goal: pin down the runtime facts the audit could not see from source, so fixes t
 
 Exit criteria: a filled baseline table in this spec (PresentMon distributions, actual present mode, wheel-device profile, environment findings).
 
+#### Baseline measurements (recorded 2026-06-12, Phase 0)
+
+| Fact | Value | Implication |
+|---|---|---|
+| Backend / adapter | Vulkan, AMD Radeon 890M, driver 26.3.1 (LLPC) | as designed (`gpu.rs:87`) |
+| Surface present modes | `[Immediate, Fifo, FifoRelaxed]`, selected **Immediate** | **No Mailbox on this hardware.** Open Question 1 resolved: the app runs fully unsynced Immediate presents; DWM samples the latest frame at each compose. Fifo is guaranteed available, de-risking Phase 4 Option A |
+| Display modes at 2560x1440 | 48/60/75/100/**120**/240/500 Hz available on the current HDMI link (VideoOutputTechnology=5) | 120Hz is a Windows settings choice, not a link limit. Open Question 2 partially resolved; 240/500Hz reachable for S1 verification without recabling |
+| winit-reported refresh | 120000 mHz, pacer interval 8.0ms | the `TIMER_COMPENSATED_120HZ_INTERVAL` clamp path is live |
+| Parsec Virtual Display Adapter | Installed, Status OK, not presenting a desktop (single active display) | low risk as primary-monitor confounder; A/B deferred |
+| Bench baseline (dir-loop, 10s, release) | frames=1256, paints/sec=**124.77**, work p50=1.139ms p95=1.547ms p99=1.806ms max=2.292ms, gpu-encode avg 0.61ms | paint cadence is exactly the 8ms timer (125Hz) against a 120Hz panel: ~4.8 undisplayable frames/sec, matching the predicted beat. 1/work would read ~880 "fps", a ~7x inflation over true cadence |
+| PresentMon | Blocked: shell not elevated (ETW capture needs admin) | external ground truth deferred to an elevated session; Phase 1 in-app interval metrics are the primary instrument until then |
+| Wheel-device trace | Deferred to the Phase 5 suite run (win32 synthesized input); default Windows wheel assumption (3 lines/notch) stands | findings 9/10 sizing unaffected for a standard wheel |
+| GPU execution cost | Unmeasured (GPUBusy needs PresentMon; no timestamp queries yet) | decision on `TIMESTAMP_QUERY` deferred until interval metrics show whether cadence holds 120 |
+| 240Hz discriminating experiment | Deferred to Phase 4 S1 (mode switch automatable via `ChangeDisplaySettingsEx`) | n/a |
+
+Verdict: diagnosis confirmed live. Present mode is Immediate (not Mailbox), the 8ms-vs-8.333ms producer/consumer mismatch is measured (124.77 paints/sec), and the overlay's work-time inversion would overstate fps ~7x on this workload. Proceed to Phase 1.
+
 ### Phase 1: Honest metrics
 
 Goal: every number labeled fps is a presentation-cadence number; work time keeps its own label.
