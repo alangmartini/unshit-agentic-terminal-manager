@@ -9,6 +9,9 @@ prototype/
 .omx/
 bench*.json
 artifacts/
+# Scratch perf-measurement captures (the blessed numbers live in specs/)
+phase0-*
+.playwright-mcp/
 .codex/
 *.remoteapp.rdp
 .claude/*

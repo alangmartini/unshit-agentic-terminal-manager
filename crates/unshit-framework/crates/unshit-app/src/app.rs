@@ -284,6 +284,11 @@ pub struct FrameMetrics {
     pub scale_us: u64,
     pub layout_us: u64,
     pub batch_build_us: u64,
+    /// CPU time spent encoding and submitting the frame's render passes
+    /// (wall time of `gpu.render()` on the render thread). Not GPU
+    /// execution time: submission is non-blocking and no timestamp
+    /// queries exist yet, so actual GPU cost is invisible here. The
+    /// overlay surfaces this as "encode".
     pub gpu_render_us: u64,
     pub total_us: u64,
     pub node_count: usize,
@@ -301,6 +306,20 @@ pub struct FrameMetrics {
     /// window crosses monitor boundaries. Used by the bench harness to
     /// report the effective frame-rate ceiling alongside measured fps.
     pub pacer_min_interval_ns: u64,
+    /// Wall-clock microseconds between the completion of this paint and
+    /// the completion of the previous paint, measured where `total_us`
+    /// is finalized. Captures the real presentation cadence rather than
+    /// per-frame CPU work. 0 when there is no cadence to measure: the
+    /// first painted frame, which has no predecessor, and paints after
+    /// an idle gap of `ACTIVITY_WINDOW` or longer (e.g. the 500ms
+    /// cursor-blink repaint of an otherwise idle session), which
+    /// represent intentional idling rather than missed refreshes.
+    pub present_interval_us: u64,
+    /// Active monitor's refresh period in nanoseconds
+    /// (`1e12 / refresh_mhz`). 0 when the platform cannot report the
+    /// monitor's refresh rate; consumers should fall back to
+    /// [`Self::pacer_min_interval_ns`] in that case.
+    pub display_period_ns: u64,
 }
 
 impl std::fmt::Display for FrameMetrics {
@@ -403,6 +422,21 @@ struct AppState {
     /// disabled and rely on the in-app FPS overlay (or other callers)
     /// flipping the flag on. See [`crate::frame_probe`].
     frame_probe: crate::frame_probe::FrameProbe,
+    /// Rolling window of paint-to-paint wall-clock intervals: the
+    /// presentation-cadence counterpart of [`Self::frame_probe`]'s CPU
+    /// work times. Emits `[FRAME-INTERVAL]` quantiles once per second
+    /// under the same runtime gating. See [`crate::frame_probe`].
+    interval_probe: crate::frame_probe::FrameProbe,
+    /// Completion timestamp of the most recent paint, taken once per
+    /// painted frame right after `total_us` is finalized. Source of
+    /// [`FrameMetrics::present_interval_us`]. `None` until the first
+    /// frame has painted.
+    last_paint_completed_at: Option<Instant>,
+    /// Active monitor's refresh rate in millihertz, as last reported by
+    /// the platform; 0 when unknown. Set at startup and kept in sync
+    /// with the frame pacer in [`refresh_pacer_from_window`]. Source of
+    /// [`FrameMetrics::display_period_ns`].
+    display_refresh_mhz: u32,
     /// Nanosecond-grained input latency histograms. See
     /// [`crate::input_latency`]. Only present when the
     /// `input-latency-histogram` cargo feature is enabled; the field
@@ -888,15 +922,123 @@ fn fast_paint_smooth_scroll_frame(
         state.window.request_redraw();
     }
 
+    finalize_frame_metrics(state, metrics, frame_start, on_frame_metrics);
+}
+
+/// Pure function: active display refresh period in nanoseconds from a
+/// refresh rate in millihertz. 0 mHz (rate unknown) maps to a 0ns period
+/// so consumers can detect "unknown" and fall back to
+/// [`FrameMetrics::pacer_min_interval_ns`]. Extracted so the mapping is
+/// unit-testable without constructing an [`AppState`].
+pub(crate) fn display_period_ns_from_mhz(mhz: u32) -> u64 {
+    if mhz == 0 {
+        0
+    } else {
+        1_000_000_000_000u64 / mhz as u64
+    }
+}
+
+/// Pure function: wall-clock microseconds between the previous paint's
+/// completion and `now`. 0 when there is no previous paint (first frame)
+/// or when the clock would run backwards. Extracted so the interval
+/// bookkeeping is unit-testable with synthetic instants without
+/// constructing an [`AppState`].
+pub(crate) fn present_interval_us(last_paint_completed_at: Option<Instant>, now: Instant) -> u64 {
+    last_paint_completed_at
+        .map(|prev| now.saturating_duration_since(prev).as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Pure function: classify a raw paint-to-paint gap as a measurable
+/// cadence interval or an idle cadence break. Gaps of [`ACTIVITY_WINDOW`]
+/// or longer mean the event loop stopped its speculative repaint rhythm
+/// between the two paints (the app went idle by design; the 500ms
+/// cursor-blink wake of an idle session is the canonical producer), so
+/// they describe intentional idling rather than missed refreshes and are
+/// mapped to 0, the same sentinel consumers already skip for the first
+/// painted frame. Without this, an idle session's blink repaints would
+/// saturate every interval quantile and dropped-frame counter with
+/// ~500ms "intervals" that no refresh was ever missed for.
+pub(crate) fn cadence_present_interval_us(raw_interval_us: u64) -> u64 {
+    if raw_interval_us >= ACTIVITY_WINDOW.as_micros() as u64 {
+        0
+    } else {
+        raw_interval_us
+    }
+}
+
+/// Shared per-paint epilogue for both paint paths (the smooth-scroll
+/// fast path and the full `RedrawRequested` pipeline). Records the paint
+/// in the pacer, finalizes the frame's metrics (total time, rss, pacer
+/// interval, presentation cadence), feeds both frame probes and emits
+/// their once-per-second summaries, logs slow frames, fires the
+/// `on_frame_metrics` callback, stores the metrics, and rolls the
+/// window-title fps counter.
+fn finalize_frame_metrics(
+    state: &mut AppState,
+    mut metrics: FrameMetrics,
+    frame_start: Instant,
+    on_frame_metrics: Option<&(dyn Fn(&FrameMetrics) + Send)>,
+) {
     state.frame_pacer.record_paint(frame_start);
     metrics.total_us = frame_start.elapsed().as_micros() as u64;
     metrics.rss_bytes = get_rss_bytes();
     metrics.pacer_min_interval_ns = state.frame_pacer.min_interval().as_nanos() as u64;
 
+    // Presentation cadence: one completion timestamp per painted frame,
+    // taken right after total_us is finalized. The interval back to the
+    // previous completion is the honest paint-to-paint period the user
+    // experiences, unlike total_us which only measures CPU work. Idle
+    // cadence breaks are zeroed (see cadence_present_interval_us) so
+    // blink-tick repaints do not masquerade as missed refreshes.
+    let now = Instant::now();
+    metrics.present_interval_us =
+        cadence_present_interval_us(present_interval_us(state.last_paint_completed_at, now));
+    state.last_paint_completed_at = Some(now);
+    metrics.display_period_ns = display_period_ns_from_mhz(state.display_refresh_mhz);
+
+    // Per-second frame-time probes. Always record into the rolling
+    // windows so the in-app FPS overlay can read live quantiles without
+    // rebuilding; `maybe_emit` only returns a summary when the runtime
+    // enable flag is set (default on in debug, off in release). See
+    // crate::frame_probe.
     state.frame_probe.record_frame(std::time::Duration::from_micros(metrics.total_us));
-    if let Some(snap) = state.frame_probe.maybe_emit(Instant::now()) {
+    if let Some(snap) = state.frame_probe.maybe_emit(now) {
         log::info!("[FRAME] {}", snap);
     }
+    if metrics.present_interval_us > 0 {
+        state
+            .interval_probe
+            .record_frame(std::time::Duration::from_micros(metrics.present_interval_us));
+    }
+    if let Some(snap) = state.interval_probe.maybe_emit(now) {
+        // Interval counts get their own field label so log consumers can
+        // tell cadence quantiles from the work-time `frames=` lines, and
+        // a dropped count (intervals > 1.5x the display period, pacer
+        // fallback) per the Phase 1 honest-metrics spec.
+        let period_us = if metrics.display_period_ns > 0 {
+            metrics.display_period_ns / 1_000
+        } else {
+            metrics.pacer_min_interval_ns / 1_000
+        };
+        let dropped = if period_us > 0 {
+            state.interval_probe.count_above_us(period_us + period_us / 2)
+        } else {
+            0
+        };
+        log::info!(
+            "[FRAME-INTERVAL] intervals={} min={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms dropped={}",
+            snap.count,
+            snap.min_us as f64 / 1000.0,
+            snap.p50_us as f64 / 1000.0,
+            snap.p95_us as f64 / 1000.0,
+            snap.p99_us as f64 / 1000.0,
+            snap.max_us as f64 / 1000.0,
+            dropped,
+        );
+    }
+
+    // Log slow frames.
     if metrics.total_us > 8333 {
         log::warn!("[PERF] {}", metrics);
     } else {
@@ -908,7 +1050,32 @@ fn fast_paint_smooth_scroll_frame(
     }
 
     state.last_metrics = metrics;
+
+    roll_over_window_title_fps(state);
+}
+
+/// Advance the once-per-second window-title fps counter. Runs on every
+/// painted frame from both paint paths so the rollover cadence (and the
+/// fps the title reports) is identical regardless of which path painted
+/// the frame. The title text itself still updates at most once per
+/// second.
+fn roll_over_window_title_fps(state: &mut AppState) {
     state.frame_count += 1;
+    let fps_elapsed = state.fps_timer.elapsed();
+    if fps_elapsed.as_millis() >= 1000 {
+        state.current_fps = state.frame_count as f32 / fps_elapsed.as_secs_f32();
+        let title = format!(
+            "{} | {:.1}ms | {:.0} fps | rss {:.0}MB | nodes {}",
+            state.app_title,
+            state.last_metrics.total_us as f64 / 1000.0,
+            state.current_fps,
+            state.last_metrics.rss_bytes as f64 / (1024.0 * 1024.0),
+            state.last_metrics.node_count,
+        );
+        state.window.set_title(&title);
+        state.frame_count = 0;
+        state.fps_timer = Instant::now();
+    }
 }
 
 /// Pure function: whether `now` is within [`ACTIVITY_WINDOW`] of the
@@ -1048,9 +1215,11 @@ impl<'a> crate::frame_pacer::MonitorRefreshSource for WindowRefreshSource<'a> {
 /// platform cannot enumerate the monitor's refresh rate (headless / some
 /// Wayland configs).
 fn refresh_pacer_from_window(state: &mut AppState) {
-    let source = WindowRefreshSource(&*state.window);
+    use crate::frame_pacer::MonitorRefreshSource as _;
+    let mhz = WindowRefreshSource(&*state.window).current_refresh_mhz().unwrap_or(0);
     let before = state.frame_pacer.min_interval();
-    crate::frame_pacer::refresh_pacer_from_source(&mut state.frame_pacer, &source);
+    state.frame_pacer.set_refresh_rate_mhz(mhz);
+    state.display_refresh_mhz = mhz;
     state.last_refresh_probe = Instant::now();
     let after = state.frame_pacer.min_interval();
     if after != before {
@@ -1755,6 +1924,9 @@ impl ApplicationHandler for AppHandler {
             // the app side before any user input arrives.
             last_activity: Instant::now(),
             frame_probe: crate::frame_probe::FrameProbe::new(),
+            interval_probe: crate::frame_probe::FrameProbe::new(),
+            last_paint_completed_at: None,
+            display_refresh_mhz: startup_refresh_mhz,
             #[cfg(feature = "input-latency-histogram")]
             input_latency: crate::input_latency::InputLatencyTracker::new()
                 .expect("hdrhistogram construction with valid sigfigs cannot fail"),
@@ -3497,36 +3669,16 @@ impl ApplicationHandler for AppHandler {
                     }
                 }
 
-                // Record this paint in the frame pacer so subsequent
-                // redraws are gated until the coalescing interval elapses.
-                state.frame_pacer.record_paint(frame_start);
-
-                metrics.total_us = frame_start.elapsed().as_micros() as u64;
-                metrics.rss_bytes = get_rss_bytes();
-                metrics.pacer_min_interval_ns = state.frame_pacer.min_interval().as_nanos() as u64;
-
-                // Per-second frame-time probe. Always records this
-                // frame's duration into a rolling window so the in-app
-                // FPS overlay can read live quantiles without rebuilding;
-                // [`FrameProbe::maybe_emit`] only returns a summary when
-                // the runtime enable flag is set (default on in debug,
-                // off in release). See crate::frame_probe.
-                state.frame_probe.record_frame(std::time::Duration::from_micros(metrics.total_us));
-                if let Some(snap) = state.frame_probe.maybe_emit(Instant::now()) {
-                    log::info!("[FRAME] {}", snap);
-                }
-
-                // Log slow frames
-                if metrics.total_us > 8333 {
-                    log::warn!("[PERF] {}", metrics);
-                } else {
-                    log::debug!("[PERF] {}", metrics);
-                }
-
-                // Fire the on_frame_metrics callback if registered.
-                if let Some(ref cb) = self.app.config.on_frame_metrics {
-                    cb(&metrics);
-                }
+                // Shared paint epilogue: pacer bookkeeping, metric
+                // finalization, frame probes, slow-frame logging, the
+                // on_frame_metrics callback, and the window-title fps
+                // rollover. See [`finalize_frame_metrics`].
+                finalize_frame_metrics(
+                    state,
+                    metrics,
+                    frame_start,
+                    self.app.config.on_frame_metrics.as_deref(),
+                );
 
                 // Close the input latency frame window only on the path
                 // that actually rendered. Pacer skipped frames bailed
@@ -3539,31 +3691,12 @@ impl ApplicationHandler for AppHandler {
                     }
                 }
 
-                state.last_metrics = metrics;
-
                 // Reset the per-frame bump arena now that the tree has
                 // been fully consumed by reconcile and the render batch
                 // has been submitted. O(1) pointer reset; preserves
                 // chunk capacity for the next frame. Safe to call even
                 // when no bump tree was built this frame.
                 state.frame_arena.reset();
-
-                state.frame_count += 1;
-                let fps_elapsed = state.fps_timer.elapsed();
-                if fps_elapsed.as_millis() >= 1000 {
-                    state.current_fps = state.frame_count as f32 / fps_elapsed.as_secs_f32();
-                    let title = format!(
-                        "{} | {:.1}ms | {:.0} fps | rss {:.0}MB | nodes {}",
-                        state.app_title,
-                        state.last_metrics.total_us as f64 / 1000.0,
-                        state.current_fps,
-                        state.last_metrics.rss_bytes as f64 / (1024.0 * 1024.0),
-                        state.last_metrics.node_count,
-                    );
-                    state.window.set_title(&title);
-                    state.frame_count = 0;
-                    state.fps_timer = Instant::now();
-                }
             }
 
             _ => {}
@@ -5146,6 +5279,8 @@ mod tests {
             gpu_upload_bytes: 8192,
             damage_area_px: 1920 * 1080,
             pacer_min_interval_ns: 6_944_444,
+            present_interval_us: 8_333,
+            display_period_ns: 8_333_333,
         };
         assert_eq!(m.quad_count, 128);
         assert_eq!(m.glyph_count, 512);
@@ -5153,6 +5288,57 @@ mod tests {
         assert_eq!(m.gpu_upload_bytes, 8192);
         assert_eq!(m.damage_area_px, 1920 * 1080);
         assert_eq!(m.pacer_min_interval_ns, 6_944_444);
+        assert_eq!(m.present_interval_us, 8_333);
+        assert_eq!(m.display_period_ns, 8_333_333);
+    }
+
+    #[test]
+    fn frame_metrics_default_has_zero_presentation_fields() {
+        let m = FrameMetrics::default();
+        assert_eq!(m.present_interval_us, 0);
+        assert_eq!(m.display_period_ns, 0);
+    }
+
+    #[test]
+    fn display_period_ns_from_mhz_maps_rates_and_unknown() {
+        // 120Hz panel: 1e12 / 120_000 mHz = 8_333_333ns.
+        assert_eq!(display_period_ns_from_mhz(120_000), 8_333_333);
+        // Unknown rate maps to 0 so consumers can fall back to the
+        // pacer's coalescing interval.
+        assert_eq!(display_period_ns_from_mhz(0), 0);
+        // 500Hz panel: 2ms period.
+        assert_eq!(display_period_ns_from_mhz(500_000), 2_000_000);
+    }
+
+    #[test]
+    fn present_interval_us_is_zero_for_first_frame() {
+        assert_eq!(present_interval_us(None, Instant::now()), 0);
+    }
+
+    #[test]
+    fn present_interval_us_measures_gap_to_previous_paint() {
+        let t0 = Instant::now();
+        assert_eq!(present_interval_us(Some(t0), t0 + Duration::from_micros(8_333)), 8_333);
+        // A non-monotonic pair saturates to zero instead of panicking.
+        assert_eq!(present_interval_us(Some(t0 + Duration::from_millis(5)), t0), 0);
+    }
+
+    #[test]
+    fn cadence_present_interval_us_passes_active_gaps_through() {
+        assert_eq!(cadence_present_interval_us(8_333), 8_333);
+        // A badly missed refresh (3x the 120Hz period) is still cadence.
+        assert_eq!(cadence_present_interval_us(25_000), 25_000);
+        let just_below = ACTIVITY_WINDOW.as_micros() as u64 - 1;
+        assert_eq!(cadence_present_interval_us(just_below), just_below);
+    }
+
+    #[test]
+    fn cadence_present_interval_us_zeroes_idle_breaks() {
+        // At or past the activity window the loop had gone idle by
+        // design, so the gap is a cadence break, not a missed refresh.
+        assert_eq!(cadence_present_interval_us(ACTIVITY_WINDOW.as_micros() as u64), 0);
+        // The 500ms cursor-blink wake of an idle session.
+        assert_eq!(cadence_present_interval_us(500_000), 0);
     }
 
     #[test]

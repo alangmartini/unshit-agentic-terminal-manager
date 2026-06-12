@@ -1066,8 +1066,12 @@ fn main() {
             })),
             on_frame_metrics: Some(Box::new(move |m| {
                 crate::bench::record_frame(m);
-                let fps_visible = crate::ui::fps_overlay::record_frame(m);
-                if fps_visible {
+                // record_frame returns true when the visible overlay is
+                // due a rebuild (throttled to ~4Hz inside fps_overlay),
+                // so a visible overlay no longer forces a full rebuild
+                // every painted frame.
+                let overlay_rebuild_due = crate::ui::fps_overlay::record_frame(m);
+                if overlay_rebuild_due {
                     if let Some(sink) = fps_window_event_sink.get() {
                         let _ = sink.send(unshit::app::ExternalEvent::RequestRebuild);
                     }

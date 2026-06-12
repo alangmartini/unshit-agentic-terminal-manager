@@ -90,6 +90,11 @@ pub struct BenchConfig {
 
 struct BenchState {
     samples_us: VecDeque<u64>,
+    /// Present-to-present intervals in microseconds, one per painted
+    /// frame after the first. Fed from [`FrameMetrics::present_interval_us`];
+    /// zero samples (first frame of a run) are skipped so quantiles
+    /// reflect real cadence gaps only.
+    intervals_us: VecDeque<u64>,
     tree_build_us_sum: u64,
     layout_us_sum: u64,
     batch_us_sum: u64,
@@ -101,6 +106,11 @@ struct BenchState {
     /// drags the window to a different monitor mid-run (uncommon but
     /// supported).
     last_pacer_min_interval_ns: u64,
+    /// Most recent nonzero active-monitor refresh period, in
+    /// nanoseconds, from [`FrameMetrics::display_period_ns`]. Stays 0
+    /// when the refresh rate is unknown for the whole run; the judder
+    /// threshold then falls back to `last_pacer_min_interval_ns`.
+    last_display_period_ns: u64,
     active: bool,
     #[cfg(feature = "input-latency-histogram")]
     latency_snapshot: Option<InputLatencySnapshot>,
@@ -110,12 +120,14 @@ impl BenchState {
     const fn new() -> Self {
         Self {
             samples_us: VecDeque::new(),
+            intervals_us: VecDeque::new(),
             tree_build_us_sum: 0,
             layout_us_sum: 0,
             batch_us_sum: 0,
             gpu_us_sum: 0,
             frames: 0,
             last_pacer_min_interval_ns: 0,
+            last_display_period_ns: 0,
             active: false,
             #[cfg(feature = "input-latency-histogram")]
             latency_snapshot: None,
@@ -137,6 +149,12 @@ pub fn record_frame(m: &FrameMetrics) {
         return;
     }
     s.samples_us.push_back(m.total_us);
+    if m.present_interval_us > 0 {
+        s.intervals_us.push_back(m.present_interval_us);
+    }
+    if m.display_period_ns > 0 {
+        s.last_display_period_ns = m.display_period_ns;
+    }
     s.tree_build_us_sum += m.tree_build_us;
     s.layout_us_sum += m.layout_us;
     s.batch_us_sum += m.batch_build_us;
@@ -162,6 +180,7 @@ fn activate() {
     let mut s = state().lock().unwrap();
     s.active = true;
     s.samples_us.clear();
+    s.intervals_us.clear();
     s.tree_build_us_sum = 0;
     s.layout_us_sum = 0;
     s.batch_us_sum = 0;
@@ -172,6 +191,7 @@ fn activate() {
         s.latency_snapshot = None;
     }
     s.last_pacer_min_interval_ns = 0;
+    s.last_display_period_ns = 0;
 }
 
 fn deactivate() {
@@ -184,7 +204,10 @@ struct Report {
     mode: &'static str,
     duration_s: f64,
     frames: u64,
-    fps_mean: f64,
+    /// Mean painted frames per second (frames / elapsed). This counts
+    /// submitted paints, not displayed frames; cadence health lives in
+    /// the `interval_*` and `judder_ratio` stats below.
+    paints_per_sec_mean: f64,
     p50_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
@@ -219,19 +242,122 @@ struct Report {
     /// 1st percentile frame time in milliseconds. Characterises the
     /// fastest path through the renderer where pool overhead matters.
     p01_ms: f64,
+    /// Median present-to-present interval in milliseconds. Unlike the
+    /// work-time quantiles above, these measure wall-clock paint
+    /// cadence; a frame that wakes late shows up here, not in `p50_ms`.
+    interval_p50_ms: f64,
+    /// 95th percentile present interval in milliseconds.
+    interval_p95_ms: f64,
+    /// 99th percentile present interval in milliseconds.
+    interval_p99_ms: f64,
+    /// Largest present interval observed, in milliseconds.
+    interval_max_ms: f64,
+    /// Population standard deviation of present intervals, in
+    /// milliseconds. A flat cadence has stddev near 0; the 8ms-vs-8.33ms
+    /// beat shows up as nonzero spread even when the mean looks fine.
+    interval_stddev_ms: f64,
+    /// Fraction of present intervals longer than 1.5x the display
+    /// period (a "dropped" cadence slot). Period comes from the active
+    /// monitor's refresh rate, falling back to the pacer coalescing
+    /// interval when the rate is unknown; 0.0 when neither is known or
+    /// no intervals were recorded.
+    judder_ratio: f64,
+    /// Width of each `interval_histogram` bucket in milliseconds.
+    interval_histogram_bucket_ms: f64,
+    /// Present-interval histogram: counts per 0.5ms bucket starting at
+    /// 0ms, the final bucket accumulating everything at or above 4x the
+    /// display period (4x the pacer interval, then 4x 8.333ms, as
+    /// fallbacks). Quantiles can only hint at the 8ms-vs-8.33ms beat;
+    /// its bimodal shape is directly visible here. Empty when no
+    /// intervals were recorded.
+    interval_histogram: Vec<u64>,
+}
+
+/// Width of each [`Report::interval_histogram`] bucket in microseconds.
+const INTERVAL_HISTOGRAM_BUCKET_US: u64 = 500;
+
+/// Fixed-bucket histogram of present intervals. `result[i]` counts
+/// intervals in `[i*500us, (i+1)*500us)`; the last bucket is an
+/// overflow bucket for everything at or above 4x the reference period
+/// (`period_ns`, or 8.333ms when unknown). Returns an empty Vec for no
+/// intervals so the JSON report stays compact on runs without cadence
+/// data.
+fn interval_histogram(intervals_us: &[u64], period_ns: u64) -> Vec<u64> {
+    if intervals_us.is_empty() {
+        return Vec::new();
+    }
+    let reference_period_us = if period_ns > 0 {
+        period_ns / 1_000
+    } else {
+        8_333
+    };
+    let cap_us = reference_period_us * 4;
+    let bucket_count = (cap_us / INTERVAL_HISTOGRAM_BUCKET_US) as usize + 1;
+    let mut buckets = vec![0u64; bucket_count];
+    for &us in intervals_us {
+        let idx = ((us / INTERVAL_HISTOGRAM_BUCKET_US) as usize).min(bucket_count - 1);
+        buckets[idx] += 1;
+    }
+    buckets
+}
+
+/// Nearest-rank percentile over an ascending-sorted slice. Returns 0
+/// for empty input.
+fn percentile_us(sorted: &[u64], q: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let n = sorted.len();
+    let rank = (q * n as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(n - 1)]
+}
+
+/// Population standard deviation of the samples, in the samples' own
+/// unit. Returns 0.0 for empty input.
+fn population_stddev(samples: &[u64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let n = samples.len() as f64;
+    let mean = samples.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let variance = samples
+        .iter()
+        .map(|&v| {
+            let d = v as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n;
+    variance.sqrt()
+}
+
+/// Fraction of present intervals strictly longer than 1.5x the display
+/// period, i.e. paints that missed their cadence slot. `period_ns` is
+/// the active monitor's refresh period (or the pacer fallback); 0.0
+/// when no intervals were recorded or no period basis is known.
+fn judder_ratio(intervals_us: &[u64], period_ns: u64) -> f64 {
+    if intervals_us.is_empty() || period_ns == 0 {
+        return 0.0;
+    }
+    let threshold_us = period_ns as f64 * 1.5 / 1000.0;
+    let dropped = intervals_us
+        .iter()
+        .filter(|&&us| us as f64 > threshold_us)
+        .count();
+    dropped as f64 / intervals_us.len() as f64
 }
 
 fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
     let s = state().lock().unwrap();
-    let n = s.samples_us.len();
     let mut sorted: Vec<u64> = s.samples_us.iter().copied().collect();
     sorted.sort_unstable();
-    let pct = |q: f64| -> u64 {
-        if sorted.is_empty() {
-            return 0;
-        }
-        let rank = (q * n as f64).ceil() as usize;
-        sorted[rank.saturating_sub(1).min(n - 1)]
+    let pct = |q: f64| -> u64 { percentile_us(&sorted, q) };
+    let mut intervals_sorted: Vec<u64> = s.intervals_us.iter().copied().collect();
+    intervals_sorted.sort_unstable();
+    let judder_period_ns = if s.last_display_period_ns > 0 {
+        s.last_display_period_ns
+    } else {
+        s.last_pacer_min_interval_ns
     };
     let avg_ms = |sum: u64| -> f64 {
         if s.frames == 0 {
@@ -271,7 +397,7 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         mode: mode.as_str(),
         duration_s: elapsed.as_secs_f64(),
         frames: s.frames,
-        fps_mean: fps,
+        paints_per_sec_mean: fps,
         p50_ms: pct(0.50) as f64 / 1000.0,
         p95_ms: pct(0.95) as f64 / 1000.0,
         p99_ms: pct(0.99) as f64 / 1000.0,
@@ -299,6 +425,14 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         pacer_min_interval_ms: s.last_pacer_min_interval_ns as f64 / 1_000_000.0,
         min_us,
         p01_ms: pct(0.01) as f64 / 1000.0,
+        interval_p50_ms: percentile_us(&intervals_sorted, 0.50) as f64 / 1000.0,
+        interval_p95_ms: percentile_us(&intervals_sorted, 0.95) as f64 / 1000.0,
+        interval_p99_ms: percentile_us(&intervals_sorted, 0.99) as f64 / 1000.0,
+        interval_max_ms: intervals_sorted.last().copied().unwrap_or(0) as f64 / 1000.0,
+        interval_stddev_ms: population_stddev(&intervals_sorted) / 1000.0,
+        judder_ratio: judder_ratio(&intervals_sorted, judder_period_ns),
+        interval_histogram_bucket_ms: INTERVAL_HISTOGRAM_BUCKET_US as f64 / 1000.0,
+        interval_histogram: interval_histogram(&intervals_sorted, judder_period_ns),
     }
 }
 
@@ -409,14 +543,16 @@ pub fn start(config: BenchConfig, shared: SharedState) {
         let report = build_report(config.mode, elapsed);
         let json = serde_json::to_string_pretty(&report).unwrap();
         log::info!(
-            "[bench] done frames={} fps={:.1} p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms pacer={:.3}ms",
+            "[bench] done frames={} paints/s={:.1} p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms pacer={:.3}ms int p99={:.2}ms judder={:.1}%",
             report.frames,
-            report.fps_mean,
+            report.paints_per_sec_mean,
             report.p50_ms,
             report.p95_ms,
             report.p99_ms,
             report.max_ms,
             report.pacer_min_interval_ms,
+            report.interval_p99_ms,
+            report.judder_ratio * 100.0,
         );
         #[cfg(feature = "input-latency-histogram")]
         log::info!(
@@ -742,5 +878,164 @@ mod tests {
         let r = build_report(BenchMode::DirLoop, Duration::from_secs(1));
         assert_eq!(r.pacer_min_interval_ms, 0.0);
         deactivate();
+    }
+
+    #[test]
+    fn percentile_us_nearest_rank_and_empty() {
+        let _g = guard();
+        let sorted: Vec<u64> = (1..=10).collect();
+        // Nearest-rank: p50 of 10 samples picks index ceil(5)-1 = 4 -> 5.
+        assert_eq!(percentile_us(&sorted, 0.50), 5);
+        assert_eq!(percentile_us(&sorted, 0.99), 10);
+        assert_eq!(percentile_us(&[], 0.50), 0);
+    }
+
+    #[test]
+    fn population_stddev_exact_on_hand_computed_input() {
+        let _g = guard();
+        // Classic example: mean 5, variance (9+1+1+1+0+0+4+16)/8 = 4.
+        let samples = [2u64, 4, 4, 4, 5, 5, 7, 9];
+        assert!((population_stddev(&samples) - 2.0).abs() < 1e-12);
+        assert_eq!(population_stddev(&[]), 0.0);
+        assert_eq!(population_stddev(&[7]), 0.0);
+    }
+
+    #[test]
+    fn judder_ratio_counts_strictly_above_threshold() {
+        let _g = guard();
+        // period 8ms -> threshold exactly 12_000us. 12_000 is not
+        // dropped (strict >); 12_001 and 20_000 are: 2 of 4 = 0.5.
+        let intervals = [8_000u64, 12_000, 12_001, 20_000];
+        assert!((judder_ratio(&intervals, 8_000_000) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn judder_ratio_is_zero_without_intervals_or_period() {
+        let _g = guard();
+        assert_eq!(judder_ratio(&[], 8_000_000), 0.0);
+        assert_eq!(judder_ratio(&[20_000], 0), 0.0);
+    }
+
+    #[test]
+    fn interval_histogram_buckets_expose_a_bimodal_beat() {
+        let _g = guard();
+        // 120Hz period: cap 33_332us -> 66 in-range buckets + overflow.
+        let intervals = [8_333u64, 8_400, 16_666, 16_700, 100_000];
+        let hist = interval_histogram(&intervals, 8_333_333);
+        assert_eq!(hist.len(), 67);
+        // The 8.33ms mode lands in bucket 16, the 16.67ms mode in 33.
+        assert_eq!(hist[16], 2);
+        assert_eq!(hist[33], 2);
+        // Out-of-range samples accumulate in the overflow bucket.
+        assert_eq!(*hist.last().unwrap(), 1);
+        assert_eq!(hist.iter().sum::<u64>(), intervals.len() as u64);
+    }
+
+    #[test]
+    fn interval_histogram_empty_input_and_unknown_period() {
+        let _g = guard();
+        assert!(interval_histogram(&[], 8_333_333).is_empty());
+        // Unknown period falls back to a 8.333ms reference: same cap.
+        let hist = interval_histogram(&[1_000], 0);
+        assert_eq!(hist.len(), 67);
+        assert_eq!(hist[2], 1);
+    }
+
+    #[test]
+    fn record_frame_skips_zero_intervals_and_keeps_last_nonzero_period() {
+        let _g = guard();
+        activate();
+        // First frame of a run reports interval 0; must not pollute the ring.
+        record_frame(&FrameMetrics {
+            total_us: 1_000,
+            present_interval_us: 0,
+            display_period_ns: 8_333_333,
+            ..Default::default()
+        });
+        record_frame(&FrameMetrics {
+            total_us: 1_000,
+            present_interval_us: 8_333,
+            // Period unknown this frame; the captured value must survive.
+            display_period_ns: 0,
+            ..Default::default()
+        });
+        let s = state().lock().unwrap();
+        assert_eq!(s.intervals_us.len(), 1);
+        assert_eq!(s.intervals_us[0], 8_333);
+        assert_eq!(s.last_display_period_ns, 8_333_333);
+        drop(s);
+        deactivate();
+    }
+
+    #[test]
+    fn report_interval_quantiles_stddev_and_judder() {
+        let _g = guard();
+        activate();
+        // Four intervals: [8333, 8333, 8333, 16666]us at a 120Hz period
+        // (threshold 12_500us): one dropped slot -> judder 0.25.
+        for &interval in &[0u64, 8_333, 8_333, 8_333, 16_666] {
+            record_frame(&FrameMetrics {
+                total_us: 1_000,
+                present_interval_us: interval,
+                display_period_ns: 8_333_333,
+                ..Default::default()
+            });
+        }
+        let r = build_report(BenchMode::DirLoop, Duration::from_secs(1));
+        deactivate();
+        // Nearest-rank over 4 samples: p50 -> index 1, p95/p99 -> index 3.
+        assert!((r.interval_p50_ms - 8.333).abs() < 0.001);
+        assert!((r.interval_p95_ms - 16.666).abs() < 0.001);
+        assert!((r.interval_p99_ms - 16.666).abs() < 0.001);
+        assert!((r.interval_max_ms - 16.666).abs() < 0.001);
+        // mean 10416.25us, variance 13_019_791.6875us^2, stddev 3608.295us.
+        assert!(
+            (r.interval_stddev_ms - 3.608_295).abs() < 0.001,
+            "stddev {} ms",
+            r.interval_stddev_ms
+        );
+        assert!((r.judder_ratio - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn report_judder_falls_back_to_pacer_interval_when_period_unknown() {
+        let _g = guard();
+        activate();
+        // No display period all run; pacer 8ms -> threshold 12_000us.
+        for &interval in &[8_000u64, 13_000] {
+            record_frame(&FrameMetrics {
+                total_us: 1_000,
+                present_interval_us: interval,
+                display_period_ns: 0,
+                pacer_min_interval_ns: 8_000_000,
+                ..Default::default()
+            });
+        }
+        let r = build_report(BenchMode::DirLoop, Duration::from_secs(1));
+        deactivate();
+        assert!((r.judder_ratio - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn report_json_renames_fps_mean_to_paints_per_sec_mean() {
+        let _g = guard();
+        activate();
+        let r = build_report(BenchMode::DirLoop, Duration::from_secs(1));
+        deactivate();
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("paints_per_sec_mean"), "json: {}", json);
+        assert!(!json.contains("fps_mean"), "json: {}", json);
+        for key in [
+            "interval_p50_ms",
+            "interval_p95_ms",
+            "interval_p99_ms",
+            "interval_max_ms",
+            "interval_stddev_ms",
+            "judder_ratio",
+            "interval_histogram",
+            "interval_histogram_bucket_ms",
+        ] {
+            assert!(json.contains(key), "json missing {}: {}", key, json);
+        }
     }
 }

@@ -122,6 +122,14 @@ impl FrameProbe {
         self.samples.len()
     }
 
+    /// Number of samples in the current window strictly above
+    /// `threshold_us`. Used by the present-interval probe to count
+    /// dropped cadence slots (intervals longer than 1.5x the display
+    /// period) over the same window a summary describes.
+    pub fn count_above_us(&self, threshold_us: u64) -> u32 {
+        self.samples.iter().filter(|&&us| us > threshold_us).count() as u32
+    }
+
     /// Force this probe's emit gate to a specific value, ignoring the
     /// process global. Mainly for unit tests that drive the gate
     /// without touching shared state.
@@ -275,6 +283,18 @@ mod tests {
             probe.record_frame(Duration::from_micros(i as u64));
         }
         assert_eq!(probe.sample_count(), WINDOW_CAPACITY);
+    }
+
+    #[test]
+    fn count_above_us_is_strict_and_window_scoped() {
+        let mut probe = FrameProbe::new();
+        assert_eq!(probe.count_above_us(0), 0);
+        for &us in &[8_000u64, 12_500, 12_501, 25_000] {
+            probe.record_frame(Duration::from_micros(us));
+        }
+        // Strictly above: 12_500 at a 12_500 threshold does not count.
+        assert_eq!(probe.count_above_us(12_500), 2);
+        assert_eq!(probe.count_above_us(0), 4);
     }
 
     #[test]
