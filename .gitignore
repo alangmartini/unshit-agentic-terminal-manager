@@ -8,6 +8,7 @@ target2/
 prototype/
 .omx/
 bench*.json
+bench*.log
 artifacts/
 # Scratch perf-measurement captures (the blessed numbers live in specs/)
 phase[0-9]-*

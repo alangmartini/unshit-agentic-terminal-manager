@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-17
+
+This release makes terminal scrolling smooth and its frame timing honest, adds
+mouse selection / copy / paste to the terminal, and restyles the workspace menu
+and Keybinds settings to the design system.
+
+### Added
+
+- Mouse text selection in the terminal: click-drag to select, double-click for a (path-aware) word, triple-click for a line, and Shift+click to extend. Selections are anchored to absolute buffer lines, so they stay pinned to their text as the view scrolls and as output streams; copying always returns the highlighted text.
+- Copy following Windows Terminal conventions: `Ctrl+C` copies when there is a selection (and still sends `SIGINT` when there is none), `Ctrl+Shift+C` always copies. Right-click and `Shift+Insert` paste, and bracketed paste (DECSET 2004) wraps pasted text in `ESC[200~`/`ESC[201~` when the running program enabled it.
+- Animated terminal scrolling (scroll-smoothness spec Phase 3): wheel notches now ease the scrollback view over ~180ms with the same browser-validated curve as the settings page, retargeting in-flight on new notches instead of teleporting whole rows. Content renders with sub-row, device-pixel-snapped precision via a one-row overscan snapshot and a paint-time translation, so motion is continuous rather than row-quantized.
+- Fractional wheel-scroll accumulation (Phase 2): wheel and touchpad deltas accumulate with sub-line precision instead of rounding every event away from zero, so scroll distance is exactly proportional to input — no more 7-rows-per-notch over-travel or 5× touchpad amplification.
+- Scrolled-back viewport anchoring: streaming PTY output no longer snaps the view to the live bottom while you read scrollback; the view (and any in-flight scroll animation) shifts with scrollback growth, including at-capacity eviction. Entering or leaving the alternate screen (full-screen TUIs) still snaps to live.
+- Vblank-anchored frame pacing (Phase 4): on a vsync-paced surface the renderer's blocking swapchain acquire now anchors the paint loop to the display's refresh clock, so animation frames land one-per-refresh instead of being driven by a wall-clock timer that beats against scanout. The swapchain prefers `Fifo` (guaranteed on Vulkan) over Mailbox/Immediate; surfaces without a blocking present mode fall back to true-period timer pacing. A `UNSHIT_FRAME_LATENCY` env var (`1` or `2`, default `1`) A/Bs the swapchain's maximum frame latency without a rebuild.
+- Honest presentation-cadence metrics (Phase 1): the FPS overlay now reports fps as paints within the trailing second instead of `1/work_time`, with `p50/p95/p99/max` present-interval rows and a `dropped` counter; a once-per-second `[FRAME-INTERVAL]` log line emits cadence quantiles. Idle cadence breaks (e.g. the cursor-blink repaint) are excluded so an idle session does not fabricate jank.
+
+### Changed
+
+- Redesigned the sidebar workspace right-click menu to a "submenu flyout" layout: each action row leads with an icon and (for navigational actions) a keyboard-hint badge, the shell list moved into a hover flyout that spawns beside "New terminal" with favourite shells starred, and the destructive actions (Kill all terminals, Remove workspace) are fenced into a grouped danger zone. The menu uses Windows-legible keyboard hints.
+- Restyled the Settings → Keybinds page to match the design mockup: a grouped command list, a filter input, and keycap-style key pills. The Settings page now toggles closed when `Ctrl+,` is pressed again while it is open.
+- The frame pacer no longer emulates vsync or "timer-compensates" 120Hz down to 8ms; it reports the display's true refresh period (e.g. 8.333ms at 120Hz, 16.666ms at 60Hz) and survives only as the metrics floor and the Timer-fallback redraw coalescer. Sub-10Hz refresh reports are treated as driver garbage and fall back to the 8ms default.
+- A single persistent, deadline-extended animation waker replaces the per-wheel-notch waker threads; terminal scroll and container smooth scroll tick from the same shared motion module. On the default vsync-paced path the waker thread is never spawned — the blocking acquire is the tick.
+- Mouse-wheel notch normalization now divides unconditionally by the OS wheel setting (`SPI_GETWHEELSCROLLLINES` / `SPI_GETWHEELSCROLLCHARS`, queried per event), removing the 3× amplification of sub-notch deltas from high-resolution wheels; one detent always scrolls exactly the configured distance.
+- Wheel scrolling over the terminal now updates grid content as a paint-only patch, so it no longer forces a full UI tree rebuild or interrupts a concurrent smooth-scroll animation. A visible FPS overlay requests rebuilds at most ~4Hz instead of every painted frame.
+- The UI framework's `DragEvent` and `MouseEvent` now carry element-local pointer coordinates (`local_x` / `local_y`) and `MouseDown` is dispatched to element handlers, so grid/canvas widgets can map a pointer to a cell without re-deriving their absolute rect; a `Key::Insert` variant was added. The CSS/layout engine now measures elements that mix raw text and child elements correctly via anonymous text boxes.
+- Bench report JSON: `fps_mean` was renamed to `paints_per_sec_mean`, with new `interval_p50/p95/p99/max_ms`, `interval_stddev_ms`, `judder_ratio`, and a present-interval `interval_histogram`. The experimental `grid-fragment-shader` path no longer applies to terminal grids (no overscan support); terminal grids render through the standard cell emitter unconditionally.
+
+### Fixed
+
+- Reconciler: when a matched child's tag changed, the child chain was stitched with the old (deallocated) `NodeId`, silently truncating the sibling chain — this blanked the entire content column after closing settings (Esc or repeated `Ctrl+,`) and rendered keybind rows / the filter input blank on the restyled Keybinds page. `reconcile_inner` now returns the live `NodeId`, covered by keyed and unkeyed tag-change regression tests.
+- Swapchain acquire failures now follow an explicit, unit-tested recovery policy: `Lost` always reconfigures, `Outdated` reconfigures at most once per episode and never while the window is minimized (preventing a reconfigure storm and an unvalidated stale-extent submit on minimized Vulkan windows), and timeouts / other errors drop the frame without touching the surface.
+- Settings: keybind key pills no longer overflow their chips.
+
 ## [0.1.0] - 2026-06-07
 
 Initial release of Terminal Manager — a GPU-accelerated, agentic terminal manager for Windows.
@@ -49,5 +82,6 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/releases/tag/v0.1.0
