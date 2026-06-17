@@ -1,20 +1,26 @@
 //! One persistent, deadline-extended animation waker for the whole app.
 //!
-//! Animated scrolling needs the event loop woken at the animation cadence
-//! for the lifetime of each animation. The previous design spawned one
-//! short-lived waker thread per wheel notch; a fast wheel spin stacked a
-//! dozen threads all sleeping on the same interval. This module replaces
-//! them with a single thread for the app lifetime that ticks while a
-//! deadline is in the future and parks on a condvar otherwise. Every
-//! animation producer (container smooth scroll, grid-animation hooks)
-//! shares it via [`AnimationWaker::extend_until`], which only ever moves
-//! the deadline forward.
+//! This is the Timer-fallback tick source for surfaces without a
+//! vsync-paced present mode (no Fifo). On the default vsync-paced path
+//! the renderer's blocking swapchain acquire anchors animation frames to
+//! the display clock, [`AnimationWaker::extend_until`] is never called,
+//! and the lazily-spawned thread never exists. Only when the app falls
+//! back to timer pacing do animation producers (container smooth scroll,
+//! grid-animation hooks) share this waker, whose tick interval is the
+//! display's true refresh period.
+//!
+//! The previous design spawned one short-lived waker thread per wheel
+//! notch; a fast wheel spin stacked a dozen threads all sleeping on the
+//! same interval. This module replaces them with a single thread for the
+//! app lifetime that ticks while a deadline is in the future and parks on
+//! a condvar otherwise; `extend_until` only ever moves the deadline
+//! forward.
 //!
 //! Each tick feeds the existing consumer path:
 //! [`ExternalEvent::RequestAnimationFrame`] into the event channel, then
-//! `EventLoopProxy::wake_up`. Phase 4 swaps this thread's fixed-interval
-//! sleep for a vblank wait — a single replacement point serving every
-//! animation kind.
+//! `EventLoopProxy::wake_up`. The tick thread's sleep runs off the winit
+//! event-loop thread, so it does not violate the "event loop never
+//! blocks" gate.
 
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};

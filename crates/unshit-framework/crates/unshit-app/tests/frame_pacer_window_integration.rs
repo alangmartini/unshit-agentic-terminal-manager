@@ -48,16 +48,16 @@ fn refresh_pacer_from_source_falls_back_to_default_when_no_monitor() {
 #[test]
 fn refresh_pacer_from_source_updates_pacer_when_rate_changes() {
     let mut pacer = FramePacer::with_refresh_rate_mhz(120_000);
-    assert_eq!(pacer.min_interval(), Duration::from_millis(8));
+    assert_eq!(pacer.min_interval(), Duration::from_nanos(8_333_333));
 
     // Simulate dragging the window onto a 240Hz display.
     let faster = FakeSource(Some(240_000));
     refresh_pacer_from_source(&mut pacer, &faster);
     assert_eq!(pacer.min_interval(), Duration::from_nanos(4_166_666));
 
-    // And back to 60Hz. Low reported rates must not slow the interactive
-    // cadence below the framework fallback.
+    // And back to 60Hz: the pacer follows the slower panel's true period
+    // rather than producing frames the display can never show.
     let slower = FakeSource(Some(60_000));
     refresh_pacer_from_source(&mut pacer, &slower);
-    assert_eq!(pacer.min_interval(), FramePacer::DEFAULT_MIN_INTERVAL);
+    assert_eq!(pacer.min_interval(), Duration::from_nanos(16_666_666));
 }

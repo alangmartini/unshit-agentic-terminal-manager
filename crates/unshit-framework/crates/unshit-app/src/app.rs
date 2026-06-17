@@ -295,10 +295,11 @@ pub struct FrameMetrics {
     pub layout_us: u64,
     pub batch_build_us: u64,
     /// CPU time spent encoding and submitting the frame's render passes
-    /// (wall time of `gpu.render()` on the render thread). Not GPU
-    /// execution time: submission is non-blocking and no timestamp
-    /// queries exist yet, so actual GPU cost is invisible here. The
-    /// overlay surfaces this as "encode".
+    /// (wall time of `gpu.render()` on the render thread, minus the
+    /// swapchain acquire wait reported in [`Self::present_wait_us`]).
+    /// Not GPU execution time: submission is non-blocking and no
+    /// timestamp queries exist yet, so actual GPU cost is invisible
+    /// here. The overlay surfaces this as "encode".
     pub gpu_render_us: u64,
     pub total_us: u64,
     pub node_count: usize,
@@ -330,6 +331,14 @@ pub struct FrameMetrics {
     /// monitor's refresh rate; consumers should fall back to
     /// [`Self::pacer_min_interval_ns`] in that case.
     pub display_period_ns: u64,
+    /// CPU time `gpu.render()` spent blocked acquiring the swapchain
+    /// image — up to one display period under a vsync-paced present
+    /// mode, ~0 otherwise. Already subtracted out of
+    /// [`Self::gpu_render_us`] and [`Self::total_us`] at the source so
+    /// every work-time consumer (bench percentiles, overlay rows, slow
+    /// frame logs) keeps measuring work; reported separately so the
+    /// vblank wait stays observable.
+    pub present_wait_us: u64,
 }
 
 impl std::fmt::Display for FrameMetrics {
@@ -404,10 +413,15 @@ struct AppState {
     /// handlers through [`ScrollGridPatch::animation`] and ticked at the
     /// shared animation cadence. See [`tick_grid_animations`].
     grid_animations: HashMap<NodeId, GridAnimationHook>,
-    /// Shared due-gate for all animation sources (container smooth scroll
-    /// and grid animations): the earliest instant the next animation frame
-    /// may paint. `None` when no animation is active.
+    /// Timer-fallback due-gate shared by all animation sources (container
+    /// smooth scroll and grid animations): the earliest instant the next
+    /// animation frame may paint. `None` when no animation is active.
+    /// Unused in [`PacingMode::VsyncBlocking`], where the blocking
+    /// swapchain acquire paces the chain instead.
     animation_next_frame: Option<Instant>,
+    /// Set by a Timer-fallback [`AnimationWaker`] tick so the next
+    /// `RedrawRequested` bypasses the due-gate and the pacer gate once.
+    /// Never set in [`PacingMode::VsyncBlocking`] (the waker never runs).
     force_animation_paint: bool,
     active_transitions: ActiveTransitions,
     animation_driver: AnimationDriver,
@@ -419,9 +433,16 @@ struct AppState {
     theme: Theme,
     /// Whether the one-shot on_cell_metrics callback has already fired.
     cell_metrics_fired: bool,
-    /// Coalesces redraw requests into at most one paint per
-    /// `FramePacer::min_interval`. Prevents per-PTY-chunk rebuild storms
-    /// from dominating the event loop. See [`crate::frame_pacer`].
+    /// How this session paces paints, fixed at startup from the surface's
+    /// present mode. See [`PacingMode`].
+    pacing_mode: PacingMode,
+    /// In [`PacingMode::Timer`], coalesces redraw requests into at most
+    /// one paint per `FramePacer::min_interval` (the display's true
+    /// period), preventing per-PTY-chunk rebuild storms from dominating
+    /// the event loop. In [`PacingMode::VsyncBlocking`] the gate is
+    /// skipped — the blocking acquire is the coalescer — and the pacer
+    /// survives as the metrics floor feeding
+    /// [`FrameMetrics::pacer_min_interval_ns`]. See [`crate::frame_pacer`].
     frame_pacer: crate::frame_pacer::FramePacer,
     /// Timestamp of the most recent external-event-driven wake (proxy wake,
     /// keyboard input, pointer input, resize, etc.). Used by `about_to_wait`
@@ -535,8 +556,81 @@ fn resize_direction_cursor_icon(direction: ResizeDirection) -> CursorIcon {
 /// keystrokes or PTY chunks without keeping the CPU warm after activity
 /// stops. Matches Ghostty's active-renderer-window concept.
 pub(crate) const ACTIVITY_WINDOW: Duration = Duration::from_millis(250);
-const SMOOTH_SCROLL_WAKE_INTERVAL: Duration = Duration::from_millis(8);
 const SMOOTH_SCROLL_WAKE_GRACE: Duration = Duration::from_millis(48);
+
+/// How the frame loop paces paints, chosen once at startup from the
+/// surface's present mode (see [`pacing_mode_for_surface`]). The mode
+/// cannot change at runtime because surface reconfigures reuse the stored
+/// present mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PacingMode {
+    /// The surface's present mode blocks in the swapchain acquire
+    /// (Fifo family): a saturated paint loop runs at exactly the display
+    /// refresh rate, so painting self-paces. Animations run the classic
+    /// vsync loop — paint, `request_redraw`, block at the next acquire —
+    /// with no timers, no due-gates, and no pacer gate.
+    VsyncBlocking,
+    /// The surface never blocks on vblank (Mailbox / Immediate, exotic
+    /// surfaces only). The legacy timer machinery — the [`FramePacer`]
+    /// gate, the speculative deadline, and the [`AnimationWaker`] —
+    /// paces paints at the display's true period instead.
+    Timer,
+}
+
+/// Pure mapping from the renderer's pacing capability
+/// ([`GpuContext::is_vsync_paced`]) to the app's [`PacingMode`].
+fn pacing_mode_for_surface(is_vsync_paced: bool) -> PacingMode {
+    if is_vsync_paced {
+        PacingMode::VsyncBlocking
+    } else {
+        PacingMode::Timer
+    }
+}
+
+/// Display period to assume when the platform cannot report a refresh
+/// rate: one 120Hz frame. Only used to schedule skipped-frame resumes,
+/// where a slightly wrong period costs at most one frame of animation
+/// idle time.
+const FALLBACK_DISPLAY_PERIOD: Duration = Duration::from_nanos(8_333_333);
+
+/// When an animation tick produced no visual change, nothing was
+/// presented and no acquire will block, so chaining a `request_redraw`
+/// would tick at CPU speed. Park the loop until the next display period
+/// instead, anchored to the skipping frame's own start so consecutive
+/// skips always schedule a strictly future wake (a stale
+/// `last_paint_completed_at` would collapse the deadline into the past
+/// and spin the loop through zero-timeout waits).
+fn skipped_frame_resume_at(frame_start: Instant, display_period_ns: u64) -> Instant {
+    let period = if display_period_ns == 0 {
+        FALLBACK_DISPLAY_PERIOD
+    } else {
+        Duration::from_nanos(display_period_ns)
+    };
+    frame_start + period
+}
+
+/// The timestamp animation positions are sampled at: the predicted
+/// present time of the frame being built, i.e. one display period past
+/// the previous paint's completion. Sampling at wake time instead turns
+/// scheduler jitter into spatial velocity noise (finding 16 of the
+/// scroll-smoothness spec). Falls back to `frame_start` when prediction
+/// is meaningless: no previous paint, unknown display period, or an idle
+/// cadence break of [`ACTIVITY_WINDOW`] or longer. The result is clamped
+/// to never precede `frame_start`, so sampled timestamps stay monotone
+/// across frames even after a missed vblank.
+pub(crate) fn predicted_present_ts(
+    last_paint_completed_at: Option<Instant>,
+    display_period_ns: u64,
+    frame_start: Instant,
+) -> Instant {
+    let Some(last) = last_paint_completed_at else {
+        return frame_start;
+    };
+    if display_period_ns == 0 || frame_start.saturating_duration_since(last) >= ACTIVITY_WINDOW {
+        return frame_start;
+    }
+    (last + Duration::from_nanos(display_period_ns)).max(frame_start)
+}
 /// Fallback lines-per-notch when the OS setting cannot be queried. Matches
 /// the Windows default of 3 wheel-scroll lines per detent.
 const WHEEL_LINE_DELTA_PER_NOTCH: f32 = 3.0;
@@ -1033,14 +1127,110 @@ fn can_fast_paint_animations(state: &AppState) -> bool {
         && !state.needs_relayout
 }
 
+/// Start (or retarget) the animation frame chain after a producer
+/// registered new animation work (a wheel notch starting a container
+/// smooth scroll, a Scroll handler registering a grid hook).
+///
+/// `VsyncBlocking`: a single `request_redraw` is all it takes — each paint
+/// re-requests the next while any animation remains, and the blocking
+/// acquire paces the chain at the refresh rate. The wake deadline is
+/// ignored; hook settling / `Done` ends the chain.
+///
+/// `Timer`: the legacy machinery — extend the shared waker through
+/// `wake_deadline` (animation end plus grace) and open the due-gate so the
+/// first frame paints immediately; mid-flight retargets keep the existing
+/// gate (at most one period away) so wheel storms never paint at event
+/// rate.
+fn kick_animation(state: &mut AppState, waker: &AnimationWaker, wake_deadline: Instant) {
+    match state.pacing_mode {
+        PacingMode::VsyncBlocking => {
+            state.window.request_redraw();
+        }
+        PacingMode::Timer => {
+            waker.extend_until(wake_deadline);
+            if state.animation_next_frame.is_none() {
+                state.animation_next_frame = Some(Instant::now());
+            }
+            state.window.request_redraw();
+        }
+    }
+}
+
+/// Post-paint continuation for a `RedrawRequested` frame that advanced
+/// animations. Keeps the chain alive while any animation remains, the way
+/// the active pacing mode wants; sets plain `Wait` once everything
+/// settled.
+///
+/// `painted` is false when the animation tick produced no visual change
+/// and nothing was presented (see [`fast_paint_animation_frame`]); the
+/// slow path always presents and passes true.
+fn schedule_animation_followup(
+    state: &mut AppState,
+    event_loop: &dyn ActiveEventLoop,
+    frame_start: Instant,
+    painted: bool,
+) {
+    if !animations_active(state) {
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        return;
+    }
+    match state.pacing_mode {
+        PacingMode::VsyncBlocking => {
+            if painted {
+                // The classic vsync loop: request the next frame now;
+                // its blocking acquire paces the chain at the refresh
+                // rate, so no timer is involved.
+                state.window.request_redraw();
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            } else {
+                // Nothing was presented, so no acquire will block and a
+                // chained redraw would tick at CPU speed. Park until the
+                // next display period; the stale-deadline branch in
+                // `about_to_wait` re-issues the redraw when the timer
+                // fires. Blind-ticking hooks therefore idle at display
+                // cadence until their deadline settles them.
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                    skipped_frame_resume_at(
+                        frame_start,
+                        display_period_ns_from_mhz(state.display_refresh_mhz),
+                    ),
+                ));
+            }
+        }
+        PacingMode::Timer => {
+            // True-period due-gate. The redraw is deliberately NOT
+            // requested here: a queued internal paint wakes the OS wait
+            // immediately, so `about_to_wait` issues it once the gate
+            // opens.
+            let due = frame_start + state.frame_pacer.min_interval();
+            state.animation_next_frame = Some(due);
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(due));
+        }
+    }
+}
+
+/// Returns whether the frame painted (presented). A `false` return means
+/// no hook produced a visual change and nothing reached the GPU, so no
+/// acquire blocked: the caller must schedule the animation continuation
+/// itself instead of chaining a redraw off a present that never happened.
 fn fast_paint_animation_frame(
     state: &mut AppState,
     frame_start: Instant,
     decorations: bool,
     on_scroll_telemetry: Option<&ScrollTelemetryCallback>,
     on_frame_metrics: Option<&(dyn Fn(&FrameMetrics) + Send)>,
-) {
+) -> bool {
     let mut metrics = FrameMetrics::default();
+
+    // Animation positions are sampled at the predicted present time of
+    // this frame, not at wake time, so scheduler jitter does not become
+    // velocity noise. Everything else (metrics, pacer bookkeeping) keeps
+    // using `frame_start`.
+    let sample_ts = predicted_present_ts(
+        state.last_paint_completed_at,
+        display_period_ns_from_mhz(state.display_refresh_mhz),
+        frame_start,
+    );
 
     // A container smooth scroll repositions on every sample (including its
     // final pin-to-target frame), so its mere presence at entry means this
@@ -1048,13 +1238,12 @@ fn fast_paint_animation_frame(
     // moved; when every hook is idle (e.g. the sampled position rounded to
     // the same device pixel) and no canvas wants a repaint, skip the batch
     // build and the GPU present entirely — the previous frame is still
-    // correct. Lifecycle (deadline expiry, `Done`) advanced above, and the
-    // callers keep scheduling the next animation tick regardless.
+    // correct. Lifecycle (deadline expiry, `Done`) advanced above.
     let container_scroll_active = state.smooth_scroll.is_some();
-    tick_smooth_scroll(state, frame_start, decorations, on_scroll_telemetry);
-    let grid_visual_change = tick_grid_animations(state, frame_start, true);
+    tick_smooth_scroll(state, sample_ts, decorations, on_scroll_telemetry);
+    let grid_visual_change = tick_grid_animations(state, sample_ts, true);
     if !container_scroll_active && !grid_visual_change && !state.gpu.any_canvas_needs_repaint() {
-        return;
+        return false;
     }
 
     state.gpu.glyph_atlas.advance_frame();
@@ -1117,13 +1306,19 @@ fn fast_paint_animation_frame(
     let t5 = Instant::now();
     state.window.pre_present_notify();
     state.gpu.render();
-    metrics.gpu_render_us = t5.elapsed().as_micros() as u64;
+    // Split the vblank wait out of the work numbers at the source so
+    // every downstream consumer of gpu_render_us / total_us keeps
+    // measuring CPU work (see FrameMetrics::present_wait_us).
+    metrics.present_wait_us = state.gpu.last_acquire_wait().as_micros() as u64;
+    metrics.gpu_render_us =
+        (t5.elapsed().as_micros() as u64).saturating_sub(metrics.present_wait_us);
 
     if state.gpu.any_canvas_needs_repaint() {
         state.window.request_redraw();
     }
 
     finalize_frame_metrics(state, metrics, frame_start, on_frame_metrics);
+    true
 }
 
 /// Pure function: active display refresh period in nanoseconds from a
@@ -1182,7 +1377,11 @@ fn finalize_frame_metrics(
     on_frame_metrics: Option<&(dyn Fn(&FrameMetrics) + Send)>,
 ) {
     state.frame_pacer.record_paint(frame_start);
-    metrics.total_us = frame_start.elapsed().as_micros() as u64;
+    // total_us is CPU work: the swapchain acquire wait that happened
+    // inside gpu.render() (up to one display period under Fifo) is
+    // subtracted so vsync pacing does not masquerade as a slow frame.
+    metrics.total_us =
+        (frame_start.elapsed().as_micros() as u64).saturating_sub(metrics.present_wait_us);
     metrics.rss_bytes = get_rss_bytes();
     metrics.pacer_min_interval_ns = state.frame_pacer.min_interval().as_nanos() as u64;
 
@@ -1264,6 +1463,12 @@ fn roll_over_window_title_fps(state: &mut AppState) {
     state.frame_count += 1;
     let fps_elapsed = state.fps_timer.elapsed();
     if fps_elapsed.as_millis() >= 1000 {
+        // Cheap pull-based refresh-rate re-probe (spec item 5): winit's
+        // win32 backend surfaces no display-mode-change event, so an
+        // in-place Hz change in Windows settings would otherwise leave
+        // the pacer interval and display_period_ns stale forever. One
+        // monitor query per second, only while frames are painting.
+        refresh_pacer_from_window(state);
         state.current_fps = state.frame_count as f32 / fps_elapsed.as_secs_f32();
         let title = format!(
             "{} | {:.1}ms | {:.0} fps | rss {:.0}MB | nodes {}",
@@ -1582,10 +1787,15 @@ impl App {
             config,
             tree_fn: Box::new(tree_fn),
             state: None,
+            // Placeholder interval: the display's refresh rate is not
+            // known until the window exists. `can_create_surfaces`
+            // rebuilds the waker with the true period before any
+            // animation can start (the tick thread spawns lazily, so
+            // nothing is wasted).
             animation_waker: AnimationWaker::new(
                 event_tx.clone(),
                 Arc::clone(&proxy_cell),
-                SMOOTH_SCROLL_WAKE_INTERVAL,
+                crate::frame_pacer::FramePacer::DEFAULT_MIN_INTERVAL,
             ),
             event_tx,
             event_rx,
@@ -1773,7 +1983,6 @@ impl ApplicationHandler for AppHandler {
                 }
                 ExternalEvent::RequestAnimationFrame => {
                     saw_animation_frame = true;
-                    state.force_animation_paint = true;
                 }
                 ExternalEvent::ActivateWindow => {
                     state.window.set_visible(true);
@@ -1841,41 +2050,18 @@ impl ApplicationHandler for AppHandler {
             // during the next [`ACTIVITY_WINDOW`].
             state.mark_activity(Instant::now());
         }
-        if saw_animation_frame && can_fast_paint_animations(state) {
-            let frame_start = Instant::now();
-            let due = state.animation_next_frame.unwrap_or(frame_start);
-            if frame_start < due {
-                _event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-                if coalescer.saw_event {
-                    state.window.request_redraw();
-                }
-                return;
-            }
-            state.force_animation_paint = false;
-            fast_paint_animation_frame(
-                state,
-                frame_start,
-                self.app.config.decorations,
-                self.app.config.on_scroll_telemetry.as_deref(),
-                self.app.config.on_frame_metrics.as_deref(),
-            );
-            if animations_active(state) {
-                state.animation_next_frame = Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
-                _event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-            } else {
-                _event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-            }
-        } else if saw_animation_frame && !animations_active(state) && !coalescer.saw_event {
-            state.force_animation_paint = false;
-            _event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-        } else if saw_animation_frame && animations_active(state) {
-            // An animation is in flight but cannot fast paint (a rebuild,
-            // restyle, or relayout is pending, e.g. from PTY output).
-            // Route the frame through the full pipeline rather than
-            // swallowing it, or animation frames would stall for as long
-            // as the dirty state persists.
+        if saw_animation_frame && animations_active(state) {
+            // A Timer-fallback waker tick (the waker never runs in
+            // VsyncBlocking mode). All painting goes through the single
+            // paint site, `RedrawRequested`; the force flag lets the
+            // tick bypass the due-gate and pacer gate once, since the
+            // waker already ticks at the display period.
+            state.force_animation_paint = true;
             state.window.request_redraw();
-            _event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        } else if saw_animation_frame && !coalescer.saw_event {
+            // Stale waker tick after every animation settled: nothing to
+            // paint, and no flag to leave armed.
+            state.force_animation_paint = false;
         } else {
             state.window.request_redraw();
         }
@@ -1916,6 +2102,24 @@ impl ApplicationHandler for AppHandler {
         log::info!("Display refresh rate: {} mHz", startup_refresh_mhz);
 
         let mut gpu = pollster::block_on(GpuContext::new(window.clone()));
+
+        // One-shot pacing mode selection: sound because surface
+        // reconfigures reuse the stored present mode, so it cannot
+        // change at runtime. On the vsync-paced default the blocking
+        // acquire paces every paint; the Timer machinery only runs on
+        // surfaces without Fifo.
+        let pacing_mode = pacing_mode_for_surface(gpu.is_vsync_paced());
+        log::info!("frame pacing: {:?} (present mode {:?})", pacing_mode, gpu.present_mode());
+
+        // Rebuild the animation waker with the display's true period now
+        // that the rate is known (it was constructed before the window
+        // existed). Cheap: the tick thread spawns lazily on first use,
+        // and in VsyncBlocking mode it is never used at all.
+        self.app.animation_waker = AnimationWaker::new(
+            self.app.event_tx.clone(),
+            Arc::clone(&self.app.proxy_cell),
+            crate::frame_pacer::FramePacer::interval_from_mhz(startup_refresh_mhz),
+        );
 
         // Apply configurable atlas size bound if set.
         if let Some(max_bytes) = self.app.config.max_atlas_bytes {
@@ -2130,6 +2334,7 @@ impl ApplicationHandler for AppHandler {
             bell_state: BellState::new(BellConfig::default()),
             theme: self.app.config.theme.clone(),
             cell_metrics_fired: false,
+            pacing_mode,
             frame_pacer: crate::frame_pacer::FramePacer::with_refresh_rate_mhz(startup_refresh_mhz),
             // Treat window creation as activity so the first few frames
             // after startup run at the speculative pacer rhythm. This
@@ -3217,8 +3422,9 @@ impl ApplicationHandler for AppHandler {
                                     browser_like_initial_slope(duration_delta),
                                 );
                                 if state.smooth_scroll.is_some() {
-                                    state.animation_next_frame = Some(scroll_started_at);
-                                    self.app.animation_waker.extend_until(
+                                    kick_animation(
+                                        state,
+                                        &self.app.animation_waker,
                                         scroll_started_at + duration + SMOOTH_SCROLL_WAKE_GRACE,
                                     );
                                     if let Some(scroll) = state.smooth_scroll {
@@ -3334,15 +3540,14 @@ impl ApplicationHandler for AppHandler {
                                     // animation hook below wants frames).
                                     if let Some(hook) = patch.animation {
                                         // Register (or replace) the node's
-                                        // grid animation and keep the shared
-                                        // waker alive through its deadline
-                                        // (which already includes grace).
-                                        self.app.animation_waker.extend_until(hook.deadline);
-                                        if state.animation_next_frame.is_none() {
-                                            state.animation_next_frame = Some(Instant::now());
-                                        }
+                                        // grid animation and start (or
+                                        // retarget) the frame chain; in
+                                        // Timer mode the hook's deadline
+                                        // (which already includes grace)
+                                        // keeps the shared waker alive.
+                                        let deadline = hook.deadline;
                                         state.grid_animations.insert(node, hook);
-                                        state.window.request_redraw();
+                                        kick_animation(state, &self.app.animation_waker, deadline);
                                     }
                                 }
                                 None => {
@@ -3407,28 +3612,43 @@ impl ApplicationHandler for AppHandler {
 
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
+                // A minimized window cannot present: Vulkan acquires
+                // return Outdated with no Fifo throttle, so painting
+                // would loop full batch builds at CPU speed. Drop the
+                // paint and let dirty flags accumulate untouched;
+                // restoring the window generates a real WM_PAINT, which
+                // resumes painting (and settles any expired animation
+                // hooks). Polled here because winit's win32 backend
+                // never delivers the zero-size resize events a
+                // suppression flag could key off.
+                if state.window.is_minimized().unwrap_or(false) {
+                    return;
+                }
                 let force_animation_paint = std::mem::take(&mut state.force_animation_paint);
                 let animation_active = animations_active(state);
                 if animation_active && can_fast_paint_animations(state) {
-                    let due = state.animation_next_frame.unwrap_or(frame_start);
-                    if frame_start < due && !force_animation_paint {
-                        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-                        return;
+                    // Timer fallback only: the due-gate paces the chain at
+                    // the true period. The redraw is NOT re-requested on
+                    // the wait branch (a queued internal paint would wake
+                    // the OS wait immediately); `about_to_wait` re-issues
+                    // it when the gate opens. In VsyncBlocking mode there
+                    // is no gate to check — the blocking acquire paces.
+                    if state.pacing_mode == PacingMode::Timer && !force_animation_paint {
+                        let due = state.animation_next_frame.unwrap_or(frame_start);
+                        if frame_start < due {
+                            event_loop
+                                .set_control_flow(winit::event_loop::ControlFlow::WaitUntil(due));
+                            return;
+                        }
                     }
-                    fast_paint_animation_frame(
+                    let painted = fast_paint_animation_frame(
                         state,
                         frame_start,
                         self.app.config.decorations,
                         self.app.config.on_scroll_telemetry.as_deref(),
                         self.app.config.on_frame_metrics.as_deref(),
                     );
-                    if animations_active(state) {
-                        state.animation_next_frame =
-                            Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
-                        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-                    } else {
-                        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-                    }
+                    schedule_animation_followup(state, event_loop, frame_start, painted);
                     return;
                 }
 
@@ -3439,20 +3659,30 @@ impl ApplicationHandler for AppHandler {
                 #[cfg(feature = "input-latency-histogram")]
                 state.input_latency.mark_frame_start();
 
-                // Coalesce RequestRebuild and input-driven redraws into at
-                // most one paint per frame_pacer.min_interval. When the
-                // pacer says wait, schedule a WaitUntil and bail out so
-                // the event loop sleeps until the coalescing deadline.
-                // Bypassed while any animation is active so rebuild frames
-                // during an animation are not deferred to pacer cadence.
-                if !(force_animation_paint || animation_active) {
+                // Timer fallback only: coalesce RequestRebuild and
+                // input-driven redraws into at most one paint per
+                // frame_pacer.min_interval (the true display period).
+                // Waker-driven animation ticks bypass the gate — they
+                // already arrive at the period. In VsyncBlocking mode the
+                // gate is skipped entirely: the blocking acquire is the
+                // coalescer, and a redraw storm paints back-to-back
+                // frames that each block until their vblank.
+                let bypass_pacer_gate = match state.pacing_mode {
+                    PacingMode::VsyncBlocking => true,
+                    PacingMode::Timer => force_animation_paint,
+                };
+                if !bypass_pacer_gate {
                     match state.frame_pacer.on_redraw_requested(frame_start) {
                         crate::frame_pacer::PaceDecision::PaintNow => {}
                         crate::frame_pacer::PaceDecision::WaitUntil(deadline) => {
+                            // Sleep until the coalescing deadline; the
+                            // speculative/hygiene branches in
+                            // `about_to_wait` re-issue the redraw once it
+                            // passes (requesting it here would wake the
+                            // OS wait immediately and spin).
                             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                                 deadline,
                             ));
-                            state.window.request_redraw();
                             return;
                         }
                     }
@@ -3460,9 +3690,17 @@ impl ApplicationHandler for AppHandler {
 
                 let mut metrics = FrameMetrics::default();
 
+                // Animation positions sample at the predicted present
+                // time (see predicted_present_ts); everything else in
+                // this frame keeps using frame_start.
+                let sample_ts = predicted_present_ts(
+                    state.last_paint_completed_at,
+                    display_period_ns_from_mhz(state.display_refresh_mhz),
+                    frame_start,
+                );
                 tick_smooth_scroll(
                     state,
-                    frame_start,
+                    sample_ts,
                     self.app.config.decorations,
                     self.app.config.on_scroll_telemetry.as_deref(),
                 );
@@ -3473,7 +3711,7 @@ impl ApplicationHandler for AppHandler {
                 // skipped (`tree_fn` recomposes every pane anyway); on
                 // restyle/relayout-only frames the patches are applied so
                 // the animated content still reaches this frame's batch.
-                tick_grid_animations(state, frame_start, !state.needs_rebuild);
+                tick_grid_animations(state, sample_ts, !state.needs_rebuild);
 
                 // Advance LRU frame counter at the start of each rendered frame.
                 state.gpu.glyph_atlas.advance_frame();
@@ -3888,8 +4126,15 @@ impl ApplicationHandler for AppHandler {
                 }
 
                 let t5 = Instant::now();
+                state.window.pre_present_notify();
                 state.gpu.render();
-                metrics.gpu_render_us = t5.elapsed().as_micros() as u64;
+                // Split the vblank wait out of the work numbers at the
+                // source so every downstream consumer of gpu_render_us /
+                // total_us keeps measuring CPU work (see
+                // FrameMetrics::present_wait_us).
+                metrics.present_wait_us = state.gpu.last_acquire_wait().as_micros() as u64;
+                metrics.gpu_render_us =
+                    (t5.elapsed().as_micros() as u64).saturating_sub(metrics.present_wait_us);
 
                 if state.gpu.any_canvas_needs_repaint() {
                     state.window.request_redraw();
@@ -3901,8 +4146,7 @@ impl ApplicationHandler for AppHandler {
                 // wake time across all sources, so the event loop sleeps
                 // between frames instead of busy-polling.
                 if animations_active(state) {
-                    state.animation_next_frame = Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
-                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                    schedule_animation_followup(state, event_loop, frame_start, true);
                 } else {
                     let mut next_wake: Option<Instant> = None;
 
@@ -3980,88 +4224,103 @@ impl ApplicationHandler for AppHandler {
         }
     }
 
-    /// Fires right before the event loop blocks for the next event. We use
-    /// it to implement speculative painting: while the window has been
-    /// "recently active" (any external event within the last
-    /// [`ACTIVITY_WINDOW`]), we ask winit to wake up at the pacer deadline
-    /// and queue a redraw so the next frame fires at vsync rhythm even
-    /// without a dirty flag. Once activity stops we fall back to the
-    /// control flow the paint handler last set (animation wake-up or
-    /// `Wait`), keeping idle CPU near zero.
+    /// Fires right before the event loop blocks for the next event. Two
+    /// jobs, both ending in either a queued redraw or a true sleep:
     ///
-    /// This is the Ghostty `DRAW_INTERVAL` pattern: during bursts of
-    /// PTY output or typing we paint at the pacer rate so that each chunk
-    /// lands on the next frame. The paint itself is cheap on clean state
-    /// because the renderer short-circuits via the line-quad cache.
+    /// Speculative repainting: while the window has been "recently
+    /// active" (any external event within the last [`ACTIVITY_WINDOW`])
+    /// and no animation is chaining its own frames, keep painting so a
+    /// PTY chunk or keystroke landing mid-frame reaches the screen on
+    /// the very next refresh — the Ghostty `DRAW_INTERVAL` pattern. In
+    /// [`PacingMode::VsyncBlocking`] (the default) the redraw is queued
+    /// unconditionally and the blocking swapchain acquire paces the
+    /// resulting paint loop at the refresh rate; in [`PacingMode::Timer`]
+    /// the pacer's speculative deadline schedules the wake instead.
+    ///
+    /// Wake hygiene: convert an expired `WaitUntil` into the redraw it
+    /// was armed for (this is how parked frames — a skipped animation
+    /// tick, a cursor-blink deadline — resume) and reset stray `Poll`s
+    /// so idle CPU returns to ~zero. Runs regardless of the activity
+    /// window because skipped animation frames park mid-interaction,
+    /// well inside it.
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         let Some(state) = self.app.state.as_mut() else {
             return;
         };
 
         let now = Instant::now();
-        if animations_active(state) {
-            if can_fast_paint_animations(state) {
+        if state.pacing_mode == PacingMode::Timer {
+            if animations_active(state) && !state.window.is_minimized().unwrap_or(false) {
+                // Pace the animation chain at the due-gate. Requesting
+                // the redraw while the gate is still closed would wake
+                // the OS wait immediately (a queued internal paint
+                // counts as input), so the redraw is only issued once
+                // the gate has opened.
                 let due = state.animation_next_frame.unwrap_or(now);
-                let wait = due.saturating_duration_since(now).min(SMOOTH_SCROLL_WAKE_INTERVAL);
-                if !wait.is_zero() {
-                    std::thread::sleep(wait);
-                }
-                let frame_start = Instant::now();
-                fast_paint_animation_frame(
-                    state,
-                    frame_start,
-                    self.app.config.decorations,
-                    self.app.config.on_scroll_telemetry.as_deref(),
-                    self.app.config.on_frame_metrics.as_deref(),
-                );
-                if animations_active(state) {
-                    state.animation_next_frame = Some(frame_start + SMOOTH_SCROLL_WAKE_INTERVAL);
-                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                if now < due {
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(due));
                 } else {
+                    state.window.request_redraw();
                     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
                 }
-            } else {
-                state.window.request_redraw();
-                let next_frame = now + SMOOTH_SCROLL_WAKE_INTERVAL;
-                state.animation_next_frame = Some(next_frame);
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                return;
             }
+
+            if state.is_recently_active(now) {
+                // Pick the earlier of (speculative pacer deadline, any
+                // wake the paint handler already set). Taking the min
+                // means a cursor-blink or transition wake-up that happens
+                // to fall before the speculative deadline still fires on
+                // time; the speculative deadline is what drives the paint
+                // rate during typing / PTY bursts.
+                let spec_deadline = state.frame_pacer.speculative_deadline(now);
+                let deadline = match event_loop.control_flow() {
+                    winit::event_loop::ControlFlow::WaitUntil(prev) if prev < spec_deadline => prev,
+                    _ => spec_deadline,
+                };
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+                if deadline <= now {
+                    state.window.request_redraw();
+                }
+                return;
+            }
+        } else if !animations_active(state)
+            && state.is_recently_active(now)
+            && !state.window.is_minimized().unwrap_or(false)
+        {
+            // VsyncBlocking speculative repaint (the Ghostty
+            // DRAW_INTERVAL pattern, re-anchored from a wall-clock timer
+            // to the display itself): while the window is recently
+            // active, keep one redraw queued so the loop paints every
+            // vblank — each paint's blocking acquire IS the pacing — and
+            // a PTY chunk or keystroke landing mid-frame reaches the
+            // screen on the very next refresh. Paints on clean state are
+            // cheap (the renderer short-circuits through its caches).
+            // Excluded while animations run: their painted frames chain
+            // their own redraws, and their *skipped* frames deliberately
+            // park on a WaitUntil that an unconditional redraw here would
+            // defeat, spinning the tick loop at CPU speed. Excluded while
+            // minimized: acquires fail instead of blocking, so this loop
+            // would also spin.
+            state.window.request_redraw();
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             return;
         }
 
-        if state.is_recently_active(now) {
-            // Pick the earlier of (speculative pacer deadline, any wake
-            // the paint handler already set for animations). Taking the
-            // min means a cursor-blink or transition wake-up that happens
-            // to fall before the speculative deadline still fires on
-            // time; the speculative deadline is what drives the paint
-            // rate during typing / PTY bursts.
-            let spec_deadline = state.frame_pacer.speculative_deadline(now);
-            let deadline = match event_loop.control_flow() {
-                winit::event_loop::ControlFlow::WaitUntil(prev) if prev < spec_deadline => prev,
-                _ => spec_deadline,
-            };
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
-            if deadline <= now {
+        // Wake hygiene (both modes). A
+        // stale `WaitUntil` (already in the past) would spin-wake winit
+        // on every iteration; convert it into the redraw it was armed
+        // for and a true sleep. Future-valued deadlines (cursor blink,
+        // CSS transitions, parked animation resumes) are left alone.
+        match event_loop.control_flow() {
+            winit::event_loop::ControlFlow::WaitUntil(deadline) if deadline <= now => {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
                 state.window.request_redraw();
             }
-        } else {
-            // Activity window has expired. If the current control flow is
-            // a stale speculative `WaitUntil` (already in the past), winit
-            // would spin-wake on every iteration; reset it so the loop
-            // truly sleeps. Preserve future-valued `WaitUntil` deadlines
-            // set by the paint handler for animations (cursor blink, CSS
-            // transitions, keyframes) by leaving them alone.
-            match event_loop.control_flow() {
-                winit::event_loop::ControlFlow::WaitUntil(deadline) if deadline <= now => {
-                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-                    state.window.request_redraw();
-                }
-                winit::event_loop::ControlFlow::Poll => {
-                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-                }
-                _ => {}
+            winit::event_loop::ControlFlow::Poll => {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             }
+            _ => {}
         }
     }
 }
@@ -5558,6 +5817,7 @@ mod tests {
             pacer_min_interval_ns: 6_944_444,
             present_interval_us: 8_333,
             display_period_ns: 8_333_333,
+            present_wait_us: 7_900,
         };
         assert_eq!(m.quad_count, 128);
         assert_eq!(m.glyph_count, 512);
@@ -5567,6 +5827,7 @@ mod tests {
         assert_eq!(m.pacer_min_interval_ns, 6_944_444);
         assert_eq!(m.present_interval_us, 8_333);
         assert_eq!(m.display_period_ns, 8_333_333);
+        assert_eq!(m.present_wait_us, 7_900);
     }
 
     #[test]
@@ -5574,6 +5835,73 @@ mod tests {
         let m = FrameMetrics::default();
         assert_eq!(m.present_interval_us, 0);
         assert_eq!(m.display_period_ns, 0);
+        assert_eq!(m.present_wait_us, 0);
+    }
+
+    #[test]
+    fn pacing_mode_follows_surface_vsync_pacing() {
+        assert_eq!(pacing_mode_for_surface(true), PacingMode::VsyncBlocking);
+        assert_eq!(pacing_mode_for_surface(false), PacingMode::Timer);
+    }
+
+    #[test]
+    fn predicted_present_ts_extrapolates_one_period_from_last_paint() {
+        let t0 = Instant::now();
+        let frame_start = t0 + Duration::from_millis(2);
+        assert_eq!(
+            predicted_present_ts(Some(t0), 8_333_333, frame_start),
+            t0 + Duration::from_nanos(8_333_333),
+        );
+    }
+
+    #[test]
+    fn predicted_present_ts_falls_back_to_frame_start_when_unknown() {
+        let t0 = Instant::now();
+        let frame_start = t0 + Duration::from_millis(2);
+        // No previous paint.
+        assert_eq!(predicted_present_ts(None, 8_333_333, frame_start), frame_start);
+        // Unknown display period.
+        assert_eq!(predicted_present_ts(Some(t0), 0, frame_start), frame_start);
+    }
+
+    #[test]
+    fn predicted_present_ts_never_moves_behind_frame_start() {
+        // After a missed vblank, last + period lands before this frame
+        // even started; the clamp keeps sampled timestamps monotone.
+        let t0 = Instant::now();
+        let frame_start = t0 + Duration::from_millis(20);
+        assert_eq!(predicted_present_ts(Some(t0), 8_333_333, frame_start), frame_start);
+    }
+
+    #[test]
+    fn predicted_present_ts_treats_idle_cadence_breaks_as_unknown() {
+        // A gap of ACTIVITY_WINDOW or more means the paint rhythm was
+        // intentionally idle (blink ticks); extrapolating from the stale
+        // completion would be meaningless.
+        let t0 = Instant::now();
+        let frame_start = t0 + ACTIVITY_WINDOW;
+        assert_eq!(predicted_present_ts(Some(t0), 8_333_333, frame_start), frame_start);
+    }
+
+    #[test]
+    fn skipped_frame_resume_is_strictly_future_across_consecutive_skips() {
+        // Regression for the skipped-frame busy-spin hazard: each skip
+        // anchors its resume to the skipping frame's own start, never a
+        // stale completion timestamp, so two consecutive skips schedule
+        // two strictly increasing wakes instead of collapsing into the
+        // past and spinning the loop through zero-timeout waits.
+        let t0 = Instant::now();
+        let first = skipped_frame_resume_at(t0, 8_333_333);
+        assert!(first > t0);
+        let second = skipped_frame_resume_at(first, 8_333_333);
+        assert!(second > first);
+        assert_eq!(second, first + Duration::from_nanos(8_333_333));
+    }
+
+    #[test]
+    fn skipped_frame_resume_falls_back_to_120hz_period_when_rate_unknown() {
+        let t0 = Instant::now();
+        assert_eq!(skipped_frame_resume_at(t0, 0), t0 + Duration::from_nanos(8_333_333));
     }
 
     #[test]

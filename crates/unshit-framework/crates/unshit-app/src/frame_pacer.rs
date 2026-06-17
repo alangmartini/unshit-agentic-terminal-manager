@@ -1,16 +1,22 @@
 //! Frame pacing utilities.
 //!
-//! Coalesces redraw requests so that the event loop paints at most once per
-//! `min_frame_interval`. The framework currently does not expose a vsync
-//! callback from winit, so we emulate it with a coalescing timer. When the
-//! framework learns about a real vsync hook we can swap in that signal
-//! without touching the call sites.
+//! The pacer no longer emulates vsync. On a vsync-paced surface (the
+//! Fifo-family present modes, the default since Phase 4 of
+//! `specs/scroll-smoothness-and-honest-fps.md`) the renderer's blocking
+//! swapchain acquire anchors the paint loop to the display clock, and this
+//! module survives only as the metrics floor: `min_interval` is reported as
+//! `FrameMetrics::pacer_min_interval_ns` and `record_paint` keeps the
+//! bookkeeping consumers expect. On surfaces without a blocking present
+//! mode (the Timer fallback) the pacer still coalesces redraw requests so
+//! the event loop paints at most once per `min_interval`, which is now the
+//! display's true period rather than a wall-clock interval that undercuts
+//! it.
 //!
 //! The design purposely keeps the decision logic pure so it can be tested
-//! deterministically with synthetic clocks. The frame loop owns a
-//! [`FramePacer`] and asks it before each paint whether it is OK to paint
-//! now; when the answer is "wait", the pacer returns the absolute wake time
-//! the caller should hand to winit's `ControlFlow::WaitUntil`.
+//! deterministically with synthetic clocks. In Timer mode the frame loop
+//! asks the pacer before each paint whether it is OK to paint now; when the
+//! answer is "wait", the pacer returns the absolute wake time the caller
+//! should hand to winit's `ControlFlow::WaitUntil`.
 //!
 //! This module never renders. It only schedules.
 
@@ -28,13 +34,14 @@ pub enum PaceDecision {
     WaitUntil(Instant),
 }
 
-/// Coalescing frame pacer. The interval is derived from the active
-/// monitor's refresh rate via [`Self::with_refresh_rate_mhz`]; the legacy
+/// Coalescing frame pacer. The interval is the active monitor's true
+/// refresh period, derived via [`Self::with_refresh_rate_mhz`]; the legacy
 /// 8ms default (matching Ghostty's default and close to Kitty's 10ms input
-/// batch interval) is kept as a fallback and as the slowest interactive
-/// cadence when the platform reports a low or bogus refresh rate. The
-/// interval is a ceiling on paint rate; actual paints may be rarer when
-/// there is nothing to redraw.
+/// batch interval) is kept only as the fallback when the platform cannot
+/// report a believable refresh rate. The interval is a ceiling on paint
+/// rate; actual paints may be rarer when there is nothing to redraw, and
+/// on vsync-paced surfaces the blocking acquire (not this pacer) is what
+/// enforces the cadence.
 pub struct FramePacer {
     /// Minimum interval between two consecutive paints.
     min_interval: Duration,
@@ -52,12 +59,16 @@ impl FramePacer {
     /// 8 milliseconds. See module documentation for the rationale. Used as
     /// the fallback when the active monitor does not report a refresh rate.
     pub const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(8);
-    pub const TIMER_COMPENSATED_120HZ_INTERVAL: Duration = Duration::from_millis(8);
 
     /// Floor on the interval derived from a refresh rate. Sub-millisecond
     /// periods (e.g. a hypothetical 1000Hz panel) would cause the event
     /// loop to wake so often that the pacer becomes useless; clamp to 1ms.
     pub const MIN_DERIVED_INTERVAL: Duration = Duration::from_millis(1);
+
+    /// Floor on believable refresh-rate reports. Anything below 10Hz is
+    /// driver garbage, not a panel; treat it like "rate unknown" instead
+    /// of pacing the app at seconds-long intervals.
+    const MIN_BELIEVABLE_MHZ: u32 = 10_000;
 
     /// Construct a pacer with the default coalescing interval (8ms).
     pub fn new() -> Self {
@@ -85,28 +96,23 @@ impl FramePacer {
         self.min_interval = Self::interval_from_mhz(mhz);
     }
 
-    /// Pure helper: `mhz -> Duration`. `mhz == 0` returns
+    /// Pure helper: `mhz -> Duration`, the display's true refresh period.
+    /// `mhz == 0` (rate unknown) and sub-10Hz garbage reports return
     /// [`Self::DEFAULT_MIN_INTERVAL`] so the pacer keeps working when the
-    /// compositor cannot enumerate the display's refresh rate. Results are
-    /// clamped to [`Self::MIN_DERIVED_INTERVAL`] on the fast end.
+    /// compositor cannot enumerate a believable rate. Results are clamped
+    /// to [`Self::MIN_DERIVED_INTERVAL`] on the fast end. The interval is
+    /// never shortened below the true period (no "timer compensation"):
+    /// a producer that undercuts the display period beats against the
+    /// scanout and drops or doubles frames, the exact defect Phase 4 of
+    /// the scroll-smoothness spec removed.
     pub fn interval_from_mhz(mhz: u32) -> Duration {
-        if mhz == 0 {
+        if mhz < Self::MIN_BELIEVABLE_MHZ {
             return Self::DEFAULT_MIN_INTERVAL;
         }
         // mhz is frames per 1000 seconds. interval_ns = 1e12 / mhz.
         // Use u64 for the division: 1e12 does not fit in u32 for low rates.
         let interval_ns = 1_000_000_000_000u64 / (mhz as u64);
-        let interval = Duration::from_nanos(interval_ns);
-        if mhz == 120_000 && interval > Self::TIMER_COMPENSATED_120HZ_INTERVAL {
-            return Self::TIMER_COMPENSATED_120HZ_INTERVAL;
-        }
-        if interval > Self::DEFAULT_MIN_INTERVAL {
-            Self::DEFAULT_MIN_INTERVAL
-        } else if interval < Self::MIN_DERIVED_INTERVAL {
-            Self::MIN_DERIVED_INTERVAL
-        } else {
-            interval
-        }
+        Duration::from_nanos(interval_ns).max(Self::MIN_DERIVED_INTERVAL)
     }
 
     /// Minimum interval between two paints. Exposed for diagnostics.
@@ -341,12 +347,13 @@ mod tests {
     // === Refresh-rate derived interval (capillary #82) ===
 
     #[test]
-    fn with_refresh_rate_mhz_120000_uses_timer_compensated_8ms() {
-        // 120000 mHz == 120 Hz. The raw period is 8_333_333ns, but Windows
-        // WaitUntil wakeups arrive late enough that the legacy 8ms interval
-        // sustains the intended 120fps cadence more reliably.
+    fn with_refresh_rate_mhz_120000_gives_true_8333us_period() {
+        // 120000 mHz == 120 Hz. The "timer compensated" 8ms clamp is gone:
+        // an 8ms producer against an 8.333ms scanout drifts one frame
+        // every ~25, the beat Phase 4 of the scroll-smoothness spec
+        // measured and removed. The pacer now reports the true period.
         let pacer = FramePacer::with_refresh_rate_mhz(120_000);
-        assert_eq!(pacer.min_interval(), Duration::from_millis(8));
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(8_333_333));
     }
 
     #[test]
@@ -380,11 +387,27 @@ mod tests {
     }
 
     #[test]
-    fn with_refresh_rate_mhz_low_reports_do_not_slow_interactive_pacing() {
+    fn with_refresh_rate_mhz_low_rates_pace_at_their_true_period() {
+        // Pacing faster than a slow panel's period would only produce
+        // frames the display can never show (the spec's "never undercut
+        // the display period" boundary), so 24Hz and 60Hz panels get
+        // their real periods rather than the old 8ms clamp.
         let pacer = FramePacer::with_refresh_rate_mhz(24_000);
-        assert_eq!(pacer.min_interval(), FramePacer::DEFAULT_MIN_INTERVAL);
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(41_666_666));
 
         let pacer = FramePacer::with_refresh_rate_mhz(60_000);
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(16_666_666));
+    }
+
+    #[test]
+    fn with_refresh_rate_mhz_sub_10hz_garbage_falls_back_to_default() {
+        // Sub-10Hz reports are driver garbage, not panels. Treat them
+        // like "rate unknown" so the pacer never schedules seconds-long
+        // intervals.
+        let pacer = FramePacer::with_refresh_rate_mhz(9_999);
+        assert_eq!(pacer.min_interval(), FramePacer::DEFAULT_MIN_INTERVAL);
+
+        let pacer = FramePacer::with_refresh_rate_mhz(1);
         assert_eq!(pacer.min_interval(), FramePacer::DEFAULT_MIN_INTERVAL);
     }
 
@@ -401,7 +424,7 @@ mod tests {
     #[test]
     fn set_refresh_rate_mhz_updates_existing_pacer() {
         let mut pacer = FramePacer::with_refresh_rate_mhz(120_000);
-        assert_eq!(pacer.min_interval(), Duration::from_millis(8));
+        assert_eq!(pacer.min_interval(), Duration::from_nanos(8_333_333));
         pacer.set_refresh_rate_mhz(144_000);
         assert_eq!(pacer.min_interval(), Duration::from_nanos(6_944_444));
     }
@@ -445,9 +468,9 @@ mod tests {
         let t0 = Instant::now();
         pacer.record_paint(t0);
 
-        // Before the rate change: speculative deadline is t0 + the
-        // timer-compensated 120Hz interval.
-        let expected_120 = t0 + Duration::from_millis(8);
+        // Before the rate change: speculative deadline is t0 + the true
+        // 120Hz period.
+        let expected_120 = t0 + Duration::from_nanos(8_333_333);
         assert_eq!(pacer.speculative_deadline(t0), expected_120);
 
         // Simulate moving to a 240Hz panel.

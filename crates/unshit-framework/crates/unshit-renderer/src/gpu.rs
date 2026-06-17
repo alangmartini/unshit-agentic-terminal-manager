@@ -114,13 +114,110 @@ fn surface_config_usages(surface_usages: wgpu::TextureUsages) -> wgpu::TextureUs
     usages
 }
 
+/// Pick the present mode for the window swapchain. Fifo wins whenever the
+/// surface offers it: the blocking acquire it produces is the vblank anchor
+/// that paces the frame loop at exactly one paint per display refresh
+/// (Phase 4 of `specs/scroll-smoothness-and-honest-fps.md`; the previous
+/// Mailbox/Immediate preference ran an unsynced ~125Hz producer against a
+/// 120Hz scanout, dropping or doubling a frame every ~25 frames). Vulkan
+/// guarantees Fifo, so the legacy order below only matters for exotic
+/// surfaces; on those the app falls back to true-period timer pacing.
+/// `FifoRelaxed` is deliberately not preferred: it tears on late frames,
+/// which is exactly the artifact vblank anchoring exists to remove.
 fn choose_present_mode(present_modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
-    if present_modes.contains(&wgpu::PresentMode::Mailbox) {
+    if present_modes.contains(&wgpu::PresentMode::Fifo) {
+        wgpu::PresentMode::Fifo
+    } else if present_modes.contains(&wgpu::PresentMode::Mailbox) {
         wgpu::PresentMode::Mailbox
     } else if present_modes.contains(&wgpu::PresentMode::Immediate) {
         wgpu::PresentMode::Immediate
     } else {
         wgpu::PresentMode::AutoNoVsync
+    }
+}
+
+/// True when `mode` paces the producer from the display clock: under these
+/// modes `get_current_texture` (or present) blocks on vblank, so a saturated
+/// paint loop runs at exactly the refresh rate. The app reads this once
+/// after GPU init (via [`GpuContext::is_vsync_paced`]) to choose between
+/// vblank-blocking and timer pacing; the mode cannot change at runtime
+/// because every reconfigure reuses the stored config.
+fn present_mode_is_vsync_paced(mode: wgpu::PresentMode) -> bool {
+    matches!(
+        mode,
+        wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed | wgpu::PresentMode::AutoVsync
+    )
+}
+
+/// Default swapchain frame latency. 1 maps to a two-image swapchain on
+/// Vulkan (`min_image_count = latency + 1`), the smallest queue the API
+/// allows: each present blocks the next acquire until vblank, bounding
+/// input-to-photon at two display periods plus work time (gate H8). The
+/// driver may silently clamp the effective depth upward and wgpu's public
+/// API does not expose the clamped value, so only the requested value is
+/// logged; a driver floor shows up in external latency measurement
+/// (PresentMon) instead.
+const DEFAULT_MAXIMUM_FRAME_LATENCY: u32 = 1;
+
+/// Env var overriding `desired_maximum_frame_latency` for latency A/B
+/// measurement without a rebuild.
+const FRAME_LATENCY_ENV: &str = "UNSHIT_FRAME_LATENCY";
+
+/// Parse an [`FRAME_LATENCY_ENV`] override. Only 1 and 2 are accepted (the
+/// spec's "ask first beyond 1-2" boundary); anything else is rejected so
+/// the caller can warn and fall back to [`DEFAULT_MAXIMUM_FRAME_LATENCY`].
+fn parse_frame_latency_override(value: &str) -> Option<u32> {
+    match value.trim() {
+        "1" => Some(1),
+        "2" => Some(2),
+        _ => None,
+    }
+}
+
+fn desired_maximum_frame_latency() -> u32 {
+    match std::env::var(FRAME_LATENCY_ENV) {
+        Ok(value) => parse_frame_latency_override(&value).unwrap_or_else(|| {
+            log::warn!(
+                "ignoring {FRAME_LATENCY_ENV}={value}; expected 1 or 2, \
+                 using {DEFAULT_MAXIMUM_FRAME_LATENCY}"
+            );
+            DEFAULT_MAXIMUM_FRAME_LATENCY
+        }),
+        Err(_) => DEFAULT_MAXIMUM_FRAME_LATENCY,
+    }
+}
+
+/// What `render` does about a failed swapchain acquire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquireRecovery {
+    /// Reconfigure the surface from the stored config, then drop the frame.
+    Reconfigure,
+    /// Drop the frame without touching the surface.
+    DropFrame,
+}
+
+/// Pure recovery policy for `get_current_texture` errors, split out so the
+/// decision table is unit-testable without a device. `Lost` always
+/// reconfigures (the swapchain is gone; nothing milder recovers it).
+/// `Outdated` reconfigures at most once per episode
+/// (`outdated_recovery_spent` is cleared by the next successful acquire)
+/// and never while minimized: a minimized Vulkan window can return
+/// `Outdated` on every acquire with no Fifo throttle, and reconfiguring
+/// with the stale nonzero extent against a (0,0)-caps surface reaches the
+/// driver unvalidated, so an unguarded arm is a reconfigure storm at best
+/// and an uncaptured device error at worst. `Timeout` and `Other` drop the
+/// frame and leave the surface alone.
+fn acquire_recovery(
+    error: &wgpu::SurfaceError,
+    minimized: bool,
+    outdated_recovery_spent: bool,
+) -> AcquireRecovery {
+    match error {
+        wgpu::SurfaceError::Lost => AcquireRecovery::Reconfigure,
+        wgpu::SurfaceError::Outdated if !minimized && !outdated_recovery_spent => {
+            AcquireRecovery::Reconfigure
+        }
+        _ => AcquireRecovery::DropFrame,
     }
 }
 
@@ -174,8 +271,20 @@ fn probe_backdrop_filter_support(
 
 /// Determines whether we render to a window surface or an offscreen texture.
 pub enum RenderTarget {
-    Window { surface: wgpu::Surface<'static>, config: wgpu::SurfaceConfiguration },
-    Headless { texture: wgpu::Texture, width: u32, height: u32 },
+    Window {
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+        /// Kept for the `Outdated` acquire-recovery guard: reconfiguring
+        /// while minimized would hand the driver a stale extent (see
+        /// `acquire_recovery`). The surface already keeps the window
+        /// alive; this clone only adds queryability.
+        window: Arc<dyn winit::window::Window>,
+    },
+    Headless {
+        texture: wgpu::Texture,
+        width: u32,
+        height: u32,
+    },
 }
 
 pub struct GpuContext {
@@ -229,6 +338,24 @@ pub struct GpuContext {
     backdrop_text_pipeline: Option<TextPipeline>,
     backdrop_image_pipeline: Option<ImagePipeline>,
     backdrop_svg_pipeline: Option<SvgPipeline>,
+
+    /// CPU time the last `render()` spent blocked inside
+    /// `Surface::get_current_texture`. Under Fifo this is the vblank wait
+    /// (up to one display period); the app subtracts it from work-time
+    /// metrics so present pacing does not masquerade as render cost.
+    /// Reset to zero at every `render()` entry so dropped frames never
+    /// report a stale wait.
+    last_acquire_wait: std::time::Duration,
+    /// True once an `Outdated` acquire error already triggered a
+    /// reconfigure in the current episode; cleared by the next successful
+    /// acquire (and by `resize`, which reconfigures anyway). Bounds
+    /// `Outdated` recovery to one reconfigure per episode (see
+    /// `acquire_recovery`).
+    outdated_recovery_spent: bool,
+    /// Dedup flag for the acquire-timeout warning. wgpu-core's acquire
+    /// timeout is 1s, so a timeout storm is slow but should still not
+    /// flood the log.
+    acquire_timeout_warned: bool,
 
     /// Pooled instance buffers holding this frame's data. Acquired
     /// during `prepare`, referenced during the render pass, and
@@ -312,10 +439,16 @@ impl GpuContext {
             .unwrap_or(surface_caps.formats[0]);
 
         let present_mode = choose_present_mode(&surface_caps.present_modes);
+        // wgpu silently clamps the requested latency to the driver's
+        // swapchain image-count range and never exposes the clamped value,
+        // so only the requested value can be logged; a driver floor is
+        // detected by the external latency A/B (PresentMon), not here.
+        let maximum_frame_latency = desired_maximum_frame_latency();
         log::info!(
-            "surface present modes: {:?}; selected {:?}",
+            "surface present modes: {:?}; selected {:?}; requested maximum frame latency {}",
             surface_caps.present_modes,
-            present_mode
+            present_mode,
+            maximum_frame_latency,
         );
 
         let alpha_mode = surface_caps
@@ -333,7 +466,7 @@ impl GpuContext {
             present_mode,
             alpha_mode,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: maximum_frame_latency,
         };
         surface.configure(&device, &surface_config);
 
@@ -379,7 +512,7 @@ impl GpuContext {
         Self {
             device,
             queue,
-            target: RenderTarget::Window { surface, config: surface_config },
+            target: RenderTarget::Window { surface, config: surface_config, window },
             quad_pipeline,
             text_pipeline,
             image_pipeline,
@@ -402,6 +535,9 @@ impl GpuContext {
             backdrop_text_pipeline: None,
             backdrop_image_pipeline: None,
             backdrop_svg_pipeline: None,
+            last_acquire_wait: std::time::Duration::ZERO,
+            outdated_recovery_spent: false,
+            acquire_timeout_warned: false,
             current_quad_instance_buffer: None,
             current_glyph_instance_buffer: None,
             current_image_instance_buffers: Vec::new(),
@@ -666,6 +802,9 @@ impl GpuContext {
             backdrop_text_pipeline: None,
             backdrop_image_pipeline: None,
             backdrop_svg_pipeline: None,
+            last_acquire_wait: std::time::Duration::ZERO,
+            outdated_recovery_spent: false,
+            acquire_timeout_warned: false,
             current_quad_instance_buffer: None,
             current_glyph_instance_buffer: None,
             current_image_instance_buffers: Vec::new(),
@@ -716,10 +855,13 @@ impl GpuContext {
         }
 
         match &mut self.target {
-            RenderTarget::Window { surface, config } => {
+            RenderTarget::Window { surface, config, .. } => {
                 config.width = w;
                 config.height = h;
                 surface.configure(&self.device, config);
+                // An explicit reconfigure starts a fresh `Outdated`
+                // recovery episode (see `acquire_recovery`).
+                self.outdated_recovery_spent = false;
             }
             RenderTarget::Headless { texture, width, height } => {
                 let format = texture.format();
@@ -768,6 +910,35 @@ impl GpuContext {
             RenderTarget::Window { config, .. } => (config.width as f32, config.height as f32),
             RenderTarget::Headless { width, height, .. } => (*width as f32, *height as f32),
         }
+    }
+
+    /// The present mode the window surface was configured with. Headless
+    /// targets have no swapchain and report `Immediate` as a non-vsync
+    /// sentinel, so [`Self::is_vsync_paced`] is false for them.
+    pub fn present_mode(&self) -> wgpu::PresentMode {
+        match &self.target {
+            RenderTarget::Window { config, .. } => config.present_mode,
+            RenderTarget::Headless { .. } => wgpu::PresentMode::Immediate,
+        }
+    }
+
+    /// Whether presentation paces the frame loop from the display clock:
+    /// on a vsync-paced surface `render()` blocks in the swapchain
+    /// acquire such that a saturated paint loop runs at the refresh rate.
+    /// The app reads this once after GPU init to select its pacing mode;
+    /// a one-shot read is sound because reconfigures reuse the stored
+    /// config, so the mode never changes at runtime.
+    pub fn is_vsync_paced(&self) -> bool {
+        present_mode_is_vsync_paced(self.present_mode())
+    }
+
+    /// CPU time the last `render()` spent blocked acquiring the swapchain
+    /// image (up to one display period under Fifo). Zero for headless
+    /// renders and for frames that returned before the acquire. Callers
+    /// subtract this from work-time metrics so the vblank wait does not
+    /// masquerade as render cost.
+    pub fn last_acquire_wait(&self) -> std::time::Duration {
+        self.last_acquire_wait
     }
 
     /// Rebuild text atlas bind groups so pipelines sample from the current
@@ -941,6 +1112,10 @@ impl GpuContext {
     }
 
     pub fn render(&mut self) {
+        // Reset before any early return: error paths still reach the
+        // app's frame-metrics epilogue, and a stale wait value from a
+        // previous frame would be double-subtracted there.
+        self.last_acquire_wait = std::time::Duration::ZERO;
         let (vw, vh) = self.window_size();
 
         if trace_text_draw_ranges() {
@@ -1006,15 +1181,41 @@ impl GpuContext {
         let image_layer_plan = self.upload_image_instance_buffers();
 
         let (surface_view, surface_output) = match &self.target {
-            RenderTarget::Window { surface, config } => {
-                let output = match surface.get_current_texture() {
-                    Ok(t) => t,
-                    Err(wgpu::SurfaceError::Lost) => {
-                        surface.configure(&self.device, config);
-                        return;
+            RenderTarget::Window { surface, config, window } => {
+                // Under Fifo this call blocks (inside an OS/driver wait
+                // primitive) until the previously presented image is
+                // released at vblank; the measured wait is exposed via
+                // `last_acquire_wait` so the app can keep work-time
+                // metrics honest.
+                let acquire_started = std::time::Instant::now();
+                let acquired = surface.get_current_texture();
+                self.last_acquire_wait = acquire_started.elapsed();
+                let output = match acquired {
+                    Ok(t) => {
+                        self.outdated_recovery_spent = false;
+                        t
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => panic!("GPU out of memory"),
-                    Err(_) => return,
+                    Err(err) => {
+                        if err == wgpu::SurfaceError::Timeout && !self.acquire_timeout_warned {
+                            self.acquire_timeout_warned = true;
+                            log::warn!(
+                                "swapchain acquire timed out; dropping frame \
+                                 (further timeouts not logged)"
+                            );
+                        }
+                        let minimized = window.is_minimized().unwrap_or(false);
+                        match acquire_recovery(&err, minimized, self.outdated_recovery_spent) {
+                            AcquireRecovery::Reconfigure => {
+                                if err == wgpu::SurfaceError::Outdated {
+                                    self.outdated_recovery_spent = true;
+                                }
+                                surface.configure(&self.device, config);
+                            }
+                            AcquireRecovery::DropFrame => {}
+                        }
+                        return;
+                    }
                 };
                 let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
                 (view, Some(output))
@@ -2120,21 +2321,136 @@ mod tests {
         assert!(!probe_backdrop_filter_support_inner(BACKDROP_FORMAT_USAGES, configured_target));
     }
 
+    /// Phase 4 of `specs/scroll-smoothness-and-honest-fps.md`: Fifo wins
+    /// whenever the surface offers it, regardless of what else is
+    /// available. The predecessors of this test
+    /// (`choose_present_mode_prefers_mailbox_when_available`,
+    /// `choose_present_mode_avoids_hard_fifo_fallback`) enshrined the
+    /// unsynced-producer bug the spec exists to fix.
     #[test]
-    fn choose_present_mode_prefers_mailbox_when_available() {
+    fn choose_present_mode_prefers_fifo() {
         let modes = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
-        assert_eq!(choose_present_mode(&modes), wgpu::PresentMode::Mailbox);
+        assert_eq!(choose_present_mode(&modes), wgpu::PresentMode::Fifo);
+        let fifo_only = [wgpu::PresentMode::Fifo];
+        assert_eq!(choose_present_mode(&fifo_only), wgpu::PresentMode::Fifo);
+        // The exact capability set Phase 0 measured on the AMD 890M
+        // Vulkan surface; FifoRelaxed must not displace Fifo (it tears
+        // on late frames).
+        let amd_890m =
+            [wgpu::PresentMode::Immediate, wgpu::PresentMode::Fifo, wgpu::PresentMode::FifoRelaxed];
+        assert_eq!(choose_present_mode(&amd_890m), wgpu::PresentMode::Fifo);
+    }
+
+    /// Without Fifo (exotic surfaces only) the legacy preference order
+    /// survives; the app then paces with true-period timers instead of
+    /// the blocking acquire.
+    #[test]
+    fn choose_present_mode_falls_back_to_legacy_order_without_fifo() {
+        let both = [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate];
+        assert_eq!(choose_present_mode(&both), wgpu::PresentMode::Mailbox);
+        let immediate_only = [wgpu::PresentMode::Immediate];
+        assert_eq!(choose_present_mode(&immediate_only), wgpu::PresentMode::Immediate);
     }
 
     #[test]
-    fn choose_present_mode_uses_immediate_before_fifo() {
-        let modes = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Immediate];
-        assert_eq!(choose_present_mode(&modes), wgpu::PresentMode::Immediate);
+    fn choose_present_mode_empty_caps_uses_auto_no_vsync() {
+        assert_eq!(choose_present_mode(&[]), wgpu::PresentMode::AutoNoVsync);
+    }
+
+    /// The classifier the app uses to pick its pacing mode: exactly the
+    /// modes whose acquire/present blocks on vblank count as vsync paced.
+    #[test]
+    fn vsync_paced_classification_matches_blocking_modes() {
+        for mode in
+            [wgpu::PresentMode::Fifo, wgpu::PresentMode::FifoRelaxed, wgpu::PresentMode::AutoVsync]
+        {
+            assert!(present_mode_is_vsync_paced(mode), "{mode:?} blocks on vblank");
+        }
+        for mode in [
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::Immediate,
+            wgpu::PresentMode::AutoNoVsync,
+        ] {
+            assert!(!present_mode_is_vsync_paced(mode), "{mode:?} never blocks on vblank");
+        }
     }
 
     #[test]
-    fn choose_present_mode_avoids_hard_fifo_fallback() {
-        let modes = [wgpu::PresentMode::Fifo];
-        assert_eq!(choose_present_mode(&modes), wgpu::PresentMode::AutoNoVsync);
+    fn parse_frame_latency_override_accepts_one_and_two() {
+        assert_eq!(parse_frame_latency_override("1"), Some(1));
+        assert_eq!(parse_frame_latency_override("2"), Some(2));
+        assert_eq!(parse_frame_latency_override(" 2 "), Some(2));
+    }
+
+    /// Anything outside the spec's 1-2 boundary is rejected so the caller
+    /// warns and uses the default instead of handing the driver a
+    /// surprising queue depth.
+    #[test]
+    fn parse_frame_latency_override_rejects_everything_else() {
+        for value in ["0", "3", "-1", "1.5", "", "two", "12"] {
+            assert_eq!(parse_frame_latency_override(value), None, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn default_maximum_frame_latency_is_one() {
+        assert_eq!(DEFAULT_MAXIMUM_FRAME_LATENCY, 1);
+    }
+
+    /// `Lost` means the swapchain is gone; reconfiguring is the only
+    /// recovery, independent of window state or episode bookkeeping.
+    #[test]
+    fn acquire_recovery_lost_always_reconfigures() {
+        for minimized in [false, true] {
+            for spent in [false, true] {
+                assert_eq!(
+                    acquire_recovery(&wgpu::SurfaceError::Lost, minimized, spent),
+                    AcquireRecovery::Reconfigure,
+                );
+            }
+        }
+    }
+
+    /// `Outdated` recovery is bounded to one reconfigure per episode: the
+    /// first error reconfigures, repeats drop frames until an acquire
+    /// succeeds (which clears the episode flag).
+    #[test]
+    fn acquire_recovery_outdated_reconfigures_once_while_visible() {
+        assert_eq!(
+            acquire_recovery(&wgpu::SurfaceError::Outdated, false, false),
+            AcquireRecovery::Reconfigure,
+        );
+        assert_eq!(
+            acquire_recovery(&wgpu::SurfaceError::Outdated, false, true),
+            AcquireRecovery::DropFrame,
+        );
+    }
+
+    /// A minimized Vulkan window can return `Outdated` on every acquire;
+    /// reconfiguring there is a reconfigure storm and a panic vector
+    /// (stale nonzero extent against (0,0) surface caps reaches the
+    /// driver unvalidated), so the frame is dropped instead.
+    #[test]
+    fn acquire_recovery_outdated_never_reconfigures_while_minimized() {
+        assert_eq!(
+            acquire_recovery(&wgpu::SurfaceError::Outdated, true, false),
+            AcquireRecovery::DropFrame,
+        );
+        assert_eq!(
+            acquire_recovery(&wgpu::SurfaceError::Outdated, true, true),
+            AcquireRecovery::DropFrame,
+        );
+    }
+
+    #[test]
+    fn acquire_recovery_timeout_and_other_drop_the_frame() {
+        assert_eq!(
+            acquire_recovery(&wgpu::SurfaceError::Timeout, false, false),
+            AcquireRecovery::DropFrame,
+        );
+        assert_eq!(
+            acquire_recovery(&wgpu::SurfaceError::Other, false, false),
+            AcquireRecovery::DropFrame,
+        );
     }
 }
