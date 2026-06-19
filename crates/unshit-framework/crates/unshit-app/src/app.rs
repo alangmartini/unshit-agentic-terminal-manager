@@ -3779,6 +3779,24 @@ impl ApplicationHandler for AppHandler {
                         state.interaction.focused = NodeId::DANGLING;
                     }
 
+                    // Honor an autofocus request recorded while building a
+                    // freshly mounted node (e.g. a dialog input). Building
+                    // runs only for new nodes, so this fires once when the
+                    // element first appears and never on the reconcile-only
+                    // rebuilds that typing into the input triggers, so it
+                    // cannot yank focus back after the user tabs away.
+                    if let Some(focus_id) = state.arena.pending_autofocus.take() {
+                        if state.arena.get(focus_id).is_some()
+                            && state.interaction.focused != focus_id
+                        {
+                            let old_focused = state.interaction.focused;
+                            state.interaction.focused = focus_id;
+                            state.interaction.focus_via_keyboard = false;
+                            update_focus_context(state);
+                            state.mark_restyle_pseudo_change(old_focused, focus_id);
+                        }
+                    }
+
                     let style_work = subtree_has_dirty_flags(
                         &state.arena,
                         state.root,

@@ -550,6 +550,15 @@ pub struct ElementDef {
     pub node_ref: Option<NodeRef>,
     /// Inline style overrides applied after the CSS cascade.
     pub style_overrides: SmallVec<[StyleDeclaration; 2]>,
+    /// Initial text seeded into an input's buffer the first time the node
+    /// is mounted. Applied only on build (like scroll state); reconciling
+    /// onto an existing node never overwrites the live buffer, so the
+    /// user's edits survive re-renders.
+    pub value: Option<String>,
+    /// When true, the framework focuses this element the first time it is
+    /// mounted. Honored once per mount; later reconciliations onto an
+    /// existing node do not re-steal focus.
+    pub autofocus: bool,
 }
 
 impl ElementDef {
@@ -587,6 +596,8 @@ impl ElementDef {
             on_unmount: None,
             node_ref: None,
             style_overrides: SmallVec::new(),
+            value: None,
+            autofocus: false,
         }
     }
 
@@ -712,6 +723,21 @@ impl ElementDef {
 
     pub fn with_placeholder(mut self, text: impl Into<String>) -> Self {
         self.placeholder = Some(text.into());
+        self
+    }
+
+    /// Seed the initial text of an input. Applied once when the node is
+    /// first mounted; later reconciliations preserve the live buffer so a
+    /// user's edits are never clobbered by a re-render.
+    pub fn with_value(mut self, value: impl Into<String>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+
+    /// Focus this element the first time it mounts — e.g. an input in a
+    /// dialog that should be ready to type into immediately.
+    pub fn with_autofocus(mut self, enabled: bool) -> Self {
+        self.autofocus = enabled;
         self
     }
 
@@ -1033,6 +1059,10 @@ impl<'a> ElementDefBump<'a> {
             on_unmount: self.on_unmount.clone(),
             node_ref: self.node_ref.clone(),
             style_overrides: self.style_overrides.iter().cloned().collect(),
+            // The bump def carries no value/autofocus, so default them. The
+            // bump path is not used for inputs that need seeding/autofocus.
+            value: None,
+            autofocus: false,
         }
     }
 }

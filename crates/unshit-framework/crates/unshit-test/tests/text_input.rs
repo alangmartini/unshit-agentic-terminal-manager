@@ -147,6 +147,35 @@ fn on_submit_fires() {
 }
 
 #[test]
+fn seeds_initial_value_and_autofocuses() {
+    let mut h = TestHarness::new(
+        CSS,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div).with_class("root").with_child(
+                ElementDef::new(Tag::Input)
+                    .with_class("my-input")
+                    .with_value("session-1")
+                    .with_autofocus(true),
+            ),
+        },
+        800.0,
+        600.0,
+    );
+    h.step();
+
+    // The buffer is seeded with the current name, cursor at the end, ready
+    // to type into immediately without a click.
+    let input = h.query(".my-input").unwrap();
+    assert_eq!(input.input_value.as_deref(), Some("session-1"));
+    assert_eq!(h.focused(), input.node_id);
+
+    // Typing appends at the seeded cursor position (end of the value).
+    h.type_text("!");
+    h.step();
+    assert_eq!(h.input_value(), Some("session-1!".to_string()));
+}
+
+#[test]
 fn placeholder_in_snapshot() {
     let mut h = TestHarness::new(CSS, make_tree, 800.0, 600.0);
     h.step();
