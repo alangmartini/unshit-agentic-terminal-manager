@@ -141,7 +141,7 @@ const FULL_INSTANCE_ATTRS: [wgpu::VertexAttribute; 28] = wgpu::vertex_attr_array
 /// stride is still `sizeof(QuadInstance)` so the same instance buffer feeds
 /// both pipelines. Locations match `FULL_INSTANCE_ATTRS` so the same offsets
 /// apply.
-const SOFTWARE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
+const SOFTWARE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 13] = wgpu::vertex_attr_array![
     0 => Float32x2,  // pos
     1 => Float32x2,  // size
     2 => Float32x4,  // color
@@ -149,6 +149,10 @@ const SOFTWARE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_ar
     4 => Float32x4,  // border_width
     5 => Float32x4,  // border_radius
     6 => Float32x4,  // clip_rect
+    7 => Float32x4,  // shadow_color
+    8 => Float32x2,  // shadow_offset
+    9 => Float32x2,  // shadow_params
+    10 => Float32x2, // shadow_spread
     26 => Float32x4, // xform
     27 => Float32x2, // xform_translate
 ];
