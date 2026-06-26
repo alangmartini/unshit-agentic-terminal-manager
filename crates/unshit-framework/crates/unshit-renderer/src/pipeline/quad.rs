@@ -180,7 +180,10 @@ impl QuadPipeline {
         software: bool,
     ) -> Self {
         let (shader_source, shader_label) = if software {
-            (wgpu::ShaderSource::Wgsl(include_str!("../shaders/quad_software.wgsl").into()), "quad software shader")
+            (
+                wgpu::ShaderSource::Wgsl(include_str!("../shaders/quad_software.wgsl").into()),
+                "quad software shader",
+            )
         } else {
             (wgpu::ShaderSource::Wgsl(include_str!("../shaders/quad.wgsl").into()), "quad shader")
         };
@@ -225,11 +228,8 @@ impl QuadPipeline {
             push_constant_ranges: &[],
         });
 
-        let instance_attrs: &[wgpu::VertexAttribute] = if software {
-            &SOFTWARE_INSTANCE_ATTRS
-        } else {
-            &FULL_INSTANCE_ATTRS
-        };
+        let instance_attrs: &[wgpu::VertexAttribute] =
+            if software { &SOFTWARE_INSTANCE_ATTRS } else { &FULL_INSTANCE_ATTRS };
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("quad pipeline"),

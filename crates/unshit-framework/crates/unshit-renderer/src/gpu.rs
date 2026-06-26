@@ -120,14 +120,8 @@ fn classify_adapter(info: &wgpu::AdapterInfo, requested_fallback: bool) -> Adapt
         return AdapterTier::Software;
     }
     let name = info.name.to_ascii_lowercase();
-    const MARKERS: &[&str] = &[
-        "llvmpipe",
-        "lavapipe",
-        "swiftshader",
-        "microsoft basic render",
-        "warp",
-        "software",
-    ];
+    const MARKERS: &[&str] =
+        &["llvmpipe", "lavapipe", "swiftshader", "microsoft basic render", "warp", "software"];
     if MARKERS.iter().any(|marker| name.contains(marker)) {
         return AdapterTier::Software;
     }
@@ -497,14 +491,13 @@ impl GpuContext {
                 ..Default::default()
             });
             if let Ok(surface) = instance.create_surface(window.clone()) {
-                if let Some((adapter, device, queue, tier)) =
-                    Self::request_window_adapter_device(
-                        &instance,
-                        &surface,
-                        wgpu::PowerPreference::HighPerformance,
-                        false,
-                    )
-                    .await
+                if let Some((adapter, device, queue, tier)) = Self::request_window_adapter_device(
+                    &instance,
+                    &surface,
+                    wgpu::PowerPreference::HighPerformance,
+                    false,
+                )
+                .await
                 {
                     log::info!(
                         "renderer adapter selected (hardware path): {:?}",
@@ -523,20 +516,19 @@ impl GpuContext {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
-        let surface = instance.create_surface(window.clone()).unwrap_or_else(|e| {
-            panic!("failed to create a render surface for the window: {e:?}")
-        });
+        let surface = instance
+            .create_surface(window.clone())
+            .unwrap_or_else(|e| panic!("failed to create a render surface for the window: {e:?}"));
 
         // Step 2 — a real GPU on a backend the preferred set excluded.
         if pref != RenderTierPref::SoftwareOnly {
-            if let Some((adapter, device, queue, tier)) =
-                Self::request_window_adapter_device(
-                    &instance,
-                    &surface,
-                    wgpu::PowerPreference::HighPerformance,
-                    false,
-                )
-                .await
+            if let Some((adapter, device, queue, tier)) = Self::request_window_adapter_device(
+                &instance,
+                &surface,
+                wgpu::PowerPreference::HighPerformance,
+                false,
+            )
+            .await
             {
                 log::info!(
                     "renderer adapter selected (broadened backends): {:?}",
