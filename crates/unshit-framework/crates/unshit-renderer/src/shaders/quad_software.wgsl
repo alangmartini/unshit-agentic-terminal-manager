@@ -58,6 +58,20 @@ struct VertexOutput {
     @location(11) pixel_pos: vec2<f32>,
 };
 
+fn positive_spread(raw_spread: f32) -> f32 {
+    return max(raw_spread, 0.0);
+}
+
+fn shadow_sigma(raw_blur: f32) -> f32 {
+    return max(raw_blur, 0.5);
+}
+
+fn expand_from_shadow(raw_blur: f32, raw_spread: f32, is_inset: bool) -> f32 {
+    let spread = positive_spread(raw_spread);
+    let spread_expand = select(spread, 0.0, is_inset);
+    return raw_blur * 3.0 + spread_expand;
+}
+
 @vertex
 fn vs_main(
     @builtin(vertex_index) vertex_index: u32,
@@ -73,10 +87,9 @@ fn vs_main(
     // shadows paint inside the padding box so they do not contribute to the
     // expand, but outer shadows grow outward by both blur and spread.
     let blur = instance.shadow_params.x;
-    let inset_flag = instance.shadow_params.y;
+    let inset_flag = instance.shadow_params.y > 0.5;
     let spread = instance.shadow_spread.x;
-    let spread_expand = select(max(spread, 0.0), 0.0, inset_flag > 0.5);
-    let expand = blur * 3.0 + spread_expand;
+    let expand = expand_from_shadow(blur, spread, inset_flag);
     let expanded_pos = instance.pos - vec2(expand);
     let expanded_size = instance.size + vec2(expand * 2.0);
 
@@ -140,8 +153,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let blur = in.shadow_params.x;
     let inset = in.shadow_params.y > 0.5;
     let spread = in.shadow_spread.x;
-    let spread_expand = select(max(spread, 0.0), 0.0, inset);
-    let expand = blur * 3.0 + spread_expand;
+    let spread_nonneg = positive_spread(spread);
+    let expand = expand_from_shadow(blur, spread, inset);
+    let sigma = shadow_sigma(blur);
 
     // Position relative to the original (unexpanded) rect.
     let half = in.size * 0.5;
@@ -161,13 +175,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if d_outer > 0.5 {
             discard;
         }
-        let inset_half = max(half - vec2(max(spread, 0.0)), vec2(0.0));
-        let inset_r = max(safe_r - max(spread, 0.0), 0.0);
+        let inset_half = max(half - vec2(spread_nonneg), vec2(0.0));
+        let inset_r = max(safe_r - spread_nonneg, 0.0);
         let shadow_p = p - in.shadow_offset;
         let shadow_d = sdf_rounded_rect(shadow_p, inset_half, inset_r);
         // Approximate a Gaussian erf with tanh so the falloff width matches
         // CSS box-shadow conventions.
-        let sigma = max(blur, 0.5);
         let shadow_alpha = 0.5 + 0.5 * tanh(shadow_d / sigma * 0.75);
         let edge_clip = 1.0 - smoothstep(-0.5, 0.5, d_outer);
         let final_a = in.shadow_color.a * shadow_alpha * edge_clip;
@@ -181,11 +194,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // present on this instance).
     var shadow = vec4(0.0);
     if in.shadow_color.a > 0.0 {
-        let outer_half = half + vec2(max(spread, 0.0));
-        let outer_r = safe_r + max(spread, 0.0);
+        let outer_half = half + vec2(spread_nonneg);
+        let outer_r = safe_r + spread_nonneg;
         let shadow_p = p - in.shadow_offset;
         let shadow_d = sdf_rounded_rect(shadow_p, outer_half, outer_r);
-        let sigma = max(blur, 0.5);
         let shadow_alpha = 0.5 - 0.5 * tanh(shadow_d / sigma * 0.75);
         shadow = vec4(in.shadow_color.rgb, in.shadow_color.a * shadow_alpha);
     }
