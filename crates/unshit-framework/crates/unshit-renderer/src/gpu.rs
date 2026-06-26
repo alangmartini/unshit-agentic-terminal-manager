@@ -63,6 +63,80 @@ fn trace_text_draw_ranges() -> bool {
 /// MSAA sample count for the main content pipelines. Set to 1 to disable.
 const MSAA_SAMPLE_COUNT: u32 = 4;
 
+/// Classifies the active wgpu adapter as a real GPU or a software/CPU
+/// rasterizer. The windowed renderer uses this to gate per-frame cost (notably
+/// MSAA) on the software path while leaving the hardware path byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterTier {
+    /// A real GPU adapter.
+    Hardware,
+    /// A software/CPU rasterizer: WARP on Windows/D3D12, lavapipe on Vulkan,
+    /// SwiftShader, etc.
+    Software,
+}
+
+/// Env-driven override for which adapter tier `GpuContext::new` may select.
+/// `auto` (the default) runs the full escalation ladder (hardware, then
+/// broadened backends, then software). `hardware` disables the software
+/// fallback (mirrors the pre-fallback panic-on-no-GPU behavior). `software`
+/// skips straight to the software adapter so the path can be exercised on a
+/// GPU machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderTierPref {
+    Auto,
+    HardwareOnly,
+    SoftwareOnly,
+}
+
+const FORCE_SOFTWARE_ENV: &str = "TM_FORCE_SOFTWARE_RENDERER";
+const RENDER_TIER_ENV: &str = "UNSHIT_RENDER_TIER";
+
+/// Read the env-driven tier preference. `TM_FORCE_SOFTWARE_RENDERER=1|true` is
+/// a convenience alias for `UNSHIT_RENDER_TIER=software`.
+fn render_tier_pref() -> RenderTierPref {
+    if matches!(std::env::var(FORCE_SOFTWARE_ENV).as_deref(), Ok("1" | "true")) {
+        return RenderTierPref::SoftwareOnly;
+    }
+    // Bind the lowered value so the `&str` handed to `match` outlives the
+    // temporary `String` (chaining `as_deref` after `map` would dangle).
+    let lower = std::env::var(RENDER_TIER_ENV).ok().map(|v| v.to_ascii_lowercase());
+    match lower.as_deref() {
+        Some("software") | Some("cpu") => RenderTierPref::SoftwareOnly,
+        Some("hardware") | Some("gpu") => RenderTierPref::HardwareOnly,
+        _ => RenderTierPref::Auto,
+    }
+}
+
+/// Pure classification: a fallback adapter request, a `Cpu` device type, or a
+/// known software-rasterizer name all mark the adapter as `Software`. Split out
+/// from `GpuContext::new` so the heuristic is unit-testable without a device
+/// (mirrors the `probe_backdrop_filter_support_inner` /
+/// `present_mode_is_vsync_paced` split-out style).
+fn classify_adapter(info: &wgpu::AdapterInfo, requested_fallback: bool) -> AdapterTier {
+    if requested_fallback {
+        return AdapterTier::Software;
+    }
+    if info.device_type == wgpu::DeviceType::Cpu {
+        return AdapterTier::Software;
+    }
+    let name = info.name.to_ascii_lowercase();
+    const MARKERS: &[&str] =
+        &["llvmpipe", "lavapipe", "swiftshader", "microsoft basic render", "warp", "software"];
+    if MARKERS.iter().any(|marker| name.contains(marker)) {
+        return AdapterTier::Software;
+    }
+    AdapterTier::Hardware
+}
+
+/// MSAA sample count for the given tier: full 4× on hardware (unchanged), off
+/// (1) on software where the multisample resolve is the dominant fill cost.
+fn sample_count_for_tier(tier: AdapterTier) -> u32 {
+    match tier {
+        AdapterTier::Hardware => MSAA_SAMPLE_COUNT,
+        AdapterTier::Software => 1,
+    }
+}
+
 fn parse_backend_env_value(value: &str) -> Option<wgpu::Backends> {
     match value.to_ascii_lowercase().as_str() {
         "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
@@ -291,6 +365,14 @@ pub struct GpuContext {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub target: RenderTarget,
+    /// Hardware vs software/CPU adapter the context was built on. Gates the
+    /// per-frame cost (notably MSAA) on the software path; the hardware tier
+    /// runs the original, byte-identical code path.
+    pub adapter_tier: AdapterTier,
+    /// MSAA sample count in effect for the content pipelines. `MSAA_SAMPLE_COUNT`
+    /// (=4) on hardware, `1` on software where the multisample resolve is the
+    /// dominant fill cost.
+    pub sample_count: u32,
     pub quad_pipeline: QuadPipeline,
     pub text_pipeline: TextPipeline,
     pub image_pipeline: ImagePipeline,
@@ -376,29 +458,137 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
+    /// Create a windowed GPU context.
+    ///
+    /// Runs an escalation ladder so the app still renders on machines without
+    /// a usable GPU, while leaving the hardware path byte-identical:
+    ///
+    /// 1. **Hardware** on the preferred backends (`renderer_backends()`, Vulkan
+    ///    on Windows), `HighPerformance`, `force_fallback_adapter: false` — the
+    ///    exact request the pre-fallback constructor made.
+    /// 2. **Broaden** to all backends, still `HighPerformance` / non-fallback —
+    ///    picks up a real GPU on a backend the preferred set excluded (e.g.
+    ///    D3D12 when Vulkan is absent), so we don't wrongly land on WARP.
+    /// 3. **Software fallback** over all backends, `LowPower`,
+    ///    `force_fallback_adapter: true` — WARP (Windows/D3D12) / lavapipe
+    ///    (Vulkan). Mirrors the proven headless fallback in `try_request_headless`.
+    ///
+    /// `TM_FORCE_SOFTWARE_RENDERER=1` / `UNSHIT_RENDER_TIER=software` skips
+    /// straight to step 3 so the software path can be exercised on a GPU
+    /// machine; `UNSHIT_RENDER_TIER=hardware` disables the fallback. The two
+    /// `Instance`s exist because a wgpu surface is bound to the instance's
+    /// backends, so reaching WARP needs a fresh all-backends instance when the
+    /// preferred (Vulkan-only on Windows) one yielded nothing.
     pub async fn new(window: Arc<dyn winit::window::Window>) -> Self {
         let size = window.surface_size();
-        let backends = renderer_backends();
+        let pref = render_tier_pref();
 
-        let instance =
-            wgpu::Instance::new(&wgpu::InstanceDescriptor { backends, ..Default::default() });
+        // Step 1 — preferred backends, hardware only. Byte-identical to the
+        // pre-fallback construction; skipped only when software is forced.
+        if pref != RenderTierPref::SoftwareOnly {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: renderer_backends(),
+                ..Default::default()
+            });
+            if let Ok(surface) = instance.create_surface(window.clone()) {
+                if let Some((adapter, device, queue, tier)) = Self::request_window_adapter_device(
+                    &instance,
+                    &surface,
+                    wgpu::PowerPreference::HighPerformance,
+                    false,
+                )
+                .await
+                {
+                    log::info!(
+                        "renderer adapter selected (hardware path): {:?}",
+                        adapter.get_info()
+                    );
+                    return Self::build_window_context(
+                        window, size, surface, adapter, device, queue, tier,
+                    );
+                }
+            }
+        }
 
-        let surface = instance.create_surface(window.clone()).unwrap();
+        // Steps 2 & 3 share a fresh all-backends instance + surface so a
+        // software adapter (WARP/lavapipe) becomes reachable.
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let surface = instance
+            .create_surface(window.clone())
+            .unwrap_or_else(|e| panic!("failed to create a render surface for the window: {e:?}"));
 
+        // Step 2 — a real GPU on a backend the preferred set excluded.
+        if pref != RenderTierPref::SoftwareOnly {
+            if let Some((adapter, device, queue, tier)) = Self::request_window_adapter_device(
+                &instance,
+                &surface,
+                wgpu::PowerPreference::HighPerformance,
+                false,
+            )
+            .await
+            {
+                log::info!(
+                    "renderer adapter selected (broadened backends): {:?}",
+                    adapter.get_info()
+                );
+                return Self::build_window_context(
+                    window, size, surface, adapter, device, queue, tier,
+                );
+            }
+            log::warn!(
+                "no hardware GPU adapter available; falling back to a software/CPU renderer"
+            );
+        } else {
+            log::info!("software renderer forced by env override; skipping hardware adapter");
+        }
+
+        // Step 3 — software/CPU adapter (WARP / lavapipe).
+        match Self::request_window_adapter_device(
+            &instance,
+            &surface,
+            wgpu::PowerPreference::LowPower,
+            true,
+        )
+        .await
+        {
+            Some((adapter, device, queue, tier)) => {
+                log::info!(
+                    "renderer adapter selected (software fallback): {:?}",
+                    adapter.get_info()
+                );
+                Self::build_window_context(window, size, surface, adapter, device, queue, tier)
+            }
+            None => panic!(
+                "GPU initialization failed: no graphics adapter (hardware or software) is \
+                 available. Update your graphics drivers or set UNSHIT_RENDER_BACKEND. A software \
+                 rasterizer (WARP/lavapipe) was also unavailable."
+            ),
+        }
+    }
+
+    /// One attempt at the window adapter+device for a given instance/surface and
+    /// preference. Returns `None` if no adapter is available or the device
+    /// cannot be created. The two-attempt device request mirrors the original
+    /// construction: first the adapter's own reported limits (needed for the
+    /// 26-attribute quad pipeline), then wgpu defaults (software renderers that
+    /// reject their own limits).
+    async fn request_window_adapter_device(
+        instance: &wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        power: wgpu::PowerPreference,
+        force_fallback: bool,
+    ) -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue, AdapterTier)> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
+                power_preference: power,
+                compatible_surface: Some(surface),
+                force_fallback_adapter: force_fallback,
             })
-            .await
-            .unwrap();
-        log::info!("renderer adapter selected: {:?}", adapter.get_info());
-
-        // Request the adapter's actual hardware limits so pipelines with many
-        // vertex attributes (gradient quad pipeline: 26 attrs) are accepted.
-        // Fall back to defaults if the adapter rejects its own reported limits
-        // (software renderers).
+            .await?;
+        let tier = classify_adapter(&adapter.get_info(), force_fallback);
         let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -423,11 +613,27 @@ impl GpuContext {
                     None,
                 )
                 .await
-                .unwrap(),
+                .ok()?,
         };
+        Some((adapter, device, queue, tier))
+    }
 
+    /// Finish a windowed context from a successfully requested adapter+device.
+    /// Holds the surface/pipeline configuration that was previously inline in
+    /// `new`; the only behavioral change is that MSAA is now driven by the
+    /// adapter tier instead of the hard-coded constant.
+    fn build_window_context(
+        window: Arc<dyn winit::window::Window>,
+        size: winit::dpi::PhysicalSize<u32>,
+        surface: wgpu::Surface<'static>,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        tier: AdapterTier,
+    ) -> Self {
         let device = Arc::new(device);
         let queue = Arc::new(queue);
+        let sample_count = sample_count_for_tier(tier);
 
         let surface_caps = surface.get_capabilities(&adapter);
         // Use a non-sRGB format so blending happens in sRGB space, matching CSS.
@@ -445,10 +651,13 @@ impl GpuContext {
         // detected by the external latency A/B (PresentMon), not here.
         let maximum_frame_latency = desired_maximum_frame_latency();
         log::info!(
-            "surface present modes: {:?}; selected {:?}; requested maximum frame latency {}",
+            "surface present modes: {:?}; selected {:?}; requested maximum frame latency {}; \
+             adapter tier {:?} (msaa {}x)",
             surface_caps.present_modes,
             present_mode,
             maximum_frame_latency,
+            tier,
+            sample_count,
         );
 
         let alpha_mode = surface_caps
@@ -470,7 +679,14 @@ impl GpuContext {
         };
         surface.configure(&device, &surface_config);
 
-        let quad_pipeline = QuadPipeline::new(&device, surface_format, MSAA_SAMPLE_COUNT);
+        // Software adapters (WARP) reject the full quad shader's 96-component
+        // varying budget; use the lite twin there. The hardware path keeps the
+        // full shader (byte-identical to before).
+        let quad_pipeline = if tier == AdapterTier::Software {
+            QuadPipeline::new_software(&device, surface_format, sample_count)
+        } else {
+            QuadPipeline::new(&device, surface_format, sample_count)
+        };
         #[cfg(target_os = "windows")]
         let glyph_atlas = GlyphAtlas::new_with_format(
             &device,
@@ -488,31 +704,37 @@ impl GpuContext {
             surface_format,
             &glyph_atlas.texture_view,
             &glyph_atlas.sampler,
-            MSAA_SAMPLE_COUNT,
+            sample_count,
         );
-        let image_pipeline = ImagePipeline::new(&device, surface_format, MSAA_SAMPLE_COUNT);
-        let svg_pipeline = SvgPipeline::new(&device, surface_format, MSAA_SAMPLE_COUNT);
+        let image_pipeline = ImagePipeline::new(&device, surface_format, sample_count);
+        let svg_pipeline = SvgPipeline::new(&device, surface_format, sample_count);
         let image_cache = ImageCache::new(&device);
 
-        let (msaa_texture, msaa_view) = if MSAA_SAMPLE_COUNT > 1 {
+        let (msaa_texture, msaa_view) = if sample_count > 1 {
             let (t, v) = Self::create_msaa_texture(
                 &device,
                 surface_format,
                 size.width.max(1),
                 size.height.max(1),
+                sample_count,
             );
             (Some(t), Some(v))
         } else {
             (None, None)
         };
 
-        let backdrop_filter_available =
-            probe_backdrop_filter_support(&adapter, surface_format, surface_config.usage);
+        // The backdrop-filter blur ping-pongs offscreen textures and is a poor
+        // fit for a software rasterizer; force it off on the software tier so
+        // chrome renders flat (no blur) instead of paying for ping-pong copies.
+        let backdrop_filter_available = tier != AdapterTier::Software
+            && probe_backdrop_filter_support(&adapter, surface_format, surface_config.usage);
 
         Self {
             device,
             queue,
             target: RenderTarget::Window { surface, config: surface_config, window },
+            adapter_tier: tier,
+            sample_count,
             quad_pipeline,
             text_pipeline,
             image_pipeline,
@@ -557,6 +779,7 @@ impl GpuContext {
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        sample_count: u32,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("MSAA texture"),
@@ -566,7 +789,7 @@ impl GpuContext {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: MSAA_SAMPLE_COUNT,
+            sample_count,
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -767,7 +990,8 @@ impl GpuContext {
         let image_cache = ImageCache::new(&device);
 
         let (msaa_texture, msaa_view) = if MSAA_SAMPLE_COUNT > 1 {
-            let (t, v) = Self::create_msaa_texture(&device, format, width, height);
+            let (t, v) =
+                Self::create_msaa_texture(&device, format, width, height, MSAA_SAMPLE_COUNT);
             (Some(t), Some(v))
         } else {
             (None, None)
@@ -780,6 +1004,11 @@ impl GpuContext {
             device,
             queue,
             target: RenderTarget::Headless { texture, width, height },
+            // Headless contexts intentionally keep the hardware profile (4x
+            // MSAA) regardless of the underlying adapter so pixel tests stay
+            // byte-stable; the tier is still classified for honesty.
+            adapter_tier: classify_adapter(&adapter.get_info(), false),
+            sample_count: MSAA_SAMPLE_COUNT,
             quad_pipeline,
             text_pipeline,
             image_pipeline,
@@ -897,9 +1126,9 @@ impl GpuContext {
             self.backdrop_blurred = None;
         }
 
-        if MSAA_SAMPLE_COUNT > 1 {
+        if self.sample_count > 1 {
             let format = self.surface_format();
-            let (t, v) = Self::create_msaa_texture(&self.device, format, w, h);
+            let (t, v) = Self::create_msaa_texture(&self.device, format, w, h, self.sample_count);
             self.msaa_texture = Some(t);
             self.msaa_view = Some(v);
         }
@@ -930,6 +1159,14 @@ impl GpuContext {
     /// config, so the mode never changes at runtime.
     pub fn is_vsync_paced(&self) -> bool {
         present_mode_is_vsync_paced(self.present_mode())
+    }
+
+    /// The adapter tier this context was built on: `Hardware` for a real GPU,
+    /// `Software` for a CPU rasterizer (WARP / lavapipe). Read once after GPU
+    /// init to surface in diagnostics or gate tier-specific behavior; the tier
+    /// never changes at runtime because a context is bound to one adapter.
+    pub fn adapter_tier(&self) -> AdapterTier {
+        self.adapter_tier
     }
 
     /// CPU time the last `render()` spent blocked acquiring the swapchain
@@ -1235,7 +1472,7 @@ impl GpuContext {
 
         // Prepare canvas painters before the render pass
         let paint_sample_count =
-            if use_backdrop_path && MSAA_SAMPLE_COUNT > 1 { 1 } else { MSAA_SAMPLE_COUNT };
+            if use_backdrop_path && self.sample_count > 1 { 1 } else { self.sample_count };
         for layer_batch in &self.layered_batch.layers {
             for cb in &layer_batch.canvas_callbacks {
                 cb.painter.prepare(&self.device, &self.queue, format, cb.rect, paint_sample_count);
@@ -1247,7 +1484,7 @@ impl GpuContext {
             if self.backdrop_blur_pipeline.is_none() {
                 self.backdrop_blur_pipeline = Some(BackdropBlurPipeline::new(&self.device, format));
             }
-            if MSAA_SAMPLE_COUNT > 1 {
+            if self.sample_count > 1 {
                 self.ensure_backdrop_pipelines();
             }
         }
@@ -1396,7 +1633,7 @@ impl GpuContext {
                                     device: &self.device,
                                     queue: &self.queue,
                                     persistent_buffer: gpu_buf,
-                                    sample_count: MSAA_SAMPLE_COUNT,
+                                    sample_count: self.sample_count,
                                 };
                                 cb.painter.paint(&ctx, &mut pass);
                             }
@@ -1504,7 +1741,7 @@ impl GpuContext {
                                     device: &self.device,
                                     queue: &self.queue,
                                     persistent_buffer: gpu_buf,
-                                    sample_count: MSAA_SAMPLE_COUNT,
+                                    sample_count: self.sample_count,
                                 };
                                 cb.painter.paint(&ctx, &mut pass);
                             }
@@ -1713,17 +1950,17 @@ impl GpuContext {
                     // duplicates for the backdrop path (single-sample
                     // target). Bind groups and buffers come from the main
                     // pipelines since the layouts are structurally identical.
-                    let quad_rp = if MSAA_SAMPLE_COUNT > 1 {
+                    let quad_rp = if self.sample_count > 1 {
                         &self.backdrop_quad_pipeline.as_ref().unwrap().pipeline
                     } else {
                         &self.quad_pipeline.pipeline
                     };
-                    let text_rp = if MSAA_SAMPLE_COUNT > 1 {
+                    let text_rp = if self.sample_count > 1 {
                         &self.backdrop_text_pipeline.as_ref().unwrap().pipeline
                     } else {
                         &self.text_pipeline.pipeline
                     };
-                    let svg_rp = if MSAA_SAMPLE_COUNT > 1 {
+                    let svg_rp = if self.sample_count > 1 {
                         &self.backdrop_svg_pipeline.as_ref().unwrap().pipeline
                     } else {
                         &self.svg_pipeline.pipeline
@@ -1860,7 +2097,7 @@ impl GpuContext {
                             let Some(buffer) = self.image_instance_buffer(slot) else {
                                 continue;
                             };
-                            if MSAA_SAMPLE_COUNT > 1 {
+                            if self.sample_count > 1 {
                                 pass.set_pipeline(
                                     &self.backdrop_image_pipeline.as_ref().unwrap().pipeline,
                                 );
@@ -2395,6 +2632,85 @@ mod tests {
     #[test]
     fn default_maximum_frame_latency_is_one() {
         assert_eq!(DEFAULT_MAXIMUM_FRAME_LATENCY, 1);
+    }
+
+    /// Builds an `AdapterInfo` for the tier-classification tests without
+    /// needing a real adapter.
+    fn adapter_info(name: &str, device_type: wgpu::DeviceType) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.to_string(),
+            vendor: 0,
+            device: 0,
+            device_type,
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Empty,
+        }
+    }
+
+    /// A real GPU (any non-Cpu device type, no fallback) is `Hardware`.
+    #[test]
+    fn classify_hardware_adapter_by_device_type() {
+        for dt in [
+            wgpu::DeviceType::DiscreteGpu,
+            wgpu::DeviceType::IntegratedGpu,
+            wgpu::DeviceType::VirtualGpu,
+        ] {
+            assert_eq!(
+                classify_adapter(&adapter_info("AMD Radeon 890M", dt), false),
+                AdapterTier::Hardware,
+                "{dt:?} is a real GPU"
+            );
+        }
+    }
+
+    /// A `Cpu` device type (lavapipe) is `Software` even without a forced
+    /// fallback request.
+    #[test]
+    fn classify_software_adapter_by_cpu_device_type() {
+        assert_eq!(
+            classify_adapter(&adapter_info("llvmpipe", wgpu::DeviceType::Cpu), false),
+            AdapterTier::Software
+        );
+    }
+
+    /// A forced-fallback request is always `Software`, even when the driver
+    /// reports a non-Cpu type (some wrappers do).
+    #[test]
+    fn classify_forced_fallback_is_always_software() {
+        assert_eq!(
+            classify_adapter(&adapter_info("WARP", wgpu::DeviceType::Other), true),
+            AdapterTier::Software
+        );
+    }
+
+    /// Known software-rasterizer names are caught by the marker heuristic even
+    /// when the device type is `Other` (WARP reports `Other` on some drivers).
+    #[test]
+    fn classify_software_adapter_by_name_marker() {
+        for name in [
+            "llvmpipe",
+            "Mesa llvmpipe (LLVM 15.0.7)",
+            "lavapipe",
+            "SwiftShader Device",
+            "Microsoft Basic Render Driver",
+            "warp",
+        ] {
+            assert_eq!(
+                classify_adapter(&adapter_info(name, wgpu::DeviceType::Other), false),
+                AdapterTier::Software,
+                "{name:?} is a known software rasterizer"
+            );
+        }
+    }
+
+    /// MSAA stays at the full hardware sample count on `Hardware` and is turned
+    /// off (1) on `Software` where the resolve is the dominant fill cost.
+    #[test]
+    fn sample_count_is_full_on_hardware_and_off_on_software() {
+        assert_eq!(sample_count_for_tier(AdapterTier::Hardware), MSAA_SAMPLE_COUNT);
+        assert_eq!(sample_count_for_tier(AdapterTier::Hardware), 4);
+        assert_eq!(sample_count_for_tier(AdapterTier::Software), 1);
     }
 
     /// `Lost` means the swapchain is gone; reconfiguring is the only
