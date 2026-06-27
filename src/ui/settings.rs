@@ -368,7 +368,10 @@ fn build_tabs_card(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ))
 }
 
-fn tab_width_mode_segmented(active: crate::state::TabWidthMode, shared: &SharedState) -> ElementDef {
+fn tab_width_mode_segmented(
+    active: crate::state::TabWidthMode,
+    shared: &SharedState,
+) -> ElementDef {
     let mut segmented = ElementDef::new(Tag::Div).with_class("input-segmented");
     for mode in crate::state::TabWidthMode::all() {
         let s = shared.clone();

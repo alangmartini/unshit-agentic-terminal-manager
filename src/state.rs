@@ -2721,7 +2721,12 @@ pub fn mutate_tab_row_mode(state: &mut AppState, mode: TabRowMode) -> bool {
 }
 
 pub fn mutate_tab_width_px_delta(state: &mut AppState, delta: i32) -> bool {
-    let next = adjusted_scroll_value(state.tab_width_px, delta, MIN_TAB_WIDTH_PX, MAX_TAB_WIDTH_PX);
+    let next = adjusted_scroll_value(
+        state.tab_width_px,
+        delta,
+        MIN_TAB_WIDTH_PX,
+        MAX_TAB_WIDTH_PX,
+    );
     if next == state.tab_width_px {
         return false;
     }
@@ -3329,14 +3334,12 @@ fn push_unique_quick_prompt_image(
 /// `quick_prompt.image_paste` command (the "Attach image" button),
 /// which deliberately surfaces a "No image on clipboard" hint.
 pub fn try_attach_clipboard_image(state: &mut AppState) -> bool {
-    let Some(session_hex) = state.quick_prompt.as_ref().map(|qp| qp.session_hex.clone()) else {
-        return false;
-    };
-    let captured =
-        crate::quick_prompt::images::capture_clipboard_image(&state.clipboard, &session_hex);
     let Some(qp) = state.quick_prompt.as_mut() else {
         return false;
     };
+    let session_hex = qp.session_hex.clone();
+    let captured =
+        crate::quick_prompt::images::capture_clipboard_image(&state.clipboard, &session_hex);
     match captured {
         Ok(Some(img)) => {
             push_unique_quick_prompt_image(qp, img);
@@ -3358,9 +3361,10 @@ pub fn try_attach_clipboard_image(state: &mut AppState) -> bool {
 /// no decodable image sets a friendly hint so the gesture is never
 /// silently ignored.
 pub fn attach_dropped_images(state: &mut AppState, paths: &[std::path::PathBuf]) -> bool {
-    let Some(session_hex) = state.quick_prompt.as_ref().map(|qp| qp.session_hex.clone()) else {
+    let Some(qp) = state.quick_prompt.as_mut() else {
         return false;
     };
+    let session_hex = qp.session_hex.clone();
 
     let mut attached = 0usize;
     let mut saw_image = false;
@@ -3373,10 +3377,8 @@ pub fn attach_dropped_images(state: &mut AppState, paths: &[std::path::PathBuf])
         saw_image = true;
         match crate::quick_prompt::images::capture_image_from_path(&session_hex, path) {
             Ok(img) => {
-                if let Some(qp) = state.quick_prompt.as_mut() {
-                    if push_unique_quick_prompt_image(qp, img) {
-                        attached += 1;
-                    }
+                if push_unique_quick_prompt_image(qp, img) {
+                    attached += 1;
                 }
             }
             Err(e) => {
@@ -3386,9 +3388,6 @@ pub fn attach_dropped_images(state: &mut AppState, paths: &[std::path::PathBuf])
         }
     }
 
-    let Some(qp) = state.quick_prompt.as_mut() else {
-        return false;
-    };
     if attached > 0 {
         qp.error = None;
         true
@@ -3908,12 +3907,10 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "tabs.width.inc" => mutate_tab_width_px_delta(state, TAB_WIDTH_PX_STEP),
         "tabs.width.dec" => mutate_tab_width_px_delta(state, -TAB_WIDTH_PX_STEP),
-        other if other.starts_with("tabs.width_mode:") => {
-            let id = &other["tabs.width_mode:".len()..];
+        other if let Some(id) = other.strip_prefix("tabs.width_mode:") => {
             TabWidthMode::from_id(id).is_some_and(|mode| mutate_tab_width_mode(state, mode))
         }
-        other if other.starts_with("tabs.row_mode:") => {
-            let id = &other["tabs.row_mode:".len()..];
+        other if let Some(id) = other.strip_prefix("tabs.row_mode:") => {
             TabRowMode::from_id(id).is_some_and(|mode| mutate_tab_row_mode(state, mode))
         }
         "theme.custom.reset" => reset_custom_theme(state),
@@ -6098,7 +6095,10 @@ mod tests {
     #[test]
     fn attach_dropped_images_no_op_when_closed() {
         let mut state = test_state();
-        assert!(!attach_dropped_images(&mut state, &[PathBuf::from("whatever.png")]));
+        assert!(!attach_dropped_images(
+            &mut state,
+            &[PathBuf::from("whatever.png")]
+        ));
     }
 
     #[test]
@@ -6110,7 +6110,10 @@ mod tests {
         let png = write_png_fixture(&src_hex, 6, 4);
 
         // First drop attaches one chip.
-        assert!(attach_dropped_images(&mut state, std::slice::from_ref(&png)));
+        assert!(attach_dropped_images(
+            &mut state,
+            std::slice::from_ref(&png)
+        ));
         let qp = state.quick_prompt.as_ref().unwrap();
         assert_eq!(qp.images.len(), 1);
         assert_eq!(qp.images[0].width, 6);
@@ -6118,7 +6121,10 @@ mod tests {
         assert!(qp.error.is_none());
 
         // Same file again: content hash dedups, no second chip, no rebuild.
-        assert!(!attach_dropped_images(&mut state, std::slice::from_ref(&png)));
+        assert!(!attach_dropped_images(
+            &mut state,
+            std::slice::from_ref(&png)
+        ));
         assert_eq!(state.quick_prompt.as_ref().unwrap().images.len(), 1);
 
         // Cleanup: the overlay session dir plus the fixture session dir.
@@ -6132,7 +6138,10 @@ mod tests {
         let mut state = test_state();
         state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
 
-        assert!(attach_dropped_images(&mut state, &[PathBuf::from("notes.txt")]));
+        assert!(attach_dropped_images(
+            &mut state,
+            &[PathBuf::from("notes.txt")]
+        ));
         let qp = state.quick_prompt.as_ref().unwrap();
         assert!(qp.images.is_empty());
         assert_eq!(qp.error.as_deref(), Some("No image in dropped files"));
@@ -6154,11 +6163,17 @@ mod tests {
         let bogus = dir.join("corrupt.png");
         std::fs::write(&bogus, b"nope").unwrap();
 
-        assert!(attach_dropped_images(&mut state, std::slice::from_ref(&bogus)));
+        assert!(attach_dropped_images(
+            &mut state,
+            std::slice::from_ref(&bogus)
+        ));
         let qp = state.quick_prompt.as_ref().unwrap();
         assert!(qp.images.is_empty());
         assert!(
-            qp.error.as_deref().unwrap().starts_with("Could not attach image:"),
+            qp.error
+                .as_deref()
+                .unwrap()
+                .starts_with("Could not attach image:"),
             "unexpected error: {:?}",
             qp.error
         );

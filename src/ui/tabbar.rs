@@ -475,10 +475,10 @@ mod tests {
         // Fit-content sets no inline width; the `.app.tabs-width-fit` rules
         // in the stylesheet do the shrink-wrapping instead.
         assert!(inline_px_width(&el).is_none());
-        assert!(!el
-            .style_overrides
-            .iter()
-            .any(|s| matches!(s, StyleDeclaration::MinWidth(_) | StyleDeclaration::MaxWidth(_))));
+        assert!(!el.style_overrides.iter().any(|s| matches!(
+            s,
+            StyleDeclaration::MinWidth(_) | StyleDeclaration::MaxWidth(_)
+        )));
     }
 
     #[test]

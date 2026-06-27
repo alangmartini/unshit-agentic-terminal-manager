@@ -127,7 +127,7 @@ pub fn save_image_to_session(
     })
 }
 
-/// Lowercase extensions we can decode. The `image` dep is built with
+/// Case-insensitive extensions we can decode. The `image` dep is built with
 /// only the `png` and `jpeg` decoders (see Cargo.toml), so we gate on
 /// those rather than attempting a decode that is guaranteed to fail for
 /// other formats. Screenshots from Snipping Tool / ShareX land as PNG;
@@ -140,8 +140,11 @@ const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg"];
 pub fn is_supported_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .is_some_and(|e| SUPPORTED_IMAGE_EXTENSIONS.contains(&e.as_str()))
+        .is_some_and(|ext| {
+            SUPPORTED_IMAGE_EXTENSIONS
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+        })
 }
 
 /// Decode an image file from disk, convert to RGBA, and store it in the
@@ -159,7 +162,12 @@ pub fn capture_image_from_path(session_hex: &str, path: &Path) -> io::Result<Qui
     })?;
     let rgba = decoded.to_rgba8();
     let (width, height) = rgba.dimensions();
-    save_image_to_session(session_hex, width as usize, height as usize, rgba.into_raw())
+    save_image_to_session(
+        session_hex,
+        width as usize,
+        height as usize,
+        rgba.into_raw(),
+    )
 }
 
 /// Resize so the longest edge is `THUMBNAIL_MAX_EDGE`, preserving
@@ -388,8 +396,9 @@ mod tests {
         // Write a real PNG to disk via the save path, then read it back
         // through the drag-and-drop path and confirm dims + on-disk files.
         let src_hex = unique_session_hex("from-path-src");
-        let written = save_image_to_session(&src_hex, 5, 3, solid_color_rgba(5, 3, [12, 34, 56, 255]))
-            .expect("write source png");
+        let written =
+            save_image_to_session(&src_hex, 5, 3, solid_color_rgba(5, 3, [12, 34, 56, 255]))
+                .expect("write source png");
 
         let dst_hex = unique_session_hex("from-path-dst");
         let img = capture_image_from_path(&dst_hex, &written.temp_path).expect("capture from path");

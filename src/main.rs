@@ -514,12 +514,7 @@ fn open_quick_prompt_on_startup_from_env() -> bool {
 /// `None` for an unset or empty value so production launches (where this
 /// is never set) skip the attach entirely.
 fn quick_prompt_attach_image_from_value(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let value = value?;
-    if value.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(value))
-    }
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 fn quick_prompt_attach_image_from_env() -> Option<PathBuf> {
@@ -1052,14 +1047,16 @@ fn main() {
                         true
                     } else if crate::state::dispatch_palette_key(&mut guard, combo) {
                         true
-                    } else if guard.quick_prompt.is_some() && is_quick_prompt_paste_combo(combo) {
+                    } else if is_quick_prompt_paste_combo(combo)
+                        && crate::state::try_attach_clipboard_image(&mut guard)
+                    {
                         // Quick Prompt is open: Ctrl+V attaches a clipboard
                         // image as a chip (spec U4/A4.1). Consume the event
                         // ONLY when an image was actually attached; otherwise
                         // return false so the framework falls through to its
                         // normal text paste and a plain Ctrl+V of text still
                         // lands in the input.
-                        crate::state::try_attach_clipboard_image(&mut guard)
+                        true
                     } else if guard.settings_open
                         && combo.key == Key::Escape
                         && combo.modifiers.is_empty()
@@ -1587,9 +1584,7 @@ mod tests {
             None
         );
         assert_eq!(
-            quick_prompt_attach_image_from_value(Some(std::ffi::OsString::from(
-                "C:/tmp/shot.png"
-            ))),
+            quick_prompt_attach_image_from_value(Some(std::ffi::OsString::from("C:/tmp/shot.png"))),
             Some(PathBuf::from("C:/tmp/shot.png"))
         );
     }
@@ -2258,7 +2253,9 @@ mod tests {
             Modifiers::CTRL
         )));
         // Wrong / extra modifiers.
-        assert!(!is_quick_prompt_paste_combo(&KeyCombo::plain(Key::Char('v'))));
+        assert!(!is_quick_prompt_paste_combo(&KeyCombo::plain(Key::Char(
+            'v'
+        ))));
         assert!(!is_quick_prompt_paste_combo(&KeyCombo::new(
             Key::Char('v'),
             Modifiers::CTRL | Modifiers::SHIFT
