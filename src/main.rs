@@ -273,6 +273,8 @@ fn build_tree(
         .with_class("app")
         .with_class(crate::theme::theme_class_name(&snap.theme))
         .with_class(format!("density-{}", snap.ui_density.id()))
+        .with_class(format!("tabs-width-{}", snap.tab_width_mode.id()))
+        .with_class(format!("tabs-rows-{}", snap.tab_row_mode.id()))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("ambient-layer")

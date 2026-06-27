@@ -310,6 +310,7 @@ fn build_appearance_page_section(state: &UiSnapshot, shared: &SharedState) -> El
                     state.config_font_size_pt,
                 )),
         )
+        .with_child(build_tabs_card(state, shared))
         .with_child(
             set_card("terminal", None)
                 .with_child(settings_page_field(
@@ -331,6 +332,80 @@ fn build_appearance_page_section(state: &UiSnapshot, shared: &SharedState) -> El
                 )),
         )
         .with_child(set_card("preview", None).with_child(build_appearance_preview(state)))
+}
+
+/// The "tabs" card on the Appearance page: how horizontal terminal tabs
+/// are sized and whether the strip stays one scrolling row or wraps onto
+/// two or three rows. The width stepper only appears in `Fixed` mode (in
+/// `FitContent` mode there is no width to tune).
+fn build_tabs_card(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let mut card = set_card("tabs", None).with_child(settings_page_field(
+        "Tab sizing",
+        Some("Fixed width per tab, or shrink-wrap each tab to its label."),
+        tab_width_mode_segmented(state.tab_width_mode, shared),
+        state.config_font_size_pt,
+    ));
+
+    if state.tab_width_mode == crate::state::TabWidthMode::Fixed {
+        card = card.with_child(settings_page_field(
+            "Tab width",
+            Some("Width of each tab when sizing is fixed."),
+            command_stepper(
+                format!("{} px", state.tab_width_px),
+                "tabs.width.dec",
+                "tabs.width.inc",
+                shared,
+            ),
+            state.config_font_size_pt,
+        ));
+    }
+
+    card.with_child(settings_page_field(
+        "Tab rows",
+        Some("Single scrolling row, or wrap tabs onto two or three rows."),
+        tab_row_mode_segmented(state.tab_row_mode, shared),
+        state.config_font_size_pt,
+    ))
+}
+
+fn tab_width_mode_segmented(active: crate::state::TabWidthMode, shared: &SharedState) -> ElementDef {
+    let mut segmented = ElementDef::new(Tag::Div).with_class("input-segmented");
+    for mode in crate::state::TabWidthMode::all() {
+        let s = shared.clone();
+        let command = format!("tabs.width_mode:{}", mode.id());
+        let mut button = ElementDef::new(Tag::Button)
+            .with_class("seg-btn")
+            .with_text(mode.label())
+            .on_click(move || {
+                let command = command.clone();
+                mutate_with(&s, move |st| dispatch(st, &command));
+            });
+        if mode == active {
+            button = button.with_class("active");
+        }
+        segmented = segmented.with_child(button);
+    }
+    segmented
+}
+
+fn tab_row_mode_segmented(active: crate::state::TabRowMode, shared: &SharedState) -> ElementDef {
+    let mut segmented = ElementDef::new(Tag::Div).with_class("input-segmented");
+    for mode in crate::state::TabRowMode::all() {
+        let s = shared.clone();
+        let command = format!("tabs.row_mode:{}", mode.id());
+        let mut button = ElementDef::new(Tag::Button)
+            .with_class("seg-btn")
+            .with_text(mode.label())
+            .on_click(move || {
+                let command = command.clone();
+                mutate_with(&s, move |st| dispatch(st, &command));
+            });
+        if mode == active {
+            button = button.with_class("active");
+        }
+        segmented = segmented.with_child(button);
+    }
+    segmented
 }
 
 fn build_theme_picker(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -2100,7 +2175,7 @@ mod tests {
         let shared = make_shared();
         let el = build_settings_page(&snap, &shared);
 
-        assert_eq!(count_with_class(&el, "set-card"), 4);
+        assert_eq!(count_with_class(&el, "set-card"), 5);
         assert!(has_class_anywhere(&el, "stepper"));
         assert!(has_class_anywhere(&el, "set-inline-control"));
         assert!(has_class_anywhere(&el, "input-num"));
@@ -2138,6 +2213,14 @@ mod tests {
         assert!(text.contains("Terminal output size"));
         assert!(text.contains("Sidebar width"));
         assert!(text.contains("Width of the workspace sidebar"));
+        // Tabs card: sizing mode, fixed width stepper, and row mode.
+        assert!(text.contains("Tab sizing"));
+        assert!(text.contains("fit content"));
+        assert!(text.contains("Tab width"));
+        assert!(text.contains("Tab rows"));
+        assert!(text.contains("single"));
+        assert!(text.contains("double"));
+        assert!(text.contains("triple"));
         assert!(text.contains("syntax tints across the whole app"));
         assert!(text.contains("~/code/main/dashboard"));
         assert!(text.contains("patching format.ts"));
@@ -2151,6 +2234,32 @@ mod tests {
     }
 
     #[test]
+    fn tabs_card_hides_width_stepper_in_fit_content_mode() {
+        // In fixed mode the width stepper is offered; in fit-content mode
+        // there is no width to tune, so the "Tab width" field is dropped.
+        let fixed = crate::state::UiSnapshot {
+            tab_width_mode: crate::state::TabWidthMode::Fixed,
+            ..make_snapshot_section(SettingsSection::Appearance)
+        };
+        let shared = make_shared();
+        let fixed_card = build_tabs_card(&fixed, &shared);
+        assert!(collect_text_recursive(&fixed_card).contains("Tab width"));
+
+        let fit = crate::state::UiSnapshot {
+            tab_width_mode: crate::state::TabWidthMode::FitContent,
+            ..make_snapshot_section(SettingsSection::Appearance)
+        };
+        let fit_card = build_tabs_card(&fit, &shared);
+        let fit_text = collect_text_recursive(&fit_card);
+        assert!(fit_text.contains("Tab sizing"));
+        assert!(fit_text.contains("Tab rows"));
+        assert!(
+            !fit_text.contains("Tab width"),
+            "fit-content mode must not render the fixed-width stepper"
+        );
+    }
+
+    #[test]
     fn settings_page_appearance_has_theme_picker() {
         let snap = make_snapshot_section(SettingsSection::Appearance);
         let shared = make_shared();
@@ -2161,7 +2270,7 @@ mod tests {
             !picker.children.is_empty(),
             "theme picker should have at least one chip"
         );
-        assert!(count_with_class(&picker, "theme-chip") >= 2);
+        assert!(count_with_class(picker, "theme-chip") >= 2);
         let theme_row =
             find_first_with_class(&el, "theme-chip").expect("theme picker should render chips");
         assert!(
