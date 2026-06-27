@@ -137,6 +137,19 @@ fn sample_count_for_tier(tier: AdapterTier) -> u32 {
     }
 }
 
+fn use_subpixel_text_shader_for_tier(tier: AdapterTier) -> bool {
+    use_subpixel_text_shader() && tier != AdapterTier::Software
+}
+
+#[cfg(target_os = "windows")]
+fn text_atlas_format_for_subpixel_shader(subpixel: bool) -> wgpu::TextureFormat {
+    if subpixel {
+        wgpu::TextureFormat::Rgba8Unorm
+    } else {
+        wgpu::TextureFormat::R8Unorm
+    }
+}
+
 fn parse_backend_env_value(value: &str) -> Option<wgpu::Backends> {
     match value.to_ascii_lowercase().as_str() {
         "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
@@ -687,19 +700,14 @@ impl GpuContext {
         } else {
             QuadPipeline::new(&device, surface_format, sample_count)
         };
-        // Subpixel (ClearType) text is a per-pixel cost -- the subpixel
-        // shader samples three chroma channels and DirectWrite rasterizes RGBA
-        // coverage -- that a CPU rasterizer pays in full fragment shading. On
-        // the Software tier use grayscale antialiasing instead (R8 atlas +
-        // text.wgsl), unless an env override forces subpixel on. The hardware
-        // path keeps the platform policy (`use_subpixel_text_shader()`) and is
-        // unchanged.
-        let subpixel = use_subpixel_text_shader() && tier != AdapterTier::Software;
+        // Subpixel (ClearType) rasterization is disabled on software adapters to
+        // avoid CPU subpixel per-pixel overhead; keep grayscale antialiasing.
+        let subpixel = use_subpixel_text_shader_for_tier(tier);
         #[cfg(target_os = "windows")]
         let glyph_atlas = GlyphAtlas::new_with_format(
             &device,
             2048,
-            if subpixel { wgpu::TextureFormat::Rgba8Unorm } else { wgpu::TextureFormat::R8Unorm },
+            text_atlas_format_for_subpixel_shader(subpixel),
         );
         #[cfg(not(target_os = "windows"))]
         let glyph_atlas = GlyphAtlas::new(&device);
@@ -812,13 +820,14 @@ impl GpuContext {
         }
         let format = self.surface_format();
         self.backdrop_quad_pipeline = Some(QuadPipeline::new(&self.device, format, 1));
+        let subpixel = use_subpixel_text_shader_for_tier(self.adapter_tier);
         self.backdrop_text_pipeline = Some(TextPipeline::new(
             &self.device,
             format,
             &self.glyph_atlas.texture_view,
             &self.glyph_atlas.sampler,
             1,
-            use_subpixel_text_shader(),
+            subpixel,
         ));
         self.backdrop_image_pipeline = Some(ImagePipeline::new(&self.device, format, 1));
         self.backdrop_svg_pipeline =
@@ -949,6 +958,8 @@ impl GpuContext {
         height: u32,
     ) -> Self {
         let format = wgpu::TextureFormat::Rgba8Unorm;
+        let adapter_tier = classify_adapter(&adapter.get_info(), false);
+        let subpixel = use_subpixel_text_shader_for_tier(adapter_tier);
 
         // `COPY_DST` is required when the backdrop filter path copies the
         // `backdrop_source` texture onto the offscreen target at the end of
@@ -976,11 +987,7 @@ impl GpuContext {
         let glyph_atlas = GlyphAtlas::new_with_format(
             &device,
             2048,
-            if use_subpixel_text_shader() {
-                wgpu::TextureFormat::Rgba8Unorm
-            } else {
-                wgpu::TextureFormat::R8Unorm
-            },
+            text_atlas_format_for_subpixel_shader(subpixel),
         );
         #[cfg(not(target_os = "windows"))]
         let glyph_atlas = GlyphAtlas::new(&device);
@@ -990,7 +997,7 @@ impl GpuContext {
             &glyph_atlas.texture_view,
             &glyph_atlas.sampler,
             MSAA_SAMPLE_COUNT,
-            use_subpixel_text_shader(),
+            subpixel,
         );
         let image_pipeline = ImagePipeline::new(&device, format, MSAA_SAMPLE_COUNT);
         let svg_pipeline = SvgPipeline::new(&device, format, MSAA_SAMPLE_COUNT);
@@ -1014,7 +1021,7 @@ impl GpuContext {
             // Headless contexts intentionally keep the hardware profile (4x
             // MSAA) regardless of the underlying adapter so pixel tests stay
             // byte-stable; the tier is still classified for honesty.
-            adapter_tier: classify_adapter(&adapter.get_info(), false),
+            adapter_tier,
             sample_count: MSAA_SAMPLE_COUNT,
             quad_pipeline,
             text_pipeline,

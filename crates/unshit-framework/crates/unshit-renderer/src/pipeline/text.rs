@@ -55,6 +55,7 @@ impl TextPipeline {
         sample_count: u32,
         subpixel: bool,
     ) -> Self {
+        let subpixel = cfg!(target_os = "windows") && subpixel;
         #[cfg(target_os = "windows")]
         let shader_src = if use_debug_solid_text_shader() {
             include_str!("../shaders/text_debug_solid.wgsl")
@@ -180,28 +181,21 @@ impl TextPipeline {
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some({
-                        #[cfg(target_os = "windows")]
-                        {
-                            if subpixel {
-                                // Premultiplied alpha for subpixel blending
-                                wgpu::BlendState {
-                                    color: wgpu::BlendComponent {
-                                        src_factor: wgpu::BlendFactor::One,
-                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                        operation: wgpu::BlendOperation::Add,
-                                    },
-                                    alpha: wgpu::BlendComponent {
-                                        src_factor: wgpu::BlendFactor::One,
-                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                        operation: wgpu::BlendOperation::Add,
-                                    },
-                                }
-                            } else {
-                                wgpu::BlendState::ALPHA_BLENDING
+                        if subpixel {
+                            // Premultiplied alpha for subpixel blending
+                            wgpu::BlendState {
+                                color: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::One,
+                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                                alpha: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::One,
+                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
                             }
-                        }
-                        #[cfg(not(target_os = "windows"))]
-                        {
+                        } else {
                             wgpu::BlendState::ALPHA_BLENDING
                         }
                     }),
