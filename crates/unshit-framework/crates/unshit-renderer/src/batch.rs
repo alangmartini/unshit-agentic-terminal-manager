@@ -5711,7 +5711,22 @@ fn glyph_image_data_for_atlas(
     bytes_per_pixel: u32,
 ) -> Vec<u8> {
     match (bytes_per_pixel, content) {
-        (4, cosmic_text::SwashContent::SubpixelMask) => data,
+        // swash emits subpixel coverage in BGR order, but the atlas is sampled
+        // as RGBA and the red channel drives the left physical subpixel on a
+        // standard RGB display. Passing the data through unswapped renders a
+        // reversed cyan-left / red-right fringe (measured per-pixel: the left
+        // stem edge was blue-dominant). Swap R<->B so red coverage lands in the
+        // red channel -- matching the DirectWrite path, which already emits RGBA.
+        (4, cosmic_text::SwashContent::SubpixelMask) => data
+            .chunks(4)
+            .flat_map(|c| {
+                let b = c.first().copied().unwrap_or(0);
+                let g = c.get(1).copied().unwrap_or(b);
+                let r = c.get(2).copied().unwrap_or(g);
+                let a = c.get(3).copied().unwrap_or(255);
+                [r, g, b, a]
+            })
+            .collect(),
         (4, cosmic_text::SwashContent::Mask) => {
             data.into_iter().flat_map(|a| [a, a, a, a]).collect()
         }
@@ -6869,7 +6884,11 @@ mod tests {
     }
 
     #[test]
-    fn rgba_text_atlas_preserves_subpixel_mask_channels() {
+    fn rgba_text_atlas_swaps_subpixel_mask_to_rgb() {
+        // swash emits subpixel coverage in BGR order; the atlas is sampled as
+        // RGBA with the red channel driving the left physical subpixel, so the
+        // bytes must be R<->B swapped to avoid a reversed (cyan-left/red-right)
+        // fringe. Per-channel coverage is preserved, just reordered to RGB.
         let data = glyph_image_data_for_atlas(
             cosmic_text::SwashContent::SubpixelMask,
             vec![10, 30, 90, 90, 0, 20, 40, 40],
@@ -6878,8 +6897,8 @@ mod tests {
 
         assert_eq!(
             data,
-            vec![10, 30, 90, 90, 0, 20, 40, 40],
-            "RGBA text atlas must keep per-channel coverage for ClearType-style smoothing"
+            vec![90, 30, 10, 90, 40, 20, 0, 40],
+            "RGBA text atlas must swap B<->R so swash's BGR subpixel coverage lands as RGB"
         );
     }
 
