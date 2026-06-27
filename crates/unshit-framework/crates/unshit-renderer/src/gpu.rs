@@ -687,15 +687,19 @@ impl GpuContext {
         } else {
             QuadPipeline::new(&device, surface_format, sample_count)
         };
+        // Subpixel (ClearType) text is a per-pixel cost -- the subpixel
+        // shader samples three chroma channels and DirectWrite rasterizes RGBA
+        // coverage -- that a CPU rasterizer pays in full fragment shading. On
+        // the Software tier use grayscale antialiasing instead (R8 atlas +
+        // text.wgsl), unless an env override forces subpixel on. The hardware
+        // path keeps the platform policy (`use_subpixel_text_shader()`) and is
+        // unchanged.
+        let subpixel = use_subpixel_text_shader() && tier != AdapterTier::Software;
         #[cfg(target_os = "windows")]
         let glyph_atlas = GlyphAtlas::new_with_format(
             &device,
             2048,
-            if use_subpixel_text_shader() {
-                wgpu::TextureFormat::Rgba8Unorm
-            } else {
-                wgpu::TextureFormat::R8Unorm
-            },
+            if subpixel { wgpu::TextureFormat::Rgba8Unorm } else { wgpu::TextureFormat::R8Unorm },
         );
         #[cfg(not(target_os = "windows"))]
         let glyph_atlas = GlyphAtlas::new(&device);
@@ -705,6 +709,7 @@ impl GpuContext {
             &glyph_atlas.texture_view,
             &glyph_atlas.sampler,
             sample_count,
+            subpixel,
         );
         let image_pipeline = ImagePipeline::new(&device, surface_format, sample_count);
         let svg_pipeline = SvgPipeline::new(&device, surface_format, sample_count);
@@ -813,6 +818,7 @@ impl GpuContext {
             &self.glyph_atlas.texture_view,
             &self.glyph_atlas.sampler,
             1,
+            use_subpixel_text_shader(),
         ));
         self.backdrop_image_pipeline = Some(ImagePipeline::new(&self.device, format, 1));
         self.backdrop_svg_pipeline =
@@ -984,6 +990,7 @@ impl GpuContext {
             &glyph_atlas.texture_view,
             &glyph_atlas.sampler,
             MSAA_SAMPLE_COUNT,
+            use_subpixel_text_shader(),
         );
         let image_pipeline = ImagePipeline::new(&device, format, MSAA_SAMPLE_COUNT);
         let svg_pipeline = SvgPipeline::new(&device, format, MSAA_SAMPLE_COUNT);
