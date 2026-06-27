@@ -3405,8 +3405,15 @@ fn emit_text_glyphs_cached(
 
     // Main text run, on top of any shadow.
     for (rel_x, rel_y, entry) in &laid_out {
+        // Snap the glyph baseline to a whole device pixel row. Positions here are
+        // already in device px (font sizes are pre-scaled by the DPR), but UI
+        // chrome text origins land on fractional rows at non-integer scale (e.g.
+        // 1.5x), which smears horizontal stems across two rows at partial
+        // coverage. Rounding Y (not X, to preserve shaping/kerning) lands stems
+        // on one crisp row -- the same trick the terminal grid path already uses
+        // (`gy.round()`). This path is UI-only; the terminal has its own emit.
         batch.glyph_instances.push(GlyphInstance {
-            pos: [x + rel_x, y + rel_y],
+            pos: [x + rel_x, (y + rel_y).round()],
             size: entry.size,
             uv_min: [entry.uv_rect[0], entry.uv_rect[1]],
             uv_max: [entry.uv_rect[2], entry.uv_rect[3]],
