@@ -3302,6 +3302,109 @@ pub fn dispatch_palette_key(
     }
 }
 
+/// Push `img` onto the Quick Prompt's image list unless an image with
+/// the same content hash is already attached. Returns `true` when the
+/// image was newly added, `false` when it was a duplicate (per spec
+/// A4.4: pasting the same screenshot twice dedups to one chip).
+fn push_unique_quick_prompt_image(
+    qp: &mut crate::quick_prompt::QuickPromptState,
+    img: crate::quick_prompt::QuickPromptImage,
+) -> bool {
+    if qp.images.iter().any(|i| i.hash == img.hash) {
+        false
+    } else {
+        qp.images.push(img);
+        true
+    }
+}
+
+/// Attach a clipboard image to the open Quick Prompt if one is present.
+///
+/// Returns `true` only when an image was actually attached, so the
+/// Ctrl+V key handler knows to *consume* the event. Returns `false`
+/// when the overlay is closed, the clipboard holds no image, or the
+/// read failed — in those cases the framework falls through to its
+/// normal text paste, so a plain Ctrl+V of text still lands in the
+/// input. This is the silent-on-miss counterpart to the
+/// `quick_prompt.image_paste` command (the "Attach image" button),
+/// which deliberately surfaces a "No image on clipboard" hint.
+pub fn try_attach_clipboard_image(state: &mut AppState) -> bool {
+    let Some(session_hex) = state.quick_prompt.as_ref().map(|qp| qp.session_hex.clone()) else {
+        return false;
+    };
+    let captured =
+        crate::quick_prompt::images::capture_clipboard_image(&state.clipboard, &session_hex);
+    let Some(qp) = state.quick_prompt.as_mut() else {
+        return false;
+    };
+    match captured {
+        Ok(Some(img)) => {
+            push_unique_quick_prompt_image(qp, img);
+            qp.error = None;
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            log::warn!("clipboard image paste failed: {e}");
+            false
+        }
+    }
+}
+
+/// Attach every decodable image among `paths` to the open Quick Prompt
+/// (native drag-and-drop). Returns `true` when overlay state changed (an
+/// image was attached or an error hint was set) so the caller can
+/// request a rebuild. Non-image paths are skipped. A drop that carried
+/// no decodable image sets a friendly hint so the gesture is never
+/// silently ignored.
+pub fn attach_dropped_images(state: &mut AppState, paths: &[std::path::PathBuf]) -> bool {
+    let Some(session_hex) = state.quick_prompt.as_ref().map(|qp| qp.session_hex.clone()) else {
+        return false;
+    };
+
+    let mut attached = 0usize;
+    let mut saw_image = false;
+    let mut last_err: Option<String> = None;
+
+    for path in paths {
+        if !crate::quick_prompt::images::is_supported_image_path(path) {
+            continue;
+        }
+        saw_image = true;
+        match crate::quick_prompt::images::capture_image_from_path(&session_hex, path) {
+            Ok(img) => {
+                if let Some(qp) = state.quick_prompt.as_mut() {
+                    if push_unique_quick_prompt_image(qp, img) {
+                        attached += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("failed to attach dropped image {}: {e}", path.display());
+                last_err = Some(e.to_string());
+            }
+        }
+    }
+
+    let Some(qp) = state.quick_prompt.as_mut() else {
+        return false;
+    };
+    if attached > 0 {
+        qp.error = None;
+        true
+    } else if let Some(err) = last_err {
+        qp.error = Some(format!("Could not attach image: {err}"));
+        true
+    } else if saw_image {
+        // Every dropped image was already attached (dedup). Nothing to
+        // repaint and no error worth showing.
+        false
+    } else {
+        qp.error = Some("No image in dropped files".into());
+        true
+    }
+}
+
 fn is_palette_safe_dispatch(command: &str) -> bool {
     matches!(
         command,
@@ -3574,9 +3677,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             match captured {
                 Ok(Some(img)) => {
-                    if !qp_mut.images.iter().any(|i| i.hash == img.hash) {
-                        qp_mut.images.push(img);
-                    }
+                    push_unique_quick_prompt_image(qp_mut, img);
                     qp_mut.error = None;
                     true
                 }
@@ -5978,6 +6079,120 @@ mod tests {
 
         assert!(dispatch(&mut state, "modal.close"));
         assert!(!dir.exists());
+    }
+
+    // --- drag-and-drop image attach -------------------------------------
+
+    /// Write a real PNG to disk and return its path. Lives in a throwaway
+    /// session dir; callers clean it up via `cleanup_session`.
+    fn write_png_fixture(session_hex: &str, w: usize, h: usize) -> PathBuf {
+        let mut bytes = Vec::with_capacity(w * h * 4);
+        for _ in 0..w * h {
+            bytes.extend_from_slice(&[20, 140, 220, 255]);
+        }
+        crate::quick_prompt::images::save_image_to_session(session_hex, w, h, bytes)
+            .expect("write png fixture")
+            .temp_path
+    }
+
+    #[test]
+    fn attach_dropped_images_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(!attach_dropped_images(&mut state, &[PathBuf::from("whatever.png")]));
+    }
+
+    #[test]
+    fn attach_dropped_images_attaches_png_and_dedups() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        let src_hex = format!("drop-src-{}", std::process::id());
+        let png = write_png_fixture(&src_hex, 6, 4);
+
+        // First drop attaches one chip.
+        assert!(attach_dropped_images(&mut state, std::slice::from_ref(&png)));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert_eq!(qp.images.len(), 1);
+        assert_eq!(qp.images[0].width, 6);
+        assert_eq!(qp.images[0].height, 4);
+        assert!(qp.error.is_none());
+
+        // Same file again: content hash dedups, no second chip, no rebuild.
+        assert!(!attach_dropped_images(&mut state, std::slice::from_ref(&png)));
+        assert_eq!(state.quick_prompt.as_ref().unwrap().images.len(), 1);
+
+        // Cleanup: the overlay session dir plus the fixture session dir.
+        let overlay_hex = state.quick_prompt.as_ref().unwrap().session_hex.clone();
+        crate::quick_prompt::images::cleanup_session(&overlay_hex);
+        crate::quick_prompt::images::cleanup_session(&src_hex);
+    }
+
+    #[test]
+    fn attach_dropped_images_hints_when_no_image_files() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        assert!(attach_dropped_images(&mut state, &[PathBuf::from("notes.txt")]));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert!(qp.images.is_empty());
+        assert_eq!(qp.error.as_deref(), Some("No image in dropped files"));
+
+        let overlay_hex = qp.session_hex.clone();
+        crate::quick_prompt::images::cleanup_session(&overlay_hex);
+    }
+
+    #[test]
+    fn attach_dropped_images_reports_error_for_corrupt_image() {
+        let mut state = test_state();
+        let qp = crate::quick_prompt::QuickPromptState::open_default();
+        let overlay_hex = qp.session_hex.clone();
+        state.quick_prompt = Some(qp);
+
+        // A file with a .png extension but non-image bytes.
+        let dir = crate::quick_prompt::images::session_dir(&overlay_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bogus = dir.join("corrupt.png");
+        std::fs::write(&bogus, b"nope").unwrap();
+
+        assert!(attach_dropped_images(&mut state, std::slice::from_ref(&bogus)));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert!(qp.images.is_empty());
+        assert!(
+            qp.error.as_deref().unwrap().starts_with("Could not attach image:"),
+            "unexpected error: {:?}",
+            qp.error
+        );
+
+        crate::quick_prompt::images::cleanup_session(&overlay_hex);
+    }
+
+    #[test]
+    fn try_attach_clipboard_image_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(!try_attach_clipboard_image(&mut state));
+    }
+
+    #[test]
+    fn try_attach_clipboard_image_is_silent_on_miss() {
+        // A freshly created clipboard context in CI has no image, so the
+        // helper must return false (let text paste proceed) WITHOUT
+        // setting an error chip. If the developer's clipboard happens to
+        // hold an image, the alternative branch attaches it instead;
+        // both outcomes leave the overlay open and panic-free.
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+        let overlay_hex = state.quick_prompt.as_ref().unwrap().session_hex.clone();
+
+        let attached = try_attach_clipboard_image(&mut state);
+        let qp = state.quick_prompt.as_ref().unwrap();
+        if attached {
+            assert!(!qp.images.is_empty());
+        } else {
+            // The key contract: a miss never leaves a stray error chip.
+            assert!(qp.error.is_none());
+            assert!(qp.images.is_empty());
+        }
+        crate::quick_prompt::images::cleanup_session(&overlay_hex);
     }
 
     fn open_with_popup() -> AppState {

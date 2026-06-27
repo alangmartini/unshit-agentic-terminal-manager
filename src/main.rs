@@ -1,3 +1,10 @@
+// On Windows, build release as a "windows" (GUI) subsystem binary so launching
+// the app from the installer shortcut or Explorer does not pop a console window
+// next to it. Debug builds stay on the console subsystem so `cargo run` keeps
+// surfacing logs during development. Release CLI/bench output is preserved via
+// `attach_parent_console` below when the exe is started from a terminal.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 pub mod bench;
 pub mod bridge;
 pub mod command_palette;
@@ -55,6 +62,11 @@ const ENV_PARITY_FONT_SIZE_PT: &str = "TM_PARITY_FONT_SIZE_PT";
 const ENV_PARITY_FONT_FAMILY: &str = "TM_PARITY_FONT_FAMILY";
 const ENV_OPEN_SETTINGS: &str = "TM_OPEN_SETTINGS";
 const ENV_OPEN_QUICK_PROMPT: &str = "TM_OPEN_QUICK_PROMPT";
+/// Preview/screenshot hook: pre-attach the image file at this path to the
+/// Quick Prompt on startup (opening the overlay if needed), exercising the
+/// real `attach_dropped_images` drag-and-drop path. Used by
+/// `scripts/qp-attach-shot.ps1` to verify the rendered image chip.
+const ENV_QP_ATTACH_IMAGE: &str = "TM_QP_ATTACH_IMAGE";
 const ENV_OPEN_CONFIRM_DIALOG: &str = "TM_OPEN_CONFIRM_DIALOG";
 const ENV_SHOW_TEST_TOAST: &str = "TM_SHOW_TEST_TOAST";
 const WINDOWS_TERMINAL_PARITY_FONT_SIZE_PT: u32 = 16;
@@ -341,6 +353,16 @@ fn user_shortcut_bindings() -> Vec<(String, String)> {
     crate::keybinds::registry::shortcut_bindings_with_overrides(&overrides)
 }
 
+/// Whether `combo` is the Quick Prompt image-paste chord (Ctrl+V). Kept
+/// as a named predicate so the key match is unit-testable and a future
+/// edit cannot silently break it (matching uppercase `'V'`, the wrong
+/// modifier set, etc.). The `on_raw_key` hook uses this to attach a
+/// clipboard image when the overlay is open.
+fn is_quick_prompt_paste_combo(combo: &unshit::core::shortcut::KeyCombo) -> bool {
+    use unshit::core::event::{Key, Modifiers};
+    combo.key == Key::Char('v') && combo.modifiers == Modifiers::CTRL
+}
+
 fn terminal_font_sources_from_value(value: Option<std::ffi::OsString>) -> Vec<FontSource> {
     let mut fonts = vec![
         FontSource::System("JetBrains Mono".to_string()),
@@ -488,6 +510,22 @@ fn open_quick_prompt_on_startup_from_env() -> bool {
     open_quick_prompt_on_startup_from_value(std::env::var_os(ENV_OPEN_QUICK_PROMPT))
 }
 
+/// Resolve the startup image-attach path from a raw env value. Returns
+/// `None` for an unset or empty value so production launches (where this
+/// is never set) skip the attach entirely.
+fn quick_prompt_attach_image_from_value(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let value = value?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+fn quick_prompt_attach_image_from_env() -> Option<PathBuf> {
+    quick_prompt_attach_image_from_value(std::env::var_os(ENV_QP_ATTACH_IMAGE))
+}
+
 fn open_confirm_dialog_on_startup_from_value(value: Option<std::ffi::OsString>) -> bool {
     truthy_env_value(value)
 }
@@ -563,7 +601,34 @@ fn parse_bench_args() -> Option<crate::bench::BenchConfig> {
     })
 }
 
+/// Reattach stdio to the parent terminal on Windows release builds.
+///
+/// Release is a "windows" subsystem binary (see the crate attribute above), so
+/// it owns no console. When the user starts it from an existing terminal —
+/// `terminal-manager --bench ...`, the `notify` CLI, etc. — this reconnects
+/// stdout/stderr to that console so logs and bench output still appear. It is a
+/// no-op when there is no parent console (the installer/Explorer launch), which
+/// is exactly the no-extra-window behavior we want. Debug builds keep their own
+/// console and skip this entirely.
+fn attach_parent_console() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        // ATTACH_PARENT_PROCESS == (DWORD)-1.
+        const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+        extern "system" {
+            fn AttachConsole(dw_process_id: u32) -> i32;
+        }
+        // SAFETY: plain kernel32 call. Returns 0 (ignored) when the process has
+        // no parent console, leaving the app window-free as intended.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 fn main() {
+    attach_parent_console();
+
     if let Some(code) = notifications::handle_cli_from_env(std::env::args_os().skip(1)) {
         std::process::exit(code);
     }
@@ -680,6 +745,16 @@ fn main() {
     }
     if open_quick_prompt_on_startup_from_env() {
         initial_state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+    }
+    if let Some(image_path) = quick_prompt_attach_image_from_env() {
+        // Preview/screenshot hook: drive the real drag-and-drop attach
+        // path so the rendered chip can be verified. Open the overlay
+        // first if it is not already open.
+        if initial_state.quick_prompt.is_none() {
+            initial_state.quick_prompt =
+                Some(crate::quick_prompt::QuickPromptState::open_default());
+        }
+        crate::state::attach_dropped_images(&mut initial_state, std::slice::from_ref(&image_path));
     }
     if open_confirm_dialog_on_startup_from_env() {
         initial_state.confirm_dialog = Some(crate::state::ConfirmDialog::KillAll {
@@ -937,6 +1012,7 @@ fn main() {
     let close_shared = shared.clone();
     let sub_shared = shared.clone();
     let raw_key_shared = shared.clone();
+    let file_drop_shared = shared.clone();
     let frame_metrics_shared = shared.clone();
     let scroll_metrics_shared = shared.clone();
     let scroll_tuning_shared = shared.clone();
@@ -976,6 +1052,14 @@ fn main() {
                         true
                     } else if crate::state::dispatch_palette_key(&mut guard, combo) {
                         true
+                    } else if guard.quick_prompt.is_some() && is_quick_prompt_paste_combo(combo) {
+                        // Quick Prompt is open: Ctrl+V attaches a clipboard
+                        // image as a chip (spec U4/A4.1). Consume the event
+                        // ONLY when an image was actually attached; otherwise
+                        // return false so the framework falls through to its
+                        // normal text paste and a plain Ctrl+V of text still
+                        // lands in the input.
+                        crate::state::try_attach_clipboard_image(&mut guard)
                     } else if guard.settings_open
                         && combo.key == Key::Escape
                         && combo.modifiers.is_empty()
@@ -1048,6 +1132,15 @@ fn main() {
                         std::process::exit(0);
                     }
                 }
+            })),
+            on_file_drop: Some(Arc::new(move |paths: &[std::path::PathBuf]| -> bool {
+                // Native drag-and-drop. When the Quick Prompt overlay is
+                // open, attach any dropped image files as chips (the
+                // drag-and-drop counterpart to Ctrl+V). When it is closed,
+                // `attach_dropped_images` is a no-op and we request no
+                // rebuild, leaving terminal drops untouched.
+                let mut guard = file_drop_shared.lock_recover();
+                crate::state::attach_dropped_images(&mut guard, paths)
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
@@ -1484,6 +1577,21 @@ mod tests {
         assert!(!open_quick_prompt_on_startup_from_value(Some(
             std::ffi::OsString::from("false")
         )));
+    }
+
+    #[test]
+    fn quick_prompt_attach_image_from_value_resolves_path_or_none() {
+        assert_eq!(quick_prompt_attach_image_from_value(None), None);
+        assert_eq!(
+            quick_prompt_attach_image_from_value(Some(std::ffi::OsString::from(""))),
+            None
+        );
+        assert_eq!(
+            quick_prompt_attach_image_from_value(Some(std::ffi::OsString::from(
+                "C:/tmp/shot.png"
+            ))),
+            Some(PathBuf::from("C:/tmp/shot.png"))
+        );
     }
 
     #[test]
@@ -2133,6 +2241,33 @@ mod tests {
             pasters.contains(&"Ctrl+Shift+V"),
             "Ctrl+Shift+V must dispatch terminal.paste; got {pasters:?}"
         );
+    }
+
+    /// The Quick Prompt image-paste hook fires only on a bare Ctrl+V.
+    /// Uppercase `'V'` (the key combo is always lowercased), a missing
+    /// Ctrl, or extra modifiers must NOT match, so plain typing and
+    /// Ctrl+Shift+V (terminal literal paste) are never mistaken for an
+    /// image paste.
+    #[test]
+    fn quick_prompt_paste_combo_matches_only_ctrl_v() {
+        use unshit::core::event::{Key, Modifiers};
+        use unshit::core::shortcut::KeyCombo;
+
+        assert!(is_quick_prompt_paste_combo(&KeyCombo::new(
+            Key::Char('v'),
+            Modifiers::CTRL
+        )));
+        // Wrong / extra modifiers.
+        assert!(!is_quick_prompt_paste_combo(&KeyCombo::plain(Key::Char('v'))));
+        assert!(!is_quick_prompt_paste_combo(&KeyCombo::new(
+            Key::Char('v'),
+            Modifiers::CTRL | Modifiers::SHIFT
+        )));
+        // Different key.
+        assert!(!is_quick_prompt_paste_combo(&KeyCombo::new(
+            Key::Char('c'),
+            Modifiers::CTRL
+        )));
     }
 
     /// Regression test for issue #63.

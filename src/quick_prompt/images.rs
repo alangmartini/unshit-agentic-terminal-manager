@@ -127,6 +127,41 @@ pub fn save_image_to_session(
     })
 }
 
+/// Lowercase extensions we can decode. The `image` dep is built with
+/// only the `png` and `jpeg` decoders (see Cargo.toml), so we gate on
+/// those rather than attempting a decode that is guaranteed to fail for
+/// other formats. Screenshots from Snipping Tool / ShareX land as PNG;
+/// browser "copy image" and camera files are typically JPEG.
+const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg"];
+
+/// Whether `path`'s extension names an image format we can decode. Used
+/// by the drag-and-drop handler to skip non-image drops (a dropped
+/// folder, text file, etc.) without trying to decode them.
+pub fn is_supported_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| SUPPORTED_IMAGE_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Decode an image file from disk, convert to RGBA, and store it in the
+/// session dir exactly like a pasted clipboard image (full-res PNG +
+/// thumbnail, content-addressed for dedup). This is the drag-and-drop
+/// counterpart to [`capture_clipboard_image`]: the source is a file the
+/// OS handed us rather than raw clipboard pixels, but everything
+/// downstream (chips, dedup, submit, cleanup) is identical.
+pub fn capture_image_from_path(session_hex: &str, path: &Path) -> io::Result<QuickPromptImage> {
+    let decoded = image::open(path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not decode image {}: {e}", path.display()),
+        )
+    })?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    save_image_to_session(session_hex, width as usize, height as usize, rgba.into_raw())
+}
+
 /// Resize so the longest edge is `THUMBNAIL_MAX_EDGE`, preserving
 /// aspect ratio. Smaller images are returned unchanged.
 fn make_thumbnail(
@@ -323,6 +358,61 @@ mod tests {
         let thumb = image::open(&small.thumb_path).expect("open thumb");
         assert_eq!(thumb.width(), 16);
         assert_eq!(thumb.height(), 16);
+        cleanup_session(&hex);
+    }
+
+    // --- is_supported_image_path ----------------------------------------
+
+    #[test]
+    fn is_supported_image_path_accepts_png_jpg_jpeg_any_case() {
+        assert!(is_supported_image_path(Path::new("a.png")));
+        assert!(is_supported_image_path(Path::new("a.PNG")));
+        assert!(is_supported_image_path(Path::new("a.jpg")));
+        assert!(is_supported_image_path(Path::new("a.JPEG")));
+        assert!(is_supported_image_path(Path::new("dir/sub/shot.Png")));
+    }
+
+    #[test]
+    fn is_supported_image_path_rejects_other_and_missing_extensions() {
+        assert!(!is_supported_image_path(Path::new("a.gif")));
+        assert!(!is_supported_image_path(Path::new("a.txt")));
+        assert!(!is_supported_image_path(Path::new("a.webp")));
+        assert!(!is_supported_image_path(Path::new("noext")));
+        assert!(!is_supported_image_path(Path::new("trailingdot.")));
+    }
+
+    // --- capture_image_from_path ----------------------------------------
+
+    #[test]
+    fn capture_image_from_path_round_trips_a_png_file() {
+        // Write a real PNG to disk via the save path, then read it back
+        // through the drag-and-drop path and confirm dims + on-disk files.
+        let src_hex = unique_session_hex("from-path-src");
+        let written = save_image_to_session(&src_hex, 5, 3, solid_color_rgba(5, 3, [12, 34, 56, 255]))
+            .expect("write source png");
+
+        let dst_hex = unique_session_hex("from-path-dst");
+        let img = capture_image_from_path(&dst_hex, &written.temp_path).expect("capture from path");
+        assert_eq!(img.width, 5);
+        assert_eq!(img.height, 3);
+        assert!(img.temp_path.exists(), "full-res PNG should exist");
+        assert!(img.thumb_path.exists(), "thumb PNG should exist");
+        assert_eq!(img.temp_path.parent().unwrap(), session_dir(&dst_hex));
+
+        cleanup_session(&src_hex);
+        cleanup_session(&dst_hex);
+    }
+
+    #[test]
+    fn capture_image_from_path_rejects_non_image_file() {
+        let hex = unique_session_hex("from-path-bad");
+        let dir = session_dir(&hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        let not_image = dir.join("note.png"); // .png name, but bytes are not a PNG
+        std::fs::write(&not_image, b"this is definitely not an image").unwrap();
+
+        let err = capture_image_from_path(&hex, &not_image).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         cleanup_session(&hex);
     }
 
