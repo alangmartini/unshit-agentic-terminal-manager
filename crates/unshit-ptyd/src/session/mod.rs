@@ -35,6 +35,52 @@ pub const ENV_NOTIFY_SOCKET: &str = "TM_NOTIFY_SOCKET";
 pub const ENV_WORKSPACE_ID: &str = "TM_WORKSPACE_ID";
 pub const ENV_PANE_ID: &str = "TM_PANE_ID";
 
+/// Environment variables that select a non-default Claude Code profile,
+/// override the Anthropic provider/model, or mark an in-progress Claude
+/// Code agent session.
+///
+/// The daemon is long-lived and inherits the environment of whatever
+/// launched it. When that launcher is a Claude Code session or a
+/// provider-override wrapper (e.g. a z.ai/GLM profile that exports
+/// `ANTHROPIC_BASE_URL` + `CLAUDE_CONFIG_DIR`), those vars would otherwise
+/// propagate into every spawned pane. A pane is meant to be a clean
+/// interactive shell, so a `claude`/`cc` started inside one must fall back
+/// to the user's default config rather than inheriting the launcher's
+/// profile. We strip these before spawn so a single tainted launch can't
+/// poison every pane until the daemon restarts.
+pub(crate) const INHERITED_AGENT_ENV_VARS: &[&str] = &[
+    // Config-directory / profile selection.
+    "CLAUDE_CONFIG_DIR",
+    // Provider + model overrides (set by GLM/z.ai-style wrappers).
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    // Markers of an in-progress Claude Code session.
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_TMPDIR",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+];
+
+/// Remove the [`INHERITED_AGENT_ENV_VARS`] from a spawn command so panes
+/// don't inherit the daemon launcher's Claude Code profile or provider
+/// override. `CommandBuilder::new` pre-seeds the command with the daemon's
+/// base environment, so `env_remove` here drops inherited values, not just
+/// ones set explicitly on this builder.
+pub(crate) fn strip_inherited_agent_env(cmd: &mut CommandBuilder) {
+    for key in INHERITED_AGENT_ENV_VARS {
+        cmd.env_remove(key);
+    }
+}
+
 /// Owns one PTY child and the reader task that fans its bytes into the
 /// outbound mpsc.
 pub struct Session {
@@ -129,6 +175,11 @@ impl Session {
         for (key, value) in terminal_manager_session_env(workspace_id, pane_id) {
             cmd.env(key, value);
         }
+        // Panes are fresh interactive shells, not children of whatever
+        // Claude Code / provider profile launched the long-lived daemon.
+        // Strip the leaked profile/session vars so e.g. `cc` uses the
+        // user's default config instead of inheriting a GLM/z.ai profile.
+        strip_inherited_agent_env(&mut cmd);
 
         let child = pty
             .slave
@@ -628,6 +679,34 @@ mod tests {
         assert_eq!(session.workspace_id(), 7);
         assert_eq!(session.pane_id(), 3);
         assert_eq!(session.name(), Some("scratch"));
+    }
+
+    #[test]
+    fn strip_inherited_agent_env_removes_profile_and_session_vars() {
+        let mut cmd = CommandBuilder::new("pwsh");
+        // Simulate the leaked GLM/z.ai profile plus Claude Code session
+        // markers that a tainted daemon launch would propagate.
+        cmd.env("CLAUDE_CONFIG_DIR", r"C:\Users\x\.claude-glm");
+        cmd.env("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic");
+        cmd.env("ANTHROPIC_MODEL", "glm-5.2");
+        cmd.env("CLAUDE_CODE_SESSION_ID", "0b453326");
+        cmd.env("CLAUDECODE", "1");
+        // A benign var the user actually wants must survive.
+        cmd.env("MY_SAFE_VAR", "keep-me");
+
+        strip_inherited_agent_env(&mut cmd);
+
+        for key in INHERITED_AGENT_ENV_VARS {
+            assert!(
+                cmd.get_env(key).is_none(),
+                "{key} should have been stripped from the spawn env"
+            );
+        }
+        assert_eq!(
+            cmd.get_env("MY_SAFE_VAR"),
+            Some(std::ffi::OsStr::new("keep-me")),
+            "non-agent env vars must be preserved"
+        );
     }
 
     #[test]
