@@ -3,7 +3,6 @@ use std::sync::OnceLock;
 use wgpu;
 
 use crate::instance_buffer_pool::InstanceBufferPool;
-use crate::text_rendering::use_subpixel_text_shader;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -54,11 +53,12 @@ impl TextPipeline {
         atlas_view: &wgpu::TextureView,
         atlas_sampler: &wgpu::Sampler,
         sample_count: u32,
+        subpixel: bool,
     ) -> Self {
         #[cfg(target_os = "windows")]
         let shader_src = if use_debug_solid_text_shader() {
             include_str!("../shaders/text_debug_solid.wgsl")
-        } else if use_subpixel_text_shader() {
+        } else if subpixel {
             include_str!("../shaders/text_subpixel.wgsl")
         } else {
             include_str!("../shaders/text.wgsl")
@@ -182,7 +182,7 @@ impl TextPipeline {
                     blend: Some({
                         #[cfg(target_os = "windows")]
                         {
-                            if use_subpixel_text_shader() {
+                            if subpixel {
                                 // Premultiplied alpha for subpixel blending
                                 wgpu::BlendState {
                                     color: wgpu::BlendComponent {

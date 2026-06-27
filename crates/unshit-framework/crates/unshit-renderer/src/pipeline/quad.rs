@@ -102,11 +102,98 @@ pub struct QuadPipeline {
     uniform_buffer: wgpu::Buffer,
 }
 
+/// Vertex attributes for the full quad pipeline. Reads every `QuadInstance`
+/// slot so the full shader (`shaders/quad.wgsl`) can render gradients,
+/// shadows, and masks.
+const FULL_INSTANCE_ATTRS: [wgpu::VertexAttribute; 28] = wgpu::vertex_attr_array![
+    0 => Float32x2,  // pos
+    1 => Float32x2,  // size
+    2 => Float32x4,  // color
+    3 => Float32x4,  // border_color
+    4 => Float32x4,  // border_width
+    5 => Float32x4,  // border_radius
+    6 => Float32x4,  // clip_rect
+    7 => Float32x4,  // shadow_color
+    8 => Float32x2,  // shadow_offset
+    9 => Float32x2,  // shadow_params
+    10 => Float32x2, // shadow_spread
+    11 => Float32x4, // gradient_stop_colors[0]
+    12 => Float32x4, // gradient_stop_colors[1]
+    13 => Float32x4, // gradient_stop_colors[2]
+    14 => Float32x4, // gradient_stop_colors[3]
+    15 => Float32x4, // gradient_stop_colors[4]
+    16 => Float32x4, // gradient_stop_colors[5]
+    17 => Float32x4, // gradient_stop_colors[6]
+    18 => Float32x4, // gradient_stop_colors[7]
+    19 => Float32x4, // gradient_stop_positions[0..4]
+    20 => Float32x4, // gradient_stop_positions[4..8]
+    21 => Float32x4, // gradient_params
+    22 => Float32x4, // gradient_extra (radial center and radii)
+    23 => Float32x4, // mask_stops_01 (alpha0, pos0, alpha1, pos1)
+    24 => Float32x4, // mask_stops_23 (alpha2, pos2, alpha3, pos3)
+    25 => Float32x4, // mask_params (angle_rad, 0, 0, stop_count)
+    26 => Float32x4, // xform (2x2 linear delta-from-identity: a-1,b,c,d-1)
+    27 => Float32x2, // xform_translate (e, f)
+];
+
+/// Vertex attributes for the software-renderer quad pipeline. Reads only the
+/// slots the lite shader (`shaders/quad_software.wgsl`) touches; the buffer
+/// stride is still `sizeof(QuadInstance)` so the same instance buffer feeds
+/// both pipelines. Locations match `FULL_INSTANCE_ATTRS` so the same offsets
+/// apply.
+const SOFTWARE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 13] = wgpu::vertex_attr_array![
+    0 => Float32x2,  // pos
+    1 => Float32x2,  // size
+    2 => Float32x4,  // color
+    3 => Float32x4,  // border_color
+    4 => Float32x4,  // border_width
+    5 => Float32x4,  // border_radius
+    6 => Float32x4,  // clip_rect
+    7 => Float32x4,  // shadow_color
+    8 => Float32x2,  // shadow_offset
+    9 => Float32x2,  // shadow_params
+    10 => Float32x2, // shadow_spread
+    26 => Float32x4, // xform
+    27 => Float32x2, // xform_translate
+];
+
 impl QuadPipeline {
+    /// Full quad pipeline: the GPU-accelerated path (`shaders/quad.wgsl`),
+    /// gradients/shadows/masks and all.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
+        Self::build(device, format, sample_count, false)
+    }
+
+    /// Software-renderer quad pipeline: the lite shader
+    /// (`shaders/quad_software.wgsl`) used only on `AdapterTier::Software`,
+    /// whose 60-component varying budget the full shader exceeds. Behavior is
+    /// identical to [`Self::new`] except for the shader source and the (smaller)
+    /// instance attribute list.
+    pub fn new_software(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) -> Self {
+        Self::build(device, format, sample_count, true)
+    }
+
+    fn build(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        sample_count: u32,
+        software: bool,
+    ) -> Self {
+        let (shader_source, shader_label) = if software {
+            (
+                wgpu::ShaderSource::Wgsl(include_str!("../shaders/quad_software.wgsl").into()),
+                "quad software shader",
+            )
+        } else {
+            (wgpu::ShaderSource::Wgsl(include_str!("../shaders/quad.wgsl").into()), "quad shader")
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("quad shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/quad.wgsl").into()),
+            label: Some(shader_label),
+            source: shader_source,
         });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -145,36 +232,8 @@ impl QuadPipeline {
             push_constant_ranges: &[],
         });
 
-        let instance_attrs = wgpu::vertex_attr_array![
-            0 => Float32x2,  // pos
-            1 => Float32x2,  // size
-            2 => Float32x4,  // color
-            3 => Float32x4,  // border_color
-            4 => Float32x4,  // border_width
-            5 => Float32x4,  // border_radius
-            6 => Float32x4,  // clip_rect
-            7 => Float32x4,  // shadow_color
-            8 => Float32x2,  // shadow_offset
-            9 => Float32x2,  // shadow_params
-            10 => Float32x2, // shadow_spread
-            11 => Float32x4, // gradient_stop_colors[0]
-            12 => Float32x4, // gradient_stop_colors[1]
-            13 => Float32x4, // gradient_stop_colors[2]
-            14 => Float32x4, // gradient_stop_colors[3]
-            15 => Float32x4, // gradient_stop_colors[4]
-            16 => Float32x4, // gradient_stop_colors[5]
-            17 => Float32x4, // gradient_stop_colors[6]
-            18 => Float32x4, // gradient_stop_colors[7]
-            19 => Float32x4, // gradient_stop_positions[0..4]
-            20 => Float32x4, // gradient_stop_positions[4..8]
-            21 => Float32x4, // gradient_params
-            22 => Float32x4, // gradient_extra (radial center and radii)
-            23 => Float32x4, // mask_stops_01 (alpha0, pos0, alpha1, pos1)
-            24 => Float32x4, // mask_stops_23 (alpha2, pos2, alpha3, pos3)
-            25 => Float32x4, // mask_params (angle_rad, 0, 0, stop_count)
-            26 => Float32x4, // xform (2x2 linear delta-from-identity: a-1,b,c,d-1)
-            27 => Float32x2, // xform_translate (e, f)
-        ];
+        let instance_attrs: &[wgpu::VertexAttribute] =
+            if software { &SOFTWARE_INSTANCE_ATTRS } else { &FULL_INSTANCE_ATTRS };
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("quad pipeline"),
@@ -185,7 +244,7 @@ impl QuadPipeline {
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<QuadInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &instance_attrs,
+                    attributes: instance_attrs,
                 }],
                 compilation_options: Default::default(),
             },

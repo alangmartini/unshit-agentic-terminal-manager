@@ -203,6 +203,13 @@ pub struct AppConfig {
     /// confirms, or leave the window alive if the user cancels. When the
     /// callback is unset the framework exits unconditionally.
     pub on_close: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Callback invoked when the OS drops one or more files onto the
+    /// window (native drag-and-drop). Receives the dropped paths. The
+    /// handler runs on the UI thread; returning `true` requests a tree
+    /// rebuild and redraw so any state it mutated paints immediately.
+    /// When unset, file drops are ignored.
+    #[allow(clippy::type_complexity)]
+    pub on_file_drop: Option<Arc<dyn Fn(&[std::path::PathBuf]) -> bool + Send + Sync>>,
     /// One-shot callback invoked once the renderer publishes valid cell
     /// metrics (cell width and height in pixels). Fires after the first
     /// render pass that produces non-zero values, giving the application a
@@ -258,6 +265,7 @@ impl Default for AppConfig {
             on_scale_factor: None,
             on_window_maximized: None,
             on_close: None,
+            on_file_drop: None,
             on_cell_metrics: None,
             on_scroll_telemetry: None,
             #[cfg(feature = "input-latency-histogram")]
@@ -642,6 +650,13 @@ fn should_check_shortcut_during_keyboard_capture(combo: &unshit_core::shortcut::
 
 fn consume_raw_key_hook(config: &AppConfig, combo: &unshit_core::shortcut::KeyCombo) -> bool {
     config.on_raw_key.as_ref().is_some_and(|f| f(combo))
+}
+
+/// Invoke the file-drop hook for a native drag-and-drop. Returns `true`
+/// when the application handled the drop and wants a rebuild. Returns
+/// `false` when no hook is installed or the hook declined the paths.
+fn invoke_file_drop_hook(config: &AppConfig, paths: &[std::path::PathBuf]) -> bool {
+    config.on_file_drop.as_ref().is_some_and(|f| f(paths))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2431,6 +2446,7 @@ impl ApplicationHandler for AppHandler {
                 | WindowEvent::Focused(_)
                 | WindowEvent::ModifiersChanged(_)
                 | WindowEvent::Ime(_)
+                | WindowEvent::DragDropped { .. }
         );
         // The subset of activity events that count as user input for the
         // input latency instrument. SurfaceResized and Focused are
@@ -3156,6 +3172,17 @@ impl ApplicationHandler for AppHandler {
                 }
             }
 
+            WindowEvent::DragDropped { paths, .. } => {
+                // Native file drag-and-drop. Hand the dropped paths to the
+                // application; it decides what to do (e.g. attach images to
+                // an open overlay). A `true` return means the callback
+                // mutated state that must paint, so schedule a rebuild.
+                if invoke_file_drop_hook(&self.app.config, &paths) {
+                    state.needs_rebuild = true;
+                    state.window.request_redraw();
+                }
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
                     // FIRST: check if focused element captures keyboard input
@@ -3777,6 +3804,24 @@ impl ApplicationHandler for AppHandler {
                     }
                     if state.arena.get(state.interaction.focused).is_none() {
                         state.interaction.focused = NodeId::DANGLING;
+                    }
+
+                    // Honor an autofocus request recorded while building a
+                    // freshly mounted node (e.g. a dialog input). Building
+                    // runs only for new nodes, so this fires once when the
+                    // element first appears and never on the reconcile-only
+                    // rebuilds that typing into the input triggers, so it
+                    // cannot yank focus back after the user tabs away.
+                    if let Some(focus_id) = state.arena.pending_autofocus.take() {
+                        if state.arena.get(focus_id).is_some()
+                            && state.interaction.focused != focus_id
+                        {
+                            let old_focused = state.interaction.focused;
+                            state.interaction.focused = focus_id;
+                            state.interaction.focus_via_keyboard = false;
+                            update_focus_context(state);
+                            state.mark_restyle_pseudo_change(old_focused, focus_id);
+                        }
                     }
 
                     let style_work = subtree_has_dirty_flags(
@@ -5986,6 +6031,37 @@ mod tests {
 
         assert!(consume_raw_key_hook(&config, &KeyCombo::plain(Key::ArrowDown)));
         assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn file_drop_hook_receives_paths_and_propagates_return() {
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_hook = seen.clone();
+        let config = AppConfig {
+            on_file_drop: Some(Arc::new(move |paths: &[PathBuf]| {
+                seen_for_hook.lock().unwrap().extend_from_slice(paths);
+                // Pretend we handled it only when at least one path arrived.
+                !paths.is_empty()
+            })),
+            ..AppConfig::default()
+        };
+
+        let dropped = vec![PathBuf::from("a.png"), PathBuf::from("b.jpg")];
+        assert!(invoke_file_drop_hook(&config, &dropped));
+        assert_eq!(*seen.lock().unwrap(), dropped);
+
+        // Empty drop: hook runs but declines, so no rebuild is requested.
+        assert!(!invoke_file_drop_hook(&config, &[]));
+    }
+
+    #[test]
+    fn file_drop_hook_is_noop_when_unset() {
+        use std::path::PathBuf;
+        let config = AppConfig::default();
+        assert!(!invoke_file_drop_hook(&config, &[PathBuf::from("a.png")]));
     }
 
     #[test]

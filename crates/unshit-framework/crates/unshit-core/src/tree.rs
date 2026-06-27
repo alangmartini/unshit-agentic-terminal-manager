@@ -11,6 +11,12 @@ enum NodeSlot {
 pub struct NodeArena {
     nodes: Vec<NodeSlot>,
     free_list: Vec<u32>,
+    /// Node that requested focus on its first mount. Set by the build pass
+    /// when it allocates an element flagged `autofocus`; the app loop
+    /// consumes (and clears) it after each rebuild. Because builds run only
+    /// for freshly created nodes, this fires once when the element appears
+    /// and not on the reconcile-only rebuilds that typing triggers.
+    pub pending_autofocus: Option<NodeId>,
 }
 
 impl Default for NodeArena {
@@ -21,7 +27,7 @@ impl Default for NodeArena {
 
 impl NodeArena {
     pub fn new() -> Self {
-        Self { nodes: Vec::with_capacity(1024), free_list: Vec::new() }
+        Self { nodes: Vec::with_capacity(1024), free_list: Vec::new(), pending_autofocus: None }
     }
 
     pub fn alloc(&mut self, element: Element) -> NodeId {

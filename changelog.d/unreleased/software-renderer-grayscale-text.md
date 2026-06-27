@@ -1,0 +1,3 @@
+### Changed
+
+- The software/CPU-renderer fallback now uses **grayscale antialiasing** for text instead of subpixel (ClearType) rendering. Subpixel text is a per-pixel cost — the subpixel shader samples three chroma channels and DirectWrite rasterizes RGBA coverage — that a CPU rasterizer (WARP/lavapipe) pays in full fragment shading. On the Software tier the renderer now builds an R8 (single-channel) glyph atlas and the grayscale `text.wgsl` shader unless `TM_FORCE_SUBPIXEL_TEXT=1` overrides it, so text-heavy terminal frames shade fewer fragments on non-GPU machines. The hardware path keeps the platform policy (ClearType on Windows) unchanged.

@@ -1,16 +1,41 @@
 use unshit::core::element::*;
 use unshit::core::event::DragPhase;
+use unshit::core::style::parse::StyleDeclaration;
+use unshit::core::style::types::Dimension;
 
 use crate::state::{
     dispatch, mutate_close_tab, mutate_with, CtxMenu, CtxMenuTarget, SharedState, TabStatus,
-    TerminalTab, UiSnapshot,
+    TabWidthMode, TerminalTab, UiSnapshot,
 };
 use crate::ui::icons::*;
+
+/// How the tab strip should size each tab, threaded from the appearance
+/// settings into [`build_tab`]. `Fixed` pins every tab to `width_px`
+/// logical pixels via inline styles; `FitContent` leaves the width to the
+/// stylesheet (`.app.tabs-width-fit`) so tabs shrink-wrap their labels.
+#[derive(Clone, Copy)]
+pub struct TabSizing {
+    pub mode: TabWidthMode,
+    pub width_px: u32,
+}
+
+impl Default for TabSizing {
+    fn default() -> Self {
+        Self {
+            mode: crate::state::DEFAULT_TAB_WIDTH_MODE,
+            width_px: crate::state::DEFAULT_TAB_WIDTH_PX,
+        }
+    }
+}
 
 pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let mut tabs = ElementDef::new(Tag::Div).with_class("tabs").with_id("tabs");
     let placeholder_index = pane_drag_insertion_index(state);
     let dragging_source_id = state.drag.dragged_tab().map(|s| s.to_string());
+    let sizing = TabSizing {
+        mode: state.tab_width_mode,
+        width_px: state.tab_width_px,
+    };
     for (index, tab) in state.tabs.iter().enumerate() {
         if Some(index) == placeholder_index {
             tabs = tabs.with_child(build_tab_drop_placeholder());
@@ -21,6 +46,7 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             tab,
             index == state.active_tab,
             is_dragging,
+            sizing,
             shared,
         ));
     }
@@ -129,6 +155,7 @@ fn build_tab(
     tab: &TerminalTab,
     is_active: bool,
     is_dragging_source: bool,
+    sizing: TabSizing,
     shared: &SharedState,
 ) -> ElementDef {
     let status_class = match tab.status {
@@ -143,6 +170,16 @@ fn build_tab(
     let mut btn = ElementDef::new(Tag::Button)
         .with_class("tab")
         .with_key(format!("tab:{}", tab.id));
+    // Fixed sizing pins the tab to an exact width (overriding the
+    // stylesheet's 150–240px band); fit-content leaves width to the
+    // `.app.tabs-width-fit` rules so the tab shrink-wraps its label.
+    if let TabWidthMode::Fixed = sizing.mode {
+        let w = sizing.width_px as f32;
+        btn = btn
+            .with_style(StyleDeclaration::Width(Dimension::Px(w)))
+            .with_style(StyleDeclaration::MinWidth(Dimension::Px(w)))
+            .with_style(StyleDeclaration::MaxWidth(Dimension::Px(w)));
+    }
     if is_active {
         btn = btn.with_class("active");
     }
@@ -380,7 +417,7 @@ mod tests {
     fn tab_active() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, true, false, &shared);
+        let el = build_tab(0, &tab, true, false, TabSizing::default(), &shared);
 
         assert_eq!(el.tag, Tag::Button);
         assert!(has_class(&el, "tab"));
@@ -391,17 +428,64 @@ mod tests {
     fn tab_inactive() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, &shared);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
 
         assert!(has_class(&el, "tab"));
         assert!(!has_class(&el, "active"));
+    }
+
+    fn inline_px_width(el: &ElementDef) -> Option<f32> {
+        el.style_overrides.iter().find_map(|s| match s {
+            StyleDeclaration::Width(Dimension::Px(w)) => Some(*w),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn tab_fixed_sizing_pins_exact_width() {
+        let shared = make_shared();
+        let tab = make_tab("shell", TabStatus::Running);
+        let sizing = TabSizing {
+            mode: TabWidthMode::Fixed,
+            width_px: 260,
+        };
+        let el = build_tab(0, &tab, false, false, sizing, &shared);
+        // Fixed mode pins width + min-width + max-width to the same px so
+        // the tab neither grows nor shrinks off the configured value.
+        assert_eq!(inline_px_width(&el), Some(260.0));
+        assert!(el
+            .style_overrides
+            .iter()
+            .any(|s| matches!(s, StyleDeclaration::MinWidth(Dimension::Px(w)) if *w == 260.0)));
+        assert!(el
+            .style_overrides
+            .iter()
+            .any(|s| matches!(s, StyleDeclaration::MaxWidth(Dimension::Px(w)) if *w == 260.0)));
+    }
+
+    #[test]
+    fn tab_fit_content_sizing_leaves_width_to_stylesheet() {
+        let shared = make_shared();
+        let tab = make_tab("shell", TabStatus::Running);
+        let sizing = TabSizing {
+            mode: TabWidthMode::FitContent,
+            width_px: 260,
+        };
+        let el = build_tab(0, &tab, false, false, sizing, &shared);
+        // Fit-content sets no inline width; the `.app.tabs-width-fit` rules
+        // in the stylesheet do the shrink-wrapping instead.
+        assert!(inline_px_width(&el).is_none());
+        assert!(!el.style_overrides.iter().any(|s| matches!(
+            s,
+            StyleDeclaration::MinWidth(_) | StyleDeclaration::MaxWidth(_)
+        )));
     }
 
     #[test]
     fn tab_status_running() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, &shared);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
         let status = find_by_class(&el, "tab-status").unwrap();
         assert!(has_class(status, "running"));
     }
@@ -410,7 +494,7 @@ mod tests {
     fn tab_status_idle() {
         let shared = make_shared();
         let tab = make_tab("vim", TabStatus::Idle);
-        let el = build_tab(0, &tab, false, false, &shared);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
         let status = find_by_class(&el, "tab-status").unwrap();
         assert!(has_class(status, "idle"));
     }
@@ -419,7 +503,7 @@ mod tests {
     fn tab_status_stopped() {
         let shared = make_shared();
         let tab = make_tab("done", TabStatus::Stopped);
-        let el = build_tab(0, &tab, false, false, &shared);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
         let status = find_by_class(&el, "tab-status").unwrap();
         assert!(has_class(status, "stopped"));
     }
@@ -428,7 +512,7 @@ mod tests {
     fn tab_shows_name_and_subtitle() {
         let shared = make_shared();
         let tab = make_tab("myshell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, &shared);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
 
         let name_el = find_by_class(&el, "tab-name").unwrap();
         assert_eq!(text_of(name_el), Some("myshell"));
@@ -441,7 +525,7 @@ mod tests {
     fn tab_has_close_button() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, &shared);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
 
         let close = find_by_class(&el, "tab-close").unwrap();
         assert_eq!(text_of(close), Some("\u{00D7}"));
@@ -451,7 +535,7 @@ mod tests {
     fn tab_children_order() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, &shared);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
 
         // Expected order: status, name, subtitle, close
         assert_eq!(el.children.len(), 4);
@@ -588,7 +672,7 @@ mod tests {
     fn tab_has_click_handler_for_activation() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, &shared);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
         assert!(el.on_click.is_some());
     }
 
@@ -596,7 +680,7 @@ mod tests {
     fn tab_close_has_click_handler() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, &shared);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
         let close = find_by_class(&el, "tab-close").unwrap();
         assert!(close.on_click.is_some());
     }
@@ -605,7 +689,7 @@ mod tests {
     fn tab_has_dragging_class_when_source_of_drag() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, true, &shared);
+        let el = build_tab(0, &tab, false, true, TabSizing::default(), &shared);
         assert!(has_class(&el, "dragging"));
     }
 

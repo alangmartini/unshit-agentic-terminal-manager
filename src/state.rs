@@ -20,6 +20,12 @@ pub const DEFAULT_SMOOTH_SCROLL_DURATION_MS: u32 = 180;
 pub const MIN_SMOOTH_SCROLL_DURATION_MS: u32 = 16;
 pub const MAX_SMOOTH_SCROLL_DURATION_MS: u32 = 300;
 pub const SMOOTH_SCROLL_DURATION_STEP_MS: i32 = 10;
+pub const DEFAULT_TAB_WIDTH_MODE: TabWidthMode = TabWidthMode::Fixed;
+pub const DEFAULT_TAB_ROW_MODE: TabRowMode = TabRowMode::Single;
+pub const DEFAULT_TAB_WIDTH_PX: u32 = 200;
+pub const MIN_TAB_WIDTH_PX: u32 = 120;
+pub const MAX_TAB_WIDTH_PX: u32 = 400;
+pub const TAB_WIDTH_PX_STEP: i32 = 10;
 /// Minimum flex-grow ratio for any pane (prevents collapsing below ~10%).
 pub const MIN_PANE_RATIO: f32 = 0.1;
 pub const MIN_SIDEBAR_WIDTH: f32 = 150.0;
@@ -289,6 +295,95 @@ impl UiDensity {
             "compact" => Some(UiDensity::Compact),
             "cozy" => Some(UiDensity::Cozy),
             "comfy" => Some(UiDensity::Comfy),
+            _ => None,
+        }
+    }
+}
+
+/// How a horizontal terminal tab is sized along the strip.
+///
+/// `Fixed` pins every tab to a configurable width ([`AppState::tab_width_px`])
+/// so the strip reads as an even row; `FitContent` lets each tab shrink-wrap
+/// its own label so short names take less room than long ones.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabWidthMode {
+    Fixed,
+    FitContent,
+}
+
+impl TabWidthMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            TabWidthMode::Fixed => "fixed",
+            TabWidthMode::FitContent => "fit",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TabWidthMode::Fixed => "fixed",
+            TabWidthMode::FitContent => "fit content",
+        }
+    }
+
+    pub fn all() -> [TabWidthMode; 2] {
+        [TabWidthMode::Fixed, TabWidthMode::FitContent]
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "fixed" => Some(TabWidthMode::Fixed),
+            "fit" => Some(TabWidthMode::FitContent),
+            _ => None,
+        }
+    }
+}
+
+/// How the tab strip behaves when it runs out of horizontal room.
+///
+/// `Single` keeps the historical one-row strip that scrolls (and shows the
+/// `>` overflow affordance) once tabs spill past the edge. `Double` and
+/// `Triple` instead wrap the tabs onto up to two or three stacked rows,
+/// growing the tab bar downward and only scrolling once even those rows fill.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabRowMode {
+    Single,
+    Double,
+    Triple,
+}
+
+impl TabRowMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            TabRowMode::Single => "single",
+            TabRowMode::Double => "double",
+            TabRowMode::Triple => "triple",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.id()
+    }
+
+    /// Maximum number of stacked rows this mode allows before the strip
+    /// starts to scroll vertically.
+    pub fn max_rows(self) -> u32 {
+        match self {
+            TabRowMode::Single => 1,
+            TabRowMode::Double => 2,
+            TabRowMode::Triple => 3,
+        }
+    }
+
+    pub fn all() -> [TabRowMode; 3] {
+        [TabRowMode::Single, TabRowMode::Double, TabRowMode::Triple]
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "single" => Some(TabRowMode::Single),
+            "double" => Some(TabRowMode::Double),
+            "triple" => Some(TabRowMode::Triple),
             _ => None,
         }
     }
@@ -670,6 +765,12 @@ pub struct AppState {
     pub ui_density: UiDensity,
     pub scroll_line_px: u32,
     pub smooth_scroll_duration_ms: u32,
+    /// How horizontal tabs are sized (fixed width vs fit-to-content).
+    pub tab_width_mode: TabWidthMode,
+    /// Whether the tab strip stays one scrolling row or wraps onto 2/3 rows.
+    pub tab_row_mode: TabRowMode,
+    /// Fixed tab width in logical px, applied when `tab_width_mode` is `Fixed`.
+    pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
     pub palette_query: String,
@@ -860,6 +961,9 @@ impl AppState {
             ui_density: self.ui_density,
             scroll_line_px: self.scroll_line_px,
             smooth_scroll_duration_ms: self.smooth_scroll_duration_ms,
+            tab_width_mode: self.tab_width_mode,
+            tab_row_mode: self.tab_row_mode,
+            tab_width_px: self.tab_width_px,
             toggles: self.toggles.clone(),
             palette_open: self.palette_open,
             palette_query: self.palette_query.clone(),
@@ -937,6 +1041,9 @@ pub struct UiSnapshot {
     pub ui_density: UiDensity,
     pub scroll_line_px: u32,
     pub smooth_scroll_duration_ms: u32,
+    pub tab_width_mode: TabWidthMode,
+    pub tab_row_mode: TabRowMode,
+    pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
     pub palette_query: String,
@@ -1127,6 +1234,9 @@ pub fn seed_state() -> AppState {
         ui_density: DEFAULT_UI_DENSITY,
         scroll_line_px: DEFAULT_SCROLL_LINE_PX,
         smooth_scroll_duration_ms: DEFAULT_SMOOTH_SCROLL_DURATION_MS,
+        tab_width_mode: DEFAULT_TAB_WIDTH_MODE,
+        tab_row_mode: DEFAULT_TAB_ROW_MODE,
+        tab_width_px: DEFAULT_TAB_WIDTH_PX,
         toggles,
         palette_open: false,
         palette_query: String::new(),
@@ -2594,6 +2704,36 @@ pub fn mutate_smooth_scroll_duration_delta(state: &mut AppState, delta: i32) -> 
     true
 }
 
+pub fn mutate_tab_width_mode(state: &mut AppState, mode: TabWidthMode) -> bool {
+    if state.tab_width_mode == mode {
+        return false;
+    }
+    state.tab_width_mode = mode;
+    true
+}
+
+pub fn mutate_tab_row_mode(state: &mut AppState, mode: TabRowMode) -> bool {
+    if state.tab_row_mode == mode {
+        return false;
+    }
+    state.tab_row_mode = mode;
+    true
+}
+
+pub fn mutate_tab_width_px_delta(state: &mut AppState, delta: i32) -> bool {
+    let next = adjusted_scroll_value(
+        state.tab_width_px,
+        delta,
+        MIN_TAB_WIDTH_PX,
+        MAX_TAB_WIDTH_PX,
+    );
+    if next == state.tab_width_px {
+        return false;
+    }
+    state.tab_width_px = next;
+    true
+}
+
 pub fn mutate_theme(state: &mut AppState, theme_id: &str) -> bool {
     let resolved = theme::resolve_theme_id(theme_id).to_string();
     if state.theme == resolved {
@@ -2640,7 +2780,10 @@ pub fn reset_appearance(state: &mut AppState) -> bool {
         || state.terminal_font_size_pt != DEFAULT_TERMINAL_FONT_SIZE_PT
         || state.ui_density != DEFAULT_UI_DENSITY
         || state.scroll_line_px != DEFAULT_SCROLL_LINE_PX
-        || state.smooth_scroll_duration_ms != DEFAULT_SMOOTH_SCROLL_DURATION_MS;
+        || state.smooth_scroll_duration_ms != DEFAULT_SMOOTH_SCROLL_DURATION_MS
+        || state.tab_width_mode != DEFAULT_TAB_WIDTH_MODE
+        || state.tab_row_mode != DEFAULT_TAB_ROW_MODE
+        || state.tab_width_px != DEFAULT_TAB_WIDTH_PX;
     state.theme = theme::default_theme_id().to_string();
     state.custom_theme = theme::default_custom_theme();
     state.config_font_size_pt = DEFAULT_CONFIG_FONT_SIZE_PT;
@@ -2648,6 +2791,9 @@ pub fn reset_appearance(state: &mut AppState) -> bool {
     state.ui_density = DEFAULT_UI_DENSITY;
     state.scroll_line_px = DEFAULT_SCROLL_LINE_PX;
     state.smooth_scroll_duration_ms = DEFAULT_SMOOTH_SCROLL_DURATION_MS;
+    state.tab_width_mode = DEFAULT_TAB_WIDTH_MODE;
+    state.tab_row_mode = DEFAULT_TAB_ROW_MODE;
+    state.tab_width_px = DEFAULT_TAB_WIDTH_PX;
     sync_terminal_size_to_font_metrics(state);
     state.last_terminal_theme_painted.clear();
     changed
@@ -3161,6 +3307,103 @@ pub fn dispatch_palette_key(
     }
 }
 
+/// Push `img` onto the Quick Prompt's image list unless an image with
+/// the same content hash is already attached. Returns `true` when the
+/// image was newly added, `false` when it was a duplicate (per spec
+/// A4.4: pasting the same screenshot twice dedups to one chip).
+fn push_unique_quick_prompt_image(
+    qp: &mut crate::quick_prompt::QuickPromptState,
+    img: crate::quick_prompt::QuickPromptImage,
+) -> bool {
+    if qp.images.iter().any(|i| i.hash == img.hash) {
+        false
+    } else {
+        qp.images.push(img);
+        true
+    }
+}
+
+/// Attach a clipboard image to the open Quick Prompt if one is present.
+///
+/// Returns `true` only when an image was actually attached, so the
+/// Ctrl+V key handler knows to *consume* the event. Returns `false`
+/// when the overlay is closed, the clipboard holds no image, or the
+/// read failed — in those cases the framework falls through to its
+/// normal text paste, so a plain Ctrl+V of text still lands in the
+/// input. This is the silent-on-miss counterpart to the
+/// `quick_prompt.image_paste` command (the "Attach image" button),
+/// which deliberately surfaces a "No image on clipboard" hint.
+pub fn try_attach_clipboard_image(state: &mut AppState) -> bool {
+    let Some(qp) = state.quick_prompt.as_mut() else {
+        return false;
+    };
+    let session_hex = qp.session_hex.clone();
+    let captured =
+        crate::quick_prompt::images::capture_clipboard_image(&state.clipboard, &session_hex);
+    match captured {
+        Ok(Some(img)) => {
+            push_unique_quick_prompt_image(qp, img);
+            qp.error = None;
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            log::warn!("clipboard image paste failed: {e}");
+            false
+        }
+    }
+}
+
+/// Attach every decodable image among `paths` to the open Quick Prompt
+/// (native drag-and-drop). Returns `true` when overlay state changed (an
+/// image was attached or an error hint was set) so the caller can
+/// request a rebuild. Non-image paths are skipped. A drop that carried
+/// no decodable image sets a friendly hint so the gesture is never
+/// silently ignored.
+pub fn attach_dropped_images(state: &mut AppState, paths: &[std::path::PathBuf]) -> bool {
+    let Some(qp) = state.quick_prompt.as_mut() else {
+        return false;
+    };
+    let session_hex = qp.session_hex.clone();
+
+    let mut attached = 0usize;
+    let mut saw_image = false;
+    let mut last_err: Option<String> = None;
+
+    for path in paths {
+        if !crate::quick_prompt::images::is_supported_image_path(path) {
+            continue;
+        }
+        saw_image = true;
+        match crate::quick_prompt::images::capture_image_from_path(&session_hex, path) {
+            Ok(img) => {
+                if push_unique_quick_prompt_image(qp, img) {
+                    attached += 1;
+                }
+            }
+            Err(e) => {
+                log::warn!("failed to attach dropped image {}: {e}", path.display());
+                last_err = Some(e.to_string());
+            }
+        }
+    }
+
+    if attached > 0 {
+        qp.error = None;
+        true
+    } else if let Some(err) = last_err {
+        qp.error = Some(format!("Could not attach image: {err}"));
+        true
+    } else if saw_image {
+        // Every dropped image was already attached (dedup). Nothing to
+        // repaint and no error worth showing.
+        false
+    } else {
+        qp.error = Some("No image in dropped files".into());
+        true
+    }
+}
+
 fn is_palette_safe_dispatch(command: &str) -> bool {
     matches!(
         command,
@@ -3433,9 +3676,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             match captured {
                 Ok(Some(img)) => {
-                    if !qp_mut.images.iter().any(|i| i.hash == img.hash) {
-                        qp_mut.images.push(img);
-                    }
+                    push_unique_quick_prompt_image(qp_mut, img);
                     qp_mut.error = None;
                     true
                 }
@@ -3663,6 +3904,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if other.starts_with("appearance.density:") => {
             let id = &other["appearance.density:".len()..];
             UiDensity::from_id(id).is_some_and(|density| mutate_ui_density(state, density))
+        }
+        "tabs.width.inc" => mutate_tab_width_px_delta(state, TAB_WIDTH_PX_STEP),
+        "tabs.width.dec" => mutate_tab_width_px_delta(state, -TAB_WIDTH_PX_STEP),
+        other if let Some(id) = other.strip_prefix("tabs.width_mode:") => {
+            TabWidthMode::from_id(id).is_some_and(|mode| mutate_tab_width_mode(state, mode))
+        }
+        other if let Some(id) = other.strip_prefix("tabs.row_mode:") => {
+            TabRowMode::from_id(id).is_some_and(|mode| mutate_tab_row_mode(state, mode))
         }
         "theme.custom.reset" => reset_custom_theme(state),
         "appearance.reset" => reset_appearance(state),
@@ -4950,6 +5199,9 @@ mod tests {
             ui_density: DEFAULT_UI_DENSITY,
             scroll_line_px: DEFAULT_SCROLL_LINE_PX,
             smooth_scroll_duration_ms: DEFAULT_SMOOTH_SCROLL_DURATION_MS,
+            tab_width_mode: DEFAULT_TAB_WIDTH_MODE,
+            tab_row_mode: DEFAULT_TAB_ROW_MODE,
+            tab_width_px: DEFAULT_TAB_WIDTH_PX,
             toggles: BTreeMap::new(),
             palette_open: false,
             palette_query: String::new(),
@@ -5826,6 +6078,138 @@ mod tests {
         assert!(!dir.exists());
     }
 
+    // --- drag-and-drop image attach -------------------------------------
+
+    /// Write a real PNG to disk and return its path. Lives in a throwaway
+    /// session dir; callers clean it up via `cleanup_session`.
+    fn write_png_fixture(session_hex: &str, w: usize, h: usize) -> PathBuf {
+        let mut bytes = Vec::with_capacity(w * h * 4);
+        for _ in 0..w * h {
+            bytes.extend_from_slice(&[20, 140, 220, 255]);
+        }
+        crate::quick_prompt::images::save_image_to_session(session_hex, w, h, bytes)
+            .expect("write png fixture")
+            .temp_path
+    }
+
+    #[test]
+    fn attach_dropped_images_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(!attach_dropped_images(
+            &mut state,
+            &[PathBuf::from("whatever.png")]
+        ));
+    }
+
+    #[test]
+    fn attach_dropped_images_attaches_png_and_dedups() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        let src_hex = format!("drop-src-{}", std::process::id());
+        let png = write_png_fixture(&src_hex, 6, 4);
+
+        // First drop attaches one chip.
+        assert!(attach_dropped_images(
+            &mut state,
+            std::slice::from_ref(&png)
+        ));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert_eq!(qp.images.len(), 1);
+        assert_eq!(qp.images[0].width, 6);
+        assert_eq!(qp.images[0].height, 4);
+        assert!(qp.error.is_none());
+
+        // Same file again: content hash dedups, no second chip, no rebuild.
+        assert!(!attach_dropped_images(
+            &mut state,
+            std::slice::from_ref(&png)
+        ));
+        assert_eq!(state.quick_prompt.as_ref().unwrap().images.len(), 1);
+
+        // Cleanup: the overlay session dir plus the fixture session dir.
+        let overlay_hex = state.quick_prompt.as_ref().unwrap().session_hex.clone();
+        crate::quick_prompt::images::cleanup_session(&overlay_hex);
+        crate::quick_prompt::images::cleanup_session(&src_hex);
+    }
+
+    #[test]
+    fn attach_dropped_images_hints_when_no_image_files() {
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        assert!(attach_dropped_images(
+            &mut state,
+            &[PathBuf::from("notes.txt")]
+        ));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert!(qp.images.is_empty());
+        assert_eq!(qp.error.as_deref(), Some("No image in dropped files"));
+
+        let overlay_hex = qp.session_hex.clone();
+        crate::quick_prompt::images::cleanup_session(&overlay_hex);
+    }
+
+    #[test]
+    fn attach_dropped_images_reports_error_for_corrupt_image() {
+        let mut state = test_state();
+        let qp = crate::quick_prompt::QuickPromptState::open_default();
+        let overlay_hex = qp.session_hex.clone();
+        state.quick_prompt = Some(qp);
+
+        // A file with a .png extension but non-image bytes.
+        let dir = crate::quick_prompt::images::session_dir(&overlay_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bogus = dir.join("corrupt.png");
+        std::fs::write(&bogus, b"nope").unwrap();
+
+        assert!(attach_dropped_images(
+            &mut state,
+            std::slice::from_ref(&bogus)
+        ));
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert!(qp.images.is_empty());
+        assert!(
+            qp.error
+                .as_deref()
+                .unwrap()
+                .starts_with("Could not attach image:"),
+            "unexpected error: {:?}",
+            qp.error
+        );
+
+        crate::quick_prompt::images::cleanup_session(&overlay_hex);
+    }
+
+    #[test]
+    fn try_attach_clipboard_image_no_op_when_closed() {
+        let mut state = test_state();
+        assert!(!try_attach_clipboard_image(&mut state));
+    }
+
+    #[test]
+    fn try_attach_clipboard_image_is_silent_on_miss() {
+        // A freshly created clipboard context in CI has no image, so the
+        // helper must return false (let text paste proceed) WITHOUT
+        // setting an error chip. If the developer's clipboard happens to
+        // hold an image, the alternative branch attaches it instead;
+        // both outcomes leave the overlay open and panic-free.
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+        let overlay_hex = state.quick_prompt.as_ref().unwrap().session_hex.clone();
+
+        let attached = try_attach_clipboard_image(&mut state);
+        let qp = state.quick_prompt.as_ref().unwrap();
+        if attached {
+            assert!(!qp.images.is_empty());
+        } else {
+            // The key contract: a miss never leaves a stray error chip.
+            assert!(qp.error.is_none());
+            assert!(qp.images.is_empty());
+        }
+        crate::quick_prompt::images::cleanup_session(&overlay_hex);
+    }
+
     fn open_with_popup() -> AppState {
         let mut state = test_state();
         let mut qp = crate::quick_prompt::QuickPromptState::open_default();
@@ -6095,6 +6479,9 @@ mod tests {
         state.ui_density = UiDensity::Comfy;
         state.scroll_line_px = 96;
         state.smooth_scroll_duration_ms = 160;
+        state.tab_width_mode = TabWidthMode::FitContent;
+        state.tab_row_mode = TabRowMode::Triple;
+        state.tab_width_px = MAX_TAB_WIDTH_PX;
 
         assert!(dispatch(&mut state, "appearance.reset"));
         assert_eq!(state.theme, crate::theme::default_theme_id());
@@ -6107,6 +6494,58 @@ mod tests {
             state.smooth_scroll_duration_ms,
             DEFAULT_SMOOTH_SCROLL_DURATION_MS
         );
+        assert_eq!(state.tab_width_mode, DEFAULT_TAB_WIDTH_MODE);
+        assert_eq!(state.tab_row_mode, DEFAULT_TAB_ROW_MODE);
+        assert_eq!(state.tab_width_px, DEFAULT_TAB_WIDTH_PX);
+    }
+
+    #[test]
+    fn dispatch_tab_width_mode_updates_state() {
+        let mut state = test_state();
+        assert_eq!(state.tab_width_mode, DEFAULT_TAB_WIDTH_MODE);
+
+        assert!(dispatch(&mut state, "tabs.width_mode:fit"));
+        assert_eq!(state.tab_width_mode, TabWidthMode::FitContent);
+        // Idempotent re-issue and unknown ids are no-ops.
+        assert!(!dispatch(&mut state, "tabs.width_mode:fit"));
+        assert!(!dispatch(&mut state, "tabs.width_mode:bogus"));
+        assert!(dispatch(&mut state, "tabs.width_mode:fixed"));
+        assert_eq!(state.tab_width_mode, TabWidthMode::Fixed);
+    }
+
+    #[test]
+    fn dispatch_tab_row_mode_updates_state() {
+        let mut state = test_state();
+        assert_eq!(state.tab_row_mode, DEFAULT_TAB_ROW_MODE);
+
+        assert!(dispatch(&mut state, "tabs.row_mode:double"));
+        assert_eq!(state.tab_row_mode, TabRowMode::Double);
+        assert!(dispatch(&mut state, "tabs.row_mode:triple"));
+        assert_eq!(state.tab_row_mode, TabRowMode::Triple);
+        assert!(!dispatch(&mut state, "tabs.row_mode:triple"));
+        assert!(!dispatch(&mut state, "tabs.row_mode:quad"));
+        assert!(dispatch(&mut state, "tabs.row_mode:single"));
+        assert_eq!(state.tab_row_mode, TabRowMode::Single);
+    }
+
+    #[test]
+    fn dispatch_tab_width_px_steps_and_clamps() {
+        let mut state = test_state();
+        state.tab_width_px = DEFAULT_TAB_WIDTH_PX;
+
+        assert!(dispatch(&mut state, "tabs.width.inc"));
+        assert_eq!(
+            state.tab_width_px,
+            DEFAULT_TAB_WIDTH_PX + TAB_WIDTH_PX_STEP as u32
+        );
+
+        state.tab_width_px = MAX_TAB_WIDTH_PX;
+        assert!(!dispatch(&mut state, "tabs.width.inc"));
+        assert_eq!(state.tab_width_px, MAX_TAB_WIDTH_PX);
+
+        state.tab_width_px = MIN_TAB_WIDTH_PX;
+        assert!(!dispatch(&mut state, "tabs.width.dec"));
+        assert_eq!(state.tab_width_px, MIN_TAB_WIDTH_PX);
     }
 
     #[test]

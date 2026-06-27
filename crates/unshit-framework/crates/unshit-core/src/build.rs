@@ -53,6 +53,11 @@ pub fn build_tree_from_def(
         element.input_state.step = step;
     }
     element.input_state.checked = def.checked;
+    // Seed the input buffer on first mount (see build_subtree for rationale).
+    if let Some(v) = &def.value {
+        element.input_state.value = v.clone();
+        element.input_state.cursor_pos = v.len();
+    }
 
     // For select elements: populate SelectState from the def's options list.
     if def.tag == Tag::Select {
@@ -67,6 +72,11 @@ pub fn build_tree_from_def(
     }
 
     let node_id = arena.alloc(element);
+
+    // Record an autofocus request for the app loop to honor after the build.
+    if def.autofocus {
+        arena.pending_autofocus = Some(node_id);
+    }
 
     // For select elements, do not add option children as arena nodes.
     if def.tag == Tag::Select {

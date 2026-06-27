@@ -24,3 +24,6 @@ phase[0-9]-*
 *.msi
 # Intermediate icon rasters (the committed source of truth is packaging/app.ico)
 packaging/source-*.png
+# Throwaway screenshot-verification artifacts (previews + captured log dumps)
+preview-*.png
+preview-*.png.err.txt

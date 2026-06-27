@@ -551,6 +551,12 @@ pub fn build_subtree(
         element.input_state.step = step;
     }
     element.input_state.checked = def.checked;
+    // Seed the input buffer on first mount. Reconciliation (update_from_def)
+    // never touches value, so user edits survive later re-renders.
+    if let Some(v) = &def.value {
+        element.input_state.value = v.clone();
+        element.input_state.cursor_pos = v.len();
+    }
     element.on_mount = def.on_mount.clone();
     element.on_unmount = def.on_unmount.clone();
     element.style_overrides = def.style_overrides.clone();
@@ -569,6 +575,13 @@ pub fn build_subtree(
     }
 
     let node_id = arena.alloc(element);
+
+    // Record an autofocus request for the app loop to honor after this
+    // rebuild. Only fires here (build path) so focus is granted once when
+    // the element first appears, not on every reconcile.
+    if def.autofocus {
+        arena.pending_autofocus = Some(node_id);
+    }
 
     // If the def carries a NodeRef, store it on the element and record the id.
     if let Some(nr) = def.node_ref.clone() {
@@ -673,6 +686,62 @@ mod tests {
         }
 
         assert_eq!(count.load(Ordering::SeqCst), 1, "on_mount should fire once on first build");
+    }
+
+    #[test]
+    fn build_seeds_input_value_and_cursor_at_end() {
+        let def = ElementDef::new(Tag::Input).with_value("hello");
+        let mut arena = NodeArena::new();
+        let mut taffy = TaffyTree::new();
+        let mut pending = Vec::new();
+        let id = build_subtree(&def, &mut arena, &mut taffy, NodeId::DANGLING, &mut pending);
+
+        let elem = arena.get(id).expect("input node");
+        assert_eq!(elem.input_state.value, "hello");
+        // cursor_pos is a byte offset; "hello" is 5 bytes.
+        assert_eq!(elem.input_state.cursor_pos, 5);
+    }
+
+    #[test]
+    fn reconcile_preserves_typed_value_over_seed() {
+        // After mount, the live buffer must survive a re-render even though
+        // the new def still carries the original seed value — otherwise the
+        // user's keystrokes would be clobbered on every reconcile.
+        let def = ElementDef::new(Tag::Input).with_value("seed");
+        let mut arena = NodeArena::new();
+        let mut taffy = TaffyTree::new();
+        let mut pending = Vec::new();
+        let id = build_subtree(&def, &mut arena, &mut taffy, NodeId::DANGLING, &mut pending);
+
+        // Simulate the user typing into the input.
+        arena.get_mut(id).unwrap().input_state.value = "typed".to_string();
+
+        let def2 = ElementDef::new(Tag::Input).with_value("seed");
+        reconcile(&mut arena, &mut taffy, id, &def2);
+
+        assert_eq!(arena.get(id).unwrap().input_state.value, "typed");
+    }
+
+    #[test]
+    fn build_records_autofocus_request() {
+        let def = ElementDef::new(Tag::Input).with_autofocus(true);
+        let mut arena = NodeArena::new();
+        let mut taffy = TaffyTree::new();
+        let mut pending = Vec::new();
+        let id = build_subtree(&def, &mut arena, &mut taffy, NodeId::DANGLING, &mut pending);
+
+        assert_eq!(arena.pending_autofocus, Some(id));
+    }
+
+    #[test]
+    fn build_without_autofocus_records_no_request() {
+        let def = ElementDef::new(Tag::Input);
+        let mut arena = NodeArena::new();
+        let mut taffy = TaffyTree::new();
+        let mut pending = Vec::new();
+        build_subtree(&def, &mut arena, &mut taffy, NodeId::DANGLING, &mut pending);
+
+        assert_eq!(arena.pending_autofocus, None);
     }
 
     #[test]

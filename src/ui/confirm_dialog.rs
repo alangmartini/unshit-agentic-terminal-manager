@@ -505,18 +505,19 @@ fn agent_label(pane: &crate::state::Pane) -> Option<&'static str> {
     }
 }
 
-/// Card body for the `RenameSession` dialog. The input's on_change
-/// keeps the dialog buffer in sync so the commit handler can read the
-/// typed value. The framework does not seed an input's initial value
-/// from the ElementDef, so the current name is shown as placeholder
-/// text; submitting an empty field clears the custom name.
+/// Card body for the `RenameSession` dialog. The input is seeded with the
+/// session's current name (`buffer`) and autofocused so the user can edit
+/// or retype immediately; its on_change keeps the dialog buffer in sync so
+/// the commit handler can read the typed value. Submitting an empty field
+/// clears the custom name (the placeholder is shown only when the field is
+/// emptied).
 ///
 /// `error` carries an inline failure message under the input when
 /// the most recent rename RPC came back Err. Typing into the input
 /// clears it so a retry does not show stale text.
 fn build_rename_session_card(
     pane_id: u32,
-    _buffer: &str,
+    buffer: &str,
     error: Option<&str>,
     shared: &SharedState,
 ) -> ElementDef {
@@ -525,6 +526,8 @@ fn build_rename_session_card(
     let input = ElementDef::new(Tag::Input)
         .with_class("confirm-dialog-input")
         .with_placeholder("New session name")
+        .with_value(buffer)
+        .with_autofocus(true)
         .on_change(move |text| {
             let typed = text.to_string();
             mutate_with(&input_shared, |st| {
@@ -956,6 +959,31 @@ mod tests {
             "save button hover must use a concrete background change"
         );
         assert_eq!(save_after, Background::Color(Color::rgb(0xd4, 0xa3, 0x48)));
+    }
+
+    #[test]
+    fn rename_dialog_seeds_current_name_and_autofocuses_input() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
+                pane_id: 3,
+                buffer: "build-watch".into(),
+                error: None,
+            });
+        }
+        let snap = s.lock().unwrap().ui_snapshot();
+        let el = build_confirm_dialog_overlay(&snap, &s);
+        let card = &el.children[0];
+        let input = card
+            .children
+            .iter()
+            .find(|c| c.classes.iter().any(|cls| cls == "confirm-dialog-input"))
+            .expect("input element");
+        // The field is prefilled with the session's current name and
+        // autofocused so the user can edit/retype without clicking.
+        assert_eq!(input.value.as_deref(), Some("build-watch"));
+        assert!(input.autofocus, "rename input should autofocus on open");
     }
 
     #[test]

@@ -2354,6 +2354,60 @@ input, select {
   margin: 0 var(--sp-2);
 }
 
+/* ============================================================
+   Tab strip: width modes & multi-row wrapping (configurable in
+   Settings → Appearance → tabs). Width in Fixed mode is pinned per
+   tab by inline styles; these rules cover Fit-content and the
+   single/double/triple row behavior.
+   ============================================================ */
+
+/* Fit-content: tabs shrink-wrap their label instead of the fixed
+   150–240px band, and the name stops stretching/ellipsizing so the
+   full label sets the tab width. */
+.app.tabs-width-fit .tab {
+  min-width: 0;
+  max-width: none;
+}
+
+.app.tabs-width-fit .tab-name {
+  flex: 0 0 auto;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+/* Double / triple rows: wrap the strip onto stacked rows instead of a
+   single scrolling line (dropping the ">" overflow affordance). The tab
+   bar grows downward to fit the rows; the terminal grid below shrinks.
+   Each wrapped row is one tab-bar tall, and the strip scrolls vertically
+   only once it exceeds the configured row cap. (--tabbar-h is 38px.) */
+.app.tabs-rows-double .tabbar,
+.app.tabs-rows-triple .tabbar {
+  height: auto;
+  align-items: flex-start;
+}
+
+.app.tabs-rows-double .tabs,
+.app.tabs-rows-triple .tabs {
+  flex-wrap: wrap;
+  align-content: flex-start;
+  overflow-x: visible;
+  overflow-y: auto;
+  row-gap: 0;
+}
+
+.app.tabs-rows-double .tab,
+.app.tabs-rows-triple .tab {
+  height: var(--tabbar-h);
+}
+
+.app.tabs-rows-double .tabs {
+  max-height: calc(var(--tabbar-h) * 2);
+}
+
+.app.tabs-rows-triple .tabs {
+  max-height: calc(var(--tabbar-h) * 3);
+}
+
 
 .terminal-grid {
   position: relative;
@@ -3967,8 +4021,8 @@ body.dragging-pane {
 }
 
 .quick-prompt-image-thumb {
-  width: 100%;
-  height: 100%;
+  width: 52px;
+  height: 52px;
   object-fit: cover;
 }
 

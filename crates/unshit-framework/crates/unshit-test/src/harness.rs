@@ -61,7 +61,13 @@ impl TestHarness {
         let root =
             build_tree_from_def(&element_tree.root, &mut arena, &mut taffy, NodeId::DANGLING);
 
-        let interaction = InteractionState::default();
+        let mut interaction = InteractionState::default();
+        // Mirror production: honor an autofocus request recorded during build.
+        if let Some(focus_id) = arena.pending_autofocus.take() {
+            if arena.get(focus_id).is_some() {
+                interaction.focused = focus_id;
+            }
+        }
 
         resolve_all_styles(
             &mut arena,
@@ -151,6 +157,14 @@ impl TestHarness {
         }
         if self.arena.get(self.interaction.focused).is_none() {
             self.interaction.focused = NodeId::DANGLING;
+        }
+
+        // Mirror production: honor an autofocus request recorded while
+        // building a freshly mounted node during this reconcile.
+        if let Some(focus_id) = self.arena.pending_autofocus.take() {
+            if self.arena.get(focus_id).is_some() && self.interaction.focused != focus_id {
+                self.interaction.focused = focus_id;
+            }
         }
 
         // Post-reconcile cascade: use the dirty-flag short-circuit to skip
@@ -525,6 +539,11 @@ pub(crate) fn build_tree_from_def(
         element.input_state.step = step;
     }
     element.input_state.checked = def.checked;
+    // Mirror production build: seed the input buffer on first mount.
+    if let Some(v) = &def.value {
+        element.input_state.value = v.clone();
+        element.input_state.cursor_pos = v.len();
+    }
 
     // For select elements: populate SelectState from the def's options list.
     if def.tag == Tag::Select {
@@ -539,6 +558,12 @@ pub(crate) fn build_tree_from_def(
     }
 
     let node_id = arena.alloc(element);
+
+    // Mirror production build: record an autofocus request for the harness
+    // to honor after the tree is built.
+    if def.autofocus {
+        arena.pending_autofocus = Some(node_id);
+    }
 
     // For select elements, do not add option children as arena nodes.
     if def.tag == Tag::Select {

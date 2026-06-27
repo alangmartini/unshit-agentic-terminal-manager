@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The rename-session dialog now prefills the field with the session's current name and focuses the input on open (cursor at the end of the name), so you can edit or retype it immediately without clicking. Backed by two new framework primitives on `ElementDef`: `with_value` seeds an input's buffer once on mount (preserved across re-renders so edits are never clobbered) and `with_autofocus` focuses an element the first time it mounts.
+
 ## [0.2.0] - 2026-06-17
 
 This release makes terminal scrolling smooth and its frame timing honest, adds
