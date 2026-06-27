@@ -11,6 +11,11 @@ pub fn build_statusbar(state: &UiSnapshot) -> ElementDef {
         .with_class("statusbar")
         .with_class("role-footer")
         .with_child(build_statusbar_left(state))
+        // Flex spacer pushes the right group to the far edge. Without it the
+        // `.statusbar` (justify-content: flex-start, gap: 0) leaves the two
+        // groups flush, so the left group's last item ("k/s") collides with
+        // the right group's first ("utf-8") -> the unreadable "k/sutf-8".
+        .with_child(ElementDef::new(Tag::Span).with_class("sb-spacer"))
         .with_child(build_statusbar_right(state))
 }
 
@@ -260,10 +265,12 @@ mod tests {
     }
 
     #[test]
-    fn build_statusbar_has_left_and_right() {
+    fn build_statusbar_has_left_spacer_and_right() {
         let snap = snapshot_from_seed();
         let elem = build_statusbar(&snap);
-        assert_eq!(elem.children.len(), 2);
+        // left group, flex spacer, right group
+        assert_eq!(elem.children.len(), 3);
+        assert!(elem.children[1].classes.contains(&"sb-spacer".to_string()));
     }
 
     #[test]
