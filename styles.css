@@ -241,6 +241,13 @@ body::after {
   border-radius: var(--r-sm);
 }
 
+/* Instance-profile badge (dev / test builds); amber so a non-default
+   instance stands out from the installed app at a glance. */
+.brand-profile {
+  color: var(--amber-200);
+  border-color: var(--amber-200);
+}
+
 .titlebar-breadcrumb {
   display: flex;
   align-items: center;

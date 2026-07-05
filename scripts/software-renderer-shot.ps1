@@ -38,6 +38,12 @@ $env:RUST_LOG = "info"
 if ($Software) { $env:TM_FORCE_SOFTWARE_RENDERER = "1" }
 else { $env:TM_FORCE_SOFTWARE_RENDERER = $null }
 
+# Run in a throwaway instance profile so this shot never attaches to a
+# real session's daemon or config.
+. (Join-Path $PSScriptRoot "lib\tm-isolation.ps1")
+$iso = Enter-TmIsolation -Tag "shot"
+$ptydExe = Join-Path (Split-Path -Parent $exe) "unshit-ptyd.exe"
+
 $proc = Start-Process -FilePath $exe -WorkingDirectory $root -PassThru -RedirectStandardError $errLog
 $tier = if ($Software) { "software (forced)" } else { "hardware (default)" }
 Write-Output "Launched pid=$($proc.Id) [$tier], waiting for window..."
@@ -65,4 +71,5 @@ $shot.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $shot.Dispose()
 
 Stop-Process -Id $proc.Id -Force
+Exit-TmIsolation -Isolation $iso -PtydExe $ptydExe
 Write-Output "Saved $Out ($w x $hh); tier log in $errLog"

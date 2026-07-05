@@ -147,7 +147,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             && glyph_px.y < gmeta.pixel_size.y {
             let uv = mix(gmeta.atlas_uv_min, gmeta.atlas_uv_max, glyph_px / gmeta.pixel_size);
             let coverage = textureSample(atlas_mono, atlas_sampler, uv).r;
-            out_color = vec4<f32>(mix(out_color.rgb, fg.rgb, coverage), 1.0);
+            // Mild stem-contrast curve, identical to text.wgsl, so terminal-cell
+            // text and UI text share the same grayscale stem weight.
+            let cov = pow(coverage, 0.88);
+            out_color = vec4<f32>(mix(out_color.rgb, fg.rgb, cov), 1.0);
         }
     }
 

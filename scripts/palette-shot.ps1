@@ -37,6 +37,12 @@ if (-not (Test-Path $exe)) { throw "Missing exe: $exe (run cargo build first)" }
 # Resolve output to an absolute path before we change anything.
 if (-not [System.IO.Path]::IsPathRooted($Out)) { $Out = Join-Path $root $Out }
 
+# Run in a throwaway instance profile so this shot never attaches to a
+# real session's daemon or config.
+. (Join-Path $PSScriptRoot "lib\tm-isolation.ps1")
+$iso = Enter-TmIsolation -Tag "shot"
+$ptydExe = Join-Path (Split-Path -Parent $exe) "unshit-ptyd.exe"
+
 $errLog = "$Out.err.txt"
 $proc = Start-Process -FilePath $exe -WorkingDirectory $root -PassThru -RedirectStandardError $errLog
 Write-Output "Launched pid=$($proc.Id), waiting for window..."
@@ -77,4 +83,5 @@ $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $bmp.Dispose()
 
 Stop-Process -Id $proc.Id -Force
+Exit-TmIsolation -Isolation $iso -PtydExe $ptydExe
 Write-Output "Saved $Out ($w x $hh)"

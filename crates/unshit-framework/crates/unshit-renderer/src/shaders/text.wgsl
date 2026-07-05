@@ -68,20 +68,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
+    // Grayscale antialiasing. The atlas on this path is a single-channel (R8)
+    // coverage mask, so there is no real per-subpixel data to recover. The old
+    // code synthesized an RGB "fringe" by sampling the +/-1 neighbour texels
+    // into the red/blue channels; on a grayscale mask that only injects a fake
+    // cyan-left / orange-right halo on every stem (and shifts the hue of
+    // coloured text at its edges). Sample the true coverage and blend it
+    // straight -- this path uses `ALPHA_BLENDING`, so premultiplying is wrong.
     let coverage = textureSample(atlas_texture, atlas_sampler, in.uv).r;
-    let dims = vec2<f32>(textureDimensions(atlas_texture, 0));
-    let texel_x = vec2<f32>(1.0 / dims.x, 0.0);
-    let left = textureSample(atlas_texture, atlas_sampler, in.uv - texel_x).r;
-    let right = textureSample(atlas_texture, atlas_sampler, in.uv + texel_x).r;
-
-    // Browser text has a restrained RGB fringe, but the pipeline uses normal
-    // alpha blending. Use max channel coverage as alpha and pre-divide color
-    // so the existing blend state can approximate per-channel coverage.
-    let chroma = 0.15;
-    let red = pow(mix(coverage, left, chroma), 0.88);
-    let green = pow(coverage, 0.88);
-    let blue = pow(mix(coverage, right, chroma), 0.88);
-    let alpha = max(red, max(green, blue));
-    let rgb = in.color.rgb * vec3(red, green, blue) / max(alpha, 0.001);
-    return vec4(rgb, in.color.a * alpha);
+    // Mild stem-contrast curve. Compositing happens on gamma-encoded (sRGB)
+    // bytes, which perceptually thins light-on-dark edges; a gentle gamma keeps
+    // stem weight without bloating. Kept identical to grid_fragment.wgsl so
+    // UI-chrome text and terminal-cell text have the same weight.
+    let cov = pow(coverage, 0.88);
+    return vec4(in.color.rgb, in.color.a * cov);
 }

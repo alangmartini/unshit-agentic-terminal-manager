@@ -3405,8 +3405,15 @@ fn emit_text_glyphs_cached(
 
     // Main text run, on top of any shadow.
     for (rel_x, rel_y, entry) in &laid_out {
+        // Snap the glyph baseline to a whole device pixel row. Positions here are
+        // already in device px (font sizes are pre-scaled by the DPR), but UI
+        // chrome text origins land on fractional rows at non-integer scale (e.g.
+        // 1.5x), which smears horizontal stems across two rows at partial
+        // coverage. Rounding Y (not X, to preserve shaping/kerning) lands stems
+        // on one crisp row -- the same trick the terminal grid path already uses
+        // (`gy.round()`). This path is UI-only; the terminal has its own emit.
         batch.glyph_instances.push(GlyphInstance {
-            pos: [x + rel_x, y + rel_y],
+            pos: [x + rel_x, (y + rel_y).round()],
             size: entry.size,
             uv_min: [entry.uv_rect[0], entry.uv_rect[1]],
             uv_max: [entry.uv_rect[2], entry.uv_rect[3]],
@@ -5704,7 +5711,22 @@ fn glyph_image_data_for_atlas(
     bytes_per_pixel: u32,
 ) -> Vec<u8> {
     match (bytes_per_pixel, content) {
-        (4, cosmic_text::SwashContent::SubpixelMask) => data,
+        // swash emits subpixel coverage in BGR order, but the atlas is sampled
+        // as RGBA and the red channel drives the left physical subpixel on a
+        // standard RGB display. Passing the data through unswapped renders a
+        // reversed cyan-left / red-right fringe (measured per-pixel: the left
+        // stem edge was blue-dominant). Swap R<->B so red coverage lands in the
+        // red channel -- matching the DirectWrite path, which already emits RGBA.
+        (4, cosmic_text::SwashContent::SubpixelMask) => data
+            .chunks(4)
+            .flat_map(|c| {
+                let b = c.first().copied().unwrap_or(0);
+                let g = c.get(1).copied().unwrap_or(b);
+                let r = c.get(2).copied().unwrap_or(g);
+                let a = c.get(3).copied().unwrap_or(255);
+                [r, g, b, a]
+            })
+            .collect(),
         (4, cosmic_text::SwashContent::Mask) => {
             data.into_iter().flat_map(|a| [a, a, a, a]).collect()
         }
@@ -6862,7 +6884,11 @@ mod tests {
     }
 
     #[test]
-    fn rgba_text_atlas_preserves_subpixel_mask_channels() {
+    fn rgba_text_atlas_swaps_subpixel_mask_to_rgb() {
+        // swash emits subpixel coverage in BGR order; the atlas is sampled as
+        // RGBA with the red channel driving the left physical subpixel, so the
+        // bytes must be R<->B swapped to avoid a reversed (cyan-left/red-right)
+        // fringe. Per-channel coverage is preserved, just reordered to RGB.
         let data = glyph_image_data_for_atlas(
             cosmic_text::SwashContent::SubpixelMask,
             vec![10, 30, 90, 90, 0, 20, 40, 40],
@@ -6871,8 +6897,8 @@ mod tests {
 
         assert_eq!(
             data,
-            vec![10, 30, 90, 90, 0, 20, 40, 40],
-            "RGBA text atlas must keep per-channel coverage for ClearType-style smoothing"
+            vec![90, 30, 10, 90, 40, 20, 0, 40],
+            "RGBA text atlas must swap B<->R so swash's BGR subpixel coverage lands as RGB"
         );
     }
 

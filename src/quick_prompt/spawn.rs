@@ -45,10 +45,10 @@ const CODEX_PROGRAM: &str = "codex.cmd";
 const CODEX_PROGRAM: &str = "codex";
 
 /// Production base for Quick Prompt worktrees:
-/// `%APPDATA%\com.godly.terminal\worktrees` on Windows; matching
-/// platform-specific data dir elsewhere.
+/// `%APPDATA%\com.godly.terminal\worktrees` on Windows (namespaced by
+/// instance profile); matching platform-specific data dir elsewhere.
 pub fn worktree_base() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("com.godly.terminal").join("worktrees"))
+    crate::profile::data_dir().map(|d| d.join("worktrees"))
 }
 
 /// Generate a fresh `godly-qp-<8-hex>` directory name. The hex draws

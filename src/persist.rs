@@ -202,9 +202,10 @@ impl PersistedState {
 }
 
 /// Default location for the persisted workspaces file. Lives outside the repo
-/// so it is not tracked by git.
+/// so it is not tracked by git, and inside the instance-profile config dir so
+/// dev/test instances never overwrite the installed app's layout.
 pub fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.godly.terminal").join("workspaces.json"))
+    crate::profile::config_dir().map(|d| d.join("workspaces.json"))
 }
 
 /// Install the config path used by `save_workspaces` / `load_workspaces`.

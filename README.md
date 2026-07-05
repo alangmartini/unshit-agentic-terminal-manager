@@ -1,16 +1,16 @@
 # Unshit Terminal Manager
 
-A GPU-accelerated terminal manager for Windows. Tabs, split panes, persistent sessions, and a keyboard-first command palette — rendered on the GPU by a custom UI framework.
+A GPU-accelerated terminal manager for Windows with **tmux-style session persistence**. Your shells run in a background daemon, so long-running work keeps going after you close the window — reopen it and your tabs, splits, and panes reattach to the *same* live processes. All of it — tabbed, split-pane terminals and a keyboard-first command palette — is rendered on the GPU by a custom UI framework.
 
 ![Unshit Terminal Manager](preview.png)
 
-Unshit Terminal Manager is a native Windows terminal multiplexer built on **unshit**, a local GPU-first UI framework (CSS styling, flexbox/grid layout via [Taffy](https://github.com/DioxusLabs/taffy), a [wgpu](https://github.com/gfx-rs/wgpu) renderer, and [cosmic-text](https://github.com/pop-os/cosmic-text) for text shaping). Your shells run inside a background daemon that owns the PTYs, parsers, and scrollback, so the windows, tabs, and splits you left open survive a UI restart.
+Unshit Terminal Manager is a native Windows terminal multiplexer built on **unshit**, a local GPU-first UI framework (CSS styling, flexbox/grid layout via [Taffy](https://github.com/DioxusLabs/taffy), a [wgpu](https://github.com/gfx-rs/wgpu) renderer, and [cosmic-text](https://github.com/pop-os/cosmic-text) for text shaping). Your shells run inside a background daemon that owns the PTYs, parsers, and scrollback — the same detach/reattach model as **tmux**, but backing a native GPU window instead of a text-mode multiplexer. The windows, tabs, and splits you left open survive a UI restart or crash, and commands you kicked off keep running while the UI is closed.
 
 ## Features
 
 - **Tabbed, split-pane terminals** — open multiple tabs per workspace and split any pane horizontally or vertically into a resizable grid.
 - **Workspaces** — group terminals by project, each with an optional working directory and a per-workspace shell override.
-- **Persistent sessions and layout** — tabs, splits, split ratios, and workspaces are saved to disk and restored on the next launch. Because the daemon owns the shells, surviving sessions reattach to the *same* running process instead of spawning a fresh one.
+- **tmux-style persistent sessions** — tabs, splits, split ratios, and workspaces are saved to disk and restored on the next launch. Because the daemon owns the shells, a session survives closing the UI (or a UI crash) and reattaches to the *same* running process on reopen — a build or agent you kicked off keeps running in the background. Sessions only end on an explicit close or a daemon shutdown, never when the UI disconnects.
 - **Command palette** (`Ctrl+Shift+P`) — a VS Code-style launcher with fuzzy search and typed modes: `>` for actions, `@` for agents, `:` for navigation, and `/` for scrollback. Drive splits, tabs, renames, the sidebar, and settings without leaving the keyboard.
 - **Quick Prompt** (`Ctrl+Shift+Q`) — type a prompt, attach images, and launch an agent CLI (`claude` or `codex`) in a fresh git worktree. When the active workspace is a git repo it runs `git worktree add` so the agent works on an anonymous branch without disturbing your checkout; otherwise it falls back to a plain scratch directory.
 - **Git awareness** — the sidebar detects the current branch for terminals whose working directory lives inside a repository.
@@ -73,6 +73,14 @@ cargo run --release
 ```
 
 `cargo run` launches the UI, which finds and starts the sibling daemon for you. All assets — the CSS stylesheet, the JetBrains Mono fonts, and the bundled themes — are embedded into the binary, so there is nothing else to copy alongside the executables.
+
+Repo builds automatically run in the **`dev` instance profile**: their own daemon
+pipe, their own persisted sessions and config, and a `dev` badge in the titlebar.
+You can keep the installed app open as your daily terminal while hacking on a
+work-in-progress build — the two can never share a session. Tests and screenshot
+scripts likewise run in throwaway profiles. See
+[docs/DOGFOODING.md](docs/DOGFOODING.md) for the full model (`TM_PROFILE`,
+`TM_CONFIG_DIR`, repo-scoped `scripts\kill-all.ps1`).
 
 ### Building the installer
 

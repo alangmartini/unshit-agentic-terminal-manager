@@ -54,7 +54,7 @@ pub fn save_if_installed(map: &UserKeybinds) {
 /// Default location of the user keybindings file. `None` if we cannot
 /// determine a config dir (rare; happens on stripped-down systems).
 pub fn keybinds_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.godly.terminal").join("keybindings.json"))
+    crate::profile::config_dir().map(|d| d.join("keybindings.json"))
 }
 
 /// Read user overrides from disk. A missing file yields an empty map.

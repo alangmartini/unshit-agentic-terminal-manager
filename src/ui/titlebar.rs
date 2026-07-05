@@ -51,8 +51,8 @@ pub fn build_titlebar(
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("titlebar-left")
-                .with_child(
-                    ElementDef::new(Tag::Div)
+                .with_child({
+                    let brand = ElementDef::new(Tag::Div)
                         .with_class("brand")
                         .with_child(
                             ElementDef::new(Tag::Span)
@@ -63,8 +63,20 @@ pub fn build_titlebar(
                             ElementDef::new(Tag::Span)
                                 .with_class("brand-name")
                                 .with_text("terminal.mgr"),
+                        );
+                    // Non-default instances (dev builds, test profiles)
+                    // wear their profile in the custom titlebar so a
+                    // dev window is never mistaken for the installed app.
+                    match crate::profile::active_profile() {
+                        Some(tag) => brand.with_child(
+                            ElementDef::new(Tag::Span)
+                                .with_class("brand-version")
+                                .with_class("brand-profile")
+                                .with_text(tag),
                         ),
-                )
+                        None => brand,
+                    }
+                })
                 .with_child(
                     ElementDef::new(Tag::Div)
                         .with_class("titlebar-breadcrumb")
@@ -411,13 +423,26 @@ mod tests {
         let snap = test_snapshot();
         let el = build_titlebar(&snap, &shared, None);
         let brand = &el.children[0].children[0];
-        assert_eq!(brand.children.len(), 2);
+        // Test binaries run as a non-default instance profile (debug
+        // builds resolve to "dev" unless TM_PROFILE overrides), which
+        // appends a brand-profile badge after mark + name.
+        let expected = if crate::profile::active_profile().is_some() {
+            3
+        } else {
+            2
+        };
+        assert_eq!(brand.children.len(), expected);
         assert!(brand.children[0]
             .classes
             .contains(&"brand-mark".to_string()));
         assert!(brand.children[1]
             .classes
             .contains(&"brand-name".to_string()));
+        if let Some(tag) = crate::profile::active_profile() {
+            let badge = &brand.children[2];
+            assert!(badge.classes.contains(&"brand-profile".to_string()));
+            assert_eq!(collect_text(badge), tag);
+        }
     }
 
     #[test]

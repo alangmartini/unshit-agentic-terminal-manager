@@ -25,9 +25,11 @@ pub enum ParsedArgs {
     Run {
         socket: Option<PathBuf>,
     },
-    /// Connect to an existing daemon and ask it to shut down.
+    /// Connect to an existing daemon and ask it to shut down. `force`
+    /// kills live sessions first instead of refusing.
     Shutdown {
         socket: Option<PathBuf>,
+        force: bool,
     },
     Status,
     Help,
@@ -108,6 +110,7 @@ where
     let mut iter = args.into_iter();
     let mut mode: Option<Mode> = None;
     let mut socket: Option<PathBuf> = None;
+    let mut force = false;
 
     while let Some(arg) = iter.next() {
         let s = arg.as_ref();
@@ -116,6 +119,10 @@ where
             "--help" | "-h" => Some(Mode::Help),
             "--version" | "-V" => Some(Mode::Version),
             "--shutdown" => Some(Mode::Shutdown),
+            "--force" => {
+                force = true;
+                None
+            }
             "--socket" => {
                 let value = iter
                     .next()
@@ -148,9 +155,15 @@ where
             flag: "--socket".to_string(),
         });
     }
+    if force && resolved != Mode::Shutdown {
+        return Err(ArgError::IncompatibleFlag {
+            mode: resolved.label().to_string(),
+            flag: "--force".to_string(),
+        });
+    }
     Ok(match resolved {
         Mode::Run => ParsedArgs::Run { socket },
-        Mode::Shutdown => ParsedArgs::Shutdown { socket },
+        Mode::Shutdown => ParsedArgs::Shutdown { socket, force },
         Mode::Status => ParsedArgs::Status,
         Mode::Help => ParsedArgs::Help,
         Mode::Version => ParsedArgs::Version,
@@ -177,6 +190,7 @@ FLAGS:
     --help, -h         Print this help and exit
     --version, -V      Print version and exit
     --shutdown         Connect to a running daemon and ask it to shut down
+    --force            With --shutdown: kill live sessions instead of refusing
     --socket <path>    Override the default pipe / socket path
 
 With no flags, runs the daemon event loop on the default socket path.
@@ -224,7 +238,42 @@ mod tests {
     fn shutdown_flag_parsed() {
         assert_eq!(
             parse(&["--shutdown"]),
-            Ok(ParsedArgs::Shutdown { socket: None })
+            Ok(ParsedArgs::Shutdown {
+                socket: None,
+                force: false
+            })
+        );
+    }
+
+    #[test]
+    fn shutdown_with_force_parsed() {
+        assert_eq!(
+            parse(&["--shutdown", "--force"]),
+            Ok(ParsedArgs::Shutdown {
+                socket: None,
+                force: true
+            })
+        );
+        assert_eq!(
+            parse(&["--force", "--shutdown"]),
+            Ok(ParsedArgs::Shutdown {
+                socket: None,
+                force: true
+            })
+        );
+    }
+
+    #[test]
+    fn force_without_shutdown_is_incompatible() {
+        let err = parse(&["--force"]).unwrap_err();
+        assert!(
+            matches!(err, ArgError::IncompatibleFlag { ref flag, .. } if flag == "--force"),
+            "{err:?}"
+        );
+        let err = parse(&["--status", "--force"]).unwrap_err();
+        assert!(
+            matches!(err, ArgError::IncompatibleFlag { ref flag, .. } if flag == "--force"),
+            "{err:?}"
         );
     }
 
@@ -243,7 +292,8 @@ mod tests {
         assert_eq!(
             parse(&["--shutdown", "--socket", "/tmp/x.sock"]),
             Ok(ParsedArgs::Shutdown {
-                socket: Some(PathBuf::from("/tmp/x.sock"))
+                socket: Some(PathBuf::from("/tmp/x.sock")),
+                force: false
             })
         );
     }
@@ -253,7 +303,8 @@ mod tests {
         assert_eq!(
             parse(&["--socket", "/tmp/x.sock", "--shutdown"]),
             Ok(ParsedArgs::Shutdown {
-                socket: Some(PathBuf::from("/tmp/x.sock"))
+                socket: Some(PathBuf::from("/tmp/x.sock")),
+                force: false
             })
         );
     }
