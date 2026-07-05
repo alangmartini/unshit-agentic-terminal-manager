@@ -57,7 +57,8 @@ pub fn save_clipboard_png(width: usize, height: usize, bytes: Vec<u8>) -> io::Re
                 "ImageBuffer::from_raw rejected the clipboard pixels",
             )
         })?;
-    buf.save(&path).map_err(|e| io::Error::other(e.to_string()))?;
+    buf.save(&path)
+        .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(path)
 }
 

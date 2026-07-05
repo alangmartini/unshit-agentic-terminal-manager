@@ -56,7 +56,9 @@ fn default_named_pipe_path(instance: Option<&str>) -> PathBuf {
         std::env::var_os("USERNAME").as_deref(),
     );
     match instance.map(sanitize_socket_component) {
-        Some(tag) if !tag.is_empty() => PathBuf::from(format!(r"\\.\pipe\unshit-ptyd-{user}-{tag}")),
+        Some(tag) if !tag.is_empty() => {
+            PathBuf::from(format!(r"\\.\pipe\unshit-ptyd-{user}-{tag}"))
+        }
         _ => PathBuf::from(format!(r"\\.\pipe\unshit-ptyd-{user}")),
     }
 }

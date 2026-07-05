@@ -395,10 +395,7 @@ fn terminal_font_sources() -> Vec<FontSource> {
     terminal_font_sources_from_value(std::env::var_os(ENV_PARITY_FONT_FAMILY))
 }
 
-fn ptyd_socket_path_from_env(
-    value: Option<std::ffi::OsString>,
-    instance: Option<&str>,
-) -> PathBuf {
+fn ptyd_socket_path_from_env(value: Option<std::ffi::OsString>, instance: Option<&str>) -> PathBuf {
     value
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -1506,7 +1503,9 @@ mod tests {
     #[test]
     fn ptyd_socket_path_from_env_uses_override() {
         let path = ptyd_socket_path_from_env(
-            Some(std::ffi::OsString::from(r"\\.\pipe\unshit-ptyd-parity-test")),
+            Some(std::ffi::OsString::from(
+                r"\\.\pipe\unshit-ptyd-parity-test",
+            )),
             Some("dev"),
         );
         assert_eq!(
