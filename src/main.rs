@@ -15,6 +15,7 @@ pub mod git;
 pub mod keybinds;
 pub mod notifications;
 pub mod persist;
+pub mod profile;
 pub mod pty;
 pub mod quick_prompt;
 pub mod shell;
@@ -394,15 +395,24 @@ fn terminal_font_sources() -> Vec<FontSource> {
     terminal_font_sources_from_value(std::env::var_os(ENV_PARITY_FONT_FAMILY))
 }
 
-fn ptyd_socket_path_from_env(value: Option<std::ffi::OsString>) -> PathBuf {
+fn ptyd_socket_path_from_env(
+    value: Option<std::ffi::OsString>,
+    instance: Option<&str>,
+) -> PathBuf {
     value
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(unshit_ptyd::transport::default_socket_path)
+        .unwrap_or_else(|| unshit_ptyd::transport::default_socket_path_for_instance(instance))
 }
 
+/// Daemon pipe for this instance: explicit `TM_PTYD_SOCKET` wins,
+/// otherwise the default pipe namespaced by the active profile so a
+/// dev/test instance never attaches to the installed app's daemon.
 fn ptyd_socket_path() -> PathBuf {
-    ptyd_socket_path_from_env(std::env::var_os(ENV_PTYD_SOCKET))
+    ptyd_socket_path_from_env(
+        std::env::var_os(ENV_PTYD_SOCKET),
+        crate::profile::active_profile(),
+    )
 }
 
 fn truthy_env_value(value: Option<std::ffi::OsString>) -> bool {
@@ -1018,7 +1028,7 @@ fn main() {
 
     let mut app = App::new(
         AppConfig {
-            title: "terminal manager".to_string(),
+            title: format!("terminal manager{}", crate::profile::title_suffix()),
             width: 1280,
             height: 800,
             decorations: false,
@@ -1495,9 +1505,10 @@ mod tests {
 
     #[test]
     fn ptyd_socket_path_from_env_uses_override() {
-        let path = ptyd_socket_path_from_env(Some(std::ffi::OsString::from(
-            r"\\.\pipe\unshit-ptyd-parity-test",
-        )));
+        let path = ptyd_socket_path_from_env(
+            Some(std::ffi::OsString::from(r"\\.\pipe\unshit-ptyd-parity-test")),
+            Some("dev"),
+        );
         assert_eq!(
             path,
             std::path::PathBuf::from(r"\\.\pipe\unshit-ptyd-parity-test")
@@ -1507,8 +1518,21 @@ mod tests {
     #[test]
     fn ptyd_socket_path_from_env_uses_default_when_missing() {
         assert_eq!(
-            ptyd_socket_path_from_env(None),
+            ptyd_socket_path_from_env(None, None),
             unshit_ptyd::transport::default_socket_path()
+        );
+    }
+
+    #[test]
+    fn ptyd_socket_path_from_env_namespaces_by_instance() {
+        assert_eq!(
+            ptyd_socket_path_from_env(None, Some("dev")),
+            unshit_ptyd::transport::default_socket_path_for_instance(Some("dev"))
+        );
+        assert_ne!(
+            ptyd_socket_path_from_env(None, Some("dev")),
+            unshit_ptyd::transport::default_socket_path(),
+            "an instance profile must not share the default pipe"
         );
     }
 

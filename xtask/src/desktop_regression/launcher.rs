@@ -59,6 +59,13 @@ pub struct AppSession {
     child: Child,
     window: WindowHandle,
     support_processes_before: Vec<u32>,
+    /// Directory the spawned daemon binary lives in (sibling of the app
+    /// exe). Cleanup only ever kills daemons running from here so an
+    /// installed app's daemon — or a dev instance launched mid-run —
+    /// is never collateral damage.
+    daemon_dir: Option<PathBuf>,
+    /// Ephemeral per-session config dir (TM_CONFIG_DIR), removed on close.
+    config_dir: Option<PathBuf>,
 }
 
 impl AppSession {
@@ -91,6 +98,13 @@ impl AppSession {
         let support_processes_before = process_ids_by_image("unshit-ptyd.exe");
         let mut command = Command::new(exe_path);
         command.current_dir(workspace_root);
+        // Isolate every test launch in its own instance profile: unique
+        // daemon pipe, unique notify pipe, throwaway config dir. A test
+        // run must never attach to (or persist into) the user's real
+        // session. Callers can still override via extra_env below.
+        let isolation = SessionIsolation::fresh();
+        command.env("TM_PROFILE", &isolation.profile);
+        command.env("TM_CONFIG_DIR", &isolation.config_dir);
         apply_diagnostics_env(&mut command, diagnostics);
         for (key, value) in extra_env {
             command.env(key, value);
@@ -136,6 +150,8 @@ impl AppSession {
             child,
             window,
             support_processes_before,
+            daemon_dir: exe_path.parent().map(Path::to_path_buf),
+            config_dir: Some(isolation.config_dir),
         })
     }
 
@@ -154,7 +170,7 @@ impl AppSession {
             .map_err(|e| format!("failed to query app process {}: {e}", self.child.id()))?
             .is_some()
         {
-            kill_new_processes_by_image("unshit-ptyd.exe", &self.support_processes_before);
+            self.cleanup_session_leftovers();
             return Ok(());
         }
 
@@ -167,7 +183,7 @@ impl AppSession {
                 .map_err(|e| format!("failed to query app process {}: {e}", self.child.id()))?
                 .is_some()
             {
-                kill_new_processes_by_image("unshit-ptyd.exe", &self.support_processes_before);
+                self.cleanup_session_leftovers();
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(50));
@@ -179,8 +195,42 @@ impl AppSession {
         self.child
             .wait()
             .map_err(|e| format!("failed to wait for app process {}: {e}", self.child.id()))?;
-        kill_new_processes_by_image("unshit-ptyd.exe", &self.support_processes_before);
+        self.cleanup_session_leftovers();
         Ok(())
+    }
+
+    /// Kill the daemon this session spawned (and nothing else), then
+    /// drop its throwaway config dir.
+    fn cleanup_session_leftovers(&self) {
+        kill_new_session_daemons(
+            &self.support_processes_before,
+            self.daemon_dir.as_deref(),
+        );
+        if let Some(dir) = &self.config_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Per-session isolation values handed to the app via env.
+struct SessionIsolation {
+    profile: String,
+    config_dir: PathBuf,
+}
+
+impl SessionIsolation {
+    fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let profile = format!("reg{}x{n}", std::process::id());
+        let config_dir = std::env::temp_dir()
+            .join("tm-desktop-regression")
+            .join(&profile);
+        Self {
+            profile,
+            config_dir,
+        }
     }
 }
 
@@ -195,7 +245,7 @@ pub fn apply_diagnostics_env(command: &mut Command, diagnostics: Option<&Diagnos
 impl Drop for AppSession {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_some() {
-            kill_new_processes_by_image("unshit-ptyd.exe", &self.support_processes_before);
+            self.cleanup_session_leftovers();
             return;
         }
 
@@ -223,7 +273,7 @@ pub fn prepare_app_binary(
 }
 
 fn build_app(workspace_root: &Path) -> Result<(), String> {
-    stop_processes_that_lock_debug_binaries()?;
+    stop_processes_that_lock_debug_binaries(workspace_root)?;
 
     let cargo = cargo_program();
     run_cargo_build(
@@ -247,18 +297,32 @@ fn build_app(workspace_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn stop_processes_that_lock_debug_binaries() -> Result<(), String> {
+/// The build below writes `target\debug`, so only processes running
+/// *from that directory* can lock its output. Never touch the installed
+/// app or a dev instance running from `target\release`.
+fn stop_processes_that_lock_debug_binaries(workspace_root: &Path) -> Result<(), String> {
+    let debug_dir = workspace_root.join("target").join("debug");
     let mut stopped = 0usize;
     for image_name in build_locking_image_names() {
-        let pids = process_ids_by_image(image_name);
+        let pids: Vec<u32> = processes_by_image(image_name)
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .exe
+                    .as_deref()
+                    .is_some_and(|exe| path_is_under(exe, &debug_dir))
+            })
+            .map(|entry| entry.pid)
+            .collect();
         if pids.is_empty() {
             continue;
         }
 
         println!(
-            "desktop-regression: stopping {} existing {} process(es) before build",
+            "desktop-regression: stopping {} {} process(es) running from {} before build",
             pids.len(),
-            image_name
+            image_name,
+            debug_dir.display()
         );
         for pid in pids {
             if kill_process_by_id(pid, image_name)? {
@@ -338,13 +402,32 @@ fn platform_binary_name() -> &'static str {
 }
 
 fn process_ids_by_image(image_name: &str) -> Vec<u32> {
+    processes_by_image(image_name)
+        .into_iter()
+        .map(|p| p.pid)
+        .collect()
+}
+
+struct ProcessEntry {
+    pid: u32,
+    exe: Option<PathBuf>,
+}
+
+/// List processes by image name with their executable paths so kill
+/// logic can filter by *where a process runs from* instead of only its
+/// name. An installed Terminal Manager shares the image name with repo
+/// builds; the path is the only reliable discriminator.
+fn processes_by_image(image_name: &str) -> Vec<ProcessEntry> {
     if !cfg!(windows) {
         return Vec::new();
     }
 
-    let filter = format!("IMAGENAME eq {image_name}");
-    let Ok(output) = Command::new("tasklist")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='{image_name}'\" | \
+         ForEach-Object {{ \"$($_.ProcessId)`t$($_.ExecutablePath)\" }}"
+    );
+    let Ok(output) = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
     else {
         return Vec::new();
@@ -353,16 +436,59 @@ fn process_ids_by_image(image_name: &str) -> Vec<u32> {
         return Vec::new();
     }
 
-    parse_tasklist_csv(&String::from_utf8_lossy(&output.stdout))
+    parse_pid_exe_lines(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn kill_new_processes_by_image(image_name: &str, existing: &[u32]) {
-    for pid in process_ids_by_image(image_name) {
-        if existing.contains(&pid) {
+fn parse_pid_exe_lines(output: &str) -> Vec<ProcessEntry> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (pid, exe) = match line.split_once('\t') {
+                Some((pid, exe)) => (pid, exe.trim()),
+                None => (line, ""),
+            };
+            let pid = pid.trim().parse::<u32>().ok()?;
+            Some(ProcessEntry {
+                pid,
+                exe: (!exe.is_empty()).then(|| PathBuf::from(exe)),
+            })
+        })
+        .collect()
+}
+
+/// Windows paths compare case-insensitively; both sides come in as
+/// absolute paths.
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    let normalize =
+        |p: &Path| p.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    let p = normalize(path);
+    let r = normalize(root);
+    let r = r.trim_end_matches('\\');
+    p == r || p.starts_with(&format!("{r}\\"))
+}
+
+/// Kill daemons that appeared during a test session, but only those
+/// running from the session's own binary dir. A daemon with an unknown
+/// or foreign path (the installed app, a dev instance the user opened
+/// mid-run) is always spared.
+fn kill_new_session_daemons(existing: &[u32], daemon_dir: Option<&Path>) {
+    for entry in processes_by_image("unshit-ptyd.exe") {
+        if existing.contains(&entry.pid) {
+            continue;
+        }
+        let from_session_dir = match (&entry.exe, daemon_dir) {
+            (Some(exe), Some(dir)) => exe.parent().is_some_and(|p| path_is_under(p, dir)),
+            _ => false,
+        };
+        if !from_session_dir {
             continue;
         }
         let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
+            .args(["/PID", &entry.pid.to_string(), "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -414,20 +540,6 @@ fn command_failure_details_text(stdout: &[u8], stderr: &[u8], status: &str) -> S
     format!("status {status}")
 }
 
-fn parse_tasklist_csv(output: &str) -> Vec<u32> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.contains("No tasks are running") {
-                return None;
-            }
-            let fields = trimmed.trim_matches('"').split("\",\"").collect::<Vec<_>>();
-            fields.get(1).and_then(|pid| pid.parse::<u32>().ok())
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,10 +566,37 @@ mod tests {
     }
 
     #[test]
-    fn parses_tasklist_csv_process_ids() {
-        let output = "\"unshit-ptyd.exe\",\"26372\",\"Console\",\"1\",\"12,340 K\"\r\n";
+    fn parses_pid_exe_lines_with_and_without_paths() {
+        let output =
+            "26372\tC:\\repo\\target\\debug\\unshit-ptyd.exe\r\n999\t\r\n1234\r\n\r\n";
 
-        assert_eq!(parse_tasklist_csv(output), vec![26372]);
+        let entries = parse_pid_exe_lines(output);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].pid, 26372);
+        assert_eq!(
+            entries[0].exe.as_deref(),
+            Some(Path::new(r"C:\repo\target\debug\unshit-ptyd.exe"))
+        );
+        assert_eq!(entries[1].pid, 999);
+        assert!(entries[1].exe.is_none(), "empty path must map to None");
+        assert_eq!(entries[2].pid, 1234);
+        assert!(entries[2].exe.is_none());
+    }
+
+    #[test]
+    fn path_is_under_is_case_insensitive_and_boundary_safe() {
+        assert!(path_is_under(
+            Path::new(r"C:\Repo\Target\Debug\unshit-ptyd.exe"),
+            Path::new(r"c:\repo\target\debug")
+        ));
+        assert!(!path_is_under(
+            Path::new(r"C:\repo\target\debug-other\unshit-ptyd.exe"),
+            Path::new(r"C:\repo\target\debug")
+        ));
+        assert!(!path_is_under(
+            Path::new(r"C:\Users\a\AppData\Local\Programs\Terminal Manager\unshit-ptyd.exe"),
+            Path::new(r"C:\repo\target\debug")
+        ));
     }
 
     #[test]

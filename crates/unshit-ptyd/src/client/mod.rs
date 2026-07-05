@@ -122,7 +122,16 @@ impl Client {
     /// Sends a Shutdown and waits for the matching ShutdownAck.
     pub async fn shutdown(&mut self) -> Result<Response, ProtocolError> {
         let id = self.alloc_id();
-        self.roundtrip(Request::Shutdown { id }, id).await
+        self.roundtrip(Request::Shutdown { id, force: false }, id)
+            .await
+    }
+
+    /// Sends a Shutdown that kills every live session first. Used by
+    /// test/script cleanup where the daemon is ephemeral by design.
+    pub async fn shutdown_force(&mut self) -> Result<Response, ProtocolError> {
+        let id = self.alloc_id();
+        self.roundtrip(Request::Shutdown { id, force: true }, id)
+            .await
     }
 
     /// Spawns a session on the daemon.

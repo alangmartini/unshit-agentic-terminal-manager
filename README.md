@@ -74,6 +74,14 @@ cargo run --release
 
 `cargo run` launches the UI, which finds and starts the sibling daemon for you. All assets — the CSS stylesheet, the JetBrains Mono fonts, and the bundled themes — are embedded into the binary, so there is nothing else to copy alongside the executables.
 
+Repo builds automatically run in the **`dev` instance profile**: their own daemon
+pipe, their own persisted sessions and config, and a `dev` badge in the titlebar.
+You can keep the installed app open as your daily terminal while hacking on a
+work-in-progress build — the two can never share a session. Tests and screenshot
+scripts likewise run in throwaway profiles. See
+[docs/DOGFOODING.md](docs/DOGFOODING.md) for the full model (`TM_PROFILE`,
+`TM_CONFIG_DIR`, repo-scoped `scripts\kill-all.ps1`).
+
 ### Building the installer
 
 The Windows installer is built with [Inno Setup 6](https://jrsoftware.org/isinfo.php). After a release build:

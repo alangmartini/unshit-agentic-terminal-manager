@@ -122,9 +122,9 @@ pub struct PersistedQuickPrompt {
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Default location for the persisted quick prompt file. Lives next to
-/// `workspaces.json` under the same `com.godly.terminal` namespace.
+/// `workspaces.json` in the same instance-profile config dir.
 pub fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.godly.terminal").join("quick_prompt.json"))
+    crate::profile::config_dir().map(|d| d.join("quick_prompt.json"))
 }
 
 /// Pluggable accessor over the persisted file. Tests install a temp

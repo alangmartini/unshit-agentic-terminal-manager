@@ -122,7 +122,16 @@ where
             .await?;
             Ok(PostRequest::Continue)
         }
-        Request::Shutdown { id } => {
+        Request::Shutdown { id, force } => {
+            if force {
+                let killed = registry.kill_all().await;
+                if !killed.is_empty() {
+                    log::info!(
+                        "force shutdown: killed {} session(s): {killed:?}",
+                        killed.len()
+                    );
+                }
+            }
             let alive = registry.len().await;
             if alive > 0 {
                 // Slice 3 policy: refuse shutdown while this connection
@@ -411,9 +420,15 @@ mod tests {
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
-        write_request(&mut client_write, &Request::Shutdown { id: 3 })
-            .await
-            .unwrap();
+        write_request(
+            &mut client_write,
+            &Request::Shutdown {
+                id: 3,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
         let resp = read_response(&mut client_read)
             .await
             .unwrap()

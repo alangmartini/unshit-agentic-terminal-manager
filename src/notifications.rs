@@ -250,16 +250,22 @@ async fn send_cli_request(socket: &Path, request: &NotificationIpcRequest) -> io
 }
 
 pub fn default_notification_socket_path() -> PathBuf {
+    // Namespace by instance profile: a dev/test instance must not bind
+    // (or deliver activations to) the installed app's notify pipe.
+    let name = match crate::profile::active_profile() {
+        Some(tag) => format!("terminal-manager-notify-{tag}"),
+        None => "terminal-manager-notify".to_string(),
+    };
     #[cfg(windows)]
     {
-        PathBuf::from(r"\\.\pipe\terminal-manager-notify")
+        PathBuf::from(format!(r"\\.\pipe\{name}"))
     }
     #[cfg(unix)]
     {
         if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(dir).join("terminal-manager-notify.sock");
+            return PathBuf::from(dir).join(format!("{name}.sock"));
         }
-        std::env::temp_dir().join(format!("terminal-manager-notify-{}.sock", current_euid()))
+        std::env::temp_dir().join(format!("{name}-{}.sock", current_euid()))
     }
 }
 

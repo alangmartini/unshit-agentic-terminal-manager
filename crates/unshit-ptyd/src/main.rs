@@ -50,9 +50,9 @@ fn main() -> ExitCode {
             eprintln!("unshit-ptyd: listening on {}", path.display());
             run_daemon(&path)
         }
-        Ok(ParsedArgs::Shutdown { socket }) => {
+        Ok(ParsedArgs::Shutdown { socket, force }) => {
             let path = socket.unwrap_or_else(transport::default_socket_path);
-            run_shutdown_client(&path)
+            run_shutdown_client(&path, force)
         }
         Ok(ParsedArgs::Status) => {
             println!("{}", status_line());
@@ -95,7 +95,7 @@ fn run_daemon(path: &Path) -> ExitCode {
     }
 }
 
-fn run_shutdown_client(path: &Path) -> ExitCode {
+fn run_shutdown_client(path: &Path, force: bool) -> ExitCode {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -106,10 +106,10 @@ fn run_shutdown_client(path: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    rt.block_on(shutdown_over_ipc(path))
+    rt.block_on(shutdown_over_ipc(path, force))
 }
 
-async fn shutdown_over_ipc(path: &Path) -> ExitCode {
+async fn shutdown_over_ipc(path: &Path, force: bool) -> ExitCode {
     let mut client = match client::Client::connect(path).await {
         Ok(c) => c,
         Err(e) => {
@@ -121,7 +121,11 @@ async fn shutdown_over_ipc(path: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let resp = match client.shutdown().await {
+    let resp = match if force {
+        client.shutdown_force().await
+    } else {
+        client.shutdown().await
+    } {
         Ok(r) => r,
         Err(e) => {
             eprintln!("unshit-ptyd: shutdown request failed: {e}");

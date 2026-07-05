@@ -40,8 +40,16 @@ pub const SNAPSHOT_MAX_SCROLLBACK_LINES: usize = 100;
 pub enum Request {
     /// Opening handshake. The daemon replies with `hello_ack`.
     Hello { id: u64, client_version: String },
-    /// Graceful daemon shutdown. Only succeeds with zero sessions alive.
-    Shutdown { id: u64 },
+    /// Graceful daemon shutdown. Only succeeds with zero sessions
+    /// alive, unless `force` is set, which kills every session first
+    /// (used by test/script cleanup on ephemeral daemons). Additive in
+    /// v1: defaults to false for old clients, omitted from the wire
+    /// when false so old daemons see the same shape they always have.
+    Shutdown {
+        id: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+    },
     /// Spawn a new session running `shell` (or the platform default).
     SpawnSession {
         id: u64,
@@ -112,7 +120,7 @@ impl Request {
     pub fn id(&self) -> u64 {
         match self {
             Request::Hello { id, .. } => *id,
-            Request::Shutdown { id } => *id,
+            Request::Shutdown { id, .. } => *id,
             Request::SpawnSession { id, .. } => *id,
             Request::Write { id, .. } => *id,
             Request::Resize { id, .. } => *id,
@@ -355,10 +363,42 @@ mod tests {
 
     #[test]
     fn shutdown_request_round_trips() {
-        let req = Request::Shutdown { id: 42 };
+        let req = Request::Shutdown {
+            id: 42,
+            force: false,
+        };
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn shutdown_force_is_additive_on_the_wire() {
+        // force = false must not appear in the JSON output so old
+        // daemons keep seeing the exact v1 shutdown shape, and a
+        // force-less payload (from an old client) must decode as
+        // force = false.
+        let plain = serde_json::to_string(&Request::Shutdown {
+            id: 1,
+            force: false,
+        })
+        .unwrap();
+        assert!(!plain.contains("force"), "omit false force: {plain}");
+
+        let old_wire = br#"{"kind":"shutdown","id":5}"#;
+        let back: Request = serde_json::from_slice(old_wire).unwrap();
+        assert_eq!(
+            back,
+            Request::Shutdown {
+                id: 5,
+                force: false
+            }
+        );
+
+        let forced = serde_json::to_string(&Request::Shutdown { id: 2, force: true }).unwrap();
+        assert!(forced.contains("\"force\":true"), "{forced}");
+        let back: Request = serde_json::from_str(&forced).unwrap();
+        assert_eq!(back, Request::Shutdown { id: 2, force: true });
     }
 
     #[test]
@@ -426,7 +466,11 @@ mod tests {
     fn request_kind_is_snake_case_on_wire() {
         // Pin the wire spelling so a future refactor cannot silently
         // switch it (which would break deployed clients).
-        let s = serde_json::to_string(&Request::Shutdown { id: 9 }).unwrap();
+        let s = serde_json::to_string(&Request::Shutdown {
+            id: 9,
+            force: false,
+        })
+        .unwrap();
         assert!(s.contains("\"kind\":\"shutdown\""), "{s}");
     }
 
@@ -440,7 +484,14 @@ mod tests {
             .id(),
             11
         );
-        assert_eq!(Request::Shutdown { id: 12 }.id(), 12);
+        assert_eq!(
+            Request::Shutdown {
+                id: 12,
+                force: false
+            }
+            .id(),
+            12
+        );
     }
 
     #[test]
