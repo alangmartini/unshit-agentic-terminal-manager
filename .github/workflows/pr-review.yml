@@ -67,50 +67,39 @@ jobs:
     runs-on: [self-hosted, Windows, X64, local-windows]
     timeout-minutes: 45
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       # Same rationale as rust-checks: keep cargo state off the developer's
-      # ~/.cargo. Codex runs with --sandbox danger-full-access, so any cargo
-      # install it triggers would otherwise pollute / wipe the dev shims too.
+      # ~/.cargo. Claude Code runs with --dangerously-skip-permissions, so any
+      # cargo install it triggers would otherwise pollute / wipe the dev shims too.
       CARGO_HOME: C:\Users\Alan Beelink\actions-runner\.cargo-runner
 
     steps:
-      - name: Add Codex CLI to PATH
+      - name: Add Claude Code CLI to PATH
         shell: powershell
         run: |
-          $npmBin = Join-Path $env:APPDATA 'npm'
-          if (Test-Path $npmBin) {
-            $npmBin >> $env:GITHUB_PATH
-            $env:PATH = "$npmBin;$env:PATH"
+          $claudeBin = Join-Path $env:USERPROFILE '.local\bin'
+          if (Test-Path $claudeBin) {
+            $claudeBin >> $env:GITHUB_PATH
+            $env:PATH = "$claudeBin;$env:PATH"
           }
 
-      - name: Check Codex configuration
+      - name: Check Claude Code configuration
         id: config
         shell: powershell
         run: |
-          $hasCodex = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
-          $hasOpenAIKey = -not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)
-          $hasCodexLogin = $false
-          if ($hasCodex -and -not $hasOpenAIKey) {
-            $previousErrorActionPreference = $ErrorActionPreference
-            $ErrorActionPreference = 'Continue'
-            try {
-              & codex login status 2>&1 | Out-Null
-              $hasCodexLogin = $LASTEXITCODE -eq 0
-            } finally {
-              $ErrorActionPreference = $previousErrorActionPreference
-            }
-          }
+          $hasClaude = $null -ne (Get-Command claude -ErrorAction SilentlyContinue)
+          $hasToken = -not [string]::IsNullOrWhiteSpace($env:CLAUDE_CODE_OAUTH_TOKEN)
           $hasApp = (-not [string]::IsNullOrWhiteSpace($env:APP_ID)) -and (-not [string]::IsNullOrWhiteSpace($env:APP_PRIVATE_KEY))
-          $ready = $hasCodex -and ($hasOpenAIKey -or $hasCodexLogin)
+          $ready = $hasClaude -and $hasToken
           "ready=$($ready.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "has_app=$($hasApp.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
           if (-not $ready) {
             "Automated repair cannot run." >> $env:GITHUB_STEP_SUMMARY
             "" >> $env:GITHUB_STEP_SUMMARY
-            "Required: Codex CLI plus either OPENAI_API_KEY or an existing Codex login on the runner." >> $env:GITHUB_STEP_SUMMARY
+            "Required: Claude Code CLI plus CLAUDE_CODE_OAUTH_TOKEN configured on the runner." >> $env:GITHUB_STEP_SUMMARY
             exit 1
           }
 
@@ -156,32 +145,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Configure Codex auth
-        if: steps.config.outputs.ready == 'true' && steps.stale.outputs.stale != 'true'
-        shell: powershell
-        run: |
-          $previousErrorActionPreference = $ErrorActionPreference
-          $ErrorActionPreference = 'Continue'
-          try {
-            if (-not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) {
-              $loginOutput = $env:OPENAI_API_KEY | codex login --with-api-key 2>&1
-              $loginExitCode = $LASTEXITCODE
-              $loginOutput | ForEach-Object { Write-Host $_ }
-              if ($loginExitCode -ne 0) {
-                exit $loginExitCode
-              }
-            }
-
-            $statusOutput = & codex login status 2>&1
-            $statusExitCode = $LASTEXITCODE
-            $statusOutput | ForEach-Object { Write-Host $_ }
-            if ($statusExitCode -ne 0) {
-              exit $statusExitCode
-            }
-          } finally {
-            $ErrorActionPreference = $previousErrorActionPreference
-          }
-
       - name: Skip repeated repair commits
         id: guard
         if: steps.config.outputs.ready == 'true' && steps.stale.outputs.stale != 'true'
@@ -195,7 +158,7 @@ jobs:
             "Skipping automated repair because the failing head commit is already an agent repair commit." >> $env:GITHUB_STEP_SUMMARY
           }
 
-      - name: Run GPT-5.5 xhigh repair
+      - name: Run Claude Sonnet 5 high-effort repair
         if: steps.config.outputs.ready == 'true' && steps.stale.outputs.stale != 'true' && steps.guard.outputs.skip != 'true'
         shell: powershell
         env:
@@ -230,20 +193,18 @@ jobs:
           $previousErrorActionPreference = $ErrorActionPreference
           $ErrorActionPreference = 'Continue'
           try {
-            $prompt | codex --ask-for-approval never exec `
-              --model gpt-5.5 `
-              -c 'model_reasoning_effort="xhigh"' `
-              --sandbox danger-full-access `
-              --ephemeral `
-              --cd "$PWD" `
-              -
-            $codexExitCode = $LASTEXITCODE
+            $prompt | claude -p `
+              --model claude-sonnet-5 `
+              --effort high `
+              --dangerously-skip-permissions `
+              --bare
+            $claudeExitCode = $LASTEXITCODE
           } finally {
             $ErrorActionPreference = $previousErrorActionPreference
           }
 
-          if ($codexExitCode -ne 0) {
-            exit $codexExitCode
+          if ($claudeExitCode -ne 0) {
+            exit $claudeExitCode
           }
 
   coverage:

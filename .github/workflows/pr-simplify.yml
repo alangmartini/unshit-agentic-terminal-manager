@@ -23,49 +23,38 @@ jobs:
     runs-on: [self-hosted, Windows, X64, local-windows]
     timeout-minutes: 30
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
-      # Codex sandbox may run cargo; keep its writes off the developer's
+      # Claude Code may run cargo; keep its writes off the developer's
       # ~/.cargo (see pr-review.yml for the multi-incident root-cause note).
       CARGO_HOME: C:\Users\Alan Beelink\actions-runner\.cargo-runner
 
     steps:
-      - name: Add Codex CLI to PATH
+      - name: Add Claude Code CLI to PATH
         shell: powershell
         run: |
-          $npmBin = Join-Path $env:APPDATA 'npm'
-          if (Test-Path $npmBin) {
-            $npmBin >> $env:GITHUB_PATH
-            $env:PATH = "$npmBin;$env:PATH"
+          $claudeBin = Join-Path $env:USERPROFILE '.local\bin'
+          if (Test-Path $claudeBin) {
+            $claudeBin >> $env:GITHUB_PATH
+            $env:PATH = "$claudeBin;$env:PATH"
           }
 
-      - name: Check Codex configuration
+      - name: Check Claude Code configuration
         id: config
         shell: powershell
         run: |
-          $hasCodex = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
-          $hasOpenAIKey = -not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)
-          $hasCodexLogin = $false
-          if ($hasCodex -and -not $hasOpenAIKey) {
-            $previousErrorActionPreference = $ErrorActionPreference
-            $ErrorActionPreference = 'Continue'
-            try {
-              & codex login status 2>&1 | Out-Null
-              $hasCodexLogin = $LASTEXITCODE -eq 0
-            } finally {
-              $ErrorActionPreference = $previousErrorActionPreference
-            }
-          }
+          $hasClaude = $null -ne (Get-Command claude -ErrorAction SilentlyContinue)
+          $hasToken = -not [string]::IsNullOrWhiteSpace($env:CLAUDE_CODE_OAUTH_TOKEN)
           $hasApp = (-not [string]::IsNullOrWhiteSpace($env:APP_ID)) -and (-not [string]::IsNullOrWhiteSpace($env:APP_PRIVATE_KEY))
-          $ready = $hasCodex -and ($hasOpenAIKey -or $hasCodexLogin)
+          $ready = $hasClaude -and $hasToken
           "ready=$($ready.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "has_app=$($hasApp.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
           if (-not $ready) {
             "Agentic PR review cannot run." >> $env:GITHUB_STEP_SUMMARY
             "" >> $env:GITHUB_STEP_SUMMARY
-            "Required: Codex CLI plus either OPENAI_API_KEY or an existing Codex login on the runner." >> $env:GITHUB_STEP_SUMMARY
+            "Required: Claude Code CLI plus CLAUDE_CODE_OAUTH_TOKEN configured on the runner." >> $env:GITHUB_STEP_SUMMARY
             exit 1
           }
 
@@ -97,32 +86,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Configure Codex auth
-        if: steps.config.outputs.ready == 'true'
-        shell: powershell
-        run: |
-          $previousErrorActionPreference = $ErrorActionPreference
-          $ErrorActionPreference = 'Continue'
-          try {
-            if (-not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) {
-              $loginOutput = $env:OPENAI_API_KEY | codex login --with-api-key 2>&1
-              $loginExitCode = $LASTEXITCODE
-              $loginOutput | ForEach-Object { Write-Host $_ }
-              if ($loginExitCode -ne 0) {
-                exit $loginExitCode
-              }
-            }
-
-            $statusOutput = & codex login status 2>&1
-            $statusExitCode = $LASTEXITCODE
-            $statusOutput | ForEach-Object { Write-Host $_ }
-            if ($statusExitCode -ne 0) {
-              exit $statusExitCode
-            }
-          } finally {
-            $ErrorActionPreference = $previousErrorActionPreference
-          }
 
       - name: Skip agent-generated commits
         id: guard
@@ -216,14 +179,12 @@ jobs:
           $previousErrorActionPreference = $ErrorActionPreference
           $ErrorActionPreference = 'Continue'
           try {
-            $prompt | codex --ask-for-approval never exec `
-              --model gpt-5.5 `
-              -c 'model_reasoning_effort="xhigh"' `
-              --sandbox danger-full-access `
-              --ephemeral `
-              --cd "$PWD" `
-              -
-            $codexExitCode = $LASTEXITCODE
+            $prompt | claude -p `
+              --model claude-sonnet-5 `
+              --effort high `
+              --dangerously-skip-permissions `
+              --bare
+            $claudeExitCode = $LASTEXITCODE
           } finally {
             $ErrorActionPreference = $previousErrorActionPreference
           }
@@ -235,12 +196,12 @@ jobs:
           "changed=$($changed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "dirty=$($dirty.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
-          if ($codexExitCode -ne 0) {
-            exit $codexExitCode
+          if ($claudeExitCode -ne 0) {
+            exit $claudeExitCode
           }
 
           if ($dirty) {
-            Write-Host "Codex left uncommitted changes; refusing to approve or continue."
+            Write-Host "Claude left uncommitted changes; refusing to approve or continue."
             git status --short
             exit 1
           }
