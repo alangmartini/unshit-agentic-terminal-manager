@@ -190,8 +190,10 @@ fn make_thumbnail(
 /// of an extra cryptographic hash dep; collisions at this width are
 /// negligible for the per-overlay image counts we expect (single
 /// digits) and the spec's contract is "stable filename per content"
-/// rather than a specific algorithm.
-fn content_hash(bytes: &[u8]) -> String {
+/// rather than a specific algorithm. Shared with the terminal paste
+/// path (`terminal::paste_image`) so both pipelines address identical
+/// pixels identically.
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         hash ^= b as u64;

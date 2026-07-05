@@ -15,6 +15,7 @@ use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 use vte::{Params, Perform};
 
 pub mod keys;
+pub mod paste_image;
 
 /// Maximum number of scrollback lines retained per terminal.
 const MAX_SCROLLBACK: usize = 10_000;

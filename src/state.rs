@@ -4243,14 +4243,20 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
 /// Read the system clipboard, normalise the bytes, and forward them
 /// to the active pane's PTY through the fire-and-forget write path.
 ///
-/// Empty / non-text clipboard is a silent no-op so a stray Ctrl+V
-/// after the user copied a non-text selection (image, file path
-/// listing in some apps) does not spam toasts. A real clipboard
-/// failure (driver unavailable, OS access denied, permission error)
-/// surfaces as a `push_error_toast` so the user knows their paste
-/// did not land. Returns `true` whenever the action was recognised
-/// (even if the resulting write was a no-op) so the framework
-/// rebuilds the tree and a toast becomes visible promptly.
+/// Text is preferred when present. When the clipboard holds no text
+/// but does hold a bitmap (ShareX Ctrl+Print, Win+Shift+S, browser
+/// "Copy image"), Windows Terminal parity kicks in: the image is
+/// written to a temp PNG and its (quoted) path is pasted instead, so
+/// agent CLIs like Claude Code attach it exactly like a drag-and-drop.
+/// See [`crate::terminal::paste_image`].
+///
+/// Fully empty clipboard is a silent no-op so a stray Ctrl+V does not
+/// spam toasts. A real clipboard failure (driver unavailable, OS
+/// access denied, permission error) surfaces as a `push_error_toast`
+/// so the user knows their paste did not land. Returns `true`
+/// whenever the action was recognised (even if the resulting write
+/// was a no-op) so the framework rebuilds the tree and a toast
+/// becomes visible promptly.
 ///
 /// Bracketed-paste mode is not yet tracked per session in the
 /// daemon. Until it is, raw bytes go through and `normalize_pasted_text`
@@ -4268,13 +4274,16 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
             return true;
         }
     };
-    if raw.is_empty() {
-        // Empty clipboard / non-text payload (arboard maps
-        // `ContentNotAvailable` to an empty string). No-op without a
-        // toast so a stray Ctrl+V is invisible rather than annoying.
-        return true;
-    }
-    let payload = normalize_pasted_text(&raw);
+    let (payload, source) = if raw.is_empty() {
+        // Non-text clipboard (arboard maps `ContentNotAvailable` to an
+        // empty string). Fall back to an image payload before giving up.
+        match clipboard_image_paste_payload(state) {
+            Some(path_text) => (path_text, "paste-image"),
+            None => return true,
+        }
+    } else {
+        (normalize_pasted_text(&raw), "paste")
+    };
     if payload.is_empty() {
         return true;
     }
@@ -4314,16 +4323,58 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
         log::warn!("terminal.paste: queue write failed for pane {pane_id}: {e}");
         record_diagnostic_pty_event(
             state,
-            format!("write_failed pane={pane_id} source=paste error={e}"),
+            format!("write_failed pane={pane_id} source={source} error={e}"),
         );
         push_error_toast(state, format!("paste failed: {e}"));
     } else {
         record_diagnostic_pty_event(
             state,
-            format!("write pane={pane_id} bytes={byte_count} source=paste"),
+            format!("write pane={pane_id} bytes={byte_count} source={source}"),
         );
     }
     true
+}
+
+/// Try to turn a clipboard bitmap into a pasteable temp-PNG path
+/// (Windows Terminal behaviour). Returns `None` when the clipboard
+/// holds no image — the caller treats that as the silent empty-paste
+/// no-op. Read or encode failures toast and log, then also return
+/// `None` so the paste ends there.
+fn clipboard_image_paste_payload(state: &mut AppState) -> Option<String> {
+    use crate::terminal::paste_image;
+    let content = match state.clipboard.read_image() {
+        Ok(Some(content)) => content,
+        Ok(None) => return None,
+        Err(e) => {
+            log::warn!("terminal.paste: clipboard image read failed: {e}");
+            push_error_toast(state, format!("paste failed: {e}"));
+            return None;
+        }
+    };
+    let unshit::app::ClipboardContent::Image {
+        width,
+        height,
+        bytes,
+    } = content
+    else {
+        // read_image is documented to return only Image; be defensive.
+        return None;
+    };
+    let pane_id = state.active_pane.0;
+    match paste_image::save_clipboard_png(width, height, bytes) {
+        Ok(path) => {
+            record_diagnostic_pty_event(
+                state,
+                format!("paste_image_saved pane={pane_id} path={}", path.display()),
+            );
+            Some(paste_image::pasteable_path_text(&path))
+        }
+        Err(e) => {
+            log::warn!("terminal.paste: failed to save clipboard image: {e}");
+            push_error_toast(state, format!("paste failed: {e}"));
+            None
+        }
+    }
 }
 
 /// True when the active pane has a real (non-collapsed) text selection.
@@ -11110,6 +11161,45 @@ mod tests {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
         assert!(dispatch(&mut state, "terminal.paste"));
+    }
+
+    /// Image-on-clipboard paste (Windows Terminal parity): with a bitmap
+    /// and no text on the clipboard, `terminal.paste` must take the
+    /// image branch — proven here by the "no terminal in focus" toast,
+    /// which only fires once a non-empty payload was produced. A
+    /// regression back to text-only paste would silently no-op instead.
+    #[test]
+    fn dispatch_terminal_paste_image_clipboard_reaches_focus_check() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let local = std::sync::Arc::new(unshit::app::ClipboardContext::new());
+        let seeded = local
+            .set_content(unshit::app::ClipboardContent::Image {
+                width: 2,
+                height: 2,
+                bytes: vec![255u8; 2 * 2 * 4],
+            })
+            .is_ok();
+        state.clipboard = local;
+        // Headless CI may refuse clipboard writes; only assert when the
+        // image actually landed (mirrors the empty-clipboard test).
+        if !seeded
+            || !matches!(
+                state.clipboard.read_image(),
+                Ok(Some(unshit::app::ClipboardContent::Image { .. }))
+            )
+        {
+            return;
+        }
+
+        let toasts_before = state.toasts.len();
+        let handled = dispatch(&mut state, "terminal.paste");
+        assert!(handled);
+        assert!(
+            state.toasts.len() > toasts_before,
+            "image paste with no PTY in focus must toast, proving the \
+             image payload path ran instead of the silent text no-op"
+        );
     }
 }
 
