@@ -133,7 +133,9 @@ mod tests {
 
     #[test]
     fn unset_env_on_installed_release_exe_is_default_profile() {
-        let exe = PathBuf::from(r"C:\Users\a\AppData\Local\Programs\Terminal Manager\terminal-manager.exe");
+        let exe = PathBuf::from(
+            r"C:\Users\a\AppData\Local\Programs\Terminal Manager\terminal-manager.exe",
+        );
         assert_eq!(resolve_profile(None, Some(&exe), false), None);
     }
 

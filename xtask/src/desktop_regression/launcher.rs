@@ -202,10 +202,7 @@ impl AppSession {
     /// Kill the daemon this session spawned (and nothing else), then
     /// drop its throwaway config dir.
     fn cleanup_session_leftovers(&self) {
-        kill_new_session_daemons(
-            &self.support_processes_before,
-            self.daemon_dir.as_deref(),
-        );
+        kill_new_session_daemons(&self.support_processes_before, self.daemon_dir.as_deref());
         if let Some(dir) = &self.config_dir {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -463,8 +460,7 @@ fn parse_pid_exe_lines(output: &str) -> Vec<ProcessEntry> {
 /// Windows paths compare case-insensitively; both sides come in as
 /// absolute paths.
 fn path_is_under(path: &Path, root: &Path) -> bool {
-    let normalize =
-        |p: &Path| p.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    let normalize = |p: &Path| p.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
     let p = normalize(path);
     let r = normalize(root);
     let r = r.trim_end_matches('\\');
@@ -567,8 +563,7 @@ mod tests {
 
     #[test]
     fn parses_pid_exe_lines_with_and_without_paths() {
-        let output =
-            "26372\tC:\\repo\\target\\debug\\unshit-ptyd.exe\r\n999\t\r\n1234\r\n\r\n";
+        let output = "26372\tC:\\repo\\target\\debug\\unshit-ptyd.exe\r\n999\t\r\n1234\r\n\r\n";
 
         let entries = parse_pid_exe_lines(output);
         assert_eq!(entries.len(), 3);
