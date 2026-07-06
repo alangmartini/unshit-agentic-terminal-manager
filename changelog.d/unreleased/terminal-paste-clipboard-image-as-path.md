@@ -1,3 +1,0 @@
-### Added
-
-- **Paste images into terminal panes** (Windows Terminal parity). When you press **Ctrl+V** (or Ctrl+Shift+V / Shift+Insert / right-click) and the clipboard holds a bitmap instead of text — e.g. right after a ShareX **Ctrl+Print** capture, Win+Shift+S, or a browser "Copy image" — the image is saved as a PNG under `%TEMP%\godly-paste\` and its path is pasted into the focused pane, quoted when it contains spaces. Agent CLIs such as Claude Code pick the path up exactly like a drag-and-dropped image file. Text on the clipboard still takes priority; repeated pastes of the same screenshot reuse the same content-addressed file.

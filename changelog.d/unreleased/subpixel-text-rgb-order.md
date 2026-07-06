@@ -1,3 +1,0 @@
-### Fixed
-
-- Hardware ClearType (subpixel) text no longer renders a reversed colored fringe. The swash subpixel rasterizer emits coverage in **BGR** order, but the glyph atlas is sampled as RGBA where the red channel drives the left physical subpixel on a standard RGB display, so the data was being read reversed — measured per-pixel as a cyan/blue-left, red/orange-right halo on every stem (the opposite of correct RGB ClearType, and the hue contamination on colored text). The `SubpixelMask` atlas-fill path now swaps R↔B so red coverage lands in the red channel, matching the DirectWrite path (which already emits RGBA). Verified per-pixel after the fix: the left stem edge is now red-dominant (correct RGB orientation). The grayscale (R8) software path is unaffected.

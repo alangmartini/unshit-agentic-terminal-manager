@@ -7,9 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-06
+
+This release lets the app run without a GPU via a software-renderer fallback,
+pastes clipboard images straight into terminal panes (Windows Terminal parity),
+adds Quick Prompt image drag-and-drop, makes the tab strip configurable, and
+isolates dev/test instances from the installed app through instance profiles.
+
+### Added
+
+- **Paste images into terminal panes** (Windows Terminal parity). When you press **Ctrl+V** (or Ctrl+Shift+V / Shift+Insert / right-click) and the clipboard holds a bitmap instead of text — e.g. right after a ShareX **Ctrl+Print** capture, Win+Shift+S, or a browser "Copy image" — the image is saved as a PNG under `%TEMP%\godly-paste\` and its path is pasted into the focused pane, quoted when it contains spaces. Agent CLIs such as Claude Code pick the path up exactly like a drag-and-dropped image file. Text on the clipboard still takes priority; repeated pastes of the same screenshot reuse the same content-addressed file.
+- **Software/CPU-renderer fallback** so the terminal manager runs on machines without a usable GPU (headless servers over RDP, VMs without GPU passthrough, old hardware) instead of panicking at startup. When no hardware adapter is available the renderer now escalates: it tries the preferred backend (Vulkan on Windows), then all backends (catching a real D3D12/OpenGL GPU), and finally falls back to a software adapter — WARP on Windows/D3D12, lavapipe on Vulkan — reusing the entire existing renderer so the output looks the same.
+- A new `AdapterTier` (`Hardware` / `Software`) classifies the active adapter. On `Software` the renderer automatically disables 4× MSAA (the dominant fill cost) and the backdrop-filter blur, and builds a lightweight quad shader (`quad_software.wgsl`) that fits software adapters' smaller vertex→fragment varying budget (60 components vs the full shader's 96) by dropping gradients/shadows/masks. Terminal text and panel backgrounds/borders render identically; only gradient/shadow chrome goes flat.
+- `TM_FORCE_SOFTWARE_RENDERER=1` (or `UNSHIT_RENDER_TIER=software`) exercises the fallback on a GPU machine for testing; `UNSHIT_RENDER_TIER=hardware` disables it. The GPU-accelerated path is unchanged: same adapter selection, full shader, 4× MSAA.
+- The Quick Prompt overlay can now attach images two new ways, in addition to the existing paste pipeline:
+  - **Drag-and-drop** — drop one or more image files (PNG/JPEG) onto the window to attach them. Non-image drops (folders, text files, unsupported formats) are skipped, and a hint is shown when a drop contained no usable image.
+  - **Clipboard paste** — press **Ctrl+V** while the overlay is open to attach an image from the clipboard. A paste with no image on the clipboard is a silent no-op.
+  - Both paths reuse the existing pasted-image handling: full-resolution PNG plus thumbnail, content-addressed so duplicates are de-duplicated, with identical chips, submit, and cleanup behavior.
+- Configurable horizontal tab strip in Settings → Appearance → **tabs**:
+  - **Tab sizing** — `fixed` pins every tab to a configurable width, or `fit content` shrink-wraps each tab to its own label.
+  - **Tab width** — a stepper (120–400px, default 200px) for the fixed width; hidden in fit-content mode where there is nothing to tune.
+  - **Tab rows** — keep the historical `single` scrolling row, or wrap the strip onto `double`/`triple` stacked rows. In multi-row mode the tab bar grows downward (the terminal grid below shrinks) and the `>`-style horizontal overflow is dropped; once tabs exceed the row cap the strip scrolls vertically instead.
+- Instance profiles isolate parallel app instances from each other. Every
+  OS-shared resource — the `unshit-ptyd` daemon pipe, the notification pipe,
+  and the config dir (`workspaces.json`, `quick_prompt.json`,
+  `keybindings.json`, Quick Prompt worktrees) — is now namespaced by a profile:
+  - The **installed app** keeps the unsuffixed defaults (`com.godly.terminal`,
+    `\\.\pipe\unshit-ptyd-<user>`), so nothing changes for daily use.
+  - **Repo builds** (`cargo run`, debug or release, any `target*` dir)
+    automatically run in the `dev` profile with their own daemon, sessions,
+    and config — dogfooding a work-in-progress build can no longer attach to
+    the installed app's sessions or overwrite its workspace layout.
+  - `TM_PROFILE=<name>` selects an explicit profile (`TM_PROFILE=default`
+    forces the installed-app namespace); `TM_CONFIG_DIR` additionally
+    redirects the config dir, which tests use to stay fully ephemeral.
+  The window title shows the active profile (e.g. `terminal manager [dev]`).
+
 ### Changed
 
 - The rename-session dialog now prefills the field with the session's current name and focuses the input on open (cursor at the end of the name), so you can edit or retype it immediately without clicking. Backed by two new framework primitives on `ElementDef`: `with_value` seeds an input's buffer once on mount (preserved across re-renders so edits are never clobbered) and `with_autofocus` focuses an element the first time it mounts.
+- Tabs now default to a fixed 200px width (previously a 150–240px content-clamped band). Width, sizing mode, and row mode are all adjustable from the appearance settings and reset with the rest of the appearance section.
+- The software/CPU-renderer fallback now uses **grayscale antialiasing** for text instead of subpixel (ClearType) rendering. Subpixel text is a per-pixel cost — the subpixel shader samples three chroma channels and DirectWrite rasterizes RGBA coverage — that a CPU rasterizer (WARP/lavapipe) pays in full fragment shading. On the Software tier the renderer now builds an R8 (single-channel) glyph atlas and the grayscale `text.wgsl` shader unless `TM_FORCE_SUBPIXEL_TEXT=1` overrides it, so text-heavy terminal frames shade fewer fragments on non-GPU machines. The hardware path keeps the platform policy (ClearType on Windows) unchanged.
+- The software/CPU-renderer fallback now renders **box-shadows** (outer and inset), restoring panel depth so the non-GPU path looks much closer to the GPU-accelerated one. The lite quad shader (`quad_software.wgsl`) was expanded with the full shader's shadow math — outer-spread expansion in the vertex stage, the tanh-Gaussian outer/inset shadow passes, and shadow compositing behind the rect — while staying within software adapters' 60-component varying budget (it now uses ~36 of 60; gradients and `mask-image` remain omitted). The GPU path and its full shader are unchanged.
+
+### Fixed
+
+- The `unshit-ptyd` PTY daemon is now built as a Windows GUI-subsystem binary in
+  release, so launching the installed app no longer pops a stray console window
+  alongside it. Previously the daemon was a console-subsystem executable and,
+  depending on how Windows honored the `CREATE_NO_WINDOW | DETACHED_PROCESS`
+  spawn flags, could surface its own terminal window next to the app. Debug
+  builds keep their console so `cargo run -p unshit-ptyd` still shows logs, and
+  the `--status` / `--version` / `--help` / `--shutdown` subcommands still print
+  when run from a terminal (via `attach_parent_console`, mirroring the UI binary).
+- Hardware ClearType (subpixel) text no longer renders a reversed colored fringe. The swash subpixel rasterizer emits coverage in **BGR** order, but the glyph atlas is sampled as RGBA where the red channel drives the left physical subpixel on a standard RGB display, so the data was being read reversed — measured per-pixel as a cyan/blue-left, red/orange-right halo on every stem (the opposite of correct RGB ClearType, and the hue contamination on colored text). The `SubpixelMask` atlas-fill path now swaps R↔B so red coverage lands in the red channel, matching the DirectWrite path (which already emits RGBA). Verified per-pixel after the fix: the left stem edge is now red-dominant (correct RGB orientation). The grayscale (R8) software path is unaffected.
+- The software/CPU-renderer (grayscale text) path no longer paints a fake colored fringe on every glyph. The grayscale `text.wgsl` shader was synthesizing per-channel "subpixel" coverage by sampling the ±1 neighbour texels of a single-channel (R8) atlas into the red/blue channels — but a grayscale mask has no real subpixel data, so this only injected a cyan-left / orange-right halo on every stem and shifted the hue of colored text at its edges. The shader now samples the true coverage once and blends it straight (verified per-pixel: glyph edges are now neutral dimmer-foreground instead of color-fringed). `grid_fragment.wgsl` applies the same mild stem-contrast curve so terminal-cell text and UI text share identical grayscale weight. The hardware ClearType (`text_subpixel.wgsl`) path is unchanged.
+- UI/chrome text (sidebar, tabs, breadcrumbs, status bar, buttons) now snaps its glyph baseline to a whole device-pixel row, so horizontal stems land on one crisp row instead of smearing across two at partial coverage on non-integer display scales (e.g. 1.5x). Positions are already in device pixels (font sizes are pre-scaled by the DPR); only Y is rounded (X is left untouched to preserve shaping/kerning), mirroring the trick the terminal grid path already uses (`gy.round()`). This path is UI-only — terminal cells render through their own emit path and are unaffected.
+- The bottom status bar no longer renders the unreadable token `k/sutf-8`. The left and right status groups were laid flush against each other (`.statusbar` is `justify-content: flex-start; gap: 0`), so the left group's last item (`↓ 0.0 k/s`) collided with the right group's first (`utf-8`). A flex spacer (`.sb-spacer`, matching the settings status bar) is now inserted between the two groups, pushing the right group to the far edge as intended.
+- Test harnesses and helper scripts can no longer disturb a running session:
+  - `cargo xtask desktop-regression` launches every app session in a unique
+    throwaway profile (own daemon pipe, temp config dir) and its pre-build /
+    post-test process cleanup now matches executables by *path* (repo
+    `target\debug` builds only) instead of killing every `terminal-manager.exe`
+    / `unshit-ptyd.exe` by name — the installed app and its daemon are never
+    collateral damage.
+  - `scripts/kill-all.ps1` is repo-scoped by default (only kills processes
+    running from this repository's build dirs) and requires `-All` to touch
+    anything else.
+  - Screenshot helpers (`palette-shot.ps1`, `software-renderer-shot.ps1`) run
+    the app in an ephemeral profile via `scripts/lib/tm-isolation.ps1` and shut
+    their daemon down afterwards.
+
+## [0.2.1] - 2026-07-05
+
+Pre-release test build of the non-GPU/software-renderer channel, published as
+`terminal-manager-0.2.1-non-gpu-setup.exe` alongside the official 0.2.0 build.
+Its changes are folded into the 0.2.2 entry above.
 
 ## [0.2.0] - 2026-06-17
 
@@ -86,6 +159,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/releases/tag/v0.1.0
