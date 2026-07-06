@@ -6,7 +6,7 @@ use crate::scroll_motion::{
     browser_like_initial_slope, browser_like_wheel_duration, dominant_delta, ScrollMotion,
     SMOOTH_SCROLL_EPSILON,
 };
-use crate::shortcut::{key_combo_from_winit, ShortcutResolver};
+use crate::shortcut::{dead_key_commit_combo, key_combo_from_winit, ShortcutResolver};
 use crate::window;
 use cosmic_text::{FontSystem, SwashCache};
 use std::collections::HashMap;
@@ -3222,8 +3222,20 @@ impl ApplicationHandler for AppHandler {
                     }
 
                     if focused_captures {
+                        // Dead-key presses that commit text (e.g. quote typed
+                        // twice on US-International / ABNT2) still report
+                        // `Dead` as their logical key; fall back to the
+                        // committed text so the character reaches the capture
+                        // handler instead of being dropped.
                         if let Some(combo) =
                             key_combo_from_winit(&event.logical_key, &state.modifiers_state)
+                                .or_else(|| {
+                                    dead_key_commit_combo(
+                                        &event.logical_key,
+                                        event.text.as_deref(),
+                                        &state.modifiers_state,
+                                    )
+                                })
                         {
                             // Release chord: clear capture, do NOT forward the event
                             if combo == state.release_chord {

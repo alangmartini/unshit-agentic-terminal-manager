@@ -60,6 +60,33 @@ pub fn key_combo_from_winit(
         _ => return None,
     };
 
+    Some(KeyCombo::new(key, modifiers_from_winit(modifiers)))
+}
+
+/// Build a KeyCombo for a dead-key press that committed text.
+///
+/// Dead keys (`'` / `"` / `~` / `^` on US-International and ABNT2 layouts)
+/// report `WinitKey::Dead`, which `key_combo_from_winit` cannot map. The
+/// press that commits a literal character (the dead key pressed twice)
+/// still reports `Dead` as its logical key but carries the committed text.
+/// Map it to a `Char` combo so keyboard-capture handlers (e.g. a terminal)
+/// receive the character instead of the event being dropped.
+pub fn dead_key_commit_combo(
+    logical_key: &WinitKey,
+    text: Option<&str>,
+    modifiers: &ModifiersState,
+) -> Option<KeyCombo> {
+    if !matches!(logical_key, WinitKey::Dead(_)) {
+        return None;
+    }
+    let ch = text?.chars().next()?;
+    if ch.is_control() {
+        return None;
+    }
+    Some(KeyCombo::new(Key::Char(ch), modifiers_from_winit(modifiers)))
+}
+
+fn modifiers_from_winit(modifiers: &ModifiersState) -> Modifiers {
     let mut mods = Modifiers::empty();
     if modifiers.shift_key() {
         mods |= Modifiers::SHIFT;
@@ -73,8 +100,7 @@ pub fn key_combo_from_winit(
     if modifiers.meta_key() {
         mods |= Modifiers::META;
     }
-
-    Some(KeyCombo::new(key, mods))
+    mods
 }
 
 // -- JSON config types --
@@ -394,6 +420,43 @@ mod tests {
 
     fn dummy_interaction() -> InteractionState {
         InteractionState::default()
+    }
+
+    // -- dead_key_commit_combo -------------------------------------------------
+
+    #[test]
+    fn dead_key_with_committed_text_maps_to_char() {
+        let combo = dead_key_commit_combo(
+            &WinitKey::Dead(Some('\'')),
+            Some("'"),
+            &ModifiersState::default(),
+        );
+        assert_eq!(combo, Some(KeyCombo::new(Key::Char('\''), Modifiers::empty())));
+    }
+
+    #[test]
+    fn dead_key_with_shift_keeps_modifier() {
+        let combo =
+            dead_key_commit_combo(&WinitKey::Dead(Some('"')), Some("\""), &ModifiersState::SHIFT);
+        assert_eq!(combo, Some(KeyCombo::new(Key::Char('"'), Modifiers::SHIFT)));
+    }
+
+    #[test]
+    fn dead_key_without_text_returns_none() {
+        // The initial dead-key press composes silently; nothing to forward.
+        let combo =
+            dead_key_commit_combo(&WinitKey::Dead(Some('~')), None, &ModifiersState::default());
+        assert_eq!(combo, None);
+    }
+
+    #[test]
+    fn non_dead_key_returns_none() {
+        let combo = dead_key_commit_combo(
+            &WinitKey::Character("a".into()),
+            Some("a"),
+            &ModifiersState::default(),
+        );
+        assert_eq!(combo, None);
     }
 
     fn dummy_arena() -> NodeArena {

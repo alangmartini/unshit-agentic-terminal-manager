@@ -64,6 +64,16 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
                 // Ctrl+Space sends NUL.
                 Some(vec![0x00])
             } else {
+                // A dead key followed by Space commits the literal accent
+                // character (`'`, `"`, `~`, ... on US-International / ABNT2
+                // layouts) and arrives as a Space press carrying the
+                // committed text. Prefer the text so the character reaches
+                // the shell instead of a plain space.
+                if let Some(ref text) = event.text {
+                    if !text.is_empty() {
+                        return Some(text.as_bytes().to_vec());
+                    }
+                }
                 Some(vec![0x20])
             }
         }
@@ -353,6 +363,45 @@ mod tests {
             encode_key(&key_event(Key::Space, Modifiers::CTRL)),
             Some(vec![0x00])
         );
+    }
+
+    // -- Dead-key composition ---------------------------------------------------
+
+    #[test]
+    fn dead_key_then_space_sends_committed_quote() {
+        // Dead `"` followed by Space arrives as a Space press whose text is
+        // the committed quote; the quote must reach the shell, not a space.
+        let result = encode_key(&key_event_with_text(Key::Space, Modifiers::empty(), "\""));
+        assert_eq!(result, Some(b"\"".to_vec()));
+    }
+
+    #[test]
+    fn dead_key_then_space_sends_committed_apostrophe() {
+        let result = encode_key(&key_event_with_text(Key::Space, Modifiers::empty(), "'"));
+        assert_eq!(result, Some(b"'".to_vec()));
+    }
+
+    #[test]
+    fn space_with_space_text_still_sends_space() {
+        let result = encode_key(&key_event_with_text(Key::Space, Modifiers::empty(), " "));
+        assert_eq!(result, Some(vec![0x20]));
+    }
+
+    #[test]
+    fn ctrl_space_ignores_text() {
+        let result = encode_key(&key_event_with_text(Key::Space, Modifiers::CTRL, " "));
+        assert_eq!(result, Some(vec![0x00]));
+    }
+
+    #[test]
+    fn dead_key_commit_char_prefers_text() {
+        // Quote pressed twice: forwarded as Char('"') with text `"`.
+        let result = encode_key(&key_event_with_text(
+            Key::Char('"'),
+            Modifiers::empty(),
+            "\"",
+        ));
+        assert_eq!(result, Some(b"\"".to_vec()));
     }
 
     // -- Arrow keys -----------------------------------------------------------
