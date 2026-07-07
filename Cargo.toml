@@ -138,6 +138,11 @@ dhat = { version = "0.3", optional = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 unshit-test = { path = "crates/unshit-framework/crates/unshit-test" }
 
+# `shellapi` provides ShellExecuteW, used to open Ctrl+clicked links in the
+# default browser without going through a command shell (see src/browser.rs).
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["shellapi"] }
+
 # Embeds the application icon into terminal-manager.exe (best-effort; see build.rs).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

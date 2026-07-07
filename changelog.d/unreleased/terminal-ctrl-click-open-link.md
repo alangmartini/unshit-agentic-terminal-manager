@@ -1,0 +1,3 @@
+### Added
+
+- **Ctrl+click a URL in a terminal pane to open it in your default browser.** `http://` and `https://` links printed by any program are now detected under the pointer; holding `Ctrl` and clicking one hands it to the system's default browser instead of starting a text selection (a plain click still selects, and `Ctrl`+drag over non-link text still selects). Detection keeps query strings and fragments intact and strips trailing sentence punctuation (so clicking `http://example.com).` opens the bare address). Only `http`/`https` are ever opened, and the URL is passed to the OS via the shell-association API (`ShellExecuteW`), never through a command interpreter, so a link from an untrusted source (e.g. an SSH session) cannot inject shell syntax.

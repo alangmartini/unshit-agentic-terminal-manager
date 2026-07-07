@@ -820,6 +820,7 @@ fn build_pane_body(
                 if let Event::Mouse(me) = event {
                     if me.kind == MouseEventKind::Down && me.button == MouseButton::Left {
                         let shift = me.modifiers.contains(Modifiers::SHIFT);
+                        let ctrl = me.modifiers.contains(Modifiers::CTRL);
                         let (lx, ly) = (me.local_x, me.local_y);
                         mutate_with(&sel_down_shared, |st| {
                             // Focus the pane on press. A click-DRAG has its
@@ -834,22 +835,35 @@ fn build_pane_body(
                             );
                             let x_offset = terminal_content_x_offset();
                             let scale = terminal_cell_width_scale();
-                            if let Some(cell) = crate::state::terminal_cell_at(
+                            let Some(cell) = crate::state::terminal_cell_at(
                                 st,
                                 sel_down_pane.0,
                                 lx,
                                 ly,
                                 x_offset,
                                 scale,
-                            ) {
-                                crate::state::handle_terminal_mouse_down(
-                                    st,
-                                    sel_down_pane.0,
-                                    cell,
-                                    shift,
-                                    std::time::Instant::now(),
-                                );
+                            ) else {
+                                return;
+                            };
+                            // Ctrl+click opens a link under the pointer in the
+                            // browser instead of starting a selection. Only
+                            // consumes the press when a URL is actually there so
+                            // Ctrl+drag still selects over non-link text.
+                            if ctrl {
+                                if let Some(url) =
+                                    crate::state::terminal_url_at(st, sel_down_pane.0, cell)
+                                {
+                                    crate::state::open_terminal_url(st, &url);
+                                    return;
+                                }
                             }
+                            crate::state::handle_terminal_mouse_down(
+                                st,
+                                sel_down_pane.0,
+                                cell,
+                                shift,
+                                std::time::Instant::now(),
+                            );
                         });
                     }
                 }

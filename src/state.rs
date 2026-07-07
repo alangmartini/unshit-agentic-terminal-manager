@@ -4523,6 +4523,45 @@ pub fn terminal_cell_at(
     Some((t.view_pixel_to_abs_line(local_y, cell_h), col))
 }
 
+/// The `http`/`https` URL under absolute `cell` in `pane`'s terminal, if any.
+/// Backs Ctrl+click-to-open; see [`crate::terminal::Terminal::url_at`].
+pub fn terminal_url_at(state: &AppState, pane: u32, cell: (u64, usize)) -> Option<String> {
+    state
+        .terminals
+        .get(&pane)
+        .and_then(|h| h.lock_recover().url_at(cell.0, cell.1))
+}
+
+/// `scheme://host` prefix of `url`, dropping any path / query / fragment that
+/// could carry a token or other secret. Used so logs never record the full
+/// clicked URL.
+fn url_scheme_host(url: &str) -> &str {
+    match url.find("://") {
+        Some(i) => {
+            let after = &url[i + 3..];
+            let host_len = after
+                .find(|c| c == '/' || c == '?' || c == '#')
+                .unwrap_or(after.len());
+            &url[..i + 3 + host_len]
+        }
+        None => url,
+    }
+}
+
+/// Open a link Ctrl+clicked in a terminal pane in the default browser. Logs the
+/// attempt (host only) and surfaces a toast if the OS refuses to open it.
+pub fn open_terminal_url(state: &mut AppState, url: &str) {
+    log::info!("terminal.open_url host={}", url_scheme_host(url));
+    if let Err(e) = crate::browser::open_url(url) {
+        log::warn!(
+            "terminal.open_url failed host={} error={}",
+            url_scheme_host(url),
+            e
+        );
+        push_error_toast(state, format!("Couldn't open link: {e}"));
+    }
+}
+
 fn terminal_word_bounds(state: &AppState, pane: u32, cell: (u64, usize)) -> (usize, usize) {
     state
         .terminals
