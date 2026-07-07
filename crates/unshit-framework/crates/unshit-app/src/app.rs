@@ -3550,6 +3550,7 @@ impl ApplicationHandler for AppHandler {
                             animate: smooth_scroll,
                             smooth_duration_ms,
                             smooth_initial_slope,
+                            modifiers: modifiers_from_winit(&state.modifiers_state),
                         });
                     let mut node = state.interaction.hovered;
                     while let Some(element) = state.arena.get(node) {

@@ -578,6 +578,54 @@ fn handle_animated_wheel(
     }
 }
 
+/// Forward a wheel notch to the PTY as mouse-wheel reports when the
+/// focused program has enabled mouse tracking (DECSET 1000/1002/1003).
+///
+/// Returns `Some(empty patch)` when the program is capturing the mouse:
+/// the wheel then belongs to the program (so a TUI in the alternate
+/// screen — Claude Code, vim, fzf — scrolls its own content) and must
+/// NOT also move local scrollback, so the caller stops here. Returns
+/// `None` when mouse reporting is off, so the caller falls through to the
+/// normal scrollback paths. `Shift+wheel` is the local-scrollback escape
+/// hatch and is filtered by the caller before this is reached.
+fn forward_wheel_if_mouse_mode(
+    shared: &SharedState,
+    pane: u32,
+    delta_y: f32,
+    cell_h: f32,
+) -> Option<unshit::app::app::ScrollGridPatch> {
+    mutate_with(shared, |st| {
+        let handle = st.terminals.get(&pane)?.clone();
+        let bytes = {
+            let mut terminal = handle.lock_recover();
+            if !terminal.mouse_reporting_active() {
+                return None;
+            }
+            terminal.encode_wheel_reports(delta_y, cell_h)
+        };
+        // Mouse mode is active: consume the wheel regardless of whether
+        // this (possibly sub-line) delta has yet accumulated to a whole
+        // line of reports, so it never leaks into local scrollback.
+        if !bytes.is_empty() {
+            let byte_count = bytes.len();
+            match st.pty_manager.write(pane, &bytes) {
+                Ok(()) => record_diagnostic_pty_event(
+                    st,
+                    format!("write pane={} bytes={} source=wheel", pane, byte_count),
+                ),
+                Err(e) => record_diagnostic_pty_event(
+                    st,
+                    format!("write_failed pane={} source=wheel error={}", pane, e),
+                ),
+            }
+        }
+        Some(unshit::app::app::ScrollGridPatch {
+            grid: None,
+            animation: None,
+        })
+    })
+}
+
 fn build_pane_body(
     pane_id: PaneId,
     capture_keyboard: bool,
@@ -743,6 +791,21 @@ fn build_pane_body(
                     if let Event::Scroll(se) = event {
                         use unshit::core::cell_grid::CellGrid;
                         let cell_h = CellGrid::global_cell_h().max(1.0);
+                        // A program capturing the mouse (DECSET 1000/1002/1003)
+                        // owns the wheel: forward the notch as mouse reports so
+                        // the TUI scrolls its own content. Shift+wheel is the
+                        // escape hatch that always drives local scrollback
+                        // (xterm convention), so it skips forwarding.
+                        if !se.modifiers.contains(Modifiers::SHIFT) {
+                            if let Some(patch) = forward_wheel_if_mouse_mode(
+                                &scroll_shared,
+                                scroll_pane_id.0,
+                                se.delta_y,
+                                cell_h,
+                            ) {
+                                return Some(Box::new(patch));
+                            }
+                        }
                         let patch = if se.animate {
                             handle_animated_wheel(&scroll_shared, scroll_pane_id.0, se, cell_h)
                         } else {
@@ -2297,6 +2360,82 @@ mod tests_mouse_selection_copy_paste {
         assert_eq!(term.scroll_offset(), 0);
     }
 
+    fn wheel_event_shift(delta_y: f32) -> Event {
+        Event::Scroll(unshit::core::event::ScrollEvent {
+            delta_x: 0.0,
+            delta_y,
+            x: 0.0,
+            y: 0.0,
+            modifiers: Modifiers::SHIFT,
+            ..Default::default()
+        })
+    }
+
+    /// Seed pane 1 with one scrollback line and a program that has enabled
+    /// mouse tracking + SGR encoding (like Claude Code in the alt screen).
+    fn seed_mouse_reporting_terminal(shared: &SharedState) {
+        let mut guard = shared.lock().unwrap();
+        guard.active_pane = PaneId(1);
+        let mut term = crate::terminal::Terminal::new(3, 5);
+        term.process_bytes(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+        term.process_bytes(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+        assert!(term.mouse_reporting_active());
+        guard.terminals.insert(1, Arc::new(Mutex::new(term)));
+    }
+
+    #[test]
+    fn wheel_forwarded_to_pty_when_mouse_reporting_active_suppresses_local_scroll() {
+        // Regression: a TUI in the alternate screen (Claude Code) enables
+        // mouse tracking; the wheel must be reported to the program, not
+        // consumed by local scrollback, so the view stays pinned at live.
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        seed_mouse_reporting_terminal(&shared);
+        let handler = scroll_handler_for_pane(&shared, 1);
+
+        let cell_h = CellGrid::global_cell_h().max(1.0);
+        let patch = (handler)(&wheel_event(cell_h * 2.0))
+            .expect("scroll handler must return a value")
+            .downcast::<unshit::app::app::ScrollGridPatch>()
+            .expect("scroll handler must return a ScrollGridPatch");
+
+        assert!(
+            patch.grid.is_none(),
+            "a forwarded wheel must not repaint local scrollback"
+        );
+        let guard = shared.lock().unwrap();
+        let term = guard.terminals.get(&1).unwrap().lock().unwrap();
+        assert_eq!(
+            term.scroll_offset(),
+            0,
+            "wheel forwarded to the program must not move the local view"
+        );
+    }
+
+    #[test]
+    fn shift_wheel_bypasses_mouse_reporting_and_scrolls_local_scrollback() {
+        // Escape hatch (xterm convention): Shift+wheel drives local
+        // scrollback even while the program is capturing the mouse.
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        seed_mouse_reporting_terminal(&shared);
+        let handler = scroll_handler_for_pane(&shared, 1);
+
+        let cell_h = CellGrid::global_cell_h().max(1.0);
+        let _ = (handler)(&wheel_event_shift(cell_h * 2.0))
+            .expect("scroll handler must return a value")
+            .downcast::<unshit::app::app::ScrollGridPatch>()
+            .expect("scroll handler must return a ScrollGridPatch");
+
+        let guard = shared.lock().unwrap();
+        let term = guard.terminals.get(&1).unwrap().lock().unwrap();
+        assert_eq!(
+            term.scroll_offset(),
+            1,
+            "Shift+wheel must scroll local scrollback (clamped at the one line available)"
+        );
+    }
+
     fn wheel_animate_event(delta_y: f32) -> Event {
         Event::Scroll(unshit::core::event::ScrollEvent {
             delta_x: 0.0,
@@ -2306,6 +2445,7 @@ mod tests_mouse_selection_copy_paste {
             animate: true,
             smooth_duration_ms: 180.0,
             smooth_initial_slope: 0.25,
+            ..Default::default()
         })
     }
 

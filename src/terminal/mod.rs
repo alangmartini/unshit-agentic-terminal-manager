@@ -133,6 +133,26 @@ pub struct Terminal {
     /// wrapped in `ESC[200~` / `ESC[201~` so readline/editors can tell
     /// a paste from typed input. Reset by `CSI ? 2004 l`.
     bracketed_paste: bool,
+    /// Which DEC private mouse-reporting modes the running program has
+    /// enabled: `1000` (button press/release), `1002` (button + drag),
+    /// `1003` (any motion). When any is set the program wants to receive
+    /// the mouse — including wheel notches — as input events, so the UI
+    /// must forward the wheel to the PTY instead of scrolling its own
+    /// scrollback (matching xterm / Windows Terminal / VS Code). A TUI in
+    /// the alternate screen (Claude Code, vim, fzf) relies on this to
+    /// scroll its own content. Each toggled independently by `CSI ?100Xh/l`.
+    mouse_report_1000: bool,
+    mouse_report_1002: bool,
+    mouse_report_1003: bool,
+    /// Whether the program requested SGR mouse encoding (DECSET 1006,
+    /// `ESC[<b;x;yM`). When unset we fall back to legacy X10 encoding
+    /// (`ESC[M` + three offset-by-32 bytes). Claude Code enables 1006.
+    mouse_sgr: bool,
+    /// Fractional-line carry for wheel-to-mouse-report forwarding, so a
+    /// precision touchpad's sub-line deltas accumulate into whole-line
+    /// wheel events instead of rounding every event (mirrors
+    /// `scroll_accum_lines`, but for the forwarded-report path).
+    mouse_wheel_accum: f32,
     /// Count of scrollback lines permanently evicted off the top (when the
     /// buffer exceeds `MAX_SCROLLBACK`). Added to a line's index within the
     /// live `scrollback ++ screen` buffer to form a stable *absolute* line
@@ -389,6 +409,11 @@ impl Terminal {
             pending_response: Vec::new(),
             synchronized_output_active: false,
             bracketed_paste: false,
+            mouse_report_1000: false,
+            mouse_report_1002: false,
+            mouse_report_1003: false,
+            mouse_sgr: false,
+            mouse_wheel_accum: 0.0,
             evicted_lines: 0,
         }
     }
@@ -1183,6 +1208,62 @@ impl Terminal {
     /// `ESC[200~`/`ESC[201~` when this is set.
     pub fn bracketed_paste_active(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether the running program is capturing the mouse (DECSET
+    /// 1000/1002/1003). When true, wheel notches belong to the program,
+    /// not to local scrollback: the UI forwards them via
+    /// [`Terminal::encode_wheel_reports`]. A TUI in the alternate screen
+    /// (Claude Code, vim, fzf) can only be scrolled through this path.
+    pub fn mouse_reporting_active(&self) -> bool {
+        self.mouse_report_1000 || self.mouse_report_1002 || self.mouse_report_1003
+    }
+
+    /// Encode vertical wheel motion as mouse-wheel *button* reports for
+    /// the running program, one report per whole line of motion.
+    ///
+    /// `delta_y` is in physical pixels with the UI's sign convention
+    /// (`> 0` = wheel up, toward older content); `cell_h` is pixels per
+    /// text row. The sub-line remainder is carried in `mouse_wheel_accum`
+    /// so a precision touchpad tracks 1:1 instead of rounding each event.
+    /// Returns the bytes to write to the PTY, empty when the accumulated
+    /// motion has not yet reached a whole line (or reporting is off).
+    ///
+    /// Wheel up is button code 64, wheel down 65 (the xterm "button 4/5"
+    /// wheel encoding). SGR mode (DECSET 1006) emits `ESC[<Cb;Cx;CyM`;
+    /// otherwise legacy X10 `ESC[M` with each of button/col/row offset by
+    /// 32 and clamped to the 223 byte ceiling. The pointer cell is
+    /// reported as `1;1`: the wheel dispatch only carries window-absolute
+    /// coordinates, and mouse-driven TUIs scroll their content regardless
+    /// of the reported cell, so a fixed valid position is sufficient.
+    pub fn encode_wheel_reports(&mut self, delta_y: f32, cell_h: f32) -> Vec<u8> {
+        if !self.mouse_reporting_active() || cell_h <= 0.0 || !delta_y.is_finite() {
+            self.mouse_wheel_accum = 0.0;
+            return Vec::new();
+        }
+        self.mouse_wheel_accum += delta_y / cell_h;
+        if !self.mouse_wheel_accum.is_finite() {
+            self.mouse_wheel_accum = 0.0;
+            return Vec::new();
+        }
+        let lines = self.mouse_wheel_accum.trunc() as i32;
+        self.mouse_wheel_accum -= lines as f32;
+        if lines == 0 {
+            return Vec::new();
+        }
+        let button: u16 = if lines > 0 { 64 } else { 65 };
+        let count = lines.unsigned_abs() as usize;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            if self.mouse_sgr {
+                out.extend_from_slice(format!("\x1b[<{};1;1M", button).as_bytes());
+            } else {
+                // X10: cap the 7-bit payload bytes at 255 (32 + 223).
+                let enc = |v: u16| -> u8 { (32 + v.min(223)) as u8 };
+                out.extend_from_slice(&[0x1b, b'[', b'M', enc(button), enc(1), enc(1)]);
+            }
+        }
+        out
     }
 
     /// Absolute index of the virtual line currently shown at display
@@ -2045,14 +2126,22 @@ impl<'a> Perform for Performer<'a> {
             // the older aliases. `?25l` is equally important for TUI
             // prompts that hide the hardware cursor while drawing their
             // own input cursor; ignoring it produces a brief double cursor.
-            // Other private modes (mouse reporting, application keypad,
-            // etc.) are ignored here; the daemon owns those semantics.
+            // Mouse reporting (1000/1002/1003 + 1006 SGR encoding) is
+            // tracked locally so the UI's wheel handler can forward
+            // notches to the PTY as mouse events (see
+            // `mouse_reporting_active` / `encode_wheel_reports`); without
+            // it, TUIs in the alternate screen can never be scrolled.
+            // Other private modes (application keypad, etc.) are ignored.
             // Bracketed paste (2004) is tracked locally so `terminal.paste`
             // can wrap pasted bodies in `ESC[200~`/`ESC[201~`.
             'h' if intermediates == [b'?'] => {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(true),
+                        1000 => t.mouse_report_1000 = true,
+                        1002 => t.mouse_report_1002 = true,
+                        1003 => t.mouse_report_1003 = true,
+                        1006 => t.mouse_sgr = true,
                         2004 => t.bracketed_paste = true,
                         2026 => t.synchronized_output_active = true,
                         47 | 1047 | 1049 => t.enter_alt_screen(),
@@ -2064,6 +2153,10 @@ impl<'a> Perform for Performer<'a> {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(false),
+                        1000 => t.mouse_report_1000 = false,
+                        1002 => t.mouse_report_1002 = false,
+                        1003 => t.mouse_report_1003 = false,
+                        1006 => t.mouse_sgr = false,
                         2004 => t.bracketed_paste = false,
                         2026 => t.synchronized_output_active = false,
                         47 | 1047 | 1049 => t.exit_alt_screen(),
@@ -4857,6 +4950,79 @@ mod tests {
             !term.bracketed_paste_active(),
             "CSI ?2004l must disable bracketed paste mode"
         );
+    }
+
+    #[test]
+    fn mouse_reporting_tracks_dec_private_1000_1002_1003() {
+        for mode in ["1000", "1002", "1003"] {
+            let mut term = Terminal::new(3, 5);
+            assert!(!term.mouse_reporting_active());
+            term.process_bytes(format!("\x1b[?{mode}h").as_bytes());
+            assert!(
+                term.mouse_reporting_active(),
+                "CSI ?{mode}h must enable mouse reporting"
+            );
+            term.process_bytes(format!("\x1b[?{mode}l").as_bytes());
+            assert!(
+                !term.mouse_reporting_active(),
+                "CSI ?{mode}l must disable mouse reporting"
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_reporting_stays_active_until_all_modes_cleared() {
+        // Claude Code enables 1000+1002+1003 together; disabling only one
+        // must not prematurely hand the wheel back to local scrollback.
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h");
+        assert!(term.mouse_reporting_active());
+        term.process_bytes(b"\x1b[?1002l");
+        assert!(
+            term.mouse_reporting_active(),
+            "reporting must persist while 1000/1003 are still set"
+        );
+        term.process_bytes(b"\x1b[?1000l\x1b[?1003l");
+        assert!(!term.mouse_reporting_active());
+    }
+
+    #[test]
+    fn encode_wheel_reports_empty_when_reporting_off() {
+        let mut term = Terminal::new(3, 5);
+        assert!(term.encode_wheel_reports(100.0, 20.0).is_empty());
+    }
+
+    #[test]
+    fn encode_wheel_reports_sgr_up_and_down() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?1000h\x1b[?1006h"); // tracking + SGR
+                                                        // Wheel up (delta_y > 0) => button 64; one line == one report.
+        assert_eq!(term.encode_wheel_reports(20.0, 20.0), b"\x1b[<64;1;1M");
+        // Wheel down (delta_y < 0) => button 65.
+        assert_eq!(term.encode_wheel_reports(-20.0, 20.0), b"\x1b[<65;1;1M");
+        // Three lines of motion in one event => three reports.
+        assert_eq!(
+            term.encode_wheel_reports(60.0, 20.0),
+            b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M"
+        );
+    }
+
+    #[test]
+    fn encode_wheel_reports_x10_when_no_sgr() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?1000h"); // tracking, legacy X10 encoding
+                                            // ESC [ M  (32+64)=96='`'  (32+1)=33='!'  (32+1)=33='!'
+        assert_eq!(term.encode_wheel_reports(20.0, 20.0), b"\x1b[M`!!");
+    }
+
+    #[test]
+    fn encode_wheel_reports_accumulates_sub_line_deltas() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?1000h\x1b[?1006h");
+        // Half a line: below the whole-line threshold, so no report yet.
+        assert!(term.encode_wheel_reports(10.0, 20.0).is_empty());
+        // Another half line completes one whole line => exactly one report.
+        assert_eq!(term.encode_wheel_reports(10.0, 20.0), b"\x1b[<64;1;1M");
     }
 
     #[test]
