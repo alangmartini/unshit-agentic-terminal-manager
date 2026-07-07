@@ -3403,17 +3403,12 @@ fn emit_text_glyphs_cached(
         }
     }
 
-    // Main text run, on top of any shadow.
+    // Main text run, on top of any shadow. Pin each glyph to the device pixel
+    // grid via `snapped_text_glyph_pos` (see its docs): this is what stops
+    // already-typed letters from vibrating as the run origin drifts sub-pixel.
     for (rel_x, rel_y, entry) in &laid_out {
-        // Snap the glyph baseline to a whole device pixel row. Positions here are
-        // already in device px (font sizes are pre-scaled by the DPR), but UI
-        // chrome text origins land on fractional rows at non-integer scale (e.g.
-        // 1.5x), which smears horizontal stems across two rows at partial
-        // coverage. Rounding Y (not X, to preserve shaping/kerning) lands stems
-        // on one crisp row -- the same trick the terminal grid path already uses
-        // (`gy.round()`). This path is UI-only; the terminal has its own emit.
         batch.glyph_instances.push(GlyphInstance {
-            pos: [x + rel_x, (y + rel_y).round()],
+            pos: snapped_text_glyph_pos(x, y, *rel_x, *rel_y),
             size: entry.size,
             uv_min: [entry.uv_rect[0], entry.uv_rect[1]],
             uv_max: [entry.uv_rect[2], entry.uv_rect[3]],
@@ -3423,6 +3418,28 @@ fn emit_text_glyphs_cached(
             xform_translate: IDENTITY_XFORM_TRANSLATE,
         });
     }
+}
+
+/// Snap a UI text glyph to the device pixel grid.
+///
+/// `rel_x`/`rel_y` come from cosmic-text's integer pixel split
+/// (`physical.x`/`.y`) plus the glyph's integer atlas offset, so they already
+/// carry the shaped advances and kerning; only the run ORIGIN (`x`, `y`) is
+/// fractional. Rounding the origin therefore lands every glyph on a whole pixel
+/// without disturbing relative spacing.
+///
+/// Both axes are pinned. Y-snapping stops horizontal stems smearing across two
+/// rows at non-integer scale. X-snapping fixes the "already-typed letters
+/// vibrate in place" artifact: the glyph atlas is Nearest-sampled and each
+/// bitmap bakes a fixed subpixel bin, so drawing it at a fractional, per-frame
+/// drifting origin (a horizontally scrolling input, a centered field, DPR-
+/// scaled chrome) resamples the bitmap onto different physical pixels each
+/// frame. Snapping the origin holds each glyph on one crisp column and moves
+/// the run as a unit (by at most 1px) only when the origin crosses a pixel
+/// boundary.
+#[inline]
+fn snapped_text_glyph_pos(x: f32, y: f32, rel_x: f32, rel_y: f32) -> [f32; 2] {
+    [x.round() + rel_x, (y + rel_y).round()]
 }
 
 /// Hash a font family name into the stable `font_id` used by
@@ -4151,6 +4168,215 @@ fn emit_double_box_drawing_primitive(
     true
 }
 
+/// A geometric "square" glyph we draw as a crisp, cell-fitted vector instead of
+/// deferring to the font. The only bundled face (JetBrains Mono) is missing
+/// most of these codepoints, and with no glyph fallback wired the glyph path
+/// rasterizes a solid `.notdef` box filled with the cell foreground -- which is
+/// exactly the "task checkbox is a solid colored block" artifact Claude Code's
+/// TODO list produces. Drawing them here (like the block / box-drawing ranges
+/// already are) yields the outline squares peer terminals get from a symbol
+/// fallback font.
+#[derive(Clone, Copy)]
+struct GeometricSquare {
+    filled: bool,
+    /// Side length as a fraction of the cell WIDTH (the tighter axis of a
+    /// monospace cell) so the shape reads square inside a taller cell.
+    frac: f32,
+    mark: SquareMark,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SquareMark {
+    None,
+    Check,
+    Cross,
+}
+
+fn terminal_geometric_square(ch: char) -> Option<GeometricSquare> {
+    let (filled, frac, mark) = match ch {
+        // Ballot boxes -- Claude Code's task-list checkboxes.
+        '\u{2610}' => (false, 0.82, SquareMark::None), // ☐ ballot box
+        '\u{2611}' => (false, 0.82, SquareMark::Check), // ☑ ballot box with check
+        '\u{2612}' => (false, 0.82, SquareMark::Cross), // ☒ ballot box with x
+        // Geometric Shapes squares.
+        '\u{25A0}' => (true, 0.72, SquareMark::None), // ■ black square
+        '\u{25A1}' => (false, 0.72, SquareMark::None), // □ white square
+        '\u{25A2}' => (false, 0.72, SquareMark::None), // ▢ white square, rounded corners (approx)
+        '\u{25AA}' => (true, 0.42, SquareMark::None), // ▪ black small square
+        '\u{25AB}' => (false, 0.42, SquareMark::None), // ▫ white small square
+        '\u{25FB}' => (false, 0.60, SquareMark::None), // ◻ white medium square
+        '\u{25FC}' => (true, 0.60, SquareMark::None), // ◼ black medium square
+        '\u{25FD}' => (false, 0.48, SquareMark::None), // ◽ white medium-small square
+        '\u{25FE}' => (true, 0.48, SquareMark::None), // ◾ black medium-small square
+        // Large squares (Miscellaneous Symbols and Pictographs).
+        '\u{2B1B}' => (true, 0.86, SquareMark::None), // ⬛ black large square
+        '\u{2B1C}' => (false, 0.86, SquareMark::None), // ⬜ white large square
+        _ => return None,
+    };
+    Some(GeometricSquare { filled, frac, mark })
+}
+
+/// Emit a thick diagonal segment as a run of small square dabs. The quad batch
+/// only draws axis-aligned rectangles, so a diagonal (for the check / cross
+/// marks inside ballot boxes) is approximated by stepping along its dominant
+/// axis one pixel at a time.
+fn push_terminal_diagonal(
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    thickness: f32,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let steps = dx.abs().max(dy.abs()).round().max(1.0) as u32;
+    let t = thickness.max(1.0);
+    let half = t * 0.5;
+    for i in 0..=steps {
+        let f = i as f32 / steps as f32;
+        let px = (x0 + dx * f - half).round();
+        let py = (y0 + dy * f - half).round();
+        push_terminal_quad(row_quads, [px, py], [t, t], color, clip_rect);
+    }
+}
+
+/// Draw a geometric square / ballot box (see [`terminal_geometric_square`]) as
+/// a crisp, pixel-snapped, cell-centered vector. Returns false for any other
+/// char so the caller falls through to the remaining primitive / glyph paths.
+#[allow(clippy::too_many_arguments)]
+fn emit_geometric_square_primitive(
+    ch: char,
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) -> bool {
+    let Some(sq) = terminal_geometric_square(ch) else {
+        return false;
+    };
+
+    let side = (cell_w * sq.frac).round().max(2.0);
+    let x0 = (cell_x + (cell_w - side) * 0.5).round();
+    let y0 = (cell_y + (cell_h - side) * 0.5).round();
+    let stroke = box_stroke_width(cell_h, false);
+
+    if sq.filled {
+        push_terminal_quad(row_quads, [x0, y0], [side, side], color, clip_rect);
+    } else {
+        // Four edges of a hollow square.
+        push_terminal_quad(row_quads, [x0, y0], [side, stroke], color, clip_rect);
+        push_terminal_quad(row_quads, [x0, y0 + side - stroke], [side, stroke], color, clip_rect);
+        push_terminal_quad(row_quads, [x0, y0], [stroke, side], color, clip_rect);
+        push_terminal_quad(row_quads, [x0 + side - stroke, y0], [stroke, side], color, clip_rect);
+    }
+
+    let mark_thickness = (stroke * 1.4).round().max(1.0);
+    match sq.mark {
+        SquareMark::None => {}
+        SquareMark::Check => {
+            push_terminal_diagonal(
+                x0 + side * 0.22,
+                y0 + side * 0.55,
+                x0 + side * 0.42,
+                y0 + side * 0.74,
+                mark_thickness,
+                color,
+                clip_rect,
+                row_quads,
+            );
+            push_terminal_diagonal(
+                x0 + side * 0.42,
+                y0 + side * 0.74,
+                x0 + side * 0.80,
+                y0 + side * 0.28,
+                mark_thickness,
+                color,
+                clip_rect,
+                row_quads,
+            );
+        }
+        SquareMark::Cross => {
+            push_terminal_diagonal(
+                x0 + side * 0.26,
+                y0 + side * 0.26,
+                x0 + side * 0.74,
+                y0 + side * 0.74,
+                mark_thickness,
+                color,
+                clip_rect,
+                row_quads,
+            );
+            push_terminal_diagonal(
+                x0 + side * 0.74,
+                y0 + side * 0.26,
+                x0 + side * 0.26,
+                y0 + side * 0.74,
+                mark_thickness,
+                color,
+                clip_rect,
+                row_quads,
+            );
+        }
+    }
+
+    true
+}
+
+/// Render a Braille pattern (U+2800..=U+28FF) as its raised-dot matrix. The low
+/// 8 bits of the codepoint select which of the 2x4 dots are raised (Unicode dot
+/// numbering: dots 1-3 down the left column, 4-6 down the right, dots 7/8 the
+/// fourth row). Progress spinners built from Braille render as identical tofu
+/// boxes without this, since the bundled font lacks the range.
+#[allow(clippy::too_many_arguments)]
+fn emit_braille_primitive(
+    ch: char,
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) -> bool {
+    let cp = ch as u32;
+    if !(0x2800..=0x28FF).contains(&cp) {
+        return false;
+    }
+    // U+2800 BRAILLE PATTERN BLANK occupies a cell but raises no dots; claim it
+    // so it draws nothing rather than falling through to a tofu box.
+    let bits = (cp - 0x2800) as u8;
+    if bits == 0 {
+        return true;
+    }
+
+    let dot = (cell_w * 0.22).round().max(1.0);
+    let col_x = [cell_x + cell_w * 0.34, cell_x + cell_w * 0.66];
+    let row_y = [
+        cell_y + cell_h * 0.18,
+        cell_y + cell_h * 0.38,
+        cell_y + cell_h * 0.58,
+        cell_y + cell_h * 0.80,
+    ];
+    // (row, col) -> bit index, per the Unicode Braille dot numbering.
+    const DOT_BITS: [[u8; 2]; 4] = [[0, 3], [1, 4], [2, 5], [6, 7]];
+    for (r, y) in row_y.iter().enumerate() {
+        for (c, x) in col_x.iter().enumerate() {
+            if bits & (1 << DOT_BITS[r][c]) != 0 {
+                let px = (x - dot * 0.5).round();
+                let py = (y - dot * 0.5).round();
+                push_terminal_quad(row_quads, [px, py], [dot, dot], color, clip_rect);
+            }
+        }
+    }
+    true
+}
+
 fn emit_terminal_cell_primitive(
     cell: &unshit_core::cell_grid::Cell,
     row: usize,
@@ -4208,6 +4434,34 @@ fn emit_terminal_cell_primitive(
             row_quads,
         )
     {
+        return true;
+    }
+
+    // Geometric squares / ballot boxes and Braille patterns: draw as crisp
+    // vectors (both color profiles) so they don't fall through to a tofu box
+    // for the missing font glyphs.
+    if emit_geometric_square_primitive(
+        cell.ch,
+        cell_x,
+        primitive_y,
+        cell_w,
+        cell_h,
+        color,
+        clip_rect,
+        row_quads,
+    ) {
+        return true;
+    }
+    if emit_braille_primitive(
+        cell.ch,
+        cell_x,
+        primitive_y,
+        cell_w,
+        cell_h,
+        color,
+        clip_rect,
+        row_quads,
+    ) {
         return true;
     }
 
@@ -7658,6 +7912,173 @@ mod tests {
 
         assert!(!emitted);
         assert!(quads.is_empty());
+    }
+
+    #[test]
+    fn terminal_primitive_draws_ballot_box_as_hollow_square() {
+        // U+2610 BALLOT BOX -- Claude Code's task checkbox. JetBrains Mono lacks
+        // it, so without this it renders as a solid tofu box filled with the
+        // cell fg. It must draw as four thin edges (a hollow outline), never a
+        // filled block, and stay on the primitive path (returns true).
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{2610}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            9.0,
+            18.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut quads,
+        );
+
+        assert!(emitted, "ballot box must be drawn by the primitive path, not the glyph path");
+        assert_eq!(quads.len(), 4, "hollow square is four edge quads");
+        let total_area: f32 = quads.iter().map(|q| q.size[0] * q.size[1]).sum();
+        let side = (9.0_f32 * 0.82).round();
+        assert!(
+            total_area < side * side,
+            "outline must cover far less than a filled square of the same side"
+        );
+        assert!(
+            quads.iter().all(|q| q.pos[0].fract() == 0.0 && q.pos[1].fract() == 0.0),
+            "square edges must snap to whole pixels"
+        );
+    }
+
+    #[test]
+    fn terminal_primitive_draws_filled_and_checked_boxes() {
+        // Black medium square is a single filled quad.
+        let mut filled = Vec::new();
+        assert!(emit_terminal_cell_primitive(
+            &terminal_cell('\u{25FC}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            9.0,
+            18.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut filled,
+        ));
+        assert_eq!(filled.len(), 1, "filled square is one quad");
+
+        // Checked / crossed ballot boxes add mark strokes on top of the outline,
+        // so they emit strictly more quads than the plain outline's four edges.
+        let mut checked = Vec::new();
+        assert!(emit_terminal_cell_primitive(
+            &terminal_cell('\u{2611}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            9.0,
+            18.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut checked,
+        ));
+        assert!(checked.len() > 4, "checked box draws the outline plus a check mark");
+    }
+
+    #[test]
+    fn terminal_primitive_draws_braille_dot_matrix() {
+        // Blank pattern claims the cell but draws nothing.
+        let mut blank = Vec::new();
+        assert!(emit_terminal_cell_primitive(
+            &terminal_cell('\u{2800}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            9.0,
+            18.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut blank,
+        ));
+        assert!(blank.is_empty(), "U+2800 blank pattern raises no dots");
+
+        // Single dot (bit 0 = dot 1) -> one quad.
+        let mut one = Vec::new();
+        assert!(emit_terminal_cell_primitive(
+            &terminal_cell('\u{2801}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            9.0,
+            18.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut one,
+        ));
+        assert_eq!(one.len(), 1, "single raised dot is one quad");
+
+        // All eight dots set -> eight quads.
+        let mut full = Vec::new();
+        assert!(emit_terminal_cell_primitive(
+            &terminal_cell('\u{28FF}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            9.0,
+            18.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut full,
+        ));
+        assert_eq!(full.len(), 8, "fully raised pattern draws all eight dots");
+    }
+
+    #[test]
+    fn snapped_text_glyph_pos_is_stable_within_a_pixel_band() {
+        // The anti-jitter invariant: sub-pixel drift of the run origin inside a
+        // single pixel band must NOT move the glyph. Earlier-typed letters stay
+        // put as the origin wobbles by fractions of a pixel.
+        let rel_x = 12.0;
+        let a = snapped_text_glyph_pos(100.1, 40.0, rel_x, 0.0);
+        let b = snapped_text_glyph_pos(100.4, 40.0, rel_x, 0.0);
+        let c = snapped_text_glyph_pos(100.49, 40.0, rel_x, 0.0);
+        assert_eq!(a[0], b[0], "sub-pixel origin drift must not move the glyph");
+        assert_eq!(b[0], c[0], "sub-pixel origin drift must not move the glyph");
+        assert_eq!(a[0], 112.0, "origin snaps to 100, plus the glyph's relative advance");
+        assert_eq!(a[0].fract(), 0.0, "snapped X lands on a whole device pixel");
+
+        // Crossing into the next band moves the whole run by exactly one pixel.
+        let next = snapped_text_glyph_pos(100.6, 40.0, rel_x, 0.0);
+        assert_eq!(next[0], 113.0, "crossing the pixel boundary shifts the run by 1px");
+    }
+
+    #[test]
+    fn snapped_text_glyph_pos_preserves_relative_spacing() {
+        // Two glyphs in the same run keep their exact shaped separation because
+        // only the shared origin is rounded; the per-glyph `rel_x` is untouched.
+        let g0 = snapped_text_glyph_pos(50.3, 40.0, 0.0, 0.0);
+        let g1 = snapped_text_glyph_pos(50.3, 40.0, 7.0, 0.0);
+        assert_eq!(g1[0] - g0[0], 7.0, "kerning/advance between glyphs is preserved exactly");
     }
 
     #[test]
