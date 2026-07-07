@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-07
+
+Bugfix release: panes no longer inherit the Claude Code profile / provider
+override of whatever launched the daemon, and quotes typed on dead-key
+keyboard layouts reach the shell.
+
+### Fixed
+
+- **`claude`/`cc` run inside a pane no longer picks up the launcher's Claude Code profile.** The PTY daemon is long-lived and inherits the environment of whatever launched it. When that launcher was a Claude Code session or a provider-override wrapper (e.g. a z.ai/GLM profile exporting `ANTHROPIC_BASE_URL` + `CLAUDE_CONFIG_DIR`), those variables propagated into every spawned pane, so an agent started in a pane opened the launcher's profile instead of the user's default config — and stayed poisoned until the daemon restarted. The daemon now strips the profile/provider/session variables (`CLAUDE_CONFIG_DIR`, the `ANTHROPIC_*` base-url/auth/model overrides, and the `CLAUDECODE`/`CLAUDE_CODE_*` session markers) from every pane spawn, so each pane is a clean interactive shell.
+- **Quotes typed on dead-key layouts now reach the terminal.** On keyboard layouts where `'` and `"` are dead keys (US-International, ABNT2), the committed character was silently dropped: pressing the quote key twice produced nothing, and quote-then-space sent a plain space. Both paths now forward the composed text to the shell, so `'`, `"`, and other dead-key accents (`~`, `^`, `` ` ``) can be typed normally.
+
 ## [0.2.2] - 2026-07-06
 
 This release lets the app run without a GPU via a software-renderer fallback,
@@ -159,7 +170,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.1.0...v0.2.0
