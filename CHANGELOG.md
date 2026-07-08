@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-08
+
+Quality-of-life release for terminal panes: Ctrl+click opens `http(s)` links in
+your default browser, the mouse wheel now scrolls full-screen TUIs (Claude Code,
+vim, fzf, lazygit) that capture the mouse, missing symbol glyphs (task-list
+checkboxes, Braille spinners) render as crisp vectors instead of solid blocks,
+and already-typed UI text no longer jitters while you type.
+
+### Added
+
+- **Ctrl+click a URL in a terminal pane to open it in your default browser.** `http://` and `https://` links printed by any program are now detected under the pointer; holding `Ctrl` and clicking one hands it to the system's default browser instead of starting a text selection (a plain click still selects, and `Ctrl`+drag over non-link text still selects). Detection keeps query strings and fragments intact and strips trailing sentence punctuation (so clicking `http://example.com).` opens the bare address). Only `http`/`https` are ever opened, and the URL is passed to the OS via the shell-association API (`ShellExecuteW`), never through a command interpreter, so a link from an untrusted source (e.g. an SSH session) cannot inject shell syntax.
+
+### Fixed
+
+- **The mouse wheel now scrolls TUIs that capture the mouse (Claude Code, vim, fzf, lazygit).** Full-screen programs run in the alternate screen and enable mouse tracking (DECSET 1000/1002/1003 + 1006 SGR), expecting the terminal to *forward* wheel notches to them so they can scroll their own content — exactly what Windows Terminal and VS Code do. This terminal parsed those modes and threw them away, and its wheel handler only ever moved its own scrollback, so while such a program was running the wheel appeared to do nothing (the local scrollback it moved was the irrelevant pre-program shell history). It now tracks mouse-reporting mode and, when active, encodes each wheel notch as an SGR (or legacy X10) mouse-button report and writes it to the PTY, so the program scrolls as expected. `Shift`+wheel remains an escape hatch that always scrolls local scrollback, matching the xterm convention.
+- **Task-list checkboxes and other symbol glyphs no longer render as solid colored blocks.** JetBrains Mono (the only bundled font) lacks the ballot-box, geometric-square, and Braille codepoints that tools like Claude Code print, and with no glyph fallback wired the renderer rasterized a `.notdef` box filled with the cell foreground — the orange/yellow "solid block" checkboxes. These ranges (U+2610–2612 ballot boxes, the U+25A0–25FE / U+2B1B–2B1C squares, and U+2800–28FF Braille) are now drawn as crisp, cell-fitted vectors — outline squares, filled squares, check/cross marks, and Braille dot matrices — the same way block and box-drawing characters already were. Spinners built from Braille animate cleanly instead of flashing identical tofu boxes.
+- **Already-typed text no longer vibrates while you type in UI fields.** UI text glyphs were drawn at a fractional, per-frame-drifting run origin against a nearest-sampled glyph atlas, so a sub-pixel shift of the origin (a scrolling input, a centered field, DPR-scaled chrome) resampled every glyph onto different physical pixels each frame. UI text now snaps its origin to the device pixel grid on both axes, holding each glyph on one stable column while preserving shaped kerning.
+
 ## [0.2.3] - 2026-07-07
 
 Bugfix release: panes no longer inherit the Claude Code profile / provider
@@ -170,7 +188,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.0...v0.2.1
