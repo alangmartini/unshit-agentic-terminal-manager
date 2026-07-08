@@ -203,6 +203,15 @@ bitflags! {
     }
 }
 
+impl Default for Modifiers {
+    /// No modifiers held. Defined explicitly (rather than via `derive`)
+    /// so it holds across `bitflags` versions and lets containing structs
+    /// such as [`ScrollEvent`] derive `Default`.
+    fn default() -> Self {
+        Modifiers::empty()
+    }
+}
+
 impl Modifiers {
     /// Parse a modifier name (case-insensitive) into a `Modifiers` flag.
     pub fn parse_name(s: &str) -> Option<Modifiers> {
@@ -256,6 +265,13 @@ pub struct ScrollEvent {
     /// Suggested initial ease-curve slope for this event's delta
     /// (`browser_like_initial_slope`); pairs with `smooth_duration_ms`.
     pub smooth_initial_slope: f32,
+    /// Keyboard modifiers held when the wheel event was produced. Filled
+    /// by the framework's wheel dispatch from the live modifier state.
+    /// The terminal grid uses `SHIFT` as the escape hatch that keeps a
+    /// wheel notch scrolling local scrollback even while a TUI has mouse
+    /// reporting enabled (xterm convention). Defaults to empty so test
+    /// constructors and synthetic events read as "no modifiers".
+    pub modifiers: Modifiers,
 }
 
 // ---------------------------------------------------------------------------
