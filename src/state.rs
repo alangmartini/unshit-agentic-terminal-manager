@@ -4539,9 +4539,7 @@ fn url_scheme_host(url: &str) -> &str {
     match url.find("://") {
         Some(i) => {
             let after = &url[i + 3..];
-            let host_len = after
-                .find(|c| c == '/' || c == '?' || c == '#')
-                .unwrap_or(after.len());
+            let host_len = after.find(['/', '?', '#']).unwrap_or(after.len());
             &url[..i + 3 + host_len]
         }
         None => url,

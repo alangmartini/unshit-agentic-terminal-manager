@@ -5109,7 +5109,7 @@ mod tests {
     fn encode_wheel_reports_sgr_up_and_down() {
         let mut term = Terminal::new(3, 5);
         term.process_bytes(b"\x1b[?1000h\x1b[?1006h"); // tracking + SGR
-                                                        // Wheel up (delta_y > 0) => button 64; one line == one report.
+                                                       // Wheel up (delta_y > 0) => button 64; one line == one report.
         assert_eq!(term.encode_wheel_reports(20.0, 20.0), b"\x1b[<64;1;1M");
         // Wheel down (delta_y < 0) => button 65.
         assert_eq!(term.encode_wheel_reports(-20.0, 20.0), b"\x1b[<65;1;1M");

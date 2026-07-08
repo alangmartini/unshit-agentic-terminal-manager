@@ -72,10 +72,10 @@ fn open_validated(url: &str) -> std::io::Result<()> {
     if hinst as isize > 32 {
         Ok(())
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("ShellExecuteW failed (code {})", hinst as isize),
-        ))
+        Err(std::io::Error::other(format!(
+            "ShellExecuteW failed (code {})",
+            hinst as isize
+        )))
     }
 }
 
