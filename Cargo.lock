@@ -3562,6 +3562,7 @@ dependencies = [
  "unshit-terminal-core",
  "unshit-test",
  "vte",
+ "winapi",
  "winresource",
 ]
 

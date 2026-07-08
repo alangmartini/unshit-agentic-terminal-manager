@@ -7,6 +7,7 @@
 
 pub mod bench;
 pub mod bridge;
+pub mod browser;
 pub mod command_palette;
 pub mod daemon;
 pub mod diagnostics;

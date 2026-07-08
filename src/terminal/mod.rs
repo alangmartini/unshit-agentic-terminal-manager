@@ -1382,6 +1382,31 @@ impl Terminal {
         (0, self.cols.saturating_sub(1))
     }
 
+    /// The `http`/`https` URL occupying absolute `(abs_line, col)`, or `None`
+    /// when the clicked cell is not inside a recognizable link. Powers
+    /// Ctrl+click-to-open. Detection is single-line: a URL that soft-wraps onto
+    /// the next row is only recognized up to the row boundary. Only `http://`
+    /// and `https://` are matched so a click can never hand an arbitrary
+    /// protocol (`file:`, custom handlers) to the OS; scheme is re-validated at
+    /// open time in [`crate::browser`].
+    pub fn url_at(&self, abs_line: u64, col: usize) -> Option<String> {
+        if self.cols == 0 || col >= self.cols {
+            return None;
+        }
+        // Materialize the row as one char per column. URLs are ASCII, so every
+        // URL character occupies exactly one cell and column == char index;
+        // wide (CJK) continuation cells collapse to spaces and simply break a
+        // run, which is correct because they can't appear inside a URL.
+        let line: Vec<char> = (0..self.cols)
+            .map(|c| {
+                self.cell_at_abs(abs_line, c)
+                    .map(|cell| if cell.ch == '\0' { ' ' } else { cell.ch })
+                    .unwrap_or(' ')
+            })
+            .collect();
+        find_url_at_col(&line, col)
+    }
+
     /// Paint `bg` over every visible cell of the selection spanning absolute
     /// coordinates `anchor`..`focus` (order-independent) on `grid`, which
     /// must be the [`Terminal::display_grid`] clone for the current view.
@@ -1734,6 +1759,94 @@ impl Terminal {
             self.wrap_pending = false;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// URL detection for Ctrl+click-to-open
+// ---------------------------------------------------------------------------
+
+/// Characters permitted in the body of a URL: the RFC 3986 unreserved,
+/// gen-delim, sub-delim, and percent sets. Whitespace and control characters
+/// terminate the run, so a link stops at the surrounding spaces.
+fn is_url_char(ch: char) -> bool {
+    matches!(ch,
+        'a'..='z' | 'A'..='Z' | '0'..='9'
+        // unreserved
+        | '-' | '.' | '_' | '~'
+        // gen-delims
+        | ':' | '/' | '?' | '#' | '[' | ']' | '@'
+        // sub-delims
+        | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+        // percent-encoding
+        | '%'
+    )
+}
+
+/// Strip trailing characters that are far more likely to be sentence
+/// punctuation than part of the link (e.g. the `).` in "(see http://x.com).").
+/// A closing bracket is only dropped when it has no matching opener inside the
+/// URL, so `http://en.wikipedia.org/wiki/Foo_(bar)` keeps its parenthesis.
+fn trim_url_trailing(url: &str) -> &str {
+    let mut end = url.len();
+    let bytes = url.as_bytes();
+    while end > 0 {
+        let last = bytes[end - 1] as char;
+        let drop = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '<' | '>' => true,
+            ')' | ']' | '}' => {
+                let (open, close) = match last {
+                    ')' => ('(', ')'),
+                    ']' => ('[', ']'),
+                    _ => ('{', '}'),
+                };
+                let slice = &url[..end];
+                slice.matches(close).count() > slice.matches(open).count()
+            }
+            _ => false,
+        };
+        if drop {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    &url[..end]
+}
+
+/// Find the `http`/`https` URL covering column `col` in a row rendered as one
+/// `char` per column. Scans for each scheme, extends over the run of URL
+/// characters, and returns the span (minus trailing punctuation) that contains
+/// the click. `None` when the click is not on a link.
+fn find_url_at_col(line: &[char], col: usize) -> Option<String> {
+    if col >= line.len() {
+        return None;
+    }
+    // Prefer the longer scheme first so "https" is never mis-split as "http".
+    for scheme in ["https://", "http://"] {
+        let sch: Vec<char> = scheme.chars().collect();
+        let mut i = 0;
+        while i + sch.len() <= line.len() {
+            if line[i..i + sch.len()] == sch[..] {
+                let mut end = i + sch.len(); // exclusive
+                while end < line.len() && is_url_char(line[end]) {
+                    end += 1;
+                }
+                // Require at least one host character after the scheme, and
+                // that the click land within the matched span.
+                if end > i + sch.len() && col >= i && col < end {
+                    let run: String = line[i..end].iter().collect();
+                    let url = trim_url_trailing(&run);
+                    if url.len() > scheme.len() {
+                        return Some(url.to_string());
+                    }
+                }
+                i = end.max(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -5140,6 +5253,72 @@ mod tests {
     fn line_bounds_cover_full_row() {
         let term = Terminal::new(2, 12);
         assert_eq!(term.line_bounds_at(0), (0, 11));
+    }
+
+    #[test]
+    fn url_at_detects_https_link_under_click() {
+        let mut term = Terminal::new(2, 40);
+        term.process_bytes(b"go to https://example.com/path now");
+        // Click anywhere inside the URL span (cols 6..30).
+        assert_eq!(
+            term.url_at(0, 6).as_deref(),
+            Some("https://example.com/path")
+        );
+        assert_eq!(
+            term.url_at(0, 20).as_deref(),
+            Some("https://example.com/path")
+        );
+    }
+
+    #[test]
+    fn url_at_returns_none_off_the_link() {
+        let mut term = Terminal::new(2, 40);
+        term.process_bytes(b"go to https://example.com now");
+        // "go" at col 0 is not a link, and the trailing "now" is not either.
+        assert_eq!(term.url_at(0, 0), None);
+        assert_eq!(term.url_at(0, 27), None);
+    }
+
+    #[test]
+    fn url_at_preserves_query_and_fragment() {
+        let mut term = Terminal::new(2, 60);
+        term.process_bytes(b"open https://ex.com/a?b=c&d=e#frag end");
+        assert_eq!(
+            term.url_at(0, 10).as_deref(),
+            Some("https://ex.com/a?b=c&d=e#frag")
+        );
+    }
+
+    #[test]
+    fn url_at_trims_trailing_sentence_punctuation() {
+        let mut term = Terminal::new(2, 50);
+        term.process_bytes(b"see (http://example.com).");
+        // The click lands inside the link; the wrapping ")." is stripped but
+        // a balanced parenthesis inside a path is kept.
+        assert_eq!(term.url_at(0, 8).as_deref(), Some("http://example.com"));
+
+        let mut wiki = Terminal::new(2, 60);
+        wiki.process_bytes(b"http://en.wikipedia.org/wiki/Foo_(bar)");
+        assert_eq!(
+            wiki.url_at(0, 5).as_deref(),
+            Some("http://en.wikipedia.org/wiki/Foo_(bar)")
+        );
+    }
+
+    #[test]
+    fn url_at_ignores_non_http_schemes() {
+        let mut term = Terminal::new(2, 40);
+        term.process_bytes(b"file:///etc/passwd ftp://h/x");
+        assert_eq!(term.url_at(0, 2), None);
+        assert_eq!(term.url_at(0, 22), None);
+    }
+
+    #[test]
+    fn url_at_bare_scheme_is_not_a_link() {
+        let mut term = Terminal::new(2, 20);
+        term.process_bytes(b"https:// x");
+        // No host after the scheme: nothing to open.
+        assert_eq!(term.url_at(0, 2), None);
     }
 
     #[test]
