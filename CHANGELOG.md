@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-07-11
+
+Observability release: terminal panes can export a compact debug pointer plus a
+full JSON terminal snapshot, the Sessions settings page now shows RAM usage for
+the UI, daemon, and terminal sessions, and common colored status emoji render
+with their canonical colors instead of foreground-colored tofu boxes.
+
+### Added
+
+- **Export terminal info from a tab name context menu.** Right-click the visible
+  tab name and choose "Export terminal info" to write a full JSON snapshot under
+  the profile data directory and copy a small pointer JSON to the clipboard. The
+  export includes pane/session ids, workspace/tab context, terminal grid shape,
+  cursor, scrollback and mode state, renderer metrics, mapped/cached PTY
+  sessions, recent PTY events, and UI/daemon memory metadata. The pointer keeps
+  clipboard payloads small while giving agents and debugging tools a stable file
+  path to inspect.
+- **RAM usage is now visible in Settings -> Sessions.** The sessions refresh path
+  samples the UI process, daemon process, and each live terminal session working
+  set, then shows total RAM, UI/ptyd/terminal buckets, per-workspace rollups, and
+  per-session memory pills. Sampling is best-effort and keeps session listing
+  reliable if a process exits or denies inspection.
+
+### Fixed
+
+- **Common colored terminal status emoji no longer render as solid
+  foreground-colored tofu.** Colored squares/circles, ❌, ✅, and ⚠️ are now
+  drawn as crisp canonical-colored vectors in the terminal renderer, matching
+  the practical Windows Terminal look for AI CLI status markers without waiting
+  on a full color-glyph atlas pipeline.
+- **Inactive workspaces no longer show selected subtab styling.** Sidebar
+  subtabs only receive active styling for the active workspace, so background
+  workspaces no longer look selected.
+
 ## [0.2.4] - 2026-07-08
 
 Quality-of-life release for terminal panes: Ctrl+click opens `http(s)` links in
@@ -188,7 +222,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.1...v0.2.2

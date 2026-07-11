@@ -5,7 +5,7 @@
 ; OutputBaseFilename differs; everything else is identical to the base script.
 
 #define MyAppName "Terminal Manager"
-#define MyAppVersion "0.2.4"
+#define MyAppVersion "0.2.5"
 #define MyAppPublisher "Alan Galvao"
 #define MyAppURL "https://github.com/alangmartini/unshit-agentic-terminal-manager"
 #define MyAppExeName "terminal-manager.exe"
