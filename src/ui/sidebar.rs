@@ -155,6 +155,7 @@ fn build_workspace(
             s_idx,
             subtab,
             workspace,
+            is_active,
             shared,
         ));
         if subtab.label == "terminals"
@@ -191,10 +192,11 @@ fn build_subtab(
     subtab_index: usize,
     subtab: &Subtab,
     workspace: &Workspace,
+    workspace_is_active: bool,
     shared: &SharedState,
 ) -> ElementDef {
     let mut btn = ElementDef::new(Tag::Button).with_class("subtab");
-    if subtab.active {
+    if workspace_is_active && subtab.active {
         btn = btn.with_class("active");
     }
     if subtab.disabled {
@@ -397,7 +399,10 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
             build_workspace_ctx_menu(snap, shared, ctx.x, ctx.y, *idx, &installed)
         }
         crate::state::CtxMenuTarget::Tab { pane_id } => {
-            build_tab_ctx_menu(snap, shared, ctx.x, ctx.y, *pane_id)
+            build_tab_ctx_menu(snap, shared, ctx.x, ctx.y, *pane_id, false)
+        }
+        crate::state::CtxMenuTarget::TabName { pane_id } => {
+            build_tab_ctx_menu(snap, shared, ctx.x, ctx.y, *pane_id, true)
         }
     };
 
@@ -711,6 +716,7 @@ fn build_tab_ctx_menu(
     x: f32,
     y: f32,
     pane_id: u32,
+    include_export: bool,
 ) -> ElementDef {
     use unshit::core::style::parse::StyleDeclaration;
     use unshit::core::style::types::Dimension;
@@ -722,7 +728,7 @@ fn build_tab_ctx_menu(
     let header =
         pane_title_from_snapshot(snap, pane_id).unwrap_or_else(|| format!("pane {pane_id}"));
 
-    ElementDef::new(Tag::Div)
+    let mut menu = ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
         .with_style(StyleDeclaration::Left(Dimension::Px(x)))
         .with_style(StyleDeclaration::Top(Dimension::Px(y)))
@@ -736,7 +742,17 @@ fn build_tab_ctx_menu(
             "Rename session",
             shared,
             format!("tab.request_rename:{}", pane_id),
-        ))
+        ));
+
+    if include_export {
+        menu = menu.with_child(ctx_menu_item(
+            "Export terminal info",
+            shared,
+            format!("terminal.export_info:{}", pane_id),
+        ));
+    }
+
+    menu
 }
 
 fn pane_title_from_snapshot(snap: &UiSnapshot, pane_id: u32) -> Option<String> {
@@ -1145,10 +1161,32 @@ mod tests {
             });
         }
         let snap = shared.lock().unwrap().ui_snapshot();
-        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 77);
+        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 77, false);
         let header = find_by_class(&menu, "ctx-menu-header").expect("ctx menu header");
 
         assert_eq!(text_of(header), Some("saved-pane-title"));
+    }
+
+    #[test]
+    fn tab_name_ctx_menu_includes_export_item() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 1, true);
+        let text = collect_text_recursive(&menu);
+
+        assert!(text.contains("Rename session"));
+        assert!(text.contains("Export terminal info"));
+    }
+
+    #[test]
+    fn sidebar_tab_ctx_menu_omits_export_item() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 1, false);
+        let text = collect_text_recursive(&menu);
+
+        assert!(text.contains("Rename session"));
+        assert!(!text.contains("Export terminal info"));
     }
 
     #[test]
@@ -1298,10 +1336,31 @@ mod tests {
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &ws, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, true, &shared);
         assert_eq!(el.tag, Tag::Button);
         assert!(has_class(&el, "subtab"));
         assert!(has_class(&el, "active"));
+    }
+
+    #[test]
+    fn subtab_active_state_is_visual_only_in_active_workspace() {
+        let shared = make_shared();
+        let ws = make_workspace(1, false);
+        let sub = Subtab {
+            label: "test".to_string(),
+            count: None,
+            pulse: false,
+            active: true,
+            disabled: false,
+            icon: None,
+            tree_glyph: "\u{251C}",
+        };
+        let el = build_subtab(0, 0, &sub, &ws, false, &shared);
+        assert!(has_class(&el, "subtab"));
+        assert!(
+            !has_class(&el, "active"),
+            "inactive workspace subtabs must not keep selected styling"
+        );
     }
 
     #[test]
@@ -1317,7 +1376,7 @@ mod tests {
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &ws, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, true, &shared);
         assert!(has_class(&el, "subtab"));
         assert!(!has_class(&el, "active"));
     }
@@ -1335,7 +1394,7 @@ mod tests {
             icon: Some(SubtabIcon::Terminal),
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &ws, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, true, &shared);
         assert!(find_by_class(&el, "subtab-icon").is_some());
     }
 
@@ -1352,7 +1411,7 @@ mod tests {
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &ws, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, true, &shared);
         assert!(find_by_class(&el, "subtab-icon").is_none());
     }
 
@@ -1369,7 +1428,7 @@ mod tests {
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &ws, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, true, &shared);
         let count_el = find_by_class(&el, "subtab-count").expect("subtab-count not found");
         assert_eq!(text_of(count_el), Some("42"));
         assert!(!has_class(count_el, "pulse"));
@@ -1388,7 +1447,7 @@ mod tests {
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &ws, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, true, &shared);
         assert!(find_by_class(&el, "subtab-count").is_none());
     }
 
@@ -1405,7 +1464,7 @@ mod tests {
             icon: None,
             tree_glyph: "\u{251C}",
         };
-        let el = build_subtab(0, 0, &sub, &ws, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, true, &shared);
         let count_el = find_by_class(&el, "subtab-count").unwrap();
         assert!(has_class(count_el, "pulse"));
     }
@@ -1423,7 +1482,7 @@ mod tests {
             icon: None,
             tree_glyph: "\u{2514}",
         };
-        let el = build_subtab(0, 0, &sub, &ws, &shared);
+        let el = build_subtab(0, 0, &sub, &ws, true, &shared);
         let glyph = find_by_class(&el, "tree-glyph").unwrap();
         assert_eq!(text_of(glyph), Some("\u{2514}"));
         let label = find_by_class(&el, "subtab-label").unwrap();

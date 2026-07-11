@@ -3673,6 +3673,20 @@ fn push_terminal_quad(
     color: [f32; 4],
     clip_rect: [f32; 4],
 ) {
+    push_terminal_rounded_quad(row_quads, pos, size, color, 0.0, clip_rect);
+}
+
+/// Like [`push_terminal_quad`] but with a uniform corner radius. Used by the
+/// emoji status-marker primitives to draw crisp rounded squares and discs (a
+/// disc is a square whose radius is half its side) in their canonical colors.
+fn push_terminal_rounded_quad(
+    row_quads: &mut Vec<QuadInstance>,
+    pos: [f32; 2],
+    size: [f32; 2],
+    color: [f32; 4],
+    radius: f32,
+    clip_rect: [f32; 4],
+) {
     if size[0] <= 0.0 || size[1] <= 0.0 || color[3] <= 0.0 {
         return;
     }
@@ -3683,7 +3697,7 @@ fn push_terminal_quad(
         color,
         border_color: [0.0; 4],
         border_width: [0.0; 4],
-        border_radius: [0.0; 4],
+        border_radius: [radius; 4],
         clip_rect,
         shadow_color: [0.0; 4],
         shadow_offset: [0.0; 2],
@@ -4377,6 +4391,257 @@ fn emit_braille_primitive(
     true
 }
 
+/// Canonical sRGB colors for the emoji status markers, approximating the
+/// Segoe UI Emoji palette that Windows Terminal renders.
+mod emoji_rgb {
+    pub const RED: (u8, u8, u8) = (233, 69, 61);
+    pub const ORANGE: (u8, u8, u8) = (245, 154, 56);
+    pub const YELLOW: (u8, u8, u8) = (245, 199, 71);
+    pub const GREEN: (u8, u8, u8) = (92, 184, 92);
+    pub const BLUE: (u8, u8, u8) = (79, 143, 231);
+    pub const PURPLE: (u8, u8, u8) = (162, 118, 209);
+    pub const BROWN: (u8, u8, u8) = (156, 110, 74);
+    pub const WHITE: (u8, u8, u8) = (245, 245, 245);
+    pub const BLACK: (u8, u8, u8) = (38, 38, 40);
+}
+
+/// A common emoji "status marker" that AI CLIs / TUIs print, drawn as a crisp
+/// colored vector. See [`terminal_emoji_marker`] for why.
+#[derive(Clone, Copy)]
+enum EmojiMarker {
+    /// Filled rounded square (colored-square emoji 🟥🟧🟨🟩🟦🟪🟫).
+    Square((u8, u8, u8)),
+    /// Filled disc (colored-circle emoji 🔴🟠🟡🟢🔵🟣🟤⚪).
+    Disc((u8, u8, u8)),
+    /// Heavy "X" cross with no surrounding box (❌).
+    Cross((u8, u8, u8)),
+    /// Filled rounded square with an inset check mark (✅).
+    CheckBox { box_rgb: (u8, u8, u8), check_rgb: (u8, u8, u8) },
+    /// Warning sign: filled triangle with an exclamation (⚠️).
+    Warning { fill_rgb: (u8, u8, u8), mark_rgb: (u8, u8, u8) },
+}
+
+/// Map a codepoint to a hand-drawn [`EmojiMarker`], or `None` to defer to the
+/// remaining primitive / glyph paths.
+///
+/// These emoji live outside the bundled monospace face. The grid glyph path
+/// resolves them from the system emoji fallback (Segoe UI Emoji) as *color*
+/// glyphs, then flattens that color into a coverage mask painted in the cell
+/// foreground -- the "solid fg-colored box" tofu seen for 🟨 / ❌ / ⚠️. Drawing
+/// the common geometric-marker set here as canonical-colored vectors makes them
+/// read like the OS emoji (matching Windows Terminal) without a color-glyph
+/// atlas or pipeline. Routing arbitrary color glyphs to `GlyphAtlasKind::Color`
+/// is a larger, separate change; this covers the markers that occur in practice.
+fn terminal_emoji_marker(ch: char) -> Option<EmojiMarker> {
+    use emoji_rgb::*;
+    let marker = match ch {
+        // Colored squares.
+        '\u{1F7E5}' => EmojiMarker::Square(RED),
+        '\u{1F7E7}' => EmojiMarker::Square(ORANGE),
+        '\u{1F7E8}' => EmojiMarker::Square(YELLOW),
+        '\u{1F7E9}' => EmojiMarker::Square(GREEN),
+        '\u{1F7E6}' => EmojiMarker::Square(BLUE),
+        '\u{1F7EA}' => EmojiMarker::Square(PURPLE),
+        '\u{1F7EB}' => EmojiMarker::Square(BROWN),
+        // Colored circles.
+        '\u{1F534}' => EmojiMarker::Disc(RED),
+        '\u{1F7E0}' => EmojiMarker::Disc(ORANGE),
+        '\u{1F7E1}' => EmojiMarker::Disc(YELLOW),
+        '\u{1F7E2}' => EmojiMarker::Disc(GREEN),
+        '\u{1F535}' => EmojiMarker::Disc(BLUE),
+        '\u{1F7E3}' => EmojiMarker::Disc(PURPLE),
+        '\u{1F7E4}' => EmojiMarker::Disc(BROWN),
+        '\u{26AA}' => EmojiMarker::Disc(WHITE),
+        // Status marks.
+        '\u{274C}' => EmojiMarker::Cross(RED),
+        '\u{2705}' => EmojiMarker::CheckBox { box_rgb: GREEN, check_rgb: WHITE },
+        '\u{26A0}' => EmojiMarker::Warning { fill_rgb: YELLOW, mark_rgb: BLACK },
+        _ => return None,
+    };
+    Some(marker)
+}
+
+/// Convert a canonical sRGB marker color into the linear RGBA the quad batch
+/// expects, scaling alpha by the cell opacity.
+fn emoji_marker_color(rgb: (u8, u8, u8), opacity: f32) -> [f32; 4] {
+    let mut c = Color { r: rgb.0, g: rgb.1, b: rgb.2, a: 255 }.to_linear_f32();
+    c[3] *= opacity;
+    c
+}
+
+/// Draw an upward warning triangle (⚠️) as a stack of 1px rows plus an
+/// exclamation mark. The quad SDF antialiases each row's vertical edges so the
+/// sloped sides read smooth at cell size.
+#[allow(clippy::too_many_arguments)]
+fn emit_warning_triangle(
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    fill: [f32; 4],
+    mark: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) {
+    let tri_w = (cell_w * 0.96).max(2.0);
+    let tri_h = (cell_h * 0.72).max(2.0);
+    let cx = cell_x + cell_w * 0.5;
+    let top = (cell_y + (cell_h - tri_h) * 0.5).round();
+    let rows = tri_h.round().max(1.0) as u32;
+    for i in 0..rows {
+        let f = (i as f32 + 1.0) / rows as f32;
+        let half = (tri_w * 0.5 * f).max(0.5);
+        push_terminal_quad(
+            row_quads,
+            [cx - half, top + i as f32],
+            [half * 2.0, 1.0],
+            fill,
+            clip_rect,
+        );
+    }
+    // Exclamation: a short vertical bar above a square dot, centered.
+    let bar_w = (cell_w * 0.10).round().max(1.0);
+    let bar_h = (tri_h * 0.30).round().max(1.0);
+    push_terminal_quad(
+        row_quads,
+        [(cx - bar_w * 0.5).round(), (top + tri_h * 0.34).round()],
+        [bar_w, bar_h],
+        mark,
+        clip_rect,
+    );
+    push_terminal_quad(
+        row_quads,
+        [(cx - bar_w * 0.5).round(), (top + tri_h * 0.78).round()],
+        [bar_w, bar_w],
+        mark,
+        clip_rect,
+    );
+}
+
+/// Draw a hand-drawn emoji status marker (see [`terminal_emoji_marker`]) as a
+/// crisp, cell-centered vector in its canonical color. Returns false for any
+/// other char so the caller falls through to the remaining primitive / glyph
+/// paths. Sized by cell WIDTH and centered in the lead cell, matching the
+/// geometric-square convention; a wide emoji's continuation cell stays blank.
+#[allow(clippy::too_many_arguments)]
+fn emit_emoji_marker_primitive(
+    ch: char,
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    opacity: f32,
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) -> bool {
+    let Some(marker) = terminal_emoji_marker(ch) else {
+        return false;
+    };
+    match marker {
+        EmojiMarker::Square(rgb) => {
+            let side = (cell_w * 0.86).round().max(2.0);
+            let x0 = (cell_x + (cell_w - side) * 0.5).round();
+            let y0 = (cell_y + (cell_h - side) * 0.5).round();
+            push_terminal_rounded_quad(
+                row_quads,
+                [x0, y0],
+                [side, side],
+                emoji_marker_color(rgb, opacity),
+                (side * 0.22).round(),
+                clip_rect,
+            );
+        }
+        EmojiMarker::Disc(rgb) => {
+            let side = (cell_w * 0.82).round().max(2.0);
+            let x0 = (cell_x + (cell_w - side) * 0.5).round();
+            let y0 = (cell_y + (cell_h - side) * 0.5).round();
+            push_terminal_rounded_quad(
+                row_quads,
+                [x0, y0],
+                [side, side],
+                emoji_marker_color(rgb, opacity),
+                side * 0.5,
+                clip_rect,
+            );
+        }
+        EmojiMarker::Cross(rgb) => {
+            let side = (cell_w * 0.82).round().max(2.0);
+            let x0 = cell_x + (cell_w - side) * 0.5;
+            let y0 = cell_y + (cell_h - side) * 0.5;
+            let color = emoji_marker_color(rgb, opacity);
+            let t = (cell_w * 0.19).round().max(2.0);
+            push_terminal_diagonal(
+                x0 + side * 0.18,
+                y0 + side * 0.18,
+                x0 + side * 0.82,
+                y0 + side * 0.82,
+                t,
+                color,
+                clip_rect,
+                row_quads,
+            );
+            push_terminal_diagonal(
+                x0 + side * 0.82,
+                y0 + side * 0.18,
+                x0 + side * 0.18,
+                y0 + side * 0.82,
+                t,
+                color,
+                clip_rect,
+                row_quads,
+            );
+        }
+        EmojiMarker::CheckBox { box_rgb, check_rgb } => {
+            let side = (cell_w * 0.86).round().max(2.0);
+            let x0 = (cell_x + (cell_w - side) * 0.5).round();
+            let y0 = (cell_y + (cell_h - side) * 0.5).round();
+            push_terminal_rounded_quad(
+                row_quads,
+                [x0, y0],
+                [side, side],
+                emoji_marker_color(box_rgb, opacity),
+                (side * 0.22).round(),
+                clip_rect,
+            );
+            let color = emoji_marker_color(check_rgb, opacity);
+            let t = (side * 0.13).round().max(2.0);
+            push_terminal_diagonal(
+                x0 + side * 0.24,
+                y0 + side * 0.54,
+                x0 + side * 0.42,
+                y0 + side * 0.72,
+                t,
+                color,
+                clip_rect,
+                row_quads,
+            );
+            push_terminal_diagonal(
+                x0 + side * 0.42,
+                y0 + side * 0.72,
+                x0 + side * 0.74,
+                y0 + side * 0.32,
+                t,
+                color,
+                clip_rect,
+                row_quads,
+            );
+        }
+        EmojiMarker::Warning { fill_rgb, mark_rgb } => {
+            emit_warning_triangle(
+                cell_x,
+                cell_y,
+                cell_w,
+                cell_h,
+                emoji_marker_color(fill_rgb, opacity),
+                emoji_marker_color(mark_rgb, opacity),
+                clip_rect,
+                row_quads,
+            );
+        }
+    }
+    true
+}
+
 fn emit_terminal_cell_primitive(
     cell: &unshit_core::cell_grid::Cell,
     row: usize,
@@ -4459,6 +4724,22 @@ fn emit_terminal_cell_primitive(
         cell_w,
         cell_h,
         color,
+        clip_rect,
+        row_quads,
+    ) {
+        return true;
+    }
+
+    // Common emoji status markers (colored squares/circles, ❌ ✅ ⚠️) that AI
+    // CLIs print: draw as canonical-colored vectors so they render like the OS
+    // emoji instead of flattening to a solid fg-colored tofu box.
+    if emit_emoji_marker_primitive(
+        cell.ch,
+        cell_x,
+        primitive_y,
+        cell_w,
+        cell_h,
+        opacity,
         clip_rect,
         row_quads,
     ) {
@@ -7692,6 +7973,151 @@ mod tests {
 
         assert!(emitted);
         assert_eq!(quads.len(), 2, "corner should render horizontal and vertical strokes");
+    }
+
+    #[test]
+    fn terminal_emoji_marker_maps_common_status_codepoints() {
+        assert!(terminal_emoji_marker('\u{1F7E8}').is_some(), "🟨 large yellow square");
+        assert!(terminal_emoji_marker('\u{1F534}').is_some(), "🔴 red circle");
+        assert!(terminal_emoji_marker('\u{274C}').is_some(), "❌ cross mark");
+        assert!(terminal_emoji_marker('\u{2705}').is_some(), "✅ check mark button");
+        assert!(terminal_emoji_marker('\u{26A0}').is_some(), "⚠ warning sign");
+        assert!(terminal_emoji_marker('a').is_none(), "plain ascii defers to glyph path");
+        assert!(terminal_emoji_marker('\u{2500}').is_none(), "box drawing defers to its path");
+    }
+
+    #[test]
+    fn terminal_primitive_draws_yellow_square_for_large_yellow_square() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{1F7E8}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut quads,
+        );
+
+        assert!(emitted, "🟨 must bypass the glyph/tofu path");
+        assert_eq!(quads.len(), 1, "a colored square is a single rounded quad");
+        // Canonical yellow, NOT the cell's orange foreground -- this is the fix
+        // for the solid fg-colored box artifact.
+        assert_eq!(quads[0].color, emoji_marker_color(emoji_rgb::YELLOW, 1.0));
+        assert!(quads[0].border_radius[0] > 0.0, "colored square has rounded corners");
+        assert!(
+            quads[0].pos[0] > 0.0 && quads[0].size[0] < 10.0,
+            "marker is centered within the cell"
+        );
+    }
+
+    #[test]
+    fn terminal_primitive_draws_canonical_red_cross_for_cross_mark() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{274C}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            true,
+            true,
+            None,
+            &mut quads,
+        );
+
+        assert!(emitted);
+        assert!(quads.len() >= 2, "cross renders as two diagonal dab runs");
+        let expected = emoji_marker_color(emoji_rgb::RED, 1.0);
+        assert!(
+            quads.iter().all(|q| q.color == expected),
+            "every cross quad is canonical red, independent of cell fg"
+        );
+    }
+
+    #[test]
+    fn terminal_primitive_draws_green_checkbox_for_check_mark() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{2705}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut quads,
+        );
+
+        assert!(emitted);
+        assert!(quads.len() >= 3, "green box plus white check strokes");
+        let box_color = quads[0].color;
+        assert_eq!(box_color, emoji_marker_color(emoji_rgb::GREEN, 1.0));
+        assert!(
+            box_color[1] > box_color[0] && box_color[1] > box_color[2],
+            "check box is green, not the cell's orange fg"
+        );
+    }
+
+    #[test]
+    fn terminal_primitive_draws_warning_triangle_for_warning_sign() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('\u{26A0}'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut quads,
+        );
+
+        assert!(emitted, "⚠ must bypass the glyph/tofu path");
+        assert!(quads.len() > 4, "triangle is a stack of row quads plus an exclamation");
+    }
+
+    #[test]
+    fn terminal_primitive_defers_plain_char_to_glyph_path() {
+        let mut quads = Vec::new();
+        let emitted = emit_terminal_cell_primitive(
+            &terminal_cell('a'),
+            0,
+            0,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            1.0,
+            [0.0, 0.0, 200.0, 200.0],
+            false,
+            true,
+            None,
+            &mut quads,
+        );
+
+        assert!(!emitted, "ascii text falls through to the glyph path");
+        assert!(quads.is_empty());
     }
 
     #[test]

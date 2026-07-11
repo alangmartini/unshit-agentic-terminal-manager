@@ -62,6 +62,13 @@ pub struct Client {
     reader_task: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionListSnapshot {
+    pub sessions: Vec<SessionInfo>,
+    pub daemon_pid: Option<u32>,
+    pub daemon_memory_rss_bytes: Option<u64>,
+}
+
 impl Client {
     /// Opens a connection to the daemon listening on `path`.
     ///
@@ -202,10 +209,24 @@ impl Client {
 
     /// Returns the current list of sessions.
     pub async fn list_sessions(&mut self) -> Result<Vec<SessionInfo>, ProtocolError> {
+        Ok(self.list_sessions_snapshot().await?.sessions)
+    }
+
+    /// Returns sessions plus daemon process memory sampled with the same request.
+    pub async fn list_sessions_snapshot(&mut self) -> Result<SessionListSnapshot, ProtocolError> {
         let id = self.alloc_id();
         let resp = self.roundtrip(Request::ListSessions { id }, id).await?;
         match resp {
-            Response::SessionList { sessions, .. } => Ok(sessions),
+            Response::SessionList {
+                sessions,
+                daemon_pid,
+                daemon_memory_rss_bytes,
+                ..
+            } => Ok(SessionListSnapshot {
+                sessions,
+                daemon_pid,
+                daemon_memory_rss_bytes,
+            }),
             Response::Error { code, message, .. } => Err(ProtocolError::Io(io::Error::other(
                 format!("list_sessions failed: {code}: {message}"),
             ))),

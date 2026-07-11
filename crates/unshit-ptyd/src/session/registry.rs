@@ -165,6 +165,7 @@ impl SessionRegistry {
                 rows: s.rows(),
                 alive: s.alive(),
                 pid: s.pid(),
+                memory_rss_bytes: s.pid().and_then(crate::memory::resident_set_bytes),
                 workspace_id: s.workspace_id(),
                 pane_id: s.pane_id(),
                 name: s.name().map(|n| n.to_string()),

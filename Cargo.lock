@@ -4002,6 +4002,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "unshit-terminal-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

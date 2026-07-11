@@ -32,6 +32,8 @@ pub const MIN_SIDEBAR_WIDTH: f32 = 150.0;
 pub const MAX_SIDEBAR_WIDTH: f32 = 500.0;
 const DIAGNOSTIC_PTY_EVENT_LIMIT: usize = 32;
 const DIAGNOSTIC_SCROLL_SAMPLE_LIMIT: usize = 96;
+const TERMINAL_EXPORT_SCHEMA_VERSION: &str = "terminal-manager.terminal-info/v1";
+const TERMINAL_EXPORT_POINTER_SCHEMA_VERSION: &str = "terminal-manager.terminal-info-pointer/v1";
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
@@ -174,6 +176,10 @@ pub enum CtxMenuTarget {
     /// at the moment the menu opened so rename / kill actions reach a
     /// specific session even after the active pane changes.
     Tab { pane_id: u32 },
+    /// Menu opened specifically on the visible tab name in the top tab bar.
+    /// This target carries extra debugging/export actions that should not
+    /// appear on sidebar terminal rows.
+    TabName { pane_id: u32 },
 }
 
 /// Pending destructive action awaiting user confirmation via the confirm
@@ -401,6 +407,7 @@ pub struct SessionSnapshot {
     pub workspace_id: u32,
     pub name: Option<String>,
     pub pid: Option<u32>,
+    pub memory_rss_bytes: Option<u64>,
     pub alive: bool,
 }
 
@@ -820,6 +827,13 @@ pub struct AppState {
     /// [`refresh_sessions`]. Empty when the daemon has never been
     /// polled or when the last poll returned no sessions.
     pub sessions: Vec<SessionSnapshot>,
+    /// Current UI process id and resident memory sampled alongside the
+    /// sessions refresh path. The render path reads this cached value.
+    pub ui_pid: u32,
+    pub ui_memory_rss_bytes: Option<u64>,
+    /// Daemon process id and resident memory returned by `ListSessions`.
+    pub daemon_pid: Option<u32>,
+    pub daemon_memory_rss_bytes: Option<u64>,
     /// Set when the most recent `list_sessions` RPC failed. Drives
     /// the "stale" chip next to the Sessions panel refresh button so
     /// the user sees that the cached rows may not match the daemon.
@@ -989,6 +1003,10 @@ impl AppState {
             active_terminal_cols,
             active_terminal_rows,
             sessions: self.sessions.clone(),
+            ui_pid: self.ui_pid,
+            ui_memory_rss_bytes: self.ui_memory_rss_bytes,
+            daemon_pid: self.daemon_pid,
+            daemon_memory_rss_bytes: self.daemon_memory_rss_bytes,
             sessions_stale: self.sessions_stale,
             diagnostic_scroll_samples: self.diagnostic_scroll_samples.iter().cloned().collect(),
             toasts: self
@@ -1081,6 +1099,10 @@ pub struct UiSnapshot {
     pub active_terminal_cols: u16,
     pub active_terminal_rows: u16,
     pub sessions: Vec<SessionSnapshot>,
+    pub ui_pid: u32,
+    pub ui_memory_rss_bytes: Option<u64>,
+    pub daemon_pid: Option<u32>,
+    pub daemon_memory_rss_bytes: Option<u64>,
     /// Mirrors `AppState::sessions_stale`. `true` when the most recent
     /// `list_sessions` RPC failed and the cached rows may be stale.
     pub sessions_stale: bool,
@@ -1267,6 +1289,10 @@ pub fn seed_state() -> AppState {
         tabbar_rect: crate::drag::Rect::default(),
         confirm_dialog: None,
         sessions: Vec::new(),
+        ui_pid: std::process::id(),
+        ui_memory_rss_bytes: unshit_ptyd::memory::current_resident_set_bytes(),
+        daemon_pid: None,
+        daemon_memory_rss_bytes: None,
         sessions_stale: false,
         diagnostic_frame_counter: 0,
         diagnostic_last_present_unix_ms: None,
@@ -3051,9 +3077,15 @@ pub fn mutate_kill_all_terminals(state: &mut AppState) {
 /// Sessions panel can show the user that the rows may not match the
 /// daemon).
 pub fn refresh_sessions(state: &mut AppState) {
-    match state.pty_manager.list_sessions() {
-        Ok(list) => {
-            state.sessions = list
+    state.ui_pid = std::process::id();
+    state.ui_memory_rss_bytes = unshit_ptyd::memory::current_resident_set_bytes();
+
+    match state.pty_manager.list_sessions_snapshot() {
+        Ok(snapshot) => {
+            state.daemon_pid = snapshot.daemon_pid;
+            state.daemon_memory_rss_bytes = snapshot.daemon_memory_rss_bytes;
+            state.sessions = snapshot
+                .sessions
                 .into_iter()
                 .map(|info| SessionSnapshot {
                     session_id: info.id,
@@ -3061,17 +3093,29 @@ pub fn refresh_sessions(state: &mut AppState) {
                     workspace_id: info.workspace_id,
                     name: info.name,
                     pid: info.pid,
+                    memory_rss_bytes: info.memory_rss_bytes,
                     alive: info.alive,
                 })
                 .collect();
+            state.mem_gb = total_known_memory_bytes(state) as f32 / 1024.0 / 1024.0 / 1024.0;
             state.sessions_stale = false;
         }
         Err(e) => {
             log::warn!("refresh_sessions: list_sessions failed: {e}");
+            state.mem_gb = total_known_memory_bytes(state) as f32 / 1024.0 / 1024.0 / 1024.0;
             state.sessions_stale = true;
             push_error_toast(state, format!("refresh failed: {e}"));
         }
     }
+}
+
+pub fn total_known_memory_bytes(state: &AppState) -> u64 {
+    state
+        .ui_memory_rss_bytes
+        .into_iter()
+        .chain(state.daemon_memory_rss_bytes)
+        .chain(state.sessions.iter().filter_map(|s| s.memory_rss_bytes))
+        .sum()
 }
 
 /// Kill a session directly by session id without requiring a local
@@ -4009,6 +4053,13 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "terminal.paste" => dispatch_terminal_paste(state),
         "terminal.copy" => dispatch_terminal_copy(state),
+        "terminal.export_info" => dispatch_terminal_export_info(state),
+        other if other.starts_with("terminal.export_info:") => {
+            let Ok(pane_id) = other["terminal.export_info:".len()..].parse::<u32>() else {
+                return false;
+            };
+            dispatch_terminal_export_info_for_pane(state, pane_id)
+        }
         other if other.starts_with("tab.switch:") => {
             if let Ok(index) = other["tab.switch:".len()..].parse::<usize>() {
                 if index < state.tabs.len() && state.active_tab != index {
@@ -4238,6 +4289,329 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn active_session_id_for_export(state: &AppState, pane_id: u32) -> Option<u64> {
+    state.pty_manager.session_id(pane_id).or_else(|| {
+        state
+            .sessions
+            .iter()
+            .find(|session| session.pane_id == pane_id)
+            .map(|session| session.session_id)
+    })
+}
+
+fn pane_export_context_json(state: &AppState, pane_id: u32) -> serde_json::Value {
+    if state
+        .panes
+        .iter()
+        .flatten()
+        .any(|pane| pane.id.0 == pane_id)
+    {
+        let workspace = state.workspaces.get(state.active_workspace);
+        let tab = state.tabs.get(state.active_tab);
+        return serde_json::json!({
+            "workspace_index": state.active_workspace,
+            "workspace_num": workspace.map(|ws| ws.num),
+            "workspace_name": workspace.map(|ws| ws.name.as_str()),
+            "tab_index": state.active_tab,
+            "tab_id": tab.map(|tab| tab.id.as_str()),
+            "tab_name": tab.map(|tab| tab.name.as_str()),
+            "pane_title": pane_title_by_id(state, pane_id),
+        });
+    }
+
+    for (tab_index, tab) in state.tabs.iter().enumerate() {
+        if tab.panes.iter().flatten().any(|pane| pane.id.0 == pane_id) {
+            let workspace = state.workspaces.get(state.active_workspace);
+            return serde_json::json!({
+                "workspace_index": state.active_workspace,
+                "workspace_num": workspace.map(|ws| ws.num),
+                "workspace_name": workspace.map(|ws| ws.name.as_str()),
+                "tab_index": tab_index,
+                "tab_id": tab.id.as_str(),
+                "tab_name": tab.name.as_str(),
+                "pane_title": pane_title_by_id(state, pane_id),
+            });
+        }
+    }
+
+    for (workspace_index, workspace) in state.workspaces.iter().enumerate() {
+        for (tab_index, tab) in workspace.tabs.iter().enumerate() {
+            if tab.panes.iter().flatten().any(|pane| pane.id.0 == pane_id) {
+                return serde_json::json!({
+                    "workspace_index": workspace_index,
+                    "workspace_num": workspace.num,
+                    "workspace_name": workspace.name.as_str(),
+                    "tab_index": tab_index,
+                    "tab_id": tab.id.as_str(),
+                    "tab_name": tab.name.as_str(),
+                    "pane_title": pane_title_by_id(state, pane_id),
+                });
+            }
+        }
+    }
+
+    serde_json::json!({
+        "workspace_index": serde_json::Value::Null,
+        "workspace_num": serde_json::Value::Null,
+        "workspace_name": serde_json::Value::Null,
+        "tab_index": serde_json::Value::Null,
+        "tab_id": serde_json::Value::Null,
+        "tab_name": serde_json::Value::Null,
+        "pane_title": pane_title_by_id(state, pane_id),
+    })
+}
+
+fn terminal_dirty_regions_json(grid: &unshit::core::cell_grid::CellGrid) -> Vec<serde_json::Value> {
+    grid.line_damage()
+        .iter()
+        .enumerate()
+        .filter_map(|(row, damage)| {
+            if damage.is_clean() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "row": row,
+                "first_col": damage.first_dirty_col,
+                "last_col": damage.last_dirty_col,
+                "seqno": damage.seqno,
+            }))
+        })
+        .collect()
+}
+
+fn active_terminal_json(state: &AppState, pane_id: u32) -> serde_json::Value {
+    let Some(handle) = state.terminals.get(&pane_id) else {
+        return serde_json::json!({
+            "present": false,
+        });
+    };
+
+    let terminal = handle.lock_recover();
+    let grid = terminal.grid();
+    let (scroll_rows, scroll_fraction) = terminal.fractional_view_position();
+    serde_json::json!({
+        "present": true,
+        "title": terminal.title(),
+        "grid": {
+            "rows": grid.rows(),
+            "cols": grid.cols(),
+            "viewport_rows": grid.viewport_rows(),
+            "overscan_rows": grid.overscan_rows(),
+        },
+        "cursor": {
+            "row": grid.cursor_row(),
+            "col": grid.cursor_col(),
+            "visible": grid.cursor_visible(),
+        },
+        "scrollback_len": terminal.scrollback_len(),
+        "scroll_offset": terminal.scroll_offset(),
+        "fractional_view": {
+            "rows": scroll_rows,
+            "fraction": scroll_fraction,
+        },
+        "first_abs_line": terminal.first_abs_line(),
+        "line_ids": grid.line_ids(),
+        "dirty_regions": terminal_dirty_regions_json(grid),
+        "modes": {
+            "bracketed_paste": terminal.bracketed_paste_active(),
+            "mouse_reporting": terminal.mouse_reporting_active(),
+            "synchronized_output": terminal.synchronized_output_active(),
+        },
+    })
+}
+
+fn terminal_export_payload_for_pane(state: &AppState, pane_id: u32) -> serde_json::Value {
+    let session_id = active_session_id_for_export(state, pane_id);
+    let mapped_sessions = state
+        .pty_manager
+        .sessions_iter()
+        .map(|(pane_id, session_id)| {
+            serde_json::json!({
+                "pane_id": pane_id,
+                "session_id": session_id,
+                "session_id_text": session_id.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let cached_sessions = state
+        .sessions
+        .iter()
+        .map(|session| {
+            serde_json::json!({
+                "session_id": session.session_id,
+                "session_id_text": session.session_id.to_string(),
+                "pane_id": session.pane_id,
+                "workspace_id": session.workspace_id,
+                "name": session.name.as_deref(),
+                "pid": session.pid,
+                "memory_rss_bytes": session.memory_rss_bytes,
+                "alive": session.alive,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "schema_version": TERMINAL_EXPORT_SCHEMA_VERSION,
+        "target": {
+            "pane_id": pane_id,
+            "session_id": session_id,
+            "session_id_text": session_id.map(|id| id.to_string()),
+            "context": pane_export_context_json(state, pane_id),
+        },
+        "active_at_export": {
+            "pane_id": state.active_pane.0,
+            "workspace_index": state.active_workspace,
+            "tab_index": state.active_tab,
+        },
+        "terminal": active_terminal_json(state, pane_id),
+        "renderer": {
+            "scale_factor": state.scale_factor,
+            "last_grid_width": state.last_grid_width,
+            "last_grid_height": state.last_grid_height,
+            "diagnostic_frame_counter": state.diagnostic_frame_counter,
+            "diagnostic_last_present_unix_ms": state.diagnostic_last_present_unix_ms,
+        },
+        "pty": {
+            "mapped_sessions": mapped_sessions,
+            "cached_sessions": cached_sessions,
+            "sessions_stale": state.sessions_stale,
+            "recent_events": state.diagnostic_pty_recent_events.iter().collect::<Vec<_>>(),
+            "daemon_pid": state.daemon_pid,
+            "daemon_memory_rss_bytes": state.daemon_memory_rss_bytes,
+        },
+        "app": {
+            "ui_pid": state.ui_pid,
+            "ui_memory_rss_bytes": state.ui_memory_rss_bytes,
+            "theme": state.theme.as_str(),
+            "terminal_font_size_pt": state.terminal_font_size_pt,
+        },
+    })
+}
+
+#[cfg(test)]
+fn terminal_export_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("terminal-manager-test-exports")
+}
+
+#[cfg(not(test))]
+fn terminal_export_dir() -> std::path::PathBuf {
+    crate::profile::data_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("terminal-manager"))
+        .join("terminal-info")
+}
+
+fn unix_epoch_millis_for_export() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn terminal_export_file_path(pane_id: u32, session_id: Option<u64>) -> std::path::PathBuf {
+    let session = session_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    terminal_export_dir().join(format!(
+        "terminal-info-{}-pane-{}-session-{}.json",
+        unix_epoch_millis_for_export(),
+        pane_id,
+        session
+    ))
+}
+
+fn terminal_export_pointer_payload(
+    export_path: &std::path::Path,
+    full_payload: &serde_json::Value,
+) -> serde_json::Value {
+    let target = full_payload
+        .get("target")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let terminal = full_payload
+        .get("terminal")
+        .map(|terminal| {
+            serde_json::json!({
+                "present": terminal.get("present").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                "grid": terminal.get("grid").cloned().unwrap_or(serde_json::Value::Null),
+                "cursor": terminal.get("cursor").cloned().unwrap_or(serde_json::Value::Null),
+                "scrollback_len": terminal.get("scrollback_len").cloned().unwrap_or(serde_json::Value::Null),
+                "modes": terminal.get("modes").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({ "present": false }));
+
+    serde_json::json!({
+        "schema_version": TERMINAL_EXPORT_POINTER_SCHEMA_VERSION,
+        "export_schema_version": TERMINAL_EXPORT_SCHEMA_VERSION,
+        "export_path": export_path.display().to_string(),
+        "target": target,
+        "terminal": terminal,
+    })
+}
+
+fn write_terminal_export_file(
+    pane_id: u32,
+    session_id: Option<u64>,
+    payload: &serde_json::Value,
+) -> std::io::Result<std::path::PathBuf> {
+    let path = terminal_export_file_path(pane_id, session_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+fn dispatch_terminal_export_info_for_pane(state: &mut AppState, pane_id: u32) -> bool {
+    let session_id = active_session_id_for_export(state, pane_id);
+    let payload = terminal_export_payload_for_pane(state, pane_id);
+    let export_path = match write_terminal_export_file(pane_id, session_id, &payload) {
+        Ok(path) => path,
+        Err(e) => {
+            push_error_toast(state, format!("terminal info export failed: {e}"));
+            return true;
+        }
+    };
+    let pointer = terminal_export_pointer_payload(&export_path, &payload);
+    let text = match serde_json::to_string_pretty(&pointer) {
+        Ok(text) => text,
+        Err(e) => {
+            push_error_toast(state, format!("terminal info pointer failed: {e}"));
+            return true;
+        }
+    };
+
+    match state.clipboard.write_text(&text) {
+        Ok(()) => {
+            let session = session_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            state.toasts.push(format!(
+                "terminal info exported: pane {pane_id}, session {session}"
+            ));
+            retain_live_toast_meta(state);
+            record_diagnostic_pty_event(
+                state,
+                format!(
+                    "export_info pane={pane_id} session={session} path={}",
+                    export_path.display()
+                ),
+            );
+        }
+        Err(e) => {
+            log::warn!("terminal.export_info: clipboard write failed: {e}");
+            push_error_toast(state, format!("terminal info export failed: {e}"));
+        }
+    }
+    true
+}
+
+fn dispatch_terminal_export_info(state: &mut AppState) -> bool {
+    dispatch_terminal_export_info_for_pane(state, state.active_pane.0)
 }
 
 /// Read the system clipboard, normalise the bytes, and forward them
@@ -5229,7 +5603,7 @@ pub fn compute_pty_dimensions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     /// Process-wide guard for tests that touch the real OS clipboard.
     ///
@@ -5318,6 +5692,10 @@ mod tests {
             tabbar_rect: crate::drag::Rect::default(),
             confirm_dialog: None,
             sessions: Vec::new(),
+            ui_pid: std::process::id(),
+            ui_memory_rss_bytes: None,
+            daemon_pid: None,
+            daemon_memory_rss_bytes: None,
             sessions_stale: false,
             diagnostic_frame_counter: 0,
             diagnostic_last_present_unix_ms: None,
@@ -7809,6 +8187,7 @@ mod tests {
             workspace_id: 1,
             name: None,
             pid: None,
+            memory_rss_bytes: None,
             alive: true,
         }];
         // No daemon connected in tests; refresh must log and not panic.
@@ -7836,6 +8215,35 @@ mod tests {
             msg.starts_with("refresh failed:"),
             "expected refresh-failure toast, got {msg:?}"
         );
+    }
+
+    #[test]
+    fn total_known_memory_bytes_sums_ui_daemon_and_sessions() {
+        let mut state = seed_state();
+        state.ui_memory_rss_bytes = Some(10);
+        state.daemon_memory_rss_bytes = Some(20);
+        state.sessions = vec![
+            SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 1,
+                name: None,
+                pid: None,
+                memory_rss_bytes: Some(30),
+                alive: true,
+            },
+            SessionSnapshot {
+                session_id: 2,
+                pane_id: 2,
+                workspace_id: 1,
+                name: None,
+                pid: None,
+                memory_rss_bytes: None,
+                alive: true,
+            },
+        ];
+
+        assert_eq!(total_known_memory_bytes(&state), 60);
     }
 
     #[test]
@@ -7949,6 +8357,7 @@ mod tests {
                 workspace_id: 1,
                 name: None,
                 pid: None,
+                memory_rss_bytes: None,
                 alive: true,
             },
             SessionSnapshot {
@@ -7957,6 +8366,7 @@ mod tests {
                 workspace_id: 1,
                 name: None,
                 pid: None,
+                memory_rss_bytes: None,
                 alive: true,
             },
         ];
@@ -11237,6 +11647,117 @@ mod tests {
             "image paste with no PTY in focus must toast, proving the \
              image payload path ran instead of the silent text no-op"
         );
+    }
+
+    #[test]
+    fn active_terminal_export_payload_includes_pane_session_and_terminal_shape() {
+        let mut state = test_state();
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(1, 42);
+        let mut terminal = crate::terminal::Terminal::new(3, 5);
+        terminal.process_bytes(b"hello");
+        state.terminals.insert(1, Arc::new(Mutex::new(terminal)));
+
+        let payload = super::terminal_export_payload_for_pane(&state, 1);
+
+        assert_eq!(payload["schema_version"], TERMINAL_EXPORT_SCHEMA_VERSION);
+        assert_eq!(payload["target"]["pane_id"], serde_json::json!(1));
+        assert_eq!(payload["target"]["session_id"], serde_json::json!(42));
+        assert_eq!(
+            payload["target"]["session_id_text"],
+            serde_json::json!("42")
+        );
+        assert_eq!(payload["terminal"]["present"], serde_json::json!(true));
+        assert_eq!(payload["terminal"]["grid"]["rows"], serde_json::json!(3));
+        assert_eq!(payload["terminal"]["grid"]["cols"], serde_json::json!(5));
+        assert_eq!(
+            payload["terminal"]["modes"]["bracketed_paste"],
+            serde_json::json!(false)
+        );
+        assert!(payload["pty"]["mapped_sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["pane_id"] == serde_json::json!(1)
+                && session["session_id"] == serde_json::json!(42)));
+    }
+
+    #[test]
+    fn dispatch_terminal_export_info_copies_pointer_json_and_writes_export_file() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(1, 99);
+
+        assert!(dispatch(&mut state, "terminal.export_info"));
+
+        let text = state
+            .clipboard
+            .read_text()
+            .expect("terminal info pointer should be readable");
+        let pointer: serde_json::Value =
+            serde_json::from_str(&text).expect("terminal info pointer must be JSON");
+        assert_eq!(
+            pointer["schema_version"],
+            TERMINAL_EXPORT_POINTER_SCHEMA_VERSION
+        );
+        assert_eq!(pointer["target"]["pane_id"], serde_json::json!(1));
+        assert_eq!(pointer["target"]["session_id"], serde_json::json!(99));
+        assert!(
+            pointer.get("terminal").is_some(),
+            "clipboard should include small metadata summary"
+        );
+        assert!(
+            pointer.get("pty").is_none(),
+            "clipboard pointer must not include full PTY/session dump"
+        );
+
+        let path = std::path::PathBuf::from(
+            pointer["export_path"]
+                .as_str()
+                .expect("pointer must include export_path"),
+        );
+        let file_text = std::fs::read_to_string(&path).expect("export file should exist");
+        let payload: serde_json::Value =
+            serde_json::from_str(&file_text).expect("export file must contain JSON");
+        assert_eq!(payload["schema_version"], TERMINAL_EXPORT_SCHEMA_VERSION);
+        assert_eq!(payload["target"]["pane_id"], serde_json::json!(1));
+        assert_eq!(payload["target"]["session_id"], serde_json::json!(99));
+        assert!(state
+            .toasts
+            .iter()
+            .any(|toast| toast.message.contains("terminal info exported")));
+    }
+
+    #[test]
+    fn dispatch_terminal_export_info_can_target_specific_pane() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        state.panes[0].push(Pane {
+            id: PaneId(2),
+            title: "other".into(),
+            subtitle: "bash".into(),
+            pid: 0,
+            cpu: 0.0,
+        });
+        state.active_pane = PaneId(1);
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(2, 200);
+
+        assert!(dispatch(&mut state, "terminal.export_info:2"));
+
+        let text = state
+            .clipboard
+            .read_text()
+            .expect("terminal info pointer should be readable");
+        let pointer: serde_json::Value =
+            serde_json::from_str(&text).expect("terminal info pointer must be JSON");
+        assert_eq!(pointer["target"]["pane_id"], serde_json::json!(2));
+        assert_eq!(pointer["target"]["session_id"], serde_json::json!(200));
+        assert_eq!(state.active_pane, PaneId(1), "export must not steal focus");
     }
 }
 

@@ -1427,6 +1427,7 @@ mod tests {
             workspace_id: 1,
             name: Some("main-session".to_string()),
             pid: Some(1234),
+            memory_rss_bytes: Some(64 * 1024 * 1024),
             alive: true,
         }];
         let snap = state.ui_snapshot();

@@ -1,4 +1,5 @@
 use smallvec::smallvec;
+use std::collections::BTreeMap;
 use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{
@@ -216,7 +217,7 @@ fn settings_section_desc(active: SettingsSection) -> &'static str {
         SettingsSection::Keybinds => {
             "Click any shortcut to rebind it. Press a new combination, or Esc to cancel."
         }
-        SettingsSection::Sessions => "Daemon sessions and workspace attachment.",
+        SettingsSection::Sessions => "RAM usage, daemon sessions, and workspace attachment.",
         SettingsSection::Notifications => "Desktop notifications and focused panes.",
         SettingsSection::DangerZone => "Destructive session and close behavior.",
     }
@@ -1755,6 +1756,8 @@ fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
         control,
     ));
 
+    section = section.with_child(build_memory_dashboard(state));
+
     if state.sessions.is_empty() {
         section = section.with_child(
             ElementDef::new(Tag::Div)
@@ -1768,6 +1771,184 @@ fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
         section = section.with_child(session_row(s, shared));
     }
     section
+}
+
+fn build_memory_dashboard(state: &UiSnapshot) -> ElementDef {
+    let terminal_total = sum_known_bytes(state.sessions.iter().map(|s| s.memory_rss_bytes));
+    let total = sum_known_bytes([
+        state.ui_memory_rss_bytes,
+        state.daemon_memory_rss_bytes,
+        terminal_total,
+    ]);
+
+    let mut buckets = ElementDef::new(Tag::Div).with_class("session-memory-buckets");
+    buckets = buckets
+        .with_child(memory_bucket(
+            "ui",
+            state.ui_memory_rss_bytes,
+            Some(format!("pid {}", state.ui_pid)),
+        ))
+        .with_child(memory_bucket(
+            "ptyd",
+            state.daemon_memory_rss_bytes,
+            state.daemon_pid.map(|pid| format!("pid {pid}")),
+        ))
+        .with_child(memory_bucket(
+            "terminals",
+            terminal_total,
+            Some(format!("{} sessions", state.sessions.len())),
+        ));
+
+    let mut workspaces = ElementDef::new(Tag::Div).with_class("session-workspace-memory-list");
+    for row in workspace_memory_summaries(state) {
+        workspaces = workspaces.with_child(workspace_memory_row(&row));
+    }
+
+    ElementDef::new(Tag::Div)
+        .with_class("sessions-memory-dashboard")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("session-memory-total")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("session-memory-label")
+                        .with_text("total RAM"),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("session-memory-value")
+                        .with_text(memory_value(total)),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("session-memory-hint")
+                        .with_text("working set sampled on refresh"),
+                ),
+        )
+        .with_child(buckets)
+        .with_child(workspaces)
+}
+
+fn memory_bucket(label: &str, bytes: Option<u64>, detail: Option<String>) -> ElementDef {
+    let mut bucket = ElementDef::new(Tag::Div)
+        .with_class("session-memory-bucket")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("session-memory-bucket-label")
+                .with_text(label),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("session-memory-bucket-value")
+                .with_text(memory_value(bytes)),
+        );
+    if let Some(detail) = detail {
+        bucket = bucket.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("session-memory-bucket-detail")
+                .with_text(detail),
+        );
+    }
+    bucket
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceMemorySummary {
+    workspace_id: u32,
+    label: String,
+    terminal_count: usize,
+    memory_rss_bytes: Option<u64>,
+}
+
+fn workspace_memory_summaries(state: &UiSnapshot) -> Vec<WorkspaceMemorySummary> {
+    let mut by_workspace: BTreeMap<u32, (usize, u64, bool)> = BTreeMap::new();
+    for session in &state.sessions {
+        let entry = by_workspace
+            .entry(session.workspace_id)
+            .or_insert((0, 0, false));
+        entry.0 += 1;
+        if let Some(bytes) = session.memory_rss_bytes {
+            entry.1 = entry.1.saturating_add(bytes);
+            entry.2 = true;
+        }
+    }
+
+    by_workspace
+        .into_iter()
+        .map(|(workspace_id, (terminal_count, bytes, has_known))| {
+            let label = state
+                .workspaces
+                .iter()
+                .find(|w| w.num == workspace_id)
+                .map(|w| w.name.clone())
+                .unwrap_or_else(|| format!("workspace {workspace_id}"));
+            WorkspaceMemorySummary {
+                workspace_id,
+                label,
+                terminal_count,
+                memory_rss_bytes: has_known.then_some(bytes),
+            }
+        })
+        .collect()
+}
+
+fn workspace_memory_row(row: &WorkspaceMemorySummary) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("session-workspace-memory-row")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("session-workspace-memory-meta")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("session-workspace-memory-name")
+                        .with_text(row.label.clone()),
+                )
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("session-workspace-memory-count")
+                        .with_text(format!(
+                            "{} terminal{}",
+                            row.terminal_count,
+                            if row.terminal_count == 1 { "" } else { "s" }
+                        )),
+                ),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("session-workspace-memory-value")
+                .with_text(memory_value(row.memory_rss_bytes)),
+        )
+}
+
+fn sum_known_bytes<I>(values: I) -> Option<u64>
+where
+    I: IntoIterator<Item = Option<u64>>,
+{
+    let mut total = 0u64;
+    let mut saw_known = false;
+    for value in values.into_iter().flatten() {
+        total = total.saturating_add(value);
+        saw_known = true;
+    }
+    saw_known.then_some(total)
+}
+
+fn memory_value(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format_memory_bytes(bytes),
+        None => "unknown".to_string(),
+    }
+}
+
+fn format_memory_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else {
+        format!("{:.1} MiB", bytes / MIB)
+    }
 }
 
 fn session_row(s: &crate::state::SessionSnapshot, shared: &SharedState) -> ElementDef {
@@ -1816,6 +1997,10 @@ fn session_row(s: &crate::state::SessionSnapshot, shared: &SharedState) -> Eleme
             });
         });
 
+    let memory = ElementDef::new(Tag::Span)
+        .with_class("session-memory-pill")
+        .with_text(memory_value(s.memory_rss_bytes));
+
     ElementDef::new(Tag::Div)
         .with_class("setting-row")
         .with_child(
@@ -1831,6 +2016,7 @@ fn session_row(s: &crate::state::SessionSnapshot, shared: &SharedState) -> Eleme
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("session-row-actions")
+                .with_child(memory)
                 .with_child(rename)
                 .with_child(kill),
         )
@@ -4385,6 +4571,7 @@ mod tests {
                 workspace_id: 1,
                 name: Some("build".into()),
                 pid: Some(1234),
+                memory_rss_bytes: Some(128 * 1024 * 1024),
                 alive: true,
             },
             crate::state::SessionSnapshot {
@@ -4393,6 +4580,7 @@ mod tests {
                 workspace_id: 1,
                 name: None,
                 pid: Some(5678),
+                memory_rss_bytes: Some(64 * 1024 * 1024),
                 alive: false,
             },
         ];
@@ -4410,6 +4598,106 @@ mod tests {
     }
 
     #[test]
+    fn sessions_section_renders_memory_dashboard_totals() {
+        let mut state = seed_state();
+        state.settings_section = SettingsSection::Sessions;
+        state.ui_pid = 10;
+        state.ui_memory_rss_bytes = Some(100 * 1024 * 1024);
+        state.daemon_pid = Some(20);
+        state.daemon_memory_rss_bytes = Some(50 * 1024 * 1024);
+        state.sessions = vec![
+            crate::state::SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 1,
+                name: Some("build".into()),
+                pid: Some(1234),
+                memory_rss_bytes: Some(25 * 1024 * 1024),
+                alive: true,
+            },
+            crate::state::SessionSnapshot {
+                session_id: 2,
+                pane_id: 2,
+                workspace_id: 2,
+                name: Some("api".into()),
+                pid: Some(5678),
+                memory_rss_bytes: Some(75 * 1024 * 1024),
+                alive: true,
+            },
+        ];
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let text = collect_text_recursive(&el);
+
+        assert!(has_class_anywhere(&el, "sessions-memory-dashboard"));
+        assert!(text.contains("250.0 MiB"), "dashboard text: {text}");
+        assert!(text.contains("pid 10"), "dashboard text: {text}");
+        assert!(text.contains("pid 20"), "dashboard text: {text}");
+    }
+
+    #[test]
+    fn sessions_section_renders_workspace_memory_rollup() {
+        let mut state = seed_state();
+        state.settings_section = SettingsSection::Sessions;
+        state.workspaces[1].num = 2;
+        state.workspaces[1].name = "api".into();
+        state.sessions = vec![
+            crate::state::SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 1,
+                name: Some("build".into()),
+                pid: Some(1234),
+                memory_rss_bytes: Some(25 * 1024 * 1024),
+                alive: true,
+            },
+            crate::state::SessionSnapshot {
+                session_id: 2,
+                pane_id: 2,
+                workspace_id: 2,
+                name: Some("api".into()),
+                pid: Some(5678),
+                memory_rss_bytes: Some(75 * 1024 * 1024),
+                alive: true,
+            },
+        ];
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let mut rows = Vec::new();
+        collect_with_class(&el, "session-workspace-memory-row", &mut rows);
+        let text = collect_text_recursive(&el);
+
+        assert_eq!(rows.len(), 2);
+        assert!(text.contains("api"), "dashboard text: {text}");
+        assert!(text.contains("75.0 MiB"), "dashboard text: {text}");
+    }
+
+    #[test]
+    fn sessions_section_renders_terminal_memory_pill() {
+        let snap = crate::state::UiSnapshot {
+            sessions: vec![crate::state::SessionSnapshot {
+                session_id: 1,
+                pane_id: 1,
+                workspace_id: 1,
+                name: Some("builder".into()),
+                pid: Some(1234),
+                memory_rss_bytes: Some(128 * 1024 * 1024),
+                alive: true,
+            }],
+            ..seed_state().ui_snapshot()
+        };
+        let shared = make_shared();
+        let el = build_sessions_section(&snap, &shared);
+        let mut pills = Vec::new();
+        collect_with_class(&el, "session-memory-pill", &mut pills);
+        let pill = pills.into_iter().next().expect("terminal memory pill");
+
+        assert!(collect_text_recursive(pill).contains("128.0 MiB"));
+    }
+
+    #[test]
     fn sessions_section_named_session_shows_custom_label() {
         let snap = crate::state::UiSnapshot {
             sessions: vec![crate::state::SessionSnapshot {
@@ -4418,6 +4706,7 @@ mod tests {
                 workspace_id: 42,
                 name: Some("api-server".into()),
                 pid: Some(1234),
+                memory_rss_bytes: Some(96 * 1024 * 1024),
                 alive: true,
             }],
             ..seed_state().ui_snapshot()
@@ -4447,6 +4736,7 @@ mod tests {
                 workspace_id: 1,
                 name: None,
                 pid: Some(9999),
+                memory_rss_bytes: None,
                 alive: true,
             }],
             ..seed_state().ui_snapshot()
@@ -4478,6 +4768,7 @@ mod tests {
                     workspace_id: 1,
                     name: Some("a".into()),
                     pid: None,
+                    memory_rss_bytes: None,
                     alive: true,
                 },
                 crate::state::SessionSnapshot {
@@ -4486,6 +4777,7 @@ mod tests {
                     workspace_id: 1,
                     name: Some("b".into()),
                     pid: None,
+                    memory_rss_bytes: None,
                     alive: false,
                 },
             ],

@@ -6848,6 +6848,14 @@ body.dragging-pane {
     align-items: stretch;
     grid-template-columns: 1fr;
   }
+  .sessions-memory-dashboard,
+  .session-memory-buckets,
+  .session-workspace-memory-row {
+    grid-template-columns: 1fr;
+  }
+  .session-memory-pill {
+    min-width: 0;
+  }
   .modal-footer {
     flex-direction: column;
   }
@@ -6942,6 +6950,112 @@ body.dragging-pane {
   color: var(--accent-danger, #d75f5f);
   text-transform: uppercase;
   letter-spacing: 0.05em;
+}
+
+.sessions-memory-dashboard {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.72fr) minmax(220px, 1.1fr);
+  gap: 12px;
+  padding: 12px 14px;
+  margin: 0 calc(var(--sp-3) * -1);
+  border-bottom: 1px solid rgba(74, 62, 42, 0.3);
+}
+
+.session-memory-total {
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  min-height: 94px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-md);
+  background: rgba(20, 17, 12, 0.36);
+}
+
+.session-memory-label,
+.session-memory-bucket-label,
+.session-workspace-memory-count {
+  color: var(--fg-tertiary);
+  font-size: var(--t-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.session-memory-value {
+  color: var(--amber-50);
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.session-memory-hint,
+.session-memory-bucket-detail {
+  color: var(--fg-secondary);
+  font-size: var(--t-xs);
+}
+
+.session-memory-buckets {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.session-memory-bucket {
+  display: grid;
+  align-content: center;
+  gap: 3px;
+  min-height: 64px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-md);
+  background: rgba(34, 29, 22, 0.54);
+}
+
+.session-memory-bucket-value,
+.session-workspace-memory-value,
+.session-memory-pill {
+  color: var(--fg-primary);
+  font-size: var(--t-sm);
+  font-weight: 600;
+}
+
+.session-workspace-memory-list {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+}
+
+.session-workspace-memory-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid rgba(74, 62, 42, 0.28);
+  border-radius: var(--r-sm);
+  background: rgba(20, 17, 12, 0.24);
+}
+
+.session-workspace-memory-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-workspace-memory-name {
+  min-width: 0;
+  color: var(--fg-primary);
+  font-size: var(--t-sm);
+  font-weight: 600;
+}
+
+.session-memory-pill {
+  min-width: 84px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  text-align: center;
+  background: rgba(20, 17, 12, 0.42);
 }
 
 .rename-session-error {

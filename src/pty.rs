@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc as tokio_mpsc;
 
-use unshit_ptyd::client::Client;
+use unshit_ptyd::client::{Client, SessionListSnapshot};
 use unshit_ptyd::protocol::message::{SessionInfo, SNAPSHOT_MAX_SCROLLBACK_LINES};
 use unshit_ptyd::protocol::{ProtocolError, Response, ServerEvent};
 use unshit_terminal_core::Snapshot;
@@ -142,7 +142,7 @@ enum Command {
         reply: std_mpsc::SyncSender<io::Result<()>>,
     },
     List {
-        reply: std_mpsc::SyncSender<io::Result<Vec<SessionInfo>>>,
+        reply: std_mpsc::SyncSender<io::Result<SessionListSnapshot>>,
     },
     Rename {
         session_id: u64,
@@ -523,8 +523,12 @@ impl DaemonPty {
     }
 
     pub fn list_sessions(&mut self) -> io::Result<Vec<SessionInfo>> {
+        Ok(self.list_sessions_snapshot()?.sessions)
+    }
+
+    pub fn list_sessions_snapshot(&mut self) -> io::Result<SessionListSnapshot> {
         let inner = self.inner.as_mut().ok_or_else(not_connected)?;
-        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<Vec<SessionInfo>>>(1);
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<SessionListSnapshot>>(1);
         inner
             .cmd_tx
             .send(Command::List { reply: reply_tx })
@@ -928,8 +932,8 @@ fn worker_main(
                     let _ = reply.send(result);
                 }
                 Command::List { reply } => {
-                    let result = match client.list_sessions().await {
-                        Ok(list) => Ok(list),
+                    let result = match client.list_sessions_snapshot().await {
+                        Ok(snapshot) => Ok(snapshot),
                         Err(ProtocolError::Io(e)) => Err(e),
                         Err(other) => Err(io::Error::other(other.to_string())),
                     };

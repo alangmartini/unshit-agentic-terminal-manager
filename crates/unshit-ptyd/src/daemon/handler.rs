@@ -230,7 +230,16 @@ where
         }
         Request::ListSessions { id } => {
             let sessions = registry.list().await;
-            send_response(&writer, Response::SessionList { id, sessions }).await?;
+            send_response(
+                &writer,
+                Response::SessionList {
+                    id,
+                    sessions,
+                    daemon_pid: Some(std::process::id()),
+                    daemon_memory_rss_bytes: crate::memory::current_resident_set_bytes(),
+                },
+            )
+            .await?;
             Ok(PostRequest::Continue)
         }
         Request::AttachSession {

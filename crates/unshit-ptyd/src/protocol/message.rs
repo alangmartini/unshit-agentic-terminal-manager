@@ -142,6 +142,8 @@ pub struct SessionInfo {
     pub alive: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_rss_bytes: Option<u64>,
     pub workspace_id: u32,
     pub pane_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,6 +180,10 @@ pub enum Response {
     SessionList {
         id: u64,
         sessions: Vec<SessionInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_memory_rss_bytes: Option<u64>,
     },
     SessionAttached {
         id: u64,
@@ -678,6 +684,7 @@ mod tests {
             rows: 24,
             alive: true,
             pid: None,
+            memory_rss_bytes: None,
             workspace_id: 7,
             pane_id: 3,
             name: None,
@@ -686,6 +693,28 @@ mod tests {
         assert!(
             !s.contains("\"name\""),
             "None name must be omitted on the wire: {s}"
+        );
+        let back: SessionInfo = serde_json::from_str(&s).unwrap();
+        assert_eq!(info, back);
+    }
+
+    #[test]
+    fn session_info_round_trips_memory_when_present() {
+        let info = SessionInfo {
+            id: 1,
+            cols: 80,
+            rows: 24,
+            alive: true,
+            pid: Some(1234),
+            memory_rss_bytes: Some(42 * 1024 * 1024),
+            workspace_id: 7,
+            pane_id: 3,
+            name: Some("build".into()),
+        };
+        let s = serde_json::to_string(&info).unwrap();
+        assert!(
+            s.contains("\"memory_rss_bytes\":44040192"),
+            "memory field must serialize when present: {s}"
         );
         let back: SessionInfo = serde_json::from_str(&s).unwrap();
         assert_eq!(info, back);
@@ -737,6 +766,7 @@ mod tests {
                     rows: 24,
                     alive: true,
                     pid: Some(1234),
+                    memory_rss_bytes: Some(128 * 1024 * 1024),
                     workspace_id: 0,
                     pane_id: 1,
                     name: Some("shell".into()),
@@ -747,11 +777,14 @@ mod tests {
                     rows: 30,
                     alive: false,
                     pid: None,
+                    memory_rss_bytes: None,
                     workspace_id: 1,
                     pane_id: 0,
                     name: None,
                 },
             ],
+            daemon_pid: Some(4321),
+            daemon_memory_rss_bytes: Some(64 * 1024 * 1024),
         };
         let s = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&s).unwrap();
@@ -921,7 +954,9 @@ mod tests {
         assert_eq!(
             Response::SessionList {
                 id: 43,
-                sessions: vec![]
+                sessions: vec![],
+                daemon_pid: None,
+                daemon_memory_rss_bytes: None,
             }
             .id(),
             43

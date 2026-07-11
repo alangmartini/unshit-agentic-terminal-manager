@@ -222,26 +222,29 @@ fn build_tab(
 
     let tab_pane_id = tab.active_pane.0;
     let ctx_state = shared.clone();
-    btn = btn.on_context_menu(move |x, y| {
-        mutate_with(&ctx_state, |st| {
-            let same_tab = matches!(
-                st.ctx_menu.as_ref().map(|m| &m.target),
-                Some(CtxMenuTarget::Tab { pane_id }) if *pane_id == tab_pane_id
-            );
-            if same_tab {
-                st.ctx_menu = None;
-            } else {
-                let sf = st.scale_factor;
-                st.ctx_menu = Some(CtxMenu {
-                    x: x / sf,
-                    y: y / sf,
-                    target: CtxMenuTarget::Tab {
-                        pane_id: tab_pane_id,
-                    },
-                });
-            }
+    let tab_name = ElementDef::new(Tag::Span)
+        .with_class("tab-name")
+        .with_text(tab.name.clone())
+        .on_context_menu(move |x, y| {
+            mutate_with(&ctx_state, |st| {
+                let same_tab = matches!(
+                    st.ctx_menu.as_ref().map(|m| &m.target),
+                    Some(CtxMenuTarget::TabName { pane_id }) if *pane_id == tab_pane_id
+                );
+                if same_tab {
+                    st.ctx_menu = None;
+                } else {
+                    let sf = st.scale_factor;
+                    st.ctx_menu = Some(CtxMenu {
+                        x: x / sf,
+                        y: y / sf,
+                        target: CtxMenuTarget::TabName {
+                            pane_id: tab_pane_id,
+                        },
+                    });
+                }
+            });
         });
-    });
 
     let close_state = shared.clone();
     btn.with_child(
@@ -249,11 +252,7 @@ fn build_tab(
             .with_class("tab-status")
             .with_class(status_class.to_string()),
     )
-    .with_child(
-        ElementDef::new(Tag::Span)
-            .with_class("tab-name")
-            .with_text(tab.name.clone()),
-    )
+    .with_child(tab_name)
     .with_child(
         ElementDef::new(Tag::Span)
             .with_class("tab-subtitle")
@@ -674,6 +673,42 @@ mod tests {
         let tab = make_tab("shell", TabStatus::Running);
         let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
         assert!(el.on_click.is_some());
+    }
+
+    #[test]
+    fn tab_context_menu_is_only_on_tab_name() {
+        let shared = make_shared();
+        let tab = make_tab("shell", TabStatus::Running);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let name = find_by_class(&el, "tab-name").expect("tab name");
+
+        assert!(
+            el.on_context_menu.is_none(),
+            "right-click affordance must not be attached to the whole tab"
+        );
+        assert!(
+            name.on_context_menu.is_some(),
+            "right-click affordance must live on the tab name"
+        );
+    }
+
+    #[test]
+    fn tab_name_right_click_opens_export_context_menu() {
+        let shared = make_shared();
+        let tab = make_tab("shell", TabStatus::Running);
+        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let name = find_by_class(&el, "tab-name").expect("tab name");
+
+        (name
+            .on_context_menu
+            .as_ref()
+            .expect("tab-name context menu"))(120.0, 80.0);
+
+        let guard = shared.lock().unwrap();
+        match guard.ctx_menu.as_ref().map(|menu| &menu.target) {
+            Some(CtxMenuTarget::TabName { pane_id }) => assert_eq!(*pane_id, 1),
+            other => panic!("expected tab-name context target, got {other:?}"),
+        }
     }
 
     #[test]
