@@ -2683,6 +2683,10 @@ input, select {
   line-height: 1.25;
 }
 
+.pane.link-hover .terminal-content {
+  cursor: pointer;
+}
+
 .term-line,
 .tline {
   white-space: pre-wrap;

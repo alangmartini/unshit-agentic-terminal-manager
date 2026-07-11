@@ -300,6 +300,12 @@ fn build_pane(
     if is_active {
         container = container.with_class("active");
     }
+    if state
+        .terminal_link_hover
+        .is_some_and(|hover| hover.pane == pane.id.0)
+    {
+        container = container.with_class("link-hover");
+    }
     let activate_state = shared.clone();
     let pane_id = pane.id;
     container = container.on_click(move || {
@@ -466,6 +472,13 @@ fn scrolled_pane_snapshot(
     }
     if let Some(sel) = st.terminal_selections.get(&pane) {
         crate::state::apply_selection_highlight(&mut grid, terminal, sel);
+    }
+    if let Some(hover) = st
+        .terminal_link_hover
+        .as_ref()
+        .filter(|hover| hover.pane == pane)
+    {
+        crate::state::apply_terminal_link_hover(&mut grid, terminal, hover);
     }
     grid.mark_all_dirty();
     grid
@@ -867,6 +880,49 @@ fn build_pane_body(
             });
         }
 
+        // Track links inside the GPU-backed grid at cell precision. The
+        // framework delivers MouseMove continuously within the same element;
+        // RequestRebuild is returned only when the hovered link span changes.
+        let hover_shared = shared.clone();
+        let hover_pane = pane_id;
+        grid_el = grid_el.on(
+            EventType::MouseMove,
+            move |event: &Event| -> Option<Box<dyn std::any::Any>> {
+                let Event::Mouse(me) = event else {
+                    return None;
+                };
+                let changed = mutate_with(&hover_shared, |st| {
+                    let next = crate::state::terminal_cell_at(
+                        st,
+                        hover_pane.0,
+                        me.local_x,
+                        me.local_y,
+                        terminal_content_x_offset(),
+                        terminal_cell_width_scale(),
+                    )
+                    .and_then(|cell| crate::state::terminal_link_hover_at(st, hover_pane.0, cell));
+                    crate::state::set_terminal_link_hover(st, next)
+                });
+                changed.then(|| {
+                    Box::new(unshit::core::event::RequestRebuild) as Box<dyn std::any::Any>
+                })
+            },
+        );
+
+        let leave_shared = shared.clone();
+        let leave_pane = pane_id;
+        grid_el = grid_el.on(
+            EventType::MouseLeave,
+            move |_| -> Option<Box<dyn std::any::Any>> {
+                let changed = mutate_with(&leave_shared, |st| {
+                    crate::state::clear_terminal_link_hover(st, leave_pane.0)
+                });
+                changed.then(|| {
+                    Box::new(unshit::core::event::RequestRebuild) as Box<dyn std::any::Any>
+                })
+            },
+        );
+
         // -- Text selection (mouse) -----------------------------------------
         // Registered for every pane with a grid so the user can select in any
         // visible pane (clicking also focuses it via the pane's on_click).
@@ -1181,6 +1237,29 @@ mod tests {
         let el = build_pane(&pane, true, true, false, &make_snapshot(), &shared, &grids);
         assert!(el.classes.contains(&"pane".to_string()));
         assert!(el.classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn pane_with_hovered_link_has_pointer_cursor_class() {
+        let pane = make_pane_titled(1, "shell");
+        let mut snap = make_snapshot();
+        snap.terminal_link_hover = Some(crate::state::TerminalLinkHover {
+            pane: 1,
+            abs_line: 0,
+            start_col: 3,
+            end_col: 21,
+        });
+        let el = build_pane(
+            &pane,
+            true,
+            true,
+            false,
+            &snap,
+            &make_shared(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(el.classes.contains(&"link-hover".to_string()));
     }
 
     #[test]
@@ -2655,6 +2734,63 @@ mod tests_mouse_selection_copy_paste {
             PaneId(1),
             "MouseDown on inactive pane must focus it"
         );
+    }
+
+    #[test]
+    fn mousemove_over_url_sets_link_hover_and_requests_one_rebuild() {
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        let mut terminal = crate::terminal::Terminal::new(3, 50);
+        terminal.process_bytes(b"go https://example.com now");
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.terminals.insert(1, Arc::new(Mutex::new(terminal)));
+        }
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(3, 50));
+        let body = build_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let handler = body.children[0]
+            .handlers
+            .iter()
+            .find(|(event_type, _)| *event_type == EventType::MouseMove)
+            .map(|(_, handler)| handler.clone())
+            .expect("terminal grid must track pointer movement");
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Move,
+            x: 100.0,
+            y: 10.0,
+            local_x: 100.0,
+            local_y: 10.0,
+            button: MouseButton::None,
+            modifiers: Modifiers::empty(),
+        });
+
+        let first = handler(&event).expect("entering a link changes visual state");
+        assert!(first.is::<unshit::core::event::RequestRebuild>());
+        assert_eq!(
+            shared.lock().unwrap().terminal_link_hover,
+            Some(crate::state::TerminalLinkHover {
+                pane: 1,
+                abs_line: 0,
+                start_col: 3,
+                end_col: 21,
+            })
+        );
+
+        assert!(
+            handler(&event).is_none(),
+            "same link must not rebuild again"
+        );
+
+        let leave = body.children[0]
+            .handlers
+            .iter()
+            .find(|(event_type, _)| *event_type == EventType::MouseLeave)
+            .map(|(_, handler)| handler.clone())
+            .expect("terminal grid must clear hover on leave");
+        let response = leave(&event).expect("leaving a link changes visual state");
+        assert!(response.is::<unshit::core::event::RequestRebuild>());
+        assert_eq!(shared.lock().unwrap().terminal_link_hover, None);
     }
 
     #[test]

@@ -160,6 +160,14 @@ pub struct Terminal {
     evicted_lines: u64,
 }
 
+/// Recognized HTTP(S) link and its inclusive cell span on one terminal line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalUrlMatch {
+    pub url: String,
+    pub start_col: usize,
+    pub end_col: usize,
+}
+
 const ENV_PARITY_WINDOWS_TERMINAL_COLORS: &str = "TM_PARITY_WINDOWS_TERMINAL_COLORS";
 
 /// Default foreground: warm amber.
@@ -1390,6 +1398,13 @@ impl Terminal {
     /// protocol (`file:`, custom handlers) to the OS; scheme is re-validated at
     /// open time in [`crate::browser`].
     pub fn url_at(&self, abs_line: u64, col: usize) -> Option<String> {
+        self.url_match_at(abs_line, col).map(|link| link.url)
+    }
+
+    /// The HTTP(S) URL under `(abs_line, col)` plus its inclusive cell span.
+    /// Used by hover rendering so every cell in the detected link receives
+    /// the same visual treatment.
+    pub fn url_match_at(&self, abs_line: u64, col: usize) -> Option<TerminalUrlMatch> {
         if self.cols == 0 || col >= self.cols {
             return None;
         }
@@ -1468,6 +1483,37 @@ impl Terminal {
                 }
             }
             abs += 1;
+        }
+    }
+
+    /// Add an underline to the visible cells of one single-line link hover.
+    /// The live terminal buffer is untouched; callers pass a display-grid
+    /// clone and publish that clone for the current frame.
+    pub fn paint_link_hover(
+        &self,
+        grid: &mut CellGrid,
+        abs_line: u64,
+        start_col: usize,
+        end_col: usize,
+    ) {
+        if self.rows == 0 || self.cols == 0 || start_col > end_col {
+            return;
+        }
+        let overscan = grid.overscan_rows() as u64;
+        let top = self.top_abs_line();
+        let Some(row) = (abs_line + overscan)
+            .checked_sub(top)
+            .map(|row| row as usize)
+            .filter(|&row| row < grid.rows())
+        else {
+            return;
+        };
+        let last_col = self.cols - 1;
+        for col in start_col.min(last_col)..=end_col.min(last_col) {
+            if let Some(mut cell) = grid.get_cell(row, col).copied() {
+                cell.attrs.insert(CellAttrs::UNDERLINE);
+                grid.set_cell(row, col, cell);
+            }
         }
     }
 
@@ -1817,7 +1863,7 @@ fn trim_url_trailing(url: &str) -> &str {
 /// `char` per column. Scans for each scheme, extends over the run of URL
 /// characters, and returns the span (minus trailing punctuation) that contains
 /// the click. `None` when the click is not on a link.
-fn find_url_at_col(line: &[char], col: usize) -> Option<String> {
+fn find_url_at_col(line: &[char], col: usize) -> Option<TerminalUrlMatch> {
     if col >= line.len() {
         return None;
     }
@@ -1833,11 +1879,16 @@ fn find_url_at_col(line: &[char], col: usize) -> Option<String> {
                 }
                 // Require at least one host character after the scheme, and
                 // that the click land within the matched span.
-                if end > i + sch.len() && col >= i && col < end {
+                if end > i + sch.len() {
                     let run: String = line[i..end].iter().collect();
                     let url = trim_url_trailing(&run);
-                    if url.len() > scheme.len() {
-                        return Some(url.to_string());
+                    let trimmed_end = i + url.len();
+                    if url.len() > scheme.len() && col >= i && col < trimmed_end {
+                        return Some(TerminalUrlMatch {
+                            url: url.to_string(),
+                            start_col: i,
+                            end_col: trimmed_end - 1,
+                        });
                     }
                 }
                 i = end.max(i + 1);
@@ -5268,6 +5319,50 @@ mod tests {
             term.url_at(0, 20).as_deref(),
             Some("https://example.com/path")
         );
+    }
+
+    #[test]
+    fn url_match_at_reports_trimmed_cell_span() {
+        let mut term = Terminal::new(2, 50);
+        term.process_bytes(b"see (http://example.com). next");
+
+        let link = term.url_match_at(0, 10).expect("link under pointer");
+
+        assert_eq!(link.url, "http://example.com");
+        assert_eq!(link.start_col, 5);
+        assert_eq!(link.end_col, 22);
+    }
+
+    #[test]
+    fn paint_link_hover_underlines_only_matched_cells() {
+        let mut term = Terminal::new(2, 50);
+        term.process_bytes(b"see https://example.com next");
+        let link = term.url_match_at(0, 10).expect("link under pointer");
+        let mut grid = term.display_grid();
+        let row = grid.overscan_rows() as usize;
+
+        term.paint_link_hover(&mut grid, 0, link.start_col, link.end_col);
+
+        assert!(!grid
+            .get_cell(row, 3)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::UNDERLINE));
+        assert!(grid
+            .get_cell(row, link.start_col)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::UNDERLINE));
+        assert!(grid
+            .get_cell(row, link.end_col)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::UNDERLINE));
+        assert!(!grid
+            .get_cell(row, link.end_col + 1)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::UNDERLINE));
     }
 
     #[test]

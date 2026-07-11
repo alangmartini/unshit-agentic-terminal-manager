@@ -241,6 +241,7 @@ mod tests {
             scale_factor: 1.0,
             default_shell: crate::shell::ShellSpec::default(),
             quick_prompt: None,
+            terminal_link_hover: None,
         }
     }
 

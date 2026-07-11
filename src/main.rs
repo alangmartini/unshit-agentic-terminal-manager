@@ -1211,12 +1211,14 @@ fn main() {
                 force_terminal_theme_repaint,
                 selections,
                 selection_repaint,
+                link_hover_repaint,
             ): (
                 crate::state::UiSnapshot,
                 u32,
                 Vec<(u32, crate::state::SharedTerminal)>,
                 bool,
                 std::collections::HashMap<u32, crate::state::TermSelection>,
+                std::collections::HashSet<u32>,
                 std::collections::HashSet<u32>,
             ) = {
                 let mut guard = tree_shared.lock_recover();
@@ -1234,6 +1236,7 @@ fn main() {
                 // one-frame repaint of panes whose selection just changed.
                 let selections = guard.terminal_selections.clone();
                 let selection_repaint = std::mem::take(&mut guard.terminal_selection_repaint);
+                let link_hover_repaint = std::mem::take(&mut guard.terminal_link_hover_repaint);
                 (
                     snap,
                     active_id,
@@ -1241,6 +1244,7 @@ fn main() {
                     force_terminal_theme_repaint,
                     selections,
                     selection_repaint,
+                    link_hover_repaint,
                 )
             };
 
@@ -1270,12 +1274,19 @@ fn main() {
                     if let Some(sel) = selections.get(&id) {
                         crate::state::apply_selection_highlight(&mut grid, &t, sel);
                     }
+                    if let Some(hover) = snap
+                        .terminal_link_hover
+                        .as_ref()
+                        .filter(|hover| hover.pane == id)
+                    {
+                        crate::state::apply_terminal_link_hover(&mut grid, &t, hover);
+                    }
                     // Force a full repaint of this pane the frame its selection
                     // changed (added / moved / cleared) so the renderer's line
                     // cache re-emits the rows whose highlight just changed. A
                     // static selection re-applies the same bg each frame and
                     // needs no extra damage.
-                    if selection_repaint.contains(&id) {
+                    if selection_repaint.contains(&id) || link_hover_repaint.contains(&id) {
                         grid.mark_all_dirty();
                     }
                     (id, grid)

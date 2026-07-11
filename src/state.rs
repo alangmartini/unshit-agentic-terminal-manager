@@ -127,6 +127,15 @@ impl TermSelection {
     }
 }
 
+/// Link span currently under the pointer, in stable terminal coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalLinkHover {
+    pub pane: u32,
+    pub abs_line: u64,
+    pub start_col: usize,
+    pub end_col: usize,
+}
+
 /// Tracks consecutive left-clicks on a terminal so a second/third press on
 /// the same cell promotes the selection to word / line. Reset when the
 /// pane, cell, or timing window changes.
@@ -157,6 +166,15 @@ pub fn apply_selection_highlight(
         return;
     }
     terminal.paint_selection(grid, sel.anchor, sel.focus, SELECTION_BG);
+}
+
+/// Paint the current terminal link hover onto a display-grid clone.
+pub fn apply_terminal_link_hover(
+    grid: &mut unshit::core::cell_grid::CellGrid,
+    terminal: &crate::terminal::Terminal,
+    hover: &TerminalLinkHover,
+) {
+    terminal.paint_link_hover(grid, hover.abs_line, hover.start_col, hover.end_col);
 }
 
 #[derive(Clone, Debug)]
@@ -872,6 +890,12 @@ pub struct AppState {
     /// need a forced full repaint so the renderer's line cache re-emits the
     /// rows that gained or lost the highlight. Drained each render.
     pub terminal_selection_repaint: std::collections::HashSet<u32>,
+    /// Link span currently under the pointer. Stored separately from text
+    /// selection because hover changes cursor styling and underline paint but
+    /// must never affect copy behavior.
+    pub terminal_link_hover: Option<TerminalLinkHover>,
+    /// Panes whose prior/new hover underline must bypass retained row paint.
+    pub terminal_link_hover_repaint: std::collections::HashSet<u32>,
     /// Last left-press on a terminal, for double/triple-click promotion.
     pub terminal_click: Option<TerminalClick>,
     /// App wide default shell. Empty means "let the daemon's own
@@ -1022,6 +1046,7 @@ impl AppState {
                 .collect(),
             default_shell: self.default_shell.clone(),
             quick_prompt: self.quick_prompt.clone(),
+            terminal_link_hover: self.terminal_link_hover,
         }
     }
 
@@ -1116,6 +1141,8 @@ pub struct UiSnapshot {
     /// Mirror of `AppState::quick_prompt`. `None` when the overlay is
     /// closed.
     pub quick_prompt: Option<crate::quick_prompt::QuickPromptState>,
+    /// Link hover used by the terminal element to select pointer cursor style.
+    pub terminal_link_hover: Option<TerminalLinkHover>,
 }
 
 fn current_folder_name() -> String {
@@ -1303,6 +1330,8 @@ pub fn seed_state() -> AppState {
         clipboard: Arc::new(unshit::app::ClipboardContext::new()),
         terminal_selections: std::collections::HashMap::new(),
         terminal_selection_repaint: std::collections::HashSet::new(),
+        terminal_link_hover: None,
+        terminal_link_hover_repaint: std::collections::HashSet::new(),
         terminal_click: None,
         default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
         quick_prompt: None,
@@ -4844,6 +4873,34 @@ pub fn mark_terminal_selection_dirty(state: &mut AppState, pane: u32) {
     }
 }
 
+/// Replace the hovered terminal link. Returns `true` only when visual state
+/// changed, and marks both the old and new panes for retained-paint bypass.
+pub fn set_terminal_link_hover(state: &mut AppState, next: Option<TerminalLinkHover>) -> bool {
+    if state.terminal_link_hover == next {
+        return false;
+    }
+    if let Some(previous) = state.terminal_link_hover {
+        state.terminal_link_hover_repaint.insert(previous.pane);
+    }
+    if let Some(next) = next {
+        state.terminal_link_hover_repaint.insert(next.pane);
+    }
+    state.terminal_link_hover = next;
+    true
+}
+
+/// Clear hover only when it belongs to `pane`, leaving other panes untouched.
+pub fn clear_terminal_link_hover(state: &mut AppState, pane: u32) -> bool {
+    if state
+        .terminal_link_hover
+        .is_some_and(|hover| hover.pane == pane)
+    {
+        set_terminal_link_hover(state, None)
+    } else {
+        false
+    }
+}
+
 /// Pure element-local pointer → visible cell mapping. `x_offset` is the
 /// content translate applied to the grid (Windows-Terminal parity). The
 /// result is clamped into `[0, cols)` x `[0, rows)`. Returns `None` only
@@ -4904,6 +4961,25 @@ pub fn terminal_url_at(state: &AppState, pane: u32, cell: (u64, usize)) -> Optio
         .terminals
         .get(&pane)
         .and_then(|h| h.lock_recover().url_at(cell.0, cell.1))
+}
+
+/// Hover paint span for the HTTP(S) link under `cell`, if present.
+pub fn terminal_link_hover_at(
+    state: &AppState,
+    pane: u32,
+    cell: (u64, usize),
+) -> Option<TerminalLinkHover> {
+    let link = state
+        .terminals
+        .get(&pane)?
+        .lock_recover()
+        .url_match_at(cell.0, cell.1)?;
+    Some(TerminalLinkHover {
+        pane,
+        abs_line: cell.0,
+        start_col: link.start_col,
+        end_col: link.end_col,
+    })
 }
 
 /// `scheme://host` prefix of `url`, dropping any path / query / fragment that
@@ -5706,6 +5782,8 @@ mod tests {
             clipboard: Arc::new(unshit::app::ClipboardContext::new()),
             terminal_selections: std::collections::HashMap::new(),
             terminal_selection_repaint: std::collections::HashSet::new(),
+            terminal_link_hover: None,
+            terminal_link_hover_repaint: std::collections::HashSet::new(),
             terminal_click: None,
             default_shell: crate::shell::ShellSpec::default(),
             quick_prompt: None,
@@ -11765,6 +11843,7 @@ mod tests {
 mod tests_mouse_selection_copy_paste {
     use super::tests::{clipboard_access_guard, test_state};
     use super::*;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     // -------- cell_from_local tests --------
@@ -12098,6 +12177,39 @@ mod tests_mouse_selection_copy_paste {
         assert!(!st.terminal_selections.contains_key(&pane));
         clear_terminal_selection(&mut st, pane);
         assert!(!st.terminal_selection_repaint.contains(&pane));
+    }
+
+    #[test]
+    fn terminal_link_hover_changes_repaint_only_affected_panes() {
+        let mut st = seed_state();
+        let first = TerminalLinkHover {
+            pane: 1,
+            abs_line: 4,
+            start_col: 2,
+            end_col: 18,
+        };
+        let second = TerminalLinkHover {
+            pane: 2,
+            abs_line: 9,
+            start_col: 1,
+            end_col: 12,
+        };
+
+        assert!(set_terminal_link_hover(&mut st, Some(first)));
+        assert_eq!(st.terminal_link_hover, Some(first));
+        assert_eq!(st.terminal_link_hover_repaint, HashSet::from([1]));
+
+        st.terminal_link_hover_repaint.clear();
+        assert!(!set_terminal_link_hover(&mut st, Some(first)));
+        assert!(st.terminal_link_hover_repaint.is_empty());
+
+        assert!(set_terminal_link_hover(&mut st, Some(second)));
+        assert_eq!(st.terminal_link_hover_repaint, HashSet::from([1, 2]));
+
+        st.terminal_link_hover_repaint.clear();
+        assert!(clear_terminal_link_hover(&mut st, 2));
+        assert_eq!(st.terminal_link_hover, None);
+        assert_eq!(st.terminal_link_hover_repaint, HashSet::from([2]));
     }
 
     #[test]

@@ -22,6 +22,13 @@ pub enum EventType {
     Clipboard,
 }
 
+/// Explicit response from a generic event handler when its state mutation
+/// requires rebuilding the element tree. Pointer-move handlers return this
+/// only when crossing an app-defined interaction boundary, allowing precise
+/// hit testing without rebuilding on every pixel of mouse movement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RequestRebuild;
+
 /// Events related to IME (Input Method Editor) composition, used for CJK and other complex input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {

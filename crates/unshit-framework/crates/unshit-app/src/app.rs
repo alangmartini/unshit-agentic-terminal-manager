@@ -3903,6 +3903,9 @@ impl ApplicationHandler for AppHandler {
                     // change is now irrelevant. Drop it so the next
                     // restyle sees a clean slate.
                     state.restyle_root = None;
+                    // A same-node pointer move can rebuild classes that change
+                    // `cursor` without changing the hovered NodeId.
+                    apply_cursor_icon(&*state.window, &state.arena, state.interaction.hovered);
 
                     // Reconcile subscriptions after each rebuild.
                     #[cfg(feature = "async")]
@@ -4456,11 +4459,49 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32), decorations: bool)
 
     let new_hover = hit_test(&state.arena, state.root, pos.0, pos.1).unwrap_or(NodeId::DANGLING);
 
-    if new_hover != state.interaction.hovered {
-        let old_hover = state.interaction.hovered;
+    let old_hover = state.interaction.hovered;
+    let hover_changed = new_hover != old_hover;
+    let mut rebuild_requested = false;
+
+    if hover_changed {
+        if !old_hover.is_dangling() {
+            let (local_x, local_y) = local_pointer_coords(&state.arena, old_hover, pos.0, pos.1);
+            let leave = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Leave,
+                x: pos.0,
+                y: pos.1,
+                local_x,
+                local_y,
+                button: MouseButton::None,
+                modifiers: Modifiers::empty(),
+            });
+            rebuild_requested |=
+                dispatch_pointer_event(&state.arena, old_hover, EventType::MouseLeave, &leave)
+                    .rebuild_requested;
+        }
+
         state.interaction.hovered = new_hover;
         apply_cursor_icon(&*state.window, &state.arena, new_hover);
         state.mark_restyle_pseudo_change(old_hover, new_hover);
+
+        if !new_hover.is_dangling() {
+            let (local_x, local_y) = local_pointer_coords(&state.arena, new_hover, pos.0, pos.1);
+            let enter = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Enter,
+                x: pos.0,
+                y: pos.1,
+                local_x,
+                local_y,
+                button: MouseButton::None,
+                modifiers: Modifiers::empty(),
+            });
+            rebuild_requested |=
+                dispatch_pointer_event(&state.arena, new_hover, EventType::MouseEnter, &enter)
+                    .rebuild_requested;
+        }
+    }
+
+    if !new_hover.is_dangling() {
         let (local_x, local_y) = local_pointer_coords(&state.arena, new_hover, pos.0, pos.1);
         let event = Event::Mouse(MouseEvent {
             kind: MouseEventKind::Move,
@@ -4471,9 +4512,17 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32), decorations: bool)
             button: MouseButton::None,
             modifiers: Modifiers::empty(),
         });
-        if dispatch_mouse_move_event(&state.arena, new_hover, &event) {
-            state.needs_rebuild = true;
-        }
+        let dispatch = dispatch_mouse_move_event(&state.arena, new_hover, &event);
+        // Preserve the legacy contract: entering a node with a MouseMove
+        // handler rebuilds once. Further movement within that same node only
+        // rebuilds when the handler explicitly returns RequestRebuild.
+        rebuild_requested |= dispatch.rebuild_requested || (hover_changed && dispatch.handled);
+    }
+
+    if rebuild_requested {
+        state.needs_rebuild = true;
+    }
+    if hover_changed || rebuild_requested {
         state.window.request_redraw();
     }
 
@@ -4500,21 +4549,41 @@ fn handle_normal_hover(state: &mut AppState, pos: (f32, f32), decorations: bool)
     }
 }
 
-fn dispatch_mouse_move_event(arena: &NodeArena, start: NodeId, event: &Event) -> bool {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PointerEventDispatch {
+    handled: bool,
+    rebuild_requested: bool,
+}
+
+fn dispatch_mouse_move_event(
+    arena: &NodeArena,
+    start: NodeId,
+    event: &Event,
+) -> PointerEventDispatch {
+    dispatch_pointer_event(arena, start, EventType::MouseMove, event)
+}
+
+fn dispatch_pointer_event(
+    arena: &NodeArena,
+    start: NodeId,
+    event_type: EventType,
+    event: &Event,
+) -> PointerEventDispatch {
     let mut node = start;
     while !node.is_dangling() {
         let Some(element) = arena.get(node) else {
             break;
         };
-        for (event_type, handler) in &element.handlers {
-            if *event_type == EventType::MouseMove {
-                handler(event);
-                return true;
+        for (registered_type, handler) in &element.handlers {
+            if *registered_type == event_type {
+                let rebuild_requested = handler(event)
+                    .is_some_and(|response| response.is::<unshit_core::event::RequestRebuild>());
+                return PointerEventDispatch { handled: true, rebuild_requested };
             }
         }
         node = element.parent;
     }
-    false
+    PointerEventDispatch::default()
 }
 
 /// Cursor position relative to a node's content box (padding box origin),
@@ -5485,6 +5554,7 @@ fn handle_select_keyboard(state: &mut AppState, event: &winit::event::KeyEvent) 
 mod tests {
     use super::*;
     use crate::scroll_motion::browser_scroll_ease;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn default_app_config_uses_dark_theme() {
@@ -5504,6 +5574,38 @@ mod tests {
     fn app_config_decorations_defaults_to_native_chrome() {
         let config = AppConfig::default();
         assert!(config.decorations);
+    }
+
+    #[test]
+    fn mouse_move_handler_can_explicitly_request_rebuild() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let mut element = Element::new(Tag::Div);
+        element.handlers.push((
+            EventType::MouseMove,
+            Arc::new(move |_| {
+                handler_calls.fetch_add(1, Ordering::Relaxed);
+                Some(Box::new(unshit_core::event::RequestRebuild))
+            }),
+        ));
+        let mut arena = NodeArena::new();
+        let node = arena.alloc(element);
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Move,
+            x: 10.0,
+            y: 20.0,
+            local_x: 10.0,
+            local_y: 20.0,
+            button: MouseButton::None,
+            modifiers: Modifiers::empty(),
+        });
+
+        let first = dispatch_mouse_move_event(&arena, node, &event);
+        let second = dispatch_mouse_move_event(&arena, node, &event);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(first.handled && first.rebuild_requested);
+        assert!(second.handled && second.rebuild_requested);
     }
 
     #[test]
@@ -6109,7 +6211,7 @@ mod tests {
             modifiers: Modifiers::empty(),
         });
 
-        assert!(dispatch_mouse_move_event(&arena, child_id, &event));
+        assert!(dispatch_mouse_move_event(&arena, child_id, &event).handled);
         assert!(called.load(Ordering::SeqCst));
     }
 
