@@ -56,6 +56,10 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
 
         // -- Simple special keys -----------------------------------------------
         Key::Enter => Some(vec![0x0D]),
+        // Shift+Tab is the terminal BackTab sequence. Ctrl+Tab and
+        // Ctrl+Shift+Tab are app-level tab-navigation shortcuts and are
+        // intercepted before terminal capture.
+        Key::Tab if has_shift && !has_ctrl && !has_alt => Some(b"\x1b[Z".to_vec()),
         Key::Tab => Some(vec![0x09]),
         Key::Backspace => Some(vec![0x7F]),
         Key::Escape => Some(vec![0x1B]),
@@ -334,6 +338,14 @@ mod tests {
     }
 
     #[test]
+    fn shift_tab_encodes_backtab() {
+        assert_eq!(
+            encode_key(&key_event(Key::Tab, Modifiers::SHIFT)),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
     fn backspace() {
         assert_eq!(
             encode_key(&key_event(Key::Backspace, Modifiers::empty())),
@@ -423,10 +435,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_arrow_right() {
-        let result = encode_key(&key_event(Key::ArrowRight, Modifiers::CTRL));
-        // Ctrl modifier = 5, so \x1b[1;5C
-        assert_eq!(result, Some(b"\x1b[1;5C".to_vec()));
+    fn ctrl_arrows_encode_word_navigation_sequences() {
+        for (key, expected) in [
+            (Key::ArrowLeft, b"\x1b[1;5D".as_slice()),
+            (Key::ArrowRight, b"\x1b[1;5C".as_slice()),
+            (Key::ArrowUp, b"\x1b[1;5A".as_slice()),
+            (Key::ArrowDown, b"\x1b[1;5B".as_slice()),
+        ] {
+            assert_eq!(
+                encode_key(&key_event(key, Modifiers::CTRL)),
+                Some(expected.to_vec())
+            );
+        }
     }
 
     #[test]

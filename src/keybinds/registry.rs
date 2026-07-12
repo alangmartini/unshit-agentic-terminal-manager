@@ -132,6 +132,22 @@ mod tests {
     }
 
     #[test]
+    fn pane_focus_defaults_use_ctrl_alt_arrows() {
+        for (combo, command) in [
+            ("Ctrl+Alt+Left", "pane.focus_left"),
+            ("Ctrl+Alt+Right", "pane.focus_right"),
+            ("Ctrl+Alt+Up", "pane.focus_up"),
+            ("Ctrl+Alt+Down", "pane.focus_down"),
+        ] {
+            assert_eq!(find(combo).as_deref(), Some(command));
+        }
+
+        for combo in ["Ctrl+Left", "Ctrl+Right", "Ctrl+Up", "Ctrl+Down"] {
+            assert!(find(combo).is_none(), "{combo} must reach the terminal");
+        }
+    }
+
+    #[test]
     fn ctrl_v_dispatches_terminal_paste() {
         // Conventional Windows paste binding routed through the
         // app-level paste action so the focused PTY receives the text.

@@ -229,10 +229,11 @@ impl KeybindAction {
             Self::SplitRight => "Ctrl+D",
             Self::SplitDown => "Ctrl+Shift+D",
             Self::Unsplit => "Ctrl+W",
-            Self::FocusLeft => "Ctrl+Left",
-            Self::FocusRight => "Ctrl+Right",
-            Self::FocusUp => "Ctrl+Up",
-            Self::FocusDown => "Ctrl+Down",
+            // Reserve Ctrl+Arrow for word navigation in terminal applications.
+            Self::FocusLeft => "Ctrl+Alt+Left",
+            Self::FocusRight => "Ctrl+Alt+Right",
+            Self::FocusUp => "Ctrl+Alt+Up",
+            Self::FocusDown => "Ctrl+Alt+Down",
             Self::NextTab => "Ctrl+Tab",
             Self::PrevTab => "Ctrl+Shift+Tab",
             Self::CommandPalette => "Ctrl+Shift+P",
@@ -314,6 +315,23 @@ mod tests {
         assert_eq!(
             KeybindAction::CommandPalette.default_combo_str(),
             "Ctrl+Shift+P"
+        );
+    }
+
+    #[test]
+    fn pane_focus_defaults_preserve_ctrl_arrow_for_terminal_navigation() {
+        assert_eq!(
+            KeybindAction::FocusLeft.default_combo_str(),
+            "Ctrl+Alt+Left"
+        );
+        assert_eq!(
+            KeybindAction::FocusRight.default_combo_str(),
+            "Ctrl+Alt+Right"
+        );
+        assert_eq!(KeybindAction::FocusUp.default_combo_str(), "Ctrl+Alt+Up");
+        assert_eq!(
+            KeybindAction::FocusDown.default_combo_str(),
+            "Ctrl+Alt+Down"
         );
     }
 
