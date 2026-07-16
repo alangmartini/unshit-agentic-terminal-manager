@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-16
+
+Terminal interaction polish: links now show clear hover feedback, and navigation
+key input reaches terminal applications again.
+
+### Added
+
+- **Terminal HTTP(S) links now show hover feedback.** Moving the pointer over a
+  detected link underlines its complete span and changes the cursor to a hand,
+  while opening it remains an explicit `Ctrl`+click action.
+
+### Fixed
+
+- **Terminal navigation keys now reach the active shell or application.** Plain
+  `Shift`+`Tab` sends the standard terminal BackTab sequence, `Ctrl`+Arrow is
+  available for word navigation, and pane-focus shortcuts use
+  `Ctrl`+`Alt`+Arrow instead.
+
 ## [0.2.5] - 2026-07-11
 
 Observability release: terminal panes can export a compact debug pointer plus a
@@ -222,7 +240,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.2...v0.2.3

@@ -1,13 +1,14 @@
 ; packaging\terminal-manager.iss — Inno Setup 6 script, per-user install.
 ;
-; Build the app first, then compile this script:
-;   cargo build --release
+; Build both executables first, then compile this script:
+;   cargo build --release -p terminal-manager --bin terminal-manager
+;   cargo build --release -p unshit-ptyd --bin unshit-ptyd
 ;   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" packaging\terminal-manager.iss
 ;
-; Output: dist\terminal-manager-0.2.5-setup.exe
+; Output: dist\terminal-manager-0.2.6-setup.exe
 
 #define MyAppName "Terminal Manager"
-#define MyAppVersion "0.2.5"
+#define MyAppVersion "0.2.6"
 #define MyAppPublisher "Alan Galvao"
 #define MyAppURL "https://github.com/alangmartini/unshit-agentic-terminal-manager"
 #define MyAppExeName "terminal-manager.exe"

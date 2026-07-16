@@ -1,11 +1,9 @@
-; packaging\terminal-manager-non-gpu.iss — one-off variant of
-; terminal-manager.iss that emits a distinctly named setup.exe for the
-; non-GPU/software-renderer test build (this branch), so it does not clobber
-; the official dist\terminal-manager-0.2.0-setup.exe. Only the
-; OutputBaseFilename differs; everything else is identical to the base script.
+; packaging\terminal-manager-non-gpu.iss — variant of terminal-manager.iss
+; that emits a distinctly named setup.exe for non-GPU/software-renderer tests.
+; Only the OutputBaseFilename differs from the standard installer.
 
 #define MyAppName "Terminal Manager"
-#define MyAppVersion "0.2.5"
+#define MyAppVersion "0.2.6"
 #define MyAppPublisher "Alan Galvao"
 #define MyAppURL "https://github.com/alangmartini/unshit-agentic-terminal-manager"
 #define MyAppExeName "terminal-manager.exe"

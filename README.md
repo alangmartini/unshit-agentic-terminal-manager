@@ -56,7 +56,8 @@ Clone and build:
 ```powershell
 git clone https://github.com/alangmartini/unshit-agentic-terminal-manager.git
 cd unshit-agentic-terminal-manager
-cargo build --release
+cargo build --release -p terminal-manager --bin terminal-manager
+cargo build --release -p unshit-ptyd --bin unshit-ptyd
 ```
 
 Both binaries land together in `target\release\`:
@@ -87,16 +88,17 @@ scripts likewise run in throwaway profiles. See
 The Windows installer is built with [Inno Setup 6](https://jrsoftware.org/isinfo.php). After a release build:
 
 ```powershell
-cargo build --release
+cargo build --release -p terminal-manager --bin terminal-manager
+cargo build --release -p unshit-ptyd --bin unshit-ptyd
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" packaging\terminal-manager.iss
 ```
 
-The result is `dist\terminal-manager-0.1.0-setup.exe`.
+The result is `dist\terminal-manager-0.2.6-setup.exe`.
 
 ## Usage
 
 - **Tabs:** `Ctrl+T` opens a new terminal; `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle tabs; `Ctrl+Shift+W` closes a tab.
-- **Splits:** `Ctrl+D` splits right, `Ctrl+Shift+D` splits down, `Ctrl+W` unsplits. Move focus between panes with `Ctrl+Arrow`.
+- **Splits:** `Ctrl+D` splits right, `Ctrl+Shift+D` splits down, `Ctrl+W` unsplits. Move focus between panes with `Ctrl+Alt+Arrow`; `Ctrl+Arrow` remains available to terminal applications for word navigation.
 - **Command palette:** `Ctrl+Shift+P`. Type to fuzzy-search, or prefix your query with `>`, `@`, `:`, or `/` to scope the search. `Enter` runs the highlighted item, `Esc` clears the query then closes.
 - **Quick Prompt:** `Ctrl+Shift+Q`. Type a prompt, optionally paste images, pick Claude or Codex, and submit to launch the agent in a fresh worktree.
 - **Other:** `Ctrl+B` toggles the sidebar, `Ctrl+,` opens Settings, `F2` renames the active session, `Ctrl+=` / `Ctrl+-` zoom the font, `F11` toggles fullscreen.
