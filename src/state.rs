@@ -620,6 +620,11 @@ pub enum ToggleKey {
     /// silent close actions: false = keep running (leave daemon
     /// sessions alive), true = kill all and quit.
     KillAllOnClose,
+    /// Worktree-tabs mode: when true, every new tab (`tab.new` and
+    /// `workspace.new_terminal:*`) opens on a fresh git worktree of
+    /// its workspace's repo. Non-repo workspaces fall back to a plain
+    /// tab so Ctrl+T never stops working.
+    WorktreeTabs,
 }
 
 impl ToggleKey {
@@ -627,6 +632,7 @@ impl ToggleKey {
         match self {
             ToggleKey::RememberCloseChoice => "remember-close-choice",
             ToggleKey::KillAllOnClose => "kill-all-on-close",
+            ToggleKey::WorktreeTabs => "worktree-tabs",
         }
     }
 }
@@ -1265,6 +1271,7 @@ pub fn seed_state() -> AppState {
     let mut toggles = BTreeMap::new();
     toggles.insert(ToggleKey::RememberCloseChoice, false);
     toggles.insert(ToggleKey::KillAllOnClose, false);
+    toggles.insert(ToggleKey::WorktreeTabs, false);
 
     AppState {
         workspaces,
@@ -1673,6 +1680,129 @@ pub fn mutate_add_quick_prompt_tab(
     state.active_pane = pane_id;
     state.row_ratios = vec![1.0];
     state.col_ratios = vec![vec![1.0]];
+}
+
+/// Tab/pane title for a worktree tab: the worktree directory name
+/// without the app namespace prefix (`godly-wt-1a2b3c4d` ->
+/// `wt-1a2b3c4d`), falling back to the full name for unexpected paths.
+fn worktree_tab_title(worktree_path: &std::path::Path) -> String {
+    let dir_name = worktree_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("worktree");
+    dir_name
+        .strip_prefix("godly-")
+        .unwrap_or(dir_name)
+        .to_string()
+}
+
+/// Spawn a new tab whose shell runs inside `worktree_path`. Mirrors
+/// `mutate_add_tab` but pins the cwd to the freshly created worktree
+/// and names the tab/session after it so the origin is visible.
+pub fn mutate_add_worktree_tab(state: &mut AppState, worktree_path: &std::path::Path) {
+    save_tab_state(state);
+
+    let id_num = state.next_id;
+    state.next_id += 1;
+    let pane_id = PaneId(id_num);
+
+    let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w();
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let (cols, rows) = compute_pty_dimensions(
+        state.last_grid_width,
+        state.last_grid_height,
+        cell_w,
+        cell_h,
+    );
+
+    let workspace_id = active_workspace_num(state);
+    let shell = pane_spawn_shell(state);
+    let title = worktree_tab_title(worktree_path);
+    let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+    match state.pty_manager.spawn_in_named(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        Some(worktree_path),
+        shell.as_ref(),
+        Some(&title),
+    ) {
+        Ok(reader) => {
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
+            crate::bridge::register_reader(id_num, reader);
+        }
+        Err(e) => {
+            log::error!(
+                "failed to spawn PTY for worktree tab pane {}: {}",
+                id_num,
+                e
+            );
+            terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
+        }
+    }
+
+    let pane = Pane {
+        id: pane_id,
+        title: title.clone(),
+        subtitle: "bash".to_string(),
+        pid: 0,
+        cpu: 0.0,
+    };
+
+    let tab = TerminalTab {
+        id: format!("t{}", id_num),
+        name: title,
+        subtitle: "bash".to_string(),
+        status: TabStatus::Running,
+        panes: vec![vec![pane.clone()]],
+        active_pane: pane_id,
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+
+    state.tabs.push(tab);
+    state.active_tab = state.tabs.len() - 1;
+
+    state.panes = vec![vec![pane]];
+    state.active_pane = pane_id;
+    state.row_ratios = vec![1.0];
+    state.col_ratios = vec![vec![1.0]];
+}
+
+/// Open a new tab, honoring worktree-tabs mode: when the toggle is on
+/// and the active workspace sits in a git repo, the tab opens on a
+/// fresh worktree; otherwise (non-repo workspace, no workspace path,
+/// or worktree creation failure) it falls back to a plain tab so the
+/// new-tab gesture always produces a terminal. Worktree failures are
+/// surfaced as a toast on top of the fallback tab.
+fn mutate_add_tab_respecting_mode(state: &mut AppState) {
+    if !toggle_on(state, ToggleKey::WorktreeTabs) {
+        mutate_add_tab(state);
+        return;
+    }
+
+    let repo_cwd = active_workspace_cwd(state)
+        .filter(|cwd| cwd.exists() && crate::quick_prompt::spawn::is_inside_work_tree(cwd));
+    let Some(repo_cwd) = repo_cwd else {
+        log::debug!("worktree_tabs_fallback reason=workspace_not_a_repo");
+        mutate_add_tab(state);
+        return;
+    };
+
+    match crate::quick_prompt::spawn::prepare_tab_worktree(&repo_cwd) {
+        Ok(target) => mutate_add_worktree_tab(state, &target.path),
+        Err(e) => {
+            log::error!("worktree_tab_failed mode=toggle error={e}");
+            push_error_toast(state, format!("Worktree failed ({e}); opened a normal tab"));
+            mutate_add_tab(state);
+        }
+    }
 }
 
 pub fn mutate_close_tab(state: &mut AppState, index: usize) {
@@ -3484,6 +3614,8 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "pane.split_right"
             | "pane.split_down"
             | "tab.new"
+            | "tab.new_worktree"
+            | "tabs.worktree_mode.toggle"
             | "pane.close"
             | "sidebar.toggle"
             | "modal.open"
@@ -3863,8 +3995,44 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             true
         }
         "tab.new" => {
-            mutate_add_tab(state);
+            mutate_add_tab_respecting_mode(state);
             crate::persist::save_workspaces(state);
+            true
+        }
+        "tab.new_worktree" => {
+            let repo_cwd = active_workspace_cwd(state)
+                .filter(|cwd| cwd.exists() && crate::quick_prompt::spawn::is_inside_work_tree(cwd));
+            let Some(repo_cwd) = repo_cwd else {
+                push_error_toast(
+                    state,
+                    "New worktree tab needs the workspace to be a git repository",
+                );
+                return true;
+            };
+            match crate::quick_prompt::spawn::prepare_tab_worktree(&repo_cwd) {
+                Ok(target) => {
+                    mutate_add_worktree_tab(state, &target.path);
+                    crate::persist::save_workspaces(state);
+                }
+                Err(e) => {
+                    log::error!("worktree_tab_failed mode=one_shot error={e}");
+                    push_error_toast(state, format!("Could not create worktree: {e}"));
+                }
+            }
+            true
+        }
+        "tabs.worktree_mode.toggle" => {
+            let now_on = !toggle_on(state, ToggleKey::WorktreeTabs);
+            state.toggles.insert(ToggleKey::WorktreeTabs, now_on);
+            crate::persist::save_workspaces(state);
+            push_error_toast(
+                state,
+                if now_on {
+                    "Worktree tabs on: new tabs open on a fresh git worktree"
+                } else {
+                    "Worktree tabs off: new tabs open in the workspace folder"
+                },
+            );
             true
         }
         "tab.close.active" => {
@@ -4132,7 +4300,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.ctx_menu = None;
                 if idx < state.workspaces.len() {
                     mutate_switch_workspace(state, idx);
-                    mutate_add_tab(state);
+                    mutate_add_tab_respecting_mode(state);
                     crate::persist::save_workspaces(state);
                     return true;
                 }
@@ -6863,6 +7031,55 @@ mod tests {
         let mut state = test_state();
         assert!(dispatch(&mut state, "tab.new"));
         assert_eq!(state.tabs.len(), 2);
+    }
+
+    #[test]
+    fn dispatch_tab_new_worktree_without_repo_toasts_and_adds_no_tab() {
+        let mut state = test_state();
+        // No workspaces at all -> no cwd -> no repo to branch from.
+        assert!(dispatch(&mut state, "tab.new_worktree"));
+        assert_eq!(state.tabs.len(), 1);
+        let messages: Vec<String> = state.toasts.iter().map(|t| t.message.clone()).collect();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("git repository"), "got: {messages:?}");
+    }
+
+    #[test]
+    fn dispatch_worktree_mode_toggle_flips_state_and_confirms_via_toast() {
+        let mut state = test_state();
+        assert!(!toggle_on(&state, ToggleKey::WorktreeTabs));
+
+        assert!(dispatch(&mut state, "tabs.worktree_mode.toggle"));
+        assert!(toggle_on(&state, ToggleKey::WorktreeTabs));
+        assert_eq!(state.toasts.len(), 1);
+
+        assert!(dispatch(&mut state, "tabs.worktree_mode.toggle"));
+        assert!(!toggle_on(&state, ToggleKey::WorktreeTabs));
+    }
+
+    #[test]
+    fn dispatch_tab_new_with_worktree_mode_falls_back_silently_without_repo() {
+        let mut state = test_state();
+        state.toggles.insert(ToggleKey::WorktreeTabs, true);
+
+        assert!(dispatch(&mut state, "tab.new"));
+        // Non-repo workspace: plain tab, and no error toast because the
+        // fallback is expected behavior, not a failure.
+        assert_eq!(state.tabs.len(), 2);
+        assert!(state.toasts.is_empty());
+    }
+
+    #[test]
+    fn mutate_add_worktree_tab_names_tab_after_worktree_dir() {
+        let mut state = test_state();
+        let path = std::path::Path::new("C:\\wt-base\\godly-wt-1a2b3c4d");
+
+        mutate_add_worktree_tab(&mut state, path);
+
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.active_tab, 1);
+        assert_eq!(state.tabs[1].name, "wt-1a2b3c4d");
+        assert_eq!(state.panes[0][0].title, "wt-1a2b3c4d");
     }
 
     #[test]

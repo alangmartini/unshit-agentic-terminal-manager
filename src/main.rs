@@ -721,6 +721,10 @@ fn main() {
             crate::state::ToggleKey::KillAllOnClose,
             persisted.kill_all_on_close,
         );
+        initial_state.toggles.insert(
+            crate::state::ToggleKey::WorktreeTabs,
+            persisted.worktree_tabs,
+        );
         // Override the seed_state inference with whatever the user
         // last persisted. An upgrader without the field gets an
         // empty spec here, which keeps the daemon's `default_shell()`

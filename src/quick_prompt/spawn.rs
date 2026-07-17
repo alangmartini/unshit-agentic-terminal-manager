@@ -10,6 +10,11 @@
 //! 2. `claude_shell_spec(prompt)` builds the `ShellSpec` the daemon
 //!    will exec when spawning the new tab. Codex parity lands in
 //!    Slice 6.
+//!
+//! Worktree tabs ("New worktree tab" / worktree-tabs mode) reuse the
+//! same base directory through `prepare_tab_worktree`, but require a
+//! git repo and create a named branch so work done in the tab is easy
+//! to merge back.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -51,10 +56,10 @@ pub fn worktree_base() -> Option<PathBuf> {
     crate::profile::data_dir().map(|d| d.join("worktrees"))
 }
 
-/// Generate a fresh `godly-qp-<8-hex>` directory name. The hex draws
+/// Generate a fresh `<prefix>-<8-hex>` directory name. The hex draws
 /// from the system clock + PID + a process-local counter so collisions
 /// between two submits in the same millisecond are still avoided.
-fn generate_target_name() -> String {
+fn generate_target_name(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -66,7 +71,7 @@ fn generate_target_name() -> String {
     let mixed = (nanos.wrapping_mul(0x9E3779B97F4A7C15))
         .wrapping_add(pid.wrapping_mul(0x100000001B3))
         .wrapping_add(n as u128);
-    format!("godly-qp-{:08x}", mixed as u32)
+    format!("{prefix}-{:08x}", mixed as u32)
 }
 
 /// Convenience wrapper over `prepare_target_in` that uses the
@@ -84,7 +89,7 @@ pub fn prepare_target(workspace_cwd: Option<&Path>) -> io::Result<TargetDir> {
 /// Prepare a worktree (or plain dir) under `base`. Tests pass a temp
 /// directory so they do not pollute the user's APPDATA.
 pub fn prepare_target_in(base: &Path, workspace_cwd: Option<&Path>) -> io::Result<TargetDir> {
-    let path = base.join(generate_target_name());
+    let path = base.join(generate_target_name("godly-qp"));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -121,9 +126,71 @@ pub fn prepare_target_in(base: &Path, workspace_cwd: Option<&Path>) -> io::Resul
     }
 }
 
+/// Worktree name prefix for worktree tabs ("New worktree tab" and
+/// worktree-tabs mode). Distinct from the Quick Prompt `godly-qp`
+/// prefix so the two are tellable apart on disk and in `git branch`.
+const TAB_WORKTREE_PREFIX: &str = "godly-wt";
+
+/// Create a fresh git worktree for a worktree tab using the production
+/// `%APPDATA%` base. Unlike `prepare_target`, there is no plain-dir
+/// fallback: the caller decides what a non-repo workspace should do.
+pub fn prepare_tab_worktree(repo_cwd: &Path) -> io::Result<TargetDir> {
+    let base = worktree_base().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not determine APPDATA worktree base",
+        )
+    })?;
+    prepare_tab_worktree_in(&base, repo_cwd)
+}
+
+/// Create a fresh git worktree under `base` for a worktree tab.
+///
+/// Runs `git worktree add -b <name> <path>` so the tab starts on a
+/// real branch (named after the directory) instead of a detached
+/// HEAD; work done in the tab stays reachable and mergeable. Errors
+/// if `repo_cwd` is not inside a git work tree.
+pub fn prepare_tab_worktree_in(base: &Path, repo_cwd: &Path) -> io::Result<TargetDir> {
+    if !repo_cwd.exists() || !is_inside_work_tree(repo_cwd) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace is not inside a git repository",
+        ));
+    }
+
+    let name = generate_target_name(TAB_WORKTREE_PREFIX);
+    let path = base.join(&name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 worktree path"))?;
+    let output = Command::new("git")
+        .args(["worktree", "add", "-b", &name, path_str])
+        .current_dir(repo_cwd)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    log::info!(
+        "worktree_tab_created path={} branch={} repo={}",
+        path.display(),
+        name,
+        repo_cwd.display()
+    );
+    Ok(TargetDir {
+        path,
+        kind: TargetKind::Worktree,
+    })
+}
+
 /// `git rev-parse --is-inside-work-tree` against `path`. Returns false
 /// for non-existent paths, non-repo dirs, and any error from git.
-fn is_inside_work_tree(path: &Path) -> bool {
+pub fn is_inside_work_tree(path: &Path) -> bool {
     let Ok(output) = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(path)
@@ -200,8 +267,8 @@ mod tests {
     // --- Pure helper tests ----------------------------------------------
 
     #[test]
-    fn generate_target_name_is_godly_qp_prefixed() {
-        let name = generate_target_name();
+    fn generate_target_name_is_prefixed_hex() {
+        let name = generate_target_name("godly-qp");
         assert!(name.starts_with("godly-qp-"), "got: {}", name);
         assert_eq!(name.len(), "godly-qp-".len() + 8);
         assert!(name[9..].chars().all(|c| c.is_ascii_hexdigit()));
@@ -211,8 +278,8 @@ mod tests {
     fn generate_target_name_collisions_are_unlikely() {
         // Sequential calls in the same nanosecond use the counter; we
         // expect two consecutive calls to differ.
-        let a = generate_target_name();
-        let b = generate_target_name();
+        let a = generate_target_name("godly-qp");
+        let b = generate_target_name("godly-qp");
         assert_ne!(a, b);
     }
 
@@ -300,6 +367,67 @@ mod tests {
         // Clean up: remove the worktree from git's bookkeeping before
         // dropping the temp dirs so we do not leave the source repo
         // referencing a missing worktree.
+        let _ = Command::new("git")
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                result.path.to_str().unwrap(),
+            ])
+            .current_dir(&workspace)
+            .status();
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // --- prepare_tab_worktree_in --------------------------------------
+
+    #[test]
+    fn prepare_tab_worktree_in_errors_when_workspace_is_not_a_repo() {
+        let base = unique_temp_dir("wt-tab-non-repo-base");
+        let workspace = unique_temp_dir("wt-tab-non-repo-ws");
+        let err = prepare_tab_worktree_in(&base, &workspace).expect_err("must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn prepare_tab_worktree_in_errors_when_workspace_path_missing() {
+        let base = unique_temp_dir("wt-tab-missing-base");
+        let workspace = unique_temp_dir("wt-tab-missing-ws");
+        std::fs::remove_dir_all(&workspace).ok();
+        let err = prepare_tab_worktree_in(&base, &workspace).expect_err("must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prepare_tab_worktree_in_creates_worktree_on_named_branch() {
+        let base = unique_temp_dir("wt-tab-base");
+        let workspace = unique_temp_dir("wt-tab-repo");
+        init_repo(&workspace);
+
+        let result = prepare_tab_worktree_in(&base, &workspace).expect("prepare");
+        assert_eq!(result.kind, TargetKind::Worktree);
+        assert!(result.path.exists(), "worktree path should exist");
+        let dir_name = result
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("worktree dir name");
+        assert!(dir_name.starts_with("godly-wt-"), "got: {dir_name}");
+
+        // The worktree must sit on a branch named after its directory,
+        // not a detached HEAD.
+        let output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&result.path)
+            .output()
+            .expect("git rev-parse");
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(branch, dir_name);
+
         let _ = Command::new("git")
             .args([
                 "worktree",

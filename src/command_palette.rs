@@ -145,6 +145,18 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         enabled: true,
     },
     PaletteAction {
+        id: "new_worktree",
+        label: "New worktree tab",
+        description: "Open a new tab on a fresh git worktree of this workspace.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::Workspace,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "tab.new_worktree",
+        keywords: &["new", "worktree", "git", "branch", "tab", "isolated"],
+        enabled: true,
+    },
+    PaletteAction {
         id: "close_pane",
         label: "Close pane",
         description: "Close the focused pane using the existing close behavior.",
@@ -253,18 +265,6 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         enabled: true,
     },
     PaletteAction {
-        id: "new_worktree",
-        label: "New worktree...",
-        description: "Worktree creation is not wired to a command yet.",
-        group: PaletteGroup::Session,
-        icon: PaletteIcon::Workspace,
-        keybind: None,
-        shortcut_label: None,
-        dispatch: "session",
-        keywords: &["new", "worktree", "git", "session"],
-        enabled: false,
-    },
-    PaletteAction {
         id: "open_settings",
         label: "Open settings",
         description: "Open app settings.",
@@ -286,6 +286,18 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         shortcut_label: None,
         dispatch: "modal.open",
         keywords: &["change", "theme", "appearance", "color", "app"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "toggle_worktree_tabs",
+        label: "Toggle worktree tabs",
+        description: "When on, every new tab opens on a fresh git worktree.",
+        group: PaletteGroup::App,
+        icon: PaletteIcon::Workspace,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "tabs.worktree_mode.toggle",
+        keywords: &["toggle", "worktree", "mode", "tabs", "git", "branch"],
         enabled: true,
     },
 ];
@@ -578,7 +590,11 @@ fn action_items(snap: &UiSnapshot) -> Vec<PaletteItem> {
                 .collect(),
             enabled: action.enabled,
             score: None,
-            status: None,
+            // Mode toggles surface their live state as a status pill so
+            // the row answers "is it on right now?" without executing.
+            status: (action.id == "toggle_worktree_tabs"
+                && crate::state::is_on(snap, crate::state::ToggleKey::WorktreeTabs))
+            .then(|| "on".to_string()),
         })
         .collect()
 }
@@ -1171,6 +1187,7 @@ mod tests {
                 "split_pane_right",
                 "split_pane_down",
                 "new_terminal",
+                "new_worktree",
                 "close_pane",
                 "arrange_grid_2x2",
                 "balance_panes",
@@ -1180,9 +1197,9 @@ mod tests {
                 "restart_session",
                 "clear_scrollback",
                 "spawn_agent",
-                "new_worktree",
                 "open_settings",
                 "change_theme",
+                "toggle_worktree_tabs",
             ]
         );
         assert!(SAFE_ACTIONS.iter().all(|action| {
@@ -1195,7 +1212,6 @@ mod tests {
                         | "kill_session"
                         | "restart_session"
                         | "clear_scrollback"
-                        | "new_worktree"
                 )
         }));
         assert!(SAFE_ACTIONS
@@ -1299,6 +1315,8 @@ mod tests {
                         | "pane.split_right"
                         | "pane.split_down"
                         | "tab.new"
+                        | "tab.new_worktree"
+                        | "tabs.worktree_mode.toggle"
                         | "pane.close"
                         | "sidebar.toggle"
                         | "modal.open"
@@ -1337,6 +1355,7 @@ mod tests {
                         "split_pane_right",
                         "split_pane_down",
                         "new_terminal",
+                        "new_worktree",
                         "close_pane",
                     ],
                 ),
@@ -1357,12 +1376,50 @@ mod tests {
                         "restart_session",
                         "clear_scrollback",
                         "spawn_agent",
-                        "new_worktree",
                     ],
                 ),
-                (PaletteGroup::App, vec!["open_settings", "change_theme"]),
+                (
+                    PaletteGroup::App,
+                    vec!["open_settings", "change_theme", "toggle_worktree_tabs"],
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn worktree_rows_are_enabled_and_toggle_reflects_mode_state() {
+        let mut state = seed_state();
+        let snap = state.ui_snapshot();
+
+        let results = build_palette_results(&snap, "> worktree");
+        let items = flatten(&results);
+        let one_shot = items
+            .iter()
+            .find(|item| item.id == "new_worktree")
+            .expect("new worktree row");
+        assert!(one_shot.enabled);
+        assert_eq!(one_shot.dispatch.as_deref(), Some("tab.new_worktree"));
+        let toggle = items
+            .iter()
+            .find(|item| item.id == "toggle_worktree_tabs")
+            .expect("toggle row");
+        assert!(toggle.enabled);
+        assert_eq!(
+            toggle.dispatch.as_deref(),
+            Some("tabs.worktree_mode.toggle")
+        );
+        assert_eq!(toggle.status, None);
+
+        state
+            .toggles
+            .insert(crate::state::ToggleKey::WorktreeTabs, true);
+        let snap = state.ui_snapshot();
+        let results = build_palette_results(&snap, "> worktree");
+        let toggle = flatten(&results)
+            .into_iter()
+            .find(|item| item.id == "toggle_worktree_tabs")
+            .expect("toggle row");
+        assert_eq!(toggle.status.as_deref(), Some("on"));
     }
 
     #[test]

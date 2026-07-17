@@ -75,6 +75,11 @@ pub struct PersistedState {
     pub remember_close_choice: bool,
     #[serde(default)]
     pub kill_all_on_close: bool,
+    /// Worktree-tabs mode: when true, new tabs open on a fresh git
+    /// worktree of their workspace's repo. Defaults to false so
+    /// upgraders keep plain new-tab behavior.
+    #[serde(default)]
+    pub worktree_tabs: bool,
     /// App wide default shell. Empty for upgraders predating the
     /// feature so the daemon's own `default_shell()` keeps the floor;
     /// inference only runs in `seed_state` for true first runs.
@@ -171,6 +176,11 @@ impl PersistedState {
             kill_all_on_close: state
                 .toggles
                 .get(&crate::state::ToggleKey::KillAllOnClose)
+                .copied()
+                .unwrap_or(false),
+            worktree_tabs: state
+                .toggles
+                .get(&crate::state::ToggleKey::WorktreeTabs)
                 .copied()
                 .unwrap_or(false),
             default_shell: state.default_shell.clone(),
@@ -290,6 +300,7 @@ mod tests {
             active_workspace: 0,
             remember_close_choice: false,
             kill_all_on_close: false,
+            worktree_tabs: false,
             default_shell: ShellSpec::default(),
         };
         persisted.write_to(&path).unwrap();
@@ -354,6 +365,28 @@ mod tests {
         assert_eq!(split_tab.panes.len(), 1);
         assert_eq!(split_tab.panes[0].len(), 2);
         assert_eq!(split_tab.col_ratios[0].len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn round_trip_preserves_worktree_tabs_toggle() {
+        let mut state = seed_state();
+        state
+            .toggles
+            .insert(crate::state::ToggleKey::WorktreeTabs, true);
+        let persisted = PersistedState::from_state(&state);
+        let path = unique_temp_path("worktree-tabs-round-trip");
+        persisted.write_to(&path).unwrap();
+        let loaded = PersistedState::read_from(&path).unwrap();
+        assert!(loaded.worktree_tabs);
+
+        // A config predating the field must default to off.
+        let json = r#"{
+            "workspaces": [{"name":"alpha","path":null,"collapsed":false}],
+            "active_workspace": 0
+        }"#;
+        let legacy: PersistedState = serde_json::from_str(json).unwrap();
+        assert!(!legacy.worktree_tabs);
         let _ = std::fs::remove_file(&path);
     }
 
