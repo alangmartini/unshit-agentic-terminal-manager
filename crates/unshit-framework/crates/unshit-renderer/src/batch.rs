@@ -2141,6 +2141,81 @@ fn walk_for_batch(
                     );
                     let text_y = render_y + style.padding.top + y_offset;
 
+                    // Selection highlight for the focused input, emitted
+                    // before the glyphs so it renders behind them. Byte
+                    // offsets into `value` are mapped through the same
+                    // masking/transform the glyph pass applies.
+                    if node_id == focused && !is_placeholder {
+                        if let Some((sel_start, sel_end)) =
+                            unshit_core::input::selection_range(&element.input_state)
+                        {
+                            let display_prefix = |end: usize| -> std::borrow::Cow<'_, str> {
+                                if input.input_type == InputType::Password {
+                                    let chars = input.value[..end].chars().count();
+                                    std::borrow::Cow::Owned("\u{2022}".repeat(chars))
+                                } else {
+                                    apply_text_transform(
+                                        &input.value[..end],
+                                        style.text_transform,
+                                    )
+                                }
+                            };
+                            let start_prefix = display_prefix(sel_start).into_owned();
+                            let end_prefix = display_prefix(sel_end).into_owned();
+                            let mut prefix_width = |prefix: &str| -> f32 {
+                                if prefix.is_empty() {
+                                    return 0.0;
+                                }
+                                measure_text_with_style_cached(
+                                    prefix,
+                                    &style.font_family,
+                                    style.font_weight,
+                                    style.font_style,
+                                    style.font_size,
+                                    style.line_height,
+                                    style.letter_spacing,
+                                    Some(content_w),
+                                    font_system,
+                                    Some(measure_cache),
+                                )
+                                .0
+                            };
+                            let sel_x0 = prefix_width(&start_prefix);
+                            let sel_x1 = prefix_width(&end_prefix);
+                            if sel_x1 > sel_x0 {
+                                // Same tint the text-node selection pass uses.
+                                let sel_color = [0.2, 0.4, 0.8, 0.4];
+                                batch.layer_mut(effective_layer).quad_instances.push(
+                                    QuadInstance {
+                                        pos: [text_x + sel_x0, text_y],
+                                        size: [
+                                            sel_x1 - sel_x0,
+                                            style.font_size * style.line_height,
+                                        ],
+                                        color: sel_color,
+                                        border_color: [0.0; 4],
+                                        border_width: [0.0; 4],
+                                        border_radius: [0.0; 4],
+                                        clip_rect,
+                                        shadow_color: [0.0; 4],
+                                        shadow_offset: [0.0; 2],
+                                        shadow_params: [0.0; 2],
+                                        shadow_spread: [0.0; 2],
+                                        gradient_stop_colors: EMPTY_GRADIENT_STOP_COLORS,
+                                        gradient_stop_positions: EMPTY_GRADIENT_STOP_POSITIONS,
+                                        gradient_params: [0.0; 4],
+                                        gradient_extra: EMPTY_GRADIENT_EXTRA,
+                                        mask_stops_01: EMPTY_MASK_STOPS,
+                                        mask_stops_23: EMPTY_MASK_STOPS,
+                                        mask_params: EMPTY_MASK_PARAMS,
+                                        xform: IDENTITY_XFORM,
+                                        xform_translate: IDENTITY_XFORM_TRANSLATE,
+                                    },
+                                );
+                            }
+                        }
+                    }
+
                     emit_text_glyphs_cached(
                         display_text,
                         text_x,

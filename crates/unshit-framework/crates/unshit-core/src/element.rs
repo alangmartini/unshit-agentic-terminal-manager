@@ -156,6 +156,12 @@ impl InputType {
 pub struct InputState {
     pub value: String,
     pub cursor_pos: usize, // byte offset into value
+    /// Selection anchor as a byte offset into `value`. The selection spans
+    /// anchor..cursor (unordered); `None` means no active selection. Lives
+    /// here rather than in interaction state so editing ops and the
+    /// renderer share one source of truth and it survives reconciliation
+    /// like `value` and `cursor_pos` do.
+    pub selection_anchor: Option<usize>,
     pub input_type: InputType,
     /// For checkbox/radio: whether the control is checked.
     pub checked: bool,
@@ -178,6 +184,7 @@ impl Default for InputState {
         Self {
             value: String::new(),
             cursor_pos: 0,
+            selection_anchor: None,
             input_type: InputType::Text,
             checked: false,
             numeric_value: 0.0,

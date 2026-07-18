@@ -2847,6 +2847,7 @@ impl ApplicationHandler for AppHandler {
                                     let old_focused = state.interaction.focused;
                                     state.interaction.focused = new_focused;
                                     state.interaction.focus_via_keyboard = false;
+                                    clear_input_selection_on_blur(state, old_focused);
                                     update_focus_context(state);
                                     state.mark_restyle_pseudo_change(old_focused, new_focused);
                                     state.window.request_redraw();
@@ -2963,10 +2964,37 @@ impl ApplicationHandler for AppHandler {
                                                 )
                                                 .unwrap_or(element.input_state.value.len());
 
+                                                let shift_held =
+                                                    state.modifiers_state.shift_key();
                                                 if let Some(elem) = state.arena.get_mut(new_focused)
                                                 {
-                                                    elem.input_state.cursor_pos = byte_offset;
+                                                    if is_double_click {
+                                                        // Double-click selects the word under
+                                                        // the cursor.
+                                                        let (start, end) = word_boundary_at(
+                                                            &elem.input_state.value,
+                                                            byte_offset
+                                                                .min(elem.input_state.value.len()),
+                                                        );
+                                                        elem.input_state.selection_anchor =
+                                                            if start < end { Some(start) } else { None };
+                                                        elem.input_state.cursor_pos = end;
+                                                        state.interaction.last_click_time = None;
+                                                    } else if shift_held {
+                                                        // Shift+click extends from the current
+                                                        // cursor (or existing anchor).
+                                                        if elem.input_state.selection_anchor.is_none()
+                                                        {
+                                                            elem.input_state.selection_anchor =
+                                                                Some(elem.input_state.cursor_pos);
+                                                        }
+                                                        elem.input_state.cursor_pos = byte_offset;
+                                                    } else {
+                                                        elem.input_state.cursor_pos = byte_offset;
+                                                        elem.input_state.selection_anchor = None;
+                                                    }
                                                 }
+                                                state.batch_cache.clear();
                                             }
                                             // Checkbox, Radio, Hidden: no cursor positioning.
                                             _ => {}
@@ -3214,6 +3242,7 @@ impl ApplicationHandler for AppHandler {
                                     let old_focused = state.interaction.focused;
                                     state.interaction.focused = fallback_id;
                                     state.interaction.focus_via_keyboard = false;
+                                    clear_input_selection_on_blur(state, old_focused);
                                     state.mark_restyle_pseudo_change(old_focused, fallback_id);
                                 }
                                 focused_captures = true;
@@ -3329,7 +3358,7 @@ impl ApplicationHandler for AppHandler {
                             .map(|e| e.tag == Tag::Select)
                             .unwrap_or(false);
 
-                        // Handle clipboard shortcuts (Ctrl+C/V/X) when a text input is focused
+                        // Handle clipboard shortcuts (Ctrl+A/C/V/X) when a text input is focused
                         let handled_by_clipboard =
                             if focused_is_input && state.modifiers_state.control_key() {
                                 handle_clipboard_shortcut(state, &event, &self.app.clipboard)
@@ -3832,6 +3861,7 @@ impl ApplicationHandler for AppHandler {
                             let old_focused = state.interaction.focused;
                             state.interaction.focused = focus_id;
                             state.interaction.focus_via_keyboard = false;
+                            clear_input_selection_on_blur(state, old_focused);
                             update_focus_context(state);
                             state.mark_restyle_pseudo_change(old_focused, focus_id);
                         }
@@ -4706,6 +4736,18 @@ fn handle_input_click(state: &mut AppState, target: NodeId) -> bool {
     }
 }
 
+/// Drop any text selection left on `node` when it loses keyboard focus so
+/// a later refocus does not resurrect a stale selection that typing would
+/// then silently replace.
+fn clear_input_selection_on_blur(state: &mut AppState, node: NodeId) {
+    if let Some(element) = state.arena.get_mut(node) {
+        if element.tag == Tag::Input && element.input_state.selection_anchor.is_some() {
+            element.input_state.selection_anchor = None;
+            state.batch_cache.clear();
+        }
+    }
+}
+
 fn handle_text_input(state: &mut AppState, event: &winit::event::KeyEvent) -> bool {
     use unshit_core::element::InputType;
     use winit::keyboard::Key as WinitKey;
@@ -4857,21 +4899,27 @@ fn handle_text_input(state: &mut AppState, event: &winit::event::KeyEvent) -> bo
         };
 
         if let Some(k) = key {
-            let (changed, new_value, on_change) = {
+            let shift = state.modifiers_state.shift_key();
+            let ctrl = state.modifiers_state.control_key();
+            let (changed, sel_changed, new_value, on_change) = {
                 let element = state.arena.get_mut(focused).unwrap();
                 let old = element.input_state.value.clone();
-                unshit_core::input::apply_key(&mut element.input_state, &k);
+                let old_anchor = element.input_state.selection_anchor;
+                unshit_core::input::apply_key_with_mods(&mut element.input_state, &k, shift, ctrl);
                 element.cursor_state.reset_blink(Instant::now());
                 let diff = element.input_state.value != old;
+                let sel_diff = element.input_state.selection_anchor != old_anchor;
                 let nv = element.input_state.value.clone();
                 let cb = element.on_change.clone();
-                (diff, nv, cb)
+                (diff, sel_diff, nv, cb)
             };
 
             if changed {
                 if let Some(f) = on_change {
                     f(&new_value);
                 }
+            }
+            if changed || sel_changed {
                 state.shaped_cache.clear();
                 state.batch_cache.clear();
             }
@@ -4919,7 +4967,11 @@ fn check_radio(state: &mut AppState, target: NodeId, name: Option<&str>) {
     state.window.request_redraw();
 }
 
-/// Handle Ctrl+C, Ctrl+V, Ctrl+X clipboard shortcuts when a text input is focused.
+/// Handle Ctrl+A, Ctrl+C, Ctrl+V, Ctrl+X shortcuts when a text input is
+/// focused. Selection state lives on the input itself
+/// (`input_state.selection_anchor`), not in `interaction.text_selection`:
+/// the interaction selection is anchored on text NODES by the mouse path
+/// and can never reference an Input, whose value is not a text node.
 /// Returns `true` if the event was consumed.
 fn handle_clipboard_shortcut(
     state: &mut AppState,
@@ -4943,79 +4995,68 @@ fn handle_clipboard_shortcut(
     };
 
     match char_key {
+        Some('a') => {
+            // Select all: whole value, cursor at the end.
+            let changed = {
+                let element = state.arena.get_mut(focused).unwrap();
+                let changed = unshit_core::input::select_all(&mut element.input_state);
+                element.cursor_state.reset_blink(Instant::now());
+                changed
+            };
+            if changed {
+                state.batch_cache.clear();
+                state.window.request_redraw();
+            }
+            true
+        }
         Some('c') => {
-            // Copy: get selected text from focused input and write to clipboard
-            if let Some(ref sel) = state.interaction.text_selection {
-                if let Some((start, end)) = sel.single_element_range() {
-                    if let Some(element) = state.arena.get(focused) {
-                        let text = &element.input_state.value;
-                        if start < text.len() && end <= text.len() && start < end {
-                            let selected = &text[start..end];
-                            if let Err(e) = clipboard.write_text(selected) {
-                                log::warn!("Clipboard copy failed: {}", e);
-                            }
-                        }
+            // Copy: write the input's selected text to the clipboard.
+            if let Some(element) = state.arena.get(focused) {
+                if let Some((start, end)) =
+                    unshit_core::input::selection_range(&element.input_state)
+                {
+                    let selected = &element.input_state.value[start..end];
+                    if let Err(e) = clipboard.write_text(selected) {
+                        log::warn!("Clipboard copy failed: {}", e);
                     }
                 }
             }
             true
         }
         Some('x') => {
-            // Cut: copy selected text to clipboard, then delete the selection
-            if let Some(ref sel) = state.interaction.text_selection.clone() {
-                if let Some((start, end)) = sel.single_element_range() {
-                    let (cut_text, new_value, on_change) = {
-                        let element = state.arena.get_mut(focused).unwrap();
-                        let text = &element.input_state.value;
-                        if start < text.len() && end <= text.len() && start < end {
-                            let selected = text[start..end].to_string();
-                            element.input_state.value =
-                                format!("{}{}", &text[..start], &text[end..]);
-                            element.input_state.cursor_pos = start;
-                            let nv = element.input_state.value.clone();
-                            let cb = element.on_change.clone();
-                            (Some(selected), nv, cb)
-                        } else {
-                            (None, String::new(), None)
-                        }
-                    };
-
-                    if let Some(selected) = cut_text {
-                        if let Err(e) = clipboard.write_text(&selected) {
-                            log::warn!("Clipboard cut failed: {}", e);
-                        }
-                        state.interaction.text_selection = None;
-                        if let Some(f) = on_change {
-                            f(&new_value);
-                        }
-                        state.shaped_cache.clear();
-                        state.batch_cache.clear();
-                        state.needs_relayout = true;
-                        state.window.request_redraw();
+            // Cut: copy selected text to clipboard, then delete the selection.
+            let (cut_text, new_value, on_change) = {
+                let element = state.arena.get_mut(focused).unwrap();
+                match unshit_core::input::selection_range(&element.input_state) {
+                    Some((start, end)) => {
+                        let selected = element.input_state.value[start..end].to_string();
+                        unshit_core::input::delete_selection(&mut element.input_state);
+                        element.cursor_state.reset_blink(Instant::now());
+                        (Some(selected), element.input_state.value.clone(), element.on_change.clone())
                     }
+                    None => (None, String::new(), None),
                 }
+            };
+
+            if let Some(selected) = cut_text {
+                if let Err(e) = clipboard.write_text(&selected) {
+                    log::warn!("Clipboard cut failed: {}", e);
+                }
+                if let Some(f) = on_change {
+                    f(&new_value);
+                }
+                state.shaped_cache.clear();
+                state.batch_cache.clear();
+                state.needs_relayout = true;
+                state.window.request_redraw();
             }
             true
         }
         Some('v') => {
-            // Paste: read text from clipboard and insert at cursor
+            // Paste: read text from clipboard and insert at cursor,
+            // replacing any active selection (insert_text handles that).
             match clipboard.read_text() {
                 Ok(text) if !text.is_empty() => {
-                    // If there is a selection, delete it first
-                    if let Some(ref sel) = state.interaction.text_selection.clone() {
-                        if let Some((start, end)) = sel.single_element_range() {
-                            if let Some(element) = state.arena.get_mut(focused) {
-                                let val = &element.input_state.value;
-                                if start < val.len() && end <= val.len() && start < end {
-                                    element.input_state.value =
-                                        format!("{}{}", &val[..start], &val[end..]);
-                                    element.input_state.cursor_pos = start;
-                                }
-                            }
-                            state.interaction.text_selection = None;
-                        }
-                    }
-
                     let (new_value, on_change) = {
                         let element = state.arena.get_mut(focused).unwrap();
                         unshit_core::input::insert_text(&mut element.input_state, &text);
@@ -5057,6 +5098,7 @@ fn dispatch_command(
                     let old_focused = state.interaction.focused;
                     state.interaction.focused = id;
                     state.interaction.focus_via_keyboard = true;
+                    clear_input_selection_on_blur(state, old_focused);
                     update_focus_context(state);
                     state.mark_restyle_pseudo_change(old_focused, id);
                     state.window.request_redraw();
@@ -5070,6 +5112,7 @@ fn dispatch_command(
                     let old_focused = state.interaction.focused;
                     state.interaction.focused = id;
                     state.interaction.focus_via_keyboard = true;
+                    clear_input_selection_on_blur(state, old_focused);
                     update_focus_context(state);
                     state.mark_restyle_pseudo_change(old_focused, id);
                     state.window.request_redraw();

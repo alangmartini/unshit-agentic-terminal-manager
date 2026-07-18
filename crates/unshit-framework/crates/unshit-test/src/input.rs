@@ -386,7 +386,9 @@ impl TestHarness {
     /// Directly set focus to a specific node. Marks restyle if focus changed.
     pub fn focus(&mut self, node_id: NodeId) {
         if node_id != self.interaction.focused {
+            let old_focused = self.interaction.focused;
             self.interaction.focused = node_id;
+            self.clear_input_selection_on_blur(old_focused);
             self.needs_restyle = true;
         }
     }
@@ -395,8 +397,10 @@ impl TestHarness {
     pub fn tab(&mut self) {
         if let Some(id) = next_focusable(&self.arena, self.root, self.interaction.focused) {
             if id != self.interaction.focused {
+                let old_focused = self.interaction.focused;
                 self.interaction.focused = id;
                 self.interaction.focus_via_keyboard = true;
+                self.clear_input_selection_on_blur(old_focused);
                 self.needs_restyle = true;
             }
         }
@@ -406,9 +410,21 @@ impl TestHarness {
     pub fn shift_tab(&mut self) {
         if let Some(id) = prev_focusable(&self.arena, self.root, self.interaction.focused) {
             if id != self.interaction.focused {
+                let old_focused = self.interaction.focused;
                 self.interaction.focused = id;
                 self.interaction.focus_via_keyboard = true;
+                self.clear_input_selection_on_blur(old_focused);
                 self.needs_restyle = true;
+            }
+        }
+    }
+
+    /// Mirror the production app: an input losing focus drops any active
+    /// text selection so a later refocus starts clean.
+    fn clear_input_selection_on_blur(&mut self, node: NodeId) {
+        if let Some(element) = self.arena.get_mut(node) {
+            if element.tag == Tag::Input {
+                element.input_state.selection_anchor = None;
             }
         }
     }
@@ -464,6 +480,13 @@ impl TestHarness {
 
     /// Press a special key on the focused input element.
     pub fn press_key(&mut self, key: unshit_core::event::Key) {
+        self.press_key_with_mods(key, false, false);
+    }
+
+    /// Press a key with modifier context, mirroring the production app's
+    /// `handle_text_input`: `shift` extends the selection on movement keys,
+    /// `ctrl` switches movement/deletion to word granularity.
+    pub fn press_key_with_mods(&mut self, key: unshit_core::event::Key, shift: bool, ctrl: bool) {
         let focused = self.interaction.focused;
         let Some(element) = self.arena.get_mut(focused) else {
             return;
@@ -488,7 +511,7 @@ impl TestHarness {
         }
 
         let old_value = element.input_state.value.clone();
-        unshit_core::input::apply_key(&mut element.input_state, &key);
+        unshit_core::input::apply_key_with_mods(&mut element.input_state, &key, shift, ctrl);
         element.cursor_state.reset_blink(Instant::now());
         let changed = element.input_state.value != old_value;
         let new_value = element.input_state.value.clone();
@@ -499,6 +522,20 @@ impl TestHarness {
                 f(&new_value);
             }
         }
+        self.needs_relayout = true;
+    }
+
+    /// Select the entire value of the focused input (Ctrl+A).
+    pub fn select_all(&mut self) {
+        let focused = self.interaction.focused;
+        let Some(element) = self.arena.get_mut(focused) else {
+            return;
+        };
+        if element.tag != Tag::Input {
+            return;
+        }
+        unshit_core::input::select_all(&mut element.input_state);
+        element.cursor_state.reset_blink(Instant::now());
         self.needs_relayout = true;
     }
 
@@ -575,5 +612,16 @@ impl TestHarness {
             return None;
         }
         Some(element.input_state.cursor_pos)
+    }
+
+    /// Ordered byte range of the focused input's active selection, or
+    /// `None` when the focused element is not an input or nothing is
+    /// selected.
+    pub fn input_selection(&self) -> Option<(usize, usize)> {
+        let element = self.arena.get(self.interaction.focused)?;
+        if element.tag != Tag::Input {
+            return None;
+        }
+        unshit_core::input::selection_range(&element.input_state)
     }
 }

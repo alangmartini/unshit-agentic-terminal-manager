@@ -1,0 +1,3 @@
+### Fixed
+
+- **Text inputs now support the full selection hotkey suite.** In the rename-session dialog (and every other text field), `Ctrl+A` selects the whole value with a visible highlight, typing or `Backspace`/`Delete` replaces the selection, `Ctrl+C`/`Ctrl+X`/`Ctrl+V` copy/cut/paste it, `Shift+Arrow`/`Shift+Home`/`Shift+End` extend it, `Ctrl+Arrow` jumps by word (`+Shift` selects by word), `Ctrl+Backspace`/`Ctrl+Delete` delete by word, and double-click selects the word under the cursor. Previously the framework's inputs had no selection model at all, so `Ctrl+A` and friends silently did nothing.

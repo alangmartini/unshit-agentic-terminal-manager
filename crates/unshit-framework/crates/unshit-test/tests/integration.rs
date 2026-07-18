@@ -691,8 +691,10 @@ fn input_type_and_key_press() {
     h.press_key(unshit_core::event::Key::Enter);
     assert_eq!(*submitted.lock().unwrap(), "hello world");
 
-    // Clear with press_on
+    // Ctrl+A selects everything; Backspace then deletes the selection.
     h.press_on(".field.search", "Ctrl+A");
+    h.expect_value(".field.search", "hello world");
+    h.press_on(".field.search", "Backspace");
     h.expect_value(".field.search", "");
 }
 

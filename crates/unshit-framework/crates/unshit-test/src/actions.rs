@@ -103,6 +103,7 @@ impl TestHarness {
                 let old_value = element.input_state.value.clone();
                 element.input_state.value.clear();
                 element.input_state.cursor_pos = 0;
+                element.input_state.selection_anchor = None;
                 element.cursor_state.reset_blink(Instant::now());
                 let on_change = element.on_change.clone();
                 if !old_value.is_empty() {
@@ -118,8 +119,9 @@ impl TestHarness {
     /// Press a key (or key combo) on the element matching `selector`.
     ///
     /// Supports single keys (`"Enter"`, `"Backspace"`, `"a"`) and combos
-    /// with modifiers like `"Ctrl+A"`. Currently, the Ctrl modifier is
-    /// handled specially for `Ctrl+A` (select all / clear).
+    /// with modifiers like `"Ctrl+A"` (select all), `"Shift+ArrowLeft"`
+    /// (extend selection), or `"Ctrl+Backspace"` (delete word), matching
+    /// the production app's text-input hotkeys.
     ///
     /// The element is focused (clicked) before the key is pressed.
     pub fn press_on(&mut self, selector: &str, key_str: &str) {
@@ -131,21 +133,22 @@ impl TestHarness {
         self.step();
     }
 
-    /// Parse a key string like "Enter", "Backspace", "Ctrl+A" and dispatch it.
-    pub(crate) fn press_key_str(&mut self, key_str: &str) {
+    /// Parse a key string like "Enter", "Backspace", "Ctrl+A" and dispatch
+    /// it to the focused input.
+    pub fn press_key_str(&mut self, key_str: &str) {
         let parts: Vec<&str> = key_str.split('+').collect();
         let has_ctrl = parts.iter().any(|p| p.eq_ignore_ascii_case("ctrl"));
+        let has_shift = parts.iter().any(|p| p.eq_ignore_ascii_case("shift"));
 
         let key_part = parts.last().unwrap_or(&"");
 
         if has_ctrl && key_part.eq_ignore_ascii_case("a") {
-            let focused = self.interaction.focused;
-            self.clear_input(focused);
+            self.select_all();
             return;
         }
 
         let key = parse_key(key_part);
-        self.press_key(key);
+        self.press_key_with_mods(key, has_shift, has_ctrl);
     }
 
     /// Select an option by value on the first `<select>` matching `selector`.

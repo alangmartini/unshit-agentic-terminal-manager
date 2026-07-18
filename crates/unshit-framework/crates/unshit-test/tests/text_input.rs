@@ -241,3 +241,97 @@ fn insert_in_middle() {
     assert_eq!(h.input_value(), Some("hello".to_string()));
     assert_eq!(h.input_cursor_pos(), Some(2));
 }
+
+// ===========================================================================
+// Selection hotkey suite (Ctrl+A, Shift+arrows, word ops)
+// ===========================================================================
+
+#[test]
+fn ctrl_a_selects_all() {
+    let mut h = focused_harness();
+    h.type_text("hello world");
+    h.press_key_str("Ctrl+A");
+    h.step();
+    assert_eq!(h.input_selection(), Some((0, 11)));
+    assert_eq!(h.input_cursor_pos(), Some(11));
+}
+
+#[test]
+fn typing_over_select_all_replaces_value() {
+    let mut h = focused_harness();
+    h.type_text("hello world");
+    h.press_key_str("Ctrl+A");
+    h.type_text("bye");
+    h.step();
+    assert_eq!(h.input_value(), Some("bye".to_string()));
+    assert_eq!(h.input_selection(), None);
+}
+
+#[test]
+fn backspace_over_select_all_clears_value() {
+    let mut h = focused_harness();
+    h.type_text("hello");
+    h.press_key_str("Ctrl+A");
+    h.press_key(Key::Backspace);
+    h.step();
+    assert_eq!(h.input_value(), Some(String::new()));
+    assert_eq!(h.input_cursor_pos(), Some(0));
+}
+
+#[test]
+fn shift_arrows_extend_selection() {
+    let mut h = focused_harness();
+    h.type_text("abc");
+    h.press_key_str("Shift+ArrowLeft");
+    h.press_key_str("Shift+ArrowLeft");
+    assert_eq!(h.input_selection(), Some((1, 3)));
+    // Plain arrow collapses the selection.
+    h.press_key(Key::ArrowRight);
+    assert_eq!(h.input_selection(), None);
+    assert_eq!(h.input_cursor_pos(), Some(3));
+}
+
+#[test]
+fn ctrl_backspace_deletes_word() {
+    let mut h = focused_harness();
+    h.type_text("hello world");
+    h.press_key_str("Ctrl+Backspace");
+    h.step();
+    assert_eq!(h.input_value(), Some("hello ".to_string()));
+}
+
+#[test]
+fn ctrl_arrows_jump_words() {
+    let mut h = focused_harness();
+    h.type_text("foo bar");
+    h.press_key_str("Ctrl+ArrowLeft");
+    assert_eq!(h.input_cursor_pos(), Some(4));
+    h.press_key_str("Ctrl+ArrowLeft");
+    assert_eq!(h.input_cursor_pos(), Some(0));
+    h.press_key_str("Ctrl+ArrowRight");
+    assert_eq!(h.input_cursor_pos(), Some(4));
+}
+
+#[test]
+fn shift_home_selects_to_start() {
+    let mut h = focused_harness();
+    h.type_text("abcde");
+    h.press_key_str("Shift+Home");
+    assert_eq!(h.input_selection(), Some((0, 5)));
+    assert_eq!(h.input_cursor_pos(), Some(0));
+}
+
+#[test]
+fn tab_focus_change_clears_selection() {
+    let mut h = focused_harness();
+    h.type_text("abc");
+    h.press_key_str("Ctrl+A");
+    assert_eq!(h.input_selection(), Some((0, 3)));
+    h.tab();
+    h.step();
+    // Focus moved to the button; refocusing the input must not resurrect
+    // the old selection through the focused-element accessor.
+    let input = h.query(".my-input").unwrap();
+    let anchor = h.arena().get(input.node_id).unwrap().input_state.selection_anchor;
+    assert_eq!(anchor, None);
+}
