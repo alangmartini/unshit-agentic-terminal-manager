@@ -22,6 +22,7 @@ pub mod pty;
 pub mod quick_prompt;
 pub mod renderer_telemetry;
 pub mod shell;
+pub mod startup;
 pub mod state;
 pub mod terminal;
 pub mod theme;
@@ -721,6 +722,8 @@ fn main() {
         // floor exactly as before.
         initial_state.default_shell = persisted.default_shell;
     }
+    #[cfg(windows)]
+    crate::state::refresh_start_at_login(&mut initial_state);
     // Bench mode needs a deterministic shell so the scroll workload
     // measures comparable output across runs. On Windows the bench
     // exercises `dir`, which only behaves on cmd.exe; route it through

@@ -645,6 +645,14 @@ pub enum ToggleKey {
     /// Defaults off; enabling it is also the consent boundary for the
     /// managed user-level session hooks.
     AutoResumeAgents,
+    /// Mirrors this profile's per-user Windows login startup entry. The
+    /// registry is the durable source of truth; workspace persistence must
+    /// never serialize this runtime-only value.
+    StartAtLogin,
+    /// The owned Windows Run value exists but targets a different executable
+    /// command. Surfaced separately so Settings can offer explicit repair or
+    /// removal without claiming this copy will start at sign-in.
+    StartAtLoginStale,
 }
 
 impl ToggleKey {
@@ -654,6 +662,8 @@ impl ToggleKey {
             ToggleKey::KillAllOnClose => "kill-all-on-close",
             ToggleKey::WorktreeTabs => "worktree-tabs",
             ToggleKey::AutoResumeAgents => "auto-resume-agents",
+            ToggleKey::StartAtLogin => "start-at-login",
+            ToggleKey::StartAtLoginStale => "start-at-login-stale",
         }
     }
 }
@@ -1331,6 +1341,8 @@ pub fn seed_state() -> AppState {
     toggles.insert(ToggleKey::KillAllOnClose, false);
     toggles.insert(ToggleKey::WorktreeTabs, false);
     toggles.insert(ToggleKey::AutoResumeAgents, false);
+    toggles.insert(ToggleKey::StartAtLogin, false);
+    toggles.insert(ToggleKey::StartAtLoginStale, false);
 
     AppState {
         workspaces,
@@ -5338,6 +5350,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "agent.auto_resume.toggle" => dispatch_agent_auto_resume_toggle(state),
         "agent.recovery_hooks.remove" => dispatch_agent_recovery_hooks_remove(state),
+        "settings.start_at_login.toggle" => dispatch_start_at_login_toggle(state),
+        "settings.start_at_login.remove" => dispatch_start_at_login_remove(state),
         other if other.starts_with("agent.resume:") => dispatch_agent_resume(state, other),
         other if other.starts_with("shell.set_default:") => {
             dispatch_shell_set_default(state, other)
@@ -6253,6 +6267,171 @@ fn dispatch_agent_auto_resume_toggle(state: &mut AppState) -> bool {
         },
     );
     true
+}
+
+/// Hydrate the runtime mirror from Windows before the first UI snapshot. The
+/// registry remains authoritative; a failed read keeps the existing safe
+/// default and is recorded without exposing paths or localized OS messages.
+pub fn refresh_start_at_login(state: &mut AppState) {
+    if !crate::startup::is_supported() {
+        return;
+    }
+    let status = crate::startup::status();
+    let (level, outcome, error_kind, error_code) = match status {
+        Ok(crate::startup::RegistrationStatus::Disabled) => (
+            crate::agent_restore::telemetry::Level::Info,
+            "disabled",
+            None,
+            None,
+        ),
+        Ok(crate::startup::RegistrationStatus::Enabled) => (
+            crate::agent_restore::telemetry::Level::Info,
+            "enabled",
+            None,
+            None,
+        ),
+        Ok(crate::startup::RegistrationStatus::Stale) => (
+            crate::agent_restore::telemetry::Level::Warn,
+            "stale",
+            None,
+            None,
+        ),
+        Err(error) => (
+            crate::agent_restore::telemetry::Level::Error,
+            "status_failed",
+            Some(error.telemetry_kind()),
+            error.os_code(),
+        ),
+    };
+    apply_start_at_login_status(state, status);
+
+    let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+        &state.restore_correlation_id,
+        crate::agent_restore::telemetry::EventName::LoginStartupStatus,
+        level,
+    );
+    event.source = Some("startup");
+    event.outcome = Some(outcome);
+    event.error_kind = error_kind;
+    event.error_code = error_code;
+    crate::agent_restore::telemetry::record(&event);
+}
+
+fn apply_start_at_login_status(
+    state: &mut AppState,
+    status: Result<crate::startup::RegistrationStatus, crate::startup::StartupError>,
+) {
+    let (enabled, stale) = match status {
+        Ok(crate::startup::RegistrationStatus::Disabled) => (false, false),
+        Ok(crate::startup::RegistrationStatus::Enabled) => (true, false),
+        Ok(crate::startup::RegistrationStatus::Stale) => (false, true),
+        Err(_) => return,
+    };
+    state.toggles.insert(ToggleKey::StartAtLogin, enabled);
+    state.toggles.insert(ToggleKey::StartAtLoginStale, stale);
+}
+
+fn dispatch_start_at_login_toggle(state: &mut AppState) -> bool {
+    dispatch_start_at_login_toggle_with(state, update_start_at_login_registration)
+}
+
+fn dispatch_start_at_login_toggle_with(
+    state: &mut AppState,
+    update: impl FnOnce(bool) -> Result<(), crate::startup::StartupError>,
+) -> bool {
+    let repairing = toggle_on(state, ToggleKey::StartAtLoginStale);
+    let enabled = repairing || !toggle_on(state, ToggleKey::StartAtLogin);
+    let outcome = if repairing {
+        "repaired"
+    } else if enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    dispatch_start_at_login_change_with(state, enabled, outcome, update)
+}
+
+fn dispatch_start_at_login_remove(state: &mut AppState) -> bool {
+    dispatch_start_at_login_remove_with(state, update_start_at_login_registration)
+}
+
+fn dispatch_start_at_login_remove_with(
+    state: &mut AppState,
+    update: impl FnOnce(bool) -> Result<(), crate::startup::StartupError>,
+) -> bool {
+    dispatch_start_at_login_change_with(state, false, "removed_stale", update)
+}
+
+fn dispatch_start_at_login_change_with(
+    state: &mut AppState,
+    enabled: bool,
+    success_outcome: &'static str,
+    update: impl FnOnce(bool) -> Result<(), crate::startup::StartupError>,
+) -> bool {
+    let result = apply_start_at_login_with(state, enabled, update);
+    let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+        &state.restore_correlation_id,
+        crate::agent_restore::telemetry::EventName::LoginStartupChanged,
+        if result.is_ok() {
+            crate::agent_restore::telemetry::Level::Info
+        } else {
+            crate::agent_restore::telemetry::Level::Error
+        },
+    );
+    event.source = Some("settings_toggle");
+    event.outcome = Some(if result.is_ok() {
+        success_outcome
+    } else {
+        "change_failed"
+    });
+    if let Err(error) = result {
+        event.error_kind = Some(error.telemetry_kind());
+        event.error_code = error.os_code();
+        push_error_toast(state, start_at_login_error_message(error));
+    }
+    crate::agent_restore::telemetry::record(&event);
+    true
+}
+
+fn start_at_login_error_message(error: crate::startup::StartupError) -> &'static str {
+    match error.kind() {
+        crate::startup::StartupErrorKind::CommandTooLong => {
+            "The Terminal Manager install path is too long for Windows login startup. Reinstall it in a shorter location and try again; the previous setting is still active."
+        }
+        crate::startup::StartupErrorKind::CurrentExecutable
+        | crate::startup::StartupErrorKind::InvalidExecutable => {
+            "Windows login startup could not determine a safe Terminal Manager executable. Reinstall the app and try again; the previous setting is still active."
+        }
+        crate::startup::StartupErrorKind::UnsupportedProfile => {
+            "Windows login startup is unavailable while TM_PROFILE overrides this app instance. Launch without that override and try again; the previous setting is still active."
+        }
+        crate::startup::StartupErrorKind::RegistryRead
+        | crate::startup::StartupErrorKind::RegistryWrite
+        | crate::startup::StartupErrorKind::RegistryDelete => {
+            "Windows login startup could not be changed. The previous setting is still active; check registry permissions and try again."
+        }
+    }
+}
+
+fn apply_start_at_login_with(
+    state: &mut AppState,
+    enabled: bool,
+    update: impl FnOnce(bool) -> Result<(), crate::startup::StartupError>,
+) -> Result<(), crate::startup::StartupError> {
+    update(enabled)?;
+    state.toggles.insert(ToggleKey::StartAtLogin, enabled);
+    state.toggles.insert(ToggleKey::StartAtLoginStale, false);
+    Ok(())
+}
+
+#[cfg(test)]
+fn update_start_at_login_registration(_enabled: bool) -> Result<(), crate::startup::StartupError> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn update_start_at_login_registration(enabled: bool) -> Result<(), crate::startup::StartupError> {
+    crate::startup::set_enabled(enabled)
 }
 
 fn persist_auto_resume_preference(state: &mut AppState, enabled: bool) -> bool {
@@ -9922,6 +10101,116 @@ mod tests {
 
         assert!(dispatch(&mut state, "agent.auto_resume.toggle"));
         assert!(!toggle_on(&state, ToggleKey::AutoResumeAgents));
+    }
+
+    #[test]
+    fn login_startup_status_is_runtime_only_and_stale_entries_require_repair() {
+        let mut state = test_state();
+        assert!(!toggle_on(&state, ToggleKey::StartAtLogin));
+
+        apply_start_at_login_status(&mut state, Ok(crate::startup::RegistrationStatus::Enabled));
+        assert!(toggle_on(&state, ToggleKey::StartAtLogin));
+
+        apply_start_at_login_status(&mut state, Ok(crate::startup::RegistrationStatus::Stale));
+        assert!(!toggle_on(&state, ToggleKey::StartAtLogin));
+        assert!(toggle_on(&state, ToggleKey::StartAtLoginStale));
+
+        apply_start_at_login_status(&mut state, Ok(crate::startup::RegistrationStatus::Disabled));
+        assert!(!toggle_on(&state, ToggleKey::StartAtLogin));
+        assert!(!toggle_on(&state, ToggleKey::StartAtLoginStale));
+    }
+
+    #[test]
+    fn stale_login_startup_entry_can_be_repaired_or_removed() {
+        let mut state = test_state();
+        state.toggles.insert(ToggleKey::StartAtLoginStale, true);
+
+        assert!(dispatch_start_at_login_toggle_with(&mut state, |_| Ok(())));
+        assert!(toggle_on(&state, ToggleKey::StartAtLogin));
+        assert!(!toggle_on(&state, ToggleKey::StartAtLoginStale));
+
+        state.toggles.insert(ToggleKey::StartAtLogin, false);
+        state.toggles.insert(ToggleKey::StartAtLoginStale, true);
+        assert!(dispatch_start_at_login_remove_with(&mut state, |_| Ok(())));
+        assert!(!toggle_on(&state, ToggleKey::StartAtLogin));
+        assert!(!toggle_on(&state, ToggleKey::StartAtLoginStale));
+    }
+
+    #[test]
+    fn login_startup_write_failure_keeps_the_previous_ui_state() {
+        let mut state = test_state();
+        let failure =
+            crate::startup::StartupError::new(crate::startup::StartupErrorKind::RegistryWrite);
+
+        assert!(apply_start_at_login_with(&mut state, true, |_| Err(failure)).is_err());
+        assert!(!toggle_on(&state, ToggleKey::StartAtLogin));
+
+        state.toggles.insert(ToggleKey::StartAtLogin, true);
+        assert!(apply_start_at_login_with(&mut state, false, |_| Err(failure)).is_err());
+        assert!(toggle_on(&state, ToggleKey::StartAtLogin));
+    }
+
+    #[test]
+    fn login_startup_dispatch_failure_is_actionable_and_keeps_state() {
+        let mut state = test_state();
+        let failure =
+            crate::startup::StartupError::new(crate::startup::StartupErrorKind::RegistryWrite);
+
+        assert!(dispatch_start_at_login_toggle_with(&mut state, |_| Err(
+            failure
+        )));
+
+        assert!(!toggle_on(&state, ToggleKey::StartAtLogin));
+        let message = &state.toasts.iter().next().expect("failure toast").message;
+        assert!(message.contains("previous setting is still active"));
+        assert!(message.contains("registry permissions"));
+        assert!(!message.contains(r"C:\"));
+    }
+
+    #[test]
+    fn login_startup_path_failure_does_not_claim_registry_permissions_failed() {
+        let mut state = test_state();
+        let failure =
+            crate::startup::StartupError::new(crate::startup::StartupErrorKind::CommandTooLong);
+
+        assert!(dispatch_start_at_login_toggle_with(&mut state, |_| Err(
+            failure
+        )));
+
+        let message = &state.toasts.iter().next().expect("failure toast").message;
+        assert!(message.contains("install path is too long"));
+        assert!(message.contains("shorter location"));
+        assert!(!message.contains("registry permissions"));
+        assert!(!message.contains(r"C:\"));
+    }
+
+    #[test]
+    fn login_startup_write_success_updates_without_persisting_workspace_state() {
+        let mut state = test_state();
+        assert!(apply_start_at_login_with(&mut state, true, |_| Ok(())).is_ok());
+        assert!(toggle_on(&state, ToggleKey::StartAtLogin));
+
+        let json = serde_json::to_string(&crate::persist::PersistedState::from_state(&state))
+            .expect("serialize persisted state");
+        assert!(!json.contains("start_at_login"));
+        assert!(!json.contains("start-at-login"));
+    }
+
+    #[test]
+    fn login_startup_and_automatic_agent_resume_are_independent_consents() {
+        let mut state = test_state();
+
+        assert!(dispatch(&mut state, "settings.start_at_login.toggle"));
+        assert!(toggle_on(&state, ToggleKey::StartAtLogin));
+        assert!(!toggle_on(&state, ToggleKey::AutoResumeAgents));
+
+        assert!(dispatch(&mut state, "agent.auto_resume.toggle"));
+        assert!(toggle_on(&state, ToggleKey::StartAtLogin));
+        assert!(toggle_on(&state, ToggleKey::AutoResumeAgents));
+
+        assert!(dispatch(&mut state, "settings.start_at_login.toggle"));
+        assert!(!toggle_on(&state, ToggleKey::StartAtLogin));
+        assert!(toggle_on(&state, ToggleKey::AutoResumeAgents));
     }
 
     #[test]

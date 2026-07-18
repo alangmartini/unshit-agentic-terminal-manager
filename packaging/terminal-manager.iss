@@ -13,6 +13,7 @@
 #define MyAppURL "https://github.com/alangmartini/unshit-agentic-terminal-manager"
 #define MyAppExeName "terminal-manager.exe"
 #define MyDaemonExeName "unshit-ptyd.exe"
+#define MyStartupValueName "Unshit Terminal Manager"
 ; Release binaries, relative to this script (packaging\ -> repo root -> target\release).
 #define ReleaseDir "..\target\release"
 
@@ -59,6 +60,10 @@ Source: "..\LICENSE";                      DestDir: "{app}"; Flags: ignoreversio
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#MyAppName}";  Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+
+[Registry]
+; Remove the app-created, opt-in startup value without creating it during setup.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "{#MyStartupValueName}"; Flags: dontcreatekey uninsdeletevalue
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent

@@ -3564,6 +3564,7 @@ dependencies = [
  "unshit-test",
  "vte",
  "winapi",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

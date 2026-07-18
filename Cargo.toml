@@ -142,6 +142,7 @@ unshit-test = { path = "crates/unshit-framework/crates/unshit-test" }
 # default browser without going through a command shell (see src/browser.rs).
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["shellapi"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

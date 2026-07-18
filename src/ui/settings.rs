@@ -217,7 +217,9 @@ fn settings_section_desc(active: SettingsSection) -> &'static str {
         SettingsSection::Keybinds => {
             "Click any shortcut to rebind it. Press a new combination, or Esc to cancel."
         }
-        SettingsSection::Sessions => "RAM usage, daemon sessions, and workspace attachment.",
+        SettingsSection::Sessions => {
+            "Login startup, agent recovery, daemon sessions, and workspace attachment."
+        }
         SettingsSection::Notifications => "Desktop notifications and focused panes.",
         SettingsSection::DangerZone => "Destructive session and close behavior.",
     }
@@ -1750,6 +1752,50 @@ fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
         );
     }
 
+    let start_at_login = is_on(state, ToggleKey::StartAtLogin);
+    let start_at_login_stale = is_on(state, ToggleKey::StartAtLoginStale);
+    let startup_shared = shared.clone();
+    let mut startup_control = ElementDef::new(Tag::Button)
+        .with_class("login-startup-toggle")
+        .with_id("settings-start-at-login")
+        .with_tab_index(0)
+        .with_text(if start_at_login_stale {
+            "repair"
+        } else if start_at_login {
+            "on"
+        } else {
+            "off"
+        })
+        .on_click(move || {
+            mutate_with(&startup_shared, |st| {
+                dispatch(st, "settings.start_at_login.toggle");
+            });
+        });
+    if start_at_login {
+        startup_control = startup_control.with_class("on");
+    }
+    if start_at_login_stale {
+        startup_control = startup_control.with_class("stale");
+    }
+    let mut startup_controls = ElementDef::new(Tag::Div)
+        .with_class("login-startup-controls")
+        .with_child(startup_control);
+    if start_at_login_stale {
+        let remove_shared = shared.clone();
+        startup_controls = startup_controls.with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("login-startup-remove")
+                .with_id("settings-start-at-login-remove")
+                .with_tab_index(0)
+                .with_text("remove")
+                .on_click(move || {
+                    mutate_with(&remove_shared, |st| {
+                        dispatch(st, "settings.start_at_login.remove");
+                    });
+                }),
+        );
+    }
+
     let auto_resume = is_on(state, ToggleKey::AutoResumeAgents);
     let auto_shared = shared.clone();
     let mut auto_control = ElementDef::new(Tag::Button)
@@ -1781,17 +1827,27 @@ fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
         .with_child(auto_control)
         .with_child(remove_hooks);
 
-    let mut section = section_shell("sessions")
-        .with_child(setting_row(
-            "daemon sessions",
-            "sessions currently tracked by the session daemon; refresh to re-poll",
-            control,
-        ))
-        .with_child(setting_row(
-            "automatic agent resume",
-            "On a cold restart, reopen saved Claude or Codex conversations. Enabling installs managed SessionStart capture hooks; turning this off leaves them installed for manual recovery. Remove hooks changes only Terminal Manager-marked entries.",
-            recovery_controls,
+    let mut section = section_shell("sessions").with_child(setting_row(
+        "daemon sessions",
+        "sessions currently tracked by the session daemon; refresh to re-poll",
+        control,
+    ));
+    if crate::startup::is_supported() {
+        section = section.with_child(setting_row(
+            "start at Windows sign-in",
+            if start_at_login_stale {
+                "Windows has an outdated Terminal Manager login entry. Repair it to point at this app, or remove it."
+            } else {
+                "Launch Terminal Manager after you sign in. Turn on Automatic agent resume below as well to reopen saved Claude or Codex conversations without opening the app manually."
+            },
+            startup_controls,
         ));
+    }
+    section = section.with_child(setting_row(
+        "automatic agent resume",
+        "On a cold restart, reopen saved Claude or Codex conversations. Enabling installs managed SessionStart capture hooks; turning this off leaves them installed for manual recovery. Remove hooks changes only Terminal Manager-marked entries.",
+        recovery_controls,
+    ));
 
     section = section.with_child(build_memory_dashboard(state));
 
@@ -2040,6 +2096,7 @@ fn session_row(s: &crate::state::SessionSnapshot, shared: &SharedState) -> Eleme
 
     ElementDef::new(Tag::Div)
         .with_class("setting-row")
+        .with_class("session-row")
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("setting-meta")
@@ -4627,10 +4684,9 @@ mod tests {
         let rows: Vec<_> = el
             .children
             .iter()
-            .filter(|c| c.classes.contains(&"setting-row".to_string()))
+            .filter(|c| c.classes.contains(&"session-row".to_string()))
             .collect();
-        // Daemon refresh, automatic recovery, then one row per session.
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]
@@ -4824,11 +4880,10 @@ mod tests {
         let rows: Vec<_> = el
             .children
             .iter()
-            .filter(|c| c.classes.contains(&"setting-row".to_string()))
+            .filter(|c| c.classes.contains(&"session-row".to_string()))
             .collect();
-        // rows[0] is daemon refresh, rows[1] recovery, then live sessions.
-        let alive_meta = &rows[2].children[0];
-        let dead_meta = &rows[3].children[0];
+        let alive_meta = &rows[0].children[0];
+        let dead_meta = &rows[1].children[0];
         let has_status_class = |meta: &ElementDef, cls: &str| {
             meta.children.iter().any(|c| {
                 c.children
@@ -4865,6 +4920,47 @@ mod tests {
 
         let state = shared.lock().unwrap();
         assert!(is_on(&state.ui_snapshot(), ToggleKey::AutoResumeAgents));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sessions_section_login_startup_control_is_focusable_and_dispatches() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_sessions_section(&snap, &shared);
+        let control = find_by_id(&el, "settings-start-at-login").expect("start at login");
+
+        assert_eq!(control.tab_index, Some(0));
+        assert_eq!(text_of(control), Some("off"));
+        assert!(!control.classes.contains(&"on".to_string()));
+        (control.on_click.as_ref().expect("click handler"))();
+
+        let state = shared.lock().unwrap();
+        assert!(is_on(&state.ui_snapshot(), ToggleKey::StartAtLogin));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sessions_section_stale_login_startup_can_be_repaired_or_removed() {
+        let shared = make_shared();
+        {
+            let mut state = shared.lock().unwrap();
+            state.toggles.insert(ToggleKey::StartAtLoginStale, true);
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_sessions_section(&snap, &shared);
+        let repair = find_by_id(&el, "settings-start-at-login").expect("repair startup");
+        let remove =
+            find_by_id(&el, "settings-start-at-login-remove").expect("remove stale startup");
+
+        assert_eq!(text_of(repair), Some("repair"));
+        assert!(repair.classes.contains(&"stale".to_string()));
+        assert_eq!(text_of(remove), Some("remove"));
+        (remove.on_click.as_ref().expect("remove click"))();
+
+        let state = shared.lock().unwrap();
+        assert!(!is_on(&state.ui_snapshot(), ToggleKey::StartAtLogin));
+        assert!(!is_on(&state.ui_snapshot(), ToggleKey::StartAtLoginStale));
     }
 
     #[test]

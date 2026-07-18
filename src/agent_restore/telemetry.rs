@@ -25,6 +25,8 @@ pub enum EventName {
     HookObserved,
     HookRejected,
     CloseStatePersisted,
+    LoginStartupStatus,
+    LoginStartupChanged,
 }
 
 impl EventName {
@@ -40,6 +42,8 @@ impl EventName {
             Self::HookObserved => "agent_restore.hook_observed",
             Self::HookRejected => "agent_restore.hook_rejected",
             Self::CloseStatePersisted => "agent_restore.close_state_persisted",
+            Self::LoginStartupStatus => "agent_restore.login_startup_status",
+            Self::LoginStartupChanged => "agent_restore.login_startup_changed",
         }
     }
 }
@@ -62,6 +66,8 @@ pub struct RestoreEvent {
     pub outcome: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<u32>,
 }
 
 impl RestoreEvent {
@@ -81,6 +87,7 @@ impl RestoreEvent {
             source: None,
             outcome: None,
             error_kind: None,
+            error_code: None,
         }
     }
 }
@@ -232,5 +239,37 @@ mod tests {
             EventName::CloseStatePersisted.as_str(),
             "agent_restore.close_state_persisted"
         );
+        assert_eq!(
+            EventName::LoginStartupStatus.as_str(),
+            "agent_restore.login_startup_status"
+        );
+        assert_eq!(
+            EventName::LoginStartupChanged.as_str(),
+            "agent_restore.login_startup_changed"
+        );
+    }
+
+    #[test]
+    fn login_startup_failure_telemetry_is_durable_and_redacted() {
+        let path = temp_log("login-startup");
+        let correlation = crate::agent_restore::generate_session_id();
+        let mut event =
+            RestoreEvent::new(&correlation, EventName::LoginStartupChanged, Level::Error);
+        event.source = Some("settings_toggle");
+        event.outcome = Some("change_failed");
+        event.error_kind = Some("registry_write_access_denied");
+        event.error_code = Some(5);
+        record_to(&path, &event).expect("write telemetry");
+
+        let body = std::fs::read_to_string(&path).expect("read telemetry");
+        let value: serde_json::Value = serde_json::from_str(body.trim()).expect("json line");
+        assert_eq!(value["event"], "agent_restore.login_startup_changed");
+        assert_eq!(value["correlation_id"], correlation);
+        assert_eq!(value["source"], "settings_toggle");
+        assert_eq!(value["outcome"], "change_failed");
+        assert_eq!(value["error_kind"], "registry_write_access_denied");
+        assert_eq!(value["error_code"], 5);
+        assert!(!body.contains(r"C:\Users"));
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 }

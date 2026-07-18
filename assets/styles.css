@@ -6235,7 +6235,8 @@ body.dragging-pane {
   box-shadow: var(--glow-amber-s);
 }
 
-.agent-auto-resume-toggle {
+.agent-auto-resume-toggle,
+.login-startup-toggle {
   min-width: 42px;
   padding: var(--sp-2) var(--sp-3);
   color: var(--fg-tertiary);
@@ -6247,10 +6248,23 @@ body.dragging-pane {
   cursor: pointer;
 }
 
-.agent-auto-resume-toggle.on {
+.agent-auto-resume-toggle.on,
+.login-startup-toggle.on {
   color: var(--amber-100);
   background: var(--accent-a16);
   border-color: var(--accent-a35);
+}
+
+.login-startup-toggle.stale {
+  color: var(--amber-100);
+  border-color: var(--amber-500);
+}
+
+.login-startup-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
 }
 
 .agent-recovery-controls {
@@ -6260,7 +6274,8 @@ body.dragging-pane {
   gap: var(--sp-2);
 }
 
-.agent-recovery-hooks-remove {
+.agent-recovery-hooks-remove,
+.login-startup-remove {
   padding: var(--sp-2) var(--sp-3);
   color: var(--fg-tertiary);
   background: transparent;
@@ -6271,7 +6286,9 @@ body.dragging-pane {
 }
 
 .agent-recovery-hooks-remove:hover,
-.agent-recovery-hooks-remove:focus-visible {
+.agent-recovery-hooks-remove:focus-visible,
+.login-startup-remove:hover,
+.login-startup-remove:focus-visible {
   color: var(--rust);
   border-color: var(--rust);
 }
