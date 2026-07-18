@@ -256,6 +256,21 @@ pub enum CloseAction {
     KillAll,
 }
 
+/// Fully specified close mutation. `kept_pane_ids: None` is the silent,
+/// remembered "keep everything" policy; `Some` is the dialog's explicit
+/// per-pane selection. The mutation is not allowed to terminate the UI until
+/// its resulting recovery state has been durably persisted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CloseChoice {
+    KeepRunning {
+        kept_pane_ids: Option<BTreeSet<u32>>,
+        remember: bool,
+    },
+    KillAll {
+        remember: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSection {
     Appearance,
@@ -625,6 +640,11 @@ pub enum ToggleKey {
     /// its workspace's repo. Non-repo workspaces fall back to a plain
     /// tab so Ctrl+T never stops working.
     WorktreeTabs,
+    /// Relaunch a recorded Claude Code or Codex conversation after the
+    /// daemon atomically confirms that the pane has no surviving PTY.
+    /// Defaults off; enabling it is also the consent boundary for the
+    /// managed user-level session hooks.
+    AutoResumeAgents,
 }
 
 impl ToggleKey {
@@ -633,6 +653,7 @@ impl ToggleKey {
             ToggleKey::RememberCloseChoice => "remember-close-choice",
             ToggleKey::KillAllOnClose => "kill-all-on-close",
             ToggleKey::WorktreeTabs => "worktree-tabs",
+            ToggleKey::AutoResumeAgents => "auto-resume-agents",
         }
     }
 }
@@ -776,6 +797,12 @@ impl DiagnosticScrollSample {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentResumeAttempt {
+    pub candidate: crate::agent_restore::ResumeCandidate,
+    pub reader_generation: u64,
+}
+
 pub struct AppState {
     pub workspaces: Vec<Workspace>,
     pub active_workspace: usize,
@@ -819,6 +846,25 @@ pub struct AppState {
     pub next_id: u32,
     pub pty_manager: crate::pty::DaemonPty,
     pub terminals: std::collections::HashMap<u32, SharedTerminal>,
+    /// Durable provider conversation metadata keyed by pane id. This
+    /// is deliberately separate from `Pane` so it never leaks into
+    /// generic labels or the terminal renderer.
+    pub agent_restarts: std::collections::HashMap<u32, crate::agent_restore::AgentRestart>,
+    /// Confirmed cold-start candidates waiting for an explicit click.
+    /// The UI snapshot projects only provider names, never ids or cwd.
+    pub pending_agent_resumes:
+        std::collections::HashMap<u32, crate::agent_restore::ResumeCandidate>,
+    /// Resume processes awaiting a provider SessionStart confirmation.
+    /// They are not shown as clickable while running; an early PTY EOF
+    /// moves the candidate back to `pending_agent_resumes` for retry.
+    pub agent_resume_attempts: std::collections::HashMap<u32, AgentResumeAttempt>,
+    /// Runtime-only launch phases saved before a resume fallback is issued.
+    /// A warm cache attach restores the prior phase; an Ensure winner keeps
+    /// the durable confirming phase across a lost response or UI restart.
+    pub agent_resume_preflights:
+        std::collections::HashMap<u32, crate::agent_restore::AgentLaunchPhase>,
+    /// Correlates structured restoration telemetry for this UI run.
+    pub restore_correlation_id: String,
     /// Panes whose title was set by the user (rename dialog). A pane in
     /// this set keeps its manual name; titles reported by the guest
     /// program via OSC 0/2 are ignored until the rename is cleared.
@@ -1057,6 +1103,11 @@ impl AppState {
             default_shell: self.default_shell.clone(),
             quick_prompt: self.quick_prompt.clone(),
             terminal_link_hover: self.terminal_link_hover,
+            pending_agent_resumes: self
+                .pending_agent_resumes
+                .iter()
+                .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
+                .collect(),
         }
     }
 
@@ -1153,6 +1204,9 @@ pub struct UiSnapshot {
     pub quick_prompt: Option<crate::quick_prompt::QuickPromptState>,
     /// Link hover used by the terminal element to select pointer cursor style.
     pub terminal_link_hover: Option<TerminalLinkHover>,
+    /// Presentation-only pending restore providers keyed by pane id.
+    /// Conversation ids and directories remain outside render state.
+    pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
 }
 
 fn current_folder_name() -> String {
@@ -1276,6 +1330,7 @@ pub fn seed_state() -> AppState {
     toggles.insert(ToggleKey::RememberCloseChoice, false);
     toggles.insert(ToggleKey::KillAllOnClose, false);
     toggles.insert(ToggleKey::WorktreeTabs, false);
+    toggles.insert(ToggleKey::AutoResumeAgents, false);
 
     AppState {
         workspaces,
@@ -1312,6 +1367,11 @@ pub fn seed_state() -> AppState {
         next_id: 2,
         pty_manager: crate::pty::DaemonPty::new(),
         terminals: std::collections::HashMap::new(),
+        agent_restarts: std::collections::HashMap::new(),
+        pending_agent_resumes: std::collections::HashMap::new(),
+        agent_resume_attempts: std::collections::HashMap::new(),
+        agent_resume_preflights: std::collections::HashMap::new(),
+        restore_correlation_id: crate::agent_restore::generate_session_id(),
         custom_titled_panes: std::collections::HashSet::new(),
         scale_factor: 1.0,
         cell_width_ratio: 0.6,
@@ -1591,17 +1651,11 @@ pub fn mutate_add_tab(state: &mut AppState) {
     state.col_ratios = vec![vec![1.0]];
 }
 
-/// Build the tab title for a Quick Prompt submission. Truncates on
-/// character boundaries (not bytes) so the buffer is safe for any
-/// prompt the user types.
-fn quick_prompt_tab_title(prompt: &str) -> String {
-    let trimmed = prompt.trim();
-    let truncated: String = trimmed.chars().take(30).collect();
-    if truncated.is_empty() {
-        "qp".to_string()
-    } else {
-        format!("qp: {}", truncated)
-    }
+/// Durable-safe label for a Quick Prompt tab and daemon session. Prompt
+/// previews stay inside the overlay; pane identity must never copy user
+/// content into workspaces.json or daemon inspection metadata.
+fn quick_prompt_tab_title(agent: crate::agent_restore::AgentKind) -> String {
+    format!("qp: {}", agent.label())
 }
 
 /// Spawn a new tab running an agent at `cwd` with `shell`. Mirrors
@@ -1609,9 +1663,10 @@ fn quick_prompt_tab_title(prompt: &str) -> String {
 /// not consult the active workspace's settings.
 pub fn mutate_add_quick_prompt_tab(
     state: &mut AppState,
-    prompt: &str,
+    _prompt: &str,
     cwd: &std::path::Path,
     shell: &crate::shell::ShellSpec,
+    mut restart: crate::agent_restore::AgentRestart,
 ) {
     save_tab_state(state);
 
@@ -1629,37 +1684,14 @@ pub fn mutate_add_quick_prompt_tab(
     );
 
     let workspace_id = active_workspace_num(state);
+    let provider = restart.agent;
+    restart.launch_phase = crate::agent_restore::AgentLaunchPhase::ConfirmingResume;
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
-    let session_name = quick_prompt_tab_title(prompt);
-    match state.pty_manager.spawn_in_named(
-        id_num,
-        workspace_id,
-        cols,
-        rows,
-        Some(cwd),
-        Some(shell),
-        Some(&session_name),
-    ) {
-        Ok(reader) => {
-            state
-                .terminals
-                .insert(id_num, Arc::new(Mutex::new(terminal)));
-            crate::bridge::register_reader(id_num, reader);
-        }
-        Err(e) => {
-            log::error!(
-                "failed to spawn PTY for quick prompt pane {}: {}",
-                id_num,
-                e
-            );
-            terminal.process_bytes(format!("error: {}\r\n", e).as_bytes());
-            state
-                .terminals
-                .insert(id_num, Arc::new(Mutex::new(terminal)));
-        }
-    }
-
-    let title = quick_prompt_tab_title(prompt);
+    // The daemon-owned session list and persisted layout survive UI restarts,
+    // so both the session label and tab title stay provider-generic and never
+    // contain the Quick Prompt text.
+    let session_name = quick_prompt_tab_title(provider);
+    let title = session_name.clone();
     let pane = Pane {
         id: pane_id,
         title: title.clone(),
@@ -1685,6 +1717,110 @@ pub fn mutate_add_quick_prompt_tab(
     state.active_pane = pane_id;
     state.row_ratios = vec![1.0];
     state.col_ratios = vec![vec![1.0]];
+    state.agent_restarts.insert(id_num, restart);
+
+    // Stage the pane, routing key, provider, launch phase, cwd, and known id
+    // before the spawn request can reach the daemon. If the response or UI is
+    // lost after process creation, the next launch can safely reattach it.
+    if !persist_agent_metadata(
+        state,
+        provider,
+        workspace_id,
+        id_num,
+        "quick_prompt_preflight",
+    ) {
+        state.agent_restarts.remove(&id_num);
+        terminal.process_bytes(b"error: agent recovery metadata could not be saved\r\n");
+        state
+            .terminals
+            .insert(id_num, Arc::new(Mutex::new(terminal)));
+        return;
+    }
+
+    match state.pty_manager.spawn_in_named(
+        id_num,
+        workspace_id,
+        cols,
+        rows,
+        Some(cwd),
+        Some(shell),
+        Some(&session_name),
+    ) {
+        Ok(reader) => {
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
+            let reader_generation = crate::bridge::register_reader(id_num, reader);
+            if let Some(candidate) = state
+                .agent_restarts
+                .get(&id_num)
+                .filter(|record| {
+                    record.launch_phase == crate::agent_restore::AgentLaunchPhase::ConfirmingResume
+                })
+                .and_then(crate::agent_restore::exact_candidate)
+            {
+                state.agent_resume_attempts.insert(
+                    id_num,
+                    AgentResumeAttempt {
+                        candidate,
+                        reader_generation,
+                    },
+                );
+            }
+            let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+                &state.restore_correlation_id,
+                crate::agent_restore::telemetry::EventName::ResumeSpawned,
+                crate::agent_restore::telemetry::Level::Info,
+            );
+            event.provider = Some(provider);
+            event.workspace_id = Some(workspace_id);
+            event.pane_id = Some(id_num);
+            event.source = Some("quick_prompt");
+            event.outcome = Some("spawned");
+            crate::agent_restore::telemetry::record(&event);
+        }
+        Err(error) => {
+            let authoritative = agent_spawn_failure_is_authoritative(&error);
+            let outcome = if authoritative { "rejected" } else { "unknown" };
+            let error_kind = match error.kind() {
+                std::io::ErrorKind::BrokenPipe => "transport_lost",
+                std::io::ErrorKind::TimedOut => "timeout",
+                std::io::ErrorKind::NotConnected => "not_connected",
+                std::io::ErrorKind::InvalidInput => "spawn_rejected",
+                _ => "io_error",
+            };
+            if authoritative {
+                state.agent_restarts.remove(&id_num);
+                state.agent_resume_attempts.remove(&id_num);
+                crate::persist::save_workspaces(state);
+            }
+            log::error!(
+                r#"{{"event":"quick_prompt_spawn_failed","workspace_id":{workspace_id},"pane_id":{id_num},"provider":{:?},"outcome":"{}","error_kind":"{}"}}"#,
+                match provider {
+                    crate::agent_restore::AgentKind::Claude => "claude",
+                    crate::agent_restore::AgentKind::Codex => "codex",
+                },
+                outcome,
+                error_kind,
+            );
+            let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+                &state.restore_correlation_id,
+                crate::agent_restore::telemetry::EventName::ResumeFailed,
+                crate::agent_restore::telemetry::Level::Error,
+            );
+            event.provider = Some(provider);
+            event.workspace_id = Some(workspace_id);
+            event.pane_id = Some(id_num);
+            event.source = Some("quick_prompt");
+            event.outcome = Some(outcome);
+            event.error_kind = Some(error_kind);
+            crate::agent_restore::telemetry::record(&event);
+            terminal.process_bytes(format!("error: {}\r\n", error).as_bytes());
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
+        }
+    }
 }
 
 /// Tab/pane title for a worktree tab: the worktree directory name
@@ -1833,6 +1969,7 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     for id in &pane_ids {
         state.pty_manager.destroy(*id);
         state.terminals.remove(id);
+        forget_agent_restore(state, *id);
     }
 
     state.tabs.remove(index);
@@ -1895,18 +2032,43 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
     }
     let mut max_pane_id = 0u32;
     let mut custom_titled = std::collections::HashSet::new();
+    let mut agent_restarts = std::collections::HashMap::new();
+    let mut used_workspace_nums = std::collections::HashSet::new();
     let active_idx = persisted
         .active_workspace
         .min(persisted.workspaces.len() - 1);
     let mut workspaces = Vec::with_capacity(persisted.workspaces.len());
     for (i, entry) in persisted.workspaces.iter().enumerate() {
-        let mut ws = new_workspace((i + 1) as u32, entry.name.clone(), entry.path.clone());
+        let workspace_num = if entry.num != 0 && !used_workspace_nums.contains(&entry.num) {
+            entry.num
+        } else {
+            let Some(allocated) = allocate_workspace_num(&used_workspace_nums) else {
+                log::error!(
+                    r#"{{"event":"workspace_restore_skipped","reason":"id_space_exhausted","workspace_index":{i}}}"#
+                );
+                continue;
+            };
+            log::warn!(
+                r#"{{"event":"workspace_id_normalized","workspace_index":{i},"persisted_id":{},"assigned_id":{allocated}}}"#,
+                entry.num
+            );
+            allocated
+        };
+        used_workspace_nums.insert(workspace_num);
+        let mut ws = new_workspace(workspace_num, entry.name.clone(), entry.path.clone());
         ws.collapsed = entry.collapsed;
         ws.shell = entry.shell.clone();
         let tabs: Vec<TerminalTab> = entry
             .tabs
             .iter()
-            .filter_map(|pt| terminal_tab_from_persisted(pt, &mut max_pane_id, &mut custom_titled))
+            .filter_map(|pt| {
+                terminal_tab_from_persisted(
+                    pt,
+                    &mut max_pane_id,
+                    &mut custom_titled,
+                    &mut agent_restarts,
+                )
+            })
             .collect();
         ws.active_tab = if tabs.is_empty() {
             0
@@ -1925,6 +2087,10 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
     state.workspaces = workspaces;
     state.active_workspace = active_idx;
     state.custom_titled_panes = custom_titled;
+    state.agent_restarts = agent_restarts;
+    state.pending_agent_resumes.clear();
+    state.agent_resume_attempts.clear();
+    state.agent_resume_preflights.clear();
     load_workspace_state(state);
 
     // The render/PTY bootstrap assumes the active workspace always has a
@@ -1944,6 +2110,7 @@ fn terminal_tab_from_persisted(
     pt: &crate::persist::PersistedTab,
     max_pane_id: &mut u32,
     custom_titled: &mut std::collections::HashSet<u32>,
+    agent_restarts: &mut std::collections::HashMap<u32, crate::agent_restore::AgentRestart>,
 ) -> Option<TerminalTab> {
     let panes: Vec<Vec<Pane>> = pt
         .panes
@@ -1954,6 +2121,13 @@ fn terminal_tab_from_persisted(
                     *max_pane_id = (*max_pane_id).max(pp.id);
                     if pp.custom_title && !pp.title.is_empty() {
                         custom_titled.insert(pp.id);
+                    }
+                    if let Some(restart) = pp
+                        .agent_restart
+                        .as_ref()
+                        .filter(|restart| restart.cwd.is_absolute())
+                    {
+                        agent_restarts.insert(pp.id, restart.clone());
                     }
                     Pane {
                         id: PaneId(pp.id),
@@ -2074,7 +2248,19 @@ pub fn mutate_add_workspace(state: &mut AppState) {
 }
 
 pub fn mutate_add_workspace_with_path(state: &mut AppState, path: Option<PathBuf>) {
-    let num = state.workspaces.len() as u32 + 1;
+    let used_workspace_nums = state
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.num)
+        .collect::<std::collections::HashSet<_>>();
+    let Some(num) = allocate_workspace_num(&used_workspace_nums) else {
+        log::error!(r#"{{"event":"workspace_add_failed","reason":"id_space_exhausted"}}"#);
+        push_error_toast(
+            state,
+            "Could not add a workspace because no routing IDs remain.",
+        );
+        return;
+    };
     let name = path
         .as_ref()
         .and_then(|p| p.file_name())
@@ -2085,18 +2271,53 @@ pub fn mutate_add_workspace_with_path(state: &mut AppState, path: Option<PathBuf
     mutate_switch_workspace(state, new_idx);
 }
 
+/// Allocate a stable, non-zero workspace routing id without overflow.
+/// Normal state grows monotonically; malformed state containing `u32::MAX`
+/// falls back to the lowest free id. With `n` occupied ids, at least one of
+/// `1..=n+1` is free, so the fallback is bounded by the number of workspaces.
+fn allocate_workspace_num(used: &std::collections::HashSet<u32>) -> Option<u32> {
+    let highest = used.iter().copied().max().unwrap_or(0);
+    if let Some(next) = highest.checked_add(1).filter(|next| *next != 0) {
+        if !used.contains(&next) {
+            return Some(next);
+        }
+    }
+
+    let bounded_end = u32::try_from(used.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
+        .max(1);
+    (1..=bounded_end).find(|candidate| !used.contains(candidate))
+}
+
 pub fn mutate_remove_workspace(state: &mut AppState, idx: usize) {
     if state.workspaces.len() <= 1 || idx >= state.workspaces.len() {
         return;
     }
+    save_workspace_state(state);
+    let pane_ids = state.workspaces[idx]
+        .tabs
+        .iter()
+        .flat_map(|tab| tab.panes.iter())
+        .flat_map(|row| row.iter())
+        .map(|pane| pane.id.0)
+        .collect::<Vec<_>>();
+    for pane_id in pane_ids {
+        state.pty_manager.destroy(pane_id);
+        state.terminals.remove(&pane_id);
+        state.custom_titled_panes.remove(&pane_id);
+        forget_agent_restore(state, pane_id);
+    }
+    let old_active = state.active_workspace;
     state.workspaces.remove(idx);
-    // Renumber remaining workspaces.
-    for (i, ws) in state.workspaces.iter_mut().enumerate() {
-        ws.num = i as u32 + 1;
-    }
-    if state.active_workspace >= state.workspaces.len() {
-        state.active_workspace = state.workspaces.len() - 1;
-    }
+    state.active_workspace = if old_active == idx {
+        idx.min(state.workspaces.len() - 1)
+    } else if old_active > idx {
+        old_active - 1
+    } else {
+        old_active
+    };
+    load_workspace_state(state);
 }
 
 pub fn find_pane_coord(state: &AppState, target: PaneId) -> Option<(usize, usize)> {
@@ -2269,6 +2490,7 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
     state.pty_manager.destroy(target.0);
     state.terminals.remove(&target.0);
     state.custom_titled_panes.remove(&target.0);
+    forget_agent_restore(state, target.0);
 
     // Absorb the closed pane's column ratio into a neighbor.
     let closed_ratio = state.col_ratios[row_idx][col_idx];
@@ -3052,6 +3274,7 @@ pub fn mutate_kill_workspace_terminals(state: &mut AppState, ws_idx: usize) {
     for id in &pane_ids {
         state.pty_manager.destroy(*id);
         state.terminals.remove(id);
+        forget_agent_restore(state, *id);
     }
 
     if ws_idx == state.active_workspace {
@@ -3156,6 +3379,18 @@ fn retain_tab_panes(tab: &mut TerminalTab, kept_pane_ids: &BTreeSet<u32>) -> boo
 }
 
 fn prune_close_layout_to_kept_panes(state: &mut AppState, kept_pane_ids: &BTreeSet<u32>) {
+    state
+        .agent_restarts
+        .retain(|pane_id, _| kept_pane_ids.contains(pane_id));
+    state
+        .pending_agent_resumes
+        .retain(|pane_id, _| kept_pane_ids.contains(pane_id));
+    state
+        .agent_resume_attempts
+        .retain(|pane_id, _| kept_pane_ids.contains(pane_id));
+    state
+        .agent_resume_preflights
+        .retain(|pane_id, _| kept_pane_ids.contains(pane_id));
     if state.workspaces.is_empty() {
         save_tab_state(state);
         state
@@ -3218,6 +3453,130 @@ pub fn resolve_close_action(state: &mut AppState) -> CloseAction {
     }
 }
 
+/// Apply a remembered close policy and return whether the caller may exit.
+/// `Prompt` has already populated the dialog and always vetoes the close.
+pub fn finalize_resolved_close(state: &mut AppState, action: CloseAction) -> bool {
+    finalize_resolved_close_with(state, action, crate::persist::save_workspaces)
+}
+
+fn finalize_resolved_close_with(
+    state: &mut AppState,
+    action: CloseAction,
+    persist: impl FnOnce(&AppState) -> bool,
+) -> bool {
+    let choice = match action {
+        CloseAction::Prompt => return false,
+        CloseAction::KeepRunning => CloseChoice::KeepRunning {
+            kept_pane_ids: None,
+            remember: false,
+        },
+        CloseAction::KillAll => CloseChoice::KillAll { remember: false },
+    };
+    finalize_close_choice_with(state, choice, persist)
+}
+
+/// Apply the current close dialog's selected action and return whether the UI
+/// may terminate. The dialog is consumed even on a persistence failure; the
+/// toast tells the user to retry Close against the already-updated live state.
+pub fn finalize_close_dialog_choice(state: &mut AppState, keep_running: bool) -> bool {
+    finalize_close_dialog_choice_with(state, keep_running, crate::persist::save_workspaces)
+}
+
+fn finalize_close_dialog_choice_with(
+    state: &mut AppState,
+    keep_running: bool,
+    persist: impl FnOnce(&AppState) -> bool,
+) -> bool {
+    let (remember, kept_pane_ids) = match state.confirm_dialog.as_ref() {
+        Some(ConfirmDialog::CloseApp {
+            remember,
+            kept_pane_ids,
+            ..
+        }) => (*remember, kept_pane_ids.clone()),
+        _ => return false,
+    };
+    let choice = if keep_running {
+        CloseChoice::KeepRunning {
+            kept_pane_ids: Some(kept_pane_ids),
+            remember,
+        }
+    } else {
+        CloseChoice::KillAll { remember }
+    };
+    finalize_close_choice_with(state, choice, persist)
+}
+
+fn finalize_close_choice_with(
+    state: &mut AppState,
+    choice: CloseChoice,
+    persist: impl FnOnce(&AppState) -> bool,
+) -> bool {
+    use crate::agent_restore::telemetry::{EventName, Level, RestoreEvent};
+
+    let (source, destructive) = match &choice {
+        CloseChoice::KeepRunning { .. } => ("close_keep_running", false),
+        CloseChoice::KillAll { .. } => ("close_kill_all", true),
+    };
+    match choice {
+        CloseChoice::KeepRunning {
+            kept_pane_ids,
+            remember,
+        } => {
+            state.confirm_dialog = None;
+            if remember {
+                state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+                state.toggles.insert(ToggleKey::KillAllOnClose, false);
+            }
+            if let Some(kept_pane_ids) = kept_pane_ids {
+                let all_pane_ids = close_app_pane_ids(state);
+                for pane_id in all_pane_ids.difference(&kept_pane_ids).copied() {
+                    state.pty_manager.destroy(pane_id);
+                    state.terminals.remove(&pane_id);
+                }
+                prune_close_layout_to_kept_panes(state, &kept_pane_ids);
+            }
+        }
+        CloseChoice::KillAll { remember } => {
+            state.confirm_dialog = None;
+            if remember {
+                state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+                state.toggles.insert(ToggleKey::KillAllOnClose, true);
+            }
+            mutate_kill_all_terminals(state);
+        }
+    }
+
+    let saved = persist(state);
+    let mut event = RestoreEvent::new(
+        &state.restore_correlation_id,
+        EventName::CloseStatePersisted,
+        if saved { Level::Info } else { Level::Error },
+    );
+    event.source = Some(source);
+    event.outcome = Some(if saved { "saved" } else { "failed" });
+    if !saved {
+        event.error_kind = Some("workspace_write");
+    }
+    crate::agent_restore::telemetry::record(&event);
+
+    if !saved {
+        let message = if destructive {
+            "Sessions were stopped, but the empty recovery state could not be saved. Terminal Manager stayed open; retry Close to prevent those sessions from reopening."
+        } else {
+            "Session recovery state could not be saved, so Terminal Manager stayed open. Retry Close after checking the config file permissions."
+        };
+        push_error_toast(state, message);
+        return false;
+    }
+
+    if !destructive {
+        // Drop UI readers only after the layout has landed. Daemon-owned
+        // sessions remain alive and will be reattached on the next launch.
+        state.terminals.clear();
+    }
+    true
+}
+
 /// Kill every terminal across every workspace and empty every workspace.
 /// All pane ids currently tracked in `state.terminals` are destroyed on
 /// the daemon, then every workspace's saved tabs and the live active
@@ -3239,6 +3598,450 @@ pub fn mutate_kill_all_terminals(state: &mut AppState) {
     state.active_pane = PaneId(0);
     state.row_ratios.clear();
     state.col_ratios.clear();
+    state.agent_restarts.clear();
+    state.pending_agent_resumes.clear();
+    state.agent_resume_attempts.clear();
+    state.agent_resume_preflights.clear();
+}
+
+/// Resolve the daemon fallback for one restored pane. The daemon owns
+/// the final attach-vs-spawn decision atomically; this plan is never
+/// executed when a live PTY already exists for the pane key.
+pub fn pane_agent_spawn_plan(
+    state: &AppState,
+    pane_id: u32,
+    fallback_cwd: Option<std::path::PathBuf>,
+    fallback_shell: Option<crate::shell::ShellSpec>,
+) -> crate::agent_restore::AgentSpawnPlan {
+    let auto_resume = state
+        .toggles
+        .get(&ToggleKey::AutoResumeAgents)
+        .copied()
+        .unwrap_or(false);
+    let plan = crate::agent_restore::spawn_plan(
+        state.agent_restarts.get(&pane_id),
+        auto_resume,
+        fallback_cwd,
+        fallback_shell,
+    );
+    if let Some(candidate) = plan.candidate.as_ref() {
+        let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+            &state.restore_correlation_id,
+            crate::agent_restore::telemetry::EventName::CandidateFound,
+            crate::agent_restore::telemetry::Level::Info,
+        );
+        event.provider = Some(candidate.agent);
+        event.pane_id = Some(pane_id);
+        event.source = Some("spawn_plan");
+        event.outcome = Some(match candidate.confidence {
+            crate::agent_restore::CandidateConfidence::Exact => "exact",
+            crate::agent_restore::CandidateConfidence::Discovered => "discovered",
+        });
+        crate::agent_restore::telemetry::record(&event);
+    }
+    plan
+}
+
+/// Durably mark a resume fallback as in-flight before it can reach the
+/// daemon. If the Ensure response is lost after spawning, a later UI attach
+/// must hide the destructive retry affordance until the winner confirms or
+/// exits. Warm cache attaches restore the prior phase in
+/// [`apply_agent_spawn_outcome`].
+pub fn prepare_agent_resume_launch(
+    state: &mut AppState,
+    pane_id: u32,
+    workspace_id: u32,
+    plan: &crate::agent_restore::AgentSpawnPlan,
+    source: &'static str,
+) -> bool {
+    use crate::agent_restore::{AgentLaunchPhase, SpawnIntent};
+
+    if plan.intent != SpawnIntent::AutoResume {
+        return true;
+    }
+    let Some(candidate) = plan.candidate.as_ref() else {
+        return false;
+    };
+    let Some(previous_phase) = state
+        .agent_restarts
+        .get(&pane_id)
+        .map(|record| record.launch_phase)
+    else {
+        return false;
+    };
+    state
+        .agent_resume_preflights
+        .insert(pane_id, previous_phase);
+    state.pending_agent_resumes.remove(&pane_id);
+    state.agent_resume_attempts.remove(&pane_id);
+
+    let phase_changed = previous_phase != AgentLaunchPhase::ConfirmingResume;
+    if phase_changed {
+        if let Some(record) = state.agent_restarts.get_mut(&pane_id) {
+            record.launch_phase = AgentLaunchPhase::ConfirmingResume;
+        }
+        if !persist_agent_metadata(state, candidate.agent, workspace_id, pane_id, source) {
+            if let Some(record) = state.agent_restarts.get_mut(&pane_id) {
+                record.launch_phase = previous_phase;
+            }
+            state.agent_resume_preflights.remove(&pane_id);
+            if previous_phase == AgentLaunchPhase::PendingManual {
+                state
+                    .pending_agent_resumes
+                    .insert(pane_id, candidate.clone());
+            }
+            return false;
+        }
+    }
+
+    let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+        &state.restore_correlation_id,
+        crate::agent_restore::telemetry::EventName::ResumePending,
+        crate::agent_restore::telemetry::Level::Info,
+    );
+    event.provider = Some(candidate.agent);
+    event.workspace_id = Some(workspace_id);
+    event.pane_id = Some(pane_id);
+    event.source = Some(source);
+    event.outcome = Some("launch_prepared");
+    crate::agent_restore::telemetry::record(&event);
+    true
+}
+
+/// Apply the visible/durable side of an atomic daemon reconciliation.
+/// `attached` means the fallback was ignored. `false` means the daemon
+/// positively found no survivor and spawned the plan.
+pub fn apply_agent_spawn_outcome(
+    state: &mut AppState,
+    pane_id: u32,
+    workspace_id: u32,
+    plan: &crate::agent_restore::AgentSpawnPlan,
+    attached: bool,
+    source: &'static str,
+) {
+    use crate::agent_restore::telemetry::{EventName, Level, RestoreEvent};
+    use crate::agent_restore::{AgentLaunchPhase, CandidateConfidence, SpawnIntent};
+
+    let reconcile_outcome = state.pty_manager.take_reconcile_outcome(pane_id);
+    let preflight_phase = state.agent_resume_preflights.remove(&pane_id);
+    if attached {
+        if reconcile_outcome == Some(crate::pty::ReconcileOutcome::CachedAttached) {
+            if let Some(previous_phase) = preflight_phase {
+                let restored = state
+                    .agent_restarts
+                    .get_mut(&pane_id)
+                    .is_some_and(|record| {
+                        let changed = record.launch_phase != previous_phase;
+                        record.launch_phase = previous_phase;
+                        changed
+                    });
+                if restored {
+                    if let Some(candidate) = plan.candidate.as_ref() {
+                        persist_agent_metadata(
+                            state,
+                            candidate.agent,
+                            workspace_id,
+                            pane_id,
+                            source,
+                        );
+                    }
+                }
+            }
+        }
+        let launch_phase = state
+            .agent_restarts
+            .get(&pane_id)
+            .map(|record| record.launch_phase)
+            .unwrap_or_default();
+        match (launch_phase, plan.candidate.as_ref()) {
+            (AgentLaunchPhase::PendingManual, Some(candidate)) => {
+                state
+                    .pending_agent_resumes
+                    .insert(pane_id, candidate.clone());
+                state.agent_resume_attempts.remove(&pane_id);
+            }
+            (AgentLaunchPhase::ConfirmingResume, Some(candidate)) => {
+                state.pending_agent_resumes.remove(&pane_id);
+                state.agent_resume_attempts.insert(
+                    pane_id,
+                    AgentResumeAttempt {
+                        candidate: candidate.clone(),
+                        reader_generation: crate::bridge::reader_generation(pane_id).unwrap_or(0),
+                    },
+                );
+            }
+            _ => {
+                state.pending_agent_resumes.remove(&pane_id);
+                state.agent_resume_attempts.remove(&pane_id);
+            }
+        }
+        if let Some(record) = state.agent_restarts.get(&pane_id) {
+            let mut event = RestoreEvent::new(
+                &state.restore_correlation_id,
+                EventName::Attached,
+                Level::Info,
+            );
+            event.provider = Some(record.agent);
+            event.workspace_id = Some(workspace_id);
+            event.pane_id = Some(pane_id);
+            event.source = Some(source);
+            event.outcome = Some(match launch_phase {
+                AgentLaunchPhase::PendingManual => "attached_pending_manual",
+                AgentLaunchPhase::ConfirmingResume => "attached_confirming",
+                AgentLaunchPhase::Confirmed => "attached",
+            });
+            crate::agent_restore::telemetry::record(&event);
+        }
+        return;
+    }
+
+    let Some(candidate) = plan.candidate.as_ref() else {
+        state.pending_agent_resumes.remove(&pane_id);
+        return;
+    };
+    let mut metadata_changed = false;
+    if candidate.confidence == CandidateConfidence::Discovered {
+        if let Some(record) = state.agent_restarts.get_mut(&pane_id) {
+            if record.session_id.as_deref() != Some(candidate.session_id.as_str()) {
+                record.session_id = Some(candidate.session_id.clone());
+                record.cwd = candidate.cwd.clone();
+                record.observed_at_unix_ms = crate::agent_restore::now_unix_ms();
+                metadata_changed = true;
+            }
+        }
+    }
+    let (event_name, outcome, launch_phase) = match plan.intent {
+        SpawnIntent::PendingManual => {
+            state
+                .pending_agent_resumes
+                .insert(pane_id, candidate.clone());
+            (
+                EventName::ResumePending,
+                "pending",
+                AgentLaunchPhase::PendingManual,
+            )
+        }
+        SpawnIntent::AutoResume => {
+            state.pending_agent_resumes.remove(&pane_id);
+            state.agent_resume_attempts.insert(
+                pane_id,
+                AgentResumeAttempt {
+                    candidate: candidate.clone(),
+                    reader_generation: crate::bridge::reader_generation(pane_id).unwrap_or(0),
+                },
+            );
+            (
+                EventName::ResumeSpawned,
+                "spawned",
+                AgentLaunchPhase::ConfirmingResume,
+            )
+        }
+        SpawnIntent::Ordinary => return,
+    };
+    if let Some(record) = state.agent_restarts.get_mut(&pane_id) {
+        if record.launch_phase != launch_phase {
+            record.launch_phase = launch_phase;
+            metadata_changed = true;
+        }
+    }
+    if metadata_changed {
+        persist_agent_metadata(state, candidate.agent, workspace_id, pane_id, source);
+    }
+    let mut event = RestoreEvent::new(&state.restore_correlation_id, event_name, Level::Info);
+    event.provider = Some(candidate.agent);
+    event.workspace_id = Some(workspace_id);
+    event.pane_id = Some(pane_id);
+    event.source = Some(source);
+    event.outcome = Some(outcome);
+    crate::agent_restore::telemetry::record(&event);
+}
+
+pub fn persist_agent_metadata(
+    state: &mut AppState,
+    provider: crate::agent_restore::AgentKind,
+    workspace_id: u32,
+    pane_id: u32,
+    source: &'static str,
+) -> bool {
+    use crate::agent_restore::telemetry::{EventName, Level, RestoreEvent};
+
+    let saved = crate::persist::save_workspaces(state);
+    let mut event = RestoreEvent::new(
+        &state.restore_correlation_id,
+        EventName::MetadataSaved,
+        if saved { Level::Info } else { Level::Error },
+    );
+    event.provider = Some(provider);
+    event.workspace_id = Some(workspace_id);
+    event.pane_id = Some(pane_id);
+    event.source = Some(source);
+    event.outcome = Some(if saved { "saved" } else { "failed" });
+    if !saved {
+        event.error_kind = Some("workspace_write");
+    }
+    crate::agent_restore::telemetry::record(&event);
+    if !saved {
+        push_error_toast(
+            state,
+            "Agent recovery metadata could not be saved. The current conversation is still running, but a crash may prevent restoration.",
+        );
+    }
+    saved
+}
+
+pub fn record_agent_spawn_failure(
+    state: &mut AppState,
+    pane_id: u32,
+    workspace_id: u32,
+    plan: &crate::agent_restore::AgentSpawnPlan,
+    source: &'static str,
+    error: &std::io::Error,
+) -> bool {
+    let Some(candidate) = plan.candidate.as_ref() else {
+        return false;
+    };
+    state.agent_resume_preflights.remove(&pane_id);
+    state.pty_manager.take_reconcile_outcome(pane_id);
+    let authoritative = plan.intent != crate::agent_restore::SpawnIntent::AutoResume
+        || agent_spawn_failure_is_authoritative(error);
+    if authoritative {
+        state
+            .pending_agent_resumes
+            .insert(pane_id, candidate.clone());
+    } else {
+        state.pending_agent_resumes.remove(&pane_id);
+    }
+    state.agent_resume_attempts.remove(&pane_id);
+    let target_phase = if authoritative {
+        crate::agent_restore::AgentLaunchPhase::PendingManual
+    } else {
+        crate::agent_restore::AgentLaunchPhase::ConfirmingResume
+    };
+    let phase_changed = state
+        .agent_restarts
+        .get_mut(&pane_id)
+        .is_some_and(|record| {
+            let changed = record.launch_phase != target_phase;
+            record.launch_phase = target_phase;
+            changed
+        });
+    if phase_changed {
+        persist_agent_metadata(state, candidate.agent, workspace_id, pane_id, source);
+    }
+    let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+        &state.restore_correlation_id,
+        crate::agent_restore::telemetry::EventName::ResumeFailed,
+        crate::agent_restore::telemetry::Level::Error,
+    );
+    event.provider = Some(candidate.agent);
+    event.workspace_id = Some(workspace_id);
+    event.pane_id = Some(pane_id);
+    event.source = Some(source);
+    event.outcome = Some(if authoritative {
+        "retryable"
+    } else {
+        "outcome_unknown"
+    });
+    event.error_kind = Some(match error.kind() {
+        std::io::ErrorKind::NotConnected => "not_connected",
+        std::io::ErrorKind::BrokenPipe => "transport_lost",
+        std::io::ErrorKind::TimedOut => "timeout",
+        std::io::ErrorKind::AlreadyExists => "ambiguous_session_key",
+        std::io::ErrorKind::NotFound => "session_not_found",
+        _ => "io_error",
+    });
+    crate::agent_restore::telemetry::record(&event);
+    authoritative
+}
+
+fn agent_spawn_failure_is_authoritative(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::AlreadyExists
+            | std::io::ErrorKind::Unsupported
+    )
+}
+
+/// Restore the manual retry affordance when the exact reader associated
+/// with a resume attempt reaches EOF before a provider hook confirms it.
+/// Generation matching prevents the killed fallback shell's old reader
+/// from racing with the replacement agent reader.
+pub fn mark_agent_resume_stream_ended(
+    state: &mut AppState,
+    pane_id: u32,
+    reader_generation: u64,
+) -> bool {
+    let Some(attempt) = state.agent_resume_attempts.get(&pane_id) else {
+        return false;
+    };
+    if attempt.reader_generation != reader_generation {
+        return false;
+    }
+    let attempt = state
+        .agent_resume_attempts
+        .remove(&pane_id)
+        .expect("attempt existed above");
+    state
+        .pending_agent_resumes
+        .insert(pane_id, attempt.candidate.clone());
+    if let Some(record) = state.agent_restarts.get_mut(&pane_id) {
+        record.launch_phase = crate::agent_restore::AgentLaunchPhase::PendingManual;
+    }
+    if let Some(workspace_id) = workspace_num_for_pane(state, pane_id) {
+        persist_agent_metadata(
+            state,
+            attempt.candidate.agent,
+            workspace_id,
+            pane_id,
+            "pty_eof",
+        );
+    }
+    let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+        &state.restore_correlation_id,
+        crate::agent_restore::telemetry::EventName::ResumeFailed,
+        crate::agent_restore::telemetry::Level::Warn,
+    );
+    event.provider = Some(attempt.candidate.agent);
+    event.pane_id = Some(pane_id);
+    event.source = Some("pty_eof");
+    event.outcome = Some("retryable");
+    event.error_kind = Some("provider_exited");
+    crate::agent_restore::telemetry::record(&event);
+    push_error_toast(
+        state,
+        format!(
+            "{} resume exited before confirmation. The recovery button is available again.",
+            attempt.candidate.agent.label()
+        ),
+    );
+    true
+}
+
+fn workspace_num_for_pane(state: &AppState, pane_id: u32) -> Option<u32> {
+    let active_contains = state
+        .panes
+        .iter()
+        .flatten()
+        .chain(state.tabs.iter().flat_map(|tab| tab.panes.iter().flatten()))
+        .any(|pane| pane.id.0 == pane_id);
+    if active_contains {
+        return state
+            .workspaces
+            .get(state.active_workspace)
+            .map(|workspace| workspace.num);
+    }
+    state.workspaces.iter().find_map(|workspace| {
+        workspace
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter().flatten())
+            .any(|pane| pane.id.0 == pane_id)
+            .then_some(workspace.num)
+    })
 }
 
 /// Poll the daemon for its live session list and cache the result in
@@ -3324,6 +4127,7 @@ pub fn mutate_kill_session_id(state: &mut AppState, session_id: u64) {
 }
 
 fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
+    forget_agent_restore(state, pane_id);
     state.panes.retain_mut(|row| {
         row.retain(|p| p.id.0 != pane_id);
         !row.is_empty()
@@ -3342,6 +4146,13 @@ fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
             });
         }
     }
+}
+
+fn forget_agent_restore(state: &mut AppState, pane_id: u32) {
+    state.agent_restarts.remove(&pane_id);
+    state.pending_agent_resumes.remove(&pane_id);
+    state.agent_resume_attempts.remove(&pane_id);
+    state.agent_resume_preflights.remove(&pane_id);
 }
 
 /// Update the display title of a pane. Writes through to both the
@@ -3849,53 +4660,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
         }
         "app.close.keep_running" => {
-            let all_pane_ids = close_app_pane_ids(state);
-            let (remember, kept_pane_ids) = match state.confirm_dialog.as_ref() {
-                Some(ConfirmDialog::CloseApp {
-                    remember,
-                    kept_pane_ids,
-                    ..
-                }) => (*remember, kept_pane_ids.clone()),
-                _ => (false, all_pane_ids.clone()),
-            };
-            let kill_pane_ids: Vec<u32> =
-                all_pane_ids.difference(&kept_pane_ids).copied().collect();
-            state.confirm_dialog = None;
-            if remember {
-                state.toggles.insert(ToggleKey::RememberCloseChoice, true);
-                state.toggles.insert(ToggleKey::KillAllOnClose, false);
-            }
-            for pane_id in kill_pane_ids {
-                state.pty_manager.destroy(pane_id);
-                state.terminals.remove(&pane_id);
-            }
-            prune_close_layout_to_kept_panes(state, &kept_pane_ids);
-            // Always persist the live layout (not just when "remember" is
-            // ticked): the daemon keeps these sessions alive, so the next
-            // launch must restore the same tabs/panes to reattach them.
-            // Without this, keep-running dropped the layout and the relaunch
-            // showed a fresh terminal instead of the surviving session.
-            crate::persist::save_workspaces(state);
-            // Drop local readers; daemon sessions remain alive. The UI
-            // callback follows up with `process::exit(0)`.
-            state.terminals.clear();
+            let _may_exit = finalize_close_dialog_choice(state, true);
             true
         }
         "app.close.kill_and_quit" => {
-            let remember = matches!(
-                state.confirm_dialog,
-                Some(ConfirmDialog::CloseApp { remember: true, .. })
-            );
-            state.confirm_dialog = None;
-            if remember {
-                state.toggles.insert(ToggleKey::RememberCloseChoice, true);
-                state.toggles.insert(ToggleKey::KillAllOnClose, true);
-            }
-            mutate_kill_all_terminals(state);
-            // The layout is now empty; persisting it means the relaunch
-            // starts fresh instead of restoring panes whose sessions were
-            // just killed.
-            crate::persist::save_workspaces(state);
+            let _may_exit = finalize_close_dialog_choice(state, false);
             true
         }
         "app.close.reset_preference" => {
@@ -4071,15 +4840,38 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             let augmented_prompt =
                 crate::quick_prompt::images::append_image_references(&prompt, &refs);
-            let shell_spec = match agent {
+            let (shell_spec, session_id) = match agent {
                 crate::quick_prompt::Agent::Claude => {
-                    crate::quick_prompt::spawn::claude_shell_spec(&augmented_prompt)
+                    let session_id = crate::agent_restore::generate_session_id();
+                    let shell = crate::agent_restore::claude_initial_shell_spec(
+                        &augmented_prompt,
+                        &session_id,
+                    )
+                    .expect("generated Claude session id must be valid");
+                    (shell, Some(session_id))
                 }
-                crate::quick_prompt::Agent::Codex => {
-                    crate::quick_prompt::spawn::codex_shell_spec(&augmented_prompt)
-                }
+                crate::quick_prompt::Agent::Codex => (
+                    crate::quick_prompt::spawn::codex_shell_spec(&augmented_prompt),
+                    None,
+                ),
             };
-            mutate_add_quick_prompt_tab(state, &prompt, &target.path, &shell_spec);
+            let restart = crate::agent_restore::AgentRestart {
+                agent: agent.into(),
+                cwd: crate::agent_restore::normalized_cwd(&target.path),
+                resume_mode: match agent {
+                    crate::quick_prompt::Agent::Claude => {
+                        crate::agent_restore::AgentResumeMode::Interactive
+                    }
+                    crate::quick_prompt::Agent::Codex => {
+                        crate::agent_restore::AgentResumeMode::CodexExec
+                    }
+                },
+                session_id,
+                observed_at_unix_ms: crate::agent_restore::now_unix_ms(),
+                managed: true,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+            };
+            mutate_add_quick_prompt_tab(state, &prompt, &target.path, &shell_spec, restart);
             crate::quick_prompt::images::cleanup_session(&session_hex);
             state.quick_prompt = None;
             crate::persist::save_workspaces(state);
@@ -4544,6 +5336,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             handled
         }
+        "agent.auto_resume.toggle" => dispatch_agent_auto_resume_toggle(state),
+        "agent.recovery_hooks.remove" => dispatch_agent_recovery_hooks_remove(state),
+        other if other.starts_with("agent.resume:") => dispatch_agent_resume(state, other),
         other if other.starts_with("shell.set_default:") => {
             dispatch_shell_set_default(state, other)
         }
@@ -5432,6 +6227,326 @@ fn dispatch_shell_clear_workspace(state: &mut AppState, cmd: &str) -> bool {
     true
 }
 
+fn dispatch_agent_auto_resume_toggle(state: &mut AppState) -> bool {
+    let currently_on = toggle_on(state, ToggleKey::AutoResumeAgents);
+    if !currently_on && !install_agent_recovery_hooks(state) {
+        return true;
+    }
+    let target = !currently_on;
+    if !persist_auto_resume_preference(state, target) {
+        push_error_toast(
+            state,
+            if target {
+                "Automatic agent resume stayed off because the preference could not be saved. Managed hooks may remain installed for manual recovery."
+            } else {
+                "Automatic agent resume is off for this run, but that safety preference could not be saved. Fix storage permissions or free space, then toggle it again before restarting."
+            },
+        );
+        return true;
+    }
+    push_error_toast(
+        state,
+        if currently_on {
+            "Automatic agent resume is off. Recovery metadata capture remains installed for the manual Resume button."
+        } else {
+            "Automatic agent resume is on. Codex may ask you to trust the hook from /hooks."
+        },
+    );
+    true
+}
+
+fn persist_auto_resume_preference(state: &mut AppState, enabled: bool) -> bool {
+    let saved =
+        persist_auto_resume_preference_with(state, enabled, crate::persist::save_workspaces);
+    let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+        &state.restore_correlation_id,
+        crate::agent_restore::telemetry::EventName::HookConfigChanged,
+        if saved {
+            crate::agent_restore::telemetry::Level::Info
+        } else {
+            crate::agent_restore::telemetry::Level::Error
+        },
+    );
+    event.source = Some("settings_preference");
+    event.outcome = Some(if saved {
+        if enabled {
+            "auto_on_saved"
+        } else {
+            "auto_off_saved"
+        }
+    } else {
+        "preference_save_failed"
+    });
+    if !saved {
+        event.error_kind = Some("workspace_write");
+    }
+    crate::agent_restore::telemetry::record(&event);
+    saved
+}
+
+fn persist_auto_resume_preference_with(
+    state: &mut AppState,
+    enabled: bool,
+    save: impl FnOnce(&AppState) -> bool,
+) -> bool {
+    let previous = toggle_on(state, ToggleKey::AutoResumeAgents);
+    state.toggles.insert(ToggleKey::AutoResumeAgents, enabled);
+    if save(state) {
+        return true;
+    }
+
+    // Enabling must never take effect without durable consent. When an
+    // explicit disable cannot be written, keep this process safely off while
+    // surfacing that a later restart may still read the old on-disk value.
+    if enabled {
+        state.toggles.insert(ToggleKey::AutoResumeAgents, previous);
+    }
+    false
+}
+
+#[cfg(test)]
+fn install_agent_recovery_hooks(_state: &mut AppState) -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn install_agent_recovery_hooks(state: &mut AppState) -> bool {
+    use crate::agent_restore::telemetry::{EventName, Level, RestoreEvent};
+
+    let report = crate::agent_restore::hooks::install_managed_hooks();
+    for (provider, result) in [
+        (crate::agent_restore::AgentKind::Claude, &report.claude),
+        (crate::agent_restore::AgentKind::Codex, &report.codex),
+    ] {
+        let succeeded = result.is_ok();
+        let mut event = RestoreEvent::new(
+            &state.restore_correlation_id,
+            EventName::HookConfigChanged,
+            if succeeded { Level::Info } else { Level::Error },
+        );
+        event.provider = Some(provider);
+        event.source = Some("settings_toggle");
+        event.outcome = Some(if succeeded { "installed" } else { "rejected" });
+        event.error_kind = crate::agent_restore::hooks::error_kind(result);
+        crate::agent_restore::telemetry::record(&event);
+    }
+    if report.all_succeeded() {
+        true
+    } else {
+        push_error_toast(
+            state,
+            "Automatic resume stayed off because one or more recovery hooks could not be installed. Any hook installed successfully remains available for manual recovery.",
+        );
+        false
+    }
+}
+
+fn dispatch_agent_recovery_hooks_remove(state: &mut AppState) -> bool {
+    if !persist_auto_resume_preference(state, false) {
+        push_error_toast(
+            state,
+            "Recovery hooks were not removed because the automatic-resume off preference could not be saved. It remains off for this run; fix storage and retry removal.",
+        );
+        return true;
+    }
+
+    let removed = remove_agent_recovery_hooks(state);
+    push_error_toast(
+        state,
+        if removed {
+            "Terminal Manager recovery hooks were removed and automatic resume is off. Existing saved conversation IDs were kept."
+        } else {
+            "Automatic resume is off, but one or more managed recovery hooks could not be removed. No unmarked hook entries were changed."
+        },
+    );
+    true
+}
+
+#[cfg(test)]
+fn remove_agent_recovery_hooks(_state: &mut AppState) -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn remove_agent_recovery_hooks(state: &mut AppState) -> bool {
+    use crate::agent_restore::telemetry::{EventName, Level, RestoreEvent};
+
+    let report = crate::agent_restore::hooks::uninstall_managed_hooks();
+    for (provider, result) in [
+        (crate::agent_restore::AgentKind::Claude, &report.claude),
+        (crate::agent_restore::AgentKind::Codex, &report.codex),
+    ] {
+        let succeeded = result.is_ok();
+        let mut event = RestoreEvent::new(
+            &state.restore_correlation_id,
+            EventName::HookConfigChanged,
+            if succeeded { Level::Info } else { Level::Error },
+        );
+        event.provider = Some(provider);
+        event.source = Some("settings_remove");
+        event.outcome = Some(if succeeded { "removed" } else { "rejected" });
+        event.error_kind = crate::agent_restore::hooks::error_kind(result);
+        crate::agent_restore::telemetry::record(&event);
+    }
+    report.all_succeeded()
+}
+
+fn record_manual_resume_winner(
+    state: &mut AppState,
+    pane_id: u32,
+    workspace_id: u32,
+    candidate: &crate::agent_restore::ResumeCandidate,
+    reader_generation: u64,
+    spawned: bool,
+) {
+    let provider = candidate.agent;
+    state.agent_resume_preflights.remove(&pane_id);
+    state.pty_manager.take_reconcile_outcome(pane_id);
+    let managed = state
+        .agent_restarts
+        .get(&pane_id)
+        .map(|record| record.managed)
+        .unwrap_or(false);
+    state.pending_agent_resumes.remove(&pane_id);
+    state.agent_resume_attempts.insert(
+        pane_id,
+        AgentResumeAttempt {
+            candidate: candidate.clone(),
+            reader_generation,
+        },
+    );
+    state.agent_restarts.insert(
+        pane_id,
+        crate::agent_restore::AgentRestart {
+            agent: candidate.agent,
+            cwd: candidate.cwd.clone(),
+            resume_mode: candidate.resume_mode,
+            session_id: Some(candidate.session_id.clone()),
+            observed_at_unix_ms: crate::agent_restore::now_unix_ms(),
+            managed,
+            launch_phase: crate::agent_restore::AgentLaunchPhase::ConfirmingResume,
+        },
+    );
+    persist_agent_metadata(state, provider, workspace_id, pane_id, "manual_button");
+
+    let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+        &state.restore_correlation_id,
+        if spawned {
+            crate::agent_restore::telemetry::EventName::ResumeSpawned
+        } else {
+            crate::agent_restore::telemetry::EventName::ResumePending
+        },
+        crate::agent_restore::telemetry::Level::Info,
+    );
+    event.provider = Some(provider);
+    event.workspace_id = Some(workspace_id);
+    event.pane_id = Some(pane_id);
+    event.source = Some("manual_button");
+    event.outcome = Some(if spawned {
+        "spawned"
+    } else {
+        "existing_unconfirmed"
+    });
+    crate::agent_restore::telemetry::record(&event);
+
+    if !spawned {
+        push_error_toast(
+            state,
+            "The recovery session was reattached; waiting for Claude or Codex to confirm its conversation ID.",
+        );
+    }
+}
+
+fn dispatch_agent_resume(state: &mut AppState, cmd: &str) -> bool {
+    let Ok(pane_id) = cmd["agent.resume:".len()..].parse::<u32>() else {
+        return false;
+    };
+    let Some(candidate) = state.pending_agent_resumes.get(&pane_id).cloned() else {
+        return false;
+    };
+    if !crate::agent_restore::is_valid_session_id(&candidate.session_id) {
+        return false;
+    }
+    let workspace_id =
+        workspace_num_for_pane(state, pane_id).unwrap_or_else(|| active_workspace_num(state));
+    let (cols, rows) = state
+        .terminals
+        .get(&pane_id)
+        .map(|terminal| {
+            let terminal = terminal.lock_recover();
+            (
+                terminal.grid().cols().max(1).min(u16::MAX as usize) as u16,
+                terminal.grid().rows().max(1).min(u16::MAX as usize) as u16,
+            )
+        })
+        .unwrap_or((80, 24));
+    let shell = crate::agent_restore::resume_shell_spec(&candidate);
+    let resume_plan = crate::agent_restore::AgentSpawnPlan {
+        cwd: Some(candidate.cwd.clone()),
+        shell: Some(shell.clone()),
+        candidate: Some(candidate.clone()),
+        intent: crate::agent_restore::SpawnIntent::AutoResume,
+    };
+    let launch_prepared =
+        prepare_agent_resume_launch(state, pane_id, workspace_id, &resume_plan, "manual_button");
+    let resume_result = if launch_prepared {
+        state.pty_manager.replace_or_spawn(
+            pane_id,
+            workspace_id,
+            cols,
+            rows,
+            Some(&candidate.cwd),
+            Some(&shell),
+        )
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "agent recovery launch preflight was not durable",
+        ))
+    }
+    .map(|(snapshot, reader)| {
+        let spawned = snapshot.is_none();
+        let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+        if let Some(snapshot) = snapshot {
+            terminal.apply_snapshot(&snapshot);
+        }
+        state
+            .terminals
+            .insert(pane_id, Arc::new(Mutex::new(terminal)));
+        let reader_generation = crate::bridge::register_reader(pane_id, reader);
+        (spawned, reader_generation)
+    });
+    match resume_result {
+        Ok((spawned, reader_generation)) => record_manual_resume_winner(
+            state,
+            pane_id,
+            workspace_id,
+            &candidate,
+            reader_generation,
+            spawned,
+        ),
+        Err(error) => {
+            let retryable = record_agent_spawn_failure(
+                state,
+                pane_id,
+                workspace_id,
+                &resume_plan,
+                "manual_button",
+                &error,
+            );
+            push_error_toast(
+                state,
+                if retryable {
+                    "Could not replace the temporary shell with the agent; the recovery button is still available."
+                } else {
+                    "The recovery result is unknown, so retry is hidden to avoid killing a possible winner. Reopen Terminal Manager to reconcile safely."
+                },
+            );
+        }
+    }
+    true
+}
+
 /// Parse `keybind.set:<action_id>:<combo>` and apply. The combo can
 /// itself contain `+` and the separator is only the *first* colon after
 /// the prefix, since combos like `Ctrl+,` do not contain colons but
@@ -6014,6 +7129,11 @@ mod tests {
             next_id: 2,
             pty_manager: crate::pty::DaemonPty::new(),
             terminals: std::collections::HashMap::new(),
+            agent_restarts: std::collections::HashMap::new(),
+            pending_agent_resumes: std::collections::HashMap::new(),
+            agent_resume_attempts: std::collections::HashMap::new(),
+            agent_resume_preflights: std::collections::HashMap::new(),
+            restore_correlation_id: crate::agent_restore::generate_session_id(),
             custom_titled_panes: std::collections::HashSet::new(),
             scale_factor: 1.0,
             cell_width_ratio: 0.6,
@@ -6783,25 +7903,23 @@ mod tests {
         );
         assert_eq!(
             state.tabs.last().unwrap().name,
-            "qp: do the thing",
-            "tab title comes from quick_prompt_tab_title(prompt)"
+            "qp: Codex",
+            "tab title must not persist prompt content"
         );
     }
 
     #[test]
-    fn quick_prompt_tab_title_truncates_to_thirty_chars() {
-        let title = super::quick_prompt_tab_title(&"a".repeat(50));
-        // "qp: " + 30 chars = 34 chars total.
-        assert_eq!(title.chars().count(), 34);
-        assert!(title.starts_with("qp: "));
+    fn quick_prompt_tab_title_names_claude() {
+        let title = super::quick_prompt_tab_title(crate::agent_restore::AgentKind::Claude);
+        assert_eq!(title, "qp: Claude");
     }
 
     #[test]
-    fn quick_prompt_tab_title_handles_empty_prompt() {
-        // Defensive: even though dispatch rejects empty prompts, the
-        // title helper should not panic on one.
-        assert_eq!(super::quick_prompt_tab_title(""), "qp");
-        assert_eq!(super::quick_prompt_tab_title("   "), "qp");
+    fn quick_prompt_tab_title_names_codex() {
+        assert_eq!(
+            super::quick_prompt_tab_title(crate::agent_restore::AgentKind::Codex),
+            "qp: Codex"
+        );
     }
 
     #[test]
@@ -6809,11 +7927,9 @@ mod tests {
         // Multi-byte chars must not split. 30 emojis is well over 30
         // bytes but exactly 30 chars; the truncation is on chars.
         let prompt: String = "🎯".repeat(50);
-        let title = super::quick_prompt_tab_title(&prompt);
-        assert!(title.starts_with("qp: "));
-        // Body should be exactly 30 chars.
-        let body: String = title.chars().skip(4).collect();
-        assert_eq!(body.chars().count(), 30);
+        let _ = prompt;
+        let title = super::quick_prompt_tab_title(crate::agent_restore::AgentKind::Claude);
+        assert_eq!(title, "qp: Claude");
     }
 
     #[test]
@@ -8341,6 +9457,84 @@ mod tests {
     }
 
     #[test]
+    fn failed_remembered_keep_save_vetoes_close_and_retains_live_reader() {
+        let mut state = seed_state();
+        install_dummy_terminal(&mut state, PaneId(1));
+
+        let may_exit =
+            finalize_resolved_close_with(&mut state, CloseAction::KeepRunning, |_| false);
+
+        assert!(!may_exit);
+        assert!(state.terminals.contains_key(&1));
+        assert_eq!(state.tabs[0].panes[0][0].id, PaneId(1));
+        assert!(state
+            .toasts
+            .iter()
+            .any(|toast| toast.message.contains("stayed open")));
+    }
+
+    #[test]
+    fn failed_remembered_kill_save_keeps_empty_state_open_for_retry() {
+        let mut state = seed_state();
+        install_dummy_terminal(&mut state, PaneId(1));
+        state.agent_restarts.insert(
+            1,
+            crate::agent_restore::AgentRestart {
+                agent: crate::agent_restore::AgentKind::Claude,
+                cwd: std::env::current_dir().expect("cwd"),
+                resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+                session_id: Some("24c31fc8-8200-4773-8a0b-0447bd64bcdc".into()),
+                observed_at_unix_ms: 1,
+                managed: true,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+            },
+        );
+
+        let may_exit = finalize_resolved_close_with(&mut state, CloseAction::KillAll, |_| false);
+
+        assert!(!may_exit);
+        assert!(state.terminals.is_empty());
+        assert!(state.tabs.is_empty());
+        assert!(state.agent_restarts.is_empty());
+        assert!(state
+            .toasts
+            .iter()
+            .any(|toast| toast.message.contains("retry Close")));
+    }
+
+    #[test]
+    fn failed_dialog_keep_save_prunes_killed_pane_state_but_retains_survivor() {
+        let mut state = seed_state();
+        let pane_two = Pane {
+            id: PaneId(2),
+            title: "kill".into(),
+            subtitle: "bash".into(),
+            pid: 0,
+            cpu: 0.0,
+        };
+        state.panes[0].push(pane_two.clone());
+        state.col_ratios[0] = vec![0.5, 0.5];
+        state.tabs[0].panes = state.panes.clone();
+        state.tabs[0].col_ratios = state.col_ratios.clone();
+        install_dummy_terminal(&mut state, PaneId(1));
+        install_dummy_terminal(&mut state, PaneId(2));
+        state
+            .agent_resume_preflights
+            .insert(2, crate::agent_restore::AgentLaunchPhase::ConfirmingResume);
+        state.confirm_dialog = Some(close_app_dialog(2, false, &[1]));
+
+        let may_exit = finalize_close_dialog_choice_with(&mut state, true, |_| false);
+
+        assert!(!may_exit);
+        assert!(state.terminals.contains_key(&1));
+        assert!(!state.terminals.contains_key(&2));
+        assert_eq!(state.panes[0].len(), 1);
+        assert_eq!(state.panes[0][0].id, PaneId(1));
+        assert!(!state.agent_resume_preflights.contains_key(&2));
+        assert!(state.confirm_dialog.is_none());
+    }
+
+    #[test]
     fn close_reset_preference_clears_remember_flag() {
         let mut state = seed_state();
         state.toggles.insert(ToggleKey::RememberCloseChoice, true);
@@ -8719,6 +9913,409 @@ mod tests {
     }
 
     #[test]
+    fn auto_resume_toggle_is_opt_in_and_round_trips() {
+        let mut state = test_state();
+        assert!(!toggle_on(&state, ToggleKey::AutoResumeAgents));
+
+        assert!(dispatch(&mut state, "agent.auto_resume.toggle"));
+        assert!(toggle_on(&state, ToggleKey::AutoResumeAgents));
+
+        assert!(dispatch(&mut state, "agent.auto_resume.toggle"));
+        assert!(!toggle_on(&state, ToggleKey::AutoResumeAgents));
+    }
+
+    #[test]
+    fn failed_preference_write_never_enables_and_keeps_current_run_disabled() {
+        let mut state = test_state();
+        assert!(!persist_auto_resume_preference_with(
+            &mut state,
+            true,
+            |_| false
+        ));
+        assert!(!toggle_on(&state, ToggleKey::AutoResumeAgents));
+
+        state.toggles.insert(ToggleKey::AutoResumeAgents, true);
+        assert!(!persist_auto_resume_preference_with(
+            &mut state,
+            false,
+            |_| false,
+        ));
+        assert!(!toggle_on(&state, ToggleKey::AutoResumeAgents));
+    }
+
+    #[test]
+    fn removing_recovery_hooks_turns_automatic_resume_off() {
+        let mut state = test_state();
+        state.toggles.insert(ToggleKey::AutoResumeAgents, true);
+
+        assert!(dispatch(&mut state, "agent.recovery_hooks.remove"));
+
+        assert!(!toggle_on(&state, ToggleKey::AutoResumeAgents));
+        assert!(state
+            .toasts
+            .iter()
+            .any(|toast| toast.message.contains("recovery hooks were removed")));
+    }
+
+    #[test]
+    fn quick_prompt_stages_layout_and_agent_metadata_before_ambiguous_spawn_result() {
+        let mut state = seed_state();
+        let pane_id = state.next_id;
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(999, 77);
+        let cwd = std::env::current_dir().expect("cwd");
+        let session_id = "019f75b0-e94f-71f0-b1ea-f478f8438c1a";
+        let restart = crate::agent_restore::AgentRestart {
+            agent: crate::agent_restore::AgentKind::Claude,
+            cwd: cwd.clone(),
+            resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+            session_id: Some(session_id.into()),
+            observed_at_unix_ms: 1,
+            managed: true,
+            launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+        };
+        let shell = crate::agent_restore::claude_initial_shell_spec(
+            "sentinel prompt must never persist",
+            session_id,
+        )
+        .expect("shell");
+
+        mutate_add_quick_prompt_tab(
+            &mut state,
+            "sentinel prompt must never persist",
+            &cwd,
+            &shell,
+            restart,
+        );
+
+        let record = state
+            .agent_restarts
+            .get(&pane_id)
+            .expect("ambiguous response keeps staged record");
+        assert_eq!(
+            record.launch_phase,
+            crate::agent_restore::AgentLaunchPhase::ConfirmingResume
+        );
+        assert!(state
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter().flatten())
+            .any(|pane| pane.id.0 == pane_id));
+        let persisted = serde_json::to_string(&crate::persist::PersistedState::from_state(&state))
+            .expect("persisted state");
+        assert!(persisted.contains(session_id));
+        assert!(!persisted.contains("sentinel prompt"));
+    }
+
+    #[test]
+    fn manual_resume_failure_keeps_candidate_available() {
+        let mut state = test_state();
+        state.pending_agent_resumes.insert(
+            1,
+            crate::agent_restore::ResumeCandidate {
+                agent: crate::agent_restore::AgentKind::Codex,
+                cwd: std::path::PathBuf::from(r"C:\dev\project"),
+                resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+                session_id: "019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string(),
+                confidence: crate::agent_restore::CandidateConfidence::Exact,
+            },
+        );
+
+        assert!(dispatch(&mut state, "agent.resume:1"));
+        assert!(state.pending_agent_resumes.contains_key(&1));
+        assert_eq!(state.toasts.len(), 1);
+        assert!(!dispatch(&mut state, "agent.resume:not-a-pane"));
+        assert!(!dispatch(&mut state, "agent.resume:99"));
+    }
+
+    #[test]
+    fn manual_candidate_survives_reattach_to_its_temporary_shell() {
+        let mut state = test_state();
+        let candidate = crate::agent_restore::ResumeCandidate {
+            agent: crate::agent_restore::AgentKind::Claude,
+            cwd: std::path::PathBuf::from(r"C:\dev\project"),
+            resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+            session_id: "019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string(),
+            confidence: crate::agent_restore::CandidateConfidence::Exact,
+        };
+        let plan = crate::agent_restore::AgentSpawnPlan {
+            cwd: Some(candidate.cwd.clone()),
+            shell: None,
+            candidate: Some(candidate.clone()),
+            intent: crate::agent_restore::SpawnIntent::PendingManual,
+        };
+        state.agent_restarts.insert(
+            1,
+            crate::agent_restore::AgentRestart {
+                agent: candidate.agent,
+                cwd: candidate.cwd.clone(),
+                resume_mode: candidate.resume_mode,
+                session_id: Some(candidate.session_id.clone()),
+                observed_at_unix_ms: 1,
+                managed: true,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+            },
+        );
+
+        apply_agent_spawn_outcome(&mut state, 1, 7, &plan, false, "test");
+        assert_eq!(state.pending_agent_resumes.get(&1), Some(&candidate));
+        assert_eq!(
+            state.agent_restarts[&1].launch_phase,
+            crate::agent_restore::AgentLaunchPhase::PendingManual
+        );
+
+        // Runtime maps are rebuilt on each UI launch. Reattaching the
+        // daemon-owned temporary shell must reconstruct the affordance.
+        state.pending_agent_resumes.clear();
+        apply_agent_spawn_outcome(&mut state, 1, 7, &plan, true, "test");
+        assert_eq!(state.pending_agent_resumes.get(&1), Some(&candidate));
+    }
+
+    #[test]
+    fn existing_manual_resume_winner_hides_retry_until_confirmation_or_eof() {
+        let mut state = test_state();
+        let candidate = crate::agent_restore::ResumeCandidate {
+            agent: crate::agent_restore::AgentKind::Claude,
+            cwd: std::path::PathBuf::from(r"C:\dev\project"),
+            resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+            session_id: "019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string(),
+            confidence: crate::agent_restore::CandidateConfidence::Exact,
+        };
+        state.pending_agent_resumes.insert(1, candidate.clone());
+
+        record_manual_resume_winner(&mut state, 1, 1, &candidate, 41, false);
+
+        assert!(!state.pending_agent_resumes.contains_key(&1));
+        assert_eq!(
+            state
+                .agent_resume_attempts
+                .get(&1)
+                .map(|attempt| attempt.reader_generation),
+            Some(41)
+        );
+        assert_eq!(
+            state.agent_restarts[&1].launch_phase,
+            crate::agent_restore::AgentLaunchPhase::ConfirmingResume
+        );
+
+        assert!(mark_agent_resume_stream_ended(&mut state, 1, 41));
+        assert_eq!(state.pending_agent_resumes.get(&1), Some(&candidate));
+        assert_eq!(
+            state.agent_restarts[&1].launch_phase,
+            crate::agent_restore::AgentLaunchPhase::PendingManual
+        );
+    }
+
+    #[test]
+    fn confirming_resume_reconstructs_eof_tracking_after_ui_reattach() {
+        let mut state = test_state();
+        let candidate = crate::agent_restore::ResumeCandidate {
+            agent: crate::agent_restore::AgentKind::Claude,
+            cwd: std::path::PathBuf::from(r"C:\dev\project"),
+            resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+            session_id: "019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string(),
+            confidence: crate::agent_restore::CandidateConfidence::Exact,
+        };
+        state.agent_restarts.insert(
+            1,
+            crate::agent_restore::AgentRestart {
+                agent: candidate.agent,
+                cwd: candidate.cwd.clone(),
+                resume_mode: candidate.resume_mode,
+                session_id: Some(candidate.session_id.clone()),
+                observed_at_unix_ms: 1,
+                managed: true,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::ConfirmingResume,
+            },
+        );
+        let plan = crate::agent_restore::AgentSpawnPlan {
+            cwd: Some(candidate.cwd.clone()),
+            shell: Some(crate::agent_restore::resume_shell_spec(&candidate)),
+            candidate: Some(candidate.clone()),
+            intent: crate::agent_restore::SpawnIntent::AutoResume,
+        };
+
+        apply_agent_spawn_outcome(&mut state, 1, 7, &plan, true, "test");
+
+        assert!(!state.pending_agent_resumes.contains_key(&1));
+        assert_eq!(
+            state
+                .agent_resume_attempts
+                .get(&1)
+                .map(|attempt| &attempt.candidate),
+            Some(&candidate)
+        );
+    }
+
+    #[test]
+    fn lost_resume_response_reattaches_winner_without_exposing_kill_retry() {
+        let mut state = test_state();
+        let candidate = crate::agent_restore::ResumeCandidate {
+            agent: crate::agent_restore::AgentKind::Codex,
+            cwd: std::env::current_dir().expect("cwd"),
+            resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+            session_id: "019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string(),
+            confidence: crate::agent_restore::CandidateConfidence::Exact,
+        };
+        state.agent_restarts.insert(
+            1,
+            crate::agent_restore::AgentRestart {
+                agent: candidate.agent,
+                cwd: candidate.cwd.clone(),
+                resume_mode: candidate.resume_mode,
+                session_id: Some(candidate.session_id.clone()),
+                observed_at_unix_ms: 1,
+                managed: true,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::PendingManual,
+            },
+        );
+        state.pending_agent_resumes.insert(1, candidate.clone());
+        let plan = crate::agent_restore::AgentSpawnPlan {
+            cwd: Some(candidate.cwd.clone()),
+            shell: Some(crate::agent_restore::resume_shell_spec(&candidate)),
+            candidate: Some(candidate.clone()),
+            intent: crate::agent_restore::SpawnIntent::AutoResume,
+        };
+
+        assert!(prepare_agent_resume_launch(&mut state, 1, 1, &plan, "test"));
+        let response_lost = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "redacted");
+        assert!(!record_agent_spawn_failure(
+            &mut state,
+            1,
+            1,
+            &plan,
+            "test",
+            &response_lost,
+        ));
+        assert!(!state.pending_agent_resumes.contains_key(&1));
+        assert_eq!(
+            state.agent_restarts[&1].launch_phase,
+            crate::agent_restore::AgentLaunchPhase::ConfirmingResume
+        );
+
+        // Model a new UI attaching the live agent created before the reply
+        // was lost. Runtime preflight state is gone, but the durable phase
+        // prevents projection of a destructive Resume action.
+        state.agent_resume_preflights.clear();
+        state
+            .pty_manager
+            .test_set_reconcile_outcome(1, crate::pty::ReconcileOutcome::CachedAttached);
+        apply_agent_spawn_outcome(&mut state, 1, 1, &plan, true, "test_restart");
+
+        assert!(!state.pending_agent_resumes.contains_key(&1));
+        assert!(state.agent_resume_attempts.contains_key(&1));
+        assert!(!dispatch(&mut state, "agent.resume:1"));
+    }
+
+    #[test]
+    fn prepared_auto_resume_restores_confirmed_phase_on_warm_cache_attach() {
+        let mut state = test_state();
+        let candidate = crate::agent_restore::ResumeCandidate {
+            agent: crate::agent_restore::AgentKind::Claude,
+            cwd: std::env::current_dir().expect("cwd"),
+            resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+            session_id: "019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string(),
+            confidence: crate::agent_restore::CandidateConfidence::Exact,
+        };
+        state.agent_restarts.insert(
+            1,
+            crate::agent_restore::AgentRestart {
+                agent: candidate.agent,
+                cwd: candidate.cwd.clone(),
+                resume_mode: candidate.resume_mode,
+                session_id: Some(candidate.session_id.clone()),
+                observed_at_unix_ms: 1,
+                managed: true,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+            },
+        );
+        let plan = crate::agent_restore::AgentSpawnPlan {
+            cwd: Some(candidate.cwd.clone()),
+            shell: Some(crate::agent_restore::resume_shell_spec(&candidate)),
+            candidate: Some(candidate),
+            intent: crate::agent_restore::SpawnIntent::AutoResume,
+        };
+
+        assert!(prepare_agent_resume_launch(&mut state, 1, 1, &plan, "test"));
+        state
+            .pty_manager
+            .test_set_reconcile_outcome(1, crate::pty::ReconcileOutcome::CachedAttached);
+        apply_agent_spawn_outcome(&mut state, 1, 1, &plan, true, "test");
+
+        assert_eq!(
+            state.agent_restarts[&1].launch_phase,
+            crate::agent_restore::AgentLaunchPhase::Confirmed
+        );
+        assert!(!state.agent_resume_attempts.contains_key(&1));
+        assert!(!state.pending_agent_resumes.contains_key(&1));
+    }
+
+    #[test]
+    fn failed_automatic_spawn_falls_back_to_retryable_manual_state() {
+        let mut state = test_state();
+        let candidate = crate::agent_restore::ResumeCandidate {
+            agent: crate::agent_restore::AgentKind::Codex,
+            cwd: std::path::PathBuf::from(r"C:\dev\project"),
+            resume_mode: crate::agent_restore::AgentResumeMode::CodexExec,
+            session_id: "019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string(),
+            confidence: crate::agent_restore::CandidateConfidence::Exact,
+        };
+        let plan = crate::agent_restore::AgentSpawnPlan {
+            cwd: Some(candidate.cwd.clone()),
+            shell: Some(crate::agent_restore::resume_shell_spec(&candidate)),
+            candidate: Some(candidate.clone()),
+            intent: crate::agent_restore::SpawnIntent::AutoResume,
+        };
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "redacted");
+
+        record_agent_spawn_failure(&mut state, 1, 7, &plan, "test", &error);
+
+        assert_eq!(state.pending_agent_resumes.get(&1), Some(&candidate));
+    }
+
+    #[test]
+    fn pre_confirmation_eof_restores_retry_only_for_matching_reader_generation() {
+        let mut state = test_state();
+        let candidate = crate::agent_restore::ResumeCandidate {
+            agent: crate::agent_restore::AgentKind::Claude,
+            cwd: std::path::PathBuf::from(r"C:\dev\project"),
+            resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+            session_id: "019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string(),
+            confidence: crate::agent_restore::CandidateConfidence::Exact,
+        };
+        state.agent_resume_attempts.insert(
+            1,
+            AgentResumeAttempt {
+                candidate: candidate.clone(),
+                reader_generation: 9,
+            },
+        );
+        state.agent_restarts.insert(
+            1,
+            crate::agent_restore::AgentRestart {
+                agent: candidate.agent,
+                cwd: candidate.cwd.clone(),
+                resume_mode: candidate.resume_mode,
+                session_id: Some(candidate.session_id.clone()),
+                observed_at_unix_ms: 1,
+                managed: true,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::ConfirmingResume,
+            },
+        );
+
+        assert!(!mark_agent_resume_stream_ended(&mut state, 1, 8));
+        assert!(!state.pending_agent_resumes.contains_key(&1));
+        assert!(mark_agent_resume_stream_ended(&mut state, 1, 9));
+        assert_eq!(state.pending_agent_resumes.get(&1), Some(&candidate));
+        assert!(!state.agent_resume_attempts.contains_key(&1));
+        assert_eq!(
+            state.agent_restarts[&1].launch_phase,
+            crate::agent_restore::AgentLaunchPhase::PendingManual
+        );
+    }
+
+    #[test]
     fn notification_activate_focuses_workspace_pane_and_dismisses_toast() {
         let mut state = two_workspace_state();
         let id = push_notification_toast(&mut state, "Done", "Pane 8 finished", 2, 8);
@@ -8924,7 +10521,11 @@ mod tests {
         assert_eq!(state.panes[0][0].title, "powershell");
 
         // A title that merely mentions a path keeps its full text.
-        assert!(mutate_apply_osc_title(&mut state, 1, r"claude - C:\dev\proj"));
+        assert!(mutate_apply_osc_title(
+            &mut state,
+            1,
+            r"claude - C:\dev\proj"
+        ));
         assert_eq!(state.panes[0][0].title, r"claude - C:\dev\proj");
     }
 
@@ -8979,18 +10580,58 @@ mod tests {
     }
 
     #[test]
-    fn workspace_remove_renumbers() {
+    fn workspace_remove_preserves_surviving_routing_ids() {
         let mut state = test_state();
         mutate_add_workspace(&mut state);
         mutate_add_workspace(&mut state);
         mutate_add_workspace(&mut state);
         let count = state.workspaces.len();
         assert!(count >= 3);
+        let surviving_ids = state
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 1)
+            .map(|(_, workspace)| workspace.num)
+            .collect::<Vec<_>>();
         mutate_remove_workspace(&mut state, 1);
         assert_eq!(state.workspaces.len(), count - 1);
-        for (i, ws) in state.workspaces.iter().enumerate() {
-            assert_eq!(ws.num, i as u32 + 1);
-        }
+        assert_eq!(
+            state
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.num)
+                .collect::<Vec<_>>(),
+            surviving_ids
+        );
+    }
+
+    #[test]
+    fn workspace_remove_prunes_agent_restore_state_for_removed_panes() {
+        let mut state = seed_state();
+        state.agent_restarts.insert(
+            1,
+            crate::agent_restore::AgentRestart {
+                agent: crate::agent_restore::AgentKind::Claude,
+                cwd: std::env::current_dir().expect("cwd"),
+                resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+                session_id: Some("019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string()),
+                observed_at_unix_ms: 1,
+                managed: true,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+            },
+        );
+        state.pending_agent_resumes.insert(
+            1,
+            crate::agent_restore::exact_candidate(&state.agent_restarts[&1]).expect("candidate"),
+        );
+        mutate_add_workspace(&mut state);
+
+        mutate_remove_workspace(&mut state, 0);
+
+        assert!(!state.agent_restarts.contains_key(&1));
+        assert!(!state.pending_agent_resumes.contains_key(&1));
+        assert!(!state.terminals.contains_key(&1));
     }
 
     #[test]
@@ -11757,6 +13398,97 @@ mod tests {
     }
 
     #[test]
+    fn mutate_add_workspace_allocates_a_free_id_after_u32_max() {
+        let mut state = seed_state();
+        state.workspaces[0].num = u32::MAX;
+        let before = state.workspaces.len();
+
+        mutate_add_workspace(&mut state);
+
+        assert_eq!(state.workspaces.len(), before + 1);
+        assert_eq!(state.workspaces[0].num, u32::MAX);
+        assert_eq!(
+            state.workspaces.last().map(|workspace| workspace.num),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn restore_layout_normalizes_legacy_and_duplicate_ids_after_u32_max() {
+        use crate::persist::{PersistedState, PersistedWorkspace};
+
+        let workspace = |num, name: &str| PersistedWorkspace {
+            num,
+            name: name.into(),
+            path: None,
+            collapsed: false,
+            shell: crate::shell::ShellSpec::default(),
+            tabs: vec![],
+            active_tab: 0,
+        };
+        let persisted = PersistedState {
+            workspaces: vec![
+                workspace(u32::MAX, "max"),
+                workspace(0, "legacy"),
+                workspace(u32::MAX, "duplicate"),
+            ],
+            active_workspace: 0,
+            ..Default::default()
+        };
+
+        let mut state = seed_state();
+        restore_layout(&mut state, &persisted);
+
+        let ids = state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.num)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![u32::MAX, 1, 2]);
+        assert_eq!(
+            ids.iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn restore_layout_preserves_sparse_ids_when_no_tabs_are_persisted() {
+        use crate::persist::{PersistedState, PersistedWorkspace};
+
+        let workspace = |num, name: &str| PersistedWorkspace {
+            num,
+            name: name.into(),
+            path: None,
+            collapsed: false,
+            shell: crate::shell::ShellSpec::default(),
+            tabs: vec![],
+            active_tab: 0,
+        };
+        let persisted = PersistedState {
+            workspaces: vec![workspace(1, "one"), workspace(3, "three")],
+            active_workspace: 1,
+            ..Default::default()
+        };
+
+        let mut state = seed_state();
+        restore_layout(&mut state, &persisted);
+
+        assert_eq!(
+            state
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.num)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(state.active_workspace, 1);
+        assert_eq!(state.tabs.len(), 1, "active workspace gets one fresh tab");
+    }
+
+    #[test]
     fn restore_layout_round_trips_tabs_panes_and_next_id() {
         // Original: ws0 has tab1(pane 1) and a second tab carrying a
         // right-split (panes 2 and 3, with pane 3 active).
@@ -11791,6 +13523,7 @@ mod tests {
         let persisted = PersistedState {
             workspaces: vec![
                 PersistedWorkspace {
+                    num: 1,
                     name: "main".into(),
                     path: None,
                     collapsed: false,
@@ -11799,6 +13532,7 @@ mod tests {
                     active_tab: 0,
                 },
                 PersistedWorkspace {
+                    num: 2,
                     name: "api".into(),
                     path: None,
                     collapsed: false,
@@ -11812,6 +13546,7 @@ mod tests {
                             title: String::new(),
                             subtitle: String::new(),
                             custom_title: false,
+                            agent_restart: None,
                         }]],
                         active_pane: 9,
                         row_ratios: vec![1.0],

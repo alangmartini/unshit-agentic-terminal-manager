@@ -332,6 +332,10 @@ fn build_pane(
     )
     .with_key("pane-body");
     container = container.with_child(body);
+    if let Some(agent) = state.pending_agent_resumes.get(&pane.id.0).copied() {
+        container = container
+            .with_child(build_agent_resume_chip(pane.id, agent, shared).with_key("agent-resume"));
+    }
     // During a tab drag, layer the 4-edge drop overlay inside the pane
     // so it tracks the pane's real layout rather than a recomputed
     // window rect that would drift under border/padding changes.
@@ -339,6 +343,33 @@ fn build_pane(
         container = container.with_child(overlay.with_key("drop-overlay"));
     }
     container
+}
+
+fn build_agent_resume_chip(
+    pane_id: PaneId,
+    agent: crate::agent_restore::AgentKind,
+    shared: &SharedState,
+) -> ElementDef {
+    let resume_state = shared.clone();
+    ElementDef::new(Tag::Button)
+        .with_class("agent-resume-chip")
+        .with_id(format!("agent-resume-{}", pane_id.0))
+        .with_tab_index(0)
+        .on_click(move || {
+            mutate_with(&resume_state, |state| {
+                crate::state::dispatch(state, &format!("agent.resume:{}", pane_id.0));
+            });
+        })
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("agent-resume-icon")
+                .with_child(svg_icon(icon_agent())),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("agent-resume-label")
+                .with_text(format!("Resume {}", agent.label())),
+        )
 }
 
 fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
@@ -1289,6 +1320,34 @@ mod tests {
         assert_eq!(el.children.len(), 2);
         assert!(el.children[0].classes.contains(&"pane-header".to_string()));
         assert!(el.children[1].classes.contains(&"pane-body".to_string()));
+    }
+
+    #[test]
+    fn pane_with_pending_agent_restore_has_accessible_resume_chip() {
+        let pane = make_pane_titled(1, "shell");
+        let shared = make_shared();
+        {
+            let mut state = shared.lock().unwrap();
+            state.pending_agent_resumes.insert(
+                1,
+                crate::agent_restore::ResumeCandidate {
+                    agent: crate::agent_restore::AgentKind::Claude,
+                    cwd: std::path::PathBuf::from(r"C:\dev\project"),
+                    resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+                    session_id: "019f75b0-e94f-71f0-b1ea-f478f8438c1a".to_string(),
+                    confidence: crate::agent_restore::CandidateConfidence::Exact,
+                },
+            );
+        }
+        let snapshot = shared.lock().unwrap().ui_snapshot();
+        let grids = std::collections::HashMap::new();
+        let el = build_pane(&pane, true, true, false, &snapshot, &shared, &grids);
+        let chip = find_by_class(&el, "agent-resume-chip").expect("resume chip");
+
+        assert_eq!(chip.id.as_deref(), Some("agent-resume-1"));
+        assert_eq!(chip.tab_index, Some(0));
+        assert!(tree_has_text(chip, "Resume Claude"));
+        assert!(chip.on_click.is_some());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_core::Stream;
@@ -9,7 +10,14 @@ use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 
 use crate::state::{record_diagnostic_pty_event, MutexExt, SharedState};
 
-static PENDING_READERS: Mutex<Option<HashMap<u32, Box<dyn Read + Send>>>> = Mutex::new(None);
+struct PendingReader {
+    generation: u64,
+    reader: Box<dyn Read + Send>,
+}
+
+static PENDING_READERS: Mutex<Option<HashMap<u32, PendingReader>>> = Mutex::new(None);
+static ACTIVE_READER_GENERATIONS: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
+static NEXT_READER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn preview_bytes(bytes: &[u8], limit: usize) -> String {
     let mut preview = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]).into_owned();
@@ -27,18 +35,27 @@ fn should_emit_terminal_rebuild(synchronized_output_active: bool) -> bool {
     !synchronized_output_active
 }
 
-pub fn register_reader(pane_id: u32, reader: Box<dyn Read + Send>) {
+pub fn register_reader(pane_id: u32, reader: Box<dyn Read + Send>) -> u64 {
+    let generation = NEXT_READER_GENERATION.fetch_add(1, Ordering::Relaxed);
     let mut guard = PENDING_READERS.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
-    map.insert(pane_id, reader);
+    map.insert(pane_id, PendingReader { generation, reader });
+    let mut active = ACTIVE_READER_GENERATIONS.lock().unwrap();
+    active
+        .get_or_insert_with(HashMap::new)
+        .insert(pane_id, generation);
+    generation
 }
 
-fn take_reader(pane_id: u32) -> Option<Box<dyn Read + Send>> {
-    let mut guard = PENDING_READERS.lock().unwrap();
-    guard.as_mut().and_then(|map| map.remove(&pane_id))
+pub fn reader_generation(pane_id: u32) -> Option<u64> {
+    ACTIVE_READER_GENERATIONS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|map| map.get(&pane_id).copied())
 }
 
-fn take_all_readers() -> HashMap<u32, Box<dyn Read + Send>> {
+fn take_all_readers() -> HashMap<u32, PendingReader> {
     let mut guard = PENDING_READERS.lock().unwrap();
     guard.take().unwrap_or_default()
 }
@@ -48,14 +65,17 @@ fn take_all_readers() -> HashMap<u32, Box<dyn Read + Send>> {
 ///
 /// Uses a single long-lived blocking task with a channel to avoid
 /// per-read task-spawn overhead and buffer allocation.
-fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
-    let reader = take_reader(pane_id)?;
-
+fn pty_subscription(
+    pane_id: u32,
+    generation: u64,
+    reader: Box<dyn Read + Send>,
+    shared: SharedState,
+) -> Subscription {
     // Wrap reader in Arc<Mutex<>> so the factory closure is Sync.
     let reader_cell: Arc<Mutex<Option<Box<dyn Read + Send>>>> = Arc::new(Mutex::new(Some(reader)));
 
-    Some(Subscription::new(
-        format!("pty-{}", pane_id),
+    Subscription::new(
+        format!("pty-{pane_id}-{generation}"),
         move |_sink: EventSink| -> Pin<Box<dyn Stream<Item = ExternalEvent> + Send>> {
             let shared = shared.clone();
             let reader_cell = reader_cell.clone();
@@ -210,9 +230,20 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                         yield ExternalEvent::RequestRebuild;
                     }
                 }
+                let retryable = {
+                    let mut guard = shared.lock_recover();
+                    crate::state::mark_agent_resume_stream_ended(
+                        &mut guard,
+                        pane_id,
+                        generation,
+                    )
+                };
+                if retryable {
+                    yield ExternalEvent::RequestRebuild;
+                }
             })
         },
-    ))
+    )
 }
 
 /// Cursor focus, toast bookkeeping, and deferred PTY spawn subscription.
@@ -349,14 +380,36 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                 let shell = crate::state::pane_spawn_shell(&guard);
                                 for id in &all_pane_ids {
                                     if !guard.terminals.contains_key(id) {
-                                        match guard.pty_manager.attach_or_spawn(
+                                        let spawn_plan = crate::state::pane_agent_spawn_plan(
+                                            &guard,
                                             *id,
-                                            workspace_id,
-                                            cols,
-                                            rows,
-                                            cwd.as_deref(),
-                                            shell.as_ref(),
-                                        ) {
+                                            cwd.clone(),
+                                            shell.clone(),
+                                        );
+                                        let launch_prepared =
+                                            crate::state::prepare_agent_resume_launch(
+                                                &mut guard,
+                                                *id,
+                                                workspace_id,
+                                                &spawn_plan,
+                                                "deferred",
+                                            );
+                                        let reconcile_result = if launch_prepared {
+                                            guard.pty_manager.attach_or_spawn(
+                                                *id,
+                                                workspace_id,
+                                                cols,
+                                                rows,
+                                                spawn_plan.cwd.as_deref(),
+                                                spawn_plan.shell.as_ref(),
+                                            )
+                                        } else {
+                                            Err(std::io::Error::new(
+                                                std::io::ErrorKind::PermissionDenied,
+                                                "agent recovery launch preflight was not durable",
+                                            ))
+                                        };
+                                        match reconcile_result {
                                             Ok((Some(snapshot), reader)) => {
                                                 let snap_rows = snapshot.grid.rows();
                                                 let snap_cols = snapshot.grid.cols();
@@ -382,6 +435,14 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                         ),
                                                     );
                                                 }
+                                                crate::state::apply_agent_spawn_outcome(
+                                                    &mut guard,
+                                                    *id,
+                                                    workspace_id,
+                                                    &spawn_plan,
+                                                    true,
+                                                    "deferred",
+                                                );
                                                 log::info!(
                                                     "deferred reattach for pane {}: {}x{}",
                                                     id, snap_cols, snap_rows
@@ -410,12 +471,28 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                         ),
                                                     );
                                                 }
+                                                crate::state::apply_agent_spawn_outcome(
+                                                    &mut guard,
+                                                    *id,
+                                                    workspace_id,
+                                                    &spawn_plan,
+                                                    false,
+                                                    "deferred",
+                                                );
                                                 log::info!(
                                                     "deferred PTY spawn for pane {}: {}x{}",
                                                     id, cols, rows
                                                 );
                                             }
                                             Err(e) => {
+                                                crate::state::record_agent_spawn_failure(
+                                                    &mut guard,
+                                                    *id,
+                                                    workspace_id,
+                                                    &spawn_plan,
+                                                    "deferred",
+                                                    &e,
+                                                );
                                                 log::error!(
                                                     "failed to spawn deferred PTY for pane {}: {}",
                                                     id, e
@@ -551,19 +628,29 @@ pub fn build_subscriptions(shared: &SharedState) -> Vec<Subscription> {
 
     // Pick up any newly registered readers and create subscriptions for them.
     let pending = take_all_readers();
-    for (pane_id, reader) in pending {
-        register_reader(pane_id, reader);
-        if let Some(sub) = pty_subscription(pane_id, shared.clone()) {
-            subs.push(sub);
-        }
+    let replaced_panes = pending
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    for (pane_id, pending) in pending {
+        subs.push(pty_subscription(
+            pane_id,
+            pending.generation,
+            pending.reader,
+            shared.clone(),
+        ));
     }
 
     // For existing terminals, emit identity-only subscriptions so the
     // framework keeps already-running streams alive.
     let guard = shared.lock_recover();
     for &pane_id in guard.terminals.keys() {
+        if replaced_panes.contains(&pane_id) {
+            continue;
+        }
+        let generation = reader_generation(pane_id).unwrap_or(0);
         subs.push(Subscription::new(
-            format!("pty-{}", pane_id),
+            format!("pty-{pane_id}-{generation}"),
             move |_sink: EventSink| -> Pin<Box<dyn Stream<Item = ExternalEvent> + Send>> {
                 Box::pin(async_stream::stream! {
                     // Yield nothing. The framework identity system keeps the

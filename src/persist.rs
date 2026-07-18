@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +29,10 @@ pub struct PersistedPane {
     /// relaunch. Defaults to false for configs predating the field.
     #[serde(default)]
     pub custom_title: bool,
+    /// Optional Claude/Codex restart identity. Legacy files default to
+    /// no record, preserving the existing fresh-shell behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_restart: Option<crate::agent_restore::AgentRestart>,
 }
 
 /// A persisted terminal tab: its pane grid plus the split ratios needed
@@ -50,6 +56,10 @@ pub struct PersistedTab {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedWorkspace {
+    /// Stable daemon routing identity. Legacy files omit it and receive
+    /// a collision-free id during restore.
+    #[serde(default)]
+    pub num: u32,
     pub name: String,
     pub path: Option<PathBuf>,
     #[serde(default)]
@@ -87,6 +97,10 @@ pub struct PersistedState {
     /// upgraders keep plain new-tab behavior.
     #[serde(default)]
     pub worktree_tabs: bool,
+    /// Explicit opt-in for automatic agent conversation restoration.
+    /// False for legacy files and first runs.
+    #[serde(default)]
+    pub auto_resume_agents: bool,
     /// App wide default shell. Empty for upgraders predating the
     /// feature so the daemon's own `default_shell()` keeps the floor;
     /// inference only runs in `seed_state` for true first runs.
@@ -95,15 +109,32 @@ pub struct PersistedState {
 }
 
 /// Capture a single tab's pane grid into its persisted form.
-fn persisted_tab(tab: &TerminalTab, custom_titled: &HashSet<u32>) -> PersistedTab {
+fn persisted_tab(
+    tab: &TerminalTab,
+    custom_titled: &HashSet<u32>,
+    agent_restarts: &std::collections::HashMap<u32, crate::agent_restore::AgentRestart>,
+) -> PersistedTab {
+    let managed_agent = tab
+        .panes
+        .iter()
+        .flatten()
+        .filter_map(|pane| agent_restarts.get(&pane.id.0))
+        .find(|restart| restart.managed)
+        .map(|restart| restart.agent);
     PersistedTab {
         id: tab.id.clone(),
-        name: tab.name.clone(),
+        name: managed_agent
+            .map(|agent| format!("qp: {}", agent.label()))
+            .unwrap_or_else(|| tab.name.clone()),
         subtitle: tab.subtitle.clone(),
         panes: tab
             .panes
             .iter()
-            .map(|row| row.iter().map(|p| persisted_pane(p, custom_titled)).collect())
+            .map(|row| {
+                row.iter()
+                    .map(|p| persisted_pane(p, custom_titled, agent_restarts))
+                    .collect()
+            })
             .collect(),
         active_pane: tab.active_pane.0,
         row_ratios: tab.row_ratios.clone(),
@@ -111,12 +142,24 @@ fn persisted_tab(tab: &TerminalTab, custom_titled: &HashSet<u32>) -> PersistedTa
     }
 }
 
-fn persisted_pane(pane: &Pane, custom_titled: &HashSet<u32>) -> PersistedPane {
+fn persisted_pane(
+    pane: &Pane,
+    custom_titled: &HashSet<u32>,
+    agent_restarts: &std::collections::HashMap<u32, crate::agent_restore::AgentRestart>,
+) -> PersistedPane {
+    let agent_restart = agent_restarts.get(&pane.id.0).cloned();
+    let managed_agent = agent_restart
+        .as_ref()
+        .filter(|restart| restart.managed)
+        .map(|restart| restart.agent);
     PersistedPane {
         id: pane.id.0,
-        title: pane.title.clone(),
+        title: managed_agent
+            .map(|agent| format!("qp: {}", agent.label()))
+            .unwrap_or_else(|| pane.title.clone()),
         subtitle: pane.subtitle.clone(),
-        custom_title: custom_titled.contains(&pane.id.0),
+        custom_title: managed_agent.is_none() && custom_titled.contains(&pane.id.0),
+        agent_restart,
     }
 }
 
@@ -127,13 +170,14 @@ fn persisted_pane(pane: &Pane, custom_titled: &HashSet<u32>) -> PersistedPane {
 /// in `workspaces[i].tabs`.
 fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize) {
     let custom_titled = &state.custom_titled_panes;
+    let agent_restarts = &state.agent_restarts;
     if ws_idx == state.active_workspace {
         let tabs = state
             .tabs
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                let mut pt = persisted_tab(tab, custom_titled);
+                let mut pt = persisted_tab(tab, custom_titled, agent_restarts);
                 if i == state.active_tab {
                     // Overlay the live (authoritative) pane grid for the
                     // active tab; `state.tabs[active_tab]` is only synced
@@ -143,7 +187,7 @@ fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize)
                         .iter()
                         .map(|row| {
                             row.iter()
-                                .map(|p| persisted_pane(p, custom_titled))
+                                .map(|p| persisted_pane(p, custom_titled, agent_restarts))
                                 .collect()
                         })
                         .collect();
@@ -160,7 +204,7 @@ fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize)
         (
             ws.tabs
                 .iter()
-                .map(|t| persisted_tab(t, custom_titled))
+                .map(|t| persisted_tab(t, custom_titled, agent_restarts))
                 .collect(),
             ws.active_tab,
         )
@@ -177,6 +221,7 @@ impl PersistedState {
                 .map(|(i, w)| {
                     let (tabs, active_tab) = workspace_tabs(state, i);
                     PersistedWorkspace {
+                        num: w.num,
                         name: w.name.clone(),
                         path: w.path.clone(),
                         collapsed: w.collapsed,
@@ -202,17 +247,19 @@ impl PersistedState {
                 .get(&crate::state::ToggleKey::WorktreeTabs)
                 .copied()
                 .unwrap_or(false),
+            auto_resume_agents: state
+                .toggles
+                .get(&crate::state::ToggleKey::AutoResumeAgents)
+                .copied()
+                .unwrap_or(false),
             default_shell: state.default_shell.clone(),
         }
     }
 
     pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let body = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, body)
+        atomic_write_private(path, body.as_bytes())
     }
 
     pub fn read_from(path: &Path) -> std::io::Result<Self> {
@@ -228,6 +275,170 @@ impl PersistedState {
     pub fn has_layout(&self) -> bool {
         self.workspaces.iter().any(|w| !w.tabs.is_empty())
     }
+}
+
+/// Write a complete file by syncing a same-directory temporary and
+/// atomically replacing the destination. Keeping the temporary beside
+/// the target is required: atomic rename guarantees do not cross file
+/// systems, and a reboot must leave either the old or the new JSON.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_with_permissions(path, bytes, AtomicWritePermissions::Preserve)
+}
+
+fn atomic_write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_with_permissions(path, bytes, AtomicWritePermissions::OwnerOnly)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtomicWritePermissions {
+    Preserve,
+    OwnerOnly,
+}
+
+fn atomic_write_with_permissions(
+    path: &Path,
+    bytes: &[u8],
+    permission_policy: AtomicWritePermissions,
+) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = permission_policy;
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let existing_permissions = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mode = if permission_policy == AtomicWritePermissions::OwnerOnly {
+                0o600
+            } else {
+                existing_permissions
+                    .as_ref()
+                    .map(PermissionsExt::mode)
+                    .unwrap_or(0o600)
+            };
+            options.mode(mode);
+        }
+        let mut temp = options.open(&temp_path)?;
+        temp.write_all(bytes)?;
+        temp.flush()?;
+        temp.sync_all()?;
+        drop(temp);
+        #[cfg(unix)]
+        if permission_policy == AtomicWritePermissions::OwnerOnly {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
+        } else if let Some(permissions) = existing_permissions.clone() {
+            std::fs::set_permissions(&temp_path, permissions)?;
+        }
+        #[cfg(not(unix))]
+        if let Some(permissions) = existing_permissions.clone() {
+            std::fs::set_permissions(&temp_path, permissions)?;
+        }
+        atomic_replace(&temp_path, path)?;
+        sync_parent_dir(parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // ReplaceFileW preserves the destination's ACL and other security
+    // metadata. It requires an existing destination; first writes use
+    // MoveFileExW and inherit the private profile directory ACL.
+    let moved = if destination.exists() {
+        // SAFETY: both paths are NUL-terminated and the optional pointers
+        // are intentionally null. The buffers live for the full call.
+        unsafe {
+            ReplaceFileW(
+                destination_wide.as_ptr(),
+                source_wide.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
+    } else {
+        // SAFETY: both pointers refer to NUL-terminated buffers that remain
+        // alive for the call. Flags request same-volume atomic replacement.
+        unsafe {
+            MoveFileExW(
+                source_wide.as_ptr(),
+                destination_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
+    // Windows directory handles require backup-semantics flags. The
+    // MOVEFILE_WRITE_THROUGH call above supplies the durable rename.
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_dir(parent: &Path) -> std::io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
 }
 
 /// Default location for the persisted workspaces file. Lives outside the repo
@@ -248,13 +459,23 @@ fn configured_path() -> Option<&'static Path> {
     CONFIG_PATH.get().map(|p| p.as_path())
 }
 
-pub fn save_workspaces(state: &AppState) {
+pub fn save_workspaces(state: &AppState) -> bool {
     let Some(path) = configured_path() else {
-        return;
+        return true;
     };
     let persisted = PersistedState::from_state(state);
     if let Err(e) = persisted.write_to(path) {
-        log::warn!("failed to save workspaces to {}: {}", path.display(), e);
+        let error_kind = match e.kind() {
+            std::io::ErrorKind::PermissionDenied => "permission_denied",
+            std::io::ErrorKind::WriteZero => "write_zero",
+            _ => "io_error",
+        };
+        log::warn!(
+            "{{\"event\":\"workspace_persist.failed\",\"level\":\"warn\",\"error_kind\":{error_kind:?}}}"
+        );
+        false
+    } else {
+        true
     }
 }
 
@@ -309,6 +530,7 @@ mod tests {
         let path = unique_temp_path("parent");
         let persisted = PersistedState {
             workspaces: vec![PersistedWorkspace {
+                num: 1,
                 name: "alpha".into(),
                 path: Some(PathBuf::from("/tmp/alpha")),
                 collapsed: true,
@@ -320,6 +542,7 @@ mod tests {
             remember_close_choice: false,
             kill_all_on_close: false,
             worktree_tabs: false,
+            auto_resume_agents: false,
             default_shell: ShellSpec::default(),
         };
         persisted.write_to(&path).unwrap();
@@ -477,5 +700,129 @@ mod tests {
             "missing default_shell must deserialize to an empty ShellSpec, got {:?}",
             loaded.default_shell
         );
+        assert!(!loaded.auto_resume_agents);
+    }
+
+    #[test]
+    fn agent_restart_and_auto_resume_round_trip_without_content() {
+        let mut state = seed_state();
+        const SECRET_PROMPT_PREFIX: &str = "SENTINEL_DO_NOT_PERSIST_7f5a";
+        state.workspaces[0].num = 42;
+        let cwd = unique_temp_path("agent-cwd")
+            .parent()
+            .expect("temp parent")
+            .to_path_buf();
+        state.agent_restarts.insert(
+            1,
+            crate::agent_restore::AgentRestart {
+                agent: crate::agent_restore::AgentKind::Codex,
+                cwd: cwd.clone(),
+                resume_mode: crate::agent_restore::AgentResumeMode::CodexExec,
+                session_id: Some("24c31fc8-8200-4773-8a0b-0447bd64bcdc".into()),
+                observed_at_unix_ms: 42,
+                managed: true,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::PendingManual,
+            },
+        );
+        state
+            .toggles
+            .insert(crate::state::ToggleKey::AutoResumeAgents, true);
+        state.panes[0][0].title = SECRET_PROMPT_PREFIX.to_string();
+        state.tabs[0].name = SECRET_PROMPT_PREFIX.to_string();
+
+        let persisted = PersistedState::from_state(&state);
+        let body = serde_json::to_string(&persisted).expect("serialize");
+        assert!(body.contains("24c31fc8-8200-4773-8a0b-0447bd64bcdc"));
+        assert!(!body.contains("prompt"));
+        assert!(!body.contains("transcript"));
+        assert!(!body.contains(SECRET_PROMPT_PREFIX));
+        assert!(body.contains("qp: Codex"));
+
+        let restored: PersistedState = serde_json::from_str(&body).expect("deserialize");
+        let record = restored.workspaces[0].tabs[0].panes[0][0]
+            .agent_restart
+            .as_ref()
+            .expect("restart record");
+        assert_eq!(record.agent, crate::agent_restore::AgentKind::Codex);
+        assert_eq!(record.cwd, cwd);
+        assert_eq!(
+            record.resume_mode,
+            crate::agent_restore::AgentResumeMode::CodexExec
+        );
+        assert!(record.managed);
+        assert_eq!(
+            record.launch_phase,
+            crate::agent_restore::AgentLaunchPhase::PendingManual
+        );
+        assert_eq!(restored.workspaces[0].num, 42);
+        assert!(restored.auto_resume_agents);
+    }
+
+    #[test]
+    fn legacy_pane_defaults_to_no_agent_restart() {
+        let pane: PersistedPane = serde_json::from_str(
+            r#"{"id":7,"title":"shell","subtitle":"bash","custom_title":false}"#,
+        )
+        .expect("legacy pane");
+        assert!(pane.agent_restart.is_none());
+    }
+
+    #[test]
+    fn legacy_agent_restart_defaults_to_confirmed_launch_phase() {
+        let record: crate::agent_restore::AgentRestart = serde_json::from_str(
+            r#"{"agent":"claude","cwd":"C:\\dev","session_id":"24c31fc8-8200-4773-8a0b-0447bd64bcdc","managed":true}"#,
+        )
+        .expect("legacy restart record");
+        assert_eq!(
+            record.launch_phase,
+            crate::agent_restore::AgentLaunchPhase::Confirmed
+        );
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_json_without_temp_artifacts() {
+        let path = unique_temp_path("atomic-replace");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
+        }
+        std::fs::write(&path, b"old body").expect("seed target");
+
+        atomic_write(&path, b"new body").expect("atomic replace");
+
+        assert_eq!(std::fs::read(&path).expect("read target"), b"new body");
+        let parent = path.parent().expect("parent");
+        let leftovers: Vec<_> = std::fs::read_dir(parent)
+            .expect("read parent")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_write_tightens_legacy_world_readable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_temp_path("private-migration");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
+        }
+        std::fs::write(&path, b"legacy").expect("legacy file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("legacy mode");
+
+        PersistedState::default()
+            .write_to(&path)
+            .expect("private workspace write");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 }

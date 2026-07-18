@@ -20,6 +20,13 @@ pub use message::{
     SNAPSHOT_MAX_SCROLLBACK_LINES,
 };
 
-/// Wire protocol version advertised in `HelloAck`. Bump on any
-/// non-additive change (see SPEC.md section 10).
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Wire protocol version advertised in `HelloAck`. Bump whenever a client
+/// must feature-detect a request or response before using it, including new
+/// variants that an older peer cannot safely ignore (see SPEC.md section 10).
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// First protocol version whose daemon understands the atomic
+/// `EnsureSession` request. New clients can still reattach to sessions on a
+/// v1 daemon, but must not send the unknown variant or assume a cache miss is
+/// proof that no live session exists.
+pub const ENSURE_SESSION_PROTOCOL_VERSION: u32 = 2;

@@ -4,9 +4,8 @@
 //! buttons: Confirm dispatches the queued action via
 //! `dialog.confirm`; Cancel clears the dialog via `dialog.cancel`.
 //! The `CloseApp` variant adds a "remember my choice" checkbox and
-//! dispatches `app.close.keep_running` / `app.close.kill_and_quit`
-//! instead of going through `dialog.confirm`; the close-app UI
-//! handlers follow up with `process::exit(0)` to drive the real exit.
+//! commits the selected policy only after its recovery state is durably
+//! saved; the close-app UI handlers then drive the real exit.
 //! The `RenameSession` variant shows a text input and commits via
 //! `dialog.rename_commit` so the commit handler can pull the typed
 //! buffer before clearing the dialog.
@@ -18,7 +17,9 @@ use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{AlignItems, CssPosition, Dimension, JustifyContent};
 
-use crate::state::{dispatch, mutate_with, ConfirmDialog, SharedState, UiSnapshot};
+use crate::state::{
+    dispatch, finalize_close_dialog_choice, mutate_with, ConfirmDialog, SharedState, UiSnapshot,
+};
 use crate::ui::icons::{icon_check, icon_close, svg_icon};
 
 /// Build the confirmation modal overlay. Returns an empty hidden div
@@ -193,10 +194,9 @@ fn build_close_app_card(
         .with_class("confirm-dialog-button")
         .with_class("secondary")
         .on_click(move || {
-            mutate_with(&keep_shared, |st| {
-                dispatch(st, "app.close.keep_running");
-            });
-            crate::shutdown_now();
+            if mutate_with(&keep_shared, |st| finalize_close_dialog_choice(st, true)) {
+                crate::shutdown_now();
+            }
         })
         .with_child(ElementDef::new(Tag::Span).with_text(keep_label))
         .with_child(
@@ -215,10 +215,9 @@ fn build_close_app_card(
         .with_class("confirm-dialog-button")
         .with_class("danger")
         .on_click(move || {
-            mutate_with(&kill_shared, |st| {
-                dispatch(st, "app.close.kill_and_quit");
-            });
-            crate::shutdown_now();
+            if mutate_with(&kill_shared, |st| finalize_close_dialog_choice(st, false)) {
+                crate::shutdown_now();
+            }
         })
         .with_child(ElementDef::new(Tag::Span).with_text(kill_label));
 

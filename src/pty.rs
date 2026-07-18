@@ -21,7 +21,7 @@
 //! spawning a second shell. The `Drop` impl no longer tears down
 //! sessions; only an explicit `destroy` / `destroy_all` does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
@@ -32,7 +32,10 @@ use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use unshit_ptyd::client::{Client, SessionListSnapshot};
-use unshit_ptyd::protocol::message::{SessionInfo, SNAPSHOT_MAX_SCROLLBACK_LINES};
+use unshit_ptyd::protocol::message::{
+    EnsureDisposition, SessionInfo, SNAPSHOT_MAX_SCROLLBACK_LINES,
+};
+use unshit_ptyd::protocol::ENSURE_SESSION_PROTOCOL_VERSION;
 use unshit_ptyd::protocol::{ProtocolError, Response, ServerEvent};
 use unshit_terminal_core::Snapshot;
 
@@ -52,6 +55,20 @@ pub struct DaemonPty {
     /// caller passes `Some(spec)`; missing key = "no shell requested",
     /// equivalent to letting the daemon's own `default_shell()` decide.
     spawn_shells: HashMap<u32, ShellSpec>,
+    /// Per-pane bearer capabilities supplied by the daemon and required
+    /// on agent hook IPC. Never persisted or logged.
+    hook_capabilities: HashMap<u32, String>,
+    /// Origin of the most recent successful pane reconciliation. State uses
+    /// this to distinguish a warm cache attach from an Ensure winner after a
+    /// resume launch was durably marked as in-flight.
+    reconcile_outcomes: HashMap<u32, ReconcileOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReconcileOutcome {
+    CachedAttached,
+    EnsuredExisting,
+    Spawned,
 }
 
 struct Inner {
@@ -59,9 +76,13 @@ struct Inner {
     sessions: HashMap<u32, u64>,
     /// Reconciliation cache populated on `connect_to` from the
     /// daemon's current session list. Entries are consumed by
-    /// `attach_or_spawn` on cache hits so a second pane with the same
-    /// `(workspace_id, pane_id)` tuple still gets a fresh spawn.
+    /// `attach_or_spawn` on cache hits; cache misses go through the
+    /// daemon's atomic ensure operation instead of assuming absence.
     reattach_cache: HashMap<(u32, u32), u64>,
+    /// Pane keys that appeared more than once in the initial daemon
+    /// snapshot. Legacy duplicate sessions must fail closed rather than
+    /// attaching an arbitrary conversation.
+    ambiguous_reattach_keys: HashSet<(u32, u32)>,
     worker: Option<thread::JoinHandle<()>>,
     /// Receive end of the worker's async-write error channel. Drained
     /// by [`DaemonPty::take_write_errors`]; the bridge polls it and
@@ -103,13 +124,25 @@ enum Command {
         pane_id: u32,
         name: Option<String>,
         byte_tx: std_mpsc::Sender<Vec<u8>>,
-        reply: std_mpsc::SyncSender<io::Result<u64>>,
+        reply: std_mpsc::SyncSender<io::Result<SpawnReply>>,
+    },
+    Ensure {
+        cols: u16,
+        rows: u16,
+        cwd: Option<PathBuf>,
+        shell: Option<String>,
+        shell_args: Vec<String>,
+        workspace_id: u32,
+        pane_id: u32,
+        name: Option<String>,
+        byte_tx: std_mpsc::Sender<Vec<u8>>,
+        reply: std_mpsc::SyncSender<io::Result<EnsureReply>>,
     },
     Attach {
         session_id: u64,
         scrollback_lines: u32,
         byte_tx: std_mpsc::Sender<Vec<u8>>,
-        reply: std_mpsc::SyncSender<io::Result<Snapshot>>,
+        reply: std_mpsc::SyncSender<io::Result<AttachReply>>,
     },
     Write {
         session_id: u64,
@@ -151,12 +184,31 @@ enum Command {
     },
 }
 
+struct EnsureReply {
+    session_id: u64,
+    disposition: EnsureDisposition,
+    snapshot: Snapshot,
+    hook_capability: String,
+}
+
+struct SpawnReply {
+    session_id: u64,
+    hook_capability: String,
+}
+
+struct AttachReply {
+    snapshot: Snapshot,
+    hook_capability: String,
+}
+
 impl DaemonPty {
     pub fn new() -> Self {
         Self {
             inner: None,
             spawn_cwds: HashMap::new(),
             spawn_shells: HashMap::new(),
+            hook_capabilities: HashMap::new(),
+            reconcile_outcomes: HashMap::new(),
         }
     }
 
@@ -186,6 +238,7 @@ impl DaemonPty {
                     cmd_tx,
                     sessions: HashMap::new(),
                     reattach_cache: HashMap::new(),
+                    ambiguous_reattach_keys: HashSet::new(),
                     worker: Some(worker),
                     write_error_rx,
                 });
@@ -198,9 +251,14 @@ impl DaemonPty {
                         if let Some(inner) = self.inner.as_mut() {
                             for info in sessions {
                                 if info.alive {
-                                    inner
-                                        .reattach_cache
-                                        .insert((info.workspace_id, info.pane_id), info.id);
+                                    let key = (info.workspace_id, info.pane_id);
+                                    if inner.ambiguous_reattach_keys.contains(&key) {
+                                        continue;
+                                    }
+                                    if inner.reattach_cache.insert(key, info.id).is_some() {
+                                        inner.reattach_cache.remove(&key);
+                                        inner.ambiguous_reattach_keys.insert(key);
+                                    }
                                 }
                             }
                         }
@@ -271,7 +329,7 @@ impl DaemonPty {
         let (shell_program, shell_args) = shell_spec_to_wire(shell);
         let inner = self.inner.as_mut().ok_or_else(not_connected)?;
         let (byte_tx, byte_rx) = std_mpsc::channel::<Vec<u8>>();
-        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<u64>>(1);
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<SpawnReply>>(1);
         let cmd = Command::Spawn {
             cols,
             rows,
@@ -285,8 +343,10 @@ impl DaemonPty {
             reply: reply_tx,
         };
         inner.cmd_tx.send(cmd).map_err(|_| worker_gone())?;
-        let session_id = reply_rx.recv().map_err(|_| worker_gone())??;
-        inner.sessions.insert(pane_id, session_id);
+        let spawned = reply_rx.recv().map_err(|_| worker_gone())??;
+        inner.sessions.insert(pane_id, spawned.session_id);
+        self.hook_capabilities
+            .insert(pane_id, spawned.hook_capability);
         Ok(Box::new(ChannelReader::new(byte_rx)))
     }
 
@@ -314,7 +374,7 @@ impl DaemonPty {
     ) -> io::Result<(Snapshot, Box<dyn io::Read + Send>)> {
         let inner = self.inner.as_mut().ok_or_else(not_connected)?;
         let (byte_tx, byte_rx) = std_mpsc::channel::<Vec<u8>>();
-        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<Snapshot>>(1);
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<AttachReply>>(1);
         let cmd = Command::Attach {
             session_id,
             scrollback_lines,
@@ -322,9 +382,11 @@ impl DaemonPty {
             reply: reply_tx,
         };
         inner.cmd_tx.send(cmd).map_err(|_| worker_gone())?;
-        let snapshot = reply_rx.recv().map_err(|_| worker_gone())??;
+        let attached = reply_rx.recv().map_err(|_| worker_gone())??;
         inner.sessions.insert(pane_id, session_id);
-        Ok((snapshot, Box::new(ChannelReader::new(byte_rx))))
+        self.hook_capabilities
+            .insert(pane_id, attached.hook_capability);
+        Ok((attached.snapshot, Box::new(ChannelReader::new(byte_rx))))
     }
 
     /// Reconcile a pane against the daemon's surviving sessions: attach
@@ -332,9 +394,9 @@ impl DaemonPty {
     /// otherwise spawn a fresh one. Returns the snapshot (on attach) or
     /// `None` (on fresh spawn) together with the live byte reader.
     ///
-    /// Cache entries are consumed by hits so a second call with the
-    /// same `(workspace_id, pane_id)` tuple will spawn a fresh session
-    /// rather than double-attach.
+    /// Cache entries are consumed by hits. A later call with the same
+    /// key is still safe: daemon-side ensure returns the existing
+    /// session and never executes the supplied fallback twice.
     pub fn attach_or_spawn(
         &mut self,
         pane_id: u32,
@@ -344,26 +406,122 @@ impl DaemonPty {
         cwd: Option<&Path>,
         shell: Option<&ShellSpec>,
     ) -> io::Result<(Option<Snapshot>, Box<dyn io::Read + Send>)> {
+        let key = (workspace_id, pane_id);
+        self.reconcile_outcomes.remove(&pane_id);
+        if self
+            .inner
+            .as_ref()
+            .ok_or_else(not_connected)?
+            .ambiguous_reattach_keys
+            .contains(&key)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "multiple daemon sessions share this workspace and pane key",
+            ));
+        }
         let cache_hit = self
             .inner
             .as_mut()
             .ok_or_else(not_connected)?
             .reattach_cache
-            .remove(&(workspace_id, pane_id));
+            .remove(&key);
         if let Some(session_id) = cache_hit {
             match self.attach_to(pane_id, session_id, SNAPSHOT_MAX_SCROLLBACK_LINES as u32) {
-                Ok((snapshot, reader)) => return Ok((Some(snapshot), reader)),
-                Err(e) => {
+                Ok((snapshot, reader)) => {
+                    self.reconcile_outcomes
+                        .insert(pane_id, ReconcileOutcome::CachedAttached);
+                    return Ok((Some(snapshot), reader));
+                }
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    if let Some(inner) = self.inner.as_mut() {
+                        inner
+                            .reattach_cache
+                            .insert((workspace_id, pane_id), session_id);
+                    }
                     log::warn!(
                         "attach_or_spawn: cached session {session_id} for pane {pane_id} \
                          in workspace {workspace_id} failed to reattach ({e}); \
-                         falling back to fresh spawn"
+                         refusing to execute the fallback"
+                    );
+                    return Err(e);
+                }
+                Err(e) => {
+                    log::info!(
+                        "attach_or_spawn: cached session {session_id} for pane {pane_id} \
+                         in workspace {workspace_id} no longer exists ({e}); \
+                         delegating the final attach-or-spawn decision to EnsureSession"
                     );
                 }
             }
         }
-        let reader = self.spawn_in(pane_id, workspace_id, cols, rows, cwd, shell)?;
-        Ok((None, reader))
+
+        let cwd_owned = cwd.map(Path::to_path_buf);
+        let (shell_program, shell_args) = shell_spec_to_wire(shell);
+        let inner = self.inner.as_mut().ok_or_else(not_connected)?;
+        let (byte_tx, byte_rx) = std_mpsc::channel::<Vec<u8>>();
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<EnsureReply>>(1);
+        inner
+            .cmd_tx
+            .send(Command::Ensure {
+                cols,
+                rows,
+                cwd: cwd_owned.clone(),
+                shell: shell_program,
+                shell_args,
+                workspace_id,
+                pane_id,
+                name: None,
+                byte_tx,
+                reply: reply_tx,
+            })
+            .map_err(|_| worker_gone())?;
+        let ensured = reply_rx.recv().map_err(|_| worker_gone())??;
+        inner.sessions.insert(pane_id, ensured.session_id);
+        self.hook_capabilities
+            .insert(pane_id, ensured.hook_capability);
+        if ensured.disposition == EnsureDisposition::Spawned {
+            if let Some(path) = cwd_owned {
+                self.spawn_cwds.insert(pane_id, path);
+            }
+            if let Some(spec) = shell.filter(|spec| !spec.is_empty()) {
+                self.spawn_shells.insert(pane_id, spec.clone());
+            }
+        }
+        let reader: Box<dyn io::Read + Send> = Box::new(ChannelReader::new(byte_rx));
+        match ensured.disposition {
+            EnsureDisposition::Existing => {
+                self.reconcile_outcomes
+                    .insert(pane_id, ReconcileOutcome::EnsuredExisting);
+                Ok((Some(ensured.snapshot), reader))
+            }
+            EnsureDisposition::Spawned => {
+                self.reconcile_outcomes
+                    .insert(pane_id, ReconcileOutcome::Spawned);
+                Ok((None, reader))
+            }
+        }
+    }
+
+    /// Replace this UI's current pane session with a structured command,
+    /// then reconcile through daemon-atomic Ensure. The explicit kill is
+    /// acknowledged before spawning, so manual recovery never injects text
+    /// into an arbitrary foreground process. A concurrent/lost-response
+    /// winner is returned as an attached snapshot instead of spawning a
+    /// duplicate.
+    pub fn replace_or_spawn(
+        &mut self,
+        pane_id: u32,
+        workspace_id: u32,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
+        shell: Option<&ShellSpec>,
+    ) -> io::Result<(Option<Snapshot>, Box<dyn io::Read + Send>)> {
+        if let Some(session_id) = self.session_id(pane_id) {
+            self.kill_session_id_blocking(session_id)?;
+        }
+        self.attach_or_spawn(pane_id, workspace_id, cols, rows, cwd, shell)
     }
 
     /// Synchronous write that round-trips through the daemon and waits
@@ -447,6 +605,8 @@ impl DaemonPty {
     pub fn destroy(&mut self, pane_id: u32) {
         self.spawn_cwds.remove(&pane_id);
         self.spawn_shells.remove(&pane_id);
+        self.hook_capabilities.remove(&pane_id);
+        self.reconcile_outcomes.remove(&pane_id);
         let Some(inner) = self.inner.as_mut() else {
             log::warn!("DaemonPty::destroy called before connect");
             return;
@@ -464,7 +624,16 @@ impl DaemonPty {
             log::warn!("DaemonPty::kill_session_id called before connect");
             return;
         };
+        let removed_panes = inner
+            .sessions
+            .iter()
+            .filter_map(|(pane_id, sid)| (*sid == session_id).then_some(*pane_id))
+            .collect::<Vec<_>>();
         inner.sessions.retain(|_pane, sid| *sid != session_id);
+        for pane_id in removed_panes {
+            self.hook_capabilities.remove(&pane_id);
+            self.reconcile_outcomes.remove(&pane_id);
+        }
         let _ = inner.cmd_tx.send(Command::Kill { session_id });
     }
 
@@ -488,10 +657,27 @@ impl DaemonPty {
         let result = reply_rx
             .recv_timeout(Duration::from_secs(2))
             .map_err(|_| worker_gone())?;
-        if result.is_ok() {
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
             inner.sessions.retain(|_pane, sid| *sid != session_id);
+            let removed_panes = self
+                .hook_capabilities
+                .keys()
+                .copied()
+                .filter(|pane_id| !inner.sessions.contains_key(pane_id))
+                .collect::<Vec<_>>();
+            for pane_id in removed_panes {
+                self.hook_capabilities.remove(&pane_id);
+                self.reconcile_outcomes.remove(&pane_id);
+            }
         }
-        result
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
     }
 
     /// Iterate over every `(pane_id, session_id)` mapping the shim
@@ -506,6 +692,8 @@ impl DaemonPty {
     pub fn destroy_all(&mut self) {
         self.spawn_cwds.clear();
         self.spawn_shells.clear();
+        self.hook_capabilities.clear();
+        self.reconcile_outcomes.clear();
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -569,6 +757,25 @@ impl DaemonPty {
             .and_then(|i| i.sessions.get(&pane_id).copied())
     }
 
+    pub fn hook_capability(&self, pane_id: u32) -> Option<&str> {
+        self.hook_capabilities.get(&pane_id).map(String::as_str)
+    }
+
+    pub(crate) fn take_reconcile_outcome(&mut self, pane_id: u32) -> Option<ReconcileOutcome> {
+        self.reconcile_outcomes.remove(&pane_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_reconcile_outcome(&mut self, pane_id: u32, outcome: ReconcileOutcome) {
+        self.reconcile_outcomes.insert(pane_id, outcome);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_hook_capability(&mut self, pane_id: u32, capability: &str) {
+        self.hook_capabilities
+            .insert(pane_id, capability.to_string());
+    }
+
     #[cfg(test)]
     fn session_id_for_pane(&self, pane_id: u32) -> Option<u64> {
         self.inner
@@ -595,6 +802,7 @@ impl DaemonPty {
             cmd_tx,
             sessions,
             reattach_cache: HashMap::new(),
+            ambiguous_reattach_keys: HashSet::new(),
             worker: None,
             write_error_rx,
         });
@@ -627,6 +835,7 @@ impl DaemonPty {
             cmd_tx,
             sessions,
             reattach_cache: HashMap::new(),
+            ambiguous_reattach_keys: HashSet::new(),
             worker: None,
             write_error_rx,
         });
@@ -744,7 +953,23 @@ impl io::Read for ChannelReader {
     }
 }
 
-type SessionSinks = Arc<Mutex<HashMap<u64, std_mpsc::Sender<Vec<u8>>>>>;
+struct OutputRoutes {
+    sinks: HashMap<u64, std_mpsc::Sender<Vec<u8>>>,
+    pending: HashMap<u64, VecDeque<Vec<u8>>>,
+    pending_bytes: usize,
+}
+
+impl OutputRoutes {
+    fn new() -> Self {
+        Self {
+            sinks: HashMap::new(),
+            pending: HashMap::new(),
+            pending_bytes: 0,
+        }
+    }
+}
+
+type SessionSinks = Arc<Mutex<OutputRoutes>>;
 
 fn worker_main(
     socket_path: PathBuf,
@@ -764,10 +989,29 @@ fn worker_main(
     };
 
     runtime.block_on(async move {
-        let (client, events) = match Client::connect_with_events(&socket_path).await {
+        let (mut client, events) = match Client::connect_with_events(&socket_path).await {
             Ok(pair) => pair,
             Err(e) => {
                 let _ = ready.send(Err(e));
+                return;
+            }
+        };
+        let protocol_version = match client.hello(env!("CARGO_PKG_VERSION")).await {
+            Ok(Response::HelloAck {
+                protocol_version, ..
+            }) => protocol_version,
+            Ok(other) => {
+                let _ = ready.send(Err(io::Error::other(format!(
+                    "unexpected daemon hello response: {other:?}"
+                ))));
+                return;
+            }
+            Err(ProtocolError::Io(error)) => {
+                let _ = ready.send(Err(error));
+                return;
+            }
+            Err(error) => {
+                let _ = ready.send(Err(io::Error::other(error.to_string())));
                 return;
             }
         };
@@ -775,7 +1019,7 @@ fn worker_main(
             return;
         }
 
-        let sinks: SessionSinks = Arc::new(Mutex::new(HashMap::new()));
+        let sinks: SessionSinks = Arc::new(Mutex::new(OutputRoutes::new()));
         let sinks_for_events = sinks.clone();
         let event_task = tokio::spawn(async move {
             event_loop(events, sinks_for_events).await;
@@ -807,7 +1051,7 @@ fn worker_main(
                     // tracks the latest UI binary.
                     let shell = shell.or_else(|| Some(unshit_ptyd::pty::default_shell()));
                     let result = match client
-                        .spawn_session(
+                        .spawn_session_with_context(
                             cols,
                             rows,
                             cwd_string,
@@ -816,20 +1060,92 @@ fn worker_main(
                             workspace_id,
                             pane_id,
                             name,
+                            std::env::var(
+                                unshit_ptyd::session::ENV_AGENT_RESTORE_CORRELATION_ID,
+                            )
+                            .ok(),
                         )
                         .await
                     {
-                        Ok(Response::SessionSpawned { session_id, .. }) => {
-                            if let Ok(mut guard) = sinks.lock() {
-                                guard.insert(session_id, byte_tx);
-                            }
-                            Ok(session_id)
+                        Ok(Response::SessionSpawned {
+                            session_id,
+                            hook_capability,
+                            ..
+                        }) => {
+                            install_output_sink(&sinks, session_id, byte_tx);
+                            Ok(SpawnReply {
+                                session_id,
+                                hook_capability,
+                            })
                         }
                         Ok(Response::Error { code, message, .. }) => {
-                            Err(io::Error::other(format!("{code}: {message}")))
+                            Err(daemon_response_error(&code, &message))
                         }
                         Ok(other) => Err(io::Error::other(format!("unexpected: {other:?}"))),
                         Err(ProtocolError::Io(e)) => Err(e),
+                        Err(other) => Err(io::Error::other(other.to_string())),
+                    };
+                    let _ = reply.send(result);
+                }
+                Command::Ensure {
+                    cols,
+                    rows,
+                    cwd,
+                    shell,
+                    shell_args,
+                    workspace_id,
+                    pane_id,
+                    name,
+                    byte_tx,
+                    reply,
+                } => {
+                    if protocol_version < ENSURE_SESSION_PROTOCOL_VERSION {
+                        let _ = reply.send(Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "the running PTY daemon predates atomic session recovery; surviving sessions can reattach, but a cold pane requires restarting the daemon",
+                        )));
+                        continue;
+                    }
+                    let cwd_string = cwd.map(|path| path.display().to_string());
+                    let shell = shell.or_else(|| Some(unshit_ptyd::pty::default_shell()));
+                    let result = match client
+                        .ensure_session_with_context(
+                            cols,
+                            rows,
+                            cwd_string,
+                            shell,
+                            shell_args,
+                            workspace_id,
+                            pane_id,
+                            name,
+                            SNAPSHOT_MAX_SCROLLBACK_LINES as u32,
+                            std::env::var(
+                                unshit_ptyd::session::ENV_AGENT_RESTORE_CORRELATION_ID,
+                            )
+                            .ok(),
+                        )
+                        .await
+                    {
+                        Ok(Response::SessionEnsured {
+                            session_id,
+                            disposition,
+                            snapshot,
+                            hook_capability,
+                            ..
+                        }) => {
+                            install_output_sink(&sinks, session_id, byte_tx);
+                            Ok(EnsureReply {
+                                session_id,
+                                disposition,
+                                snapshot,
+                                hook_capability,
+                            })
+                        }
+                        Ok(Response::Error { code, message, .. }) => {
+                            Err(daemon_response_error(&code, &message))
+                        }
+                        Ok(other) => Err(io::Error::other(format!("unexpected: {other:?}"))),
+                        Err(ProtocolError::Io(error)) => Err(error),
                         Err(other) => Err(io::Error::other(other.to_string())),
                     };
                     let _ = reply.send(result);
@@ -844,20 +1160,24 @@ fn worker_main(
                     // events that arrive between the daemon accepting
                     // the attach and us wiring up the route are not
                     // dropped.
-                    if let Ok(mut guard) = sinks.lock() {
-                        guard.insert(session_id, byte_tx);
-                    }
-                    let result = match client.attach_session(session_id, scrollback_lines).await {
-                        Ok(snapshot) => Ok(snapshot),
+                    install_output_sink(&sinks, session_id, byte_tx);
+                    let result = match client
+                        .attach_session_with_metadata(session_id, scrollback_lines)
+                        .await
+                    {
+                        Ok(attached) => Ok(AttachReply {
+                            snapshot: attached.snapshot,
+                            hook_capability: attached.hook_capability,
+                        }),
                         Err(ProtocolError::Io(e)) => {
                             if let Ok(mut guard) = sinks.lock() {
-                                guard.remove(&session_id);
+                                remove_output_route(&mut guard, session_id);
                             }
                             Err(e)
                         }
                         Err(other) => {
                             if let Ok(mut guard) = sinks.lock() {
-                                guard.remove(&session_id);
+                                remove_output_route(&mut guard, session_id);
                             }
                             Err(io::Error::other(other.to_string()))
                         }
@@ -872,7 +1192,7 @@ fn worker_main(
                     let result = match client.write(session_id, bytes).await {
                         Ok(Response::Ack { .. }) => Ok(()),
                         Ok(Response::Error { code, message, .. }) => {
-                            Err(io::Error::other(format!("{code}: {message}")))
+                            Err(daemon_response_error(&code, &message))
                         }
                         Ok(other) => Err(io::Error::other(format!("unexpected: {other:?}"))),
                         Err(ProtocolError::Io(e)) => Err(e),
@@ -888,7 +1208,7 @@ fn worker_main(
                     let result: io::Result<()> = match client.write(session_id, bytes).await {
                         Ok(Response::Ack { .. }) => Ok(()),
                         Ok(Response::Error { code, message, .. }) => {
-                            Err(io::Error::other(format!("{code}: {message}")))
+                            Err(daemon_response_error(&code, &message))
                         }
                         Ok(other) => Err(io::Error::other(format!("unexpected: {other:?}"))),
                         Err(ProtocolError::Io(e)) => Err(e),
@@ -912,19 +1232,19 @@ fn worker_main(
                 }
                 Command::Kill { session_id } => {
                     if let Ok(mut guard) = sinks.lock() {
-                        guard.remove(&session_id);
+                        remove_output_route(&mut guard, session_id);
                     }
                     let _ = client.kill_session(session_id).await;
                 }
                 Command::KillAck { session_id, reply } => {
                     if let Ok(mut guard) = sinks.lock() {
-                        guard.remove(&session_id);
+                        remove_output_route(&mut guard, session_id);
                     }
                     let result: io::Result<()> = match client.kill_session(session_id).await {
                         Ok(Response::Ack { .. }) => Ok(()),
-                        Ok(Response::Error { code, message, .. }) => Err(io::Error::other(
-                            format!("kill_session failed: {code}: {message}"),
-                        )),
+                        Ok(Response::Error { code, message, .. }) => {
+                            Err(daemon_response_error(&code, &message))
+                        }
                         Ok(other) => Err(io::Error::other(format!("unexpected: {other:?}"))),
                         Err(ProtocolError::Io(e)) => Err(e),
                         Err(other) => Err(io::Error::other(other.to_string())),
@@ -960,21 +1280,95 @@ fn worker_main(
     });
 }
 
+fn daemon_response_error(code: &str, message: &str) -> io::Error {
+    let kind = match code {
+        "session_not_found" => io::ErrorKind::NotFound,
+        "session_dead" => io::ErrorKind::NotConnected,
+        "session_key_ambiguous" => io::ErrorKind::AlreadyExists,
+        // The daemon reached an authoritative child-spawn rejection and
+        // sanitizes its raw command-line-bearing OS error before replying.
+        "spawn_failed" => io::ErrorKind::InvalidInput,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, format!("{code}: {message}"))
+}
+
+fn remove_output_route(routes: &mut OutputRoutes, session_id: u64) {
+    routes.sinks.remove(&session_id);
+    if let Some(chunks) = routes.pending.remove(&session_id) {
+        routes.pending_bytes = routes
+            .pending_bytes
+            .saturating_sub(chunks.iter().map(Vec::len).sum::<usize>());
+    }
+}
+
+fn install_output_sink(routes: &SessionSinks, session_id: u64, sink: std_mpsc::Sender<Vec<u8>>) {
+    let Ok(mut routes) = routes.lock() else {
+        return;
+    };
+    routes.sinks.insert(session_id, sink.clone());
+    if let Some(chunks) = routes.pending.remove(&session_id) {
+        routes.pending_bytes = routes
+            .pending_bytes
+            .saturating_sub(chunks.iter().map(Vec::len).sum::<usize>());
+        for bytes in chunks {
+            if sink.send(bytes).is_err() {
+                routes.sinks.remove(&session_id);
+                break;
+            }
+        }
+    }
+}
+
 async fn event_loop(mut events: tokio_mpsc::Receiver<ServerEvent>, sinks: SessionSinks) {
+    const MAX_PENDING_BYTES: usize = 512 * 1024;
+    const MAX_PENDING_CHUNKS_PER_SESSION: usize = 128;
     while let Some(ev) = events.recv().await {
         match ev {
             ServerEvent::Output { session_id, bytes } => {
-                let sink = match sinks.lock() {
-                    Ok(guard) => guard.get(&session_id).cloned(),
-                    Err(_) => return,
+                let Ok(mut routes) = sinks.lock() else {
+                    return;
                 };
-                if let Some(tx) = sink {
+                if let Some(tx) = routes.sinks.get(&session_id).cloned() {
                     if tx.send(bytes).is_err() {
-                        if let Ok(mut guard) = sinks.lock() {
-                            guard.remove(&session_id);
-                        }
+                        routes.sinks.remove(&session_id);
+                    }
+                    continue;
+                }
+                if bytes.len() > MAX_PENDING_BYTES {
+                    continue;
+                }
+                while routes.pending_bytes.saturating_add(bytes.len()) > MAX_PENDING_BYTES {
+                    let Some((&oldest_session, _)) = routes.pending.iter().next() else {
+                        break;
+                    };
+                    let removed = routes
+                        .pending
+                        .get_mut(&oldest_session)
+                        .and_then(VecDeque::pop_front);
+                    if let Some(removed) = removed {
+                        routes.pending_bytes = routes.pending_bytes.saturating_sub(removed.len());
+                    }
+                    if routes
+                        .pending
+                        .get(&oldest_session)
+                        .is_some_and(VecDeque::is_empty)
+                    {
+                        routes.pending.remove(&oldest_session);
                     }
                 }
+                let queue = routes.pending.entry(session_id).or_default();
+                if queue.len() >= MAX_PENDING_CHUNKS_PER_SESSION {
+                    if let Some(removed) = queue.pop_front() {
+                        routes.pending_bytes = routes.pending_bytes.saturating_sub(removed.len());
+                    }
+                }
+                routes.pending_bytes = routes.pending_bytes.saturating_add(bytes.len());
+                routes
+                    .pending
+                    .entry(session_id)
+                    .or_default()
+                    .push_back(bytes);
             }
         }
     }
@@ -1406,6 +1800,221 @@ mod tests {
                 .expect("attach_or_spawn");
             assert!(snapshot.is_none(), "cache miss must spawn fresh");
             assert!(shim.has(1));
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[test]
+    fn cached_attach_transient_failure_retains_cache_and_refuses_fallback() {
+        let mut shim = DaemonPty::new();
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
+        let (_write_error_tx, write_error_rx) = std_mpsc::channel();
+        let key = (7, 42);
+        let session_id = 91;
+        shim.inner = Some(Inner {
+            cmd_tx,
+            sessions: HashMap::new(),
+            reattach_cache: HashMap::from([(key, session_id)]),
+            ambiguous_reattach_keys: HashSet::new(),
+            worker: None,
+            write_error_rx,
+        });
+        let responder = std::thread::spawn(move || match cmd_rx.blocking_recv() {
+            Some(Command::Attach { reply, .. }) => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "simulated transient attach failure",
+                )));
+            }
+            _ => panic!("expected cached Attach command"),
+        });
+
+        let error = match shim.attach_or_spawn(42, 7, 80, 24, None, None) {
+            Err(error) => error,
+            Ok(_) => panic!("transient cached attach failure must not spawn"),
+        };
+        responder.join().expect("responder");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            shim.inner
+                .as_ref()
+                .and_then(|inner| inner.reattach_cache.get(&key)),
+            Some(&session_id)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_cached_session_not_found_delegates_to_atomic_ensure() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let pane_id = 73;
+            let workspace_id = 11;
+            let mut creator = DaemonPty::new();
+            connect_with_retry(&mut creator, &shim_path);
+            let _reader = creator
+                .spawn_in(pane_id, workspace_id, 80, 24, None, None)
+                .expect("seed session");
+            let stale_id = creator.session_id(pane_id).expect("seed id");
+
+            let mut restorer = DaemonPty::new();
+            connect_with_retry(&mut restorer, &shim_path);
+            assert_eq!(restorer.reattach_cache_len(), 1);
+            creator
+                .kill_session_id_blocking(stale_id)
+                .expect("remove cached session after snapshot");
+
+            let (snapshot, _reader) = restorer
+                .attach_or_spawn(pane_id, workspace_id, 80, 24, None, None)
+                .expect("stale NotFound should continue through EnsureSession");
+            assert!(
+                snapshot.is_none(),
+                "EnsureSession should spawn the replacement"
+            );
+            assert_ne!(restorer.session_id(pane_id), Some(stale_id));
+            restorer.destroy(pane_id);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_after_lost_ensure_response_attaches_without_running_fallback_twice() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let (first_snapshot, first_reader) = shim
+                .attach_or_spawn(88, 12, 80, 24, None, None)
+                .expect("first ensure");
+            assert!(first_snapshot.is_none());
+            let first_id = shim.session_id(88).expect("first id");
+            drop(first_reader);
+
+            let impossible_fallback = crate::shell::ShellSpec {
+                program: "definitely-not-a-real-agent-executable".into(),
+                args: vec!["--resume".into()],
+            };
+            let (retry_snapshot, _retry_reader) = shim
+                .attach_or_spawn(88, 12, 80, 24, None, Some(&impossible_fallback))
+                .expect("retry must observe the session created by the first Ensure");
+            assert!(retry_snapshot.is_some());
+            assert_eq!(shim.session_id(88), Some(first_id));
+            shim.destroy(88);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test]
+    async fn output_arriving_before_sink_registration_is_buffered_and_drained() {
+        let routes = Arc::new(Mutex::new(OutputRoutes::new()));
+        let (event_tx, event_rx) = tokio_mpsc::channel(4);
+        let event_task = tokio::spawn(event_loop(event_rx, routes.clone()));
+        event_tx
+            .send(ServerEvent::Output {
+                session_id: 7,
+                bytes: b"early-output".to_vec(),
+            })
+            .await
+            .expect("event send");
+        tokio::task::yield_now().await;
+
+        let (sink_tx, sink_rx) = std_mpsc::channel();
+        install_output_sink(&routes, 7, sink_tx);
+        assert_eq!(
+            sink_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("buffered output"),
+            b"early-output"
+        );
+        drop(event_tx);
+        event_task.await.expect("event loop");
+    }
+
+    #[tokio::test]
+    async fn failed_pending_output_drain_releases_the_buffer_budget() {
+        let routes = Arc::new(Mutex::new(OutputRoutes::new()));
+        let (event_tx, event_rx) = tokio_mpsc::channel(4);
+        let event_task = tokio::spawn(event_loop(event_rx, routes.clone()));
+        for bytes in [b"first".to_vec(), b"second".to_vec()] {
+            event_tx
+                .send(ServerEvent::Output {
+                    session_id: 9,
+                    bytes,
+                })
+                .await
+                .expect("event send");
+        }
+        tokio::task::yield_now().await;
+
+        let (sink_tx, sink_rx) = std_mpsc::channel();
+        drop(sink_rx);
+        install_output_sink(&routes, 9, sink_tx);
+        {
+            let routes = routes.lock().expect("routes");
+            assert_eq!(routes.pending_bytes, 0);
+            assert!(!routes.pending.contains_key(&9));
+            assert!(!routes.sinks.contains_key(&9));
+        }
+        drop(event_tx);
+        event_task.await.expect("event loop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_or_spawn_cache_miss_executes_structured_fallback() {
+        const MARKER: &str = "ensure-structured-fallback-marker";
+        #[cfg(windows)]
+        let shell = crate::shell::ShellSpec {
+            program: "cmd.exe".into(),
+            args: vec!["/C".into(), format!("echo {MARKER}")],
+        };
+        #[cfg(unix)]
+        let shell = crate::shell::ShellSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), format!("echo {MARKER}")],
+        };
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let (snapshot, mut reader) = shim
+                .attach_or_spawn(91, 17, 80, 24, None, Some(&shell))
+                .expect("ensure structured fallback");
+            assert!(snapshot.is_none());
+
+            let mut collected = Vec::new();
+            let mut buffer = [0u8; 4096];
+            for _ in 0..4 {
+                let count = reader.read(&mut buffer).expect("fallback output");
+                collected.extend_from_slice(&buffer[..count]);
+                if String::from_utf8_lossy(&collected).contains(MARKER) {
+                    break;
+                }
+            }
+            let output = String::from_utf8_lossy(&collected);
+            assert!(output.contains(MARKER), "fallback output: {output:?}");
         })
         .await
         .unwrap();

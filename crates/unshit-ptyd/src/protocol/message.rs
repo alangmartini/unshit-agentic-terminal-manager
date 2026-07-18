@@ -70,6 +70,34 @@ pub enum Request {
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// Per-UI-launch telemetry correlation passed to newly spawned
+        /// children. It must travel on the request because the daemon can
+        /// outlive the UI process whose environment originally launched it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_correlation_id: Option<String>,
+    },
+    /// Atomically attach to the one live session for this pane key or
+    /// spawn the supplied command when none exists. Unlike a client-side
+    /// list followed by spawn, this request is idempotent across lost
+    /// replies and concurrent clients.
+    EnsureSession {
+        id: u64,
+        cols: u16,
+        rows: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shell_args: Vec<String>,
+        workspace_id: u32,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_correlation_id: Option<String>,
+        #[serde(default)]
+        scrollback_lines: u32,
     },
     /// Write `bytes` to the PTY stdin of `session_id`.
     Write {
@@ -122,6 +150,7 @@ impl Request {
             Request::Hello { id, .. } => *id,
             Request::Shutdown { id, .. } => *id,
             Request::SpawnSession { id, .. } => *id,
+            Request::EnsureSession { id, .. } => *id,
             Request::Write { id, .. } => *id,
             Request::Resize { id, .. } => *id,
             Request::KillSession { id, .. } => *id,
@@ -150,11 +179,19 @@ pub struct SessionInfo {
     pub name: Option<String>,
 }
 
+/// Whether an atomic ensure reused a daemon-owned PTY or created one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnsureDisposition {
+    Existing,
+    Spawned,
+}
+
 /// Daemon-to-client control responses and errors.
 ///
 /// `Eq` is intentionally not derived: `SessionAttached` carries a
 /// [`Snapshot`] whose cells only implement `PartialEq`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
     HelloAck {
@@ -171,12 +208,20 @@ pub enum Response {
     SessionSpawned {
         id: u64,
         session_id: u64,
+        #[serde(default)]
+        hook_capability: String,
+    },
+    SessionEnsured {
+        id: u64,
+        session_id: u64,
+        disposition: EnsureDisposition,
+        snapshot: Snapshot,
+        #[serde(default)]
+        hook_capability: String,
     },
     /// Generic success ack used for write / resize / kill_session /
     /// detach_session.
-    Ack {
-        id: u64,
-    },
+    Ack { id: u64 },
     SessionList {
         id: u64,
         sessions: Vec<SessionInfo>,
@@ -188,6 +233,8 @@ pub enum Response {
     SessionAttached {
         id: u64,
         snapshot: Snapshot,
+        #[serde(default)]
+        hook_capability: String,
     },
     Error {
         id: u64,
@@ -196,12 +243,93 @@ pub enum Response {
     },
 }
 
+impl std::fmt::Debug for Response {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Response::HelloAck {
+                id,
+                server_version,
+                protocol_version,
+            } => formatter
+                .debug_struct("HelloAck")
+                .field("id", id)
+                .field("server_version", server_version)
+                .field("protocol_version", protocol_version)
+                .finish(),
+            Response::ShutdownAck { id, ok, reason } => formatter
+                .debug_struct("ShutdownAck")
+                .field("id", id)
+                .field("ok", ok)
+                .field("reason", reason)
+                .finish(),
+            Response::SessionSpawned {
+                id,
+                session_id,
+                hook_capability: _,
+            } => formatter
+                .debug_struct("SessionSpawned")
+                .field("id", id)
+                .field("session_id", session_id)
+                .field("hook_capability", &"<redacted>")
+                .finish(),
+            Response::SessionEnsured {
+                id,
+                session_id,
+                disposition,
+                snapshot: _,
+                hook_capability: _,
+            } => formatter
+                .debug_struct("SessionEnsured")
+                .field("id", id)
+                .field("session_id", session_id)
+                .field("disposition", disposition)
+                .field("snapshot", &"<redacted>")
+                .field("hook_capability", &"<redacted>")
+                .finish(),
+            Response::Ack { id } => formatter.debug_struct("Ack").field("id", id).finish(),
+            Response::SessionList {
+                id,
+                sessions,
+                daemon_pid,
+                daemon_memory_rss_bytes,
+            } => formatter
+                .debug_struct("SessionList")
+                .field("id", id)
+                .field("session_count", &sessions.len())
+                .field("daemon_pid", daemon_pid)
+                .field("daemon_memory_rss_bytes", daemon_memory_rss_bytes)
+                .finish(),
+            Response::SessionAttached {
+                id,
+                snapshot: _,
+                hook_capability: _,
+            } => formatter
+                .debug_struct("SessionAttached")
+                .field("id", id)
+                .field("snapshot", &"<redacted>")
+                .field("hook_capability", &"<redacted>")
+                .finish(),
+            Response::Error {
+                id,
+                code,
+                message: _,
+            } => formatter
+                .debug_struct("Error")
+                .field("id", id)
+                .field("code", code)
+                .field("message", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 impl Response {
     pub fn id(&self) -> u64 {
         match self {
             Response::HelloAck { id, .. } => *id,
             Response::ShutdownAck { id, .. } => *id,
             Response::SessionSpawned { id, .. } => *id,
+            Response::SessionEnsured { id, .. } => *id,
             Response::Ack { id } => *id,
             Response::SessionList { id, .. } => *id,
             Response::SessionAttached { id, .. } => *id,
@@ -576,6 +704,7 @@ mod tests {
             workspace_id: 2,
             pane_id: 5,
             name: Some("scratch".into()),
+            restore_correlation_id: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(
@@ -598,6 +727,7 @@ mod tests {
             workspace_id: 0,
             pane_id: 0,
             name: None,
+            restore_correlation_id: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(
@@ -625,6 +755,7 @@ mod tests {
             workspace_id: 0,
             pane_id: 0,
             name: None,
+            restore_correlation_id: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(
@@ -649,6 +780,7 @@ mod tests {
             workspace_id: 0,
             pane_id: 0,
             name: None,
+            restore_correlation_id: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(
@@ -741,6 +873,7 @@ mod tests {
         let resp = Response::SessionSpawned {
             id: 1,
             session_id: 42,
+            hook_capability: "capability".into(),
         };
         let s = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&s).unwrap();
@@ -889,6 +1022,7 @@ mod tests {
                 workspace_id: 0,
                 pane_id: 0,
                 name: None,
+                restore_correlation_id: None,
             }
             .id(),
             31
@@ -945,7 +1079,8 @@ mod tests {
         assert_eq!(
             Response::SessionSpawned {
                 id: 41,
-                session_id: 2
+                session_id: 2,
+                hook_capability: "capability".into(),
             }
             .id(),
             41
@@ -966,6 +1101,7 @@ mod tests {
             Response::SessionAttached {
                 id: 44,
                 snapshot: snap,
+                hook_capability: "capability".into(),
             }
             .id(),
             44
@@ -998,7 +1134,11 @@ mod tests {
     #[test]
     fn session_attached_response_round_trips() {
         let snapshot = unshit_terminal_core::Terminal::new(3, 5, 10).snapshot(0);
-        let resp = Response::SessionAttached { id: 103, snapshot };
+        let resp = Response::SessionAttached {
+            id: 103,
+            snapshot,
+            hook_capability: "capability".into(),
+        };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let back: Response = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(resp, back);
@@ -1021,5 +1161,55 @@ mod tests {
         // Pin the v1 wire cap so a future refactor has to revisit the
         // deliberate choice documented in the constant's docstring.
         assert_eq!(SNAPSHOT_MAX_SCROLLBACK_LINES, 100);
+    }
+
+    #[test]
+    fn ensure_session_request_and_response_round_trip() {
+        let request = Request::EnsureSession {
+            id: 201,
+            cols: 120,
+            rows: 40,
+            cwd: Some("project".into()),
+            shell: Some("claude".into()),
+            shell_args: vec!["--resume".into(), "conversation".into()],
+            workspace_id: 7,
+            pane_id: 9,
+            name: Some("agent".into()),
+            restore_correlation_id: Some("019f75b0-e94f-71f0-b1ea-f478f8438c1a".into()),
+            scrollback_lines: 50,
+        };
+        let bytes = serde_json::to_vec(&request).expect("serialize request");
+        assert_eq!(
+            serde_json::from_slice::<Request>(&bytes).expect("deserialize request"),
+            request
+        );
+
+        let response = Response::SessionEnsured {
+            id: 201,
+            session_id: 3,
+            disposition: EnsureDisposition::Spawned,
+            snapshot: unshit_terminal_core::Terminal::new(40, 120, 10).snapshot(0),
+            hook_capability: "capability".into(),
+        };
+        let bytes = serde_json::to_vec(&response).expect("serialize response");
+        assert_eq!(
+            serde_json::from_slice::<Response>(&bytes).expect("deserialize response"),
+            response
+        );
+        assert_eq!(response.id(), 201);
+    }
+
+    #[test]
+    fn response_debug_redacts_hook_capabilities() {
+        let capability = "sentinel-hook-capability-never-log";
+        let response = Response::SessionSpawned {
+            id: 8,
+            session_id: 13,
+            hook_capability: capability.into(),
+        };
+        let debug = format!("{response:?}");
+
+        assert!(!debug.contains(capability));
+        assert!(debug.contains("<redacted>"));
     }
 }

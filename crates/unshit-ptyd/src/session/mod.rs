@@ -34,6 +34,11 @@ const READ_BUF_LEN: usize = 4096;
 pub const ENV_NOTIFY_SOCKET: &str = "TM_NOTIFY_SOCKET";
 pub const ENV_WORKSPACE_ID: &str = "TM_WORKSPACE_ID";
 pub const ENV_PANE_ID: &str = "TM_PANE_ID";
+pub const ENV_AGENT_HOOK_CAPABILITY: &str = "TM_AGENT_HOOK_CAPABILITY";
+pub const ENV_AGENT_RESTORE_CORRELATION_ID: &str = "TM_AGENT_RESTORE_CORRELATION_ID";
+
+/// Session-scoped generation that identifies the current output attachment.
+pub type AttachmentToken = u64;
 
 /// Environment variables that select a non-default Claude Code profile,
 /// override the Anthropic provider/model, or mark an in-progress Claude
@@ -96,15 +101,21 @@ pub struct Session {
     /// Reader task handle; aborted on drop so the blocking read does not
     /// keep the child's master alive.
     reader_task: Option<JoinHandle<()>>,
+    /// Polls the primary child independently from the PTY reader. ConPTY can
+    /// keep a master read pending after a one-shot child exits, so reader EOF
+    /// alone is not a reliable lifecycle signal on Windows.
+    child_watch_task: Option<JoinHandle<()>>,
     /// Daemon-side terminal emulator. Every PTY chunk is parsed into
     /// this in the reader task before being forwarded to the mpsc, so
     /// `snapshot()` always reflects bytes already observed by clients.
     terminal: Arc<Mutex<Terminal>>,
-    /// Swappable output sink. `None` when no client is attached; the
-    /// reader task still parses bytes into `terminal`, but nothing is
-    /// forwarded. `attach()` swaps in a fresh sender and returns the
-    /// matching receiver; `detach()` sets this back to `None`.
-    output_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    /// Swappable output sink plus its session-scoped generation token.
+    /// `None` when no client is attached; the reader task still parses
+    /// bytes into `terminal`, but nothing is forwarded. `attach()` swaps
+    /// in a fresh sender with a new token. `detach(token)` only clears the
+    /// sender when the token still owns the attachment, so cleanup from a
+    /// stale connection cannot detach a newer connection.
+    output: Arc<Mutex<OutputState>>,
     /// Workspace id tag used by the UI to match sessions back to panes
     /// after a restart. Opaque to the daemon.
     workspace_id: u32,
@@ -112,21 +123,39 @@ pub struct Session {
     pane_id: u32,
     /// Optional human-friendly name for the session.
     name: Option<String>,
+    /// Unpredictable bearer capability injected only into this PTY's
+    /// environment and echoed to the attached UI over the daemon protocol.
+    hook_capability: String,
 }
 
 /// Internal representation of one PTY child, mirrored after the
 /// `PtyPair` used by the old UI-side manager but without per-pane
 /// bookkeeping.
 struct PtyPair {
-    child: Arc<Mutex<Box<dyn Child + Send>>>,
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
 }
 
+struct OutputState {
+    current: Option<OutputSink>,
+    next_token: u64,
+    /// False once the sole PTY reader reaches EOF, errors, or panics. The
+    /// flag shares the output lock so attach and reader shutdown form one
+    /// atomic decision: an attach either installs its sender before shutdown
+    /// clears it, or observes a closed reader and fails.
+    reader_open: bool,
+}
+
+struct OutputSink {
+    token: AttachmentToken,
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
 impl Session {
     /// Spawns a shell with the requested geometry and starts the reader
-    /// task. On success the caller receives both the `Session` and a
-    /// `Receiver` it can poll for outbound bytes.
+    /// task. On success the caller receives the `Session`, the initial
+    /// attachment token, and a `Receiver` it can poll for outbound bytes.
     ///
     /// `shell` overrides the platform default when `Some`; falling back
     /// to `SHELL` + platform default when `None`. `shell_args` are
@@ -142,7 +171,35 @@ impl Session {
         workspace_id: u32,
         pane_id: u32,
         name: Option<String>,
-    ) -> std::io::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
+    ) -> std::io::Result<(Self, AttachmentToken, mpsc::Receiver<Vec<u8>>)> {
+        Self::spawn_with_context(
+            id,
+            cols,
+            rows,
+            cwd,
+            shell,
+            shell_args,
+            workspace_id,
+            pane_id,
+            name,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_context(
+        id: u64,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
+        shell: Option<&str>,
+        shell_args: &[String],
+        workspace_id: u32,
+        pane_id: u32,
+        name: Option<String>,
+        restore_correlation_id: Option<&str>,
+    ) -> std::io::Result<(Self, AttachmentToken, mpsc::Receiver<Vec<u8>>)> {
+        let hook_capability = generate_hook_capability()?;
         let pty_system = native_pty_system();
         let size = PtySize {
             rows,
@@ -172,7 +229,12 @@ impl Session {
         // a dumb terminal and skip DECSET 1049 / 256-color escapes.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        for (key, value) in terminal_manager_session_env(workspace_id, pane_id) {
+        for (key, value) in terminal_manager_session_env_with_correlation(
+            workspace_id,
+            pane_id,
+            &hook_capability,
+            restore_correlation_id,
+        ) {
             cmd.env(key, value);
         }
         // Panes are fresh interactive shells, not children of whatever
@@ -181,11 +243,17 @@ impl Session {
         // user's default config instead of inheriting a GLM/z.ai profile.
         strip_inherited_agent_env(&mut cmd);
 
-        let child = pty
-            .slave
-            .spawn_command(cmd)
-            .map_err(std::io::Error::other)?;
+        let child = pty.slave.spawn_command(cmd).map_err(|_| {
+            // portable-pty's Windows error includes the full CreateProcess
+            // command line. Agent prompts can be argv values, so neither the
+            // daemon response nor logs may forward that raw provider error.
+            log::error!(
+                r#"{{"event":"pty_child_spawn_failed","workspace_id":{workspace_id},"pane_id":{pane_id},"error_kind":"spawn_command"}}"#
+            );
+            std::io::Error::other("PTY child process could not be started")
+        })?;
         let pid = child.process_id();
+        let child = Arc::new(Mutex::new(child));
 
         let reader = pty
             .master
@@ -202,17 +270,27 @@ impl Session {
         )));
         let reader_terminal = Arc::clone(&terminal);
 
-        let output_tx = Arc::new(Mutex::new(Some(tx)));
-        let reader_output_tx = Arc::clone(&output_tx);
+        let attachment_token = 1;
+        let output = Arc::new(Mutex::new(OutputState {
+            current: Some(OutputSink {
+                token: attachment_token,
+                tx,
+            }),
+            next_token: 2,
+            reader_open: true,
+        }));
+        let reader_output = Arc::clone(&output);
 
         let reader_task = tokio::task::spawn_blocking(move || {
-            run_reader(reader, reader_output_tx, reader_terminal);
+            run_reader(reader, reader_output, reader_terminal);
         });
+        let child_watch_task =
+            tokio::spawn(watch_child_exit(Arc::clone(&child), Arc::clone(&output)));
 
         let session = Self {
             id,
             pty: Some(PtyPair {
-                child: Arc::new(Mutex::new(child)),
+                child,
                 writer,
                 master: pty.master,
             }),
@@ -220,32 +298,71 @@ impl Session {
             rows,
             pid,
             reader_task: Some(reader_task),
+            child_watch_task: Some(child_watch_task),
             terminal,
-            output_tx,
+            output,
             workspace_id,
             pane_id,
             name,
+            hook_capability,
         };
 
-        Ok((session, rx))
+        Ok((session, attachment_token, rx))
     }
 
     /// Replaces the current output sender with a fresh channel and
     /// returns the matching receiver. Any prior receiver is dropped;
     /// the reader stops forwarding to it on the next chunk.
-    pub fn attach(&self) -> mpsc::Receiver<Vec<u8>> {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
-        if let Ok(mut guard) = self.output_tx.lock() {
-            *guard = Some(tx);
-        }
-        rx
+    pub fn attach(&self) -> Option<(AttachmentToken, mpsc::Receiver<Vec<u8>>)> {
+        self.attach_with_snapshot(0)
+            .map(|(token, _snapshot, output)| (token, output))
     }
 
-    /// Clears the output sender. Future PTY output still lands in the
-    /// terminal but is not forwarded anywhere. No-op if already detached.
-    pub fn detach(&self) {
-        if let Ok(mut guard) = self.output_tx.lock() {
-            *guard = None;
+    /// Atomically establishes a new output boundary and snapshots everything
+    /// before it. The reader takes the same `terminal -> output` lock order,
+    /// so a byte chunk is either represented in this snapshot and delivered
+    /// only to the old attachment, or absent from the snapshot and delivered
+    /// to the new attachment. It can never be replayed through both surfaces.
+    pub fn attach_with_snapshot(
+        &self,
+        scrollback_lines: usize,
+    ) -> Option<(AttachmentToken, Snapshot, mpsc::Receiver<Vec<u8>>)> {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        let terminal = self
+            .terminal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !output.reader_open || !self.child_running() {
+            output.reader_open = false;
+            output.current = None;
+            return None;
+        }
+        let token = output.next_token;
+        output.next_token = token
+            .checked_add(1)
+            .expect("session attachment token space exhausted");
+        output.current = Some(OutputSink { token, tx });
+        let snapshot = terminal.snapshot(scrollback_lines);
+        Some((token, snapshot, rx))
+    }
+
+    /// Clears the output sender only when `token` still owns it. Future
+    /// PTY output still lands in the terminal but is not forwarded
+    /// anywhere. Returns `false` for a stale or already-detached token.
+    pub fn detach(&self, token: AttachmentToken) -> bool {
+        let mut guard = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.current.as_ref().map(|sink| sink.token) == Some(token) {
+            guard.current = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -297,6 +414,9 @@ impl Session {
     ///
     /// Safe to call multiple times; subsequent calls are no-ops.
     pub fn kill(&mut self) {
+        if let Some(handle) = self.child_watch_task.take() {
+            handle.abort();
+        }
         if let Some(pty) = self.pty.take() {
             if let Ok(mut child) = pty.child.lock() {
                 let _ = child.kill();
@@ -309,10 +429,23 @@ impl Session {
         if let Some(handle) = self.reader_task.take() {
             handle.abort();
         }
+        close_output(&self.output);
     }
 
     /// Reports whether the child is still running.
     pub fn alive(&self) -> bool {
+        let reader_open = self
+            .output
+            .lock()
+            .map(|output| output.reader_open)
+            .unwrap_or(false);
+        if !reader_open {
+            return false;
+        }
+        self.child_running()
+    }
+
+    fn child_running(&self) -> bool {
         let Some(pty) = self.pty.as_ref() else {
             return false;
         };
@@ -346,6 +479,10 @@ impl Session {
         self.name.as_deref()
     }
 
+    pub fn hook_capability(&self) -> &str {
+        &self.hook_capability
+    }
+
     /// Set or clear the display name. An empty string is treated the
     /// same as `None` so the UI does not have to care which it sends.
     pub fn set_name(&mut self, name: Option<String>) {
@@ -356,12 +493,81 @@ impl Session {
 pub fn terminal_manager_session_env(
     workspace_id: u32,
     pane_id: u32,
+    hook_capability: &str,
 ) -> Vec<(&'static str, String)> {
+    terminal_manager_session_env_with_correlation(workspace_id, pane_id, hook_capability, None)
+}
+
+fn terminal_manager_session_env_with_correlation(
+    workspace_id: u32,
+    pane_id: u32,
+    hook_capability: &str,
+    restore_correlation_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let restore_correlation_id = restore_correlation_id
+        .filter(|value| is_valid_correlation_id(value))
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var(ENV_AGENT_RESTORE_CORRELATION_ID)
+                .ok()
+                .filter(|value| is_valid_correlation_id(value))
+        })
+        .unwrap_or_default();
     vec![
         (ENV_NOTIFY_SOCKET, notification_socket_path_from_env()),
         (ENV_WORKSPACE_ID, workspace_id.to_string()),
         (ENV_PANE_ID, pane_id.to_string()),
+        (ENV_AGENT_HOOK_CAPABILITY, hook_capability.to_string()),
+        (ENV_AGENT_RESTORE_CORRELATION_ID, restore_correlation_id),
     ]
+}
+
+fn is_valid_correlation_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+fn generate_hook_capability() -> std::io::Result<String> {
+    let mut bytes = [0u8; 32];
+    fill_secure_random(&mut bytes)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(encoded)
+}
+
+#[cfg(windows)]
+fn fill_secure_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+
+    // SAFETY: the pointer and byte count describe the live mutable slice;
+    // a null algorithm handle is required with SYSTEM_PREFERRED_RNG.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len().try_into().expect("capability size fits u32"),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status >= 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("system random generator failed"))
+    }
+}
+
+#[cfg(unix)]
+fn fill_secure_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    std::fs::File::open("/dev/urandom")?.read_exact(bytes)
 }
 
 fn notification_socket_path_from_env() -> String {
@@ -405,7 +611,7 @@ impl Drop for Session {
 
 fn run_reader(
     reader: Box<dyn Read + Send>,
-    output_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    output: Arc<Mutex<OutputState>>,
     terminal: Arc<Mutex<Terminal>>,
 ) {
     // The reader body can panic if the VTE parser hits a bug on
@@ -416,18 +622,51 @@ fn run_reader(
     // criterion: the task exits cleanly, the child stays killable
     // through the normal Session::kill path, and every other session's
     // reader keeps streaming on its own thread.
+    let reader_output = Arc::clone(&output);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        run_reader_inner(reader, output_tx, terminal);
+        run_reader_inner(reader, reader_output, terminal);
     }));
     if let Err(payload) = result {
         let msg = panic_payload_str(&payload);
         log::error!("session reader panicked: {msg}; reader exiting");
     }
+    close_output(&output);
+}
+
+async fn watch_child_exit(
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    output: Arc<Mutex<OutputState>>,
+) {
+    loop {
+        let exited = match child.lock() {
+            Ok(mut child) => !matches!(child.try_wait(), Ok(None)),
+            Err(_) => true,
+        };
+        if exited {
+            // Give the reader a bounded window to drain output the child
+            // wrote immediately before exit. Unix PTYs usually reach EOF in
+            // this window and close themselves; ConPTY may keep the read
+            // pending until the pseudoconsole is torn down, so the watcher
+            // still provides the eventual close required by the UI.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            close_output(&output);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn close_output(output: &Arc<Mutex<OutputState>>) {
+    let mut output = output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    output.reader_open = false;
+    output.current = None;
 }
 
 fn run_reader_inner(
     mut reader: Box<dyn Read + Send>,
-    output_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    output: Arc<Mutex<OutputState>>,
     terminal: Arc<Mutex<Terminal>>,
 ) {
     let mut buf = vec![0u8; READ_BUF_LEN];
@@ -435,10 +674,16 @@ fn run_reader_inner(
         match reader.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => {
-                if let Ok(mut term) = terminal.lock() {
+                let tx_opt = {
+                    let Ok(mut term) = terminal.lock() else {
+                        continue;
+                    };
                     term.process_bytes(&buf[..n]);
-                }
-                let tx_opt = output_tx.lock().ok().and_then(|g| g.clone());
+                    output
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.current.as_ref().map(|sink| sink.tx.clone()))
+                };
                 if let Some(tx) = tx_opt {
                     // Non-blocking: if the current client is slow or gone
                     // we drop the chunk and rely on the terminal plus
@@ -496,7 +741,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_emits_output_from_echo() {
-        let (mut session, mut rx) =
+        let (mut session, _token, mut rx) =
             Session::spawn(1, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
 
@@ -518,7 +763,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resize_updates_recorded_dimensions() {
-        let (mut session, _rx) =
+        let (mut session, _token, _rx) =
             Session::spawn(2, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
         assert_eq!(session.cols(), 80);
@@ -533,7 +778,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn set_name_stores_and_clears_display_name() {
-        let (mut session, _rx) =
+        let (mut session, _token, _rx) =
             Session::spawn(10, 80, 24, None, Some(test_shell()), &[], 0, 0, None).expect("spawn");
         assert_eq!(session.name(), None);
 
@@ -554,7 +799,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kill_is_idempotent_and_marks_session_dead() {
-        let (mut session, _rx) =
+        let (mut session, _token, _rx) =
             Session::spawn(3, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
         assert!(
@@ -569,7 +814,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drop_kills_child_and_closes_receiver() {
-        let (session, mut rx) =
+        let (session, _token, mut rx) =
             Session::spawn(4, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
         drop(session);
@@ -581,6 +826,29 @@ mod tests {
         })
         .await;
         assert!(closed.is_ok(), "receiver should close once session dropped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn natural_child_exit_closes_receiver_while_session_is_retained() {
+        #[cfg(windows)]
+        let shell_args = vec!["/Q".into(), "/D".into(), "/C".into(), "exit /B 0".into()];
+        #[cfg(unix)]
+        let shell_args = vec!["-c".into(), "exit 0".into()];
+
+        let (mut session, _token, mut rx) =
+            Session::spawn(5, 80, 24, None, Some(test_shell()), &shell_args, 0, 0, None)
+                .expect("spawn one-shot session");
+
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "natural PTY EOF must close the output channel even while the Session remains registered"
+        );
+
+        session.kill();
     }
 
     fn grid_text(snap: &Snapshot) -> String {
@@ -599,7 +867,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_reflects_bytes_written_to_pty() {
-        let (mut session, mut rx) =
+        let (mut session, _token, mut rx) =
             Session::spawn(10, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
 
@@ -622,7 +890,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_is_empty_for_fresh_session() {
-        let (mut session, _rx) =
+        let (mut session, _token, _rx) =
             Session::spawn(11, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
         let snap = session.snapshot(0);
@@ -634,7 +902,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resize_propagates_to_terminal() {
-        let (mut session, _rx) =
+        let (mut session, _token, _rx) =
             Session::spawn(12, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
         let snap = session.snapshot(0);
@@ -650,7 +918,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_on_dead_session_returns_empty_grid() {
-        let (mut session, _rx) =
+        let (mut session, _token, _rx) =
             Session::spawn(13, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
         session.kill();
@@ -664,7 +932,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_records_workspace_and_pane_metadata() {
-        let (session, _rx) = Session::spawn(
+        let (session, _token, _rx) = Session::spawn(
             20,
             80,
             24,
@@ -711,7 +979,7 @@ mod tests {
 
     #[test]
     fn session_env_includes_notification_target_metadata() {
-        let env = terminal_manager_session_env(7, 3);
+        let env = terminal_manager_session_env(7, 3, "capability");
         let find = |key: &str| {
             env.iter()
                 .find(|(k, _)| *k == key)
@@ -722,15 +990,66 @@ mod tests {
         assert!(!find(ENV_NOTIFY_SOCKET).is_empty());
         assert_eq!(find(ENV_WORKSPACE_ID), "7");
         assert_eq!(find(ENV_PANE_ID), "3");
+        assert_eq!(find(ENV_AGENT_HOOK_CAPABILITY), "capability");
+    }
+
+    #[test]
+    fn per_spawn_correlation_overrides_long_lived_daemon_environment() {
+        const CURRENT_UI: &str = "019f75b0-e94f-71f0-b1ea-f478f8438c1a";
+        let env =
+            terminal_manager_session_env_with_correlation(7, 3, "capability", Some(CURRENT_UI));
+        let correlation = env
+            .iter()
+            .find(|(key, _)| *key == ENV_AGENT_RESTORE_CORRELATION_ID)
+            .map(|(_, value)| value.as_str());
+
+        assert_eq!(correlation, Some(CURRENT_UI));
+    }
+
+    #[test]
+    fn generated_hook_capabilities_are_valid_and_distinct() {
+        let first = generate_hook_capability().expect("first capability");
+        let second = generate_hook_capability().expect("second capability");
+
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(second.len(), 64);
+        assert!(second.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn child_spawn_failure_never_exposes_command_arguments() {
+        const SECRET_PROMPT: &str = "sentinel-prompt-that-must-not-escape";
+        let shell_args = vec![SECRET_PROMPT.to_string()];
+        let error = match Session::spawn(
+            91,
+            80,
+            24,
+            None,
+            Some("terminal-manager-deliberately-missing-executable"),
+            &shell_args,
+            4,
+            7,
+            None,
+        ) {
+            Ok(_) => panic!("missing executable unexpectedly spawned"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert_eq!(message, "PTY child process could not be started");
+        assert!(!message.contains(SECRET_PROMPT));
+        assert!(!message.contains("terminal-manager-deliberately-missing-executable"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attach_replaces_prior_receiver_and_drops_it() {
-        let (mut session, original_rx) =
+        let (mut session, _original_token, original_rx) =
             Session::spawn(21, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
 
-        let mut new_rx = session.attach();
+        let (_new_token, mut new_rx) = session.attach().expect("live session attaches");
 
         #[cfg(windows)]
         let payload = b"echo reattach-marker\r\n";
@@ -754,11 +1073,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detach_clears_tx_but_keeps_terminal_parsing() {
-        let (mut session, rx) =
+        let (mut session, token, rx) =
             Session::spawn(22, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
         drop(rx);
-        session.detach();
+        assert!(session.detach(token));
 
         #[cfg(windows)]
         let payload = b"echo detachmarker\r\n";
@@ -779,7 +1098,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reader_does_not_exit_when_output_receiver_dropped() {
-        let (mut session, rx) =
+        let (mut session, _token, rx) =
             Session::spawn(23, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
                 .expect("spawn session");
         drop(rx);
@@ -817,13 +1136,27 @@ mod tests {
         }
 
         let terminal = Arc::new(Mutex::new(Terminal::new(24, 80, 0)));
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
-        let output_tx = Arc::new(Mutex::new(Some(tx)));
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        let output = Arc::new(Mutex::new(OutputState {
+            current: Some(OutputSink { token: 1, tx }),
+            next_token: 2,
+            reader_open: true,
+        }));
 
         // Call directly on the current thread so any escaped panic
         // would fail the test; catch_unwind inside run_reader must
         // swallow it.
-        run_reader(Box::new(PanickingReader), output_tx, Arc::clone(&terminal));
+        run_reader(
+            Box::new(PanickingReader),
+            Arc::clone(&output),
+            Arc::clone(&terminal),
+        );
+
+        assert_eq!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected),
+            "a failed reader must close its output channel"
+        );
 
         // Terminal state is still accessible: the Mutex is not poisoned
         // (the panic happened before any terminal lock was acquired, and

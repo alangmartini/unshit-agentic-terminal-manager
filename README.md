@@ -13,6 +13,7 @@ Unshit Terminal Manager is a native Windows terminal multiplexer built on **unsh
 - **tmux-style persistent sessions** — tabs, splits, split ratios, and workspaces are saved to disk and restored on the next launch. Because the daemon owns the shells, a session survives closing the UI (or a UI crash) and reattaches to the *same* running process on reopen — a build or agent you kicked off keeps running in the background. Sessions only end on an explicit close or a daemon shutdown, never when the UI disconnects.
 - **Command palette** (`Ctrl+Shift+P`) — a VS Code-style launcher with fuzzy search and typed modes: `>` for actions, `@` for agents, `:` for navigation, and `/` for scrollback. Drive splits, tabs, renames, the sidebar, and settings without leaving the keyboard.
 - **Quick Prompt** (`Ctrl+Shift+Q`) — type a prompt, attach images, and launch an agent CLI (`claude` or `codex`) in a fresh git worktree. When the active workspace is a git repo it runs `git worktree add` so the agent works on an anonymous branch without disturbing your checkout; otherwise it falls back to a plain scratch directory.
+- **Agent conversation recovery** — if the PTY daemon is lost in a reboot or crash, a saved pane with an exact or unambiguous provider conversation id offers a provider-specific **Resume Claude/Codex** button the next time Terminal Manager is opened. Automatic recovery is an explicit opt-in under **Settings → Sessions**; a normal UI-only restart still reattaches to the already-running agent instead of launching a duplicate. This does not register Terminal Manager to start with Windows.
 - **Git awareness** — the sidebar detects the current branch for terminals whose working directory lives inside a repository.
 - **Themes** — bundled palettes (Amber, Catppuccin, Tokyo Night, Nord, Dracula, Everforest, Rosé Pine, Gruvbox, and more) plus a customizable accent/surface/foreground theme.
 - **Configurable keybindings** — every action has an editable default key combo, persisted as JSON and editable from Settings.
@@ -101,6 +102,7 @@ The result is `dist\terminal-manager-0.2.6-setup.exe`.
 - **Splits:** `Ctrl+D` splits right, `Ctrl+Shift+D` splits down, `Ctrl+W` unsplits. Move focus between panes with `Ctrl+Alt+Arrow`; `Ctrl+Arrow` remains available to terminal applications for word navigation.
 - **Command palette:** `Ctrl+Shift+P`. Type to fuzzy-search, or prefix your query with `>`, `@`, `:`, or `/` to scope the search. `Enter` runs the highlighted item, `Esc` clears the query then closes.
 - **Quick Prompt:** `Ctrl+Shift+Q`. Type a prompt, optionally paste images, pick Claude or Codex, and submit to launch the agent in a fresh worktree.
+- **Agent recovery:** after a cold restart, open Terminal Manager and use the **Resume Claude/Codex** chip in an affected pane with an exact or unambiguous conversation id. Enabling automatic launch from **Settings → Sessions** immediately installs the minimal SessionStart capture hooks used to remember exact ids. Turning automatic launch off leaves those hooks installed for manual recovery; use **Remove recovery hooks** in the same section to remove only Terminal Manager's managed entries.
 - **Other:** `Ctrl+B` toggles the sidebar, `Ctrl+,` opens Settings, `F2` renames the active session, `Ctrl+=` / `Ctrl+-` zoom the font, `F11` toggles fullscreen.
 
 ## Configuration
@@ -111,10 +113,15 @@ User data is stored under your platform config and data directories:
 |------|----------|
 | Workspaces, tabs, and pane layout | `%APPDATA%\com.godly.terminal\workspaces.json` |
 | Quick Prompt agent worktrees | `%APPDATA%\com.godly.terminal\worktrees\` |
+| Redacted agent recovery events | `%APPDATA%\com.godly.terminal\agent-restore-events.jsonl` |
 
 - **Keybindings** are editable in **Settings → Keybinds**. Each action keeps a stable id and is persisted as JSON; defaults follow Windows conventions (see the table above).
 - **Themes** are chosen in Settings. Bundled palettes ship in `assets/themes.json`, and the *Custom* theme lets you set accent, surface, and foreground colors directly.
 - **Shells** can be set app-wide or overridden per workspace from Settings.
+- **Agent recovery** stores only minimal routing and launch metadata in the workspace file: provider, stable workspace and pane identity, cwd, launch mode and phase, managed-pane flag, opaque session id, and observation time. Workspace numeric ids are stable and are not renumbered when another workspace is removed. Prompt text, transcript content, terminal output, and hook payloads are never stored in this record or in recovery telemetry.
+- **Recovery discovery** reads at most the first 128 KiB and 64 JSONL records from each recent provider metadata candidate, extracts only the allowlisted session id and cwd, and does not retain or log the remaining content. Ambiguous matches fail closed and do not offer or automatically launch a conversation.
+- **Recovery hooks** are merged into Claude Code and Codex user hook settings without replacing unrelated hooks. Disabling automatic launch keeps them installed so manual recovery can continue capturing ids; **Remove recovery hooks** removes only entries marked as managed by Terminal Manager.
+- **Recovery IPC and files** are owner-scoped: clients verify the connected server's Windows SID or Unix uid before sending hook metadata, Unix servers reject other-owner peers, hook edits refuse symlinks/reparse points, and recovery state/telemetry use owner-private files. If the final close-state save fails, Terminal Manager stays open and offers a retry instead of allowing stale agent metadata to return on the next launch.
 
 ## Development
 

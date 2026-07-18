@@ -2659,6 +2659,43 @@ input, select {
   background: rgba(201, 85, 58, 0.15);
 }
 
+.agent-resume-chip {
+  position: absolute;
+  right: var(--sp-4);
+  bottom: var(--sp-4);
+  z-index: 10;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--amber-100);
+  background: var(--bg-elevated);
+  border: 1px solid var(--accent-a35);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-sm);
+  font: var(--type-meta);
+  cursor: pointer;
+  transition: color var(--dur-fast), background var(--dur-fast), border-color var(--dur-fast), transform var(--dur-fast);
+}
+
+.agent-resume-chip:hover {
+  color: var(--amber-50);
+  background: var(--bg-hover);
+  border-color: var(--accent-a60);
+  transform: translateY(-1px);
+}
+
+.agent-resume-icon {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+}
+
+.agent-resume-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
 
 .pane-body {
   display: flex;
@@ -6196,6 +6233,47 @@ body.dragging-pane {
   left: 14px;
   background: var(--amber-300);
   box-shadow: var(--glow-amber-s);
+}
+
+.agent-auto-resume-toggle {
+  min-width: 42px;
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--fg-tertiary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  font: var(--type-meta);
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.agent-auto-resume-toggle.on {
+  color: var(--amber-100);
+  background: var(--accent-a16);
+  border-color: var(--accent-a35);
+}
+
+.agent-recovery-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+.agent-recovery-hooks-remove {
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--fg-tertiary);
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  font: var(--type-meta);
+  cursor: pointer;
+}
+
+.agent-recovery-hooks-remove:hover,
+.agent-recovery-hooks-remove:focus-visible {
+  color: var(--rust);
+  border-color: var(--rust);
 }
 
 .preview-tile {

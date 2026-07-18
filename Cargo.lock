@@ -3548,6 +3548,7 @@ dependencies = [
  "env_logger",
  "futures-core",
  "image",
+ "libc",
  "log",
  "portable-pty",
  "rfd",

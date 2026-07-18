@@ -27,7 +27,7 @@ use crate::protocol::{
     },
     ProtocolError, PROTOCOL_VERSION,
 };
-use crate::session::registry::SessionRegistry;
+use crate::session::{registry::SessionRegistry, AttachmentToken};
 use crate::DAEMON_VERSION;
 
 /// Outcome the outer loop uses to decide whether to keep serving.
@@ -59,25 +59,27 @@ where
     let writer = Arc::new(Mutex::new(write_half));
     let mut shutdown_rx = shutdown.subscribe();
 
-    // Keyed by session_id so KillSession can abort the matching
-    // forwarder without a linear scan, and per-connection cleanup
-    // can drain them all on close.
-    let mut forwarders: HashMap<u64, JoinHandle<()>> = HashMap::new();
+    // Keyed by `(session_id, attachment_token)`. The token lets cleanup
+    // prove that this connection still owns the session's output sink;
+    // a stale connection must never detach a newer attachment.
+    let mut forwarders: HashMap<(u64, AttachmentToken), JoinHandle<()>> = HashMap::new();
 
     let result = loop {
         tokio::select! {
             _ = shutdown_rx.recv() => break Ok(()),
             req = read_request(&mut reader) => {
-                let req = match req? {
-                    Some(r) => r,
-                    None => break Ok(()),
+                let req = match req {
+                    Ok(Some(request)) => request,
+                    Ok(None) => break Ok(()),
+                    Err(error) => break Err(error),
                 };
-                match handle(req, writer.clone(), registry.clone(), &mut forwarders).await? {
-                    PostRequest::Continue => continue,
-                    PostRequest::ShutdownRequested => {
+                match handle(req, writer.clone(), registry.clone(), &mut forwarders).await {
+                    Ok(PostRequest::Continue) => continue,
+                    Ok(PostRequest::ShutdownRequested) => {
                         let _ = shutdown.send(());
                         break Ok(());
                     }
+                    Err(error) => break Err(error),
                 }
             }
         }
@@ -88,11 +90,7 @@ where
     // session so a later attach sees a fresh channel. The `Terminal`
     // inside each session keeps parsing PTY output so reattaches observe
     // the authoritative grid plus scrollback.
-    for (id, handle) in forwarders.drain() {
-        handle.abort();
-        let _ = handle.await;
-        registry.detach(id).await;
-    }
+    cleanup_forwarders(&mut forwarders, &registry).await;
 
     result
 }
@@ -103,7 +101,7 @@ async fn handle<W>(
     req: Request,
     writer: SharedWriter<W>,
     registry: Arc<SessionRegistry>,
-    forwarders: &mut HashMap<u64, JoinHandle<()>>,
+    forwarders: &mut HashMap<(u64, AttachmentToken), JoinHandle<()>>,
 ) -> Result<PostRequest, ProtocolError>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -170,11 +168,12 @@ where
             workspace_id,
             pane_id,
             name,
+            restore_correlation_id,
         } => {
             let cwd_path = cwd.as_deref().map(PathBuf::from);
             let shell_ref = shell.as_deref();
             let spawn_res = registry
-                .spawn(
+                .spawn_with_context(
                     cols,
                     rows,
                     cwd_path.as_deref(),
@@ -183,13 +182,22 @@ where
                     workspace_id,
                     pane_id,
                     name,
+                    restore_correlation_id.as_deref(),
                 )
                 .await;
             match spawn_res {
-                Ok((session_id, rx)) => {
+                Ok((session_id, attachment_token, hook_capability, rx)) => {
                     let handle = tokio::spawn(forward_output(session_id, rx, writer.clone()));
-                    forwarders.insert(session_id, handle);
-                    send_response(&writer, Response::SessionSpawned { id, session_id }).await?;
+                    forwarders.insert((session_id, attachment_token), handle);
+                    send_response(
+                        &writer,
+                        Response::SessionSpawned {
+                            id,
+                            session_id,
+                            hook_capability,
+                        },
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     send_err(&writer, id, "spawn_failed", &e).await?;
@@ -222,9 +230,7 @@ where
         }
         Request::KillSession { id, session_id } => {
             registry.remove(session_id).await;
-            if let Some(h) = forwarders.remove(&session_id) {
-                h.abort();
-            }
+            abort_forwarders_for_session(forwarders, session_id).await;
             send_response(&writer, Response::Ack { id }).await?;
             Ok(PostRequest::Continue)
         }
@@ -242,26 +248,86 @@ where
             .await?;
             Ok(PostRequest::Continue)
         }
+        Request::EnsureSession {
+            id,
+            cols,
+            rows,
+            cwd,
+            shell,
+            shell_args,
+            workspace_id,
+            pane_id,
+            name,
+            restore_correlation_id,
+            scrollback_lines,
+        } => {
+            let cwd_path = cwd.as_deref().map(PathBuf::from);
+            let clamped = (scrollback_lines as usize).min(SNAPSHOT_MAX_SCROLLBACK_LINES);
+            match registry
+                .ensure_with_context(
+                    cols,
+                    rows,
+                    cwd_path.as_deref(),
+                    shell.as_deref(),
+                    &shell_args,
+                    workspace_id,
+                    pane_id,
+                    name,
+                    clamped,
+                    restore_correlation_id.as_deref(),
+                )
+                .await
+            {
+                Ok(ensured) => {
+                    let session_id = ensured.session_id;
+                    abort_forwarders_for_session(forwarders, session_id).await;
+                    let handle =
+                        tokio::spawn(forward_output(session_id, ensured.output, writer.clone()));
+                    forwarders.insert((session_id, ensured.attachment_token), handle);
+                    send_response(
+                        &writer,
+                        Response::SessionEnsured {
+                            id,
+                            session_id,
+                            disposition: ensured.disposition,
+                            snapshot: ensured.snapshot,
+                            hook_capability: ensured.hook_capability,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    let code = if e.kind() == io::ErrorKind::AlreadyExists {
+                        error_code(&e)
+                    } else {
+                        "spawn_failed"
+                    };
+                    send_err(&writer, id, code, &e).await?;
+                }
+            }
+            Ok(PostRequest::Continue)
+        }
         Request::AttachSession {
             id,
             session_id,
             scrollback_lines,
         } => {
             let clamped = (scrollback_lines as usize).min(SNAPSHOT_MAX_SCROLLBACK_LINES);
-            let rx = registry.attach(session_id).await;
-            match rx {
-                Some(rx) => {
-                    if let Some(old) = forwarders.remove(&session_id) {
-                        old.abort();
-                        let _ = old.await;
-                    }
+            let attachment = registry.attach_with_snapshot(session_id, clamped).await;
+            match attachment {
+                Some((attachment_token, hook_capability, snapshot, rx)) => {
+                    abort_forwarders_for_session(forwarders, session_id).await;
                     let handle = tokio::spawn(forward_output(session_id, rx, writer.clone()));
-                    forwarders.insert(session_id, handle);
-                    let snapshot = registry
-                        .snapshot(session_id, clamped)
-                        .await
-                        .expect("session existed for attach but not snapshot");
-                    send_response(&writer, Response::SessionAttached { id, snapshot }).await?;
+                    forwarders.insert((session_id, attachment_token), handle);
+                    send_response(
+                        &writer,
+                        Response::SessionAttached {
+                            id,
+                            snapshot,
+                            hook_capability,
+                        },
+                    )
+                    .await?;
                 }
                 None => {
                     let err = io::Error::new(
@@ -274,11 +340,18 @@ where
             Ok(PostRequest::Continue)
         }
         Request::DetachSession { id, session_id } => {
-            if let Some(h) = forwarders.remove(&session_id) {
-                h.abort();
-                let _ = h.await;
+            let attachment_keys: Vec<_> = forwarders
+                .keys()
+                .copied()
+                .filter(|(attached_session_id, _)| *attached_session_id == session_id)
+                .collect();
+            for (attached_session_id, attachment_token) in attachment_keys {
+                if let Some(handle) = forwarders.remove(&(attached_session_id, attachment_token)) {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+                registry.detach(attached_session_id, attachment_token).await;
             }
-            registry.detach(session_id).await;
             send_response(&writer, Response::Ack { id }).await?;
             Ok(PostRequest::Continue)
         }
@@ -298,6 +371,34 @@ where
             }
             Ok(PostRequest::Continue)
         }
+    }
+}
+
+async fn abort_forwarders_for_session(
+    forwarders: &mut HashMap<(u64, AttachmentToken), JoinHandle<()>>,
+    session_id: u64,
+) {
+    let attachment_keys: Vec<_> = forwarders
+        .keys()
+        .copied()
+        .filter(|(attached_session_id, _)| *attached_session_id == session_id)
+        .collect();
+    for attachment_key in attachment_keys {
+        if let Some(handle) = forwarders.remove(&attachment_key) {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+async fn cleanup_forwarders(
+    forwarders: &mut HashMap<(u64, AttachmentToken), JoinHandle<()>>,
+    registry: &SessionRegistry,
+) {
+    for ((session_id, attachment_token), handle) in forwarders.drain() {
+        handle.abort();
+        let _ = handle.await;
+        registry.detach(session_id, attachment_token).await;
     }
 }
 
@@ -354,6 +455,7 @@ fn error_code(e: &io::Error) -> &'static str {
     match e.kind() {
         io::ErrorKind::NotFound => "session_not_found",
         io::ErrorKind::NotConnected => "session_dead",
+        io::ErrorKind::AlreadyExists => "session_key_ambiguous",
         _ => "io_error",
     }
 }
@@ -370,7 +472,7 @@ pub fn protocol_to_io(err: ProtocolError) -> io::Error {
 mod tests {
     use super::*;
     use crate::protocol::message::{read_response, write_request};
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncWriteExt};
 
     #[tokio::test]
     async fn hello_elicits_hello_ack_with_echoed_id() {
@@ -451,6 +553,139 @@ mod tests {
             }
         );
         server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_connection_cleanup_preserves_newer_attachment() {
+        #[cfg(windows)]
+        let test_shell = "cmd.exe";
+        #[cfg(unix)]
+        let test_shell = "/bin/sh";
+
+        let registry = Arc::new(SessionRegistry::new());
+        let writer_a = Arc::new(Mutex::new(tokio::io::sink()));
+        let writer_b = Arc::new(Mutex::new(tokio::io::sink()));
+        let mut forwarders_a = HashMap::new();
+        let mut forwarders_b = HashMap::new();
+
+        handle(
+            Request::SpawnSession {
+                id: 1,
+                cols: 80,
+                rows: 24,
+                cwd: None,
+                shell: Some(test_shell.into()),
+                shell_args: vec![],
+                workspace_id: 7,
+                pane_id: 3,
+                name: None,
+                restore_correlation_id: None,
+            },
+            writer_a,
+            registry.clone(),
+            &mut forwarders_a,
+        )
+        .await
+        .expect("spawn request");
+        let session_id = registry.list().await[0].id;
+
+        handle(
+            Request::AttachSession {
+                id: 2,
+                session_id,
+                scrollback_lines: 0,
+            },
+            writer_b,
+            registry.clone(),
+            &mut forwarders_b,
+        )
+        .await
+        .expect("attach request");
+        let current_token = forwarders_b
+            .keys()
+            .find_map(|(id, token)| (*id == session_id).then_some(*token))
+            .expect("new connection attachment token");
+
+        cleanup_forwarders(&mut forwarders_a, &registry).await;
+
+        assert!(
+            registry.detach(session_id, current_token).await,
+            "cleanup from the original connection must not detach the replacement"
+        );
+
+        cleanup_forwarders(&mut forwarders_b, &registry).await;
+        registry.remove(session_id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protocol_error_still_detaches_the_connections_attachment() {
+        #[cfg(windows)]
+        let (test_shell, shell_args) = (
+            "cmd.exe",
+            vec![
+                "/Q".into(),
+                "/D".into(),
+                "/C".into(),
+                "ping -n 30 127.0.0.1 >nul".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (test_shell, shell_args) = ("/bin/sh", vec!["-c".into(), "sleep 30".into()]);
+
+        let (client, server) = duplex(16 * 1024);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
+        let registry = Arc::new(SessionRegistry::new());
+        let server_registry = registry.clone();
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(server, shutdown_tx, server_registry).await },
+            );
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        write_request(
+            &mut client_write,
+            &Request::SpawnSession {
+                id: 9,
+                cols: 80,
+                rows: 24,
+                cwd: None,
+                shell: Some(test_shell.into()),
+                shell_args,
+                workspace_id: 7,
+                pane_id: 4,
+                name: None,
+                restore_correlation_id: None,
+            },
+        )
+        .await
+        .expect("spawn request");
+        let response = read_response(&mut client_read)
+            .await
+            .expect("spawn response frame")
+            .expect("spawn response");
+        let session_id = match response {
+            Response::SessionSpawned { session_id, .. } => session_id,
+            other => panic!("unexpected spawn response: {other:?}"),
+        };
+
+        // A one-byte frame body whose kind byte is not part of the
+        // protocol forces `read_request` down its error path.
+        client_write
+            .write_all(&[0, 0, 0, 1, 0xff])
+            .await
+            .expect("malformed frame write");
+        drop(client_write);
+        drop(client_read);
+
+        assert!(
+            server_task.await.expect("server task").is_err(),
+            "the malformed frame must surface a protocol error"
+        );
+        assert!(
+            !registry.detach(session_id, 1).await,
+            "error-path cleanup must already detach the connection's initial attachment"
+        );
+        registry.remove(session_id).await;
     }
 
     #[test]

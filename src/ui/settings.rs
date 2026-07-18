@@ -1750,11 +1750,48 @@ fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
         );
     }
 
-    let mut section = section_shell("sessions").with_child(setting_row(
-        "daemon sessions",
-        "sessions currently tracked by the session daemon; refresh to re-poll",
-        control,
-    ));
+    let auto_resume = is_on(state, ToggleKey::AutoResumeAgents);
+    let auto_shared = shared.clone();
+    let mut auto_control = ElementDef::new(Tag::Button)
+        .with_class("agent-auto-resume-toggle")
+        .with_id("settings-agent-auto-resume")
+        .with_tab_index(0)
+        .with_text(if auto_resume { "on" } else { "off" })
+        .on_click(move || {
+            mutate_with(&auto_shared, |st| {
+                dispatch(st, "agent.auto_resume.toggle");
+            });
+        });
+    if auto_resume {
+        auto_control = auto_control.with_class("on");
+    }
+    let remove_hooks_shared = shared.clone();
+    let remove_hooks = ElementDef::new(Tag::Button)
+        .with_class("agent-recovery-hooks-remove")
+        .with_id("settings-agent-recovery-hooks-remove")
+        .with_tab_index(0)
+        .with_text("remove hooks")
+        .on_click(move || {
+            mutate_with(&remove_hooks_shared, |st| {
+                dispatch(st, "agent.recovery_hooks.remove");
+            });
+        });
+    let recovery_controls = ElementDef::new(Tag::Div)
+        .with_class("agent-recovery-controls")
+        .with_child(auto_control)
+        .with_child(remove_hooks);
+
+    let mut section = section_shell("sessions")
+        .with_child(setting_row(
+            "daemon sessions",
+            "sessions currently tracked by the session daemon; refresh to re-poll",
+            control,
+        ))
+        .with_child(setting_row(
+            "automatic agent resume",
+            "On a cold restart, reopen saved Claude or Codex conversations. Enabling installs managed SessionStart capture hooks; turning this off leaves them installed for manual recovery. Remove hooks changes only Terminal Manager-marked entries.",
+            recovery_controls,
+        ));
 
     section = section.with_child(build_memory_dashboard(state));
 
@@ -4592,9 +4629,8 @@ mod tests {
             .iter()
             .filter(|c| c.classes.contains(&"setting-row".to_string()))
             .collect();
-        // First row is the "daemon sessions / refresh" header row, then
-        // one row per session.
-        assert_eq!(rows.len(), 3);
+        // Daemon refresh, automatic recovery, then one row per session.
+        assert_eq!(rows.len(), 4);
     }
 
     #[test]
@@ -4790,9 +4826,9 @@ mod tests {
             .iter()
             .filter(|c| c.classes.contains(&"setting-row".to_string()))
             .collect();
-        // rows[0] is header; rows[1] alive, rows[2] dead.
-        let alive_meta = &rows[1].children[0];
-        let dead_meta = &rows[2].children[0];
+        // rows[0] is daemon refresh, rows[1] recovery, then live sessions.
+        let alive_meta = &rows[2].children[0];
+        let dead_meta = &rows[3].children[0];
         let has_status_class = |meta: &ElementDef, cls: &str| {
             meta.children.iter().any(|c| {
                 c.children
@@ -4813,6 +4849,43 @@ mod tests {
         // Invoking succeeds without panic; actual daemon call is a no-op
         // because no daemon is connected in unit tests.
         (refresh_btn.on_click.as_ref().unwrap())();
+    }
+
+    #[test]
+    fn sessions_section_auto_resume_control_is_visible_and_dispatches() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_sessions_section(&snap, &shared);
+        let control = find_by_id(&el, "settings-agent-auto-resume").expect("auto resume");
+
+        assert_eq!(control.tab_index, Some(0));
+        assert_eq!(text_of(control), Some("off"));
+        assert!(!control.classes.contains(&"on".to_string()));
+        (control.on_click.as_ref().unwrap())();
+
+        let state = shared.lock().unwrap();
+        assert!(is_on(&state.ui_snapshot(), ToggleKey::AutoResumeAgents));
+    }
+
+    #[test]
+    fn sessions_section_remove_recovery_hooks_control_is_focusable_and_dispatches() {
+        let shared = make_shared();
+        {
+            let mut state = shared.lock().unwrap();
+            state.toggles.insert(ToggleKey::AutoResumeAgents, true);
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_sessions_section(&snap, &shared);
+        let control =
+            find_by_id(&el, "settings-agent-recovery-hooks-remove").expect("remove recovery hooks");
+
+        assert_eq!(control.tab_index, Some(0));
+        assert_eq!(text_of(control), Some("remove hooks"));
+        (control.on_click.as_ref().unwrap())();
+
+        let state = shared.lock().unwrap();
+        assert!(!is_on(&state.ui_snapshot(), ToggleKey::AutoResumeAgents));
+        assert!(!state.toasts.is_empty());
     }
 
     fn find_by_id<'a>(el: &'a ElementDef, target: &str) -> Option<&'a ElementDef> {

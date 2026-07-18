@@ -69,6 +69,12 @@ pub struct SessionListSnapshot {
     pub daemon_memory_rss_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachedSession {
+    pub snapshot: Snapshot,
+    pub hook_capability: String,
+}
+
 impl Client {
     /// Opens a connection to the daemon listening on `path`.
     ///
@@ -153,6 +159,36 @@ impl Client {
         pane_id: u32,
         name: Option<String>,
     ) -> Result<Response, ProtocolError> {
+        self.spawn_session_with_context(
+            cols,
+            rows,
+            cwd,
+            shell,
+            shell_args,
+            workspace_id,
+            pane_id,
+            name,
+            None,
+        )
+        .await
+    }
+
+    /// Spawns a session while explicitly carrying the current UI launch's
+    /// telemetry correlation. This avoids inheriting stale context from a
+    /// daemon that survived an earlier UI process.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_session_with_context(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        shell: Option<String>,
+        shell_args: Vec<String>,
+        workspace_id: u32,
+        pane_id: u32,
+        name: Option<String>,
+        restore_correlation_id: Option<String>,
+    ) -> Result<Response, ProtocolError> {
         let id = self.alloc_id();
         let req = Request::SpawnSession {
             id,
@@ -164,8 +200,73 @@ impl Client {
             workspace_id,
             pane_id,
             name,
+            restore_correlation_id,
         };
         self.roundtrip(req, id).await
+    }
+
+    /// Atomically attach to or spawn the daemon session for one pane
+    /// key. The daemon, not the client, decides whether the fallback
+    /// command may execute.
+    pub async fn ensure_session(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        shell: Option<String>,
+        shell_args: Vec<String>,
+        workspace_id: u32,
+        pane_id: u32,
+        name: Option<String>,
+        scrollback_lines: u32,
+    ) -> Result<Response, ProtocolError> {
+        self.ensure_session_with_context(
+            cols,
+            rows,
+            cwd,
+            shell,
+            shell_args,
+            workspace_id,
+            pane_id,
+            name,
+            scrollback_lines,
+            None,
+        )
+        .await
+    }
+
+    /// Atomic attach-or-spawn with per-UI-launch telemetry context for the
+    /// spawn branch. Existing sessions keep the environment they started
+    /// with; a newly spawned recovery process receives this launch's id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ensure_session_with_context(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        shell: Option<String>,
+        shell_args: Vec<String>,
+        workspace_id: u32,
+        pane_id: u32,
+        name: Option<String>,
+        scrollback_lines: u32,
+        restore_correlation_id: Option<String>,
+    ) -> Result<Response, ProtocolError> {
+        let id = self.alloc_id();
+        let request = Request::EnsureSession {
+            id,
+            cols,
+            rows,
+            cwd,
+            shell,
+            shell_args,
+            workspace_id,
+            pane_id,
+            name,
+            restore_correlation_id,
+            scrollback_lines,
+        };
+        self.roundtrip(request, id).await
     }
 
     /// Writes `bytes` to the PTY stdin of `session_id`.
@@ -247,6 +348,16 @@ impl Client {
         session_id: u64,
         scrollback_lines: u32,
     ) -> Result<Snapshot, ProtocolError> {
+        self.attach_session_with_metadata(session_id, scrollback_lines)
+            .await
+            .map(|attached| attached.snapshot)
+    }
+
+    pub async fn attach_session_with_metadata(
+        &mut self,
+        session_id: u64,
+        scrollback_lines: u32,
+    ) -> Result<AttachedSession, ProtocolError> {
         let id = self.alloc_id();
         let req = Request::AttachSession {
             id,
@@ -255,10 +366,26 @@ impl Client {
         };
         let resp = self.roundtrip(req, id).await?;
         match resp {
-            Response::SessionAttached { snapshot, .. } => Ok(snapshot),
-            Response::Error { code, message, .. } => Err(ProtocolError::Io(io::Error::other(
-                format!("attach_session failed: {code}: {message}"),
-            ))),
+            Response::SessionAttached {
+                snapshot,
+                hook_capability,
+                ..
+            } => Ok(AttachedSession {
+                snapshot,
+                hook_capability,
+            }),
+            Response::Error { code, message, .. } => {
+                let kind = match code.as_str() {
+                    "session_not_found" => io::ErrorKind::NotFound,
+                    "session_dead" => io::ErrorKind::NotConnected,
+                    "session_key_ambiguous" => io::ErrorKind::AlreadyExists,
+                    _ => io::ErrorKind::Other,
+                };
+                Err(ProtocolError::Io(io::Error::new(
+                    kind,
+                    format!("attach_session failed: {code}: {message}"),
+                )))
+            }
             other => Err(ProtocolError::Io(io::Error::other(format!(
                 "unexpected response: {other:?}"
             )))),

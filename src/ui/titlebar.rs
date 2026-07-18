@@ -2,8 +2,8 @@ use unshit::app::EventSink;
 use unshit::core::element::*;
 
 use crate::state::{
-    dispatch, mutate_kill_all_terminals, mutate_with, resolve_close_action, CloseAction, MutexExt,
-    SharedState, UiSnapshot,
+    dispatch, finalize_resolved_close, mutate_with, resolve_close_action, MutexExt, SharedState,
+    UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -182,22 +182,13 @@ pub fn build_titlebar(
                                 .with_class("win-btn")
                                 .with_class("win-close")
                                 .on_click(move || {
-                                    let action = {
+                                    let should_exit = {
                                         let mut guard = close_state.lock_recover();
-                                        resolve_close_action(&mut guard)
+                                        let action = resolve_close_action(&mut guard);
+                                        finalize_resolved_close(&mut guard, action)
                                     };
-                                    match action {
-                                        CloseAction::Prompt => {}
-                                        CloseAction::KeepRunning => {
-                                            let mut guard = close_state.lock_recover();
-                                            guard.terminals.clear();
-                                            crate::shutdown_now();
-                                        }
-                                        CloseAction::KillAll => {
-                                            let mut guard = close_state.lock_recover();
-                                            mutate_kill_all_terminals(&mut guard);
-                                            crate::shutdown_now();
-                                        }
+                                    if should_exit {
+                                        crate::shutdown_now();
                                     }
                                 })
                                 .with_child(svg_icon(icon_close())),

@@ -45,10 +45,10 @@ Reduce the friction of "I have a quick task for an agent" from "open a terminal,
 * **A5.2** A new git worktree is created under `%APPDATA%\com.godly.terminal\worktrees\godly-qp-<8-hex>` if and only if the current workspace cwd is inside a git repo. Worktree base ref is whatever HEAD points at (no detached HEAD; we use `git worktree add <path> HEAD` so the worktree starts on a fresh anonymous branch).
 * **A5.3** If the current workspace cwd is NOT inside a git repo, the same path is created as a plain directory and the agent is launched there with no git context (empty repo fallback).
 * **A5.4** Pasted images are moved from temp into `<worktree>\.quick-prompt\<hash>.png`. The prompt the agent receives gets `@.quick-prompt/<hash>.png` references appended (one per image, on their own line under a "Attached images:" header).
-* **A5.5** A new tab opens running the chosen agent with the prompt as the first argument:
-  * Claude: `claude.cmd <prompt>` (Windows) / `claude <prompt>` (Unix), shell launched as the daemon's `default_shell()` with `shell_args = ["claude", <prompt>]`. (Resolved during planning: spawn `claude` directly as the shell; the daemon is fine with that since it just execs.)
-  * Codex: `codex exec <prompt>` resolved the same way (`shell = "codex"`, `shell_args = ["exec", <prompt>]`). To verify in Slice 6.
-* **A5.6** The new tab's display name is "qp: <first 30 chars of prompt>" so it is recognizable in the tab bar.
+* **A5.5** A new tab opens running the chosen agent with the prompt as one structured trailing positional argument:
+  * Claude: `claude.cmd --session-id <uuid> <prompt>` (Windows) / `claude --session-id <uuid> <prompt>` (Unix). Terminal Manager generates and persists the UUID before launch so the conversation can be resumed after a machine restart; prompt text is not included in that recovery record.
+  * Codex: `codex exec <prompt>` resolved the same way (`shell = "codex"`, `shell_args = ["exec", <prompt>]`). Its recovery record preserves non-interactive mode. Once a SessionStart hook or unambiguous bounded discovery has supplied the exact UUID, a cold restart uses `codex exec resume <uuid>` rather than the interactive `codex resume` command.
+* **A5.6** The new tab's display name is `qp: Claude` or `qp: Codex`. Prompt text stays inside the provider conversation and is never copied into persisted pane, tab, or daemon-session names.
 * **A5.7** If worktree creation fails (git not installed, repo locked, disk full), the overlay stays open and shows an inline error chip with the underlying message; no temp files are deleted.
 * **A5.8** On success the overlay closes, the prompt input clears, the agent picker keeps its current value.
 
@@ -96,7 +96,7 @@ Touched in app:
 * `src/keybinds/mod.rs`: add `KeybindAction::QuickPromptOpen` (and bump variant count test to 18).
 * `src/state.rs`: `AppState.quick_prompt: Option<QuickPromptState>`, dispatch arms.
 * `src/main.rs`: render block.
-* `src/persist.rs`: leave alone; Quick Prompt has its own file.
+* `src/persist.rs`: keep the picker preference in `quick_prompt.json`, and persist the new pane's minimal agent recovery metadata with its workspace layout.
 
 Touched in framework subtree:
 * `crates/unshit-framework/crates/unshit-app/src/clipboard.rs`: add `ClipboardContent::Image { width, height, bytes }`, `ClipboardFormat::Image`, `read_image()`. Honor the existing process wide arboard mutex.
@@ -129,7 +129,7 @@ Touched in framework subtree:
 
 ## Open questions
 
-* **OQ1** Codex `exec` flag confirmed? We pass `codex exec <prompt>` and assume it accepts a free form prompt as the trailing positional. Verify before Slice 6 is merged.
+* **OQ1 (resolved)** Codex accepts the prompt as the trailing `exec` positional. Non-interactive continuation uses the separate `codex exec resume` command.
 * **OQ2** Should the prompt draft itself persist across opens, not just the agent? Current spec says no (clean draft each open). Confirm during review.
 * **OQ3** Is a worktree pruning cron needed? Out of scope for this spec; track separately.
 * **OQ4** What is the right behavior when the user's home `.claude/` or `.codex/` dirs do not exist? Treat as zero entries, no error chip. Spec assumes this; confirm.

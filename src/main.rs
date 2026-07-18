@@ -5,6 +5,7 @@
 // `attach_parent_console` below when the exe is started from a terminal.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+pub mod agent_restore;
 pub mod bench;
 pub mod bridge;
 pub mod browser;
@@ -37,9 +38,9 @@ use unshit::core::trace::{
 };
 
 use crate::state::{
-    dispatch, mutate_with, new_workspace, record_diagnostic_pty_event,
-    record_diagnostic_renderer_frame, resize_all_terminals, seed_state, MutexExt, SharedState,
-    UiSnapshot, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
+    dispatch, mutate_with, record_diagnostic_pty_event, record_diagnostic_renderer_frame,
+    resize_all_terminals, seed_state, MutexExt, SharedState, UiSnapshot, MAX_SIDEBAR_WIDTH,
+    MIN_SIDEBAR_WIDTH,
 };
 use crate::ui::settings::build_settings_page;
 use crate::ui::sidebar::{build_ctx_menu_overlay, build_sidebar};
@@ -690,28 +691,12 @@ fn main() {
 
     let mut initial_state = seed_state();
     if let Some(persisted) = persist::load_workspaces() {
-        if persisted.has_layout() {
-            // Full layout restore: rebuild every workspace's tab/pane tree
-            // and the live fields so the startup reattach below can rejoin
-            // each surviving daemon session keyed by `(workspace, pane)`.
+        if !persisted.workspaces.is_empty() {
+            // Rebuild persisted workspaces through the same collision-safe
+            // stable-id path whether or not legacy state contains tabs.
+            // `restore_layout` seeds one fresh active tab when all persisted
+            // workspaces are empty, without renumbering surviving ids.
             crate::state::restore_layout(&mut initial_state, &persisted);
-        } else if !persisted.workspaces.is_empty() {
-            // Legacy config (predates layout persistence): restore only the
-            // workspace metadata and keep the seeded default terminal.
-            initial_state.workspaces = persisted
-                .workspaces
-                .iter()
-                .enumerate()
-                .map(|(i, entry)| {
-                    let mut ws =
-                        new_workspace((i + 1) as u32, entry.name.clone(), entry.path.clone());
-                    ws.collapsed = entry.collapsed;
-                    ws.shell = entry.shell.clone();
-                    ws
-                })
-                .collect();
-            let last = initial_state.workspaces.len() - 1;
-            initial_state.active_workspace = persisted.active_workspace.min(last);
         }
         initial_state.toggles.insert(
             crate::state::ToggleKey::RememberCloseChoice,
@@ -724,6 +709,10 @@ fn main() {
         initial_state.toggles.insert(
             crate::state::ToggleKey::WorktreeTabs,
             persisted.worktree_tabs,
+        );
+        initial_state.toggles.insert(
+            crate::state::ToggleKey::AutoResumeAgents,
+            persisted.auto_resume_agents,
         );
         // Override the seed_state inference with whatever the user
         // last persisted. An upgrader without the field gets an
@@ -787,6 +776,20 @@ fn main() {
     // is async; the shim's own worker thread drives every subsequent
     // IPC call, so this runtime dies once the probe completes.
     {
+        // The daemon injects this address into every child PTY. Publish
+        // the profile-specific UI socket before a fresh daemon starts so
+        // SessionStart hooks report back to the instance that owns them.
+        let notification_socket = notifications::default_notification_socket_path();
+        std::env::set_var(notifications::ENV_NOTIFY_SOCKET, &notification_socket);
+        let restore_correlation_id = shared
+            .lock()
+            .expect("state lock for restoration correlation")
+            .restore_correlation_id
+            .clone();
+        std::env::set_var(
+            notifications::ENV_AGENT_RESTORE_CORRELATION_ID,
+            restore_correlation_id,
+        );
         let socket_path = ptyd_socket_path();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for daemon probe");
         if let Err(err) = rt.block_on(daemon::connect_or_spawn(&socket_path)) {
@@ -850,14 +853,30 @@ fn main() {
         let workspace_id = crate::state::active_workspace_num(&guard);
         let cwd = crate::state::active_workspace_cwd(&guard);
         let shell = crate::shell::resolve(None, Some(&guard.default_shell));
-        match guard.pty_manager.attach_or_spawn(
+        let spawn_plan = crate::state::pane_agent_spawn_plan(&guard, pane_id, cwd, shell);
+        let launch_prepared = crate::state::prepare_agent_resume_launch(
+            &mut guard,
             pane_id,
             workspace_id,
-            init_cols,
-            init_rows,
-            cwd.as_deref(),
-            shell.as_ref(),
-        ) {
+            &spawn_plan,
+            "initial",
+        );
+        let reconcile_result = if launch_prepared {
+            guard.pty_manager.attach_or_spawn(
+                pane_id,
+                workspace_id,
+                init_cols,
+                init_rows,
+                spawn_plan.cwd.as_deref(),
+                spawn_plan.shell.as_ref(),
+            )
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "agent recovery launch preflight was not durable",
+            ))
+        };
+        match reconcile_result {
             Ok((Some(snapshot), reader)) => {
                 let rows = snapshot.grid.rows();
                 let cols = snapshot.grid.cols();
@@ -874,6 +893,14 @@ fn main() {
                         format!("attach pane={pane_id} session={session_id} source=initial"),
                     );
                 }
+                crate::state::apply_agent_spawn_outcome(
+                    &mut guard,
+                    pane_id,
+                    workspace_id,
+                    &spawn_plan,
+                    true,
+                    "initial",
+                );
                 log::info!(
                     "reattached pane {} to surviving daemon session ({}x{})",
                     pane_id,
@@ -895,8 +922,24 @@ fn main() {
                         format!("spawn pane={pane_id} session={session_id} source=initial"),
                     );
                 }
+                crate::state::apply_agent_spawn_outcome(
+                    &mut guard,
+                    pane_id,
+                    workspace_id,
+                    &spawn_plan,
+                    false,
+                    "initial",
+                );
             }
             Err(e) => {
+                crate::state::record_agent_spawn_failure(
+                    &mut guard,
+                    pane_id,
+                    workspace_id,
+                    &spawn_plan,
+                    "initial",
+                    &e,
+                );
                 log::error!("failed to spawn initial PTY: {}", e);
                 let mut terminal =
                     crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
@@ -955,14 +998,30 @@ fn main() {
             if guard.terminals.contains_key(&pane_id) {
                 continue;
             }
-            match guard.pty_manager.attach_or_spawn(
+            let spawn_plan = crate::state::pane_agent_spawn_plan(&guard, pane_id, cwd, shell);
+            let launch_prepared = crate::state::prepare_agent_resume_launch(
+                &mut guard,
                 pane_id,
                 workspace_id,
-                init_cols,
-                init_rows,
-                cwd.as_deref(),
-                shell.as_ref(),
-            ) {
+                &spawn_plan,
+                "background",
+            );
+            let reconcile_result = if launch_prepared {
+                guard.pty_manager.attach_or_spawn(
+                    pane_id,
+                    workspace_id,
+                    init_cols,
+                    init_rows,
+                    spawn_plan.cwd.as_deref(),
+                    spawn_plan.shell.as_ref(),
+                )
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "agent recovery launch preflight was not durable",
+                ))
+            };
+            match reconcile_result {
                 Ok((Some(snapshot), reader)) => {
                     let rows = snapshot.grid.rows();
                     let cols = snapshot.grid.cols();
@@ -973,6 +1032,14 @@ fn main() {
                         std::sync::Arc::new(std::sync::Mutex::new(terminal)),
                     );
                     crate::bridge::register_reader(pane_id, reader);
+                    crate::state::apply_agent_spawn_outcome(
+                        &mut guard,
+                        pane_id,
+                        workspace_id,
+                        &spawn_plan,
+                        true,
+                        "background",
+                    );
                     log::info!(
                         "reattached background pane {} (workspace {}) to surviving session ({}x{})",
                         pane_id,
@@ -989,6 +1056,14 @@ fn main() {
                         std::sync::Arc::new(std::sync::Mutex::new(terminal)),
                     );
                     crate::bridge::register_reader(pane_id, reader);
+                    crate::state::apply_agent_spawn_outcome(
+                        &mut guard,
+                        pane_id,
+                        workspace_id,
+                        &spawn_plan,
+                        false,
+                        "background",
+                    );
                     log::info!(
                         "background pane {} (workspace {}) had no surviving session; spawned fresh",
                         pane_id,
@@ -996,6 +1071,14 @@ fn main() {
                     );
                 }
                 Err(e) => {
+                    crate::state::record_agent_spawn_failure(
+                        &mut guard,
+                        pane_id,
+                        workspace_id,
+                        &spawn_plan,
+                        "background",
+                        &e,
+                    );
                     log::error!(
                         "failed to reattach/spawn background pane {} (workspace {}): {}",
                         pane_id,
@@ -1103,44 +1186,16 @@ fn main() {
                 // running on the daemon. Kill-all routes through
                 // `DaemonPty::destroy_all` before exit.
                 //
-                // Use .lock().ok() instead of .expect() so a poisoned mutex
-                // (from a panic on another thread) does not prevent us from
-                // reaching process::exit below.
-                let action = {
-                    let Ok(mut guard) = close_shared.lock() else {
-                        // Mutex poisoned: skip the prompt path, fall back
-                        // to the legacy "just exit" behaviour so we do not
-                        // wedge the user holding an undismissable dialog.
-                        finalize_profiler();
-                        return true;
-                    };
-                    crate::state::resolve_close_action(&mut guard)
-                };
-                match action {
-                    crate::state::CloseAction::Prompt => {
-                        // Veto. The confirm dialog is now visible; the UI
-                        // click handlers drive the real exit.
-                        false
-                    }
-                    crate::state::CloseAction::KeepRunning => {
-                        if let Ok(mut guard) = close_shared.lock() {
-                            // Persist the live layout so the relaunch
-                            // reattaches every surviving daemon session.
-                            crate::persist::save_workspaces(&guard);
-                            guard.terminals.clear();
-                        }
-                        finalize_profiler();
-                        std::process::exit(0);
-                    }
-                    crate::state::CloseAction::KillAll => {
-                        if let Ok(mut guard) = close_shared.lock() {
-                            crate::state::mutate_kill_all_terminals(&mut guard);
-                            crate::persist::save_workspaces(&guard);
-                        }
-                        finalize_profiler();
-                        std::process::exit(0);
-                    }
+                let mut guard = close_shared.lock_recover();
+                let action = crate::state::resolve_close_action(&mut guard);
+                if !crate::state::finalize_resolved_close(&mut guard, action) {
+                    // Prompt or persistence failure: veto. The framework
+                    // schedules the rebuild that paints the dialog/toast.
+                    return false;
                 }
+                drop(guard);
+                finalize_profiler();
+                true
             })),
             on_file_drop: Some(Arc::new(move |paths: &[std::path::PathBuf]| -> bool {
                 // Native drag-and-drop. When the Quick Prompt overlay is
