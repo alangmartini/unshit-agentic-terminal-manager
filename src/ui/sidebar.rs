@@ -1139,6 +1139,62 @@ mod tests {
     }
 
     #[test]
+    fn terminal_entry_long_title_stays_readable_next_to_branch_chip() {
+        // Guest programs set long OSC titles ("claude", cwd paths, ...).
+        // The name must keep usable width at the default 252px sidebar
+        // even when the branch chip is long; the chip yields first.
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.workspaces[0].terminals_expanded = true;
+            guard.workspaces[0].git_branch = Some("feat/rust-terminal-manager".to_string());
+            guard.panes[0][0].title = "claude-test".to_string();
+        }
+        let state = shared.lock().unwrap().ui_snapshot();
+        let tree_shared = shared.clone();
+        let tree_state = state.clone();
+        let css = format!(
+            "{}\n.sidebar-test-root {{ display: flex; width: 252px; height: 720px; }}",
+            include_str!("../../assets/styles.css")
+        );
+        let mut harness = TestHarness::new(
+            &css,
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("sidebar-test-root")
+                    .with_child(build_sidebar(&tree_state, &tree_shared)),
+            },
+            1280.0,
+            720.0,
+        );
+        harness.step();
+
+        let name = harness
+            .query(".terminal-entry-name")
+            .expect("terminal entry name should render");
+        let chip = harness
+            .query(".terminal-entry .branch-tag")
+            .expect("branch chip should render");
+        assert!(
+            name.layout_rect.width >= 70.0,
+            "entry name must not be crushed by the branch chip: name {}px, chip {}px",
+            name.layout_rect.width,
+            chip.layout_rect.width
+        );
+        let row = harness
+            .query(".terminal-entry")
+            .expect("terminal entry row should render");
+        assert!(
+            chip.layout_rect.x + chip.layout_rect.width
+                <= row.layout_rect.x + row.layout_rect.width + 0.5,
+            "branch chip must stay inside the row: chip ends {} row ends {}",
+            chip.layout_rect.x + chip.layout_rect.width,
+            row.layout_rect.x + row.layout_rect.width
+        );
+    }
+
+    #[test]
     fn tab_ctx_menu_header_uses_saved_pane_title() {
         let shared = make_shared();
         {

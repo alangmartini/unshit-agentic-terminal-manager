@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -20,6 +21,12 @@ pub struct PersistedPane {
     pub title: String,
     #[serde(default)]
     pub subtitle: String,
+    /// True when `title` was set by the user via the rename dialog.
+    /// Restored into `AppState::custom_titled_panes` so guest-program
+    /// titles (OSC 0/2) keep deferring to the manual name after a
+    /// relaunch. Defaults to false for configs predating the field.
+    #[serde(default)]
+    pub custom_title: bool,
 }
 
 /// A persisted terminal tab: its pane grid plus the split ratios needed
@@ -88,7 +95,7 @@ pub struct PersistedState {
 }
 
 /// Capture a single tab's pane grid into its persisted form.
-fn persisted_tab(tab: &TerminalTab) -> PersistedTab {
+fn persisted_tab(tab: &TerminalTab, custom_titled: &HashSet<u32>) -> PersistedTab {
     PersistedTab {
         id: tab.id.clone(),
         name: tab.name.clone(),
@@ -96,7 +103,7 @@ fn persisted_tab(tab: &TerminalTab) -> PersistedTab {
         panes: tab
             .panes
             .iter()
-            .map(|row| row.iter().map(persisted_pane).collect())
+            .map(|row| row.iter().map(|p| persisted_pane(p, custom_titled)).collect())
             .collect(),
         active_pane: tab.active_pane.0,
         row_ratios: tab.row_ratios.clone(),
@@ -104,11 +111,12 @@ fn persisted_tab(tab: &TerminalTab) -> PersistedTab {
     }
 }
 
-fn persisted_pane(pane: &Pane) -> PersistedPane {
+fn persisted_pane(pane: &Pane, custom_titled: &HashSet<u32>) -> PersistedPane {
     PersistedPane {
         id: pane.id.0,
         title: pane.title.clone(),
         subtitle: pane.subtitle.clone(),
+        custom_title: custom_titled.contains(&pane.id.0),
     }
 }
 
@@ -118,13 +126,14 @@ fn persisted_pane(pane: &Pane) -> PersistedPane {
 /// than in `state.tabs[active_tab]`. Inactive workspaces hold everything
 /// in `workspaces[i].tabs`.
 fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize) {
+    let custom_titled = &state.custom_titled_panes;
     if ws_idx == state.active_workspace {
         let tabs = state
             .tabs
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                let mut pt = persisted_tab(tab);
+                let mut pt = persisted_tab(tab, custom_titled);
                 if i == state.active_tab {
                     // Overlay the live (authoritative) pane grid for the
                     // active tab; `state.tabs[active_tab]` is only synced
@@ -132,7 +141,11 @@ fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize)
                     pt.panes = state
                         .panes
                         .iter()
-                        .map(|row| row.iter().map(persisted_pane).collect())
+                        .map(|row| {
+                            row.iter()
+                                .map(|p| persisted_pane(p, custom_titled))
+                                .collect()
+                        })
                         .collect();
                     pt.active_pane = state.active_pane.0;
                     pt.row_ratios = state.row_ratios.clone();
@@ -144,7 +157,13 @@ fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize)
         (tabs, state.active_tab)
     } else {
         let ws = &state.workspaces[ws_idx];
-        (ws.tabs.iter().map(persisted_tab).collect(), ws.active_tab)
+        (
+            ws.tabs
+                .iter()
+                .map(|t| persisted_tab(t, custom_titled))
+                .collect(),
+            ws.active_tab,
+        )
     }
 }
 

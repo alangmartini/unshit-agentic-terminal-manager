@@ -419,7 +419,12 @@ fn is_bidi_control(ch: char) -> bool {
     )
 }
 
-fn sanitize_palette_text(input: &str, fallback: String, max_chars: usize) -> String {
+/// Sanitize untrusted text for display as a UI label: strips bidi
+/// overrides and control characters, collapses whitespace, caps length
+/// (appending "..." when truncated), and substitutes `fallback` when
+/// nothing printable remains. Shared by palette rows and OSC-sourced
+/// pane titles.
+pub(crate) fn sanitize_display_label(input: &str, fallback: String, max_chars: usize) -> String {
     let scan_limit = max_chars.saturating_mul(4).max(max_chars + 1);
     let mut output = String::new();
     let mut last_was_space = false;
@@ -464,11 +469,11 @@ fn sanitize_palette_text(input: &str, fallback: String, max_chars: usize) -> Str
 }
 
 fn sanitize_palette_label(input: &str, fallback: String) -> String {
-    sanitize_palette_text(input, fallback, PALETTE_LABEL_MAX_CHARS)
+    sanitize_display_label(input, fallback, PALETTE_LABEL_MAX_CHARS)
 }
 
 fn sanitize_palette_detail(input: &str, fallback: String) -> String {
-    sanitize_palette_text(input, fallback, PALETTE_DETAIL_MAX_CHARS)
+    sanitize_display_label(input, fallback, PALETTE_DETAIL_MAX_CHARS)
 }
 
 pub fn fuzzy_match(query: &str, text: &str) -> Option<FuzzyScore> {

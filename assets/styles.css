@@ -2058,12 +2058,27 @@ input, select {
   box-shadow: inset 2px 0 0 var(--amber-300), inset 0 0 12px var(--accent-a06);
 }
 
+/* Two-class selector: must out-rank `.sb-row .sb-label`'s `flex: 1`
+   above, whose basis-0 expansion would zero the name out. */
+.sb-row .terminal-entry-name,
 .terminal-entry-name {
-  flex: 1;
+  /* Basis `auto` (not 0) so the name starts from the text's own width
+     and OSC/guest titles longer than "shell" stay readable when the
+     row overflows... */
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ...and make the branch chip absorb the overflow before the name
+   shrinks, keeping a small floor so the branch stays hinted. */
+.terminal-entry .branch-tag {
+  flex-shrink: 999;
+  min-width: 56px;
 }
 
 .sidebar-footer {

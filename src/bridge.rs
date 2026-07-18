@@ -105,6 +105,11 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                 // parser. `process_bytes` holds only the per-terminal mutex so
                 // the render closure and other state mutators can proceed
                 // concurrently on the state lock.
+                // Last guest-program title (OSC 0/2) pushed into the pane
+                // label. Starts empty so panes without a title keep their
+                // default/persisted label until the guest sets one.
+                let mut last_osc_title = String::new();
+
                 while let Some(data) = rx.recv().await {
                     let terminal_handle: Option<crate::state::SharedTerminal> = {
                         let guard = shared.lock_recover();
@@ -116,7 +121,7 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
 
                     let mut batched = 1u32;
                     let mut total_bytes = data.len();
-                    let (pending_response, synchronized_output_active) = {
+                    let (pending_response, synchronized_output_active, osc_title) = {
                         let mut terminal = terminal_handle.lock_recover();
                         terminal.process_bytes(&data);
                         while let Ok(more) = rx.try_recv() {
@@ -139,9 +144,18 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                                 rows.get(3).cloned().unwrap_or_default(),
                             ));
                         }
+                        // Detect guest title changes (OSC 0/2) while the
+                        // terminal mutex is held; the state-lock block
+                        // below pushes them into the pane/tab labels.
+                        let osc_title = if terminal.title() != last_osc_title {
+                            Some(terminal.title().to_string())
+                        } else {
+                            None
+                        };
                         (
                             terminal.take_pending_response(),
                             terminal.synchronized_output_active(),
+                            osc_title,
                         )
                     };
                     {
@@ -153,6 +167,18 @@ fn pty_subscription(pane_id: u32, shared: SharedState) -> Option<Subscription> {
                                 pane_id, total_bytes, batched
                             ),
                         );
+                        if let Some(title) = osc_title {
+                            // Mirror the guest window title onto the pane
+                            // label the way Windows Terminal renames its
+                            // tab. Manual renames win inside the mutator.
+                            if crate::state::mutate_apply_osc_title(&mut guard, pane_id, &title) {
+                                record_diagnostic_pty_event(
+                                    &mut guard,
+                                    format!("osc-title pane={} title={:?}", pane_id, title),
+                                );
+                            }
+                            last_osc_title = title;
+                        }
                         if !pending_response.is_empty() {
                             // Reply to host queries (DA1, DA2, DSR, CPR,
                             // XTVERSION) the parser collected. Done outside

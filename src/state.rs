@@ -819,6 +819,10 @@ pub struct AppState {
     pub next_id: u32,
     pub pty_manager: crate::pty::DaemonPty,
     pub terminals: std::collections::HashMap<u32, SharedTerminal>,
+    /// Panes whose title was set by the user (rename dialog). A pane in
+    /// this set keeps its manual name; titles reported by the guest
+    /// program via OSC 0/2 are ignored until the rename is cleared.
+    pub custom_titled_panes: std::collections::HashSet<u32>,
     pub scale_factor: f32,
     /// Ratio of monospace cell_width to font_size, measured from the actual font.
     pub cell_width_ratio: f32,
@@ -1308,6 +1312,7 @@ pub fn seed_state() -> AppState {
         next_id: 2,
         pty_manager: crate::pty::DaemonPty::new(),
         terminals: std::collections::HashMap::new(),
+        custom_titled_panes: std::collections::HashSet::new(),
         scale_factor: 1.0,
         cell_width_ratio: 0.6,
         last_grid_width: 0.0,
@@ -1889,6 +1894,7 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
         return;
     }
     let mut max_pane_id = 0u32;
+    let mut custom_titled = std::collections::HashSet::new();
     let active_idx = persisted
         .active_workspace
         .min(persisted.workspaces.len() - 1);
@@ -1900,7 +1906,7 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
         let tabs: Vec<TerminalTab> = entry
             .tabs
             .iter()
-            .filter_map(|pt| terminal_tab_from_persisted(pt, &mut max_pane_id))
+            .filter_map(|pt| terminal_tab_from_persisted(pt, &mut max_pane_id, &mut custom_titled))
             .collect();
         ws.active_tab = if tabs.is_empty() {
             0
@@ -1918,6 +1924,7 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
 
     state.workspaces = workspaces;
     state.active_workspace = active_idx;
+    state.custom_titled_panes = custom_titled;
     load_workspace_state(state);
 
     // The render/PTY bootstrap assumes the active workspace always has a
@@ -1936,6 +1943,7 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
 fn terminal_tab_from_persisted(
     pt: &crate::persist::PersistedTab,
     max_pane_id: &mut u32,
+    custom_titled: &mut std::collections::HashSet<u32>,
 ) -> Option<TerminalTab> {
     let panes: Vec<Vec<Pane>> = pt
         .panes
@@ -1944,6 +1952,9 @@ fn terminal_tab_from_persisted(
             row.iter()
                 .map(|pp| {
                     *max_pane_id = (*max_pane_id).max(pp.id);
+                    if pp.custom_title && !pp.title.is_empty() {
+                        custom_titled.insert(pp.id);
+                    }
                     Pane {
                         id: PaneId(pp.id),
                         title: if pp.title.is_empty() {
@@ -2257,6 +2268,7 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
     // Destroy the PTY and terminal.
     state.pty_manager.destroy(target.0);
     state.terminals.remove(&target.0);
+    state.custom_titled_panes.remove(&target.0);
 
     // Absorb the closed pane's column ratio into a neighbor.
     let closed_ratio = state.col_ratios[row_idx][col_idx];
@@ -3339,8 +3351,12 @@ fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
 pub fn mutate_rename_pane(state: &mut AppState, pane_id: u32, name: &str) {
     let trimmed = name.trim();
     let new_title = if trimmed.is_empty() {
+        // Clearing the name also re-enables OSC title updates from the
+        // guest program (see `mutate_apply_osc_title`).
+        state.custom_titled_panes.remove(&pane_id);
         "shell".to_string()
     } else {
+        state.custom_titled_panes.insert(pane_id);
         trimmed.to_string()
     };
 
@@ -3353,6 +3369,81 @@ pub fn mutate_rename_pane(state: &mut AppState, pane_id: u32, name: &str) {
             rename_pane_in_tab(tab, pane_id, &new_title);
         }
     }
+}
+
+/// Character cap for titles reported by the guest program via OSC 0/2 so
+/// a hostile or buggy program cannot blow up the sidebar/tab layout.
+const OSC_TITLE_MAX_CHARS: usize = 64;
+
+/// Apply a window title reported by the pane's guest program (OSC 0/2)
+/// to the pane label — the same behavior as Windows Terminal renaming
+/// its tab while claude/codex run. Manual renames win: panes in
+/// `custom_titled_panes` ignore guest titles until the rename is
+/// cleared. The title is sanitized for display (control characters and
+/// bidi overrides stripped, whitespace collapsed, length capped); an
+/// empty result falls back to the generic "shell" label. Returns true
+/// when a pane label actually changed.
+pub fn mutate_apply_osc_title(state: &mut AppState, pane_id: u32, raw_title: &str) -> bool {
+    if state.custom_titled_panes.contains(&pane_id) {
+        return false;
+    }
+    let new_title = crate::command_palette::sanitize_display_label(
+        prettify_osc_title(raw_title),
+        "shell".to_string(),
+        OSC_TITLE_MAX_CHARS,
+    );
+
+    let current = state
+        .panes
+        .iter()
+        .flatten()
+        .chain(state.tabs.iter().flat_map(|t| t.panes.iter().flatten()))
+        .chain(
+            state
+                .workspaces
+                .iter()
+                .flat_map(|w| w.tabs.iter().flat_map(|t| t.panes.iter().flatten())),
+        )
+        .find(|p| p.id.0 == pane_id)
+        .map(|p| p.title.clone());
+    let Some(current) = current else {
+        return false;
+    };
+    if current == new_title {
+        return false;
+    }
+
+    rename_panes_in_rows(&mut state.panes, pane_id, &new_title);
+    for tab in state.tabs.iter_mut() {
+        rename_pane_in_tab(tab, pane_id, &new_title);
+    }
+    for ws in state.workspaces.iter_mut() {
+        for tab in ws.tabs.iter_mut() {
+            rename_pane_in_tab(tab, pane_id, &new_title);
+        }
+    }
+    true
+}
+
+/// ConPTY reports a bare executable path as the console title when a
+/// program starts (e.g. `C:\WINDOWS\...\powershell.exe`). Collapse such
+/// titles to the program stem so pane labels read "powershell" rather
+/// than a truncated path. Titles that merely contain a path (like a
+/// shell prompt's cwd) are left untouched.
+fn prettify_osc_title(title: &str) -> &str {
+    let trimmed = title.trim();
+    let looks_like_exe_path = trimmed.to_ascii_lowercase().ends_with(".exe")
+        && !trimmed.contains(' ')
+        && (trimmed.contains('\\') || trimmed.contains('/'));
+    if looks_like_exe_path {
+        if let Some(stem) = std::path::Path::new(trimmed)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            return stem;
+        }
+    }
+    title
 }
 
 fn rename_panes_in_rows(rows: &mut [Vec<Pane>], pane_id: u32, new_title: &str) -> bool {
@@ -5923,6 +6014,7 @@ mod tests {
             next_id: 2,
             pty_manager: crate::pty::DaemonPty::new(),
             terminals: std::collections::HashMap::new(),
+            custom_titled_panes: std::collections::HashSet::new(),
             scale_factor: 1.0,
             cell_width_ratio: 0.6,
             last_grid_width: 0.0,
@@ -8781,6 +8873,100 @@ mod tests {
     }
 
     #[test]
+    fn osc_title_updates_pane_and_tab_labels() {
+        let mut state = seed_state();
+        assert!(mutate_apply_osc_title(&mut state, 1, "claude"));
+        assert_eq!(state.panes[0][0].title, "claude");
+        assert_eq!(state.tabs[0].name, "claude");
+        // Same title again is a no-op (no rebuild-worthy change).
+        assert!(!mutate_apply_osc_title(&mut state, 1, "claude"));
+    }
+
+    #[test]
+    fn osc_title_defers_to_manual_rename_until_cleared() {
+        let mut state = seed_state();
+        mutate_rename_pane(&mut state, 1, "my build");
+        assert!(!mutate_apply_osc_title(&mut state, 1, "claude"));
+        assert_eq!(state.panes[0][0].title, "my build");
+
+        // Clearing the manual name re-enables guest titles.
+        mutate_rename_pane(&mut state, 1, "");
+        assert_eq!(state.panes[0][0].title, "shell");
+        assert!(mutate_apply_osc_title(&mut state, 1, "claude"));
+        assert_eq!(state.panes[0][0].title, "claude");
+    }
+
+    #[test]
+    fn osc_title_is_sanitized_and_capped() {
+        let mut state = seed_state();
+        assert!(mutate_apply_osc_title(
+            &mut state,
+            1,
+            "evil\r\ntitle\u{202e}\x07"
+        ));
+        assert_eq!(state.panes[0][0].title, "evil title");
+
+        let long = "x".repeat(500);
+        assert!(mutate_apply_osc_title(&mut state, 1, &long));
+        let title = &state.panes[0][0].title;
+        assert!(title.chars().count() <= OSC_TITLE_MAX_CHARS + 3);
+        assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn osc_title_exe_path_collapses_to_program_stem() {
+        let mut state = seed_state();
+        assert!(mutate_apply_osc_title(
+            &mut state,
+            1,
+            r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert_eq!(state.panes[0][0].title, "powershell");
+
+        // A title that merely mentions a path keeps its full text.
+        assert!(mutate_apply_osc_title(&mut state, 1, r"claude - C:\dev\proj"));
+        assert_eq!(state.panes[0][0].title, r"claude - C:\dev\proj");
+    }
+
+    #[test]
+    fn osc_title_empty_falls_back_to_shell_label() {
+        let mut state = seed_state();
+        assert!(mutate_apply_osc_title(&mut state, 1, "claude"));
+        assert!(mutate_apply_osc_title(&mut state, 1, ""));
+        assert_eq!(state.panes[0][0].title, "shell");
+    }
+
+    #[test]
+    fn osc_title_unknown_pane_is_noop() {
+        let mut state = seed_state();
+        assert!(!mutate_apply_osc_title(&mut state, 999, "claude"));
+    }
+
+    #[test]
+    fn custom_title_flag_round_trips_through_persistence() {
+        let mut state = seed_state();
+        mutate_rename_pane(&mut state, 1, "my build");
+        let persisted = crate::persist::PersistedState::from_state(&state);
+        assert!(persisted.workspaces[0].tabs[0].panes[0][0].custom_title);
+
+        let mut restored = seed_state();
+        restore_layout(&mut restored, &persisted);
+        assert!(restored.custom_titled_panes.contains(&1));
+        assert!(!mutate_apply_osc_title(&mut restored, 1, "claude"));
+        assert_eq!(restored.panes[0][0].title, "my build");
+    }
+
+    #[test]
+    fn close_pane_forgets_custom_title_flag() {
+        let mut state = seed_state();
+        mutate_split_right(&mut state, PaneId(1));
+        let new_pane = state.active_pane;
+        mutate_rename_pane(&mut state, new_pane.0, "named");
+        mutate_close_pane(&mut state, new_pane);
+        assert!(!state.custom_titled_panes.contains(&new_pane.0));
+    }
+
+    #[test]
     fn workspace_remove_does_not_remove_last() {
         let mut state = test_state();
         // Remove workspaces until one remains.
@@ -11625,6 +11811,7 @@ mod tests {
                             id: 9,
                             title: String::new(),
                             subtitle: String::new(),
+                            custom_title: false,
                         }]],
                         active_pane: 9,
                         row_ratios: vec![1.0],
