@@ -20,6 +20,7 @@ pub mod persist;
 pub mod profile;
 pub mod pty;
 pub mod quick_prompt;
+pub mod renderer_telemetry;
 pub mod shell;
 pub mod state;
 pub mod terminal;
@@ -1240,6 +1241,9 @@ fn main() {
                     record_diagnostic_renderer_frame(&mut guard, unix_epoch_millis_now());
                 }
             })),
+            on_glyph_atlas_recovery: Some(Box::new(
+                crate::renderer_telemetry::record_glyph_atlas_recovery,
+            )),
             on_scroll_telemetry: diagnostics_enabled.then(|| {
                 Box::new(move |sample: &unshit::app::ScrollTelemetry| {
                     let mut guard = scroll_metrics_shared.lock_recover();

@@ -182,6 +182,11 @@ pub struct AppConfig {
     /// Callback invoked after each rendered frame with the collected metrics.
     /// Called on the UI thread immediately after the frame is complete.
     pub on_frame_metrics: Option<Box<dyn Fn(&FrameMetrics) + Send>>,
+    /// Callback invoked when glyph-atlas exhaustion forces the renderer to
+    /// discard a partial batch, rebuild the atlas, and batch the frame again.
+    /// The event contains capacity metadata only; it never includes rendered
+    /// text or other user content.
+    pub on_glyph_atlas_recovery: Option<Box<dyn Fn(&GlyphAtlasRecoveryEvent) + Send>>,
     /// Callback read on wheel input to tune line-wheel scroll distance and
     /// animation duration without rebuilding the app.
     pub scroll_tuning: Option<Arc<dyn Fn() -> ScrollTuning + Send + Sync>>,
@@ -261,6 +266,7 @@ impl Default for AppConfig {
             max_atlas_bytes: None,
             css_path: None,
             on_frame_metrics: None,
+            on_glyph_atlas_recovery: None,
             scroll_tuning: None,
             on_scale_factor: None,
             on_window_maximized: None,
@@ -273,6 +279,19 @@ impl Default for AppConfig {
             tree_fn_bump: None,
         }
     }
+}
+
+/// Content-free metadata for an automatic glyph-atlas exhaustion recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlyphAtlasRecoveryEvent {
+    pub correlation_id: String,
+    pub requested_width: u32,
+    pub requested_height: u32,
+    pub atlas_size: u32,
+    pub resident_glyphs: u32,
+    pub generation_before: u64,
+    pub generation_after: u64,
+    pub retry_succeeded: bool,
 }
 
 pub struct App {
@@ -1228,12 +1247,109 @@ fn schedule_animation_followup(
 /// no hook produced a visual change and nothing reached the GPU, so no
 /// acquire blocked: the caller must schedule the animation continuation
 /// itself instead of chaining a redraw off a present that never happened.
+fn build_render_batch_once(state: &mut AppState) {
+    state.gpu.layered_batch.clear();
+    state.batch_cache.begin_frame();
+    let mut rasterizer = Rasterizer {
+        swash: &mut state.swash_cache,
+        subpixel_swash: &mut state.subpixel_swash_cache,
+        #[cfg(target_os = "windows")]
+        dw: &state.dw_rasterizer,
+    };
+    batch::build_render_batch(
+        &state.arena,
+        state.root,
+        &mut state.gpu.layered_batch,
+        &mut state.gpu.glyph_atlas,
+        &mut state.font_system,
+        &mut rasterizer,
+        &mut state.measure_cache,
+        &mut state.shaped_cache,
+        &mut state.gpu.svg_cache,
+        &mut state.shape_cache,
+        state.interaction.text_selection.as_ref(),
+        Some(&state.canvas_registry),
+        &state.scrollbar_visual,
+        state.interaction.focused,
+        &mut state.batch_cache,
+        Some(&mut state.line_quad_cache),
+    );
+}
+
+/// Build a complete frame, rebuilding and retrying once when atlas placement
+/// fails. The first partial batch is never presented.
+fn build_render_batch_with_atlas_recovery(
+    state: &mut AppState,
+    on_recovery: Option<&(dyn Fn(&GlyphAtlasRecoveryEvent) + Send)>,
+) -> bool {
+    build_render_batch_once(state);
+    let Some(failure) = state.gpu.glyph_atlas.take_allocation_failure() else {
+        return true;
+    };
+
+    let generation_before = state.gpu.glyph_atlas.generation;
+    let correlation_id =
+        format!("glyph-atlas-{}-{}-{}", std::process::id(), state.frame_count, generation_before);
+    let device = state.gpu.device.clone();
+    let queue = state.gpu.queue.clone();
+    state.gpu.glyph_atlas.rebuild(&device, &queue);
+    state.gpu.refresh_glyph_atlas_bind_groups();
+    state.batch_cache.clear();
+    state.shaped_cache.clear();
+    state.line_quad_cache.clear();
+
+    build_render_batch_once(state);
+    let retry_succeeded = state.gpu.glyph_atlas.take_allocation_failure().is_none();
+    let event = GlyphAtlasRecoveryEvent {
+        correlation_id,
+        requested_width: failure.requested_width,
+        requested_height: failure.requested_height,
+        atlas_size: failure.atlas_size,
+        resident_glyphs: failure.resident_glyphs,
+        generation_before,
+        generation_after: state.gpu.glyph_atlas.generation,
+        retry_succeeded,
+    };
+    let level = if retry_succeeded { "warn" } else { "error" };
+    let log_line = format!(
+        "{{\"event\":\"renderer.glyph_atlas_recovery\",\"level\":{:?},\"correlation_id\":{:?},\"atlas_size\":{},\"resident_glyphs\":{},\"requested_width\":{},\"requested_height\":{},\"generation_before\":{},\"generation_after\":{},\"retry_succeeded\":{}}}",
+        level,
+        event.correlation_id,
+        event.atlas_size,
+        event.resident_glyphs,
+        event.requested_width,
+        event.requested_height,
+        event.generation_before,
+        event.generation_after,
+        event.retry_succeeded,
+    );
+    if retry_succeeded {
+        log::warn!(target: "unshit.renderer", "{log_line}");
+    } else {
+        log::error!(target: "unshit.renderer", "{log_line}");
+        // Do not present the second partial batch. Leave the last complete
+        // swapchain image visible and reset atlas/cache state for a later
+        // frame after the visible glyph set changes.
+        state.gpu.glyph_atlas.rebuild(&device, &queue);
+        state.gpu.refresh_glyph_atlas_bind_groups();
+        state.gpu.layered_batch.clear();
+        state.batch_cache.clear();
+        state.shaped_cache.clear();
+        state.line_quad_cache.clear();
+    }
+    if let Some(callback) = on_recovery {
+        callback(&event);
+    }
+    retry_succeeded
+}
+
 fn fast_paint_animation_frame(
     state: &mut AppState,
     frame_start: Instant,
     decorations: bool,
     on_scroll_telemetry: Option<&ScrollTelemetryCallback>,
     on_frame_metrics: Option<&(dyn Fn(&FrameMetrics) + Send)>,
+    on_glyph_atlas_recovery: Option<&(dyn Fn(&GlyphAtlasRecoveryEvent) + Send)>,
 ) -> bool {
     let mut metrics = FrameMetrics::default();
 
@@ -1264,33 +1380,8 @@ fn fast_paint_animation_frame(
     state.gpu.glyph_atlas.advance_frame();
 
     let t4 = Instant::now();
-    state.gpu.layered_batch.clear();
-    state.batch_cache.begin_frame();
-    {
-        let mut rasterizer = Rasterizer {
-            swash: &mut state.swash_cache,
-            subpixel_swash: &mut state.subpixel_swash_cache,
-            #[cfg(target_os = "windows")]
-            dw: &state.dw_rasterizer,
-        };
-        batch::build_render_batch(
-            &state.arena,
-            state.root,
-            &mut state.gpu.layered_batch,
-            &mut state.gpu.glyph_atlas,
-            &mut state.font_system,
-            &mut rasterizer,
-            &mut state.measure_cache,
-            &mut state.shaped_cache,
-            &mut state.gpu.svg_cache,
-            &mut state.shape_cache,
-            state.interaction.text_selection.as_ref(),
-            Some(&state.canvas_registry),
-            &state.scrollbar_visual,
-            state.interaction.focused,
-            &mut state.batch_cache,
-            Some(&mut state.line_quad_cache),
-        );
+    if !build_render_batch_with_atlas_recovery(state, on_glyph_atlas_recovery) {
+        return false;
     }
     state.batch_cache.commit_frame();
     state.shaped_cache.finish_frame(state.gpu.glyph_atlas.generation);
@@ -3716,6 +3807,7 @@ impl ApplicationHandler for AppHandler {
                         self.app.config.decorations,
                         self.app.config.on_scroll_telemetry.as_deref(),
                         self.app.config.on_frame_metrics.as_deref(),
+                        self.app.config.on_glyph_atlas_recovery.as_deref(),
                     );
                     schedule_animation_followup(state, event_loop, frame_start, painted);
                     return;
@@ -4080,32 +4172,12 @@ impl ApplicationHandler for AppHandler {
                 }
 
                 let t4 = Instant::now();
-                state.gpu.layered_batch.clear();
-                state.batch_cache.begin_frame();
-                let mut rasterizer = Rasterizer {
-                    swash: &mut state.swash_cache,
-                    subpixel_swash: &mut state.subpixel_swash_cache,
-                    #[cfg(target_os = "windows")]
-                    dw: &state.dw_rasterizer,
-                };
-                batch::build_render_batch(
-                    &state.arena,
-                    state.root,
-                    &mut state.gpu.layered_batch,
-                    &mut state.gpu.glyph_atlas,
-                    &mut state.font_system,
-                    &mut rasterizer,
-                    &mut state.measure_cache,
-                    &mut state.shaped_cache,
-                    &mut state.gpu.svg_cache,
-                    &mut state.shape_cache,
-                    state.interaction.text_selection.as_ref(),
-                    Some(&state.canvas_registry),
-                    &state.scrollbar_visual,
-                    state.interaction.focused,
-                    &mut state.batch_cache,
-                    Some(&mut state.line_quad_cache),
-                );
+                if !build_render_batch_with_atlas_recovery(
+                    state,
+                    self.app.config.on_glyph_atlas_recovery.as_deref(),
+                ) {
+                    return;
+                }
                 state.batch_cache.commit_frame();
                 // Atlas generation is passed so `ShapedTextCache` can detect
                 // coarse atlas residency changes between frames on top of the
@@ -5725,9 +5797,10 @@ mod tests {
     }
 
     #[test]
-    fn app_config_on_frame_metrics_defaults_to_none() {
+    fn app_config_renderer_observability_callbacks_default_to_none() {
         let config = AppConfig::default();
         assert!(config.on_frame_metrics.is_none());
+        assert!(config.on_glyph_atlas_recovery.is_none());
     }
 
     #[test]

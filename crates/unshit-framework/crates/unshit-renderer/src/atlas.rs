@@ -78,6 +78,19 @@ pub struct PendingGlyph {
     pub data: Vec<u8>,
 }
 
+/// Snapshot of a glyph placement that could not fit in the atlas.
+///
+/// The renderer consumes this one-shot latch after batch construction and
+/// rebuilds the atlas before presenting, so callers never have to infer
+/// exhaustion from silently missing glyph instances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlyphAtlasAllocationFailure {
+    pub requested_width: u32,
+    pub requested_height: u32,
+    pub atlas_size: u32,
+    pub resident_glyphs: u32,
+}
+
 struct Shelf {
     y: u32,
     height: u32,
@@ -141,6 +154,7 @@ pub struct GlyphAtlas {
     /// Monotonic generation that bumps when atlas residency changes in a way
     /// that can invalidate cached glyph UV usage.
     pub generation: u64,
+    allocation_failure: Option<GlyphAtlasAllocationFailure>,
 }
 
 impl GlyphAtlas {
@@ -195,6 +209,7 @@ impl GlyphAtlas {
             format,
             bytes_per_pixel,
             generation: 0,
+            allocation_failure: None,
         }
     }
 
@@ -295,7 +310,13 @@ impl GlyphAtlas {
         self.cache.clear();
         self.lru.last_used.clear();
         self.pending_uploads.clear();
+        self.allocation_failure = None;
         self.bump_generation();
+    }
+
+    /// Consume the most recent atlas-full signal, if any.
+    pub fn take_allocation_failure(&mut self) -> Option<GlyphAtlasAllocationFailure> {
+        self.allocation_failure.take()
     }
 
     pub fn get_or_insert(
@@ -340,6 +361,12 @@ impl GlyphAtlas {
         } else {
             // New shelf
             if self.next_shelf_y + height > self.size {
+                self.allocation_failure = Some(GlyphAtlasAllocationFailure {
+                    requested_width: width,
+                    requested_height: height,
+                    atlas_size: self.size,
+                    resident_glyphs: self.cache.len().min(u32::MAX as usize) as u32,
+                });
                 return None; // Atlas full
             }
             let mut shelf = Shelf {
@@ -612,6 +639,37 @@ mod tests {
         }
         lru.advance_frame();
         assert!(lru.stale_keys(10).is_empty(), "no stale keys expected");
+    }
+
+    #[test]
+    fn atlas_exhaustion_is_latched_until_the_renderer_handles_it() {
+        let Some((device, _queue)) = test_device() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new_with_size(&device, 8);
+
+        assert!(atlas.get_or_insert(make_key(1), 7, 7, vec![255; 49], [0.0; 2]).is_some());
+        assert!(atlas.get_or_insert(make_key(2), 1, 1, vec![255], [0.0; 2]).is_none());
+
+        let failure = atlas.take_allocation_failure().expect("atlas-full failure must be visible");
+        assert_eq!((failure.requested_width, failure.requested_height), (1, 1));
+        assert_eq!(failure.atlas_size, 8);
+        assert_eq!(failure.resident_glyphs, 1);
+        assert!(atlas.take_allocation_failure().is_none(), "the recovery latch is one-shot");
+    }
+
+    fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: None,
+                    force_fallback_adapter: true,
+                })
+                .await?;
+            adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await.ok()
+        })
     }
 
     // -- Atlas kind routing ---------------------------------------------------

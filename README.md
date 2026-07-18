@@ -114,6 +114,7 @@ User data is stored under your platform config and data directories:
 | Workspaces, tabs, and pane layout | `%APPDATA%\com.godly.terminal\workspaces.json` |
 | Quick Prompt agent worktrees | `%APPDATA%\com.godly.terminal\worktrees\` |
 | Redacted agent recovery events | `%APPDATA%\com.godly.terminal\agent-restore-events.jsonl` |
+| Renderer recovery events | `%APPDATA%\com.godly.terminal\renderer-events.jsonl` |
 
 - **Keybindings** are editable in **Settings → Keybinds**. Each action keeps a stable id and is persisted as JSON; defaults follow Windows conventions (see the table above).
 - **Themes** are chosen in Settings. Bundled palettes ship in `assets/themes.json`, and the *Custom* theme lets you set accent, surface, and foreground colors directly.
