@@ -17,9 +17,9 @@
 - [x] S4: Save + open UX (atomic save, CRLF preserve, rfd dialog, keybinds, palette)
   - Acceptance: save/failure/CRLF dispatch tests; keybind parity green; palette rows.
   - Verify: `cargo test -p terminal-manager keybind` + editor tests.
-- [ ] CHECKPOINT B: full tests + fmt + clippy; manual edit+save on real file; split
+- [x] CHECKPOINT B: full tests + fmt + clippy; manual edit+save on real file; split
       editor beside terminal.
-- [ ] S5: Mouse (click cursor, drag select, double-click word, wheel, gutter)
+- [x] S5: Mouse (click cursor, drag select, double-click word, wheel, gutter)
   - Acceptance: click→cursor and drag-selection UI tests.
 - [ ] S6: Lifecycle polish + full guard audit + telemetry completeness
   - Acceptance: close-dirty dialog tests; terminal-only dispatch no-op tests;

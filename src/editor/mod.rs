@@ -215,6 +215,40 @@ impl EditorPane {
         self.scroll_to(target)
     }
 
+    /// Scroll horizontally by `delta` characters (Shift+wheel). A
+    /// changed offset shifts every visible row, so the whole viewport
+    /// repaints. Does not move the cursor.
+    pub fn scroll_h_by(&mut self, delta: isize) -> bool {
+        let max = self.buffer.max_line_chars().saturating_sub(1);
+        let target = self.h_offset.saturating_add_signed(delta).min(max);
+        if target == self.h_offset {
+            return false;
+        }
+        self.h_offset = target;
+        self.repaint_viewport();
+        self.sync_cursor_into_grid();
+        true
+    }
+
+    /// Gutter width in cells for the current document.
+    pub fn gutter_cells(&self) -> usize {
+        grid::gutter_width(self.buffer.line_count())
+    }
+
+    /// Buffer position rendered at viewport cell (`row`, `col_cell`).
+    /// Signed coordinates so drags past the pane edges keep resolving
+    /// (negative row maps above the viewport); everything clamps to the
+    /// document like code editors do.
+    pub fn position_at_cell(&self, row: isize, col_cell: isize) -> Position {
+        let last = self.buffer.line_count() as isize - 1;
+        let line = (self.top_line as isize + row).clamp(0, last) as usize;
+        let content = (col_cell - self.gutter_cells() as isize).max(0) as usize;
+        let col = self
+            .buffer
+            .col_for_char_index(line, self.h_offset + content);
+        Position { line, col }
+    }
+
     /// Resize the viewport grid (e.g. pane layout or font change) and
     /// repaint from the buffer.
     pub fn resize(&mut self, rows: usize, cols: usize) {
@@ -445,6 +479,66 @@ mod tests {
         assert!(!pane.scroll_by(1));
         assert!(pane.scroll_by(-100));
         assert_eq!(pane.top_line, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn position_at_cell_maps_content_cells_to_buffer_positions() {
+        let path = temp_file(b"hello\nworld wide");
+        let pane = EditorPane::open(&path, 5, 40).expect("open");
+        let gutter = pane.gutter_cells() as isize;
+        // Row 1, third character of "world wide".
+        let pos = pane.position_at_cell(1, gutter + 2);
+        assert_eq!(pos, Position { line: 1, col: 2 });
+        // Clicks inside the gutter clamp to column 0.
+        assert_eq!(pane.position_at_cell(0, 1), Position { line: 0, col: 0 });
+        // Past the end of the line clamps to line end.
+        let pos = pane.position_at_cell(0, gutter + 99);
+        assert_eq!(pos, Position { line: 0, col: 5 });
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn position_at_cell_clamps_rows_to_document() {
+        let path = temp_file(b"a\nb\nc\nd\ne\nf");
+        let mut pane = EditorPane::open(&path, 3, 20).expect("open");
+        pane.scroll_to(2);
+        // Negative row (drag above the pane) resolves above the viewport.
+        assert_eq!(pane.position_at_cell(-1, 5).line, 1);
+        // Far below the last line clamps to the last line.
+        assert_eq!(pane.position_at_cell(99, 5).line, 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn position_at_cell_respects_h_offset() {
+        let path = temp_file(b"abcdefghij");
+        let mut pane = EditorPane::open(&path, 2, 20).expect("open");
+        assert!(pane.scroll_h_by(3));
+        let gutter = pane.gutter_cells() as isize;
+        // First content cell now renders 'd' (index 3).
+        assert_eq!(
+            pane.position_at_cell(0, gutter),
+            Position { line: 0, col: 3 }
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scroll_h_clamps_and_repaints() {
+        let path = temp_file(b"abcdefghij\nxy");
+        let mut pane = EditorPane::open(&path, 2, 8).expect("open");
+        assert!(pane.scroll_h_by(100));
+        assert_eq!(pane.h_offset, 9, "clamps to longest line minus one");
+        let gutter = pane.gutter_cells();
+        assert_eq!(
+            pane.grid.get_cell(0, gutter).map(|c| c.ch),
+            Some('j'),
+            "viewport repaints from the new offset"
+        );
+        assert!(pane.scroll_h_by(-100));
+        assert_eq!(pane.h_offset, 0);
+        assert!(!pane.scroll_h_by(-1), "already at the left edge");
         let _ = std::fs::remove_file(path);
     }
 
