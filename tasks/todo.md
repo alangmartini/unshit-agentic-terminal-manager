@@ -1,6 +1,6 @@
 # File Editor MVP Todo
 
-- [ ] S1: Read-only file viewer pane (structural seam)
+- [x] S1: Read-only file viewer pane (structural seam)
   - Acceptance: `editor.open:<path>` creates tab+pane+editors entry; grid renders
     viewport-only with gutter and stable line_ids; oversized/invalid-UTF-8 refused
     with notification; terminal panes unaffected; open telemetry events emitted.

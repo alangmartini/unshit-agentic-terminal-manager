@@ -856,6 +856,10 @@ pub struct AppState {
     pub next_id: u32,
     pub pty_manager: crate::pty::DaemonPty,
     pub terminals: std::collections::HashMap<u32, SharedTerminal>,
+    /// Editor panes keyed by pane id, mirroring `terminals`. A pane id
+    /// present here is a file-editor pane and must never enter PTY
+    /// spawn/resize/write paths.
+    pub editors: std::collections::HashMap<u32, crate::editor::EditorPane>,
     /// Durable provider conversation metadata keyed by pane id. This
     /// is deliberately separate from `Pane` so it never leaks into
     /// generic labels or the terminal renderer.
@@ -1118,6 +1122,7 @@ impl AppState {
                 .iter()
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
+            editor_panes: self.editors.keys().copied().collect(),
         }
     }
 
@@ -1217,6 +1222,8 @@ pub struct UiSnapshot {
     /// Presentation-only pending restore providers keyed by pane id.
     /// Conversation ids and directories remain outside render state.
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
+    /// Pane ids rendered by the file editor instead of a terminal.
+    pub editor_panes: std::collections::HashSet<u32>,
 }
 
 fn current_folder_name() -> String {
@@ -1379,6 +1386,7 @@ pub fn seed_state() -> AppState {
         next_id: 2,
         pty_manager: crate::pty::DaemonPty::new(),
         terminals: std::collections::HashMap::new(),
+        editors: std::collections::HashMap::new(),
         agent_restarts: std::collections::HashMap::new(),
         pending_agent_resumes: std::collections::HashMap::new(),
         agent_resume_attempts: std::collections::HashMap::new(),
@@ -1661,6 +1669,48 @@ pub fn mutate_add_tab(state: &mut AppState) {
     state.active_pane = pane_id;
     state.row_ratios = vec![1.0];
     state.col_ratios = vec![vec![1.0]];
+}
+
+/// Open `editor` as a new single-pane tab. Mirrors `mutate_add_tab`
+/// but spawns no PTY: the pane id maps into `state.editors` instead of
+/// `state.terminals`.
+pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::EditorPane) -> PaneId {
+    save_tab_state(state);
+
+    let id_num = state.next_id;
+    state.next_id += 1;
+    let pane_id = PaneId(id_num);
+
+    let title = editor.display_name.clone();
+    state.editors.insert(id_num, editor);
+
+    let pane = Pane {
+        id: pane_id,
+        title: title.clone(),
+        subtitle: "editor".to_string(),
+        pid: 0,
+        cpu: 0.0,
+    };
+
+    let tab = TerminalTab {
+        id: format!("t{}", id_num),
+        name: title,
+        subtitle: "editor".to_string(),
+        status: TabStatus::Idle,
+        panes: vec![vec![pane.clone()]],
+        active_pane: pane_id,
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+
+    state.tabs.push(tab);
+    state.active_tab = state.tabs.len() - 1;
+
+    state.panes = vec![vec![pane]];
+    state.active_pane = pane_id;
+    state.row_ratios = vec![1.0];
+    state.col_ratios = vec![vec![1.0]];
+    pane_id
 }
 
 /// Durable-safe label for a Quick Prompt tab and daemon session. Prompt
@@ -2498,11 +2548,15 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         return;
     };
 
-    // Destroy the PTY and terminal.
-    state.pty_manager.destroy(target.0);
-    state.terminals.remove(&target.0);
-    state.custom_titled_panes.remove(&target.0);
-    forget_agent_restore(state, target.0);
+    if state.editors.remove(&target.0).is_some() {
+        // Editor pane: no PTY/terminal state to tear down.
+    } else {
+        // Destroy the PTY and terminal.
+        state.pty_manager.destroy(target.0);
+        state.terminals.remove(&target.0);
+        state.custom_titled_panes.remove(&target.0);
+        forget_agent_restore(state, target.0);
+    }
 
     // Absorb the closed pane's column ratio into a neighbor.
     let closed_ratio = state.col_ratios[row_idx][col_idx];
@@ -4563,6 +4617,71 @@ fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
     handled
 }
 
+/// Viewport dimensions for a new editor pane, derived the same way new
+/// terminal panes size their PTY. The pane's own `on_resize` corrects
+/// the grid once real element dimensions are known.
+fn editor_viewport_dims(state: &AppState) -> (usize, usize) {
+    let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w();
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let (cols, rows) = compute_pty_dimensions(
+        state.last_grid_width,
+        state.last_grid_height,
+        cell_w,
+        cell_h,
+    );
+    (rows as usize, cols as usize)
+}
+
+/// Handle `editor.open:<path>`: open the file in a new editor tab, or
+/// surface a refusal/failure toast. Emits `editor.open` /
+/// `editor.open_failed` telemetry either way.
+pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        push_error_toast(state, "Open file: no path given");
+        return true;
+    }
+    let path = std::path::PathBuf::from(trimmed);
+    let path_str = path.to_string_lossy().into_owned();
+    let (rows, cols) = editor_viewport_dims(state);
+    match crate::editor::EditorPane::open(&path, rows, cols) {
+        Ok(editor) => {
+            record_editor_event(&EditorEventRecord {
+                timestamp_unix_ms: now_unix_ms(),
+                event: "editor.open",
+                level: "info",
+                correlation_id: &editor.correlation_id,
+                path: Some(&path_str),
+                file_bytes: Some(editor.file_bytes),
+                line_count: Some(editor.buffer.line_count() as u64),
+                reason: None,
+            });
+            mutate_add_editor_tab(state, editor);
+        }
+        Err(err) => {
+            let correlation_id = crate::editor::generate_correlation_id();
+            let file_bytes = match &err {
+                crate::editor::OpenError::TooLarge(bytes) => Some(*bytes),
+                _ => None,
+            };
+            record_editor_event(&EditorEventRecord {
+                timestamp_unix_ms: now_unix_ms(),
+                event: "editor.open_failed",
+                level: "warn",
+                correlation_id: &correlation_id,
+                path: Some(&path_str),
+                file_bytes,
+                line_count: None,
+                reason: Some(err.reason()),
+            });
+            push_error_toast(state, err.message(&path));
+        }
+    }
+    true
+}
+
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
     match command {
         "modal.close" => {
@@ -4893,6 +5012,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             mutate_add_tab_respecting_mode(state);
             crate::persist::save_workspaces(state);
             true
+        }
+        other if let Some(path) = other.strip_prefix("editor.open:") => {
+            dispatch_editor_open_path(state, path)
         }
         "tab.new_worktree" => {
             let repo_cwd = active_workspace_cwd(state)
@@ -7120,6 +7242,11 @@ pub fn resize_all_terminals(state: &mut AppState, cols: u16, rows: u16) {
         }
         state.pty_manager.resize(id, cols, rows);
     }
+    // Editor panes track the same uniform dims; their per-pane
+    // `on_resize` refines this once element metrics land. No PTY calls.
+    for editor in state.editors.values_mut() {
+        editor.resize(rows as usize, cols as usize);
+    }
 }
 
 /// Re-publish terminal cell metrics and resize live PTYs after a terminal font
@@ -7308,6 +7435,7 @@ mod tests {
             next_id: 2,
             pty_manager: crate::pty::DaemonPty::new(),
             terminals: std::collections::HashMap::new(),
+            editors: std::collections::HashMap::new(),
             agent_restarts: std::collections::HashMap::new(),
             pending_agent_resumes: std::collections::HashMap::new(),
             agent_resume_attempts: std::collections::HashMap::new(),
@@ -8418,6 +8546,124 @@ mod tests {
         let mut state = test_state();
         assert!(dispatch(&mut state, "tab.new"));
         assert_eq!(state.tabs.len(), 2);
+    }
+
+    fn editor_temp_file(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "tm-state-editor-{}-{}.txt",
+            std::process::id(),
+            tag
+        ));
+        std::fs::write(&path, contents).expect("write temp file");
+        path
+    }
+
+    #[test]
+    fn dispatch_editor_open_creates_editor_tab() {
+        let mut state = test_state();
+        let path = editor_temp_file("open", b"alpha\nbeta\ngamma");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.editors.len(), 1);
+        let pane_id = state.active_pane.0;
+        assert!(
+            state.editors.contains_key(&pane_id),
+            "active pane is the editor"
+        );
+        assert!(
+            !state.terminals.contains_key(&pane_id),
+            "no terminal spawned"
+        );
+        let editor = state.editors.get(&pane_id).expect("editor pane");
+        assert_eq!(editor.buffer.line_count(), 3);
+        // Tab and pane titled after the file.
+        assert_eq!(state.panes[0][0].title, editor.display_name);
+        assert_eq!(state.panes[0][0].subtitle, "editor");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_editor_open_snapshot_marks_editor_pane() {
+        let mut state = test_state();
+        let path = editor_temp_file("snapshot", b"one\ntwo");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let snap = state.ui_snapshot();
+        assert!(snap.editor_panes.contains(&state.active_pane.0));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_editor_open_refuses_invalid_utf8_with_toast() {
+        let mut state = test_state();
+        let path = editor_temp_file("utf8", &[0xff, 0xfe, 0x41]);
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        assert_eq!(state.tabs.len(), 1, "no tab added");
+        assert!(state.editors.is_empty());
+        let messages: Vec<String> = state.toasts.iter().map(|t| t.message.clone()).collect();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("UTF-8"), "got: {messages:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_editor_open_refuses_missing_file_with_toast() {
+        let mut state = test_state();
+        assert!(dispatch(
+            &mut state,
+            "editor.open:C:/definitely/not/a/real/file.txt"
+        ));
+        assert_eq!(state.tabs.len(), 1);
+        assert!(state.editors.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_editor_open_empty_path_toasts() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "editor.open:  "));
+        assert!(state.editors.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn close_editor_pane_removes_editor_state() {
+        let mut state = test_state();
+        let path = editor_temp_file("close", b"x\ny");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane;
+        assert!(state.editors.contains_key(&pane_id.0));
+        mutate_close_pane(&mut state, pane_id);
+        assert!(state.editors.is_empty());
+        // The editor tab closed with its only pane.
+        assert_eq!(state.tabs.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_only_dispatches_noop_on_editor_pane() {
+        let mut state = test_state();
+        let path = editor_temp_file("guard", b"content");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        // Copy path requires a terminal with a selection; must not panic
+        // and must not report success on an editor pane.
+        assert!(!active_pane_has_selection(&state));
+        assert!(!dispatch(&mut state, "terminal.copy"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

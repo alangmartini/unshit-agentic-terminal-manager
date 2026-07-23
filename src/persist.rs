@@ -163,6 +163,79 @@ fn persisted_pane(
     }
 }
 
+/// Remove editor panes from a persisted tab. Editor panes are not
+/// restored across restarts (SPEC: no editor-session persistence), so
+/// persisting them would respawn them as terminal panes on load. Ratios
+/// are absorbed into a neighbor exactly like a live pane close. Returns
+/// `false` when the tab has no panes left and should be dropped.
+fn strip_editor_panes(tab: &mut PersistedTab, editor_ids: &HashSet<u32>) -> bool {
+    let mut row = 0;
+    while row < tab.panes.len() {
+        let mut col = 0;
+        while col < tab.panes[row].len() {
+            if editor_ids.contains(&tab.panes[row][col].id) {
+                tab.panes[row].remove(col);
+                if let Some(ratios) = tab.col_ratios.get_mut(row) {
+                    if col < ratios.len() {
+                        let closed = ratios.remove(col);
+                        if !ratios.is_empty() {
+                            let absorb = if col > 0 { col - 1 } else { 0 };
+                            ratios[absorb] += closed;
+                        }
+                    }
+                }
+            } else {
+                col += 1;
+            }
+        }
+        if tab.panes[row].is_empty() {
+            tab.panes.remove(row);
+            if row < tab.col_ratios.len() {
+                tab.col_ratios.remove(row);
+            }
+            if row < tab.row_ratios.len() {
+                let closed = tab.row_ratios.remove(row);
+                if !tab.row_ratios.is_empty() {
+                    let absorb = if row > 0 { row - 1 } else { 0 };
+                    tab.row_ratios[absorb] += closed;
+                }
+            }
+        } else {
+            row += 1;
+        }
+    }
+    if tab.panes.is_empty() {
+        return false;
+    }
+    if editor_ids.contains(&tab.active_pane) {
+        tab.active_pane = tab.panes[0][0].id;
+    }
+    true
+}
+
+/// Drop editor panes (and tabs that only contained editors) from a
+/// workspace's persisted tabs, remapping the active tab index.
+fn strip_editor_tabs(
+    tabs: Vec<PersistedTab>,
+    active_tab: usize,
+    editor_ids: &HashSet<u32>,
+) -> (Vec<PersistedTab>, usize) {
+    if editor_ids.is_empty() {
+        return (tabs, active_tab);
+    }
+    let mut kept = Vec::with_capacity(tabs.len());
+    let mut new_active = 0usize;
+    for (idx, mut tab) in tabs.into_iter().enumerate() {
+        if strip_editor_panes(&mut tab, editor_ids) {
+            if idx <= active_tab {
+                new_active = kept.len();
+            }
+            kept.push(tab);
+        }
+    }
+    (kept, new_active)
+}
+
 /// Effective tabs for a workspace, accounting for the live/stored split:
 /// the active workspace keeps its tabs in `state.tabs`, and the active
 /// tab's panes/ratios live in the top-level `state.panes` fields rather
@@ -171,6 +244,7 @@ fn persisted_pane(
 fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize) {
     let custom_titled = &state.custom_titled_panes;
     let agent_restarts = &state.agent_restarts;
+    let editor_ids: HashSet<u32> = state.editors.keys().copied().collect();
     if ws_idx == state.active_workspace {
         let tabs = state
             .tabs
@@ -198,15 +272,16 @@ fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize)
                 pt
             })
             .collect();
-        (tabs, state.active_tab)
+        strip_editor_tabs(tabs, state.active_tab, &editor_ids)
     } else {
         let ws = &state.workspaces[ws_idx];
-        (
+        strip_editor_tabs(
             ws.tabs
                 .iter()
                 .map(|t| persisted_tab(t, custom_titled, agent_restarts))
                 .collect(),
             ws.active_tab,
+            &editor_ids,
         )
     }
 }
@@ -506,6 +581,39 @@ mod tests {
         std::env::temp_dir()
             .join(format!("godly-persist-{}-{}-{}", tag, pid, n))
             .join("workspaces.json")
+    }
+
+    #[test]
+    fn editor_tabs_are_not_persisted() {
+        let mut state = seed_state();
+        let file =
+            std::env::temp_dir().join(format!("tm-persist-editor-{}.txt", std::process::id()));
+        std::fs::write(&file, "hello\nworld").unwrap();
+        assert!(crate::state::dispatch(
+            &mut state,
+            &format!("editor.open:{}", file.display())
+        ));
+        assert_eq!(state.tabs.len(), 2);
+        let editor_tab_count = state.tabs.len();
+
+        let persisted = PersistedState::from_state(&state);
+        let ws = &persisted.workspaces[state.active_workspace];
+        // The editor tab is stripped; only the terminal tab persists.
+        assert_eq!(ws.tabs.len(), editor_tab_count - 1);
+        let persisted_pane_ids: Vec<u32> = ws
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.iter().flatten().map(|p| p.id))
+            .collect();
+        for editor_id in state.editors.keys() {
+            assert!(
+                !persisted_pane_ids.contains(editor_id),
+                "editor pane {editor_id} leaked into persistence"
+            );
+        }
+        // Active tab index remapped into bounds.
+        assert!(ws.active_tab < ws.tabs.len());
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

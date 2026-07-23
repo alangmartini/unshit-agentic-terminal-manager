@@ -44,7 +44,7 @@ fn terminal_line_height_from_values(value: Option<std::ffi::OsString>, wt_profil
         })
 }
 
-fn terminal_line_height() -> f32 {
+pub(crate) fn terminal_line_height() -> f32 {
     terminal_line_height_from_values(
         std::env::var_os(ENV_PARITY_LINE_HEIGHT),
         crate::truthy_env_value(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)),
@@ -323,13 +323,23 @@ fn build_pane(
         let header = build_pane_header(pane, shared).with_key("pane-header");
         container = container.with_child(header);
     }
-    let body = build_pane_body(
-        pane.id,
-        capture_keyboard,
-        state.terminal_font_size_pt,
-        shared,
-        grids,
-    )
+    let body = if state.editor_panes.contains(&pane.id.0) {
+        crate::ui::editor_pane::build_editor_pane_body(
+            pane.id,
+            capture_keyboard,
+            state.terminal_font_size_pt,
+            shared,
+            grids,
+        )
+    } else {
+        build_pane_body(
+            pane.id,
+            capture_keyboard,
+            state.terminal_font_size_pt,
+            shared,
+            grids,
+        )
+    }
     .with_key("pane-body");
     container = container.with_child(body);
     if let Some(agent) = state.pending_agent_resumes.get(&pane.id.0).copied() {

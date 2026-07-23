@@ -13,6 +13,7 @@ pub mod command_palette;
 pub mod daemon;
 pub mod diagnostics;
 pub mod drag;
+pub mod editor;
 pub mod git;
 pub mod keybinds;
 pub mod notifications;
@@ -1320,44 +1321,54 @@ fn main() {
             // interleaved PTY writes that land between two snapshots must
             // stay reflected as damage on the next clone, otherwise the
             // renderer can skip them and drop cells from the viewport.
-            let grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> = handles
-                .into_iter()
-                .map(|(id, handle)| {
-                    let mut t = handle.lock_recover();
-                    let mut grid = snapshot_terminal_for_render(
-                        &mut t,
-                        id,
-                        id == active_id,
-                        &snap.theme,
-                        &snap.custom_theme,
-                        force_terminal_theme_repaint,
-                    );
-                    // Paint the selection highlight onto the per-frame clone
-                    // (never the live buffer). Applied after the palette so
-                    // the selection bg wins over the themed cell bg. The
-                    // terminal maps the selection's absolute lines to current
-                    // display rows, so it tracks content as the view scrolls.
-                    if let Some(sel) = selections.get(&id) {
-                        crate::state::apply_selection_highlight(&mut grid, &t, sel);
-                    }
-                    if let Some(hover) = snap
-                        .terminal_link_hover
-                        .as_ref()
-                        .filter(|hover| hover.pane == id)
-                    {
-                        crate::state::apply_terminal_link_hover(&mut grid, &t, hover);
-                    }
-                    // Force a full repaint of this pane the frame its selection
-                    // changed (added / moved / cleared) so the renderer's line
-                    // cache re-emits the rows whose highlight just changed. A
-                    // static selection re-applies the same bg each frame and
-                    // needs no extra damage.
-                    if selection_repaint.contains(&id) || link_hover_repaint.contains(&id) {
-                        grid.mark_all_dirty();
-                    }
-                    (id, grid)
-                })
-                .collect();
+            let mut grids: std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid> =
+                handles
+                    .into_iter()
+                    .map(|(id, handle)| {
+                        let mut t = handle.lock_recover();
+                        let mut grid = snapshot_terminal_for_render(
+                            &mut t,
+                            id,
+                            id == active_id,
+                            &snap.theme,
+                            &snap.custom_theme,
+                            force_terminal_theme_repaint,
+                        );
+                        // Paint the selection highlight onto the per-frame clone
+                        // (never the live buffer). Applied after the palette so
+                        // the selection bg wins over the themed cell bg. The
+                        // terminal maps the selection's absolute lines to current
+                        // display rows, so it tracks content as the view scrolls.
+                        if let Some(sel) = selections.get(&id) {
+                            crate::state::apply_selection_highlight(&mut grid, &t, sel);
+                        }
+                        if let Some(hover) = snap
+                            .terminal_link_hover
+                            .as_ref()
+                            .filter(|hover| hover.pane == id)
+                        {
+                            crate::state::apply_terminal_link_hover(&mut grid, &t, hover);
+                        }
+                        // Force a full repaint of this pane the frame its selection
+                        // changed (added / moved / cleared) so the renderer's line
+                        // cache re-emits the rows whose highlight just changed. A
+                        // static selection re-applies the same bg each frame and
+                        // needs no extra damage.
+                        if selection_repaint.contains(&id) || link_hover_repaint.contains(&id) {
+                            grid.mark_all_dirty();
+                        }
+                        (id, grid)
+                    })
+                    .collect();
+            // Editor panes publish their live viewport grid the same way
+            // terminals publish display grids. Editors are plain state (no
+            // per-pane mutex), so this is a short second state lock.
+            {
+                let guard = tree_shared.lock_recover();
+                for (&id, editor) in guard.editors.iter() {
+                    grids.insert(id, editor.grid.clone());
+                }
+            }
             build_tree(
                 &snap,
                 &tree_shared,

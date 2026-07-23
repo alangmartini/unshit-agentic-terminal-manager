@@ -1,0 +1,3 @@
+### Added
+
+- Built-in file editor (MVP): open a text file in an editor pane via the `editor.open:<path>` command. The editor renders through the terminal's GPU cell-grid pipeline (viewport-only publication, stable line identities for cached line replay), shows a line-number gutter, and scrolls by keyboard (arrows, PageUp/PageDown, Ctrl+Home/End) and mouse wheel. Oversized (>16 MiB) and non-UTF-8 files are refused with a notification instead of being lossily converted. Editor panes are session-local and are not persisted across restarts. Editor lifecycle telemetry (open/save/close, never file content) is recorded to `editor-events.jsonl`.

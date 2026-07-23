@@ -243,6 +243,7 @@ mod tests {
             quick_prompt: None,
             terminal_link_hover: None,
             pending_agent_resumes: BTreeMap::new(),
+            editor_panes: std::collections::HashSet::new(),
         }
     }
 
