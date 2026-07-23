@@ -379,7 +379,12 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                 let workspace_id = crate::state::active_workspace_num(&guard);
                                 let shell = crate::state::pane_spawn_shell(&guard);
                                 for id in &all_pane_ids {
-                                    if !guard.terminals.contains_key(id) {
+                                    // Editor panes have no PTY by design;
+                                    // spawning one here would shadow the
+                                    // editor with a shell session.
+                                    if !guard.terminals.contains_key(id)
+                                        && !guard.editors.contains_key(id)
+                                    {
                                         let spawn_plan = crate::state::pane_agent_spawn_plan(
                                             &guard,
                                             *id,

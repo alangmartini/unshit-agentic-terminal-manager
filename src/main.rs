@@ -1000,7 +1000,7 @@ fn main() {
             .collect();
 
         for (workspace_id, pane_id, cwd, shell) in targets {
-            if guard.terminals.contains_key(&pane_id) {
+            if guard.terminals.contains_key(&pane_id) || guard.editors.contains_key(&pane_id) {
                 continue;
             }
             let spawn_plan = crate::state::pane_agent_spawn_plan(&guard, pane_id, cwd, shell);
@@ -1401,6 +1401,21 @@ fn main() {
         let app_clipboard = app.clipboard();
         let mut guard = shared.lock_recover();
         guard.clipboard = app_clipboard;
+    }
+
+    // Dev/automation hook: dispatch `;`-separated state commands once at
+    // startup (screenshot scripts, desktop regression). Not a user
+    // surface; commands run with the same rights as any local keybind.
+    if let Ok(commands) = std::env::var("TM_STARTUP_DISPATCH") {
+        let mut guard = shared.lock_recover();
+        for command in commands.split(';').filter(|c| !c.trim().is_empty()) {
+            let handled = crate::state::dispatch(&mut guard, command.trim());
+            log::info!(
+                "{{\"event\":\"startup.dispatch\",\"level\":\"info\",\"command\":{:?},\"handled\":{}}}",
+                command.trim(),
+                handled
+            );
+        }
     }
 
     app.run();
