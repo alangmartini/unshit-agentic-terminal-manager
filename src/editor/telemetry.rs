@@ -28,6 +28,10 @@ pub struct EditorEventRecord<'a> {
     /// Machine-readable failure reason (`too_large`, `invalid_utf8`, `io`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// Raw OS error code for `io` failures, so the sink alone can tell
+    /// readonly (5) from disk-full (112) from sharing violations (32).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_error: Option<i32>,
 }
 
 pub fn now_unix_ms() -> u64 {
@@ -108,6 +112,7 @@ mod tests {
             file_bytes: Some(42),
             line_count: Some(3),
             reason: None,
+            os_error: None,
         };
 
         record_to(&path, &record).expect("write editor telemetry");
@@ -145,6 +150,7 @@ mod tests {
             file_bytes: Some(999_999_999),
             line_count: None,
             reason: Some("too_large"),
+            os_error: None,
         };
         record_to(&path, &record).expect("write editor telemetry");
         let value: serde_json::Value = serde_json::from_str(

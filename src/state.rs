@@ -4767,6 +4767,7 @@ pub fn save_editor_pane(state: &mut AppState, pane_id: u32) -> bool {
                 file_bytes: Some(bytes),
                 line_count: Some(line_count),
                 reason: None,
+                os_error: None,
             });
             record_diagnostic_pty_event(
                 state,
@@ -4784,6 +4785,7 @@ pub fn save_editor_pane(state: &mut AppState, pane_id: u32) -> bool {
                 file_bytes: None,
                 line_count: None,
                 reason: Some("io"),
+                os_error: e.raw_os_error(),
             });
             record_diagnostic_pty_event(
                 state,
@@ -4849,6 +4851,7 @@ fn open_close_editor_dialog(
             file_bytes: Some(editor.file_bytes),
             line_count: Some(editor.buffer.line_count() as u64),
             reason: None,
+            os_error: None,
         });
         record_diagnostic_pty_event(state, format!("editor_close_dirty_prompt pane={}", id));
     }
@@ -4900,6 +4903,32 @@ pub fn request_close_tab(state: &mut AppState, index: usize) {
     crate::persist::save_workspaces(state);
 }
 
+/// Record `editor.close_dirty_discarded` for each pane whose unsaved
+/// buffer the user chose to drop. Must run before the close mutation
+/// while the panes (and their correlation ids) still exist.
+fn record_editor_discard(state: &mut AppState, pane_ids: &[u32]) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+
+    for id in pane_ids {
+        let Some(editor) = state.editors.get(id) else {
+            continue;
+        };
+        let path_str = editor.path.to_string_lossy().into_owned();
+        record_editor_event(&EditorEventRecord {
+            timestamp_unix_ms: now_unix_ms(),
+            event: "editor.close_dirty_discarded",
+            level: "warn",
+            correlation_id: &editor.correlation_id,
+            path: Some(&path_str),
+            file_bytes: Some(editor.file_bytes),
+            line_count: Some(editor.buffer.line_count() as u64),
+            reason: None,
+            os_error: None,
+        });
+        record_diagnostic_pty_event(state, format!("editor_close_dirty_discarded pane={}", id));
+    }
+}
+
 /// Execute the close the `CloseEditor` dialog was guarding: the whole
 /// tab when the request came from a tab close, else the single pane.
 fn close_editor_dialog_scope(state: &mut AppState, pane_ids: &[u32], tab: Option<usize>) {
@@ -4939,6 +4968,7 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
                 file_bytes: Some(editor.file_bytes),
                 line_count: Some(editor.buffer.line_count() as u64),
                 reason: None,
+                os_error: None,
             });
             let pane_id = mutate_add_editor_tab(state, editor);
             record_diagnostic_pty_event(state, format!("editor_open pane={}", pane_id.0));
@@ -4958,6 +4988,10 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
                 file_bytes,
                 line_count: None,
                 reason: Some(err.reason()),
+                os_error: match &err {
+                    crate::editor::OpenError::Io(e) => e.raw_os_error(),
+                    _ => None,
+                },
             });
             record_diagnostic_pty_event(
                 state,
@@ -5084,6 +5118,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             else {
                 unreachable!("checked above");
             };
+            // The one deliberate data-loss action in the editor: record
+            // it durably (warn) before the panes and their buffers go.
+            record_editor_discard(state, &pane_ids);
             close_editor_dialog_scope(state, &pane_ids, tab);
             true
         }
@@ -9159,6 +9196,11 @@ mod tests {
         assert!(state.confirm_dialog.is_none());
         // Discard never touched the file.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta");
+        // The deliberate data-loss action is queryable from diagnostics.
+        assert!(state
+            .diagnostic_pty_recent_events
+            .iter()
+            .any(|e| e.starts_with(&format!("editor_close_dirty_discarded pane={pane_id}"))));
         let _ = std::fs::remove_file(path);
     }
 
