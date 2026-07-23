@@ -67,6 +67,9 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
             buffer,
             error,
         } => build_rename_session_card(*pane_id, buffer, error.as_deref(), shared),
+        ConfirmDialog::CloseEditor { names, tab, .. } => {
+            build_close_editor_card(names, tab.is_some(), shared)
+        }
     };
 
     let backdrop_shared = shared.clone();
@@ -140,6 +143,86 @@ fn build_simple_confirm_card(
                 .with_class("confirm-dialog-buttons")
                 .with_child(cancel)
                 .with_child(confirm),
+        )
+}
+
+/// Card for the `CloseEditor` dialog: save / discard / cancel over the
+/// dirty editor pane(s) a pane or tab close would drop.
+fn build_close_editor_card(names: &[String], closes_tab: bool, shared: &SharedState) -> ElementDef {
+    let list = names.join(", ");
+    let scope = if closes_tab {
+        "Closing this tab"
+    } else {
+        "Closing this pane"
+    };
+    let body = if names.len() == 1 {
+        format!("{scope} discards unsaved changes in \"{list}\".")
+    } else {
+        format!(
+            "{scope} discards unsaved changes in {} files: {list}.",
+            names.len()
+        )
+    };
+
+    let cancel_shared = shared.clone();
+    let cancel = ElementDef::new(Tag::Button)
+        .with_class("confirm-dialog-button")
+        .with_class("cancel")
+        .with_class("ghost")
+        .on_click(move || {
+            mutate_with(&cancel_shared, |st| {
+                dispatch(st, "dialog.cancel");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Cancel".to_string()));
+
+    let discard_shared = shared.clone();
+    let discard = ElementDef::new(Tag::Button)
+        .with_class("confirm-dialog-button")
+        .with_class("danger")
+        .on_click(move || {
+            mutate_with(&discard_shared, |st| {
+                dispatch(st, "dialog.editor_discard_close");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Discard".to_string()));
+
+    let save_shared = shared.clone();
+    let save = ElementDef::new(Tag::Button)
+        .with_class("confirm-dialog-button")
+        .with_class("primary")
+        .on_click(move || {
+            mutate_with(&save_shared, |st| {
+                dispatch(st, "dialog.editor_save_close");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text(if names.len() == 1 {
+            "Save & close".to_string()
+        } else {
+            "Save all & close".to_string()
+        }));
+
+    ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-card")
+        .with_class("confirm-dialog-simple-card")
+        .with_class("confirm-dialog-close-editor-card")
+        .on_click(|| {})
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-title")
+                .with_text("Unsaved changes".to_string()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-body")
+                .with_text(body),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-buttons")
+                .with_child(cancel)
+                .with_child(discard)
+                .with_child(save),
         )
 }
 
@@ -1205,6 +1288,76 @@ mod tests {
         let guard = s.lock().unwrap();
         assert!(guard.confirm_dialog.is_none());
         assert_eq!(guard.panes[0][0].title, "enter-to-commit");
+    }
+
+    #[test]
+    fn close_editor_dialog_renders_save_discard_cancel() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.confirm_dialog = Some(ConfirmDialog::CloseEditor {
+                pane_ids: vec![7],
+                names: vec!["notes.md".to_string()],
+                tab: None,
+            });
+        }
+        let snap = s.lock().unwrap().ui_snapshot();
+        let el = build_confirm_dialog_overlay(&snap, &s);
+        let card = &el.children[0];
+        assert!(has_class(card, "confirm-dialog-close-editor-card"));
+
+        let text = normalized_text(card);
+        assert!(text.contains("Unsaved changes"));
+        assert!(text.contains("notes.md"));
+        assert!(text.contains("Closing this pane"));
+
+        let buttons = find_by_class(card, "confirm-dialog-buttons").expect("buttons row");
+        let labels: Vec<String> = buttons
+            .children
+            .iter()
+            .map(|b| normalized_text(b))
+            .collect();
+        assert_eq!(labels, vec!["Cancel", "Discard", "Save & close"]);
+    }
+
+    #[test]
+    fn close_editor_dialog_tab_scope_lists_all_files() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.confirm_dialog = Some(ConfirmDialog::CloseEditor {
+                pane_ids: vec![7, 9],
+                names: vec!["a.rs".to_string(), "b.rs".to_string()],
+                tab: Some(2),
+            });
+        }
+        let snap = s.lock().unwrap().ui_snapshot();
+        let el = build_confirm_dialog_overlay(&snap, &s);
+        let text = normalized_text(&el);
+        assert!(text.contains("Closing this tab"));
+        assert!(text.contains("2 files"));
+        assert!(text.contains("a.rs, b.rs"));
+        assert!(text.contains("Save all & close"));
+    }
+
+    #[test]
+    fn close_editor_dialog_discard_click_dispatches_discard_close() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.confirm_dialog = Some(ConfirmDialog::CloseEditor {
+                pane_ids: vec![7],
+                names: vec!["notes.md".to_string()],
+                tab: None,
+            });
+        }
+        let snap = s.lock().unwrap().ui_snapshot();
+        let el = build_confirm_dialog_overlay(&snap, &s);
+        let buttons = find_by_class(&el, "confirm-dialog-buttons").expect("buttons");
+        // Discard: pane 7 has no editor entry in this seeded state, so the
+        // dialog resolves and clears without side effects.
+        (buttons.children[1].on_click.as_ref().unwrap())();
+        assert!(s.lock().unwrap().confirm_dialog.is_none());
     }
 
     #[test]

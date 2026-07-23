@@ -238,6 +238,16 @@ pub enum ConfirmDialog {
         buffer: String,
         error: Option<String>,
     },
+    /// Close request that would drop unsaved editor changes, awaiting
+    /// save / discard / cancel. `pane_ids` are the dirty editor panes in
+    /// the closing scope; `names` are their display names copied at open
+    /// time for the dialog body. `tab: None` closes the single pane,
+    /// `Some(idx)` closes the whole tab at `idx` once resolved.
+    CloseEditor {
+        pane_ids: Vec<u32>,
+        names: Vec<String>,
+        tab: Option<usize>,
+    },
 }
 
 /// Outcome of resolving the user's persisted close preference when the
@@ -2068,6 +2078,10 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     };
 
     for id in &pane_ids {
+        if state.editors.remove(id).is_some() {
+            record_diagnostic_pty_event(state, format!("editor_close pane={} scope=tab", id));
+            continue;
+        }
         state.pty_manager.destroy(*id);
         state.terminals.remove(id);
         forget_agent_restore(state, *id);
@@ -2589,6 +2603,7 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
 
     if state.editors.remove(&target.0).is_some() {
         // Editor pane: no PTY/terminal state to tear down.
+        record_diagnostic_pty_event(state, format!("editor_close pane={} scope=pane", target.0));
     } else {
         // Destroy the PTY and terminal.
         state.pty_manager.destroy(target.0);
@@ -3377,6 +3392,9 @@ pub fn mutate_kill_workspace_terminals(state: &mut AppState, ws_idx: usize) {
     }
 
     for id in &pane_ids {
+        if state.editors.remove(id).is_some() {
+            continue;
+        }
         state.pty_manager.destroy(*id);
         state.terminals.remove(id);
         forget_agent_restore(state, *id);
@@ -3693,6 +3711,8 @@ pub fn mutate_kill_all_terminals(state: &mut AppState) {
         state.pty_manager.destroy(*id);
         state.terminals.remove(id);
     }
+    // Every tab is cleared below, so editor panes go with them.
+    state.editors.clear();
     for ws in state.workspaces.iter_mut() {
         ws.tabs.clear();
         ws.active_tab = 0;
@@ -4724,19 +4744,18 @@ fn dispatch_editor_open_dialog(state: &mut AppState) -> bool {
     true
 }
 
-/// Handle `editor.save` for the focused editor pane. Returns `false`
-/// when the active pane is not an editor so the keybind can fall
-/// through unclaimed.
-fn dispatch_editor_save(state: &mut AppState) -> bool {
+/// Save one editor pane to disk with telemetry and a failure toast.
+/// Returns `true` when the save succeeded, `false` on failure or when
+/// `pane_id` is not an editor pane.
+pub fn save_editor_pane(state: &mut AppState, pane_id: u32) -> bool {
     use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
 
-    let pane_id = state.active_pane.0;
     let Some(editor) = state.editors.get_mut(&pane_id) else {
         return false;
     };
     let path_str = editor.path.to_string_lossy().into_owned();
     let correlation_id = editor.correlation_id.clone();
-    match editor.save() {
+    let saved = match editor.save() {
         Ok(bytes) => {
             let line_count = editor.buffer.line_count() as u64;
             record_editor_event(&EditorEventRecord {
@@ -4749,6 +4768,11 @@ fn dispatch_editor_save(state: &mut AppState) -> bool {
                 line_count: Some(line_count),
                 reason: None,
             });
+            record_diagnostic_pty_event(
+                state,
+                format!("editor_save pane={} bytes={}", pane_id, bytes),
+            );
+            true
         }
         Err(e) => {
             record_editor_event(&EditorEventRecord {
@@ -4761,12 +4785,133 @@ fn dispatch_editor_save(state: &mut AppState) -> bool {
                 line_count: None,
                 reason: Some("io"),
             });
+            record_diagnostic_pty_event(
+                state,
+                format!("editor_save_failed pane={} error={}", pane_id, e),
+            );
             let name = crate::editor::display_name(&state.editors[&pane_id].path);
             push_error_toast(state, format!("Could not save {}: {}", name, e));
+            false
+        }
+    };
+    sync_editor_pane_title(state, pane_id);
+    saved
+}
+
+/// Handle `editor.save` for the focused editor pane. Returns `false`
+/// when the active pane is not an editor so the keybind can fall
+/// through unclaimed.
+fn dispatch_editor_save(state: &mut AppState) -> bool {
+    let pane_id = state.active_pane.0;
+    if !state.editors.contains_key(&pane_id) {
+        return false;
+    }
+    save_editor_pane(state, pane_id);
+    true
+}
+
+/// Dirty editor panes among `pane_ids`, with their display names.
+fn dirty_editor_panes(state: &AppState, pane_ids: &[u32]) -> (Vec<u32>, Vec<String>) {
+    let mut ids = Vec::new();
+    let mut names = Vec::new();
+    for id in pane_ids {
+        if let Some(editor) = state.editors.get(id) {
+            if editor.dirty {
+                ids.push(*id);
+                names.push(editor.display_name.clone());
+            }
         }
     }
-    sync_editor_pane_title(state, pane_id);
-    true
+    (ids, names)
+}
+
+/// Open the unsaved-changes prompt for `pane_ids` and emit one
+/// `editor.close_dirty_prompt` telemetry event per dirty pane.
+fn open_close_editor_dialog(
+    state: &mut AppState,
+    pane_ids: Vec<u32>,
+    names: Vec<String>,
+    tab: Option<usize>,
+) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+
+    for id in &pane_ids {
+        let Some(editor) = state.editors.get(id) else {
+            continue;
+        };
+        let path_str = editor.path.to_string_lossy().into_owned();
+        record_editor_event(&EditorEventRecord {
+            timestamp_unix_ms: now_unix_ms(),
+            event: "editor.close_dirty_prompt",
+            level: "info",
+            correlation_id: &editor.correlation_id,
+            path: Some(&path_str),
+            file_bytes: Some(editor.file_bytes),
+            line_count: Some(editor.buffer.line_count() as u64),
+            reason: None,
+        });
+        record_diagnostic_pty_event(state, format!("editor_close_dirty_prompt pane={}", id));
+    }
+    state.confirm_dialog = Some(ConfirmDialog::CloseEditor {
+        pane_ids,
+        names,
+        tab,
+    });
+}
+
+/// Close `target` unless it is an editor pane with unsaved changes, in
+/// which case the save/discard/cancel prompt opens instead. Every user
+/// facing pane-close path funnels through here.
+pub fn request_close_pane(state: &mut AppState, target: PaneId) {
+    if let Some(editor) = state.editors.get(&target.0) {
+        if editor.dirty {
+            let names = vec![editor.display_name.clone()];
+            open_close_editor_dialog(state, vec![target.0], names, None);
+            return;
+        }
+    }
+    mutate_close_pane(state, target);
+    crate::persist::save_workspaces(state);
+}
+
+/// Close the tab at `index` unless it contains dirty editor panes, in
+/// which case the save/discard/cancel prompt opens instead (resolving
+/// it closes the whole tab).
+pub fn request_close_tab(state: &mut AppState, index: usize) {
+    if index >= state.tabs.len() {
+        return;
+    }
+    let pane_ids: Vec<u32> = if index == state.active_tab {
+        state.panes.iter().flatten().map(|p| p.id.0).collect()
+    } else {
+        state.tabs[index]
+            .panes
+            .iter()
+            .flatten()
+            .map(|p| p.id.0)
+            .collect()
+    };
+    let (dirty_ids, names) = dirty_editor_panes(state, &pane_ids);
+    if !dirty_ids.is_empty() {
+        open_close_editor_dialog(state, dirty_ids, names, Some(index));
+        return;
+    }
+    mutate_close_tab(state, index);
+    crate::persist::save_workspaces(state);
+}
+
+/// Execute the close the `CloseEditor` dialog was guarding: the whole
+/// tab when the request came from a tab close, else the single pane.
+fn close_editor_dialog_scope(state: &mut AppState, pane_ids: &[u32], tab: Option<usize>) {
+    match tab {
+        Some(idx) => mutate_close_tab(state, idx),
+        None => {
+            if let Some(&id) = pane_ids.first() {
+                mutate_close_pane(state, PaneId(id));
+            }
+        }
+    }
+    crate::persist::save_workspaces(state);
 }
 
 /// Handle `editor.open:<path>`: open the file in a new editor tab, or
@@ -4795,7 +4940,8 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
                 line_count: Some(editor.buffer.line_count() as u64),
                 reason: None,
             });
-            mutate_add_editor_tab(state, editor);
+            let pane_id = mutate_add_editor_tab(state, editor);
+            record_diagnostic_pty_event(state, format!("editor_open pane={}", pane_id.0));
         }
         Err(err) => {
             let correlation_id = crate::editor::generate_correlation_id();
@@ -4813,6 +4959,10 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
                 line_count: None,
                 reason: Some(err.reason()),
             });
+            record_diagnostic_pty_event(
+                state,
+                format!("editor_open_failed reason={}", err.reason()),
+            );
             push_error_toast(state, err.message(&path));
         }
     }
@@ -4867,10 +5017,13 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             // CloseApp has three explicit actions and is driven by
             // `app.close.*` dispatches, not the generic yes/no confirm.
             // RenameSession commits via `dialog.rename_commit` so the
-            // handler can read the buffer before clearing.
+            // handler can read the buffer before clearing. CloseEditor
+            // resolves via `dialog.editor_save_close` / `_discard_close`.
             if matches!(
                 dlg,
-                ConfirmDialog::CloseApp { .. } | ConfirmDialog::RenameSession { .. }
+                ConfirmDialog::CloseApp { .. }
+                    | ConfirmDialog::RenameSession { .. }
+                    | ConfirmDialog::CloseEditor { .. }
             ) {
                 return false;
             }
@@ -4881,7 +5034,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 ConfirmDialog::KillAll { .. } => {
                     mutate_kill_all_terminals(state);
                 }
-                ConfirmDialog::CloseApp { .. } | ConfirmDialog::RenameSession { .. } => {
+                ConfirmDialog::CloseApp { .. }
+                | ConfirmDialog::RenameSession { .. }
+                | ConfirmDialog::CloseEditor { .. } => {
                     unreachable!("filtered above")
                 }
             }
@@ -4895,6 +5050,42 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             } else {
                 false
             }
+        }
+        "dialog.editor_save_close" => {
+            if !matches!(
+                state.confirm_dialog,
+                Some(ConfirmDialog::CloseEditor { .. })
+            ) {
+                return false;
+            }
+            let Some(ConfirmDialog::CloseEditor { pane_ids, tab, .. }) =
+                state.confirm_dialog.take()
+            else {
+                unreachable!("checked above");
+            };
+            // Save every dirty pane in scope first; any failure keeps
+            // everything open (the failure toast explains why) so a
+            // half-saved tab is never silently dropped.
+            let all_saved = pane_ids.iter().all(|&id| save_editor_pane(state, id));
+            if all_saved {
+                close_editor_dialog_scope(state, &pane_ids, tab);
+            }
+            true
+        }
+        "dialog.editor_discard_close" => {
+            if !matches!(
+                state.confirm_dialog,
+                Some(ConfirmDialog::CloseEditor { .. })
+            ) {
+                return false;
+            }
+            let Some(ConfirmDialog::CloseEditor { pane_ids, tab, .. }) =
+                state.confirm_dialog.take()
+            else {
+                unreachable!("checked above");
+            };
+            close_editor_dialog_scope(state, &pane_ids, tab);
+            true
         }
         "dialog.toggle_remember" => {
             // Only applies while a CloseApp dialog is active. Flips the
@@ -5193,8 +5384,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "tab.close.active" => {
             let idx = state.active_tab;
-            mutate_close_tab(state, idx);
-            crate::persist::save_workspaces(state);
+            request_close_tab(state, idx);
             true
         }
         "tab.next" => {
@@ -5228,8 +5418,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             true
         }
         "pane.close" => {
-            mutate_close_pane(state, state.active_pane);
-            crate::persist::save_workspaces(state);
+            request_close_pane(state, state.active_pane);
             true
         }
         "pane.focus_left" => {
@@ -5573,6 +5762,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "session.rename_active" => {
             let pane_id = state.active_pane.0;
+            // Editor panes are titled by their file name + dirty marker;
+            // session rename is a terminal concept and must not clobber it.
+            if state.editors.contains_key(&pane_id) {
+                return false;
+            }
             dispatch(state, &format!("tab.request_rename:{pane_id}"))
         }
         other if other.starts_with("tab.request_rename:") => {
@@ -8888,6 +9082,186 @@ mod tests {
         // and must not report success on an editor pane.
         assert!(!active_pane_has_selection(&state));
         assert!(!dispatch(&mut state, "terminal.copy"));
+        // Session rename is a terminal concept; it must not open a rename
+        // dialog that would clobber the filename+dirty title.
+        assert!(!dispatch(&mut state, "session.rename_active"));
+        assert!(state.confirm_dialog.is_none());
+        // Paste writes to a PTY the editor pane does not have; the write
+        // fails internally without panicking or corrupting the buffer.
+        let before = state.editors[&state.active_pane.0].buffer.to_text();
+        dispatch(&mut state, "terminal.paste");
+        assert_eq!(state.editors[&state.active_pane.0].buffer.to_text(), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // -- S6: close-dirty confirm flow ---------------------------------------
+
+    /// Open a temp file in an editor tab and dirty it. Returns the pane id.
+    fn dirty_editor(state: &mut AppState, tag: &str) -> (u32, std::path::PathBuf) {
+        let path = editor_temp_file(tag, b"alpha\nbeta");
+        assert!(dispatch(state, &format!("editor.open:{}", path.display())));
+        let pane_id = state.active_pane.0;
+        state
+            .editors
+            .get_mut(&pane_id)
+            .unwrap()
+            .apply(|b| b.insert_typed("x"));
+        assert!(state.editors[&pane_id].dirty);
+        (pane_id, path)
+    }
+
+    #[test]
+    fn pane_close_on_dirty_editor_prompts_instead_of_closing() {
+        let mut state = test_state();
+        let (pane_id, path) = dirty_editor(&mut state, "dirty-close");
+        assert!(dispatch(&mut state, "pane.close"));
+        assert!(
+            state.editors.contains_key(&pane_id),
+            "pane must stay open while the prompt is up"
+        );
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::CloseEditor {
+                pane_ids,
+                names,
+                tab,
+            }) => {
+                assert_eq!(pane_ids, &vec![pane_id]);
+                assert_eq!(names.len(), 1);
+                assert!(names[0].starts_with("tm-state-editor-"), "got: {names:?}");
+                assert_eq!(*tab, None);
+            }
+            other => panic!("expected CloseEditor dialog, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pane_close_on_clean_editor_just_closes() {
+        let mut state = test_state();
+        let path = editor_temp_file("clean-close", b"alpha");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        assert!(dispatch(&mut state, "pane.close"));
+        assert!(state.editors.is_empty());
+        assert!(state.confirm_dialog.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dialog_editor_discard_close_drops_changes_and_closes() {
+        let mut state = test_state();
+        let (pane_id, path) = dirty_editor(&mut state, "discard");
+        dispatch(&mut state, "pane.close");
+        assert!(dispatch(&mut state, "dialog.editor_discard_close"));
+        assert!(!state.editors.contains_key(&pane_id));
+        assert!(state.confirm_dialog.is_none());
+        // Discard never touched the file.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dialog_editor_save_close_saves_then_closes() {
+        let mut state = test_state();
+        let (pane_id, path) = dirty_editor(&mut state, "saveclose");
+        dispatch(&mut state, "pane.close");
+        assert!(dispatch(&mut state, "dialog.editor_save_close"));
+        assert!(!state.editors.contains_key(&pane_id));
+        assert!(state.confirm_dialog.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "xalpha\nbeta");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dialog_editor_save_close_failure_keeps_pane_open() {
+        let mut state = test_state();
+        let (pane_id, path) = dirty_editor(&mut state, "savefail");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+
+        dispatch(&mut state, "pane.close");
+        assert!(dispatch(&mut state, "dialog.editor_save_close"));
+        assert!(
+            state.editors.contains_key(&pane_id),
+            "failed save must keep the pane (and its buffer) alive"
+        );
+        assert_eq!(state.toasts.len(), 1);
+
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dialog_cancel_keeps_dirty_editor_open() {
+        let mut state = test_state();
+        let (pane_id, path) = dirty_editor(&mut state, "cancel");
+        dispatch(&mut state, "pane.close");
+        assert!(dispatch(&mut state, "dialog.cancel"));
+        assert!(state.editors.contains_key(&pane_id));
+        assert!(state.editors[&pane_id].dirty);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tab_close_with_dirty_editor_prompts_and_discard_closes_tab() {
+        let mut state = test_state();
+        let (pane_id, path) = dirty_editor(&mut state, "tabclose");
+        let editor_tab = state.active_tab;
+        let tabs_before = state.tabs.len();
+        assert!(dispatch(&mut state, "tab.close.active"));
+        assert_eq!(state.tabs.len(), tabs_before, "tab stays while prompted");
+        match state.confirm_dialog.as_ref() {
+            Some(ConfirmDialog::CloseEditor { tab, .. }) => assert_eq!(*tab, Some(editor_tab)),
+            other => panic!("expected CloseEditor dialog, got {other:?}"),
+        }
+        assert!(dispatch(&mut state, "dialog.editor_discard_close"));
+        assert_eq!(state.tabs.len(), tabs_before - 1);
+        assert!(!state.editors.contains_key(&pane_id));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn close_tab_removes_editor_entries() {
+        let mut state = test_state();
+        let path = editor_temp_file("tab-guard", b"alpha");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let idx = state.active_tab;
+        mutate_close_tab(&mut state, idx);
+        assert!(
+            state.editors.is_empty(),
+            "closing a tab must drop its editor pane state"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn kill_all_terminals_clears_editors() {
+        let mut state = test_state();
+        let path = editor_temp_file("killall-guard", b"alpha");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        mutate_kill_all_terminals(&mut state);
+        assert!(state.editors.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_dialog_confirm_does_not_consume_close_editor() {
+        let mut state = test_state();
+        let (pane_id, path) = dirty_editor(&mut state, "genconfirm");
+        dispatch(&mut state, "pane.close");
+        assert!(!dispatch(&mut state, "dialog.confirm"));
+        assert!(state.confirm_dialog.is_some(), "dialog must stay up");
+        assert!(state.editors.contains_key(&pane_id));
         let _ = std::fs::remove_file(path);
     }
 

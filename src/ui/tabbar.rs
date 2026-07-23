@@ -4,8 +4,8 @@ use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::Dimension;
 
 use crate::state::{
-    dispatch, mutate_close_tab, mutate_with, CtxMenu, CtxMenuTarget, SharedState, TabStatus,
-    TabWidthMode, TerminalTab, UiSnapshot,
+    dispatch, mutate_with, CtxMenu, CtxMenuTarget, SharedState, TabStatus, TabWidthMode,
+    TerminalTab, UiSnapshot,
 };
 use crate::ui::icons::*;
 
@@ -263,7 +263,9 @@ fn build_tab(
             .with_class("tab-close")
             .with_text("\u{00D7}")
             .on_click(move || {
-                mutate_with(&close_state, |st| mutate_close_tab(st, index));
+                mutate_with(&close_state, |st| {
+                    crate::state::request_close_tab(st, index)
+                });
             }),
     )
 }

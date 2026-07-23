@@ -21,8 +21,8 @@
       editor beside terminal.
 - [x] S5: Mouse (click cursor, drag select, double-click word, wheel, gutter)
   - Acceptance: click→cursor and drag-selection UI tests.
-- [ ] S6: Lifecycle polish + full guard audit + telemetry completeness
+- [x] S6: Lifecycle polish + full guard audit + telemetry completeness
   - Acceptance: close-dirty dialog tests; terminal-only dispatch no-op tests;
     privacy test on telemetry sink; diagnostics events recorded.
-- [ ] CHECKPOINT C: full gates, manual smoke + screenshot, telemetry inspected,
+- [x] CHECKPOINT C: full gates, manual smoke + screenshot, telemetry inspected,
       changelog fragment, commit(s).

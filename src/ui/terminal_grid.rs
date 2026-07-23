@@ -6,7 +6,7 @@ use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{Transform, TransformX};
 
 use crate::state::{
-    apply_ratio_delta, mutate_close_pane, mutate_split_down, mutate_split_right, mutate_with,
+    apply_ratio_delta, mutate_split_down, mutate_split_right, mutate_with,
     record_diagnostic_pty_event, MutexExt, Pane, PaneId, ResizeDragSnapshot, SharedState,
     UiSnapshot, CSS_LINE_HEIGHT,
 };
@@ -478,7 +478,9 @@ fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
                         .with_class("pane-action")
                         .with_class("danger")
                         .on_click(move || {
-                            mutate_with(&close_state, |st| mutate_close_pane(st, pane_id));
+                            mutate_with(&close_state, |st| {
+                                crate::state::request_close_pane(st, pane_id)
+                            });
                         })
                         .with_child(svg_icon(icon_close())),
                 ),
