@@ -1713,6 +1713,45 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     pane_id
 }
 
+/// Refresh the pane/tab titles for an editor pane from its dirty state
+/// (`● name` while unsaved changes exist). No-op for non-editor panes.
+pub fn sync_editor_pane_title(state: &mut AppState, pane_id: u32) {
+    let Some(editor) = state.editors.get(&pane_id) else {
+        return;
+    };
+    let title = if editor.dirty {
+        format!("\u{25CF} {}", editor.display_name)
+    } else {
+        editor.display_name.clone()
+    };
+    for pane in state.panes.iter_mut().flatten() {
+        if pane.id.0 == pane_id {
+            pane.title = title.clone();
+        }
+    }
+    for tab in &mut state.tabs {
+        let mut contains = false;
+        for pane in tab.panes.iter_mut().flatten() {
+            if pane.id.0 == pane_id {
+                pane.title = title.clone();
+                contains = true;
+            }
+        }
+        // Single-pane editor tabs mirror the marker into the tab strip.
+        if contains && tab.panes.iter().flatten().count() == 1 {
+            tab.name = title.clone();
+        }
+    }
+    // The active tab's name follows the live pane when it is the only one.
+    if state.panes.iter().flatten().count() == 1
+        && state.panes.iter().flatten().any(|p| p.id.0 == pane_id)
+    {
+        if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+            tab.name = title.clone();
+        }
+    }
+}
+
 /// Durable-safe label for a Quick Prompt tab and daemon session. Prompt
 /// previews stay inside the overlay; pane identity must never copy user
 /// content into workspaces.json or daemon inspection metadata.

@@ -7,7 +7,7 @@
   - Verify: `cargo test -p terminal-manager editor`; full tests; fmt; clippy.
 - [ ] CHECKPOINT A: manual launch (isolation profile), open src/state.rs, scroll;
       screenshot; terminals still work.
-- [ ] S2: Core editing (buffer ops, keyboard capture, cursor/selection render, dirty)
+- [x] S2: Core editing (buffer ops, keyboard capture, cursor/selection render, dirty)
   - Acceptance: buffer unit suite (edits/movement/selection/UTF-8/sticky column);
     typing "abc" via capture handler lands in grid cells.
   - Verify: `cargo test -p terminal-manager editor_buffer` + editor UI tests.

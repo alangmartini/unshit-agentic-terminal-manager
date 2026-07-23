@@ -1366,7 +1366,11 @@ fn main() {
             {
                 let guard = tree_shared.lock_recover();
                 for (&id, editor) in guard.editors.iter() {
-                    grids.insert(id, editor.grid.clone());
+                    let mut grid = editor.grid.clone();
+                    if id != active_id {
+                        grid.set_cursor_visible(false);
+                    }
+                    grids.insert(id, grid);
                 }
             }
             build_tree(

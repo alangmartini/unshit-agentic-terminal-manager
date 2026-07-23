@@ -16,6 +16,112 @@ fn page_step(rows: usize) -> isize {
     rows.saturating_sub(1).max(1) as isize
 }
 
+/// Printable text for an insert keystroke. Prefers the event's `text`
+/// (dead-key/IME composition — see `terminal/keys.rs`), falling back to
+/// the key's own character. Control characters never insert.
+fn insert_text_for(kb: &unshit::core::event::KeyboardEvent) -> Option<String> {
+    if let Some(text) = kb.text.as_ref() {
+        let printable: String = text.chars().filter(|c| !c.is_control()).collect();
+        if !printable.is_empty() {
+            return Some(printable);
+        }
+    }
+    match kb.key {
+        Key::Char(c) if !c.is_control() => Some(c.to_string()),
+        Key::Space => Some(" ".to_string()),
+        _ => None,
+    }
+}
+
+/// Translate one captured keystroke into editor buffer operations.
+/// Returns `None` when the key is not an editor key (unconsumed),
+/// `Some(changed)` otherwise. Global app shortcuts never reach this
+/// handler — the framework resolves registered keybinds first.
+pub(crate) fn handle_editor_key(
+    st: &mut crate::state::AppState,
+    pane_id: u32,
+    kb: &unshit::core::event::KeyboardEvent,
+) -> Option<bool> {
+    use crate::editor::{Damage, TAB_SPACES};
+
+    let editor = st.editors.get_mut(&pane_id)?;
+    let ctrl = kb.modifiers.contains(Modifiers::CTRL);
+    let alt = kb.modifiers.contains(Modifiers::ALT);
+    let shift = kb.modifiers.contains(Modifiers::SHIFT);
+    let page = page_step(editor.grid.rows());
+
+    let changed = match kb.key {
+        Key::ArrowLeft if ctrl => editor.apply(|b| {
+            b.move_word_left(shift);
+            Damage::None
+        }),
+        Key::ArrowRight if ctrl => editor.apply(|b| {
+            b.move_word_right(shift);
+            Damage::None
+        }),
+        Key::ArrowLeft => editor.apply(|b| {
+            b.move_left(shift);
+            Damage::None
+        }),
+        Key::ArrowRight => editor.apply(|b| {
+            b.move_right(shift);
+            Damage::None
+        }),
+        // Ctrl+Up/Down scroll the viewport without moving the cursor
+        // (VS Code behavior).
+        Key::ArrowUp if ctrl => editor.scroll_by(-1),
+        Key::ArrowDown if ctrl => editor.scroll_by(1),
+        Key::ArrowUp => editor.apply(|b| {
+            b.move_up(shift);
+            Damage::None
+        }),
+        Key::ArrowDown => editor.apply(|b| {
+            b.move_down(shift);
+            Damage::None
+        }),
+        Key::PageUp => editor.apply(|b| {
+            b.move_page(-page, shift);
+            Damage::None
+        }),
+        Key::PageDown => editor.apply(|b| {
+            b.move_page(page, shift);
+            Damage::None
+        }),
+        Key::Home if ctrl => editor.apply(|b| {
+            b.move_doc_start(shift);
+            Damage::None
+        }),
+        Key::End if ctrl => editor.apply(|b| {
+            b.move_doc_end(shift);
+            Damage::None
+        }),
+        Key::Home => editor.apply(|b| {
+            b.move_home(shift);
+            Damage::None
+        }),
+        Key::End => editor.apply(|b| {
+            b.move_end(shift);
+            Damage::None
+        }),
+        Key::Enter if !ctrl && !alt => editor.apply(|b| b.insert_newline()),
+        Key::Tab if !ctrl && !alt && !shift => {
+            editor.apply(|b| b.insert_str(&" ".repeat(TAB_SPACES)))
+        }
+        Key::Backspace => editor.apply(|b| b.backspace(ctrl)),
+        Key::Delete => editor.apply(|b| b.delete_forward(ctrl)),
+        Key::Char('a') | Key::Char('A') if ctrl && !shift && !alt => editor.apply(|b| {
+            b.select_all();
+            Damage::None
+        }),
+        _ if !ctrl && !alt => {
+            let text = insert_text_for(kb)?;
+            editor.apply(|b| b.insert_str(&text))
+        }
+        _ => return None,
+    };
+    Some(changed)
+}
+
 /// Build the editor pane body. `capture_keyboard` is true for the active
 /// pane only, exactly like terminal panes.
 pub fn build_editor_pane_body(
@@ -58,25 +164,14 @@ pub fn build_editor_pane_body(
                 if kb.kind != KeyEventKind::Pressed {
                     return None;
                 }
-                let ctrl = kb.modifiers.contains(Modifiers::CTRL);
-                let scrolled = mutate_with(&kbd_shared, |st| {
-                    let editor = st.editors.get_mut(&kbd_pane.0)?;
-                    let rows = editor.grid.rows();
-                    let moved = match kb.key {
-                        Key::ArrowUp => editor.scroll_by(-1),
-                        Key::ArrowDown => editor.scroll_by(1),
-                        Key::PageUp => editor.scroll_by(-page_step(rows)),
-                        Key::PageDown => editor.scroll_by(page_step(rows)),
-                        Key::Home if ctrl => editor.scroll_to(0),
-                        Key::End if ctrl => {
-                            let target = editor.max_top_line();
-                            editor.scroll_to(target)
-                        }
-                        _ => return None,
-                    };
-                    Some(moved)
+                let changed = mutate_with(&kbd_shared, |st| {
+                    let changed = handle_editor_key(st, kbd_pane.0, kb)?;
+                    if changed {
+                        crate::state::sync_editor_pane_title(st, kbd_pane.0);
+                    }
+                    Some(changed)
                 });
-                match scrolled {
+                match changed {
                     Some(true) => Some(Box::new(unshit::core::event::RequestRebuild)),
                     _ => None,
                 }
@@ -214,6 +309,179 @@ mod tests {
         let grids = std::collections::HashMap::new();
         let el = build_editor_pane_body(PaneId(1), true, 13, &shared, &grids);
         assert!(el.children.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    // -- keystroke handling -------------------------------------------------
+
+    use unshit::core::event::{KeyEventKind, KeyboardEvent};
+
+    fn key(key: Key) -> KeyboardEvent {
+        KeyboardEvent {
+            kind: KeyEventKind::Pressed,
+            key,
+            modifiers: Modifiers::empty(),
+            text: None,
+        }
+    }
+
+    fn key_mod(k: Key, modifiers: Modifiers) -> KeyboardEvent {
+        KeyboardEvent {
+            kind: KeyEventKind::Pressed,
+            key: k,
+            modifiers,
+            text: None,
+        }
+    }
+
+    fn char_key(c: char) -> KeyboardEvent {
+        KeyboardEvent {
+            kind: KeyEventKind::Pressed,
+            key: Key::Char(c),
+            modifiers: Modifiers::empty(),
+            text: Some(c.to_string()),
+        }
+    }
+
+    fn editor_state() -> (crate::state::AppState, std::path::PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tm-editor-keys-{}-{}.txt",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "hello\nworld").expect("write temp file");
+        let mut state = seed_state();
+        let editor = crate::editor::EditorPane::open(&path, 10, 40).expect("open editor");
+        state.editors.insert(1, editor);
+        (state, path)
+    }
+
+    fn grid_row_text(state: &crate::state::AppState, row: usize) -> String {
+        let grid = &state.editors.get(&1).unwrap().grid;
+        (0..grid.cols())
+            .map(|c| {
+                let ch = grid.get_cell(row, c).map(|cell| cell.ch).unwrap_or('\0');
+                if ch == '\0' {
+                    ' '
+                } else {
+                    ch
+                }
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn typing_chars_lands_in_buffer_and_grid() {
+        let (mut state, path) = editor_state();
+        for c in ['a', 'b', 'c'] {
+            assert_eq!(handle_editor_key(&mut state, 1, &char_key(c)), Some(true));
+        }
+        let editor = state.editors.get(&1).unwrap();
+        assert_eq!(editor.buffer.line(0), Some("abchello"));
+        assert!(editor.dirty);
+        assert_eq!(grid_row_text(&state, 0), "  1 abchello");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dead_key_composed_text_is_preferred_over_key_char() {
+        let (mut state, path) = editor_state();
+        // US-International dead-key composition: key reports the base
+        // char but text carries the composed character.
+        let ev = KeyboardEvent {
+            kind: KeyEventKind::Pressed,
+            key: Key::Char('e'),
+            modifiers: Modifiers::empty(),
+            text: Some("é".to_string()),
+        };
+        assert_eq!(handle_editor_key(&mut state, 1, &ev), Some(true));
+        assert_eq!(
+            state.editors.get(&1).unwrap().buffer.line(0),
+            Some("éhello")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn enter_backspace_delete_edit_lines() {
+        let (mut state, path) = editor_state();
+        handle_editor_key(&mut state, 1, &key_mod(Key::ArrowRight, Modifiers::CTRL));
+        handle_editor_key(&mut state, 1, &key(Key::Enter));
+        assert_eq!(state.editors.get(&1).unwrap().buffer.line_count(), 3);
+        handle_editor_key(&mut state, 1, &key(Key::Backspace));
+        assert_eq!(state.editors.get(&1).unwrap().buffer.line_count(), 2);
+        handle_editor_key(&mut state, 1, &key(Key::Delete));
+        assert_eq!(
+            state.editors.get(&1).unwrap().buffer.line(0),
+            Some("helloworld")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ctrl_a_selects_all_and_typing_replaces() {
+        let (mut state, path) = editor_state();
+        handle_editor_key(&mut state, 1, &key_mod(Key::Char('a'), Modifiers::CTRL));
+        assert!(state.editors.get(&1).unwrap().buffer.selection().is_some());
+        handle_editor_key(&mut state, 1, &char_key('x'));
+        let editor = state.editors.get(&1).unwrap();
+        assert_eq!(editor.buffer.to_text(), "x");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shift_arrows_select_and_grid_paints_selection() {
+        let (mut state, path) = editor_state();
+        handle_editor_key(&mut state, 1, &key_mod(Key::ArrowRight, Modifiers::SHIFT));
+        handle_editor_key(&mut state, 1, &key_mod(Key::ArrowRight, Modifiers::SHIFT));
+        let editor = state.editors.get(&1).unwrap();
+        assert_eq!(editor.buffer.selected_text().as_deref(), Some("he"));
+        // Selected cells carry a non-transparent background.
+        let bg = editor.grid.get_cell(0, 4).unwrap().bg;
+        assert_ne!(bg.a, 0, "selection background should be painted");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dirty_marker_appears_in_pane_title() {
+        let (mut state, path) = editor_state();
+        // Seed a pane entry matching the editor pane id so titles sync.
+        state.panes[0][0].id = PaneId(1);
+        handle_editor_key(&mut state, 1, &char_key('z'));
+        crate::state::sync_editor_pane_title(&mut state, 1);
+        assert!(state.panes[0][0].title.starts_with('\u{25CF}'));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unrelated_keys_are_not_consumed() {
+        let (mut state, path) = editor_state();
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key_mod(Key::Char('p'), Modifiers::CTRL)),
+            None
+        );
+        assert_eq!(handle_editor_key(&mut state, 1, &key(Key::Escape)), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn typing_at_viewport_bottom_scrolls_cursor_into_view() {
+        let path =
+            std::env::temp_dir().join(format!("tm-editor-scrolltype-{}.txt", std::process::id()));
+        let text: Vec<String> = (0..40).map(|i| format!("l{}", i)).collect();
+        std::fs::write(&path, text.join("\n")).expect("write temp file");
+        let mut state = seed_state();
+        let editor = crate::editor::EditorPane::open(&path, 10, 40).expect("open editor");
+        state.editors.insert(1, editor);
+        handle_editor_key(&mut state, 1, &key_mod(Key::End, Modifiers::CTRL));
+        let editor = state.editors.get(&1).unwrap();
+        assert_eq!(editor.buffer.cursor().line, 39);
+        assert_eq!(editor.top_line, 30, "viewport follows the cursor");
+        assert!(editor.grid.cursor_visible());
+        assert_eq!(editor.grid.cursor_row(), 9);
         let _ = std::fs::remove_file(path);
     }
 }

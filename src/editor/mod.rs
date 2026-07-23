@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use unshit::core::cell_grid::CellGrid;
 
-pub use buffer::{EditorBuffer, LineEnding};
+pub use buffer::{Damage, EditorBuffer, LineEnding, Position, TAB_SPACES};
 
 /// Files above this size are refused (MVP guard; see SPEC.md).
 pub const MAX_EDITOR_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -111,10 +111,7 @@ pub struct EditorPane {
 impl EditorPane {
     pub fn open(path: &Path, rows: usize, cols: usize) -> Result<Self, OpenError> {
         let (buffer, line_ending, file_bytes) = load_file(path)?;
-        let mut grid = CellGrid::new(rows.max(1), cols.max(1));
-        grid.set_cursor_visible(false);
-        grid::repaint_all(&mut grid, &buffer, 0, 0);
-        Ok(Self {
+        let mut pane = Self {
             path: path.to_path_buf(),
             display_name: display_name(path),
             buffer,
@@ -124,8 +121,11 @@ impl EditorPane {
             correlation_id: generate_correlation_id(),
             line_ending,
             file_bytes,
-            grid,
-        })
+            grid: CellGrid::new(rows.max(1), cols.max(1)),
+        };
+        pane.repaint_viewport();
+        pane.sync_cursor_into_grid();
+        Ok(pane)
     }
 
     /// Largest allowed `top_line`: keeps at least one buffer line in view.
@@ -133,8 +133,60 @@ impl EditorPane {
         self.buffer.line_count().saturating_sub(1)
     }
 
+    fn repaint_viewport(&mut self) {
+        grid::repaint_all(
+            &mut self.grid,
+            &self.buffer,
+            self.top_line,
+            self.h_offset,
+            self.buffer.selection(),
+        );
+    }
+
+    fn repaint_visible_row(&mut self, line_idx: usize) {
+        if line_idx < self.top_line {
+            return;
+        }
+        let row = line_idx - self.top_line;
+        if row >= self.grid.rows() {
+            return;
+        }
+        let gutter_w = grid::gutter_width(self.buffer.line_count());
+        let selection = self.buffer.selection();
+        grid::paint_row(
+            &mut self.grid,
+            row,
+            line_idx,
+            &self.buffer,
+            self.h_offset,
+            gutter_w,
+            selection,
+        );
+    }
+
+    /// Position the grid cursor at the buffer cursor, hiding it when it
+    /// is scrolled out of the viewport. Inactive panes additionally hide
+    /// it at frame-clone time (main.rs), mirroring terminals.
+    fn sync_cursor_into_grid(&mut self) {
+        let cursor = self.buffer.cursor();
+        let rows = self.grid.rows();
+        let cols = self.grid.cols();
+        let gutter_w = grid::gutter_width(self.buffer.line_count());
+        let char_col = self.buffer.char_col(cursor);
+        let in_vertical = cursor.line >= self.top_line && cursor.line < self.top_line + rows;
+        let visible_col = char_col >= self.h_offset;
+        let cell_col = gutter_w + char_col.saturating_sub(self.h_offset);
+        if in_vertical && visible_col && cell_col < cols {
+            self.grid.set_cursor(cursor.line - self.top_line, cell_col);
+            self.grid.set_cursor_visible(true);
+        } else {
+            self.grid.set_cursor_visible(false);
+        }
+    }
+
     /// Scroll the viewport so `top_line` becomes `target` (clamped).
-    /// Returns `true` when the viewport actually moved.
+    /// Returns `true` when the viewport actually moved. Does not move
+    /// the cursor (wheel scrolling inspects, it doesn't edit).
     pub fn scroll_to(&mut self, target: usize) -> bool {
         let clamped = target.min(self.max_top_line());
         if clamped == self.top_line {
@@ -146,8 +198,10 @@ impl EditorPane {
             self.top_line,
             clamped,
             self.h_offset,
+            self.buffer.selection(),
         );
         self.top_line = clamped;
+        self.sync_cursor_into_grid();
         true
     }
 
@@ -165,8 +219,114 @@ impl EditorPane {
             return;
         }
         self.grid.resize(rows, cols);
-        self.grid.set_cursor_visible(false);
-        grid::repaint_all(&mut self.grid, &self.buffer, self.top_line, self.h_offset);
+        self.repaint_viewport();
+        self.sync_cursor_into_grid();
+    }
+
+    /// Scroll (vertically and horizontally) so the cursor is in view.
+    /// Returns `true` when the whole viewport was repainted.
+    fn ensure_cursor_visible(&mut self) -> bool {
+        let cursor = self.buffer.cursor();
+        let rows = self.grid.rows();
+        let gutter_w = grid::gutter_width(self.buffer.line_count());
+        let content_cols = self.grid.cols().saturating_sub(gutter_w).max(1);
+        let char_col = self.buffer.char_col(cursor);
+
+        let mut new_top = self.top_line.min(self.max_top_line());
+        if cursor.line < new_top {
+            new_top = cursor.line;
+        } else if cursor.line >= new_top + rows {
+            new_top = cursor.line + 1 - rows;
+        }
+
+        let mut new_h = self.h_offset;
+        if char_col < new_h {
+            new_h = char_col;
+        } else if char_col >= new_h + content_cols {
+            new_h = char_col + 1 - content_cols;
+        }
+
+        if new_h != self.h_offset {
+            // Horizontal scroll invalidates every visible row.
+            self.h_offset = new_h;
+            self.top_line = new_top;
+            self.repaint_viewport();
+            return true;
+        }
+        if new_top != self.top_line {
+            grid::scroll_viewport(
+                &mut self.grid,
+                &self.buffer,
+                self.top_line,
+                new_top,
+                self.h_offset,
+                self.buffer.selection(),
+            );
+            self.top_line = new_top;
+        }
+        false
+    }
+
+    /// Run a buffer operation and repaint exactly what it invalidated:
+    /// content damage, selection-span changes, scrolling to keep the
+    /// cursor visible, and the dirty flag. Returns `true` when anything
+    /// changed (callers request a redraw on `true`).
+    pub fn apply<F: FnOnce(&mut EditorBuffer) -> buffer::Damage>(&mut self, op: F) -> bool {
+        let old_cursor = self.buffer.cursor();
+        let old_sel = self.buffer.selection();
+        let old_gutter = grid::gutter_width(self.buffer.line_count());
+
+        let damage = op(&mut self.buffer);
+
+        let new_cursor = self.buffer.cursor();
+        let new_sel = self.buffer.selection();
+        let content_changed = damage != buffer::Damage::None;
+        if content_changed {
+            self.dirty = true;
+        }
+        if !content_changed && new_cursor == old_cursor && new_sel == old_sel {
+            return false;
+        }
+
+        // Deletions can shrink the document above the viewport.
+        self.top_line = self.top_line.min(self.max_top_line());
+
+        let repainted_all = if grid::gutter_width(self.buffer.line_count()) != old_gutter {
+            // Gutter got wider/narrower: every row's layout shifted.
+            self.repaint_viewport();
+            self.ensure_cursor_visible();
+            true
+        } else {
+            self.ensure_cursor_visible()
+        };
+
+        if !repainted_all {
+            let rows = self.grid.rows();
+            let last_visible = self.top_line + rows - 1;
+            match damage {
+                buffer::Damage::From(line) => {
+                    for l in line.max(self.top_line)..=last_visible {
+                        self.repaint_visible_row(l);
+                    }
+                }
+                buffer::Damage::Line(line) => self.repaint_visible_row(line),
+                buffer::Damage::None => {}
+            }
+            // Repaint lines whose selection membership changed. The
+            // union of old and new spans covers grow, shrink, and clear;
+            // an empty clamped range simply doesn't iterate.
+            if old_sel != new_sel {
+                for span in [old_sel, new_sel].into_iter().flatten() {
+                    let first = span.0.line.max(self.top_line);
+                    let last = span.1.line.min(last_visible);
+                    for l in first..=last {
+                        self.repaint_visible_row(l);
+                    }
+                }
+            }
+        }
+        self.sync_cursor_into_grid();
+        true
     }
 }
 
