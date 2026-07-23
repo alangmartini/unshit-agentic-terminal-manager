@@ -161,6 +161,21 @@ pub(crate) fn handle_editor_key(
             let text = insert_text_for(kb)?;
             editor.apply(|b| b.insert_typed(&text))
         }
+        // AltGr arrives as CTRL+ALT on Windows. Only composed text may
+        // insert here — never the bare `Key::Char` fallback, so plain
+        // Ctrl+Alt+<letter> chords stay unconsumed.
+        _ if ctrl && alt => {
+            let printable: String = kb
+                .text
+                .as_ref()?
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            if printable.is_empty() {
+                return None;
+            }
+            editor.apply(|b| b.insert_typed(&printable))
+        }
         _ => return None,
     };
     Some(changed)
@@ -238,7 +253,9 @@ pub(crate) fn handle_editor_mouse_down(
                 && prev.cell == cell
                 && now.duration_since(prev.at).as_millis() <= crate::state::MULTI_CLICK_MS =>
         {
-            prev.count % 3 + 1
+            // Rapid clicks past three stay on line select (VS Code),
+            // unlike the terminal's word/line cycle.
+            (prev.count + 1).min(3)
         }
         _ => 1,
     };
@@ -744,6 +761,50 @@ mod tests {
         assert_eq!(
             handle_editor_key(&mut state, 1, &key_mod(Key::Char('z'), Modifiers::CTRL)),
             Some(false)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn altgr_composed_text_inserts_but_bare_ctrl_alt_chords_do_not() {
+        let (mut state, path) = editor_state();
+        // AltGr on Windows arrives as CTRL+ALT with the composed char in
+        // `text` (US-International AltGr+q = ä).
+        let ev = KeyboardEvent {
+            kind: KeyEventKind::Pressed,
+            key: Key::Char('q'),
+            modifiers: Modifiers::CTRL | Modifiers::ALT,
+            text: Some("ä".to_string()),
+        };
+        assert_eq!(handle_editor_key(&mut state, 1, &ev), Some(true));
+        assert_eq!(
+            state.editors.get(&1).unwrap().buffer.line(0),
+            Some("ähello")
+        );
+        // A Ctrl+Alt chord without composed text must stay unconsumed.
+        let bare = key_mod(Key::Char('q'), Modifiers::CTRL | Modifiers::ALT);
+        assert_eq!(handle_editor_key(&mut state, 1, &bare), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fourth_rapid_click_stays_on_line_select() {
+        let (mut state, path) = editor_state();
+        let gutter = state.editors.get(&1).unwrap().gutter_cells() as isize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..4 {
+            handle_editor_mouse_down(&mut state, 1, 0, gutter + 2, false, t0);
+        }
+        assert_eq!(
+            state
+                .editors
+                .get(&1)
+                .unwrap()
+                .buffer
+                .selected_text()
+                .as_deref(),
+            Some("hello\n"),
+            "clicks past three keep the line selection (VS Code)"
         );
         let _ = std::fs::remove_file(path);
     }

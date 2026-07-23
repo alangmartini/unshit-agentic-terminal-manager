@@ -2078,7 +2078,8 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     };
 
     for id in &pane_ids {
-        if state.editors.remove(id).is_some() {
+        if let Some(editor) = state.editors.remove(id) {
+            record_editor_closed(&editor);
             record_diagnostic_pty_event(state, format!("editor_close pane={} scope=tab", id));
             continue;
         }
@@ -2601,8 +2602,9 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         return;
     };
 
-    if state.editors.remove(&target.0).is_some() {
+    if let Some(editor) = state.editors.remove(&target.0) {
         // Editor pane: no PTY/terminal state to tear down.
+        record_editor_closed(&editor);
         record_diagnostic_pty_event(state, format!("editor_close pane={} scope=pane", target.0));
     } else {
         // Destroy the PTY and terminal.
@@ -3392,7 +3394,8 @@ pub fn mutate_kill_workspace_terminals(state: &mut AppState, ws_idx: usize) {
     }
 
     for id in &pane_ids {
-        if state.editors.remove(id).is_some() {
+        if let Some(editor) = state.editors.remove(id) {
+            record_editor_closed(&editor);
             continue;
         }
         state.pty_manager.destroy(*id);
@@ -3559,7 +3562,13 @@ fn prune_close_layout_to_kept_panes(state: &mut AppState, kept_pane_ids: &BTreeS
 /// state. Helper instead of inline logic so `main::on_close` does not
 /// have to know the toggle keys.
 pub fn resolve_close_action(state: &mut AppState) -> CloseAction {
-    if toggle_on(state, ToggleKey::RememberCloseChoice) {
+    // Editor buffers are not persisted, so any exit drops them. A dirty
+    // editor therefore always forces the prompt — a remembered close
+    // preference must never silently discard unsaved edits (the dialog's
+    // session list shows the ● dirty marker, and Cancel leaves room to
+    // save first).
+    let dirty_editor = state.editors.values().any(|e| e.dirty);
+    if !dirty_editor && toggle_on(state, ToggleKey::RememberCloseChoice) {
         if toggle_on(state, ToggleKey::KillAllOnClose) {
             CloseAction::KillAll
         } else {
@@ -3697,6 +3706,12 @@ fn finalize_close_choice_with(
         // sessions remain alive and will be reattached on the next launch.
         state.terminals.clear();
     }
+    // The process exits after this returns true. Editor buffers are not
+    // persisted, so close out every surviving editor's telemetry chain
+    // here (kill-all has already drained the map).
+    for editor in state.editors.values() {
+        record_editor_closed(editor);
+    }
     true
 }
 
@@ -3711,8 +3726,11 @@ pub fn mutate_kill_all_terminals(state: &mut AppState) {
         state.pty_manager.destroy(*id);
         state.terminals.remove(id);
     }
-    // Every tab is cleared below, so editor panes go with them.
-    state.editors.clear();
+    // Every tab is cleared below, so editor panes go with them; close
+    // out each one's telemetry chain (dirty ones at warn) on the way.
+    for (_, editor) in state.editors.drain() {
+        record_editor_closed(&editor);
+    }
     for ws in state.workspaces.iter_mut() {
         ws.tabs.clear();
         ws.active_tab = 0;
@@ -4727,12 +4745,21 @@ fn dispatch_editor_open_dialog(state: &mut AppState) -> bool {
     }
     let start_dir = active_workspace_cwd(state);
     std::thread::spawn(move || {
+        // Drop guard so a panicking picker cannot leave the one-dialog
+        // latch stuck `true` for the rest of the process.
+        struct DialogOpenGuard;
+        impl Drop for DialogOpenGuard {
+            fn drop(&mut self) {
+                EDITOR_DIALOG_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _latch = DialogOpenGuard;
+
         let mut dialog = rfd::FileDialog::new().set_title("Open file");
         if let Some(dir) = start_dir.filter(|d| d.exists()) {
             dialog = dialog.set_directory(dir);
         }
         let picked = dialog.pick_file();
-        EDITOR_DIALOG_OPEN.store(false, Ordering::SeqCst);
         if let Some(path) = picked {
             {
                 let mut guard = hooks.shared.lock_recover();
@@ -4901,6 +4928,27 @@ pub fn request_close_tab(state: &mut AppState, index: usize) {
     }
     mutate_close_tab(state, index);
     crate::persist::save_workspaces(state);
+}
+
+/// Durably close out an editor pane's lifecycle in the JSONL sink so the
+/// correlation chain (open → saves → close) is replayable from telemetry
+/// alone. `reason: "dirty"` at warn level marks unsaved changes that died
+/// with the pane.
+fn record_editor_closed(editor: &crate::editor::EditorPane) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+
+    let path_str = editor.path.to_string_lossy().into_owned();
+    record_editor_event(&EditorEventRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event: "editor.close",
+        level: if editor.dirty { "warn" } else { "info" },
+        correlation_id: &editor.correlation_id,
+        path: Some(&path_str),
+        file_bytes: Some(editor.file_bytes),
+        line_count: Some(editor.buffer.line_count() as u64),
+        reason: editor.dirty.then_some("dirty"),
+        os_error: None,
+    });
 }
 
 /// Record `editor.close_dirty_discarded` for each pane whose unsaved
@@ -5097,10 +5145,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             else {
                 unreachable!("checked above");
             };
-            // Save every dirty pane in scope first; any failure keeps
-            // everything open (the failure toast explains why) so a
-            // half-saved tab is never silently dropped.
-            let all_saved = pane_ids.iter().all(|&id| save_editor_pane(state, id));
+            // Attempt every save (no short-circuit) so each failure
+            // surfaces its own toast/telemetry, then close only if all
+            // landed — a half-saved tab is never silently dropped.
+            let results: Vec<bool> = pane_ids
+                .iter()
+                .map(|&id| save_editor_pane(state, id))
+                .collect();
+            let all_saved = results.into_iter().all(|saved| saved);
             if all_saved {
                 close_editor_dialog_scope(state, &pane_ids, tab);
             }
@@ -9293,6 +9345,38 @@ mod tests {
         ));
         mutate_kill_all_terminals(&mut state);
         assert!(state.editors.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remembered_close_choice_still_prompts_when_editor_is_dirty() {
+        let mut state = test_state();
+        state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+        state.toggles.insert(ToggleKey::KillAllOnClose, false);
+        let (_pane_id, path) = dirty_editor(&mut state, "quit-dirty");
+        assert_eq!(
+            resolve_close_action(&mut state),
+            CloseAction::Prompt,
+            "a dirty editor must veto the silent remembered close"
+        );
+        assert!(matches!(
+            state.confirm_dialog,
+            Some(ConfirmDialog::CloseApp { .. })
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remembered_close_choice_applies_when_editors_are_clean() {
+        let mut state = test_state();
+        state.toggles.insert(ToggleKey::RememberCloseChoice, true);
+        state.toggles.insert(ToggleKey::KillAllOnClose, false);
+        let path = editor_temp_file("quit-clean", b"alpha");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        assert_eq!(resolve_close_action(&mut state), CloseAction::KeepRunning);
         let _ = std::fs::remove_file(path);
     }
 

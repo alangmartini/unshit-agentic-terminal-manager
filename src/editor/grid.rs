@@ -83,29 +83,40 @@ pub fn paint_row(
         );
     }
 
-    // Content cells, skipping `h_offset` leading characters. Byte
-    // offsets ride along so selection membership is exact.
+    // Content cells from visual column `h_offset` onward. Tabs expand
+    // to their next stop and paint as spaces (selection background
+    // covers the whole span); byte offsets ride along so selection
+    // membership is exact even mid-tab.
     let mut col = gutter_w;
-    for (byte, ch) in line.char_indices().skip(h_offset) {
-        if col >= cols {
-            break;
+    let mut vcol = 0usize;
+    'content: for (byte, ch) in line.char_indices() {
+        let width = super::buffer::char_width_at(ch, vcol);
+        for k in 0..width {
+            if vcol + k < h_offset {
+                continue;
+            }
+            if col >= cols {
+                break 'content;
+            }
+            let bg = if in_selection(selection, line_idx, byte) {
+                SELECTION_BG
+            } else {
+                Color::TRANSPARENT
+            };
+            let display = if ch == '\t' { ' ' } else { ch };
+            grid.set_cell(
+                row,
+                col,
+                Cell {
+                    ch: display,
+                    fg: TEXT_FG,
+                    bg,
+                    ..Default::default()
+                },
+            );
+            col += 1;
         }
-        let bg = if in_selection(selection, line_idx, byte) {
-            SELECTION_BG
-        } else {
-            Color::TRANSPARENT
-        };
-        grid.set_cell(
-            row,
-            col,
-            Cell {
-                ch,
-                fg: TEXT_FG,
-                bg,
-                ..Default::default()
-            },
-        );
-        col += 1;
+        vcol += width;
     }
     // A selection that continues past the end of this line paints one
     // trailing marker cell (the newline), like every code editor.
@@ -288,6 +299,37 @@ mod tests {
         repaint_all(&mut grid, &buffer, 0, 0, None);
         scroll_viewport(&mut grid, &buffer, 0, 50, 0, None);
         assert_eq!(row_text(&grid, 0), " 51 line 50");
+    }
+
+    #[test]
+    fn tabs_expand_to_tab_stops() {
+        let buffer = EditorBuffer::from_text("\tx\nab\tc");
+        let mut grid = CellGrid::new(2, 16);
+        repaint_all(&mut grid, &buffer, 0, 0, None);
+        // gutter "  1 " + tab expands to 4 cells + 'x'.
+        assert_eq!(row_text(&grid, 0), "  1     x");
+        // "ab" then a tab from visual col 2 to the stop at 4, then 'c'.
+        assert_eq!(row_text(&grid, 1), "  2 ab  c");
+    }
+
+    #[test]
+    fn selection_covers_whole_tab_span() {
+        let buffer = EditorBuffer::from_text("\tx");
+        let mut grid = CellGrid::new(1, 16);
+        let sel = Some((Position { line: 0, col: 0 }, Position { line: 0, col: 1 }));
+        repaint_all(&mut grid, &buffer, 0, 0, sel);
+        let gutter_w = gutter_width(1);
+        for k in 0..4 {
+            assert_eq!(
+                grid.get_cell(0, gutter_w + k).unwrap().bg,
+                SELECTION_BG,
+                "cell {k} of the tab span must carry the selection bg"
+            );
+        }
+        assert_eq!(
+            grid.get_cell(0, gutter_w + 4).unwrap().bg,
+            Color::TRANSPARENT
+        );
     }
 
     #[test]

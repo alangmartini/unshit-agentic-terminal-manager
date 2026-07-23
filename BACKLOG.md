@@ -1,5 +1,23 @@
 # Unshit Terminal Manager Backlog
 
+## File editor follow-ups (post-MVP; from the 2026-07 feature review)
+
+- [ ] **Wide-glyph cell mapping** — CJK/emoji glyphs render wide but occupy one
+  editor cell, so cursor/selection drift on such lines. Tab stops are handled;
+  extend `char_width_at` with unicode-width and `wide_continuation` cells.
+- [ ] **Duplicate-open focuses the existing pane** — opening an already-open
+  path today creates a second editor pane; last save silently wins. Focus the
+  existing pane instead, and consider an mtime staleness check before overwrite.
+- [ ] **CloseEditor dialog: store tab id, not index** — `tab: Some(idx)` can
+  close the wrong tab if tab order changes while the dialog is up (consistent
+  with the existing `KillWorkspace { workspace_idx }` pattern, so low risk).
+- [ ] **Terminal AltGr audit** — `terminal/keys.rs` `encode_key` treats CTRL as
+  winning before composed text; if AltGr chars misbehave in terminals too, the
+  editor's fix (composed-text-only insert under CTRL+ALT) is the model.
+- [ ] **CloseApp dialog: name unsaved files** — the dialog is now forced when a
+  dirty editor exists and rows show the ● marker, but a "N files have unsaved
+  changes" blurb + save action would make the data-loss stakes explicit.
+
 ## Product ideas
 
 - [ ] **Learning mode using agent skills**

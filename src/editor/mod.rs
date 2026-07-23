@@ -95,7 +95,8 @@ pub struct EditorPane {
     pub buffer: EditorBuffer,
     /// First buffer line visible at the top of the viewport.
     pub top_line: usize,
-    /// Characters skipped at the left of every line (horizontal scroll).
+    /// Visual columns (tabs expanded) skipped at the left of every line
+    /// (horizontal scroll).
     pub h_offset: usize,
     pub dirty: bool,
     /// Undo-stack identity at the last save (0 = pristine). Comparing
@@ -177,10 +178,10 @@ impl EditorPane {
         let rows = self.grid.rows();
         let cols = self.grid.cols();
         let gutter_w = grid::gutter_width(self.buffer.line_count());
-        let char_col = self.buffer.char_col(cursor);
+        let visual_col = self.buffer.visual_col(cursor);
         let in_vertical = cursor.line >= self.top_line && cursor.line < self.top_line + rows;
-        let visible_col = char_col >= self.h_offset;
-        let cell_col = gutter_w + char_col.saturating_sub(self.h_offset);
+        let visible_col = visual_col >= self.h_offset;
+        let cell_col = gutter_w + visual_col.saturating_sub(self.h_offset);
         if in_vertical && visible_col && cell_col < cols {
             self.grid.set_cursor(cursor.line - self.top_line, cell_col);
             self.grid.set_cursor_visible(true);
@@ -218,8 +219,17 @@ impl EditorPane {
     /// Scroll horizontally by `delta` characters (Shift+wheel). A
     /// changed offset shifts every visible row, so the whole viewport
     /// repaints. Does not move the cursor.
+    ///
+    /// Clamps against the longest *visible* line — O(rows) per tick,
+    /// where a whole-buffer `max_line_chars()` scan would be O(file) on
+    /// a wheel-rate hot path.
     pub fn scroll_h_by(&mut self, delta: isize) -> bool {
-        let max = self.buffer.max_line_chars().saturating_sub(1);
+        let rows = self.grid.rows();
+        let max = (self.top_line..self.top_line + rows)
+            .map(|l| self.buffer.line_visual_width(l))
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
         let target = self.h_offset.saturating_add_signed(delta).min(max);
         if target == self.h_offset {
             return false;
@@ -243,9 +253,7 @@ impl EditorPane {
         let last = self.buffer.line_count() as isize - 1;
         let line = (self.top_line as isize + row).clamp(0, last) as usize;
         let content = (col_cell - self.gutter_cells() as isize).max(0) as usize;
-        let col = self
-            .buffer
-            .col_for_char_index(line, self.h_offset + content);
+        let col = self.buffer.col_for_visual(line, self.h_offset + content);
         Position { line, col }
     }
 
@@ -273,6 +281,11 @@ impl EditorPane {
     /// Save the buffer to its file atomically (sibling temp file +
     /// rename) with the original line endings. A failed write never
     /// touches the destination. Returns the byte count written.
+    ///
+    /// Known limitation: renaming over a symlink replaces the link
+    /// itself with a regular file rather than writing through to its
+    /// target (acceptable for the MVP; symlinked files are rare on
+    /// Windows).
     pub fn save(&mut self) -> std::io::Result<u64> {
         let mut text = self.buffer.to_text();
         if self.line_ending == LineEnding::CrLf {
@@ -313,7 +326,7 @@ impl EditorPane {
         let rows = self.grid.rows();
         let gutter_w = grid::gutter_width(self.buffer.line_count());
         let content_cols = self.grid.cols().saturating_sub(gutter_w).max(1);
-        let char_col = self.buffer.char_col(cursor);
+        let visual_col = self.buffer.visual_col(cursor);
 
         let mut new_top = self.top_line.min(self.max_top_line());
         if cursor.line < new_top {
@@ -323,10 +336,10 @@ impl EditorPane {
         }
 
         let mut new_h = self.h_offset;
-        if char_col < new_h {
-            new_h = char_col;
-        } else if char_col >= new_h + content_cols {
-            new_h = char_col + 1 - content_cols;
+        if visual_col < new_h {
+            new_h = visual_col;
+        } else if visual_col >= new_h + content_cols {
+            new_h = visual_col + 1 - content_cols;
         }
 
         if new_h != self.h_offset {

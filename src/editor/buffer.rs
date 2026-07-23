@@ -12,8 +12,20 @@
 //! word boundaries mirror `unshit-core/src/input.rs` (same-class runs of
 //! word chars `[alphanumeric_]` vs punctuation, whitespace skipped).
 
-/// Spaces inserted for a Tab keypress (MVP: no tab characters).
+/// Spaces inserted for a Tab keypress (MVP: no tab characters), and the
+/// tab-stop interval used to render literal `\t` in loaded files.
 pub const TAB_SPACES: usize = 4;
+
+/// Visual cell width of `ch` when it starts at visual column `col`:
+/// tabs expand to the next [`TAB_SPACES`] stop, everything else is one
+/// cell. (Wide CJK/emoji glyphs are a documented follow-up.)
+pub fn char_width_at(ch: char, col: usize) -> usize {
+    if ch == '\t' {
+        TAB_SPACES - (col % TAB_SPACES)
+    } else {
+        1
+    }
+}
 
 /// Line-ending flavor detected at load time and preserved on save.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,8 +192,9 @@ pub struct EditorBuffer {
     /// Selection anchor; `Some` while a selection is active. The
     /// selection is the ordered span between anchor and cursor.
     anchor: Option<Position>,
-    /// Desired visual column (in chars) preserved across vertical
-    /// movement over short lines. Cleared by any horizontal move/edit.
+    /// Desired visual column (grid cells, tabs expanded) preserved
+    /// across vertical movement over short lines. Cleared by any
+    /// horizontal move/edit.
     sticky_chars: Option<usize>,
     undo: Vec<UndoGroup>,
     redo: Vec<UndoGroup>,
@@ -221,15 +234,6 @@ impl EditorBuffer {
     /// internal form). Callers re-apply the stored `LineEnding` on save.
     pub fn to_text(&self) -> String {
         self.lines.join("\n")
-    }
-
-    /// Longest line length in characters. Used to clamp horizontal scroll.
-    pub fn max_line_chars(&self) -> usize {
-        self.lines
-            .iter()
-            .map(|l| l.chars().count())
-            .max()
-            .unwrap_or(0)
     }
 
     pub fn cursor(&self) -> Position {
@@ -288,20 +292,61 @@ impl EditorBuffer {
         c
     }
 
-    /// Character (not byte) column of a position — the visual cell
-    /// column in a monospace grid before horizontal scroll.
+    /// Character (not byte) column of a position. Note this does NOT
+    /// expand tabs — display mapping uses [`Self::visual_col`].
     pub fn char_col(&self, pos: Position) -> usize {
         self.lines[pos.line][..pos.col].chars().count()
     }
 
     /// Byte offset of the `chars`-th character of `line` (clamped to
-    /// line end). Inverse of `char_col` for cell→byte mapping.
+    /// line end). Inverse of `char_col`.
     pub fn col_for_char_index(&self, line: usize, chars: usize) -> usize {
         let s = &self.lines[line];
         s.char_indices()
             .nth(chars)
             .map(|(b, _)| b)
             .unwrap_or(s.len())
+    }
+
+    /// Visual grid column of `pos` (before horizontal scroll), with tabs
+    /// expanded to their next [`TAB_SPACES`] stop.
+    pub fn visual_col(&self, pos: Position) -> usize {
+        let mut v = 0;
+        for (byte, ch) in self.lines[pos.line].char_indices() {
+            if byte >= pos.col {
+                break;
+            }
+            v += char_width_at(ch, v);
+        }
+        v
+    }
+
+    /// Byte offset of the character rendered at visual column `target`
+    /// of `line` (clamped to line end). Clicks inside a tab's expanded
+    /// span resolve to the tab character itself.
+    pub fn col_for_visual(&self, line: usize, target: usize) -> usize {
+        let s = &self.lines[line];
+        let mut v = 0;
+        for (byte, ch) in s.char_indices() {
+            let width = char_width_at(ch, v);
+            if target < v + width {
+                return byte;
+            }
+            v += width;
+        }
+        s.len()
+    }
+
+    /// Visual width of the whole `line` in grid cells (tabs expanded).
+    /// Out-of-range lines are 0.
+    pub fn line_visual_width(&self, line: usize) -> usize {
+        self.line(line).map_or(0, |s| {
+            let mut v = 0;
+            for ch in s.chars() {
+                v += char_width_at(ch, v);
+            }
+            v
+        })
     }
 
     fn prev_char_col(&self, line: usize, col: usize) -> usize {
@@ -394,7 +439,7 @@ impl EditorBuffer {
         self.begin_move(extend);
         let sticky = self
             .sticky_chars
-            .unwrap_or_else(|| self.char_col(self.cursor));
+            .unwrap_or_else(|| self.visual_col(self.cursor));
         self.sticky_chars = Some(sticky);
         let target_line = self
             .cursor
@@ -412,7 +457,7 @@ impl EditorBuffer {
             return;
         }
         self.cursor.line = target_line;
-        self.cursor.col = self.col_for_char_index(target_line, sticky);
+        self.cursor.col = self.col_for_visual(target_line, sticky);
     }
 
     pub fn move_up(&mut self, extend: bool) {
@@ -883,11 +928,6 @@ mod tests {
         assert_eq!(LineEnding::detect("a\r\nb"), LineEnding::CrLf);
         assert_eq!(LineEnding::detect("a\nb"), LineEnding::Lf);
         assert_eq!(LineEnding::detect("plain"), LineEnding::Lf);
-    }
-
-    #[test]
-    fn max_line_chars_counts_chars_not_bytes() {
-        assert_eq!(buf("ééé\nab").max_line_chars(), 3);
     }
 
     // -- insertion ----------------------------------------------------------
@@ -1382,6 +1422,40 @@ mod tests {
         assert_eq!(b.col_for_char_index(0, 1), 1);
         assert_eq!(b.col_for_char_index(0, 2), 5);
         assert_eq!(b.char_col(Position { line: 0, col: 5 }), 2);
+    }
+
+    // -- tab expansion ------------------------------------------------------
+
+    #[test]
+    fn visual_col_and_inverse_expand_tabs_to_stops() {
+        let b = buf("a\tb");
+        assert_eq!(b.visual_col(Position { line: 0, col: 0 }), 0);
+        assert_eq!(b.visual_col(Position { line: 0, col: 1 }), 1);
+        // The tab at visual col 1 expands to the stop at 4.
+        assert_eq!(b.visual_col(Position { line: 0, col: 2 }), 4);
+        assert_eq!(b.visual_col(Position { line: 0, col: 3 }), 5);
+        // Clicks anywhere inside the tab span resolve to the tab char.
+        assert_eq!(b.col_for_visual(0, 1), 1);
+        assert_eq!(b.col_for_visual(0, 3), 1);
+        assert_eq!(b.col_for_visual(0, 4), 2);
+        assert_eq!(b.col_for_visual(0, 99), 3);
+        assert_eq!(b.line_visual_width(0), 5);
+        assert_eq!(b.line_visual_width(7), 0);
+    }
+
+    #[test]
+    fn vertical_sticky_column_is_visual_across_tabbed_lines() {
+        // Line 0: "\tx" (x at visual 4); line 1: "abcdefgh".
+        let mut b = buf("\tx\nabcdefgh");
+        b.set_cursor(Position { line: 0, col: 1 }, false); // before x, visual 4
+        b.move_down(false);
+        assert_eq!(
+            b.cursor(),
+            Position { line: 1, col: 4 },
+            "lands at visual 4"
+        );
+        b.move_up(false);
+        assert_eq!(b.cursor(), Position { line: 0, col: 1 }, "returns before x");
     }
 
     // -- damage -------------------------------------------------------------
