@@ -367,36 +367,21 @@ pub fn build_editor_pane_body(
                     return None;
                 };
                 // Shift+wheel scrolls horizontally (VS Code / xterm
-                // convention), in character steps against the cell width.
-                if se.modifiers.contains(Modifiers::SHIFT) {
-                    let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w().max(1.0);
-                    let chars = (se.delta_y / cell_w).round() as isize;
-                    let grid = mutate_with(&scroll_shared, |st| {
-                        let editor = st.editors.get_mut(&scroll_pane.0)?;
-                        let step = if chars == 0 {
-                            if se.delta_y > 0.0 {
-                                -1
-                            } else if se.delta_y < 0.0 {
-                                1
-                            } else {
-                                return None;
-                            }
-                        } else {
-                            -chars
-                        };
-                        editor.scroll_h_by(step).then(|| editor.grid.clone())
-                    });
-                    return Some(Box::new(unshit::app::app::ScrollGridPatch {
-                        grid,
-                        animation: None,
-                    }));
+                // convention) in character steps against the cell width;
+                // plain wheel scrolls whole lines against the cell
+                // height. delta_y > 0 is wheel up (toward the top of
+                // the file / start of the line).
+                let horizontal = se.modifiers.contains(Modifiers::SHIFT);
+                let cell = if horizontal {
+                    unshit::core::cell_grid::CellGrid::global_cell_w()
+                } else {
+                    unshit::core::cell_grid::CellGrid::global_cell_h()
                 }
-                let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h().max(1.0);
-                // delta_y > 0 is wheel up (toward the top of the file).
-                let lines = (se.delta_y / cell_h).round() as isize;
+                .max(1.0);
+                let units = (se.delta_y / cell).round() as isize;
                 let grid = mutate_with(&scroll_shared, |st| {
                     let editor = st.editors.get_mut(&scroll_pane.0)?;
-                    let step = if lines == 0 {
+                    let step = if units == 0 {
                         if se.delta_y > 0.0 {
                             -1
                         } else if se.delta_y < 0.0 {
@@ -405,9 +390,14 @@ pub fn build_editor_pane_body(
                             return None;
                         }
                     } else {
-                        -lines
+                        -units
                     };
-                    editor.scroll_by(step).then(|| editor.grid.clone())
+                    let moved = if horizontal {
+                        editor.scroll_h_by(step)
+                    } else {
+                        editor.scroll_by(step)
+                    };
+                    moved.then(|| editor.grid.clone())
                 });
                 Some(Box::new(unshit::app::app::ScrollGridPatch {
                     grid,

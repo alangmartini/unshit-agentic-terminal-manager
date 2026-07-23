@@ -2057,25 +2057,24 @@ fn mutate_add_tab_respecting_mode(state: &mut AppState) {
     }
 }
 
+/// Pane IDs of the tab at `index`: live fields for the active tab,
+/// stored fields for a background tab.
+fn tab_pane_ids(state: &AppState, index: usize) -> Vec<u32> {
+    let panes = if index == state.active_tab {
+        &state.panes
+    } else {
+        &state.tabs[index].panes
+    };
+    panes.iter().flatten().map(|p| p.id.0).collect()
+}
+
 pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     if index >= state.tabs.len() {
         return;
     }
 
     let is_active = state.active_tab == index;
-
-    // Collect pane IDs to destroy: live fields for the active tab,
-    // stored fields for a background tab.
-    let pane_ids: Vec<u32> = if is_active {
-        state.panes.iter().flatten().map(|p| p.id.0).collect()
-    } else {
-        state.tabs[index]
-            .panes
-            .iter()
-            .flatten()
-            .map(|p| p.id.0)
-            .collect()
-    };
+    let pane_ids = tab_pane_ids(state, index);
 
     for id in &pane_ids {
         if let Some(editor) = state.editors.remove(id) {
@@ -4771,31 +4770,46 @@ fn dispatch_editor_open_dialog(state: &mut AppState) -> bool {
     true
 }
 
+/// Emit one editor lifecycle event carrying the pane's correlation id,
+/// path, and current size — the shared shape of every `editor.*` event
+/// except io failures (which add `os_error` and drop the size fields).
+fn record_editor_pane_event(
+    editor: &crate::editor::EditorPane,
+    event: &'static str,
+    level: &'static str,
+    reason: Option<&'static str>,
+) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+
+    let path_str = editor.path.to_string_lossy().into_owned();
+    record_editor_event(&EditorEventRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event,
+        level,
+        correlation_id: &editor.correlation_id,
+        path: Some(&path_str),
+        file_bytes: Some(editor.file_bytes),
+        line_count: Some(editor.buffer.line_count() as u64),
+        reason,
+        os_error: None,
+    });
+}
+
 /// Save one editor pane to disk with telemetry and a failure toast.
 /// Returns `true` when the save succeeded, `false` on failure or when
 /// `pane_id` is not an editor pane.
 pub fn save_editor_pane(state: &mut AppState, pane_id: u32) -> bool {
     use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
 
-    let Some(editor) = state.editors.get_mut(&pane_id) else {
-        return false;
+    let save_result = match state.editors.get_mut(&pane_id) {
+        Some(editor) => editor.save(),
+        None => return false,
     };
-    let path_str = editor.path.to_string_lossy().into_owned();
-    let correlation_id = editor.correlation_id.clone();
-    let saved = match editor.save() {
+    let saved = match save_result {
         Ok(bytes) => {
-            let line_count = editor.buffer.line_count() as u64;
-            record_editor_event(&EditorEventRecord {
-                timestamp_unix_ms: now_unix_ms(),
-                event: "editor.save",
-                level: "info",
-                correlation_id: &correlation_id,
-                path: Some(&path_str),
-                file_bytes: Some(bytes),
-                line_count: Some(line_count),
-                reason: None,
-                os_error: None,
-            });
+            // `save()` refreshed `file_bytes`, so the shared record
+            // carries the just-written size.
+            record_editor_pane_event(&state.editors[&pane_id], "editor.save", "info", None);
             record_diagnostic_pty_event(
                 state,
                 format!("editor_save pane={} bytes={}", pane_id, bytes),
@@ -4803,11 +4817,13 @@ pub fn save_editor_pane(state: &mut AppState, pane_id: u32) -> bool {
             true
         }
         Err(e) => {
+            let editor = &state.editors[&pane_id];
+            let path_str = editor.path.to_string_lossy().into_owned();
             record_editor_event(&EditorEventRecord {
                 timestamp_unix_ms: now_unix_ms(),
                 event: "editor.save_failed",
                 level: "error",
-                correlation_id: &correlation_id,
+                correlation_id: &editor.correlation_id,
                 path: Some(&path_str),
                 file_bytes: None,
                 line_count: None,
@@ -4841,17 +4857,13 @@ fn dispatch_editor_save(state: &mut AppState) -> bool {
 
 /// Dirty editor panes among `pane_ids`, with their display names.
 fn dirty_editor_panes(state: &AppState, pane_ids: &[u32]) -> (Vec<u32>, Vec<String>) {
-    let mut ids = Vec::new();
-    let mut names = Vec::new();
-    for id in pane_ids {
-        if let Some(editor) = state.editors.get(id) {
-            if editor.dirty {
-                ids.push(*id);
-                names.push(editor.display_name.clone());
-            }
-        }
-    }
-    (ids, names)
+    pane_ids
+        .iter()
+        .filter_map(|id| {
+            let editor = state.editors.get(id)?;
+            editor.dirty.then(|| (*id, editor.display_name.clone()))
+        })
+        .unzip()
 }
 
 /// Open the unsaved-changes prompt for `pane_ids` and emit one
@@ -4862,24 +4874,11 @@ fn open_close_editor_dialog(
     names: Vec<String>,
     tab: Option<usize>,
 ) {
-    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
-
     for id in &pane_ids {
         let Some(editor) = state.editors.get(id) else {
             continue;
         };
-        let path_str = editor.path.to_string_lossy().into_owned();
-        record_editor_event(&EditorEventRecord {
-            timestamp_unix_ms: now_unix_ms(),
-            event: "editor.close_dirty_prompt",
-            level: "info",
-            correlation_id: &editor.correlation_id,
-            path: Some(&path_str),
-            file_bytes: Some(editor.file_bytes),
-            line_count: Some(editor.buffer.line_count() as u64),
-            reason: None,
-            os_error: None,
-        });
+        record_editor_pane_event(editor, "editor.close_dirty_prompt", "info", None);
         record_diagnostic_pty_event(state, format!("editor_close_dirty_prompt pane={}", id));
     }
     state.confirm_dialog = Some(ConfirmDialog::CloseEditor {
@@ -4893,12 +4892,10 @@ fn open_close_editor_dialog(
 /// which case the save/discard/cancel prompt opens instead. Every user
 /// facing pane-close path funnels through here.
 pub fn request_close_pane(state: &mut AppState, target: PaneId) {
-    if let Some(editor) = state.editors.get(&target.0) {
-        if editor.dirty {
-            let names = vec![editor.display_name.clone()];
-            open_close_editor_dialog(state, vec![target.0], names, None);
-            return;
-        }
+    let (dirty_ids, names) = dirty_editor_panes(state, &[target.0]);
+    if !dirty_ids.is_empty() {
+        open_close_editor_dialog(state, dirty_ids, names, None);
+        return;
     }
     mutate_close_pane(state, target);
     crate::persist::save_workspaces(state);
@@ -4911,16 +4908,7 @@ pub fn request_close_tab(state: &mut AppState, index: usize) {
     if index >= state.tabs.len() {
         return;
     }
-    let pane_ids: Vec<u32> = if index == state.active_tab {
-        state.panes.iter().flatten().map(|p| p.id.0).collect()
-    } else {
-        state.tabs[index]
-            .panes
-            .iter()
-            .flatten()
-            .map(|p| p.id.0)
-            .collect()
-    };
+    let pane_ids = tab_pane_ids(state, index);
     let (dirty_ids, names) = dirty_editor_panes(state, &pane_ids);
     if !dirty_ids.is_empty() {
         open_close_editor_dialog(state, dirty_ids, names, Some(index));
@@ -4935,45 +4923,40 @@ pub fn request_close_tab(state: &mut AppState, index: usize) {
 /// alone. `reason: "dirty"` at warn level marks unsaved changes that died
 /// with the pane.
 fn record_editor_closed(editor: &crate::editor::EditorPane) {
-    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
-
-    let path_str = editor.path.to_string_lossy().into_owned();
-    record_editor_event(&EditorEventRecord {
-        timestamp_unix_ms: now_unix_ms(),
-        event: "editor.close",
-        level: if editor.dirty { "warn" } else { "info" },
-        correlation_id: &editor.correlation_id,
-        path: Some(&path_str),
-        file_bytes: Some(editor.file_bytes),
-        line_count: Some(editor.buffer.line_count() as u64),
-        reason: editor.dirty.then_some("dirty"),
-        os_error: None,
-    });
+    let level = if editor.dirty { "warn" } else { "info" };
+    record_editor_pane_event(
+        editor,
+        "editor.close",
+        level,
+        editor.dirty.then_some("dirty"),
+    );
 }
 
 /// Record `editor.close_dirty_discarded` for each pane whose unsaved
 /// buffer the user chose to drop. Must run before the close mutation
 /// while the panes (and their correlation ids) still exist.
 fn record_editor_discard(state: &mut AppState, pane_ids: &[u32]) {
-    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
-
     for id in pane_ids {
         let Some(editor) = state.editors.get(id) else {
             continue;
         };
-        let path_str = editor.path.to_string_lossy().into_owned();
-        record_editor_event(&EditorEventRecord {
-            timestamp_unix_ms: now_unix_ms(),
-            event: "editor.close_dirty_discarded",
-            level: "warn",
-            correlation_id: &editor.correlation_id,
-            path: Some(&path_str),
-            file_bytes: Some(editor.file_bytes),
-            line_count: Some(editor.buffer.line_count() as u64),
-            reason: None,
-            os_error: None,
-        });
+        record_editor_pane_event(editor, "editor.close_dirty_discarded", "warn", None);
         record_diagnostic_pty_event(state, format!("editor_close_dirty_discarded pane={}", id));
+    }
+}
+
+/// Take the active `CloseEditor` dialog, or `None` when a different
+/// (or no) dialog is up — never drops another dialog on the floor.
+fn take_close_editor_dialog(state: &mut AppState) -> Option<(Vec<u32>, Option<usize>)> {
+    if !matches!(
+        state.confirm_dialog,
+        Some(ConfirmDialog::CloseEditor { .. })
+    ) {
+        return None;
+    }
+    match state.confirm_dialog.take() {
+        Some(ConfirmDialog::CloseEditor { pane_ids, tab, .. }) => Some((pane_ids, tab)),
+        _ => unreachable!("checked above"),
     }
 }
 
@@ -5134,16 +5117,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
         }
         "dialog.editor_save_close" => {
-            if !matches!(
-                state.confirm_dialog,
-                Some(ConfirmDialog::CloseEditor { .. })
-            ) {
+            let Some((pane_ids, tab)) = take_close_editor_dialog(state) else {
                 return false;
-            }
-            let Some(ConfirmDialog::CloseEditor { pane_ids, tab, .. }) =
-                state.confirm_dialog.take()
-            else {
-                unreachable!("checked above");
             };
             // Attempt every save (no short-circuit) so each failure
             // surfaces its own toast/telemetry, then close only if all
@@ -5159,16 +5134,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             true
         }
         "dialog.editor_discard_close" => {
-            if !matches!(
-                state.confirm_dialog,
-                Some(ConfirmDialog::CloseEditor { .. })
-            ) {
+            let Some((pane_ids, tab)) = take_close_editor_dialog(state) else {
                 return false;
-            }
-            let Some(ConfirmDialog::CloseEditor { pane_ids, tab, .. }) =
-                state.confirm_dialog.take()
-            else {
-                unreachable!("checked above");
             };
             // The one deliberate data-loss action in the editor: record
             // it durably (warn) before the panes and their buffers go.
