@@ -748,6 +748,60 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn ctrl_s_through_capture_handler_saves_to_disk() {
+        let (mut state, path) = editor_state();
+        // The save dispatch targets the active pane; seed both.
+        state.active_pane = PaneId(1);
+        state.panes[0][0].id = PaneId(1);
+        handle_editor_key(&mut state, 1, &char_key('!'));
+        assert!(state.editors[&1].dirty);
+        let ev = key_mod(Key::Char('s'), Modifiers::CTRL);
+        assert_eq!(handle_editor_key(&mut state, 1, &ev), Some(true));
+        assert!(!state.editors[&1].dirty);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "!hello\nworld");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn vertical_wheel_returns_patch_and_scrolls_viewport() {
+        use unshit::core::cell_grid::CellGrid;
+        let path =
+            std::env::temp_dir().join(format!("tm-editor-vwheel-{}.txt", std::process::id()));
+        let text: Vec<String> = (0..40).map(|i| format!("l{}", i)).collect();
+        std::fs::write(&path, text.join("\n")).expect("write temp file");
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        let shared: SharedState = {
+            let mut state = seed_state();
+            let editor = crate::editor::EditorPane::open(&path, 10, 40).expect("open editor");
+            state.editors.insert(1, editor);
+            Arc::new(Mutex::new(state))
+        };
+        let grids = grids_for(&shared);
+        let el = build_editor_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let handler = el.children[0]
+            .handlers
+            .iter()
+            .find(|(et, _)| *et == EventType::Scroll)
+            .map(|(_, h)| h.clone())
+            .expect("Scroll handler must be present");
+        // Wheel down two notches (delta_y = -2 cells): scrolls forward.
+        let ev = Event::Scroll(unshit::core::event::ScrollEvent {
+            delta_x: 0.0,
+            delta_y: -40.0,
+            x: 0.0,
+            y: 0.0,
+            ..Default::default()
+        });
+        let patch = (handler)(&ev)
+            .expect("handler must return a patch")
+            .downcast::<unshit::app::app::ScrollGridPatch>()
+            .expect("must be a ScrollGridPatch");
+        assert!(patch.grid.is_some());
+        assert_eq!(shared.lock().unwrap().editors.get(&1).unwrap().top_line, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
     // -- mouse handling -----------------------------------------------------
 
     #[test]

@@ -1351,6 +1351,39 @@ mod tests {
         assert_eq!(b.to_text(), "");
     }
 
+    // -- astral-plane UTF-8 (emoji) -----------------------------------------
+
+    #[test]
+    fn emoji_never_split_by_movement_or_deletion() {
+        let mut b = buf("a🦀b");
+        // Right steps over the whole 4-byte crab in one move.
+        b.move_right(false);
+        assert_eq!(b.cursor().col, 1);
+        b.move_right(false);
+        assert_eq!(b.cursor().col, 5);
+        // Backspace removes the whole emoji, not one byte of it.
+        b.backspace(false);
+        assert_eq!(b.to_text(), "ab");
+        // Insert restores it and delete-forward removes it whole.
+        b.insert_char('🦀');
+        assert_eq!(b.to_text(), "a🦀b");
+        b.move_left(false);
+        b.delete_forward(false);
+        assert_eq!(b.to_text(), "ab");
+    }
+
+    #[test]
+    fn emoji_selection_slice_and_cell_mapping_stay_on_boundaries() {
+        let mut b = buf("x😀y\nz");
+        b.set_cursor(Position { line: 0, col: 1 }, false);
+        b.move_right(true);
+        assert_eq!(b.selected_text().as_deref(), Some("😀"));
+        // Cell→byte mapping snaps to char boundaries.
+        assert_eq!(b.col_for_char_index(0, 1), 1);
+        assert_eq!(b.col_for_char_index(0, 2), 5);
+        assert_eq!(b.char_col(Position { line: 0, col: 5 }), 2);
+    }
+
     // -- damage -------------------------------------------------------------
 
     #[test]
