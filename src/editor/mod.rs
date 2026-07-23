@@ -80,8 +80,12 @@ pub fn load_file(path: &Path) -> Result<(EditorBuffer, LineEnding, u64), OpenErr
     let bytes = std::fs::read(path).map_err(OpenError::Io)?;
     let text = String::from_utf8(bytes).map_err(|_| OpenError::InvalidUtf8)?;
     let line_ending = LineEnding::detect(&text);
-    let normalized = if line_ending == LineEnding::CrLf {
-        text.replace("\r\n", "\n")
+    // Normalize CRLF pairs first, then any stray bare CR (classic-Mac
+    // or mixed files) so no line ever carries a literal `\r` — the
+    // buffer invariant every consumer relies on. Bare CRs become line
+    // breaks, matching VS Code and the typed/paste insert path.
+    let normalized = if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
     } else {
         text
     };
@@ -461,6 +465,32 @@ mod tests {
         assert_eq!(pane.line_ending, LineEnding::CrLf);
         assert_eq!(pane.buffer.line(0), Some("alpha"));
         assert_eq!(pane.buffer.line(1), Some("beta"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_normalizes_lone_cr_line_endings() {
+        // Classic-Mac file: bare CR separators, no LF anywhere.
+        let path = temp_file(b"alpha\rbeta");
+        let pane = EditorPane::open(&path, 10, 40).expect("open");
+        assert_eq!(pane.buffer.line(0), Some("alpha"));
+        assert_eq!(pane.buffer.line(1), Some("beta"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_normalizes_stray_cr_in_crlf_file() {
+        // Mixed endings: CRLF-dominant with one bare CR. No line may
+        // keep a literal \r (the buffer invariant every consumer
+        // relies on).
+        let path = temp_file(b"a\r\nb\rc");
+        let pane = EditorPane::open(&path, 10, 40).expect("open");
+        assert_eq!(pane.line_ending, LineEnding::CrLf);
+        for i in 0..pane.buffer.line_count() {
+            let line = pane.buffer.line(i).unwrap();
+            assert!(!line.contains('\r'), "line {i} kept a \\r: {line:?}");
+        }
+        assert_eq!(pane.buffer.line_count(), 3);
         let _ = std::fs::remove_file(path);
     }
 
