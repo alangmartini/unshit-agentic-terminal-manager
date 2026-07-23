@@ -1,255 +1,107 @@
-# Implementation Plan: Command Palette Redesign
+# Plan: Built-in File Editor (MVP)
 
-## Overview
-Replace the current minimal command palette with the downloaded handoff design and full typed-mode behavior. The production palette must use real application state only: safe commands are executable, navigation rows come from real workspaces/tabs/panes, agent and scrollback modes show honest empty states unless real data is available.
+Spec: `SPEC.md` (file editor). Recon facts baked in: `CellGrid` is the render
+primitive (virtualization + line cache solved); `Pane` has no content type — editor
+uses an `editors: HashMap<u32, EditorPane>` side map mirroring `terminals`; multi-line
+editing is app-owned via `KeyboardCapture` like the terminal pane.
 
-## Architecture Decisions
-- Create a neutral palette model module (`src/command_palette.rs`) for parsing, fuzzy ranking, safe action descriptors, real-state result projection, and execution IDs. This keeps `state.rs` from depending on `src/ui/*`.
-- Keep the visual renderer in `src/ui/command_palette.rs`. It should render grouped result views from the model and dispatch stable IDs through `state::dispatch`.
-- Store only volatile interaction state in `AppState`: open flag, query, active flattened index. Mode is derived from the query prefix.
-- Route safe commands through existing dispatch arms (`session.rename_active`, `pane.split_right`, `pane.split_down`, `tab.new`, `pane.close`, `sidebar.toggle`, `modal.open`).
-- Do not introduce fake agents, fake worktrees, or fake scrollback rows. Empty states are explicit product behavior for unavailable data.
-- Change editable command-palette default to `Ctrl+Shift+P`. Keep `Ctrl+K` only as a non-conflicting compatibility alias.
+## Dependency graph
 
-## Dependency Graph
-```text
-KeybindAction default + shortcut registry
-    -> startup shortcut registration
-    -> settings effective keybind display
-
-Palette model (modes, fuzzy, result groups, item ids)
-    -> AppState palette selection/execution dispatch
-    -> UI grouped list, preview, footer, empty states
-
-AppState real workspace/tab/pane snapshot
-    -> navigation/session rows
-    -> terminal.focus/workspace.switch execution
-
-Framework keyboard event behavior
-    -> ArrowUp/ArrowDown while palette input focused
-    -> palette select prev/next dispatch
-
-CSS handoff shell
-    -> UI element classes
-    -> visual verification
+```
+buffer.rs (pure, no deps)
+   ├─> editor/mod.rs (EditorPane: open/save, dirty, viewport)
+   │      ├─> state.rs (editors map, dispatch arms, guards)
+   │      │      ├─> ui/editor_pane.rs (grid publication + keyboard capture)
+   │      │      │      ├─> mouse handling
+   │      │      │      └─> main.rs grid publication + resize-guard wiring
+   │      │      ├─> keybinds + command palette entries
+   │      │      └─> close-dirty dialog
+   │      └─> editor/telemetry.rs (sink; events emitted from open/save/close)
+   └─> undo/redo + clipboard ops (buffer-internal)
 ```
 
-Implementation order follows the graph: model first, then state execution, then keyboard, then UI/rendering, then visual polish.
+Structural risk is concentrated in the state.rs seam (side map + guards at
+terminal-assuming call sites) and the main.rs grid-publication/resize loop. Slice 1
+retires that risk with the smallest possible feature (read-only viewer).
 
-## Task List
+## Slices (vertical — each lands complete with tests)
 
-### Phase 1: Palette Model And Editable Default
+### S1 — Read-only file viewer pane (structural seam)
+Open a file into a scrollable, read-only editor pane in a new tab.
+- `src/editor/mod.rs`: `EditorPane { id, path, buffer, top_line, h_offset, dirty=false,
+  correlation_id, line_ending }`; `open_file(path)` with UTF-8/16 MiB refusal.
+- `src/editor/buffer.rs`: just the storage type + line access (editing ops come in S2).
+- `state.rs`: `editors` map; `editor.open:<path>` dispatch arm → new tab + pane +
+  entry in `editors`; notification on refusal.
+- `src/editor/grid.rs`: viewport window (+overscan) → `CellGrid` with gutter,
+  stable `line_id`s.
+- `src/ui/editor_pane.rs`: pane body with grid, `captures_keyboard(true)`,
+  handler supporting only scroll keys (arrows/PageUp/Down/Ctrl+Home/End move viewport)
+  + wheel scroll.
+- `main.rs`: publish editor grids per frame alongside terminal grids; resize-poll loop
+  skips editor panes (no PTY resize).
+- Guards (minimum viable set): `pane.close`, resize path, copy path no-op safely.
+- Telemetry: sink skeleton + `editor.open` / `editor.open_failed`.
+- **Acceptance**: dispatch test opens temp file → tab exists, grid renders expected
+  cells; oversized/invalid-UTF-8 refused with notification; UI test: grid publishes
+  viewport only, stable line_ids across scroll; terminal panes untouched (existing
+  tests green).
+- **Verify**: `cargo test -p terminal-manager editor`, full `cargo test`, fmt, clippy.
 
-## Task 1: Add Palette Result Model
+**CHECKPOINT A**: structural seam proven. Manual launch (isolation profile): open
+`src/state.rs`, scroll fast; terminals still work. Screenshot for UI verification.
 
-**Description:** Create the shared palette model and pure helpers for mode parsing, fuzzy scoring, grouped result construction, and safe action descriptors. Initial real data includes safe actions, workspaces, tabs, panes, and sessions from `UiSnapshot`; agents and scrollback return mode-aware empty groups when unavailable.
+### S2 — Core editing
+- `buffer.rs`: insert char/str, newline, backspace/delete (+Ctrl word variants),
+  movement (arrows/Home/End/Ctrl+arrows/Ctrl+Home/End/PageUp/Down), sticky column,
+  selection (Shift-extend, replace-on-type, Ctrl+A), damage ranges. Multi-byte safe.
+- `ui/editor_pane.rs`: full `KeyboardCapture` translation; don't swallow registered
+  app shortcuts; cursor via `set_cursor`; selection bg rendering; cursor kept in view
+  (auto-scroll vertical + horizontal).
+- Dirty flag + `●` title marker.
+- **Acceptance**: buffer unit tests (the bulk — edits, movement, selection, UTF-8,
+  sticky column); UI test: synthetic "abc" keystrokes appear in grid cells.
 
-**Acceptance criteria:**
-- [ ] `parse_palette_query` maps no prefix, `>`, `@`, `:`, and `/` to the correct mode and stripped query.
-- [ ] Fuzzy matcher supports subsequence matching with contiguous and word-boundary score boosts.
-- [ ] Safe actions list includes exactly rename, split right, split down, new terminal, close pane, toggle sidebar, and open settings.
-- [ ] Result builder emits real navigation/session rows from `UiSnapshot` and no prototype fake rows.
+### S3 — Clipboard + undo/redo
+- Ctrl+C/X/V through the existing clipboard path (multi-line paste); Ctrl+Z/Y/
+  Ctrl+Shift+Z with VS Code-like grouping (typing runs; break on jump/kind/save).
+- **Acceptance**: buffer tests for grouping, cursor restore, redo-clear-on-edit,
+  multi-line clipboard slices; capture-handler tests for the combos.
 
-**Verification:**
-- [ ] Focused tests pass: `cargo test -p terminal-manager command_palette`
-- [ ] Compile check through focused test command.
+### S4 — Save + open UX (keybinds, palette, dialog)
+- Atomic save (temp + rename), preserve CRLF, clear dirty, failure → notification +
+  keep dirty. `editor.save` dispatch.
+- `editor.open` arm → `rfd` dialog (off the render path).
+- `KeybindAction::{OpenFile, EditorSave}` (defaults: Ctrl+O / Ctrl+S if free in
+  registry; capture handler routes Ctrl+S when editor focused), palette actions added
+  to safe-dispatch allowlist.
+- Telemetry: `editor.save` / `editor.save_failed`.
+- **Acceptance**: dispatch tests save/failure/CRLF round-trip; keybind parity test
+  green; palette lists the actions.
 
-**Dependencies:** None
+**CHECKPOINT B**: core loop complete (open→edit→save). Full test suite + fmt +
+clippy. Manual: edit+save a real file, verify on disk; split editor next to terminal.
 
-**Files likely touched:**
-- `src/command_palette.rs`
-- `src/main.rs`
+### S5 — Mouse
+- Click places cursor (gutter click selects line), drag selects, double-click selects
+  word, wheel vertical, Shift+wheel horizontal.
+- **Acceptance**: UI tests for click→cursor mapping and drag selection.
 
-**Estimated scope:** Small
+### S6 — Lifecycle polish + full guard audit
+- Close-dirty confirm dialog (save/discard/cancel) via existing dialog mechanism;
+  clean close just closes. Editor panes dropped cleanly on restart (no persistence).
+- Audit ALL terminal-assuming call sites for the active pane (state.rs:5482, 5872,
+  6014, 7115 et al.) — guard each; dispatch tests prove terminal-only commands no-op
+  on editor panes.
+- Telemetry: `editor.close_dirty_prompt`; diagnostics events for open/save/close via
+  `DiagnosticEventStore`.
+- **Acceptance**: dialog state tests; guard tests; privacy test (no file content in
+  sink, mirroring `renderer_telemetry.rs:93`).
 
-## Task 2: Make Ctrl+Shift+P The Editable Default
+**CHECKPOINT C (final)**: full gates — fmt, clippy `-D warnings`, full test suite,
+manual smoke (isolation profile) + screenshot, telemetry file inspected for expected
+events. Changelog fragment written.
 
-**Description:** Change the command palette default keybind from `Ctrl+K` to `Ctrl+Shift+P`, keep settings editability through existing keybind state, and preserve `Ctrl+K` as an alias only if it does not create duplicate registered combos.
-
-**Acceptance criteria:**
-- [ ] `KeybindAction::CommandPalette.default_combo_str()` returns `Ctrl+Shift+P`.
-- [ ] Settings keybind state resolves command palette to `Ctrl+Shift+P` when no override exists.
-- [ ] Shortcut registry registers `Ctrl+Shift+P -> palette.toggle`.
-- [ ] `Ctrl+K` remains registered as `palette.toggle` compatibility alias and does not duplicate the editable default.
-
-**Verification:**
-- [ ] Focused tests pass: `cargo test -p terminal-manager keybind`
-
-**Dependencies:** None
-
-**Files likely touched:**
-- `src/keybinds/mod.rs`
-- `src/keybinds/registry.rs`
-- `src/keybinds/state.rs`
-
-**Estimated scope:** Small
-
-### Checkpoint: Foundation
-- [ ] `cargo test -p terminal-manager command_palette`
-- [ ] `cargo test -p terminal-manager keybind`
-- [ ] No app implementation rows use prototype data.
-
-### Phase 2: Executable Palette Behavior
-
-## Task 3: Add Palette State Selection And Safe Execution
-
-**Description:** Extend palette state handling with active index selection, query reset rules, escape behavior, and execution of all safe action IDs plus real navigation IDs. Keep execution centralized in `state::dispatch`.
-
-**Acceptance criteria:**
-- [ ] Opening palette clears query and active selection.
-- [ ] Closing palette clears query and active selection.
-- [ ] Query updates reset active selection to zero.
-- [ ] `palette.select_next` and `palette.select_prev` wrap across flattened current results.
-- [ ] `palette.escape` clears query first and closes on second escape.
-- [ ] `palette.execute_active` executes the active result when present.
-- [ ] `palette.execute:<id>` dispatches the correct safe command or real navigation command, closes palette only on handled execution, and refuses unknown/destructive IDs.
-
-**Verification:**
-- [ ] Focused tests pass: `cargo test -p terminal-manager palette`
-- [ ] Existing state dispatch tests still pass: `cargo test -p terminal-manager state::tests::dispatch_palette`
-
-**Dependencies:** Task 1
-
-**Files likely touched:**
-- `src/state.rs`
-- `src/command_palette.rs`
-
-**Estimated scope:** Medium
-
-## Task 4: Wire Keyboard Navigation Without Breaking Terminal Input
-
-**Description:** Route palette-only keyboard controls (`ArrowDown`, `ArrowUp`, `Ctrl+N`, `Ctrl+P`, `Enter`, `Escape`) into palette dispatch while the palette is open. First try app-level raw key/system shortcut handling; if arrow keys are blocked by focused input handling, make the smallest framework-level change required and cover it with regression tests.
-
-**Acceptance criteria:**
-- [ ] `Ctrl+Shift+P` opens the palette.
-- [ ] `ArrowDown` and `Ctrl+N` move to the next result while palette is open.
-- [ ] `ArrowUp` and `Ctrl+P` move to the previous result while palette is open.
-- [ ] `Enter` executes the active result while palette is open.
-- [ ] `Escape` clears query first, then closes.
-- [ ] The same keys do not trigger palette behavior when palette is closed.
-- [ ] Terminal keyboard capture remains unchanged outside palette mode.
-
-**Verification:**
-- [ ] Focused tests pass: `cargo test -p terminal-manager palette`
-- [ ] Framework key-routing regression test passes if framework code is touched: `cargo test -p unshit-app keyboard`
-- [ ] App keybind tests pass: `cargo test -p terminal-manager keybind`
-
-**Dependencies:** Tasks 2 and 3
-
-**Files likely touched:**
-- `src/main.rs`
-- `src/state.rs`
-- `src/keybinds/registry.rs`
-- `crates/unshit-framework/crates/unshit-app/src/app.rs` only if blocked
-
-**Estimated scope:** Medium
-
-### Checkpoint: Behavior
-- [ ] Safe commands execute through existing dispatch.
-- [ ] Palette keyboard behavior works in tests.
-- [ ] No synchronous PTY IPC added.
-
-### Phase 3: Production UI And Real Modes
-
-## Task 5: Render Handoff-Style Grouped Palette UI
-
-**Description:** Replace the current single-action overlay with a grouped, typed-mode palette shell based on the handoff structure: scrim, panel, input row, mode chip, mode pills, grouped list, active row, footer, and preview pane.
-
-**Acceptance criteria:**
-- [ ] Closed palette returns hidden element.
-- [ ] Open palette renders `cp-scrim`/overlay, `cp` panel, input, body, grouped list, footer, and preview.
-- [ ] Active typed mode shows the correct chip for `>`, `@`, `:`, and `/`.
-- [ ] Empty query shows mode hint pills.
-- [ ] Active row class follows `snap.palette_active`.
-- [ ] Row click dispatches `palette.execute:<id>`.
-- [ ] Input submit dispatches `palette.execute_active` after syncing query.
-
-**Verification:**
-- [ ] Focused UI tests pass: `cargo test -p terminal-manager command_palette`
-
-**Dependencies:** Tasks 1 and 3
-
-**Files likely touched:**
-- `src/ui/command_palette.rs`
-- `src/command_palette.rs`
-- `src/state.rs`
-
-**Estimated scope:** Medium
-
-## Task 6: Implement Real Mode Content And Honest Empty States
-
-**Description:** Complete typed modes against real data: actions mode groups safe commands, unified mode mixes safe actions with real navigation/session rows, navigation mode can switch/focus real workspaces and terminals, agents and scrollback modes render honest empty states when no real source exists.
-
-**Acceptance criteria:**
-- [ ] `>` actions mode shows the seven safe executable commands grouped by command/layout/session/app.
-- [ ] Unified mode includes safe commands plus real workspaces, tabs, panes, and sessions where present.
-- [ ] `:` navigation mode shows real workspaces/tabs/panes and executing rows uses `workspace.switch` or `terminal.focus`.
-- [ ] `@` mode renders no fake agents and shows an honest empty state if no real agent rows exist.
-- [ ] `/` mode renders no fake scrollback and shows an honest empty state if no read-only scrollback source exists.
-- [ ] No unsupported prototype actions appear as executable rows.
-
-**Verification:**
-- [ ] Focused tests pass: `cargo test -p terminal-manager command_palette`
-- [ ] State navigation execution tests pass: `cargo test -p terminal-manager terminal_focus`
-
-**Dependencies:** Tasks 1, 3, and 5
-
-**Files likely touched:**
-- `src/command_palette.rs`
-- `src/ui/command_palette.rs`
-- `src/state.rs`
-
-**Estimated scope:** Medium
-
-## Task 7: Apply Handoff CSS And Visual Regression Coverage
-
-**Description:** Replace the old `.command-palette-*` styling with handoff-equivalent classes and add layout/style tests where the local harness can verify panel width, row active rail, footer, preview, and responsive constraints.
-
-**Acceptance criteria:**
-- [ ] Scrim is fixed, dark, blurred, top-centered around `12vh`.
-- [ ] Panel target width is `760px`, viewport constrained, max height bounded, radius 8px or less.
-- [ ] Active row has amber left rail and soft amber background.
-- [ ] Mode chips/pills, footer key hints, empty state, and preview pane have dedicated CSS.
-- [ ] Mobile/narrow viewport constraints prevent overflow.
-- [ ] Visual output is checked with `cargo run` when practical.
-
-**Verification:**
-- [ ] Style/UI tests pass: `cargo test -p terminal-manager command_palette`
-- [ ] Format passes: `cargo fmt --check`
-- [ ] App tests pass: `cargo test -p terminal-manager`
-- [ ] Lint passes: `cargo clippy -p terminal-manager -- -D warnings`
-- [ ] Manual run: `cargo run`
-
-**Dependencies:** Tasks 5 and 6
-
-**Files likely touched:**
-- `assets/styles.css`
-- `src/ui/command_palette.rs`
-- `src/main.rs` tests only if harness coverage is added there
-
-**Estimated scope:** Medium
-
-### Checkpoint: Complete
-- [ ] All success criteria in `SPEC.md` met or explicitly documented as unavailable real data.
-- [ ] No fake prototype rows in production output.
-- [ ] Focused tests, full tests, fmt, clippy pass.
-- [ ] Manual palette check with `cargo run`: `rename`, `>split`, `@`, `:`, `/`.
-
-## Risks and Mitigations
-
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| Arrow keys are consumed by focused text input before app shortcuts. | Medium | Test early in Task 4; make minimal framework change only if blocked. |
-| State and UI duplicate result-building logic. | Medium | Put result model in `src/command_palette.rs` and import from both state and UI. |
-| Navigation rows execute against stale saved workspace data. | Medium | Build IDs from `UiSnapshot` and route through existing tested `workspace.switch`/`terminal.focus` arms. |
-| Closing last pane through palette leaves empty workspace unexpectedly. | Low | This matches existing `pane.close` behavior; tests should assert dispatch only, not redefine pane lifecycle. |
-| Scrollback mode cannot search real terminal output from current snapshot. | Low | Render honest empty state; do not add daemon IPC in this change. |
-| Framework change could affect input handling globally. | Medium | Keep change palette-gated or raw-hook-specific; add framework regression tests. |
-
-## Parallelization Opportunities
-- Tasks 1 and 2 can run in parallel.
-- Task 7 CSS work can start after Task 5 renders stable classes.
-- Tasks 3 through 6 are sequential because they share the result contract and state dispatch behavior.
-
-## Open Questions
-- None blocking. User approved full scope, safe command set, `Ctrl+Shift+P` default with settings editability, and boundaries.
+## Out of scope (deferred per spec)
+Syntax highlighting, in-file search, soft wrap, multi-cursor, IME preedit, file tree,
+editor-session persistence, new dependencies.
