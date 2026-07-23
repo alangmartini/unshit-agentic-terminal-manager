@@ -4627,6 +4627,8 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "sidebar.toggle"
             | "modal.open"
             | "quick_prompt.open"
+            | "editor.open"
+            | "editor.save"
     ) || command.starts_with("workspace.switch:")
         || command.starts_with("terminal.focus:")
 }
@@ -4669,6 +4671,102 @@ fn editor_viewport_dims(state: &AppState) -> (usize, usize) {
         cell_h,
     );
     (rows as usize, cols as usize)
+}
+
+/// Hooks the `editor.open` file dialog needs to hand its result back to
+/// the app: the shared state to dispatch into and a rebuild trigger.
+/// Registered once at startup; absent in unit tests, where the dialog
+/// arm degrades to a toast.
+pub struct EditorOpenHooks {
+    pub shared: SharedState,
+    pub request_rebuild: Box<dyn Fn() + Send + Sync>,
+}
+
+static EDITOR_OPEN_HOOKS: std::sync::OnceLock<std::sync::Arc<EditorOpenHooks>> =
+    std::sync::OnceLock::new();
+static EDITOR_DIALOG_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
+    let _ = EDITOR_OPEN_HOOKS.set(std::sync::Arc::new(hooks));
+}
+
+/// Handle `editor.open` (no path): run the native file picker on a
+/// worker thread so the state lock and render loop stay free, then
+/// route the picked path through `editor.open:<path>`.
+fn dispatch_editor_open_dialog(state: &mut AppState) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        push_error_toast(state, "Open file dialog is not available");
+        return true;
+    };
+    // One dialog at a time; a second request while open is a no-op.
+    if EDITOR_DIALOG_OPEN.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    let start_dir = active_workspace_cwd(state);
+    std::thread::spawn(move || {
+        let mut dialog = rfd::FileDialog::new().set_title("Open file");
+        if let Some(dir) = start_dir.filter(|d| d.exists()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let picked = dialog.pick_file();
+        EDITOR_DIALOG_OPEN.store(false, Ordering::SeqCst);
+        if let Some(path) = picked {
+            {
+                let mut guard = hooks.shared.lock_recover();
+                dispatch(&mut guard, &format!("editor.open:{}", path.display()));
+            }
+            (hooks.request_rebuild)();
+        }
+    });
+    true
+}
+
+/// Handle `editor.save` for the focused editor pane. Returns `false`
+/// when the active pane is not an editor so the keybind can fall
+/// through unclaimed.
+fn dispatch_editor_save(state: &mut AppState) -> bool {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    let path_str = editor.path.to_string_lossy().into_owned();
+    let correlation_id = editor.correlation_id.clone();
+    match editor.save() {
+        Ok(bytes) => {
+            let line_count = editor.buffer.line_count() as u64;
+            record_editor_event(&EditorEventRecord {
+                timestamp_unix_ms: now_unix_ms(),
+                event: "editor.save",
+                level: "info",
+                correlation_id: &correlation_id,
+                path: Some(&path_str),
+                file_bytes: Some(bytes),
+                line_count: Some(line_count),
+                reason: None,
+            });
+        }
+        Err(e) => {
+            record_editor_event(&EditorEventRecord {
+                timestamp_unix_ms: now_unix_ms(),
+                event: "editor.save_failed",
+                level: "error",
+                correlation_id: &correlation_id,
+                path: Some(&path_str),
+                file_bytes: None,
+                line_count: None,
+                reason: Some("io"),
+            });
+            let name = crate::editor::display_name(&state.editors[&pane_id].path);
+            push_error_toast(state, format!("Could not save {}: {}", name, e));
+        }
+    }
+    sync_editor_pane_title(state, pane_id);
+    true
 }
 
 /// Handle `editor.open:<path>`: open the file in a new editor tab, or
@@ -5055,6 +5153,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if let Some(path) = other.strip_prefix("editor.open:") => {
             dispatch_editor_open_path(state, path)
         }
+        "editor.open" => dispatch_editor_open_dialog(state),
+        "editor.save" => dispatch_editor_save(state),
         "tab.new_worktree" => {
             let repo_cwd = active_workspace_cwd(state)
                 .filter(|cwd| cwd.exists() && crate::quick_prompt::spawn::is_inside_work_tree(cwd));
@@ -8671,6 +8771,92 @@ mod tests {
         assert!(dispatch(&mut state, "editor.open:  "));
         assert!(state.editors.is_empty());
         assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_editor_save_round_trips_edits_to_disk() {
+        let mut state = test_state();
+        let path = editor_temp_file("save", b"alpha\nbeta");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+        state
+            .editors
+            .get_mut(&pane_id)
+            .unwrap()
+            .apply(|b| b.insert_typed("x"));
+        sync_editor_pane_title(&mut state, pane_id);
+        assert!(state.editors[&pane_id].dirty);
+        assert!(state.panes[0][0].title.starts_with('\u{25CF}'));
+
+        assert!(dispatch(&mut state, "editor.save"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "xalpha\nbeta");
+        assert!(!state.editors[&pane_id].dirty);
+        assert!(!state.panes[0][0].title.starts_with('\u{25CF}'));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_editor_save_preserves_crlf() {
+        let mut state = test_state();
+        let path = editor_temp_file("save-crlf", b"alpha\r\nbeta");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+        state
+            .editors
+            .get_mut(&pane_id)
+            .unwrap()
+            .apply(|b| b.insert_newline());
+        assert!(dispatch(&mut state, "editor.save"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "\r\nalpha\r\nbeta");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_editor_save_failure_keeps_dirty_and_toasts() {
+        let mut state = test_state();
+        let path = editor_temp_file("save-ro", b"alpha");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+        state
+            .editors
+            .get_mut(&pane_id)
+            .unwrap()
+            .apply(|b| b.insert_typed("x"));
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+
+        assert!(dispatch(&mut state, "editor.save"));
+        assert!(state.editors[&pane_id].dirty, "failed save keeps dirty");
+        assert_eq!(state.toasts.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha");
+
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_editor_save_on_terminal_pane_is_unclaimed() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "editor.save"));
+    }
+
+    #[test]
+    fn dispatch_editor_open_dialog_without_hooks_toasts() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "editor.open"));
+        assert_eq!(state.toasts.len(), 1);
+        assert!(state.editors.is_empty());
     }
 
     #[test]

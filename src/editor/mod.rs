@@ -236,6 +236,42 @@ impl EditorPane {
         self.dirty = false;
     }
 
+    /// Save the buffer to its file atomically (sibling temp file +
+    /// rename) with the original line endings. A failed write never
+    /// touches the destination. Returns the byte count written.
+    pub fn save(&mut self) -> std::io::Result<u64> {
+        let mut text = self.buffer.to_text();
+        if self.line_ending == LineEnding::CrLf {
+            text = text.replace('\n', "\r\n");
+        }
+        let bytes = text.into_bytes();
+        let file_name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "editor".to_string());
+        let tmp =
+            self.path
+                .with_file_name(format!(".{}.tm-save-{}.tmp", file_name, std::process::id()));
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })();
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        self.file_bytes = bytes.len() as u64;
+        self.mark_saved();
+        Ok(bytes.len() as u64)
+    }
+
     /// Scroll (vertically and horizontally) so the cursor is in view.
     /// Returns `true` when the whole viewport was repainted.
     fn ensure_cursor_visible(&mut self) -> bool {

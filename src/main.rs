@@ -1383,6 +1383,21 @@ fn main() {
     );
     let _ = window_event_sink.set(app.event_sink());
 
+    // Hand the editor's file-open dialog thread a way back into app
+    // state and the render loop (see `dispatch_editor_open_dialog`).
+    {
+        let hooks_shared = shared.clone();
+        let hooks_sink = window_event_sink.clone();
+        crate::state::register_editor_open_hooks(crate::state::EditorOpenHooks {
+            shared: hooks_shared,
+            request_rebuild: Box::new(move || {
+                if let Some(sink) = hooks_sink.get() {
+                    let _ = sink.send(unshit::app::ExternalEvent::RequestRebuild);
+                }
+            }),
+        });
+    }
+
     // Set up PTY output subscriptions.
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
 

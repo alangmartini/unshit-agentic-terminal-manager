@@ -145,6 +145,30 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         enabled: true,
     },
     PaletteAction {
+        id: "open_file",
+        label: "Open file\u{2026}",
+        description: "Open a file in the built-in editor.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::Workspace,
+        keybind: Some(KeybindAction::OpenFile),
+        shortcut_label: None,
+        dispatch: "editor.open",
+        keywords: &["open", "file", "edit", "editor", "text"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "save_file",
+        label: "Save file",
+        description: "Save the focused editor pane to disk.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::Tab,
+        keybind: Some(KeybindAction::EditorSave),
+        shortcut_label: None,
+        dispatch: "editor.save",
+        keywords: &["save", "file", "write", "editor"],
+        enabled: true,
+    },
+    PaletteAction {
         id: "new_worktree",
         label: "New worktree tab",
         description: "Open a new tab on a fresh git worktree of this workspace.",
@@ -1192,6 +1216,8 @@ mod tests {
                 "split_pane_right",
                 "split_pane_down",
                 "new_terminal",
+                "open_file",
+                "save_file",
                 "new_worktree",
                 "close_pane",
                 "arrange_grid_2x2",
@@ -1326,6 +1352,8 @@ mod tests {
                         | "sidebar.toggle"
                         | "modal.open"
                         | "quick_prompt.open"
+                        | "editor.open"
+                        | "editor.save"
                 )
             })));
         assert!(items
@@ -1360,6 +1388,8 @@ mod tests {
                         "split_pane_right",
                         "split_pane_down",
                         "new_terminal",
+                        "open_file",
+                        "save_file",
                         "new_worktree",
                         "close_pane",
                     ],

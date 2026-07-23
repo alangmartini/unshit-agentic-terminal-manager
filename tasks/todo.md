@@ -14,7 +14,7 @@
 - [x] S3: Clipboard + undo/redo
   - Acceptance: grouping, cursor restore, redo-clear, multi-line clipboard tests.
   - Verify: focused buffer tests.
-- [ ] S4: Save + open UX (atomic save, CRLF preserve, rfd dialog, keybinds, palette)
+- [x] S4: Save + open UX (atomic save, CRLF preserve, rfd dialog, keybinds, palette)
   - Acceptance: save/failure/CRLF dispatch tests; keybind parity green; palette rows.
   - Verify: `cargo test -p terminal-manager keybind` + editor tests.
 - [ ] CHECKPOINT B: full tests + fmt + clippy; manual edit+save on real file; split

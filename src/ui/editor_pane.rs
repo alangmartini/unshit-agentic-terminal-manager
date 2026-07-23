@@ -44,10 +44,21 @@ pub(crate) fn handle_editor_key(
 ) -> Option<bool> {
     use crate::editor::{Damage, TAB_SPACES};
 
-    let editor = st.editors.get_mut(&pane_id)?;
     let ctrl = kb.modifiers.contains(Modifiers::CTRL);
     let alt = kb.modifiers.contains(Modifiers::ALT);
     let shift = kb.modifiers.contains(Modifiers::SHIFT);
+
+    // Plain Ctrl+S saves when the editor is focused. It is deliberately
+    // NOT a global keybind: registered Ctrl-combos are consumed before
+    // terminal capture, which would break XOFF/nano in terminal panes.
+    if ctrl && !alt && !shift && matches!(kb.key, Key::Char('s') | Key::Char('S')) {
+        if st.editors.contains_key(&pane_id) {
+            return Some(crate::state::dispatch(st, "editor.save"));
+        }
+        return None;
+    }
+
+    let editor = st.editors.get_mut(&pane_id)?;
     let page = page_step(editor.grid.rows());
 
     let changed = match kb.key {

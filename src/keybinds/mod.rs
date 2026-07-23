@@ -33,6 +33,8 @@ pub enum KeybindAction {
     CommandPalette,
     QuickPromptOpen,
     RenameSession,
+    OpenFile,
+    EditorSave,
     ToggleSidebar,
     OpenSettings,
     ZoomIn,
@@ -82,6 +84,8 @@ impl KeybindAction {
         Self::CommandPalette,
         Self::QuickPromptOpen,
         Self::RenameSession,
+        Self::OpenFile,
+        Self::EditorSave,
         Self::ToggleSidebar,
         Self::OpenSettings,
         Self::ZoomIn,
@@ -106,6 +110,8 @@ impl KeybindAction {
             Self::CommandPalette => "command_palette",
             Self::QuickPromptOpen => "quick_prompt_open",
             Self::RenameSession => "rename_session",
+            Self::OpenFile => "open_file",
+            Self::EditorSave => "editor_save",
             Self::ToggleSidebar => "toggle_sidebar",
             Self::OpenSettings => "open_settings",
             Self::ZoomIn => "zoom_in",
@@ -136,6 +142,8 @@ impl KeybindAction {
             Self::CommandPalette => "Command palette",
             Self::QuickPromptOpen => "Quick prompt",
             Self::RenameSession => "Rename session",
+            Self::OpenFile => "Open file",
+            Self::EditorSave => "Save file",
             Self::ToggleSidebar => "Toggle sidebar",
             Self::OpenSettings => "Settings",
             Self::ZoomIn => "Zoom in",
@@ -161,6 +169,8 @@ impl KeybindAction {
             Self::CommandPalette => "Open the fuzzy command runner",
             Self::QuickPromptOpen => "Open the quick prompt",
             Self::RenameSession => "Edit the active session label",
+            Self::OpenFile => "Open a file in the built-in editor",
+            Self::EditorSave => "Save the focused editor pane (Ctrl+S also works in the editor)",
             Self::ToggleSidebar => "Show or hide the workspace sidebar",
             Self::OpenSettings => "Open the settings window",
             Self::ZoomIn => "Increase the terminal font size",
@@ -185,7 +195,9 @@ impl KeybindAction {
             | Self::PrevTab
             | Self::RenameSession => KeybindGroup::Tabs,
             Self::CommandPalette | Self::QuickPromptOpen => KeybindGroup::Navigation,
-            Self::ToggleSidebar
+            Self::OpenFile
+            | Self::EditorSave
+            | Self::ToggleSidebar
             | Self::OpenSettings
             | Self::ZoomIn
             | Self::ZoomOut
@@ -213,6 +225,8 @@ impl KeybindAction {
             Self::CommandPalette => "palette.toggle",
             Self::QuickPromptOpen => "quick_prompt.open",
             Self::RenameSession => "session.rename_active",
+            Self::OpenFile => "editor.open",
+            Self::EditorSave => "editor.save",
             Self::ToggleSidebar => "sidebar.toggle",
             Self::OpenSettings => "modal.open",
             Self::ZoomIn => "font.inc",
@@ -239,6 +253,10 @@ impl KeybindAction {
             Self::CommandPalette => "Ctrl+Shift+P",
             Self::QuickPromptOpen => "Ctrl+Shift+Q",
             Self::RenameSession => "F2",
+            // Ctrl+Shift chords: plain Ctrl+O / Ctrl+S must keep
+            // reaching terminal programs (nano, readline, XOFF).
+            Self::OpenFile => "Ctrl+Shift+O",
+            Self::EditorSave => "Ctrl+Shift+S",
             Self::ToggleSidebar => "Ctrl+B",
             Self::OpenSettings => "Ctrl+,",
             Self::ZoomIn => "Ctrl+=",
@@ -259,8 +277,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_has_nineteen_variants() {
-        assert_eq!(KeybindAction::ALL.len(), 19);
+    fn all_has_twenty_one_variants() {
+        assert_eq!(KeybindAction::ALL.len(), 21);
     }
 
     #[test]
