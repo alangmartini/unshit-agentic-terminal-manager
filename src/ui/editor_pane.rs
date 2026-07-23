@@ -105,7 +105,7 @@ pub(crate) fn handle_editor_key(
         }),
         Key::Enter if !ctrl && !alt => editor.apply(|b| b.insert_newline()),
         Key::Tab if !ctrl && !alt && !shift => {
-            editor.apply(|b| b.insert_str(&" ".repeat(TAB_SPACES)))
+            editor.apply(|b| b.insert_typed(&" ".repeat(TAB_SPACES)))
         }
         Key::Backspace => editor.apply(|b| b.backspace(ctrl)),
         Key::Delete => editor.apply(|b| b.delete_forward(ctrl)),
@@ -113,9 +113,40 @@ pub(crate) fn handle_editor_key(
             b.select_all();
             Damage::None
         }),
+        // Clipboard. Copy/cut consume the key even without a selection
+        // so nothing leaks toward other handlers.
+        Key::Char('c') | Key::Char('C') if ctrl && !shift && !alt => {
+            if let Some(text) = editor.buffer.selected_text() {
+                if let Err(e) = st.clipboard.write_text(&text) {
+                    log::warn!("editor copy: clipboard write failed: {e}");
+                }
+            }
+            false
+        }
+        Key::Char('x') | Key::Char('X') if ctrl && !shift && !alt => {
+            match editor.buffer.selected_text() {
+                Some(text) => {
+                    if let Err(e) = st.clipboard.write_text(&text) {
+                        log::warn!("editor cut: clipboard write failed: {e}");
+                    }
+                    editor.apply(|b| b.delete_selection())
+                }
+                None => false,
+            }
+        }
+        Key::Char('v') | Key::Char('V') if ctrl && !shift && !alt => {
+            match st.clipboard.read_text() {
+                Ok(text) if !text.is_empty() => editor.apply(|b| b.insert_str(&text)),
+                _ => false,
+            }
+        }
+        // Undo / redo.
+        Key::Char('z') | Key::Char('Z') if ctrl && !shift && !alt => editor.apply(|b| b.undo()),
+        Key::Char('y') | Key::Char('Y') if ctrl && !shift && !alt => editor.apply(|b| b.redo()),
+        Key::Char('z') | Key::Char('Z') if ctrl && shift && !alt => editor.apply(|b| b.redo()),
         _ if !ctrl && !alt => {
             let text = insert_text_for(kb)?;
-            editor.apply(|b| b.insert_str(&text))
+            editor.apply(|b| b.insert_typed(&text))
         }
         _ => return None,
     };
@@ -464,6 +495,50 @@ mod tests {
             None
         );
         assert_eq!(handle_editor_key(&mut state, 1, &key(Key::Escape)), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ctrl_z_undoes_typing_run_and_ctrl_y_redoes() {
+        let (mut state, path) = editor_state();
+        for c in ['a', 'b', 'c'] {
+            handle_editor_key(&mut state, 1, &char_key(c));
+        }
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key_mod(Key::Char('z'), Modifiers::CTRL)),
+            Some(true)
+        );
+        let editor = state.editors.get(&1).unwrap();
+        assert_eq!(editor.buffer.line(0), Some("hello"));
+        assert!(!editor.dirty, "undo back to pristine clears dirty");
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key_mod(Key::Char('y'), Modifiers::CTRL)),
+            Some(true)
+        );
+        let editor = state.editors.get(&1).unwrap();
+        assert_eq!(editor.buffer.line(0), Some("abchello"));
+        assert!(editor.dirty);
+        // Ctrl+Shift+Z is redo too (after another undo).
+        handle_editor_key(&mut state, 1, &key_mod(Key::Char('z'), Modifiers::CTRL));
+        handle_editor_key(
+            &mut state,
+            1,
+            &key_mod(Key::Char('Z'), Modifiers::CTRL | Modifiers::SHIFT),
+        );
+        assert_eq!(
+            state.editors.get(&1).unwrap().buffer.line(0),
+            Some("abchello")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn undo_with_empty_history_consumes_without_change() {
+        let (mut state, path) = editor_state();
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key_mod(Key::Char('z'), Modifiers::CTRL)),
+            Some(false)
+        );
         let _ = std::fs::remove_file(path);
     }
 

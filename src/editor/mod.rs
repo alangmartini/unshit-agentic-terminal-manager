@@ -98,6 +98,10 @@ pub struct EditorPane {
     /// Characters skipped at the left of every line (horizontal scroll).
     pub h_offset: usize,
     pub dirty: bool,
+    /// Undo-stack identity at the last save (0 = pristine). Comparing
+    /// against `buffer.top_group_id()` yields the dirty flag correctly
+    /// across undo/redo (undoing back to the saved state is clean).
+    saved_top_group: u64,
     /// Correlates open→save→close telemetry for this pane instance.
     pub correlation_id: String,
     pub line_ending: LineEnding,
@@ -118,6 +122,7 @@ impl EditorPane {
             top_line: 0,
             h_offset: 0,
             dirty: false,
+            saved_top_group: 0,
             correlation_id: generate_correlation_id(),
             line_ending,
             file_bytes,
@@ -223,6 +228,14 @@ impl EditorPane {
         self.sync_cursor_into_grid();
     }
 
+    /// Record that the buffer's current state is on disk: the dirty
+    /// flag clears and future undo steps compare against this point.
+    pub fn mark_saved(&mut self) {
+        self.buffer.break_undo_group();
+        self.saved_top_group = self.buffer.top_group_id();
+        self.dirty = false;
+    }
+
     /// Scroll (vertically and horizontally) so the cursor is in view.
     /// Returns `true` when the whole viewport was repainted.
     fn ensure_cursor_visible(&mut self) -> bool {
@@ -282,7 +295,7 @@ impl EditorPane {
         let new_sel = self.buffer.selection();
         let content_changed = damage != buffer::Damage::None;
         if content_changed {
-            self.dirty = true;
+            self.dirty = self.buffer.top_group_id() != self.saved_top_group;
         }
         if !content_changed && new_cursor == old_cursor && new_sel == old_sel {
             return false;

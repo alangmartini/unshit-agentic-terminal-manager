@@ -5,13 +5,13 @@
     viewport-only with gutter and stable line_ids; oversized/invalid-UTF-8 refused
     with notification; terminal panes unaffected; open telemetry events emitted.
   - Verify: `cargo test -p terminal-manager editor`; full tests; fmt; clippy.
-- [ ] CHECKPOINT A: manual launch (isolation profile), open src/state.rs, scroll;
+- [x] CHECKPOINT A: manual launch (isolation profile), open src/state.rs, scroll;
       screenshot; terminals still work.
 - [x] S2: Core editing (buffer ops, keyboard capture, cursor/selection render, dirty)
   - Acceptance: buffer unit suite (edits/movement/selection/UTF-8/sticky column);
     typing "abc" via capture handler lands in grid cells.
   - Verify: `cargo test -p terminal-manager editor_buffer` + editor UI tests.
-- [ ] S3: Clipboard + undo/redo
+- [x] S3: Clipboard + undo/redo
   - Acceptance: grouping, cursor restore, redo-clear, multi-line clipboard tests.
   - Verify: focused buffer tests.
 - [ ] S4: Save + open UX (atomic save, CRLF preserve, rfd dialog, keybinds, palette)

@@ -74,6 +74,52 @@ impl Damage {
     }
 }
 
+/// Undo grouping category. `Typing` and `Deleting` runs coalesce into
+/// one undo step (VS Code granularity); `Other` edits (paste, newline,
+/// word deletes, selection replaces… ) get their own group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupKind {
+    Typing,
+    Deleting,
+    Other,
+}
+
+/// One recorded range replacement: `old_text` at `start` became
+/// `new_text`. Inverse application order restores either direction.
+#[derive(Clone, Debug, PartialEq)]
+struct EditRecord {
+    start: Position,
+    old_text: String,
+    new_text: String,
+    cursor_before: Position,
+    anchor_before: Option<Position>,
+    cursor_after: Position,
+}
+
+/// A single undo step. `id` is monotonically unique per buffer so the
+/// pane can compare "top of undo stack" against the last-saved state
+/// even across undo/redo/edit sequences.
+#[derive(Clone, Debug, PartialEq)]
+struct UndoGroup {
+    id: u64,
+    kind: GroupKind,
+    records: Vec<EditRecord>,
+}
+
+/// Position of the end of `text` inserted at `start`.
+fn end_of_text(start: Position, text: &str) -> Position {
+    match text.rsplit_once('\n') {
+        None => Position {
+            line: start.line,
+            col: start.col + text.len(),
+        },
+        Some((head, last)) => Position {
+            line: start.line + head.matches('\n').count() + 1,
+            col: last.len(),
+        },
+    }
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -137,6 +183,12 @@ pub struct EditorBuffer {
     /// Desired visual column (in chars) preserved across vertical
     /// movement over short lines. Cleared by any horizontal move/edit.
     sticky_chars: Option<usize>,
+    undo: Vec<UndoGroup>,
+    redo: Vec<UndoGroup>,
+    next_group_id: u64,
+    /// True while the latest undo group may still absorb contiguous
+    /// same-kind edits. Cursor moves and undo/redo close the group.
+    group_open: bool,
 }
 
 impl EditorBuffer {
@@ -150,6 +202,10 @@ impl EditorBuffer {
             cursor: Position::default(),
             anchor: None,
             sticky_chars: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            next_group_id: 1,
+            group_open: false,
         }
     }
 
@@ -280,6 +336,10 @@ impl EditorBuffer {
     /// collapse consumed the keypress (plain Left/Right on a selection
     /// jump to the selection edge without further movement).
     fn begin_move(&mut self, extend: bool) {
+        // Any cursor movement closes the open undo group (VS Code
+        // granularity: a typing run interrupted by navigation undoes in
+        // two steps).
+        self.group_open = false;
         if extend {
             if self.anchor.is_none() {
                 self.anchor = Some(self.cursor);
@@ -487,40 +547,188 @@ impl EditorBuffer {
 
     // -- editing ------------------------------------------------------------
 
-    /// Remove the ordered range and place the cursor at its start.
-    fn delete_range(&mut self, start: Position, end: Position) -> Damage {
-        if start == end {
+    /// Splice `[start, end)` out and `text` in, without recording undo
+    /// history. Cursor lands at the end of the inserted text. This is
+    /// the single primitive every edit (and undo/redo replay) uses.
+    fn raw_replace(&mut self, start: Position, end: Position, text: &str) -> Damage {
+        let removal = if start == end {
+            Damage::None
+        } else if start.line == end.line {
+            self.lines[start.line].replace_range(start.col..end.col, "");
+            Damage::Line(start.line)
+        } else {
+            let tail = self.lines[end.line][end.col..].to_string();
+            self.lines[start.line].truncate(start.col);
+            self.lines[start.line].push_str(&tail);
+            self.lines.drain(start.line + 1..=end.line);
+            Damage::From(start.line)
+        };
+        let insertion = if text.is_empty() {
+            Damage::None
+        } else if !text.contains('\n') {
+            self.lines[start.line].insert_str(start.col, text);
+            Damage::Line(start.line)
+        } else {
+            let tail = self.lines[start.line][start.col..].to_string();
+            self.lines[start.line].truncate(start.col);
+            let mut parts = text.split('\n');
+            self.lines[start.line].push_str(parts.next().unwrap_or_default());
+            let mut last_line = start.line;
+            for (insert_at, part) in (start.line + 1..).zip(parts) {
+                self.lines.insert(insert_at, part.to_string());
+                last_line = insert_at;
+            }
+            self.lines[last_line].push_str(&tail);
+            Damage::From(start.line)
+        };
+        self.cursor = end_of_text(start, text);
+        self.anchor = None;
+        removal.merge(insertion)
+    }
+
+    /// Perform and record a range replacement, coalescing into the open
+    /// undo group when the kind and adjacency allow it.
+    fn record_replace(
+        &mut self,
+        start: Position,
+        end: Position,
+        text: &str,
+        kind: GroupKind,
+    ) -> Damage {
+        let old_text = self.text_range(start, end);
+        if old_text.is_empty() && text.is_empty() {
             return Damage::None;
         }
-        if start.line == end.line {
-            self.lines[start.line].replace_range(start.col..end.col, "");
-            self.cursor = start;
-            self.anchor = None;
-            return Damage::Line(start.line);
+        let record = EditRecord {
+            start,
+            old_text,
+            new_text: text.to_string(),
+            cursor_before: self.cursor,
+            anchor_before: self.anchor,
+            cursor_after: end_of_text(start, text),
+        };
+        let damage = self.raw_replace(start, end, text);
+        self.push_record(kind, record);
+        damage
+    }
+
+    fn push_record(&mut self, kind: GroupKind, record: EditRecord) {
+        self.redo.clear();
+        if self.group_open && kind != GroupKind::Other {
+            if let Some(group) = self.undo.last_mut() {
+                if group.kind == kind {
+                    if let Some(last) = group.records.last_mut() {
+                        match kind {
+                            // Typing run: appended right at the end of the
+                            // previous insertion.
+                            GroupKind::Typing
+                                if record.old_text.is_empty()
+                                    && record.start == end_of_text(last.start, &last.new_text) =>
+                            {
+                                last.new_text.push_str(&record.new_text);
+                                last.cursor_after = record.cursor_after;
+                                return;
+                            }
+                            // Backspace run: each delete ends where the
+                            // previous one started.
+                            GroupKind::Deleting
+                                if record.new_text.is_empty()
+                                    && end_of_text(record.start, &record.old_text)
+                                        == last.start =>
+                            {
+                                last.old_text = format!("{}{}", record.old_text, last.old_text);
+                                last.start = record.start;
+                                last.cursor_after = record.cursor_after;
+                                return;
+                            }
+                            // Delete-forward run: repeated deletes at the
+                            // same spot.
+                            GroupKind::Deleting
+                                if record.new_text.is_empty() && record.start == last.start =>
+                            {
+                                last.old_text.push_str(&record.old_text);
+                                last.cursor_after = record.cursor_after;
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
-        let tail = self.lines[end.line][end.col..].to_string();
-        self.lines[start.line].truncate(start.col);
-        self.lines[start.line].push_str(&tail);
-        self.lines.drain(start.line + 1..=end.line);
-        self.cursor = start;
+        let id = self.next_group_id;
+        self.next_group_id += 1;
+        self.undo.push(UndoGroup {
+            id,
+            kind,
+            records: vec![record],
+        });
+        self.group_open = kind != GroupKind::Other;
+    }
+
+    /// Identity of the newest undo step (0 for a pristine buffer). The
+    /// pane compares this against the id captured at save time to derive
+    /// the dirty flag correctly across undo/redo.
+    pub fn top_group_id(&self) -> u64 {
+        self.undo.last().map(|g| g.id).unwrap_or(0)
+    }
+
+    /// Close the open undo group so the next edit starts a fresh step
+    /// (called on save).
+    pub fn break_undo_group(&mut self) {
+        self.group_open = false;
+    }
+
+    /// Undo the newest edit group. Returns the repaint damage
+    /// (`Damage::None` when there is nothing to undo).
+    pub fn undo(&mut self) -> Damage {
+        self.sticky_chars = None;
+        self.group_open = false;
+        let Some(group) = self.undo.pop() else {
+            return Damage::None;
+        };
+        let mut damage = Damage::None;
+        for rec in group.records.iter().rev() {
+            let end = end_of_text(rec.start, &rec.new_text);
+            damage = damage.merge(self.raw_replace(rec.start, end, &rec.old_text));
+        }
+        let first = group.records.first().expect("groups are never empty");
+        self.cursor = first.cursor_before;
+        self.anchor = first.anchor_before;
+        self.redo.push(group);
+        damage
+    }
+
+    /// Re-apply the newest undone group.
+    pub fn redo(&mut self) -> Damage {
+        self.sticky_chars = None;
+        self.group_open = false;
+        let Some(group) = self.redo.pop() else {
+            return Damage::None;
+        };
+        let mut damage = Damage::None;
+        for rec in group.records.iter() {
+            let end = end_of_text(rec.start, &rec.old_text);
+            damage = damage.merge(self.raw_replace(rec.start, end, &rec.new_text));
+        }
+        let last = group.records.last().expect("groups are never empty");
+        self.cursor = last.cursor_after;
         self.anchor = None;
-        Damage::From(start.line)
+        self.undo.push(group);
+        damage
     }
 
     /// Delete the active selection, if any.
     pub fn delete_selection(&mut self) -> Damage {
         self.sticky_chars = None;
         match self.selection() {
-            Some((start, end)) => self.delete_range(start, end),
+            Some((start, end)) => self.record_replace(start, end, "", GroupKind::Other),
             None => Damage::None,
         }
     }
 
-    /// Insert text at the cursor (replacing any selection). `text` may
-    /// contain `\n` (multi-line paste); `\r` is normalized away.
-    pub fn insert_str(&mut self, text: &str) -> Damage {
+    fn insert_with_kind(&mut self, text: &str, kind: GroupKind) -> Damage {
         self.sticky_chars = None;
-        let sel_damage = self.delete_selection();
         let normalized;
         let text = if text.contains('\r') {
             normalized = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -528,43 +736,29 @@ impl EditorBuffer {
         } else {
             text
         };
-        if text.is_empty() {
-            return sel_damage;
-        }
-        let Position { line, col } = self.cursor;
-        let damage = if !text.contains('\n') {
-            self.lines[line].insert_str(col, text);
-            self.cursor.col = col + text.len();
-            Damage::Line(line)
-        } else {
-            let tail = self.lines[line][col..].to_string();
-            self.lines[line].truncate(col);
-            let mut parts = text.split('\n');
-            let first = parts.next().unwrap_or_default();
-            self.lines[line].push_str(first);
-            let mut last_line = line;
-            let mut last_col = self.lines[line].len();
-            for (insert_at, part) in (line + 1..).zip(parts) {
-                self.lines.insert(insert_at, part.to_string());
-                last_line = insert_at;
-                last_col = part.len();
-            }
-            self.lines[last_line].push_str(&tail);
-            self.cursor = Position {
-                line: last_line,
-                col: last_col,
-            };
-            Damage::From(line)
-        };
-        sel_damage.merge(damage)
+        let (start, end) = self.selection().unwrap_or((self.cursor, self.cursor));
+        self.record_replace(start, end, text, kind)
+    }
+
+    /// Insert text at the cursor (replacing any selection) as its own
+    /// undo step. `text` may contain `\n` (multi-line paste); `\r` is
+    /// normalized away.
+    pub fn insert_str(&mut self, text: &str) -> Damage {
+        self.insert_with_kind(text, GroupKind::Other)
+    }
+
+    /// Insert keystroke text; consecutive typed inserts coalesce into
+    /// one undo step.
+    pub fn insert_typed(&mut self, text: &str) -> Damage {
+        self.insert_with_kind(text, GroupKind::Typing)
     }
 
     pub fn insert_char(&mut self, ch: char) -> Damage {
         let mut buf = [0u8; 4];
-        self.insert_str(ch.encode_utf8(&mut buf))
+        self.insert_typed(ch.encode_utf8(&mut buf))
     }
 
-    /// Split the current line at the cursor (Enter).
+    /// Split the current line at the cursor (Enter). Its own undo step.
     pub fn insert_newline(&mut self) -> Damage {
         self.insert_str("\n")
     }
@@ -577,22 +771,35 @@ impl EditorBuffer {
             return self.delete_selection();
         }
         let Position { line, col } = self.cursor;
-        if col == 0 {
+        let (start, kind) = if col == 0 {
             if line == 0 {
                 return Damage::None;
             }
-            let start = Position {
-                line: line - 1,
-                col: self.lines[line - 1].len(),
-            };
-            return self.delete_range(start, self.cursor);
-        }
-        let target = if word {
-            prev_word_boundary(&self.lines[line], col)
+            (
+                Position {
+                    line: line - 1,
+                    col: self.lines[line - 1].len(),
+                },
+                GroupKind::Other,
+            )
+        } else if word {
+            (
+                Position {
+                    line,
+                    col: prev_word_boundary(&self.lines[line], col),
+                },
+                GroupKind::Other,
+            )
         } else {
-            self.prev_char_col(line, col)
+            (
+                Position {
+                    line,
+                    col: self.prev_char_col(line, col),
+                },
+                GroupKind::Deleting,
+            )
         };
-        self.delete_range(Position { line, col: target }, self.cursor)
+        self.record_replace(start, self.cursor, "", kind)
     }
 
     /// Delete: delete selection, or the char (Ctrl: word) after the
@@ -604,22 +811,35 @@ impl EditorBuffer {
         }
         let Position { line, col } = self.cursor;
         let line_len = self.lines[line].len();
-        if col >= line_len {
+        let (end, kind) = if col >= line_len {
             if line + 1 >= self.lines.len() {
                 return Damage::None;
             }
-            let end = Position {
-                line: line + 1,
-                col: 0,
-            };
-            return self.delete_range(self.cursor, end);
-        }
-        let target = if word {
-            next_word_boundary(&self.lines[line], col)
+            (
+                Position {
+                    line: line + 1,
+                    col: 0,
+                },
+                GroupKind::Other,
+            )
+        } else if word {
+            (
+                Position {
+                    line,
+                    col: next_word_boundary(&self.lines[line], col),
+                },
+                GroupKind::Other,
+            )
         } else {
-            self.next_char_col(line, col)
+            (
+                Position {
+                    line,
+                    col: self.next_char_col(line, col),
+                },
+                GroupKind::Deleting,
+            )
         };
-        self.delete_range(self.cursor, Position { line, col: target })
+        self.record_replace(self.cursor, end, "", kind)
     }
 }
 
@@ -986,6 +1206,149 @@ mod tests {
         assert_eq!(b.cursor(), at(0, 3));
         b.set_cursor(at(0, 2), false); // inside 'é'
         assert_eq!(b.cursor(), at(0, 1));
+    }
+
+    // -- undo / redo --------------------------------------------------------
+
+    #[test]
+    fn typing_run_undoes_as_one_step() {
+        let mut b = buf("base");
+        for c in "hello".chars() {
+            b.insert_char(c);
+        }
+        assert_eq!(b.to_text(), "hellobase");
+        assert_ne!(b.undo(), Damage::None);
+        assert_eq!(b.to_text(), "base");
+        assert_eq!(b.cursor(), at(0, 0));
+        // Nothing further to undo.
+        assert_eq!(b.undo(), Damage::None);
+    }
+
+    #[test]
+    fn movement_breaks_typing_group() {
+        let mut b = buf("");
+        b.insert_char('a');
+        b.insert_char('b');
+        b.move_left(false);
+        b.move_right(false);
+        b.insert_char('c');
+        assert_eq!(b.to_text(), "abc");
+        b.undo();
+        assert_eq!(b.to_text(), "ab");
+        b.undo();
+        assert_eq!(b.to_text(), "");
+    }
+
+    #[test]
+    fn backspace_run_undoes_as_one_step() {
+        let mut b = buf("hello");
+        b.move_doc_end(false);
+        b.backspace(false);
+        b.backspace(false);
+        b.backspace(false);
+        assert_eq!(b.to_text(), "he");
+        b.undo();
+        assert_eq!(b.to_text(), "hello");
+        assert_eq!(b.cursor(), at(0, 5));
+    }
+
+    #[test]
+    fn delete_forward_run_undoes_as_one_step() {
+        let mut b = buf("hello");
+        b.set_cursor(at(0, 0), false);
+        b.delete_forward(false);
+        b.delete_forward(false);
+        assert_eq!(b.to_text(), "llo");
+        b.undo();
+        assert_eq!(b.to_text(), "hello");
+    }
+
+    #[test]
+    fn redo_reapplies_and_new_edit_clears_redo() {
+        let mut b = buf("");
+        b.insert_char('a');
+        b.move_left(false); // break group
+        b.insert_char('b');
+        b.undo();
+        assert_eq!(b.to_text(), "a");
+        assert_ne!(b.redo(), Damage::None);
+        assert_eq!(b.to_text(), "ba");
+        b.undo();
+        b.insert_char('c');
+        // Redo history is gone after a fresh edit.
+        assert_eq!(b.redo(), Damage::None);
+        assert_eq!(b.to_text(), "ca");
+    }
+
+    #[test]
+    fn undo_restores_replaced_selection() {
+        let mut b = buf("hello world");
+        b.set_cursor(at(0, 0), false);
+        b.move_word_right(true); // select "hello "
+        b.insert_char('X');
+        assert_eq!(b.to_text(), "Xworld");
+        b.undo();
+        assert_eq!(b.to_text(), "hello world");
+        // Cursor and selection restored to the pre-edit state.
+        assert_eq!(b.selection(), Some((at(0, 0), at(0, 6))));
+    }
+
+    #[test]
+    fn undo_of_multiline_paste_removes_all_lines() {
+        let mut b = buf("head tail");
+        b.set_cursor(at(0, 4), false);
+        b.insert_str("A\nB\nC");
+        assert_eq!(b.to_text(), "headA\nB\nC tail");
+        b.undo();
+        assert_eq!(b.to_text(), "head tail");
+        assert_eq!(b.cursor(), at(0, 4));
+        b.redo();
+        assert_eq!(b.to_text(), "headA\nB\nC tail");
+        assert_eq!(b.cursor(), at(2, 1));
+    }
+
+    #[test]
+    fn undo_of_line_join_restores_newline() {
+        let mut b = buf("ab\ncd");
+        b.set_cursor(at(1, 0), false);
+        b.backspace(false);
+        assert_eq!(b.to_text(), "abcd");
+        b.undo();
+        assert_eq!(b.to_text(), "ab\ncd");
+        assert_eq!(b.cursor(), at(1, 0));
+    }
+
+    #[test]
+    fn top_group_id_tracks_edit_identity_across_undo() {
+        let mut b = buf("");
+        assert_eq!(b.top_group_id(), 0);
+        b.insert_char('a');
+        let first = b.top_group_id();
+        assert_ne!(first, 0);
+        b.undo();
+        assert_eq!(b.top_group_id(), 0);
+        b.redo();
+        assert_eq!(b.top_group_id(), first);
+        // A fresh edit after undo gets a new identity, so "back to
+        // saved depth" cannot be confused with "same content".
+        b.undo();
+        b.insert_char('b');
+        assert_ne!(b.top_group_id(), first);
+    }
+
+    #[test]
+    fn paste_is_its_own_undo_step_between_typing() {
+        let mut b = buf("");
+        b.insert_char('a');
+        b.insert_str("PASTE");
+        b.insert_char('b');
+        assert_eq!(b.to_text(), "aPASTEb");
+        b.undo();
+        assert_eq!(b.to_text(), "aPASTE");
+        b.undo();
+        assert_eq!(b.to_text(), "a");
+        b.undo();
+        assert_eq!(b.to_text(), "");
     }
 
     // -- damage -------------------------------------------------------------
