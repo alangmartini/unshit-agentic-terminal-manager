@@ -96,9 +96,9 @@ pub struct BenchConfig {
 struct BenchState {
     samples_us: VecDeque<u64>,
     /// Present-to-present intervals in microseconds, one per painted
-    /// frame after the first. Fed from [`FrameMetrics::present_interval_us`];
-    /// zero samples (first frame of a run) are skipped so quantiles
-    /// reflect real cadence gaps only.
+    /// frame after the first benchmark frame. Fed from
+    /// [`FrameMetrics::present_interval_us`]. The first metric is skipped
+    /// even when nonzero because its interval began before activation.
     intervals_us: VecDeque<u64>,
     tree_build_us_sum: u64,
     layout_us_sum: u64,
@@ -118,6 +118,10 @@ struct BenchState {
     last_display_period_ns: u64,
     active: bool,
     #[cfg(feature = "input-latency-histogram")]
+    capture_input_latency: bool,
+    #[cfg(feature = "input-latency-histogram")]
+    latency_baseline: Option<InputLatencySnapshot>,
+    #[cfg(feature = "input-latency-histogram")]
     latency_snapshot: Option<InputLatencySnapshot>,
 }
 
@@ -134,6 +138,10 @@ impl BenchState {
             last_pacer_min_interval_ns: 0,
             last_display_period_ns: 0,
             active: false,
+            #[cfg(feature = "input-latency-histogram")]
+            capture_input_latency: false,
+            #[cfg(feature = "input-latency-histogram")]
+            latency_baseline: None,
             #[cfg(feature = "input-latency-histogram")]
             latency_snapshot: None,
         }
@@ -154,7 +162,7 @@ pub fn record_frame(m: &FrameMetrics) {
         return;
     }
     s.samples_us.push_back(m.total_us);
-    if m.present_interval_us > 0 {
+    if s.frames > 0 && m.present_interval_us > 0 {
         s.intervals_us.push_back(m.present_interval_us);
     }
     if m.display_period_ns > 0 {
@@ -169,16 +177,24 @@ pub fn record_frame(m: &FrameMetrics) {
 }
 
 /// Called once per rendered frame by the framework when the
-/// `input-latency-histogram` feature is enabled. Stores the latest
-/// snapshot so `build_report` can read it without polling. No-op
-/// unless the bench is active.
+/// `input-latency-histogram` feature is enabled. Retains the latest
+/// cumulative snapshot during warmup so [`activate`] can establish a
+/// benchmark boundary, then continues updating it during the run.
 #[cfg(feature = "input-latency-histogram")]
 pub fn record_input_latency(snap: &InputLatencySnapshot) {
     let mut s = state().lock().unwrap();
-    if !s.active {
+    if !s.capture_input_latency {
         return;
     }
     s.latency_snapshot = Some(snap.clone());
+}
+
+#[cfg(feature = "input-latency-histogram")]
+fn prepare_input_latency_capture() {
+    let mut s = state().lock().unwrap();
+    s.capture_input_latency = true;
+    s.latency_baseline = None;
+    s.latency_snapshot = None;
 }
 
 fn activate() {
@@ -193,7 +209,18 @@ fn activate() {
     s.frames = 0;
     #[cfg(feature = "input-latency-histogram")]
     {
-        s.latency_snapshot = None;
+        s.latency_baseline = s.latency_snapshot.clone();
+        s.capture_input_latency = true;
+        let (samples, events) = s
+            .latency_baseline
+            .as_ref()
+            .map(|snap| (snap.latency_ns.len(), snap.events_observed))
+            .unwrap_or((0, 0));
+        log::info!(
+            "{{\"event\":\"bench.input_latency_baseline_captured\",\"samples\":{},\"events\":{}}}",
+            samples,
+            events
+        );
     }
     s.last_pacer_min_interval_ns = 0;
     s.last_display_period_ns = 0;
@@ -202,6 +229,43 @@ fn activate() {
 fn deactivate() {
     let mut s = state().lock().unwrap();
     s.active = false;
+}
+
+#[cfg(feature = "input-latency-histogram")]
+fn scoped_input_latency_snapshot(s: &BenchState) -> Option<InputLatencySnapshot> {
+    let latest = s.latency_snapshot.as_ref()?;
+    let Some(baseline) = s.latency_baseline.as_ref() else {
+        return Some(latest.clone());
+    };
+
+    let mut latency_ns = latest.latency_ns.clone();
+    let mut events_per_frame = latest.events_per_frame.clone();
+    if latency_ns.subtract(&baseline.latency_ns).is_err()
+        || events_per_frame
+            .subtract(&baseline.events_per_frame)
+            .is_err()
+    {
+        log::warn!(
+            "{{\"event\":\"bench.input_latency_delta_failed\",\"latest_events\":{},\"baseline_events\":{}}}",
+            latest.events_observed,
+            baseline.events_observed
+        );
+        return None;
+    }
+
+    Some(InputLatencySnapshot {
+        latency_ns,
+        events_per_frame,
+        mid_draw_events_dropped: latest
+            .mid_draw_events_dropped
+            .saturating_sub(baseline.mid_draw_events_dropped),
+        frames_presented: latest
+            .frames_presented
+            .saturating_sub(baseline.frames_presented),
+        events_observed: latest
+            .events_observed
+            .saturating_sub(baseline.events_observed),
+    })
 }
 
 #[derive(Serialize)]
@@ -229,6 +293,10 @@ struct Report {
     input_latency_p99_us: f64,
     #[cfg(feature = "input-latency-histogram")]
     input_latency_max_us: f64,
+    #[cfg(feature = "input-latency-histogram")]
+    input_latency_samples: u64,
+    #[cfg(feature = "input-latency-histogram")]
+    input_events_observed: u64,
     #[cfg(feature = "input-latency-histogram")]
     events_per_frame_p50: f64,
     #[cfg(feature = "input-latency-histogram")]
@@ -380,8 +448,19 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         0.0
     };
     #[cfg(feature = "input-latency-histogram")]
-    let (lat_p50, lat_p95, lat_p99, lat_max, ev_p50, ev_p95, ev_max, mid_draw) = {
-        if let Some(ref snap) = s.latency_snapshot {
+    let (
+        lat_p50,
+        lat_p95,
+        lat_p99,
+        lat_max,
+        latency_samples,
+        input_events,
+        ev_p50,
+        ev_p95,
+        ev_max,
+        mid_draw,
+    ) = {
+        if let Some(snap) = scoped_input_latency_snapshot(&s) {
             let lat = &snap.latency_ns;
             let ev = &snap.events_per_frame;
             let us = |ns: u64| (ns as f64) / 1000.0;
@@ -390,13 +469,15 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
                 us(lat.value_at_quantile(0.95)),
                 us(lat.value_at_quantile(0.99)),
                 us(lat.max()),
+                lat.len(),
+                snap.events_observed,
                 ev.value_at_quantile(0.50) as f64,
                 ev.value_at_quantile(0.95) as f64,
                 ev.max(),
                 snap.mid_draw_events_dropped,
             )
         } else {
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0)
+            (0.0, 0.0, 0.0, 0.0, 0, 0, 0.0, 0.0, 0, 0)
         }
     };
     let min_us = sorted.first().copied().unwrap_or(0);
@@ -422,6 +503,10 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         input_latency_p99_us: lat_p99,
         #[cfg(feature = "input-latency-histogram")]
         input_latency_max_us: lat_max,
+        #[cfg(feature = "input-latency-histogram")]
+        input_latency_samples: latency_samples,
+        #[cfg(feature = "input-latency-histogram")]
+        input_events_observed: input_events,
         #[cfg(feature = "input-latency-histogram")]
         events_per_frame_p50: ev_p50,
         #[cfg(feature = "input-latency-histogram")]
@@ -501,6 +586,8 @@ fn create_split_stress_panes(shared: &SharedState, target_count: usize) -> Vec<u
 /// sleeps for `warmup`, runs the workload for `duration`, writes the
 /// report, then force-exits the process.
 pub fn start(config: BenchConfig, shared: SharedState) {
+    #[cfg(feature = "input-latency-histogram")]
+    prepare_input_latency_capture();
     std::thread::spawn(move || {
         log::info!(
             "[bench] warmup={:?} mode={} duration={:?} out={:?}",
@@ -566,11 +653,13 @@ pub fn start(config: BenchConfig, shared: SharedState) {
         );
         #[cfg(feature = "input-latency-histogram")]
         log::info!(
-            "[bench] input latency p50={:.2}us p95={:.2}us p99={:.2}us max={:.2}us ev/frame p50={:.0} p95={:.0} mid_draw_dropped={}",
+            "[bench] input latency p50={:.2}us p95={:.2}us p99={:.2}us max={:.2}us samples={} events={} ev/frame p50={:.0} p95={:.0} mid_draw_dropped={}",
             report.input_latency_p50_us,
             report.input_latency_p95_us,
             report.input_latency_p99_us,
             report.input_latency_max_us,
+            report.input_latency_samples,
+            report.input_events_observed,
             report.events_per_frame_p50,
             report.events_per_frame_p95,
             report.mid_draw_events_dropped,
@@ -777,6 +866,8 @@ mod tests {
             "input_latency_p95_us",
             "input_latency_p99_us",
             "input_latency_max_us",
+            "input_latency_samples",
+            "input_events_observed",
             "events_per_frame_p50",
             "events_per_frame_p95",
             "events_per_frame_max",
@@ -807,6 +898,8 @@ mod tests {
             "input_latency_p95_us",
             "input_latency_p99_us",
             "input_latency_max_us",
+            "input_latency_samples",
+            "input_events_observed",
             "events_per_frame_p50",
             "events_per_frame_p95",
             "events_per_frame_max",
@@ -842,6 +935,7 @@ mod tests {
         // Clear any residue from other tests.
         {
             let mut s = state().lock().unwrap();
+            s.latency_baseline = None;
             s.latency_snapshot = None;
         }
 
@@ -869,6 +963,69 @@ mod tests {
             "max {} us should reflect the 5ms sample",
             report.input_latency_max_us
         );
+    }
+
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn bench_report_excludes_input_latency_recorded_before_activation() {
+        use crate::bench::record_input_latency;
+        use unshit::app::InputLatencyTracker;
+
+        let _g = guard();
+        deactivate();
+        prepare_input_latency_capture();
+        {
+            let mut s = state().lock().unwrap();
+            s.latency_baseline = None;
+            s.latency_snapshot = None;
+        }
+
+        let mut tracker = InputLatencyTracker::new().unwrap();
+        let base = Instant::now();
+        tracker.record_event(base);
+        tracker.record_frame_presented(base + Duration::from_millis(50));
+        record_input_latency(&tracker.snapshot());
+
+        activate();
+        let active_event = base + Duration::from_millis(100);
+        tracker.record_event(active_event);
+        tracker.record_frame_presented(active_event + Duration::from_millis(2));
+        record_input_latency(&tracker.snapshot());
+
+        let report = build_report(BenchMode::HumanTyping, Duration::from_secs(1));
+        deactivate();
+        assert!(
+            report.input_latency_max_us < 3_000.0,
+            "pre-activation 50ms sample leaked into report: {}us",
+            report.input_latency_max_us
+        );
+    }
+
+    #[cfg(feature = "input-latency-histogram")]
+    #[test]
+    fn bench_report_fails_closed_when_input_histograms_are_not_cumulative() {
+        use unshit::app::InputLatencyTracker;
+
+        let _g = guard();
+        let base = Instant::now();
+        let mut baseline_tracker = InputLatencyTracker::new().unwrap();
+        baseline_tracker.record_event(base);
+        baseline_tracker.record_frame_presented(base + Duration::from_millis(50));
+        let mut latest_tracker = InputLatencyTracker::new().unwrap();
+        latest_tracker.record_event(base);
+        latest_tracker.record_frame_presented(base + Duration::from_millis(2));
+
+        activate();
+        {
+            let mut s = state().lock().unwrap();
+            s.latency_baseline = Some(baseline_tracker.snapshot());
+            s.latency_snapshot = Some(latest_tracker.snapshot());
+        }
+        let report = build_report(BenchMode::HumanTyping, Duration::from_secs(1));
+        deactivate();
+
+        assert_eq!(report.input_latency_samples, 0);
+        assert_eq!(report.input_latency_p99_us, 0.0);
     }
 
     #[test]
@@ -1000,6 +1157,35 @@ mod tests {
     }
 
     #[test]
+    fn record_frame_skips_inherited_interval_on_first_benchmark_frame() {
+        let _g = guard();
+        activate();
+        // FrameMetrics measures from the preceding application paint. The
+        // first frame after activation therefore crosses the benchmark
+        // boundary and must not become a cadence sample.
+        record_frame(&FrameMetrics {
+            total_us: 1_000,
+            present_interval_us: 139_000,
+            display_period_ns: 8_333_333,
+            ..Default::default()
+        });
+        record_frame(&FrameMetrics {
+            total_us: 1_000,
+            present_interval_us: 8_333,
+            display_period_ns: 8_333_333,
+            ..Default::default()
+        });
+
+        let s = state().lock().unwrap();
+        assert_eq!(
+            s.intervals_us.iter().copied().collect::<Vec<_>>(),
+            vec![8_333]
+        );
+        drop(s);
+        deactivate();
+    }
+
+    #[test]
     fn report_interval_quantiles_stddev_and_judder() {
         let _g = guard();
         activate();
@@ -1034,7 +1220,7 @@ mod tests {
         let _g = guard();
         activate();
         // No display period all run; pacer 8ms -> threshold 12_000us.
-        for &interval in &[8_000u64, 13_000] {
+        for &interval in &[0u64, 8_000, 13_000] {
             record_frame(&FrameMetrics {
                 total_us: 1_000,
                 present_interval_us: interval,
