@@ -12,6 +12,8 @@
 //!   runs the same stress stream in every pane.
 //! - `type-burst`: writes one ASCII char every 50ms. Stresses the
 //!   single-cell keystroke path.
+//! - `human-typing`: records while an external desktop driver sends real
+//!   keyboard input through the focused window.
 //!
 //! The probe is off by default; activation is gated on the main thread
 //! setting up the bench. In non-bench runs, `record_frame` is a
@@ -40,6 +42,7 @@ pub enum BenchMode {
     StressCat2Pane,
     StressCat4Pane,
     TypeBurst,
+    HumanTyping,
     /// Stress mode for issue #86 (epic #81 item 2): run the dir-loop
     /// workload at the hardware's sustained rate while reporting per
     /// frame counters for the instance buffer pool. Used to verify the
@@ -55,6 +58,7 @@ impl BenchMode {
             "stress-cat-2pane" => Some(Self::StressCat2Pane),
             "stress-cat-4pane" => Some(Self::StressCat4Pane),
             "type-burst" => Some(Self::TypeBurst),
+            "human-typing" => Some(Self::HumanTyping),
             "instance-pool-stress" => Some(Self::InstancePoolStress),
             _ => None,
         }
@@ -67,6 +71,7 @@ impl BenchMode {
             Self::StressCat2Pane => "stress-cat-2pane",
             Self::StressCat4Pane => "stress-cat-4pane",
             Self::TypeBurst => "type-burst",
+            Self::HumanTyping => "human-typing",
             Self::InstancePoolStress => "instance-pool-stress",
         }
     }
@@ -236,6 +241,9 @@ struct Report {
     /// active monitor's refresh rate. 8.0 on the historic fallback path;
     /// ~6.944 on 144Hz, ~4.166 on 240Hz.
     pacer_min_interval_ms: f64,
+    /// Active monitor refresh period in milliseconds. Zero only when the
+    /// platform did not report a refresh rate during the run.
+    display_period_ms: f64,
     /// Minimum frame time observed in microseconds. Lower bound on the
     /// per frame cost of the pool below which hardware limits dominate.
     min_us: u64,
@@ -423,6 +431,7 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         #[cfg(feature = "input-latency-histogram")]
         mid_draw_events_dropped: mid_draw,
         pacer_min_interval_ms: s.last_pacer_min_interval_ns as f64 / 1_000_000.0,
+        display_period_ms: s.last_display_period_ns as f64 / 1_000_000.0,
         min_us,
         p01_ms: pct(0.01) as f64 / 1000.0,
         interval_p50_ms: percentile_us(&intervals_sorted, 0.50) as f64 / 1000.0,
@@ -531,6 +540,7 @@ pub fn start(config: BenchConfig, shared: SharedState) {
                 run_stress_cat(config.duration)
             }
             BenchMode::TypeBurst => run_type_burst(&shared, pane_id, config.duration),
+            BenchMode::HumanTyping => run_human_typing(config.duration),
             BenchMode::InstancePoolStress => {
                 run_instance_pool_stress(&shared, pane_id, config.duration)
             }
@@ -620,6 +630,10 @@ fn run_type_burst(shared: &SharedState, pane_id: u32, duration: Duration) {
     }
 }
 
+fn run_human_typing(duration: Duration) {
+    std::thread::sleep(duration);
+}
+
 /// Stress mode for the instance buffer pool. Drives the same scroll
 /// heavy workload as `dir-loop` but at a faster write cadence (10ms vs
 /// 80ms) to produce more frames per second. The renderer acquires and
@@ -673,6 +687,10 @@ mod tests {
         assert!(matches!(
             BenchMode::parse("type-burst"),
             Some(BenchMode::TypeBurst)
+        ));
+        assert!(matches!(
+            BenchMode::parse("human-typing"),
+            Some(BenchMode::HumanTyping)
         ));
         assert!(matches!(
             BenchMode::parse("instance-pool-stress"),
@@ -868,6 +886,20 @@ mod tests {
             "expected ~6.944ms, got {}",
             r.pacer_min_interval_ms
         );
+        deactivate();
+    }
+
+    #[test]
+    fn report_records_active_display_period_from_last_known_frame() {
+        let _g = guard();
+        activate();
+        record_frame(&FrameMetrics {
+            total_us: 2_000,
+            display_period_ns: 8_333_333,
+            ..Default::default()
+        });
+        let report = build_report(BenchMode::HumanTyping, Duration::from_secs(1));
+        assert!((report.display_period_ms - 8.333_333).abs() < 0.001);
         deactivate();
     }
 
