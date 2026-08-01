@@ -20,6 +20,7 @@ use std::process::{Command, ExitCode};
 mod args;
 mod desktop_regression;
 mod profile;
+mod typing_perf;
 
 fn main() -> ExitCode {
     let raw: Vec<OsString> = env::args_os().skip(1).collect();
@@ -33,6 +34,13 @@ fn main() -> ExitCode {
             }
         },
         Ok(args::Cli::Profile(opts)) => match profile::run(&opts) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Ok(args::Cli::TypingPerf(opts)) => match typing_perf::run(&opts) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("xtask: {e}");
@@ -60,6 +68,7 @@ fn print_usage() {
     println!("  profile cpu    [--out-dir DIR] [--rate HZ]  Record CPU profile via samply");
     println!("  profile memory [--out-dir DIR]              Record heap profile via dhat");
     println!("  profile all    [--out-dir DIR] [--rate HZ]  Record both, then open dashboard");
+    println!("  typing-perf [--runs N] [--duration SEC] [--mode human|stress|all] [--out-dir DIR] [--skip-build]");
     println!();
     println!("Defaults:");
     println!("  --out-dir target/profile");

@@ -419,6 +419,21 @@ mod imp {
         Ok(())
     }
 
+    pub fn send_text_to_window(handle: WindowHandle, text: &str) -> Result<(), String> {
+        ensure_foreground_window(handle)?;
+        for unit in text.encode_utf16() {
+            send_keyboard_input(0, unit, KEYEVENTF_UNICODE)?;
+            send_keyboard_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)?;
+        }
+        Ok(())
+    }
+
+    pub fn send_enter_to_window(handle: WindowHandle) -> Result<(), String> {
+        ensure_foreground_window(handle)?;
+        send_keyboard_input(VK_RETURN as u16, 0, 0)?;
+        send_keyboard_input(VK_RETURN as u16, 0, KEYEVENTF_KEYUP)
+    }
+
     pub fn send_ctrl_d() -> Result<(), String> {
         send_key_combo(VK_CONTROL as u16, VK_D as u16)
     }
@@ -460,6 +475,18 @@ mod imp {
             if sent != 1 {
                 return Err("SendInput failed".to_owned());
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_foreground_window(handle: WindowHandle) -> Result<(), String> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground != hwnd(handle) {
+            return Err(format!(
+                "refusing synthetic keyboard input: target={:?} foreground={:?}",
+                handle,
+                non_null_window_handle(foreground)
+            ));
         }
         Ok(())
     }
@@ -705,6 +732,14 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn send_text_to_window(_handle: WindowHandle, _text: &str) -> Result<(), String> {
+        Err(unsupported())
+    }
+
+    pub fn send_enter_to_window(_handle: WindowHandle) -> Result<(), String> {
+        Err(unsupported())
+    }
+
     pub fn close_window(_handle: WindowHandle) -> Result<(), String> {
         Err(unsupported())
     }
@@ -795,6 +830,14 @@ pub fn verify_snap_capture_ready(
 
 pub fn send_text_enter(text: &str) -> Result<(), String> {
     imp::send_text_enter(text)
+}
+
+pub fn send_text_to_window(handle: WindowHandle, text: &str) -> Result<(), String> {
+    imp::send_text_to_window(handle, text)
+}
+
+pub fn send_enter_to_window(handle: WindowHandle) -> Result<(), String> {
+    imp::send_enter_to_window(handle)
 }
 
 pub fn close_window(handle: WindowHandle) -> Result<(), String> {

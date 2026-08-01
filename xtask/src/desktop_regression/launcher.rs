@@ -53,6 +53,14 @@ impl AppLogFiles {
     pub fn artifact_names(&self) -> [String; 2] {
         [self.stdout_name.clone(), self.stderr_name.clone()]
     }
+
+    pub fn stdout_path(&self) -> &Path {
+        &self.stdout_path
+    }
+
+    pub fn stderr_path(&self) -> &Path {
+        &self.stderr_path
+    }
 }
 
 pub struct AppSession {
@@ -91,6 +99,24 @@ impl AppSession {
         diagnostics: Option<&DiagnosticLaunchConfig>,
         extra_env: &BTreeMap<&str, String>,
     ) -> Result<Self, String> {
+        Self::launch_with_logs_env_and_args(
+            exe_path,
+            workspace_root,
+            logs,
+            diagnostics,
+            extra_env,
+            &[],
+        )
+    }
+
+    pub fn launch_with_logs_env_and_args(
+        exe_path: &Path,
+        workspace_root: &Path,
+        logs: Option<&AppLogFiles>,
+        diagnostics: Option<&DiagnosticLaunchConfig>,
+        extra_env: &BTreeMap<&str, String>,
+        args: &[String],
+    ) -> Result<Self, String> {
         if !exe_path.is_file() {
             return Err(format!("missing built binary: {}", exe_path.display()));
         }
@@ -98,6 +124,7 @@ impl AppSession {
         let support_processes_before = process_ids_by_image("unshit-ptyd.exe");
         let mut command = Command::new(exe_path);
         command.current_dir(workspace_root);
+        command.args(args);
         // Isolate every test launch in its own instance profile: unique
         // daemon pipe, unique notify pipe, throwaway config dir. A test
         // run must never attach to (or persist into) the user's real
@@ -161,6 +188,25 @@ impl AppSession {
 
     pub fn process_id(&self) -> u32 {
         self.child.id()
+    }
+
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Result<std::process::ExitStatus, String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|e| format!("failed to query app process {}: {e}", self.child.id()))?
+            {
+                return Ok(status);
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        Err(format!(
+            "app process {} did not exit within {:.1}s",
+            self.child.id(),
+            timeout.as_secs_f64()
+        ))
     }
 
     pub fn close_now(&mut self) -> Result<(), String> {

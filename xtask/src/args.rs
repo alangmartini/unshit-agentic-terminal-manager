@@ -10,6 +10,7 @@ use crate::desktop_regression::options::{parse_desktop_regression, DesktopRegres
 pub enum Cli {
     DesktopRegression(DesktopRegressionOpts),
     Profile(ProfileOpts),
+    TypingPerf(TypingPerfOpts),
     Help,
 }
 
@@ -25,6 +26,34 @@ pub struct ProfileOpts {
     pub kind: ProfileKind,
     pub out_dir: PathBuf,
     pub rate: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TypingPerfMode {
+    Human,
+    Stress,
+    All,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct TypingPerfOpts {
+    pub runs: u32,
+    pub duration_secs: u64,
+    pub mode: TypingPerfMode,
+    pub out_dir: PathBuf,
+    pub skip_build: bool,
+}
+
+impl Default for TypingPerfOpts {
+    fn default() -> Self {
+        Self {
+            runs: 3,
+            duration_secs: 8,
+            mode: TypingPerfMode::All,
+            out_dir: PathBuf::from("target/perf/typing"),
+            skip_build: false,
+        }
+    }
 }
 
 impl Default for ProfileOpts {
@@ -52,10 +81,90 @@ impl Cli {
             "-h" | "--help" | "help" => Ok(Cli::Help),
             "desktop-regression" => parse_desktop_regression(iter).map(Cli::DesktopRegression),
             "profile" => parse_profile(iter),
+            "typing-perf" => parse_typing_perf(iter),
             other => Err(format!(
                 "unknown subcommand '{other}'. Run `cargo xtask --help`."
             )),
         }
+    }
+}
+
+fn parse_typing_perf(mut iter: impl Iterator<Item = String>) -> Result<Cli, String> {
+    let mut opts = TypingPerfOpts::default();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--runs" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--runs requires a value".to_owned())?;
+                opts.runs = parse_positive_u32("--runs", &value)?;
+            }
+            "--duration" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--duration requires a value".to_owned())?;
+                opts.duration_secs = parse_duration_secs(&value)?;
+            }
+            "--mode" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--mode requires a value".to_owned())?;
+                opts.mode = parse_typing_perf_mode(&value)?;
+            }
+            "--out-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--out-dir requires a value".to_owned())?;
+                opts.out_dir = PathBuf::from(value);
+            }
+            "--skip-build" => opts.skip_build = true,
+            "-h" | "--help" | "help" => return Ok(Cli::Help),
+            other if other.starts_with("--runs=") => {
+                opts.runs = parse_positive_u32("--runs", &other["--runs=".len()..])?;
+            }
+            other if other.starts_with("--duration=") => {
+                opts.duration_secs = parse_duration_secs(&other["--duration=".len()..])?;
+            }
+            other if other.starts_with("--mode=") => {
+                opts.mode = parse_typing_perf_mode(&other["--mode=".len()..])?;
+            }
+            other if other.starts_with("--out-dir=") => {
+                opts.out_dir = PathBuf::from(&other["--out-dir=".len()..]);
+            }
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+    Ok(Cli::TypingPerf(opts))
+}
+
+fn parse_positive_u32(flag: &str, value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("{flag} expected a positive integer, got '{value}'"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be at least 1"));
+    }
+    Ok(parsed)
+}
+
+fn parse_duration_secs(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("--duration expected integer seconds, got '{value}'"))?;
+    if parsed < 4 {
+        return Err("--duration must be at least 4 seconds".to_owned());
+    }
+    Ok(parsed)
+}
+
+fn parse_typing_perf_mode(value: &str) -> Result<TypingPerfMode, String> {
+    match value {
+        "human" => Ok(TypingPerfMode::Human),
+        "stress" => Ok(TypingPerfMode::Stress),
+        "all" => Ok(TypingPerfMode::All),
+        _ => Err(format!(
+            "--mode expected human, stress, or all; got '{value}'"
+        )),
     }
 }
 
@@ -255,5 +364,49 @@ mod tests {
             panic!("expected DesktopRegression");
         };
         assert!(opts.list);
+    }
+
+    #[test]
+    fn typing_perf_defaults_to_repeated_human_and_stress_runs() {
+        let cli = parse(&["typing-perf"]).unwrap();
+        let Cli::TypingPerf(opts) = cli else {
+            panic!("expected TypingPerf");
+        };
+        assert_eq!(opts.runs, 3);
+        assert_eq!(opts.duration_secs, 8);
+        assert_eq!(opts.mode, TypingPerfMode::All);
+        assert_eq!(opts.out_dir, PathBuf::from("target/perf/typing"));
+        assert!(!opts.skip_build);
+    }
+
+    #[test]
+    fn typing_perf_parses_run_controls() {
+        let cli = parse(&[
+            "typing-perf",
+            "--runs",
+            "5",
+            "--duration",
+            "12",
+            "--mode",
+            "stress",
+            "--out-dir",
+            "target/custom-typing",
+            "--skip-build",
+        ])
+        .unwrap();
+        let Cli::TypingPerf(opts) = cli else {
+            panic!("expected TypingPerf");
+        };
+        assert_eq!(opts.runs, 5);
+        assert_eq!(opts.duration_secs, 12);
+        assert_eq!(opts.mode, TypingPerfMode::Stress);
+        assert_eq!(opts.out_dir, PathBuf::from("target/custom-typing"));
+        assert!(opts.skip_build);
+    }
+
+    #[test]
+    fn typing_perf_rejects_zero_runs_and_short_duration() {
+        assert!(parse(&["typing-perf", "--runs", "0"]).is_err());
+        assert!(parse(&["typing-perf", "--duration", "2"]).is_err());
     }
 }
