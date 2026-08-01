@@ -333,11 +333,16 @@ pub fn diagnostic_json() -> serde_json::Value {
         "rendered_sample_count": snap.rendered_sample_count,
         "current_fps": snap.current_fps(),
         "last_total_us": snap.last.total_us,
+        "work_p50_us": q.p50_us,
+        "work_p95_us": q.p95_us,
+        "work_p99_us": q.p99_us,
         "interval_p50_us": iq.p50_us,
         "interval_p95_us": iq.p95_us,
         "interval_p99_us": iq.p99_us,
         "interval_max_us": iq.max_us,
         "dropped_count": snap.dropped_count(),
+        "display_period_ns": snap.last.display_period_ns,
+        "pacer_min_interval_ns": snap.last.pacer_min_interval_ns,
         "frame_offsets_ms": snap.frame_offsets_ms(),
     })
 }
@@ -753,7 +758,10 @@ mod tests {
         reset_for_test();
         toggle_visible();
         record_frame(&metrics_with(4_000));
-        record_frame(&metrics_with_interval(9_000, 8_333_333));
+        let mut second = metrics_with_interval(9_000, 8_333_333);
+        second.total_us = 6_000;
+        second.pacer_min_interval_ns = 8_333_333;
+        record_frame(&second);
         build_fps_overlay();
         let diagnostic = diagnostic_json();
         assert_eq!(diagnostic["visible"], true);
@@ -763,11 +771,16 @@ mod tests {
         assert!(diagnostic["rendered_generation"].as_u64().unwrap() >= 1);
         assert_eq!(diagnostic["recorded_sample_count"], 2);
         assert_eq!(diagnostic["rendered_sample_count"], 2);
+        assert_eq!(diagnostic["work_p50_us"], 4_000);
+        assert_eq!(diagnostic["work_p95_us"], 6_000);
+        assert_eq!(diagnostic["work_p99_us"], 6_000);
         assert_eq!(diagnostic["interval_p50_us"], 9_000);
         assert_eq!(diagnostic["interval_p95_us"], 9_000);
         assert_eq!(diagnostic["interval_p99_us"], 9_000);
         assert_eq!(diagnostic["interval_max_us"], 9_000);
         assert_eq!(diagnostic["dropped_count"], 0);
+        assert_eq!(diagnostic["display_period_ns"], 8_333_333);
+        assert_eq!(diagnostic["pacer_min_interval_ns"], 8_333_333);
         let offsets = diagnostic["frame_offsets_ms"]
             .as_array()
             .expect("frame_offsets_ms must be an array");
