@@ -47,6 +47,16 @@ pub struct FramePacer {
     min_interval: Duration,
     /// Timestamp of the last paint this pacer observed.
     last_paint: Option<Instant>,
+    /// Absolute phase boundary at which the next timer-paced frame should
+    /// be presented. Unlike `last_paint + min_interval`, this remains
+    /// anchored when the OS wakes a little late, so sub-millisecond wake
+    /// jitter cannot accumulate into lost refresh slots.
+    next_presentation_target: Option<Instant>,
+    /// How far before `next_presentation_target` rendering may begin. Zero
+    /// preserves the traditional start-on-phase behavior; a non-zero lead
+    /// lets the renderer absorb variable work and hold the completed frame
+    /// until the stable presentation phase.
+    presentation_lead: Duration,
 }
 
 impl Default for FramePacer {
@@ -72,13 +82,23 @@ impl FramePacer {
 
     /// Construct a pacer with the default coalescing interval (8ms).
     pub fn new() -> Self {
-        Self { min_interval: Self::DEFAULT_MIN_INTERVAL, last_paint: None }
+        Self {
+            min_interval: Self::DEFAULT_MIN_INTERVAL,
+            last_paint: None,
+            next_presentation_target: None,
+            presentation_lead: Duration::ZERO,
+        }
     }
 
     /// Construct a pacer with a custom coalescing interval. Useful for tests
     /// and future experimentation.
     pub fn with_min_interval(min_interval: Duration) -> Self {
-        Self { min_interval, last_paint: None }
+        Self {
+            min_interval,
+            last_paint: None,
+            next_presentation_target: None,
+            presentation_lead: Duration::ZERO,
+        }
     }
 
     /// Construct a pacer whose coalescing interval is derived from the
@@ -86,7 +106,12 @@ impl FramePacer {
     /// force the historic 8ms fallback. Values above ~1000Hz are clamped
     /// to [`Self::MIN_DERIVED_INTERVAL`].
     pub fn with_refresh_rate_mhz(mhz: u32) -> Self {
-        Self { min_interval: Self::interval_from_mhz(mhz), last_paint: None }
+        Self {
+            min_interval: Self::interval_from_mhz(mhz),
+            last_paint: None,
+            next_presentation_target: None,
+            presentation_lead: Duration::ZERO,
+        }
     }
 
     /// Update the coalescing interval after construction. Called when the
@@ -94,6 +119,9 @@ impl FramePacer {
     /// different refresh rate. Pass 0 to fall back to the default.
     pub fn set_refresh_rate_mhz(&mut self, mhz: u32) {
         self.min_interval = Self::interval_from_mhz(mhz);
+        self.presentation_lead = self.presentation_lead.min(self.min_interval);
+        self.next_presentation_target =
+            self.last_paint.and_then(|last| last.checked_add(self.min_interval));
     }
 
     /// Pure helper: `mhz -> Duration`, the display's true refresh period.
@@ -125,10 +153,46 @@ impl FramePacer {
         self.last_paint
     }
 
+    /// Allow timer-paced rendering to begin this far before the stable
+    /// presentation phase. Values longer than one refresh period are clamped
+    /// so a frame can never be prepared more than one slot ahead.
+    pub fn set_presentation_lead(&mut self, lead: Duration) {
+        self.presentation_lead = lead.min(self.min_interval);
+    }
+
+    pub fn presentation_lead(&self) -> Duration {
+        self.presentation_lead
+    }
+
+    /// Presentation phase assigned to the frame that is currently due.
+    /// `None` only before the first paint establishes an anchor.
+    pub fn presentation_target(&self) -> Option<Instant> {
+        self.next_presentation_target
+    }
+
+    fn render_deadline(&self) -> Option<Instant> {
+        self.next_presentation_target
+            .map(|target| target.checked_sub(self.presentation_lead).unwrap_or(target))
+    }
+
     /// Record that a paint occurred at `now`. Subsequent redraw requests
     /// are gated against this timestamp.
     pub fn record_paint(&mut self, now: Instant) {
         self.last_paint = Some(now);
+        self.next_presentation_target = Some(match self.next_presentation_target {
+            None => now.checked_add(self.min_interval).unwrap_or(now),
+            // A frame that began on or before its target consumes exactly
+            // that phase, even when a presentation lead made the start early.
+            Some(target) if now <= target => target.checked_add(self.min_interval).unwrap_or(now),
+            // A late frame resumes only at a target that still leaves the
+            // configured render lead available; otherwise it would be born
+            // late again and could spin through stale deadlines.
+            Some(target) => next_phase_deadline(
+                target,
+                now.checked_add(self.presentation_lead).unwrap_or(now),
+                self.min_interval,
+            ),
+        });
     }
 
     /// Decide whether the caller should paint at `now`. Returns
@@ -137,16 +201,10 @@ impl FramePacer {
     ///
     /// The first paint after construction always proceeds immediately.
     pub fn on_redraw_requested(&self, now: Instant) -> PaceDecision {
-        match self.last_paint {
+        match self.render_deadline() {
             None => PaceDecision::PaintNow,
-            Some(last) => {
-                let elapsed = now.saturating_duration_since(last);
-                if elapsed >= self.min_interval {
-                    PaceDecision::PaintNow
-                } else {
-                    PaceDecision::WaitUntil(last + self.min_interval)
-                }
-            }
+            Some(deadline) if now >= deadline => PaceDecision::PaintNow,
+            Some(deadline) => PaceDecision::WaitUntil(deadline),
         }
     }
 
@@ -164,18 +222,28 @@ impl FramePacer {
     /// `ControlFlow::WaitUntil` and to also call `request_redraw()` so the
     /// redraw fires as soon as the deadline elapses.
     pub fn speculative_deadline(&self, now: Instant) -> Instant {
-        match self.last_paint {
+        match self.render_deadline() {
             None => now,
-            Some(last) => {
-                let next = last + self.min_interval;
-                if next > now {
-                    next
-                } else {
-                    now
-                }
-            }
+            Some(deadline) => deadline.max(now),
         }
     }
+}
+
+/// Advance an existing timer phase past `now`, skipping whole missed slots.
+/// The arithmetic path is O(1), including after a long suspend; an overflow
+/// falls back to a fresh one-period deadline instead of returning a stale
+/// instant that would spin the event loop.
+fn next_phase_deadline(deadline: Instant, now: Instant, period: Duration) -> Instant {
+    if period.is_zero() {
+        return now;
+    }
+    let elapsed = now.saturating_duration_since(deadline);
+    let slots = elapsed.as_nanos() / period.as_nanos() + 1;
+    let advanced = u32::try_from(slots)
+        .ok()
+        .and_then(|slots| period.checked_mul(slots))
+        .and_then(|advance| deadline.checked_add(advance));
+    advanced.filter(|next| *next > now).or_else(|| now.checked_add(period)).unwrap_or(now)
 }
 
 /// Abstract source of the active display's refresh rate.
@@ -270,6 +338,106 @@ mod tests {
             let t = t0 + Duration::from_micros(i * 500); // 0.5ms each = 6ms total
             assert_decisions_eq(pacer.on_redraw_requested(t), PaceDecision::WaitUntil(expected));
         }
+    }
+
+    #[test]
+    fn late_wake_does_not_shift_the_refresh_phase() {
+        let mut pacer = FramePacer::with_min_interval(Duration::from_millis(8));
+        let t0 = Instant::now();
+        pacer.record_paint(t0);
+
+        // The OS wakes 500us after the first 8ms deadline. The next frame
+        // still belongs at the 16ms phase boundary, not at 16.5ms.
+        pacer.record_paint(t0 + Duration::from_micros(8_500));
+        assert_decisions_eq(
+            pacer.on_redraw_requested(t0 + Duration::from_millis(15)),
+            PaceDecision::WaitUntil(t0 + Duration::from_millis(16)),
+        );
+    }
+
+    #[test]
+    fn repeated_wake_overshoot_does_not_accumulate() {
+        let mut pacer = FramePacer::with_min_interval(Duration::from_millis(8));
+        let t0 = Instant::now();
+        pacer.record_paint(t0);
+
+        // A 500us wake overshoot on every frame must remain a bounded
+        // offset from the phase. Re-anchoring every deadline to the actual
+        // wake would lose 60ms over these 120 frames (about seven 120Hz
+        // presentation slots in one second).
+        for frame in 1..=120u32 {
+            let phase = Duration::from_millis(u64::from(frame) * 8);
+            pacer.record_paint(t0 + phase + Duration::from_micros(500));
+        }
+        assert_decisions_eq(
+            pacer.on_redraw_requested(t0 + Duration::from_millis(967)),
+            PaceDecision::WaitUntil(t0 + Duration::from_millis(968)),
+        );
+    }
+
+    #[test]
+    fn badly_late_wake_skips_whole_missed_slots() {
+        let mut pacer = FramePacer::with_min_interval(Duration::from_millis(8));
+        let t0 = Instant::now();
+        pacer.record_paint(t0);
+
+        // A frame that arrives after the 8, 16, and 24ms boundaries must
+        // resume on the 32ms boundary. Returning a stale deadline would
+        // spin the event loop; re-anchoring at 26ms would add drift.
+        pacer.record_paint(t0 + Duration::from_millis(26));
+        assert_decisions_eq(
+            pacer.on_redraw_requested(t0 + Duration::from_millis(27)),
+            PaceDecision::WaitUntil(t0 + Duration::from_millis(32)),
+        );
+    }
+
+    #[test]
+    fn presentation_lead_wakes_before_the_phase_target() {
+        let mut pacer = FramePacer::with_min_interval(Duration::from_millis(8));
+        pacer.set_presentation_lead(Duration::from_millis(6));
+        let t0 = Instant::now();
+        pacer.record_paint(t0);
+
+        assert_eq!(pacer.presentation_target(), Some(t0 + Duration::from_millis(8)));
+        assert_decisions_eq(
+            pacer.on_redraw_requested(t0 + Duration::from_millis(1)),
+            PaceDecision::WaitUntil(t0 + Duration::from_millis(2)),
+        );
+
+        // The frame starts at 2ms and is held until its 8ms presentation
+        // target. Recording that start consumes the target without
+        // re-anchoring the phase.
+        pacer.record_paint(t0 + Duration::from_millis(2));
+        assert_eq!(pacer.presentation_target(), Some(t0 + Duration::from_millis(16)));
+        assert_decisions_eq(
+            pacer.on_redraw_requested(t0 + Duration::from_millis(9)),
+            PaceDecision::WaitUntil(t0 + Duration::from_millis(10)),
+        );
+    }
+
+    #[test]
+    fn presentation_lead_is_clamped_to_one_period() {
+        let mut pacer = FramePacer::with_min_interval(Duration::from_millis(8));
+        pacer.set_presentation_lead(Duration::from_millis(20));
+        assert_eq!(pacer.presentation_lead(), Duration::from_millis(8));
+    }
+
+    #[test]
+    fn late_leaded_frame_skips_until_a_full_render_window_exists() {
+        let mut pacer = FramePacer::with_min_interval(Duration::from_millis(8));
+        pacer.set_presentation_lead(Duration::from_millis(6));
+        let t0 = Instant::now();
+        pacer.record_paint(t0);
+
+        // Starting at 11ms has already missed the 8ms target. The 16ms
+        // target is only 5ms away, less than the configured render lead,
+        // so resume at the 24ms target / 18ms render deadline.
+        pacer.record_paint(t0 + Duration::from_millis(11));
+        assert_eq!(pacer.presentation_target(), Some(t0 + Duration::from_millis(24)));
+        assert_decisions_eq(
+            pacer.on_redraw_requested(t0 + Duration::from_millis(12)),
+            PaceDecision::WaitUntil(t0 + Duration::from_millis(18)),
+        );
     }
 
     #[test]

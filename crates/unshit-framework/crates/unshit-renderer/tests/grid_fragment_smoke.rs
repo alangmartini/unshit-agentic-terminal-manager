@@ -31,16 +31,14 @@ fn try_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
-    }))?;
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("grid-fragment smoke test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            ..Default::default()
-        },
-        None,
-    ))
+    }))
+    .ok()?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("grid-fragment smoke test device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
     .ok()?;
     Some((device, queue))
 }
@@ -213,7 +211,7 @@ fn write_cells_and_uniforms_without_validation_errors() {
         pipeline.write_glyph_meta(&queue, 0, bytemuck::cast_slice(&metas));
 
         queue.submit(std::iter::empty());
-        device.poll(wgpu::Maintain::Wait);
+        device.poll(wgpu::PollType::Wait).expect("GPU poll failed");
     });
 }
 

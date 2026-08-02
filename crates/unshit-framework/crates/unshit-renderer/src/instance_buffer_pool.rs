@@ -310,16 +310,14 @@ mod tests {
             power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("pool test device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                ..Default::default()
-            },
-            None,
-        ))
+        }))
+        .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("pool test device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
         .ok()?;
         Some((Arc::new(device), Arc::new(queue)))
     }
@@ -514,7 +512,7 @@ mod tests {
             let slice = staging.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-            device.poll(wgpu::Maintain::Wait);
+            device.poll(wgpu::PollType::Wait).expect("GPU poll failed");
             rx.recv().unwrap().unwrap();
             let data = slice.get_mapped_range();
             let round: &[TestInstance] = bytemuck::cast_slice(&data);

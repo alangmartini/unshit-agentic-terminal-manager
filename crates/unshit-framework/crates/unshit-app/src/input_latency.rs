@@ -117,6 +117,16 @@ impl InputLatencyTracker {
         self.frame_in_progress = true;
     }
 
+    /// Cancel a frame that was marked but did not reach presentation.
+    ///
+    /// Fast animation ticks can discover after sampling their hooks that no
+    /// pixels changed. Keep the queued input timestamp and event count for the
+    /// next real present, but reopen event collection so later input is not
+    /// misclassified as arriving during GPU work.
+    pub fn cancel_frame(&mut self) {
+        self.frame_in_progress = false;
+    }
+
     /// Called after `surface.present()` returns and the paint handler
     /// has already fired `on_frame_metrics`.
     ///
@@ -228,6 +238,24 @@ mod tests {
         assert_eq!(snap.latency_ns.len(), 0);
         assert_eq!(snap.events_per_frame.len(), 0);
         assert_eq!(snap.events_observed, 2);
+    }
+
+    #[test]
+    fn cancelled_frame_preserves_pending_input_for_next_present() {
+        let mut t = fresh_tracker();
+        let now = Instant::now();
+        t.record_event(now);
+        t.mark_frame_start();
+        t.cancel_frame();
+        t.record_event(now + Duration::from_millis(1));
+        t.mark_frame_start();
+        t.record_frame_presented(now + Duration::from_millis(5));
+
+        let snap = t.snapshot();
+        assert_eq!(snap.latency_ns.len(), 1);
+        assert_eq!(snap.events_per_frame.value_at_quantile(1.0), 2);
+        assert_eq!(snap.mid_draw_events_dropped, 0);
+        assert_eq!(snap.frames_presented, 1);
     }
 
     #[test]

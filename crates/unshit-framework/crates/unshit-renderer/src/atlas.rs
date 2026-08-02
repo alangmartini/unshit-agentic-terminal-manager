@@ -667,8 +667,9 @@ mod tests {
                     compatible_surface: None,
                     force_fallback_adapter: true,
                 })
-                .await?;
-            adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await.ok()
+                .await
+                .ok()?;
+            adapter.request_device(&wgpu::DeviceDescriptor::default()).await.ok()
         })
     }
 

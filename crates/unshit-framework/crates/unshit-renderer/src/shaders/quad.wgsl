@@ -40,31 +40,39 @@ struct VertexOutput {
     @location(0) local_pos: vec2<f32>,
     @location(1) size: vec2<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) border_color: vec4<f32>,
-    @location(4) border_width: vec4<f32>,
+    @location(3) @interpolate(flat) border_color_packed: vec2<u32>,
+    @location(4) @interpolate(flat) border_width_packed: vec2<u32>,
     @location(5) border_radius: vec4<f32>,
     @location(6) clip_rect: vec4<f32>,
-    @location(7) shadow_color: vec4<f32>,
-    @location(8) shadow_offset: vec2<f32>,
-    @location(9) shadow_params: vec2<f32>,
-    @location(10) shadow_spread: vec2<f32>,
-    @location(11) gradient_stop_color_0: vec4<f32>,
-    @location(12) gradient_stop_color_1: vec4<f32>,
-    @location(13) gradient_stop_color_2: vec4<f32>,
-    @location(14) gradient_stop_color_3: vec4<f32>,
-    @location(15) gradient_stop_color_4: vec4<f32>,
-    @location(16) gradient_stop_color_5: vec4<f32>,
-    @location(17) gradient_stop_color_6: vec4<f32>,
-    @location(18) gradient_stop_color_7: vec4<f32>,
-    @location(19) gradient_stop_positions_lo: vec4<f32>,
-    @location(20) gradient_stop_positions_hi: vec4<f32>,
-    @location(21) gradient_params: vec4<f32>,
+    @location(7) @interpolate(flat) shadow_color_packed: vec2<u32>,
+    @location(8) @interpolate(flat) shadow_offset_packed: u32,
+    @location(9) @interpolate(flat) shadow_params_packed: u32,
+    @location(10) @interpolate(flat) shadow_spread_packed: u32,
+    @location(11) @interpolate(flat) gradient_stop_color_0_packed: vec2<u32>,
+    @location(12) @interpolate(flat) gradient_stop_color_1_packed: vec2<u32>,
+    @location(13) @interpolate(flat) gradient_stop_color_2_packed: vec2<u32>,
+    @location(14) @interpolate(flat) gradient_stop_color_3_packed: vec2<u32>,
+    @location(15) @interpolate(flat) gradient_stop_color_4_packed: vec2<u32>,
+    @location(16) @interpolate(flat) gradient_stop_color_5_packed: vec2<u32>,
+    @location(17) @interpolate(flat) gradient_stop_color_6_packed: vec2<u32>,
+    @location(18) @interpolate(flat) gradient_stop_color_7_packed: vec2<u32>,
+    @location(19) @interpolate(flat) gradient_stop_positions_lo_packed: vec2<u32>,
+    @location(20) @interpolate(flat) gradient_stop_positions_hi_packed: vec2<u32>,
+    @location(21) @interpolate(flat) gradient_params_packed: vec2<u32>,
     @location(22) gradient_extra: vec4<f32>,
     @location(23) pixel_pos: vec2<f32>,
-    @location(24) mask_stops_01: vec4<f32>,
-    @location(25) mask_stops_23: vec4<f32>,
-    @location(26) mask_params: vec4<f32>,
+    @location(24) @interpolate(flat) mask_stops_01_packed: vec2<u32>,
+    @location(25) @interpolate(flat) mask_stops_23_packed: vec2<u32>,
+    @location(26) @interpolate(flat) mask_params_packed: vec2<u32>,
 };
+
+fn pack4x16float(value: vec4<f32>) -> vec2<u32> {
+    return vec2(pack2x16float(value.xy), pack2x16float(value.zw));
+}
+
+fn unpack4x16float(value: vec2<u32>) -> vec4<f32> {
+    return vec4(unpack2x16float(value.x), unpack2x16float(value.y));
+}
 
 @vertex
 fn vs_main(
@@ -110,30 +118,30 @@ fn vs_main(
     out.local_pos = corner * expanded_size;
     out.size = instance.size;
     out.color = instance.color;
-    out.border_color = instance.border_color;
-    out.border_width = instance.border_width;
+    out.border_color_packed = pack4x16float(instance.border_color);
+    out.border_width_packed = pack4x16float(instance.border_width);
     out.border_radius = instance.border_radius;
     out.clip_rect = instance.clip_rect;
-    out.shadow_color = instance.shadow_color;
-    out.shadow_offset = instance.shadow_offset;
-    out.shadow_params = instance.shadow_params;
-    out.shadow_spread = instance.shadow_spread;
-    out.gradient_stop_color_0 = instance.gradient_stop_color_0;
-    out.gradient_stop_color_1 = instance.gradient_stop_color_1;
-    out.gradient_stop_color_2 = instance.gradient_stop_color_2;
-    out.gradient_stop_color_3 = instance.gradient_stop_color_3;
-    out.gradient_stop_color_4 = instance.gradient_stop_color_4;
-    out.gradient_stop_color_5 = instance.gradient_stop_color_5;
-    out.gradient_stop_color_6 = instance.gradient_stop_color_6;
-    out.gradient_stop_color_7 = instance.gradient_stop_color_7;
-    out.gradient_stop_positions_lo = instance.gradient_stop_positions_lo;
-    out.gradient_stop_positions_hi = instance.gradient_stop_positions_hi;
-    out.gradient_params = instance.gradient_params;
+    out.shadow_color_packed = pack4x16float(instance.shadow_color);
+    out.shadow_offset_packed = pack2x16float(instance.shadow_offset);
+    out.shadow_params_packed = pack2x16float(instance.shadow_params);
+    out.shadow_spread_packed = pack2x16float(instance.shadow_spread);
+    out.gradient_stop_color_0_packed = pack4x16float(instance.gradient_stop_color_0);
+    out.gradient_stop_color_1_packed = pack4x16float(instance.gradient_stop_color_1);
+    out.gradient_stop_color_2_packed = pack4x16float(instance.gradient_stop_color_2);
+    out.gradient_stop_color_3_packed = pack4x16float(instance.gradient_stop_color_3);
+    out.gradient_stop_color_4_packed = pack4x16float(instance.gradient_stop_color_4);
+    out.gradient_stop_color_5_packed = pack4x16float(instance.gradient_stop_color_5);
+    out.gradient_stop_color_6_packed = pack4x16float(instance.gradient_stop_color_6);
+    out.gradient_stop_color_7_packed = pack4x16float(instance.gradient_stop_color_7);
+    out.gradient_stop_positions_lo_packed = pack4x16float(instance.gradient_stop_positions_lo);
+    out.gradient_stop_positions_hi_packed = pack4x16float(instance.gradient_stop_positions_hi);
+    out.gradient_params_packed = pack4x16float(instance.gradient_params);
     out.gradient_extra = instance.gradient_extra;
     out.pixel_pos = pixel_pos;
-    out.mask_stops_01 = instance.mask_stops_01;
-    out.mask_stops_23 = instance.mask_stops_23;
-    out.mask_params = instance.mask_params;
+    out.mask_stops_01_packed = pack4x16float(instance.mask_stops_01);
+    out.mask_stops_23_packed = pack4x16float(instance.mask_stops_23);
+    out.mask_params_packed = pack4x16float(instance.mask_params);
     return out;
 }
 
@@ -153,6 +161,21 @@ fn select_radius(local_pos: vec2<f32>, size: vec2<f32>, radii: vec4<f32>) -> f32
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // These values are constant across a quad, so transporting them as flat
+    // f16 pairs preserves the full feature set while reducing the varying
+    // budget from 96 to 59 components. That fits D3D12's 60-component limit;
+    // geometry, clipping, radii, base color, and radial geometry stay f32.
+    let border_color = unpack4x16float(in.border_color_packed);
+    let border_width = unpack4x16float(in.border_width_packed);
+    let shadow_color = unpack4x16float(in.shadow_color_packed);
+    let shadow_offset = unpack2x16float(in.shadow_offset_packed);
+    let shadow_params = unpack2x16float(in.shadow_params_packed);
+    let shadow_spread = unpack2x16float(in.shadow_spread_packed);
+    let gradient_params = unpack4x16float(in.gradient_params_packed);
+    let mask_stops_01 = unpack4x16float(in.mask_stops_01_packed);
+    let mask_stops_23 = unpack4x16float(in.mask_stops_23_packed);
+    let mask_params = unpack4x16float(in.mask_params_packed);
+
     // Clip rect discard: clip_rect = [x, y, width, height]
     let clip_min = in.clip_rect.xy;
     let clip_max = in.clip_rect.xy + in.clip_rect.zw;
@@ -161,9 +184,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    let blur = in.shadow_params.x;
-    let inset = in.shadow_params.y > 0.5;
-    let spread = in.shadow_spread.x;
+    let blur = shadow_params.x;
+    let inset = shadow_params.y > 0.5;
+    let spread = shadow_spread.x;
     let spread_expand = select(max(spread, 0.0), 0.0, inset);
     let expand = blur * 3.0 + spread_expand;
 
@@ -191,7 +214,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // the shadow boundary inward.
         let inset_half = max(half - vec2(max(spread, 0.0)), vec2(0.0));
         let inset_r = max(safe_r - max(spread, 0.0), 0.0);
-        let shadow_p = p - in.shadow_offset;
+        let shadow_p = p - shadow_offset;
         let shadow_d = sdf_rounded_rect(shadow_p, inset_half, inset_r);
         // Inset: shadow is strongest at d = 0 and fades into the interior.
         // Approximate a Gaussian erf with tanh so the falloff width matches
@@ -202,27 +225,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Clip softly to the outer rounded rect so the shadow does not
         // bleed past the visible edge.
         let edge_clip = 1.0 - smoothstep(-0.5, 0.5, d_outer);
-        let final_a = in.shadow_color.a * shadow_alpha * edge_clip;
+        let final_a = shadow_color.a * shadow_alpha * edge_clip;
         if final_a < 0.001 {
             discard;
         }
-        return vec4(in.shadow_color.rgb * final_a, final_a);
+        return vec4(shadow_color.rgb * final_a, final_a);
     }
 
     // Outer shadow pass (and the main rect's background pass when no
     // shadow is present on this instance).
     var shadow = vec4(0.0);
-    if in.shadow_color.a > 0.0 {
+    if shadow_color.a > 0.0 {
         // Outer spread grows the SDF sample box by `spread`, matching CSS
         // semantics where positive spread makes the shadow bigger.
         let outer_half = half + vec2(max(spread, 0.0));
         let outer_r = safe_r + max(spread, 0.0);
-        let shadow_p = p - in.shadow_offset;
+        let shadow_p = p - shadow_offset;
         let shadow_d = sdf_rounded_rect(shadow_p, outer_half, outer_r);
         // See the inset path for why this uses tanh instead of smoothstep.
         let sigma = max(blur, 0.5);
         let shadow_alpha = 0.5 - 0.5 * tanh(shadow_d / sigma * 0.75);
-        shadow = vec4(in.shadow_color.rgb, in.shadow_color.a * shadow_alpha);
+        shadow = vec4(shadow_color.rgb, shadow_color.a * shadow_alpha);
     }
 
     // Main rect pass
@@ -253,14 +276,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // optionally wraps via `fract` for repeating; radial computes a
     // normalized distance from the explicit center.
     var base_color: vec4<f32>;
-    let raw_tag = in.gradient_params.w;
+    let raw_tag = gradient_params.w;
     let stop_count = i32(abs(raw_tag) + 0.5);
     if (stop_count >= 2) {
         var raw_t: f32 = 0.0;
         var is_linear: bool = raw_tag > 0.0;
         if (is_linear) {
             // Linear gradient: project rect local point onto direction.
-            let angle = in.gradient_params.x;
+            let angle = gradient_params.x;
             let dir = vec2<f32>(sin(angle), -cos(angle));
             let normalized = rect_local / in.size;
             raw_t = dot(normalized - vec2(0.5), dir) + 0.5;
@@ -275,7 +298,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let rx = in.gradient_extra.z;
             let ry = in.gradient_extra.w;
             let local = rect_local - center;
-            let shape_is_circle = in.gradient_params.y < 0.0;
+            let shape_is_circle = gradient_params.y < 0.0;
             if (rx <= 0.0 || ry <= 0.0) {
                 raw_t = 1.0;
             } else if (shape_is_circle) {
@@ -290,24 +313,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
 
         var stop_positions = array<f32, 8>(
-            in.gradient_stop_positions_lo.x,
-            in.gradient_stop_positions_lo.y,
-            in.gradient_stop_positions_lo.z,
-            in.gradient_stop_positions_lo.w,
-            in.gradient_stop_positions_hi.x,
-            in.gradient_stop_positions_hi.y,
-            in.gradient_stop_positions_hi.z,
-            in.gradient_stop_positions_hi.w,
+            unpack2x16float(in.gradient_stop_positions_lo_packed.x).x,
+            unpack2x16float(in.gradient_stop_positions_lo_packed.x).y,
+            unpack2x16float(in.gradient_stop_positions_lo_packed.y).x,
+            unpack2x16float(in.gradient_stop_positions_lo_packed.y).y,
+            unpack2x16float(in.gradient_stop_positions_hi_packed.x).x,
+            unpack2x16float(in.gradient_stop_positions_hi_packed.x).y,
+            unpack2x16float(in.gradient_stop_positions_hi_packed.y).x,
+            unpack2x16float(in.gradient_stop_positions_hi_packed.y).y,
         );
         var stop_colors = array<vec4<f32>, 8>(
-            in.gradient_stop_color_0,
-            in.gradient_stop_color_1,
-            in.gradient_stop_color_2,
-            in.gradient_stop_color_3,
-            in.gradient_stop_color_4,
-            in.gradient_stop_color_5,
-            in.gradient_stop_color_6,
-            in.gradient_stop_color_7,
+            unpack4x16float(in.gradient_stop_color_0_packed),
+            unpack4x16float(in.gradient_stop_color_1_packed),
+            unpack4x16float(in.gradient_stop_color_2_packed),
+            unpack4x16float(in.gradient_stop_color_3_packed),
+            unpack4x16float(in.gradient_stop_color_4_packed),
+            unpack4x16float(in.gradient_stop_color_5_packed),
+            unpack4x16float(in.gradient_stop_color_6_packed),
+            unpack4x16float(in.gradient_stop_color_7_packed),
         );
 
         let last_idx = stop_count - 1;
@@ -322,7 +345,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // CSS spec requirement that the gradient's color at the start and
         // the end of a tile are the same. Radial gradients ignore the
         // repeating flag (they currently never repeat) and clamp instead.
-        let repeating = is_linear && (in.gradient_params.y >= 0.5);
+        let repeating = is_linear && (gradient_params.y >= 0.5);
         var t: f32;
         if (repeating) {
             let tile = max(stop_last - stop_first, 1e-6);
@@ -383,7 +406,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     //    stripe. This ignores rounded corners (CSS requires all
     //    corners be square for mismatched borders in practice), but
     //    lets the common left-only / right-only patterns render.
-    let bw = in.border_width;
+    let bw = border_width;
     let max_border = max(max(bw.x, bw.y), max(bw.z, bw.w));
     let min_border = min(min(bw.x, bw.y), min(bw.z, bw.w));
     let uniform_border = (max_border - min_border) < 0.001;
@@ -414,12 +437,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             border_factor = clamp(max(max(f_top, f_right), max(f_bottom, f_left)), 0.0, 1.0);
         }
         // Composite border OVER background (CSS-like alpha blending)
-        let ba = in.border_color.a * border_factor;
+        let ba = border_color.a * border_factor;
         let one_minus_ba = 1.0 - ba;
         let result_a = ba + base_color.a * one_minus_ba;
         let result_rgb = select(
             vec3(0.0),
-            (in.border_color.rgb * ba + base_color.rgb * base_color.a * one_minus_ba) / result_a,
+            (border_color.rgb * ba + base_color.rgb * base_color.a * one_minus_ba) / result_a,
             result_a > 0.001
         );
         rect_color = vec4(result_rgb, result_a);
@@ -434,24 +457,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // semantics from the CSS Masking Module Level 1 spec. The mask is a
     // simple linear gradient; positions and alpha values are packed two
     // per stop in `mask_stops_01` / `mask_stops_23`.
-    let mask_count = i32(in.mask_params.w + 0.5);
+    let mask_count = i32(mask_params.w + 0.5);
     if (mask_count >= 2) {
-        let mask_angle = in.mask_params.x;
+        let mask_angle = mask_params.x;
         let mask_dir = vec2<f32>(sin(mask_angle), -cos(mask_angle));
         let normalized = rect_local / in.size;
         let mask_t = dot(normalized - vec2(0.5), mask_dir) + 0.5;
 
         var mask_alphas = array<f32, 4>(
-            in.mask_stops_01.x,
-            in.mask_stops_01.z,
-            in.mask_stops_23.x,
-            in.mask_stops_23.z,
+            mask_stops_01.x,
+            mask_stops_01.z,
+            mask_stops_23.x,
+            mask_stops_23.z,
         );
         var mask_positions = array<f32, 4>(
-            in.mask_stops_01.y,
-            in.mask_stops_01.w,
-            in.mask_stops_23.y,
-            in.mask_stops_23.w,
+            mask_stops_01.y,
+            mask_stops_01.w,
+            mask_stops_23.y,
+            mask_stops_23.w,
         );
         let m_last_idx = mask_count - 1;
         let m_first = mask_positions[0];

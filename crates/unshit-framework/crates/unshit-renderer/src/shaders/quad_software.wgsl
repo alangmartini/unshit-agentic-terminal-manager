@@ -1,10 +1,9 @@
 // Software/CPU-renderer quad shader (AdapterTier::Software).
 //
 // A deliberately minimal twin of `quad.wgsl` used only when the renderer runs
-// on a software adapter such as WARP, whose vertex->fragment varying budget
-// is 60 components. The full `quad.wgsl` packs 96 components of varyings (the
-// 8 gradient stop colors alone are 32) which WARP rejects at pipeline
-// creation, so the full feature set physically cannot run there. This variant
+// on a software adapter such as WARP. The full `quad.wgsl` uses a packed
+// 59-component varying layout, but software adapters still benefit from the
+// smaller shader and vertex-attribute footprint. This variant
 // keeps the features a software fallback needs to look close to the GPU path
 // -- solid color, per-side borders, rounded corners, the ancestor clip rect,
 // the CSS transform, and box-shadows (outer + inset) -- and drops only the

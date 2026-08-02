@@ -159,7 +159,9 @@ const SOFTWARE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 13] = wgpu::vertex_attr_a
 
 impl QuadPipeline {
     /// Full quad pipeline: the GPU-accelerated path (`shaders/quad.wgsl`),
-    /// gradients/shadows/masks and all.
+    /// gradients/shadows/masks and all. Constant per-instance varyings are
+    /// transported as flat f16 pairs so this path also fits D3D12 hardware's
+    /// 60-component inter-stage budget.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
         Self::build(device, format, sample_count, false)
     }

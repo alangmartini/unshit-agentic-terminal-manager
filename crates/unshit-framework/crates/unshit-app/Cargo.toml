@@ -31,7 +31,7 @@ notify = { version = "6", optional = true }
 hdrhistogram = { version = "7.5", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, features = ["winuser"] }
+winapi = { workspace = true, features = ["avrt", "winuser"] }
 
 [features]
 default = ["clipboard", "hot-reload"]

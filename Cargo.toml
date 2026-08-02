@@ -19,7 +19,7 @@ categories = ["gui", "rendering"]
 
 [workspace.dependencies]
 winit = "0.31.0-beta.2"
-wgpu = "24.0"
+wgpu = "26.0"
 taffy = "0.7"
 cssparser = "0.34"
 cosmic-text = "0.12"

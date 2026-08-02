@@ -47,6 +47,62 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{ResizeDirection, Window, WindowId};
 
+#[cfg(target_os = "windows")]
+struct MultimediaRenderThread {
+    handle: winapi::um::winnt::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl MultimediaRenderThread {
+    /// Register the UI/render thread with Windows' Multimedia Class
+    /// Scheduler. The Games task gives timing-sensitive foreground work
+    /// priority without the starvation risk of a process-wide realtime or
+    /// high priority class.
+    fn register() -> Option<Self> {
+        let mut task_index = 0;
+        // SAFETY: `Games\0` is a process-lifetime NUL-terminated string and
+        // `task_index` remains valid for the duration of the call.
+        let handle = unsafe {
+            winapi::um::avrt::AvSetMmThreadCharacteristicsA(c"Games".as_ptr(), &mut task_index)
+        };
+        let correlation_id = format!("process-{}", std::process::id());
+        if handle.is_null() {
+            let error_code = std::io::Error::last_os_error().raw_os_error().unwrap_or_default();
+            log::warn!(
+                "{{\"event\":\"frame_scheduler.mmcss_registration_failed\",\"correlation_id\":{correlation_id:?},\"task\":\"Games\",\"error_code\":{error_code}}}"
+            );
+            return None;
+        }
+
+        // SAFETY: `handle` was returned for this calling thread by
+        // AvSetMmThreadCharacteristicsA immediately above.
+        let priority_selected = unsafe {
+            winapi::um::avrt::AvSetMmThreadPriority(handle, winapi::um::avrt::AVRT_PRIORITY_HIGH)
+                != 0
+        };
+        log::info!(
+            "{{\"event\":\"frame_scheduler.mmcss_registered\",\"correlation_id\":{correlation_id:?},\"task\":\"Games\",\"task_index\":{task_index},\"relative_priority\":\"high\",\"priority_selected\":{priority_selected}}}"
+        );
+        Some(Self { handle })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for MultimediaRenderThread {
+    fn drop(&mut self) {
+        // SAFETY: the registration is owned by this same UI thread and the
+        // handle is reverted exactly once by this guard.
+        let reverted = unsafe { winapi::um::avrt::AvRevertMmThreadCharacteristics(self.handle) };
+        if reverted == 0 {
+            let correlation_id = format!("process-{}", std::process::id());
+            let error_code = std::io::Error::last_os_error().raw_os_error().unwrap_or_default();
+            log::warn!(
+                "{{\"event\":\"frame_scheduler.mmcss_revert_failed\",\"correlation_id\":{correlation_id:?},\"error_code\":{error_code}}}"
+            );
+        }
+    }
+}
+
 pub const DEFAULT_WHEEL_LINE_SCROLL_PX: f32 = 100.0;
 pub const DEFAULT_SMOOTH_SCROLL_DURATION_MS: u64 = 180;
 
@@ -322,11 +378,12 @@ pub struct FrameMetrics {
     pub layout_us: u64,
     pub batch_build_us: u64,
     /// CPU time spent encoding and submitting the frame's render passes
-    /// (wall time of `gpu.render()` on the render thread, minus the
-    /// swapchain acquire wait reported in [`Self::present_wait_us`]).
+    /// (wall time of `gpu.render()` on the render thread, minus swapchain
+    /// acquisition, phase holding, and the platform present call).
     /// Not GPU execution time: submission is non-blocking and no
     /// timestamp queries exist yet, so actual GPU cost is invisible
-    /// here. The overlay surfaces this as "encode".
+    /// here. Swapchain acquisition and deliberate presentation holds
+    /// are excluded. The overlay surfaces this as "encode".
     pub gpu_render_us: u64,
     pub total_us: u64,
     pub node_count: usize,
@@ -366,13 +423,21 @@ pub struct FrameMetrics {
     /// frame logs) keeps measuring work; reported separately so the
     /// vblank wait stays observable.
     pub present_wait_us: u64,
+    /// CPU wall time spent deliberately holding an already-submitted frame
+    /// until its timer-mode presentation phase. Excluded from work metrics;
+    /// exposed separately so cadence tuning never hides synchronous wait on
+    /// the UI thread.
+    pub present_hold_us: u64,
+    /// CPU time blocked inside the platform present call. Excluded from
+    /// work metrics and reported independently from acquire and phase waits.
+    pub present_call_us: u64,
 }
 
 impl std::fmt::Display for FrameMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "frame {:.1}ms | tree {:.1}ms  style {:.1}ms  scale {:.1}ms  layout {:.1}ms  batch {:.1}ms  gpu {:.1}ms | nodes {} | quads {} glyphs {} | rss {:.1}MB",
+            "frame {:.1}ms | tree {:.1}ms  style {:.1}ms  scale {:.1}ms  layout {:.1}ms  batch {:.1}ms  gpu {:.1}ms  acquire {:.1}ms  hold {:.1}ms  present {:.1}ms | nodes {} | quads {} glyphs {} | rss {:.1}MB",
             self.total_us as f64 / 1000.0,
             self.tree_build_us as f64 / 1000.0,
             self.style_resolve_us as f64 / 1000.0,
@@ -380,6 +445,9 @@ impl std::fmt::Display for FrameMetrics {
             self.layout_us as f64 / 1000.0,
             self.batch_build_us as f64 / 1000.0,
             self.gpu_render_us as f64 / 1000.0,
+            self.present_wait_us as f64 / 1000.0,
+            self.present_hold_us as f64 / 1000.0,
+            self.present_call_us as f64 / 1000.0,
             self.node_count,
             self.quad_count,
             self.glyph_count,
@@ -611,6 +679,47 @@ fn pacing_mode_for_surface(is_vsync_paced: bool) -> PacingMode {
         PacingMode::VsyncBlocking
     } else {
         PacingMode::Timer
+    }
+}
+
+/// Diagnostic override used to compare swapchain-driven pacing with the
+/// absolute-phase timer while keeping the surface present mode unchanged.
+const PACING_OVERRIDE_ENV: &str = "UNSHIT_FRAME_PACING";
+
+fn parse_pacing_override(value: &str) -> Option<Option<PacingMode>> {
+    match value.trim() {
+        "surface" => Some(None),
+        "timer" => Some(Some(PacingMode::Timer)),
+        "swapchain" => Some(Some(PacingMode::VsyncBlocking)),
+        _ => None,
+    }
+}
+
+fn configured_pacing_mode(is_vsync_paced: bool) -> PacingMode {
+    let surface_mode = pacing_mode_for_surface(is_vsync_paced);
+    let Ok(raw) = std::env::var(PACING_OVERRIDE_ENV) else {
+        return surface_mode;
+    };
+    let correlation_id = format!("process-{}", std::process::id());
+    match parse_pacing_override(&raw) {
+        Some(Some(mode)) => {
+            log::info!(
+                "{{\"event\":\"frame_pacer.mode_selected\",\"correlation_id\":{correlation_id:?},\"source\":\"override\",\"mode\":{mode:?}}}"
+            );
+            mode
+        }
+        Some(None) => {
+            log::info!(
+                "{{\"event\":\"frame_pacer.mode_selected\",\"correlation_id\":{correlation_id:?},\"source\":\"surface\",\"mode\":{surface_mode:?}}}"
+            );
+            surface_mode
+        }
+        None => {
+            log::warn!(
+                "{{\"event\":\"frame_pacer.mode_rejected\",\"correlation_id\":{correlation_id:?},\"value\":{raw:?},\"fallback\":{surface_mode:?}}}"
+            );
+            surface_mode
+        }
     }
 }
 
@@ -1276,6 +1385,32 @@ fn build_render_batch_once(state: &mut AppState) {
     );
 }
 
+const PRESENT_LEAD_ENV: &str = "UNSHIT_PRESENT_LEAD_US";
+const MAX_PRESENT_LEAD_US: u64 = 1_000_000;
+
+fn parse_present_lead_us(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().filter(|value| *value <= MAX_PRESENT_LEAD_US)
+}
+
+fn configured_present_lead(period: Duration) -> Duration {
+    let Ok(raw) = std::env::var(PRESENT_LEAD_ENV) else {
+        return Duration::ZERO;
+    };
+    let correlation_id = format!("process-{}", std::process::id());
+    let Some(requested_us) = parse_present_lead_us(&raw) else {
+        log::warn!(
+            "{{\"event\":\"frame_pacer.present_lead_rejected\",\"correlation_id\":{correlation_id:?},\"value\":{raw:?},\"fallback_us\":0}}"
+        );
+        return Duration::ZERO;
+    };
+    let selected = Duration::from_micros(requested_us).min(period);
+    log::info!(
+        "{{\"event\":\"frame_pacer.present_lead_selected\",\"correlation_id\":{correlation_id:?},\"requested_us\":{requested_us},\"selected_us\":{}}}",
+        selected.as_micros()
+    );
+    selected
+}
+
 /// Build a complete frame, rebuilding and retrying once when atlas placement
 /// fails. The first partial batch is never presented.
 fn build_render_batch_with_atlas_recovery(
@@ -1343,10 +1478,20 @@ fn build_render_batch_with_atlas_recovery(
     retry_succeeded
 }
 
+fn should_paint_fast_animation_frame(
+    container_scroll_active: bool,
+    grid_visual_change: bool,
+    canvas_needs_repaint: bool,
+    speculative_activity: bool,
+) -> bool {
+    container_scroll_active || grid_visual_change || canvas_needs_repaint || speculative_activity
+}
+
 fn fast_paint_animation_frame(
     state: &mut AppState,
     frame_start: Instant,
     decorations: bool,
+    speculative_activity: bool,
     on_scroll_telemetry: Option<&ScrollTelemetryCallback>,
     on_frame_metrics: Option<&(dyn Fn(&FrameMetrics) + Send)>,
     on_glyph_atlas_recovery: Option<&(dyn Fn(&GlyphAtlasRecoveryEvent) + Send)>,
@@ -1373,7 +1518,13 @@ fn fast_paint_animation_frame(
     let container_scroll_active = state.smooth_scroll.is_some();
     tick_smooth_scroll(state, sample_ts, decorations, on_scroll_telemetry);
     let grid_visual_change = tick_grid_animations(state, sample_ts, true);
-    if !container_scroll_active && !grid_visual_change && !state.gpu.any_canvas_needs_repaint() {
+    let canvas_needs_repaint = state.gpu.any_canvas_needs_repaint();
+    if !should_paint_fast_animation_frame(
+        container_scroll_active,
+        grid_visual_change,
+        canvas_needs_repaint,
+        speculative_activity,
+    ) {
         return false;
     }
 
@@ -1410,14 +1561,22 @@ fn fast_paint_animation_frame(
         state.gpu.glyph_atlas.pending_uploads.iter().map(|g| (g.width * g.height) as u64).sum();
 
     let t5 = Instant::now();
-    state.window.pre_present_notify();
+    state.gpu.set_present_not_before(
+        (state.pacing_mode == PacingMode::Timer)
+            .then(|| state.frame_pacer.presentation_target())
+            .flatten(),
+    );
     state.gpu.render();
-    // Split the vblank wait out of the work numbers at the source so
+    // Split display waits out of the work numbers at the source so
     // every downstream consumer of gpu_render_us / total_us keeps
-    // measuring CPU work (see FrameMetrics::present_wait_us).
+    // measuring CPU work (see FrameMetrics::{present_wait_us,present_hold_us}).
     metrics.present_wait_us = state.gpu.last_acquire_wait().as_micros() as u64;
-    metrics.gpu_render_us =
-        (t5.elapsed().as_micros() as u64).saturating_sub(metrics.present_wait_us);
+    metrics.present_hold_us = state.gpu.last_present_hold().as_micros() as u64;
+    metrics.present_call_us = state.gpu.last_present_call_wait().as_micros() as u64;
+    metrics.gpu_render_us = (t5.elapsed().as_micros() as u64)
+        .saturating_sub(metrics.present_wait_us)
+        .saturating_sub(metrics.present_hold_us)
+        .saturating_sub(metrics.present_call_us);
 
     if state.gpu.any_canvas_needs_repaint() {
         state.window.request_redraw();
@@ -1483,11 +1642,12 @@ fn finalize_frame_metrics(
     on_frame_metrics: Option<&(dyn Fn(&FrameMetrics) + Send)>,
 ) {
     state.frame_pacer.record_paint(frame_start);
-    // total_us is CPU work: the swapchain acquire wait that happened
-    // inside gpu.render() (up to one display period under Fifo) is
-    // subtracted so vsync pacing does not masquerade as a slow frame.
-    metrics.total_us =
-        (frame_start.elapsed().as_micros() as u64).saturating_sub(metrics.present_wait_us);
+    // total_us is CPU work: display/driver waits inside gpu.render() are
+    // subtracted so pacing does not masquerade as a slow frame.
+    metrics.total_us = (frame_start.elapsed().as_micros() as u64)
+        .saturating_sub(metrics.present_wait_us)
+        .saturating_sub(metrics.present_hold_us)
+        .saturating_sub(metrics.present_call_us);
     metrics.rss_bytes = get_rss_bytes();
     metrics.pacer_min_interval_ns = state.frame_pacer.min_interval().as_nanos() as u64;
 
@@ -2051,6 +2211,9 @@ impl App {
     }
 
     pub fn run(self) {
+        #[cfg(target_os = "windows")]
+        let _multimedia_render_thread = MultimediaRenderThread::register();
+
         let event_loop = EventLoop::new().unwrap();
         // Wait instead of Poll: sleep until an OS event or proxy.wake_up().
         // This alone drops idle CPU from ~100% of one core to near zero.
@@ -2214,8 +2377,13 @@ impl ApplicationHandler for AppHandler {
         // change at runtime. On the vsync-paced default the blocking
         // acquire paces every paint; the Timer machinery only runs on
         // surfaces without Fifo.
-        let pacing_mode = pacing_mode_for_surface(gpu.is_vsync_paced());
+        let pacing_mode = configured_pacing_mode(gpu.is_vsync_paced());
         log::info!("frame pacing: {:?} (present mode {:?})", pacing_mode, gpu.present_mode());
+        let mut frame_pacer =
+            crate::frame_pacer::FramePacer::with_refresh_rate_mhz(startup_refresh_mhz);
+        if pacing_mode == PacingMode::Timer {
+            frame_pacer.set_presentation_lead(configured_present_lead(frame_pacer.min_interval()));
+        }
 
         // Rebuild the animation waker with the display's true period now
         // that the rate is known (it was constructed before the window
@@ -2441,7 +2609,7 @@ impl ApplicationHandler for AppHandler {
             theme: self.app.config.theme.clone(),
             cell_metrics_fired: false,
             pacing_mode,
-            frame_pacer: crate::frame_pacer::FramePacer::with_refresh_rate_mhz(startup_refresh_mhz),
+            frame_pacer,
             // Treat window creation as activity so the first few frames
             // after startup run at the speculative pacer rhythm. This
             // smooths over the initial PTY-spawn / cell-metrics dance on
@@ -3055,8 +3223,7 @@ impl ApplicationHandler for AppHandler {
                                                 )
                                                 .unwrap_or(element.input_state.value.len());
 
-                                                let shift_held =
-                                                    state.modifiers_state.shift_key();
+                                                let shift_held = state.modifiers_state.shift_key();
                                                 if let Some(elem) = state.arena.get_mut(new_focused)
                                                 {
                                                     if is_double_click {
@@ -3068,13 +3235,20 @@ impl ApplicationHandler for AppHandler {
                                                                 .min(elem.input_state.value.len()),
                                                         );
                                                         elem.input_state.selection_anchor =
-                                                            if start < end { Some(start) } else { None };
+                                                            if start < end {
+                                                                Some(start)
+                                                            } else {
+                                                                None
+                                                            };
                                                         elem.input_state.cursor_pos = end;
                                                         state.interaction.last_click_time = None;
                                                     } else if shift_held {
                                                         // Shift+click extends from the current
                                                         // cursor (or existing anchor).
-                                                        if elem.input_state.selection_anchor.is_none()
+                                                        if elem
+                                                            .input_state
+                                                            .selection_anchor
+                                                            .is_none()
                                                         {
                                                             elem.input_state.selection_anchor =
                                                                 Some(elem.input_state.cursor_pos);
@@ -3801,24 +3975,30 @@ impl ApplicationHandler for AppHandler {
                             return;
                         }
                     }
+                    let speculative_activity = state.is_recently_active(frame_start);
+                    #[cfg(feature = "input-latency-histogram")]
+                    state.input_latency.mark_frame_start();
                     let painted = fast_paint_animation_frame(
                         state,
                         frame_start,
                         self.app.config.decorations,
+                        speculative_activity,
                         self.app.config.on_scroll_telemetry.as_deref(),
                         self.app.config.on_frame_metrics.as_deref(),
                         self.app.config.on_glyph_atlas_recovery.as_deref(),
                     );
+                    #[cfg(feature = "input-latency-histogram")]
+                    if painted {
+                        state.input_latency.record_frame_presented(Instant::now());
+                        if let Some(ref cb) = self.app.config.on_input_latency {
+                            cb(&state.input_latency.snapshot());
+                        }
+                    } else {
+                        state.input_latency.cancel_frame();
+                    }
                     schedule_animation_followup(state, event_loop, frame_start, painted);
                     return;
                 }
-
-                // Flip the input latency tracker BEFORE the pacer early
-                // return so events that arrive during a pacer sleep are
-                // counted as mid draw drops rather than leaking into the
-                // next frame's latency sample.
-                #[cfg(feature = "input-latency-histogram")]
-                state.input_latency.mark_frame_start();
 
                 // Timer fallback only: coalesce RequestRebuild and
                 // input-driven redraws into at most one paint per
@@ -3848,6 +4028,12 @@ impl ApplicationHandler for AppHandler {
                         }
                     }
                 }
+
+                // A pacer rejection is not a frame: keep collecting its
+                // pending events until a paint actually starts. From here on
+                // every path reaches the presentation epilogue below.
+                #[cfg(feature = "input-latency-histogram")]
+                state.input_latency.mark_frame_start();
 
                 let mut metrics = FrameMetrics::default();
 
@@ -4289,15 +4475,23 @@ impl ApplicationHandler for AppHandler {
                 }
 
                 let t5 = Instant::now();
-                state.window.pre_present_notify();
+                state.gpu.set_present_not_before(
+                    (state.pacing_mode == PacingMode::Timer)
+                        .then(|| state.frame_pacer.presentation_target())
+                        .flatten(),
+                );
                 state.gpu.render();
-                // Split the vblank wait out of the work numbers at the
+                // Split display waits out of the work numbers at the
                 // source so every downstream consumer of gpu_render_us /
                 // total_us keeps measuring CPU work (see
-                // FrameMetrics::present_wait_us).
+                // FrameMetrics::{present_wait_us,present_hold_us}).
                 metrics.present_wait_us = state.gpu.last_acquire_wait().as_micros() as u64;
-                metrics.gpu_render_us =
-                    (t5.elapsed().as_micros() as u64).saturating_sub(metrics.present_wait_us);
+                metrics.present_hold_us = state.gpu.last_present_hold().as_micros() as u64;
+                metrics.present_call_us = state.gpu.last_present_call_wait().as_micros() as u64;
+                metrics.gpu_render_us = (t5.elapsed().as_micros() as u64)
+                    .saturating_sub(metrics.present_wait_us)
+                    .saturating_sub(metrics.present_hold_us)
+                    .saturating_sub(metrics.present_call_us);
 
                 if state.gpu.any_canvas_needs_repaint() {
                     state.window.request_redraw();
@@ -5104,7 +5298,11 @@ fn handle_clipboard_shortcut(
                         let selected = element.input_state.value[start..end].to_string();
                         unshit_core::input::delete_selection(&mut element.input_state);
                         element.cursor_state.reset_blink(Instant::now());
-                        (Some(selected), element.input_state.value.clone(), element.on_change.clone())
+                        (
+                            Some(selected),
+                            element.input_state.value.clone(),
+                            element.on_change.clone(),
+                        )
                     }
                     None => (None, String::new(), None),
                 }
@@ -6094,6 +6292,8 @@ mod tests {
             present_interval_us: 8_333,
             display_period_ns: 8_333_333,
             present_wait_us: 7_900,
+            present_hold_us: 6_500,
+            present_call_us: 1_750,
         };
         assert_eq!(m.quad_count, 128);
         assert_eq!(m.glyph_count, 512);
@@ -6104,6 +6304,8 @@ mod tests {
         assert_eq!(m.present_interval_us, 8_333);
         assert_eq!(m.display_period_ns, 8_333_333);
         assert_eq!(m.present_wait_us, 7_900);
+        assert_eq!(m.present_hold_us, 6_500);
+        assert_eq!(m.present_call_us, 1_750);
     }
 
     #[test]
@@ -6112,12 +6314,34 @@ mod tests {
         assert_eq!(m.present_interval_us, 0);
         assert_eq!(m.display_period_ns, 0);
         assert_eq!(m.present_wait_us, 0);
+        assert_eq!(m.present_hold_us, 0);
+        assert_eq!(m.present_call_us, 0);
     }
 
     #[test]
     fn pacing_mode_follows_surface_vsync_pacing() {
         assert_eq!(pacing_mode_for_surface(true), PacingMode::VsyncBlocking);
         assert_eq!(pacing_mode_for_surface(false), PacingMode::Timer);
+    }
+
+    #[test]
+    fn pacing_override_parser_accepts_only_explicit_modes() {
+        assert_eq!(parse_pacing_override("surface"), Some(None));
+        assert_eq!(parse_pacing_override(" timer "), Some(Some(PacingMode::Timer)));
+        assert_eq!(parse_pacing_override("swapchain"), Some(Some(PacingMode::VsyncBlocking)));
+        for value in ["", "fifo", "blocking", "auto", "timer-paced", "unpaced"] {
+            assert_eq!(parse_pacing_override(value), None, "value={value:?}");
+        }
+    }
+
+    #[test]
+    fn present_lead_parser_accepts_bounded_microseconds() {
+        assert_eq!(parse_present_lead_us("0"), Some(0));
+        assert_eq!(parse_present_lead_us(" 7500 "), Some(7_500));
+        assert_eq!(parse_present_lead_us("1000000"), Some(1_000_000));
+        for value in ["", "-1", "1.5", "1000001", "fast"] {
+            assert_eq!(parse_present_lead_us(value), None, "value={value:?}");
+        }
     }
 
     #[test]
@@ -6194,6 +6418,15 @@ mod tests {
     #[test]
     fn present_interval_us_is_zero_for_first_frame() {
         assert_eq!(present_interval_us(None, Instant::now()), 0);
+    }
+
+    #[test]
+    fn fast_animation_paints_speculatively_during_recent_input() {
+        assert!(!should_paint_fast_animation_frame(false, false, false, false));
+        assert!(should_paint_fast_animation_frame(false, false, false, true));
+        assert!(should_paint_fast_animation_frame(true, false, false, false));
+        assert!(should_paint_fast_animation_frame(false, true, false, false));
+        assert!(should_paint_fast_animation_frame(false, false, true, false));
     }
 
     #[test]

@@ -63,6 +63,11 @@ fn trace_text_draw_ranges() -> bool {
 /// MSAA sample count for the main content pipelines. Set to 1 to disable.
 const MSAA_SAMPLE_COUNT: u32 = 4;
 
+/// Optional diagnostic override for controlled fill-rate A/B tests. The
+/// production default remains 4x; accepting only renderer-supported counts
+/// prevents an invalid surface/pipeline configuration from reaching wgpu.
+const MSAA_SAMPLES_ENV: &str = "UNSHIT_MSAA_SAMPLES";
+
 /// Classifies the active wgpu adapter as a real GPU or a software/CPU
 /// rasterizer. The windowed renderer uses this to gate per-frame cost (notably
 /// MSAA) on the software path while leaving the hardware path byte-identical.
@@ -160,11 +165,13 @@ fn renderer_backends() -> wgpu::Backends {
 
     #[cfg(target_os = "windows")]
     {
-        // Prefer Vulkan on Windows because some D3D12 adapters expose the
-        // WebGPU minimum inter-stage component limit, which is too low for
-        // the current quad shader's gradient payload. `UNSHIT_RENDER_BACKEND`
-        // can still force D3D12 when a system needs it.
-        wgpu::Backends::VULKAN
+        // Prefer native D3D12 on Windows. The full quad shader transports its
+        // constant decorative varyings as flat f16 pairs and now fits the
+        // backend's 60-component inter-stage budget without dropping visual
+        // features. D3D12 FIFO also provides stable tear-free 120 Hz pacing
+        // on the tested AMD driver; Vulkan FIFO does not.
+        // `UNSHIT_RENDER_BACKEND` remains available for diagnostics/fallback.
+        wgpu::Backends::DX12
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -210,6 +217,91 @@ fn choose_present_mode(present_modes: &[wgpu::PresentMode]) -> wgpu::PresentMode
     }
 }
 
+fn parse_msaa_sample_count(value: &str) -> Option<u32> {
+    match value.trim() {
+        "1" => Some(1),
+        "4" => Some(4),
+        _ => None,
+    }
+}
+
+fn desired_sample_count(tier: AdapterTier) -> u32 {
+    let fallback = sample_count_for_tier(tier);
+    let Ok(value) = std::env::var(MSAA_SAMPLES_ENV) else {
+        return fallback;
+    };
+    let Some(selected) = parse_msaa_sample_count(&value) else {
+        log::warn!(
+            "{{\"event\":\"renderer.msaa_override_rejected\",\"value\":\"{value}\",\"fallback_samples\":{fallback}}}"
+        );
+        return fallback;
+    };
+    log::info!(
+        "{{\"event\":\"renderer.msaa_override_selected\",\"samples\":{selected},\"adapter_tier\":\"{tier:?}\"}}"
+    );
+    selected
+}
+
+/// Resource limits consumed by the full quad pipeline. Adapters below either
+/// threshold must use the compatibility shader instead of reaching a fatal
+/// pipeline-validation error during startup.
+const FULL_QUAD_VERTEX_ATTRIBUTES: u32 = 28;
+const FULL_QUAD_INTER_STAGE_COMPONENTS: u32 = 59;
+
+fn needs_compat_quad_pipeline(tier: AdapterTier, limits: &wgpu::Limits) -> bool {
+    tier == AdapterTier::Software
+        || limits.max_vertex_attributes < FULL_QUAD_VERTEX_ATTRIBUTES
+        || limits.max_inter_stage_shader_components < FULL_QUAD_INTER_STAGE_COMPONENTS
+}
+
+/// Optional present-mode override for controlled driver/backend A/B tests.
+/// The requested mode is accepted only when the active surface advertises it;
+/// production behavior otherwise remains the tear-free default above.
+const PRESENT_MODE_ENV: &str = "UNSHIT_PRESENT_MODE";
+
+fn parse_present_mode_override(value: &str) -> Option<wgpu::PresentMode> {
+    match value.trim() {
+        "fifo" => Some(wgpu::PresentMode::Fifo),
+        "fifo-relaxed" => Some(wgpu::PresentMode::FifoRelaxed),
+        "mailbox" => Some(wgpu::PresentMode::Mailbox),
+        "immediate" => Some(wgpu::PresentMode::Immediate),
+        _ => None,
+    }
+}
+
+fn choose_supported_present_mode(
+    present_modes: &[wgpu::PresentMode],
+    requested: Option<wgpu::PresentMode>,
+) -> wgpu::PresentMode {
+    requested
+        .filter(|mode| present_modes.contains(mode))
+        .unwrap_or_else(|| choose_present_mode(present_modes))
+}
+
+fn desired_present_mode(present_modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    let fallback = choose_present_mode(present_modes);
+    let Ok(value) = std::env::var(PRESENT_MODE_ENV) else {
+        return fallback;
+    };
+    let Some(requested) = parse_present_mode_override(&value) else {
+        log::warn!(
+            "{{\"event\":\"renderer.present_mode_override_rejected\",\"reason\":\"invalid_value\",\"fallback\":\"{fallback:?}\"}}"
+        );
+        return fallback;
+    };
+    let selected = choose_supported_present_mode(present_modes, Some(requested));
+    if selected == requested {
+        log::info!(
+            "{{\"event\":\"renderer.present_mode_override_selected\",\"mode\":\"{selected:?}\"}}"
+        );
+    } else {
+        log::warn!(
+            "{{\"event\":\"renderer.present_mode_override_rejected\",\"reason\":\"unsupported_by_surface\",\"requested\":\"{requested:?}\",\"fallback\":\"{fallback:?}\"}}"
+        );
+    }
+    selected
+}
+
 /// True when `mode` paces the producer from the display clock: under these
 /// modes `get_current_texture` (or present) blocks on vblank, so a saturated
 /// paint loop runs at exactly the refresh rate. The app reads this once
@@ -223,27 +315,30 @@ fn present_mode_is_vsync_paced(mode: wgpu::PresentMode) -> bool {
     )
 }
 
-/// Default swapchain frame latency. 1 maps to a two-image swapchain on
-/// Vulkan (`min_image_count = latency + 1`), the smallest queue the API
-/// allows: each present blocks the next acquire until vblank, bounding
-/// input-to-photon at two display periods plus work time (gate H8). The
-/// driver may silently clamp the effective depth upward and wgpu's public
-/// API does not expose the clamped value, so only the requested value is
-/// logged; a driver floor shows up in external latency measurement
-/// (PresentMon) instead.
-const DEFAULT_MAXIMUM_FRAME_LATENCY: u32 = 1;
+/// Default swapchain frame latency. A request of 4 gives D3D12 FIFO enough
+/// spare images to absorb occasional driver-release stalls: depths from 1
+/// through 3 all produced rare double-vblank acquires on the tested AMD driver,
+/// while 4 sustained repeated human and stress input runs without changing
+/// measured input-to-paint latency. The producer remains acquire-paced at one
+/// frame per vblank. Drivers may silently clamp the effective depth and wgpu
+/// does not expose that result, so the request and acquire-wait distribution
+/// are both logged for diagnosis.
+const DEFAULT_MAXIMUM_FRAME_LATENCY: u32 = 4;
 
 /// Env var overriding `desired_maximum_frame_latency` for latency A/B
 /// measurement without a rebuild.
 const FRAME_LATENCY_ENV: &str = "UNSHIT_FRAME_LATENCY";
 
-/// Parse an [`FRAME_LATENCY_ENV`] override. Only 1 and 2 are accepted (the
-/// spec's "ask first beyond 1-2" boundary); anything else is rejected so
-/// the caller can warn and fall back to [`DEFAULT_MAXIMUM_FRAME_LATENCY`].
+/// Parse a [`FRAME_LATENCY_ENV`] override for controlled queue-depth A/B
+/// tests. Four is the largest useful diagnostic value here; anything else is
+/// rejected so a typo cannot silently create an arbitrarily deep present
+/// queue.
 fn parse_frame_latency_override(value: &str) -> Option<u32> {
     match value.trim() {
         "1" => Some(1),
         "2" => Some(2),
+        "3" => Some(3),
+        "4" => Some(4),
         _ => None,
     }
 }
@@ -252,7 +347,7 @@ fn desired_maximum_frame_latency() -> u32 {
     match std::env::var(FRAME_LATENCY_ENV) {
         Ok(value) => parse_frame_latency_override(&value).unwrap_or_else(|| {
             log::warn!(
-                "ignoring {FRAME_LATENCY_ENV}={value}; expected 1 or 2, \
+                "ignoring {FRAME_LATENCY_ENV}={value}; expected 1, 2, 3, or 4, \
                  using {DEFAULT_MAXIMUM_FRAME_LATENCY}"
             );
             DEFAULT_MAXIMUM_FRAME_LATENCY
@@ -293,6 +388,24 @@ fn acquire_recovery(
         }
         _ => AcquireRecovery::DropFrame,
     }
+}
+
+fn present_hold_remaining(
+    target: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    target.and_then(|target| target.checked_duration_since(now)).unwrap_or_default()
+}
+
+fn hold_until_present_target(target: Option<std::time::Instant>) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    let remaining = present_hold_remaining(target, started);
+    if remaining.is_zero() {
+        return std::time::Duration::ZERO;
+    }
+
+    std::thread::sleep(remaining);
+    started.elapsed()
 }
 
 /// Texture-format capabilities the backdrop-filter path needs. The format
@@ -428,6 +541,19 @@ pub struct GpuContext {
     /// Reset to zero at every `render()` entry so dropped frames never
     /// report a stale wait.
     last_acquire_wait: std::time::Duration,
+    /// Optional timer-mode presentation phase assigned by the app for the
+    /// next render. The renderer submits GPU work early, then holds only the
+    /// lightweight present call until this instant. Consumed at render entry
+    /// so every error/early-return path clears it.
+    present_not_before: Option<std::time::Instant>,
+    /// Wall time spent holding the most recent present for
+    /// `present_not_before`. Reported separately from render work, just like
+    /// swapchain acquisition wait.
+    last_present_hold: std::time::Duration,
+    /// CPU time spent inside the platform presentation call after any
+    /// deliberate phase hold. Some compositors throttle here even when
+    /// swapchain acquisition itself is non-blocking.
+    last_present_call_wait: std::time::Duration,
     /// True once an `Outdated` acquire error already triggered a
     /// reconfigure in the current episode; cleared by the next successful
     /// acquire (and by `resize`, which reconfigures anyway). Bounds
@@ -463,12 +589,12 @@ impl GpuContext {
     /// Runs an escalation ladder so the app still renders on machines without
     /// a usable GPU, while leaving the hardware path byte-identical:
     ///
-    /// 1. **Hardware** on the preferred backends (`renderer_backends()`, Vulkan
+    /// 1. **Hardware** on the preferred backends (`renderer_backends()`, D3D12
     ///    on Windows), `HighPerformance`, `force_fallback_adapter: false` — the
     ///    exact request the pre-fallback constructor made.
     /// 2. **Broaden** to all backends, still `HighPerformance` / non-fallback —
     ///    picks up a real GPU on a backend the preferred set excluded (e.g.
-    ///    D3D12 when Vulkan is absent), so we don't wrongly land on WARP.
+    ///    Vulkan when D3D12 is absent), so we don't wrongly land on WARP.
     /// 3. **Software fallback** over all backends, `LowPower`,
     ///    `force_fallback_adapter: true` — WARP (Windows/D3D12) / lavapipe
     ///    (Vulkan). Mirrors the proven headless fallback in `try_request_headless`.
@@ -478,7 +604,7 @@ impl GpuContext {
     /// machine; `UNSHIT_RENDER_TIER=hardware` disables the fallback. The two
     /// `Instance`s exist because a wgpu surface is bound to the instance's
     /// backends, so reaching WARP needs a fresh all-backends instance when the
-    /// preferred (Vulkan-only on Windows) one yielded nothing.
+    /// preferred (D3D12-only on Windows) one yielded nothing.
     pub async fn new(window: Arc<dyn winit::window::Window>) -> Self {
         let size = window.surface_size();
         let pref = render_tier_pref();
@@ -587,31 +713,26 @@ impl GpuContext {
                 compatible_surface: Some(surface),
                 force_fallback_adapter: force_fallback,
             })
-            .await?;
+            .await
+            .ok()?;
         let tier = classify_adapter(&adapter.get_info(), force_fallback);
         let (device, queue) = match adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("unshit device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: adapter.limits(),
-                    ..Default::default()
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("unshit device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
             .await
         {
             Ok(dq) => dq,
             Err(_) => adapter
-                .request_device(
-                    &wgpu::DeviceDescriptor {
-                        label: Some("unshit device"),
-                        required_features: wgpu::Features::empty(),
-                        required_limits: wgpu::Limits::default(),
-                        ..Default::default()
-                    },
-                    None,
-                )
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("unshit device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    ..Default::default()
+                })
                 .await
                 .ok()?,
         };
@@ -631,9 +752,14 @@ impl GpuContext {
         queue: wgpu::Queue,
         tier: AdapterTier,
     ) -> Self {
+        // Use the limits of the device that was actually created. The first
+        // request asks for adapter limits, but the fallback request uses
+        // WebGPU defaults; selecting a shader from adapter limits after that
+        // fallback could exceed the real device contract.
+        let device_limits = device.limits();
         let device = Arc::new(device);
         let queue = Arc::new(queue);
-        let sample_count = sample_count_for_tier(tier);
+        let sample_count = desired_sample_count(tier);
 
         let surface_caps = surface.get_capabilities(&adapter);
         // Use a non-sRGB format so blending happens in sRGB space, matching CSS.
@@ -644,7 +770,7 @@ impl GpuContext {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        let present_mode = choose_present_mode(&surface_caps.present_modes);
+        let present_mode = desired_present_mode(&surface_caps.present_modes);
         // wgpu silently clamps the requested latency to the driver's
         // swapchain image-count range and never exposes the clamped value,
         // so only the requested value can be logged; a driver floor is
@@ -679,10 +805,19 @@ impl GpuContext {
         };
         surface.configure(&device, &surface_config);
 
-        // Software adapters (WARP) reject the full quad shader's 96-component
-        // varying budget; use the lite twin there. The hardware path keeps the
-        // full shader (byte-identical to before).
-        let quad_pipeline = if tier == AdapterTier::Software {
+        // Some hardware backends expose WebGPU downlevel limits too (notably
+        // D3D12 at 60 inter-stage components and GL at 16 vertex attributes).
+        // Select the compatibility shader from the advertised limits rather
+        // than discovering the mismatch through a fatal validation error.
+        let use_compat_quad = needs_compat_quad_pipeline(tier, &device_limits);
+        if use_compat_quad {
+            log::warn!(
+                "{{\"event\":\"renderer.compat_quad_pipeline_selected\",\"adapter_tier\":\"{tier:?}\",\"max_vertex_attributes\":{},\"max_inter_stage_components\":{}}}",
+                device_limits.max_vertex_attributes,
+                device_limits.max_inter_stage_shader_components,
+            );
+        }
+        let quad_pipeline = if use_compat_quad {
             QuadPipeline::new_software(&device, surface_format, sample_count)
         } else {
             QuadPipeline::new(&device, surface_format, sample_count)
@@ -763,6 +898,9 @@ impl GpuContext {
             backdrop_image_pipeline: None,
             backdrop_svg_pipeline: None,
             last_acquire_wait: std::time::Duration::ZERO,
+            present_not_before: None,
+            last_present_hold: std::time::Duration::ZERO,
+            last_present_call_wait: std::time::Duration::ZERO,
             outdated_recovery_spent: false,
             acquire_timeout_warned: false,
             current_quad_instance_buffer: None,
@@ -852,7 +990,10 @@ impl GpuContext {
         height: u32,
         preferred: Option<wgpu::Backends>,
     ) -> Option<Self> {
-        let backends = preferred.unwrap_or(wgpu::Backends::all());
+        // Match the windowed renderer's platform preference by default so
+        // headless screenshots exercise the same shader compiler and driver.
+        // Explicit callers can still select another backend.
+        let backends = preferred.unwrap_or_else(renderer_backends);
 
         // Try normal adapter
         if let Some(ctx) = Self::try_request_headless(backends, false, width, height).await {
@@ -890,8 +1031,8 @@ impl GpuContext {
             .await;
 
         let adapter = match adapter {
-            Some(a) => a,
-            None => {
+            Ok(a) => a,
+            Err(_) => {
                 eprintln!("[unshit-test] no adapter for backends {:?}", backends);
                 return None;
             }
@@ -904,28 +1045,22 @@ impl GpuContext {
         // not silently skip on GPUs that can render the real app.
         let limits = adapter.limits();
         let (device, queue) = match adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("unshit headless device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: limits,
-                    ..Default::default()
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("unshit headless device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                ..Default::default()
+            })
             .await
         {
             Ok(dq) => dq,
             Err(_) => adapter
-                .request_device(
-                    &wgpu::DeviceDescriptor {
-                        label: Some("unshit headless device"),
-                        required_features: wgpu::Features::empty(),
-                        required_limits: wgpu::Limits::default(),
-                        ..Default::default()
-                    },
-                    None,
-                )
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("unshit headless device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    ..Default::default()
+                })
                 .await
                 .ok()?,
         };
@@ -1039,6 +1174,9 @@ impl GpuContext {
             backdrop_image_pipeline: None,
             backdrop_svg_pipeline: None,
             last_acquire_wait: std::time::Duration::ZERO,
+            present_not_before: None,
+            last_present_hold: std::time::Duration::ZERO,
+            last_present_call_wait: std::time::Duration::ZERO,
             outdated_recovery_spent: false,
             acquire_timeout_warned: false,
             current_quad_instance_buffer: None,
@@ -1183,6 +1321,20 @@ impl GpuContext {
     /// masquerade as render cost.
     pub fn last_acquire_wait(&self) -> std::time::Duration {
         self.last_acquire_wait
+    }
+
+    /// Assign the stable timer phase for the next windowed present. Passing
+    /// `None` disables holding. Headless renders consume but ignore targets.
+    pub fn set_present_not_before(&mut self, target: Option<std::time::Instant>) {
+        self.present_not_before = target;
+    }
+
+    pub fn last_present_hold(&self) -> std::time::Duration {
+        self.last_present_hold
+    }
+
+    pub fn last_present_call_wait(&self) -> std::time::Duration {
+        self.last_present_call_wait
     }
 
     /// Rebuild text atlas bind groups so pipelines sample from the current
@@ -1360,6 +1512,9 @@ impl GpuContext {
         // app's frame-metrics epilogue, and a stale wait value from a
         // previous frame would be double-subtracted there.
         self.last_acquire_wait = std::time::Duration::ZERO;
+        self.last_present_hold = std::time::Duration::ZERO;
+        self.last_present_call_wait = std::time::Duration::ZERO;
+        let present_not_before = self.present_not_before.take();
         let (vw, vh) = self.window_size();
 
         if trace_text_draw_ranges() {
@@ -1542,6 +1697,7 @@ impl GpuContext {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: pass_view,
                     resolve_target: pass_resolve,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.051,
@@ -1835,7 +1991,13 @@ impl GpuContext {
         });
 
         if let Some(output) = surface_output {
+            self.last_present_hold = hold_until_present_target(present_not_before);
+            if let RenderTarget::Window { window, .. } = &self.target {
+                window.pre_present_notify();
+            }
+            let present_started = std::time::Instant::now();
             output.present();
+            self.last_present_call_wait = present_started.elapsed();
         }
     }
 
@@ -1984,6 +2146,7 @@ impl GpuContext {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: render_view,
                             resolve_target: None,
+                            depth_slice: None,
                             ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                         })],
                         depth_stencil_attachment: None,
@@ -2236,6 +2399,7 @@ impl GpuContext {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &blurred_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
@@ -2265,6 +2429,7 @@ impl GpuContext {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &source_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
@@ -2341,7 +2506,7 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::Wait).expect("GPU poll failed during frame capture");
         rx.recv().unwrap().unwrap();
 
         let mapped = slice.get_mapped_range();
@@ -2601,6 +2766,37 @@ mod tests {
         assert_eq!(choose_present_mode(&[]), wgpu::PresentMode::AutoNoVsync);
     }
 
+    #[test]
+    fn present_mode_override_parser_accepts_named_modes() {
+        assert_eq!(parse_present_mode_override("fifo"), Some(wgpu::PresentMode::Fifo));
+        assert_eq!(
+            parse_present_mode_override(" fifo-relaxed "),
+            Some(wgpu::PresentMode::FifoRelaxed)
+        );
+        assert_eq!(parse_present_mode_override("mailbox"), Some(wgpu::PresentMode::Mailbox));
+        assert_eq!(parse_present_mode_override("immediate"), Some(wgpu::PresentMode::Immediate));
+    }
+
+    #[test]
+    fn present_mode_override_parser_rejects_unknown_modes() {
+        for value in ["", "auto", "vsync", "latest", "FIFO"] {
+            assert_eq!(parse_present_mode_override(value), None, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn present_mode_override_requires_surface_support() {
+        let modes = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Immediate];
+        assert_eq!(
+            choose_supported_present_mode(&modes, Some(wgpu::PresentMode::Immediate)),
+            wgpu::PresentMode::Immediate
+        );
+        assert_eq!(
+            choose_supported_present_mode(&modes, Some(wgpu::PresentMode::Mailbox)),
+            wgpu::PresentMode::Fifo
+        );
+    }
+
     /// The classifier the app uses to pick its pacing mode: exactly the
     /// modes whose acquire/present blocks on vblank count as vsync paced.
     #[test]
@@ -2620,25 +2816,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_frame_latency_override_accepts_one_and_two() {
+    fn parse_frame_latency_override_accepts_bounded_queue_depths() {
         assert_eq!(parse_frame_latency_override("1"), Some(1));
         assert_eq!(parse_frame_latency_override("2"), Some(2));
-        assert_eq!(parse_frame_latency_override(" 2 "), Some(2));
+        assert_eq!(parse_frame_latency_override("3"), Some(3));
+        assert_eq!(parse_frame_latency_override(" 4 "), Some(4));
     }
 
-    /// Anything outside the spec's 1-2 boundary is rejected so the caller
-    /// warns and uses the default instead of handing the driver a
-    /// surprising queue depth.
+    /// Anything outside the bounded diagnostic range is rejected so the
+    /// caller warns instead of handing the driver a surprising queue depth.
     #[test]
     fn parse_frame_latency_override_rejects_everything_else() {
-        for value in ["0", "3", "-1", "1.5", "", "two", "12"] {
+        for value in ["0", "5", "-1", "1.5", "", "two", "12"] {
             assert_eq!(parse_frame_latency_override(value), None, "value {value:?}");
         }
     }
 
     #[test]
-    fn default_maximum_frame_latency_is_one() {
-        assert_eq!(DEFAULT_MAXIMUM_FRAME_LATENCY, 1);
+    fn default_maximum_frame_latency_absorbs_driver_release_stalls() {
+        assert_eq!(DEFAULT_MAXIMUM_FRAME_LATENCY, 4);
     }
 
     /// Builds an `AdapterInfo` for the tier-classification tests without
@@ -2651,7 +2847,7 @@ mod tests {
             device_type,
             driver: String::new(),
             driver_info: String::new(),
-            backend: wgpu::Backend::Empty,
+            backend: wgpu::Backend::Vulkan,
         }
     }
 
@@ -2718,6 +2914,50 @@ mod tests {
         assert_eq!(sample_count_for_tier(AdapterTier::Hardware), MSAA_SAMPLE_COUNT);
         assert_eq!(sample_count_for_tier(AdapterTier::Hardware), 4);
         assert_eq!(sample_count_for_tier(AdapterTier::Software), 1);
+    }
+
+    #[test]
+    fn msaa_override_parser_accepts_only_supported_sample_counts() {
+        assert_eq!(parse_msaa_sample_count("1"), Some(1));
+        assert_eq!(parse_msaa_sample_count(" 4 "), Some(4));
+        for value in ["", "0", "2", "8", "off"] {
+            assert_eq!(parse_msaa_sample_count(value), None, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn present_hold_remaining_only_waits_for_future_targets() {
+        let now = std::time::Instant::now();
+        assert_eq!(present_hold_remaining(None, now), std::time::Duration::ZERO);
+        assert_eq!(
+            present_hold_remaining(Some(now - std::time::Duration::from_millis(1)), now),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            present_hold_remaining(Some(now + std::time::Duration::from_millis(3)), now),
+            std::time::Duration::from_millis(3),
+        );
+    }
+
+    #[test]
+    fn quad_pipeline_compatibility_tracks_adapter_shader_limits() {
+        let mut full = wgpu::Limits::default();
+        full.max_vertex_attributes = 28;
+        full.max_inter_stage_shader_components = 96;
+        assert!(!needs_compat_quad_pipeline(AdapterTier::Hardware, &full));
+
+        let mut dx12_downlevel = full.clone();
+        dx12_downlevel.max_inter_stage_shader_components = 60;
+        assert!(!needs_compat_quad_pipeline(AdapterTier::Hardware, &dx12_downlevel));
+
+        let mut below_packed_budget = full.clone();
+        below_packed_budget.max_inter_stage_shader_components = 58;
+        assert!(needs_compat_quad_pipeline(AdapterTier::Hardware, &below_packed_budget));
+
+        let mut gl_downlevel = full;
+        gl_downlevel.max_vertex_attributes = 16;
+        assert!(needs_compat_quad_pipeline(AdapterTier::Hardware, &gl_downlevel));
+        assert!(needs_compat_quad_pipeline(AdapterTier::Software, &wgpu::Limits::default()));
     }
 
     /// `Lost` means the swapchain is gone; reconfiguring is the only
