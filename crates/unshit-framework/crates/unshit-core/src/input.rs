@@ -290,10 +290,7 @@ fn next_word_boundary(s: &str, pos: usize) -> usize {
     let mut i = 0;
     if i < chars.len() && !chars[i].1.is_whitespace() {
         let class = is_word_char(chars[i].1);
-        while i < chars.len()
-            && !chars[i].1.is_whitespace()
-            && is_word_char(chars[i].1) == class
-        {
+        while i < chars.len() && !chars[i].1.is_whitespace() && is_word_char(chars[i].1) == class {
             i += 1;
         }
     }

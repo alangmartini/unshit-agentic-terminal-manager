@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn assert_stable_after_drag_accepts_flatline() {
         assert!(
-            assert_stable_after_drag(&[(80, 24), (80, 24), (80, 24), (80, 24)].as_slice()).is_ok()
+            assert_stable_after_drag([(80, 24), (80, 24), (80, 24), (80, 24)].as_slice()).is_ok()
         );
     }
 

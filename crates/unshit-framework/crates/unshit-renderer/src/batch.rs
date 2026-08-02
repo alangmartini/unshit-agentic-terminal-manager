@@ -2154,10 +2154,7 @@ fn walk_for_batch(
                                     let chars = input.value[..end].chars().count();
                                     std::borrow::Cow::Owned("\u{2022}".repeat(chars))
                                 } else {
-                                    apply_text_transform(
-                                        &input.value[..end],
-                                        style.text_transform,
-                                    )
+                                    apply_text_transform(&input.value[..end], style.text_transform)
                                 }
                             };
                             let start_prefix = display_prefix(sel_start).into_owned();
