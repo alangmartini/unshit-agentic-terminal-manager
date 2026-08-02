@@ -374,11 +374,34 @@ pub struct App {
     subscription_manager: Option<crate::subscription::SubscriptionManager>,
 }
 
+/// Scope traversed by the frame's style resolver.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StyleResolveScope {
+    #[default]
+    None,
+    Document,
+    Subtree,
+}
+
+impl StyleResolveScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Document => "document",
+            Self::Subtree => "subtree",
+        }
+    }
+}
+
 /// Per-frame performance metrics.
 #[derive(Clone, Debug, Default)]
 pub struct FrameMetrics {
     pub tree_build_us: u64,
     pub style_resolve_us: u64,
+    /// Whether style resolution traversed the whole document or a narrowed
+    /// subtree. Kept separate from duration so a future slow style pass can be
+    /// localized from telemetry without reproducing the interaction.
+    pub style_resolve_scope: StyleResolveScope,
     pub scale_us: u64,
     pub layout_us: u64,
     pub batch_build_us: u64,
@@ -468,10 +491,11 @@ impl std::fmt::Display for FrameMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "frame {:.1}ms | tree {:.1}ms  style {:.1}ms  scale {:.1}ms  layout {:.1}ms  batch {:.1}ms  gpu {:.1}ms  acquire {:.1}ms  hold {:.1}ms  present {:.1}ms | nodes {} | quads {} glyphs {} | rss {:.1}MB",
+            "frame {:.1}ms | tree {:.1}ms  style {:.1}ms ({})  scale {:.1}ms  layout {:.1}ms  batch {:.1}ms  gpu {:.1}ms  acquire {:.1}ms  hold {:.1}ms  present {:.1}ms | nodes {} | quads {} glyphs {} | rss {:.1}MB",
             self.total_us as f64 / 1000.0,
             self.tree_build_us as f64 / 1000.0,
             self.style_resolve_us as f64 / 1000.0,
+            self.style_resolve_scope.as_str(),
             self.scale_us as f64 / 1000.0,
             self.layout_us as f64 / 1000.0,
             self.batch_build_us as f64 / 1000.0,
@@ -1808,11 +1832,34 @@ fn finalize_frame_metrics(
         );
     }
 
-    // Log slow frames.
+    // Keep stderr telemetry queryable even when an embedding application does
+    // not install an on_frame_metrics callback.
+    let frame_log = |level: &'static str| {
+        let correlation_id = format!("process-{}", std::process::id());
+        format!(
+            "{{\"event\":\"renderer.frame_performance\",\"level\":{level:?},\"correlation_id\":{correlation_id:?},\"frame_index\":{},\"budget_us\":8333,\"total_us\":{},\"tree_build_us\":{},\"style_resolve_us\":{},\"style_resolve_scope\":{:?},\"scale_us\":{},\"layout_us\":{},\"batch_build_us\":{},\"gpu_render_us\":{},\"present_wait_us\":{},\"present_hold_us\":{},\"present_call_us\":{},\"node_count\":{},\"quad_count\":{},\"glyph_count\":{},\"display_period_ns\":{}}}",
+            state.frame_count,
+            metrics.total_us,
+            metrics.tree_build_us,
+            metrics.style_resolve_us,
+            metrics.style_resolve_scope.as_str(),
+            metrics.scale_us,
+            metrics.layout_us,
+            metrics.batch_build_us,
+            metrics.gpu_render_us,
+            metrics.present_wait_us,
+            metrics.present_hold_us,
+            metrics.present_call_us,
+            metrics.node_count,
+            metrics.quad_count,
+            metrics.glyph_count,
+            metrics.display_period_ns,
+        )
+    };
     if metrics.total_us > 8333 {
-        log::warn!("[PERF] {}", metrics);
+        log::warn!("{}", frame_log("warn"));
     } else {
-        log::debug!("[PERF] {}", metrics);
+        log::debug!("{}", frame_log("debug"));
     }
 
     if let Some(cb) = on_frame_metrics {
@@ -1838,16 +1885,8 @@ pub(crate) fn is_within_activity_window(
     now.saturating_duration_since(last_activity) < window
 }
 
-fn cascade_root_for_restyle(
-    restyle_root: Option<NodeId>,
-    document_root: NodeId,
-    scale_factor: f32,
-) -> NodeId {
-    if (scale_factor - 1.0).abs() >= 0.001 {
-        document_root
-    } else {
-        restyle_root.unwrap_or(document_root)
-    }
+fn cascade_root_for_restyle(restyle_root: Option<NodeId>, document_root: NodeId) -> NodeId {
+    restyle_root.unwrap_or(document_root)
 }
 
 fn subtree_has_dirty_flags(arena: &NodeArena, node_id: NodeId, flags: DirtyFlags) -> bool {
@@ -4324,6 +4363,7 @@ impl ApplicationHandler for AppHandler {
                             &mut state.pseudo_table,
                         );
                         metrics.style_resolve_us = t1.elapsed().as_micros() as u64;
+                        metrics.style_resolve_scope = StyleResolveScope::Document;
 
                         let t2 = Instant::now();
                         scale_all_styles(&mut state.arena, state.root, state.scale_factor);
@@ -4377,16 +4417,10 @@ impl ApplicationHandler for AppHandler {
                 } else if state.needs_restyle {
                     // Pseudo-class state changes (hover / focus / active)
                     // narrow `restyle_root` to the LCA of the leaving and
-                    // entering nodes. At non-1.0 scale factors, however,
-                    // inherited values outside that subtree have already
-                    // been scaled in-place, so a narrow cascade can inherit
-                    // scaled font metrics and then scale them again. Use a
-                    // full cascade when scaling is active.
-                    let cascade_root = cascade_root_for_restyle(
-                        state.restyle_root.take(),
-                        state.root,
-                        state.scale_factor,
-                    );
+                    // entering nodes. Cascade inheritance reads the parent's
+                    // unscaled logical style, so this remains safe at HiDPI.
+                    let cascade_root =
+                        cascade_root_for_restyle(state.restyle_root.take(), state.root);
                     let t1 = Instant::now();
                     resolve_all_styles_with_transitions(
                         &mut state.arena,
@@ -4410,6 +4444,11 @@ impl ApplicationHandler for AppHandler {
                         &mut state.pseudo_table,
                     );
                     metrics.style_resolve_us = t1.elapsed().as_micros() as u64;
+                    metrics.style_resolve_scope = if cascade_root == state.root {
+                        StyleResolveScope::Document
+                    } else {
+                        StyleResolveScope::Subtree
+                    };
 
                     // Scale only the subtree we just re-resolved.
                     // `scale_all_styles` mutates `computed_style` in place,
@@ -6461,6 +6500,7 @@ mod tests {
         let m = FrameMetrics {
             tree_build_us: 100,
             style_resolve_us: 200,
+            style_resolve_scope: StyleResolveScope::Subtree,
             scale_us: 10,
             layout_us: 300,
             batch_build_us: 50,
@@ -6485,6 +6525,7 @@ mod tests {
             present_call_us: 1_750,
         };
         assert_eq!(m.quad_count, 128);
+        assert_eq!(m.style_resolve_scope, StyleResolveScope::Subtree);
         assert_eq!(m.glyph_count, 512);
         assert!((m.atlas_fill_ratio - 0.75).abs() < f32::EPSILON);
         assert_eq!(m.gpu_upload_bytes, 8192);
@@ -7101,29 +7142,18 @@ mod tests {
     }
 
     #[test]
-    fn cascade_root_for_restyle_keeps_narrow_scope_at_normal_scale() {
+    fn cascade_root_for_restyle_keeps_narrow_scope() {
         let document_root = NodeId { index: 1, generation: 0 };
         let restyle_root = NodeId { index: 8, generation: 0 };
 
-        assert_eq!(cascade_root_for_restyle(Some(restyle_root), document_root, 1.0), restyle_root);
-    }
-
-    #[test]
-    fn cascade_root_for_restyle_uses_document_root_when_scaled() {
-        let document_root = NodeId { index: 1, generation: 0 };
-        let restyle_root = NodeId { index: 8, generation: 0 };
-
-        assert_eq!(
-            cascade_root_for_restyle(Some(restyle_root), document_root, 1.25),
-            document_root
-        );
+        assert_eq!(cascade_root_for_restyle(Some(restyle_root), document_root), restyle_root);
     }
 
     #[test]
     fn cascade_root_for_restyle_defaults_to_document_root() {
         let document_root = NodeId { index: 1, generation: 0 };
 
-        assert_eq!(cascade_root_for_restyle(None, document_root, 1.0), document_root);
+        assert_eq!(cascade_root_for_restyle(None, document_root), document_root);
     }
 
     #[test]

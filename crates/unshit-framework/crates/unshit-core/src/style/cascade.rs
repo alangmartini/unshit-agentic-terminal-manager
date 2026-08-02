@@ -128,7 +128,13 @@ pub fn resolve_style_with_pseudo(
 
     if !element.parent.is_dangling() {
         if let Some(parent) = arena.get(element.parent) {
-            style.inherit_from(&parent.computed_style);
+            // `computed_style` is scaled in-place for presentation after the
+            // cascade. A narrow restyle can begin below that scaling boundary,
+            // so inherit from the parent's last logical cascade result when it
+            // exists. The subtree will be scaled exactly once after resolving.
+            let inheritance_style =
+                parent.previous_style.as_deref().unwrap_or(&parent.computed_style);
+            style.inherit_from(inheritance_style);
         }
     }
 

@@ -1288,4 +1288,41 @@ mod tests {
             arena.get(root).unwrap().dirty
         );
     }
+
+    #[test]
+    fn narrow_restyle_after_dpi_scaling_inherits_unscaled_parent_style() {
+        let stylesheet = CompiledStylesheet::parse(
+            ".parent { font-size: 20px; } .child:hover { color: #ff0000; }",
+        );
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let def = ElementDef::new(Tag::Div)
+            .with_class("parent")
+            .with_child(ElementDef::new(Tag::Div).with_class("child"));
+        let root = build_tree_from_def(&def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let child = arena.children(root)[0];
+
+        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+        scale_all_styles(&mut arena, root, 1.5);
+        assert!((arena.get(child).unwrap().computed_style.font_size - 30.0).abs() < 0.001);
+
+        // A hover change should be able to cascade only the affected subtree.
+        // Its parent is outside the pass and already has a device-scaled
+        // computed style, so inheritance must use the parent's unscaled
+        // cascade result before this subtree is scaled once for presentation.
+        resolve_all_styles_with_transitions(
+            &mut arena,
+            &stylesheet,
+            child,
+            child,
+            None,
+            NodeId::DANGLING,
+            false,
+            Some(Instant::now()),
+            None,
+        );
+        scale_all_styles(&mut arena, child, 1.5);
+
+        assert_eq!(arena.get(child).unwrap().computed_style.font_size, 30.0);
+    }
 }

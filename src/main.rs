@@ -666,6 +666,7 @@ fn main() {
         ),
     )
     .init();
+    crate::renderer_telemetry::initialize();
 
     let diagnostics_config = crate::diagnostics::DiagnosticConfig::from_env().unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -1230,6 +1231,7 @@ fn main() {
             })),
             on_frame_metrics: Some(Box::new(move |m| {
                 crate::bench::record_frame(m);
+                crate::renderer_telemetry::record_slow_frame(m);
                 // record_frame returns true when the visible overlay is
                 // due a rebuild (throttled to ~4Hz inside fps_overlay),
                 // so a visible overlay no longer forces a full rebuild
