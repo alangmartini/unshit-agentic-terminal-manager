@@ -9081,17 +9081,17 @@ mod tests {
             .get_mut(&pane_id)
             .unwrap()
             .apply(|b| b.insert_typed("x"));
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        std::fs::set_permissions(&path, read_only_permissions).unwrap();
 
         assert!(dispatch(&mut state, "editor.save"));
         assert!(state.editors[&pane_id].dirty, "failed save keeps dirty");
         assert_eq!(state.toasts.len(), 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha");
 
-        perms.set_readonly(false);
-        std::fs::set_permissions(&path, perms).unwrap();
+        std::fs::set_permissions(&path, original_permissions).unwrap();
         let _ = std::fs::remove_file(path);
     }
 
@@ -9239,9 +9239,10 @@ mod tests {
     fn dialog_editor_save_close_failure_keeps_pane_open() {
         let mut state = test_state();
         let (pane_id, path) = dirty_editor(&mut state, "savefail");
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        std::fs::set_permissions(&path, read_only_permissions).unwrap();
 
         dispatch(&mut state, "pane.close");
         assert!(dispatch(&mut state, "dialog.editor_save_close"));
@@ -9251,8 +9252,7 @@ mod tests {
         );
         assert_eq!(state.toasts.len(), 1);
 
-        perms.set_readonly(false);
-        std::fs::set_permissions(&path, perms).unwrap();
+        std::fs::set_permissions(&path, original_permissions).unwrap();
         let _ = std::fs::remove_file(path);
     }
 
