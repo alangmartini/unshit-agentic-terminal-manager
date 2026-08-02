@@ -11,7 +11,7 @@ use crate::desktop_regression::launcher::{AppLogFiles, AppSession};
 use crate::desktop_regression::win32;
 use crate::{binary_path, ensure_dir};
 
-const BENCH_WARMUP_SECS: f64 = 3.0;
+const BENCH_WARMUP_SECS: f64 = 5.0;
 const BENCH_EXIT_GRACE: Duration = Duration::from_secs(6);
 // Leave just enough time for the final key-up and terminal echo to paint before
 // the benchmark thread takes its snapshot. A longer tail would measure idle
@@ -19,6 +19,7 @@ const BENCH_EXIT_GRACE: Duration = Duration::from_secs(6);
 const INPUT_SETTLE: Duration = Duration::from_millis(100);
 const TARGET_WINDOW_WIDTH: i32 = 1280;
 const TARGET_WINDOW_HEIGHT: i32 = 800;
+const TARGET_WINDOW_MARGIN: i32 = 40;
 const HUMAN_DELAYS_MS: &[u64] = &[62, 78, 55, 91, 69, 83, 48, 74, 101, 58, 87, 66];
 const STRESS_DELAY_MS: u64 = 4;
 const PROBE_COMMAND: &str = "echo terminal-manager typing cadence probe 0123456789";
@@ -63,6 +64,18 @@ struct BenchReport {
     p95_ms: f64,
     p99_ms: f64,
     max_ms: f64,
+    present_wait_p50_ms: f64,
+    present_wait_p95_ms: f64,
+    present_wait_p99_ms: f64,
+    present_wait_max_ms: f64,
+    present_hold_p50_ms: f64,
+    present_hold_p95_ms: f64,
+    present_hold_p99_ms: f64,
+    present_hold_max_ms: f64,
+    present_call_p50_ms: f64,
+    present_call_p95_ms: f64,
+    present_call_p99_ms: f64,
+    present_call_max_ms: f64,
     input_latency_p50_us: f64,
     input_latency_p95_us: f64,
     input_latency_p99_us: f64,
@@ -88,6 +101,8 @@ struct PerfRun {
     correlation_id: String,
     iteration: u32,
     profile: InputProfile,
+    focus_attempts: u32,
+    focus_elapsed_ms: f64,
     characters_sent: u64,
     input_elapsed_ms: f64,
     report: BenchReport,
@@ -309,14 +324,78 @@ fn run_once(
         &env,
         &args,
     )?;
+    wait_for_log_marker(
+        &logs,
+        "frame pacing:",
+        "renderer initialization",
+        Duration::from_secs(10),
+    )?;
     let screen = win32::screen_size()?;
     let width = TARGET_WINDOW_WIDTH.min(screen.width.saturating_sub(80));
     let height = TARGET_WINDOW_HEIGHT.min(screen.height.saturating_sub(80));
-    win32::set_window_rect(session.window(), 40, 40, width, height)?;
-    win32::focus_window(session.window())?;
+    let (window_x, window_y) = target_window_origin(screen.width, width);
+    win32::set_window_rect(session.window(), window_x, window_y, width, height)?;
+    // Focus the terminal surface directly from its post-layout client bounds.
+    // Windows can DPI-virtualize requested outer-window coordinates independently of the
+    // physical cursor coordinate space; ClientToScreen gives the authoritative
+    // clickable rectangle after SetWindowPos has settled.
+    let client = win32::get_client_rect(session.window())?;
+    let (focus_x, focus_y) =
+        terminal_focus_point(client.left, client.top, client.width(), client.height());
+    let focus_result = win32::focus_window_at(session.window(), focus_x, focus_y);
+    let focus_diagnostic = match &focus_result {
+        Ok(outcome) => serde_json::json!({
+            "event": "typing_perf.focus_ready",
+            "correlation_id": correlation_id,
+            "iteration": iteration,
+            "profile": profile,
+            "attempts": outcome.attempts,
+            "elapsed_ms": outcome.elapsed.as_secs_f64() * 1_000.0,
+            "focus_x": focus_x,
+            "focus_y": focus_y,
+        }),
+        Err(error) => serde_json::json!({
+            "event": "typing_perf.focus_failed",
+            "correlation_id": correlation_id,
+            "iteration": iteration,
+            "profile": profile,
+            "reason_code": "activation-timeout",
+            "details": error,
+            "focus_x": focus_x,
+            "focus_y": focus_y,
+        }),
+    };
+    let focus_path = run_dir.join("focus.json");
+    std::fs::write(
+        &focus_path,
+        serde_json::to_vec_pretty(&focus_diagnostic)
+            .map_err(|e| format!("failed to serialize {}: {e}", focus_path.display()))?,
+    )
+    .map_err(|e| format!("failed to write {}: {e}", focus_path.display()))?;
+    let focus = focus_result?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "typing_perf.input_driver_ready",
+            "correlation_id": correlation_id,
+            "iteration": iteration,
+            "profile": profile,
+            "strategy": "layout-aware-virtual-key",
+            "focus_attempts": focus.attempts,
+            "focus_elapsed_ms": focus.elapsed.as_secs_f64() * 1_000.0,
+            "focus_x": focus_x,
+            "focus_y": focus_y,
+            "client_rect": {
+                "left": client.left,
+                "top": client.top,
+                "right": client.right,
+                "bottom": client.bottom,
+            },
+        })
+    );
     // Exercise the exact terminal keyboard path during warmup. Besides priming
     // focus, this puts the probe glyphs in the atlas before measurement.
-    win32::send_text_to_window(session.window(), PROBE_COMMAND)?;
+    win32::send_physical_text_to_window(session.window(), PROBE_COMMAND)?;
     win32::send_enter_to_window(session.window())?;
     println!(
         "{}",
@@ -363,10 +442,18 @@ fn run_once(
             "correlation_id": correlation_id,
             "iteration": iteration,
             "profile": profile,
+            "focus_attempts": focus.attempts,
+            "focus_elapsed_ms": focus.elapsed.as_secs_f64() * 1_000.0,
             "characters_sent": characters_sent,
             "display_hz": verdict.display_hz,
             "paints_per_sec": report.paints_per_sec_mean,
             "work_p99_ms": report.p99_ms,
+            "present_wait_p99_ms": report.present_wait_p99_ms,
+            "present_wait_max_ms": report.present_wait_max_ms,
+            "present_hold_p99_ms": report.present_hold_p99_ms,
+            "present_hold_max_ms": report.present_hold_max_ms,
+            "present_call_p99_ms": report.present_call_p99_ms,
+            "present_call_max_ms": report.present_call_max_ms,
             "input_latency_p99_us": report.input_latency_p99_us,
             "input_latency_samples": report.input_latency_samples,
             "interval_p99_ms": report.interval_p99_ms,
@@ -379,11 +466,31 @@ fn run_once(
         correlation_id: correlation_id.to_owned(),
         iteration,
         profile,
+        focus_attempts: focus.attempts,
+        focus_elapsed_ms: focus.elapsed.as_secs_f64() * 1_000.0,
         characters_sent,
         input_elapsed_ms: input_elapsed.as_secs_f64() * 1_000.0,
         report,
         verdict,
     })
+}
+
+fn terminal_focus_point(left: i32, top: i32, width: i32, height: i32) -> (i32, i32) {
+    // The terminal workspace occupies the right side of the app. Clicking at
+    // 75% width avoids the sidebar and explicitly establishes the same focused
+    // keyboard-capture node a person gets by clicking the terminal before
+    // typing.
+    (left + width * 3 / 4, top + height / 2)
+}
+
+fn target_window_origin(screen_width: i32, window_width: i32) -> (i32, i32) {
+    (
+        screen_width
+            .saturating_sub(window_width)
+            .saturating_sub(TARGET_WINDOW_MARGIN)
+            .max(0),
+        TARGET_WINDOW_MARGIN,
+    )
 }
 
 fn drive_typing(
@@ -400,7 +507,7 @@ fn drive_typing(
                 return Ok(characters_sent);
             }
             let mut encoded = [0u8; 4];
-            win32::send_text_to_window(window, ch.encode_utf8(&mut encoded))?;
+            win32::send_physical_text_to_window(window, ch.encode_utf8(&mut encoded))?;
             characters_sent = characters_sent.saturating_add(1);
             thread::sleep(profile.inter_key_delay(key_index));
             key_index = key_index.saturating_add(1);
@@ -415,11 +522,20 @@ fn drive_typing(
 }
 
 fn wait_for_bench_activation(logs: &AppLogFiles, timeout: Duration) -> Result<(), String> {
+    wait_for_log_marker(logs, "[bench] activated", "benchmark activation", timeout)
+}
+
+fn wait_for_log_marker(
+    logs: &AppLogFiles,
+    marker: &str,
+    description: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         for path in [logs.stdout_path(), logs.stderr_path()] {
             if std::fs::read_to_string(path)
-                .map(|contents| contents.contains("[bench] activated"))
+                .map(|contents| contents.contains(marker))
                 .unwrap_or(false)
             {
                 return Ok(());
@@ -428,7 +544,7 @@ fn wait_for_bench_activation(logs: &AppLogFiles, timeout: Duration) -> Result<()
         thread::sleep(Duration::from_millis(25));
     }
     Err(format!(
-        "benchmark did not activate within {:.1}s; inspect {} and {}",
+        "{description} did not complete within {:.1}s; inspect {} and {}",
         timeout.as_secs_f64(),
         logs.stdout_path().display(),
         logs.stderr_path().display()
@@ -544,6 +660,17 @@ mod tests {
         assert!(verdict.renderer_meets_budget);
         assert!(verdict.cadence_meets_budget);
         assert!(verdict.input_meets_budget);
+    }
+
+    #[test]
+    fn typing_focus_point_targets_right_center_of_window() {
+        assert_eq!(terminal_focus_point(40, 40, 1280, 800), (1000, 440));
+    }
+
+    #[test]
+    fn typing_window_is_right_aligned_with_a_safe_margin() {
+        assert_eq!(target_window_origin(2560, 1280), (1240, 40));
+        assert_eq!(target_window_origin(800, 800), (0, 40));
     }
 
     #[test]

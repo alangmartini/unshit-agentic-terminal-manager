@@ -31,6 +31,12 @@ pub struct DesktopSize {
 pub struct WindowHandle(pub isize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusWindowOutcome {
+    pub attempts: u32,
+    pub elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowOcclusionCandidate {
     pub handle: WindowHandle,
     pub rect: DesktopRect,
@@ -113,6 +119,19 @@ fn first_occluding_window_before_target(
         .find(|candidate| candidate.occludes(target_rect))
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn retry_until<T>(
+    maximum_attempts: u32,
+    mut attempt: impl FnMut(u32) -> Option<T>,
+) -> Option<(u32, T)> {
+    for attempt_index in 1..=maximum_attempts {
+        if let Some(value) = attempt(attempt_index) {
+            return Some((attempt_index, value));
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use std::ffi::OsString;
@@ -122,24 +141,62 @@ mod imp {
 
     use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, TRUE};
     use winapi::shared::windef::{HWND, POINT, RECT};
+    use winapi::um::processthreadsapi::GetCurrentThreadId;
     use winapi::um::winuser::{
-        keybd_event, mouse_event, ClientToScreen, CloseWindow, EnumWindows, GetClassNameW,
-        GetDpiForWindow, GetForegroundWindow, GetKeyState, GetSystemMetrics, GetWindow,
-        GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendInput,
-        SetCursorPos, SetForegroundWindow, SetProcessDPIAware, SetProcessDpiAwarenessContext,
-        SetWindowPos, ShowWindow, GW_HWNDFIRST, GW_HWNDNEXT, GW_OWNER, INPUT, INPUT_KEYBOARD,
-        KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEEVENTF_WHEEL, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_RESTORE,
-        VK_CONTROL, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE,
+        keybd_event, mouse_event, AttachThreadInput, BringWindowToTop, ClientToScreen, CloseWindow,
+        EnumWindows, GetAncestor, GetClassNameW, GetDpiForWindow, GetForegroundWindow, GetKeyState,
+        GetSystemMetrics, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindowEnabled, IsWindowVisible, SendInput, SetActiveWindow,
+        SetCursorPos, SetFocus, SetForegroundWindow, SetProcessDPIAware,
+        SetProcessDpiAwarenessContext, SetWindowPos, ShowWindow, VkKeyScanW, WindowFromPoint,
+        GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_HWNDFIRST, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, INPUT,
+        INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, VK_CONTROL, VK_LEFT, VK_LWIN, VK_MENU,
+        VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TRANSPARENT,
     };
     use winapi::um::winuser::{GetClientRect, IsZoomed, PostMessageW, HWND_TOPMOST};
 
     use super::{
-        DesktopRect, DesktopSize, SnapCaptureReadinessError, WindowHandle, WindowOcclusionCandidate,
+        DesktopRect, DesktopSize, FocusWindowOutcome, SnapCaptureReadinessError, WindowHandle,
+        WindowOcclusionCandidate,
     };
 
     const VK_D: u16 = 0x44;
     const VK_F: u16 = 0x46;
+    const FOCUS_ACTIVATION_ATTEMPTS: u32 = 25;
+    const FOCUS_ACTIVATION_SETTLE: Duration = Duration::from_millis(100);
+
+    #[derive(Debug)]
+    struct FocusWindowDiagnostic {
+        handle: WindowHandle,
+        process_id: u32,
+        class: String,
+        rect: DesktopRect,
+        visible: bool,
+        enabled: bool,
+        owner: Option<WindowHandle>,
+        style: u32,
+        ex_style: u32,
+    }
+
+    impl FocusWindowDiagnostic {
+        fn telemetry_fields(&self) -> String {
+            format!(
+                "handle={:?},pid={},class={:?},rect={:?},visible={},enabled={},owner={:?},style=0x{:08x},ex_style=0x{:08x}",
+                self.handle,
+                self.process_id,
+                self.class,
+                self.rect,
+                self.visible,
+                self.enabled,
+                self.owner,
+                self.style,
+                self.ex_style,
+            )
+        }
+    }
 
     pub fn find_window_for_process(
         process_id: u32,
@@ -150,21 +207,69 @@ mod imp {
         enable_dpi_awareness();
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            let windows = enumerate_process_windows(process_id);
+            let windows = enumerate_process_windows(process_id)
+                .into_iter()
+                .filter(|window| automation_window_candidate(*window))
+                .collect::<Vec<_>>();
             if let Some(window) = windows
                 .iter()
                 .copied()
-                .find(|hwnd| matches_expected(*hwnd, title_substrings, class_substrings))
+                .filter(|hwnd| matches_expected(*hwnd, title_substrings, class_substrings))
+                .max_by_key(|window| automation_window_area(*window))
             {
                 return Ok(WindowHandle(window as isize));
             }
-            if let Some(window) = windows.first().copied() {
+            if let Some(window) = windows
+                .iter()
+                .copied()
+                .max_by_key(|window| automation_window_area(*window))
+            {
                 return Ok(WindowHandle(window as isize));
             }
             thread::sleep(Duration::from_millis(100));
         }
 
         Err(format!("window did not appear for pid={process_id}"))
+    }
+
+    fn automation_window_candidate(window: HWND) -> bool {
+        focus_window_diagnostic(window)
+            .map(|diagnostic| {
+                automation_window_properties_eligible(
+                    diagnostic.rect,
+                    diagnostic.visible,
+                    diagnostic.enabled,
+                    diagnostic.owner,
+                    diagnostic.ex_style,
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn automation_window_area(window: HWND) -> i64 {
+        focus_window_diagnostic(window)
+            .map(|diagnostic| {
+                i64::from(diagnostic.rect.width().max(0))
+                    * i64::from(diagnostic.rect.height().max(0))
+            })
+            .unwrap_or(0)
+    }
+
+    pub(super) fn automation_window_properties_eligible(
+        rect: DesktopRect,
+        visible: bool,
+        enabled: bool,
+        owner: Option<WindowHandle>,
+        ex_style: u32,
+    ) -> bool {
+        const MIN_AUTOMATION_WINDOW_DIMENSION_PX: i32 = 64;
+        let non_interactive_styles = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT;
+        visible
+            && enabled
+            && owner.is_none()
+            && rect.width() >= MIN_AUTOMATION_WINDOW_DIMENSION_PX
+            && rect.height() >= MIN_AUTOMATION_WINDOW_DIMENSION_PX
+            && ex_style & non_interactive_styles == 0
     }
 
     pub fn screen_size() -> Result<DesktopSize, String> {
@@ -283,7 +388,15 @@ mod imp {
         let rect = get_window_rect(handle)?;
         let click_x = (rect.left + rect.right) / 2;
         let click_y = rect.top + 8;
-        show_and_click(handle, click_x, click_y)
+        show_and_click(handle, click_x, click_y).map(|_| ())
+    }
+
+    pub fn focus_window_at(
+        handle: WindowHandle,
+        x: i32,
+        y: i32,
+    ) -> Result<FocusWindowOutcome, String> {
+        show_and_click(handle, x, y)
     }
 
     pub fn mouse_click(x: i32, y: i32, button: Option<&str>) -> Result<(), String> {
@@ -318,20 +431,161 @@ mod imp {
         Ok(())
     }
 
-    fn show_and_click(handle: WindowHandle, click_x: i32, click_y: i32) -> Result<(), String> {
-        unsafe {
-            ShowWindow(hwnd(handle), SW_RESTORE);
-            SetCursorPos(click_x, click_y);
-            thread::sleep(Duration::from_millis(50));
-            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-            thread::sleep(Duration::from_millis(30));
-            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-            thread::sleep(Duration::from_millis(200));
-            SetForegroundWindow(hwnd(handle));
-        }
-        thread::sleep(Duration::from_millis(250));
+    fn show_and_click(
+        handle: WindowHandle,
+        click_x: i32,
+        click_y: i32,
+    ) -> Result<FocusWindowOutcome, String> {
+        let target = hwnd(handle);
+        let point = POINT {
+            x: click_x,
+            y: click_y,
+        };
+        let started = Instant::now();
+        let mut last_hit = std::ptr::null_mut();
+        let mut last_foreground = std::ptr::null_mut();
 
-        Ok(())
+        let focused = super::retry_until(FOCUS_ACTIVATION_ATTEMPTS, |_| {
+            let positioned = request_window_activation(target);
+            thread::sleep(FOCUS_ACTIVATION_SETTLE);
+            last_foreground = unsafe { GetForegroundWindow() };
+            last_hit = unsafe { GetAncestor(WindowFromPoint(point), GA_ROOT) };
+            if !positioned || last_foreground != target || last_hit != target {
+                thread::sleep(FOCUS_ACTIVATION_SETTLE);
+                return None;
+            }
+
+            unsafe {
+                SetCursorPos(click_x, click_y);
+                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                thread::sleep(Duration::from_millis(30));
+                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+            }
+            thread::sleep(FOCUS_ACTIVATION_SETTLE);
+            last_foreground = unsafe { GetForegroundWindow() };
+            if last_foreground == target {
+                Some(())
+            } else {
+                thread::sleep(FOCUS_ACTIVATION_SETTLE);
+                None
+            }
+        });
+
+        if let Some((attempts, ())) = focused {
+            return Ok(FocusWindowOutcome {
+                attempts,
+                elapsed: started.elapsed(),
+            });
+        }
+
+        let window_above = unsafe { GetWindow(target, GW_HWNDPREV) };
+        let target_diagnostic = focus_window_diagnostic(target);
+        let hit_diagnostic = focus_window_diagnostic(last_hit);
+        let above_diagnostic = focus_window_diagnostic(window_above);
+        let process_windows = target_diagnostic
+            .as_ref()
+            .map(|diagnostic| {
+                enumerate_process_windows(diagnostic.process_id)
+                    .into_iter()
+                    .filter_map(focus_window_diagnostic)
+                    .map(|window| window.telemetry_fields())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let target_state = target_diagnostic.map(|window| window.telemetry_fields());
+        let hit_state = hit_diagnostic.map(|window| window.telemetry_fields());
+        let above_state = above_diagnostic.map(|window| window.telemetry_fields());
+        Err(format!(
+            "failed to focus keyboard target after {} attempts in {:.1}ms: target={handle:?} point=({click_x},{click_y}) foreground={:?} target_state={target_state:?} hit_state={hit_state:?} above_state={above_state:?} process_windows={process_windows:?}",
+            FOCUS_ACTIVATION_ATTEMPTS,
+            started.elapsed().as_secs_f64() * 1_000.0,
+            non_null_window_handle(last_foreground),
+        ))
+    }
+
+    fn focus_window_diagnostic(window: HWND) -> Option<FocusWindowDiagnostic> {
+        if window.is_null() {
+            return None;
+        }
+        let mut process_id = 0;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe {
+            GetWindowThreadProcessId(window, &mut process_id);
+            GetWindowRect(window, &mut rect);
+        }
+        Some(FocusWindowDiagnostic {
+            handle: WindowHandle(window as isize),
+            process_id,
+            class: window_class(window),
+            rect: DesktopRect {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            visible: unsafe { IsWindowVisible(window) != 0 },
+            enabled: unsafe { IsWindowEnabled(window) != 0 },
+            owner: non_null_window_handle(unsafe { GetWindow(window, GW_OWNER) }),
+            style: unsafe { GetWindowLongW(window, GWL_STYLE) } as u32,
+            ex_style: unsafe { GetWindowLongW(window, GWL_EXSTYLE) } as u32,
+        })
+    }
+
+    fn request_window_activation(target: HWND) -> bool {
+        unsafe {
+            let current_thread = GetCurrentThreadId();
+            let target_thread = GetWindowThreadProcessId(target, std::ptr::null_mut());
+            let foreground = GetForegroundWindow();
+            let foreground_thread = if foreground.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+            };
+
+            let attached_foreground = foreground_thread != 0
+                && foreground_thread != current_thread
+                && AttachThreadInput(current_thread, foreground_thread, TRUE) != 0;
+            let attached_target = target_thread != 0
+                && target_thread != current_thread
+                && target_thread != foreground_thread
+                && AttachThreadInput(current_thread, target_thread, TRUE) != 0;
+
+            ShowWindow(target, SW_RESTORE);
+            let positioned = SetWindowPos(
+                target,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            ) != 0;
+            BringWindowToTop(target);
+            SetActiveWindow(target);
+            SetFocus(target);
+            // Windows may reject SetForegroundWindow when this automation
+            // process is not the current foreground owner. An Alt transition
+            // is treated as user input and opens the documented foreground
+            // activation path; release it immediately so benchmark keystrokes
+            // never inherit a modifier.
+            keybd_event(VK_MENU as u8, 0, 0, 0);
+            SetForegroundWindow(target);
+            keybd_event(VK_MENU as u8, 0, KEYEVENTF_KEYUP, 0);
+
+            if attached_target {
+                AttachThreadInput(current_thread, target_thread, 0);
+            }
+            if attached_foreground {
+                AttachThreadInput(current_thread, foreground_thread, 0);
+            }
+
+            positioned
+        }
     }
 
     pub fn left_edge_drag(
@@ -419,13 +673,45 @@ mod imp {
         Ok(())
     }
 
-    pub fn send_text_to_window(handle: WindowHandle, text: &str) -> Result<(), String> {
+    /// Send layout-aware virtual-key presses, matching the event path of a
+    /// physical keyboard. Unlike `KEYEVENTF_UNICODE`/`VK_PACKET`, this is
+    /// surfaced consistently as winit `KeyboardInput` on Windows and is the
+    /// right primitive for latency/cadence benchmarks.
+    pub fn send_physical_text_to_window(handle: WindowHandle, text: &str) -> Result<(), String> {
         ensure_foreground_window(handle)?;
-        for unit in text.encode_utf16() {
-            send_keyboard_input(0, unit, KEYEVENTF_UNICODE)?;
-            send_keyboard_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)?;
+        for ch in text.chars() {
+            let (vk, modifiers) = physical_key_chord(ch)?;
+            let modifier_keys = [
+                (1u8, VK_SHIFT as u16),
+                (2u8, VK_CONTROL as u16),
+                (4u8, VK_MENU as u16),
+            ];
+            for &(mask, modifier_vk) in &modifier_keys {
+                if modifiers & mask != 0 {
+                    send_keyboard_input(modifier_vk, 0, 0)?;
+                }
+            }
+            send_keyboard_input(vk, 0, 0)?;
+            send_keyboard_input(vk, 0, KEYEVENTF_KEYUP)?;
+            for &(mask, modifier_vk) in modifier_keys.iter().rev() {
+                if modifiers & mask != 0 {
+                    send_keyboard_input(modifier_vk, 0, KEYEVENTF_KEYUP)?;
+                }
+            }
         }
         Ok(())
+    }
+
+    pub(super) fn physical_key_chord(ch: char) -> Result<(u16, u8), String> {
+        let codepoint = u16::try_from(ch as u32)
+            .map_err(|_| format!("character {ch:?} is outside the Windows BMP"))?;
+        let mapped = unsafe { VkKeyScanW(codepoint) };
+        if mapped == -1 {
+            return Err(format!(
+                "character {ch:?} is unavailable in the active keyboard layout"
+            ));
+        }
+        Ok(((mapped as u16) & 0xff, ((mapped as u16) >> 8) as u8))
     }
 
     pub fn send_enter_to_window(handle: WindowHandle) -> Result<(), String> {
@@ -435,7 +721,7 @@ mod imp {
     }
 
     pub fn send_ctrl_d() -> Result<(), String> {
-        send_key_combo(VK_CONTROL as u16, VK_D as u16)
+        send_key_combo(VK_CONTROL as u16, VK_D)
     }
 
     pub fn send_ctrl_shift_f() -> Result<(), String> {
@@ -647,7 +933,9 @@ mod imp {
 mod imp {
     use std::time::Duration;
 
-    use super::{DesktopRect, DesktopSize, SnapCaptureReadinessError, WindowHandle};
+    use super::{
+        DesktopRect, DesktopSize, FocusWindowOutcome, SnapCaptureReadinessError, WindowHandle,
+    };
 
     pub fn find_window_for_process(
         _process_id: u32,
@@ -692,6 +980,14 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn focus_window_at(
+        _handle: WindowHandle,
+        _x: i32,
+        _y: i32,
+    ) -> Result<FocusWindowOutcome, String> {
+        Err(unsupported())
+    }
+
     pub fn mouse_click(_x: i32, _y: i32, _button: Option<&str>) -> Result<(), String> {
         Err(unsupported())
     }
@@ -732,7 +1028,7 @@ mod imp {
         Err(unsupported())
     }
 
-    pub fn send_text_to_window(_handle: WindowHandle, _text: &str) -> Result<(), String> {
+    pub fn send_physical_text_to_window(_handle: WindowHandle, _text: &str) -> Result<(), String> {
         Err(unsupported())
     }
 
@@ -792,6 +1088,10 @@ pub fn focus_window(handle: WindowHandle) -> Result<(), String> {
     imp::focus_window(handle)
 }
 
+pub fn focus_window_at(handle: WindowHandle, x: i32, y: i32) -> Result<FocusWindowOutcome, String> {
+    imp::focus_window_at(handle, x, y)
+}
+
 pub fn mouse_click(x: i32, y: i32, button: Option<&str>) -> Result<(), String> {
     imp::mouse_click(x, y, button)
 }
@@ -832,8 +1132,8 @@ pub fn send_text_enter(text: &str) -> Result<(), String> {
     imp::send_text_enter(text)
 }
 
-pub fn send_text_to_window(handle: WindowHandle, text: &str) -> Result<(), String> {
-    imp::send_text_to_window(handle, text)
+pub fn send_physical_text_to_window(handle: WindowHandle, text: &str) -> Result<(), String> {
+    imp::send_physical_text_to_window(handle, text)
 }
 
 pub fn send_enter_to_window(handle: WindowHandle) -> Result<(), String> {
@@ -859,6 +1159,56 @@ mod tests {
 
         assert_eq!(rect.width(), 100);
         assert_eq!(rect.height(), 50);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn physical_key_mapping_supports_typing_probe_characters() {
+        for ch in "echo terminal-manager typing cadence probe 0123456789".chars() {
+            let (vk, modifiers) = imp::physical_key_chord(ch)
+                .unwrap_or_else(|error| panic!("probe character {ch:?}: {error}"));
+            assert_ne!(vk, 0, "probe character {ch:?} must map to a virtual key");
+            assert_eq!(
+                modifiers & !0b111,
+                0,
+                "probe character {ch:?} requires an unsupported modifier"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_retry_tolerates_transient_activation_states() {
+        let mut readiness = [false, false, true].into_iter();
+
+        let result = retry_until(5, |_| readiness.next().filter(|ready| *ready));
+
+        assert_eq!(result, Some((3, true)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn automation_window_filter_rejects_winit_event_target_styles() {
+        let usable_rect = DesktopRect {
+            left: 76,
+            top: 76,
+            right: 1356,
+            bottom: 876,
+        };
+
+        assert!(!imp::automation_window_properties_eligible(
+            usable_rect,
+            true,
+            true,
+            None,
+            0x0808_00a8,
+        ));
+        assert!(imp::automation_window_properties_eligible(
+            usable_rect,
+            true,
+            true,
+            None,
+            0x0004_0110,
+        ));
     }
 
     #[test]

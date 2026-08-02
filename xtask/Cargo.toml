@@ -23,6 +23,7 @@ image = { workspace = true }
 winapi = { workspace = true, features = [
     "errhandlingapi",
     "minwindef",
+    "processthreadsapi",
     "windef",
     "wingdi",
     "winuser",

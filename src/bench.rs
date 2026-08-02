@@ -95,6 +95,15 @@ pub struct BenchConfig {
 
 struct BenchState {
     samples_us: VecDeque<u64>,
+    /// Time spent waiting for the next swapchain texture, in
+    /// microseconds. Kept separate from `samples_us` because frame work
+    /// deliberately excludes this display/driver throttle.
+    present_waits_us: VecDeque<u64>,
+    /// Intentional timer-mode wait between GPU submission and the stable
+    /// presentation phase. Kept out of work samples and queryable on its own.
+    present_holds_us: VecDeque<u64>,
+    /// Driver/compositor time spent inside the platform present call.
+    present_calls_us: VecDeque<u64>,
     /// Present-to-present intervals in microseconds, one per painted
     /// frame after the first benchmark frame. Fed from
     /// [`FrameMetrics::present_interval_us`]. The first metric is skipped
@@ -129,6 +138,9 @@ impl BenchState {
     const fn new() -> Self {
         Self {
             samples_us: VecDeque::new(),
+            present_waits_us: VecDeque::new(),
+            present_holds_us: VecDeque::new(),
+            present_calls_us: VecDeque::new(),
             intervals_us: VecDeque::new(),
             tree_build_us_sum: 0,
             layout_us_sum: 0,
@@ -162,6 +174,9 @@ pub fn record_frame(m: &FrameMetrics) {
         return;
     }
     s.samples_us.push_back(m.total_us);
+    s.present_waits_us.push_back(m.present_wait_us);
+    s.present_holds_us.push_back(m.present_hold_us);
+    s.present_calls_us.push_back(m.present_call_us);
     if s.frames > 0 && m.present_interval_us > 0 {
         s.intervals_us.push_back(m.present_interval_us);
     }
@@ -201,6 +216,9 @@ fn activate() {
     let mut s = state().lock().unwrap();
     s.active = true;
     s.samples_us.clear();
+    s.present_waits_us.clear();
+    s.present_holds_us.clear();
+    s.present_calls_us.clear();
     s.intervals_us.clear();
     s.tree_build_us_sum = 0;
     s.layout_us_sum = 0;
@@ -281,6 +299,20 @@ struct Report {
     p95_ms: f64,
     p99_ms: f64,
     max_ms: f64,
+    /// Swapchain acquisition wait quantiles. These isolate display or
+    /// driver throttling from the CPU/GPU work-time fields above.
+    present_wait_p50_ms: f64,
+    present_wait_p95_ms: f64,
+    present_wait_p99_ms: f64,
+    present_wait_max_ms: f64,
+    present_hold_p50_ms: f64,
+    present_hold_p95_ms: f64,
+    present_hold_p99_ms: f64,
+    present_hold_max_ms: f64,
+    present_call_p50_ms: f64,
+    present_call_p95_ms: f64,
+    present_call_p99_ms: f64,
+    present_call_max_ms: f64,
     tree_build_ms_avg: f64,
     layout_ms_avg: f64,
     batch_ms_avg: f64,
@@ -428,6 +460,15 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
     let mut sorted: Vec<u64> = s.samples_us.iter().copied().collect();
     sorted.sort_unstable();
     let pct = |q: f64| -> u64 { percentile_us(&sorted, q) };
+    let mut present_waits_sorted: Vec<u64> = s.present_waits_us.iter().copied().collect();
+    present_waits_sorted.sort_unstable();
+    let present_wait_pct = |q: f64| -> u64 { percentile_us(&present_waits_sorted, q) };
+    let mut present_holds_sorted: Vec<u64> = s.present_holds_us.iter().copied().collect();
+    present_holds_sorted.sort_unstable();
+    let present_hold_pct = |q: f64| -> u64 { percentile_us(&present_holds_sorted, q) };
+    let mut present_calls_sorted: Vec<u64> = s.present_calls_us.iter().copied().collect();
+    present_calls_sorted.sort_unstable();
+    let present_call_pct = |q: f64| -> u64 { percentile_us(&present_calls_sorted, q) };
     let mut intervals_sorted: Vec<u64> = s.intervals_us.iter().copied().collect();
     intervals_sorted.sort_unstable();
     let judder_period_ns = if s.last_display_period_ns > 0 {
@@ -491,6 +532,18 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         p95_ms: pct(0.95) as f64 / 1000.0,
         p99_ms: pct(0.99) as f64 / 1000.0,
         max_ms: sorted.last().copied().unwrap_or(0) as f64 / 1000.0,
+        present_wait_p50_ms: present_wait_pct(0.50) as f64 / 1000.0,
+        present_wait_p95_ms: present_wait_pct(0.95) as f64 / 1000.0,
+        present_wait_p99_ms: present_wait_pct(0.99) as f64 / 1000.0,
+        present_wait_max_ms: present_waits_sorted.last().copied().unwrap_or(0) as f64 / 1000.0,
+        present_hold_p50_ms: present_hold_pct(0.50) as f64 / 1000.0,
+        present_hold_p95_ms: present_hold_pct(0.95) as f64 / 1000.0,
+        present_hold_p99_ms: present_hold_pct(0.99) as f64 / 1000.0,
+        present_hold_max_ms: present_holds_sorted.last().copied().unwrap_or(0) as f64 / 1000.0,
+        present_call_p50_ms: present_call_pct(0.50) as f64 / 1000.0,
+        present_call_p95_ms: present_call_pct(0.95) as f64 / 1000.0,
+        present_call_p99_ms: present_call_pct(0.99) as f64 / 1000.0,
+        present_call_max_ms: present_calls_sorted.last().copied().unwrap_or(0) as f64 / 1000.0,
         tree_build_ms_avg: avg_ms(s.tree_build_us_sum),
         layout_ms_avg: avg_ms(s.layout_us_sum),
         batch_ms_avg: avg_ms(s.batch_us_sum),
@@ -1057,6 +1110,63 @@ mod tests {
         });
         let report = build_report(BenchMode::HumanTyping, Duration::from_secs(1));
         assert!((report.display_period_ms - 8.333_333).abs() < 0.001);
+        deactivate();
+    }
+
+    #[test]
+    fn report_records_present_wait_quantiles() {
+        let _g = guard();
+        activate();
+        for &present_wait_us in &[100, 200, 300, 4_000] {
+            record_frame(&FrameMetrics {
+                total_us: 1_000,
+                present_wait_us,
+                ..Default::default()
+            });
+        }
+        let report = build_report(BenchMode::HumanTyping, Duration::from_secs(1));
+        assert!((report.present_wait_p50_ms - 0.2).abs() < 0.001);
+        assert!((report.present_wait_p95_ms - 4.0).abs() < 0.001);
+        assert!((report.present_wait_p99_ms - 4.0).abs() < 0.001);
+        assert!((report.present_wait_max_ms - 4.0).abs() < 0.001);
+        deactivate();
+    }
+
+    #[test]
+    fn report_records_present_hold_quantiles() {
+        let _g = guard();
+        activate();
+        for &present_hold_us in &[500, 1_000, 2_000, 6_000] {
+            record_frame(&FrameMetrics {
+                total_us: 1_000,
+                present_hold_us,
+                ..Default::default()
+            });
+        }
+        let report = build_report(BenchMode::HumanTyping, Duration::from_secs(1));
+        assert!((report.present_hold_p50_ms - 1.0).abs() < 0.001);
+        assert!((report.present_hold_p95_ms - 6.0).abs() < 0.001);
+        assert!((report.present_hold_p99_ms - 6.0).abs() < 0.001);
+        assert!((report.present_hold_max_ms - 6.0).abs() < 0.001);
+        deactivate();
+    }
+
+    #[test]
+    fn report_records_present_call_quantiles() {
+        let _g = guard();
+        activate();
+        for &present_call_us in &[50, 100, 200, 900] {
+            record_frame(&FrameMetrics {
+                total_us: 1_000,
+                present_call_us,
+                ..Default::default()
+            });
+        }
+        let report = build_report(BenchMode::HumanTyping, Duration::from_secs(1));
+        assert!((report.present_call_p50_ms - 0.1).abs() < 0.001);
+        assert!((report.present_call_p95_ms - 0.9).abs() < 0.001);
+        assert!((report.present_call_p99_ms - 0.9).abs() < 0.001);
+        assert!((report.present_call_max_ms - 0.9).abs() < 0.001);
         deactivate();
     }
 
