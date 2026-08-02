@@ -67,7 +67,7 @@ fn reuse_buffer_after_submission_completes() {
         // instance buffers (even an empty frame attaches no pooled
         // buffers; so skip the assertion in that case).
         ctx.render();
-        device.poll(wgpu::PollType::Wait).expect("GPU poll failed");
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll failed");
         let stats = ctx.quad_pipeline.instance_pool.stats();
         // Outstanding must drop back to zero after the callback fires
         // regardless of whether we submitted quads this frame.
@@ -91,7 +91,7 @@ fn pool_survives_1000_frame_loop() {
             // Drain the queue so callbacks fire each frame.
             device.poll(wgpu::PollType::Poll).expect("GPU poll failed");
         }
-        device.poll(wgpu::PollType::Wait).expect("GPU poll failed");
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll failed");
         let stats = ctx.quad_pipeline.instance_pool.stats();
         assert_eq!(stats.outstanding, 0);
         // An empty frame renders zero quads, so the pool may never
@@ -120,7 +120,7 @@ fn regression_81_item2_no_cpu_gpu_race_at_200_fps() {
         for _ in 0..600 {
             ctx.render();
         }
-        device.poll(wgpu::PollType::Wait).expect("GPU poll failed");
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll failed");
         let quad_stats = ctx.quad_pipeline.instance_pool.stats();
         let glyph_stats = ctx.text_pipeline.instance_pool.stats();
         assert_eq!(quad_stats.outstanding, 0, "quad pool leaked");

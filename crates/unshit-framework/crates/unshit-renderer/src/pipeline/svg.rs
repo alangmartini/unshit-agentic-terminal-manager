@@ -215,8 +215,11 @@ impl SvgPipeline {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("svg pipeline layout"),
-            bind_group_layouts: &[&global_bind_group_layout, &instance_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[
+                Some(&global_bind_group_layout),
+                Some(&instance_bind_group_layout),
+            ],
+            immediate_size: 0,
         });
 
         let attrs = wgpu::vertex_attr_array![
@@ -231,11 +234,11 @@ impl SvgPipeline {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<SvgVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &attrs,
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -258,7 +261,7 @@ impl SvgPipeline {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

@@ -666,6 +666,7 @@ mod tests {
                     power_preference: wgpu::PowerPreference::LowPower,
                     compatible_surface: None,
                     force_fallback_adapter: true,
+                    apply_limit_buckets: false,
                 })
                 .await
                 .ok()?;

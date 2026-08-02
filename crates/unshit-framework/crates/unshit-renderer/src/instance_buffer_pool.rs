@@ -302,14 +302,15 @@ mod tests {
     const SIZE: u64 = std::mem::size_of::<TestInstance>() as u64;
 
     fn try_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -512,9 +513,9 @@ mod tests {
             let slice = staging.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-            device.poll(wgpu::PollType::Wait).expect("GPU poll failed");
+            device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll failed");
             rx.recv().unwrap().unwrap();
-            let data = slice.get_mapped_range();
+            let data = slice.get_mapped_range().expect("staging buffer was not mapped");
             let round: &[TestInstance] = bytemuck::cast_slice(&data);
             assert_eq!(round.len(), 2);
             for (a, b) in round.iter().zip(expected.iter()) {

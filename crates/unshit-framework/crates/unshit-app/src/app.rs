@@ -1,5 +1,6 @@
 use crate::animation_waker::AnimationWaker;
 use crate::clipboard::ClipboardContext;
+use crate::compositor_clock::CompositorClockWaker;
 use crate::event_sink::{EventSink, ExternalEvent};
 use crate::notification::{AttentionUrgency, BellConfig, BellState};
 use crate::scroll_motion::{
@@ -37,7 +38,7 @@ use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
-use unshit_renderer::gpu::GpuContext;
+use unshit_renderer::gpu::{GpuContext, WindowGpuPreferences};
 use unshit_renderer::pipeline::quad::QuadInstance;
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
@@ -48,7 +49,7 @@ use winit::keyboard::ModifiersState;
 use winit::window::{ResizeDirection, Window, WindowId};
 
 #[cfg(target_os = "windows")]
-struct MultimediaRenderThread {
+pub(crate) struct MultimediaRenderThread {
     handle: winapi::um::winnt::HANDLE,
 }
 
@@ -58,7 +59,7 @@ impl MultimediaRenderThread {
     /// Scheduler. The Games task gives timing-sensitive foreground work
     /// priority without the starvation risk of a process-wide realtime or
     /// high priority class.
-    fn register() -> Option<Self> {
+    pub(crate) fn register(role: &'static str) -> Option<Self> {
         let mut task_index = 0;
         // SAFETY: `Games\0` is a process-lifetime NUL-terminated string and
         // `task_index` remains valid for the duration of the call.
@@ -69,7 +70,7 @@ impl MultimediaRenderThread {
         if handle.is_null() {
             let error_code = std::io::Error::last_os_error().raw_os_error().unwrap_or_default();
             log::warn!(
-                "{{\"event\":\"frame_scheduler.mmcss_registration_failed\",\"correlation_id\":{correlation_id:?},\"task\":\"Games\",\"error_code\":{error_code}}}"
+                "{{\"event\":\"frame_scheduler.mmcss_registration_failed\",\"correlation_id\":{correlation_id:?},\"role\":{role:?},\"task\":\"Games\",\"error_code\":{error_code}}}"
             );
             return None;
         }
@@ -81,7 +82,7 @@ impl MultimediaRenderThread {
                 != 0
         };
         log::info!(
-            "{{\"event\":\"frame_scheduler.mmcss_registered\",\"correlation_id\":{correlation_id:?},\"task\":\"Games\",\"task_index\":{task_index},\"relative_priority\":\"high\",\"priority_selected\":{priority_selected}}}"
+            "{{\"event\":\"frame_scheduler.mmcss_registered\",\"correlation_id\":{correlation_id:?},\"role\":{role:?},\"task\":\"Games\",\"task_index\":{task_index},\"relative_priority\":\"high\",\"priority_selected\":{priority_selected}}}"
         );
         Some(Self { handle })
     }
@@ -361,6 +362,10 @@ pub struct App {
     /// producer (container smooth scroll, grid-animation hooks). Replaces
     /// the per-wheel-notch waker threads; see [`crate::animation_waker`].
     animation_waker: AnimationWaker,
+    /// Native Windows compositor heartbeat used by the D3D12 Mailbox path.
+    /// The waiter thread is lazy and parks outside active input/animation
+    /// windows, so idle applications pay no recurring wake cost.
+    compositor_clock_waker: CompositorClockWaker,
     canvas_registry: CanvasRegistry,
     clipboard: Arc<ClipboardContext>,
     #[cfg(feature = "async")]
@@ -403,13 +408,26 @@ pub struct FrameMetrics {
     pub pacer_min_interval_ns: u64,
     /// Wall-clock microseconds between the completion of this paint and
     /// the completion of the previous paint, measured where `total_us`
-    /// is finalized. Captures the real presentation cadence rather than
-    /// per-frame CPU work. 0 when there is no cadence to measure: the
+    /// is finalized. Captures paint-completion cadence rather than
+    /// per-frame CPU work; compositor-paced frames use
+    /// [`Self::pacing_interval_us`] as their vblank authority. 0 when there
+    /// is no cadence to measure: the
     /// first painted frame, which has no predecessor, and paints after
     /// an idle gap of `ACTIVITY_WINDOW` or longer (e.g. the 500ms
     /// cursor-blink repaint of an otherwise idle session), which
     /// represent intentional idling rather than missed refreshes.
     pub present_interval_us: u64,
+    /// Microseconds between native compositor heartbeats associated with this
+    /// and the previous painted frame. This is the cadence authority for the
+    /// Windows Mailbox path because paint completion moves within a refresh as
+    /// frame work varies. 0 for the first tick and for other pacing modes.
+    pub pacing_interval_us: u64,
+    /// Microseconds from the native compositor heartbeat to return from the
+    /// platform present call for this frame. Includes event delivery, all CPU
+    /// frame work, swapchain acquisition, and present-call time. 0 when the
+    /// frame was not admitted by a compositor heartbeat. This is the strict
+    /// per-slot submission deadline signal; GPU execution remains asynchronous.
+    pub pacing_submit_us: u64,
     /// Active monitor's refresh period in nanoseconds
     /// (`1e12 / refresh_mhz`). 0 when the platform cannot report the
     /// monitor's refresh rate; consumers should fall back to
@@ -431,6 +449,19 @@ pub struct FrameMetrics {
     /// CPU time blocked inside the platform present call. Excluded from
     /// work metrics and reported independently from acquire and phase waits.
     pub present_call_us: u64,
+}
+
+impl FrameMetrics {
+    /// Cadence interval appropriate for user-visible frame-rate analysis.
+    /// Compositor-clock pacing uses its vblank-aligned heartbeat; all other
+    /// modes retain paint-completion cadence.
+    pub fn cadence_interval_us(&self) -> u64 {
+        if self.pacing_interval_us > 0 {
+            self.pacing_interval_us
+        } else {
+            self.present_interval_us
+        }
+    }
 }
 
 impl std::fmt::Display for FrameMetrics {
@@ -497,9 +528,6 @@ struct AppState {
     canvas_registry: CanvasRegistry,
     last_metrics: FrameMetrics,
     frame_count: u64,
-    fps_timer: Instant,
-    current_fps: f32,
-    app_title: String,
     event_log: Option<Vec<String>>,
     event_log_start: Instant,
     scrollbar_visual: ScrollbarVisualState,
@@ -565,6 +593,12 @@ struct AppState {
     /// [`FrameMetrics::present_interval_us`]. `None` until the first
     /// frame has painted.
     last_paint_completed_at: Option<Instant>,
+    /// Most recent compositor tick delivered to the event loop but not yet
+    /// consumed by a paint. Coalesced to one slot by [`CompositorClockWaker`].
+    compositor_frame_ready: Option<Instant>,
+    /// Timestamp of the compositor heartbeat used for the previous painted
+    /// frame. Source of [`FrameMetrics::pacing_interval_us`].
+    last_compositor_tick: Option<Instant>,
     /// Active monitor's refresh rate in millihertz, as last reported by
     /// the platform; 0 when unknown. Set at startup and kept in sync
     /// with the frame pacer in [`refresh_pacer_from_window`]. Source of
@@ -665,6 +699,10 @@ enum PacingMode {
     /// vsync loop — paint, `request_redraw`, block at the next acquire —
     /// with no timers, no due-gates, and no pacer gate.
     VsyncBlocking,
+    /// A non-blocking, tear-free Mailbox surface paints exactly once per
+    /// native compositor heartbeat. Unlike completion-to-completion timing,
+    /// the heartbeat stays phase-locked to vblank even when frame work varies.
+    CompositorClock,
     /// The surface never blocks on vblank (Mailbox / Immediate, exotic
     /// surfaces only). The legacy timer machinery — the [`FramePacer`]
     /// gate, the speculative deadline, and the [`AnimationWaker`] —
@@ -674,9 +712,15 @@ enum PacingMode {
 
 /// Pure mapping from the renderer's pacing capability
 /// ([`GpuContext::is_vsync_paced`]) to the app's [`PacingMode`].
-fn pacing_mode_for_surface(is_vsync_paced: bool) -> PacingMode {
+fn pacing_mode_for_surface(
+    is_vsync_paced: bool,
+    is_mailbox_paced: bool,
+    compositor_clock_supported: bool,
+) -> PacingMode {
     if is_vsync_paced {
         PacingMode::VsyncBlocking
+    } else if is_mailbox_paced && compositor_clock_supported {
+        PacingMode::CompositorClock
     } else {
         PacingMode::Timer
     }
@@ -691,22 +735,50 @@ fn parse_pacing_override(value: &str) -> Option<Option<PacingMode>> {
         "surface" => Some(None),
         "timer" => Some(Some(PacingMode::Timer)),
         "swapchain" => Some(Some(PacingMode::VsyncBlocking)),
+        "compositor" => Some(Some(PacingMode::CompositorClock)),
         _ => None,
     }
 }
 
-fn configured_pacing_mode(is_vsync_paced: bool) -> PacingMode {
-    let surface_mode = pacing_mode_for_surface(is_vsync_paced);
+fn pacing_override_rejection_reason(
+    requested: PacingMode,
+    surface_mode: PacingMode,
+) -> Option<&'static str> {
+    match requested {
+        PacingMode::VsyncBlocking if surface_mode != PacingMode::VsyncBlocking => {
+            Some("blocking_swapchain_unavailable")
+        }
+        PacingMode::CompositorClock if surface_mode != PacingMode::CompositorClock => {
+            Some("compositor_clock_or_mailbox_unavailable")
+        }
+        PacingMode::VsyncBlocking | PacingMode::CompositorClock | PacingMode::Timer => None,
+    }
+}
+
+fn configured_pacing_mode(
+    is_vsync_paced: bool,
+    is_mailbox_paced: bool,
+    compositor_clock_supported: bool,
+) -> PacingMode {
+    let surface_mode =
+        pacing_mode_for_surface(is_vsync_paced, is_mailbox_paced, compositor_clock_supported);
     let Ok(raw) = std::env::var(PACING_OVERRIDE_ENV) else {
         return surface_mode;
     };
     let correlation_id = format!("process-{}", std::process::id());
     match parse_pacing_override(&raw) {
         Some(Some(mode)) => {
-            log::info!(
-                "{{\"event\":\"frame_pacer.mode_selected\",\"correlation_id\":{correlation_id:?},\"source\":\"override\",\"mode\":{mode:?}}}"
-            );
-            mode
+            if let Some(reason) = pacing_override_rejection_reason(mode, surface_mode) {
+                log::warn!(
+                    "{{\"event\":\"frame_pacer.mode_rejected\",\"correlation_id\":{correlation_id:?},\"value\":{raw:?},\"reason\":{reason:?},\"fallback\":{surface_mode:?}}}"
+                );
+                surface_mode
+            } else {
+                log::info!(
+                    "{{\"event\":\"frame_pacer.mode_selected\",\"correlation_id\":{correlation_id:?},\"source\":\"override\",\"mode\":{mode:?}}}"
+                );
+                mode
+            }
         }
         Some(None) => {
             log::info!(
@@ -721,6 +793,16 @@ fn configured_pacing_mode(is_vsync_paced: bool) -> PacingMode {
             surface_mode
         }
     }
+}
+
+fn window_gpu_preferences(compositor_clock_supported: bool) -> WindowGpuPreferences {
+    #[cfg(target_os = "windows")]
+    if compositor_clock_supported {
+        return WindowGpuPreferences::compositor_mailbox();
+    }
+
+    let _ = compositor_clock_supported;
+    WindowGpuPreferences::default()
 }
 
 /// Display period to assume when the platform cannot report a refresh
@@ -1286,7 +1368,7 @@ fn can_fast_paint_animations(state: &AppState) -> bool {
 /// rate.
 fn kick_animation(state: &mut AppState, waker: &AnimationWaker, wake_deadline: Instant) {
     match state.pacing_mode {
-        PacingMode::VsyncBlocking => {
+        PacingMode::VsyncBlocking | PacingMode::CompositorClock => {
             state.window.request_redraw();
         }
         PacingMode::Timer => {
@@ -1348,6 +1430,11 @@ fn schedule_animation_followup(
             let due = frame_start + state.frame_pacer.min_interval();
             state.animation_next_frame = Some(due);
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(due));
+        }
+        PacingMode::CompositorClock => {
+            // `about_to_wait` keeps the native clock active while animation
+            // work exists. Its next heartbeat requests the continuation.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
         }
     }
 }
@@ -1490,6 +1577,8 @@ fn should_paint_fast_animation_frame(
 fn fast_paint_animation_frame(
     state: &mut AppState,
     frame_start: Instant,
+    pacing_interval_us: u64,
+    pacing_tick_at: Option<Instant>,
     decorations: bool,
     speculative_activity: bool,
     on_scroll_telemetry: Option<&ScrollTelemetryCallback>,
@@ -1497,6 +1586,7 @@ fn fast_paint_animation_frame(
     on_glyph_atlas_recovery: Option<&(dyn Fn(&GlyphAtlasRecoveryEvent) + Send)>,
 ) -> bool {
     let mut metrics = FrameMetrics::default();
+    metrics.pacing_interval_us = pacing_interval_us;
 
     // Animation positions are sampled at the predicted present time of
     // this frame, not at wake time, so scheduler jitter does not become
@@ -1525,6 +1615,12 @@ fn fast_paint_animation_frame(
         canvas_needs_repaint,
         speculative_activity,
     ) {
+        // No pixels changed, so deliberately consume this heartbeat without
+        // presenting. This is not a dropped slot: the existing image remains
+        // correct and the next changed frame should not report judder.
+        if let Some(tick_at) = pacing_tick_at {
+            state.last_compositor_tick = Some(tick_at);
+        }
         return false;
     }
 
@@ -1566,7 +1662,7 @@ fn fast_paint_animation_frame(
             .then(|| state.frame_pacer.presentation_target())
             .flatten(),
     );
-    state.gpu.render();
+    let presented = state.gpu.render();
     // Split display waits out of the work numbers at the source so
     // every downstream consumer of gpu_render_us / total_us keeps
     // measuring CPU work (see FrameMetrics::{present_wait_us,present_hold_us}).
@@ -1577,6 +1673,16 @@ fn fast_paint_animation_frame(
         .saturating_sub(metrics.present_wait_us)
         .saturating_sub(metrics.present_hold_us)
         .saturating_sub(metrics.present_call_us);
+
+    if !presented {
+        return false;
+    }
+    metrics.pacing_submit_us = pacing_tick_at
+        .map(|tick_at| Instant::now().saturating_duration_since(tick_at).as_micros() as u64)
+        .unwrap_or(0);
+    if let Some(tick_at) = pacing_tick_at {
+        state.last_compositor_tick = Some(tick_at);
+    }
 
     if state.gpu.any_canvas_needs_repaint() {
         state.window.request_redraw();
@@ -1633,8 +1739,7 @@ pub(crate) fn cadence_present_interval_us(raw_interval_us: u64) -> u64 {
 /// in the pacer, finalizes the frame's metrics (total time, rss, pacer
 /// interval, presentation cadence), feeds both frame probes and emits
 /// their once-per-second summaries, logs slow frames, fires the
-/// `on_frame_metrics` callback, stores the metrics, and rolls the
-/// window-title fps counter.
+/// `on_frame_metrics` callback, and stores the metrics.
 fn finalize_frame_metrics(
     state: &mut AppState,
     mut metrics: FrameMetrics,
@@ -1672,10 +1777,9 @@ fn finalize_frame_metrics(
     if let Some(snap) = state.frame_probe.maybe_emit(now) {
         log::info!("[FRAME] {}", snap);
     }
-    if metrics.present_interval_us > 0 {
-        state
-            .interval_probe
-            .record_frame(std::time::Duration::from_micros(metrics.present_interval_us));
+    let cadence_interval_us = metrics.cadence_interval_us();
+    if cadence_interval_us > 0 {
+        state.interval_probe.record_frame(std::time::Duration::from_micros(cadence_interval_us));
     }
     if let Some(snap) = state.interval_probe.maybe_emit(now) {
         // Interval counts get their own field label so log consumers can
@@ -1717,37 +1821,10 @@ fn finalize_frame_metrics(
 
     state.last_metrics = metrics;
 
-    roll_over_window_title_fps(state);
-}
-
-/// Advance the once-per-second window-title fps counter. Runs on every
-/// painted frame from both paint paths so the rollover cadence (and the
-/// fps the title reports) is identical regardless of which path painted
-/// the frame. The title text itself still updates at most once per
-/// second.
-fn roll_over_window_title_fps(state: &mut AppState) {
-    state.frame_count += 1;
-    let fps_elapsed = state.fps_timer.elapsed();
-    if fps_elapsed.as_millis() >= 1000 {
-        // Cheap pull-based refresh-rate re-probe (spec item 5): winit's
-        // win32 backend surfaces no display-mode-change event, so an
-        // in-place Hz change in Windows settings would otherwise leave
-        // the pacer interval and display_period_ns stale forever. One
-        // monitor query per second, only while frames are painting.
-        refresh_pacer_from_window(state);
-        state.current_fps = state.frame_count as f32 / fps_elapsed.as_secs_f32();
-        let title = format!(
-            "{} | {:.1}ms | {:.0} fps | rss {:.0}MB | nodes {}",
-            state.app_title,
-            state.last_metrics.total_us as f64 / 1000.0,
-            state.current_fps,
-            state.last_metrics.rss_bytes as f64 / (1024.0 * 1024.0),
-            state.last_metrics.node_count,
-        );
-        state.window.set_title(&title);
-        state.frame_count = 0;
-        state.fps_timer = Instant::now();
-    }
+    // Keep the render path free of synchronous native window/monitor I/O.
+    // `frame_count` remains a monotonic renderer-local identifier; live FPS
+    // diagnostics are exposed through FrameMetrics and the in-app overlay.
+    state.frame_count = state.frame_count.saturating_add(1);
 }
 
 /// Pure function: whether `now` is within [`ACTIVITY_WINDOW`] of the
@@ -1895,7 +1972,11 @@ fn refresh_pacer_from_window(state: &mut AppState) {
     state.last_refresh_probe = Instant::now();
     let after = state.frame_pacer.min_interval();
     if after != before {
-        log::info!("pacer coalescing interval: {:.3}ms", after.as_secs_f64() * 1000.0);
+        let correlation_id = format!("process-{}", std::process::id());
+        log::info!(
+            "{{\"event\":\"frame_pacer.refresh_rate_changed\",\"correlation_id\":{correlation_id:?},\"refresh_mhz\":{mhz},\"interval_ns\":{}}}",
+            after.as_nanos(),
+        );
     }
 }
 
@@ -2063,6 +2144,11 @@ impl App {
                 Arc::clone(&proxy_cell),
                 crate::frame_pacer::FramePacer::DEFAULT_MIN_INTERVAL,
             ),
+            compositor_clock_waker: CompositorClockWaker::new(
+                event_tx.clone(),
+                Arc::clone(&proxy_cell),
+                crate::frame_pacer::FramePacer::DEFAULT_MIN_INTERVAL,
+            ),
             event_tx,
             event_rx,
             proxy_cell,
@@ -2212,7 +2298,7 @@ impl App {
 
     pub fn run(self) {
         #[cfg(target_os = "windows")]
-        let _multimedia_render_thread = MultimediaRenderThread::register();
+        let _multimedia_render_thread = MultimediaRenderThread::register("ui_render");
 
         let event_loop = EventLoop::new().unwrap();
         // Wait instead of Poll: sleep until an OS event or proxy.wake_up().
@@ -2241,6 +2327,7 @@ impl ApplicationHandler for AppHandler {
         };
         let mut coalescer = RebuildCoalescer::default();
         let mut saw_animation_frame = false;
+        let mut compositor_tick = None;
         coalescer.begin_drain();
         for event in self.event_rx.try_iter() {
             match event {
@@ -2252,6 +2339,13 @@ impl ApplicationHandler for AppHandler {
                 }
                 ExternalEvent::RequestAnimationFrame => {
                     saw_animation_frame = true;
+                }
+                ExternalEvent::RequestCompositorFrame { tick_at } => {
+                    self.app.compositor_clock_waker.acknowledge_tick();
+                    compositor_tick = Some(match compositor_tick {
+                        Some(previous) => std::cmp::max(previous, tick_at),
+                        None => tick_at,
+                    });
                 }
                 ExternalEvent::ActivateWindow => {
                     state.window.set_visible(true);
@@ -2312,6 +2406,9 @@ impl ApplicationHandler for AppHandler {
         if coalescer.needs_rebuild {
             state.needs_rebuild = true;
         }
+        if let Some(tick_at) = compositor_tick {
+            state.compositor_frame_ready = Some(tick_at);
+        }
         if coalescer.saw_event {
             // An external source (PTY reader, subscription, bridge, hot
             // reload, etc.) produced work for the UI thread. Count this as
@@ -2370,15 +2467,26 @@ impl ApplicationHandler for AppHandler {
         };
         log::info!("Display refresh rate: {} mHz", startup_refresh_mhz);
 
-        let mut gpu = pollster::block_on(GpuContext::new(window.clone()));
+        let compositor_clock_supported = self.app.compositor_clock_waker.is_supported();
+        let gpu_preferences = window_gpu_preferences(compositor_clock_supported);
+        let mut gpu =
+            pollster::block_on(GpuContext::new_with_preferences(window.clone(), gpu_preferences));
 
         // One-shot pacing mode selection: sound because surface
         // reconfigures reuse the stored present mode, so it cannot
         // change at runtime. On the vsync-paced default the blocking
         // acquire paces every paint; the Timer machinery only runs on
         // surfaces without Fifo.
-        let pacing_mode = configured_pacing_mode(gpu.is_vsync_paced());
-        log::info!("frame pacing: {:?} (present mode {:?})", pacing_mode, gpu.present_mode());
+        let pacing_mode = configured_pacing_mode(
+            gpu.is_vsync_paced(),
+            gpu.is_mailbox_paced(),
+            compositor_clock_supported,
+        );
+        let correlation_id = format!("process-{}", std::process::id());
+        log::info!(
+            "{{\"event\":\"frame_pacer.mode_selected\",\"correlation_id\":{correlation_id:?},\"source\":\"effective\",\"mode\":{pacing_mode:?},\"present_mode\":{:?},\"compositor_clock_supported\":{compositor_clock_supported}}}",
+            gpu.present_mode(),
+        );
         let mut frame_pacer =
             crate::frame_pacer::FramePacer::with_refresh_rate_mhz(startup_refresh_mhz);
         if pacing_mode == PacingMode::Timer {
@@ -2390,6 +2498,11 @@ impl ApplicationHandler for AppHandler {
         // existed). Cheap: the tick thread spawns lazily on first use,
         // and in VsyncBlocking mode it is never used at all.
         self.app.animation_waker = AnimationWaker::new(
+            self.app.event_tx.clone(),
+            Arc::clone(&self.app.proxy_cell),
+            crate::frame_pacer::FramePacer::interval_from_mhz(startup_refresh_mhz),
+        );
+        self.app.compositor_clock_waker = CompositorClockWaker::new(
             self.app.event_tx.clone(),
             Arc::clone(&self.app.proxy_cell),
             crate::frame_pacer::FramePacer::interval_from_mhz(startup_refresh_mhz),
@@ -2588,9 +2701,6 @@ impl ApplicationHandler for AppHandler {
             canvas_registry,
             last_metrics: FrameMetrics::default(),
             frame_count: 0,
-            fps_timer: Instant::now(),
-            current_fps: 0.0,
-            app_title: self.app.config.title.clone(),
             event_log,
             event_log_start: Instant::now(),
             scrollbar_visual: ScrollbarVisualState::default(),
@@ -2618,6 +2728,8 @@ impl ApplicationHandler for AppHandler {
             frame_probe: crate::frame_probe::FrameProbe::new(),
             interval_probe: crate::frame_probe::FrameProbe::new(),
             last_paint_completed_at: None,
+            compositor_frame_ready: None,
+            last_compositor_tick: None,
             display_refresh_mhz: startup_refresh_mhz,
             #[cfg(feature = "input-latency-histogram")]
             input_latency: crate::input_latency::InputLatencyTracker::new()
@@ -3427,6 +3539,15 @@ impl ApplicationHandler for AppHandler {
                     state.window.request_redraw();
                 }
 
+                // Returning from display settings is the common path for an
+                // in-place refresh-rate change on Windows. Re-probe here,
+                // outside the paint epilogue, and debounce repeated focus
+                // notifications through the same gate used by move events.
+                let now = Instant::now();
+                if focused && state.should_reprobe_refresh(now) {
+                    refresh_pacer_from_window(state);
+                }
+
                 // Losing focus mid-drag (e.g. Alt-Tab) means the mouse-up
                 // will never be delivered to our window. Synthesize a
                 // DragPhase::End so the app's on_drag handler can clean up
@@ -3956,8 +4077,34 @@ impl ApplicationHandler for AppHandler {
                 // never delivers the zero-size resize events a
                 // suppression flag could key off.
                 if state.window.is_minimized().unwrap_or(false) {
+                    state.compositor_frame_ready = None;
+                    state.last_compositor_tick = None;
                     return;
                 }
+
+                // Mailbox acquisition is intentionally non-blocking. Admit
+                // exactly one paint for each native compositor heartbeat so
+                // event storms cannot run ahead of vblank. The first startup
+                // paint is allowed before the clock thread has been activated.
+                let (pacing_interval_us, pacing_tick_at) =
+                    if state.pacing_mode == PacingMode::CompositorClock {
+                        match state.compositor_frame_ready.take() {
+                            Some(tick_at) => {
+                                let interval = cadence_present_interval_us(present_interval_us(
+                                    state.last_compositor_tick,
+                                    tick_at,
+                                ));
+                                (interval, Some(tick_at))
+                            }
+                            None if state.last_paint_completed_at.is_none() => (0, None),
+                            None => {
+                                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                                return;
+                            }
+                        }
+                    } else {
+                        (0, None)
+                    };
                 let force_animation_paint = std::mem::take(&mut state.force_animation_paint);
                 let animation_active = animations_active(state);
                 if animation_active && can_fast_paint_animations(state) {
@@ -3981,6 +4128,8 @@ impl ApplicationHandler for AppHandler {
                     let painted = fast_paint_animation_frame(
                         state,
                         frame_start,
+                        pacing_interval_us,
+                        pacing_tick_at,
                         self.app.config.decorations,
                         speculative_activity,
                         self.app.config.on_scroll_telemetry.as_deref(),
@@ -4009,7 +4158,7 @@ impl ApplicationHandler for AppHandler {
                 // coalescer, and a redraw storm paints back-to-back
                 // frames that each block until their vblank.
                 let bypass_pacer_gate = match state.pacing_mode {
-                    PacingMode::VsyncBlocking => true,
+                    PacingMode::VsyncBlocking | PacingMode::CompositorClock => true,
                     PacingMode::Timer => force_animation_paint,
                 };
                 if !bypass_pacer_gate {
@@ -4036,6 +4185,7 @@ impl ApplicationHandler for AppHandler {
                 state.input_latency.mark_frame_start();
 
                 let mut metrics = FrameMetrics::default();
+                metrics.pacing_interval_us = pacing_interval_us;
 
                 // Animation positions sample at the predicted present
                 // time (see predicted_present_ts); everything else in
@@ -4480,7 +4630,7 @@ impl ApplicationHandler for AppHandler {
                         .then(|| state.frame_pacer.presentation_target())
                         .flatten(),
                 );
-                state.gpu.render();
+                let presented = state.gpu.render();
                 // Split display waits out of the work numbers at the
                 // source so every downstream consumer of gpu_render_us /
                 // total_us keeps measuring CPU work (see
@@ -4492,6 +4642,16 @@ impl ApplicationHandler for AppHandler {
                     .saturating_sub(metrics.present_wait_us)
                     .saturating_sub(metrics.present_hold_us)
                     .saturating_sub(metrics.present_call_us);
+                if presented {
+                    metrics.pacing_submit_us = pacing_tick_at
+                        .map(|tick_at| {
+                            Instant::now().saturating_duration_since(tick_at).as_micros() as u64
+                        })
+                        .unwrap_or(0);
+                    if let Some(tick_at) = pacing_tick_at {
+                        state.last_compositor_tick = Some(tick_at);
+                    }
+                }
 
                 if state.gpu.any_canvas_needs_repaint() {
                     state.window.request_redraw();
@@ -4503,7 +4663,7 @@ impl ApplicationHandler for AppHandler {
                 // wake time across all sources, so the event loop sleeps
                 // between frames instead of busy-polling.
                 if animations_active(state) {
-                    schedule_animation_followup(state, event_loop, frame_start, true);
+                    schedule_animation_followup(state, event_loop, frame_start, presented);
                 } else {
                     let mut next_wake: Option<Instant> = None;
 
@@ -4551,21 +4711,32 @@ impl ApplicationHandler for AppHandler {
                 // finalization, frame probes, slow-frame logging, the
                 // on_frame_metrics callback, and the window-title fps
                 // rollover. See [`finalize_frame_metrics`].
-                finalize_frame_metrics(
-                    state,
-                    metrics,
-                    frame_start,
-                    self.app.config.on_frame_metrics.as_deref(),
-                );
+                if presented {
+                    finalize_frame_metrics(
+                        state,
+                        metrics,
+                        frame_start,
+                        self.app.config.on_frame_metrics.as_deref(),
+                    );
+                } else {
+                    // Surface recovery consumed the attempted frame. Retry on
+                    // the next scheduler admission without counting it or
+                    // closing pending input as presented.
+                    state.window.request_redraw();
+                }
 
                 // Close the input latency frame window only on the path
                 // that actually rendered. Pacer skipped frames bailed
                 // out well above; they never reach this line.
                 #[cfg(feature = "input-latency-histogram")]
                 {
-                    state.input_latency.record_frame_presented(Instant::now());
-                    if let Some(ref cb) = self.app.config.on_input_latency {
-                        cb(&state.input_latency.snapshot());
+                    if presented {
+                        state.input_latency.record_frame_presented(Instant::now());
+                        if let Some(ref cb) = self.app.config.on_input_latency {
+                            cb(&state.input_latency.snapshot());
+                        }
+                    } else {
+                        state.input_latency.cancel_frame();
                     }
                 }
 
@@ -4606,7 +4777,22 @@ impl ApplicationHandler for AppHandler {
         };
 
         let now = Instant::now();
-        if state.pacing_mode == PacingMode::Timer {
+        if state.pacing_mode == PacingMode::CompositorClock {
+            let minimized = state.window.is_minimized().unwrap_or(false);
+            let animation_active = animations_active(state);
+            let recently_active = state.is_recently_active(now);
+            if !minimized && (animation_active || recently_active) {
+                let period = state.frame_pacer.min_interval();
+                let mut deadline =
+                    if recently_active { state.last_activity + ACTIVITY_WINDOW } else { now };
+                if animation_active {
+                    deadline = std::cmp::max(deadline, now + period.saturating_mul(2));
+                }
+                self.app.compositor_clock_waker.extend_until(deadline);
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                return;
+            }
+        } else if state.pacing_mode == PacingMode::Timer {
             if animations_active(state) && !state.window.is_minimized().unwrap_or(false) {
                 // Pace the animation chain at the due-gate. Requesting
                 // the redraw while the gate is still closed would wake
@@ -4641,7 +4827,8 @@ impl ApplicationHandler for AppHandler {
                 }
                 return;
             }
-        } else if !animations_active(state)
+        } else if state.pacing_mode == PacingMode::VsyncBlocking
+            && !animations_active(state)
             && state.is_recently_active(now)
             && !state.window.is_minimized().unwrap_or(false)
         {
@@ -6290,6 +6477,8 @@ mod tests {
             damage_area_px: 1920 * 1080,
             pacer_min_interval_ns: 6_944_444,
             present_interval_us: 8_333,
+            pacing_interval_us: 8_334,
+            pacing_submit_us: 2_750,
             display_period_ns: 8_333_333,
             present_wait_us: 7_900,
             present_hold_us: 6_500,
@@ -6302,6 +6491,9 @@ mod tests {
         assert_eq!(m.damage_area_px, 1920 * 1080);
         assert_eq!(m.pacer_min_interval_ns, 6_944_444);
         assert_eq!(m.present_interval_us, 8_333);
+        assert_eq!(m.pacing_interval_us, 8_334);
+        assert_eq!(m.pacing_submit_us, 2_750);
+        assert_eq!(m.cadence_interval_us(), 8_334);
         assert_eq!(m.display_period_ns, 8_333_333);
         assert_eq!(m.present_wait_us, 7_900);
         assert_eq!(m.present_hold_us, 6_500);
@@ -6312,6 +6504,8 @@ mod tests {
     fn frame_metrics_default_has_zero_presentation_fields() {
         let m = FrameMetrics::default();
         assert_eq!(m.present_interval_us, 0);
+        assert_eq!(m.pacing_interval_us, 0);
+        assert_eq!(m.pacing_submit_us, 0);
         assert_eq!(m.display_period_ns, 0);
         assert_eq!(m.present_wait_us, 0);
         assert_eq!(m.present_hold_us, 0);
@@ -6320,8 +6514,10 @@ mod tests {
 
     #[test]
     fn pacing_mode_follows_surface_vsync_pacing() {
-        assert_eq!(pacing_mode_for_surface(true), PacingMode::VsyncBlocking);
-        assert_eq!(pacing_mode_for_surface(false), PacingMode::Timer);
+        assert_eq!(pacing_mode_for_surface(true, false, true), PacingMode::VsyncBlocking);
+        assert_eq!(pacing_mode_for_surface(false, true, true), PacingMode::CompositorClock);
+        assert_eq!(pacing_mode_for_surface(false, true, false), PacingMode::Timer);
+        assert_eq!(pacing_mode_for_surface(false, false, true), PacingMode::Timer);
     }
 
     #[test]
@@ -6329,9 +6525,36 @@ mod tests {
         assert_eq!(parse_pacing_override("surface"), Some(None));
         assert_eq!(parse_pacing_override(" timer "), Some(Some(PacingMode::Timer)));
         assert_eq!(parse_pacing_override("swapchain"), Some(Some(PacingMode::VsyncBlocking)));
+        assert_eq!(parse_pacing_override("compositor"), Some(Some(PacingMode::CompositorClock)));
         for value in ["", "fifo", "blocking", "auto", "timer-paced", "unpaced"] {
             assert_eq!(parse_pacing_override(value), None, "value={value:?}");
         }
+    }
+
+    #[test]
+    fn pacing_override_rejects_scheduler_surface_mismatches() {
+        assert_eq!(
+            pacing_override_rejection_reason(
+                PacingMode::VsyncBlocking,
+                PacingMode::CompositorClock
+            ),
+            Some("blocking_swapchain_unavailable")
+        );
+        assert_eq!(
+            pacing_override_rejection_reason(PacingMode::CompositorClock, PacingMode::Timer),
+            Some("compositor_clock_or_mailbox_unavailable")
+        );
+        assert_eq!(
+            pacing_override_rejection_reason(PacingMode::Timer, PacingMode::CompositorClock),
+            None
+        );
+        assert_eq!(
+            pacing_override_rejection_reason(
+                PacingMode::CompositorClock,
+                PacingMode::CompositorClock
+            ),
+            None
+        );
     }
 
     #[test]

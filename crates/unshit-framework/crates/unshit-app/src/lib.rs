@@ -1,6 +1,7 @@
 pub mod animation_waker;
 pub mod app;
 pub mod clipboard;
+mod compositor_clock;
 pub mod event_sink;
 pub mod font;
 pub mod frame_pacer;

@@ -104,11 +104,20 @@ struct BenchState {
     present_holds_us: VecDeque<u64>,
     /// Driver/compositor time spent inside the platform present call.
     present_calls_us: VecDeque<u64>,
-    /// Present-to-present intervals in microseconds, one per painted
-    /// frame after the first benchmark frame. Fed from
-    /// [`FrameMetrics::present_interval_us`]. The first metric is skipped
-    /// even when nonzero because its interval began before activation.
+    /// Native compositor-heartbeat to present-return latency. Unlike work
+    /// samples, this includes wake delivery and non-deliberate display calls.
+    pacing_submits_us: VecDeque<u64>,
+    /// Authoritative cadence intervals in microseconds, one per painted frame
+    /// after the first benchmark frame. Compositor-clock frames use the native
+    /// heartbeat; other modes use paint completion. The first metric is
+    /// skipped even when nonzero because its interval began before activation.
     intervals_us: VecDeque<u64>,
+    /// Paint-completion intervals retained independently from cadence. Work
+    /// finishing earlier or later within a compositor slot is diagnostic
+    /// jitter, not a missed displayed frame, but must remain observable.
+    completion_intervals_us: VecDeque<u64>,
+    /// Whether any measured frame carried a native compositor-clock interval.
+    uses_compositor_clock: bool,
     tree_build_us_sum: u64,
     layout_us_sum: u64,
     batch_us_sum: u64,
@@ -141,7 +150,10 @@ impl BenchState {
             present_waits_us: VecDeque::new(),
             present_holds_us: VecDeque::new(),
             present_calls_us: VecDeque::new(),
+            pacing_submits_us: VecDeque::new(),
             intervals_us: VecDeque::new(),
+            completion_intervals_us: VecDeque::new(),
+            uses_compositor_clock: false,
             tree_build_us_sum: 0,
             layout_us_sum: 0,
             batch_us_sum: 0,
@@ -177,9 +189,19 @@ pub fn record_frame(m: &FrameMetrics) {
     s.present_waits_us.push_back(m.present_wait_us);
     s.present_holds_us.push_back(m.present_hold_us);
     s.present_calls_us.push_back(m.present_call_us);
-    if s.frames > 0 && m.present_interval_us > 0 {
-        s.intervals_us.push_back(m.present_interval_us);
+    if m.pacing_submit_us > 0 {
+        s.pacing_submits_us.push_back(m.pacing_submit_us);
     }
+    if s.frames > 0 {
+        if m.present_interval_us > 0 {
+            s.completion_intervals_us.push_back(m.present_interval_us);
+        }
+        let cadence_interval_us = m.cadence_interval_us();
+        if cadence_interval_us > 0 {
+            s.intervals_us.push_back(cadence_interval_us);
+        }
+    }
+    s.uses_compositor_clock |= m.pacing_interval_us > 0;
     if m.display_period_ns > 0 {
         s.last_display_period_ns = m.display_period_ns;
     }
@@ -219,7 +241,10 @@ fn activate() {
     s.present_waits_us.clear();
     s.present_holds_us.clear();
     s.present_calls_us.clear();
+    s.pacing_submits_us.clear();
     s.intervals_us.clear();
+    s.completion_intervals_us.clear();
+    s.uses_compositor_clock = false;
     s.tree_build_us_sum = 0;
     s.layout_us_sum = 0;
     s.batch_us_sum = 0;
@@ -313,6 +338,10 @@ struct Report {
     present_call_p95_ms: f64,
     present_call_p99_ms: f64,
     present_call_max_ms: f64,
+    /// Native compositor heartbeat to platform-present return. These are the
+    /// strict frame-slot deadline measurements and stay zero on other modes.
+    pacing_submit_p99_ms: f64,
+    pacing_submit_max_ms: f64,
     tree_build_ms_avg: f64,
     layout_ms_avg: f64,
     batch_ms_avg: f64,
@@ -350,9 +379,10 @@ struct Report {
     /// 1st percentile frame time in milliseconds. Characterises the
     /// fastest path through the renderer where pool overhead matters.
     p01_ms: f64,
-    /// Median present-to-present interval in milliseconds. Unlike the
-    /// work-time quantiles above, these measure wall-clock paint
-    /// cadence; a frame that wakes late shows up here, not in `p50_ms`.
+    /// Source backing the `interval_*` cadence fields: `compositor-clock` for
+    /// native Mailbox pacing, otherwise `paint-completion`.
+    cadence_source: &'static str,
+    /// Median authoritative cadence interval in milliseconds.
     interval_p50_ms: f64,
     /// 95th percentile present interval in milliseconds.
     interval_p95_ms: f64,
@@ -364,6 +394,14 @@ struct Report {
     /// milliseconds. A flat cadence has stddev near 0; the 8ms-vs-8.33ms
     /// beat shows up as nonzero spread even when the mean looks fine.
     interval_stddev_ms: f64,
+    /// Paint-completion cadence retained separately when compositor heartbeat
+    /// cadence is authoritative. These fields equal `interval_*` on other
+    /// pacing modes.
+    completion_interval_p50_ms: f64,
+    completion_interval_p95_ms: f64,
+    completion_interval_p99_ms: f64,
+    completion_interval_max_ms: f64,
+    completion_interval_stddev_ms: f64,
     /// Fraction of present intervals longer than 1.5x the display
     /// period (a "dropped" cadence slot). Period comes from the active
     /// monitor's refresh rate, falling back to the pacer coalescing
@@ -469,8 +507,13 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
     let mut present_calls_sorted: Vec<u64> = s.present_calls_us.iter().copied().collect();
     present_calls_sorted.sort_unstable();
     let present_call_pct = |q: f64| -> u64 { percentile_us(&present_calls_sorted, q) };
+    let mut pacing_submits_sorted: Vec<u64> = s.pacing_submits_us.iter().copied().collect();
+    pacing_submits_sorted.sort_unstable();
     let mut intervals_sorted: Vec<u64> = s.intervals_us.iter().copied().collect();
     intervals_sorted.sort_unstable();
+    let mut completion_intervals_sorted: Vec<u64> =
+        s.completion_intervals_us.iter().copied().collect();
+    completion_intervals_sorted.sort_unstable();
     let judder_period_ns = if s.last_display_period_ns > 0 {
         s.last_display_period_ns
     } else {
@@ -544,6 +587,8 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         present_call_p95_ms: present_call_pct(0.95) as f64 / 1000.0,
         present_call_p99_ms: present_call_pct(0.99) as f64 / 1000.0,
         present_call_max_ms: present_calls_sorted.last().copied().unwrap_or(0) as f64 / 1000.0,
+        pacing_submit_p99_ms: percentile_us(&pacing_submits_sorted, 0.99) as f64 / 1000.0,
+        pacing_submit_max_ms: pacing_submits_sorted.last().copied().unwrap_or(0) as f64 / 1000.0,
         tree_build_ms_avg: avg_ms(s.tree_build_us_sum),
         layout_ms_avg: avg_ms(s.layout_us_sum),
         batch_ms_avg: avg_ms(s.batch_us_sum),
@@ -572,11 +617,25 @@ fn build_report(mode: BenchMode, elapsed: Duration) -> Report {
         display_period_ms: s.last_display_period_ns as f64 / 1_000_000.0,
         min_us,
         p01_ms: pct(0.01) as f64 / 1000.0,
+        cadence_source: if s.uses_compositor_clock {
+            "compositor-clock"
+        } else {
+            "paint-completion"
+        },
         interval_p50_ms: percentile_us(&intervals_sorted, 0.50) as f64 / 1000.0,
         interval_p95_ms: percentile_us(&intervals_sorted, 0.95) as f64 / 1000.0,
         interval_p99_ms: percentile_us(&intervals_sorted, 0.99) as f64 / 1000.0,
         interval_max_ms: intervals_sorted.last().copied().unwrap_or(0) as f64 / 1000.0,
         interval_stddev_ms: population_stddev(&intervals_sorted) / 1000.0,
+        completion_interval_p50_ms: percentile_us(&completion_intervals_sorted, 0.50) as f64
+            / 1000.0,
+        completion_interval_p95_ms: percentile_us(&completion_intervals_sorted, 0.95) as f64
+            / 1000.0,
+        completion_interval_p99_ms: percentile_us(&completion_intervals_sorted, 0.99) as f64
+            / 1000.0,
+        completion_interval_max_ms: completion_intervals_sorted.last().copied().unwrap_or(0) as f64
+            / 1000.0,
+        completion_interval_stddev_ms: population_stddev(&completion_intervals_sorted) / 1000.0,
         judder_ratio: judder_ratio(&intervals_sorted, judder_period_ns),
         interval_histogram_bucket_ms: INTERVAL_HISTOGRAM_BUCKET_US as f64 / 1000.0,
         interval_histogram: interval_histogram(&intervals_sorted, judder_period_ns),
@@ -1171,6 +1230,23 @@ mod tests {
     }
 
     #[test]
+    fn report_records_compositor_submission_deadline_quantiles() {
+        let _g = guard();
+        activate();
+        for &pacing_submit_us in &[1_200, 1_600, 2_100, 7_900] {
+            record_frame(&FrameMetrics {
+                total_us: 1_000,
+                pacing_submit_us,
+                ..Default::default()
+            });
+        }
+        let report = build_report(BenchMode::HumanTyping, Duration::from_secs(1));
+        assert!((report.pacing_submit_p99_ms - 7.9).abs() < 0.001);
+        assert!((report.pacing_submit_max_ms - 7.9).abs() < 0.001);
+        deactivate();
+    }
+
+    #[test]
     fn report_pacer_min_interval_is_zero_without_frames() {
         let _g = guard();
         activate();
@@ -1261,6 +1337,7 @@ mod tests {
         let s = state().lock().unwrap();
         assert_eq!(s.intervals_us.len(), 1);
         assert_eq!(s.intervals_us[0], 8_333);
+        assert_eq!(s.completion_intervals_us[0], 8_333);
         assert_eq!(s.last_display_period_ns, 8_333_333);
         drop(s);
         deactivate();
@@ -1326,6 +1403,30 @@ mod tests {
     }
 
     #[test]
+    fn compositor_cadence_and_paint_completion_are_reported_independently() {
+        let _g = guard();
+        activate();
+        for (present_interval_us, pacing_interval_us) in
+            [(0, 0), (7_000, 8_333), (9_500, 8_333), (6_500, 8_334)]
+        {
+            record_frame(&FrameMetrics {
+                total_us: 1_000,
+                present_interval_us,
+                pacing_interval_us,
+                display_period_ns: 8_333_333,
+                ..Default::default()
+            });
+        }
+        let report = build_report(BenchMode::HumanTyping, Duration::from_secs(1));
+        deactivate();
+
+        assert_eq!(report.cadence_source, "compositor-clock");
+        assert!((report.interval_p99_ms - 8.334).abs() < 0.001);
+        assert!((report.completion_interval_p99_ms - 9.5).abs() < 0.001);
+        assert!((report.completion_interval_max_ms - 9.5).abs() < 0.001);
+    }
+
+    #[test]
     fn report_judder_falls_back_to_pacer_interval_when_period_unknown() {
         let _g = guard();
         activate();
@@ -1362,6 +1463,11 @@ mod tests {
             "judder_ratio",
             "interval_histogram",
             "interval_histogram_bucket_ms",
+            "cadence_source",
+            "completion_interval_p99_ms",
+            "completion_interval_max_ms",
+            "pacing_submit_p99_ms",
+            "pacing_submit_max_ms",
         ] {
             assert!(json.contains(key), "json missing {}: {}", key, json);
         }

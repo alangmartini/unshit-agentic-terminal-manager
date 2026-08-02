@@ -58,10 +58,10 @@ pub struct FpsOverlayState {
     /// newest entry on every record, with a hard cap of
     /// [`FRAME_TIMES_CAPACITY`].
     pub frame_times: VecDeque<Instant>,
-    /// Rolling window of present intervals in microseconds
-    /// (`FrameMetrics::present_interval_us`). Zero intervals (the
-    /// first painted frame and idle cadence breaks, which the framework
-    /// reports as 0) are not recorded.
+    /// Rolling window of authoritative cadence intervals in microseconds.
+    /// Native compositor-heartbeat intervals take precedence over paint
+    /// completion when available. Zero intervals (the first painted frame and
+    /// idle cadence breaks) are not recorded.
     pub intervals_us: VecDeque<u64>,
     /// When the overlay last asked the host to rebuild. Throttles
     /// overlay-driven rebuild requests to [`REBUILD_THROTTLE`].
@@ -91,11 +91,12 @@ impl FpsOverlayState {
             self.samples_us.pop_front();
         }
         self.samples_us.push_back(metrics.total_us);
-        if metrics.present_interval_us > 0 {
+        let cadence_interval_us = metrics.cadence_interval_us();
+        if cadence_interval_us > 0 {
             if self.intervals_us.len() == WINDOW_CAPACITY {
                 self.intervals_us.pop_front();
             }
-            self.intervals_us.push_back(metrics.present_interval_us);
+            self.intervals_us.push_back(cadence_interval_us);
         }
         if self.frame_times.len() == FRAME_TIMES_CAPACITY {
             self.frame_times.pop_front();
@@ -341,6 +342,9 @@ pub fn diagnostic_json() -> serde_json::Value {
         "interval_p99_us": iq.p99_us,
         "interval_max_us": iq.max_us,
         "dropped_count": snap.dropped_count(),
+        "present_interval_us": snap.last.present_interval_us,
+        "pacing_interval_us": snap.last.pacing_interval_us,
+        "pacing_submit_us": snap.last.pacing_submit_us,
         "display_period_ns": snap.last.display_period_ns,
         "pacer_min_interval_ns": snap.last.pacer_min_interval_ns,
         "frame_offsets_ms": snap.frame_offsets_ms(),
@@ -601,6 +605,24 @@ mod tests {
     }
 
     #[test]
+    fn record_prefers_compositor_cadence_over_completion_jitter() {
+        let mut s = FpsOverlayState::new();
+        let metrics = FrameMetrics {
+            present_interval_us: 6_900,
+            pacing_interval_us: 8_333,
+            display_period_ns: 8_333_333,
+            ..Default::default()
+        };
+
+        s.record(&metrics, Instant::now());
+
+        assert_eq!(
+            s.intervals_us.iter().copied().collect::<Vec<_>>(),
+            vec![8_333]
+        );
+    }
+
+    #[test]
     fn interval_quantiles_match_nearest_rank_with_max() {
         let mut s = FpsOverlayState::new();
         assert_eq!(s.interval_quantiles(), IntervalQuantiles::default());
@@ -759,6 +781,8 @@ mod tests {
         toggle_visible();
         record_frame(&metrics_with(4_000));
         let mut second = metrics_with_interval(9_000, 8_333_333);
+        second.pacing_interval_us = 8_333;
+        second.pacing_submit_us = 2_750;
         second.total_us = 6_000;
         second.pacer_min_interval_ns = 8_333_333;
         record_frame(&second);
@@ -774,11 +798,14 @@ mod tests {
         assert_eq!(diagnostic["work_p50_us"], 4_000);
         assert_eq!(diagnostic["work_p95_us"], 6_000);
         assert_eq!(diagnostic["work_p99_us"], 6_000);
-        assert_eq!(diagnostic["interval_p50_us"], 9_000);
-        assert_eq!(diagnostic["interval_p95_us"], 9_000);
-        assert_eq!(diagnostic["interval_p99_us"], 9_000);
-        assert_eq!(diagnostic["interval_max_us"], 9_000);
+        assert_eq!(diagnostic["interval_p50_us"], 8_333);
+        assert_eq!(diagnostic["interval_p95_us"], 8_333);
+        assert_eq!(diagnostic["interval_p99_us"], 8_333);
+        assert_eq!(diagnostic["interval_max_us"], 8_333);
         assert_eq!(diagnostic["dropped_count"], 0);
+        assert_eq!(diagnostic["present_interval_us"], 9_000);
+        assert_eq!(diagnostic["pacing_interval_us"], 8_333);
+        assert_eq!(diagnostic["pacing_submit_us"], 2_750);
         assert_eq!(diagnostic["display_period_ns"], 8_333_333);
         assert_eq!(diagnostic["pacer_min_interval_ns"], 8_333_333);
         let offsets = diagnostic["frame_offsets_ms"]

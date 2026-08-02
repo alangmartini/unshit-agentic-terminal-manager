@@ -1,4 +1,5 @@
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use winit::event_loop::EventLoopProxy;
 
 /// Opaque event type that external sources push into the framework.
@@ -10,6 +11,10 @@ pub enum ExternalEvent {
     /// Request an animation repaint. This bypasses redraw coalescing once so
     /// short-lived motion does not stall behind unrelated frame pacing.
     RequestAnimationFrame,
+    /// One native compositor heartbeat. The timestamp is captured on the
+    /// waiting thread immediately after the clock wakes, before event-loop
+    /// scheduling jitter can affect cadence telemetry.
+    RequestCompositorFrame { tick_at: Instant },
     /// Ask the application window to become visible, unminimized, focused,
     /// and attention-requesting where the platform allows it.
     ActivateWindow,

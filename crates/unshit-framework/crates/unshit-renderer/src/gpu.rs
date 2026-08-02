@@ -29,6 +29,11 @@ use wgpu;
 type BackdropFallbackKey = (wgpu::TextureFormat, wgpu::TextureUsages);
 static BACKDROP_FALLBACK_LOG: OnceLock<Mutex<HashSet<BackdropFallbackKey>>> = OnceLock::new();
 
+fn process_correlation_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| format!("process-{}", std::process::id()))
+}
+
 fn log_backdrop_fallback_once(
     format: wgpu::TextureFormat,
     format_usages: wgpu::TextureUsages,
@@ -70,7 +75,7 @@ const MSAA_SAMPLES_ENV: &str = "UNSHIT_MSAA_SAMPLES";
 
 /// Classifies the active wgpu adapter as a real GPU or a software/CPU
 /// rasterizer. The windowed renderer uses this to gate per-frame cost (notably
-/// MSAA) on the software path while leaving the hardware path byte-identical.
+/// MSAA) on the software path while retaining full quality on hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterTier {
     /// A real GPU adapter.
@@ -152,26 +157,39 @@ fn parse_backend_env_value(value: &str) -> Option<wgpu::Backends> {
     }
 }
 
-fn renderer_backends() -> wgpu::Backends {
+fn renderer_backends(preferred: Option<wgpu::Backends>) -> wgpu::Backends {
+    let correlation_id = process_correlation_id();
     for key in ["UNSHIT_RENDER_BACKEND", "WGPU_BACKEND"] {
         if let Ok(value) = std::env::var(key) {
             if let Some(backends) = parse_backend_env_value(&value) {
-                log::info!("renderer backend forced by {key}={value}");
+                log::info!(
+                    "{{\"event\":\"renderer.backend_override_selected\",\"correlation_id\":{correlation_id:?},\"environment_variable\":{key:?},\"value\":{value:?},\"backends\":\"{backends:?}\"}}"
+                );
                 return backends;
             }
-            log::warn!("ignoring unsupported {key}={value}; expected vulkan, dx12, metal, or gl");
+            log::warn!(
+                "{{\"event\":\"renderer.backend_override_rejected\",\"correlation_id\":{correlation_id:?},\"environment_variable\":{key:?},\"value\":{value:?},\"reason\":\"unsupported_backend\"}}"
+            );
         }
+    }
+
+    if let Some(backends) = preferred {
+        log::info!(
+            "{{\"event\":\"renderer.backend_preference_selected\",\"correlation_id\":{correlation_id:?},\"backends\":\"{backends:?}\"}}"
+        );
+        return backends;
     }
 
     #[cfg(target_os = "windows")]
     {
-        // Prefer native D3D12 on Windows. The full quad shader transports its
-        // constant decorative varyings as flat f16 pairs and now fits the
-        // backend's 60-component inter-stage budget without dropping visual
-        // features. D3D12 FIFO also provides stable tear-free 120 Hz pacing
-        // on the tested AMD driver; Vulkan FIFO does not.
+        // Prefer Vulkan on Windows. Its FIFO acquire path stayed within one
+        // 120 Hz period across repeated physical-input trials on the tested
+        // AMD driver, while D3D12 occasionally held an acquire for two
+        // periods even with a four-frame latency request. Both backends use
+        // the same full-quality shaders, DirectWrite glyph rasterization, and
+        // 4x MSAA, so this changes presentation reliability, not appearance.
         // `UNSHIT_RENDER_BACKEND` remains available for diagnostics/fallback.
-        wgpu::Backends::DX12
+        wgpu::Backends::VULKAN
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -246,12 +264,12 @@ fn desired_sample_count(tier: AdapterTier) -> u32 {
 /// threshold must use the compatibility shader instead of reaching a fatal
 /// pipeline-validation error during startup.
 const FULL_QUAD_VERTEX_ATTRIBUTES: u32 = 28;
-const FULL_QUAD_INTER_STAGE_COMPONENTS: u32 = 59;
+const FULL_QUAD_INTER_STAGE_VARIABLES: u32 = 27;
 
 fn needs_compat_quad_pipeline(tier: AdapterTier, limits: &wgpu::Limits) -> bool {
     tier == AdapterTier::Software
         || limits.max_vertex_attributes < FULL_QUAD_VERTEX_ATTRIBUTES
-        || limits.max_inter_stage_shader_components < FULL_QUAD_INTER_STAGE_COMPONENTS
+        || limits.max_inter_stage_shader_variables < FULL_QUAD_INTER_STAGE_VARIABLES
 }
 
 /// Optional present-mode override for controlled driver/backend A/B tests.
@@ -278,26 +296,43 @@ fn choose_supported_present_mode(
         .unwrap_or_else(|| choose_present_mode(present_modes))
 }
 
-fn desired_present_mode(present_modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+fn desired_present_mode(
+    present_modes: &[wgpu::PresentMode],
+    preferred: Option<wgpu::PresentMode>,
+) -> wgpu::PresentMode {
+    let correlation_id = process_correlation_id();
     let fallback = choose_present_mode(present_modes);
-    let Ok(value) = std::env::var(PRESENT_MODE_ENV) else {
-        return fallback;
-    };
-    let Some(requested) = parse_present_mode_override(&value) else {
-        log::warn!(
-            "{{\"event\":\"renderer.present_mode_override_rejected\",\"reason\":\"invalid_value\",\"fallback\":\"{fallback:?}\"}}"
-        );
-        return fallback;
-    };
-    let selected = choose_supported_present_mode(present_modes, Some(requested));
-    if selected == requested {
-        log::info!(
-            "{{\"event\":\"renderer.present_mode_override_selected\",\"mode\":\"{selected:?}\"}}"
-        );
-    } else {
-        log::warn!(
-            "{{\"event\":\"renderer.present_mode_override_rejected\",\"reason\":\"unsupported_by_surface\",\"requested\":\"{requested:?}\",\"fallback\":\"{fallback:?}\"}}"
-        );
+    if let Ok(value) = std::env::var(PRESENT_MODE_ENV) {
+        let Some(requested) = parse_present_mode_override(&value) else {
+            log::warn!(
+                "{{\"event\":\"renderer.present_mode_override_rejected\",\"correlation_id\":{correlation_id:?},\"reason\":\"invalid_value\",\"fallback\":\"{fallback:?}\"}}"
+            );
+            return fallback;
+        };
+        let selected = choose_supported_present_mode(present_modes, Some(requested));
+        if selected == requested {
+            log::info!(
+                "{{\"event\":\"renderer.present_mode_override_selected\",\"correlation_id\":{correlation_id:?},\"mode\":\"{selected:?}\"}}"
+            );
+        } else {
+            log::warn!(
+                "{{\"event\":\"renderer.present_mode_override_rejected\",\"correlation_id\":{correlation_id:?},\"reason\":\"unsupported_by_surface\",\"requested\":\"{requested:?}\",\"fallback\":\"{fallback:?}\"}}"
+            );
+        }
+        return selected;
+    }
+
+    let selected = choose_supported_present_mode(present_modes, preferred);
+    if let Some(requested) = preferred {
+        if selected == requested {
+            log::info!(
+                "{{\"event\":\"renderer.present_mode_preference_selected\",\"correlation_id\":{correlation_id:?},\"mode\":\"{selected:?}\"}}"
+            );
+        } else {
+            log::warn!(
+                "{{\"event\":\"renderer.present_mode_preference_rejected\",\"correlation_id\":{correlation_id:?},\"reason\":\"unsupported_by_surface\",\"requested\":\"{requested:?}\",\"fallback\":\"{fallback:?}\"}}"
+            );
+        }
     }
     selected
 }
@@ -315,15 +350,12 @@ fn present_mode_is_vsync_paced(mode: wgpu::PresentMode) -> bool {
     )
 }
 
-/// Default swapchain frame latency. A request of 4 gives D3D12 FIFO enough
-/// spare images to absorb occasional driver-release stalls: depths from 1
-/// through 3 all produced rare double-vblank acquires on the tested AMD driver,
-/// while 4 sustained repeated human and stress input runs without changing
-/// measured input-to-paint latency. The producer remains acquire-paced at one
-/// frame per vblank. Drivers may silently clamp the effective depth and wgpu
-/// does not expose that result, so the request and acquire-wait distribution
-/// are both logged for diagnosis.
-const DEFAULT_MAXIMUM_FRAME_LATENCY: u32 = 4;
+/// Default swapchain frame latency. Two lets the CPU and GPU overlap by one
+/// refresh while keeping the queue shallow enough for interactive latency.
+/// Drivers may silently clamp the effective depth and wgpu does not expose
+/// that result, so the request and acquire-wait distribution are both logged
+/// for diagnosis.
+const DEFAULT_MAXIMUM_FRAME_LATENCY: u32 = 2;
 
 /// Env var overriding `desired_maximum_frame_latency` for latency A/B
 /// measurement without a rebuild.
@@ -365,25 +397,54 @@ enum AcquireRecovery {
     DropFrame,
 }
 
+/// Surface outcomes that do not represent an ordinary, fully compatible
+/// acquisition. Kept separate from `wgpu::CurrentSurfaceTexture` so the
+/// recovery table remains exhaustively unit-testable without constructing a
+/// GPU-owned `SurfaceTexture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquireIssue {
+    Suboptimal,
+    Timeout,
+    Occluded,
+    Outdated,
+    Lost,
+    Validation,
+}
+
+impl AcquireIssue {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Suboptimal => "suboptimal",
+            Self::Timeout => "timeout",
+            Self::Occluded => "occluded",
+            Self::Outdated => "outdated",
+            Self::Lost => "lost",
+            Self::Validation => "validation",
+        }
+    }
+}
+
 /// Pure recovery policy for `get_current_texture` errors, split out so the
 /// decision table is unit-testable without a device. `Lost` always
 /// reconfigures (the swapchain is gone; nothing milder recovers it).
-/// `Outdated` reconfigures at most once per episode
-/// (`outdated_recovery_spent` is cleared by the next successful acquire)
+/// `Outdated` and `Suboptimal` reconfigure at most once per episode
+/// (`surface_recovery_spent` is cleared by the next fully successful acquire)
 /// and never while minimized: a minimized Vulkan window can return
 /// `Outdated` on every acquire with no Fifo throttle, and reconfiguring
 /// with the stale nonzero extent against a (0,0)-caps surface reaches the
 /// driver unvalidated, so an unguarded arm is a reconfigure storm at best
-/// and an uncaptured device error at worst. `Timeout` and `Other` drop the
-/// frame and leave the surface alone.
+/// and an uncaptured device error at worst. `Timeout`, `Occluded`, and
+/// `Validation` drop the frame and leave the surface alone.
 fn acquire_recovery(
-    error: &wgpu::SurfaceError,
+    issue: AcquireIssue,
     minimized: bool,
-    outdated_recovery_spent: bool,
+    surface_recovery_spent: bool,
 ) -> AcquireRecovery {
-    match error {
-        wgpu::SurfaceError::Lost => AcquireRecovery::Reconfigure,
-        wgpu::SurfaceError::Outdated if !minimized && !outdated_recovery_spent => {
+    match issue {
+        AcquireIssue::Lost => AcquireRecovery::Reconfigure,
+        AcquireIssue::Outdated | AcquireIssue::Suboptimal
+            if !minimized && !surface_recovery_spent =>
+        {
             AcquireRecovery::Reconfigure
         }
         _ => AcquireRecovery::DropFrame,
@@ -474,13 +535,35 @@ pub enum RenderTarget {
     },
 }
 
+/// Startup-only preferences supplied by the windowing layer. Explicit
+/// renderer environment overrides still take precedence, and unsupported
+/// present modes fall back to the renderer's ordinary tear-free selection.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowGpuPreferences {
+    pub backends: Option<wgpu::Backends>,
+    pub present_mode: Option<wgpu::PresentMode>,
+}
+
+impl WindowGpuPreferences {
+    /// Prefer the Windows compositor-clock path: D3D12 supplies wgpu's
+    /// tear-free Mailbox implementation, while the windowing layer wakes one
+    /// paint per compositor heartbeat. Explicit renderer environment
+    /// overrides still win over both fields.
+    pub const fn compositor_mailbox() -> Self {
+        Self {
+            backends: Some(wgpu::Backends::DX12),
+            present_mode: Some(wgpu::PresentMode::Mailbox),
+        }
+    }
+}
+
 pub struct GpuContext {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub target: RenderTarget,
     /// Hardware vs software/CPU adapter the context was built on. Gates the
     /// per-frame cost (notably MSAA) on the software path; the hardware tier
-    /// runs the original, byte-identical code path.
+    /// retains the full-quality rendering path.
     pub adapter_tier: AdapterTier,
     /// MSAA sample count in effect for the content pipelines. `MSAA_SAMPLE_COUNT`
     /// (=4) on hardware, `1` on software where the multisample resolve is the
@@ -559,7 +642,7 @@ pub struct GpuContext {
     /// acquire (and by `resize`, which reconfigures anyway). Bounds
     /// `Outdated` recovery to one reconfigure per episode (see
     /// `acquire_recovery`).
-    outdated_recovery_spent: bool,
+    surface_recovery_spent: bool,
     /// Dedup flag for the acquire-timeout warning. wgpu-core's acquire
     /// timeout is 1s, so a timeout storm is slow but should still not
     /// flood the log.
@@ -587,9 +670,9 @@ impl GpuContext {
     /// Create a windowed GPU context.
     ///
     /// Runs an escalation ladder so the app still renders on machines without
-    /// a usable GPU, while leaving the hardware path byte-identical:
+    /// a usable GPU, while retaining the full-quality hardware path:
     ///
-    /// 1. **Hardware** on the preferred backends (`renderer_backends()`, D3D12
+    /// 1. **Hardware** on the preferred backends (`renderer_backends()`, Vulkan
     ///    on Windows), `HighPerformance`, `force_fallback_adapter: false` — the
     ///    exact request the pre-fallback constructor made.
     /// 2. **Broaden** to all backends, still `HighPerformance` / non-fallback —
@@ -604,17 +687,27 @@ impl GpuContext {
     /// machine; `UNSHIT_RENDER_TIER=hardware` disables the fallback. The two
     /// `Instance`s exist because a wgpu surface is bound to the instance's
     /// backends, so reaching WARP needs a fresh all-backends instance when the
-    /// preferred (D3D12-only on Windows) one yielded nothing.
+    /// preferred-backend instance yielded nothing.
     pub async fn new(window: Arc<dyn winit::window::Window>) -> Self {
+        Self::new_with_preferences(window, WindowGpuPreferences::default()).await
+    }
+
+    /// Create a windowed context with startup-only backend and presentation
+    /// preferences from the app's platform scheduler. Environment overrides
+    /// remain authoritative for diagnostics and recovery.
+    pub async fn new_with_preferences(
+        window: Arc<dyn winit::window::Window>,
+        preferences: WindowGpuPreferences,
+    ) -> Self {
         let size = window.surface_size();
         let pref = render_tier_pref();
 
-        // Step 1 — preferred backends, hardware only. Byte-identical to the
-        // pre-fallback construction; skipped only when software is forced.
+        // Step 1 — preferred backends, hardware only; skipped only when
+        // software is forced.
         if pref != RenderTierPref::SoftwareOnly {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-                backends: renderer_backends(),
-                ..Default::default()
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: renderer_backends(preferences.backends),
+                ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
             });
             if let Ok(surface) = instance.create_surface(window.clone()) {
                 if let Some((adapter, device, queue, tier)) = Self::request_window_adapter_device(
@@ -630,7 +723,14 @@ impl GpuContext {
                         adapter.get_info()
                     );
                     return Self::build_window_context(
-                        window, size, surface, adapter, device, queue, tier,
+                        window,
+                        size,
+                        surface,
+                        adapter,
+                        device,
+                        queue,
+                        tier,
+                        preferences,
                     );
                 }
             }
@@ -638,9 +738,9 @@ impl GpuContext {
 
         // Steps 2 & 3 share a fresh all-backends instance + surface so a
         // software adapter (WARP/lavapipe) becomes reachable.
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
         });
         let surface = instance
             .create_surface(window.clone())
@@ -661,7 +761,14 @@ impl GpuContext {
                     adapter.get_info()
                 );
                 return Self::build_window_context(
-                    window, size, surface, adapter, device, queue, tier,
+                    window,
+                    size,
+                    surface,
+                    adapter,
+                    device,
+                    queue,
+                    tier,
+                    preferences,
                 );
             }
             log::warn!(
@@ -685,7 +792,16 @@ impl GpuContext {
                     "renderer adapter selected (software fallback): {:?}",
                     adapter.get_info()
                 );
-                Self::build_window_context(window, size, surface, adapter, device, queue, tier)
+                Self::build_window_context(
+                    window,
+                    size,
+                    surface,
+                    adapter,
+                    device,
+                    queue,
+                    tier,
+                    preferences,
+                )
             }
             None => panic!(
                 "GPU initialization failed: no graphics adapter (hardware or software) is \
@@ -699,7 +815,7 @@ impl GpuContext {
     /// preference. Returns `None` if no adapter is available or the device
     /// cannot be created. The two-attempt device request mirrors the original
     /// construction: first the adapter's own reported limits (needed for the
-    /// 26-attribute quad pipeline), then wgpu defaults (software renderers that
+    /// 28-attribute quad pipeline), then wgpu defaults (software renderers that
     /// reject their own limits).
     async fn request_window_adapter_device(
         instance: &wgpu::Instance,
@@ -712,6 +828,7 @@ impl GpuContext {
                 power_preference: power,
                 compatible_surface: Some(surface),
                 force_fallback_adapter: force_fallback,
+                apply_limit_buckets: false,
             })
             .await
             .ok()?;
@@ -740,9 +857,8 @@ impl GpuContext {
     }
 
     /// Finish a windowed context from a successfully requested adapter+device.
-    /// Holds the surface/pipeline configuration that was previously inline in
-    /// `new`; the only behavioral change is that MSAA is now driven by the
-    /// adapter tier instead of the hard-coded constant.
+    /// Holds surface and full-quality pipeline configuration shared by every
+    /// successful window-adapter selection.
     fn build_window_context(
         window: Arc<dyn winit::window::Window>,
         size: winit::dpi::PhysicalSize<u32>,
@@ -751,6 +867,7 @@ impl GpuContext {
         device: wgpu::Device,
         queue: wgpu::Queue,
         tier: AdapterTier,
+        preferences: WindowGpuPreferences,
     ) -> Self {
         // Use the limits of the device that was actually created. The first
         // request asks for adapter limits, but the fallback request uses
@@ -770,20 +887,18 @@ impl GpuContext {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        let present_mode = desired_present_mode(&surface_caps.present_modes);
+        let present_mode =
+            desired_present_mode(&surface_caps.present_modes, preferences.present_mode);
         // wgpu silently clamps the requested latency to the driver's
         // swapchain image-count range and never exposes the clamped value,
         // so only the requested value can be logged; a driver floor is
         // detected by the external latency A/B (PresentMon), not here.
         let maximum_frame_latency = desired_maximum_frame_latency();
+        let correlation_id = format!("process-{}", std::process::id());
+        let supported_present_modes = format!("{:?}", surface_caps.present_modes);
+        let backend = adapter.get_info().backend;
         log::info!(
-            "surface present modes: {:?}; selected {:?}; requested maximum frame latency {}; \
-             adapter tier {:?} (msaa {}x)",
-            surface_caps.present_modes,
-            present_mode,
-            maximum_frame_latency,
-            tier,
-            sample_count,
+            "{{\"event\":\"renderer.surface_configured\",\"correlation_id\":{correlation_id:?},\"backend\":\"{backend:?}\",\"supported_present_modes\":{supported_present_modes:?},\"present_mode\":\"{present_mode:?}\",\"requested_maximum_frame_latency\":{maximum_frame_latency},\"adapter_tier\":\"{tier:?}\",\"msaa_samples\":{sample_count}}}"
         );
 
         let alpha_mode = surface_caps
@@ -796,6 +911,7 @@ impl GpuContext {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: surface_config_usages(surface_caps.usages),
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode,
@@ -806,15 +922,15 @@ impl GpuContext {
         surface.configure(&device, &surface_config);
 
         // Some hardware backends expose WebGPU downlevel limits too (notably
-        // D3D12 at 60 inter-stage components and GL at 16 vertex attributes).
+        // GL at 16 vertex attributes or inter-stage locations).
         // Select the compatibility shader from the advertised limits rather
         // than discovering the mismatch through a fatal validation error.
         let use_compat_quad = needs_compat_quad_pipeline(tier, &device_limits);
         if use_compat_quad {
             log::warn!(
-                "{{\"event\":\"renderer.compat_quad_pipeline_selected\",\"adapter_tier\":\"{tier:?}\",\"max_vertex_attributes\":{},\"max_inter_stage_components\":{}}}",
+                "{{\"event\":\"renderer.compat_quad_pipeline_selected\",\"correlation_id\":{correlation_id:?},\"adapter_tier\":\"{tier:?}\",\"max_vertex_attributes\":{},\"max_inter_stage_variables\":{}}}",
                 device_limits.max_vertex_attributes,
-                device_limits.max_inter_stage_shader_components,
+                device_limits.max_inter_stage_shader_variables,
             );
         }
         let quad_pipeline = if use_compat_quad {
@@ -901,7 +1017,7 @@ impl GpuContext {
             present_not_before: None,
             last_present_hold: std::time::Duration::ZERO,
             last_present_call_wait: std::time::Duration::ZERO,
-            outdated_recovery_spent: false,
+            surface_recovery_spent: false,
             acquire_timeout_warned: false,
             current_quad_instance_buffer: None,
             current_glyph_instance_buffer: None,
@@ -993,7 +1109,7 @@ impl GpuContext {
         // Match the windowed renderer's platform preference by default so
         // headless screenshots exercise the same shader compiler and driver.
         // Explicit callers can still select another backend.
-        let backends = preferred.unwrap_or_else(renderer_backends);
+        let backends = preferred.unwrap_or_else(|| renderer_backends(None));
 
         // Try normal adapter
         if let Some(ctx) = Self::try_request_headless(backends, false, width, height).await {
@@ -1013,8 +1129,10 @@ impl GpuContext {
         width: u32,
         height: u32,
     ) -> Option<Self> {
-        let instance =
-            wgpu::Instance::new(&wgpu::InstanceDescriptor { backends, ..Default::default() });
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
 
         let power = if force_fallback {
             wgpu::PowerPreference::LowPower
@@ -1027,6 +1145,7 @@ impl GpuContext {
                 power_preference: power,
                 compatible_surface: None,
                 force_fallback_adapter: force_fallback,
+                apply_limit_buckets: false,
             })
             .await;
 
@@ -1177,7 +1296,7 @@ impl GpuContext {
             present_not_before: None,
             last_present_hold: std::time::Duration::ZERO,
             last_present_call_wait: std::time::Duration::ZERO,
-            outdated_recovery_spent: false,
+            surface_recovery_spent: false,
             acquire_timeout_warned: false,
             current_quad_instance_buffer: None,
             current_glyph_instance_buffer: None,
@@ -1233,9 +1352,9 @@ impl GpuContext {
                 config.width = w;
                 config.height = h;
                 surface.configure(&self.device, config);
-                // An explicit reconfigure starts a fresh `Outdated`
+                // An explicit reconfigure starts a fresh surface
                 // recovery episode (see `acquire_recovery`).
-                self.outdated_recovery_spent = false;
+                self.surface_recovery_spent = false;
             }
             RenderTarget::Headless { texture, width, height } => {
                 let format = texture.format();
@@ -1304,6 +1423,13 @@ impl GpuContext {
     /// config, so the mode never changes at runtime.
     pub fn is_vsync_paced(&self) -> bool {
         present_mode_is_vsync_paced(self.present_mode())
+    }
+
+    /// Whether the configured surface uses the tear-free single-frame
+    /// Mailbox queue. The app pairs this mode with the platform compositor
+    /// heartbeat instead of a software timer.
+    pub fn is_mailbox_paced(&self) -> bool {
+        self.present_mode() == wgpu::PresentMode::Mailbox
     }
 
     /// The adapter tier this context was built on: `Hardware` for a real GPU,
@@ -1507,10 +1633,13 @@ impl GpuContext {
         (quads, glyphs, images, svg)
     }
 
-    pub fn render(&mut self) {
-        // Reset before any early return: error paths still reach the
-        // app's frame-metrics epilogue, and a stale wait value from a
-        // previous frame would be double-subtracted there.
+    /// Encode and submit one frame. Returns `true` after submission and, for a
+    /// window target, after the platform present call. Returns `false` only
+    /// when surface acquisition failed and the frame was dropped or deferred.
+    pub fn render(&mut self) -> bool {
+        // Reset before any early return so diagnostics queried after a
+        // dropped acquisition never observe stale waits from the previous
+        // presented frame.
         self.last_acquire_wait = std::time::Duration::ZERO;
         self.last_present_hold = std::time::Duration::ZERO;
         self.last_present_call_wait = std::time::Duration::ZERO;
@@ -1579,7 +1708,7 @@ impl GpuContext {
         let (quad_bases, glyph_bases) = self.upload_content_instance_buffers();
         let image_layer_plan = self.upload_image_instance_buffers();
 
-        let (surface_view, surface_output) = match &self.target {
+        let (surface_view, surface_output, reconfigure_after_present) = match &self.target {
             RenderTarget::Window { surface, config, window } => {
                 // Under Fifo this call blocks (inside an OS/driver wait
                 // primitive) until the previously presented image is
@@ -1589,40 +1718,82 @@ impl GpuContext {
                 let acquire_started = std::time::Instant::now();
                 let acquired = surface.get_current_texture();
                 self.last_acquire_wait = acquire_started.elapsed();
+                let mut reconfigure_after_present = false;
                 let output = match acquired {
-                    Ok(t) => {
-                        self.outdated_recovery_spent = false;
-                        t
+                    wgpu::CurrentSurfaceTexture::Success(texture) => {
+                        self.surface_recovery_spent = false;
+                        texture
                     }
-                    Err(wgpu::SurfaceError::OutOfMemory) => panic!("GPU out of memory"),
-                    Err(err) => {
-                        if err == wgpu::SurfaceError::Timeout && !self.acquire_timeout_warned {
-                            self.acquire_timeout_warned = true;
+                    wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                        let minimized = window.is_minimized().unwrap_or(false);
+                        if acquire_recovery(
+                            AcquireIssue::Suboptimal,
+                            minimized,
+                            self.surface_recovery_spent,
+                        ) == AcquireRecovery::Reconfigure
+                        {
+                            self.surface_recovery_spent = true;
+                            reconfigure_after_present = true;
+                            let correlation_id = process_correlation_id();
                             log::warn!(
-                                "swapchain acquire timed out; dropping frame \
-                                 (further timeouts not logged)"
+                                "{{\"event\":\"renderer.surface_acquire_recovery\",\"correlation_id\":{correlation_id:?},\"issue\":\"suboptimal\",\"action\":\"present_then_reconfigure\",\"width\":{},\"height\":{}}}",
+                                config.width,
+                                config.height,
+                            );
+                        }
+                        texture
+                    }
+                    outcome => {
+                        let issue = match outcome {
+                            wgpu::CurrentSurfaceTexture::Timeout => AcquireIssue::Timeout,
+                            wgpu::CurrentSurfaceTexture::Occluded => AcquireIssue::Occluded,
+                            wgpu::CurrentSurfaceTexture::Outdated => AcquireIssue::Outdated,
+                            wgpu::CurrentSurfaceTexture::Lost => AcquireIssue::Lost,
+                            wgpu::CurrentSurfaceTexture::Validation => AcquireIssue::Validation,
+                            wgpu::CurrentSurfaceTexture::Success(_)
+                            | wgpu::CurrentSurfaceTexture::Suboptimal(_) => unreachable!(),
+                        };
+                        if issue == AcquireIssue::Timeout && !self.acquire_timeout_warned {
+                            self.acquire_timeout_warned = true;
+                            let correlation_id = process_correlation_id();
+                            log::warn!(
+                                "{{\"event\":\"renderer.surface_acquire_recovery\",\"correlation_id\":{correlation_id:?},\"issue\":\"timeout\",\"action\":\"drop_frame\",\"further_timeouts_logged\":false}}"
                             );
                         }
                         let minimized = window.is_minimized().unwrap_or(false);
-                        match acquire_recovery(&err, minimized, self.outdated_recovery_spent) {
+                        match acquire_recovery(issue, minimized, self.surface_recovery_spent) {
                             AcquireRecovery::Reconfigure => {
-                                if err == wgpu::SurfaceError::Outdated {
-                                    self.outdated_recovery_spent = true;
+                                if issue == AcquireIssue::Outdated {
+                                    self.surface_recovery_spent = true;
                                 }
+                                let correlation_id = process_correlation_id();
+                                log::warn!(
+                                    "{{\"event\":\"renderer.surface_acquire_recovery\",\"correlation_id\":{correlation_id:?},\"issue\":\"{}\",\"action\":\"reconfigure\",\"width\":{},\"height\":{}}}",
+                                    issue.as_str(),
+                                    config.width,
+                                    config.height,
+                                );
                                 surface.configure(&self.device, config);
                             }
-                            AcquireRecovery::DropFrame => {}
+                            AcquireRecovery::DropFrame => {
+                                if issue == AcquireIssue::Validation {
+                                    let correlation_id = process_correlation_id();
+                                    log::error!(
+                                        "{{\"event\":\"renderer.surface_acquire_recovery\",\"correlation_id\":{correlation_id:?},\"issue\":\"validation\",\"action\":\"drop_frame\"}}"
+                                    );
+                                }
+                            }
                         }
-                        return;
+                        return false;
                     }
                 };
                 let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-                (view, Some(output))
+                (view, Some(output), reconfigure_after_present)
             }
             RenderTarget::Headless { texture, .. } => {
                 // Create a fresh view handle each frame (cheap, no GPU allocation).
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                (view, None)
+                (view, None, false)
             }
         };
 
@@ -1711,6 +1882,7 @@ impl GpuContext {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             // Running index into `svg_instance_buffer` so each layer's
@@ -1996,9 +2168,16 @@ impl GpuContext {
                 window.pre_present_notify();
             }
             let present_started = std::time::Instant::now();
-            output.present();
+            self.queue.present(output);
             self.last_present_call_wait = present_started.elapsed();
+
+            if reconfigure_after_present {
+                if let RenderTarget::Window { surface, config, .. } = &self.target {
+                    surface.configure(&self.device, config);
+                }
+            }
         }
+        true
     }
 
     /// Ensure the ping pong textures used by the backdrop blur path are
@@ -2152,6 +2331,7 @@ impl GpuContext {
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
                         occlusion_query_set: None,
+                        multiview_mask: None,
                     });
 
                     // Check if draw_spans are available for interleaved rendering.
@@ -2405,6 +2585,7 @@ impl GpuContext {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &h_bind_group, &[]);
@@ -2435,6 +2616,7 @@ impl GpuContext {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &v_bind_group, &[]);
@@ -2506,10 +2688,12 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::PollType::Wait).expect("GPU poll failed during frame capture");
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll failed during frame capture");
         rx.recv().unwrap().unwrap();
 
-        let mapped = slice.get_mapped_range();
+        let mapped = slice.get_mapped_range().expect("frame capture staging buffer was not mapped");
 
         // Strip row padding if present
         if padded_bytes_per_row == bytes_per_row {
@@ -2833,8 +3017,8 @@ mod tests {
     }
 
     #[test]
-    fn default_maximum_frame_latency_absorbs_driver_release_stalls() {
-        assert_eq!(DEFAULT_MAXIMUM_FRAME_LATENCY, 4);
+    fn default_maximum_frame_latency_balances_overlap_and_input_latency() {
+        assert_eq!(DEFAULT_MAXIMUM_FRAME_LATENCY, 2);
     }
 
     /// Builds an `AdapterInfo` for the tier-classification tests without
@@ -2842,12 +3026,7 @@ mod tests {
     fn adapter_info(name: &str, device_type: wgpu::DeviceType) -> wgpu::AdapterInfo {
         wgpu::AdapterInfo {
             name: name.to_string(),
-            vendor: 0,
-            device: 0,
-            device_type,
-            driver: String::new(),
-            driver_info: String::new(),
-            backend: wgpu::Backend::Vulkan,
+            ..wgpu::AdapterInfo::new(device_type, wgpu::Backend::Vulkan)
         }
     }
 
@@ -2943,15 +3122,15 @@ mod tests {
     fn quad_pipeline_compatibility_tracks_adapter_shader_limits() {
         let mut full = wgpu::Limits::default();
         full.max_vertex_attributes = 28;
-        full.max_inter_stage_shader_components = 96;
+        full.max_inter_stage_shader_variables = 32;
         assert!(!needs_compat_quad_pipeline(AdapterTier::Hardware, &full));
 
-        let mut dx12_downlevel = full.clone();
-        dx12_downlevel.max_inter_stage_shader_components = 60;
-        assert!(!needs_compat_quad_pipeline(AdapterTier::Hardware, &dx12_downlevel));
+        let mut exact_packed_budget = full.clone();
+        exact_packed_budget.max_inter_stage_shader_variables = 27;
+        assert!(!needs_compat_quad_pipeline(AdapterTier::Hardware, &exact_packed_budget));
 
         let mut below_packed_budget = full.clone();
-        below_packed_budget.max_inter_stage_shader_components = 58;
+        below_packed_budget.max_inter_stage_shader_variables = 26;
         assert!(needs_compat_quad_pipeline(AdapterTier::Hardware, &below_packed_budget));
 
         let mut gl_downlevel = full;
@@ -2967,7 +3146,7 @@ mod tests {
         for minimized in [false, true] {
             for spent in [false, true] {
                 assert_eq!(
-                    acquire_recovery(&wgpu::SurfaceError::Lost, minimized, spent),
+                    acquire_recovery(AcquireIssue::Lost, minimized, spent),
                     AcquireRecovery::Reconfigure,
                 );
             }
@@ -2980,11 +3159,11 @@ mod tests {
     #[test]
     fn acquire_recovery_outdated_reconfigures_once_while_visible() {
         assert_eq!(
-            acquire_recovery(&wgpu::SurfaceError::Outdated, false, false),
+            acquire_recovery(AcquireIssue::Outdated, false, false),
             AcquireRecovery::Reconfigure,
         );
         assert_eq!(
-            acquire_recovery(&wgpu::SurfaceError::Outdated, false, true),
+            acquire_recovery(AcquireIssue::Outdated, false, true),
             AcquireRecovery::DropFrame,
         );
     }
@@ -2996,24 +3175,39 @@ mod tests {
     #[test]
     fn acquire_recovery_outdated_never_reconfigures_while_minimized() {
         assert_eq!(
-            acquire_recovery(&wgpu::SurfaceError::Outdated, true, false),
+            acquire_recovery(AcquireIssue::Outdated, true, false),
             AcquireRecovery::DropFrame,
         );
         assert_eq!(
-            acquire_recovery(&wgpu::SurfaceError::Outdated, true, true),
+            acquire_recovery(AcquireIssue::Outdated, true, true),
             AcquireRecovery::DropFrame,
         );
     }
 
     #[test]
-    fn acquire_recovery_timeout_and_other_drop_the_frame() {
+    fn acquire_recovery_suboptimal_reconfigures_once_after_present() {
         assert_eq!(
-            acquire_recovery(&wgpu::SurfaceError::Timeout, false, false),
+            acquire_recovery(AcquireIssue::Suboptimal, false, false),
+            AcquireRecovery::Reconfigure,
+        );
+        assert_eq!(
+            acquire_recovery(AcquireIssue::Suboptimal, false, true),
             AcquireRecovery::DropFrame,
         );
         assert_eq!(
-            acquire_recovery(&wgpu::SurfaceError::Other, false, false),
+            acquire_recovery(AcquireIssue::Suboptimal, true, false),
             AcquireRecovery::DropFrame,
         );
+    }
+
+    #[test]
+    fn acquire_recovery_nonrecoverable_outcomes_drop_the_frame() {
+        for issue in [AcquireIssue::Timeout, AcquireIssue::Occluded, AcquireIssue::Validation] {
+            assert_eq!(
+                acquire_recovery(issue, false, false),
+                AcquireRecovery::DropFrame,
+                "{issue:?}",
+            );
+        }
     }
 }

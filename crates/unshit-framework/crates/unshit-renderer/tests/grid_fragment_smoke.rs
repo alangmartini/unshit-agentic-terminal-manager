@@ -23,14 +23,15 @@ use unshit_renderer::pipeline::grid_fragment::{
 };
 
 fn try_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .ok()?;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -211,7 +212,7 @@ fn write_cells_and_uniforms_without_validation_errors() {
         pipeline.write_glyph_meta(&queue, 0, bytemuck::cast_slice(&metas));
 
         queue.submit(std::iter::empty());
-        device.poll(wgpu::PollType::Wait).expect("GPU poll failed");
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll failed");
     });
 }
 

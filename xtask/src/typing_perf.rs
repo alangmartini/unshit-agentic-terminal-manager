@@ -76,6 +76,8 @@ struct BenchReport {
     present_call_p95_ms: f64,
     present_call_p99_ms: f64,
     present_call_max_ms: f64,
+    pacing_submit_p99_ms: f64,
+    pacing_submit_max_ms: f64,
     input_latency_p50_us: f64,
     input_latency_p95_us: f64,
     input_latency_p99_us: f64,
@@ -88,11 +90,17 @@ struct BenchReport {
     mid_draw_events_dropped: u64,
     pacer_min_interval_ms: f64,
     display_period_ms: f64,
+    cadence_source: String,
     interval_p50_ms: f64,
     interval_p95_ms: f64,
     interval_p99_ms: f64,
     interval_max_ms: f64,
     interval_stddev_ms: f64,
+    completion_interval_p50_ms: f64,
+    completion_interval_p95_ms: f64,
+    completion_interval_p99_ms: f64,
+    completion_interval_max_ms: f64,
+    completion_interval_stddev_ms: f64,
     judder_ratio: f64,
 }
 
@@ -208,6 +216,8 @@ struct TypingMetrics {
     display_period_ns: u64,
     current_fps: f64,
     work_p99_us: u64,
+    work_max_us: u64,
+    pacing_submit_max_us: u64,
     interval_p99_us: u64,
     interval_max_us: u64,
     judder_ratio: f64,
@@ -222,6 +232,7 @@ struct TypingVerdict {
     minimum_displayed_fps: f64,
     display_supports_120: bool,
     renderer_meets_budget: bool,
+    every_frame_meets_deadline: bool,
     cadence_meets_budget: bool,
     input_meets_budget: bool,
 }
@@ -230,6 +241,7 @@ impl TypingVerdict {
     fn passed(self) -> bool {
         self.display_supports_120
             && self.renderer_meets_budget
+            && self.every_frame_meets_deadline
             && self.cadence_meets_budget
             && self.input_meets_budget
     }
@@ -250,6 +262,13 @@ fn analyze_metrics(metrics: TypingMetrics) -> TypingVerdict {
     let minimum_displayed_fps = display_hz * MINIMUM_DISPLAYED_FPS_RATIO;
     let display_supports_120 = display_hz >= REQUIRED_DISPLAY_HZ;
     let renderer_meets_budget = metrics.work_p99_us < MAXIMUM_WORK_P99_US;
+    let deadline_max_us = if metrics.pacing_submit_max_us > 0 {
+        metrics.pacing_submit_max_us
+    } else {
+        metrics.work_max_us
+    };
+    let every_frame_meets_deadline =
+        period_us > 0.0 && deadline_max_us > 0 && deadline_max_us as f64 <= period_us;
     let cadence_meets_budget = period_us > 0.0
         && metrics.current_fps >= minimum_displayed_fps
         && metrics.interval_p99_us as f64 <= period_us * MAXIMUM_INTERVAL_P99_PERIODS
@@ -265,6 +284,7 @@ fn analyze_metrics(metrics: TypingMetrics) -> TypingVerdict {
         minimum_displayed_fps,
         display_supports_120,
         renderer_meets_budget,
+        every_frame_meets_deadline,
         cadence_meets_budget,
         input_meets_budget,
     }
@@ -326,7 +346,7 @@ fn run_once(
     )?;
     wait_for_log_marker(
         &logs,
-        "frame pacing:",
+        "frame_pacer.mode_selected",
         "renderer initialization",
         Duration::from_secs(10),
     )?;
@@ -447,17 +467,24 @@ fn run_once(
             "characters_sent": characters_sent,
             "display_hz": verdict.display_hz,
             "paints_per_sec": report.paints_per_sec_mean,
+            "cadence_source": report.cadence_source,
             "work_p99_ms": report.p99_ms,
+            "work_max_ms": report.max_ms,
             "present_wait_p99_ms": report.present_wait_p99_ms,
             "present_wait_max_ms": report.present_wait_max_ms,
             "present_hold_p99_ms": report.present_hold_p99_ms,
             "present_hold_max_ms": report.present_hold_max_ms,
             "present_call_p99_ms": report.present_call_p99_ms,
             "present_call_max_ms": report.present_call_max_ms,
+            "pacing_submit_p99_ms": report.pacing_submit_p99_ms,
+            "pacing_submit_max_ms": report.pacing_submit_max_ms,
             "input_latency_p99_us": report.input_latency_p99_us,
             "input_latency_samples": report.input_latency_samples,
             "interval_p99_ms": report.interval_p99_ms,
+            "completion_interval_p99_ms": report.completion_interval_p99_ms,
+            "completion_interval_max_ms": report.completion_interval_max_ms,
             "judder_ratio": report.judder_ratio,
+            "every_frame_meets_deadline": verdict.every_frame_meets_deadline,
             "passed": verdict.passed(),
         })
     );
@@ -556,6 +583,8 @@ fn metrics_from_report(report: &BenchReport) -> TypingMetrics {
         display_period_ns: (report.display_period_ms * 1_000_000.0).round() as u64,
         current_fps: report.paints_per_sec_mean,
         work_p99_us: (report.p99_ms * 1_000.0).round() as u64,
+        work_max_us: (report.max_ms * 1_000.0).round() as u64,
+        pacing_submit_max_us: (report.pacing_submit_max_ms * 1_000.0).round() as u64,
         interval_p99_us: (report.interval_p99_ms * 1_000.0).round() as u64,
         interval_max_us: (report.interval_max_ms * 1_000.0).round() as u64,
         judder_ratio: report.judder_ratio,
@@ -648,6 +677,8 @@ mod tests {
             display_period_ns: 8_333_333,
             current_fps: 120.0,
             work_p99_us: 2_100,
+            work_max_us: 3_400,
+            pacing_submit_max_us: 3_800,
             interval_p99_us: 8_900,
             interval_max_us: 10_200,
             judder_ratio: 0.0,
@@ -658,6 +689,7 @@ mod tests {
         assert!(verdict.passed());
         assert!(verdict.display_supports_120);
         assert!(verdict.renderer_meets_budget);
+        assert!(verdict.every_frame_meets_deadline);
         assert!(verdict.cadence_meets_budget);
         assert!(verdict.input_meets_budget);
     }
@@ -679,6 +711,8 @@ mod tests {
             display_period_ns: 16_666_666,
             current_fps: 60.0,
             work_p99_us: 1_900,
+            work_max_us: 3_000,
+            pacing_submit_max_us: 3_400,
             interval_p99_us: 17_400,
             interval_max_us: 18_100,
             judder_ratio: 0.0,
@@ -699,6 +733,8 @@ mod tests {
             display_period_ns: 8_333_333,
             current_fps: 120.0,
             work_p99_us: 8_400,
+            work_max_us: 9_100,
+            pacing_submit_max_us: 9_500,
             interval_p99_us: 16_700,
             interval_max_us: 25_100,
             judder_ratio: 0.02,
@@ -708,6 +744,7 @@ mod tests {
 
         assert!(!verdict.passed());
         assert!(!verdict.renderer_meets_budget);
+        assert!(!verdict.every_frame_meets_deadline);
         assert!(!verdict.cadence_meets_budget);
         assert!(!verdict.input_meets_budget);
     }
@@ -718,6 +755,8 @@ mod tests {
             display_period_ns: 8_333_333,
             current_fps: 120.0,
             work_p99_us: 2_000,
+            work_max_us: 3_000,
+            pacing_submit_max_us: 3_400,
             interval_p99_us: 8_900,
             interval_max_us: 10_000,
             judder_ratio: 0.0,
@@ -727,5 +766,25 @@ mod tests {
 
         assert!(!verdict.passed());
         assert!(!verdict.input_meets_budget);
+    }
+
+    #[test]
+    fn typing_budget_rejects_one_over_deadline_frame_hidden_by_p99() {
+        let verdict = analyze_metrics(TypingMetrics {
+            display_period_ns: 8_333_333,
+            current_fps: 120.0,
+            work_p99_us: 2_200,
+            work_max_us: 3_200,
+            pacing_submit_max_us: 8_334,
+            interval_p99_us: 8_500,
+            interval_max_us: 9_000,
+            judder_ratio: 0.0,
+            input_latency_p99_us: 6_000,
+            input_latency_samples: 80,
+        });
+
+        assert!(verdict.renderer_meets_budget);
+        assert!(!verdict.every_frame_meets_deadline);
+        assert!(!verdict.passed());
     }
 }
