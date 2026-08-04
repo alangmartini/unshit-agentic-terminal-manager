@@ -1,5 +1,29 @@
 # Unshit Terminal Manager Backlog
 
+## Renderer follow-ups (from the 2026-08 dropping-artifacts audit)
+
+The persistent missing-glyph bug was fixed by never caching runs/rows with
+failed glyphs (see `changelog.d/unreleased/glyph-dropping-artifacts.md`).
+The audit surfaced adjacent hazards that are not yet fixed:
+
+- [ ] **`emit_select_overlays` runs outside atlas recovery** — it emits after
+  `build_render_batch_with_atlas_recovery`, so an atlas-full latched there is
+  only consumed on the NEXT frame (spurious rebuild), and its instances are
+  appended after `draw_spans` were built — the interleaved span path never
+  draws instances beyond the last span. Move it inside the recovery window or
+  give overlay instances their own span.
+- [ ] **Grid splice trusts damage ranges over content** — `splice_inputs`
+  deliberately skips the `content_sig` check; an under-reported damage range
+  copies a stale cached column forward silently. Consider a debug-assert
+  comparing spliced-row content hash against the stored payload.
+- [ ] **`GlyphAtlasSet` generation trap** — mono and color atlases keep
+  independent `generation` counters while every renderer cache stores a single
+  u64. If the set is ever adopted (color emoji atlas), the caches need a
+  combined generation or per-kind stamps.
+- [ ] **Atlas shelf-height slack** — a freed shelf keeps its original height
+  forever, so short glyphs revived onto tall shelves waste vertical space and
+  accelerate exhaustion. Consider shelf splitting or best-fit selection.
+
 ## File editor follow-ups (post-MVP; from the 2026-07 feature review)
 
 - [ ] **Wide-glyph cell mapping** — CJK/emoji glyphs render wide but occupy one
