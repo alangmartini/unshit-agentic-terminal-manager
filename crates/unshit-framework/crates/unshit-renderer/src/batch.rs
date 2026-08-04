@@ -31,6 +31,50 @@ pub struct Rasterizer<'a> {
     pub dw: &'a DwRasterizer,
 }
 
+/// Frame-scoped counters for glyphs that dropped out of the batch without
+/// latching the atlas-exhaustion recovery (shaping or rasterization failed).
+/// Single writer (the batch-building thread); the app layer drains them once
+/// per frame via [`take_glyph_drop_stats`] and folds them into frame metrics
+/// and telemetry, so a silent glyph drop is always visible in the field.
+static GLYPH_RASTER_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Runs/rows that skipped their cross-frame cache because a glyph failed.
+/// Nonzero means the renderer is retrying content every frame instead of
+/// baking a hole into a cached payload.
+static GLYPH_CACHE_BYPASSES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the glyph-drop counters for one frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlyphDropStats {
+    pub raster_failures: u64,
+    pub cache_bypasses: u64,
+}
+
+/// Drain the glyph-drop counters accumulated since the previous call.
+pub fn take_glyph_drop_stats() -> GlyphDropStats {
+    GlyphDropStats {
+        raster_failures: GLYPH_RASTER_FAILURES.swap(0, Ordering::Relaxed),
+        cache_bypasses: GLYPH_CACHE_BYPASSES.swap(0, Ordering::Relaxed),
+    }
+}
+
+/// Outcome of emitting one grid cell's glyph.
+///
+/// The distinction between `Empty` and `Failed` is what keeps the line-quad
+/// cache honest: a row containing a `Failed` cell must not be stored, or the
+/// hole replays from cache on every subsequent frame while the residency
+/// checks pass vacuously (the failed glyph was never recorded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellGlyphOutcome {
+    /// A visible glyph instance was pushed into the row buffers.
+    Emitted,
+    /// The cell legitimately has no ink (empty, wide continuation,
+    /// whitespace, zero-coverage glyph). Safe to cache as an absent column.
+    Empty,
+    /// Shaping or rasterization failed; the cell should have ink but none
+    /// was produced. The row must be re-emitted next frame, not cached.
+    Failed,
+}
+
 /// Swash rasterizer variant that requests RGB subpixel masks. cosmic-text's
 /// public SwashCache currently hardcodes alpha masks, so the renderer owns the
 /// alternate scale context needed by the experimental subpixel text pipeline.
@@ -3371,7 +3415,11 @@ fn emit_text_glyphs_cached(
                 if let Some(keys) = glyph_keys_out.as_deref_mut() {
                     keys.insert(cg.atlas_key);
                 }
-                laid_out.push((cg.rel_x, cg.rel_y, atlas_entry));
+                // Zero-coverage entries (spaces) are tracked for residency
+                // but have no ink to draw.
+                if atlas_entry.size[0] > 0.0 && atlas_entry.size[1] > 0.0 {
+                    laid_out.push((cg.rel_x, cg.rel_y, atlas_entry));
+                }
             }
             from_cache = true;
         } else {
@@ -3393,6 +3441,7 @@ fn emit_text_glyphs_cached(
         buffer.shape_until_scroll(font_system, false);
 
         let mut cached_glyphs = Vec::new();
+        let mut run_failed = false;
         for run in buffer.layout_runs() {
             let run_y = run.line_y;
             for (glyph_idx, glyph) in run.glyphs.iter().enumerate() {
@@ -3426,7 +3475,17 @@ fn emit_text_glyphs_cached(
                     );
                     match raster_result {
                         Some(entry) => entry,
-                        None => continue,
+                        None => {
+                            // Rasterization failed for a glyph that should
+                            // have ink (legit-inkless glyphs resolve to a
+                            // zero-size entry, not `None`). Render the run
+                            // short this frame but poison-pill the cache
+                            // insert below so it is reshaped and retried
+                            // next frame instead of replaying the hole.
+                            GLYPH_RASTER_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            run_failed = true;
+                            continue;
+                        }
                     }
                 };
 
@@ -3437,10 +3496,16 @@ fn emit_text_glyphs_cached(
                 if let Some(keys) = glyph_keys_out.as_deref_mut() {
                     keys.insert(key);
                 }
-                laid_out.push((rel_x, rel_y, entry));
+                if entry.size[0] > 0.0 && entry.size[1] > 0.0 {
+                    laid_out.push((rel_x, rel_y, entry));
+                }
             }
         }
-        shaped_cache.buf.insert(cache_key, ShapedTextEntry { glyphs: cached_glyphs });
+        if run_failed {
+            GLYPH_CACHE_BYPASSES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            shaped_cache.buf.insert(cache_key, ShapedTextEntry { glyphs: cached_glyphs });
+        }
     }
 
     // `text-shadow` glow: stacked Gaussian-weighted offset copies of the run in
@@ -5127,7 +5192,7 @@ fn emit_grid_cells(
         // Splice fast-path when a compatible cached entry and a concrete
         // damage range are both available. Otherwise emit fresh for the
         // full row.
-        if let Some((
+        let row_failed = if let Some((
             damage_start,
             damage_end,
             cached_glyphs,
@@ -5172,7 +5237,7 @@ fn emit_grid_cells(
                 &mut ch_buf,
                 trace_this_grid,
                 &mut trace_glyphs,
-            );
+            )
         } else {
             emit_grid_row_fresh(
                 grid,
@@ -5204,8 +5269,8 @@ fn emit_grid_cells(
                 &mut ch_buf,
                 trace_this_grid,
                 &mut trace_glyphs,
-            );
-        }
+            )
+        };
 
         // Forward to the frame batch.
         batch.quad_instances.extend_from_slice(&row_quads);
@@ -5222,18 +5287,28 @@ fn emit_grid_cells(
         // produce a whole-row payload plus its per-column glyph index.
         // `row` is captured so `lookup_and_retarget` can translate Y when
         // a scroll rotates this line to a different row slot (issue #77).
+        //
+        // A row with a failed glyph must NOT be stored: the payload would
+        // pass every later content/geometry check while permanently missing
+        // ink, replaying the hole from cache on every frame. Skipping the
+        // store keeps the row on the fresh-emit path until rasterization
+        // succeeds (typically the very next frame for transient failures).
         if let Some(cache) = line_cache.as_deref_mut() {
-            cache.store(
-                node_id,
-                line_id,
-                content_sig,
-                geom_sig,
-                row_quads,
-                row_glyphs,
-                row_keys,
-                row_glyph_col_index,
-                row,
-            );
+            if row_failed {
+                GLYPH_CACHE_BYPASSES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                cache.store(
+                    node_id,
+                    line_id,
+                    content_sig,
+                    geom_sig,
+                    row_quads,
+                    row_glyphs,
+                    row_keys,
+                    row_glyph_col_index,
+                    row,
+                );
+            }
         }
     }
 
@@ -5312,9 +5387,12 @@ fn emit_grid_cells(
 
 /// Emit the glyph for a single cell, shaping if not yet cached and
 /// pushing the resulting `GlyphInstance` and `GlyphKey` into the row
-/// buffers. Returns `true` when a glyph was emitted. Empty cells, wide
-/// continuations, and cells whose prototype shape-step yields nothing
-/// return `false`.
+/// buffers. Returns [`CellGlyphOutcome::Emitted`] when a glyph was pushed,
+/// [`CellGlyphOutcome::Empty`] for cells that legitimately render no ink
+/// (empty, wide continuation, whitespace, zero-coverage glyph), and
+/// [`CellGlyphOutcome::Failed`] when shaping or rasterization failed for a
+/// cell that should have ink — the caller must then keep the row out of the
+/// line-quad cache so the missing glyph is retried next frame.
 ///
 /// Shared between `emit_grid_row_fresh` (full-row fresh emit) and
 /// `emit_grid_row_splice` (column-range splice fast path on cache miss
@@ -5349,10 +5427,10 @@ fn emit_grid_cell_glyph(
     ch_buf: &mut [u8; 4],
     trace_this_grid: bool,
     trace_glyphs: &mut Vec<String>,
-) -> bool {
+) -> CellGlyphOutcome {
     // Skip glyph for empty cells and wide continuation cells.
     if cell.is_empty() || cell.wide_continuation {
-        return false;
+        return CellGlyphOutcome::Empty;
     }
 
     let py = origin_y + row as f32 * cell_h;
@@ -5390,12 +5468,23 @@ fn emit_grid_cell_glyph(
                 .cloned()
                 .map(|glyph| ShapedGlyphEntry { layout_glyph: glyph, line_y: run.line_y })
         });
-        shape_cache.insert(cache_key, shaped.clone());
+        // Never negative-cache a shaping failure for a cell that should have
+        // ink: `ShapeCache` promotes hits every frame, so a transient miss
+        // would otherwise blank every instance of this character until the
+        // next font/DPI retune. Whitespace legitimately shapes to nothing
+        // and stays cacheable.
+        if shaped.is_some() || cell.ch.is_whitespace() {
+            shape_cache.insert(cache_key, shaped.clone());
+        }
         shaped
     };
 
     let Some(prototype) = prototype else {
-        return false;
+        if cell.ch.is_whitespace() {
+            return CellGlyphOutcome::Empty;
+        }
+        GLYPH_RASTER_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return CellGlyphOutcome::Failed;
     };
 
     let px_floor = px.floor();
@@ -5427,7 +5516,13 @@ fn emit_grid_cell_glyph(
                 key,
             ) {
                 Some(entry) => entry,
-                None => return false,
+                None => {
+                    if cell.ch.is_whitespace() {
+                        return CellGlyphOutcome::Empty;
+                    }
+                    GLYPH_RASTER_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    return CellGlyphOutcome::Failed;
+                }
             }
         };
 
@@ -5439,6 +5534,12 @@ fn emit_grid_cell_glyph(
             line_y: prototype.line_y,
         })
     };
+
+    // Zero-coverage glyph resolved from the atlas (e.g. a non-break space):
+    // legitimately inkless, no instance to draw.
+    if resolved.entry.size[0] <= 0.0 || resolved.entry.size[1] <= 0.0 {
+        return CellGlyphOutcome::Empty;
+    }
 
     row_keys.push(resolved.key);
 
@@ -5470,7 +5571,7 @@ fn emit_grid_cell_glyph(
         xform_translate: IDENTITY_XFORM_TRANSLATE,
     });
 
-    true
+    CellGlyphOutcome::Emitted
 }
 
 fn terminal_row_next_ch(
@@ -5494,6 +5595,11 @@ fn terminal_row_next_ch(
 /// pushed, or `None` when the cell had no glyph (empty, continuation,
 /// or shaping failed). Step 4 uses this index to splice only the
 /// damaged columns on subsequent cache misses with matching geometry.
+///
+/// Returns `true` when any cell in the row failed to produce its glyph
+/// ([`CellGlyphOutcome::Failed`]); the caller must then skip the line-quad
+/// cache store so the incomplete row is re-emitted (and the rasterization
+/// retried) on the next frame instead of replaying the hole from cache.
 #[allow(clippy::too_many_arguments)]
 fn emit_grid_row_fresh(
     grid: &CellGrid,
@@ -5525,9 +5631,10 @@ fn emit_grid_row_fresh(
     ch_buf: &mut [u8; 4],
     trace_this_grid: bool,
     trace_glyphs: &mut Vec<String>,
-) {
+) -> bool {
     let row_base = row * cols;
     let parity_colors = parity_windows_terminal_colors_enabled();
+    let mut row_failed = false;
 
     // Merge adjacent cells that share the same background color (ignoring
     // fg and attrs) into a single background QuadInstance across the
@@ -5571,7 +5678,7 @@ fn emit_grid_row_fresh(
         }
 
         let pre_len = row_glyphs.len() as u32;
-        let emitted = emit_grid_cell_glyph(
+        let outcome = emit_grid_cell_glyph(
             cell,
             row,
             col,
@@ -5599,8 +5706,14 @@ fn emit_grid_row_fresh(
             trace_this_grid,
             trace_glyphs,
         );
-        row_glyph_col_index.push(if emitted { Some(pre_len) } else { None });
+        row_glyph_col_index.push(if outcome == CellGlyphOutcome::Emitted {
+            Some(pre_len)
+        } else {
+            None
+        });
+        row_failed |= outcome == CellGlyphOutcome::Failed;
     }
+    row_failed
 }
 
 /// Column-range splice fast path for the cache miss case in
@@ -5618,6 +5731,9 @@ fn emit_grid_row_fresh(
 ///
 /// Mirrors Alacritty's `LineDamageBounds`-driven emission and
 /// WezTerm's `changed_since(seqno)` cross-frame reuse.
+///
+/// Returns `true` when any freshly-emitted (damaged) column failed to
+/// produce its glyph; see [`emit_grid_row_fresh`] for the caching contract.
 #[allow(clippy::too_many_arguments)]
 fn emit_grid_row_splice(
     grid: &CellGrid,
@@ -5655,9 +5771,10 @@ fn emit_grid_row_splice(
     ch_buf: &mut [u8; 4],
     trace_this_grid: bool,
     trace_glyphs: &mut Vec<String>,
-) {
+) -> bool {
     let row_base = row * cols;
     let parity_colors = parity_windows_terminal_colors_enabled();
+    let mut row_failed = false;
 
     // Backgrounds: always re-emit for the full row. Bg runs are cheap
     // (O(cols)) and may shift boundaries as cell bg colors change, so
@@ -5698,7 +5815,7 @@ fn emit_grid_row_splice(
         if col >= damage_start && col < damage_end {
             // Damaged column: emit fresh glyph.
             let pre_len = row_glyphs.len() as u32;
-            let emitted = emit_grid_cell_glyph(
+            let outcome = emit_grid_cell_glyph(
                 cell,
                 row,
                 col,
@@ -5726,7 +5843,12 @@ fn emit_grid_row_splice(
                 trace_this_grid,
                 trace_glyphs,
             );
-            row_glyph_col_index.push(if emitted { Some(pre_len) } else { None });
+            row_glyph_col_index.push(if outcome == CellGlyphOutcome::Emitted {
+                Some(pre_len)
+            } else {
+                None
+            });
+            row_failed |= outcome == CellGlyphOutcome::Failed;
         } else {
             // Undamaged column: copy the cached glyph. The cached cell's
             // content is unchanged (damage range excludes it), the atlas
@@ -5763,6 +5885,7 @@ fn emit_grid_row_splice(
             }
         }
     }
+    row_failed
 }
 
 /// Walk the arena and emit select-specific rendering:
@@ -6260,18 +6383,21 @@ fn rasterize_swash_for_atlas(
             physical.cache_key.glyph_id,
             f32::from_bits(physical.cache_key.font_size_bits),
         ) {
-            if rg.width == 0 || rg.height == 0 {
-                return None;
+            if rg.width > 0 && rg.height > 0 {
+                let entry = atlas.get_or_insert(
+                    key,
+                    rg.width,
+                    rg.height,
+                    rgba_glyph_data_for_atlas(rg.data, atlas.bytes_per_pixel),
+                    [rg.bearing_x, rg.bearing_y],
+                )?;
+                atlas.touch(&key);
+                return Some(entry);
             }
-            let entry = atlas.get_or_insert(
-                key,
-                rg.width,
-                rg.height,
-                rgba_glyph_data_for_atlas(rg.data, atlas.bytes_per_pixel),
-                [rg.bearing_x, rg.bearing_y],
-            )?;
-            atlas.touch(&key);
-            return Some(entry);
+            // A 0x0 raster from the GDI render target is ambiguous: genuinely
+            // inkless glyph or a transient GDI/DirectWrite failure. Fall
+            // through to swash, which distinguishes the two reliably, instead
+            // of dropping the glyph.
         }
     }
 
@@ -6281,7 +6407,13 @@ fn rasterize_swash_for_atlas(
         rasterizer.swash.get_image_uncached(font_system, physical.cache_key)?
     };
     if image.placement.width == 0 || image.placement.height == 0 {
-        return None;
+        // Zero-coverage glyph (spaces and friends): record an empty atlas
+        // entry so callers can tell "legitimately inkless" (`Some`, zero
+        // size) from "rasterization failed" (`None`), and so the glyph is
+        // never re-rasterized.
+        let entry = atlas.get_or_insert(key, 0, 0, Vec::new(), [0.0, 0.0])?;
+        atlas.touch(&key);
+        return Some(entry);
     }
 
     let w = image.placement.width;
@@ -6392,20 +6524,32 @@ fn rasterize_grid_glyph_for_atlas(
     #[cfg(target_os = "windows")]
     {
         if use_directwrite_grid_rasterization() {
-            let _ = (font_system, physical); // not needed on DirectWrite path
-            let rg = rasterizer.dw.rasterize_glyph(ch, font_size)?;
-            if rg.width == 0 || rg.height == 0 {
-                return None;
+            if let Some(rg) = rasterizer.dw.rasterize_glyph(ch, font_size) {
+                if rg.width > 0 && rg.height > 0 {
+                    let entry = atlas.get_or_insert(
+                        key,
+                        rg.width,
+                        rg.height,
+                        rgba_glyph_data_for_atlas(rg.data, atlas.bytes_per_pixel),
+                        [rg.bearing_x, rg.bearing_y],
+                    )?;
+                    atlas.touch(&key);
+                    return Some(entry);
+                }
             }
-            let entry = atlas.get_or_insert(
+            // Missing glyph index, degenerate raster rect, or a transient
+            // GDI failure. Fall through to swash so a renderable glyph is
+            // never silently dropped; swash then distinguishes genuinely
+            // inkless glyphs (empty entry) from failures (`None`).
+            rasterize_swash_for_atlas(
+                rasterizer,
+                font_system,
+                physical,
+                atlas,
                 key,
-                rg.width,
-                rg.height,
-                rgba_glyph_data_for_atlas(rg.data, atlas.bytes_per_pixel),
-                [rg.bearing_x, rg.bearing_y],
-            )?;
-            atlas.touch(&key);
-            Some(entry)
+                "",
+                FontWeight::Normal,
+            )
         } else {
             // The trace shows terminal content stays correct through batching,
             // so prefer the swash path until the Windows-specific raster data
@@ -9391,6 +9535,148 @@ mod tests {
         // `emit_grid_cells` passes these exact arguments on cache miss.
         emit_grid_row_backgrounds(&g, 0, 0, cols, 0.0, 0.0, 10.0, 20.0, 1.0, [0.0; 4], &mut quads);
         assert_eq!(quads.len(), cols);
+    }
+
+    #[test]
+    fn glyph_drop_stats_drain_and_reset_on_take() {
+        // Drain whatever parallel tests may have accumulated, then verify
+        // increments become visible and a second take drains them.
+        let _ = take_glyph_drop_stats();
+        GLYPH_RASTER_FAILURES.fetch_add(2, Ordering::Relaxed);
+        GLYPH_CACHE_BYPASSES.fetch_add(1, Ordering::Relaxed);
+        let stats = take_glyph_drop_stats();
+        assert!(stats.raster_failures >= 2, "raster failures must be drained");
+        assert!(stats.cache_bypasses >= 1, "cache bypasses must be drained");
+    }
+
+    /// GPU-gated device helper (same pattern as `atlas.rs` tests): the
+    /// fallback adapter keeps this runnable on headless CI, and the test
+    /// self-skips when no adapter exists at all.
+    fn glyph_drop_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: None,
+                    force_fallback_adapter: true,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .ok()?;
+            adapter.request_device(&wgpu::DeviceDescriptor::default()).await.ok()
+        })
+    }
+
+    /// Regression test for the "dropping artifacts" bug: a zero-coverage
+    /// cell (NBSP here) must resolve to [`CellGlyphOutcome::Empty`] — a
+    /// cached empty atlas entry — not be conflated with a rasterization
+    /// failure. Only genuine failures may return
+    /// [`CellGlyphOutcome::Failed`], which keeps the row out of the
+    /// line-quad cache so holes are never baked into cached payloads.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn zero_coverage_cell_is_empty_not_failed_and_emits_no_instance() {
+        use unshit_core::cell_grid::Cell;
+
+        let Some((device, _queue)) = glyph_drop_test_device() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new_with_size(&device, 512);
+        let mut font_system = FontSystem::new();
+        let mut swash = SwashCache::new();
+        let mut subpixel = SubpixelSwashCache::new();
+        let dw = DwRasterizer::new("Consolas");
+        let mut rasterizer =
+            Rasterizer { swash: &mut swash, subpixel_swash: &mut subpixel, dw: &dw };
+        let mut shape_cache = ShapeCache::new();
+        let mut glyph_cache: FxHashMap<GlyphKey, ResolvedGlyph> = FxHashMap::default();
+        let mut buffer = cosmic_text::Buffer::new(&mut font_system, Metrics::new(14.0, 18.0));
+        let mut ch_buf = [0u8; 4];
+        let mut row_glyphs: Vec<GlyphInstance> = Vec::new();
+        let mut row_keys: Vec<GlyphKey> = Vec::new();
+        let mut trace: Vec<String> = Vec::new();
+
+        let fg = Color { r: 255, g: 255, b: 255, a: 255 };
+        let bg = Color { r: 0, g: 0, b: 0, a: 0 };
+
+        // NBSP is not `Cell::is_empty` so it walks the full shape/raster
+        // path, where it produces zero coverage.
+        let nbsp =
+            Cell { ch: '\u{00A0}', fg, bg, attrs: CellAttrs::empty(), wide_continuation: false };
+        let outcome = emit_grid_cell_glyph(
+            &nbsp,
+            0,
+            0,
+            0.0,
+            0.0,
+            9.0,
+            18.0,
+            14.0,
+            1.0,
+            [0.0; 4],
+            false,
+            1,
+            TERMINAL_SHAPE_STYLE_REGULAR,
+            140,
+            "Consolas",
+            &mut row_glyphs,
+            &mut row_keys,
+            &mut glyph_cache,
+            &mut shape_cache,
+            &mut atlas,
+            &mut font_system,
+            &mut rasterizer,
+            &mut buffer,
+            &mut ch_buf,
+            false,
+            &mut trace,
+        );
+        assert_eq!(
+            outcome,
+            CellGlyphOutcome::Empty,
+            "zero-coverage glyph must be Empty, not Failed: Failed would \
+             needlessly keep its row out of the line-quad cache"
+        );
+        assert!(row_glyphs.is_empty(), "no instance for an inkless glyph");
+        assert!(
+            atlas.take_allocation_failure().is_none(),
+            "inkless glyphs must not latch atlas recovery"
+        );
+
+        // A printable cell on the same plumbing still emits.
+        let visible = Cell { ch: 'a', fg, bg, attrs: CellAttrs::empty(), wide_continuation: false };
+        let outcome = emit_grid_cell_glyph(
+            &visible,
+            0,
+            1,
+            0.0,
+            0.0,
+            9.0,
+            18.0,
+            14.0,
+            1.0,
+            [0.0; 4],
+            false,
+            1,
+            TERMINAL_SHAPE_STYLE_REGULAR,
+            140,
+            "Consolas",
+            &mut row_glyphs,
+            &mut row_keys,
+            &mut glyph_cache,
+            &mut shape_cache,
+            &mut atlas,
+            &mut font_system,
+            &mut rasterizer,
+            &mut buffer,
+            &mut ch_buf,
+            false,
+            &mut trace,
+        );
+        assert_eq!(outcome, CellGlyphOutcome::Emitted, "printable cell must emit its glyph");
+        assert_eq!(row_glyphs.len(), 1);
+        assert_eq!(row_keys.len(), 1);
     }
 
     #[test]

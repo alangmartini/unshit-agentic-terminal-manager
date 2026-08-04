@@ -12,11 +12,75 @@ const SLOW_FRAME_BUDGET_US: u64 = 8_333;
 const SLOW_FRAME_SAMPLE_INTERVAL_MS: u64 = 250;
 const TELEMETRY_QUEUE_CAPACITY: usize = 64;
 
-static TELEMETRY_SENDER: OnceLock<Option<SyncSender<SlowFrameRecord>>> = OnceLock::new();
+static TELEMETRY_SENDER: OnceLock<Option<SyncSender<TelemetryRecord>>> = OnceLock::new();
 static FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static LAST_SLOW_FRAME_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_GLYPH_DROP_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
 static SLOW_FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static GLYPH_DROP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static QUEUE_WARNING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Envelope for the async writer queue. `untagged` keeps each variant's own
+/// `event` field as the discriminator in the JSONL output.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum TelemetryRecord {
+    SlowFrame(SlowFrameRecord),
+    GlyphDrop(GlyphDropRecord),
+}
+
+impl TelemetryRecord {
+    fn event(&self) -> &'static str {
+        match self {
+            Self::SlowFrame(record) => record.event,
+            Self::GlyphDrop(record) => record.event,
+        }
+    }
+
+    fn correlation_id(&self) -> &str {
+        match self {
+            Self::SlowFrame(record) => &record.correlation_id,
+            Self::GlyphDrop(record) => &record.correlation_id,
+        }
+    }
+}
+
+/// Content-free record of glyphs that failed to shape/rasterize and were
+/// dropped from a presented frame without the atlas-exhaustion latch firing.
+/// Persistent occurrences of this event are the telemetry signature of the
+/// "missing letters" rendering artifact.
+#[derive(Debug, Serialize)]
+struct GlyphDropRecord {
+    timestamp_unix_ms: u64,
+    event: &'static str,
+    level: &'static str,
+    correlation_id: String,
+    sample_sequence: u64,
+    sample_interval_ms: u64,
+    raster_failures: u64,
+    cache_bypasses: u64,
+    glyph_count: u32,
+    atlas_fill_ratio: f32,
+    batch_build_us: u64,
+}
+
+impl GlyphDropRecord {
+    fn from_metrics(metrics: &FrameMetrics, timestamp_unix_ms: u64) -> Self {
+        Self {
+            timestamp_unix_ms,
+            event: "renderer.glyph_drop",
+            level: "warn",
+            correlation_id: process_correlation_id().to_string(),
+            sample_sequence: GLYPH_DROP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            sample_interval_ms: SLOW_FRAME_SAMPLE_INTERVAL_MS,
+            raster_failures: metrics.glyph_raster_failures,
+            cache_bypasses: metrics.glyph_cache_bypasses,
+            glyph_count: metrics.glyph_count,
+            atlas_fill_ratio: metrics.atlas_fill_ratio,
+            batch_build_us: metrics.batch_build_us,
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct RendererRecoveryRecord {
@@ -152,7 +216,39 @@ pub fn record_slow_frame(metrics: &FrameMetrics) {
         return;
     }
 
-    enqueue(SlowFrameRecord::from_metrics(metrics, timestamp_unix_ms));
+    enqueue(TelemetryRecord::SlowFrame(SlowFrameRecord::from_metrics(
+        metrics,
+        timestamp_unix_ms,
+    )));
+}
+
+/// Sample frames that dropped glyphs (shaping/rasterization failures that
+/// bypass the atlas-exhaustion latch) into durable telemetry. Same bounded
+/// worker as slow frames; sampled to at most one record per interval.
+pub fn record_glyph_drops(metrics: &FrameMetrics) {
+    if metrics.glyph_raster_failures == 0 {
+        return;
+    }
+
+    let timestamp_unix_ms = now_unix_ms();
+    let previous = LAST_GLYPH_DROP_SAMPLE_MS.load(Ordering::Relaxed);
+    if timestamp_unix_ms.saturating_sub(previous) < SLOW_FRAME_SAMPLE_INTERVAL_MS
+        || LAST_GLYPH_DROP_SAMPLE_MS
+            .compare_exchange(
+                previous,
+                timestamp_unix_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        return;
+    }
+
+    enqueue(TelemetryRecord::GlyphDrop(GlyphDropRecord::from_metrics(
+        metrics,
+        timestamp_unix_ms,
+    )));
 }
 
 pub fn default_path() -> Option<std::path::PathBuf> {
@@ -174,7 +270,7 @@ fn now_unix_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn telemetry_sender() -> Option<&'static SyncSender<SlowFrameRecord>> {
+fn telemetry_sender() -> Option<&'static SyncSender<TelemetryRecord>> {
     TELEMETRY_SENDER
         .get_or_init(|| {
             let correlation_id = process_correlation_id();
@@ -198,7 +294,7 @@ fn telemetry_sender() -> Option<&'static SyncSender<SlowFrameRecord>> {
         .as_ref()
 }
 
-fn enqueue(record: SlowFrameRecord) {
+fn enqueue(record: TelemetryRecord) {
     let Some(sender) = telemetry_sender() else {
         return;
     };
@@ -210,8 +306,8 @@ fn enqueue(record: SlowFrameRecord) {
         if !QUEUE_WARNING_ACTIVE.swap(true, Ordering::Relaxed) {
             log::warn!(
                 "{{\"event\":\"renderer.telemetry_queue_unavailable\",\"level\":\"warn\",\"correlation_id\":{:?},\"source_event\":{:?},\"reason\":{reason:?}}}",
-                record.correlation_id,
-                record.event,
+                record.correlation_id(),
+                record.event(),
             );
         }
     }
@@ -219,8 +315,8 @@ fn enqueue(record: SlowFrameRecord) {
 
 fn spawn_writer(
     path: PathBuf,
-) -> std::io::Result<(SyncSender<SlowFrameRecord>, std::thread::JoinHandle<()>)> {
-    let (sender, receiver) = mpsc::sync_channel::<SlowFrameRecord>(TELEMETRY_QUEUE_CAPACITY);
+) -> std::io::Result<(SyncSender<TelemetryRecord>, std::thread::JoinHandle<()>)> {
+    let (sender, receiver) = mpsc::sync_channel::<TelemetryRecord>(TELEMETRY_QUEUE_CAPACITY);
     let worker = std::thread::Builder::new()
         .name("renderer-telemetry".to_string())
         .spawn(move || {
@@ -229,8 +325,8 @@ fn spawn_writer(
                 if record_to(&path, &record).is_err() {
                     log::warn!(
                         "{{\"event\":\"renderer.telemetry_write_failed\",\"level\":\"warn\",\"correlation_id\":{:?},\"source_event\":{:?}}}",
-                        record.correlation_id,
-                        record.event,
+                        record.correlation_id(),
+                        record.event(),
                     );
                 }
             }
@@ -327,7 +423,7 @@ mod tests {
             display_period_ns: 8_333_333,
             ..FrameMetrics::default()
         };
-        let record = SlowFrameRecord::from_metrics(&metrics, 123);
+        let record = TelemetryRecord::SlowFrame(SlowFrameRecord::from_metrics(&metrics, 123));
         let (sender, worker) = spawn_writer(path.clone()).expect("spawn telemetry writer");
 
         sender.send(record).expect("enqueue slow frame");
@@ -344,6 +440,43 @@ mod tests {
         assert!(value["correlation_id"]
             .as_str()
             .is_some_and(|id| id.starts_with("process-")));
+        assert!(value.get("text").is_none());
+        assert!(value.get("terminal_output").is_none());
+    }
+
+    #[test]
+    fn glyph_drop_event_is_persisted_with_queryable_counts_and_no_content() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir()
+            .join(format!(
+                "tm-renderer-glyph-drop-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("renderer-events.jsonl");
+        let metrics = FrameMetrics {
+            glyph_raster_failures: 7,
+            glyph_cache_bypasses: 3,
+            glyph_count: 1_317,
+            atlas_fill_ratio: 0.4,
+            batch_build_us: 2_500,
+            ..FrameMetrics::default()
+        };
+        let record = TelemetryRecord::GlyphDrop(GlyphDropRecord::from_metrics(&metrics, 123));
+        let (sender, worker) = spawn_writer(path.clone()).expect("spawn telemetry writer");
+
+        sender.send(record).expect("enqueue glyph drop");
+        drop(sender);
+        worker.join().expect("join telemetry writer");
+
+        let body = std::fs::read_to_string(&path).expect("read telemetry");
+        let value: serde_json::Value =
+            serde_json::from_str(body.trim()).expect("valid JSONL record");
+        assert_eq!(value["event"], "renderer.glyph_drop");
+        assert_eq!(value["raster_failures"], 7);
+        assert_eq!(value["cache_bypasses"], 3);
+        assert_eq!(value["glyph_count"], 1_317);
+        // Content-free contract: counts only, never rendered text.
         assert!(value.get("text").is_none());
         assert!(value.get("terminal_output").is_none());
     }

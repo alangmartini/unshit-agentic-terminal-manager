@@ -420,6 +420,14 @@ pub struct FrameMetrics {
     pub nodes_skipped: u32,
     pub quad_count: u32,
     pub glyph_count: u32,
+    /// Glyphs that failed to shape or rasterize during this frame's batch
+    /// build and were dropped without latching the atlas-exhaustion
+    /// recovery. Persistent nonzero values mean visible missing text.
+    pub glyph_raster_failures: u64,
+    /// Text runs / grid rows that skipped their cross-frame cache because
+    /// of a glyph failure (they re-emit, and retry the glyph, every frame
+    /// until rasterization succeeds).
+    pub glyph_cache_bypasses: u64,
     pub atlas_fill_ratio: f32,
     pub gpu_upload_bytes: u64,
     pub damage_area_px: u64,
@@ -617,6 +625,12 @@ struct AppState {
     /// [`FrameMetrics::present_interval_us`]. `None` until the first
     /// frame has painted.
     last_paint_completed_at: Option<Instant>,
+    /// Rate limiter for the `renderer.glyph_raster_failure` warn event:
+    /// timestamp of the last emitted log line, plus counts accumulated
+    /// across the frames suppressed since then.
+    last_glyph_drop_log: Option<Instant>,
+    glyph_drop_failures_accum: u64,
+    glyph_drop_bypasses_accum: u64,
     /// Most recent compositor tick delivered to the event loop but not yet
     /// consumed by a paint. Coalesced to one slot by [`CompositorClockWaker`].
     compositor_frame_ready: Option<Instant>,
@@ -1589,6 +1603,27 @@ fn build_render_batch_with_atlas_recovery(
     retry_succeeded
 }
 
+/// Evict atlas glyphs unused for 300+ frames, every 300th atlas frame.
+///
+/// Runs on BOTH paint paths. Historically only the slow redraw path checked
+/// the counter, so sustained fast-path animation (terminal output at 120hz)
+/// walked straight past every 300th frame and eviction never ran, letting
+/// the atlas fill monotonically until exhaustion.
+fn run_periodic_atlas_eviction(state: &mut AppState) {
+    let atlas_frame = state.gpu.glyph_atlas.lru.frame_counter;
+    if atlas_frame == 0 || atlas_frame % 300 != 0 {
+        return;
+    }
+    let prev_generation = state.gpu.glyph_atlas.generation;
+    let device = state.gpu.device.clone();
+    let queue = state.gpu.queue.clone();
+    state.gpu.glyph_atlas.evict_unused(300, &device, &queue);
+    if state.gpu.glyph_atlas.generation != prev_generation {
+        state.shaped_cache.clear();
+        state.gpu.refresh_glyph_atlas_bind_groups();
+    }
+}
+
 fn should_paint_fast_animation_frame(
     container_scroll_active: bool,
     grid_visual_change: bool,
@@ -1649,6 +1684,7 @@ fn fast_paint_animation_frame(
     }
 
     state.gpu.glyph_atlas.advance_frame();
+    run_periodic_atlas_eviction(state);
 
     let t4 = Instant::now();
     if !build_render_batch_with_atlas_recovery(state, on_glyph_atlas_recovery) {
@@ -1830,6 +1866,34 @@ fn finalize_frame_metrics(
             snap.max_us as f64 / 1000.0,
             dropped,
         );
+    }
+
+    // Fold this frame's silent glyph drops (shaping/rasterization failures
+    // that bypass the atlas-exhaustion latch) into the metrics, and surface
+    // them at warn level at most once per second so a persistent failure is
+    // queryable from logs without flooding them at animation frame rates.
+    let drop_stats = batch::take_glyph_drop_stats();
+    metrics.glyph_raster_failures = drop_stats.raster_failures;
+    metrics.glyph_cache_bypasses = drop_stats.cache_bypasses;
+    state.glyph_drop_failures_accum =
+        state.glyph_drop_failures_accum.saturating_add(drop_stats.raster_failures);
+    state.glyph_drop_bypasses_accum =
+        state.glyph_drop_bypasses_accum.saturating_add(drop_stats.cache_bypasses);
+    if state.glyph_drop_failures_accum > 0
+        && state
+            .last_glyph_drop_log
+            .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
+    {
+        let correlation_id = format!("process-{}", std::process::id());
+        log::warn!(
+            "{{\"event\":\"renderer.glyph_raster_failure\",\"level\":\"warn\",\"correlation_id\":{correlation_id:?},\"frame_index\":{},\"raster_failures\":{},\"cache_bypasses\":{}}}",
+            state.frame_count,
+            state.glyph_drop_failures_accum,
+            state.glyph_drop_bypasses_accum,
+        );
+        state.glyph_drop_failures_accum = 0;
+        state.glyph_drop_bypasses_accum = 0;
+        state.last_glyph_drop_log = Some(now);
     }
 
     // Keep stderr telemetry queryable even when an embedding application does
@@ -2767,6 +2831,9 @@ impl ApplicationHandler for AppHandler {
             frame_probe: crate::frame_probe::FrameProbe::new(),
             interval_probe: crate::frame_probe::FrameProbe::new(),
             last_paint_completed_at: None,
+            last_glyph_drop_log: None,
+            glyph_drop_failures_accum: 0,
+            glyph_drop_bypasses_accum: 0,
             compositor_frame_ready: None,
             last_compositor_tick: None,
             display_refresh_mhz: startup_refresh_mhz,
@@ -4251,21 +4318,7 @@ impl ApplicationHandler for AppHandler {
 
                 // Advance LRU frame counter at the start of each rendered frame.
                 state.gpu.glyph_atlas.advance_frame();
-
-                // Periodically evict glyphs unused for more than 300 frames.
-                {
-                    let atlas_frame = state.gpu.glyph_atlas.lru.frame_counter;
-                    if atlas_frame > 0 && atlas_frame % 300 == 0 {
-                        let prev_generation = state.gpu.glyph_atlas.generation;
-                        let device = state.gpu.device.clone();
-                        let queue = state.gpu.queue.clone();
-                        state.gpu.glyph_atlas.evict_unused(300, &device, &queue);
-                        if state.gpu.glyph_atlas.generation != prev_generation {
-                            state.shaped_cache.clear();
-                            state.gpu.refresh_glyph_atlas_bind_groups();
-                        }
-                    }
-                }
+                run_periodic_atlas_eviction(state);
 
                 if state.needs_rebuild {
                     let t0 = Instant::now();
@@ -6512,6 +6565,8 @@ mod tests {
             nodes_skipped: 2,
             quad_count: 128,
             glyph_count: 512,
+            glyph_raster_failures: 3,
+            glyph_cache_bypasses: 2,
             atlas_fill_ratio: 0.75,
             gpu_upload_bytes: 8192,
             damage_area_px: 1920 * 1080,
@@ -6527,6 +6582,8 @@ mod tests {
         assert_eq!(m.quad_count, 128);
         assert_eq!(m.style_resolve_scope, StyleResolveScope::Subtree);
         assert_eq!(m.glyph_count, 512);
+        assert_eq!(m.glyph_raster_failures, 3);
+        assert_eq!(m.glyph_cache_bypasses, 2);
         assert!((m.atlas_fill_ratio - 0.75).abs() < f32::EPSILON);
         assert_eq!(m.gpu_upload_bytes, 8192);
         assert_eq!(m.damage_area_px, 1920 * 1080);
