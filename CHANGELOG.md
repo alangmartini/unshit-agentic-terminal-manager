@@ -7,6 +7,177 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-20
+
+Agentic workflow release: Claude Code and Codex conversations survive a machine
+restart, new tabs can open on their own fresh git worktree, a built-in file
+editor lands, tabs name themselves from the running program's title, and the
+Windows renderer holds a real 120 Hz budget without dropping glyphs.
+
+### Added
+
+- **Claude Code and Codex conversations are restored after the PTY daemon is
+  lost, including a machine restart.** When Terminal Manager is next opened,
+  saved agent panes with an exact or unambiguous conversation id show a
+  provider-specific manual Resume chip by default, with an opt-in automatic mode
+  under Settings > Sessions. This feature does not register Windows login
+  startup.
+- **Exact conversation ids are captured through consent-gated, idempotent Claude
+  Code and Codex `SessionStart` hooks.** Enabling automatic recovery installs the
+  managed hooks immediately; disabling it leaves them available for manual
+  recovery, and a separate Remove recovery hooks control removes only Terminal
+  Manager entries.
+- **Workspace ids are now stable numeric values**, so deleting one workspace
+  cannot renumber another workspace's daemon session keys.
+- **Built-in file editor (MVP).** Open a text file in an editor pane via the
+  `editor.open:<path>` command. The editor renders through the terminal's GPU
+  cell-grid pipeline (viewport-only publication, stable line identities for
+  cached line replay), shows a line-number gutter, and scrolls by keyboard
+  (arrows, PageUp/PageDown, Ctrl+Home/End) and mouse wheel. Oversized (>16 MiB)
+  and non-UTF-8 files are refused with a notification instead of being lossily
+  converted. Full editing is supported: typing (including dead-key composition),
+  selection by keyboard and mouse (click, drag, double-click word,
+  triple-click/gutter line), clipboard (Ctrl+C/X/V), undo/redo with VS Code-style
+  grouping, and atomic save (Ctrl+S, sibling temp file + rename) that preserves
+  the file's CRLF/LF line endings (stray bare-CR line endings in classic-Mac or
+  mixed files are normalized to line breaks on load, like VS Code).
+  `Ctrl+Shift+O` (or the palette's "Open file...") opens a native file picker;
+  Shift+wheel scrolls horizontally. Closing a pane or tab with unsaved changes
+  prompts save / discard / cancel. Editor panes are session-local and are not
+  persisted across restarts. Editor lifecycle telemetry (open/save/close, never
+  file content) is recorded to `editor-events.jsonl`.
+- **New tabs can open on a fresh git worktree.** The command palette
+  (`Ctrl+Shift+P`) gains two commands: **New worktree tab** opens a new tab whose
+  shell starts inside a freshly created `git worktree` of the active workspace's
+  repo (on its own `godly-wt-<hex>` branch, so work done there is easy to merge
+  back), and **Toggle worktree tabs** turns on a mode where every new tab —
+  `Ctrl+T`, the tab-bar `+`, or a workspace's "new terminal" — opens on its own
+  fresh worktree. The mode shows an `on` pill in the palette while active and
+  persists across restarts. Worktrees are created under the app's per-profile
+  `worktrees` directory (the same base Quick Prompt uses). Non-repo workspaces
+  fall back to a plain tab in mode, and the one-shot command explains via toast
+  when the workspace has no git repo.
+- **Pane and tab names follow the program's window title (OSC 0/2).** Like
+  Windows Terminal, a pane's label — in the sidebar, the tab bar, and the tab
+  context menu — now updates live when the running program sets its terminal
+  title, so Claude Code, Codex, ssh, and title-setting shells name their own tabs
+  (e.g. `✳ claude`). Manual renames still win: a pane you renamed keeps its name
+  (also across restarts) until you clear the rename, which hands control back to
+  the program. Titles are sanitized for display (control characters stripped,
+  length capped), a bare executable-path title collapses to the program name
+  (`powershell` instead of `C:\...\powershell.exe`), and an empty title falls
+  back to the generic `shell` label.
+- **A default-off "Start at Windows sign-in" control under Settings >
+  Sessions.** Combined with the separate Automatic agent resume opt-in, Terminal
+  Manager can reopen saved Claude Code and Codex conversations after a PC restart
+  without waiting for the app to be launched manually.
+- **A repeatable real-input typing performance gate is available through
+  `cargo xtask typing-perf`.** It drives deterministic human-rate and stress-rate
+  Win32 keyboard input against an isolated release build, captures input latency
+  and frame cadence, and fails unless every run sustains the 120 Hz budget
+  without dropped presentation slots.
+- **Frame diagnostics now expose renderer work quantiles and the active display
+  period.** Desktop performance tests can distinguish an overloaded renderer from
+  a display refresh-rate limit while exercising real keyboard input.
+- **Presentation telemetry now separates swapchain acquisition, intentional phase
+  holding, and the platform present call.** Performance reports expose
+  p50/p95/p99/max values for each wait source so driver pacing cannot masquerade
+  as renderer work.
+- **Cadence telemetry now separates compositor heartbeats from paint
+  completion.** Native vblank-aligned intervals drive cadence acceptance on the
+  Windows Mailbox path, while completion jitter stays independently queryable and
+  every measured frame must return from its present call within one display
+  period of the heartbeat.
+- **Slow renderer frames persist sampled, content-free stage telemetry.**
+  `renderer-events.jsonl` records the style scope and CPU/presentation timings
+  through a bounded background writer so future stalls can be localized without
+  blocking rendering.
+- **Silent glyph drops are now observable.** Frames that drop glyphs emit a
+  rate-limited `renderer.glyph_raster_failure` warn log and a sampled,
+  content-free `renderer.glyph_drop` record in `renderer-events.jsonl` (failure
+  and cache-bypass counts only), so the artifact is diagnosable from telemetry
+  alone.
+
+### Changed
+
+- Restored panes are reconciled with a daemon-atomic attach-or-spawn request,
+  preventing duplicate agent launches when clients race, the initial session-list
+  cache is unavailable, or an IPC response is lost.
+- Hook observations are authenticated with per-PTY capabilities and acknowledged
+  only after the recovery record has been durably saved, with bounded
+  negative-acknowledgement retries.
+- Local IPC peer ownership is verified before either side accepts recovery
+  traffic, and linked/reparse-point hook configuration files are refused so
+  another local account or a filesystem redirect cannot capture a capability or
+  overwrite an unintended file.
+- Minimal routing and launch metadata is written through owner-private, synced
+  atomic replacement, discovery inspects only a bounded JSONL prefix, and
+  recovery events are size-bounded and redacted. Persistence and telemetry
+  exclude prompts, transcript content, terminal output, hook payloads,
+  conversation ids, paths, and raw errors as applicable.
+- Application exit is vetoed when the final keep-running or kill-all recovery
+  state cannot be saved. The updated live state remains open with an actionable
+  error, preventing stale disk metadata from resurrecting an intentionally
+  stopped agent.
+- Login startup is registered directly in the current user's Windows `Run` key
+  with profile-isolated values, bounded quoted executable paths, redacted durable
+  telemetry, failure-safe UI state, and uninstall cleanup for the installed app
+  value.
+- **Windows now pairs D3D12's tear-free single-frame Mailbox queue with the
+  native DirectComposition heartbeat, 4x MSAA, and a two-frame latency request.**
+  The wgpu 30 renderer keeps the full decorative quad shader, DirectWrite text
+  rasterization, gradients, masks, shadows, borders, and transforms while
+  avoiding the rare double-refresh blocking acquire observed on FIFO drivers;
+  unsupported systems retain the ordinary backend and tear-free FIFO fallback.
+- **The Windows UI/render and compositor-clock threads register with the
+  Multimedia Class Scheduler `Games` task.** This reduces scheduler preemption
+  during active 120 Hz rendering while retaining safe fallbacks and structured
+  lifecycle telemetry.
+
+### Fixed
+
+- **Missing-letter rendering artifacts no longer persist.** Text runs and
+  terminal grid rows that hit a transient glyph shaping/rasterization failure are
+  no longer stored in the cross-frame caches, so a dropped glyph is retried on
+  the next frame instead of replaying as a permanent hole app-wide. DirectWrite
+  rasterizations that come back 0×0 now fall through to the swash rasterizer
+  instead of silently dropping the glyph, and shaping failures are no longer
+  negative-cached.
+- **Glyph atlas eviction runs during sustained animation.** The periodic eviction
+  check previously only existed on the slow redraw path, so 120hz fast-path
+  streaks let the atlas fill monotonically toward exhaustion.
+- **Text inputs now support the full selection hotkey suite.** In the
+  rename-session dialog (and every other text field), `Ctrl+A` selects the whole
+  value with a visible highlight, typing or `Backspace`/`Delete` replaces the
+  selection, `Ctrl+C`/`Ctrl+X`/`Ctrl+V` copy/cut/paste it,
+  `Shift+Arrow`/`Shift+Home`/`Shift+End` extend it, `Ctrl+Arrow` jumps by word
+  (`+Shift` selects by word), `Ctrl+Backspace`/`Ctrl+Delete` delete by word, and
+  double-click selects the word under the cursor. Previously the framework's
+  inputs had no selection model at all, so `Ctrl+A` and friends silently did
+  nothing.
+- **Pointer hover changes at non-default Windows display scaling no longer
+  restyle the entire document.** Narrow pseudo-class restyles inherit logical,
+  unscaled parent styles and avoid compounding DPI scale while preserving scoped
+  style work.
+- **Sidebar terminal names no longer collapse to `…` next to a long git-branch
+  chip.** The row now lets the branch chip shrink (down to a small floor) before
+  the terminal name loses width, so longer names — including the new program-set
+  titles — stay readable at the default sidebar width.
+- **Timer-paced surfaces keep an absolute presentation phase** instead of
+  accumulating wake-up drift. Optional render lead can absorb variable work while
+  reporting its hold separately.
+- **Input-latency capture now survives pacer rejections and empty animation
+  frames.** Pending human input remains attached to the next frame that actually
+  presents.
+- **Active rendering no longer performs synchronous monitor queries or native
+  title rewrites once per second.** Refresh-rate changes are reconciled on
+  startup, move, scale, and focus events, while live FPS remains available
+  through frame metrics and the in-app overlay.
+- **Desktop automation ignores winit's transparent thread-event helper window
+  when locating the real app HWND.** Real-input runs persist bounded focus
+  diagnostics and tolerate transient Win32 activation changes instead of
+  misdirecting keystrokes.
+
 ## [0.2.6] - 2026-07-16
 
 Terminal interaction polish: links now show clear hover feedback, and navigation
@@ -240,7 +411,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.3...v0.2.4

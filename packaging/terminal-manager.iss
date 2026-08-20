@@ -5,10 +5,10 @@
 ;   cargo build --release -p unshit-ptyd --bin unshit-ptyd
 ;   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" packaging\terminal-manager.iss
 ;
-; Output: dist\terminal-manager-0.2.6-setup.exe
+; Output: dist\terminal-manager-0.3.0-setup.exe
 
 #define MyAppName "Terminal Manager"
-#define MyAppVersion "0.2.6"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "Alan Galvao"
 #define MyAppURL "https://github.com/alangmartini/unshit-agentic-terminal-manager"
 #define MyAppExeName "terminal-manager.exe"
