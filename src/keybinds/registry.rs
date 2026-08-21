@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn zoom_in_alias_registered() {
-        assert_eq!(find("Ctrl+Shift+=").as_deref(), Some("font.inc"));
+        assert_eq!(find("Ctrl+Shift+=").as_deref(), Some("zoom.in"));
     }
 
     #[test]

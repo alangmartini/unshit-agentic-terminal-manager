@@ -201,6 +201,7 @@ mod tests {
             custom_theme: crate::theme::default_custom_theme(),
             config_font_size_pt: crate::state::DEFAULT_CONFIG_FONT_SIZE_PT,
             terminal_font_size_pt: crate::state::DEFAULT_TERMINAL_FONT_SIZE_PT,
+            ui_zoom: crate::state::DEFAULT_UI_ZOOM,
             ui_density: crate::state::DEFAULT_UI_DENSITY,
             scroll_line_px: crate::state::DEFAULT_SCROLL_LINE_PX,
             smooth_scroll_duration_ms: crate::state::DEFAULT_SMOOTH_SCROLL_DURATION_MS,

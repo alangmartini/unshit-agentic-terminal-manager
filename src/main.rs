@@ -1100,10 +1100,16 @@ fn main() {
         crate::bench::start(cfg, shared.clone());
     }
 
+    // Seeded, not persisted: appearance state is session-only today, so
+    // this is 100% on every launch. It exists so the framework and the
+    // Settings readout start out agreeing on the level.
+    let initial_ui_zoom = shared.lock().unwrap().ui_zoom;
+
     let tree_shared = shared.clone();
     let command_shared = shared.clone();
     let metrics_shared = shared.clone();
     let scale_shared = shared.clone();
+    let zoom_shared = shared.clone();
     let window_state_shared = shared.clone();
     let close_shared = shared.clone();
     let sub_shared = shared.clone();
@@ -1174,6 +1180,17 @@ fn main() {
                 let mut guard = scale_shared.lock_recover();
                 guard.scale_factor = scale;
                 crate::state::sync_terminal_size_to_font_metrics(&mut guard);
+            })),
+            // Ctrl+= / Ctrl+- / Ctrl+0 and Ctrl+wheel are handled inside
+            // the framework so a single factor scales spacing, borders,
+            // icons and text together; the terminal follows because the
+            // combined DPI*zoom factor arrives via `on_scale_factor`
+            // above, which republishes cell metrics and resizes the PTYs.
+            // These two hooks only carry the level in and out for the
+            // Settings readout.
+            initial_zoom: initial_ui_zoom,
+            on_zoom: Some(Arc::new(move |zoom: f32| {
+                zoom_shared.lock_recover().ui_zoom = zoom;
             })),
             on_window_maximized: Some(Arc::new(move |maximized: bool| {
                 let mut guard = window_state_shared.lock_recover();

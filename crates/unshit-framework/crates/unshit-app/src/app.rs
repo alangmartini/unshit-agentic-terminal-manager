@@ -250,10 +250,25 @@ pub struct AppConfig {
     /// Callback invoked when smooth scrolling starts and on each animation
     /// sample. Intended for diagnostics and regression metrics.
     pub on_scroll_telemetry: Option<Box<ScrollTelemetryCallback>>,
-    /// Callback invoked when the OS reports the DPI scale factor.
-    /// Fires once at startup and again whenever the window moves between
-    /// monitors with different scale factors.
+    /// Callback invoked with the number of device pixels the framework
+    /// puts on one CSS pixel, i.e. the OS DPI scale factor multiplied by
+    /// the application zoom factor.
+    ///
+    /// Fires once at startup, whenever the window moves between monitors
+    /// with different scale factors, and whenever the zoom factor changes
+    /// (Ctrl+wheel or the built-in `zoom.*` commands). Applications that
+    /// convert physical cursor coordinates into CSS pixels, or that size
+    /// content from a point size, want exactly this combined value.
     pub on_scale_factor: Option<Arc<dyn Fn(f32) + Send + Sync>>,
+    /// Application zoom factor applied on top of the OS DPI scale at
+    /// startup, where `1.0` is 100%. Lets an application restore a
+    /// persisted zoom level. Clamped to [`MIN_ZOOM`]..=[`MAX_ZOOM`].
+    pub initial_zoom: f32,
+    /// Callback invoked whenever the application zoom factor changes,
+    /// with the new factor (`1.0` == 100%). Fires for Ctrl+wheel zoom and
+    /// for the built-in `zoom.in` / `zoom.out` / `zoom.reset` commands so
+    /// the application can persist the level and show a readout.
+    pub on_zoom: Option<Arc<dyn Fn(f32) + Send + Sync>>,
     /// Callback invoked when the window enters or leaves the maximized state.
     /// Fires once at startup with the initial state, after framework-driven
     /// maximize toggles, and when OS window events report a state change.
@@ -326,6 +341,8 @@ impl Default for AppConfig {
             on_glyph_atlas_recovery: None,
             scroll_tuning: None,
             on_scale_factor: None,
+            initial_zoom: 1.0,
+            on_zoom: None,
             on_window_maximized: None,
             on_close: None,
             on_file_drop: None,
@@ -1045,6 +1062,49 @@ fn apply_scroll_grid_patch(
     }
     mark_node_paint_dirty(arena, node_id);
     true
+}
+
+/// Smallest application zoom factor. Matches Chrome's 25% floor.
+pub const MIN_ZOOM: f32 = 0.25;
+/// Largest application zoom factor. Matches Chrome's 500% ceiling.
+pub const MAX_ZOOM: f32 = 5.0;
+/// Zoom differences below this are treated as no change, so repeated
+/// commands at either end of [`ZOOM_STEPS`] stay cheap.
+const ZOOM_EPSILON: f32 = 0.001;
+
+/// Discrete zoom levels the `zoom.in` / `zoom.out` commands step through.
+/// These are the browser zoom presets: steps get coarser as they get
+/// further from 100% so a single keystroke is always a visible change
+/// without overshooting at small sizes. Continuous Ctrl+wheel zoom is not
+/// constrained to these.
+const ZOOM_STEPS: [f32; 15] =
+    [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 3.0, 5.0];
+
+/// Device pixels per CSS pixel: the OS DPI scale with application zoom
+/// folded in. This is the factor every computed style is scaled by, so it
+/// is also the factor callers must divide physical coordinates by to get
+/// back to CSS pixels.
+pub fn effective_scale(scale_factor: f32, zoom_factor: f32) -> f32 {
+    (scale_factor * zoom_factor).max(0.01)
+}
+
+/// The next preset zoom level above (`direction > 0`) or below
+/// (`direction < 0`) `current`. Returns `current` clamped when there is
+/// no further step in that direction, so callers can compare for a no-op.
+pub fn next_zoom_step(current: f32, direction: i32) -> f32 {
+    let current = current.clamp(MIN_ZOOM, MAX_ZOOM);
+    if direction > 0 {
+        ZOOM_STEPS.iter().copied().find(|step| *step > current + ZOOM_EPSILON).unwrap_or(MAX_ZOOM)
+    } else if direction < 0 {
+        ZOOM_STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|step| *step < current - ZOOM_EPSILON)
+            .unwrap_or(MIN_ZOOM)
+    } else {
+        current
+    }
 }
 
 fn wheel_scroll_delta_pixels(
@@ -2133,7 +2193,7 @@ fn reconcile_surface_metrics(
             log::info!("Scale factor changed: {:.2}x -> {:.2}x", state.scale_factor, new_scale);
             state.scale_factor = new_scale;
             if let Some(cb) = on_scale_factor {
-                cb(new_scale);
+                cb(effective_scale(new_scale, state.zoom_factor));
             }
             refresh_pacer_from_window(state);
             mark_full_restyle_required(&mut state.arena, state.root);
@@ -2550,10 +2610,15 @@ impl ApplicationHandler for AppHandler {
         ));
 
         let scale_factor = window.scale_factor() as f32;
-        log::info!("Display scale factor: {:.2}x", scale_factor);
+        let zoom_factor = if self.app.config.initial_zoom.is_finite() {
+            self.app.config.initial_zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+        } else {
+            1.0
+        };
+        log::info!("Display scale factor: {:.2}x, zoom: {:.0}%", scale_factor, zoom_factor * 100.0);
 
         if let Some(ref cb) = self.app.config.on_scale_factor {
-            cb(scale_factor);
+            cb(effective_scale(scale_factor, zoom_factor));
         }
         let initial_window_maximized = window.is_maximized();
         if let Some(ref cb) = self.app.config.on_window_maximized {
@@ -2705,7 +2770,7 @@ impl ApplicationHandler for AppHandler {
             NodeId::DANGLING,
             &mut pseudo_table,
         );
-        scale_all_styles(&mut arena, root, scale_factor);
+        scale_all_styles(&mut arena, root, effective_scale(scale_factor, zoom_factor));
 
         let mut measure_cache = TextMeasureCache::new();
         let (w, h) = gpu.window_size();
@@ -2791,7 +2856,7 @@ impl ApplicationHandler for AppHandler {
             restyle_root: None,
             scale_factor,
             window_maximized: initial_window_maximized,
-            zoom_factor: 1.0,
+            zoom_factor,
             ctrl_held: false,
             shift_held: false,
             modifiers_state: ModifiersState::default(),
@@ -3786,6 +3851,8 @@ impl ApplicationHandler for AppHandler {
                                                 state,
                                                 &command,
                                                 self.app.config.on_command.as_ref(),
+                                                self.app.config.on_scale_factor.as_ref(),
+                                                self.app.config.on_zoom.as_ref(),
                                             );
                                             true
                                         } else if state.shortcut_resolver.is_chord_pending()
@@ -3887,6 +3954,8 @@ impl ApplicationHandler for AppHandler {
                                             state,
                                             &command,
                                             self.app.config.on_command.as_ref(),
+                                            self.app.config.on_scale_factor.as_ref(),
+                                            self.app.config.on_zoom.as_ref(),
                                         );
                                     }
                                     if was_pending != state.shortcut_resolver.is_chord_pending() {
@@ -3919,17 +3988,12 @@ impl ApplicationHandler for AppHandler {
                         winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                         winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 50.0,
                     };
-                    let old_zoom = state.zoom_factor;
-                    state.zoom_factor =
-                        (state.zoom_factor * (1.0 + scroll_y * 0.1)).clamp(0.25, 5.0);
-                    if (state.zoom_factor - old_zoom).abs() > 0.001 {
-                        log::info!("Zoom: {:.0}%", state.zoom_factor * 100.0);
-                        state.shaped_cache.clear();
-                        state.batch_cache.clear();
-                        state.measure_cache.clear();
-                        state.needs_rebuild = true;
-                        state.window.request_redraw();
-                    }
+                    apply_zoom(
+                        state,
+                        state.zoom_factor * (1.0 + scroll_y * 0.1),
+                        self.app.config.on_scale_factor.as_ref(),
+                        self.app.config.on_zoom.as_ref(),
+                    );
                 } else {
                     let scroll_tuning = self
                         .app
@@ -4431,7 +4495,11 @@ impl ApplicationHandler for AppHandler {
                         metrics.style_resolve_scope = StyleResolveScope::Document;
 
                         let t2 = Instant::now();
-                        scale_all_styles(&mut state.arena, state.root, state.scale_factor);
+                        scale_all_styles(
+                            &mut state.arena,
+                            state.root,
+                            effective_scale(state.scale_factor, state.zoom_factor),
+                        );
                         metrics.scale_us = t2.elapsed().as_micros() as u64;
 
                         mark_layout_dirty(&mut state.arena, state.root);
@@ -4522,7 +4590,11 @@ impl ApplicationHandler for AppHandler {
                     // every restyle. Visible as runaway font / layout
                     // sizes after a few hover changes on HiDPI displays.
                     let t2 = Instant::now();
-                    scale_all_styles(&mut state.arena, cascade_root, state.scale_factor);
+                    scale_all_styles(
+                        &mut state.arena,
+                        cascade_root,
+                        effective_scale(state.scale_factor, state.zoom_factor),
+                    );
                     metrics.scale_us = t2.elapsed().as_micros() as u64;
 
                     mark_layout_dirty(&mut state.arena, state.root);
@@ -5646,12 +5718,66 @@ fn handle_clipboard_shortcut(
     }
 }
 
+/// Set the application zoom factor and invalidate everything that was
+/// measured or rasterised at the old one.
+///
+/// Zoom multiplies the DPI scale that [`scale_all_styles`] applies to
+/// every computed style, so the whole interface -- spacing, borders,
+/// icons and text alike -- grows and shrinks together rather than only
+/// the font sizes. Applications are notified through `on_scale_factor`
+/// with the combined factor so they can re-derive anything they size
+/// themselves (terminal cell metrics, hit-test coordinates), and through
+/// `on_zoom` with the bare factor so they can persist and display it.
+///
+/// Returns `true` when the factor actually changed.
+fn apply_zoom(
+    state: &mut AppState,
+    next_zoom: f32,
+    on_scale_factor: Option<&Arc<dyn Fn(f32) + Send + Sync>>,
+    on_zoom: Option<&Arc<dyn Fn(f32) + Send + Sync>>,
+) -> bool {
+    let next =
+        if next_zoom.is_finite() { next_zoom.clamp(MIN_ZOOM, MAX_ZOOM) } else { return false };
+    if (next - state.zoom_factor).abs() <= ZOOM_EPSILON {
+        return false;
+    }
+    state.zoom_factor = next;
+    log::info!("Zoom: {:.0}%", next * 100.0);
+    // Shaped runs, batches and text measurements are all keyed by
+    // physical pixel size, so none of them survive a scale change.
+    state.shaped_cache.clear();
+    state.batch_cache.clear();
+    state.measure_cache.clear();
+    // A zoom change rewrites every computed style, so the next frame has
+    // to re-resolve the whole document rather than a hover subtree.
+    mark_full_restyle_required(&mut state.arena, state.root);
+    state.needs_rebuild = true;
+    if let Some(cb) = on_scale_factor {
+        cb(effective_scale(state.scale_factor, next));
+    }
+    if let Some(cb) = on_zoom {
+        cb(next);
+    }
+    state.window.request_redraw();
+    true
+}
+
 fn dispatch_command(
     state: &mut AppState,
     command: &str,
     on_command: Option<&Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    on_scale_factor: Option<&Arc<dyn Fn(f32) + Send + Sync>>,
+    on_zoom: Option<&Arc<dyn Fn(f32) + Send + Sync>>,
 ) {
     match command {
+        "zoom.in" | "zoom.out" | "zoom.reset" => {
+            let next = match command {
+                "zoom.in" => next_zoom_step(state.zoom_factor, 1),
+                "zoom.out" => next_zoom_step(state.zoom_factor, -1),
+                _ => 1.0,
+            };
+            apply_zoom(state, next, on_scale_factor, on_zoom);
+        }
         "focus.next" => {
             let new_focused = next_focusable(&state.arena, state.root, state.interaction.focused);
             if let Some(id) = new_focused {
@@ -7241,6 +7367,40 @@ mod tests {
 
         assert!(subtree_has_dirty_flags(&arena, root, DirtyFlags::LAYOUT));
         assert!(!subtree_has_dirty_flags(&arena, root, DirtyFlags::STYLE));
+    }
+
+    #[test]
+    fn zoom_steps_walk_the_browser_presets() {
+        assert_eq!(next_zoom_step(1.0, 1), 1.1);
+        assert_eq!(next_zoom_step(1.1, 1), 1.25);
+        assert_eq!(next_zoom_step(1.0, -1), 0.9);
+        assert_eq!(next_zoom_step(0.9, -1), 0.8);
+    }
+
+    #[test]
+    fn zoom_steps_snap_off_preset_levels() {
+        // Ctrl+wheel lands on arbitrary factors; a following keystroke
+        // must move to the neighbouring preset, not stall.
+        assert_eq!(next_zoom_step(1.07, 1), 1.1);
+        assert_eq!(next_zoom_step(1.07, -1), 1.0);
+    }
+
+    #[test]
+    fn zoom_steps_clamp_at_both_ends() {
+        assert_eq!(next_zoom_step(MAX_ZOOM, 1), MAX_ZOOM);
+        assert_eq!(next_zoom_step(MIN_ZOOM, -1), MIN_ZOOM);
+        assert_eq!(next_zoom_step(99.0, 1), MAX_ZOOM);
+        assert_eq!(next_zoom_step(0.0, -1), MIN_ZOOM);
+        assert_eq!(next_zoom_step(1.0, 0), 1.0);
+    }
+
+    #[test]
+    fn effective_scale_folds_zoom_into_dpi() {
+        assert_eq!(effective_scale(1.0, 1.0), 1.0);
+        assert_eq!(effective_scale(1.5, 2.0), 3.0);
+        assert_eq!(effective_scale(2.0, 0.5), 1.0);
+        // Never zero: callers divide physical coordinates by this.
+        assert!(effective_scale(0.0, 0.0) > 0.0);
     }
 
     #[test]

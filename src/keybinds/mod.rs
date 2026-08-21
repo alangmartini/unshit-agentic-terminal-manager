@@ -39,6 +39,7 @@ pub enum KeybindAction {
     OpenSettings,
     ZoomIn,
     ZoomOut,
+    ZoomReset,
     Fullscreen,
 }
 
@@ -90,6 +91,7 @@ impl KeybindAction {
         Self::OpenSettings,
         Self::ZoomIn,
         Self::ZoomOut,
+        Self::ZoomReset,
         Self::Fullscreen,
     ];
 
@@ -116,6 +118,7 @@ impl KeybindAction {
             Self::OpenSettings => "open_settings",
             Self::ZoomIn => "zoom_in",
             Self::ZoomOut => "zoom_out",
+            Self::ZoomReset => "zoom_reset",
             Self::Fullscreen => "fullscreen",
         }
     }
@@ -148,6 +151,7 @@ impl KeybindAction {
             Self::OpenSettings => "Settings",
             Self::ZoomIn => "Zoom in",
             Self::ZoomOut => "Zoom out",
+            Self::ZoomReset => "Reset zoom",
             Self::Fullscreen => "Fullscreen",
         }
     }
@@ -173,8 +177,9 @@ impl KeybindAction {
             Self::EditorSave => "Save the focused editor pane (Ctrl+S also works in the editor)",
             Self::ToggleSidebar => "Show or hide the workspace sidebar",
             Self::OpenSettings => "Open the settings window",
-            Self::ZoomIn => "Increase the terminal font size",
-            Self::ZoomOut => "Decrease the terminal font size",
+            Self::ZoomIn => "Scale the whole interface up, terminal and chrome together",
+            Self::ZoomOut => "Scale the whole interface down, terminal and chrome together",
+            Self::ZoomReset => "Return the interface to 100%",
             Self::Fullscreen => "Toggle the fullscreen window",
         }
     }
@@ -201,6 +206,7 @@ impl KeybindAction {
             | Self::OpenSettings
             | Self::ZoomIn
             | Self::ZoomOut
+            | Self::ZoomReset
             | Self::Fullscreen => KeybindGroup::Application,
         }
     }
@@ -229,8 +235,13 @@ impl KeybindAction {
             Self::EditorSave => "editor.save",
             Self::ToggleSidebar => "sidebar.toggle",
             Self::OpenSettings => "modal.open",
-            Self::ZoomIn => "font.inc",
-            Self::ZoomOut => "font.dec",
+            // Zoom is framework-owned: `zoom.*` is handled inside
+            // unshit-app so one factor scales spacing, borders, icons
+            // and text together. The per-surface font steppers in
+            // Settings still dispatch `terminal_font.*` / `config_font.*`.
+            Self::ZoomIn => "zoom.in",
+            Self::ZoomOut => "zoom.out",
+            Self::ZoomReset => "zoom.reset",
             Self::Fullscreen => "window.toggle_fullscreen",
         }
     }
@@ -261,6 +272,9 @@ impl KeybindAction {
             Self::OpenSettings => "Ctrl+,",
             Self::ZoomIn => "Ctrl+=",
             Self::ZoomOut => "Ctrl+-",
+            // Ctrl+1..Ctrl+9 switch tabs, so Ctrl+0 is free for the
+            // browser-conventional zoom reset.
+            Self::ZoomReset => "Ctrl+0",
             Self::Fullscreen => "F11",
         }
     }
@@ -277,8 +291,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_has_twenty_one_variants() {
-        assert_eq!(KeybindAction::ALL.len(), 21);
+    fn all_has_twenty_two_variants() {
+        assert_eq!(KeybindAction::ALL.len(), 22);
     }
 
     #[test]
@@ -435,7 +449,8 @@ mod tests {
             "sidebar.toggle"
         );
         assert_eq!(KeybindAction::OpenSettings.dispatch_command(), "modal.open");
-        assert_eq!(KeybindAction::ZoomIn.dispatch_command(), "font.inc");
-        assert_eq!(KeybindAction::ZoomOut.dispatch_command(), "font.dec");
+        assert_eq!(KeybindAction::ZoomIn.dispatch_command(), "zoom.in");
+        assert_eq!(KeybindAction::ZoomOut.dispatch_command(), "zoom.out");
+        assert_eq!(KeybindAction::ZoomReset.dispatch_command(), "zoom.reset");
     }
 }

@@ -10,6 +10,8 @@ pub const MAX_ROWS: usize = 4;
 pub const MIN_FONT_SIZE: u32 = 8;
 pub const MAX_FONT_SIZE: u32 = 32;
 pub const DEFAULT_CONFIG_FONT_SIZE_PT: u32 = 13;
+/// Interface zoom at first run: 100%, i.e. the OS DPI scale alone.
+pub const DEFAULT_UI_ZOOM: f32 = 1.0;
 pub const DEFAULT_TERMINAL_FONT_SIZE_PT: u32 = 13;
 pub const DEFAULT_UI_DENSITY: UiDensity = UiDensity::Cozy;
 pub const DEFAULT_SCROLL_LINE_PX: u32 = 100;
@@ -840,6 +842,13 @@ pub struct AppState {
     pub last_terminal_theme_painted: String,
     pub config_font_size_pt: u32,
     pub terminal_font_size_pt: u32,
+    /// Interface zoom factor (`1.0` == 100%), mirroring the framework's
+    /// own zoom so the Settings readout can show it. The framework owns
+    /// the live value -- Ctrl+wheel and the `zoom.*` shortcut commands
+    /// are handled inside `unshit-app`, which reports each change back
+    /// through `on_zoom`. Nothing here may write it without going
+    /// through the framework or the two would silently disagree.
+    pub ui_zoom: f32,
     pub ui_density: UiDensity,
     pub scroll_line_px: u32,
     pub smooth_scroll_duration_ms: u32,
@@ -1076,6 +1085,7 @@ impl AppState {
             custom_theme: self.custom_theme,
             config_font_size_pt: self.config_font_size_pt,
             terminal_font_size_pt: self.terminal_font_size_pt,
+            ui_zoom: self.ui_zoom,
             ui_density: self.ui_density,
             scroll_line_px: self.scroll_line_px,
             smooth_scroll_duration_ms: self.smooth_scroll_duration_ms,
@@ -1167,6 +1177,8 @@ pub struct UiSnapshot {
     pub custom_theme: theme::CustomTheme,
     pub config_font_size_pt: u32,
     pub terminal_font_size_pt: u32,
+    /// Interface zoom factor (`1.0` == 100%). See `AppState::ui_zoom`.
+    pub ui_zoom: f32,
     pub ui_density: UiDensity,
     pub scroll_line_px: u32,
     pub smooth_scroll_duration_ms: u32,
@@ -1374,6 +1386,7 @@ pub fn seed_state() -> AppState {
         custom_theme: theme::default_custom_theme(),
         last_terminal_theme_painted: String::new(),
         config_font_size_pt: DEFAULT_CONFIG_FONT_SIZE_PT,
+        ui_zoom: DEFAULT_UI_ZOOM,
         terminal_font_size_pt: DEFAULT_TERMINAL_FONT_SIZE_PT,
         ui_density: DEFAULT_UI_DENSITY,
         scroll_line_px: DEFAULT_SCROLL_LINE_PX,
@@ -7802,6 +7815,7 @@ mod tests {
             custom_theme: crate::theme::default_custom_theme(),
             last_terminal_theme_painted: String::new(),
             config_font_size_pt: DEFAULT_CONFIG_FONT_SIZE_PT,
+            ui_zoom: DEFAULT_UI_ZOOM,
             terminal_font_size_pt: DEFAULT_TERMINAL_FONT_SIZE_PT,
             ui_density: DEFAULT_UI_DENSITY,
             scroll_line_px: DEFAULT_SCROLL_LINE_PX,

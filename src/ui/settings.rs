@@ -274,6 +274,15 @@ fn build_appearance_page_section(state: &UiSnapshot, shared: &SharedState) -> El
         .with_child(
             set_card("interface", None)
                 .with_child(settings_page_field(
+                    "Zoom",
+                    Some("Scales the whole interface. Ctrl+= / Ctrl+- step, Ctrl+0 resets."),
+                    // Read-only: the framework owns the live zoom factor
+                    // (see `AppState::ui_zoom`), so there is nothing here
+                    // for a stepper button to dispatch to.
+                    readout_with_unit(&format!("{:.0}", state.ui_zoom * 100.0), "%"),
+                    state.config_font_size_pt,
+                ))
+                .with_child(settings_page_field(
                     "Config font size",
                     Some("Settings and app chrome text size in points."),
                     font_stepper(
