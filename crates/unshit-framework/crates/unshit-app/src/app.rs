@@ -3959,6 +3959,18 @@ impl ApplicationHandler for AppHandler {
                         scroll::find_scroll_container(&state.arena, state.interaction.hovered);
 
                     if let Some(target_id) = scroll_target {
+                        // A vertical wheel over a container that only
+                        // overflows horizontally moves it sideways, the
+                        // way browsers do, so a mouse without a tilt
+                        // wheel can still reach an off-screen tab. The
+                        // element `Scroll` event below keeps the raw
+                        // deltas: only container scrolling is remapped.
+                        let (delta_x, delta_y) = scroll::wheel_delta_for_container(
+                            &state.arena,
+                            &state.taffy,
+                            target_id,
+                            (delta_x, delta_y),
+                        );
                         if smooth_scroll {
                             let current =
                                 state.arena.get(target_id).map(|el| (el.scroll_x, el.scroll_y));

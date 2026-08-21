@@ -198,6 +198,57 @@ pub fn scroll_by(
     set_scroll_position(arena, node_id, next_x, next_y)
 }
 
+/// Remap a wheel delta for a scroll container that can only move on X.
+///
+/// Most mice only report a vertical wheel, so browsers translate a
+/// vertical notch into horizontal movement when the target scroller has
+/// no vertical overflow but does overflow horizontally. Without this a
+/// horizontally scrolling strip (a tab bar, a chip row) is unreachable
+/// with an ordinary wheel.
+///
+/// Only a pure vertical delta is remapped: a tilt wheel that already
+/// reports horizontal movement, or a container that can scroll on Y,
+/// keeps the original deltas. `max_scroll` is the pair returned by
+/// [`compute_max_scroll`] for the same node.
+pub fn remap_wheel_delta_for_axes(
+    overflow_x: Overflow,
+    overflow_y: Overflow,
+    max_scroll: (f32, f32),
+    delta: (f32, f32),
+) -> (f32, f32) {
+    let (delta_x, delta_y) = delta;
+    if delta_x != 0.0 || delta_y == 0.0 {
+        return delta;
+    }
+    let can_scroll_y = overflow_y == Overflow::Scroll && max_scroll.1 > 0.0;
+    let can_scroll_x = overflow_x == Overflow::Scroll && max_scroll.0 > 0.0;
+    if can_scroll_y || !can_scroll_x {
+        return delta;
+    }
+    // `scroll_by` subtracts the delta, so passing the vertical delta
+    // straight through on X makes wheel-down reveal later content --
+    // the same direction browsers use.
+    (delta_y, 0.0)
+}
+
+/// Look up a node's overflow axes and the wheel delta it should receive,
+/// applying the vertical-to-horizontal remap from
+/// [`remap_wheel_delta_for_axes`].
+pub fn wheel_delta_for_container(
+    arena: &NodeArena,
+    taffy: &taffy::TaffyTree<TextMeasureCtx>,
+    node_id: NodeId,
+    delta: (f32, f32),
+) -> (f32, f32) {
+    let Some(element) = arena.get(node_id) else {
+        return delta;
+    };
+    let overflow_x = element.computed_style.overflow_x;
+    let overflow_y = element.computed_style.overflow_y;
+    let max_scroll = compute_max_scroll(arena, taffy, node_id);
+    remap_wheel_delta_for_axes(overflow_x, overflow_y, max_scroll, delta)
+}
+
 /// Set one scrollbar axis from drag/track interaction and dirty affected paint.
 pub fn set_axis_scroll_position(
     arena: &mut NodeArena,
@@ -537,5 +588,73 @@ mod visual_state_tests {
 
         assert!(hover_alpha > resting);
         assert!(drag_alpha > hover_alpha);
+    }
+}
+
+#[cfg(test)]
+mod wheel_remap_tests {
+    use super::*;
+
+    #[test]
+    fn vertical_wheel_moves_horizontal_only_container() {
+        // A single-row tab strip: overflow-x: auto, no vertical overflow.
+        let remapped = remap_wheel_delta_for_axes(
+            Overflow::Scroll,
+            Overflow::Visible,
+            (400.0, 0.0),
+            (0.0, -120.0),
+        );
+        assert_eq!(
+            remapped,
+            (-120.0, 0.0),
+            "wheel-down over a horizontal-only scroller should move it right"
+        );
+    }
+
+    #[test]
+    fn vertical_wheel_left_alone_when_container_scrolls_vertically() {
+        // Wrapped multi-row tab strip: overflow-y: auto with real overflow.
+        let delta = (0.0, -120.0);
+        assert_eq!(
+            remap_wheel_delta_for_axes(Overflow::Visible, Overflow::Scroll, (0.0, 76.0), delta),
+            delta,
+            "a vertically scrollable container keeps the vertical delta"
+        );
+        assert_eq!(
+            remap_wheel_delta_for_axes(Overflow::Scroll, Overflow::Scroll, (400.0, 76.0), delta),
+            delta,
+            "a container that scrolls both ways keeps the vertical delta"
+        );
+    }
+
+    #[test]
+    fn wheel_remap_needs_horizontal_room() {
+        let delta = (0.0, -120.0);
+        assert_eq!(
+            remap_wheel_delta_for_axes(Overflow::Scroll, Overflow::Visible, (0.0, 0.0), delta),
+            delta,
+            "no horizontal overflow means nothing to remap onto"
+        );
+    }
+
+    #[test]
+    fn tilt_wheel_and_idle_deltas_pass_through() {
+        let tilt = (-30.0, 0.0);
+        assert_eq!(
+            remap_wheel_delta_for_axes(Overflow::Scroll, Overflow::Visible, (400.0, 0.0), tilt),
+            tilt,
+            "a horizontal delta is already usable and must not be rewritten"
+        );
+        let both = (-30.0, -120.0);
+        assert_eq!(
+            remap_wheel_delta_for_axes(Overflow::Scroll, Overflow::Visible, (400.0, 0.0), both),
+            both,
+            "a trackpad reporting both axes keeps its own deltas"
+        );
+        let idle = (0.0, 0.0);
+        assert_eq!(
+            remap_wheel_delta_for_axes(Overflow::Scroll, Overflow::Visible, (400.0, 0.0), idle),
+            idle
+        );
     }
 }
