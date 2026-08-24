@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-24
+
+Interface zoom now scales the whole app, and the tab strip scrolls with a plain
+vertical wheel. If you are still on v0.2.6 or earlier, upgrade: those builds leak
+a Win32 event handle per presented frame and grow by roughly 600 MB of memory per
+day (see the 0.3.0 note below). The leak was already fixed in 0.3.0.
+
+### Changed
+
+- **`Ctrl+=` / `Ctrl+-` now zoom the whole interface, not just the terminal.** Zoom scales the DPI factor that every computed style is resolved against, so spacing, borders, icons, the sidebar, the tab strip and the terminal grid all grow and shrink together. The terminal reflows its PTY to the new cell metrics as part of the change. `Ctrl+0` resets to 100%, and Settings > Appearance shows the current level. The separate terminal and config font-size steppers in Settings are unchanged.
+
+### Fixed
+
+- **`Ctrl` + mouse wheel zoom now has a visible effect.** The zoom factor it maintained was never folded into style scaling, so the gesture only cleared caches and forced a rebuild at the old size.
+- **The mouse wheel now scrolls the tab strip.** A vertical wheel over a container that only overflows horizontally is translated into horizontal movement, the way browsers do, so a mouse without a tilt wheel can reach tabs that have scrolled off the strip. Containers that can scroll vertically, and trackpads that already report a horizontal delta, are untouched.
+
 ## [0.3.0] - 2026-08-20
 
 Agentic workflow release: Claude Code and Codex conversations survive a machine
@@ -136,6 +152,14 @@ Windows renderer holds a real 120 Hz budget without dropping glyphs.
 
 ### Fixed
 
+- **The UI process no longer leaks a Win32 event handle on every presented
+  frame.** Builds up to and including 0.2.6 accumulated roughly 30-60 kernel
+  `Event` handles per second while the window rendered, which showed up as the UI
+  process growing by about 600 MB of memory per day (2 GB and 2.7 million open
+  handles after a day of uptime) with no corresponding growth in scrollback or
+  the glyph atlas. The Windows presentation rework below, together with the wgpu
+  upgrade it carried, ended the leak; handle count is now flat under sustained
+  rendering. This is the main reason to upgrade from 0.2.x.
 - **Missing-letter rendering artifacts no longer persist.** Text runs and
   terminal grid rows that hit a transient glyph shaping/rasterization failure are
   no longer stored in the cross-frame caches, so a dropped glyph is retried on
@@ -411,7 +435,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.4...v0.2.5
