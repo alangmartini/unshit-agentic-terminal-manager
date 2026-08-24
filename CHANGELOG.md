@@ -157,9 +157,9 @@ Windows renderer holds a real 120 Hz budget without dropping glyphs.
   `Event` handles per second while the window rendered, which showed up as the UI
   process growing by about 600 MB of memory per day (2 GB and 2.7 million open
   handles after a day of uptime) with no corresponding growth in scrollback or
-  the glyph atlas. The Windows presentation rework below, together with the wgpu
-  upgrade it carried, ended the leak; handle count is now flat under sustained
-  rendering. This is the main reason to upgrade from 0.2.x.
+  the glyph atlas. The Windows presentation rework listed under Changed above,
+  together with the wgpu upgrade it carried, ended the leak; handle count is now
+  flat under sustained rendering. This is the main reason to upgrade from 0.2.x.
 - **Missing-letter rendering artifacts no longer persist.** Text runs and
   terminal grid rows that hit a transient glyph shaping/rasterization failure are
   no longer stored in the cross-frame caches, so a dropped glyph is retried on
