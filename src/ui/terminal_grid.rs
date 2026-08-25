@@ -664,14 +664,26 @@ fn forward_wheel_if_mouse_mode(
         // line of reports, so it never leaks into local scrollback.
         if !bytes.is_empty() {
             let byte_count = bytes.len();
+            // `active` tells a hover-scrolled background pane apart from
+            // the focused one: the wheel follows the pointer, so reports
+            // can legitimately reach a PTY that has no keyboard focus,
+            // and a later "my unfocused pane reacted to the mouse"
+            // report needs to be readable straight off this line.
+            let active = st.active_pane.0 == pane;
             match st.pty_manager.write(pane, &bytes) {
                 Ok(()) => record_diagnostic_pty_event(
                     st,
-                    format!("write pane={} bytes={} source=wheel", pane, byte_count),
+                    format!(
+                        "write pane={} bytes={} source=wheel active={}",
+                        pane, byte_count, active
+                    ),
                 ),
                 Err(e) => record_diagnostic_pty_event(
                     st,
-                    format!("write_failed pane={} source=wheel error={}", pane, e),
+                    format!(
+                        "write_failed pane={} source=wheel active={} error={}",
+                        pane, active, e
+                    ),
                 ),
             }
         }
@@ -848,62 +860,6 @@ fn build_pane_body(
                 },
             );
 
-            // Mouse wheel scrolls the scrollback buffer.
-            // delta_y > 0 = wheel up (toward older history).
-            // delta_y < 0 = wheel down (toward live screen).
-            //
-            // Stepped-wheel input (`animate == true`) eases each notch
-            // toward its target through the terminal's `ScrollMotion`
-            // with the framework-provided duration/slope (bit-identical
-            // feel to the settings-page smooth scroll) and registers a
-            // grid-animation hook so the framework repaints the pane at
-            // the animation cadence with sub-row precision. Precision
-            // devices (`PixelDelta` touchpads) keep the instant path:
-            // fractional lines carry over inside the terminal's
-            // accumulator so the input tracks 1:1.
-            //
-            // Both paths return a `ScrollGridPatch` so repaints are
-            // paint-only content patches on this node, never full tree
-            // rebuilds.
-            let scroll_shared = shared.clone();
-            let scroll_pane_id = pane_id;
-            grid_el = grid_el.on(
-                EventType::Scroll,
-                move |event: &Event| -> Option<Box<dyn std::any::Any>> {
-                    if let Event::Scroll(se) = event {
-                        use unshit::core::cell_grid::CellGrid;
-                        let cell_h = CellGrid::global_cell_h().max(1.0);
-                        // A program capturing the mouse (DECSET 1000/1002/1003)
-                        // owns the wheel: forward the notch as mouse reports so
-                        // the TUI scrolls its own content. Shift+wheel is the
-                        // escape hatch that always drives local scrollback
-                        // (xterm convention), so it skips forwarding.
-                        if !se.modifiers.contains(Modifiers::SHIFT) {
-                            if let Some(patch) = forward_wheel_if_mouse_mode(
-                                &scroll_shared,
-                                scroll_pane_id.0,
-                                se.delta_y,
-                                cell_h,
-                            ) {
-                                return Some(Box::new(patch));
-                            }
-                        }
-                        let patch = if se.animate {
-                            handle_animated_wheel(&scroll_shared, scroll_pane_id.0, se, cell_h)
-                        } else {
-                            handle_instant_wheel(
-                                &scroll_shared,
-                                scroll_pane_id.0,
-                                se.delta_y,
-                                cell_h,
-                            )
-                        };
-                        return Some(Box::new(patch));
-                    }
-                    None
-                },
-            );
-
             // Register resize handler to update PTY dimensions.
             // Prefer the renderer-computed pending resize (exact), fall
             // back to global cell metrics, then to hardcoded estimates.
@@ -948,6 +904,67 @@ fn build_pane_body(
                 });
             });
         }
+
+        // Mouse wheel scrolls the scrollback buffer.
+        // delta_y > 0 = wheel up (toward older history).
+        // delta_y < 0 = wheel down (toward live screen).
+        //
+        // Registered for EVERY pane with a grid, not just the focused
+        // one (so it sits outside the `capture_keyboard` gate above):
+        // the framework dispatches Scroll from the hovered element
+        // upward, so the wheel always drives the pane under the
+        // pointer. Reading a split's other half no longer costs a
+        // click, and focus is deliberately left alone -- scrolling is
+        // not an activation gesture. Keyboard capture and the PTY
+        // resize handler stay focus-gated; only the wheel follows the
+        // pointer.
+        //
+        // Stepped-wheel input (`animate == true`) eases each notch
+        // toward its target through the terminal's `ScrollMotion`
+        // with the framework-provided duration/slope (bit-identical
+        // feel to the settings-page smooth scroll) and registers a
+        // grid-animation hook so the framework repaints the pane at
+        // the animation cadence with sub-row precision. Precision
+        // devices (`PixelDelta` touchpads) keep the instant path:
+        // fractional lines carry over inside the terminal's
+        // accumulator so the input tracks 1:1.
+        //
+        // Both paths return a `ScrollGridPatch` so repaints are
+        // paint-only content patches on this node, never full tree
+        // rebuilds.
+        let scroll_shared = shared.clone();
+        let scroll_pane_id = pane_id;
+        grid_el = grid_el.on(
+            EventType::Scroll,
+            move |event: &Event| -> Option<Box<dyn std::any::Any>> {
+                if let Event::Scroll(se) = event {
+                    use unshit::core::cell_grid::CellGrid;
+                    let cell_h = CellGrid::global_cell_h().max(1.0);
+                    // A program capturing the mouse (DECSET 1000/1002/1003)
+                    // owns the wheel: forward the notch as mouse reports so
+                    // the TUI scrolls its own content. Shift+wheel is the
+                    // escape hatch that always drives local scrollback
+                    // (xterm convention), so it skips forwarding.
+                    if !se.modifiers.contains(Modifiers::SHIFT) {
+                        if let Some(patch) = forward_wheel_if_mouse_mode(
+                            &scroll_shared,
+                            scroll_pane_id.0,
+                            se.delta_y,
+                            cell_h,
+                        ) {
+                            return Some(Box::new(patch));
+                        }
+                    }
+                    let patch = if se.animate {
+                        handle_animated_wheel(&scroll_shared, scroll_pane_id.0, se, cell_h)
+                    } else {
+                        handle_instant_wheel(&scroll_shared, scroll_pane_id.0, se.delta_y, cell_h)
+                    };
+                    return Some(Box::new(patch));
+                }
+                None
+            },
+        );
 
         // Track links inside the GPU-backed grid at cell precision. The
         // framework delivers MouseMove continuously within the same element;
@@ -1721,15 +1738,23 @@ mod tests {
         grids.insert(1, CellGrid::new(24, 80));
         let el = build_pane_body(PaneId(1), false, 13, &shared, &grids);
         let grid_el = &el.children[0];
-        // Inactive panes still register mouse selection handlers (so the user
-        // can select / copy in any visible pane) but must NOT capture the
-        // keyboard or scroll, and must not register a PTY resize handler.
+        // Inactive panes still register mouse selection and wheel handlers
+        // (so the user can select / copy and scroll in any visible pane)
+        // but must NOT capture the keyboard, and must not register a PTY
+        // resize handler.
         assert!(
             !grid_el
                 .handlers
                 .iter()
-                .any(|(et, _)| *et == EventType::KeyboardCapture || *et == EventType::Scroll),
-            "inactive pane must not capture keyboard or scroll"
+                .any(|(et, _)| *et == EventType::KeyboardCapture),
+            "inactive pane must not capture keyboard"
+        );
+        assert!(
+            grid_el
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::Scroll),
+            "inactive pane must still scroll: the wheel follows the pointer"
         );
         assert!(grid_el.on_resize.is_none());
     }
@@ -2407,7 +2432,7 @@ mod tests_mouse_selection_copy_paste {
     }
 
     #[test]
-    fn active_pane_keyboard_capture_scroll_resize_inactive_pane_none() {
+    fn active_pane_keyboard_capture_resize_inactive_pane_none() {
         let shared = make_shared();
         let mut grids = std::collections::HashMap::new();
         grids.insert(1, CellGrid::new(24, 80));
@@ -2442,16 +2467,33 @@ mod tests_mouse_selection_copy_paste {
             "inactive pane must NOT register KeyboardCapture handler"
         );
         assert!(
-            !grid_inactive
-                .handlers
-                .iter()
-                .any(|(et, _)| *et == EventType::Scroll),
-            "inactive pane must NOT register Scroll handler"
-        );
-        assert!(
             grid_inactive.on_resize.is_none(),
             "inactive pane must NOT register on_resize handler"
         );
+    }
+
+    /// The wheel follows the pointer, not the focus: every pane with a
+    /// grid registers a Scroll handler so hovering a background pane in
+    /// a split and scrolling moves THAT pane's scrollback. Before this,
+    /// the handler was gated behind `capture_keyboard`, so the event
+    /// bubbled from the hovered pane to the root and died -- a wheel
+    /// over an unfocused pane did nothing at all.
+    #[test]
+    fn scroll_handler_registered_for_active_and_inactive_panes() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        for capture_keyboard in [true, false] {
+            let el = build_pane_body(PaneId(1), capture_keyboard, 13, &shared, &grids);
+            let grid_el = &el.children[0];
+            assert!(
+                grid_el
+                    .handlers
+                    .iter()
+                    .any(|(et, _)| *et == EventType::Scroll),
+                "pane must register Scroll handler (capture_keyboard={capture_keyboard})"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2461,9 +2503,19 @@ mod tests_mouse_selection_copy_paste {
     // -----------------------------------------------------------------------
 
     fn scroll_handler_for_pane(shared: &SharedState, pane: u32) -> EventHandler {
+        scroll_handler_for_pane_with_focus(shared, pane, true)
+    }
+
+    /// `capture_keyboard == false` builds the pane the way an unfocused
+    /// half of a split is built, which is what a hover-scroll exercises.
+    fn scroll_handler_for_pane_with_focus(
+        shared: &SharedState,
+        pane: u32,
+        capture_keyboard: bool,
+    ) -> EventHandler {
         let mut grids = std::collections::HashMap::new();
         grids.insert(pane, CellGrid::new(3, 5));
-        let el = build_pane_body(PaneId(pane), true, 13, shared, &grids);
+        let el = build_pane_body(PaneId(pane), capture_keyboard, 13, shared, &grids);
         el.children[0]
             .handlers
             .iter()
@@ -2518,6 +2570,67 @@ mod tests_mouse_selection_copy_paste {
         let guard = shared.lock().unwrap();
         let term = guard.terminals.get(&1).unwrap().lock().unwrap();
         assert_eq!(term.scroll_offset(), 1);
+    }
+
+    /// The wheel belongs to the pane under the pointer. Focus pane 2,
+    /// scroll pane 1's handler: pane 1's scrollback moves and pane 2's
+    /// stays put, and focus itself is untouched (scrolling is not an
+    /// activation gesture).
+    #[test]
+    fn wheel_scroll_over_unfocused_pane_scrolls_that_pane_not_the_focused_one() {
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        {
+            let mut guard = shared.lock().unwrap();
+            // Pane 2 has the keyboard; pane 1 is the hovered background
+            // half of the split.
+            guard.active_pane = PaneId(2);
+            for pane in [1u32, 2u32] {
+                let mut term = crate::terminal::Terminal::new(3, 5);
+                term.process_bytes(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+                guard.terminals.insert(pane, Arc::new(Mutex::new(term)));
+            }
+        }
+        let handler = scroll_handler_for_pane_with_focus(&shared, 1, false);
+
+        let cell_h = CellGrid::global_cell_h().max(1.0);
+        let patch = (handler)(&wheel_event(cell_h * 2.0))
+            .expect("scroll handler must return a value")
+            .downcast::<unshit::app::app::ScrollGridPatch>()
+            .expect("scroll handler must return a ScrollGridPatch");
+        assert!(
+            patch.grid.is_some(),
+            "hover-scrolling an unfocused pane must repaint it"
+        );
+
+        let guard = shared.lock().unwrap();
+        assert_eq!(
+            guard
+                .terminals
+                .get(&1)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scroll_offset(),
+            1,
+            "the hovered (unfocused) pane must scroll"
+        );
+        assert_eq!(
+            guard
+                .terminals
+                .get(&2)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scroll_offset(),
+            0,
+            "the focused pane must not steal the wheel"
+        );
+        assert_eq!(
+            guard.active_pane,
+            PaneId(2),
+            "scrolling must not move keyboard focus"
+        );
     }
 
     #[test]
