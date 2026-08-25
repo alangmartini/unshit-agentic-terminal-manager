@@ -1,9 +1,10 @@
 use std::time::Instant;
+use unshit_app::app::{apply_scroll_grid_patch, ScrollGridPatch};
 use unshit_core::element::{ElementContent, InputType, Tag};
 use unshit_core::event::{
     dispatch_click, dispatch_context_menu, find_drag_handler, find_focusable_ancestor, hit_test,
-    next_focusable, prev_focusable, word_boundary_at, DragEvent, DragPhase, MouseButton,
-    TextSelection, DRAG_THRESHOLD,
+    next_focusable, prev_focusable, word_boundary_at, DragEvent, DragPhase, Event, EventType,
+    Modifiers, MouseButton, ScrollEvent, TextSelection, DRAG_THRESHOLD,
 };
 use unshit_core::id::NodeId;
 use unshit_core::layout;
@@ -120,6 +121,14 @@ impl TestHarness {
             return;
         }
 
+        self.refresh_hover(x, y);
+    }
+
+    /// Recompute scrollbar hover and the hovered node for the pointer at
+    /// (x, y), mirroring the production app's `handle_normal_hover`. Split
+    /// out of [`TestHarness::mouse_move`] so the wheel path can re-run it
+    /// after a container scroll moves content under a stationary cursor.
+    fn refresh_hover(&mut self, x: f32, y: f32) {
         // Check scrollbar hover
         let sb_hit = scroll::find_scrollbar_at(&self.arena, self.root, x, y);
         self.scrollbar_visual.set_hover(sb_hit.as_ref());
@@ -339,15 +348,104 @@ impl TestHarness {
 
     /// Simulate a mouse wheel event at (x, y) with the given delta.
     ///
-    /// Walks up from the hovered element to find a scroll container
-    /// (`overflow: scroll`) and applies the delta, clamped to content bounds.
+    /// Mirrors both halves of the production app's `WindowEvent::MouseWheel`
+    /// path, in the same order:
+    ///
+    /// 1. **Container scrolling.** Walks up from the hovered element to find
+    ///    a scroll container (`overflow: scroll` / `auto`) and applies the
+    ///    delta, clamped to content bounds. A scroll that actually moved
+    ///    refreshes hover, because the node under a stationary cursor may
+    ///    have changed.
+    /// 2. **Element dispatch.** Builds a `ScrollEvent` and walks from the
+    ///    hovered element up to the root, firing the *first* element
+    ///    carrying an `EventType::Scroll` handler and then stopping (bubble
+    ///    semantics; the walk also stops at a dangling parent). A handler
+    ///    returning a boxed `ScrollGridPatch` whose `grid` is set has that
+    ///    grid written onto the handling node through the app's own
+    ///    `apply_scroll_grid_patch`, so harness and app cannot drift.
+    ///
+    /// Dispatch is hover-driven, never focus-driven: the handler under the
+    /// pointer fires even when a different element holds focus.
+    ///
+    /// # What this deliberately does not replicate
+    ///
+    /// The harness is synchronous and has no clock, window, or app config,
+    /// so it reproduces only the deterministic subset of the real path:
+    ///
+    /// - **No animation.** The event is always built with `animate: false`,
+    ///   `smooth_duration_ms: 0.0` and `smooth_initial_slope: 0.0`, so
+    ///   handlers take their instant path. Container smooth scrolling is
+    ///   skipped for the same reason: `scroll_by` lands the delta at once.
+    /// - **No grid-animation hooks.** A `ScrollGridPatch::animation` hook is
+    ///   dropped rather than registered; there is no animation tick to
+    ///   drive it and no clock to sample it with.
+    /// - **No rebuild fallback.** The app sets `needs_rebuild` when a
+    ///   handler returns something other than a `ScrollGridPatch`, or when
+    ///   the patch cannot be applied in place (node gone, non-grid content,
+    ///   changed dimensions). The harness never rebuilds - it does not
+    ///   retain the tree builder - so those cases are no-ops here.
+    /// - **No modifiers.** `modifiers` is always empty; the harness tracks
+    ///   no live modifier state, so modifier-gated handler branches (for
+    ///   example Shift+wheel) are not reachable through this entry point.
+    /// - **Raw deltas.** `delta_x` / `delta_y` are passed through as given:
+    ///   no `LineDelta`-to-pixel conversion, no scale or zoom factor, no
+    ///   scroll tuning, and no Ctrl+wheel zoom branch.
+    /// - **No container axis remap.** The app runs container deltas through
+    ///   `wheel_delta_for_container`, so a vertical wheel over a
+    ///   horizontally-overflowing container moves it sideways. The harness
+    ///   applies the raw deltas to the container. (Pre-existing gap; the
+    ///   element event carries raw deltas in both.)
+    /// - **No telemetry and no redraw requests.**
     pub fn mouse_wheel(&mut self, x: f32, y: f32, delta_x: f32, delta_y: f32) {
         self.mouse_move(x, y);
 
         let scroll_target = scroll::find_scroll_container(&self.arena, self.interaction.hovered);
 
         if let Some(target_id) = scroll_target {
-            scroll::scroll_by(&mut self.arena, &self.taffy, target_id, delta_x, delta_y);
+            if scroll::scroll_by(&mut self.arena, &self.taffy, target_id, delta_x, delta_y) {
+                self.refresh_hover(x, y);
+            }
+        }
+
+        // Dispatch Scroll to element handlers, matching the app's walk.
+        let pos = self.interaction.last_cursor_pos;
+        let scroll_evt = Event::Scroll(ScrollEvent {
+            delta_x,
+            delta_y,
+            x: pos.0,
+            y: pos.1,
+            animate: false,
+            smooth_duration_ms: 0.0,
+            smooth_initial_slope: 0.0,
+            modifiers: Modifiers::empty(),
+        });
+
+        let mut node = self.interaction.hovered;
+        while let Some(element) = self.arena.get(node) {
+            let handler = element
+                .handlers
+                .iter()
+                .find(|(et, _)| *et == EventType::Scroll)
+                .map(|(_, handler)| handler.clone());
+            if let Some(handler) = handler {
+                if let Some(patch) =
+                    handler(&scroll_evt).and_then(|value| value.downcast::<ScrollGridPatch>().ok())
+                {
+                    if let Some(grid) = patch.grid {
+                        // A `false` return is where the app would fall back
+                        // to a full rebuild; the harness has no rebuild.
+                        apply_scroll_grid_patch(&mut self.arena, node, grid);
+                    }
+                    // `patch.animation` is intentionally dropped: see the
+                    // fidelity notes above.
+                }
+                break;
+            }
+            let parent = element.parent;
+            if parent.is_dangling() {
+                break;
+            }
+            node = parent;
         }
     }
 

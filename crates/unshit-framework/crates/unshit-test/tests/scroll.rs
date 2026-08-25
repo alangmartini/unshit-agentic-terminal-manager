@@ -1,7 +1,11 @@
+use std::any::Any;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use unshit_app::app::ScrollGridPatch;
+use unshit_core::cell_grid::{Cell, CellGrid};
 use unshit_core::dirty::DirtyFlags;
-use unshit_core::element::{ElementDef, ElementTree, Tag};
+use unshit_core::element::{ElementContent, ElementDef, ElementTree, Tag};
+use unshit_core::event::{Event, EventType};
 use unshit_test::TestHarness;
 
 fn scroll_css() -> &'static str {
@@ -516,4 +520,268 @@ fn scrollbar_not_interactive_when_content_fits() {
     );
     assert!(v_geom.is_none(), "no vertical scrollbar when content fits");
     assert!(h_geom.is_none(), "no horizontal scrollbar when content fits");
+}
+
+// ---------------------------------------------------------------------------
+// Element `Scroll` handler dispatch
+//
+// Container scrolling (above) is only half of the real wheel path.
+// `TestHarness::mouse_wheel` also bubbles an `EventType::Scroll` event from
+// the hovered element to the root, firing the first handler it finds -- the
+// path app-managed scroll surfaces (terminal panes, the editor) rely on
+// exclusively. These tests pin that half down.
+// ---------------------------------------------------------------------------
+
+fn handler_css() -> &'static str {
+    r#"
+    .root { display: flex; flex-direction: row; width: 100%; height: 100%; }
+    .outer {
+        display: flex;
+        flex-shrink: 0;
+        width: 400px;
+        height: 300px;
+        background: #111111;
+    }
+    .inner {
+        display: flex;
+        flex-shrink: 0;
+        width: 200px;
+        height: 150px;
+        background: #222222;
+    }
+    .sink {
+        display: flex;
+        flex-shrink: 0;
+        width: 80px;
+        height: 80px;
+        background: #333333;
+    }
+    .grid-pane {
+        display: flex;
+        flex-shrink: 0;
+        width: 300px;
+        height: 200px;
+        background: #111111;
+    }
+    "#
+}
+
+/// Center of the first element matching `selector`.
+fn center_of(h: &TestHarness, selector: &str) -> (f32, f32) {
+    let snap = h.query(selector).unwrap_or_else(|| panic!("{selector} exists"));
+    let r = snap.layout_rect;
+    (r.x + r.width / 2.0, r.y + r.height / 2.0)
+}
+
+/// A `Scroll` handler that records `(delta_x, delta_y, animate)` and consumes
+/// the event without returning a patch.
+fn recording_scroll_handler(
+    log: Arc<Mutex<Vec<(f32, f32, bool)>>>,
+) -> impl Fn(&Event) -> Option<Box<dyn Any>> + Send + Sync + 'static {
+    move |event| {
+        if let Event::Scroll(scroll) = event {
+            log.lock().unwrap().push((scroll.delta_x, scroll.delta_y, scroll.animate));
+        }
+        None
+    }
+}
+
+#[test]
+fn wheel_fires_scroll_handler_on_hovered_element() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let tree_log = log.clone();
+    let mut h = TestHarness::new(
+        handler_css(),
+        move || ElementTree {
+            root: ElementDef::new(Tag::Div).with_class("root").with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("outer")
+                    .on(EventType::Scroll, recording_scroll_handler(tree_log.clone())),
+            ),
+        },
+        800.0,
+        600.0,
+    );
+    h.step();
+
+    let (cx, cy) = center_of(&h, ".outer");
+    h.mouse_wheel(cx, cy, 3.0, -120.0);
+
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "a wheel over an element with a Scroll handler must fire it once");
+    assert_eq!(
+        seen[0],
+        (3.0, -120.0, false),
+        "the element event carries the raw deltas and the deterministic instant path"
+    );
+}
+
+#[test]
+fn wheel_bubbles_to_nearest_ancestor_scroll_handler() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let tree_log = log.clone();
+    let mut h = TestHarness::new(
+        handler_css(),
+        move || ElementTree {
+            root: ElementDef::new(Tag::Div).with_class("root").with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("outer")
+                    .on(EventType::Scroll, recording_scroll_handler(tree_log.clone()))
+                    .with_child(ElementDef::new(Tag::Div).with_class("inner")),
+            ),
+        },
+        800.0,
+        600.0,
+    );
+    h.step();
+
+    let (cx, cy) = center_of(&h, ".inner");
+    h.mouse_move(cx, cy);
+    let inner_id = h.query(".inner").expect("inner exists").node_id;
+    assert_eq!(h.hovered(), inner_id, "the handler-less child must be the hovered node");
+
+    h.mouse_wheel(cx, cy, 0.0, -60.0);
+
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "a wheel over a child with no handler must bubble to the nearest ancestor handler"
+    );
+    assert_eq!(seen[0].1, -60.0);
+}
+
+#[test]
+fn wheel_fires_only_the_first_scroll_handler() {
+    let child_log = Arc::new(Mutex::new(Vec::new()));
+    let ancestor_log = Arc::new(Mutex::new(Vec::new()));
+    let tree_child = child_log.clone();
+    let tree_ancestor = ancestor_log.clone();
+    let mut h = TestHarness::new(
+        handler_css(),
+        move || ElementTree {
+            root: ElementDef::new(Tag::Div).with_class("root").with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("outer")
+                    .on(EventType::Scroll, recording_scroll_handler(tree_ancestor.clone()))
+                    .with_child(
+                        ElementDef::new(Tag::Div)
+                            .with_class("inner")
+                            .on(EventType::Scroll, recording_scroll_handler(tree_child.clone())),
+                    ),
+            ),
+        },
+        800.0,
+        600.0,
+    );
+    h.step();
+
+    let (cx, cy) = center_of(&h, ".inner");
+    h.mouse_wheel(cx, cy, 0.0, -60.0);
+
+    assert_eq!(child_log.lock().unwrap().len(), 1, "the innermost handler must fire");
+    assert_eq!(
+        ancestor_log.lock().unwrap().len(),
+        0,
+        "dispatch stops at the first handler: the ancestor must not also fire"
+    );
+}
+
+#[test]
+fn wheel_fires_handler_under_pointer_regardless_of_focus() {
+    // Wheel dispatch is hover-driven, never focus-driven. The app depends on
+    // this: a pane scrolls under the pointer while a different pane (or an
+    // input) holds focus.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let tree_log = log.clone();
+    let mut h = TestHarness::new(
+        handler_css(),
+        move || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("outer")
+                        .on(EventType::Scroll, recording_scroll_handler(tree_log.clone())),
+                )
+                .with_child(ElementDef::new(Tag::Div).with_class("sink")),
+        },
+        800.0,
+        600.0,
+    );
+    h.step();
+
+    // Park focus on a completely different element with no Scroll handler.
+    let sink_id = h.query(".sink").expect("sink exists").node_id;
+    h.focus(sink_id);
+    h.step();
+    assert_eq!(h.focused(), sink_id, "focus must be parked off the wheel target");
+
+    let (cx, cy) = center_of(&h, ".outer");
+    h.mouse_wheel(cx, cy, 0.0, -90.0);
+
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "the handler under the pointer must fire even though another element holds focus"
+    );
+    assert_eq!(h.focused(), sink_id, "wheel dispatch must not move focus");
+}
+
+#[test]
+fn wheel_handler_scroll_grid_patch_updates_node_grid() {
+    const ROWS: usize = 4;
+    const COLS: usize = 8;
+
+    let mut h = TestHarness::new(
+        handler_css(),
+        move || ElementTree {
+            root: ElementDef::new(Tag::Div).with_class("root").with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("grid-pane")
+                    .with_grid(CellGrid::new(ROWS, COLS))
+                    .on(EventType::Scroll, move |_event| {
+                        // Same dimensions, so this takes the in-place patch
+                        // path rather than the app's rebuild fallback.
+                        let mut grid = CellGrid::new(ROWS, COLS);
+                        grid.set_cell(0, 0, Cell::with_char('Z'));
+                        Some(Box::new(ScrollGridPatch { grid: Some(grid), animation: None })
+                            as Box<dyn Any>)
+                    }),
+            ),
+        },
+        800.0,
+        600.0,
+    );
+    h.step();
+
+    let pane_id = h.query(".grid-pane").expect("grid-pane exists").node_id;
+    match &h.arena().get(pane_id).expect("grid-pane element exists").content {
+        ElementContent::Grid(grid) => {
+            assert_eq!(grid.get_cell(0, 0).map(|c| c.ch), Some('\0'), "grid starts empty");
+        }
+        _ => panic!("grid-pane must start with grid content"),
+    }
+
+    let root_id = h.root();
+    unshit_renderer::batch::clear_paint_flags_subtree(h.arena_mut(), root_id);
+
+    let (cx, cy) = center_of(&h, ".grid-pane");
+    h.mouse_wheel(cx, cy, 0.0, -120.0);
+
+    let pane = h.arena().get(pane_id).expect("grid-pane element exists");
+    match &pane.content {
+        ElementContent::Grid(grid) => {
+            assert_eq!(
+                grid.get_cell(0, 0).map(|c| c.ch),
+                Some('Z'),
+                "a handler-returned ScrollGridPatch must be written onto the handling node"
+            );
+        }
+        _ => panic!("grid-pane must still hold grid content"),
+    }
+    assert!(
+        pane.dirty.contains(DirtyFlags::PAINT),
+        "an applied grid patch must paint-dirty the handling node"
+    );
 }
