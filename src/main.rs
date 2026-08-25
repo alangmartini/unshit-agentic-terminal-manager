@@ -1600,6 +1600,112 @@ mod tests {
         );
     }
 
+    /// End-to-end proof that the wheel follows the pointer, driven through
+    /// the real element tree rather than by calling the pane's handler
+    /// directly: two stacked panes, focus on the BOTTOM one, wheel over the
+    /// TOP one. The top pane's scrollback must move, the focused bottom
+    /// pane's must not, and focus must stay where it was.
+    ///
+    /// This is the test that was impossible to write before the headless
+    /// harness learned to dispatch element `Scroll` handlers -- it is the
+    /// only coverage of the framework's hover -> element-Scroll routing
+    /// that the terminal panes actually depend on.
+    #[test]
+    fn wheel_over_unfocused_pane_scrolls_it_through_the_real_tree() {
+        use unshit::core::cell_grid::CellGrid;
+
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        let mut state = seed_state();
+        let top = crate::state::Pane {
+            id: crate::state::PaneId(1),
+            title: "top".to_string(),
+            subtitle: "bash".to_string(),
+            pid: 0,
+            cpu: 0.0,
+        };
+        let bottom = crate::state::Pane {
+            id: crate::state::PaneId(2),
+            ..top.clone()
+        };
+        // Two rows, one pane each: a vertical split, top over bottom.
+        state.panes = vec![vec![top], vec![bottom]];
+        state.row_ratios = vec![0.5, 0.5];
+        state.col_ratios = vec![vec![1.0], vec![1.0]];
+        state.tabs[0].panes = state.panes.clone();
+        state.tabs[0].row_ratios = state.row_ratios.clone();
+        state.tabs[0].col_ratios = state.col_ratios.clone();
+        // The BOTTOM pane holds the keyboard.
+        state.active_pane = crate::state::PaneId(2);
+        state.tabs[0].active_pane = crate::state::PaneId(2);
+
+        // Both panes get scrollback so either one *could* move.
+        for pane in [1u32, 2u32] {
+            let mut term = crate::terminal::Terminal::new(3, 5);
+            term.process_bytes(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+            state.terminals.insert(pane, Arc::new(Mutex::new(term)));
+        }
+
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1u32, CellGrid::new(3, 5));
+        grids.insert(2u32, CellGrid::new(3, 5));
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&tree_snap, &tree_shared, &grids, None),
+            1280.0,
+            900.0,
+        );
+        harness.step();
+
+        let contents = harness.query_all(".terminal-content");
+        assert_eq!(contents.len(), 2, "both panes must render a grid");
+        // Topmost rect == the unfocused pane.
+        let upper = contents
+            .iter()
+            .min_by(|a, b| a.layout_rect.y.total_cmp(&b.layout_rect.y))
+            .expect("an upper pane");
+        let cx = upper.layout_rect.x + upper.layout_rect.width * 0.5;
+        let cy = upper.layout_rect.y + upper.layout_rect.height * 0.5;
+
+        // Wheel up (toward older history) over the UNFOCUSED upper pane.
+        let cell_h = CellGrid::global_cell_h().max(1.0);
+        harness.mouse_wheel(cx, cy, 0.0, cell_h * 2.0);
+        harness.step();
+
+        let guard = shared.lock().unwrap();
+        assert_eq!(
+            guard
+                .terminals
+                .get(&1)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scroll_offset(),
+            1,
+            "the hovered (unfocused) upper pane must scroll"
+        );
+        assert_eq!(
+            guard
+                .terminals
+                .get(&2)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scroll_offset(),
+            0,
+            "the focused lower pane must not steal the wheel"
+        );
+        assert_eq!(
+            guard.active_pane,
+            crate::state::PaneId(2),
+            "scrolling must not move keyboard focus"
+        );
+    }
+
     #[test]
     fn renderer_font_sources_prefer_jetbrains() {
         let fonts = terminal_font_sources_from_value(None);
