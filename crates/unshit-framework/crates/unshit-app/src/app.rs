@@ -3768,7 +3768,21 @@ impl ApplicationHandler for AppHandler {
                 }
             }
 
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
+                // Synthetic key events report which keys were physically
+                // held when the window lost or gained focus (Windows and
+                // X11 only). They are state notifications, not input.
+                // Routing a focus-gain press as a real keystroke types
+                // whatever the user happened to be holding at the moment
+                // the window came back -- the tail of an Alt+Tab, Win+D or
+                // Alt+Esc chord -- into the focused element, which for a
+                // terminal pane means it reaches the shell. They also
+                // arrive with the modifier flags already cleared, so the
+                // chord that produced them cannot even be recognised.
+                if is_synthetic {
+                    return;
+                }
+
                 if event.state == winit::event::ElementState::Pressed {
                     // FIRST: check if focused element captures keyboard input
                     let mut focused_captures = state
