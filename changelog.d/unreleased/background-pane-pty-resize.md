@@ -1,0 +1,3 @@
+### Fixed
+
+- **Background panes in a split no longer keep the wrong size after a resize.** Only the focused pane told its shell how big it had become, so resizing the window, dragging a splitter or collapsing the sidebar left every other pane's shell still wrapping at the old width — a `top`, a build log or an agent CLI in the other half of a split would paint at the stale geometry until you clicked it, which was the only thing that corrected it. Every visible pane now reports its own size, and a pane whose size has not actually been measured yet is skipped instead of pushing a one-column geometry at a live shell.
