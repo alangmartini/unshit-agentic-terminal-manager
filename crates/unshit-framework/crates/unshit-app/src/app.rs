@@ -1045,7 +1045,11 @@ pub enum GridTick {
 /// its ancestors and skips style and layout entirely. Returns `false` when
 /// the node is gone, its content is not a grid, or the dimensions differ;
 /// those cases can affect layout and must go through a full rebuild.
-fn apply_scroll_grid_patch(
+///
+/// `pub` so the headless test harness (`unshit-test`) applies wheel-dispatch
+/// grid patches through this exact function rather than a copy that could
+/// drift from it.
+pub fn apply_scroll_grid_patch(
     arena: &mut NodeArena,
     node_id: NodeId,
     grid: unshit_core::cell_grid::CellGrid,
