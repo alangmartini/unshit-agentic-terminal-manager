@@ -123,7 +123,11 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
 /// - `Alt+Space` opens the window menu.
 /// - Every `Meta` (Windows / Command key) chord belongs to the window
 ///   manager or the app, never to the terminal.
-fn is_os_reserved_chord(key: Key, modifiers: Modifiers) -> bool {
+///
+/// Public to the crate so the caller can tell a deliberate suppression
+/// apart from a key that simply has no terminal encoding when it reports
+/// the drop to the diagnostics snapshot.
+pub(crate) fn is_os_reserved_chord(key: Key, modifiers: Modifiers) -> bool {
     if modifiers.contains(Modifiers::META) {
         return true;
     }

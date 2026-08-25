@@ -816,6 +816,32 @@ fn build_pane_body(
                                     ),
                                 }
                             });
+                        } else if crate::terminal::keys::is_os_reserved_chord(
+                            kb.key,
+                            kb.modifiers,
+                        ) {
+                            // A window-manager chord reached the pane instead
+                            // of being swallowed by the OS (issue #179). The
+                            // encoder declined it, so nothing was typed into
+                            // the shell -- record the drop so a later "this
+                            // chord stopped working" report can be told apart
+                            // from a key that never arrived. Only reserved
+                            // chords land here, so this stays rare, and the
+                            // character behind `Key::Char` is deliberately not
+                            // logged.
+                            let key_label = match kb.key {
+                                Key::Char(_) => "char".to_string(),
+                                other => other.to_string(),
+                            };
+                            mutate_with(&kbd_shared, |st| {
+                                record_diagnostic_pty_event(
+                                    st,
+                                    format!(
+                                        "key_suppressed pane={} key={} mods={:?} reason=os_reserved_chord",
+                                        kbd_pane_id.0, key_label, kb.modifiers
+                                    ),
+                                );
+                            });
                         }
                     }
                     None
