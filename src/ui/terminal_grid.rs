@@ -664,14 +664,26 @@ fn forward_wheel_if_mouse_mode(
         // line of reports, so it never leaks into local scrollback.
         if !bytes.is_empty() {
             let byte_count = bytes.len();
+            // `active` tells a hover-scrolled background pane apart from
+            // the focused one: the wheel follows the pointer, so reports
+            // can legitimately reach a PTY that has no keyboard focus,
+            // and a later "my unfocused pane reacted to the mouse"
+            // report needs to be readable straight off this line.
+            let active = st.active_pane.0 == pane;
             match st.pty_manager.write(pane, &bytes) {
                 Ok(()) => record_diagnostic_pty_event(
                     st,
-                    format!("write pane={} bytes={} source=wheel", pane, byte_count),
+                    format!(
+                        "write pane={} bytes={} source=wheel active={}",
+                        pane, byte_count, active
+                    ),
                 ),
                 Err(e) => record_diagnostic_pty_event(
                     st,
-                    format!("write_failed pane={} source=wheel error={}", pane, e),
+                    format!(
+                        "write_failed pane={} source=wheel active={} error={}",
+                        pane, active, e
+                    ),
                 ),
             }
         }
@@ -816,112 +828,174 @@ fn build_pane_body(
                                     ),
                                 }
                             });
+                        } else if crate::terminal::keys::is_os_reserved_chord(
+                            kb.key,
+                            kb.modifiers,
+                        ) {
+                            // A window-manager chord reached the pane instead
+                            // of being swallowed by the OS (issue #179). The
+                            // encoder declined it, so nothing was typed into
+                            // the shell -- record the drop so a later "this
+                            // chord stopped working" report can be told apart
+                            // from a key that never arrived. Only reserved
+                            // chords land here, so this stays rare, and the
+                            // character behind `Key::Char` is deliberately not
+                            // logged.
+                            let key_label = match kb.key {
+                                Key::Char(_) => "char".to_string(),
+                                other => other.to_string(),
+                            };
+                            mutate_with(&kbd_shared, |st| {
+                                record_diagnostic_pty_event(
+                                    st,
+                                    format!(
+                                        "key_suppressed pane={} key={} mods={:?} reason=os_reserved_chord",
+                                        kbd_pane_id.0, key_label, kb.modifiers
+                                    ),
+                                );
+                            });
                         }
                     }
                     None
                 },
             );
-
-            // Mouse wheel scrolls the scrollback buffer.
-            // delta_y > 0 = wheel up (toward older history).
-            // delta_y < 0 = wheel down (toward live screen).
-            //
-            // Stepped-wheel input (`animate == true`) eases each notch
-            // toward its target through the terminal's `ScrollMotion`
-            // with the framework-provided duration/slope (bit-identical
-            // feel to the settings-page smooth scroll) and registers a
-            // grid-animation hook so the framework repaints the pane at
-            // the animation cadence with sub-row precision. Precision
-            // devices (`PixelDelta` touchpads) keep the instant path:
-            // fractional lines carry over inside the terminal's
-            // accumulator so the input tracks 1:1.
-            //
-            // Both paths return a `ScrollGridPatch` so repaints are
-            // paint-only content patches on this node, never full tree
-            // rebuilds.
-            let scroll_shared = shared.clone();
-            let scroll_pane_id = pane_id;
-            grid_el = grid_el.on(
-                EventType::Scroll,
-                move |event: &Event| -> Option<Box<dyn std::any::Any>> {
-                    if let Event::Scroll(se) = event {
-                        use unshit::core::cell_grid::CellGrid;
-                        let cell_h = CellGrid::global_cell_h().max(1.0);
-                        // A program capturing the mouse (DECSET 1000/1002/1003)
-                        // owns the wheel: forward the notch as mouse reports so
-                        // the TUI scrolls its own content. Shift+wheel is the
-                        // escape hatch that always drives local scrollback
-                        // (xterm convention), so it skips forwarding.
-                        if !se.modifiers.contains(Modifiers::SHIFT) {
-                            if let Some(patch) = forward_wheel_if_mouse_mode(
-                                &scroll_shared,
-                                scroll_pane_id.0,
-                                se.delta_y,
-                                cell_h,
-                            ) {
-                                return Some(Box::new(patch));
-                            }
-                        }
-                        let patch = if se.animate {
-                            handle_animated_wheel(&scroll_shared, scroll_pane_id.0, se, cell_h)
-                        } else {
-                            handle_instant_wheel(
-                                &scroll_shared,
-                                scroll_pane_id.0,
-                                se.delta_y,
-                                cell_h,
-                            )
-                        };
-                        return Some(Box::new(patch));
-                    }
-                    None
-                },
-            );
-
-            // Register resize handler to update PTY dimensions.
-            // Prefer the renderer-computed pending resize (exact), fall
-            // back to global cell metrics, then to hardcoded estimates.
-            // Note: this fires with THIS pane's terminal-content size, not
-            // the whole grid. The full-grid dimensions used for hit-testing
-            // are captured by `.terminal-grid`'s own on_resize (see
-            // `build_terminal_grid`).
-            let resize_shared = shared.clone();
-            let resize_pane_id = pane_id;
-            grid_el = grid_el.on_resize(move |w, h| {
-                use unshit::core::cell_grid::CellGrid;
-
-                mutate_with(&resize_shared, |st| {
-                    // Use the renderer's published cell metrics when available.
-                    // On the first frame, metrics may be 0 because on_resize
-                    // fires before the render pass. The on_cell_metrics callback
-                    // and blink subscription handle the initial correction.
-                    let cell_w = CellGrid::global_cell_w();
-                    let cell_h = CellGrid::global_cell_h();
-                    if cell_w > 0.0 && cell_h > 0.0 {
-                        let cols = (w / cell_w).max(1.0) as u16;
-                        let rows = (h / cell_h).max(1.0) as u16;
-                        let dims_changed = if let Some(handle) = st.terminals.get(&resize_pane_id.0)
-                        {
-                            let mut terminal = handle.lock().expect("terminal mutex poisoned");
-                            let changed = terminal.grid().rows() != rows as usize
-                                || terminal.grid().cols() != cols as usize;
-                            terminal.resize_viewport_growth(rows as usize, cols as usize);
-                            changed
-                        } else {
-                            false
-                        };
-                        // A resize reflows the grid, so any selection's
-                        // display coordinates no longer map to the text the
-                        // user highlighted. Drop it rather than silently
-                        // copy clamped/truncated content.
-                        if dims_changed {
-                            crate::state::clear_terminal_selection(st, resize_pane_id.0);
-                        }
-                        st.pty_manager.resize(resize_pane_id.0, cols, rows);
-                    }
-                });
-            });
         }
+
+        // Keep this pane's terminal emulator and PTY in step with its
+        // on-screen size.
+        //
+        // Registered for EVERY pane with a grid, not just the focused one
+        // (so it sits outside the `capture_keyboard` gate above):
+        // `capture_keyboard` decides who receives typing, and geometry is
+        // not input. While this handler lived inside that gate, a
+        // background pane in a split kept its old rows/cols after a window
+        // resize, a splitter drag, or a sidebar toggle -- the shell went on
+        // wrapping at the stale width while the grid was drawn at the stale
+        // size. The only correction was incidental: the framework fires
+        // `on_resize` only when a node's rect differs from its
+        // `prev_width`/`prev_height`, and those advance only when the
+        // callback fires, so re-attaching the handler on focus made it fire
+        // once with the current size. That healed the pane a click too late.
+        //
+        // Ungating is safe because panes of non-active tabs are never in
+        // the tree: `AppState::panes` holds only the active tab's layout
+        // (see `save_tab_state` / `load_tab_state`), and the settings route
+        // does not build the terminal grid at all. So no hidden or
+        // collapsed pane can reach this and push a nonsense size.
+        //
+        // Note: this fires with THIS pane's terminal-content size, not the
+        // whole grid. The full-grid dimensions used for hit-testing are
+        // captured by `.terminal-grid`'s own on_resize (see
+        // `build_terminal_grid`).
+        let resize_shared = shared.clone();
+        let resize_pane_id = pane_id;
+        grid_el = grid_el.on_resize(move |w, h| {
+            use unshit::core::cell_grid::CellGrid;
+
+            // A non-positive rect is never a real pane geometry -- it means
+            // the node was measured before layout gave it a size. `cols` and
+            // `rows` are floored at 1, so letting a zero through would push a
+            // 1x1 PTY and make a live shell reflow every line to one column.
+            // The cell-metric check below does NOT cover this: those metrics
+            // are process-global and stay valid across frames, so they are
+            // non-zero long before an individual pane has been laid out.
+            if w <= 0.0 || h <= 0.0 {
+                return;
+            }
+
+            mutate_with(&resize_shared, |st| {
+                // Use the renderer's published cell metrics when available.
+                // On the first frame, metrics may be 0 because on_resize
+                // fires before the render pass. The on_cell_metrics callback
+                // and blink subscription handle the initial correction.
+                let cell_w = CellGrid::global_cell_w();
+                let cell_h = CellGrid::global_cell_h();
+                if cell_w > 0.0 && cell_h > 0.0 {
+                    let cols = (w / cell_w).max(1.0) as u16;
+                    let rows = (h / cell_h).max(1.0) as u16;
+                    let dims_changed = if let Some(handle) = st.terminals.get(&resize_pane_id.0) {
+                        let mut terminal = handle.lock().expect("terminal mutex poisoned");
+                        let changed = terminal.grid().rows() != rows as usize
+                            || terminal.grid().cols() != cols as usize;
+                        terminal.resize_viewport_growth(rows as usize, cols as usize);
+                        changed
+                    } else {
+                        false
+                    };
+                    // A resize reflows the grid, so any selection's
+                    // display coordinates no longer map to the text the
+                    // user highlighted. Drop it rather than silently
+                    // copy clamped/truncated content. Gated on
+                    // `dims_changed`, so a pane whose size did not actually
+                    // change keeps a selection the user is still holding.
+                    if dims_changed {
+                        crate::state::clear_terminal_selection(st, resize_pane_id.0);
+                    }
+                    st.pty_manager.resize(resize_pane_id.0, cols, rows);
+                }
+            });
+        });
+
+        // Mouse wheel scrolls the scrollback buffer.
+        // delta_y > 0 = wheel up (toward older history).
+        // delta_y < 0 = wheel down (toward live screen).
+        //
+        // Registered for EVERY pane with a grid, not just the focused
+        // one (so it sits outside the `capture_keyboard` gate above):
+        // the framework dispatches Scroll from the hovered element
+        // upward, so the wheel always drives the pane under the
+        // pointer. Reading a split's other half no longer costs a
+        // click, and focus is deliberately left alone -- scrolling is
+        // not an activation gesture. Keyboard capture stays focus-gated;
+        // the wheel follows the pointer and the resize handler above
+        // follows every visible pane's geometry.
+        //
+        // Stepped-wheel input (`animate == true`) eases each notch
+        // toward its target through the terminal's `ScrollMotion`
+        // with the framework-provided duration/slope (bit-identical
+        // feel to the settings-page smooth scroll) and registers a
+        // grid-animation hook so the framework repaints the pane at
+        // the animation cadence with sub-row precision. Precision
+        // devices (`PixelDelta` touchpads) keep the instant path:
+        // fractional lines carry over inside the terminal's
+        // accumulator so the input tracks 1:1.
+        //
+        // Both paths return a `ScrollGridPatch` so repaints are
+        // paint-only content patches on this node, never full tree
+        // rebuilds.
+        let scroll_shared = shared.clone();
+        let scroll_pane_id = pane_id;
+        grid_el = grid_el.on(
+            EventType::Scroll,
+            move |event: &Event| -> Option<Box<dyn std::any::Any>> {
+                if let Event::Scroll(se) = event {
+                    use unshit::core::cell_grid::CellGrid;
+                    let cell_h = CellGrid::global_cell_h().max(1.0);
+                    // A program capturing the mouse (DECSET 1000/1002/1003)
+                    // owns the wheel: forward the notch as mouse reports so
+                    // the TUI scrolls its own content. Shift+wheel is the
+                    // escape hatch that always drives local scrollback
+                    // (xterm convention), so it skips forwarding.
+                    if !se.modifiers.contains(Modifiers::SHIFT) {
+                        if let Some(patch) = forward_wheel_if_mouse_mode(
+                            &scroll_shared,
+                            scroll_pane_id.0,
+                            se.delta_y,
+                            cell_h,
+                        ) {
+                            return Some(Box::new(patch));
+                        }
+                    }
+                    let patch = if se.animate {
+                        handle_animated_wheel(&scroll_shared, scroll_pane_id.0, se, cell_h)
+                    } else {
+                        handle_instant_wheel(&scroll_shared, scroll_pane_id.0, se.delta_y, cell_h)
+                    };
+                    return Some(Box::new(patch));
+                }
+                None
+            },
+        );
 
         // Track links inside the GPU-backed grid at cell precision. The
         // framework delivers MouseMove continuously within the same element;
@@ -1695,17 +1769,28 @@ mod tests {
         grids.insert(1, CellGrid::new(24, 80));
         let el = build_pane_body(PaneId(1), false, 13, &shared, &grids);
         let grid_el = &el.children[0];
-        // Inactive panes still register mouse selection handlers (so the user
-        // can select / copy in any visible pane) but must NOT capture the
-        // keyboard or scroll, and must not register a PTY resize handler.
+        // Inactive panes still register mouse selection, wheel and resize
+        // handlers (so the user can select / copy and scroll in any visible
+        // pane, and every visible pane keeps its geometry in sync) but must
+        // NOT capture the keyboard: typing goes only to the focused pane.
         assert!(
             !grid_el
                 .handlers
                 .iter()
-                .any(|(et, _)| *et == EventType::KeyboardCapture || *et == EventType::Scroll),
-            "inactive pane must not capture keyboard or scroll"
+                .any(|(et, _)| *et == EventType::KeyboardCapture),
+            "inactive pane must not capture keyboard"
         );
-        assert!(grid_el.on_resize.is_none());
+        assert!(
+            grid_el
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::Scroll),
+            "inactive pane must still scroll: the wheel follows the pointer"
+        );
+        assert!(
+            grid_el.on_resize.is_some(),
+            "inactive pane must still track its own geometry"
+        );
     }
 
     #[test]
@@ -1972,6 +2057,126 @@ mod tests {
             term.grid().cols(),
             80,
             "snap-resize without width change must keep cols at 80"
+        );
+    }
+
+    /// Regression: a BACKGROUND pane must track its own geometry too.
+    ///
+    /// `on_resize` used to be registered only for the focused pane, so the
+    /// unfocused half of a split kept its old rows/cols after a window
+    /// resize, a splitter drag or a sidebar toggle: the shell went on
+    /// wrapping at the stale width while the grid was drawn at the stale
+    /// size. The framework only fires `on_resize` when a node's rect
+    /// differs from its `prev_width`/`prev_height`, and those advance only
+    /// when the callback fires, so re-attaching the handler on focus made
+    /// it fire once with the current size -- the pane healed, but only
+    /// after the user clicked it. Build the pane the way an unfocused half
+    /// of a split is built and drive the handler: it must reach the local
+    /// Terminal without any focus change.
+    #[test]
+    fn inactive_pane_resize_handler_updates_terminal_dimensions() {
+        let pane_id: u32 = 1;
+        let shared = test_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            // Focus is deliberately on another pane: this is the
+            // background half of a split.
+            guard.active_pane = PaneId(2);
+            let term = crate::terminal::Terminal::new(24, 80);
+            guard
+                .terminals
+                .insert(pane_id, std::sync::Arc::new(std::sync::Mutex::new(term)));
+        }
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id, CellGrid::new(24, 80));
+        // capture_keyboard = false: the pane is visible but not focused.
+        let body = build_pane_body(PaneId(pane_id), false, 13, &shared, &grids);
+        let content =
+            find_terminal_content(&body).expect("terminal-content must exist when grid present");
+        let on_resize = content
+            .on_resize
+            .as_ref()
+            .cloned()
+            .expect("every visible pane must register on_resize, not just the focused one");
+
+        // 1200x800 px of content at 10x20 px cells == 120 cols x 40 rows.
+        on_resize(1200.0, 800.0);
+
+        let guard = shared.lock().unwrap();
+        let term = guard
+            .terminals
+            .get(&pane_id)
+            .expect("local terminal still present");
+        let term = term.lock().unwrap();
+        assert_eq!(
+            term.grid().cols(),
+            120,
+            "background pane must reflow to the width it is actually drawn at"
+        );
+        assert_eq!(
+            term.grid().rows(),
+            40,
+            "background pane must reflow to the height it is actually drawn at"
+        );
+    }
+
+    /// The resize handler refuses a non-positive rect.
+    ///
+    /// `cols` and `rows` are floored at 1, so a pane measured before layout
+    /// gave it a size would otherwise push a 1x1 PTY and reflow a live
+    /// shell to a single column. The cell-metric check cannot catch this:
+    /// those metrics are process-global and are non-zero long before any
+    /// individual pane has been laid out. Nothing may be touched -- not the
+    /// grid dimensions, and not a selection the user is still holding.
+    #[test]
+    fn resize_handler_ignores_non_positive_pane_size() {
+        let pane_id: u32 = 1;
+        let shared = test_shared();
+        let selection = crate::state::TermSelection::new((3, 7), crate::state::SelectMode::Word);
+        {
+            let mut guard = shared.lock().unwrap();
+            let term = crate::terminal::Terminal::new(24, 80);
+            guard
+                .terminals
+                .insert(pane_id, std::sync::Arc::new(std::sync::Mutex::new(term)));
+            crate::state::set_terminal_selection(&mut guard, pane_id, selection);
+        }
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id, CellGrid::new(24, 80));
+        let body = build_pane_body(PaneId(pane_id), true, 13, &shared, &grids);
+        let content =
+            find_terminal_content(&body).expect("terminal-content must exist when grid present");
+        let on_resize = content
+            .on_resize
+            .as_ref()
+            .cloned()
+            .expect("active pane terminal-content must register on_resize");
+
+        on_resize(0.0, 800.0);
+        on_resize(1200.0, 0.0);
+        on_resize(-1.0, -1.0);
+
+        let guard = shared.lock().unwrap();
+        {
+            let term = guard
+                .terminals
+                .get(&pane_id)
+                .expect("local terminal still present");
+            let term = term.lock().unwrap();
+            assert_eq!(
+                (term.grid().rows(), term.grid().cols()),
+                (24, 80),
+                "a non-positive pane rect must never reflow the terminal"
+            );
+        }
+        assert_eq!(
+            guard.terminal_selections.get(&pane_id).copied(),
+            Some(selection),
+            "a non-positive pane rect must not drop a live selection"
         );
     }
 
@@ -2380,8 +2585,11 @@ mod tests_mouse_selection_copy_paste {
         );
     }
 
+    /// Keyboard capture is the only thing focus gates on a pane grid.
+    /// Scroll follows the pointer and `on_resize` follows every visible
+    /// pane's geometry, so both are registered whatever the focus is.
     #[test]
-    fn active_pane_keyboard_capture_scroll_resize_inactive_pane_none() {
+    fn keyboard_capture_is_focus_gated_but_resize_is_not() {
         let shared = make_shared();
         let mut grids = std::collections::HashMap::new();
         grids.insert(1, CellGrid::new(24, 80));
@@ -2416,16 +2624,40 @@ mod tests_mouse_selection_copy_paste {
             "inactive pane must NOT register KeyboardCapture handler"
         );
         assert!(
-            !grid_inactive
+            grid_inactive
                 .handlers
                 .iter()
                 .any(|(et, _)| *et == EventType::Scroll),
-            "inactive pane must NOT register Scroll handler"
+            "inactive pane must register Scroll handler"
         );
         assert!(
-            grid_inactive.on_resize.is_none(),
-            "inactive pane must NOT register on_resize handler"
+            grid_inactive.on_resize.is_some(),
+            "inactive pane must register on_resize handler: geometry is not input"
         );
+    }
+
+    /// The wheel follows the pointer, not the focus: every pane with a
+    /// grid registers a Scroll handler so hovering a background pane in
+    /// a split and scrolling moves THAT pane's scrollback. Before this,
+    /// the handler was gated behind `capture_keyboard`, so the event
+    /// bubbled from the hovered pane to the root and died -- a wheel
+    /// over an unfocused pane did nothing at all.
+    #[test]
+    fn scroll_handler_registered_for_active_and_inactive_panes() {
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1, CellGrid::new(24, 80));
+        for capture_keyboard in [true, false] {
+            let el = build_pane_body(PaneId(1), capture_keyboard, 13, &shared, &grids);
+            let grid_el = &el.children[0];
+            assert!(
+                grid_el
+                    .handlers
+                    .iter()
+                    .any(|(et, _)| *et == EventType::Scroll),
+                "pane must register Scroll handler (capture_keyboard={capture_keyboard})"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2435,9 +2667,19 @@ mod tests_mouse_selection_copy_paste {
     // -----------------------------------------------------------------------
 
     fn scroll_handler_for_pane(shared: &SharedState, pane: u32) -> EventHandler {
+        scroll_handler_for_pane_with_focus(shared, pane, true)
+    }
+
+    /// `capture_keyboard == false` builds the pane the way an unfocused
+    /// half of a split is built, which is what a hover-scroll exercises.
+    fn scroll_handler_for_pane_with_focus(
+        shared: &SharedState,
+        pane: u32,
+        capture_keyboard: bool,
+    ) -> EventHandler {
         let mut grids = std::collections::HashMap::new();
         grids.insert(pane, CellGrid::new(3, 5));
-        let el = build_pane_body(PaneId(pane), true, 13, shared, &grids);
+        let el = build_pane_body(PaneId(pane), capture_keyboard, 13, shared, &grids);
         el.children[0]
             .handlers
             .iter()
@@ -2492,6 +2734,67 @@ mod tests_mouse_selection_copy_paste {
         let guard = shared.lock().unwrap();
         let term = guard.terminals.get(&1).unwrap().lock().unwrap();
         assert_eq!(term.scroll_offset(), 1);
+    }
+
+    /// The wheel belongs to the pane under the pointer. Focus pane 2,
+    /// scroll pane 1's handler: pane 1's scrollback moves and pane 2's
+    /// stays put, and focus itself is untouched (scrolling is not an
+    /// activation gesture).
+    #[test]
+    fn wheel_scroll_over_unfocused_pane_scrolls_that_pane_not_the_focused_one() {
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        {
+            let mut guard = shared.lock().unwrap();
+            // Pane 2 has the keyboard; pane 1 is the hovered background
+            // half of the split.
+            guard.active_pane = PaneId(2);
+            for pane in [1u32, 2u32] {
+                let mut term = crate::terminal::Terminal::new(3, 5);
+                term.process_bytes(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+                guard.terminals.insert(pane, Arc::new(Mutex::new(term)));
+            }
+        }
+        let handler = scroll_handler_for_pane_with_focus(&shared, 1, false);
+
+        let cell_h = CellGrid::global_cell_h().max(1.0);
+        let patch = (handler)(&wheel_event(cell_h * 2.0))
+            .expect("scroll handler must return a value")
+            .downcast::<unshit::app::app::ScrollGridPatch>()
+            .expect("scroll handler must return a ScrollGridPatch");
+        assert!(
+            patch.grid.is_some(),
+            "hover-scrolling an unfocused pane must repaint it"
+        );
+
+        let guard = shared.lock().unwrap();
+        assert_eq!(
+            guard
+                .terminals
+                .get(&1)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scroll_offset(),
+            1,
+            "the hovered (unfocused) pane must scroll"
+        );
+        assert_eq!(
+            guard
+                .terminals
+                .get(&2)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scroll_offset(),
+            0,
+            "the focused pane must not steal the wheel"
+        );
+        assert_eq!(
+            guard.active_pane,
+            PaneId(2),
+            "scrolling must not move keyboard focus"
+        );
     }
 
     #[test]

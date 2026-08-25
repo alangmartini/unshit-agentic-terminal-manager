@@ -519,6 +519,11 @@ pub(crate) fn build_tree_from_def(
     element.on_context_menu = def.on_context_menu.clone();
     element.on_drag = def.on_drag.clone();
     element.on_resize = def.on_resize.clone();
+    // Generic `.on(EventType, ..)` handlers, mirroring the production
+    // reconciler (`reconcile::element_from_def`). Without this the harness
+    // silently drops every generic handler, so any test written against
+    // element-level `Scroll` / pointer dispatch would prove nothing.
+    element.handlers = def.handlers.clone();
     element.resize_axis = def.resize_axis;
     element.on_pane_resize = def.on_pane_resize.clone();
     element.placeholder = def.placeholder.clone();

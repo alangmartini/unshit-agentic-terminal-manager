@@ -355,57 +355,62 @@ pub fn build_editor_pane_body(
                 }
             },
         );
-
-        // Wheel scroll: whole-line steps as a paint-only grid patch, no
-        // tree rebuild (mirrors the terminal's instant wheel path).
-        let scroll_shared = shared.clone();
-        let scroll_pane = pane_id;
-        grid_el = grid_el.on(
-            EventType::Scroll,
-            move |event: &Event| -> Option<Box<dyn std::any::Any>> {
-                let Event::Scroll(se) = event else {
-                    return None;
-                };
-                // Shift+wheel scrolls horizontally (VS Code / xterm
-                // convention) in character steps against the cell width;
-                // plain wheel scrolls whole lines against the cell
-                // height. delta_y > 0 is wheel up (toward the top of
-                // the file / start of the line).
-                let horizontal = se.modifiers.contains(Modifiers::SHIFT);
-                let cell = if horizontal {
-                    unshit::core::cell_grid::CellGrid::global_cell_w()
-                } else {
-                    unshit::core::cell_grid::CellGrid::global_cell_h()
-                }
-                .max(1.0);
-                let units = (se.delta_y / cell).round() as isize;
-                let grid = mutate_with(&scroll_shared, |st| {
-                    let editor = st.editors.get_mut(&scroll_pane.0)?;
-                    let step = if units == 0 {
-                        if se.delta_y > 0.0 {
-                            -1
-                        } else if se.delta_y < 0.0 {
-                            1
-                        } else {
-                            return None;
-                        }
-                    } else {
-                        -units
-                    };
-                    let moved = if horizontal {
-                        editor.scroll_h_by(step)
-                    } else {
-                        editor.scroll_by(step)
-                    };
-                    moved.then(|| editor.grid.clone())
-                });
-                Some(Box::new(unshit::app::app::ScrollGridPatch {
-                    grid,
-                    animation: None,
-                }))
-            },
-        );
     }
+
+    // Wheel scroll: whole-line steps as a paint-only grid patch, no
+    // tree rebuild (mirrors the terminal's instant wheel path).
+    //
+    // Registered for every editor pane with a grid, focused or not, so
+    // the wheel drives the pane under the pointer (see the matching
+    // comment in `terminal_grid::build_pane_body`). Keyboard capture
+    // above stays focus-gated.
+    let scroll_shared = shared.clone();
+    let scroll_pane = pane_id;
+    grid_el = grid_el.on(
+        EventType::Scroll,
+        move |event: &Event| -> Option<Box<dyn std::any::Any>> {
+            let Event::Scroll(se) = event else {
+                return None;
+            };
+            // Shift+wheel scrolls horizontally (VS Code / xterm
+            // convention) in character steps against the cell width;
+            // plain wheel scrolls whole lines against the cell
+            // height. delta_y > 0 is wheel up (toward the top of
+            // the file / start of the line).
+            let horizontal = se.modifiers.contains(Modifiers::SHIFT);
+            let cell = if horizontal {
+                unshit::core::cell_grid::CellGrid::global_cell_w()
+            } else {
+                unshit::core::cell_grid::CellGrid::global_cell_h()
+            }
+            .max(1.0);
+            let units = (se.delta_y / cell).round() as isize;
+            let grid = mutate_with(&scroll_shared, |st| {
+                let editor = st.editors.get_mut(&scroll_pane.0)?;
+                let step = if units == 0 {
+                    if se.delta_y > 0.0 {
+                        -1
+                    } else if se.delta_y < 0.0 {
+                        1
+                    } else {
+                        return None;
+                    }
+                } else {
+                    -units
+                };
+                let moved = if horizontal {
+                    editor.scroll_h_by(step)
+                } else {
+                    editor.scroll_by(step)
+                };
+                moved.then(|| editor.grid.clone())
+            });
+            Some(Box::new(unshit::app::app::ScrollGridPatch {
+                grid,
+                animation: None,
+            }))
+        },
+    );
 
     // -- Mouse: cursor placement and selection ---------------------------
     // Registered for every editor pane with a grid (like terminal
@@ -544,6 +549,23 @@ mod tests {
         let grids = grids_for(&shared);
         let el = build_editor_pane_body(PaneId(1), false, 13, &shared, &grids);
         assert!(!el.children[0].captures_keyboard);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The wheel follows the pointer, so an unfocused editor pane keeps
+    /// its Scroll handler even though it does not capture the keyboard.
+    #[test]
+    fn inactive_editor_pane_still_registers_scroll_handler() {
+        let (shared, path) = shared_with_editor();
+        let grids = grids_for(&shared);
+        let el = build_editor_pane_body(PaneId(1), false, 13, &shared, &grids);
+        assert!(
+            el.children[0]
+                .handlers
+                .iter()
+                .any(|(et, _)| *et == EventType::Scroll),
+            "inactive editor pane must still scroll under the pointer"
+        );
         let _ = std::fs::remove_file(path);
     }
 

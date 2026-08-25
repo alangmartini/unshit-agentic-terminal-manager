@@ -19,6 +19,10 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
     let has_alt = event.modifiers.contains(Modifiers::ALT);
     let has_shift = event.modifiers.contains(Modifiers::SHIFT);
 
+    if is_os_reserved_chord(event.key, event.modifiers) {
+        return None;
+    }
+
     match event.key {
         // -- Characters --------------------------------------------------------
         Key::Char(c) => {
@@ -104,6 +108,30 @@ pub fn encode_key(event: &KeyboardEvent) -> Option<Vec<u8>> {
 
         Key::Unknown => None,
     }
+}
+
+/// Chords the window manager owns, which must never reach the PTY.
+///
+/// The OS normally swallows these before the app sees them, but not
+/// always: a chord can arrive with a stale or already-cleared modifier
+/// set (see issue #179), leaving a bare `Tab` or `Space` that would be
+/// typed into whatever the shell is running. An agent CLI reads that as
+/// real input and can submit a half-written prompt, so decline to encode
+/// the chord instead of leaking the naked keystroke.
+///
+/// - `Alt+Tab` / `Alt+Shift+Tab` switch windows.
+/// - `Alt+Space` opens the window menu.
+/// - Every `Meta` (Windows / Command key) chord belongs to the window
+///   manager or the app, never to the terminal.
+///
+/// Public to the crate so the caller can tell a deliberate suppression
+/// apart from a key that simply has no terminal encoding when it reports
+/// the drop to the diagnostics snapshot.
+pub(crate) fn is_os_reserved_chord(key: Key, modifiers: Modifiers) -> bool {
+    if modifiers.contains(Modifiers::META) {
+        return true;
+    }
+    modifiers.contains(Modifiers::ALT) && matches!(key, Key::Tab | Key::Space)
 }
 
 /// Encode a CSI-letter key (\x1b[X) with optional modifier.
@@ -343,6 +371,50 @@ mod tests {
             encode_key(&key_event(Key::Tab, Modifiers::SHIFT)),
             Some(b"\x1b[Z".to_vec())
         );
+    }
+
+    // -- OS-reserved chords are never forwarded (issue #179) -------------------
+
+    #[test]
+    fn alt_tab_is_not_forwarded() {
+        assert_eq!(encode_key(&key_event(Key::Tab, Modifiers::ALT)), None);
+    }
+
+    #[test]
+    fn alt_shift_tab_is_not_forwarded() {
+        assert_eq!(
+            encode_key(&key_event(Key::Tab, Modifiers::ALT | Modifiers::SHIFT)),
+            None
+        );
+    }
+
+    #[test]
+    fn alt_space_is_not_forwarded() {
+        assert_eq!(encode_key(&key_event(Key::Space, Modifiers::ALT)), None);
+    }
+
+    #[test]
+    fn alt_space_with_text_is_not_forwarded() {
+        // The window-menu chord arrives carrying `text`; the dead-key text
+        // fallback must not become a way around the guard.
+        assert_eq!(
+            encode_key(&key_event_with_text(Key::Space, Modifiers::ALT, " ")),
+            None
+        );
+    }
+
+    #[test]
+    fn meta_chords_are_not_forwarded() {
+        // Win+D and friends: the Windows key belongs to the shell. Without
+        // this guard the chord leaked its bare character into the PTY.
+        for key in [Key::Char('d'), Key::Tab, Key::Space, Key::Enter] {
+            assert_eq!(
+                encode_key(&key_event(key, Modifiers::META)),
+                None,
+                "meta chord with {:?} must not reach the PTY",
+                key
+            );
+        }
     }
 
     #[test]
