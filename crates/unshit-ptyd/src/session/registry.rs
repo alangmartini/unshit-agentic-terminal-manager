@@ -200,6 +200,20 @@ impl SessionRegistry {
         match matching_live.as_slice() {
             [session_id] => {
                 let session_id = *session_id;
+                // A surviving session keeps the geometry of the run that
+                // created it. The client has just told us the pane's
+                // current size, so honour it before handing the session
+                // back: without this a reattached PTY stays at the
+                // previous window's row count while the UI renders the
+                // new one, and every absolute cursor move the client
+                // application makes below the UI's last row collapses
+                // onto it, leaving stale rows on screen.
+                let resized = guard
+                    .get_mut(&session_id)
+                    .expect("matching live session disappeared under registry lock");
+                if resized.cols() != cols || resized.rows() != rows {
+                    resized.resize(cols, rows);
+                }
                 let session = guard
                     .get(&session_id)
                     .expect("matching live session disappeared under registry lock");
@@ -754,6 +768,49 @@ mod tests {
             second.disposition,
             crate::protocol::message::EnsureDisposition::Existing
         );
+        reg.remove(first.session_id).await;
+    }
+
+    /// Sessions outlive the UI, so a reattaching client is usually a
+    /// differently-sized window than the one that spawned the session.
+    /// Ignoring the dimensions on the reuse path left the PTY at the old
+    /// geometry: the client application kept drawing frames sized for
+    /// rows the UI no longer had, and everything it addressed past the
+    /// UI's last row collapsed onto it over stale content.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ensure_existing_resizes_the_session_to_the_requested_geometry() {
+        let reg = SessionRegistry::new();
+        let first = reg
+            .ensure(80, 24, None, Some(test_shell()), &[], 21, 7, None, 0)
+            .await
+            .expect("spawn initial");
+        assert_eq!(
+            first.disposition,
+            crate::protocol::message::EnsureDisposition::Spawned
+        );
+
+        let second = reg
+            .ensure(119, 35, None, Some(test_shell()), &[], 21, 7, None, 0)
+            .await
+            .expect("reattach to the live session");
+        assert_eq!(first.session_id, second.session_id);
+        assert_eq!(
+            second.disposition,
+            crate::protocol::message::EnsureDisposition::Existing
+        );
+
+        let info = reg
+            .list()
+            .await
+            .into_iter()
+            .find(|s| s.id == first.session_id)
+            .expect("session must still be listed");
+        assert_eq!(
+            (info.cols, info.rows),
+            (119, 35),
+            "reused session must adopt the reattaching client's geometry"
+        );
+
         reg.remove(first.session_id).await;
     }
 
