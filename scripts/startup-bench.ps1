@@ -7,6 +7,10 @@
   Measures wall-clock time from process launch to the app's top-level window
   becoming visible, over N iterations, and reports min/median/p95/max.
 
+  "Visible" means the real window, found by enumerating the process's top-level
+  windows -- not `Process.MainWindowHandle`, which during winit startup returns
+  a 22x22 helper window that exists about a second before the app does.
+
   Every iteration is a true COLD start: the isolated instance's ptyd daemon is
   shut down before each launch, so the run pays daemon spawn cost the same way
   a real first-launch-of-the-day does.
@@ -44,6 +48,38 @@ param(
     [string]$JsonOut,
     [int]$SettleMs = 1500
 )
+
+# `Process.MainWindowHandle` is not this app's window. winit creates a 22x22
+# helper window during startup and Windows associates it with the process
+# first, so MainWindowHandle goes non-zero roughly a second before anything the
+# user can see -- which is how this benchmark once reported a 110ms startup for
+# a launch whose own telemetry says the window appeared at 1.7s. Enumerate the
+# process's top-level windows and take the largest visible one instead.
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class BenchWin {
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  delegate bool EnumProc(IntPtr h, IntPtr p);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  public static IntPtr LargestVisibleWindow(uint targetPid) {
+    IntPtr best = IntPtr.Zero; long bestArea = 0;
+    EnumWindows(delegate(IntPtr h, IntPtr p) {
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      if (pid != targetPid || !IsWindowVisible(h)) return true;
+      RECT r; if (!GetWindowRect(h, out r)) return true;
+      long a = (long)(r.Right - r.Left) * (r.Bottom - r.Top);
+      if (a > bestArea) { bestArea = a; best = h; }
+      return true;
+    }, IntPtr.Zero);
+    // Smaller than any plausible app window means a helper, not the app.
+    return bestArea >= 40000 ? best : IntPtr.Zero;
+  }
+}
+"@
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -103,7 +139,7 @@ try {
         while ($sw.Elapsed.TotalSeconds -lt 30) {
             try { $proc.Refresh() } catch { break }
             if ($proc.HasExited) { break }
-            if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
+            if ([BenchWin]::LargestVisibleWindow([uint32]$proc.Id) -ne [IntPtr]::Zero) {
                 $visibleMs = $sw.Elapsed.TotalMilliseconds
                 break
             }
@@ -117,9 +153,8 @@ try {
             Write-Host ("iteration {0,2}: {1,8:N1} ms to visible window" -f $i, $visibleMs)
         }
 
-        # The window handle appears before the first frame is presented. Let the
-        # app finish coming up so its in-process startup record (emitted on the
-        # first frame) actually gets written before we tear the process down.
+        # Let the app finish coming up so its in-process startup record
+        # (emitted on the first frame) actually gets written before teardown.
         Start-Sleep -Milliseconds $SettleMs
 
         try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
