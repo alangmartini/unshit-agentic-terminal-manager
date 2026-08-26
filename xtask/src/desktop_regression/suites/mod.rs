@@ -16,6 +16,7 @@ pub mod post_resize_glitches;
 pub mod settings_scroll;
 pub mod split_divider_stability;
 pub mod titlebar_window_controls;
+pub mod window_chord_key_isolation;
 
 pub struct SuiteContext<'a> {
     pub workspace_root: &'a Path,
@@ -56,6 +57,7 @@ pub fn execute_suite(suite_id: &str, context: &SuiteContext<'_>) -> SuiteExecuti
         settings_scroll::OPTIONS_SUITE_ID => settings_scroll::run_options(context),
         settings_scroll::FPS_SUITE_ID => settings_scroll::run_fps_overlay(context),
         "titlebar-window-controls" => titlebar_window_controls::run(context),
+        "window-chord-key-isolation" => window_chord_key_isolation::run(context),
         other => SuiteExecutionRecord::failed(
             other,
             FailureClassification::Setup,

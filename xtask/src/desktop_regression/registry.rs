@@ -86,6 +86,21 @@ const SUITES: &[SuiteMetadata] = &[
         observability_needs: &["win32-window-bounds", "screenshots", "renderer-state"],
         supported_platforms: &["windows"],
     },
+    SuiteMetadata {
+        id: "window-chord-key-isolation",
+        title: "Window chord key isolation",
+        tags: &["windows", "keyboard", "focus", "input-isolation"],
+        coverage:
+            "Window-manager chords and keys held across a focus change never reach the terminal.",
+        observability_needs: &[
+            "diagnostic-config",
+            "terminal-buffer",
+            "pty-events",
+            "win32-input",
+            "screenshots",
+        ],
+        supported_platforms: &["windows"],
+    },
 ];
 
 pub fn all_suites() -> &'static [SuiteMetadata] {
@@ -129,7 +144,8 @@ mod tests {
                 "settings-scroll-smoothness",
                 "settings-scroll-options",
                 "fps-overlay-scroll-updates",
-                "titlebar-window-controls"
+                "titlebar-window-controls",
+                "window-chord-key-isolation"
             ]
         );
     }

@@ -132,6 +132,32 @@ fn retry_until<T>(
     None
 }
 
+/// Chords owned by the window manager that must never reach the terminal.
+///
+/// Firing these at a focused pane is how the desktop suite proves the app
+/// keeps them out of the PTY. `AltTab` and `WinD` also move focus away from
+/// the window, which is the second half of what they exercise: whatever key
+/// is still held when focus returns must not be replayed as typed input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowManagerChord {
+    /// Opens the window menu.
+    AltSpace,
+    /// Switches to the previously focused window.
+    AltTab,
+    /// Toggles show-desktop.
+    WinD,
+}
+
+impl WindowManagerChord {
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowManagerChord::AltSpace => "alt+space",
+            WindowManagerChord::AltTab => "alt+tab",
+            WindowManagerChord::WinD => "win+d",
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use std::ffi::OsString;
@@ -152,19 +178,24 @@ mod imp {
         GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_HWNDFIRST, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, INPUT,
         INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN,
         MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, VK_CONTROL, VK_LEFT, VK_LWIN, VK_MENU,
-        VK_RETURN, VK_RWIN, VK_SHIFT, WM_CLOSE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_EX_TRANSPARENT,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, VK_CONTROL, VK_ESCAPE, VK_LEFT,
+        VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, WM_CLOSE,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
-    use winapi::um::winuser::{GetClientRect, IsZoomed, PostMessageW, HWND_TOPMOST};
+    use winapi::um::winuser::{
+        GetClientRect, IsIconic, IsZoomed, PostMessageW, HWND_TOPMOST, SC_MINIMIZE, WM_SYSCOMMAND,
+    };
 
     use super::{
         DesktopRect, DesktopSize, FocusWindowOutcome, SnapCaptureReadinessError, WindowHandle,
-        WindowOcclusionCandidate,
+        WindowManagerChord, WindowOcclusionCandidate,
     };
 
     const VK_D: u16 = 0x44;
     const VK_F: u16 = 0x46;
+    const CHORD_STEP: Duration = Duration::from_millis(60);
+    const WINDOW_STATE_ATTEMPTS: u32 = 40;
+    const WINDOW_STATE_POLL: Duration = Duration::from_millis(50);
     const FOCUS_ACTIVATION_ATTEMPTS: u32 = 25;
     const FOCUS_ACTIVATION_SETTLE: Duration = Duration::from_millis(100);
 
@@ -746,6 +777,101 @@ mod imp {
         Ok(())
     }
 
+    pub fn send_window_manager_chord(chord: WindowManagerChord) -> Result<(), String> {
+        let (modifier_vk, key_vk) = match chord {
+            WindowManagerChord::AltSpace => (VK_MENU as u16, VK_SPACE as u16),
+            WindowManagerChord::AltTab => (VK_MENU as u16, VK_TAB as u16),
+            WindowManagerChord::WinD => (VK_LWIN as u16, VK_D),
+        };
+
+        send_keyboard_input(modifier_vk, 0, 0)?;
+        thread::sleep(CHORD_STEP);
+        send_keyboard_input(key_vk, 0, 0)?;
+        thread::sleep(CHORD_STEP);
+        send_keyboard_input(key_vk, 0, KEYEVENTF_KEYUP)?;
+        thread::sleep(CHORD_STEP);
+        send_keyboard_input(modifier_vk, 0, KEYEVENTF_KEYUP)?;
+        thread::sleep(CHORD_STEP);
+        Ok(())
+    }
+
+    pub fn send_escape() -> Result<(), String> {
+        send_keyboard_input(VK_ESCAPE as u16, 0, 0)?;
+        thread::sleep(CHORD_STEP);
+        send_keyboard_input(VK_ESCAPE as u16, 0, KEYEVENTF_KEYUP)
+    }
+
+    /// Hold or release a single letter key, so a suite can leave a key
+    /// physically down across a focus change.
+    pub fn set_letter_key_pressed(ch: char, pressed: bool) -> Result<(), String> {
+        let (vk, modifiers) = physical_key_chord(ch)?;
+        if modifiers != 0 {
+            return Err(format!(
+                "letter {ch:?} needs modifiers in the active keyboard layout and cannot be held alone"
+            ));
+        }
+        let flags = if pressed { 0 } else { KEYEVENTF_KEYUP };
+        send_keyboard_input(vk, 0, flags)
+    }
+
+    /// Name of a modifier the OS still reports as held, if any.
+    pub fn stuck_modifier_name() -> Result<Option<&'static str>, String> {
+        Ok(stuck_modifier())
+    }
+
+    /// Force every modifier back up.
+    ///
+    /// Injected chords occasionally lose a key-up -- the window manager
+    /// consumes the chord and the release never lands -- which leaves the next
+    /// plain keystroke silently reinterpreted as a chord. Releasing a key that
+    /// is already up is a no-op, so this is safe to call unconditionally.
+    pub fn release_modifier_keys() -> Result<(), String> {
+        for vk in [VK_LWIN, VK_RWIN, VK_CONTROL, VK_SHIFT, VK_MENU] {
+            send_keyboard_input(vk as u16, 0, KEYEVENTF_KEYUP)?;
+            thread::sleep(CHORD_STEP);
+        }
+        Ok(())
+    }
+
+    /// Minimize through the window's own message loop.
+    ///
+    /// `ShowWindow` from a foreign thread can return without the window ever
+    /// changing state, which would let a focus test pass while never taking
+    /// focus away. Posting `WM_SYSCOMMAND` makes the app minimize itself, and
+    /// waiting on `IsIconic` turns a silent no-op into an error.
+    pub fn minimize_window(handle: WindowHandle) -> Result<(), String> {
+        unsafe {
+            PostMessageW(hwnd(handle), WM_SYSCOMMAND, SC_MINIMIZE, 0);
+        }
+        await_iconic_state(handle, true).ok_or_else(|| {
+            format!("window {handle:?} never minimized after WM_SYSCOMMAND/SC_MINIMIZE")
+        })
+    }
+
+    pub fn restore_window(handle: WindowHandle) -> Result<(), String> {
+        unsafe {
+            ShowWindow(hwnd(handle), SW_RESTORE);
+        }
+        await_iconic_state(handle, false)
+            .ok_or_else(|| format!("window {handle:?} never came back from minimized"))
+    }
+
+    fn await_iconic_state(handle: WindowHandle, iconic: bool) -> Option<()> {
+        super::retry_until(WINDOW_STATE_ATTEMPTS, |_| {
+            let matches = unsafe { IsIconic(hwnd(handle)) != 0 } == iconic;
+            if matches {
+                return Some(());
+            }
+            thread::sleep(WINDOW_STATE_POLL);
+            None
+        })
+        .map(|(_, value)| value)
+    }
+
+    pub fn is_window_foreground(handle: WindowHandle) -> Result<bool, String> {
+        Ok(unsafe { GetForegroundWindow() } == hwnd(handle))
+    }
+
     fn send_keyboard_input(vk: u16, scan: u16, flags: u32) -> Result<(), String> {
         let mut input = unsafe { std::mem::zeroed::<INPUT>() };
         input.type_ = INPUT_KEYBOARD;
@@ -1040,6 +1166,38 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn send_window_manager_chord(_chord: WindowManagerChord) -> Result<(), String> {
+        Err(unsupported())
+    }
+
+    pub fn send_escape() -> Result<(), String> {
+        Err(unsupported())
+    }
+
+    pub fn set_letter_key_pressed(_ch: char, _pressed: bool) -> Result<(), String> {
+        Err(unsupported())
+    }
+
+    pub fn stuck_modifier_name() -> Result<Option<&'static str>, String> {
+        Err(unsupported())
+    }
+
+    pub fn release_modifier_keys() -> Result<(), String> {
+        Err(unsupported())
+    }
+
+    pub fn minimize_window(_handle: WindowHandle) -> Result<(), String> {
+        Err(unsupported())
+    }
+
+    pub fn restore_window(_handle: WindowHandle) -> Result<(), String> {
+        Err(unsupported())
+    }
+
+    pub fn is_window_foreground(_handle: WindowHandle) -> Result<bool, String> {
+        Err(unsupported())
+    }
+
     fn unsupported() -> String {
         "desktop regression execution is only supported on Windows".to_owned()
     }
@@ -1142,6 +1300,38 @@ pub fn send_enter_to_window(handle: WindowHandle) -> Result<(), String> {
 
 pub fn close_window(handle: WindowHandle) -> Result<(), String> {
     imp::close_window(handle)
+}
+
+pub fn send_window_manager_chord(chord: WindowManagerChord) -> Result<(), String> {
+    imp::send_window_manager_chord(chord)
+}
+
+pub fn send_escape() -> Result<(), String> {
+    imp::send_escape()
+}
+
+pub fn set_letter_key_pressed(ch: char, pressed: bool) -> Result<(), String> {
+    imp::set_letter_key_pressed(ch, pressed)
+}
+
+pub fn stuck_modifier_name() -> Result<Option<&'static str>, String> {
+    imp::stuck_modifier_name()
+}
+
+pub fn release_modifier_keys() -> Result<(), String> {
+    imp::release_modifier_keys()
+}
+
+pub fn minimize_window(handle: WindowHandle) -> Result<(), String> {
+    imp::minimize_window(handle)
+}
+
+pub fn restore_window(handle: WindowHandle) -> Result<(), String> {
+    imp::restore_window(handle)
+}
+
+pub fn is_window_foreground(handle: WindowHandle) -> Result<bool, String> {
+    imp::is_window_foreground(handle)
 }
 
 #[cfg(test)]

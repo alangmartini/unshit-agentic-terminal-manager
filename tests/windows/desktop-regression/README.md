@@ -141,6 +141,19 @@ powershell.exe -ExecutionPolicy Bypass -File scripts\window-resize-automation.ps
   stale terminal rows floating in the enlarged viewport.
 - `edge-resize-stability`: covers frameless left-edge drag behavior and
   right-edge stability.
+- `split-divider-stability`: covers pane divider drag stability and terminal
+  grid settling afterwards.
+- `settings-scroll-smoothness`, `settings-scroll-options`, and
+  `fps-overlay-scroll-updates`: cover settings wheel scrolling, its
+  configuration surface, and the FPS overlay during a scroll.
+- `titlebar-window-controls`: covers the custom titlebar maximize/restore
+  buttons and restored geometry.
+- `window-chord-key-isolation`: covers keyboard isolation from the window
+  manager. It leaves an unterminated command on the prompt, then holds a key
+  across a minimize/restore focus round trip and fires `Alt+Space`, `Win+D` and
+  `Alt+Tab` at the focused pane, asserting from the terminal buffer and the PTY
+  event stream that nothing was typed. Needs `--observe basic` or higher, since
+  a single leaked character is only visible in a diagnostic snapshot.
 
 ## Adding A Suite
 
