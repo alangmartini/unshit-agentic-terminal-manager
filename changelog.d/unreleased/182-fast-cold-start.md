@@ -17,3 +17,9 @@
     machine. This is also a correctness fix: the old measurement asked the OS
     for `monospace` and got Consolas, whose advance width the renderer never
     uses.
+
+### Fixed
+
+- A background pane whose reattach failed now still refreshes the UI, so the
+  spawn failure it recorded becomes visible instead of sitting in state until
+  something else happens to trigger a rebuild.

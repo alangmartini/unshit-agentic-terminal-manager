@@ -56,9 +56,11 @@ pub fn attach_background_panes_in_background(shared: SharedState, sink: Arc<Once
             let started = std::time::Instant::now();
             let summary = attach_background_panes(&shared);
 
-            if summary.attached() > 0 {
-                // Readers registered above only become live subscriptions on
-                // the next tree rebuild.
+            // Rebuild whenever there was anything to do, not only on
+            // success: a failed attach still writes a spawn failure into
+            // state that the user needs to see, and readers registered
+            // here only become live subscriptions on the next rebuild.
+            if summary.targets > 0 {
                 if let Some(sink) = sink.get() {
                     let _ = sink.send(ExternalEvent::RequestRebuild);
                 }

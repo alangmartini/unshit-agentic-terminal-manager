@@ -1030,7 +1030,16 @@ fn main() {
         let guard = shared.lock_recover();
         crate::startup_perf::Context {
             workspaces: guard.workspaces.len(),
-            panes: guard.terminals.len(),
+            // Counted from the restored layout rather than the live
+            // `terminals` map: the background panes have not attached yet
+            // at this point, so the map would under-report the workload
+            // these timings are being attributed to.
+            panes: guard
+                .workspaces
+                .iter()
+                .flat_map(|ws| ws.tabs.iter())
+                .flat_map(|tab| tab.panes.iter().flatten())
+                .count(),
             daemon_spawned: daemon_was_spawned,
             restored_layout,
         }
