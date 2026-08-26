@@ -2288,6 +2288,81 @@ mod tests {
         let _ = daemon.await;
     }
 
+    /// The app-restart path: a session outlives the UI, a fresh run
+    /// reattaches to it, and the new window is a different size than the
+    /// one that spawned it. `Request::AttachSession` carries no
+    /// dimensions, so nothing on the wire tells the daemon the pane grew
+    /// -- the reattached shell would keep the previous run's geometry and
+    /// any full-screen client would draw for rows the pane no longer has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reattaching_pushes_the_panes_size_to_a_session_that_outlived_the_ui() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let pane_id = 57u32;
+        let workspace_id = 4u32;
+
+        // Run one: spawn at the old window's size, then drop the shim.
+        // The session survives (slice 5 policy).
+        let shim_path_a = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path_a);
+            let _reader = shim
+                .spawn_in(pane_id, workspace_id, 80, 24, None, None)
+                .expect("spawn_in");
+        })
+        .await
+        .unwrap();
+
+        // Run two: a bigger window. Layout measures the pane before it
+        // has a session, and the attach itself is issued with the stale
+        // startup estimate -- so the pane's own record is the only thing
+        // that knows the truth.
+        let shim_path_b = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path_b);
+            shim.resize(pane_id, 119, 35);
+            assert!(!shim.has(pane_id), "no session mapped to the pane yet");
+
+            let (snapshot, _reader) = shim
+                .attach_or_spawn(pane_id, workspace_id, 80, 24, None, None)
+                .expect("attach_or_spawn on survivor");
+            assert!(
+                snapshot.is_some(),
+                "the surviving session must be reattached, not respawned"
+            );
+
+            let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+            let mut observed = (0u16, 0u16);
+            while std::time::Instant::now() < deadline {
+                if let Ok(sessions) = shim.list_sessions() {
+                    if let Some(info) = sessions.iter().find(|s| s.pane_id == pane_id) {
+                        observed = (info.cols, info.rows);
+                        if observed == (119, 35) {
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                observed,
+                (119, 35),
+                "a reattached session must adopt the current pane's geometry"
+            );
+
+            shim.destroy(pane_id);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
     #[test]
     fn shell_spec_to_wire_returns_none_for_no_spec() {
         assert_eq!(shell_spec_to_wire(None), (None, Vec::new()));
