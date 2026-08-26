@@ -13,15 +13,29 @@
 //! the cost the render thread pays per keystroke, which by design must
 //! be independent of daemon health.
 //!
-//! `pty.rs` has no crate-internal references, so we pull it in via
-//! `#[path]` rather than turning the package into a library. This keeps
-//! the diff for #135 surgical.
+//! `pty.rs` is pulled in via `#[path]` rather than turning the package
+//! into a library, which keeps the diff for #135 surgical. Its handful of
+//! crate-internal references are satisfied by mounting those modules at
+//! this bench's root under the same names, below.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 #[allow(dead_code)]
 #[path = "../src/shell.rs"]
 mod shell;
+
+// `pty::DaemonPty::resize` reports the fate of each geometry change
+// through `crate::renderer_telemetry`, which in turn resolves its log
+// location through `crate::profile`. Neither is exercised by this bench
+// (it only measures `write`), but both must resolve for `pty.rs` to
+// compile in the bench profile.
+#[allow(dead_code, unused_imports)]
+#[path = "../src/profile.rs"]
+mod profile;
+
+#[allow(dead_code, unused_imports)]
+#[path = "../src/renderer_telemetry.rs"]
+mod renderer_telemetry;
 
 // Bring the bin's pty module in via a path attribute so the bench can
 // reach the public `DaemonPty` API without making the whole package a

@@ -62,6 +62,14 @@ pub struct DaemonPty {
     /// this to distinguish a warm cache attach from an Ensure winner after a
     /// resume launch was durably marked as in-flight.
     reconcile_outcomes: HashMap<u32, ReconcileOutcome>,
+    /// Last `(cols, rows)` the UI asked for on each pane, recorded even
+    /// when the request could not be delivered. Lives outside `Inner` so
+    /// it survives a disconnect, and exists because a resize arriving
+    /// before the pane has a session used to be dropped on the floor:
+    /// `on_resize` only fires again when the pane's rect changes, so the
+    /// PTY stayed at the wrong geometry for the rest of the session.
+    /// `push_recorded_size` replays it the moment a session appears.
+    pane_sizes: HashMap<u32, (u16, u16)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +167,9 @@ enum Command {
     },
     Resize {
         session_id: u64,
+        /// Carried purely so a failed resize is attributable to a pane in
+        /// telemetry; the daemon addresses sessions by `session_id`.
+        pane_id: u32,
         cols: u16,
         rows: u16,
     },
@@ -209,6 +220,7 @@ impl DaemonPty {
             spawn_shells: HashMap::new(),
             hook_capabilities: HashMap::new(),
             reconcile_outcomes: HashMap::new(),
+            pane_sizes: HashMap::new(),
         }
     }
 
@@ -345,8 +357,10 @@ impl DaemonPty {
         inner.cmd_tx.send(cmd).map_err(|_| worker_gone())?;
         let spawned = reply_rx.recv().map_err(|_| worker_gone())??;
         inner.sessions.insert(pane_id, spawned.session_id);
+        let session_id = spawned.session_id;
         self.hook_capabilities
             .insert(pane_id, spawned.hook_capability);
+        self.push_recorded_size(pane_id, session_id, Some((cols, rows)));
         Ok(Box::new(ChannelReader::new(byte_rx)))
     }
 
@@ -386,6 +400,9 @@ impl DaemonPty {
         inner.sessions.insert(pane_id, session_id);
         self.hook_capabilities
             .insert(pane_id, attached.hook_capability);
+        // `Request::AttachSession` carries no dimensions, so the session
+        // is still sized for whichever run last resized it.
+        self.push_recorded_size(pane_id, session_id, None);
         Ok((attached.snapshot, Box::new(ChannelReader::new(byte_rx))))
     }
 
@@ -478,8 +495,15 @@ impl DaemonPty {
             .map_err(|_| worker_gone())?;
         let ensured = reply_rx.recv().map_err(|_| worker_gone())??;
         inner.sessions.insert(pane_id, ensured.session_id);
+        let ensured_session_id = ensured.session_id;
         self.hook_capabilities
             .insert(pane_id, ensured.hook_capability);
+        // The daemon now honours `cols`/`rows` on an ensure that reuses a
+        // live session, so a spawn is already correctly sized. A reuse is
+        // too -- but only against the dimensions sent with this call, and
+        // a resize can have landed since. Reconciling here is cheap and
+        // makes the pane's own record the final word either way.
+        self.push_recorded_size(pane_id, ensured_session_id, Some((cols, rows)));
         if ensured.disposition == EnsureDisposition::Spawned {
             if let Some(path) = cwd_owned {
                 self.spawn_cwds.insert(pane_id, path);
@@ -588,18 +612,101 @@ impl DaemonPty {
         out
     }
 
+    /// Request the pane's PTY be resized to `cols` x `rows`.
+    ///
+    /// The size is recorded first and unconditionally. `on_resize` fires
+    /// once per pane rect change, so a request that cannot be delivered
+    /// now -- no session mapped yet, shim not connected -- has no natural
+    /// retry: the PTY would keep the stale geometry until the user
+    /// happened to resize that pane again. `push_recorded_size` replays
+    /// the record as soon as the pane has a session.
     pub fn resize(&mut self, pane_id: u32, cols: u16, rows: u16) {
+        // Telemetry is gated on a real change so a window drag, which
+        // fires this per frame, does not emit an event per frame.
+        let changed = self.pane_sizes.insert(pane_id, (cols, rows)) != Some((cols, rows));
         let Some(inner) = self.inner.as_mut() else {
             log::warn!("DaemonPty::resize called before connect");
+            if changed {
+                crate::renderer_telemetry::record_pty_resize(
+                    pane_id,
+                    None,
+                    cols,
+                    rows,
+                    crate::renderer_telemetry::PtyResizeOutcome::DroppedDisconnected,
+                    None,
+                );
+            }
             return;
         };
-        if let Some(&session_id) = inner.sessions.get(&pane_id) {
-            let _ = inner.cmd_tx.send(Command::Resize {
-                session_id,
+        let Some(&session_id) = inner.sessions.get(&pane_id) else {
+            if changed {
+                crate::renderer_telemetry::record_pty_resize(
+                    pane_id,
+                    None,
+                    cols,
+                    rows,
+                    crate::renderer_telemetry::PtyResizeOutcome::DroppedUnmapped,
+                    None,
+                );
+            }
+            return;
+        };
+        let _ = inner.cmd_tx.send(Command::Resize {
+            session_id,
+            pane_id,
+            cols,
+            rows,
+        });
+        if changed {
+            crate::renderer_telemetry::record_pty_resize(
+                pane_id,
+                Some(session_id),
                 cols,
                 rows,
-            });
+                crate::renderer_telemetry::PtyResizeOutcome::Applied,
+                None,
+            );
         }
+    }
+
+    /// Push the pane's last requested geometry to a session that has just
+    /// become mapped.
+    ///
+    /// `spawned_with` is the geometry the session was created at when
+    /// this call spawned it; matching it means the daemon already agrees
+    /// and no RPC is needed. Attach passes `None` because
+    /// `Request::AttachSession` carries no dimensions at all, so a
+    /// session surviving from an earlier run keeps that run's geometry
+    /// until something pushes the current pane size.
+    fn push_recorded_size(
+        &mut self,
+        pane_id: u32,
+        session_id: u64,
+        spawned_with: Option<(u16, u16)>,
+    ) {
+        let Some(&(cols, rows)) = self.pane_sizes.get(&pane_id) else {
+            return;
+        };
+        if spawned_with == Some((cols, rows)) {
+            return;
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let _ = inner.cmd_tx.send(Command::Resize {
+            session_id,
+            pane_id,
+            cols,
+            rows,
+        });
+        crate::renderer_telemetry::record_pty_resize(
+            pane_id,
+            Some(session_id),
+            cols,
+            rows,
+            crate::renderer_telemetry::PtyResizeOutcome::Replayed,
+            None,
+        );
     }
 
     pub fn destroy(&mut self, pane_id: u32) {
@@ -607,6 +714,7 @@ impl DaemonPty {
         self.spawn_shells.remove(&pane_id);
         self.hook_capabilities.remove(&pane_id);
         self.reconcile_outcomes.remove(&pane_id);
+        self.pane_sizes.remove(&pane_id);
         let Some(inner) = self.inner.as_mut() else {
             log::warn!("DaemonPty::destroy called before connect");
             return;
@@ -694,6 +802,7 @@ impl DaemonPty {
         self.spawn_shells.clear();
         self.hook_capabilities.clear();
         self.reconcile_outcomes.clear();
+        self.pane_sizes.clear();
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -1225,10 +1334,36 @@ fn worker_main(
                 }
                 Command::Resize {
                     session_id,
+                    pane_id,
                     cols,
                     rows,
                 } => {
-                    let _ = client.resize(session_id, cols, rows).await;
+                    // A silently discarded resize leaves the daemon's PTY
+                    // at a geometry the UI has already stopped rendering,
+                    // which is invisible until an application draws off
+                    // the bottom of the local grid. Name the failure.
+                    let failure: Option<String> = match client.resize(session_id, cols, rows).await {
+                        Ok(Response::Ack { .. }) => None,
+                        Ok(Response::Error { code, .. }) => Some(code),
+                        Ok(_) => Some("unexpected_response".to_string()),
+                        Err(ProtocolError::Io(e)) => Some(format!("{:?}", e.kind())),
+                        Err(_) => Some("protocol_error".to_string()),
+                    };
+                    if let Some(kind) = failure {
+                        log::warn!(
+                            "{{\"event\":\"pty.resize\",\"level\":\"warn\",\"outcome\":\"rpc_failed\",\
+                             \"pane_id\":{pane_id},\"session_id\":{session_id},\
+                             \"cols\":{cols},\"rows\":{rows},\"error_kind\":{kind:?}}}"
+                        );
+                        crate::renderer_telemetry::record_pty_resize(
+                            pane_id,
+                            Some(session_id),
+                            cols,
+                            rows,
+                            crate::renderer_telemetry::PtyResizeOutcome::RpcFailed,
+                            Some(kind),
+                        );
+                    }
                 }
                 Command::Kill { session_id } => {
                     if let Ok(mut guard) = sinks.lock() {
@@ -1556,6 +1691,62 @@ mod tests {
             shim.resize(999, 120, 40);
             shim.destroy(999);
             assert!(!shim.has(999));
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    /// `on_resize` fires once per pane rect change, so a resize arriving
+    /// before the pane has a session has no natural retry. Dropping it
+    /// left the PTY on its spawn geometry for the rest of the session
+    /// while the UI rendered the size it had asked for -- and a client
+    /// application drawing for the larger of the two runs off the end of
+    /// the smaller grid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resize_before_the_session_exists_is_replayed_once_it_is_mapped() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let pane_id = 31u32;
+
+            // Layout measured the pane before anything spawned into it.
+            shim.resize(pane_id, 119, 35);
+            assert!(!shim.has(pane_id), "no session should exist yet");
+
+            // The spawn asks for the stale default; the pane's own record
+            // is what must win.
+            let _reader = shim
+                .spawn_in(pane_id, 1, 80, 24, None, None)
+                .expect("spawn_in");
+
+            let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+            let mut observed = (0u16, 0u16);
+            while std::time::Instant::now() < deadline {
+                if let Ok(sessions) = shim.list_sessions() {
+                    if let Some(info) = sessions.iter().find(|s| s.pane_id == pane_id) {
+                        observed = (info.cols, info.rows);
+                        if observed == (119, 35) {
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                observed,
+                (119, 35),
+                "geometry requested before the spawn must still reach the PTY"
+            );
+
+            shim.destroy(pane_id);
         })
         .await
         .unwrap();

@@ -27,6 +27,7 @@ static QUEUE_WARNING_ACTIVE: AtomicBool = AtomicBool::new(false);
 enum TelemetryRecord {
     SlowFrame(SlowFrameRecord),
     GlyphDrop(GlyphDropRecord),
+    PtyGeometry(PtyGeometryRecord),
 }
 
 impl TelemetryRecord {
@@ -34,6 +35,7 @@ impl TelemetryRecord {
         match self {
             Self::SlowFrame(record) => record.event,
             Self::GlyphDrop(record) => record.event,
+            Self::PtyGeometry(record) => record.event,
         }
     }
 
@@ -41,8 +43,63 @@ impl TelemetryRecord {
         match self {
             Self::SlowFrame(record) => &record.correlation_id,
             Self::GlyphDrop(record) => &record.correlation_id,
+            Self::PtyGeometry(record) => &record.correlation_id,
         }
     }
+}
+
+/// What became of a pane -> daemon PTY resize request.
+///
+/// The UI's local emulator and the daemon's PTY must agree on geometry.
+/// When they drift, a full-screen application draws frames for rows the
+/// local grid does not have: absolute cursor moves past the last row
+/// collapse onto it, erases land on the wrong lines, and stale content
+/// survives below the live frame. Every outcome except `Applied` is a
+/// step toward that drift, so each one is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PtyResizeOutcome {
+    /// Forwarded to the daemon worker for the pane's live session.
+    Applied,
+    /// Pushed to a session that had just become mapped, catching up a
+    /// size the UI requested while the pane had no session yet.
+    Replayed,
+    /// No session mapped for this pane yet. The size is retained and
+    /// replayed on the next spawn/attach rather than silently lost.
+    DroppedUnmapped,
+    /// The shim is not connected to a daemon at all.
+    DroppedDisconnected,
+    /// The daemon rejected the resize RPC or the transport failed.
+    RpcFailed,
+}
+
+impl PtyResizeOutcome {
+    fn level(self) -> &'static str {
+        match self {
+            Self::Applied | Self::Replayed => "info",
+            Self::DroppedUnmapped | Self::DroppedDisconnected | Self::RpcFailed => "warn",
+        }
+    }
+}
+
+/// Content-free record of a pane geometry change and its fate. Carries
+/// ids and dimensions only -- never command output, cwd, or shell text.
+#[derive(Debug, Serialize)]
+struct PtyGeometryRecord {
+    timestamp_unix_ms: u64,
+    event: &'static str,
+    level: &'static str,
+    correlation_id: String,
+    pane_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<u64>,
+    cols: u16,
+    rows: u16,
+    outcome: PtyResizeOutcome,
+    /// `io::ErrorKind` (or a daemon error code) for `RpcFailed`. Bounded
+    /// vocabulary, not the formatted error message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<String>,
 }
 
 /// Content-free record of glyphs that failed to shape/rasterize and were
@@ -192,6 +249,36 @@ pub fn record_glyph_atlas_recovery(event: &GlyphAtlasRecoveryEvent) {
             record.event,
         );
     }
+}
+
+/// Record the fate of a pane -> daemon PTY resize request.
+///
+/// Callers must only invoke this when the requested geometry actually
+/// differs from the pane's last request: `on_resize` fires per frame
+/// while a window is being dragged, and one event per distinct size
+/// keeps the log proportional to real geometry changes. Enqueueing is
+/// non-blocking and never touches the filesystem on the caller's thread,
+/// so this is safe to call from the layout callback.
+pub fn record_pty_resize(
+    pane_id: u32,
+    session_id: Option<u64>,
+    cols: u16,
+    rows: u16,
+    outcome: PtyResizeOutcome,
+    error_kind: Option<String>,
+) {
+    enqueue(TelemetryRecord::PtyGeometry(PtyGeometryRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event: "pty.resize",
+        level: outcome.level(),
+        correlation_id: process_correlation_id().to_string(),
+        pane_id,
+        session_id,
+        cols,
+        rows,
+        outcome,
+        error_kind,
+    }));
 }
 
 /// Sample over-budget frames into durable stage telemetry. The callback does
