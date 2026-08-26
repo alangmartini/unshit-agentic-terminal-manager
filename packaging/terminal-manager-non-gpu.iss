@@ -3,7 +3,7 @@
 ; Only the OutputBaseFilename differs from the standard installer.
 
 #define MyAppName "Terminal Manager"
-#define MyAppVersion "0.3.1"
+#define MyAppVersion "0.3.2"
 #define MyAppPublisher "Alan Galvao"
 #define MyAppURL "https://github.com/alangmartini/unshit-agentic-terminal-manager"
 #define MyAppExeName "terminal-manager.exe"

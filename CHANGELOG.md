@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-26
+
+A pane's shell now always knows how big its pane actually is. Reattaching to a
+session that outlived the app, resizing a split, or resizing the window used to
+leave shells wrapping at a stale width or drawing for rows the pane no longer
+had — an agent CLI or any full-screen program would pile its frame onto the last
+visible line over stale text. The mouse wheel also follows the pointer now, and
+window-switching chords no longer leak keystrokes into the shell.
+
+### Added
+
+- **The mouse wheel now scrolls the pane under the pointer.** In a split, hovering the other half and scrolling moves *that* pane's scrollback instead of doing nothing — reading back through a background pane no longer costs a click to focus it first, and scrolling deliberately leaves keyboard focus where it is. Applies to terminal and editor panes alike; a pane running a mouse-tracking TUI receives the wheel as mouse reports the same way the focused pane does. Keyboard input is unchanged and still goes only to the focused pane.
+- **`pty.resize` telemetry.** Every pane geometry change now records whether it reached the shell (`applied`, `replayed`) or not (`dropped_unmapped`, `dropped_disconnected`, `rpc_failed`) to `renderer-events.jsonl`, with the pane and session ids. Resize failures used to be discarded silently, which made a mismatched shell size invisible until something drew off the bottom of the pane.
+
+### Fixed
+
+- **Reattached shells no longer keep the previous window's size.** Sessions outlive the app, but nothing told a surviving session how big its pane had become: reattaching carried no dimensions at all, and reusing a session ignored the ones it was sent, so a shell spawned in a maximized window stayed that tall in a smaller one. A resize that arrived before its pane had a session was dropped outright with no retry, and since a pane only reports its size when its rectangle changes, the shell then kept the wrong geometry for the rest of the run. Full-screen programs — an agent CLI, `vim`, anything that redraws a frame — drew for rows the pane no longer had, so their output piled onto the last visible line over stale text and the bottom of the frame was never reachable. Panes now remember the last size they asked for and replay it the moment a session appears, and reusing a live session adopts the reattaching window's geometry.
+- **Background panes in a split no longer keep the wrong size after a resize.** Only the focused pane told its shell how big it had become, so resizing the window, dragging a splitter or collapsing the sidebar left every other pane's shell still wrapping at the old width — a `top`, a build log or an agent CLI in the other half of a split would paint at the stale geometry until you clicked it, which was the only thing that corrected it. Every visible pane now reports its own size, and a pane whose size has not actually been measured yet is skipped instead of pushing a one-column geometry at a live shell.
+- **Window-switching chords no longer type into the shell.** Keys that were physically held when the window lost or regained focus were being replayed as real keystrokes, so the tail of an `Alt+Tab` or `Win+D` arrived at the PTY as a bare character — enough to submit a half-written prompt to an agent CLI. Those focus-sync notifications are now ignored, and the chords the window manager owns (`Alt+Tab`, `Alt+Shift+Tab`, `Alt+Space`, and every `Win` combination) no longer encode to anything the terminal can send.
+
 ## [0.3.1] - 2026-08-24
 
 Interface zoom now scales the whole app, and the tab strip scrolls with a plain
@@ -435,7 +455,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.5...v0.2.6
