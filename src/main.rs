@@ -649,6 +649,17 @@ fn main() {
         std::process::exit(code);
     }
 
+    // Start the GPU before anything else needs it. Adapter and device creation
+    // are the longest single stretch of startup -- over a second here, most of
+    // it D3D12 enumerating adapters this machine will not use -- and they need
+    // no window. Kicking them off now means config load, state seeding, the
+    // daemon handshake, the event loop and the window all happen alongside
+    // that wait rather than in front of it.
+    //
+    // Placed after the notification CLI so `--notify`-style invocations, which
+    // exit without ever opening a window, do not spin up a GPU thread.
+    unshit::app::prewarm_window_gpu();
+
     #[cfg(feature = "profiling")]
     init_profiler();
 
@@ -1051,6 +1062,12 @@ fn main() {
             width: 1280,
             height: 800,
             decorations: false,
+            // Appear drawn rather than appear early. GPU bring-up runs on the
+            // event-loop thread and costs over a second on this class of
+            // machine, so a window mapped at creation time spends that second
+            // as a white rectangle that answers no clicks. Measured: window at
+            // ~210ms, first present at ~1.4s.
+            show_window_when_painted: true,
             css: STYLES.to_string(),
             fonts: terminal_font_sources(),
             user_shortcuts: user_shortcut_bindings(),

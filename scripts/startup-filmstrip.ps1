@@ -5,16 +5,20 @@
   can be checked instead of inferred from timings.
 
 .DESCRIPTION
-  The startup timings say the window exists at ~90ms and the first frame lands
-  around 1.4s. Those two numbers do not say what occupies the gap, and the gap
-  is the whole user experience: a window that appears instantly and then shows
-  a white rectangle for a second reads worse than one that appears late.
+  Stage timings say when the window was created and when the first frame
+  landed. They do not say what occupies the gap, and the gap is the whole user
+  experience: this is how we found that the window used to exist from ~210ms
+  while the first paint was ~1.4s away, and that it spent that entire interval
+  unable to answer a message, because GPU bring-up runs on the event-loop
+  thread. A window that appears instantly and then hangs white for a second is
+  worse than one that appears late and drawn.
 
-  This launches the release build under a throwaway instance profile, polls for
-  the window handle with no sleep so the measurement is not quantised by the
-  poll interval, and then captures the window at a series of offsets from
-  launch. Each capture records the offset it actually happened at, because
-  CopyFromScreen is not free and a requested 150ms is not a delivered 150ms.
+  Launches the release build under a throwaway instance profile, polls for the
+  window with no sleep so the measurement is not quantised by the poll
+  interval, and captures at a series of offsets from launch. Each capture
+  records the offset it actually happened at, not the one requested -- capture
+  is not free, and on a hung window PrintWindow blocks until the app pumps
+  messages again, which is itself the measurement.
 
   It also greps the run's stderr for the background-work telemetry, so a shot
   showing branches filled in is backed by the event that filled them.
@@ -79,6 +83,7 @@ if (-not (Test-Path $appExe)) { throw "Missing $appExe (cargo build --release -p
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 Get-ChildItem -Path $OutDir -Filter '*.png' -ErrorAction SilentlyContinue | Remove-Item -Force
 
+$launched = $null
 $isolation = Enter-TmIsolation -Tag 'filmstrip'
 $env:RUST_LOG = 'info'
 $env:TM_STARTUP_TRACE = '1'
@@ -100,6 +105,7 @@ try {
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $proc = Start-Process -FilePath $appExe -PassThru `
         -RedirectStandardError $errLog -RedirectStandardOutput $outLog
+    $launched = $proc
     $spawnMs = $clock.Elapsed.TotalMilliseconds
 
     # No sleep in this loop: a 250ms poll cannot observe a 200ms window.
@@ -177,6 +183,13 @@ try {
     $shots | Format-Table -AutoSize | Out-String | Write-Host
 } finally {
     $ErrorActionPreference = 'SilentlyContinue'
+    # In the finally block, not after the captures: a run that throws early
+    # (no window appeared, capture failed) otherwise leaves the app alive
+    # holding a lock on the very .exe the next `cargo build` has to replace.
+    if ($launched -and -not $launched.HasExited) {
+        try { $launched.Kill() } catch {}
+        try { $launched.WaitForExit(5000) | Out-Null } catch {}
+    }
     $env:RUST_LOG = $null
     $env:TM_STARTUP_TRACE = $null
     if (-not $KeepProfile) { Exit-TmIsolation -Isolation $isolation -PtydExe $ptydExe }

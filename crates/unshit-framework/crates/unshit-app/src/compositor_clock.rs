@@ -210,7 +210,7 @@ fn waker_loop(
     }
 }
 
-fn compositor_wait_fn() -> Option<WaitForCompositorClock> {
+pub(crate) fn compositor_wait_fn() -> Option<WaitForCompositorClock> {
     static WAIT_FN: OnceLock<Option<WaitForCompositorClock>> = OnceLock::new();
     *WAIT_FN.get_or_init(load_compositor_wait_fn)
 }

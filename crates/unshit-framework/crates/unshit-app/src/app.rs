@@ -168,6 +168,18 @@ pub struct AppConfig {
     pub width: u32,
     pub height: u32,
     pub decorations: bool,
+    /// Keep the window unmapped until it is ready to paint, instead of
+    /// mapping it as soon as it is created.
+    ///
+    /// Creating the window is cheap; the GPU bring-up that follows is not, and
+    /// it runs on the event-loop thread. A window mapped before that finishes
+    /// cannot answer a paint or a click for as long as it takes -- measured at
+    /// ~1.2s on a machine whose D3D12 adapter enumeration is slow -- so what
+    /// an early window actually buys the user is a white, non-responding
+    /// rectangle.
+    ///
+    /// Defaults to `false`, which preserves the map-immediately behaviour.
+    pub show_window_when_painted: bool,
     pub css: String,
     pub keybindings_path: Option<String>,
     /// Callback invoked for [`ExternalEvent::Custom`] payloads.
@@ -334,6 +346,7 @@ impl Default for AppConfig {
             width: 800,
             height: 600,
             decorations: true,
+            show_window_when_painted: false,
             css: String::new(),
             keybindings_path: None,
             on_external_event: None,
@@ -858,6 +871,23 @@ fn configured_pacing_mode(
             surface_mode
         }
     }
+}
+
+/// Begin GPU bring-up now, before the event loop exists.
+///
+/// Call once, as early in `main` as possible. Everything after it -- config,
+/// state, the event loop, the window -- then happens alongside adapter and
+/// device creation instead of in front of them.
+///
+/// Resolves the same preferences the real request will, by the same route: a
+/// prewarm that picked different backends would be discarded on arrival, and
+/// the enumeration it paid for is the expensive part.
+///
+/// Safe to call unconditionally. It is a no-op off Windows, under a forced
+/// software renderer, and in any process that never opens a window.
+pub fn prewarm_window_gpu() {
+    let compositor_clock_supported = crate::compositor_clock::compositor_wait_fn().is_some();
+    GpuContext::prewarm(window_gpu_preferences(compositor_clock_supported));
 }
 
 fn window_gpu_preferences(compositor_clock_supported: bool) -> WindowGpuPreferences {
@@ -2637,6 +2667,7 @@ impl ApplicationHandler for AppHandler {
             self.app.config.width,
             self.app.config.height,
             self.app.config.decorations,
+            !self.app.config.show_window_when_painted,
         ));
         self.mark_startup("window_created");
 
@@ -2823,6 +2854,24 @@ impl ApplicationHandler for AppHandler {
 
         // Mark every node dirty for paint so the first frame renders all elements.
         unshit_core::build::mark_paint_dirty(&mut arena, root);
+
+        // Map a deferred window here, at the last point before the first paint
+        // is asked for. Everything expensive is already behind it -- adapter,
+        // device, pipelines, fonts, tree, layout -- so what remains is one
+        // render, rather than the second-plus of GPU bring-up that a window
+        // mapped at creation time has to sit through without answering a
+        // single message.
+        //
+        // Not after the first present, which would be tighter: a window that
+        // is not mapped is never sent a paint, so a reveal waiting on a
+        // present waits on something only the reveal can cause.
+        if self.app.config.show_window_when_painted {
+            window.set_visible(true);
+            // Mapping does not focus, and this window missed the usual
+            // "new window takes focus" path by not existing visibly when it
+            // was created. Without this the app draws but ignores typing.
+            window.focus_window();
+        }
 
         window.request_redraw();
 
