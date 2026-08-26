@@ -701,6 +701,7 @@ impl GpuContext {
     ) -> Self {
         let size = window.surface_size();
         let pref = render_tier_pref();
+        let init_started = std::time::Instant::now();
 
         // Step 1 — preferred backends, hardware only; skipped only when
         // software is forced.
@@ -709,7 +710,9 @@ impl GpuContext {
                 backends: renderer_backends(preferences.backends),
                 ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
             });
+            let instance_ready = init_started.elapsed();
             if let Ok(surface) = instance.create_surface(window.clone()) {
+                let surface_ready = init_started.elapsed();
                 if let Some((adapter, device, queue, tier)) = Self::request_window_adapter_device(
                     &instance,
                     &surface,
@@ -718,6 +721,13 @@ impl GpuContext {
                 )
                 .await
                 {
+                    Self::log_gpu_init_timing(
+                        "hardware",
+                        &adapter,
+                        init_started,
+                        instance_ready,
+                        surface_ready,
+                    );
                     log::info!(
                         "renderer adapter selected (hardware path): {:?}",
                         adapter.get_info()
@@ -817,6 +827,35 @@ impl GpuContext {
     /// construction: first the adapter's own reported limits (needed for the
     /// 28-attribute quad pipeline), then wgpu defaults (software renderers that
     /// reject their own limits).
+    /// Structured breakdown of window GPU bring-up.
+    ///
+    /// GPU initialization is the single largest block of cold-start latency and
+    /// it is entirely opaque from the outside: driver load, adapter
+    /// enumeration, and device creation all happen inside one `await`. Without
+    /// this split, a regression in any of the three looks identical from the
+    /// application's own stage timings.
+    fn log_gpu_init_timing(
+        path: &str,
+        adapter: &wgpu::Adapter,
+        started: std::time::Instant,
+        instance_ready: std::time::Duration,
+        surface_ready: std::time::Duration,
+    ) {
+        let total = started.elapsed();
+        let info = adapter.get_info();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let correlation_id = format!("process-{}", std::process::id());
+        log::info!(
+            "{{\"event\":\"renderer.gpu_init\",\"correlation_id\":{correlation_id:?},\"path\":{path:?},\"backend\":\"{:?}\",\"device_type\":\"{:?}\",\"instance_ms\":{:.2},\"surface_ms\":{:.2},\"adapter_device_ms\":{:.2},\"total_ms\":{:.2}}}",
+            info.backend,
+            info.device_type,
+            ms(instance_ready),
+            ms(surface_ready - instance_ready),
+            ms(total - surface_ready),
+            ms(total),
+        );
+    }
+
     async fn request_window_adapter_device(
         instance: &wgpu::Instance,
         surface: &wgpu::Surface<'_>,

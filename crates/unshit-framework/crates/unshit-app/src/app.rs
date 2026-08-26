@@ -292,6 +292,15 @@ pub struct AppConfig {
     /// render pass that produces non-zero values, giving the application a
     /// reliable point to compute initial PTY dimensions.
     pub on_cell_metrics: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
+    /// Callback invoked as each window bring-up milestone completes, with a
+    /// static stage name (see [`STARTUP_STAGES`]).
+    ///
+    /// Cold start is the one path an application cannot instrument from the
+    /// outside: everything between `run()` and the first frame happens inside
+    /// the framework, so a slow launch has no attributable owner. These marks
+    /// give the application the breakdown without it needing to know how the
+    /// renderer is brought up.
+    pub on_startup_stage: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     /// Callback invoked on every rendered frame right after
     /// `record_frame_presented` runs, with a fresh snapshot of the
     /// input latency histograms.
@@ -347,6 +356,7 @@ impl Default for AppConfig {
             on_close: None,
             on_file_drop: None,
             on_cell_metrics: None,
+            on_startup_stage: None,
             on_scroll_telemetry: None,
             #[cfg(feature = "input-latency-histogram")]
             on_input_latency: None,
@@ -2482,9 +2492,25 @@ impl App {
     }
 }
 
+/// The bring-up milestones reported to [`AppConfig::on_startup_stage`], in the
+/// order they fire. Exposed so callers can pre-size storage and assert on the
+/// full set rather than hard-coding string literals.
+pub const STARTUP_STAGES: [&str; 5] =
+    ["window_created", "gpu_ready", "fonts_ready", "first_tree_built", "first_layout_done"];
+
 struct AppHandler {
     app: App,
     event_rx: flume::Receiver<ExternalEvent>,
+}
+
+impl AppHandler {
+    /// Report a bring-up milestone. Cheap enough to call unconditionally: the
+    /// callback is `None` in every build that has not asked for the marks.
+    fn mark_startup(&self, stage: &'static str) {
+        if let Some(ref cb) = self.app.config.on_startup_stage {
+            cb(stage);
+        }
+    }
 }
 
 impl ApplicationHandler for AppHandler {
@@ -2612,6 +2638,7 @@ impl ApplicationHandler for AppHandler {
             self.app.config.height,
             self.app.config.decorations,
         ));
+        self.mark_startup("window_created");
 
         let scale_factor = window.scale_factor() as f32;
         let zoom_factor = if self.app.config.initial_zoom.is_finite() {
@@ -2643,6 +2670,7 @@ impl ApplicationHandler for AppHandler {
         let gpu_preferences = window_gpu_preferences(compositor_clock_supported);
         let mut gpu =
             pollster::block_on(GpuContext::new_with_preferences(window.clone(), gpu_preferences));
+        self.mark_startup("gpu_ready");
 
         // One-shot pacing mode selection: sound because surface
         // reconfigures reuse the stored present mode, so it cannot
@@ -2755,12 +2783,15 @@ impl ApplicationHandler for AppHandler {
             )
         };
 
+        self.mark_startup("fonts_ready");
+
         let mut arena = NodeArena::new();
         let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
 
         let element_tree = (self.app.tree_fn)();
         let root =
             build_tree_from_def(&element_tree.root, &mut arena, &mut taffy, NodeId::DANGLING);
+        self.mark_startup("first_tree_built");
 
         resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
         let mut pseudo_table = unshit_core::style::pseudo::PseudoSideTable::new();
@@ -2787,6 +2818,8 @@ impl ApplicationHandler for AppHandler {
             h,
             &mut measure_cache,
         );
+
+        self.mark_startup("first_layout_done");
 
         // Mark every node dirty for paint so the first frame renders all elements.
         unshit_core::build::mark_paint_dirty(&mut arena, root);
