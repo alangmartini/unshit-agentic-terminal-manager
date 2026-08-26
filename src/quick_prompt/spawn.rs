@@ -103,9 +103,8 @@ pub fn prepare_target_in(base: &Path, workspace_cwd: Option<&Path>) -> io::Resul
         let path_str = path
             .to_str()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 worktree path"))?;
-        let output = Command::new("git")
+        let output = crate::git::git_command(cwd)
             .args(["worktree", "add", path_str, "HEAD"])
-            .current_dir(cwd)
             .output()?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
@@ -166,9 +165,8 @@ pub fn prepare_tab_worktree_in(base: &Path, repo_cwd: &Path) -> io::Result<Targe
     let path_str = path
         .to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 worktree path"))?;
-    let output = Command::new("git")
+    let output = crate::git::git_command(repo_cwd)
         .args(["worktree", "add", "-b", &name, path_str])
-        .current_dir(repo_cwd)
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -191,9 +189,8 @@ pub fn prepare_tab_worktree_in(base: &Path, repo_cwd: &Path) -> io::Result<Targe
 /// `git rev-parse --is-inside-work-tree` against `path`. Returns false
 /// for non-existent paths, non-repo dirs, and any error from git.
 pub fn is_inside_work_tree(path: &Path) -> bool {
-    let Ok(output) = Command::new("git")
+    let Ok(output) = crate::git::git_command(path)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(path)
         .output()
     else {
         return false;
@@ -248,9 +245,8 @@ mod tests {
     }
 
     fn run_git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::git::git_command(dir)
             .args(args)
-            .current_dir(dir)
             .status()
             .expect("run git");
         assert!(status.success(), "git {:?} failed in {:?}", args, dir);
@@ -367,14 +363,13 @@ mod tests {
         // Clean up: remove the worktree from git's bookkeeping before
         // dropping the temp dirs so we do not leave the source repo
         // referencing a missing worktree.
-        let _ = Command::new("git")
+        let _ = crate::git::git_command(&workspace)
             .args([
                 "worktree",
                 "remove",
                 "--force",
                 result.path.to_str().unwrap(),
             ])
-            .current_dir(&workspace)
             .status();
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&workspace);
@@ -420,22 +415,20 @@ mod tests {
 
         // The worktree must sit on a branch named after its directory,
         // not a detached HEAD.
-        let output = Command::new("git")
+        let output = crate::git::git_command(&result.path)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(&result.path)
             .output()
             .expect("git rev-parse");
         let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
         assert_eq!(branch, dir_name);
 
-        let _ = Command::new("git")
+        let _ = crate::git::git_command(&workspace)
             .args([
                 "worktree",
                 "remove",
                 "--force",
                 result.path.to_str().unwrap(),
             ])
-            .current_dir(&workspace)
             .status();
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&workspace);
