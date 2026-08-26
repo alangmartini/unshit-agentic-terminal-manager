@@ -15,8 +15,10 @@ pub mod diagnostics;
 pub mod drag;
 pub mod editor;
 pub mod git;
+pub mod git_watch;
 pub mod keybinds;
 pub mod notifications;
+pub mod pane_restore;
 pub mod persist;
 pub mod profile;
 pub mod pty;
@@ -55,7 +57,9 @@ use crate::ui::titlebar::build_titlebar;
 use crate::ui::toasts::build_toast_overlay;
 
 const STYLES: &str = include_str!("../assets/styles.css");
-const JETBRAINS_MONO_REGULAR: &[u8] =
+/// The terminal's own regular face. `pub(crate)` because cell metrics are
+/// measured against it directly -- see `state::measure_cell_width_ratio_at`.
+pub(crate) const JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf");
 const JETBRAINS_MONO_SEMIBOLD: &[u8] =
     include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-SemiBold.ttf");
@@ -983,145 +987,16 @@ fn main() {
 
     crate::startup_perf::mark("active_pane_attached");
 
-    // Reattach (or fresh-spawn) every *other* restored pane. The block
-    // above brings up only the active pane (it must exist first so the
-    // renderer can publish cell metrics). A restored layout can carry many
-    // more panes across tabs and workspaces; each keeps a live terminal in
-    // the runtime, so rejoin them here. A cache hit replays the surviving
-    // daemon session's snapshot; a miss (the shell exited while we were
-    // gone, or an upgrade) spawns a fresh shell in that pane.
-    {
-        let mut guard = shared.lock().unwrap();
-        let terminal_font_size = guard.terminal_font_size_pt as f32;
-        let cell_w_est = terminal_font_size * guard.cell_width_ratio;
-        let cell_h_est = terminal_font_size * crate::state::CSS_LINE_HEIGHT;
-        let init_cols = ((1280.0_f32 - 284.0) / cell_w_est).max(1.0) as u16;
-        let init_rows = ((800.0_f32 - 109.0) / cell_h_est).max(1.0) as u16;
-        let active_pane_id = guard.active_pane.0;
-
-        // Snapshot the reattach targets up front so the immutable borrow of
-        // `guard.workspaces` is released before we mutate `pty_manager` /
-        // `terminals`. The active workspace's live tabs are mirrored into
-        // `workspaces[active].tabs` by `restore_layout`, so iterating
-        // `workspaces` covers every pane.
-        let targets: Vec<(
-            u32,
-            u32,
-            Option<std::path::PathBuf>,
-            Option<crate::shell::ShellSpec>,
-        )> = guard
-            .workspaces
-            .iter()
-            .flat_map(|ws| {
-                let ws_num = ws.num;
-                let cwd = ws.path.clone();
-                let shell = crate::shell::resolve(Some(&ws.shell), Some(&guard.default_shell));
-                ws.tabs
-                    .iter()
-                    .flat_map(|tab| tab.panes.iter().flatten())
-                    .filter(|pane| pane.id.0 != active_pane_id)
-                    .map(move |pane| (ws_num, pane.id.0, cwd.clone(), shell.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        for (workspace_id, pane_id, cwd, shell) in targets {
-            if guard.terminals.contains_key(&pane_id) || guard.editors.contains_key(&pane_id) {
-                continue;
-            }
-            let spawn_plan = crate::state::pane_agent_spawn_plan(&guard, pane_id, cwd, shell);
-            let launch_prepared = crate::state::prepare_agent_resume_launch(
-                &mut guard,
-                pane_id,
-                workspace_id,
-                &spawn_plan,
-                "background",
-            );
-            let reconcile_result = if launch_prepared {
-                guard.pty_manager.attach_or_spawn(
-                    pane_id,
-                    workspace_id,
-                    init_cols,
-                    init_rows,
-                    spawn_plan.cwd.as_deref(),
-                    spawn_plan.shell.as_ref(),
-                )
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "agent recovery launch preflight was not durable",
-                ))
-            };
-            match reconcile_result {
-                Ok((Some(snapshot), reader)) => {
-                    let rows = snapshot.grid.rows();
-                    let cols = snapshot.grid.cols();
-                    let mut terminal = crate::terminal::Terminal::new(rows, cols);
-                    terminal.apply_snapshot(&snapshot);
-                    guard.terminals.insert(
-                        pane_id,
-                        std::sync::Arc::new(std::sync::Mutex::new(terminal)),
-                    );
-                    crate::bridge::register_reader(pane_id, reader);
-                    crate::state::apply_agent_spawn_outcome(
-                        &mut guard,
-                        pane_id,
-                        workspace_id,
-                        &spawn_plan,
-                        true,
-                        "background",
-                    );
-                    log::info!(
-                        "reattached background pane {} (workspace {}) to surviving session ({}x{})",
-                        pane_id,
-                        workspace_id,
-                        cols,
-                        rows
-                    );
-                }
-                Ok((None, reader)) => {
-                    let terminal =
-                        crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
-                    guard.terminals.insert(
-                        pane_id,
-                        std::sync::Arc::new(std::sync::Mutex::new(terminal)),
-                    );
-                    crate::bridge::register_reader(pane_id, reader);
-                    crate::state::apply_agent_spawn_outcome(
-                        &mut guard,
-                        pane_id,
-                        workspace_id,
-                        &spawn_plan,
-                        false,
-                        "background",
-                    );
-                    log::info!(
-                        "background pane {} (workspace {}) had no surviving session; spawned fresh",
-                        pane_id,
-                        workspace_id
-                    );
-                }
-                Err(e) => {
-                    crate::state::record_agent_spawn_failure(
-                        &mut guard,
-                        pane_id,
-                        workspace_id,
-                        &spawn_plan,
-                        "background",
-                        &e,
-                    );
-                    log::error!(
-                        "failed to reattach/spawn background pane {} (workspace {}): {}",
-                        pane_id,
-                        workspace_id,
-                        e
-                    );
-                }
-            }
-        }
-    }
-
-    crate::startup_perf::mark("background_panes_attached");
+    // Every *other* restored pane is reattached after the window is up,
+    // not before it. The block above brings up the active pane eagerly --
+    // it must exist first so the renderer can publish cell metrics -- but a
+    // restored layout can carry many more panes across tabs and workspaces,
+    // and each one costs a synchronous round trip to the daemon. On the
+    // seven-workspace profile that was 145ms of IPC in front of the first
+    // frame, for panes that are not visible on it.
+    //
+    // See `pane_restore::attach_background_panes_in_background`, kicked off
+    // once the event sink exists.
 
     if let Some(cfg) = bench_config {
         crate::bench::start(cfg, shared.clone());
@@ -1449,6 +1324,19 @@ fn main() {
     );
     let _ = window_event_sink.set(app.event_sink());
 
+    // Branch names are decoration, so they are resolved after the window is
+    // on its way up rather than in front of it. Started here, immediately
+    // after the sink exists, so a resolution that finishes early still has
+    // somewhere to deliver its rebuild request.
+    crate::git_watch::resolve_all_in_background(shared.clone(), window_event_sink.clone());
+
+    // Same reasoning for the panes the first frame will not show: reattach
+    // them alongside window and GPU bring-up rather than in front of it.
+    crate::pane_restore::attach_background_panes_in_background(
+        shared.clone(),
+        window_event_sink.clone(),
+    );
+
     // Hand the editor's file-open dialog thread a way back into app
     // state and the render loop (see `dispatch_editor_open_dialog`).
     {
@@ -1503,6 +1391,7 @@ fn main() {
         }
     }
 
+    crate::startup_perf::mark("event_loop_entered");
     app.run();
 }
 

@@ -840,7 +840,7 @@ mod tests {
                     tree_glyph: "\u{2514}",
                 },
             ],
-            git_branch: None,
+            git_branch: crate::state::GitBranch::Absent,
             tabs: vec![],
             active_tab: 0,
             shell: crate::shell::ShellSpec::default(),
@@ -1147,7 +1147,8 @@ mod tests {
         {
             let mut guard = shared.lock().unwrap();
             guard.workspaces[0].terminals_expanded = true;
-            guard.workspaces[0].git_branch = Some("feat/rust-terminal-manager".to_string());
+            guard.workspaces[0].git_branch =
+                crate::state::GitBranch::Known("feat/rust-terminal-manager".to_string());
             guard.panes[0][0].title = "claude-test".to_string();
         }
         let state = shared.lock().unwrap().ui_snapshot();

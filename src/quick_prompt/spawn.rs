@@ -18,7 +18,6 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::shell::ShellSpec;

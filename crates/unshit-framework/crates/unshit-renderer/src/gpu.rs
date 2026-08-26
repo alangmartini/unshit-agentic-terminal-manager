@@ -862,6 +862,36 @@ impl GpuContext {
         power: wgpu::PowerPreference,
         force_fallback: bool,
     ) -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue, AdapterTier)> {
+        let request_started = std::time::Instant::now();
+        // Opt-in probe. `request_adapter` is a single opaque call that was
+        // measured at 800ms on an AMD 890M laptop, and the reason turned out to
+        // be nothing to do with the GPU that got selected: wgpu instantiates
+        // *every* DXGI adapter to inspect it, and this machine exposes a
+        // "Microsoft Basic Render Driver" (WARP) whose D3D12 device creation
+        // is slow. Listing what was enumerated is the only way to see that
+        // from outside wgpu, so keep the probe available -- but off by
+        // default, since it duplicates the expensive enumeration.
+        if std::env::var_os("UNSHIT_GPU_ENUM_PROBE").is_some() {
+            let t0 = std::time::Instant::now();
+            let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+            let enumerate_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            for a in &adapters {
+                let t1 = std::time::Instant::now();
+                let info = a.get_info();
+                log::info!(
+                    "{{\"event\":\"renderer.adapter_enumerated\",\"name\":{:?},\"backend\":\"{:?}\",\"device_type\":\"{:?}\",\"get_info_ms\":{:.2}}}",
+                    info.name,
+                    info.backend,
+                    info.device_type,
+                    t1.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            log::info!(
+                "{{\"event\":\"renderer.enumerate_adapters\",\"count\":{},\"total_ms\":{:.2}}}",
+                adapters.len(),
+                enumerate_ms,
+            );
+        }
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: power,
@@ -871,6 +901,7 @@ impl GpuContext {
             })
             .await
             .ok()?;
+        let adapter_ready = request_started.elapsed();
         let tier = classify_adapter(&adapter.get_info(), force_fallback);
         let (device, queue) = match adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -892,6 +923,18 @@ impl GpuContext {
                 .await
                 .ok()?,
         };
+        // Split so a regression points at a cause: adapter enumeration can be
+        // narrowed by requesting fewer backends, while device creation is the
+        // driver's own floor that only overlap can hide.
+        let total = request_started.elapsed();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        log::info!(
+            "{{\"event\":\"renderer.adapter_device\",\"correlation_id\":{:?},\"backend\":\"{:?}\",\"adapter_ms\":{:.2},\"device_ms\":{:.2}}}",
+            process_correlation_id(),
+            adapter.get_info().backend,
+            ms(adapter_ready),
+            ms(total - adapter_ready),
+        );
         Some((adapter, device, queue, tier))
     }
 
@@ -912,6 +955,7 @@ impl GpuContext {
         // request asks for adapter limits, but the fallback request uses
         // WebGPU defaults; selecting a shader from adapter limits after that
         // fallback could exceed the real device contract.
+        let build_started = std::time::Instant::now();
         let device_limits = device.limits();
         let device = Arc::new(device);
         let queue = Arc::new(queue);
@@ -959,6 +1003,7 @@ impl GpuContext {
             desired_maximum_frame_latency: maximum_frame_latency,
         };
         surface.configure(&device, &surface_config);
+        let surface_configured = build_started.elapsed();
 
         // Some hardware backends expose WebGPU downlevel limits too (notably
         // GL at 16 vertex attributes or inter-stage locations).
@@ -1004,6 +1049,7 @@ impl GpuContext {
         let image_pipeline = ImagePipeline::new(&device, surface_format, sample_count);
         let svg_pipeline = SvgPipeline::new(&device, surface_format, sample_count);
         let image_cache = ImageCache::new(&device);
+        let pipelines_ready = build_started.elapsed();
 
         let (msaa_texture, msaa_view) = if sample_count > 1 {
             let (t, v) = Self::create_msaa_texture(
@@ -1023,6 +1069,21 @@ impl GpuContext {
         // chrome renders flat (no blur) instead of paying for ping-pong copies.
         let backdrop_filter_available = tier != AdapterTier::Software
             && probe_backdrop_filter_support(&adapter, surface_format, surface_config.usage);
+
+        // Shader compilation dominates this block on a cold driver cache, and
+        // it is invisible from `renderer.gpu_init` -- which stops once the
+        // device exists. Without this line a slow first frame looks like "the
+        // GPU was slow" with no way to tell a driver-side device creation cost
+        // from our own pipeline builds.
+        let build_total = build_started.elapsed();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        log::info!(
+            "{{\"event\":\"renderer.pipelines_built\",\"correlation_id\":{correlation_id:?},\"backend\":\"{backend:?}\",\"surface_config_ms\":{:.2},\"pipelines_ms\":{:.2},\"backdrop_probe_ms\":{:.2},\"total_ms\":{:.2}}}",
+            ms(surface_configured),
+            ms(pipelines_ready - surface_configured),
+            ms(build_total - pipelines_ready),
+            ms(build_total),
+        );
 
         Self {
             device,
