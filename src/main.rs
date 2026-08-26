@@ -24,6 +24,7 @@ pub mod quick_prompt;
 pub mod renderer_telemetry;
 pub mod shell;
 pub mod startup;
+pub mod startup_perf;
 pub mod state;
 pub mod terminal;
 pub mod theme;
@@ -634,6 +635,10 @@ fn attach_parent_console() {
 }
 
 fn main() {
+    // First statement in the process: everything after this point is time the
+    // user spends waiting for a window, and the recorder back-dates its epoch
+    // to process creation so image load counts too.
+    crate::startup_perf::init();
     attach_parent_console();
 
     if let Some(code) = notifications::handle_cli_from_env(std::env::args_os().skip(1)) {
@@ -693,8 +698,15 @@ fn main() {
         crate::quick_prompt::state::QuickPromptStore::install(path);
     }
 
+    crate::startup_perf::mark("config_installed");
     let mut initial_state = seed_state();
-    if let Some(persisted) = persist::load_workspaces() {
+    crate::startup_perf::mark("state_seeded");
+    let persisted_state = persist::load_workspaces();
+    crate::startup_perf::mark("workspaces_loaded");
+    let restored_layout = persisted_state
+        .as_ref()
+        .is_some_and(|p| !p.workspaces.is_empty());
+    if let Some(persisted) = persisted_state {
         if !persisted.workspaces.is_empty() {
             // Rebuild persisted workspaces through the same collision-safe
             // stable-id path whether or not legacy state contains tabs.
@@ -775,8 +787,13 @@ fn main() {
             pane_id,
         );
     }
+    crate::startup_perf::mark("layout_restored");
     let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
 
+    // Recorded for startup telemetry: attaching to a live daemon and spawning a
+    // fresh one have very different cost, and separating them is what makes a
+    // slow launch attributable.
+    let daemon_was_spawned;
     // Bring the unshit-ptyd daemon up and wire the UI's DaemonPty shim
     // to it. Uses a short-lived tokio runtime because connect_or_spawn
     // is async; the shim's own worker thread drives every subsequent
@@ -798,17 +815,22 @@ fn main() {
         );
         let socket_path = ptyd_socket_path();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for daemon probe");
-        if let Err(err) = rt.block_on(daemon::connect_or_spawn(&socket_path)) {
-            eprintln!("failed to connect or spawn unshit-ptyd daemon: {err}");
-            std::process::exit(1);
+        match rt.block_on(daemon::connect_or_spawn(&socket_path)) {
+            Ok(outcome) => daemon_was_spawned = outcome == daemon::DaemonStartup::Spawned,
+            Err(err) => {
+                eprintln!("failed to connect or spawn unshit-ptyd daemon: {err}");
+                std::process::exit(1);
+            }
         }
         drop(rt);
+        crate::startup_perf::mark("daemon_connected");
         let mut guard = shared.lock().unwrap();
         guard
             .pty_manager
             .connect_to(&socket_path)
             .expect("DaemonPty shim connect_to");
     }
+    crate::startup_perf::mark("daemon_shim_ready");
 
     // Measure the actual monospace cell width ratio for later use (split
     // pane spawns, etc.). Do NOT pre-publish cell metrics to the global
@@ -825,6 +847,7 @@ fn main() {
         let line_height = font_size * crate::state::CSS_LINE_HEIGHT;
         guard.cell_width_ratio = crate::state::measure_cell_width_ratio_at(font_size, line_height);
     }
+    crate::startup_perf::mark("cell_ratio_measured");
 
     // Reconcile the initial pane against any surviving daemon session
     // (slice 5): if a prior UI run left a session with a matching
@@ -957,6 +980,8 @@ fn main() {
             }
         }
     }
+
+    crate::startup_perf::mark("active_pane_attached");
 
     // Reattach (or fresh-spawn) every *other* restored pane. The block
     // above brings up only the active pane (it must exist first so the
@@ -1096,6 +1121,8 @@ fn main() {
         }
     }
 
+    crate::startup_perf::mark("background_panes_attached");
+
     if let Some(cfg) = bench_config {
         crate::bench::start(cfg, shared.clone());
     }
@@ -1122,6 +1149,17 @@ fn main() {
         Arc::new(std::sync::OnceLock::new());
     let tree_window_event_sink = window_event_sink.clone();
     let fps_window_event_sink = window_event_sink.clone();
+
+    let first_frame_seen = std::sync::atomic::AtomicBool::new(false);
+    let startup_context = {
+        let guard = shared.lock_recover();
+        crate::startup_perf::Context {
+            workspaces: guard.workspaces.len(),
+            panes: guard.terminals.len(),
+            daemon_spawned: daemon_was_spawned,
+            restored_layout,
+        }
+    };
 
     let mut app = App::new(
         AppConfig {
@@ -1246,7 +1284,15 @@ fn main() {
                 );
                 resize_all_terminals(&mut guard, cols, rows);
             })),
+            on_startup_stage: Some(Arc::new(crate::startup_perf::mark)),
             on_frame_metrics: Some(Box::new(move |m| {
+                // The first frame is the moment the user actually has a UI.
+                // Emitting here (rather than from the render setup) keeps the
+                // startup record on the far side of the path it measures.
+                if !first_frame_seen.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::startup_perf::mark("first_frame");
+                    crate::startup_perf::finish(startup_context);
+                }
                 crate::bench::record_frame(m);
                 crate::renderer_telemetry::record_slow_frame(m);
                 crate::renderer_telemetry::record_glyph_drops(m);
