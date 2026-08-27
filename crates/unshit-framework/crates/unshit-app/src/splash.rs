@@ -74,8 +74,15 @@ impl SplashRect {
 /// One thing to put on screen, in back-to-front order.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SplashCommand {
-    /// A solid fill. The color is already composited against everything behind
-    /// it, so the painter can blit it opaquely and never needs to blend.
+    /// A fill, with the alpha the cascade gave it. The painter blends.
+    ///
+    /// Flattening these to opaque at collect time is tempting -- it makes the
+    /// painter a plain blit -- and it is wrong. A stylesheet may cover the
+    /// whole window in a 3%-alpha wash (this one does, twice, via
+    /// `body::before` and `body::after`), and an opaque version of that wash
+    /// erases every rectangle underneath it. The result is a window painted
+    /// entirely in one colour, which looks exactly like a placeholder that
+    /// never drew anything.
     Fill { rect: SplashRect, color: Color },
     /// A text run. Placement is the element's content box; the painter is
     /// expected to approximate, not to reproduce the real shaper.
@@ -93,22 +100,16 @@ pub enum SplashCommand {
 /// `surface` is the window's physical size and acts as the outermost clip, so
 /// a tree laid out for a stale size cannot scribble outside the window.
 ///
-/// The result is in painter's order: index 0 is furthest back. Colors are
-/// pre-composited against `backdrop`, which should be whatever the platform
-/// will clear the window to (and, ideally, whatever the GPU's first frame will
-/// clear to -- matching them is what makes the eventual swap invisible).
-pub fn collect(
-    arena: &NodeArena,
-    root: NodeId,
-    surface: (u32, u32),
-    backdrop: Color,
-) -> Vec<SplashCommand> {
+/// The result is in painter's order: index 0 is furthest back. Colors carry
+/// their real alpha; the painter is expected to blend onto a surface it has
+/// already cleared (see [`backdrop_for`]).
+pub fn collect(arena: &NodeArena, root: NodeId, surface: (u32, u32)) -> Vec<SplashCommand> {
     let clip = SplashRect { x: 0, y: 0, width: surface.0 as i32, height: surface.1 as i32 };
     let mut out = Vec::new();
     if clip.is_empty() {
         return out;
     }
-    walk(arena, root, clip, backdrop, 1.0, 0, &mut out);
+    walk(arena, root, clip, 1.0, 0, &mut out);
     out
 }
 
@@ -116,7 +117,6 @@ fn walk(
     arena: &NodeArena,
     id: NodeId,
     clip: SplashRect,
-    under: Color,
     inherited_alpha: f32,
     depth: u32,
     out: &mut Vec<SplashCommand>,
@@ -143,30 +143,23 @@ fn walk(
 
     let node_rect = SplashRect::from_layout(&el.layout_rect).intersect(&clip);
 
-    // The color descendants sit on top of. It only changes when this node
-    // actually covers them with something.
-    let mut under_for_children = under;
-
-    if let Some(src) = background_color(&style.background) {
-        let composited = composite(src, under, alpha);
-        if !node_rect.is_empty() {
-            out.push(SplashCommand::Fill { rect: node_rect, color: composited });
+    if !node_rect.is_empty() {
+        if let Some(src) = background_color(&style.background) {
+            let color = faded(src, alpha);
+            if color.a > 0 {
+                out.push(SplashCommand::Fill { rect: node_rect, color });
+            }
         }
-        // Track the composited color even when the rect was clipped away: a
-        // child that overflows into a visible region still sits on this
-        // node's color conceptually, and guessing `under` is better than
-        // guessing the grandparent's.
-        under_for_children = composited;
-    }
 
-    if let ElementContent::Text(ref text) = el.content {
-        if !text.trim().is_empty() && !node_rect.is_empty() {
-            out.push(SplashCommand::Text {
-                rect: node_rect,
-                color: composite(style.color, under_for_children, alpha),
-                font_size: style.font_size,
-                text: text.clone(),
-            });
+        if let ElementContent::Text(ref text) = el.content {
+            if !text.trim().is_empty() {
+                out.push(SplashCommand::Text {
+                    rect: node_rect,
+                    color: faded(style.color, alpha),
+                    font_size: style.font_size,
+                    text: text.clone(),
+                });
+            }
         }
     }
 
@@ -180,7 +173,7 @@ fn walk(
     }
 
     for child in arena.children(id) {
-        walk(arena, child, child_clip, under_for_children, alpha, depth + 1, out);
+        walk(arena, child, child_clip, alpha, depth + 1, out);
     }
 }
 
@@ -215,18 +208,10 @@ fn background_color(background: &Background) -> Option<Color> {
     (mean.a > 0).then_some(mean)
 }
 
-/// `src` over `under`, with `src`'s own alpha scaled by `alpha`.
-///
-/// The result is always fully opaque, because `under` always is: the walk
-/// starts from an opaque backdrop and every composite preserves that. This is
-/// what lets the painter blit without blending.
-fn composite(src: Color, under: Color, alpha: f32) -> Color {
-    let a = (src.a as f32 / 255.0) * alpha.clamp(0.0, 1.0);
-    let mix = |s: u8, u: u8| -> u8 {
-        let v = s as f32 * a + u as f32 * (1.0 - a);
-        v.round().clamp(0.0, 255.0) as u8
-    };
-    Color { r: mix(src.r, under.r), g: mix(src.g, under.g), b: mix(src.b, under.b), a: 255 }
+/// `color` with its alpha scaled by an inherited group opacity.
+fn faded(color: Color, alpha: f32) -> Color {
+    let a = (color.a as f32) * alpha.clamp(0.0, 1.0);
+    Color { a: a.round().clamp(0.0, 255.0) as u8, ..color }
 }
 
 /// The color the window should be cleared to before any command runs.
@@ -302,25 +287,33 @@ mod tests {
         let child = arena.alloc(node((10.0, 10.0, 20.0, 20.0), Some(WHITE)));
         attach(&mut arena, root, child);
 
-        let out = collect(&arena, root, (100, 100), BLACK);
+        let out = collect(&arena, root, (100, 100));
         let f = fills(&out);
         assert_eq!(f.len(), 2);
         assert_eq!(f[0].0, SplashRect { x: 0, y: 0, width: 100, height: 100 });
         assert_eq!(f[1].0, SplashRect { x: 10, y: 10, width: 20, height: 20 });
     }
 
+    /// The bug this guards: a full-window wash at 3% alpha, flattened to an
+    /// opaque colour, repaints the entire window and erases every rectangle
+    /// already emitted. The stylesheet has two of these (`body::before` and
+    /// `body::after`), so getting this wrong turns the whole placeholder into
+    /// one flat rectangle -- which is indistinguishable from it never having
+    /// drawn at all.
     #[test]
-    fn a_translucent_fill_is_composited_against_what_is_behind_it() {
+    fn a_translucent_fill_keeps_its_alpha_instead_of_flattening_to_opaque() {
         let mut arena = NodeArena::new();
         let root = arena.alloc(node((0.0, 0.0, 10.0, 10.0), Some(BLACK)));
-        let half = Color { r: 255, g: 255, b: 255, a: 128 };
-        let child = arena.alloc(node((0.0, 0.0, 10.0, 10.0), Some(half)));
-        attach(&mut arena, root, child);
+        let sidebar = arena.alloc(node((0.0, 0.0, 4.0, 10.0), Some(WHITE)));
+        let wash = Color { r: 255, g: 200, b: 100, a: 9 };
+        let overlay = arena.alloc(node((0.0, 0.0, 10.0, 10.0), Some(wash)));
+        attach(&mut arena, root, sidebar);
+        attach(&mut arena, root, overlay);
 
-        let f = fills(&collect(&arena, root, (10, 10), BLACK));
-        // 128/255 of white over black; opaque, because the painter cannot blend.
-        assert_eq!(f[1].1.a, 255);
-        assert!((f[1].1.r as i32 - 128).abs() <= 1, "got {}", f[1].1.r);
+        let f = fills(&collect(&arena, root, (10, 10)));
+        assert_eq!(f.len(), 3);
+        assert_eq!(f[2].1, wash, "the wash must reach the painter with its alpha intact");
+        assert_eq!(f[1].1, WHITE, "the sidebar underneath must survive it");
     }
 
     #[test]
@@ -328,7 +321,7 @@ mod tests {
         let mut arena = NodeArena::new();
         let root = arena.alloc(node((0.0, 0.0, 400.0, 400.0), Some(BLACK)));
 
-        let f = fills(&collect(&arena, root, (100, 50), BLACK));
+        let f = fills(&collect(&arena, root, (100, 50)));
         assert_eq!(f[0].0, SplashRect { x: 0, y: 0, width: 100, height: 50 });
     }
 
@@ -344,7 +337,7 @@ mod tests {
         attach(&mut arena, root, clipper);
         attach(&mut arena, clipper, child);
 
-        let f = fills(&collect(&arena, root, (100, 100), BLACK));
+        let f = fills(&collect(&arena, root, (100, 100)));
         assert_eq!(f.len(), 2);
         assert_eq!(f[1].0, SplashRect { x: 50, y: 50, width: 20, height: 20 });
     }
@@ -360,7 +353,7 @@ mod tests {
         attach(&mut arena, root, clipper);
         attach(&mut arena, clipper, child);
 
-        let f = fills(&collect(&arena, root, (100, 100), BLACK));
+        let f = fills(&collect(&arena, root, (100, 100)));
         assert_eq!(f[1].0, SplashRect { x: 20, y: 20, width: 20, height: 20 });
     }
 
@@ -375,7 +368,7 @@ mod tests {
         attach(&mut arena, root, hidden);
         attach(&mut arena, hidden, child);
 
-        assert_eq!(fills(&collect(&arena, root, (100, 100), BLACK)).len(), 1);
+        assert_eq!(fills(&collect(&arena, root, (100, 100))).len(), 1);
     }
 
     #[test]
@@ -389,7 +382,7 @@ mod tests {
         attach(&mut arena, root, faded);
         attach(&mut arena, faded, child);
 
-        assert_eq!(fills(&collect(&arena, root, (100, 100), BLACK)).len(), 1);
+        assert_eq!(fills(&collect(&arena, root, (100, 100))).len(), 1);
     }
 
     #[test]
@@ -405,9 +398,11 @@ mod tests {
         attach(&mut arena, root, group);
         attach(&mut arena, group, child);
 
-        let f = fills(&collect(&arena, root, (10, 10), BLACK));
-        // 0.5 * 0.5 of white over black.
-        assert!((f[1].1.r as i32 - 64).abs() <= 1, "got {}", f[1].1.r);
+        let f = fills(&collect(&arena, root, (10, 10)));
+        // 0.5 * 0.5 applied to white's alpha, with the colour left alone for
+        // the painter to blend.
+        assert_eq!(f[1].1.r, 255);
+        assert!((f[1].1.a as i32 - 64).abs() <= 1, "got {}", f[1].1.a);
     }
 
     #[test]
@@ -427,7 +422,7 @@ mod tests {
         });
         let root = arena.alloc(root);
 
-        let f = fills(&collect(&arena, root, (10, 10), BLACK));
+        let f = fills(&collect(&arena, root, (10, 10)));
         assert_eq!(f.len(), 1);
         assert!((f[0].1.r as i32 - 127).abs() <= 1, "got {}", f[0].1.r);
     }
@@ -441,7 +436,7 @@ mod tests {
         root.computed_style.font_size = 13.0;
         let root = arena.alloc(root);
 
-        let out = collect(&arena, root, (100, 20), BLACK);
+        let out = collect(&arena, root, (100, 20));
         let text = out
             .iter()
             .find_map(|c| match c {
@@ -463,7 +458,7 @@ mod tests {
         root.content = ElementContent::Text("   \n\t".into());
         let root = arena.alloc(root);
 
-        let out = collect(&arena, root, (100, 20), BLACK);
+        let out = collect(&arena, root, (100, 20));
         assert!(out.iter().all(|c| matches!(c, SplashCommand::Fill { .. })));
     }
 
@@ -477,7 +472,7 @@ mod tests {
         attach(&mut arena, root, left);
         attach(&mut arena, root, right);
 
-        let f = fills(&collect(&arena, root, (100, 100), BLACK));
+        let f = fills(&collect(&arena, root, (100, 100)));
         assert_eq!(f[1].0.x + f[1].0.width, f[2].0.x);
     }
 
@@ -492,6 +487,91 @@ mod tests {
         assert_eq!(backdrop_for(&arena, root, WHITE), BLACK);
     }
 
+    /// The hand-built trees above prove the walk's rules. This proves the
+    /// walk agrees with the real pipeline: a tree built from an `ElementDef`,
+    /// styled by a real stylesheet and positioned by the real layout engine,
+    /// the way an actual app shell is.
+    ///
+    /// It exists because a placeholder can pass every rule test and still
+    /// paint one flat rectangle if what `layout_rect` and `background` hold
+    /// after a real pass is not what the walk assumes.
+    #[test]
+    fn a_real_app_shell_becomes_the_rectangles_it_looks_like() {
+        use cosmic_text::FontSystem;
+        use unshit_core::build::{build_tree_from_def, resolve_all_styles, run_layout_pipeline};
+        use unshit_core::element::ElementDef;
+        use unshit_core::layout::{TextMeasureCache, TextMeasureCtx};
+        use unshit_core::style::parse::CompiledStylesheet;
+
+        let stylesheet = CompiledStylesheet::parse(
+            "
+            .app { width: 100%; height: 100%; display: flex; flex-direction: column;
+                   background: #1c1812; }
+            .titlebar { height: 34px; flex-shrink: 0; background: #241f17; }
+            .body { flex: 1; min-height: 0; display: flex; flex-direction: row; }
+            .sidebar { width: 252px; flex-shrink: 0; background: #201b14; }
+            .content { flex: 1; background: #1c1812; }
+            .statusbar { height: 24px; flex-shrink: 0; background: #2a2419; }
+            ",
+        );
+        let root_def = ElementDef::new(Tag::Div)
+            .with_class("app")
+            .with_child(ElementDef::new(Tag::Div).with_class("titlebar"))
+            .with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("body")
+                    .with_child(ElementDef::new(Tag::Div).with_class("sidebar"))
+                    .with_child(ElementDef::new(Tag::Div).with_class("content")),
+            )
+            .with_child(ElementDef::new(Tag::Div).with_class("statusbar"));
+
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root = build_tree_from_def(&root_def, &mut arena, &mut taffy, NodeId::DANGLING);
+        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+        let mut font_system = FontSystem::new();
+        let mut measure_cache = TextMeasureCache::new();
+        run_layout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            1280.0,
+            800.0,
+            &mut measure_cache,
+        );
+
+        let out = collect(&arena, root, (1280, 800));
+        let f = fills(&out);
+
+        let distinct: std::collections::HashSet<[u8; 4]> =
+            f.iter().map(|(_, c)| [c.r, c.g, c.b, c.a]).collect();
+        assert!(
+            distinct.len() >= 4,
+            "a shell with four distinct backgrounds should not flatten to {} colour(s): {:?}",
+            distinct.len(),
+            f,
+        );
+
+        let titlebar = f
+            .iter()
+            .find(|(r, _)| r.y == 0 && r.height == 34)
+            .unwrap_or_else(|| panic!("no 34px titlebar across the top; got {f:?}"));
+        assert_eq!(titlebar.0.width, 1280);
+
+        let sidebar = f
+            .iter()
+            .find(|(r, _)| r.width == 252 && r.height > 400)
+            .unwrap_or_else(|| panic!("no 252px full-height sidebar; got {f:?}"));
+        assert_eq!(sidebar.0.x, 0);
+
+        let statusbar = f
+            .iter()
+            .find(|(r, _)| r.height == 24 && r.y + r.height == 800)
+            .unwrap_or_else(|| panic!("no 24px statusbar on the bottom edge; got {f:?}"));
+        assert_eq!(statusbar.0.width, 1280);
+    }
+
     #[test]
     fn a_cycle_cannot_spin_the_walk_forever() {
         let mut arena = NodeArena::new();
@@ -504,7 +584,7 @@ mod tests {
             c.last_child = root;
         }
 
-        let out = collect(&arena, root, (10, 10), BLACK);
+        let out = collect(&arena, root, (10, 10));
         assert!(out.len() <= MAX_DEPTH as usize + 2);
     }
 }

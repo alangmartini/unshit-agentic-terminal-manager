@@ -34,6 +34,25 @@ fn process_correlation_id() -> &'static str {
     ID.get_or_init(|| format!("process-{}", std::process::id()))
 }
 
+/// The color the surface is cleared to before a frame is drawn.
+///
+/// Named rather than written at each render pass because things outside the
+/// renderer have to agree with it -- the placeholder painted before the GPU
+/// exists, most of all, where a mismatch is a visible flash at the moment the
+/// two swap. One definition means they cannot drift.
+pub const SURFACE_CLEAR: wgpu::Color = wgpu::Color { r: 0.051, g: 0.067, b: 0.09, a: 1.0 };
+
+/// [`SURFACE_CLEAR`] as 8-bit components, for painters without a GPU.
+///
+/// A straight multiply is correct here, not an approximation: the surface
+/// format is chosen from the caps by explicitly rejecting sRGB
+/// (`.find(|f| !f.is_srgb())`), so clear components are written to the
+/// texture as-is with no transfer function applied.
+pub fn surface_clear_rgb8() -> [u8; 3] {
+    let quantize = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    [quantize(SURFACE_CLEAR.r), quantize(SURFACE_CLEAR.g), quantize(SURFACE_CLEAR.b)]
+}
+
 fn log_backdrop_fallback_once(
     format: wgpu::TextureFormat,
     format_usages: wgpu::TextureUsages,
@@ -155,6 +174,21 @@ fn parse_backend_env_value(value: &str) -> Option<wgpu::Backends> {
         "gl" | "opengl" => Some(wgpu::Backends::GL),
         _ => None,
     }
+}
+
+/// Whether a prewarmed GPU is on its way, already here, or was never coming.
+///
+/// Reported by [`GpuContext::prewarm_status`] so a caller can decide between
+/// waiting productively and waiting at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrewarmStatus {
+    /// Nothing is outstanding: no prewarm ran, or its result was already
+    /// collected. Waiting for it would wait forever.
+    Absent,
+    /// Still being built. Collecting now would block.
+    Pending,
+    /// Finished. Collecting now will not block.
+    Ready,
 }
 
 /// The prewarmed GPU, parked between [`GpuContext::prewarm`] and
@@ -999,6 +1033,37 @@ impl GpuContext {
         }
         #[cfg(not(windows))]
         let _ = preferences;
+    }
+
+    /// Ask whether collecting the prewarmed GPU would block, without blocking.
+    ///
+    /// This is what lets a caller keep pumping its event loop instead of
+    /// parking on [`Self::new_with_preferences`] for the second-plus that
+    /// adapter and device creation costs. Poll it; when it stops reporting
+    /// [`PrewarmStatus::Pending`], the collection inside `new_with_preferences`
+    /// is a formality.
+    ///
+    /// [`PrewarmStatus::Absent`] means there is nothing to wait for at all --
+    /// no prewarm was started, or its result has already been taken -- so a
+    /// poller should stop polling and go down the ordinary path rather than
+    /// waiting for something that will never arrive.
+    pub fn prewarm_status() -> PrewarmStatus {
+        #[cfg(windows)]
+        {
+            let Some(cell) = PREWARM.get() else {
+                return PrewarmStatus::Absent;
+            };
+            let Ok(guard) = cell.lock() else {
+                return PrewarmStatus::Absent;
+            };
+            match guard.as_ref() {
+                Some(handle) if handle.is_finished() => PrewarmStatus::Ready,
+                Some(_) => PrewarmStatus::Pending,
+                None => PrewarmStatus::Absent,
+            }
+        }
+        #[cfg(not(windows))]
+        PrewarmStatus::Absent
     }
 
     /// Collect the prewarmed GPU, blocking for whatever of it is unfinished.
@@ -2116,12 +2181,7 @@ impl GpuContext {
                     resolve_target: pass_resolve,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.051,
-                            g: 0.067,
-                            b: 0.09,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(SURFACE_CLEAR),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2564,7 +2624,7 @@ impl GpuContext {
                         wgpu::LoadOp::Load
                     } else {
                         pass_cleared = true;
-                        wgpu::LoadOp::Clear(wgpu::Color { r: 0.051, g: 0.067, b: 0.09, a: 1.0 })
+                        wgpu::LoadOp::Clear(SURFACE_CLEAR)
                     };
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("main pass (backdrop)"),

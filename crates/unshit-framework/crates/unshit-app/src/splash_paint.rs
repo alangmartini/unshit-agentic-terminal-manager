@@ -25,19 +25,51 @@
 use crate::splash::{SplashCommand, SplashRect};
 use unshit_core::style::types::Color;
 
+/// What actually made it onto the screen.
+///
+/// A placeholder that silently paints nothing looks exactly like a placeholder
+/// that was never asked to paint, and both look like a slow startup. GDI
+/// reports failure per call and never explains itself, so the counts are the
+/// only way to tell a broken painter from an empty command list -- and the
+/// only signal a future session gets without reproducing the launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaintReport {
+    pub fills: u32,
+    pub fills_failed: u32,
+    pub texts: u32,
+    pub texts_failed: u32,
+    pub backdrop_failed: bool,
+    pub blit_failed: bool,
+    /// Set when the paint returned before drawing anything, naming the reason.
+    pub gave_up: &'static str,
+}
+
+impl PaintReport {
+    /// True when nothing about this paint needs looking into.
+    pub fn is_clean(&self) -> bool {
+        self.gave_up.is_empty()
+            && !self.backdrop_failed
+            && !self.blit_failed
+            && self.fills_failed == 0
+            && self.texts_failed == 0
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
     use std::collections::HashMap;
-    use winapi::shared::windef::{COLORREF, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, HWND, RECT};
+    use winapi::ctypes::c_void;
+    use winapi::shared::minwindef::DWORD;
+    use winapi::shared::windef::{COLORREF, HBITMAP, HDC, HFONT, HGDIOBJ, HWND, RECT};
     use winapi::um::wingdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
-        DeleteDC, DeleteObject, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-        DEFAULT_CHARSET, FF_DONTCARE, FW_NORMAL, OUT_TT_PRECIS, SRCCOPY, TRANSPARENT,
+        BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject,
+        GdiFlush, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, FF_DONTCARE, FW_NORMAL, OUT_TT_PRECIS,
+        SRCCOPY, TRANSPARENT,
     };
     use winapi::um::winuser::{
-        DrawTextW, FillRect, GetDC, ReleaseDC, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-        DT_VCENTER,
+        DrawTextW, GetDC, ReleaseDC, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     };
 
     /// GDI wants 0x00BBGGRR, which is the reverse of how everyone writes colors.
@@ -55,44 +87,134 @@ mod imp {
 
     /// A window we can paint into, plus the GDI objects worth keeping.
     ///
-    /// Brushes and fonts are cached because a real frame is hundreds of
-    /// rectangles over a handful of distinct colors, and `CreateSolidBrush` per
-    /// rectangle is the kind of thing that turns a 2ms paint into a 20ms one.
+    /// Fonts are cached because a real frame is dozens of text runs over two
+    /// or three sizes, and `CreateFontW` per run is the kind of thing that
+    /// turns a 2ms paint into a 20ms one. Brushes are not cached because
+    /// there are none: fills are blended by hand, which GDI cannot do.
     pub struct SplashSurface {
         hwnd: HWND,
         /// Back buffer, sized to the client area. Rebuilt on resize.
         back: Option<BackBuffer>,
-        brushes: HashMap<COLORREF, HBRUSH>,
         fonts: HashMap<i32, HFONT>,
         face: Vec<u16>,
     }
 
+    /// A bitmap two things can draw into.
+    ///
+    /// It is a DIB section rather than a compatible bitmap so that the pixels
+    /// are addressable: fills need real alpha compositing, which GDI has no
+    /// primitive for at this granularity. Text still goes through GDI, into
+    /// the same pixels, via the DC the bitmap is selected into.
     struct BackBuffer {
         dc: HDC,
         bitmap: HBITMAP,
         previous: HGDIOBJ,
+        /// `width * height` BGRA pixels, top row first.
+        bits: *mut u32,
         width: i32,
         height: i32,
     }
 
     impl BackBuffer {
         fn new(window_dc: HDC, width: i32, height: i32) -> Option<BackBuffer> {
-            // SAFETY: `window_dc` is a live DC obtained from `GetDC` on a window
-            // that is still alive (the caller holds it for the whole call), and
-            // the compatible DC/bitmap pair is released together in `destroy`.
+            // SAFETY: `window_dc` is a live DC from `GetDC` on a window the
+            // caller holds for the whole call. The DC and the DIB section are
+            // released together in `destroy`, and `biHeight` is negated to get
+            // a top-down bitmap so `bits` can be indexed as `y * width + x`
+            // rather than upside down.
             unsafe {
                 let dc = CreateCompatibleDC(window_dc);
                 if dc.is_null() {
                     return None;
                 }
-                let bitmap = CreateCompatibleBitmap(window_dc, width, height);
-                if bitmap.is_null() {
+                let mut info: BITMAPINFO = std::mem::zeroed();
+                info.bmiHeader = BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as DWORD,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: 0,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                };
+                let mut bits: *mut c_void = std::ptr::null_mut();
+                let bitmap =
+                    CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+                if bitmap.is_null() || bits.is_null() {
+                    if !bitmap.is_null() {
+                        DeleteObject(bitmap as HGDIOBJ);
+                    }
                     DeleteDC(dc);
                     return None;
                 }
                 let previous = SelectObject(dc, bitmap as HGDIOBJ);
-                Some(BackBuffer { dc, bitmap, previous, width, height })
+                Some(BackBuffer { dc, bitmap, previous, bits: bits as *mut u32, width, height })
             }
+        }
+
+        /// Paint every pixel the given color, ignoring what was there.
+        fn clear(&mut self, color: Color) {
+            let packed = ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32);
+            // SAFETY: `bits` addresses exactly `width * height` u32s, which is
+            // the length of this slice.
+            let pixels = unsafe {
+                std::slice::from_raw_parts_mut(self.bits, (self.width * self.height) as usize)
+            };
+            pixels.fill(packed);
+        }
+
+        /// Composite a color over a rectangle.
+        ///
+        /// Returns false when the rectangle lands entirely outside the buffer,
+        /// which is a caller bug worth reporting rather than a no-op worth
+        /// hiding -- every command is supposed to arrive pre-clipped.
+        fn blend(&mut self, r: SplashRect, color: Color) -> bool {
+            let x0 = r.x.max(0);
+            let y0 = r.y.max(0);
+            let x1 = (r.x + r.width).min(self.width);
+            let y1 = (r.y + r.height).min(self.height);
+            if x0 >= x1 || y0 >= y1 {
+                return false;
+            }
+            let a = color.a as u32;
+            if a == 0 {
+                return true;
+            }
+            // SAFETY: as in `clear`.
+            let pixels = unsafe {
+                std::slice::from_raw_parts_mut(self.bits, (self.width * self.height) as usize)
+            };
+            let stride = self.width as usize;
+
+            if a == 255 {
+                let packed = ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32);
+                for y in y0..y1 {
+                    let row = y as usize * stride;
+                    pixels[row + x0 as usize..row + x1 as usize].fill(packed);
+                }
+                return true;
+            }
+
+            let inv = 255 - a;
+            // Round-to-nearest rather than truncate: a 3%-alpha wash applied
+            // over a dark background truncates to no change at all, which is
+            // how a deliberate tint becomes invisible.
+            let mix = |src: u32, dst: u32| -> u32 { (src * a + dst * inv + 127) / 255 };
+            let (sr, sg, sb) = (color.r as u32, color.g as u32, color.b as u32);
+            for y in y0..y1 {
+                let row = y as usize * stride;
+                for px in &mut pixels[row + x0 as usize..row + x1 as usize] {
+                    let dr = (*px >> 16) & 0xFF;
+                    let dg = (*px >> 8) & 0xFF;
+                    let db = *px & 0xFF;
+                    *px = (mix(sr, dr) << 16) | (mix(sg, dg) << 8) | mix(sb, db);
+                }
+            }
+            true
         }
 
         fn destroy(&mut self) {
@@ -119,7 +241,6 @@ mod imp {
             Some(SplashSurface {
                 hwnd,
                 back: None,
-                brushes: HashMap::new(),
                 fonts: HashMap::new(),
                 face: {
                     let mut w = wide(face);
@@ -127,13 +248,6 @@ mod imp {
                     w
                 },
             })
-        }
-
-        fn brush(&mut self, color: COLORREF) -> HBRUSH {
-            *self.brushes.entry(color).or_insert_with(||
-                // SAFETY: `CreateSolidBrush` cannot fail for a valid COLORREF;
-                // a null return is handled by `FillRect` becoming a no-op.
-                unsafe { CreateSolidBrush(color) })
         }
 
         fn font(&mut self, px: i32) -> HFONT {
@@ -169,10 +283,23 @@ mod imp {
         /// `size` is the client area in physical pixels; commands outside it
         /// were already clipped by the collector, and the backdrop covers
         /// whatever the commands do not.
-        pub fn paint(&mut self, commands: &[SplashCommand], size: (u32, u32), backdrop: Color) {
+        ///
+        /// Fills happen first, in order, then text -- rather than strictly
+        /// interleaved. Two different rasterizers are writing to one buffer
+        /// and GDI batches its work, so interleaving would mean flushing
+        /// between every command. Text almost always sits on top of its own
+        /// element's background anyway, so the visible difference is nil.
+        pub fn paint(
+            &mut self,
+            commands: &[SplashCommand],
+            size: (u32, u32),
+            backdrop: Color,
+        ) -> PaintReport {
+            let mut report = PaintReport::default();
             let (w, h) = (size.0 as i32, size.1 as i32);
             if w <= 0 || h <= 0 {
-                return;
+                report.gave_up = "empty_size";
+                return report;
             }
 
             // SAFETY: the window is alive for the duration of this call (it is
@@ -181,7 +308,8 @@ mod imp {
             unsafe {
                 let window_dc = GetDC(self.hwnd);
                 if window_dc.is_null() {
-                    return;
+                    report.gave_up = "no_window_dc";
+                    return report;
                 }
 
                 let stale = self.back.as_ref().is_none_or(|b| b.width != w || b.height != h);
@@ -191,45 +319,71 @@ mod imp {
                     }
                     self.back = BackBuffer::new(window_dc, w, h);
                 }
-                let Some(back) = self.back.as_ref() else {
+                if self.back.is_none() {
                     ReleaseDC(self.hwnd, window_dc);
-                    return;
-                };
-                let dc = back.dc;
+                    report.gave_up = "no_back_buffer";
+                    return report;
+                }
 
-                let full = RECT { left: 0, top: 0, right: w, bottom: h };
-                let clear = self.brush(colorref(backdrop));
-                FillRect(dc, &full, clear);
+                // GDI batches; the bits must not be touched while it still has
+                // queued work against them.
+                GdiFlush();
 
-                SetBkMode(dc, TRANSPARENT as i32);
-                for command in commands {
-                    match command {
-                        SplashCommand::Fill { rect: r, color } => {
-                            let brush = self.brush(colorref(*color));
-                            FillRect(dc, &rect(*r), brush);
-                        }
-                        SplashCommand::Text { rect: r, color, font_size, text } => {
-                            let px = font_size.round().clamp(1.0, 400.0) as i32;
-                            let font = self.font(px);
-                            let previous = SelectObject(dc, font as HGDIOBJ);
-                            SetTextColor(dc, colorref(*color));
-                            let mut buffer = wide(text);
-                            let mut bounds = rect(*r);
-                            DrawTextW(
-                                dc,
-                                buffer.as_mut_ptr(),
-                                buffer.len() as i32,
-                                &mut bounds,
-                                DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
-                            );
-                            SelectObject(dc, previous);
+                {
+                    let back = self.back.as_mut().expect("checked just above");
+                    back.clear(backdrop);
+                    for command in commands {
+                        if let SplashCommand::Fill { rect: r, color } = command {
+                            report.fills += 1;
+                            if !back.blend(*r, *color) {
+                                report.fills_failed += 1;
+                            }
                         }
                     }
                 }
 
-                BitBlt(window_dc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+                let dc = self.back.as_ref().expect("checked just above").dc;
+                SetBkMode(dc, TRANSPARENT as i32);
+                for command in commands {
+                    if let SplashCommand::Text { rect: r, color, font_size, text } = command {
+                        report.texts += 1;
+                        // Text is drawn by GDI, which has no alpha. A run
+                        // faint enough to be invisible is skipped rather than
+                        // drawn at full strength, which would be louder than
+                        // the real frame rather than merely different.
+                        if color.a < 24 {
+                            continue;
+                        }
+                        let px = font_size.round().clamp(1.0, 400.0) as i32;
+                        let font = self.font(px);
+                        if font.is_null() {
+                            report.texts_failed += 1;
+                            continue;
+                        }
+                        let previous = SelectObject(dc, font as HGDIOBJ);
+                        SetTextColor(dc, colorref(*color));
+                        let mut buffer = wide(text);
+                        let mut bounds = rect(*r);
+                        if DrawTextW(
+                            dc,
+                            buffer.as_mut_ptr(),
+                            buffer.len() as i32,
+                            &mut bounds,
+                            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+                        ) == 0
+                        {
+                            report.texts_failed += 1;
+                        }
+                        SelectObject(dc, previous);
+                    }
+                }
+
+                if BitBlt(window_dc, 0, 0, w, h, dc, 0, 0, SRCCOPY) == 0 {
+                    report.blit_failed = true;
+                }
                 ReleaseDC(self.hwnd, window_dc);
             }
+            report
         }
     }
 
@@ -242,9 +396,6 @@ mod imp {
             // deleted exactly once, here, after the back buffer that could
             // have them selected is gone.
             unsafe {
-                for (_, brush) in self.brushes.drain() {
-                    DeleteObject(brush as HGDIOBJ);
-                }
                 for (_, font) in self.fonts.drain() {
                     DeleteObject(font as HGDIOBJ);
                 }
@@ -252,7 +403,6 @@ mod imp {
         }
     }
 }
-
 #[cfg(not(windows))]
 mod imp {
     use super::*;
@@ -269,7 +419,14 @@ mod imp {
             None
         }
 
-        pub fn paint(&mut self, _commands: &[SplashCommand], _size: (u32, u32), _backdrop: Color) {}
+        pub fn paint(
+            &mut self,
+            _commands: &[SplashCommand],
+            _size: (u32, u32),
+            _backdrop: Color,
+        ) -> PaintReport {
+            PaintReport { gave_up: "unsupported_platform", ..PaintReport::default() }
+        }
     }
 }
 
