@@ -13,6 +13,7 @@ pub mod notification;
 pub mod runtime;
 pub mod scroll_motion;
 pub mod shortcut;
+pub mod splash;
 #[cfg(feature = "async")]
 pub mod subscription;
 pub mod window;
