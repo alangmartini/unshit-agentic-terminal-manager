@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod scroll_motion;
 pub mod shortcut;
 pub mod splash;
+pub mod splash_paint;
 #[cfg(feature = "async")]
 pub mod subscription;
 pub mod window;

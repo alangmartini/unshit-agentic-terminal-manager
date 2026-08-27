@@ -31,7 +31,14 @@ notify = { version = "6", optional = true }
 hdrhistogram = { version = "7.5", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, features = ["avrt", "libloaderapi", "winuser"] }
+winapi = { workspace = true, features = [
+    "avrt",
+    "libloaderapi",
+    "winuser",
+    # GDI, for painting the window while the GPU is still starting.
+    "wingdi",
+    "windef",
+] }
 
 [features]
 default = ["clipboard", "hot-reload"]
