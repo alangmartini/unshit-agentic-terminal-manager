@@ -19,6 +19,8 @@ phase[0-9]-*
 .claude/*
 !.claude/skills/
 !.claude/commands/
+# Byte-code from the vendored /watch skill's Python scripts
+.claude/skills/**/__pycache__/
 
 # Release / installer output
 /dist/
