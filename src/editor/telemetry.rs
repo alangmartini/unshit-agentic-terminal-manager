@@ -93,16 +93,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "tm-editor-telemetry-{}-{}-{}",
+            tag,
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        // PID reuse makes this name reachable again in a later run, and
+        // `record_to` appends, so a stale leftover would corrupt the read.
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("editor-events.jsonl")
+    }
+
+    fn remove_temp(path: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn editor_event_is_queryable_and_contains_no_file_content() {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir()
-            .join(format!(
-                "tm-editor-telemetry-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ))
-            .join("editor-events.jsonl");
+        let path = unique_temp_path("open");
         let record = EditorEventRecord {
             timestamp_unix_ms: 123,
             event: "editor.open",
@@ -129,18 +140,12 @@ mod tests {
         assert!(value.get("text").is_none());
         assert!(value.get("content").is_none());
         assert!(value.get("lines").is_none());
+        remove_temp(&path);
     }
 
     #[test]
     fn failure_record_carries_reason() {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir()
-            .join(format!(
-                "tm-editor-telemetry-fail-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ))
-            .join("editor-events.jsonl");
+        let path = unique_temp_path("fail");
         let record = EditorEventRecord {
             timestamp_unix_ms: 5,
             event: "editor.open_failed",
@@ -160,5 +165,6 @@ mod tests {
         )
         .expect("valid JSONL record");
         assert_eq!(value["reason"], "too_large");
+        remove_temp(&path);
     }
 }

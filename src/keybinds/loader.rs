@@ -129,9 +129,16 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        std::env::temp_dir()
-            .join(format!("godly-keybinds-{}-{}-{}", tag, pid, n))
-            .join("keybindings.json")
+        let dir = std::env::temp_dir().join(format!("godly-keybinds-{}-{}-{}", tag, pid, n));
+        // PID reuse makes this name reachable again in a later run, and
+        // `save_creates_parent_dir` asserts on the directory's absence, so a
+        // stale leftover from a previous run must be purged here.
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("keybindings.json")
+    }
+
+    fn remove_temp(path: &PathBuf) {
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     fn combo(s: &str) -> KeyCombo {
@@ -153,7 +160,7 @@ mod tests {
         std::fs::write(&path, "{ not valid json").unwrap();
         let loaded = load_user_keybinds(&path);
         assert!(loaded.is_empty());
-        let _ = std::fs::remove_file(&path);
+        remove_temp(&path);
     }
 
     #[test]
@@ -171,7 +178,7 @@ mod tests {
             loaded.get(&KeybindAction::NewTerminal),
             Some(&combo("Ctrl+T"))
         );
-        let _ = std::fs::remove_file(&path);
+        remove_temp(&path);
     }
 
     #[test]
@@ -187,7 +194,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(loaded.contains_key(&KeybindAction::NewTerminal));
         assert!(!loaded.contains_key(&KeybindAction::CloseTab));
-        let _ = std::fs::remove_file(&path);
+        remove_temp(&path);
     }
 
     #[test]
@@ -211,7 +218,7 @@ mod tests {
             loaded.get(&KeybindAction::Unsplit),
             map.get(&KeybindAction::Unsplit)
         );
-        let _ = std::fs::remove_file(&path);
+        remove_temp(&path);
     }
 
     #[test]
@@ -222,7 +229,7 @@ mod tests {
         map.insert(KeybindAction::CloseTab, combo("Ctrl+F4"));
         save_user_keybinds(&path, &map).unwrap();
         assert!(path.exists());
-        let _ = std::fs::remove_file(&path);
+        remove_temp(&path);
     }
 
     #[test]
@@ -242,7 +249,7 @@ mod tests {
             loaded.get(&KeybindAction::NewTerminal),
             Some(&combo("Ctrl+Shift+T"))
         );
-        let _ = std::fs::remove_file(&path);
+        remove_temp(&path);
     }
 
     #[test]
@@ -254,7 +261,7 @@ mod tests {
 
         let tmp = path.with_extension("tmp");
         assert!(!tmp.exists(), "leftover .tmp file at {}", tmp.display());
-        let _ = std::fs::remove_file(&path);
+        remove_temp(&path);
     }
 
     #[test]
@@ -264,7 +271,7 @@ mod tests {
         save_user_keybinds(&path, &map).unwrap();
         let loaded = load_user_keybinds(&path);
         assert!(loaded.is_empty());
-        let _ = std::fs::remove_file(&path);
+        remove_temp(&path);
     }
 
     #[test]
