@@ -41,7 +41,7 @@ pub fn build_titlebar(
         .unwrap_or("workspace")
         .to_string();
     let branch = workspace
-        .and_then(|ws| ws.git_branch.as_deref())
+        .and_then(|ws| ws.git_branch.name())
         .unwrap_or("no branch")
         .to_string();
 

@@ -27,9 +27,10 @@ image = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 dwrote = { workspace = true }
 winapi = { workspace = true }
+# Used to drive the pre-window GPU prewarm on its own blocking thread.
+pollster = { workspace = true }
 
 [dev-dependencies]
-pollster = { workspace = true }
 
 [features]
 default = []

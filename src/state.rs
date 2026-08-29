@@ -680,6 +680,33 @@ impl ToggleKey {
     }
 }
 
+/// Where a workspace's git branch detection stands.
+///
+/// Detecting a branch costs a `git` process spawn -- ~30ms on Windows -- so it
+/// deliberately does not run before the window is on screen. That makes
+/// "we have not looked yet" a real state the UI has to render, and rendering
+/// it as `no git` would flash a false negative on every launch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum GitBranch {
+    /// Detection has not finished. Rendered muted, never as an error.
+    #[default]
+    Pending,
+    /// Looked, and there is no branch: not a repo, git missing, or detached
+    /// HEAD.
+    Absent,
+    Known(String),
+}
+
+impl GitBranch {
+    /// The branch name, if one is known.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            GitBranch::Known(name) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Workspace {
     pub num: u32,
@@ -689,7 +716,7 @@ pub struct Workspace {
     pub terminals_expanded: bool,
     pub terminal_entries: Vec<TerminalEntry>,
     pub subtabs: Vec<Subtab>,
-    pub git_branch: Option<String>,
+    pub git_branch: GitBranch,
     /// Per-workspace tab list. When this workspace is active, `AppState.tabs`
     /// mirrors this (via workspace save/restore in `workspace.switch`). When
     /// inactive, this is the source of truth.
@@ -1015,14 +1042,19 @@ impl AppState {
         let mut workspaces = self.workspaces.clone();
         let active_idx = self.active_workspace;
         for (idx, ws) in workspaces.iter_mut().enumerate() {
-            let (branch_text, branch_error) = match &ws.git_branch {
-                Some(b) => (b.clone(), false),
-                None => ("no git".to_string(), true),
+            // Pending must not render as an error: on a cold start every
+            // workspace is Pending for a few hundred milliseconds, and
+            // flashing "no git" in red at each one would be a lie the user
+            // sees on every single launch.
+            let (branch_text, branch_muted, branch_error) = match &ws.git_branch {
+                GitBranch::Known(b) => (b.clone(), false, false),
+                GitBranch::Absent => ("no git".to_string(), false, true),
+                GitBranch::Pending => ("...".to_string(), true, false),
             };
             let entry_from = |p: &Pane| TerminalEntry {
                 name: p.title.clone(),
                 branch: branch_text.clone(),
-                branch_muted: false,
+                branch_muted,
                 branch_error,
                 pane_id: p.id,
             };
@@ -1257,7 +1289,6 @@ fn current_folder_name() -> String {
 
 pub fn seed_state() -> AppState {
     let ws1_path = std::env::current_dir().ok();
-    let ws1_branch = ws1_path.as_deref().and_then(crate::git::detect_git_branch);
     let workspaces = vec![
         Workspace {
             num: 1,
@@ -1275,7 +1306,7 @@ pub fn seed_state() -> AppState {
                 icon: Some(SubtabIcon::Terminal),
                 tree_glyph: "\u{2514}",
             }],
-            git_branch: ws1_branch,
+            git_branch: GitBranch::Pending,
             tabs: vec![],
             active_tab: 0,
             shell: crate::shell::ShellSpec::default(),
@@ -1296,7 +1327,7 @@ pub fn seed_state() -> AppState {
                 icon: Some(SubtabIcon::Terminal),
                 tree_glyph: "\u{2514}",
             }],
-            git_branch: None,
+            git_branch: GitBranch::Absent,
             tabs: vec![],
             active_tab: 0,
             shell: crate::shell::ShellSpec::default(),
@@ -1317,7 +1348,7 @@ pub fn seed_state() -> AppState {
                 icon: Some(SubtabIcon::Terminal),
                 tree_glyph: "\u{2514}",
             }],
-            git_branch: None,
+            git_branch: GitBranch::Absent,
             tabs: vec![],
             active_tab: 0,
             shell: crate::shell::ShellSpec::default(),
@@ -1338,7 +1369,7 @@ pub fn seed_state() -> AppState {
                 icon: None,
                 tree_glyph: "\u{2514}",
             }],
-            git_branch: None,
+            git_branch: GitBranch::Absent,
             tabs: vec![],
             active_tab: 0,
             shell: crate::shell::ShellSpec::default(),
@@ -2122,8 +2153,13 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     }
 }
 
+/// Build a workspace with its branch unresolved.
+///
+/// Detection is intentionally NOT done here. This runs once per restored
+/// workspace during startup, and a `git` spawn each time put ~30ms per
+/// workspace in front of the first frame. `crate::git_watch` fills the branch
+/// in afterwards.
 pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace {
-    let git_branch = path.as_deref().and_then(crate::git::detect_git_branch);
     Workspace {
         num,
         name,
@@ -2140,7 +2176,7 @@ pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace
             icon: Some(SubtabIcon::Terminal),
             tree_glyph: "\u{2514}",
         }],
-        git_branch,
+        git_branch: GitBranch::Pending,
         tabs: vec![],
         active_tab: 0,
         shell: crate::shell::ShellSpec::default(),
@@ -7677,6 +7713,10 @@ pub fn sync_terminal_size_to_font_metrics(state: &mut AppState) -> Option<(u16, 
     Some((cols, rows))
 }
 
+/// The family name inside the embedded JetBrains Mono TTF. Must match what
+/// the font actually declares, or `Family::Name` silently falls back.
+const EMBEDDED_TERMINAL_FAMILY: &str = "JetBrains Mono";
+
 /// Measure the actual monospace cell_width / font_size ratio using cosmic-text
 /// at a specific (DPI-scaled) font size. Because glyph hinting can produce
 /// different advance widths at different pixel sizes, the measurement must be
@@ -7685,17 +7725,33 @@ pub fn sync_terminal_size_to_font_metrics(state: &mut AppState) -> Option<(u16, 
 /// `line_height` is the absolute pixel line height (typically `font_size * 1.2`
 /// from CSS). Accepting it as a parameter keeps the caller as the single source
 /// of truth for the line_height multiplier, rather than hardcoding 1.2 here.
+///
+/// The measurement runs against a font database holding *only* the embedded
+/// JetBrains Mono face. That is deliberate on two counts:
+///
+/// - **Correctness.** The renderer's first font source is JetBrains Mono, so
+///   that is the advance width the grid will actually be drawn at. Measuring
+///   `Family::Monospace` instead asked the OS for its default monospace font --
+///   Consolas on a stock Windows box -- and produced a ratio for a font that is
+///   never rendered.
+/// - **Speed.** `FontSystem::new()` enumerates and parses every font installed
+///   on the machine. On the startup path that cost 31ms before the window
+///   existed, and it scales with how many fonts the user has.
 pub fn measure_cell_width_ratio_at(font_size: f32, line_height: f32) -> f32 {
     use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 
-    let mut fs = FontSystem::new();
+    let mut db = cosmic_text::fontdb::Database::new();
+    db.load_font_data(crate::JETBRAINS_MONO_REGULAR.to_vec());
+    db.set_monospace_family(EMBEDDED_TERMINAL_FAMILY);
+    let mut fs = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+
     let metrics = Metrics::new(font_size, line_height);
     let mut buffer = Buffer::new(&mut fs, metrics);
     buffer.set_size(&mut fs, Some(font_size * 10.0), None);
     buffer.set_text(
         &mut fs,
         "M",
-        Attrs::new().family(Family::Monospace),
+        Attrs::new().family(Family::Name(EMBEDDED_TERMINAL_FAMILY)),
         Shaping::Advanced,
     );
     buffer.shape_until_scroll(&mut fs, false);
@@ -14062,6 +14118,25 @@ mod tests {
         assert!(ratio < 1.0, "ratio must be less than 1.0, got {}", ratio);
     }
 
+    /// JetBrains Mono declares a 600/1000 advance, so its cell width ratio is
+    /// exactly 0.6 at any size. Pinning the number proves the measurement ran
+    /// against the embedded terminal font rather than whatever the host
+    /// happens to call `Family::Monospace` -- which on a stock Windows box is
+    /// Consolas at 0.55, a ratio the renderer never uses. A grid sized from
+    /// the wrong ratio puts the PTY's column count out of step with the drawn
+    /// columns.
+    #[test]
+    fn cell_width_ratio_is_measured_against_the_embedded_terminal_font() {
+        for font_size in [10.0_f32, 14.0, 18.0, 24.0] {
+            let ratio = measure_cell_width_ratio_at(font_size, font_size * CSS_LINE_HEIGHT);
+            assert!(
+                (ratio - 0.6).abs() < 0.005,
+                "expected JetBrains Mono's 0.6 advance ratio at {font_size}pt, got {ratio}; \
+                 the measurement is resolving to some other font"
+            );
+        }
+    }
+
     #[test]
     fn pre_publish_sets_nonzero_global_metrics() {
         use unshit::core::cell_grid::CellGrid;
@@ -14400,7 +14475,7 @@ mod tests {
             terminals_expanded: true,
             terminal_entries: vec![],
             subtabs: vec![],
-            git_branch: None,
+            git_branch: GitBranch::Absent,
             tabs: vec![tab],
             active_tab: 0,
             shell: crate::shell::ShellSpec::default(),

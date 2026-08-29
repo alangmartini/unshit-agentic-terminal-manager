@@ -8,6 +8,8 @@ use crate::scroll_motion::{
     SMOOTH_SCROLL_EPSILON,
 };
 use crate::shortcut::{dead_key_commit_combo, key_combo_from_winit, ShortcutResolver};
+use crate::splash::{self, SplashCommand};
+use crate::splash_paint::SplashSurface;
 use crate::window;
 use cosmic_text::{FontSystem, SwashCache};
 use std::collections::HashMap;
@@ -38,7 +40,7 @@ use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
-use unshit_renderer::gpu::{GpuContext, WindowGpuPreferences};
+use unshit_renderer::gpu::{GpuContext, PrewarmStatus, WindowGpuPreferences};
 use unshit_renderer::pipeline::quad::QuadInstance;
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
@@ -168,6 +170,18 @@ pub struct AppConfig {
     pub width: u32,
     pub height: u32,
     pub decorations: bool,
+    /// Keep the window unmapped until it is ready to paint, instead of
+    /// mapping it as soon as it is created.
+    ///
+    /// Creating the window is cheap; the GPU bring-up that follows is not, and
+    /// it runs on the event-loop thread. A window mapped before that finishes
+    /// cannot answer a paint or a click for as long as it takes -- measured at
+    /// ~1.2s on a machine whose D3D12 adapter enumeration is slow -- so what
+    /// an early window actually buys the user is a white, non-responding
+    /// rectangle.
+    ///
+    /// Defaults to `false`, which preserves the map-immediately behaviour.
+    pub show_window_when_painted: bool,
     pub css: String,
     pub keybindings_path: Option<String>,
     /// Callback invoked for [`ExternalEvent::Custom`] payloads.
@@ -292,6 +306,15 @@ pub struct AppConfig {
     /// render pass that produces non-zero values, giving the application a
     /// reliable point to compute initial PTY dimensions.
     pub on_cell_metrics: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
+    /// Callback invoked as each window bring-up milestone completes, with a
+    /// static stage name (see [`STARTUP_STAGES`]).
+    ///
+    /// Cold start is the one path an application cannot instrument from the
+    /// outside: everything between `run()` and the first frame happens inside
+    /// the framework, so a slow launch has no attributable owner. These marks
+    /// give the application the breakdown without it needing to know how the
+    /// renderer is brought up.
+    pub on_startup_stage: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     /// Callback invoked on every rendered frame right after
     /// `record_frame_presented` runs, with a fresh snapshot of the
     /// input latency histograms.
@@ -325,6 +348,7 @@ impl Default for AppConfig {
             width: 800,
             height: 600,
             decorations: true,
+            show_window_when_painted: false,
             css: String::new(),
             keybindings_path: None,
             on_external_event: None,
@@ -347,6 +371,7 @@ impl Default for AppConfig {
             on_close: None,
             on_file_drop: None,
             on_cell_metrics: None,
+            on_startup_stage: None,
             on_scroll_telemetry: None,
             #[cfg(feature = "input-latency-histogram")]
             on_input_latency: None,
@@ -848,6 +873,23 @@ fn configured_pacing_mode(
             surface_mode
         }
     }
+}
+
+/// Begin GPU bring-up now, before the event loop exists.
+///
+/// Call once, as early in `main` as possible. Everything after it -- config,
+/// state, the event loop, the window -- then happens alongside adapter and
+/// device creation instead of in front of them.
+///
+/// Resolves the same preferences the real request will, by the same route: a
+/// prewarm that picked different backends would be discarded on arrival, and
+/// the enumeration it paid for is the expensive part.
+///
+/// Safe to call unconditionally. It is a no-op off Windows, under a forced
+/// software renderer, and in any process that never opens a window.
+pub fn prewarm_window_gpu() {
+    let compositor_clock_supported = crate::compositor_clock::compositor_wait_fn().is_some();
+    GpuContext::prewarm(window_gpu_preferences(compositor_clock_supported));
 }
 
 fn window_gpu_preferences(compositor_clock_supported: bool) -> WindowGpuPreferences {
@@ -2477,172 +2519,363 @@ impl App {
         // Ignore the Err (only fails if already set, which cannot happen).
         let _ = self.proxy_cell.set(proxy);
 
-        let handler = AppHandler { event_rx: self.event_rx.clone(), app: self };
+        let handler = AppHandler { event_rx: self.event_rx.clone(), app: self, pending: None };
         event_loop.run_app(handler).unwrap();
     }
+}
+
+/// The bring-up milestones reported to [`AppConfig::on_startup_stage`], in the
+/// order they fire. Exposed so callers can pre-size storage and assert on the
+/// full set rather than hard-coding string literals.
+pub const STARTUP_STAGES: [&str; 7] = [
+    "window_created",
+    "fonts_ready",
+    "first_tree_built",
+    "first_layout_done",
+    "splash_painted",
+    "gpu_ready",
+    "gpu_swapped",
+];
+
+/// The id that ties every structured startup line from this process together.
+///
+/// Same shape as the renderer's, so `renderer.splash_shown`,
+/// `renderer.prewarm_ready` and `app.startup` from one launch join on a single
+/// field when read back out of the log.
+fn startup_correlation_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| format!("process-{}", std::process::id()))
+}
+
+/// The font family the placeholder approximates text with.
+///
+/// The real text is shaped by cosmic-text from fonts loaded into memory, which
+/// the platform blitter cannot see. Naming the same family gives it the best
+/// chance of matching; when the family is not installed, the substitute is
+/// still closer than nothing, and this is a placeholder either way.
+fn splash_font_face(config: &AppConfig) -> &str {
+    config
+        .fonts
+        .iter()
+        .find_map(|f| match f {
+            crate::font::FontSource::System(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .unwrap_or("Segoe UI")
+}
+
+/// How long the loop will keep pumping a placeholder before giving up and
+/// waiting for the GPU the old way.
+///
+/// A prewarm that never finishes is a driver problem, not an app problem, but
+/// a splash that never becomes an application is an app problem. Past this the
+/// handler blocks exactly as it did before the placeholder existed, so the
+/// worst case is the previous behaviour rather than a new one.
+const SPLASH_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How often the loop wakes to check on the GPU while the placeholder is up.
+///
+/// Also the placeholder's frame rate, which is why it is a display interval
+/// and not something coarser: the window is being dragged and resized during
+/// this period, and those want repaints.
+const SPLASH_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Most keystrokes kept from before there was anywhere to put them.
+///
+/// Sized for someone typing a command at a window that has not finished
+/// starting, not for someone holding a key down for a second and a half. Past
+/// this the extra events are dropped rather than queued, because replaying a
+/// thousand repeats into a shell the moment it appears is worse than losing
+/// them.
+const MAX_BUFFERED_STARTUP_INPUT: usize = 256;
+
+/// Everything bring-up produced before it needed a GPU, parked while the GPU
+/// finishes on its own thread.
+///
+/// This exists because the two halves of startup have nothing to do with each
+/// other: the stylesheet, the fonts, the element tree and the layout are pure
+/// CPU work that knows exactly what the first frame looks like, while adapter
+/// and device creation is a second of driver work that knows nothing about it.
+/// Holding the first half here lets the event loop keep running -- painting a
+/// placeholder, answering the window manager, collecting keystrokes -- instead
+/// of standing still until the second half lands.
+struct PendingStartup {
+    window: Arc<dyn Window>,
+    window_id: WindowId,
+    gpu_preferences: WindowGpuPreferences,
+    compositor_clock_supported: bool,
+    scale_factor: f32,
+    zoom_factor: f32,
+    initial_window_maximized: bool,
+    startup_refresh_mhz: u32,
+    stylesheet: CompiledStylesheet,
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    subpixel_swash_cache: SubpixelSwashCache,
+    #[cfg(target_os = "windows")]
+    dw_rasterizer: DwRasterizer,
+    arena: NodeArena,
+    taffy: taffy::TaffyTree<TextMeasureCtx>,
+    root: NodeId,
+    pseudo_table: unshit_core::style::pseudo::PseudoSideTable,
+    measure_cache: TextMeasureCache,
+    /// The surface size the parked layout was computed for. Compared against
+    /// the real one at swap time, because the window can be resized while the
+    /// placeholder is up.
+    laid_out_for: (u32, u32),
+    /// `None` when the platform has no placeholder painter, in which case
+    /// there is nothing on screen and the swap should not be dawdled over.
+    surface: Option<SplashSurface>,
+    commands: Vec<SplashCommand>,
+    backdrop: unshit_core::style::types::Color,
+    /// Input that arrived before there was anything to route it to, replayed
+    /// through the ordinary path once there is.
+    buffered_input: Vec<WindowEvent>,
+    /// When the placeholder went up, for [`SPLASH_DEADLINE`] and telemetry.
+    since: Instant,
+    /// How many times it has been drawn, and what the last draw managed.
+    /// Reported at the swap, so a placeholder that went up and then stopped
+    /// repainting is distinguishable from one that never went up at all.
+    paints: u32,
+    last_paint: crate::splash_paint::PaintReport,
 }
 
 struct AppHandler {
     app: App,
     event_rx: flume::Receiver<ExternalEvent>,
+    /// Set between the two halves of bring-up; `None` before and after.
+    pending: Option<PendingStartup>,
 }
 
-impl ApplicationHandler for AppHandler {
-    fn proxy_wake_up(&mut self, _event_loop: &dyn ActiveEventLoop) {
-        let Some(state) = self.app.state.as_mut() else {
-            return;
-        };
-        let mut coalescer = RebuildCoalescer::default();
-        let mut saw_animation_frame = false;
-        let mut compositor_tick = None;
-        coalescer.begin_drain();
-        for event in self.event_rx.try_iter() {
-            match event {
-                ExternalEvent::RequestRebuild => {
-                    coalescer.observe(true);
-                }
-                ExternalEvent::RequestRedraw => {
-                    coalescer.observe(false);
-                }
-                ExternalEvent::RequestAnimationFrame => {
-                    saw_animation_frame = true;
-                }
-                ExternalEvent::RequestCompositorFrame { tick_at } => {
-                    self.app.compositor_clock_waker.acknowledge_tick();
-                    compositor_tick = Some(match compositor_tick {
-                        Some(previous) => std::cmp::max(previous, tick_at),
-                        None => tick_at,
-                    });
-                }
-                ExternalEvent::ActivateWindow => {
-                    state.window.set_visible(true);
-                    state.window.set_minimized(false);
-                    state.window.focus_window();
-                    state
-                        .window
-                        .request_user_attention(Some(AttentionUrgency::Informational.to_winit()));
-                    coalescer.observe(false);
-                }
-                ExternalEvent::MinimizeWindow => {
-                    state.window.set_minimized(true);
-                    coalescer.observe(false);
-                }
-                ExternalEvent::ToggleMaximizeWindow => {
-                    let maximized = state.window.is_maximized();
-                    let next_maximized = !maximized;
-                    state.window.set_maximized(next_maximized);
-                    publish_window_maximized_change(
-                        &mut state.window_maximized,
-                        next_maximized,
-                        self.app.config.on_window_maximized.as_ref(),
-                    );
-                    coalescer.observe(true);
-                }
-                ExternalEvent::Custom(payload) => {
-                    if let Some(ref handler) = self.app.config.on_external_event {
-                        handler(payload);
-                    }
-                    // Custom events typically change app state, so rebuild.
-                    coalescer.observe(true);
-                }
-                ExternalEvent::Bytes(data) => {
-                    if let Some(ref handler) = self.app.config.on_bytes {
-                        (handler)(data);
-                    }
-                    coalescer.observe(false);
-                }
-                #[cfg(feature = "hot-reload")]
-                ExternalEvent::StylesheetReload(new_stylesheet) => {
-                    state.stylesheet = *new_stylesheet;
-                    state.needs_restyle = true;
-                    state.shaped_cache.clear();
-                    state.shape_cache.clear();
-                    state.batch_cache.clear();
-                    // Collect all node IDs first, then mark each dirty.
-                    let node_ids: Vec<_> = state.arena.iter().map(|(id, _)| id).collect();
-                    for id in node_ids {
-                        if let Some(elem) = state.arena.get_mut(id) {
-                            elem.dirty |= unshit_core::dirty::DirtyFlags::STYLE
-                                | unshit_core::dirty::DirtyFlags::SUBTREE_STYLE;
-                        }
-                    }
-                    coalescer.observe(true);
-                }
-            }
-        }
-        if coalescer.needs_rebuild {
-            state.needs_rebuild = true;
-        }
-        if let Some(tick_at) = compositor_tick {
-            state.compositor_frame_ready = Some(tick_at);
-        }
-        if coalescer.saw_event {
-            // An external source (PTY reader, subscription, bridge, hot
-            // reload, etc.) produced work for the UI thread. Count this as
-            // activity so `about_to_wait` schedules speculative frames
-            // during the next [`ACTIVITY_WINDOW`].
-            state.mark_activity(Instant::now());
-        }
-        if saw_animation_frame && animations_active(state) {
-            // A Timer-fallback waker tick (the waker never runs in
-            // VsyncBlocking mode). All painting goes through the single
-            // paint site, `RedrawRequested`; the force flag lets the
-            // tick bypass the due-gate and pacer gate once, since the
-            // waker already ticks at the display period.
-            state.force_animation_paint = true;
-            state.window.request_redraw();
-        } else if saw_animation_frame && !coalescer.saw_event {
-            // Stale waker tick after every animation settled: nothing to
-            // paint, and no flag to leave armed.
-            state.force_animation_paint = false;
-        } else {
-            state.window.request_redraw();
+impl AppHandler {
+    /// Report a bring-up milestone. Cheap enough to call unconditionally: the
+    /// callback is `None` in every build that has not asked for the marks.
+    fn mark_startup(&self, stage: &'static str) {
+        if let Some(ref cb) = self.app.config.on_startup_stage {
+            cb(stage);
         }
     }
 
-    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if self.app.state.is_some() {
+    /// Whether the placeholder is up and actually on screen.
+    ///
+    /// A pending startup with no surface means the platform has no placeholder
+    /// painter, so the window is still hidden and there is nothing to keep
+    /// alive -- that path should collect the GPU at the first opportunity
+    /// rather than sitting on an invisible window.
+    fn splash_is_showing(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.surface.is_some())
+    }
+
+    /// Draw the placeholder and, the first time, map the window.
+    fn show_splash(&mut self) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        let Some(surface) = pending.surface.as_mut() else {
+            return;
+        };
+        let report = surface.paint(&pending.commands, pending.laid_out_for, pending.backdrop);
+        pending.paints += 1;
+        pending.last_paint = report;
+        if !report.is_clean() {
+            // Warn rather than info: a placeholder that draws less than it was
+            // told to is indistinguishable, on screen, from a slow start.
+            log::warn!(
+                "{{\"event\":\"renderer.splash_paint_degraded\",\"correlation_id\":{:?},\"gave_up\":{:?},\"fills\":{},\"fills_failed\":{},\"texts\":{},\"texts_failed\":{},\"backdrop_failed\":{},\"blit_failed\":{}}}",
+                startup_correlation_id(),
+                report.gave_up,
+                report.fills,
+                report.fills_failed,
+                report.texts,
+                report.texts_failed,
+                report.backdrop_failed,
+                report.blit_failed,
+            );
+        }
+
+        if !pending.window.is_visible().unwrap_or(true) {
+            pending.window.set_visible(true);
+            // Mapping does not focus, and this window missed the usual "new
+            // window takes focus" path by not existing visibly when it was
+            // created. Without this the app draws but ignores typing -- and
+            // during the placeholder, ignoring typing means the keystrokes
+            // land in whatever the user had open before.
+            pending.window.focus_window();
+            // Split by kind and colour: a placeholder that paints one flat
+            // rectangle and a placeholder that paints the whole layout both
+            // report a healthy command count, and only this tells them apart.
+            let fills =
+                pending.commands.iter().filter(|c| matches!(c, SplashCommand::Fill { .. })).count();
+            let distinct: std::collections::HashSet<[u8; 4]> = pending
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    SplashCommand::Fill { color, .. } => Some([color.r, color.g, color.b, color.a]),
+                    _ => None,
+                })
+                .collect();
+            log::info!(
+                "{{\"event\":\"renderer.splash_shown\",\"correlation_id\":{:?},\"fills\":{},\"texts\":{},\"fill_colors\":{},\"size\":[{},{}]}}",
+                startup_correlation_id(),
+                fills,
+                pending.commands.len() - fills,
+                distinct.len(),
+                pending.laid_out_for.0,
+                pending.laid_out_for.1,
+            );
+        }
+    }
+
+    /// Re-layout the parked tree for a new window size and repaint.
+    ///
+    /// The placeholder is up for over a second, which is long enough for
+    /// someone to grab the edge of the window. Ignoring that would leave a
+    /// stretched or clipped image until the swap.
+    fn resize_splash(&mut self, size: (u32, u32)) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        if size.0 == 0 || size.1 == 0 || size == pending.laid_out_for {
+            return;
+        }
+        run_layout_pipeline(
+            &mut pending.arena,
+            &mut pending.taffy,
+            pending.root,
+            &mut pending.font_system,
+            size.0 as f32,
+            size.1 as f32,
+            &mut pending.measure_cache,
+        );
+        pending.laid_out_for = size;
+        pending.commands = splash::collect(&pending.arena, pending.root, size);
+        self.show_splash();
+    }
+
+    /// Decide, once per loop iteration, whether the GPU is worth collecting.
+    ///
+    /// The prewarm is asked whether it would block, never made to. When it
+    /// would, the loop parks for a display interval and comes back -- which is
+    /// also what keeps the placeholder repainting and the window answering the
+    /// window manager. When it would not, or when there is no prewarm to wait
+    /// for, or when waiting has gone on too long, bring-up finishes.
+    fn poll_startup(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let ready = match GpuContext::prewarm_status() {
+            // Nothing is coming: no prewarm ran, or it was already taken.
+            // Waiting would be waiting on nothing.
+            PrewarmStatus::Absent => true,
+            PrewarmStatus::Ready => true,
+            PrewarmStatus::Pending => {
+                // A placeholder is only worth keeping up if it is on screen.
+                // With no painter the window is still hidden, and lingering
+                // would just be a slower version of the old blocking path.
+                !self.splash_is_showing()
+                    || self.pending.as_ref().is_some_and(|p| p.since.elapsed() >= SPLASH_DEADLINE)
+            }
+        };
+
+        if ready {
+            self.finish_startup(event_loop);
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             return;
         }
 
-        let window: Arc<dyn Window> = Arc::from(window::create_window(
-            event_loop,
-            &self.app.config.title,
-            self.app.config.width,
-            self.app.config.height,
-            self.app.config.decorations,
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            Instant::now() + SPLASH_POLL_INTERVAL,
         ));
+    }
 
-        let scale_factor = window.scale_factor() as f32;
-        let zoom_factor = if self.app.config.initial_zoom.is_finite() {
-            self.app.config.initial_zoom.clamp(MIN_ZOOM, MAX_ZOOM)
-        } else {
-            1.0
-        };
-        log::info!("Display scale factor: {:.2}x, zoom: {:.0}%", scale_factor, zoom_factor * 100.0);
-
-        if let Some(ref cb) = self.app.config.on_scale_factor {
-            cb(effective_scale(scale_factor, zoom_factor));
+    /// Handle a window event while the placeholder is up.
+    ///
+    /// There is no [`AppState`] yet, so nothing here can go through the
+    /// ordinary path. The events worth handling are the ones whose absence the
+    /// user would feel as the window being broken rather than merely
+    /// unfinished: closing it, moving or resizing it, and typing at it.
+    fn splash_window_event(&mut self, event_loop: &dyn ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                // Deliberately not consulting `AppConfig::on_close`: a veto
+                // exists to show a confirmation dialog, and there is nothing
+                // yet that could draw one. Someone closing the window during
+                // startup means it.
+                event_loop.exit();
+            }
+            WindowEvent::RedrawRequested => {
+                self.show_splash();
+            }
+            WindowEvent::SurfaceResized(size) => {
+                self.resize_splash((size.width, size.height));
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                // The tree was styled for the old scale. Rescaling it properly
+                // is what the real path does on this event; here it is not
+                // worth the risk, and the swap will redo layout anyway.
+                self.show_splash();
+            }
+            // Keystrokes and the modifier state they depend on, kept in
+            // arrival order and replayed once there is something to route
+            // them to. Everything else -- pointer motion, focus, hover -- is
+            // about a UI that does not exist yet, and replaying it later
+            // would deliver it against a world that has since moved on.
+            event @ (WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_)) => {
+                if let Some(pending) = self.pending.as_mut() {
+                    // A bound, because this queue is only drained by an event
+                    // that may never arrive. Someone leaning on a key for the
+                    // whole of startup should not be able to grow it without
+                    // limit.
+                    if pending.buffered_input.len() < MAX_BUFFERED_STARTUP_INPUT {
+                        pending.buffered_input.push(event);
+                    }
+                }
+            }
+            _ => {}
         }
-        let initial_window_maximized = window.is_maximized();
-        if let Some(ref cb) = self.app.config.on_window_maximized {
-            cb(initial_window_maximized);
-        }
+    }
 
-        // Read the active monitor's refresh rate so the frame pacer can
-        // coalesce at the real panel rhythm rather than the historic 8ms
-        // default. Falls back to 0 (and thus `DEFAULT_MIN_INTERVAL`) on
-        // platforms or configurations that cannot report the rate.
-        let startup_refresh_mhz = {
-            use crate::frame_pacer::MonitorRefreshSource as _;
-            WindowRefreshSource(&*window).current_refresh_mhz().unwrap_or(0)
+    /// Collect the GPU and turn a [`PendingStartup`] into a live [`AppState`].
+    ///
+    /// Called from `about_to_wait` once the prewarmed GPU is ready, or once
+    /// waiting for it has stopped being reasonable. Everything from here down
+    /// is what bring-up always did; it just happens later, and with a window
+    /// the user has been looking at for a while.
+    fn finish_startup(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let Some(pending) = self.pending.take() else {
+            return;
         };
-        log::info!("Display refresh rate: {} mHz", startup_refresh_mhz);
+        let PendingStartup {
+            window,
+            window_id,
+            gpu_preferences,
+            compositor_clock_supported,
+            scale_factor,
+            zoom_factor,
+            initial_window_maximized,
+            startup_refresh_mhz,
+            stylesheet,
+            mut font_system,
+            swash_cache,
+            subpixel_swash_cache,
+            #[cfg(target_os = "windows")]
+            dw_rasterizer,
+            mut arena,
+            mut taffy,
+            root,
+            pseudo_table,
+            mut measure_cache,
+            laid_out_for,
+            surface: splash_surface,
+            commands: _,
+            backdrop: _,
+            buffered_input,
+            since,
+            paints,
+            last_paint,
+        } = pending;
 
-        let compositor_clock_supported = self.app.compositor_clock_waker.is_supported();
-        let gpu_preferences = window_gpu_preferences(compositor_clock_supported);
+        let swap_started = Instant::now();
         let mut gpu =
             pollster::block_on(GpuContext::new_with_preferences(window.clone(), gpu_preferences));
+        self.mark_startup("gpu_ready");
 
         // One-shot pacing mode selection: sound because surface
         // reconfigures reuse the stored present mode, so it cannot
@@ -2686,110 +2919,39 @@ impl ApplicationHandler for AppHandler {
             gpu.glyph_atlas.max_size = derived_size.max(512);
         }
 
-        // If a css_path is set, read that file into config.css so it acts as
-        // the initial stylesheet (both here and in the hot-reload watcher).
-        #[cfg(feature = "hot-reload")]
-        if let Some(ref css_path) = self.app.config.css_path {
-            match std::fs::read_to_string(css_path) {
-                Ok(contents) => self.app.config.css = contents,
-                Err(e) => log::warn!("hot-reload: failed to read {:?}: {}", css_path, e),
-            }
-        }
-
-        let stylesheet = CompiledStylesheet::parse(&self.app.config.css);
-        // Dev aid: surface declarations the engine could not type and silently
-        // dropped (unrecognized property, or a value its parser rejected). The
-        // enforcing guardrail is the app's `stylesheet_coverage` test; this is a
-        // low-noise debug summary so a new gap is visible during `cargo run`.
-        if !stylesheet.dropped.is_empty() {
-            let custom = stylesheet.dropped.iter().filter(|d| d.is_custom_property()).count();
-            let mut props: Vec<&str> = stylesheet
-                .dropped
-                .iter()
-                .filter(|d| !d.is_custom_property())
-                .map(|d| d.property.as_str())
-                .collect();
-            props.sort_unstable();
-            props.dedup();
-            log::debug!(
-                "stylesheet: {} dropped declaration(s) the engine does not understand \
-                 ({custom} custom-property defs); unsupported properties: {props:?}",
-                stylesheet.dropped.len(),
+        // The layout was computed against the window; the surface is what will
+        // actually be drawn to. They agree unless the window changed size
+        // during the wait and the resize was coalesced away, so this is a
+        // cheap guard rather than a routine second pass.
+        let surface_size = gpu.window_size();
+        if (surface_size.0 as u32, surface_size.1 as u32) != laid_out_for {
+            run_layout_pipeline(
+                &mut arena,
+                &mut taffy,
+                root,
+                &mut font_system,
+                surface_size.0,
+                surface_size.1,
+                &mut measure_cache,
             );
         }
-        let mut font_system = FontSystem::new();
-        let font_report =
-            crate::font::load_custom_fonts(&mut font_system, &self.app.config.fonts, &stylesheet);
-        if font_report.config_faces
-            + font_report.css_faces
-            + font_report.config_errors
-            + font_report.css_errors
-            > 0
-        {
-            log::info!(
-                "Custom fonts: {} config face(s), {} @font-face face(s), {} config error(s), {} css error(s)",
-                font_report.config_faces,
-                font_report.css_faces,
-                font_report.config_errors,
-                font_report.css_errors,
-            );
-        }
-        crate::font::check_fallback_chain(&font_system, &self.app.config.fallback_chain);
-        let swash_cache = SwashCache::new();
-        let subpixel_swash_cache = SubpixelSwashCache::new();
-        #[cfg(target_os = "windows")]
-        let dw_rasterizer = {
-            let font_name = self
-                .app
-                .config
-                .fonts
-                .first()
-                .and_then(|f| match f {
-                    crate::font::FontSource::System(name) => Some(name.as_str()),
-                    _ => None,
-                })
-                .unwrap_or("Consolas");
-            DwRasterizer::new_with_custom_font_paths(
-                font_name,
-                collect_directwrite_font_paths(&self.app.config.fonts, &stylesheet),
-            )
-        };
-
-        let mut arena = NodeArena::new();
-        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
-
-        let element_tree = (self.app.tree_fn)();
-        let root =
-            build_tree_from_def(&element_tree.root, &mut arena, &mut taffy, NodeId::DANGLING);
-
-        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
-        let mut pseudo_table = unshit_core::style::pseudo::PseudoSideTable::new();
-        unshit_core::build::resolve_pseudo_elements(
-            &mut arena,
-            &mut taffy,
-            &stylesheet,
-            root,
-            NodeId::DANGLING,
-            None,
-            NodeId::DANGLING,
-            &mut pseudo_table,
-        );
-        scale_all_styles(&mut arena, root, effective_scale(scale_factor, zoom_factor));
-
-        let mut measure_cache = TextMeasureCache::new();
-        let (w, h) = gpu.window_size();
-        run_layout_pipeline(
-            &mut arena,
-            &mut taffy,
-            root,
-            &mut font_system,
-            w,
-            h,
-            &mut measure_cache,
-        );
 
         // Mark every node dirty for paint so the first frame renders all elements.
         unshit_core::build::mark_paint_dirty(&mut arena, root);
+
+        // Release the placeholder before the first present, not after: the
+        // GDI content and the swapchain both own the client area, and the
+        // window looks better going straight from one to the other than
+        // flickering between them.
+        drop(splash_surface);
+
+        // A window that was never mapped -- no placeholder painter on this
+        // platform -- is mapped here instead, at the last point before the
+        // first paint is asked for.
+        if !window.is_visible().unwrap_or(true) {
+            window.set_visible(true);
+            window.focus_window();
+        }
 
         window.request_redraw();
 
@@ -2964,6 +3126,372 @@ impl ApplicationHandler for AppHandler {
                 }
             });
         }
+
+        log::info!(
+            "{{\"event\":\"renderer.splash_swapped\",\"correlation_id\":{:?},\"shown_ms\":{:.2},\"swap_ms\":{:.2},\"replayed_events\":{},\"paints\":{},\"last_fills\":{},\"last_texts\":{}}}",
+            startup_correlation_id(),
+            since.elapsed().as_secs_f64() * 1000.0,
+            swap_started.elapsed().as_secs_f64() * 1000.0,
+            buffered_input.len(),
+            paints,
+            last_paint.fills,
+            last_paint.texts,
+        );
+
+        // Replay what the user typed at the placeholder through the ordinary
+        // handler, in arrival order. Deliberately the raw winit events rather
+        // than anything pre-translated: dead-key composition and modifier
+        // state are reconstructed by that path, and a layout where `'` and `~`
+        // are dead keys would compose differently if the translation happened
+        // early and the replay merely delivered the result.
+        for event in buffered_input {
+            self.window_event(event_loop, window_id, event);
+        }
+
+        self.mark_startup("gpu_swapped");
+    }
+}
+
+impl ApplicationHandler for AppHandler {
+    fn proxy_wake_up(&mut self, _event_loop: &dyn ActiveEventLoop) {
+        let Some(state) = self.app.state.as_mut() else {
+            return;
+        };
+        let mut coalescer = RebuildCoalescer::default();
+        let mut saw_animation_frame = false;
+        let mut compositor_tick = None;
+        coalescer.begin_drain();
+        for event in self.event_rx.try_iter() {
+            match event {
+                ExternalEvent::RequestRebuild => {
+                    coalescer.observe(true);
+                }
+                ExternalEvent::RequestRedraw => {
+                    coalescer.observe(false);
+                }
+                ExternalEvent::RequestAnimationFrame => {
+                    saw_animation_frame = true;
+                }
+                ExternalEvent::RequestCompositorFrame { tick_at } => {
+                    self.app.compositor_clock_waker.acknowledge_tick();
+                    compositor_tick = Some(match compositor_tick {
+                        Some(previous) => std::cmp::max(previous, tick_at),
+                        None => tick_at,
+                    });
+                }
+                ExternalEvent::ActivateWindow => {
+                    state.window.set_visible(true);
+                    state.window.set_minimized(false);
+                    state.window.focus_window();
+                    state
+                        .window
+                        .request_user_attention(Some(AttentionUrgency::Informational.to_winit()));
+                    coalescer.observe(false);
+                }
+                ExternalEvent::MinimizeWindow => {
+                    state.window.set_minimized(true);
+                    coalescer.observe(false);
+                }
+                ExternalEvent::ToggleMaximizeWindow => {
+                    let maximized = state.window.is_maximized();
+                    let next_maximized = !maximized;
+                    state.window.set_maximized(next_maximized);
+                    publish_window_maximized_change(
+                        &mut state.window_maximized,
+                        next_maximized,
+                        self.app.config.on_window_maximized.as_ref(),
+                    );
+                    coalescer.observe(true);
+                }
+                ExternalEvent::Custom(payload) => {
+                    if let Some(ref handler) = self.app.config.on_external_event {
+                        handler(payload);
+                    }
+                    // Custom events typically change app state, so rebuild.
+                    coalescer.observe(true);
+                }
+                ExternalEvent::Bytes(data) => {
+                    if let Some(ref handler) = self.app.config.on_bytes {
+                        (handler)(data);
+                    }
+                    coalescer.observe(false);
+                }
+                #[cfg(feature = "hot-reload")]
+                ExternalEvent::StylesheetReload(new_stylesheet) => {
+                    state.stylesheet = *new_stylesheet;
+                    state.needs_restyle = true;
+                    state.shaped_cache.clear();
+                    state.shape_cache.clear();
+                    state.batch_cache.clear();
+                    // Collect all node IDs first, then mark each dirty.
+                    let node_ids: Vec<_> = state.arena.iter().map(|(id, _)| id).collect();
+                    for id in node_ids {
+                        if let Some(elem) = state.arena.get_mut(id) {
+                            elem.dirty |= unshit_core::dirty::DirtyFlags::STYLE
+                                | unshit_core::dirty::DirtyFlags::SUBTREE_STYLE;
+                        }
+                    }
+                    coalescer.observe(true);
+                }
+            }
+        }
+        if coalescer.needs_rebuild {
+            state.needs_rebuild = true;
+        }
+        if let Some(tick_at) = compositor_tick {
+            state.compositor_frame_ready = Some(tick_at);
+        }
+        if coalescer.saw_event {
+            // An external source (PTY reader, subscription, bridge, hot
+            // reload, etc.) produced work for the UI thread. Count this as
+            // activity so `about_to_wait` schedules speculative frames
+            // during the next [`ACTIVITY_WINDOW`].
+            state.mark_activity(Instant::now());
+        }
+        if saw_animation_frame && animations_active(state) {
+            // A Timer-fallback waker tick (the waker never runs in
+            // VsyncBlocking mode). All painting goes through the single
+            // paint site, `RedrawRequested`; the force flag lets the
+            // tick bypass the due-gate and pacer gate once, since the
+            // waker already ticks at the display period.
+            state.force_animation_paint = true;
+            state.window.request_redraw();
+        } else if saw_animation_frame && !coalescer.saw_event {
+            // Stale waker tick after every animation settled: nothing to
+            // paint, and no flag to leave armed.
+            state.force_animation_paint = false;
+        } else {
+            state.window.request_redraw();
+        }
+    }
+
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.app.state.is_some() || self.pending.is_some() {
+            return;
+        }
+
+        let window: Arc<dyn Window> = Arc::from(window::create_window(
+            event_loop,
+            &self.app.config.title,
+            self.app.config.width,
+            self.app.config.height,
+            self.app.config.decorations,
+            !self.app.config.show_window_when_painted,
+        ));
+        self.mark_startup("window_created");
+
+        let scale_factor = window.scale_factor() as f32;
+        let zoom_factor = if self.app.config.initial_zoom.is_finite() {
+            self.app.config.initial_zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+        } else {
+            1.0
+        };
+        log::info!("Display scale factor: {:.2}x, zoom: {:.0}%", scale_factor, zoom_factor * 100.0);
+
+        if let Some(ref cb) = self.app.config.on_scale_factor {
+            cb(effective_scale(scale_factor, zoom_factor));
+        }
+        let initial_window_maximized = window.is_maximized();
+        if let Some(ref cb) = self.app.config.on_window_maximized {
+            cb(initial_window_maximized);
+        }
+
+        // Read the active monitor's refresh rate so the frame pacer can
+        // coalesce at the real panel rhythm rather than the historic 8ms
+        // default. Falls back to 0 (and thus `DEFAULT_MIN_INTERVAL`) on
+        // platforms or configurations that cannot report the rate.
+        let startup_refresh_mhz = {
+            use crate::frame_pacer::MonitorRefreshSource as _;
+            WindowRefreshSource(&*window).current_refresh_mhz().unwrap_or(0)
+        };
+        log::info!("Display refresh rate: {} mHz", startup_refresh_mhz);
+
+        // The GPU is deliberately not touched here. Adapter and device
+        // creation is the longest single stretch of startup and it is already
+        // running on its own thread; everything below -- stylesheet, fonts,
+        // tree, layout -- needs none of it, and doing it now means it happens
+        // during that wait instead of after it. The GPU is collected in
+        // `finish_startup`, once there is nothing left to do without it.
+        let compositor_clock_supported = self.app.compositor_clock_waker.is_supported();
+        let gpu_preferences = window_gpu_preferences(compositor_clock_supported);
+
+        // If a css_path is set, read that file into config.css so it acts as
+        // the initial stylesheet (both here and in the hot-reload watcher).
+        #[cfg(feature = "hot-reload")]
+        if let Some(ref css_path) = self.app.config.css_path {
+            match std::fs::read_to_string(css_path) {
+                Ok(contents) => self.app.config.css = contents,
+                Err(e) => log::warn!("hot-reload: failed to read {:?}: {}", css_path, e),
+            }
+        }
+
+        let stylesheet = CompiledStylesheet::parse(&self.app.config.css);
+        // Dev aid: surface declarations the engine could not type and silently
+        // dropped (unrecognized property, or a value its parser rejected). The
+        // enforcing guardrail is the app's `stylesheet_coverage` test; this is a
+        // low-noise debug summary so a new gap is visible during `cargo run`.
+        if !stylesheet.dropped.is_empty() {
+            let custom = stylesheet.dropped.iter().filter(|d| d.is_custom_property()).count();
+            let mut props: Vec<&str> = stylesheet
+                .dropped
+                .iter()
+                .filter(|d| !d.is_custom_property())
+                .map(|d| d.property.as_str())
+                .collect();
+            props.sort_unstable();
+            props.dedup();
+            log::debug!(
+                "stylesheet: {} dropped declaration(s) the engine does not understand \
+                 ({custom} custom-property defs); unsupported properties: {props:?}",
+                stylesheet.dropped.len(),
+            );
+        }
+        // Split into its own stages because "fonts" is three unrelated pieces
+        // of work with very different costs -- a system-wide face scan, our
+        // own embedded faces, and DirectWrite bring-up -- and which of them is
+        // slow decides what to do about it.
+        let mut font_system = FontSystem::new();
+        self.mark_startup("font_system_ready");
+        let font_report =
+            crate::font::load_custom_fonts(&mut font_system, &self.app.config.fonts, &stylesheet);
+        if font_report.config_faces
+            + font_report.css_faces
+            + font_report.config_errors
+            + font_report.css_errors
+            > 0
+        {
+            log::info!(
+                "Custom fonts: {} config face(s), {} @font-face face(s), {} config error(s), {} css error(s)",
+                font_report.config_faces,
+                font_report.css_faces,
+                font_report.config_errors,
+                font_report.css_errors,
+            );
+        }
+        crate::font::check_fallback_chain(&font_system, &self.app.config.fallback_chain);
+        self.mark_startup("custom_fonts_loaded");
+        let swash_cache = SwashCache::new();
+        let subpixel_swash_cache = SubpixelSwashCache::new();
+        #[cfg(target_os = "windows")]
+        let dw_rasterizer = {
+            let font_name = self
+                .app
+                .config
+                .fonts
+                .first()
+                .and_then(|f| match f {
+                    crate::font::FontSource::System(name) => Some(name.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("Consolas");
+            DwRasterizer::new_with_custom_font_paths(
+                font_name,
+                collect_directwrite_font_paths(&self.app.config.fonts, &stylesheet),
+            )
+        };
+
+        self.mark_startup("fonts_ready");
+
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+
+        let element_tree = (self.app.tree_fn)();
+        let root =
+            build_tree_from_def(&element_tree.root, &mut arena, &mut taffy, NodeId::DANGLING);
+        self.mark_startup("first_tree_built");
+
+        resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+        let mut pseudo_table = unshit_core::style::pseudo::PseudoSideTable::new();
+        unshit_core::build::resolve_pseudo_elements(
+            &mut arena,
+            &mut taffy,
+            &stylesheet,
+            root,
+            NodeId::DANGLING,
+            None,
+            NodeId::DANGLING,
+            &mut pseudo_table,
+        );
+        scale_all_styles(&mut arena, root, effective_scale(scale_factor, zoom_factor));
+
+        let mut measure_cache = TextMeasureCache::new();
+        // The window's own size rather than the GPU's: there is no GPU yet,
+        // and the surface will be configured to this same size when there is.
+        // `finish_startup` re-runs layout if the two ever disagree, which they
+        // can when the window is resized while the placeholder is up.
+        let laid_out_for = {
+            let size = window.surface_size();
+            (size.width.max(1), size.height.max(1))
+        };
+        let (w, h) = (laid_out_for.0 as f32, laid_out_for.1 as f32);
+        run_layout_pipeline(
+            &mut arena,
+            &mut taffy,
+            root,
+            &mut font_system,
+            w,
+            h,
+            &mut measure_cache,
+        );
+
+        self.mark_startup("first_layout_done");
+
+        // Everything the first frame consists of is now known, and the GPU
+        // that would draw it is still a second away. Put it on screen with the
+        // platform's own 2D drawing instead of waiting: the window becomes
+        // visible, movable, closable and able to collect what the user types,
+        // and it shows the app's real geometry rather than a blank rectangle.
+        // Fall back to the renderer's own clear color, so the placeholder and
+        // the first real frame agree on the ground they are drawn on and the
+        // swap is not a flash.
+        let backdrop = {
+            let [r, g, b] = unshit_renderer::gpu::surface_clear_rgb8();
+            splash::backdrop_for(&arena, root, unshit_core::style::types::Color::rgb(r, g, b))
+        };
+        let commands = splash::collect(&arena, root, laid_out_for);
+        let surface = crate::splash_paint::window_handle(&*window)
+            .and_then(|hwnd| SplashSurface::new(hwnd, splash_font_face(&self.app.config)));
+
+        let pending = PendingStartup {
+            window_id: window.id(),
+            window,
+            gpu_preferences,
+            compositor_clock_supported,
+            scale_factor,
+            zoom_factor,
+            initial_window_maximized,
+            startup_refresh_mhz,
+            stylesheet,
+            font_system,
+            swash_cache,
+            subpixel_swash_cache,
+            #[cfg(target_os = "windows")]
+            dw_rasterizer,
+            arena,
+            taffy,
+            root,
+            pseudo_table,
+            measure_cache,
+            laid_out_for,
+            surface,
+            commands,
+            backdrop,
+            buffered_input: Vec::new(),
+            since: Instant::now(),
+            paints: 0,
+            last_paint: crate::splash_paint::PaintReport::default(),
+        };
+        self.pending = Some(pending);
+        self.show_splash();
+
+        // Hand control back to the event loop. `about_to_wait` polls the GPU
+        // from here and calls `finish_startup` when it lands. Only marked when
+        // something was actually painted: on a platform without a placeholder
+        // painter this is a phase boundary the user cannot see, and a stage
+        // named for a paint that did not happen is worse than a missing one.
+        if self.splash_is_showing() {
+            self.mark_startup("splash_painted");
+        }
     }
 
     fn window_event(
@@ -2972,6 +3500,10 @@ impl ApplicationHandler for AppHandler {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.pending.is_some() {
+            self.splash_window_event(event_loop, event);
+            return;
+        }
         let Some(state) = self.app.state.as_mut() else {
             return;
         };
@@ -4966,6 +5498,10 @@ impl ApplicationHandler for AppHandler {
     /// window because skipped animation frames park mid-interaction,
     /// well inside it.
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.pending.is_some() {
+            self.poll_startup(event_loop);
+            return;
+        }
         let Some(state) = self.app.state.as_mut() else {
             return;
         };

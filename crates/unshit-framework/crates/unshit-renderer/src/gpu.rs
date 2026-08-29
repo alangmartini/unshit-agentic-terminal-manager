@@ -34,6 +34,25 @@ fn process_correlation_id() -> &'static str {
     ID.get_or_init(|| format!("process-{}", std::process::id()))
 }
 
+/// The color the surface is cleared to before a frame is drawn.
+///
+/// Named rather than written at each render pass because things outside the
+/// renderer have to agree with it -- the placeholder painted before the GPU
+/// exists, most of all, where a mismatch is a visible flash at the moment the
+/// two swap. One definition means they cannot drift.
+pub const SURFACE_CLEAR: wgpu::Color = wgpu::Color { r: 0.051, g: 0.067, b: 0.09, a: 1.0 };
+
+/// [`SURFACE_CLEAR`] as 8-bit components, for painters without a GPU.
+///
+/// A straight multiply is correct here, not an approximation: the surface
+/// format is chosen from the caps by explicitly rejecting sRGB
+/// (`.find(|f| !f.is_srgb())`), so clear components are written to the
+/// texture as-is with no transfer function applied.
+pub fn surface_clear_rgb8() -> [u8; 3] {
+    let quantize = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    [quantize(SURFACE_CLEAR.r), quantize(SURFACE_CLEAR.g), quantize(SURFACE_CLEAR.b)]
+}
+
 fn log_backdrop_fallback_once(
     format: wgpu::TextureFormat,
     format_usages: wgpu::TextureUsages,
@@ -154,6 +173,63 @@ fn parse_backend_env_value(value: &str) -> Option<wgpu::Backends> {
         "metal" => Some(wgpu::Backends::METAL),
         "gl" | "opengl" => Some(wgpu::Backends::GL),
         _ => None,
+    }
+}
+
+/// Whether a prewarmed GPU is on its way, already here, or was never coming.
+///
+/// Reported by [`GpuContext::prewarm_status`] so a caller can decide between
+/// waiting productively and waiting at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrewarmStatus {
+    /// Nothing is outstanding: no prewarm ran, or its result was already
+    /// collected. Waiting for it would wait forever.
+    Absent,
+    /// Still being built. Collecting now would block.
+    Pending,
+    /// Finished. Collecting now will not block.
+    Ready,
+}
+
+/// The prewarmed GPU, parked between [`GpuContext::prewarm`] and
+/// [`GpuContext::take_prewarmed`]. A join handle rather than the values
+/// themselves, so the collector waits for the remainder instead of racing it.
+#[cfg(windows)]
+#[allow(clippy::type_complexity)]
+static PREWARM: std::sync::OnceLock<
+    std::sync::Mutex<
+        Option<
+            std::thread::JoinHandle<
+                Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue, AdapterTier)>,
+            >,
+        >,
+    >,
+> = std::sync::OnceLock::new();
+
+/// Request a device, retrying at default limits when the adapter's own limits
+/// are refused. Shared so a prewarmed device and a surface-path device can
+/// never be configured differently -- a mismatch would surface later, as a
+/// pipeline that validates on one startup path and not the other.
+async fn request_device(adapter: &wgpu::Adapter) -> Option<(wgpu::Device, wgpu::Queue)> {
+    match adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("unshit device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(dq) => Some(dq),
+        Err(_) => adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("unshit device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            })
+            .await
+            .ok(),
     }
 }
 
@@ -701,15 +777,54 @@ impl GpuContext {
     ) -> Self {
         let size = window.surface_size();
         let pref = render_tier_pref();
+        let init_started = std::time::Instant::now();
 
         // Step 1 — preferred backends, hardware only; skipped only when
         // software is forced.
+        #[cfg(windows)]
+        if pref != RenderTierPref::SoftwareOnly {
+            if let Some((instance, adapter, device, queue, tier)) = Self::take_prewarmed() {
+                // The adapter came from an instance that never saw this
+                // window, so its ability to present here is an assumption
+                // until asked. Both checks fall through to the ordinary path
+                // rather than failing: on a multi-GPU machine the prewarmed
+                // adapter may simply not drive the display the window landed
+                // on, and that is a correct outcome, not an error.
+                match instance.create_surface(window.clone()) {
+                    Ok(surface) if adapter.is_surface_supported(&surface) => {
+                        log::info!(
+                            "{{\"event\":\"renderer.prewarm_used\",\"correlation_id\":{:?},\"backend\":\"{:?}\",\"waited_ms\":{:.2}}}",
+                            process_correlation_id(),
+                            adapter.get_info().backend,
+                            init_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        return Self::build_window_context(
+                            window,
+                            size,
+                            surface,
+                            adapter,
+                            device,
+                            queue,
+                            tier,
+                            preferences,
+                        );
+                    }
+                    _ => log::warn!(
+                        "{{\"event\":\"renderer.prewarm_discarded\",\"correlation_id\":{:?},\"reason\":\"surface_unsupported\"}}",
+                        process_correlation_id(),
+                    ),
+                }
+            }
+        }
+
         if pref != RenderTierPref::SoftwareOnly {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: renderer_backends(preferences.backends),
                 ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
             });
+            let instance_ready = init_started.elapsed();
             if let Ok(surface) = instance.create_surface(window.clone()) {
+                let surface_ready = init_started.elapsed();
                 if let Some((adapter, device, queue, tier)) = Self::request_window_adapter_device(
                     &instance,
                     &surface,
@@ -718,6 +833,13 @@ impl GpuContext {
                 )
                 .await
                 {
+                    Self::log_gpu_init_timing(
+                        "hardware",
+                        &adapter,
+                        init_started,
+                        instance_ready,
+                        surface_ready,
+                    );
                     log::info!(
                         "renderer adapter selected (hardware path): {:?}",
                         adapter.get_info()
@@ -817,12 +939,189 @@ impl GpuContext {
     /// construction: first the adapter's own reported limits (needed for the
     /// 28-attribute quad pipeline), then wgpu defaults (software renderers that
     /// reject their own limits).
+    /// Structured breakdown of window GPU bring-up.
+    ///
+    /// GPU initialization is the single largest block of cold-start latency and
+    /// it is entirely opaque from the outside: driver load, adapter
+    /// enumeration, and device creation all happen inside one `await`. Without
+    /// this split, a regression in any of the three looks identical from the
+    /// application's own stage timings.
+    fn log_gpu_init_timing(
+        path: &str,
+        adapter: &wgpu::Adapter,
+        started: std::time::Instant,
+        instance_ready: std::time::Duration,
+        surface_ready: std::time::Duration,
+    ) {
+        let total = started.elapsed();
+        let info = adapter.get_info();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let correlation_id = format!("process-{}", std::process::id());
+        log::info!(
+            "{{\"event\":\"renderer.gpu_init\",\"correlation_id\":{correlation_id:?},\"path\":{path:?},\"backend\":\"{:?}\",\"device_type\":\"{:?}\",\"instance_ms\":{:.2},\"surface_ms\":{:.2},\"adapter_device_ms\":{:.2},\"total_ms\":{:.2}}}",
+            info.backend,
+            info.device_type,
+            ms(instance_ready),
+            ms(surface_ready - instance_ready),
+            ms(total - surface_ready),
+            ms(total),
+        );
+    }
+
+    /// Start GPU bring-up on a background thread, before a window exists.
+    ///
+    /// Instance, adapter and device creation need no surface -- verified by
+    /// measurement: requesting an adapter with `compatible_surface: None` cost
+    /// the same as requesting one with a surface. But they are the expensive
+    /// part of startup (over a second on a machine where D3D12 enumeration
+    /// instantiates a WARP adapter), and they run on the event-loop thread,
+    /// where they block every message the young window is sent.
+    ///
+    /// So run them off-thread from process start and let window bring-up
+    /// happen underneath. [`Self::new_with_preferences`] collects the result,
+    /// waiting only for whatever is left.
+    ///
+    /// Windows only. The surface is created later from the prewarmed instance,
+    /// which is built without a display handle -- fine for Win32 window
+    /// handles, not for X11 or Wayland, which need the display connection the
+    /// instance was denied. Elsewhere this is a no-op and the ordinary path
+    /// runs unchanged.
+    pub fn prewarm(preferences: WindowGpuPreferences) {
+        #[cfg(windows)]
+        {
+            // A forced software renderer wants WARP specifically, which this
+            // hardware-preferring request would not produce.
+            if render_tier_pref() == RenderTierPref::SoftwareOnly {
+                return;
+            }
+            // Resolved through the same helper the real request uses, env
+            // overrides included: a prewarm on a different backend than the
+            // one ultimately asked for is not merely useless, it is a second
+            // full enumeration paid for nothing.
+            let backends = renderer_backends(preferences.backends);
+            let spawned = std::thread::Builder::new()
+                .name("gpu-prewarm".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                        backends,
+                        ..wgpu::InstanceDescriptor::new_without_display_handle()
+                    });
+                    let adapter = pollster::block_on(instance.request_adapter(
+                        &wgpu::RequestAdapterOptions {
+                            power_preference: wgpu::PowerPreference::HighPerformance,
+                            compatible_surface: None,
+                            force_fallback_adapter: false,
+                            apply_limit_buckets: false,
+                        },
+                    ))
+                    .ok()?;
+                    let tier = classify_adapter(&adapter.get_info(), false);
+                    let (device, queue) = pollster::block_on(request_device(&adapter))?;
+                    log::info!(
+                        "{{\"event\":\"renderer.prewarm_ready\",\"correlation_id\":{:?},\"backend\":\"{:?}\",\"tier\":\"{tier:?}\",\"total_ms\":{:.2}}}",
+                        process_correlation_id(),
+                        adapter.get_info().backend,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                    Some((instance, adapter, device, queue, tier))
+                })
+                .ok();
+            if let Some(handle) = spawned {
+                let _ = PREWARM.set(std::sync::Mutex::new(Some(handle)));
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = preferences;
+    }
+
+    /// Ask whether collecting the prewarmed GPU would block, without blocking.
+    ///
+    /// This is what lets a caller keep pumping its event loop instead of
+    /// parking on [`Self::new_with_preferences`] for the second-plus that
+    /// adapter and device creation costs. Poll it; when it stops reporting
+    /// [`PrewarmStatus::Pending`], the collection inside `new_with_preferences`
+    /// is a formality.
+    ///
+    /// [`PrewarmStatus::Absent`] means there is nothing to wait for at all --
+    /// no prewarm was started, or its result has already been taken -- so a
+    /// poller should stop polling and go down the ordinary path rather than
+    /// waiting for something that will never arrive.
+    pub fn prewarm_status() -> PrewarmStatus {
+        #[cfg(windows)]
+        {
+            let Some(cell) = PREWARM.get() else {
+                return PrewarmStatus::Absent;
+            };
+            let Ok(guard) = cell.lock() else {
+                return PrewarmStatus::Absent;
+            };
+            match guard.as_ref() {
+                Some(handle) if handle.is_finished() => PrewarmStatus::Ready,
+                Some(_) => PrewarmStatus::Pending,
+                None => PrewarmStatus::Absent,
+            }
+        }
+        #[cfg(not(windows))]
+        PrewarmStatus::Absent
+    }
+
+    /// Collect the prewarmed GPU, blocking for whatever of it is unfinished.
+    /// Returns `None` when no prewarm ran, when one was already collected, or
+    /// when the prewarm thread failed or panicked.
+    #[cfg(windows)]
+    #[allow(clippy::type_complexity)]
+    fn take_prewarmed(
+    ) -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue, AdapterTier)> {
+        let handle = PREWARM.get()?.lock().ok()?.take()?;
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => {
+                log::warn!(
+                    "{{\"event\":\"renderer.prewarm_panicked\",\"correlation_id\":{:?}}}",
+                    process_correlation_id(),
+                );
+                None
+            }
+        }
+    }
+
     async fn request_window_adapter_device(
         instance: &wgpu::Instance,
         surface: &wgpu::Surface<'_>,
         power: wgpu::PowerPreference,
         force_fallback: bool,
     ) -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue, AdapterTier)> {
+        let request_started = std::time::Instant::now();
+        // Opt-in probe. `request_adapter` is a single opaque call that was
+        // measured at 800ms on an AMD 890M laptop, and the reason turned out to
+        // be nothing to do with the GPU that got selected: wgpu instantiates
+        // *every* DXGI adapter to inspect it, and this machine exposes a
+        // "Microsoft Basic Render Driver" (WARP) whose D3D12 device creation
+        // is slow. Listing what was enumerated is the only way to see that
+        // from outside wgpu, so keep the probe available -- but off by
+        // default, since it duplicates the expensive enumeration.
+        if std::env::var_os("UNSHIT_GPU_ENUM_PROBE").is_some() {
+            let t0 = std::time::Instant::now();
+            let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+            let enumerate_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            for a in &adapters {
+                let t1 = std::time::Instant::now();
+                let info = a.get_info();
+                log::info!(
+                    "{{\"event\":\"renderer.adapter_enumerated\",\"name\":{:?},\"backend\":\"{:?}\",\"device_type\":\"{:?}\",\"get_info_ms\":{:.2}}}",
+                    info.name,
+                    info.backend,
+                    info.device_type,
+                    t1.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            log::info!(
+                "{{\"event\":\"renderer.enumerate_adapters\",\"count\":{},\"total_ms\":{:.2}}}",
+                adapters.len(),
+                enumerate_ms,
+            );
+        }
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: power,
@@ -832,27 +1131,21 @@ impl GpuContext {
             })
             .await
             .ok()?;
+        let adapter_ready = request_started.elapsed();
         let tier = classify_adapter(&adapter.get_info(), force_fallback);
-        let (device, queue) = match adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("unshit device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: adapter.limits(),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(dq) => dq,
-            Err(_) => adapter
-                .request_device(&wgpu::DeviceDescriptor {
-                    label: Some("unshit device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    ..Default::default()
-                })
-                .await
-                .ok()?,
-        };
+        let (device, queue) = request_device(&adapter).await?;
+        // Split so a regression points at a cause: adapter enumeration can be
+        // narrowed by requesting fewer backends, while device creation is the
+        // driver's own floor that only overlap can hide.
+        let total = request_started.elapsed();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        log::info!(
+            "{{\"event\":\"renderer.adapter_device\",\"correlation_id\":{:?},\"backend\":\"{:?}\",\"adapter_ms\":{:.2},\"device_ms\":{:.2}}}",
+            process_correlation_id(),
+            adapter.get_info().backend,
+            ms(adapter_ready),
+            ms(total - adapter_ready),
+        );
         Some((adapter, device, queue, tier))
     }
 
@@ -873,6 +1166,7 @@ impl GpuContext {
         // request asks for adapter limits, but the fallback request uses
         // WebGPU defaults; selecting a shader from adapter limits after that
         // fallback could exceed the real device contract.
+        let build_started = std::time::Instant::now();
         let device_limits = device.limits();
         let device = Arc::new(device);
         let queue = Arc::new(queue);
@@ -920,6 +1214,7 @@ impl GpuContext {
             desired_maximum_frame_latency: maximum_frame_latency,
         };
         surface.configure(&device, &surface_config);
+        let surface_configured = build_started.elapsed();
 
         // Some hardware backends expose WebGPU downlevel limits too (notably
         // GL at 16 vertex attributes or inter-stage locations).
@@ -965,6 +1260,7 @@ impl GpuContext {
         let image_pipeline = ImagePipeline::new(&device, surface_format, sample_count);
         let svg_pipeline = SvgPipeline::new(&device, surface_format, sample_count);
         let image_cache = ImageCache::new(&device);
+        let pipelines_ready = build_started.elapsed();
 
         let (msaa_texture, msaa_view) = if sample_count > 1 {
             let (t, v) = Self::create_msaa_texture(
@@ -984,6 +1280,21 @@ impl GpuContext {
         // chrome renders flat (no blur) instead of paying for ping-pong copies.
         let backdrop_filter_available = tier != AdapterTier::Software
             && probe_backdrop_filter_support(&adapter, surface_format, surface_config.usage);
+
+        // Shader compilation dominates this block on a cold driver cache, and
+        // it is invisible from `renderer.gpu_init` -- which stops once the
+        // device exists. Without this line a slow first frame looks like "the
+        // GPU was slow" with no way to tell a driver-side device creation cost
+        // from our own pipeline builds.
+        let build_total = build_started.elapsed();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        log::info!(
+            "{{\"event\":\"renderer.pipelines_built\",\"correlation_id\":{correlation_id:?},\"backend\":\"{backend:?}\",\"surface_config_ms\":{:.2},\"pipelines_ms\":{:.2},\"backdrop_probe_ms\":{:.2},\"total_ms\":{:.2}}}",
+            ms(surface_configured),
+            ms(pipelines_ready - surface_configured),
+            ms(build_total - pipelines_ready),
+            ms(build_total),
+        );
 
         Self {
             device,
@@ -1870,12 +2181,7 @@ impl GpuContext {
                     resolve_target: pass_resolve,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.051,
-                            g: 0.067,
-                            b: 0.09,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(SURFACE_CLEAR),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2318,7 +2624,7 @@ impl GpuContext {
                         wgpu::LoadOp::Load
                     } else {
                         pass_cleared = true;
-                        wgpu::LoadOp::Clear(wgpu::Color { r: 0.051, g: 0.067, b: 0.09, a: 1.0 })
+                        wgpu::LoadOp::Clear(SURFACE_CLEAR)
                     };
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("main pass (backdrop)"),

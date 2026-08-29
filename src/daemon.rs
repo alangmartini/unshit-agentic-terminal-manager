@@ -14,8 +14,18 @@ const DAEMON_BIN_NAME: &str = "unshit-ptyd";
 const DAEMON_PACKAGE_NAME: &str = "unshit-ptyd";
 const ENV_OVERRIDE: &str = "UNSHIT_PTYD_BINARY";
 const CONNECT_TOTAL_DEADLINE: Duration = Duration::from_secs(3);
-const CONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
-const CONNECT_MAX_BACKOFF: Duration = Duration::from_millis(200);
+/// First pause after spawning the daemon. A freshly spawned `unshit-ptyd`
+/// publishes its endpoint in single-digit milliseconds, so the old 25ms floor
+/// was almost entirely dead time on the cold-start path: the daemon was ready
+/// and the UI was still asleep. Backoff grows geometrically, so an unhealthy
+/// daemon still costs only a handful of probes before the deadline.
+const CONNECT_INITIAL_BACKOFF: Duration = Duration::from_micros(500);
+const CONNECT_MAX_BACKOFF: Duration = Duration::from_millis(50);
+/// Pause before re-probing an endpoint that exists but refused the connection.
+/// This is the Windows named-pipe rebind window: the daemon has accepted one
+/// client and has not yet created the next pending instance.
+const REBIND_RETRY_PAUSE: Duration = Duration::from_millis(5);
+const REBIND_RETRY_ATTEMPTS: u32 = 8;
 const CARGO_BUILD_OUTPUT_LIMIT: usize = 4096;
 
 /// Resolves the daemon binary path.
@@ -219,25 +229,44 @@ fn apply_detached_flags(cmd: &mut Command) {
 #[cfg(unix)]
 fn apply_detached_flags(_cmd: &mut Command) {}
 
+/// Outcome of [`connect_or_spawn`], so startup telemetry can separate a launch
+/// that attached to a live daemon from one that had to pay process-spawn cost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DaemonStartup {
+    /// A daemon was already listening; no process was created.
+    Attached,
+    /// No daemon was listening, so one was spawned and waited for.
+    Spawned,
+}
+
 /// Connect-or-spawn convenience used by `main.rs` on startup.
 ///
 /// 1. Try `unshit_ptyd::client::Client::connect(socket_path).await`.
-///    The probe is retried once with a brief sleep so the Windows
-///    named-pipe rebind window (a few ms between accepting one client
-///    and creating the next pending instance) does not push us onto
-///    the spawn path when the daemon is actually running.
-/// 2. On failure, locate the binary, call [`spawn_daemon_detached`],
-///    then retry connect with exponential backoff up to a bounded
-///    deadline (~3 seconds).
-/// 3. On connect success, drop the returned `Client` (the probe is the
-///    only reason we opened it) and return `Ok(())`.
-pub async fn connect_or_spawn(socket_path: &Path) -> io::Result<()> {
-    if try_connect(socket_path).await.is_ok() {
-        return Ok(());
-    }
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    if try_connect(socket_path).await.is_ok() {
-        return Ok(());
+/// 2. If that failed *because the endpoint exists but refused us*, retry
+///    briefly: that is the Windows named-pipe rebind window (a few ms between
+///    accepting one client and creating the next pending instance), and
+///    spawning a second daemon over a healthy one would be wrong.
+///    A "no such endpoint" error means no daemon is running and is not retried
+///    — on the cold-start path every millisecond spent re-probing an endpoint
+///    that provably does not exist is pure latency.
+/// 3. Otherwise locate the binary, call [`spawn_daemon_detached`], then retry
+///    connect with exponential backoff up to a bounded deadline (~3 seconds).
+/// 4. On connect success, drop the returned `Client` (the probe is the only
+///    reason we opened it).
+pub async fn connect_or_spawn(socket_path: &Path) -> io::Result<DaemonStartup> {
+    match try_connect(socket_path).await {
+        Ok(()) => return Ok(DaemonStartup::Attached),
+        Err(e) if endpoint_exists_but_refused(&e) => {
+            for _ in 0..REBIND_RETRY_ATTEMPTS {
+                tokio::time::sleep(REBIND_RETRY_PAUSE).await;
+                match try_connect(socket_path).await {
+                    Ok(()) => return Ok(DaemonStartup::Attached),
+                    Err(e) if endpoint_exists_but_refused(&e) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+        Err(_) => {}
     }
 
     let binary = ensure_daemon_binary()?;
@@ -248,7 +277,7 @@ pub async fn connect_or_spawn(socket_path: &Path) -> io::Result<()> {
     let mut last_err: Option<io::Error> = None;
     while Instant::now() < deadline {
         match try_connect(socket_path).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(DaemonStartup::Spawned),
             Err(e) => last_err = Some(e),
         }
         tokio::time::sleep(backoff).await;
@@ -273,6 +302,27 @@ async fn try_connect(socket_path: &Path) -> io::Result<()> {
     let client = unshit_ptyd::client::Client::connect(socket_path).await?;
     drop(client);
     Ok(())
+}
+
+/// Whether a failed connect means "a daemon is there, try again in a moment"
+/// rather than "nothing is listening, go spawn one".
+///
+/// Windows reports the rebind window as `ERROR_PIPE_BUSY` (231) and a missing
+/// pipe as `ERROR_FILE_NOT_FOUND` (2); Unix reports a missing socket as
+/// `NotFound` and a listening-but-saturated socket as `ConnectionRefused`.
+/// Anything unclassified is treated as "not running", which costs at worst one
+/// redundant daemon spawn — the daemon itself refuses to double-bind.
+fn endpoint_exists_but_refused(err: &io::Error) -> bool {
+    #[cfg(windows)]
+    const ERROR_PIPE_BUSY: i32 = 231;
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(ERROR_PIPE_BUSY) {
+        return true;
+    }
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 #[cfg(test)]
@@ -424,7 +474,12 @@ mod tests {
 
         wait_until_listening(&socket, Duration::from_secs(3)).await;
 
-        connect_or_spawn(&socket).await.expect("connect_or_spawn");
+        let outcome = connect_or_spawn(&socket).await.expect("connect_or_spawn");
+        assert_eq!(
+            outcome,
+            DaemonStartup::Attached,
+            "a live daemon must be attached to, never re-spawned"
+        );
 
         let mut cleanup = connect_retry(&socket, Duration::from_secs(3)).await;
         cleanup.shutdown().await.expect("shutdown ack");
