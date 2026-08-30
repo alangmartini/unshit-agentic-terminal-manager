@@ -8791,6 +8791,7 @@ mod tests {
     fn dispatch_quick_prompt_image_paste_sets_error_when_clipboard_empty() {
         // The test clipboard is uninitialized so read_image returns
         // Ok(None); the dispatch arm surfaces a friendly hint.
+        let _lock = clipboard_access_guard();
         let mut state = test_state();
         state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
 
@@ -8805,8 +8806,13 @@ mod tests {
         // test only enforces that dispatch did not panic and the
         // overlay is still open.
         if let Some(err) = qp.error.as_deref() {
+            // "Could not attach image" covers a real (or stale) copied
+            // file on the developer's clipboard reaching the file-list
+            // attach path.
             assert!(
-                err == "No image on clipboard" || err.starts_with("paste failed:"),
+                err == "No image on clipboard"
+                    || err.starts_with("paste failed:")
+                    || err.starts_with("Could not attach image"),
                 "unexpected error chip: {err}"
             );
         } else {
@@ -8814,6 +8820,47 @@ mod tests {
             // exist and have a non-empty hash.
             assert!(qp.images.iter().all(|i| !i.hash.is_empty()));
         }
+    }
+
+    /// File-list clipboard (ShareX "copy file to clipboard", Explorer
+    /// Ctrl+C on a PNG): `quick_prompt.image_paste` must attach the
+    /// copied image file like a drag-and-drop instead of falling
+    /// through to the "No image on clipboard" hint.
+    #[test]
+    fn dispatch_quick_prompt_image_paste_attaches_copied_image_file() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        state.quick_prompt = Some(crate::quick_prompt::QuickPromptState::open_default());
+
+        // A real decodable PNG on disk, then seeded as a CF_HDROP list.
+        let src_hex = format!("test-qp-filelist-{}", std::process::id());
+        let png = write_png_fixture(&src_hex, 2, 2);
+        let local = std::sync::Arc::new(unshit::app::ClipboardContext::new());
+        let seeded = local.write_file_list(std::slice::from_ref(&png)).is_ok();
+        state.clipboard = local;
+        // Headless CI may refuse clipboard writes; only assert when the
+        // file list actually landed (mirrors the terminal paste test).
+        if !seeded || !matches!(state.clipboard.read_file_list(), Ok(Some(_))) {
+            crate::quick_prompt::images::cleanup_session(&src_hex);
+            return;
+        }
+
+        let handled = dispatch(&mut state, "quick_prompt.image_paste");
+        // Never leave a dangling CF_HDROP list on the OS clipboard: the
+        // fixture PNG is deleted below, and later clipboard-reading
+        // tests (and the user) would see a list of dead paths.
+        let _ = state.clipboard.clear();
+        assert!(handled);
+        let qp = state.quick_prompt.as_ref().unwrap();
+        assert_eq!(
+            qp.error, None,
+            "a copied image file must attach, not hint 'No image on clipboard'"
+        );
+        assert_eq!(qp.images.len(), 1, "the copied PNG must land as one chip");
+
+        let session_hex = qp.session_hex.clone();
+        crate::quick_prompt::images::cleanup_session(&session_hex);
+        crate::quick_prompt::images::cleanup_session(&src_hex);
     }
 
     #[test]
@@ -9297,7 +9344,9 @@ mod tests {
         assert!(state.confirm_dialog.is_none());
         // Paste writes to a PTY the editor pane does not have; the write
         // fails internally without panicking or corrupting the buffer.
+        // The dispatch reads the real OS clipboard, so hold the guard.
         let before = state.editors[&state.active_pane.0].buffer.to_text();
+        let _lock = clipboard_access_guard();
         dispatch(&mut state, "terminal.paste");
         assert_eq!(state.editors[&state.active_pane.0].buffer.to_text(), before);
         let _ = std::fs::remove_file(path);
@@ -15288,6 +15337,9 @@ mod tests {
 
         let toasts_before = state.toasts.len();
         let handled = dispatch(&mut state, "terminal.paste");
+        // Never leave a dangling CF_HDROP list on the OS clipboard —
+        // later clipboard-reading tests (and the user) would see it.
+        let _ = state.clipboard.clear();
         assert!(handled);
         assert!(
             state.toasts.len() > toasts_before,
