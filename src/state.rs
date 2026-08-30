@@ -4619,14 +4619,16 @@ fn push_unique_quick_prompt_image(
     }
 }
 
-/// Attach a clipboard image to the open Quick Prompt if one is present.
+/// Attach a clipboard image to the open Quick Prompt if one is present:
+/// a bitmap first, then any decodable image among copied *files*
+/// (ShareX "copy file to clipboard", Explorer Ctrl+C).
 ///
-/// Returns `true` only when an image was actually attached, so the
-/// Ctrl+V key handler knows to *consume* the event. Returns `false`
-/// when the overlay is closed, the clipboard holds no image, or the
-/// read failed — in those cases the framework falls through to its
-/// normal text paste, so a plain Ctrl+V of text still lands in the
-/// input. This is the silent-on-miss counterpart to the
+/// Returns `true` only when the clipboard held an image we handled, so
+/// the Ctrl+V key handler knows to *consume* the event. Returns `false`
+/// when the overlay is closed, the clipboard holds no image in either
+/// form, or the read failed — in those cases the framework falls
+/// through to its normal text paste, so a plain Ctrl+V of text still
+/// lands in the input. This is the silent-on-miss counterpart to the
 /// `quick_prompt.image_paste` command (the "Attach image" button),
 /// which deliberately surfaces a "No image on clipboard" hint.
 pub fn try_attach_clipboard_image(state: &mut AppState) -> bool {
@@ -4642,12 +4644,49 @@ pub fn try_attach_clipboard_image(state: &mut AppState) -> bool {
             qp.error = None;
             true
         }
-        Ok(None) => false,
+        // No bitmap: the clipboard may hold a copied image *file*
+        // (ShareX "copy file to clipboard", Explorer Ctrl+C) instead.
+        Ok(None) => try_attach_clipboard_file_images(state),
         Err(e) => {
             log::warn!("clipboard image paste failed: {e}");
             false
         }
     }
+}
+
+/// File-list counterpart to [`try_attach_clipboard_image`]: when the
+/// clipboard holds copied *files* (`CF_HDROP`) rather than a bitmap,
+/// attach every decodable image among them through the same machinery
+/// as a drag-and-drop. Returns `false` — silently, no hint — when the
+/// clipboard has no file list or the list contains no supported image
+/// paths, so a Ctrl+V of non-image files still falls through to the
+/// normal text paste. Returns `true` whenever the list *did* contain
+/// image paths: attach/decode outcomes (chips added, dedup no-op,
+/// error hint on a corrupt file) are [`attach_dropped_images`]'s, and
+/// even the all-duplicates case counts as handled — matching the
+/// bitmap path, which also consumes a re-paste of the same screenshot
+/// rather than reporting "No image on clipboard".
+fn try_attach_clipboard_file_images(state: &mut AppState) -> bool {
+    if state.quick_prompt.is_none() {
+        return false;
+    }
+    let paths = match state.clipboard.read_file_list() {
+        Ok(Some(paths)) => paths,
+        Ok(None) => return false,
+        Err(e) => {
+            log::warn!("clipboard file-list paste failed: {e}");
+            return false;
+        }
+    };
+    let image_paths: Vec<std::path::PathBuf> = paths
+        .into_iter()
+        .filter(|p| crate::quick_prompt::images::is_supported_image_path(p))
+        .collect();
+    if image_paths.is_empty() {
+        return false;
+    }
+    let _ = attach_dropped_images(state, &image_paths);
+    true
 }
 
 /// Attach every decodable image among `paths` to the open Quick Prompt
@@ -5300,23 +5339,34 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 &state.clipboard,
                 &session_hex,
             );
-            let Some(qp_mut) = state.quick_prompt.as_mut() else {
-                return false;
-            };
             match captured {
                 Ok(Some(img)) => {
+                    let Some(qp_mut) = state.quick_prompt.as_mut() else {
+                        return false;
+                    };
                     push_unique_quick_prompt_image(qp_mut, img);
                     qp_mut.error = None;
                     true
                 }
                 Ok(None) => {
-                    // Clipboard had no image; surface a friendly hint
-                    // so the user knows the paste did not silently
-                    // disappear.
+                    // No bitmap. A copied image *file* (ShareX "copy
+                    // file to clipboard") attaches like a drop; only
+                    // when that also finds nothing does the friendly
+                    // hint surface, so the paste never silently
+                    // disappears.
+                    if try_attach_clipboard_file_images(state) {
+                        return true;
+                    }
+                    let Some(qp_mut) = state.quick_prompt.as_mut() else {
+                        return false;
+                    };
                     qp_mut.error = Some("No image on clipboard".into());
                     true
                 }
                 Err(e) => {
+                    let Some(qp_mut) = state.quick_prompt.as_mut() else {
+                        return false;
+                    };
                     qp_mut.error = Some(format!("paste failed: {e}"));
                     true
                 }
@@ -6274,12 +6324,14 @@ fn dispatch_terminal_export_info(state: &mut AppState) -> bool {
 /// Read the system clipboard, normalise the bytes, and forward them
 /// to the active pane's PTY through the fire-and-forget write path.
 ///
-/// Text is preferred when present. When the clipboard holds no text
-/// but does hold a bitmap (ShareX Ctrl+Print, Win+Shift+S, browser
-/// "Copy image"), Windows Terminal parity kicks in: the image is
-/// written to a temp PNG and its (quoted) path is pasted instead, so
-/// agent CLIs like Claude Code attach it exactly like a drag-and-drop.
-/// See [`crate::terminal::paste_image`].
+/// Text is preferred when present. When the clipboard holds no text,
+/// two fallbacks run in order. A copied *file list* (ShareX "copy file
+/// to clipboard", Explorer Ctrl+C — `CF_HDROP`) pastes the files'
+/// quoted paths, exactly like dropping the files on the pane. Failing
+/// that, a bare bitmap (ShareX Ctrl+Print, Win+Shift+S, browser "Copy
+/// image") is written to a temp PNG and its (quoted) path is pasted,
+/// so agent CLIs like Claude Code attach it exactly like a
+/// drag-and-drop. See [`crate::terminal::paste_image`].
 ///
 /// Fully empty clipboard is a silent no-op so a stray Ctrl+V does not
 /// spam toasts. A real clipboard failure (driver unavailable, OS
@@ -6307,10 +6359,16 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
     };
     let (payload, source) = if raw.is_empty() {
         // Non-text clipboard (arboard maps `ContentNotAvailable` to an
-        // empty string). Fall back to an image payload before giving up.
-        match clipboard_image_paste_payload(state) {
-            Some(path_text) => (path_text, "paste-image"),
-            None => return true,
+        // empty string). A copied file list beats a bitmap: when both
+        // are present the on-disk file is the original bytes, so paste
+        // its path rather than re-encoding pixels to a temp PNG.
+        if let Some(paths_text) = clipboard_file_paste_payload(state) {
+            (paths_text, "paste-file")
+        } else {
+            match clipboard_image_paste_payload(state) {
+                Some(path_text) => (path_text, "paste-image"),
+                None => return true,
+            }
         }
     } else {
         (normalize_pasted_text(&raw), "paste")
@@ -6364,6 +6422,31 @@ fn dispatch_terminal_paste(state: &mut AppState) -> bool {
         );
     }
     true
+}
+
+/// Try to turn a clipboard file list (`CF_HDROP`: ShareX "copy file to
+/// clipboard", files copied in Explorer) into pasteable path text —
+/// each path quoted as needed, space-joined. Returns `None` when the
+/// clipboard holds no file list so the caller can fall through to the
+/// bitmap path. A read *failure* also returns `None` but only logs:
+/// the bitmap fallback owns the user-visible error for genuinely
+/// broken clipboards, so one paste never double-toasts.
+fn clipboard_file_paste_payload(state: &mut AppState) -> Option<String> {
+    use crate::terminal::paste_image;
+    let paths = match state.clipboard.read_file_list() {
+        Ok(Some(paths)) => paths,
+        Ok(None) => return None,
+        Err(e) => {
+            log::warn!("terminal.paste: clipboard file-list read failed: {e}");
+            return None;
+        }
+    };
+    let pane_id = state.active_pane.0;
+    record_diagnostic_pty_event(
+        state,
+        format!("paste_file_list pane={pane_id} count={}", paths.len()),
+    );
+    Some(paste_image::pasteable_paths_text(&paths))
 }
 
 /// Try to turn a clipboard bitmap into a pasteable temp-PNG path
@@ -15179,6 +15262,37 @@ mod tests {
             state.toasts.len() > toasts_before,
             "image paste with no PTY in focus must toast, proving the \
              image payload path ran instead of the silent text no-op"
+        );
+    }
+
+    /// File-list-on-clipboard paste (ShareX "copy file to clipboard",
+    /// Explorer Ctrl+C): with a `CF_HDROP` list and no text on the
+    /// clipboard, `terminal.paste` must take the file-list branch —
+    /// proven, like the image test above, by the "no terminal in
+    /// focus" toast that only fires once a non-empty payload exists.
+    #[test]
+    fn dispatch_terminal_paste_file_list_clipboard_reaches_focus_check() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let local = std::sync::Arc::new(unshit::app::ClipboardContext::new());
+        // Absolute path, need not exist: CF_HDROP stores path strings.
+        let seeded = local
+            .write_file_list(&[std::env::temp_dir().join("unshit-paste-file-list.png")])
+            .is_ok();
+        state.clipboard = local;
+        // Headless CI may refuse clipboard writes; only assert when the
+        // file list actually landed (mirrors the image test above).
+        if !seeded || !matches!(state.clipboard.read_file_list(), Ok(Some(_))) {
+            return;
+        }
+
+        let toasts_before = state.toasts.len();
+        let handled = dispatch(&mut state, "terminal.paste");
+        assert!(handled);
+        assert!(
+            state.toasts.len() > toasts_before,
+            "file-list paste with no PTY in focus must toast, proving \
+             the file payload path ran instead of the silent text no-op"
         );
     }
 

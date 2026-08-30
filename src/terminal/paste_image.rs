@@ -1,12 +1,18 @@
-//! Clipboard-image paste support for terminal panes.
+//! Clipboard-image and clipboard-file paste support for terminal panes.
 //!
-//! Windows Terminal parity: when `terminal.paste` finds no text on the
-//! clipboard but does find a bitmap (ShareX Ctrl+Print, Win+Shift+S,
-//! browser "Copy image"), the image is written to a PNG under a stable
-//! temp dir and the file's path is pasted into the PTY instead. Agent
-//! CLIs (Claude Code, Codex) detect image paths in the prompt exactly
-//! like a drag-and-dropped file, and a plain shell just receives a
-//! path string.
+//! Windows Terminal parity and beyond: when `terminal.paste` finds no
+//! text on the clipboard, two fallbacks run in order.
+//!
+//! 1. A copied *file list* (ShareX "copy file to clipboard", Explorer
+//!    Ctrl+C — `CF_HDROP`) pastes the files' quoted paths directly:
+//!    the on-disk file is the original bytes, so no re-encode.
+//! 2. A bare bitmap (ShareX Ctrl+Print, Win+Shift+S, browser "Copy
+//!    image") is written to a PNG under a stable temp dir and the
+//!    file's path is pasted instead.
+//!
+//! Either way agent CLIs (Claude Code, Codex) detect image paths in
+//! the prompt exactly like a drag-and-dropped file, and a plain shell
+//! just receives a path string.
 //!
 //! Files are content-addressed (same FNV-1a hash the Quick Prompt
 //! image pipeline uses) so pasting the same screenshot twice reuses
@@ -75,6 +81,18 @@ pub fn pasteable_path_text(path: &Path) -> String {
     }
 }
 
+/// Render a clipboard file list as the text to paste into the PTY:
+/// each path quoted when needed ([`pasteable_path_text`]) and joined
+/// with single spaces, the shape shells and agent CLIs expect for
+/// multiple file arguments.
+pub fn pasteable_paths_text(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| pasteable_path_text(p))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +150,23 @@ mod tests {
             pasteable_path_text(Path::new(r"C:\tmp\shot.png")),
             r"C:\tmp\shot.png"
         );
+    }
+
+    #[test]
+    fn pasteable_paths_text_space_joins_and_quotes_per_path() {
+        let paths = vec![
+            PathBuf::from(r"C:\tmp\shot.png"),
+            PathBuf::from(r"C:\Users\Alan Beelink\other shot.png"),
+        ];
+        assert_eq!(
+            pasteable_paths_text(&paths),
+            r#"C:\tmp\shot.png "C:\Users\Alan Beelink\other shot.png""#
+        );
+    }
+
+    #[test]
+    fn pasteable_paths_text_single_path_has_no_separator() {
+        let paths = vec![PathBuf::from(r"C:\tmp\shot.png")];
+        assert_eq!(pasteable_paths_text(&paths), r"C:\tmp\shot.png");
     }
 }

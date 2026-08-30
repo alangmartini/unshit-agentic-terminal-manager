@@ -42,6 +42,11 @@ pub enum ClipboardFormat {
     Html,
     /// The clipboard contains a bitmap image.
     Image,
+    /// The clipboard contains a list of copied files (`CF_HDROP` on
+    /// Windows, `text/uri-list` elsewhere) — what a file manager or
+    /// screenshot tool puts up when it copies a *file* rather than
+    /// its contents.
+    FileList,
 }
 
 /// Errors that can occur during clipboard operations.
@@ -246,11 +251,65 @@ impl ClipboardContext {
         }
     }
 
+    /// Read the list of copied files from the clipboard, if available.
+    ///
+    /// This is the format file managers and screenshot tools use when they
+    /// copy a *file* rather than its contents (Explorer Ctrl+C, ShareX
+    /// "copy file to clipboard"): `CF_HDROP` on Windows, `text/uri-list`
+    /// on the other desktop platforms.
+    ///
+    /// Returns `Ok(Some(paths))` when the clipboard holds a non-empty file
+    /// list, `Ok(None)` when it holds no file list — an *empty* list also
+    /// maps to `None` so callers never see a present-but-useless payload —
+    /// or `Err` for genuine clipboard failures.
+    pub fn read_file_list(&self) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
+        #[cfg(feature = "clipboard")]
+        {
+            let cb = self.get_or_init()?;
+            let mut guard = cb.lock().map_err(|e| ClipboardError::Other(e.to_string()))?;
+            match guard.as_mut().unwrap().get().file_list() {
+                Ok(paths) if paths.is_empty() => Ok(None),
+                Ok(paths) => Ok(Some(paths)),
+                Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                Err(e) => Err(ClipboardError::Other(e.to_string())),
+            }
+        }
+        #[cfg(not(feature = "clipboard"))]
+        {
+            Ok(None)
+        }
+    }
+
+    /// Place a list of file paths on the clipboard (`CF_HDROP` on Windows),
+    /// as if the files had been copied in a file manager.
+    pub fn write_file_list(
+        &self,
+        paths: &[impl AsRef<std::path::Path>],
+    ) -> Result<(), ClipboardError> {
+        #[cfg(feature = "clipboard")]
+        {
+            let cb = self.get_or_init()?;
+            let mut guard = cb.lock().map_err(|e| ClipboardError::Other(e.to_string()))?;
+            guard
+                .as_mut()
+                .unwrap()
+                .set()
+                .file_list(paths)
+                .map_err(|e| ClipboardError::Other(e.to_string()))
+        }
+        #[cfg(not(feature = "clipboard"))]
+        {
+            let _ = paths;
+            Ok(())
+        }
+    }
+
     /// Return all clipboard formats that are currently readable.
     ///
     /// Each variant in the returned `Vec` indicates that the corresponding
-    /// `read_text` / `get_html` / `read_image` call would succeed right now.
-    /// The list may be empty if the clipboard is empty or not accessible.
+    /// `read_text` / `get_html` / `read_image` / `read_file_list` call would
+    /// succeed right now. The list may be empty if the clipboard is empty or
+    /// not accessible.
     pub fn available_formats(&self) -> Vec<ClipboardFormat> {
         let mut formats = Vec::new();
 
@@ -267,6 +326,10 @@ impl ClipboardContext {
 
         if let Ok(Some(_)) = self.read_image() {
             formats.push(ClipboardFormat::Image);
+        }
+
+        if let Ok(Some(_)) = self.read_file_list() {
+            formats.push(ClipboardFormat::FileList);
         }
 
         formats
@@ -559,6 +622,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_file_list_round_trips() {
+        let _lock = clipboard_access_guard();
+        let Some(ctx) = try_context() else { return };
+        // Absolute paths: Windows CF_HDROP stores full path strings and
+        // arboard hands them back verbatim. The files need not exist.
+        let dir = std::env::temp_dir();
+        let paths = vec![dir.join("unshit-file-list-a.png"), dir.join("unshit-file-list-b.txt")];
+        // Skip if writing a file list is not supported in this environment.
+        if ctx.write_file_list(&paths).is_err() {
+            return;
+        }
+        // A concurrent test may overwrite the clipboard between write and
+        // read; tolerate Ok(None) but require shape when a list is present.
+        match ctx.read_file_list() {
+            Ok(Some(got)) => assert_eq!(got, paths),
+            Ok(None) => {} // raced with another writer; accepted
+            Err(e) => panic!("read_file_list errored: {}", e),
+        }
+    }
+
+    #[test]
+    fn read_file_list_returns_none_when_text_only() {
+        let _lock = clipboard_access_guard();
+        let Some(ctx) = try_context() else { return };
+        ctx.write_text("text only").ok();
+        // Ok(None) expected; Ok(Some(_)) tolerated if a parallel writer
+        // raced us. Never an Err.
+        match ctx.read_file_list() {
+            Ok(_) => {}
+            Err(e) => panic!("read_file_list errored on text-only clipboard: {}", e),
+        }
+    }
+
+    #[test]
+    fn available_formats_includes_file_list_after_write() {
+        let _lock = clipboard_access_guard();
+        let Some(ctx) = try_context() else { return };
+        let paths = vec![std::env::temp_dir().join("unshit-file-list-fmt.png")];
+        if ctx.write_file_list(&paths).is_err() {
+            return;
+        }
+        let formats = ctx.available_formats();
+        // A concurrent writer may have replaced the list already; only
+        // assert the positive case when no race occurred.
+        if let Ok(Some(_)) = ctx.read_file_list() {
+            assert!(
+                formats.contains(&ClipboardFormat::FileList),
+                "expected FileList in available_formats, got {:?}",
+                formats
+            );
+        }
+    }
+
     /// Regression test for `STATUS_HEAP_CORRUPTION` (exit `0xC0000374`) that
     /// reproduced on Windows when the clipboard integration tests ran in
     /// parallel under the default cargo test scheduler.
@@ -615,6 +732,10 @@ mod tests {
                         bytes: vec![worker as u8, i as u8, 0, 255],
                     });
                     let _ = ctx.read_image();
+                    let _ = ctx.write_file_list(&[
+                        std::env::temp_dir().join(format!("w{}-{}", worker, i))
+                    ]);
+                    let _ = ctx.read_file_list();
                     let _ = ctx.available_formats();
                 }
             }));
