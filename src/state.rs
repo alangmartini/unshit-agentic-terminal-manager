@@ -10409,6 +10409,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ctx_menu_open_workspace_dispatch_sets_menu_state() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "ctx_menu.open_workspace:0:12.5:60"));
+        match state.ctx_menu.as_ref() {
+            Some(CtxMenu {
+                x,
+                y,
+                target: CtxMenuTarget::Workspace { idx },
+            }) => {
+                assert_eq!(*idx, 0);
+                assert_eq!(*x, 12.5);
+                assert_eq!(*y, 60.0);
+            }
+            other => panic!("expected workspace ctx menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctx_menu_open_workspace_dispatch_rejects_bad_input() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:99:10:10"));
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:0:abc:10"));
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:0:10"));
+        assert!(state.ctx_menu.is_none());
+    }
+
+    #[test]
     fn modal_close_also_closes_ctx_menu() {
         let mut state = test_state();
         state.ctx_menu = Some(CtxMenu {
