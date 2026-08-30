@@ -409,6 +409,49 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
     backdrop.with_child(menu)
 }
 
+/// Margin kept between a context menu edge and the window edge, CSS px.
+const CTX_MENU_EDGE_MARGIN: f32 = 8.0;
+
+/// Vertical anchor for a `position: fixed` context menu opened at cursor
+/// `y` inside a window `win_h` tall (both CSS px).
+enum CtxMenuVAnchor {
+    /// `top: y` — the classic drop-down below the cursor.
+    Top(f32),
+    /// `bottom: inset` — the menu grows upward from a pinned bottom edge,
+    /// which keeps every row in-window without knowing the menu height.
+    Bottom(f32),
+}
+
+/// Picks the anchor edge. `est_h` deliberately OVERESTIMATES the menu
+/// height: it only decides which edge to anchor to and never sizes
+/// anything, so erring large merely flips or pins slightly early, while
+/// erring small would let the menu clip at the window bottom.
+fn ctx_menu_v_anchor(y: f32, win_h: f32, est_h: f32) -> CtxMenuVAnchor {
+    // win_h == 0.0 means the window has never been measured (fresh state,
+    // structural tests): keep the historical unclamped drop-down.
+    if win_h <= 0.0 || y + est_h + CTX_MENU_EDGE_MARGIN <= win_h {
+        CtxMenuVAnchor::Top(y)
+    } else if y >= est_h + CTX_MENU_EDGE_MARGIN {
+        // Enough room above the cursor: flip up, menu bottom at the cursor.
+        // The max() only matters for driven/dispatched coordinates that
+        // land past the window bottom; a real cursor y never exceeds win_h.
+        CtxMenuVAnchor::Bottom((win_h - y).max(CTX_MENU_EDGE_MARGIN))
+    } else {
+        // Window shorter than the menu either way: pin to the bottom edge
+        // so the danger actions stay visible and clickable.
+        CtxMenuVAnchor::Bottom(CTX_MENU_EDGE_MARGIN)
+    }
+}
+
+/// Clamps the menu's left edge so a fixed-width menu stays in-window.
+/// `win_w == 0.0` (unmeasured) leaves the cursor coordinate untouched.
+fn ctx_menu_clamped_x(x: f32, win_w: f32, menu_w: f32) -> f32 {
+    if win_w <= 0.0 {
+        return x;
+    }
+    x.min((win_w - menu_w - CTX_MENU_EDGE_MARGIN).max(CTX_MENU_EDGE_MARGIN))
+}
+
 fn ctx_menu_item(label: &str, shared: &SharedState, command: String) -> ElementDef {
     let s = shared.clone();
     ElementDef::new(Tag::Div)
@@ -679,12 +722,24 @@ fn build_workspace_ctx_menu(
         ));
     }
 
-    ElementDef::new(Tag::Div)
+    // Overestimated menu height for anchor choice only (see
+    // `ctx_menu_v_anchor`): header + 3 action rows + the danger group.
+    let est_h = if can_remove { 270.0 } else { 240.0 };
+    let mut menu = ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
         .with_class("m-menu")
-        .with_style(StyleDeclaration::Left(Dimension::Px(x)))
-        .with_style(StyleDeclaration::Top(Dimension::Px(y)))
-        .with_child(header)
+        .with_style(StyleDeclaration::Left(Dimension::Px(ctx_menu_clamped_x(
+            x,
+            snap.window_w,
+            222.0, // .m-menu fixed width
+        ))));
+    menu = match ctx_menu_v_anchor(y, snap.window_h, est_h) {
+        CtxMenuVAnchor::Top(top) => menu.with_style(StyleDeclaration::Top(Dimension::Px(top))),
+        CtxMenuVAnchor::Bottom(inset) => {
+            menu.with_style(StyleDeclaration::Bottom(Dimension::Px(inset)))
+        }
+    };
+    menu.with_child(header)
         .with_child(m_menu_row(
             svg_icon(icon_diamond()),
             "Set active",
@@ -728,10 +783,19 @@ fn build_tab_ctx_menu(
     let header =
         pane_title_from_snapshot(snap, pane_id).unwrap_or_else(|| format!("pane {pane_id}"));
 
+    // Overestimated height for anchor choice only: header + separator +
+    // one or two action rows.
+    let est_h = if include_export { 180.0 } else { 150.0 };
     let mut menu = ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
-        .with_style(StyleDeclaration::Left(Dimension::Px(x)))
-        .with_style(StyleDeclaration::Top(Dimension::Px(y)))
+        .with_style(StyleDeclaration::Left(Dimension::Px(x)));
+    menu = match ctx_menu_v_anchor(y, snap.window_h, est_h) {
+        CtxMenuVAnchor::Top(top) => menu.with_style(StyleDeclaration::Top(Dimension::Px(top))),
+        CtxMenuVAnchor::Bottom(inset) => {
+            menu.with_style(StyleDeclaration::Bottom(Dimension::Px(inset)))
+        }
+    };
+    menu = menu
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("ctx-menu-header")
@@ -1616,6 +1680,125 @@ mod tests {
             rule.contains("overflow: auto;"),
             "context menu must scroll when shell list is long, got rule: {rule}"
         );
+    }
+
+    // -- context menu window clamping --
+
+    fn harness_with_ctx_menu(win_w: f32, win_h: f32, x: f32, y: f32) -> TestHarness {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.window_w = win_w;
+            guard.window_h = win_h;
+            guard.ctx_menu = Some(crate::state::CtxMenu {
+                x,
+                y,
+                target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+            });
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let tree_shared = shared.clone();
+        let css = include_str!("../../assets/styles.css");
+        let mut harness = TestHarness::new(
+            css,
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_child(build_ctx_menu_overlay(&snap, &tree_shared)),
+            },
+            win_w,
+            win_h,
+        );
+        harness.step();
+        harness
+    }
+
+    #[test]
+    fn workspace_ctx_menu_pins_to_bottom_in_short_window() {
+        // Regression: in a window shorter than the menu, the raw Top(y)
+        // placement ran the danger zone ("Kill all terminals" / "Remove
+        // workspace") past the window bottom, leaving it invisible and
+        // unclickable.
+        let harness = harness_with_ctx_menu(600.0, 260.0, 20.0, 120.0);
+        let menu = harness
+            .query(".m-menu")
+            .expect("workspace ctx menu should render");
+        let bottom = menu.layout_rect.y + menu.layout_rect.height;
+        assert!(
+            bottom <= 260.0 + 0.5,
+            "menu must not cross the window bottom, got bottom {bottom} (rect {:?})",
+            menu.layout_rect
+        );
+        let danger = harness
+            .query(".m-danger")
+            .expect("danger zone should render");
+        let danger_bottom = danger.layout_rect.y + danger.layout_rect.height;
+        assert!(
+            danger_bottom <= 260.0 + 0.5,
+            "danger rows must stay inside the window, got bottom {danger_bottom}"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_flips_up_near_window_bottom() {
+        // Cursor near the bottom of a tall window: the menu flips so its
+        // bottom edge sits at the cursor instead of overflowing below.
+        let harness = harness_with_ctx_menu(1280.0, 720.0, 20.0, 650.0);
+        let menu = harness
+            .query(".m-menu")
+            .expect("workspace ctx menu should render");
+        let bottom = menu.layout_rect.y + menu.layout_rect.height;
+        assert!(
+            (bottom - 650.0).abs() <= 0.5,
+            "flipped menu bottom should sit at the cursor y, got {bottom}"
+        );
+        assert!(
+            menu.layout_rect.y >= 0.0,
+            "flipped menu must not cross the window top, got y {}",
+            menu.layout_rect.y
+        );
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_prefers_dropdown_when_it_fits() {
+        assert!(matches!(
+            ctx_menu_v_anchor(100.0, 720.0, 270.0),
+            CtxMenuVAnchor::Top(y) if y == 100.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_flips_up_when_only_space_above() {
+        assert!(matches!(
+            ctx_menu_v_anchor(650.0, 720.0, 270.0),
+            CtxMenuVAnchor::Bottom(inset) if inset == 70.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_pins_when_window_too_short() {
+        assert!(matches!(
+            ctx_menu_v_anchor(120.0, 260.0, 270.0),
+            CtxMenuVAnchor::Bottom(inset) if inset == CTX_MENU_EDGE_MARGIN
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_unmeasured_window_falls_through_to_cursor() {
+        // window_h == 0.0 (never measured) must keep the historical
+        // unclamped drop-down so structural tests and fresh state behave.
+        assert!(matches!(
+            ctx_menu_v_anchor(650.0, 0.0, 270.0),
+            CtxMenuVAnchor::Top(y) if y == 650.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_clamped_x_keeps_fixed_width_menu_in_window() {
+        assert_eq!(ctx_menu_clamped_x(20.0, 600.0, 222.0), 20.0);
+        assert_eq!(ctx_menu_clamped_x(500.0, 600.0, 222.0), 370.0);
+        // Unmeasured window: cursor coordinate passes through untouched.
+        assert_eq!(ctx_menu_clamped_x(500.0, 0.0, 222.0), 500.0);
     }
 
     #[test]
