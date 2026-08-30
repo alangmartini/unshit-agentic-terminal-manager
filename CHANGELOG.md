@@ -7,6 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-08-30
+
+Startup got an overhaul. The window now appears already drawn and answering
+input while the GPU is still coming up, the longest stretch of startup happens
+underneath the rest instead of in front of it, and launching no longer flashes
+a train of black console windows. Paste also learned about copied files:
+ShareX's "copy file to clipboard" and Ctrl+C on files in Explorer now paste
+into a terminal as quoted paths and attach to the Quick Prompt as images.
+
+### Added
+
+- **The window now appears and responds while the GPU is still starting**,
+  instead of waiting for it. GPU adapter and device creation costs over a
+  second on a cold start and none of it can be skipped, but everything needed
+  to know *what* to draw -- the stylesheet, the fonts, the element tree, the
+  layout -- is ready long before that. The window is painted from the real,
+  already-laid-out tree using the platform's own 2D drawing, then swapped for
+  the GPU surface once it is ready. The placeholder is the app's own geometry
+  in the app's own colors, not a generic spinner: every element that has a
+  background contributes a rectangle, clipped and composited exactly as the
+  layout says. It has no gradients, rounded corners, shadows or terminal
+  cells, so it reads as the application mid-assembly rather than as a finished
+  frame -- which is the honest thing for it to look like.
+- **Pasting into a terminal pane now handles copied *files*, not just copied
+  text or bitmaps.** ShareX's "copy file to clipboard" after-capture action,
+  or plain Ctrl+C on files in Explorer, puts a `CF_HDROP` file list on the
+  clipboard with no text at all -- previously Ctrl+V silently did nothing
+  with it. The paste now inserts each file's path, quoted when it contains
+  spaces and space-separated for multi-file copies, so agent CLIs (Claude
+  Code, Codex) attach the image exactly like a drag-and-drop and a plain
+  shell receives usable path arguments. Precedence is text, then file list,
+  then bitmap: when a file list and a bitmap are both present, the on-disk
+  file is the original bytes, so its path wins over re-encoding pixels to a
+  temp PNG.
+- **The Quick Prompt learned the same trick:** Ctrl+V (and the "Attach image"
+  button) with copied image files on the clipboard attaches every decodable
+  image among them as chips, exactly like dropping the files on the overlay.
+  Copied non-image files still fall through to the normal text paste
+  silently.
+
+### Changed
+
+- **GPU bring-up now starts at process entry instead of after the window
+  exists**, on Windows. Adapter and device creation need no window --
+  verified by measurement, an adapter requested with no compatible surface
+  costs the same as one requested with it -- but they are the single longest
+  stretch of startup, and they run on the event-loop thread. Starting them
+  first means config load, state seeding, the daemon handshake, the event
+  loop and the window all happen alongside that wait rather than in front of
+  it. Measured over five cold starts, 160-480ms of GPU bring-up now happens
+  underneath other startup work, median about 300ms. The prewarmed adapter is
+  only used if it can actually present to the window that was ultimately
+  created; on a machine where it cannot -- a second GPU driving the display
+  the window landed on -- it is discarded and the original path runs
+  unchanged. Backend selection goes through the same resolution the real
+  request uses, environment overrides included, so `UNSHIT_RENDER_BACKEND`
+  still decides and the compositor-clock D3D12/Mailbox pacing is unaffected.
+- **The window now waits until it has a drawn frame behind it before
+  appearing**, instead of appearing empty and then freezing. GPU adapter and
+  device creation run on the event-loop thread, so a window mapped at
+  creation time cannot answer a paint or a click until they finish --
+  measured at about 1.2 seconds on a machine whose D3D12 adapter enumeration
+  is slow. What that bought was not an early UI but a white, non-responding
+  rectangle. The app now appears already drawn.
+- **Work that does not have to finish before the first frame no longer holds
+  it up.** Time to that first frame dropped by roughly half a second on a
+  7-workspace, 10-pane profile:
+  - Git branch names resolve on a background thread and appear a moment after
+    the sidebar does. Workspaces sharing a repository are probed once, not
+    once each. A branch that has not resolved yet renders muted rather than
+    as the red "no git" error it used to flash on every launch.
+  - Panes that are not visible on the first frame reattach to the daemon in
+    the background, taking the state lock one pane at a time so a long
+    restore cannot stall the UI. The active pane still comes up eagerly,
+    exactly as before.
+  - Terminal cell metrics are measured against the embedded JetBrains Mono
+    face instead of building a font database from every font installed on the
+    machine. This is also a correctness fix: the old measurement asked the OS
+    for `monospace` and got Consolas, whose advance width the renderer never
+    uses.
+
+### Fixed
+
+- **Starting the app no longer flashes a series of black console windows on
+  screen before the UI appears.** The release binary owns no console, so
+  every `git` subprocess it spawned made Windows allocate a fresh console
+  window for the life of the child -- once per restored workspace. All `git`
+  invocations now run with `CREATE_NO_WINDOW`, and a test rejects any new
+  call site that does not.
+- **Launching the app no longer waits a fixed 25ms before its first attempt
+  to reach the `unshit-ptyd` daemon**, and no longer retries at all when the
+  daemon socket does not exist yet. The pause was paid on every single
+  launch, including the common case where the daemon was already running and
+  answered immediately. Connecting now starts at 0.5ms of backoff and only
+  retries when the endpoint exists but is momentarily busy -- which is the
+  one case a retry can actually help.
+- **A background pane whose reattach failed now still refreshes the UI**, so
+  the spawn failure it recorded becomes visible instead of sitting in state
+  until something else happens to trigger a rebuild.
+
 ## [0.3.2] - 2026-08-26
 
 A pane's shell now always knows how big its pane actually is. Reattaching to a
@@ -455,7 +555,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.2.6...v0.3.0
