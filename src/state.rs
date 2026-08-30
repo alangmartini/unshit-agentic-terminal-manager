@@ -7898,7 +7898,7 @@ pub fn compute_pty_dimensions(
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -7912,7 +7912,9 @@ mod tests {
     /// `ClipboardContext` must hold this guard for the duration of
     /// its clipboard interaction. Recovers a poisoned guard so a
     /// single panicking test does not lock the whole suite out.
-    pub(super) fn clipboard_access_guard() -> MutexGuard<'static, ()> {
+    /// `pub(crate)` because UI tests that invoke real copy/paste
+    /// handlers (e.g. `ui::terminal_grid`) touch the clipboard too.
+    pub(crate) fn clipboard_access_guard() -> MutexGuard<'static, ()> {
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
         match GUARD.get_or_init(|| Mutex::new(())).lock() {
             Ok(g) => g,

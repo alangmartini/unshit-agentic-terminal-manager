@@ -3305,6 +3305,9 @@ mod tests_mouse_selection_copy_paste {
 
     #[test]
     fn keyboard_capture_ctrl_c_with_selection_clears_selection() {
+        // The Ctrl+C handler dispatches terminal.copy, which writes the
+        // real OS clipboard — serialize with every other clipboard test.
+        let _lock = crate::state::tests::clipboard_access_guard();
         let shared = make_shared();
         {
             let mut guard = shared.lock().unwrap();
@@ -3410,6 +3413,10 @@ mod tests_mouse_selection_copy_paste {
 
     #[test]
     fn oncontext_menu_handler_dispatches_focus_and_paste() {
+        // The context-menu handler dispatches terminal.paste, which
+        // reads the real OS clipboard — serialize with other clipboard
+        // tests (concurrent access heap-corrupts, see state::tests).
+        let _lock = crate::state::tests::clipboard_access_guard();
         let shared = make_shared();
         {
             let mut guard = shared.lock().unwrap();
