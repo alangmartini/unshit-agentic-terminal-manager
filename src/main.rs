@@ -292,8 +292,23 @@ fn build_tree(
         });
 
     let titlebar = with_custom_surface_style(build_titlebar(snap, shared, window_events), snap);
+    let window_size_shared = shared.clone();
     let mut root = ElementDef::new(Tag::Div)
         .with_class("app")
+        // Track the window size (the `.app` root always spans it) so fixed
+        // overlays like the context menu can clamp themselves to the window
+        // instead of overflowing off-screen. on_resize reports physical
+        // pixels; state stores CSS pixels to compose with cursor coords.
+        .on_resize(move |w, h| {
+            if w <= 0.0 || h <= 0.0 {
+                return;
+            }
+            mutate_with(&window_size_shared, |st| {
+                let sf = st.scale_factor.max(1e-3);
+                st.window_w = w / sf;
+                st.window_h = h / sf;
+            });
+        })
         .with_class(crate::theme::theme_class_name(&snap.theme))
         .with_class(format!("density-{}", snap.ui_density.id()))
         .with_class(format!("tabs-width-{}", snap.tab_width_mode.id()))

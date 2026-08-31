@@ -935,6 +935,11 @@ pub struct AppState {
     /// Last known physical pixel dimensions of the terminal grid element.
     pub last_grid_width: f32,
     pub last_grid_height: f32,
+    /// Last known window dimensions in CSS pixels, tracked by `on_resize`
+    /// on the `.app` root. `0.0` until the first layout pass; consumers
+    /// must treat zero as "unknown" and fall back to unclamped behavior.
+    pub window_w: f32,
+    pub window_h: f32,
     /// Flex-grow ratios for each row. Length matches `panes.len()`.
     pub row_ratios: Vec<f32>,
     /// Flex-grow ratios for columns within each row. `col_ratios[r].len()` matches `panes[r].len()`.
@@ -1143,6 +1148,8 @@ impl AppState {
             tabbar_rect: self.tabbar_rect,
             last_grid_width: self.last_grid_width,
             last_grid_height: self.last_grid_height,
+            window_w: self.window_w,
+            window_h: self.window_h,
             scale_factor: self.scale_factor,
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
@@ -1241,6 +1248,11 @@ pub struct UiSnapshot {
     pub last_grid_width: f32,
     /// Last measured physical height of the terminal-grid container.
     pub last_grid_height: f32,
+    /// Window dimensions in CSS pixels (already divided by `scale_factor`).
+    /// `0.0` means "not measured yet"; overlay positioning falls back to
+    /// unclamped cursor coordinates in that case.
+    pub window_w: f32,
+    pub window_h: f32,
     /// Display scale factor so callers can convert physical pixels
     /// (stored for last_grid_*) back to CSS coordinates that compose
     /// with tabbar_rect and DragState cursor.
@@ -1451,6 +1463,8 @@ pub fn seed_state() -> AppState {
         cell_width_ratio: 0.6,
         last_grid_width: 0.0,
         last_grid_height: 0.0,
+        window_w: 0.0,
+        window_h: 0.0,
         row_ratios: vec![1.0],
         col_ratios: vec![vec![1.0]],
         resize_drag: None,
@@ -5289,6 +5303,29 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 false
             }
         }
+        // E2E/diagnostic hook: opens the workspace context menu at explicit
+        // CSS coordinates, mirroring what the sidebar right-click handler
+        // stores. Interactive opens never route through dispatch (they run
+        // inline in `on_context_menu`), so this exists for driven sessions
+        // (TM_STARTUP_DISPATCH) to exercise overlay positioning.
+        other if other.starts_with("ctx_menu.open_workspace:") => {
+            let mut parts = other["ctx_menu.open_workspace:".len()..].split(':');
+            match (
+                parts.next().and_then(|v| v.parse::<usize>().ok()),
+                parts.next().and_then(|v| v.parse::<f32>().ok()),
+                parts.next().and_then(|v| v.parse::<f32>().ok()),
+            ) {
+                (Some(idx), Some(x), Some(y)) if idx < state.workspaces.len() => {
+                    state.ctx_menu = Some(CtxMenu {
+                        x,
+                        y,
+                        target: CtxMenuTarget::Workspace { idx },
+                    });
+                    true
+                }
+                _ => false,
+            }
+        }
         "modal.open" => {
             if state.settings_open {
                 // Re-pressing the settings hotkey while open closes the
@@ -7990,6 +8027,8 @@ pub(crate) mod tests {
             cell_width_ratio: 0.6,
             last_grid_width: 0.0,
             last_grid_height: 0.0,
+            window_w: 0.0,
+            window_h: 0.0,
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
             resize_drag: None,
@@ -10367,6 +10406,33 @@ pub(crate) mod tests {
     fn ctx_menu_close_returns_false_when_already_closed() {
         let mut state = test_state();
         assert!(!dispatch(&mut state, "ctx_menu.close"));
+    }
+
+    #[test]
+    fn ctx_menu_open_workspace_dispatch_sets_menu_state() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "ctx_menu.open_workspace:0:12.5:60"));
+        match state.ctx_menu.as_ref() {
+            Some(CtxMenu {
+                x,
+                y,
+                target: CtxMenuTarget::Workspace { idx },
+            }) => {
+                assert_eq!(*idx, 0);
+                assert_eq!(*x, 12.5);
+                assert_eq!(*y, 60.0);
+            }
+            other => panic!("expected workspace ctx menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctx_menu_open_workspace_dispatch_rejects_bad_input() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:99:10:10"));
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:0:abc:10"));
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:0:10"));
+        assert!(state.ctx_menu.is_none());
     }
 
     #[test]
