@@ -5245,6 +5245,14 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
         CollapseAll,
         Toggle(usize),
         Src(&'a str),
+        SelectRow(usize),
+        SelectMove(i64),
+        SelectEdge(bool),
+        SelectInto,
+        SelectOut,
+        SelectNone,
+        ToggleSelected,
+        SrcSelected,
     }
 
     let parsed = if let Some(name) = command.strip_prefix("flow.view:") {
@@ -5257,6 +5265,24 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
         FlowCommand::CollapseAll
     } else if let Some(row) = command.strip_prefix("flow.toggle:") {
         FlowCommand::Toggle(row.parse().ok()?)
+    } else if let Some(row) = command.strip_prefix("flow.select_row:") {
+        FlowCommand::SelectRow(row.parse().ok()?)
+    } else if let Some(delta) = command.strip_prefix("flow.select_move:") {
+        FlowCommand::SelectMove(delta.parse().ok()?)
+    } else if command == "flow.select_first" {
+        FlowCommand::SelectEdge(false)
+    } else if command == "flow.select_last" {
+        FlowCommand::SelectEdge(true)
+    } else if command == "flow.select_into" {
+        FlowCommand::SelectInto
+    } else if command == "flow.select_out" {
+        FlowCommand::SelectOut
+    } else if command == "flow.select_none" {
+        FlowCommand::SelectNone
+    } else if command == "flow.toggle_selected" {
+        FlowCommand::ToggleSelected
+    } else if command == "flow.src_selected" {
+        FlowCommand::SrcSelected
     } else {
         FlowCommand::Src(command.strip_prefix("flow.src:")?)
     };
@@ -5284,6 +5310,8 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
         FlowCommand::ExpandAll => pane.expand_all(),
         FlowCommand::CollapseAll => pane.collapse_all(),
         FlowCommand::Toggle(row) => {
+            // A click both selects and toggles, like a file tree.
+            pane.select_row(row);
             pane.toggle_collapsed(row);
         }
         FlowCommand::Src(id) => {
@@ -5291,7 +5319,39 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
                 load_flow_snippet(pane, id);
             }
         }
+        FlowCommand::SelectRow(row) => {
+            pane.select_row(row);
+        }
+        FlowCommand::SelectMove(delta) => {
+            pane.move_selection(delta);
+        }
+        FlowCommand::SelectEdge(end) => {
+            pane.select_edge(end);
+        }
+        FlowCommand::SelectInto => {
+            pane.select_into();
+        }
+        FlowCommand::SelectOut => {
+            pane.select_out();
+        }
+        FlowCommand::SelectNone => {
+            pane.clear_selection();
+        }
+        FlowCommand::ToggleSelected => {
+            if let Some(row) = pane.selected_row {
+                pane.toggle_collapsed(row);
+            }
+        }
+        FlowCommand::SrcSelected => {
+            if let Some(id) = pane.selected_node_id().map(str::to_owned) {
+                if pane.toggle_src(&id) == Some(true) {
+                    load_flow_snippet(pane, &id);
+                }
+            }
+        }
     }
+    // Collapses and level changes can hide the selected row.
+    pane.clamp_selection();
     Some(true)
 }
 
@@ -16799,5 +16859,56 @@ mod flow_pane_tests {
             "{:?}",
             pane.snippets
         );
+    }
+
+    #[test]
+    fn flow_selection_commands_drive_the_cursor() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert_eq!(active_flow(&state).selected_row, None);
+        assert!(dispatch(&mut state, "flow.select_move:1"));
+        assert_eq!(active_flow(&state).selected_row, Some(0));
+        assert!(dispatch(&mut state, "flow.select_last"));
+        assert_eq!(active_flow(&state).selected_row, Some(10));
+        assert!(dispatch(&mut state, "flow.select_out"));
+        assert_eq!(active_flow(&state).selected_row, Some(9));
+        assert!(dispatch(&mut state, "flow.select_first"));
+        assert!(dispatch(&mut state, "flow.select_into"));
+        assert_eq!(active_flow(&state).selected_row, Some(1));
+        assert!(dispatch(&mut state, "flow.toggle_selected"));
+        assert!(active_flow(&state).collapsed.contains(&1));
+        assert!(dispatch(&mut state, "flow.src_selected"));
+        assert!(active_flow(&state)
+            .src_open
+            .contains("Editor.tsx::handleKeyDown"));
+        assert!(active_flow(&state)
+            .snippet("Editor.tsx::handleKeyDown")
+            .is_some());
+        // Row 4 is hidden under the collapsed row 1; expand first.
+        assert!(dispatch(&mut state, "flow.expand_all"));
+        assert!(dispatch(&mut state, "flow.select_row:4"));
+        assert_eq!(active_flow(&state).selected_row, Some(4));
+        assert!(dispatch(&mut state, "flow.select_none"));
+        assert_eq!(active_flow(&state).selected_row, None);
+        assert!(!dispatch(&mut state, "flow.select_move:x"));
+    }
+
+    #[test]
+    fn flow_toggle_click_selects_and_collapse_clamps_selection() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.select_row:8"));
+        assert!(dispatch(&mut state, "flow.toggle:4"));
+        assert_eq!(
+            active_flow(&state).selected_row,
+            Some(4),
+            "clamped to the collapsed ancestor"
+        );
+        assert!(active_flow(&state).collapsed.contains(&4));
+        assert!(dispatch(&mut state, "flow.toggle:4"));
+        assert_eq!(active_flow(&state).selected_row, Some(4));
+        assert!(dispatch(&mut state, "flow.select_row:2"));
+        assert!(dispatch(&mut state, "flow.level:events"));
+        assert_eq!(active_flow(&state).selected_row, Some(1));
     }
 }

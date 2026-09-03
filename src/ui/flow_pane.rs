@@ -3,6 +3,7 @@
 //! so clicks, keys, tests and `TM_STARTUP_DISPATCH` share one path.
 
 use unshit::core::element::*;
+use unshit::core::event::{Event, EventType, Key, KeyEventKind, KeyboardEvent, Modifiers};
 
 use crate::flow_explorer::{
     tokenize, Carrier, DiffStatus, DisplayRow, FlowLevel, FlowMode, FlowPane, FlowView, RowMarker,
@@ -27,11 +28,41 @@ const VIEW_TABS: [(&str, Option<FlowView>); 6] = [
 
 const LEVEL_TABS: [FlowLevel; 3] = [FlowLevel::Events, FlowLevel::Code, FlowLevel::Source];
 
-pub fn build_flow_pane_body(pane_id: PaneId, pane: &FlowPane, shared: &SharedState) -> ElementDef {
-    let body = ElementDef::new(Tag::Div)
+/// `capture_keyboard` is true for the active pane: its body then owns
+/// the keys listed in [`flow_key_command`] (global keybinds still win).
+pub fn build_flow_pane_body(
+    pane_id: PaneId,
+    capture_keyboard: bool,
+    pane: &FlowPane,
+    shared: &SharedState,
+) -> ElementDef {
+    let mut body = ElementDef::new(Tag::Div)
         .with_class("pane-body")
         .with_class("flow-pane")
         .with_id(format!("flow-pane-{}", pane_id.0))
+        // Focusability requires a tab index (see terminal_grid.rs).
+        .with_tab_index(0);
+    if capture_keyboard {
+        body = body.captures_keyboard(true);
+        let kbd_shared = shared.clone();
+        body = body.on(
+            EventType::KeyboardCapture,
+            move |event: &Event| -> Option<Box<dyn std::any::Any>> {
+                let Event::Keyboard(kb) = event else {
+                    return None;
+                };
+                if kb.kind != KeyEventKind::Pressed {
+                    return None;
+                }
+                let changed = mutate_with(&kbd_shared, |st| handle_flow_key(st, pane_id.0, kb));
+                match changed {
+                    Some(true) => Some(Box::new(unshit::core::event::RequestRebuild)),
+                    _ => None,
+                }
+            },
+        );
+    }
+    let body = body
         .with_child(build_header(pane))
         .with_child(build_toolbar(pane, shared));
     let body = match pane.view {
@@ -39,6 +70,54 @@ pub fn build_flow_pane_body(pane_id: PaneId, pane: &FlowPane, shared: &SharedSta
         FlowView::Panes | FlowView::Graph => body.with_child(build_placeholder(pane.view)),
     };
     body.with_child(build_legend(pane))
+}
+
+/// Keys the active Flow Explorer pane handles while it holds keyboard
+/// capture. Returns `None` for keys it does not own (the framework then
+/// falls through to global keybinds), `Some(changed)` otherwise. Every
+/// key maps onto a `flow.*` dispatch so tests and `TM_STARTUP_DISPATCH`
+/// exercise the same transitions.
+pub(crate) fn handle_flow_key(
+    st: &mut crate::state::AppState,
+    pane_id: u32,
+    kb: &KeyboardEvent,
+) -> Option<bool> {
+    if !st.flows.contains_key(&pane_id) || st.active_pane.0 != pane_id {
+        return None;
+    }
+    let command = flow_key_command(kb)?;
+    Some(crate::state::dispatch(st, command))
+}
+
+/// Pure key → command mapping (plain digits stay free for the global
+/// keybinds; views use Ctrl+1/2/3).
+pub(crate) fn flow_key_command(kb: &KeyboardEvent) -> Option<&'static str> {
+    let ctrl = kb.modifiers.contains(Modifiers::CTRL);
+    let alt = kb.modifiers.contains(Modifiers::ALT);
+    let shift = kb.modifiers.contains(Modifiers::SHIFT);
+    if alt {
+        return None;
+    }
+    let plain = !ctrl && !shift;
+    Some(match kb.key {
+        Key::ArrowDown if plain => "flow.select_move:1",
+        Key::ArrowUp if plain => "flow.select_move:-1",
+        Key::PageDown if plain => "flow.select_move:10",
+        Key::PageUp if plain => "flow.select_move:-10",
+        Key::Home if plain => "flow.select_first",
+        Key::End if plain => "flow.select_last",
+        Key::ArrowRight if plain => "flow.select_into",
+        Key::ArrowLeft if plain => "flow.select_out",
+        Key::Enter | Key::Space if plain => "flow.toggle_selected",
+        Key::Escape if plain => "flow.select_none",
+        Key::Char('s') | Key::Char('S') if plain => "flow.src_selected",
+        Key::Char('e') | Key::Char('E') if plain => "flow.expand_all",
+        Key::Char('c') | Key::Char('C') if plain => "flow.collapse_all",
+        Key::Char('1') if ctrl && !shift => "flow.view:stack",
+        Key::Char('2') if ctrl && !shift => "flow.view:panes",
+        Key::Char('3') if ctrl && !shift => "flow.view:graph",
+        _ => return None,
+    })
 }
 
 fn build_header(pane: &FlowPane) -> ElementDef {
@@ -449,7 +528,7 @@ mod tests {
 
     #[test]
     fn body_shows_title_summary_and_counts() {
-        let body = build_flow_pane_body(PaneId(7), &pane(), &shared());
+        let body = build_flow_pane_body(PaneId(7), false, &pane(), &shared());
         assert!(has_classes(&body, &["pane-body", "flow-pane"]));
         assert_eq!(body.id.as_deref(), Some("flow-pane-7"));
         assert_eq!(
@@ -467,14 +546,14 @@ mod tests {
     fn empty_summary_is_omitted() {
         let mut p = pane();
         p.flow.summary = "   ".into();
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         assert!(first(&body, &["flow-summary"]).is_none());
         assert!(first(&body, &["flow-title"]).is_some());
     }
 
     #[test]
     fn toolbar_marks_the_active_view_and_level_and_disables_unbuilt_views() {
-        let body = build_flow_pane_body(PaneId(1), &pane(), &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &pane(), &shared());
         let active: Vec<String> = all(&body, &["flow-tab", "active"])
             .iter()
             .map(|el| text_of(el))
@@ -496,7 +575,7 @@ mod tests {
     #[test]
     fn call_stack_renders_one_row_per_visible_tree_row() {
         let p = pane();
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         let rows = all(&body, &["flow-row"]);
         assert_eq!(rows.len(), 11);
         // Entry row: no indent, no connector, event carrier chip.
@@ -531,7 +610,7 @@ mod tests {
     fn collapsed_rows_hide_descendants_and_show_a_count() {
         let mut p = pane();
         assert!(p.toggle_collapsed(3));
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         let rows = all(&body, &["flow-row"]);
         assert_eq!(rows.len(), 4);
         assert!(has_classes(rows[3], &["collapsed"]));
@@ -545,7 +624,7 @@ mod tests {
     fn events_level_indents_by_visible_ancestors() {
         let mut p = pane();
         p.set_level(FlowLevel::Events);
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         let rows = all(&body, &["flow-row"]);
         assert_eq!(rows.len(), 8);
         assert_eq!(all(rows[7], &["flow-indent"]).len(), 7);
@@ -560,7 +639,7 @@ mod tests {
     fn open_snippets_mark_their_src_button() {
         let mut p = pane();
         assert_eq!(p.toggle_src("Editor.tsx::handleKeyDown"), Some(true));
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         assert_eq!(all(&body, &["flow-src", "active"]).len(), 1);
     }
 
@@ -570,7 +649,7 @@ mod tests {
         p.flow.mode = FlowMode::Review;
         p.flow.nodes[1].status = DiffStatus::Added;
         p.flow.nodes[2].status = DiffStatus::Modified;
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         assert_eq!(all(&body, &["flow-row", "diff-added"]).len(), 1);
         assert_eq!(all(&body, &["flow-row", "diff-modified"]).len(), 1);
         let markers: Vec<String> = all(&body, &["flow-diff-marker"])
@@ -585,7 +664,7 @@ mod tests {
 
     #[test]
     fn legend_lists_processes_carriers_and_service_state() {
-        let body = build_flow_pane_body(PaneId(1), &pane(), &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &pane(), &shared());
         let legend = first(&body, &["flow-legend"]).unwrap();
         let chips = all(legend, &["flow-chip"]);
         assert_eq!(chips.len(), 4 + 8 + 1);
@@ -602,7 +681,7 @@ mod tests {
     fn other_views_render_a_placeholder_instead_of_rows() {
         let mut p = pane();
         p.set_view(FlowView::Panes);
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         assert!(all(&body, &["flow-row"]).is_empty());
         assert_eq!(
             text_of(first(&body, &["flow-placeholder"]).unwrap()),
@@ -615,7 +694,7 @@ mod tests {
         let mut p = pane();
         assert_eq!(p.toggle_src("SessionRegistry.ts::open"), Some(true));
         assert_eq!(p.ensure_snippet("SessionRegistry.ts::open"), Some(true));
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         let snippet = first(&body, &["flow-snippet"]).expect("snippet under the open row");
         let lines = all(snippet, &["flow-snippet-line"]);
         let loaded = p
@@ -659,7 +738,7 @@ mod tests {
         p.flow.nodes[1].location.as_mut().unwrap().file = "gone/Missing.tsx".into();
         assert_eq!(p.toggle_src("Editor.tsx::handleKeyDown"), Some(true));
         assert_eq!(p.ensure_snippet("Editor.tsx::handleKeyDown"), Some(true));
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         assert_eq!(
             text_of(first(&body, &["flow-snippet-error"]).unwrap()),
             "source not available"
@@ -671,8 +750,110 @@ mod tests {
     fn open_but_unloaded_snippet_renders_nothing() {
         let mut p = pane();
         assert_eq!(p.toggle_src("SessionRegistry.ts::open"), Some(true));
-        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         assert!(first(&body, &["flow-snippet"]).is_none());
         assert_eq!(all(&body, &["flow-src", "active"]).len(), 1);
+    }
+
+    fn key(key: Key) -> KeyboardEvent {
+        KeyboardEvent {
+            kind: KeyEventKind::Pressed,
+            key,
+            modifiers: Modifiers::empty(),
+            text: None,
+        }
+    }
+
+    fn key_mod(k: Key, modifiers: Modifiers) -> KeyboardEvent {
+        KeyboardEvent {
+            kind: KeyEventKind::Pressed,
+            key: k,
+            modifiers,
+            text: None,
+        }
+    }
+
+    #[test]
+    fn active_flow_pane_captures_keyboard() {
+        let p = pane();
+        let active = build_flow_pane_body(PaneId(1), true, &p, &shared());
+        assert!(active.captures_keyboard);
+        assert_eq!(active.tab_index, Some(0));
+        let inactive = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        assert!(!inactive.captures_keyboard);
+    }
+
+    #[test]
+    fn key_mapping_covers_navigation_and_leaves_the_rest_alone() {
+        assert_eq!(
+            flow_key_command(&key(Key::ArrowDown)),
+            Some("flow.select_move:1")
+        );
+        assert_eq!(
+            flow_key_command(&key(Key::ArrowUp)),
+            Some("flow.select_move:-1")
+        );
+        assert_eq!(
+            flow_key_command(&key(Key::ArrowRight)),
+            Some("flow.select_into")
+        );
+        assert_eq!(
+            flow_key_command(&key(Key::ArrowLeft)),
+            Some("flow.select_out")
+        );
+        assert_eq!(
+            flow_key_command(&key(Key::Enter)),
+            Some("flow.toggle_selected")
+        );
+        assert_eq!(flow_key_command(&key(Key::Home)), Some("flow.select_first"));
+        assert_eq!(
+            flow_key_command(&key(Key::Char('s'))),
+            Some("flow.src_selected")
+        );
+        assert_eq!(
+            flow_key_command(&key_mod(Key::Char('2'), Modifiers::CTRL)),
+            Some("flow.view:panes")
+        );
+        assert_eq!(flow_key_command(&key(Key::Char('2'))), None);
+        assert_eq!(flow_key_command(&key(Key::Char('x'))), None);
+        assert_eq!(
+            flow_key_command(&key_mod(Key::ArrowDown, Modifiers::CTRL)),
+            None
+        );
+        assert_eq!(
+            flow_key_command(&key_mod(Key::Char('s'), Modifiers::ALT)),
+            None
+        );
+        assert_eq!(flow_key_command(&key(Key::Tab)), None);
+    }
+
+    #[test]
+    fn handle_flow_key_moves_the_selection_on_the_active_flow_pane() {
+        let mut st = seed_state();
+        assert!(crate::state::dispatch(
+            &mut st,
+            &format!("flow.open:{}", fixture_path().display())
+        ));
+        let pane_id = st.active_pane.0;
+        assert_eq!(
+            handle_flow_key(&mut st, pane_id, &key(Key::ArrowDown)),
+            Some(true)
+        );
+        assert_eq!(st.flows[&pane_id].selected_row, Some(0));
+        assert_eq!(
+            handle_flow_key(&mut st, pane_id, &key(Key::ArrowRight)),
+            Some(true)
+        );
+        assert_eq!(st.flows[&pane_id].selected_row, Some(1));
+        assert_eq!(
+            handle_flow_key(&mut st, pane_id, &key(Key::Char('x'))),
+            None
+        );
+        assert_eq!(
+            handle_flow_key(&mut st, pane_id + 1000, &key(Key::ArrowDown)),
+            None
+        );
+        let body = build_flow_pane_body(PaneId(pane_id), true, &st.flows[&pane_id], &shared());
+        assert_eq!(all(&body, &["flow-row", "selected"]).len(), 1);
     }
 }

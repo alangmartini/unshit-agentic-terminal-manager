@@ -332,7 +332,7 @@ fn build_pane(
             grids,
         )
     } else if let Some(flow_pane) = state.flow_panes.get(&pane.id.0) {
-        crate::ui::flow_pane::build_flow_pane_body(pane.id, flow_pane, shared)
+        crate::ui::flow_pane::build_flow_pane_body(pane.id, capture_keyboard, flow_pane, shared)
     } else {
         build_pane_body(
             pane.id,

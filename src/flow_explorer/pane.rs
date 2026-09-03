@@ -511,3 +511,231 @@ mod transition_tests {
         assert!(!ids.iter().any(|id| id == "SessionRegistry.ts::open"));
     }
 }
+
+impl FlowPane {
+    /// Position of the selected row within `rows` (the current display).
+    fn display_index(&self, rows: &[DisplayRow]) -> Option<usize> {
+        let selected = self.selected_row?;
+        rows.iter().position(|d| d.row == selected)
+    }
+
+    /// Select a tree row by index; returns whether the selection changed.
+    pub fn select_row(&mut self, row: usize) -> bool {
+        if row >= self.rows.len() || self.selected_row == Some(row) {
+            return false;
+        }
+        self.selected_row = Some(row);
+        true
+    }
+
+    pub fn clear_selection(&mut self) -> bool {
+        self.selected_row.take().is_some()
+    }
+
+    /// Move the cursor by `delta` display rows, clamped at both ends; with
+    /// nothing selected, a downward move lands on the first row and an
+    /// upward move on the last.
+    pub fn move_selection(&mut self, delta: i64) -> bool {
+        let rows = self.display_rows();
+        if rows.is_empty() {
+            return false;
+        }
+        let last = rows.len() as i64 - 1;
+        let next = match self.display_index(&rows) {
+            None if delta >= 0 => 0,
+            None => last as usize,
+            Some(i) => (i as i64 + delta).clamp(0, last) as usize,
+        };
+        self.select_row(rows[next].row)
+    }
+
+    /// Home / End.
+    pub fn select_edge(&mut self, end: bool) -> bool {
+        let rows = self.display_rows();
+        let Some(target) = (if end { rows.last() } else { rows.first() }) else {
+            return false;
+        };
+        self.select_row(target.row)
+    }
+
+    /// Right arrow: expand a collapsed selection, otherwise step into its
+    /// first visible child.
+    pub fn select_into(&mut self) -> bool {
+        let Some(selected) = self.selected_row else {
+            return self.move_selection(1);
+        };
+        if self.collapsed.remove(&selected) {
+            return true;
+        }
+        let rows = self.display_rows();
+        let Some(i) = self.display_index(&rows) else {
+            return false;
+        };
+        match rows.get(i + 1) {
+            Some(next) if next.depth > rows[i].depth => self.select_row(next.row),
+            _ => false,
+        }
+    }
+
+    /// Left arrow: collapse an expanded selection with children, otherwise
+    /// step out to its nearest visible ancestor.
+    pub fn select_out(&mut self) -> bool {
+        let Some(selected) = self.selected_row else {
+            return false;
+        };
+        if self.rows[selected].child_count > 0 && !self.collapsed.contains(&selected) {
+            self.collapsed.insert(selected);
+            return true;
+        }
+        let rows = self.display_rows();
+        let Some(i) = self.display_index(&rows) else {
+            return false;
+        };
+        let depth = rows[i].depth;
+        if depth == 0 {
+            return false;
+        }
+        match rows[..i].iter().rev().find(|d| d.depth < depth) {
+            Some(parent) => self.select_row(parent.row),
+            None => false,
+        }
+    }
+
+    /// After a collapse or level change the selection may sit on a hidden
+    /// row; move it to the nearest visible ancestor (or the first row).
+    pub fn clamp_selection(&mut self) -> bool {
+        let Some(selected) = self.selected_row else {
+            return false;
+        };
+        let rows = self.display_rows();
+        let visible = |row: usize| rows.iter().any(|d| d.row == row);
+        if visible(selected) {
+            return false;
+        }
+        let mut cursor = self.rows[selected].parent;
+        while let Some(parent) = cursor {
+            if visible(parent) {
+                self.selected_row = Some(parent);
+                return true;
+            }
+            cursor = self.rows[parent].parent;
+        }
+        self.selected_row = rows.first().map(|d| d.row);
+        true
+    }
+
+    /// Node id of the selected row, for `src` and column handoffs.
+    pub fn selected_node_id(&self) -> Option<&str> {
+        self.selected_row
+            .and_then(|row| self.rows.get(row))
+            .map(|r| r.node_id.as_str())
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::flow_explorer::test_support::fixture_path;
+
+    fn pane() -> FlowPane {
+        FlowPane::open(&fixture_path()).unwrap()
+    }
+
+    #[test]
+    fn move_selection_clamps_and_starts_at_the_edges() {
+        let mut p = pane();
+        assert!(p.move_selection(0), "no selection: lands on the first row");
+        assert_eq!(p.selected_row, Some(0));
+        assert!(p.move_selection(3));
+        assert_eq!(p.selected_row, Some(3));
+        assert!(p.move_selection(100));
+        assert_eq!(p.selected_row, Some(10));
+        assert!(!p.move_selection(1));
+        assert!(p.move_selection(-100));
+        assert_eq!(p.selected_row, Some(0));
+        p.clear_selection();
+        assert!(p.move_selection(-1));
+        assert_eq!(p.selected_row, Some(10));
+        assert!(!p.select_row(99));
+        assert!(p.select_edge(false));
+        assert_eq!(p.selected_row, Some(0));
+        assert!(p.select_edge(true));
+        assert_eq!(p.selected_row, Some(10));
+    }
+
+    #[test]
+    fn move_selection_skips_rows_hidden_by_collapse_and_level() {
+        let mut p = pane();
+        assert!(p.toggle_collapsed(3));
+        p.select_row(3);
+        assert!(
+            !p.move_selection(1),
+            "nothing visible below a collapsed row 3"
+        );
+        assert_eq!(p.selected_row, Some(3));
+        p.expand_all();
+        p.set_level(FlowLevel::Events);
+        p.select_row(1);
+        assert!(p.move_selection(1));
+        assert_eq!(
+            p.selected_row,
+            Some(3),
+            "row 2 is hidden at the events level"
+        );
+    }
+
+    #[test]
+    fn select_into_expands_then_steps_into_the_child() {
+        let mut p = pane();
+        assert!(p.select_into(), "no selection: moves onto the first row");
+        assert_eq!(p.selected_row, Some(0));
+        assert!(p.select_into());
+        assert_eq!(p.selected_row, Some(1));
+        p.toggle_collapsed(1);
+        assert!(p.select_into(), "expands the collapsed row first");
+        assert!(!p.collapsed.contains(&1));
+        assert_eq!(p.selected_row, Some(1));
+        assert!(p.select_into());
+        assert_eq!(p.selected_row, Some(2));
+        p.select_row(10);
+        assert!(!p.select_into(), "leaf: nothing to step into");
+    }
+
+    #[test]
+    fn select_out_collapses_then_steps_to_the_parent() {
+        let mut p = pane();
+        assert!(!p.select_out());
+        p.select_row(7);
+        assert!(p.select_out(), "leaf: moves to the parent");
+        assert_eq!(p.selected_row, Some(6));
+        assert!(p.select_out(), "expanded row with children collapses");
+        assert!(p.collapsed.contains(&6));
+        assert_eq!(p.selected_row, Some(6));
+        assert!(p.select_out(), "collapsed row: moves to the parent");
+        assert_eq!(p.selected_row, Some(5));
+        p.select_row(0);
+        assert!(p.select_out());
+        assert!(p.collapsed.contains(&0));
+        assert!(!p.select_out(), "entry row has no parent");
+    }
+
+    #[test]
+    fn clamp_selection_moves_a_hidden_selection_to_its_visible_ancestor() {
+        let mut p = pane();
+        p.select_row(8);
+        assert!(!p.clamp_selection());
+        p.toggle_collapsed(4);
+        assert!(p.clamp_selection());
+        assert_eq!(p.selected_row, Some(4));
+        p.expand_all();
+        p.select_row(2);
+        p.set_level(FlowLevel::Events);
+        assert!(p.clamp_selection());
+        assert_eq!(
+            p.selected_row,
+            Some(1),
+            "submit is hidden; handleKeyDown is its visible parent"
+        );
+        assert_eq!(p.selected_node_id(), Some("Editor.tsx::handleKeyDown"));
+    }
+}
