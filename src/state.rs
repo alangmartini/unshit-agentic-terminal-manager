@@ -5275,17 +5275,43 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
                 record_flow_event(&record);
             }
         }
-        FlowCommand::Level(level) => pane.set_level(level),
+        FlowCommand::Level(level) => {
+            pane.set_level(level);
+            for id in pane.unloaded_open_snippets() {
+                load_flow_snippet(pane, &id);
+            }
+        }
         FlowCommand::ExpandAll => pane.expand_all(),
         FlowCommand::CollapseAll => pane.collapse_all(),
         FlowCommand::Toggle(row) => {
             pane.toggle_collapsed(row);
         }
         FlowCommand::Src(id) => {
-            pane.toggle_src(id);
+            if pane.toggle_src(id) == Some(true) {
+                load_flow_snippet(pane, id);
+            }
         }
     }
     Some(true)
+}
+
+/// Load a node's source excerpt into the pane cache (a small synchronous
+/// read on the dispatch path, never during render) and report fresh
+/// failures that are not the expected stale-flow cases.
+fn load_flow_snippet(pane: &mut crate::flow_explorer::FlowPane, node_id: &str) {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+
+    if pane.ensure_snippet(node_id) != Some(true) {
+        return;
+    }
+    if let Some(Err(err)) = pane.snippet(node_id) {
+        if !err.is_expected() {
+            let mut record =
+                FlowEventRecord::new("flow.snippet_load_failed", "warn", &pane.flow_id);
+            record.reason = Some(err.reason());
+            record_flow_event(&record);
+        }
+    }
 }
 
 /// Handle `flow.open:<path>`: open the flow document in a new Flow
@@ -16734,6 +16760,44 @@ mod flow_pane_tests {
         assert_eq!(
             state.ui_snapshot().flow_panes[&pane_id].view,
             FlowView::Graph
+        );
+    }
+
+    #[test]
+    fn flow_src_command_loads_the_snippet_once() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.src:SessionRegistry.ts::open"));
+        let pane = active_flow(&state);
+        assert!(pane.src_open.contains("SessionRegistry.ts::open"));
+        let snippet = pane
+            .snippet("SessionRegistry.ts::open")
+            .expect("loaded on open")
+            .as_ref()
+            .expect("fixture source exists");
+        assert_eq!(snippet.hl_start, 31);
+        // Closing keeps the cache; reopening does not reload.
+        assert!(dispatch(&mut state, "flow.src:SessionRegistry.ts::open"));
+        assert!(!active_flow(&state)
+            .src_open
+            .contains("SessionRegistry.ts::open"));
+        assert!(active_flow(&state)
+            .snippet("SessionRegistry.ts::open")
+            .is_some());
+    }
+
+    #[test]
+    fn flow_source_level_loads_every_open_snippet() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.level:source"));
+        let pane = active_flow(&state);
+        assert_eq!(pane.src_open.len(), 8);
+        assert!(pane.unloaded_open_snippets().is_empty());
+        assert!(
+            pane.snippets.values().all(|r| r.is_ok()),
+            "{:?}",
+            pane.snippets
         );
     }
 }

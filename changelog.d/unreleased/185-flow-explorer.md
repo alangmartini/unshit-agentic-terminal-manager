@@ -20,3 +20,4 @@
   directory and can be reopened). Every open and close is recorded in
   `flow-events.jsonl` next to the editor's log, with reasons for failures.
 - Flow Explorer call stack view: view and level tabs, expand/collapse, process-coloured tree rows with descriptions, locations and `src` buttons, and a legend of processes and event carriers (`flow.view:`, `flow.level:`, `flow.expand_all`, `flow.collapse_all`, `flow.toggle:<row>`, `flow.src:<id>`).
+- Flow Explorer inline source: the `src` button (and the source level) opens a syntax-coloured excerpt of the node's location with line numbers and the located range highlighted; excerpts are read once per node from the flow's repo root (path-contained, 256 KiB cap) and a stale location renders "source not available" instead of failing.

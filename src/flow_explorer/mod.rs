@@ -7,18 +7,22 @@
 //! render path or spawns processes; producers and ingestion are layered on
 //! top by the app state.
 
+pub mod highlight;
 pub mod ingest;
 pub mod model;
 pub mod pane;
+pub mod snippet;
 pub mod telemetry;
 pub mod tree;
 
+pub use highlight::{tokenize, Language, Token, TokenKind};
 pub use ingest::{ingest_file, IngestError, MAX_FLOW_JSON_BYTES};
 pub use model::{
     parse_flow, resolve_repo_root, Carrier, DiffRange, DiffStatus, Edge, EdgeKind, Flow, FlowMode,
     FlowParseError, FlowValidationError, Location, Node, NodeKind, Process, FLOW_SCHEMA_VERSION,
 };
 pub use pane::{flow_id_for, DisplayRow, FlowLevel, FlowPane, FlowView};
+pub use snippet::{load_snippet, Snippet, SnippetError, CONTEXT_LINES, MAX_SNIPPET_BYTES};
 pub use tree::{
     collapsible_rows, derive_tree, visible_rows, RowMarker, TreeRow, MAX_TREE_DEPTH, MAX_TREE_ROWS,
 };

@@ -7560,3 +7560,86 @@ body.dragging-pane {
   font-size: 11px;
   color: var(--fg-tertiary);
 }
+
+/* Inline source snippet under a call-stack row. */
+.flow-snippet-row {
+  display: flex;
+  align-items: flex-start;
+  padding: 2px 14px 6px 12px;
+}
+
+.flow-snippet {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 6px 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  background: var(--bg-subtle);
+  overflow: hidden;
+}
+
+.flow-snippet-path {
+  padding: 0 10px 4px 10px;
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.flow-snippet-line {
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: hidden;
+}
+
+.flow-snippet-line.hl {
+  background: var(--bg-hover);
+}
+
+.flow-gutter {
+  color: var(--fg-muted);
+  padding-right: 12px;
+  flex-shrink: 0;
+  text-align: right;
+}
+
+.flow-snippet-line.hl .flow-gutter {
+  color: var(--fg-tertiary);
+}
+
+.tok-keyword {
+  color: var(--rust);
+}
+
+.tok-str {
+  color: var(--sage);
+}
+
+.tok-number {
+  color: var(--azure);
+}
+
+.tok-comment {
+  color: var(--fg-tertiary);
+}
+
+.tok-ident {
+  color: var(--fg-primary);
+}
+
+.tok-punct {
+  color: var(--fg-secondary);
+}
+
+.flow-snippet-error {
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--fg-tertiary);
+}

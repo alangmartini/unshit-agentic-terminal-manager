@@ -6,11 +6,12 @@
 //! `Arc::make_mut` on the dispatch path, which only copies when a snapshot
 //! still holds the previous version.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::ingest::{ingest_file, IngestError};
 use super::model::{resolve_repo_root, Flow, NodeKind};
+use super::snippet::{load_snippet, Snippet, SnippetError, CONTEXT_LINES};
 use super::tree::{collapsible_rows, derive_tree, visible_rows, TreeRow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,6 +94,9 @@ pub struct FlowPane {
     /// Miller-column focus chain: column `c + 1` lists the children of
     /// `path[c]`.
     pub path: Vec<String>,
+    /// Loaded source excerpts (and failures) keyed by node id, filled on
+    /// the dispatch path so render never touches the disk.
+    pub snippets: HashMap<String, Result<Snippet, SnippetError>>,
     pub opened_unix_ms: u64,
 }
 
@@ -119,6 +123,7 @@ impl FlowPane {
             src_open: HashSet::new(),
             selected_row: None,
             path: Vec::new(),
+            snippets: HashMap::new(),
             opened_unix_ms: crate::telemetry_sink::now_unix_ms(),
         }
     }
@@ -198,6 +203,36 @@ impl FlowPane {
             self.src_open.insert(node_id.to_string());
             Some(true)
         }
+    }
+
+    /// Load the node's source excerpt if it is not cached yet. `None` when
+    /// the node has no location; otherwise whether a load happened now (the
+    /// caller reports fresh unexpected failures).
+    pub fn ensure_snippet(&mut self, node_id: &str) -> Option<bool> {
+        if self.snippets.contains_key(node_id) {
+            return Some(false);
+        }
+        let location = self.flow.node(node_id)?.location.clone()?;
+        let result = load_snippet(&self.repo_root, &location, CONTEXT_LINES);
+        self.snippets.insert(node_id.to_string(), result);
+        Some(true)
+    }
+
+    /// The cached excerpt for a node, if any load was attempted.
+    pub fn snippet(&self, node_id: &str) -> Option<&Result<Snippet, SnippetError>> {
+        self.snippets.get(node_id)
+    }
+
+    /// Node ids whose snippet is open but not loaded yet.
+    pub fn unloaded_open_snippets(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .src_open
+            .iter()
+            .filter(|id| !self.snippets.contains_key(*id))
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// Rows the call stack shows right now, honouring collapse state and
@@ -439,5 +474,40 @@ mod transition_tests {
                 "useAgentSession.ts::prompt"
             ]
         );
+    }
+
+    #[test]
+    fn ensure_snippet_loads_once_and_caches_failures() {
+        let mut p = pane();
+        assert_eq!(p.ensure_snippet("ui.cmd-enter"), None);
+        assert_eq!(p.ensure_snippet("nope"), None);
+        assert_eq!(p.ensure_snippet("SessionRegistry.ts::open"), Some(true));
+        assert_eq!(p.ensure_snippet("SessionRegistry.ts::open"), Some(false));
+        let snippet = p
+            .snippet("SessionRegistry.ts::open")
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(snippet.hl_start, 31);
+        assert_eq!(snippet.hl_end, 41);
+        // A missing file is cached as its error and not retried.
+        p.flow.nodes[1].location.as_mut().unwrap().file = "gone/Missing.tsx".into();
+        assert_eq!(p.ensure_snippet("Editor.tsx::handleKeyDown"), Some(true));
+        assert!(matches!(
+            p.snippet("Editor.tsx::handleKeyDown"),
+            Some(Err(SnippetError::NotFound))
+        ));
+        assert_eq!(p.ensure_snippet("Editor.tsx::handleKeyDown"), Some(false));
+    }
+
+    #[test]
+    fn unloaded_open_snippets_lists_open_ids_without_a_cache_entry() {
+        let mut p = pane();
+        p.set_level(FlowLevel::Source);
+        assert_eq!(p.unloaded_open_snippets().len(), 8);
+        p.ensure_snippet("SessionRegistry.ts::open");
+        let ids = p.unloaded_open_snippets();
+        assert_eq!(ids.len(), 7);
+        assert!(!ids.iter().any(|id| id == "SessionRegistry.ts::open"));
     }
 }

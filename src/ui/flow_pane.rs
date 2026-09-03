@@ -5,7 +5,8 @@
 use unshit::core::element::*;
 
 use crate::flow_explorer::{
-    Carrier, DiffStatus, DisplayRow, FlowLevel, FlowMode, FlowPane, FlowView, RowMarker,
+    tokenize, Carrier, DiffStatus, DisplayRow, FlowLevel, FlowMode, FlowPane, FlowView, RowMarker,
+    Snippet, SnippetError,
 };
 use crate::state::{mutate_with, PaneId, SharedState};
 use crate::ui::icons::{icon_carrier, svg_icon};
@@ -165,8 +166,67 @@ fn build_call_stack(pane: &FlowPane, shared: &SharedState) -> ElementDef {
     let mut tree = ElementDef::new(Tag::Div).with_class("flow-tree");
     for display in pane.display_rows() {
         tree = tree.with_child(build_row(pane, display, review, shared));
+        let node_id = &pane.rows[display.row].node_id;
+        if pane.src_open.contains(node_id) {
+            if let Some(snippet) = pane.snippet(node_id) {
+                tree = tree.with_child(build_snippet(snippet, display.depth));
+            }
+        }
     }
     tree
+}
+
+/// The excerpt (or its failure) under an open row, indented one level
+/// deeper than the row it belongs to.
+fn build_snippet(snippet: &Result<Snippet, SnippetError>, depth: usize) -> ElementDef {
+    let mut row = ElementDef::new(Tag::Div).with_class("flow-snippet-row");
+    for _ in 0..=depth {
+        row = row.with_child(ElementDef::new(Tag::Span).with_class("flow-indent"));
+    }
+    let mut body = ElementDef::new(Tag::Div).with_class("flow-snippet");
+    match snippet {
+        Ok(snippet) => {
+            body = body.with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("flow-snippet-path")
+                    .with_text(format!(
+                        "{} \u{00B7} {}",
+                        snippet.file,
+                        snippet.language.as_str()
+                    )),
+            );
+            let width = snippet.gutter_width();
+            let mut in_block_comment = false;
+            for (offset, line) in snippet.lines.iter().enumerate() {
+                let line_no = snippet.first_line + offset as u32;
+                let mut el = ElementDef::new(Tag::Div).with_class("flow-snippet-line");
+                if snippet.is_highlighted(line_no) {
+                    el = el.with_class("hl");
+                }
+                el = el.with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("flow-gutter")
+                        .with_text(format!("{line_no:>width$}")),
+                );
+                for token in tokenize(line, snippet.language, &mut in_block_comment) {
+                    el = el.with_child(
+                        ElementDef::new(Tag::Span)
+                            .with_class(token.kind.class())
+                            .with_text(token.text),
+                    );
+                }
+                body = body.with_child(el);
+            }
+        }
+        Err(err) => {
+            body = body.with_class("flow-snippet-failed").with_child(
+                ElementDef::new(Tag::Span)
+                    .with_class("flow-snippet-error")
+                    .with_text(err.message()),
+            );
+        }
+    }
+    row.with_child(body)
 }
 
 fn build_row(
@@ -548,5 +608,71 @@ mod tests {
             text_of(first(&body, &["flow-placeholder"]).unwrap()),
             "panes view is not built yet"
         );
+    }
+
+    #[test]
+    fn open_snippet_renders_gutter_tokens_and_highlight() {
+        let mut p = pane();
+        assert_eq!(p.toggle_src("SessionRegistry.ts::open"), Some(true));
+        assert_eq!(p.ensure_snippet("SessionRegistry.ts::open"), Some(true));
+        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        let snippet = first(&body, &["flow-snippet"]).expect("snippet under the open row");
+        let lines = all(snippet, &["flow-snippet-line"]);
+        let loaded = p
+            .snippet("SessionRegistry.ts::open")
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(lines.len(), loaded.lines.len());
+        assert_eq!(all(snippet, &["flow-snippet-line", "hl"]).len(), 11);
+        assert_eq!(
+            text_of(first(lines[0], &["flow-gutter"]).unwrap()).trim(),
+            "28"
+        );
+        assert!(!all(snippet, &["tok-keyword"]).is_empty());
+        assert_eq!(
+            text_of(first(snippet, &["flow-snippet-path"]).unwrap()),
+            "packages/server/src/sessions/SessionRegistry.ts \u{00B7} typescript"
+        );
+        // The snippet sits right after its row, indented one level deeper.
+        let tree = first(&body, &["flow-tree"]).unwrap();
+        let idx = tree
+            .children
+            .iter()
+            .position(|c| has_classes(c, &["flow-snippet-row"]))
+            .unwrap();
+        assert!(has_classes(&tree.children[idx - 1], &["flow-row"]));
+        assert_eq!(
+            text_of(first(&tree.children[idx - 1], &["flow-name"]).unwrap()),
+            "SessionRegistry.open"
+        );
+        let row_indents = all(&tree.children[idx - 1], &["flow-indent"]).len();
+        assert_eq!(
+            all(&tree.children[idx], &["flow-indent"]).len(),
+            row_indents + 1
+        );
+    }
+
+    #[test]
+    fn missing_source_renders_inline_message() {
+        let mut p = pane();
+        p.flow.nodes[1].location.as_mut().unwrap().file = "gone/Missing.tsx".into();
+        assert_eq!(p.toggle_src("Editor.tsx::handleKeyDown"), Some(true));
+        assert_eq!(p.ensure_snippet("Editor.tsx::handleKeyDown"), Some(true));
+        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        assert_eq!(
+            text_of(first(&body, &["flow-snippet-error"]).unwrap()),
+            "source not available"
+        );
+        assert!(all(&body, &["flow-snippet-line"]).is_empty());
+    }
+
+    #[test]
+    fn open_but_unloaded_snippet_renders_nothing() {
+        let mut p = pane();
+        assert_eq!(p.toggle_src("SessionRegistry.ts::open"), Some(true));
+        let body = build_flow_pane_body(PaneId(1), &p, &shared());
+        assert!(first(&body, &["flow-snippet"]).is_none());
+        assert_eq!(all(&body, &["flow-src", "active"]).len(), 1);
     }
 }
