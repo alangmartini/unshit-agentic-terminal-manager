@@ -90,6 +90,7 @@ scripts/flow-explorer-shot.ps1         isolated screenshot of any dispatch seque
 * State tests dispatch the `flow.*` strings against the fixtures and assert pane state and telemetry-relevant transitions.
 * UI tests build the pane body and assert element classes/texts for all three views and review mode.
 * Screenshots: `scripts/flow-explorer-shot.ps1 -Dispatch "flow.open:<fixture>;flow.view:panes;..."` under a throwaway profile, captured with `PrintWindow`, compared by eye against the reference frames.
+* Launch path: `scripts/flow-explorer-launch-e2e.ps1` starts a throwaway-profile instance with `flow.explain:<request>`, stands in for the agent by writing the fixture through `<path>.tmp` + rename, and waits for `flow.ready` before capturing (`-StripPathDir` keeps a real agent from starting).
 * Gates: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p terminal-manager` (the workspace's GPU-gated renderer tests are run single-threaded separately).
 
 ## Boundaries
@@ -97,6 +98,7 @@ scripts/flow-explorer-shot.ps1         isolated screenshot of any dispatch seque
 * The app never runs git for this feature and never edits repository files; the agent does the analysis in the workspace cwd.
 * Snippets are read only from inside `repo_root` (canonicalised containment check), capped at 256 KiB, UTF-8 only.
 * No file watcher crate: pending launches are polled once a second by one thread; opened flows are not re-read unless reopened.
+* Pending launches live in memory only: a UI restart forgets them. The agent still writes its JSON under `flows/`, and **Open flow…** picks it up.
 * No synchronous IPC or disk reads during render; snippet loads happen on the dispatch path and are cached per node.
 * Telemetry never contains node names, prose, paths inside the repo, or source text.
 
