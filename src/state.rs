@@ -5253,6 +5253,8 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
         SelectNone,
         ToggleSelected,
         SrcSelected,
+        Select(usize, &'a str),
+        Focus(usize),
     }
 
     let parsed = if let Some(name) = command.strip_prefix("flow.view:") {
@@ -5283,6 +5285,11 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
         FlowCommand::ToggleSelected
     } else if command == "flow.src_selected" {
         FlowCommand::SrcSelected
+    } else if let Some(rest) = command.strip_prefix("flow.select:") {
+        let (col, id) = rest.split_once(':')?;
+        FlowCommand::Select(col.parse().ok()?, id)
+    } else if let Some(col) = command.strip_prefix("flow.focus:") {
+        FlowCommand::Focus(col.parse().ok()?)
     } else {
         FlowCommand::Src(command.strip_prefix("flow.src:")?)
     };
@@ -5293,6 +5300,9 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
     };
     // Copies only when a frame snapshot still holds the previous version.
     let pane = std::sync::Arc::make_mut(pane);
+    // The cursor keys are shared: they drive the row cursor in the call
+    // stack and the column cursor in the panes view.
+    let panes = pane.view == FlowView::Panes;
     match parsed {
         FlowCommand::View(view) => {
             if pane.set_view(view) {
@@ -5323,24 +5333,53 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
             pane.select_row(row);
         }
         FlowCommand::SelectMove(delta) => {
-            pane.move_selection(delta);
+            if panes {
+                pane.column_move(delta);
+            } else {
+                pane.move_selection(delta);
+            }
         }
         FlowCommand::SelectEdge(end) => {
-            pane.select_edge(end);
+            if panes {
+                pane.column_edge(end);
+            } else {
+                pane.select_edge(end);
+            }
+        }
+        FlowCommand::SelectInto | FlowCommand::ToggleSelected if panes => {
+            if pane.column_enter() {
+                load_focused_flow_snippet(pane);
+            }
         }
         FlowCommand::SelectInto => {
             pane.select_into();
         }
         FlowCommand::SelectOut => {
-            pane.select_out();
+            if panes {
+                pane.column_back();
+            } else {
+                pane.select_out();
+            }
         }
         FlowCommand::SelectNone => {
-            pane.clear_selection();
+            if panes {
+                pane.column_clear();
+            } else {
+                pane.clear_selection();
+            }
         }
         FlowCommand::ToggleSelected => {
             if let Some(row) = pane.selected_row {
                 pane.toggle_collapsed(row);
             }
+        }
+        FlowCommand::Select(col, id) => {
+            if pane.select_column(col, id) {
+                load_focused_flow_snippet(pane);
+            }
+        }
+        FlowCommand::Focus(col) => {
+            pane.focus_column(col);
         }
         FlowCommand::SrcSelected => {
             if let Some(id) = pane.selected_node_id().map(str::to_owned) {
@@ -5371,6 +5410,13 @@ fn load_flow_snippet(pane: &mut crate::flow_explorer::FlowPane, node_id: &str) {
             record.reason = Some(err.reason());
             record_flow_event(&record);
         }
+    }
+}
+
+/// The panes view shows the focused node's excerpt, so focusing loads it.
+fn load_focused_flow_snippet(pane: &mut crate::flow_explorer::FlowPane) {
+    if let Some(id) = pane.path.last().cloned() {
+        load_flow_snippet(pane, &id);
     }
 }
 
@@ -16910,5 +16956,60 @@ mod flow_pane_tests {
         assert!(dispatch(&mut state, "flow.select_row:2"));
         assert!(dispatch(&mut state, "flow.level:events"));
         assert_eq!(active_flow(&state).selected_row, Some(1));
+    }
+
+    #[test]
+    fn flow_select_and_focus_commands_drive_the_columns() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.view:panes"));
+        assert!(dispatch(&mut state, "flow.select:0:ui.cmd-enter"));
+        assert!(dispatch(
+            &mut state,
+            "flow.select:1:Editor.tsx::handleKeyDown"
+        ));
+        assert_eq!(
+            active_flow(&state).path,
+            vec!["ui.cmd-enter", "Editor.tsx::handleKeyDown"]
+        );
+        assert!(
+            active_flow(&state)
+                .snippet("Editor.tsx::handleKeyDown")
+                .is_some(),
+            "focusing a node loads its excerpt"
+        );
+        assert!(dispatch(&mut state, "flow.select:0:AgentPane.tsx::submit"));
+        assert_eq!(active_flow(&state).path.len(), 2, "not an entry: ignored");
+        assert!(dispatch(&mut state, "flow.select_move:1"));
+        assert_eq!(active_flow(&state).column_cursor, Some(0));
+        assert!(dispatch(&mut state, "flow.select_into"));
+        assert_eq!(active_flow(&state).path.len(), 3);
+        assert_eq!(active_flow(&state).path[2], "AgentPane.tsx::submit");
+        assert!(active_flow(&state)
+            .snippet("AgentPane.tsx::submit")
+            .is_some());
+        assert!(dispatch(&mut state, "flow.select_out"));
+        assert_eq!(active_flow(&state).path.len(), 2);
+        assert_eq!(active_flow(&state).column_cursor, Some(0));
+        assert!(dispatch(&mut state, "flow.select_last"));
+        assert_eq!(active_flow(&state).column_cursor, Some(1));
+        assert!(dispatch(&mut state, "flow.toggle_selected"));
+        assert_eq!(
+            active_flow(&state).path.len(),
+            3,
+            "enter opens the cursor item"
+        );
+        assert_eq!(active_flow(&state).path[2], "ui.cmd-enter");
+        assert!(dispatch(&mut state, "flow.select_none"));
+        assert_eq!(active_flow(&state).column_cursor, None);
+        assert!(dispatch(&mut state, "flow.focus:0"));
+        assert!(active_flow(&state).path.is_empty());
+        assert_eq!(
+            active_flow(&state).selected_row,
+            None,
+            "the call-stack cursor is untouched"
+        );
+        assert!(!dispatch(&mut state, "flow.select:x:y"));
+        assert!(!dispatch(&mut state, "flow.focus:x"));
     }
 }

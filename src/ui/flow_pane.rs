@@ -6,8 +6,8 @@ use unshit::core::element::*;
 use unshit::core::event::{Event, EventType, Key, KeyEventKind, KeyboardEvent, Modifiers};
 
 use crate::flow_explorer::{
-    tokenize, Carrier, DiffStatus, DisplayRow, FlowLevel, FlowMode, FlowPane, FlowView, RowMarker,
-    Snippet, SnippetError,
+    tokenize, Carrier, ColumnItem, ColumnSection, DiffStatus, DisplayRow, FlowLevel, FlowMode,
+    FlowPane, FlowView, Node, RowMarker, Snippet, SnippetError,
 };
 use crate::state::{mutate_with, PaneId, SharedState};
 use crate::ui::icons::{icon_carrier, svg_icon};
@@ -67,7 +67,8 @@ pub fn build_flow_pane_body(
         .with_child(build_toolbar(pane, shared));
     let body = match pane.view {
         FlowView::CallStack => body.with_child(build_call_stack(pane, shared)),
-        FlowView::Panes | FlowView::Graph => body.with_child(build_placeholder(pane.view)),
+        FlowView::Panes => body.with_child(build_panes(pane, shared)),
+        FlowView::Graph => body.with_child(build_placeholder(pane.view)),
     };
     body.with_child(build_legend(pane))
 }
@@ -257,11 +258,227 @@ fn build_call_stack(pane: &FlowPane, shared: &SharedState) -> ElementDef {
 
 /// The excerpt (or its failure) under an open row, indented one level
 /// deeper than the row it belongs to.
+/// Miller columns: the overview, then one column per node on `pane.path`.
+/// Every column but the last two collapses to a strip carrying its name
+/// rotated; clicking a strip refocuses that column.
+fn build_panes(pane: &FlowPane, shared: &SharedState) -> ElementDef {
+    let count = pane.column_count();
+    let mut panes = ElementDef::new(Tag::Div).with_class("flow-panes");
+    for col in 0..count {
+        panes = panes.with_child(build_column(pane, col, col + 2 < count, shared));
+    }
+    panes
+}
+
+fn node_process_class(pane: &FlowPane, node: &Node) -> Option<String> {
+    node.process
+        .as_deref()
+        .and_then(|id| pane.flow.process_index(id))
+        .map(process_class)
+}
+
+fn build_column(pane: &FlowPane, col: usize, collapsed: bool, shared: &SharedState) -> ElementDef {
+    let node = pane.column_node(col);
+    let mut column = ElementDef::new(Tag::Div).with_class("flow-col");
+    if collapsed {
+        let mut label = ElementDef::new(Tag::Span).with_class("flow-col-vlabel");
+        match node {
+            Some(node) => {
+                label = label.with_text(node.name.clone());
+                if let Some(class) = node_process_class(pane, node) {
+                    label = label.with_class(class);
+                }
+            }
+            None => label = label.with_text(pane.flow.title.clone()),
+        }
+        column = column.with_class("collapsed").with_child(label);
+        return dispatch_on_click(column, shared, format!("flow.focus:{col}"));
+    }
+    let focused = col + 1 == pane.column_count();
+    if focused {
+        column = column.with_class("focused");
+    }
+    column = column.with_child(match node {
+        Some(node) => node_head(pane, node),
+        None => overview_head(pane),
+    });
+    let chosen = pane.path.get(col).map(String::as_str);
+    let cursor = if focused { pane.column_cursor } else { None };
+    let review = pane.flow.mode == FlowMode::Review;
+    for (section, items) in group_by_section(&pane.column_items(col)) {
+        let mut list = section_block(section.label());
+        for (index, item) in items {
+            let Some(target) = pane.flow.node(&item.node_id) else {
+                continue;
+            };
+            let mut button = ElementDef::new(Tag::Button).with_class("flow-item");
+            if chosen == Some(item.node_id.as_str()) {
+                button = button.with_class("active");
+            }
+            if cursor == Some(index) {
+                button = button.with_class("cursor");
+            }
+            if review && target.status != DiffStatus::Same {
+                button = button.with_class(format!("diff-{}", target.status.slug()));
+            }
+            let mut name = ElementDef::new(Tag::Span)
+                .with_class("flow-item-name")
+                .with_text(target.name.clone());
+            if let Some(class) = node_process_class(pane, target) {
+                name = name.with_class(class);
+            }
+            button = button.with_child(name);
+            if let Some(carrier) = target.carrier {
+                button = button.with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("flow-carrier")
+                        .with_text(carrier.label()),
+                );
+            }
+            let command = format!("flow.select:{col}:{}", item.node_id);
+            list = list.with_child(dispatch_on_click(button, shared, command));
+        }
+        column = column.with_child(list);
+    }
+    if let Some(node) = node {
+        if let Some(location) = &node.location {
+            let mut source = section_block("source").with_child(
+                ElementDef::new(Tag::Span)
+                    .with_class("flow-col-loc")
+                    .with_text(location.display()),
+            );
+            if let Some(snippet) = pane.snippet(&node.id) {
+                source = source.with_child(snippet_block(snippet));
+            }
+            column = column.with_child(source);
+        }
+    }
+    column
+}
+
+/// Consecutive items of one section, each with its index in the flat
+/// column list (which is what the column cursor indexes).
+fn group_by_section(items: &[ColumnItem]) -> Vec<(ColumnSection, Vec<(usize, &ColumnItem)>)> {
+    let mut groups: Vec<(ColumnSection, Vec<(usize, &ColumnItem)>)> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        match groups.last_mut() {
+            Some((section, list)) if *section == item.section => list.push((index, item)),
+            _ => groups.push((item.section, vec![(index, item)])),
+        }
+    }
+    groups
+}
+
+fn section_block(label: &str) -> ElementDef {
+    ElementDef::new(Tag::Div)
+        .with_class("flow-section")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-section-label")
+                .with_text(label),
+        )
+}
+
+fn overview_head(pane: &FlowPane) -> ElementDef {
+    let flow = &pane.flow;
+    let mut head = ElementDef::new(Tag::Div)
+        .with_class("flow-col-head")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-col-title")
+                .with_text(flow.title.clone()),
+        );
+    if !flow.summary.trim().is_empty() {
+        head = head.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-col-desc")
+                .with_text(flow.summary.clone()),
+        );
+    }
+    if let Some(next) = &flow.next_flow {
+        head = head.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-col-next")
+                .with_text(format!("next flow: {next}")),
+        );
+    }
+    head
+}
+
+fn node_head(pane: &FlowPane, node: &Node) -> ElementDef {
+    let mut title = ElementDef::new(Tag::Span)
+        .with_class("flow-col-title")
+        .with_text(node.name.clone());
+    if let Some(class) = node_process_class(pane, node) {
+        title = title.with_class(class);
+    }
+    let mut line = ElementDef::new(Tag::Div)
+        .with_class("flow-col-title-row")
+        .with_child(title)
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-tag")
+                .with_class("flow-kind")
+                .with_text(node.kind.as_str()),
+        );
+    if let Some(carrier) = node.carrier {
+        line = line.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-carrier")
+                .with_text(carrier.label()),
+        );
+    }
+    if let Some(process) = node.process.as_deref().and_then(|id| pane.flow.process(id)) {
+        line = line.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-tag")
+                .with_text(process.label.clone()),
+        );
+    }
+    let mut head = ElementDef::new(Tag::Div)
+        .with_class("flow-col-head")
+        .with_child(line);
+    if pane.flow.mode == FlowMode::Review && node.status != DiffStatus::Same {
+        head = head.with_class(format!("diff-{}", node.status.slug()));
+    }
+    if !node.tags.is_empty() {
+        let mut tags = ElementDef::new(Tag::Div).with_class("flow-col-tags");
+        for tag in &node.tags {
+            tags = tags.with_child(
+                ElementDef::new(Tag::Span)
+                    .with_class("flow-tag")
+                    .with_text(tag.clone()),
+            );
+        }
+        head = head.with_child(tags);
+    }
+    if !node.description.trim().is_empty() {
+        head = head.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-col-desc")
+                .with_text(node.description.clone()),
+        );
+    }
+    if let Some(payload) = &node.payload {
+        head = head.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-col-payload")
+                .with_text(payload.clone()),
+        );
+    }
+    head
+}
+
 fn build_snippet(snippet: &Result<Snippet, SnippetError>, depth: usize) -> ElementDef {
     let mut row = ElementDef::new(Tag::Div).with_class("flow-snippet-row");
     for _ in 0..=depth {
         row = row.with_child(ElementDef::new(Tag::Span).with_class("flow-indent"));
     }
+    row.with_child(snippet_block(snippet))
+}
+
+/// The excerpt itself: a path line, then gutter and tokens per line.
+fn snippet_block(snippet: &Result<Snippet, SnippetError>) -> ElementDef {
     let mut body = ElementDef::new(Tag::Div).with_class("flow-snippet");
     match snippet {
         Ok(snippet) => {
@@ -305,7 +522,7 @@ fn build_snippet(snippet: &Result<Snippet, SnippetError>, depth: usize) -> Eleme
             );
         }
     }
-    row.with_child(body)
+    body
 }
 
 fn build_row(
@@ -680,12 +897,12 @@ mod tests {
     #[test]
     fn other_views_render_a_placeholder_instead_of_rows() {
         let mut p = pane();
-        p.set_view(FlowView::Panes);
+        p.set_view(FlowView::Graph);
         let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         assert!(all(&body, &["flow-row"]).is_empty());
         assert_eq!(
             text_of(first(&body, &["flow-placeholder"]).unwrap()),
-            "panes view is not built yet"
+            "graph view is not built yet"
         );
     }
 
@@ -855,5 +1072,81 @@ mod tests {
         );
         let body = build_flow_pane_body(PaneId(pane_id), true, &st.flows[&pane_id], &shared());
         assert_eq!(all(&body, &["flow-row", "selected"]).len(), 1);
+    }
+
+    #[test]
+    fn panes_view_renders_the_overview_column_with_entries() {
+        let mut p = pane();
+        p.set_view(FlowView::Panes);
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        assert!(first(&body, &["flow-placeholder"]).is_none());
+        assert!(all(&body, &["flow-row"]).is_empty());
+        assert_eq!(all(&body, &["flow-col"]).len(), 1);
+        assert_eq!(all(&body, &["flow-col", "focused"]).len(), 1);
+        assert!(all(&body, &["flow-col", "collapsed"]).is_empty());
+        assert_eq!(
+            text_of(first(&body, &["flow-col-title"]).unwrap()),
+            "Send a prompt"
+        );
+        assert_eq!(
+            text_of(first(&body, &["flow-section-label"]).unwrap()),
+            "entries"
+        );
+        let items = all(&body, &["flow-item"]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            text_of(first(items[0], &["flow-item-name"]).unwrap()),
+            "Cmd/Ctrl+Enter in the composer"
+        );
+        assert!(all(&body, &["flow-item", "active"]).is_empty());
+    }
+
+    #[test]
+    fn panes_view_collapses_older_columns_and_marks_the_path() {
+        let mut p = pane();
+        p.set_view(FlowView::Panes);
+        p.path = vec![
+            "ui.cmd-enter".into(),
+            "Editor.tsx::handleKeyDown".into(),
+            "AgentPane.tsx::submit".into(),
+        ];
+        p.column_cursor = Some(0);
+        assert_eq!(p.ensure_snippet("AgentPane.tsx::submit"), Some(true));
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        assert_eq!(all(&body, &["flow-col"]).len(), 4);
+        let strips = all(&body, &["flow-col", "collapsed"]);
+        assert_eq!(strips.len(), 2, "all but the last two columns collapse");
+        assert_eq!(
+            text_of(first(strips[0], &["flow-col-vlabel"]).unwrap()),
+            "Send a prompt"
+        );
+        assert_eq!(
+            text_of(first(strips[1], &["flow-col-vlabel"]).unwrap()),
+            "Cmd/Ctrl+Enter in the composer"
+        );
+        // The handleKeyDown column marks submit as chosen; the focused
+        // submit column carries the cursor on its first item.
+        let active = all(&body, &["flow-item", "active"]);
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            text_of(first(active[0], &["flow-item-name"]).unwrap()),
+            "Composer.submit"
+        );
+        assert_eq!(all(&body, &["flow-item", "cursor"]).len(), 1);
+        let labels: Vec<String> = all(&body, &["flow-section-label"])
+            .iter()
+            .map(|e| text_of(e))
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["calls", "handles", "source", "calls", "source"]
+        );
+        assert_eq!(
+            all(&body, &["flow-snippet"]).len(),
+            1,
+            "only the loaded excerpt renders"
+        );
+        assert_eq!(all(&body, &["flow-col-loc"]).len(), 2);
+        assert_eq!(all(&body, &["flow-kind"]).len(), 2);
     }
 }

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::ingest::{ingest_file, IngestError};
-use super::model::{resolve_repo_root, Flow, NodeKind};
+use super::model::{resolve_repo_root, EdgeKind, Flow, Node, NodeKind};
 use super::snippet::{load_snippet, Snippet, SnippetError, CONTEXT_LINES};
 use super::tree::{collapsible_rows, derive_tree, visible_rows, TreeRow};
 
@@ -94,6 +94,8 @@ pub struct FlowPane {
     /// Miller-column focus chain: column `c + 1` lists the children of
     /// `path[c]`.
     pub path: Vec<String>,
+    /// Keyboard cursor inside the last column (index into its items).
+    pub column_cursor: Option<usize>,
     /// Loaded source excerpts (and failures) keyed by node id, filled on
     /// the dispatch path so render never touches the disk.
     pub snippets: HashMap<String, Result<Snippet, SnippetError>>,
@@ -123,6 +125,7 @@ impl FlowPane {
             src_open: HashSet::new(),
             selected_row: None,
             path: Vec::new(),
+            column_cursor: None,
             snippets: HashMap::new(),
             opened_unix_ms: crate::telemetry_sink::now_unix_ms(),
         }
@@ -737,5 +740,332 @@ mod selection_tests {
             "submit is hidden; handleKeyDown is its visible parent"
         );
         assert_eq!(p.selected_node_id(), Some("Editor.tsx::handleKeyDown"));
+    }
+}
+
+/// Where an item in a Miller column comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnSection {
+    /// Column 0: the flow's entry events.
+    Entries,
+    /// Outgoing `calls` edges.
+    Calls,
+    /// Outgoing `resolves` edges.
+    Resolves,
+    /// Outgoing `handled_by` edges (an event's handlers).
+    HandledBy,
+    /// Incoming `handled_by` edges (the events a function handles).
+    Handles,
+}
+
+impl ColumnSection {
+    pub fn label(self) -> &'static str {
+        match self {
+            ColumnSection::Entries => "entries",
+            ColumnSection::Calls => "calls",
+            ColumnSection::Resolves => "resolves",
+            ColumnSection::HandledBy => "handled by",
+            ColumnSection::Handles => "handles",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnItem {
+    pub section: ColumnSection,
+    pub node_id: String,
+}
+
+impl FlowPane {
+    /// Columns on screen: the overview plus one per focused node.
+    pub fn column_count(&self) -> usize {
+        self.path.len() + 1
+    }
+
+    /// The node column `col` describes (`None` for the overview column).
+    pub fn column_node(&self, col: usize) -> Option<&Node> {
+        let id = self.path.get(col.checked_sub(1)?)?;
+        self.flow.node(id)
+    }
+
+    /// Clickable items of column `col`, in section order: outgoing edges in
+    /// array order, then the events this node handles.
+    pub fn column_items(&self, col: usize) -> Vec<ColumnItem> {
+        if col == 0 {
+            return self
+                .flow
+                .entries
+                .iter()
+                .filter(|id| self.flow.node(id).is_some())
+                .map(|id| ColumnItem {
+                    section: ColumnSection::Entries,
+                    node_id: id.clone(),
+                })
+                .collect();
+        }
+        let Some(node) = self.column_node(col) else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        for (_, edge) in self.flow.outgoing(&node.id) {
+            if self.flow.node(&edge.to).is_none() {
+                continue;
+            }
+            let section = match edge.kind {
+                EdgeKind::Calls => ColumnSection::Calls,
+                EdgeKind::Resolves => ColumnSection::Resolves,
+                EdgeKind::HandledBy => ColumnSection::HandledBy,
+            };
+            items.push(ColumnItem {
+                section,
+                node_id: edge.to.clone(),
+            });
+        }
+        for (_, edge) in self.flow.incoming(&node.id) {
+            if edge.kind == EdgeKind::HandledBy && self.flow.node(&edge.from).is_some() {
+                items.push(ColumnItem {
+                    section: ColumnSection::Handles,
+                    node_id: edge.from.clone(),
+                });
+            }
+        }
+        items
+    }
+
+    /// `flow.select:<col>:<id>`: focus `id`, which must be an item of column
+    /// `col`; deeper columns are dropped.
+    pub fn select_column(&mut self, col: usize, node_id: &str) -> bool {
+        if col > self.path.len() {
+            return false;
+        }
+        if !self.column_items(col).iter().any(|i| i.node_id == node_id) {
+            return false;
+        }
+        self.path.truncate(col);
+        self.path.push(node_id.to_string());
+        self.column_cursor = None;
+        true
+    }
+
+    /// `flow.focus:<col>`: make column `col` the last one (a click on a
+    /// collapsed strip).
+    pub fn focus_column(&mut self, col: usize) -> bool {
+        if col >= self.column_count() || col == self.path.len() {
+            return false;
+        }
+        self.path.truncate(col);
+        self.column_cursor = None;
+        true
+    }
+
+    /// Items of the last (focused) column.
+    pub fn focused_items(&self) -> Vec<ColumnItem> {
+        self.column_items(self.path.len())
+    }
+
+    /// Up/Down inside the focused column.
+    pub fn column_move(&mut self, delta: i64) -> bool {
+        let items = self.focused_items();
+        if items.is_empty() {
+            return false;
+        }
+        let last = items.len() as i64 - 1;
+        let next = match self.column_cursor {
+            None if delta >= 0 => 0,
+            None => last as usize,
+            Some(i) => (i as i64 + delta).clamp(0, last) as usize,
+        };
+        if self.column_cursor == Some(next) {
+            return false;
+        }
+        self.column_cursor = Some(next);
+        true
+    }
+
+    /// Enter/Right: open the item under the cursor (or the first item).
+    pub fn column_enter(&mut self) -> bool {
+        let items = self.focused_items();
+        let index = self.column_cursor.unwrap_or(0);
+        let Some(item) = items.get(index) else {
+            return false;
+        };
+        let col = self.path.len();
+        let id = item.node_id.clone();
+        self.select_column(col, &id)
+    }
+
+    /// Left: drop the focused column; the cursor lands on the node that
+    /// column described so Right reopens it.
+    pub fn column_back(&mut self) -> bool {
+        let Some(last) = self.path.pop() else {
+            return false;
+        };
+        let items = self.focused_items();
+        self.column_cursor = items.iter().position(|i| i.node_id == last);
+        true
+    }
+
+    /// The node the panes view is "on": the cursor item if any, else the
+    /// last focused column's node.
+    pub fn panes_focus_node_id(&self) -> Option<String> {
+        if let Some(index) = self.column_cursor {
+            if let Some(item) = self.focused_items().get(index) {
+                return Some(item.node_id.clone());
+            }
+        }
+        self.path.last().cloned()
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    use crate::flow_explorer::test_support::fixture_path;
+
+    fn pane() -> FlowPane {
+        FlowPane::open(&fixture_path()).unwrap()
+    }
+
+    fn ids(items: &[ColumnItem]) -> Vec<&str> {
+        items.iter().map(|i| i.node_id.as_str()).collect()
+    }
+
+    #[test]
+    fn overview_column_lists_entries() {
+        let p = pane();
+        assert_eq!(p.column_count(), 1);
+        assert!(p.column_node(0).is_none());
+        let items = p.column_items(0);
+        assert_eq!(ids(&items), vec!["ui.cmd-enter"]);
+        assert_eq!(items[0].section, ColumnSection::Entries);
+        assert!(p.column_items(1).is_empty());
+    }
+
+    #[test]
+    fn select_column_builds_the_path_and_lists_edges_by_section() {
+        let mut p = pane();
+        assert!(
+            !p.select_column(0, "Editor.tsx::handleKeyDown"),
+            "not an entry"
+        );
+        assert!(
+            !p.select_column(1, "ui.cmd-enter"),
+            "column 1 does not exist yet"
+        );
+        assert!(p.select_column(0, "ui.cmd-enter"));
+        assert_eq!(p.path, vec!["ui.cmd-enter"]);
+        let items = p.column_items(1);
+        assert_eq!(ids(&items), vec!["Editor.tsx::handleKeyDown"]);
+        assert_eq!(items[0].section, ColumnSection::HandledBy);
+
+        assert!(p.select_column(1, "Editor.tsx::handleKeyDown"));
+        let items = p.column_items(2);
+        assert_eq!(
+            ids(&items),
+            vec!["AgentPane.tsx::submit", "ui.cmd-enter"],
+            "calls first, then the event it handles"
+        );
+        assert_eq!(items[0].section, ColumnSection::Calls);
+        assert_eq!(items[1].section, ColumnSection::Handles);
+
+        // Re-selecting from an earlier column drops the deeper ones.
+        assert!(p.select_column(0, "ui.cmd-enter"));
+        assert_eq!(p.path, vec!["ui.cmd-enter"]);
+        assert_eq!(p.column_count(), 2);
+    }
+
+    #[test]
+    fn resolves_edges_get_their_own_section() {
+        let mut p = pane();
+        p.path = vec!["HaloAgentSession.ts::prompt".into()];
+        let items = p.column_items(1);
+        assert_eq!(ids(&items), vec!["rpc.sessions.prompt.resolves"]);
+        assert_eq!(items[0].section, ColumnSection::Resolves);
+    }
+
+    #[test]
+    fn focus_column_truncates() {
+        let mut p = pane();
+        p.path = vec![
+            "ui.cmd-enter".into(),
+            "Editor.tsx::handleKeyDown".into(),
+            "AgentPane.tsx::submit".into(),
+        ];
+        assert!(!p.focus_column(3), "already the last column");
+        assert!(!p.focus_column(9));
+        assert!(p.focus_column(1));
+        assert_eq!(p.path, vec!["ui.cmd-enter"]);
+        assert!(p.focus_column(0));
+        assert!(p.path.is_empty());
+    }
+
+    #[test]
+    fn column_cursor_moves_enters_and_backs_out() {
+        let mut p = pane();
+        assert!(p.column_move(1));
+        assert_eq!(p.column_cursor, Some(0));
+        assert!(!p.column_move(1), "one entry: clamped");
+        assert!(p.column_enter());
+        assert_eq!(p.path, vec!["ui.cmd-enter"]);
+        assert_eq!(p.column_cursor, None);
+        assert!(p.column_enter(), "no cursor: opens the first item");
+        assert_eq!(p.path, vec!["ui.cmd-enter", "Editor.tsx::handleKeyDown"]);
+        assert!(p.column_move(1));
+        assert!(p.column_move(1));
+        assert_eq!(p.column_cursor, Some(1), "handles section item");
+        assert_eq!(p.panes_focus_node_id().as_deref(), Some("ui.cmd-enter"));
+        assert!(p.column_back());
+        assert_eq!(p.path, vec!["ui.cmd-enter"]);
+        assert_eq!(p.column_cursor, Some(0), "cursor on the column just closed");
+        assert!(p.column_back());
+        assert!(p.path.is_empty());
+        assert!(!p.column_back());
+        assert_eq!(p.panes_focus_node_id().as_deref(), Some("ui.cmd-enter"));
+    }
+}
+
+impl FlowPane {
+    /// Home / End inside the focused column.
+    pub fn column_edge(&mut self, end: bool) -> bool {
+        let items = self.focused_items();
+        if items.is_empty() {
+            return false;
+        }
+        let target = if end { items.len() - 1 } else { 0 };
+        if self.column_cursor == Some(target) {
+            return false;
+        }
+        self.column_cursor = Some(target);
+        true
+    }
+
+    /// Escape: drop the column cursor.
+    pub fn column_clear(&mut self) -> bool {
+        self.column_cursor.take().is_some()
+    }
+}
+
+#[cfg(test)]
+mod column_edge_tests {
+    use super::*;
+    use crate::flow_explorer::test_support::fixture_path;
+
+    #[test]
+    fn column_edge_and_clear() {
+        let mut p = FlowPane::open(&fixture_path()).unwrap();
+        p.path = vec!["ui.cmd-enter".into(), "Editor.tsx::handleKeyDown".into()];
+        assert!(p.column_edge(true));
+        assert_eq!(p.column_cursor, Some(1));
+        assert!(!p.column_edge(true));
+        assert!(p.column_edge(false));
+        assert_eq!(p.column_cursor, Some(0));
+        assert!(p.column_clear());
+        assert!(!p.column_clear());
+        p.path = vec!["SessionRegistry.ts::open".into()];
+        assert!(
+            p.column_items(1).is_empty(),
+            "a leaf called by a function lists nothing"
+        );
+        assert!(!p.column_edge(false));
     }
 }
