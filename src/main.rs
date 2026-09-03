@@ -14,6 +14,7 @@ pub mod daemon;
 pub mod diagnostics;
 pub mod drag;
 pub mod editor;
+pub mod flow_explorer;
 pub mod git;
 pub mod git_watch;
 pub mod keybinds;
