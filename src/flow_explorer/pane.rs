@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::graph::{layout, DepthFilter, GraphLayout};
 use super::ingest::{ingest_file, IngestError};
 use super::model::{resolve_repo_root, EdgeKind, Flow, Node, NodeKind};
 use super::snippet::{load_snippet, Snippet, SnippetError, CONTEXT_LINES};
@@ -96,6 +97,9 @@ pub struct FlowPane {
     pub path: Vec<String>,
     /// Keyboard cursor inside the last column (index into its items).
     pub column_cursor: Option<usize>,
+    /// Graph view: zoomed receivers (the breadcrumb) and the depth filter.
+    pub graph_crumbs: Vec<String>,
+    pub graph_depth: DepthFilter,
     /// Loaded source excerpts (and failures) keyed by node id, filled on
     /// the dispatch path so render never touches the disk.
     pub snippets: HashMap<String, Result<Snippet, SnippetError>>,
@@ -126,6 +130,8 @@ impl FlowPane {
             selected_row: None,
             path: Vec::new(),
             column_cursor: None,
+            graph_crumbs: Vec::new(),
+            graph_depth: DepthFilter::default(),
             snippets: HashMap::new(),
             opened_unix_ms: crate::telemetry_sink::now_unix_ms(),
         }
@@ -1108,5 +1114,130 @@ mod review_fixture_tests {
             .location
             .is_none());
         assert_eq!(p.flow_id, "send-a-prompt.review");
+    }
+}
+
+impl FlowPane {
+    /// Roots of the graph: the zoomed receiver, else the flow's entries.
+    pub fn graph_roots(&self) -> Vec<String> {
+        match self.graph_crumbs.last() {
+            Some(id) => vec![id.clone()],
+            None => self.flow.entries.clone(),
+        }
+    }
+
+    /// The swim-lane layout for the current zoom and depth. Small flows
+    /// lay out in microseconds, so this runs on each UI rebuild rather
+    /// than being cached.
+    pub fn graph_layout(&self) -> GraphLayout {
+        layout(&self.flow, &self.graph_roots(), self.graph_depth)
+    }
+
+    /// `flow.graph.zoom:<id>`: show what `id` does (a badge's receiver).
+    pub fn graph_zoom(&mut self, id: &str) -> bool {
+        if self.flow.node(id).is_none() || self.graph_crumbs.last().is_some_and(|last| last == id) {
+            return false;
+        }
+        self.graph_crumbs.push(id.to_string());
+        true
+    }
+
+    /// `flow.graph.crumb:<index>`: 0 is the flow itself, `n` the n-th zoom.
+    pub fn graph_crumb(&mut self, index: usize) -> bool {
+        if index >= self.graph_crumbs.len() {
+            return false;
+        }
+        self.graph_crumbs.truncate(index);
+        true
+    }
+
+    /// `flow.graph.depth:<1|2|3|all>`.
+    pub fn graph_set_depth(&mut self, depth: DepthFilter) -> bool {
+        if self.graph_depth == depth {
+            return false;
+        }
+        self.graph_depth = depth;
+        true
+    }
+
+    /// `flow.graph.details:<id>` (a click on a box): open the panes view
+    /// on `id` with its call chain from the entry as the focus path.
+    pub fn focus_node(&mut self, id: &str) -> bool {
+        let Some(row) = self.rows.iter().position(|r| r.node_id == id) else {
+            return false;
+        };
+        let mut chain = Vec::new();
+        let mut cursor = Some(row);
+        while let Some(index) = cursor {
+            chain.push(self.rows[index].node_id.clone());
+            cursor = self.rows[index].parent;
+        }
+        chain.reverse();
+        self.path = chain;
+        self.column_cursor = None;
+        self.set_view(FlowView::Panes);
+        true
+    }
+}
+
+#[cfg(test)]
+mod graph_state_tests {
+    use super::*;
+    use crate::flow_explorer::test_support::fixture_path;
+
+    fn pane() -> FlowPane {
+        FlowPane::open(&fixture_path()).unwrap()
+    }
+
+    #[test]
+    fn zoom_crumbs_and_depth_drive_the_roots() {
+        let mut p = pane();
+        assert_eq!(p.graph_roots(), vec!["ui.cmd-enter"]);
+        assert_eq!(p.graph_layout().nodes.len(), 9);
+        assert!(!p.graph_zoom("nope"));
+        assert!(p.graph_zoom("main.ts::RPCHandler.upgrade"));
+        assert!(
+            !p.graph_zoom("main.ts::RPCHandler.upgrade"),
+            "already there"
+        );
+        assert_eq!(p.graph_roots(), vec!["main.ts::RPCHandler.upgrade"]);
+        assert_eq!(p.graph_layout().nodes.len(), 5);
+        assert!(p.graph_zoom("sessionsRouter.ts::prompt"));
+        assert_eq!(p.graph_crumbs.len(), 2);
+        assert!(!p.graph_crumb(2), "the current crumb is a no-op");
+        assert!(!p.graph_crumb(5));
+        assert!(p.graph_crumb(1));
+        assert_eq!(p.graph_roots(), vec!["main.ts::RPCHandler.upgrade"]);
+        assert!(p.graph_crumb(0));
+        assert!(p.graph_crumbs.is_empty());
+        assert_eq!(p.graph_roots(), vec!["ui.cmd-enter"]);
+        assert!(!p.graph_set_depth(DepthFilter::All));
+        assert!(p.graph_set_depth(DepthFilter::One));
+        assert_eq!(p.graph_layout().nodes.len(), 2);
+    }
+
+    #[test]
+    fn focus_node_opens_the_panes_view_on_the_call_chain() {
+        let mut p = pane();
+        assert!(!p.focus_node("nope"));
+        assert_eq!(p.view, FlowView::CallStack);
+        assert!(p.focus_node("SessionRegistry.ts::open"));
+        assert_eq!(p.view, FlowView::Panes);
+        assert_eq!(
+            p.path,
+            vec![
+                "ui.cmd-enter",
+                "Editor.tsx::handleKeyDown",
+                "AgentPane.tsx::submit",
+                "useAgentSession.ts::prompt",
+                "rpc.sessions.prompt",
+                "main.ts::RPCHandler.upgrade",
+                "sessionsRouter.ts::prompt",
+                "SessionRegistry.ts::open",
+            ]
+        );
+        assert_eq!(p.column_count(), 9);
+        assert!(p.focus_node("ui.cmd-enter"));
+        assert_eq!(p.path, vec!["ui.cmd-enter"]);
     }
 }

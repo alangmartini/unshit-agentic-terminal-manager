@@ -7,6 +7,7 @@
 //! render path or spawns processes; producers and ingestion are layered on
 //! top by the app state.
 
+pub mod graph;
 pub mod highlight;
 pub mod ingest;
 pub mod model;
@@ -15,6 +16,7 @@ pub mod snippet;
 pub mod telemetry;
 pub mod tree;
 
+pub use graph::{DepthFilter, EdgeGeom, GraphLayout, LaneGeom, NodeGeom, Rect};
 pub use highlight::{tokenize, Language, Token, TokenKind};
 pub use ingest::{ingest_file, IngestError, MAX_FLOW_JSON_BYTES};
 pub use model::{

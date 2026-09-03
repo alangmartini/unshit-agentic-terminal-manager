@@ -5236,7 +5236,7 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
 /// the active pane is not a flow, `Some(true)` once the pane handled it.
 fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
     use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
-    use crate::flow_explorer::{FlowLevel, FlowView};
+    use crate::flow_explorer::{DepthFilter, FlowLevel, FlowView};
 
     enum FlowCommand<'a> {
         View(FlowView),
@@ -5255,6 +5255,10 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
         SrcSelected,
         Select(usize, &'a str),
         Focus(usize),
+        GraphZoom(&'a str),
+        GraphCrumb(usize),
+        GraphDepth(DepthFilter),
+        GraphDetails(&'a str),
     }
 
     let parsed = if let Some(name) = command.strip_prefix("flow.view:") {
@@ -5290,6 +5294,14 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
         FlowCommand::Select(col.parse().ok()?, id)
     } else if let Some(col) = command.strip_prefix("flow.focus:") {
         FlowCommand::Focus(col.parse().ok()?)
+    } else if let Some(id) = command.strip_prefix("flow.graph.zoom:") {
+        FlowCommand::GraphZoom(id)
+    } else if let Some(index) = command.strip_prefix("flow.graph.crumb:") {
+        FlowCommand::GraphCrumb(index.parse().ok()?)
+    } else if let Some(name) = command.strip_prefix("flow.graph.depth:") {
+        FlowCommand::GraphDepth(DepthFilter::parse(name)?)
+    } else if let Some(id) = command.strip_prefix("flow.graph.details:") {
+        FlowCommand::GraphDetails(id)
     } else {
         FlowCommand::Src(command.strip_prefix("flow.src:")?)
     };
@@ -5380,6 +5392,27 @@ fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
         }
         FlowCommand::Focus(col) => {
             pane.focus_column(col);
+        }
+        FlowCommand::GraphZoom(id) => {
+            pane.graph_zoom(id);
+        }
+        FlowCommand::GraphCrumb(index) => {
+            pane.graph_crumb(index);
+        }
+        FlowCommand::GraphDepth(depth) => {
+            pane.graph_set_depth(depth);
+        }
+        FlowCommand::GraphDetails(id) => {
+            let before = pane.view;
+            if pane.focus_node(id) {
+                load_focused_flow_snippet(pane);
+                if pane.view != before {
+                    let mut record =
+                        FlowEventRecord::new("flow.view_changed", "info", &pane.flow_id);
+                    record.view = Some(pane.view.as_str());
+                    record_flow_event(&record);
+                }
+            }
         }
         FlowCommand::SrcSelected => {
             if let Some(id) = pane.selected_node_id().map(str::to_owned) {
@@ -17011,5 +17044,43 @@ mod flow_pane_tests {
         );
         assert!(!dispatch(&mut state, "flow.select:x:y"));
         assert!(!dispatch(&mut state, "flow.focus:x"));
+    }
+
+    #[test]
+    fn flow_graph_commands_zoom_crumb_depth_and_details() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.view:graph"));
+        assert_eq!(active_flow(&state).graph_layout().nodes.len(), 9);
+        assert!(dispatch(
+            &mut state,
+            "flow.graph.zoom:main.ts::RPCHandler.upgrade"
+        ));
+        assert_eq!(
+            active_flow(&state).graph_crumbs,
+            vec!["main.ts::RPCHandler.upgrade"]
+        );
+        assert_eq!(active_flow(&state).graph_layout().nodes.len(), 5);
+        assert!(dispatch(&mut state, "flow.graph.depth:1"));
+        assert_eq!(active_flow(&state).graph_layout().nodes.len(), 2);
+        assert!(!dispatch(&mut state, "flow.graph.depth:9"));
+        assert!(dispatch(&mut state, "flow.graph.crumb:0"));
+        assert!(active_flow(&state).graph_crumbs.is_empty());
+        assert!(dispatch(
+            &mut state,
+            "flow.graph.details:SessionRegistry.ts::open"
+        ));
+        assert_eq!(
+            active_flow(&state).view,
+            crate::flow_explorer::FlowView::Panes
+        );
+        assert_eq!(
+            active_flow(&state).path.last().map(String::as_str),
+            Some("SessionRegistry.ts::open")
+        );
+        assert!(active_flow(&state)
+            .snippet("SessionRegistry.ts::open")
+            .is_some());
+        assert!(!dispatch(&mut state, "flow.graph.crumb:x"));
     }
 }

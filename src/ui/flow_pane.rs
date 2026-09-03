@@ -4,10 +4,17 @@
 
 use unshit::core::element::*;
 use unshit::core::event::{Event, EventType, Key, KeyEventKind, KeyboardEvent, Modifiers};
+use unshit::core::style::parse::StyleDeclaration;
+use unshit::core::style::types::Dimension;
+use unshit::core::svg::{
+    parse_svg_path, StrokeLineCap, StrokeLineJoin, SvgAttrs, SvgNode, SvgPaint, SvgPrimitive,
+    ViewBox,
+};
 
 use crate::flow_explorer::{
-    tokenize, Carrier, ColumnItem, ColumnSection, DiffStatus, DisplayRow, FlowLevel, FlowMode,
-    FlowPane, FlowView, Node, RowMarker, Snippet, SnippetError,
+    tokenize, Carrier, ColumnItem, ColumnSection, DepthFilter, DiffStatus, DisplayRow, FlowLevel,
+    FlowMode, FlowPane, FlowView, GraphLayout, Node, NodeKind, Rect, RowMarker, Snippet,
+    SnippetError,
 };
 use crate::state::{mutate_with, PaneId, SharedState};
 use crate::ui::icons::{icon_carrier, svg_icon};
@@ -68,7 +75,7 @@ pub fn build_flow_pane_body(
     let body = match pane.view {
         FlowView::CallStack => body.with_child(build_call_stack(pane, shared)),
         FlowView::Panes => body.with_child(build_panes(pane, shared)),
-        FlowView::Graph => body.with_child(build_placeholder(pane.view)),
+        FlowView::Graph => body.with_child(build_graph(pane, shared)),
     };
     body.with_child(build_legend(pane))
 }
@@ -234,14 +241,220 @@ fn dispatch_on_click(el: ElementDef, shared: &SharedState, command: String) -> E
     })
 }
 
-fn build_placeholder(view: FlowView) -> ElementDef {
-    ElementDef::new(Tag::Div)
-        .with_class("flow-tree")
+/// Swim-lane graph: breadcrumb and depth filter on top, then a scrolling
+/// canvas of absolutely positioned lanes, boxes, badges and one SVG layer
+/// for the edges. Geometry comes from [`FlowPane::graph_layout`].
+fn build_graph(pane: &FlowPane, shared: &SharedState) -> ElementDef {
+    let graph = pane.graph_layout();
+    let root = ElementDef::new(Tag::Div)
+        .with_class("flow-graph")
+        .with_child(build_graph_bar(pane, shared));
+    if graph.nodes.is_empty() {
+        return root.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("flow-tree")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("flow-placeholder")
+                        .with_text("nothing reachable from this root"),
+                ),
+        );
+    }
+    let mut canvas = ElementDef::new(Tag::Div)
+        .with_class("flow-graph-canvas")
+        .with_style(StyleDeclaration::Width(Dimension::Px(graph.width)))
+        .with_style(StyleDeclaration::Height(Dimension::Px(graph.height)));
+    for lane in &graph.lanes {
+        canvas = canvas.with_child(
+            place(ElementDef::new(Tag::Div), &lane.rect)
+                .with_class("flow-lane")
+                .with_class(process_class(lane.palette))
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("flow-lane-pill")
+                        .with_text(lane.label.clone()),
+                ),
+        );
+    }
+    canvas = canvas.with_child(build_graph_edges(&graph));
+    let review = pane.flow.mode == FlowMode::Review;
+    for node_geom in &graph.nodes {
+        let Some(node) = pane.flow.node(&node_geom.node_id) else {
+            continue;
+        };
+        let mut el =
+            place(ElementDef::new(Tag::Div), &node_geom.rect).with_class("flow-graph-node");
+        if let Some(class) = node_process_class(pane, node) {
+            el = el.with_class(class);
+        }
+        if node.kind == NodeKind::Event {
+            el = el.with_class("event");
+        }
+        if review && node.status != DiffStatus::Same {
+            el = el.with_class(format!("diff-{}", node.status.slug()));
+        }
+        el = el.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("flow-graph-node-name")
+                .with_text(node.name.clone()),
+        );
+        if !node.description.trim().is_empty() {
+            el = el.with_child(
+                ElementDef::new(Tag::Span)
+                    .with_class("flow-graph-node-desc")
+                    .with_text(node.description.clone()),
+            );
+        }
+        let command = format!("flow.graph.details:{}", node.id);
+        canvas = canvas.with_child(dispatch_on_click(el, shared, command));
+    }
+    for edge in &graph.edges {
+        let (Some(number), Some(label)) = (edge.number, edge.label.as_deref()) else {
+            continue;
+        };
+        let (bx, by) = edge.badge;
+        let badge = Rect {
+            x: bx - GRAPH_BADGE / 2.0,
+            y: by - GRAPH_BADGE / 2.0,
+            w: GRAPH_BADGE,
+            h: GRAPH_BADGE,
+        };
+        let badge_el = place(ElementDef::new(Tag::Button), &badge)
+            .with_class("flow-graph-badge")
+            .with_text(number.to_string());
+        let command = format!("flow.graph.zoom:{}", edge.to);
+        canvas = canvas.with_child(dispatch_on_click(badge_el, shared, command));
+        let label_rect = Rect {
+            x: bx + GRAPH_BADGE / 2.0 + 6.0,
+            y: by - 8.0,
+            w: GRAPH_LABEL_WIDTH,
+            h: 16.0,
+        };
+        canvas = canvas.with_child(
+            place(ElementDef::new(Tag::Span), &label_rect)
+                .with_class("flow-graph-edge-label")
+                .with_text(label.to_string()),
+        );
+    }
+    root.with_child(
+        ElementDef::new(Tag::Div)
+            .with_class("flow-graph-scroll")
+            .with_child(canvas),
+    )
+}
+
+/// Badge diameter in px.
+const GRAPH_BADGE: f32 = 18.0;
+/// Width reserved for an edge label next to its badge.
+const GRAPH_LABEL_WIDTH: f32 = 200.0;
+
+fn place(el: ElementDef, rect: &Rect) -> ElementDef {
+    el.with_style(StyleDeclaration::Left(Dimension::Px(rect.x)))
+        .with_style(StyleDeclaration::Top(Dimension::Px(rect.y)))
+        .with_style(StyleDeclaration::Width(Dimension::Px(rect.w)))
+        .with_style(StyleDeclaration::Height(Dimension::Px(rect.h)))
+}
+
+/// Breadcrumb (flow title, then each zoomed receiver), the hint, and the
+/// depth filter.
+fn build_graph_bar(pane: &FlowPane, shared: &SharedState) -> ElementDef {
+    let mut crumbs = ElementDef::new(Tag::Div).with_class("flow-crumbs");
+    let mut names = vec![pane.flow.title.clone()];
+    for id in &pane.graph_crumbs {
+        names.push(
+            pane.flow
+                .node(id)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| id.clone()),
+        );
+    }
+    let last = names.len() - 1;
+    for (index, name) in names.into_iter().enumerate() {
+        if index > 0 {
+            crumbs = crumbs.with_child(
+                ElementDef::new(Tag::Span)
+                    .with_class("flow-crumb-sep")
+                    .with_text("\u{203A}"),
+            );
+        }
+        let mut crumb = ElementDef::new(Tag::Button)
+            .with_class("flow-crumb")
+            .with_text(name);
+        if index == last {
+            crumb = crumb.with_class("current");
+        } else {
+            crumb = dispatch_on_click(crumb, shared, format!("flow.graph.crumb:{index}"));
+        }
+        crumbs = crumbs.with_child(crumb);
+    }
+    let tools = ElementDef::new(Tag::Div)
+        .with_class("flow-graph-tools")
         .with_child(
             ElementDef::new(Tag::Span)
-                .with_class("flow-placeholder")
-                .with_text(format!("{} view is not built yet", view.as_str())),
-        )
+                .with_class("flow-graph-hint")
+                .with_text(
+                    "click a numbered event to zoom into what its receiver does. \
+                     click a box for details.",
+                ),
+        );
+    let mut depth_group = ElementDef::new(Tag::Div)
+        .with_class("flow-depth-group")
+        .with_child(toolbar_label("depth:"));
+    for depth in DepthFilter::ALL {
+        depth_group = depth_group.with_child(
+            tab_button(
+                depth.as_str(),
+                pane.graph_depth == depth,
+                shared,
+                format!("flow.graph.depth:{}", depth.as_str()),
+            )
+            .with_class("flow-depth"),
+        );
+    }
+    let tools = tools.with_child(depth_group);
+    ElementDef::new(Tag::Div)
+        .with_class("flow-graph-bar")
+        .with_child(crumbs)
+        .with_child(tools)
+}
+
+/// One SVG layer with every edge path; the viewBox matches the canvas so
+/// path coordinates are canvas pixels.
+fn build_graph_edges(graph: &GraphLayout) -> ElementDef {
+    let paths = graph
+        .edges
+        .iter()
+        .map(|edge| SvgNode {
+            primitive: SvgPrimitive::Path {
+                d: edge.path.clone(),
+                commands: parse_svg_path(&edge.path).expect("layout emits valid path data"),
+            },
+            attrs: SvgAttrs::default(),
+            children: Vec::new(),
+        })
+        .collect();
+    let group = SvgNode {
+        primitive: SvgPrimitive::Group,
+        attrs: SvgAttrs {
+            view_box: Some(ViewBox::new(0.0, 0.0, graph.width, graph.height)),
+            fill: Some(SvgPaint::None),
+            stroke: Some(SvgPaint::Current),
+            stroke_width: Some(1.5),
+            stroke_linecap: Some(StrokeLineCap::Round),
+            stroke_linejoin: Some(StrokeLineJoin::Round),
+            ..Default::default()
+        },
+        children: paths,
+    };
+    let full = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: graph.width,
+        h: graph.height,
+    };
+    place(ElementDef::new(Tag::Div), &full)
+        .with_class("flow-graph-edges")
+        .with_svg(group)
 }
 
 fn build_call_stack(pane: &FlowPane, shared: &SharedState) -> ElementDef {
@@ -910,18 +1123,6 @@ mod tests {
     }
 
     #[test]
-    fn other_views_render_a_placeholder_instead_of_rows() {
-        let mut p = pane();
-        p.set_view(FlowView::Graph);
-        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
-        assert!(all(&body, &["flow-row"]).is_empty());
-        assert_eq!(
-            text_of(first(&body, &["flow-placeholder"]).unwrap()),
-            "graph view is not built yet"
-        );
-    }
-
-    #[test]
     fn open_snippet_renders_gutter_tokens_and_highlight() {
         let mut p = pane();
         assert_eq!(p.toggle_src("SessionRegistry.ts::open"), Some(true));
@@ -1209,5 +1410,67 @@ mod tests {
             1,
             "clearDraft in the calls list"
         );
+    }
+
+    #[test]
+    fn graph_view_renders_lanes_boxes_edges_and_badges() {
+        let mut p = pane();
+        p.set_view(FlowView::Graph);
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        assert!(all(&body, &["flow-row"]).is_empty());
+        assert_eq!(all(&body, &["flow-lane"]).len(), 3);
+        assert_eq!(all(&body, &["flow-graph-node"]).len(), 9);
+        assert_eq!(all(&body, &["flow-graph-node", "event"]).len(), 1);
+        let badges: Vec<String> = all(&body, &["flow-graph-badge"])
+            .iter()
+            .map(|e| text_of(e))
+            .collect();
+        assert_eq!(badges, vec!["1", "2", "3"]);
+        let labels = all(&body, &["flow-graph-edge-label"]);
+        assert_eq!(labels.len(), 3);
+        assert_eq!(
+            text_of(labels[0]),
+            "UI \u{00B7} Cmd/Ctrl+Enter in the composer"
+        );
+        let edges = first(&body, &["flow-graph-edges"]).unwrap();
+        assert!(matches!(edges.content, ElementContent::Svg(_)));
+        let crumbs = all(&body, &["flow-crumb"]);
+        assert_eq!(crumbs.len(), 1);
+        assert!(has_classes(crumbs[0], &["current"]));
+        let depth_tabs = all(&body, &["flow-depth"]);
+        assert_eq!(depth_tabs.len(), 4);
+        assert!(has_classes(depth_tabs[3], &["active"]));
+        let lanes: Vec<String> = all(&body, &["flow-lane-pill"])
+            .iter()
+            .map(|e| text_of(e))
+            .collect();
+        assert_eq!(lanes, vec!["Human", "Renderer", "Main process"]);
+    }
+
+    #[test]
+    fn graph_zoom_adds_crumbs_and_shrinks_the_canvas() {
+        let mut p = pane();
+        p.set_view(FlowView::Graph);
+        assert!(p.graph_zoom("main.ts::RPCHandler.upgrade"));
+        assert!(p.graph_set_depth(DepthFilter::One));
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        let crumbs: Vec<String> = all(&body, &["flow-crumb"])
+            .iter()
+            .map(|e| text_of(e))
+            .collect();
+        assert_eq!(crumbs, vec!["Send a prompt", "RPCHandler.upgrade(port1)"]);
+        assert_eq!(all(&body, &["flow-graph-node"]).len(), 2);
+        assert!(
+            all(&body, &["flow-graph-badge"]).is_empty(),
+            "no event within one hop"
+        );
+        assert_eq!(all(&body, &["flow-lane"]).len(), 1);
+        p.graph_crumbs = vec!["useAgentSession.ts::invalidateQueries".into()];
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        assert_eq!(all(&body, &["flow-graph-node"]).len(), 1);
+        assert!(first(&body, &["flow-placeholder"]).is_none());
+        p.graph_crumbs = vec!["nope".into()];
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        assert!(first(&body, &["flow-placeholder"]).is_some());
     }
 }
