@@ -126,6 +126,15 @@ try {
         $errText = Get-Content $errLog -Raw
         if ($errText -and $errText.Trim()) { Write-Host "--- stderr ---`n$errText" }
     }
+    # The isolated config dir is deleted on exit; surface the flow telemetry
+    # first so a capture doubles as the "did the event land" check.
+    $events = Join-Path $isolation.ConfigDir 'flow-events.jsonl'
+    if (Test-Path $events) {
+        Write-Host '--- flow-events.jsonl (tail) ---'
+        Get-Content $events -Tail 8
+    } else {
+        Write-Warning "No flow-events.jsonl under $($isolation.ConfigDir)"
+    }
 } finally {
     $ErrorActionPreference = 'SilentlyContinue'
     if ($launched -and -not $launched.HasExited) {

@@ -10,8 +10,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::ingest::{ingest_file, IngestError};
-use super::model::{resolve_repo_root, Flow};
-use super::tree::{derive_tree, TreeRow};
+use super::model::{resolve_repo_root, Flow, NodeKind};
+use super::tree::{collapsible_rows, derive_tree, visible_rows, TreeRow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FlowView {
@@ -128,6 +128,134 @@ impl FlowPane {
     }
 }
 
+/// One call-stack row as rendered: the tree row index plus the depth the
+/// current level shows it at (the Events level hides function rows, so
+/// display depth can be shallower than the tree depth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayRow {
+    pub row: usize,
+    pub depth: usize,
+}
+
+impl FlowPane {
+    /// Returns `true` when the view actually changed.
+    pub fn set_view(&mut self, view: FlowView) -> bool {
+        if self.view == view {
+            return false;
+        }
+        self.view = view;
+        true
+    }
+
+    /// `Source` opens every snippet; the other levels close them so the
+    /// level acts as a three-way switch rather than accumulating state.
+    pub fn set_level(&mut self, level: FlowLevel) {
+        self.level = level;
+        self.src_open.clear();
+        if level == FlowLevel::Source {
+            self.src_open.extend(
+                self.flow
+                    .nodes
+                    .iter()
+                    .filter(|n| n.location.is_some())
+                    .map(|n| n.id.clone()),
+            );
+        }
+    }
+
+    /// Collapse or expand a row's children. Leaves are ignored; returns
+    /// whether anything changed.
+    pub fn toggle_collapsed(&mut self, row: usize) -> bool {
+        match self.rows.get(row) {
+            Some(r) if r.child_count > 0 => {
+                if !self.collapsed.remove(&row) {
+                    self.collapsed.insert(row);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn expand_all(&mut self) {
+        self.collapsed.clear();
+    }
+
+    pub fn collapse_all(&mut self) {
+        self.collapsed = collapsible_rows(&self.rows);
+    }
+
+    /// Open or close a node's inline source. Nodes without a location are
+    /// ignored; returns the new open state when something changed.
+    pub fn toggle_src(&mut self, node_id: &str) -> Option<bool> {
+        let has_location = self.flow.node(node_id)?.location.is_some();
+        if !has_location {
+            return None;
+        }
+        if self.src_open.remove(node_id) {
+            Some(false)
+        } else {
+            self.src_open.insert(node_id.to_string());
+            Some(true)
+        }
+    }
+
+    /// Rows the call stack shows right now, honouring collapse state and
+    /// the level filter. `Events` keeps event rows, the row each event
+    /// hangs off (its emitter) and each event's direct children (its
+    /// handlers), so every hop still reads as "who sent it, who got it".
+    pub fn display_rows(&self) -> Vec<DisplayRow> {
+        let visible = visible_rows(&self.rows, &self.collapsed);
+        if self.level != FlowLevel::Events {
+            return visible
+                .into_iter()
+                .map(|row| DisplayRow {
+                    row,
+                    depth: self.rows[row].depth,
+                })
+                .collect();
+        }
+
+        let is_event = |row: usize| {
+            self.flow
+                .node(&self.rows[row].node_id)
+                .is_some_and(|n| n.kind == NodeKind::Event)
+        };
+        let mut keep = vec![false; self.rows.len()];
+        for (i, row) in self.rows.iter().enumerate() {
+            if !is_event(i) {
+                continue;
+            }
+            keep[i] = true;
+            if let Some(parent) = row.parent {
+                keep[parent] = true;
+            }
+        }
+        for (i, row) in self.rows.iter().enumerate() {
+            if row.parent.is_some_and(|p| is_event(p)) {
+                keep[i] = true;
+            }
+        }
+
+        let mut out = Vec::new();
+        for row in visible {
+            if !keep[row] {
+                continue;
+            }
+            let mut depth = 0;
+            let mut cursor = self.rows[row].parent;
+            while let Some(p) = cursor {
+                if keep[p] {
+                    depth += 1;
+                }
+                cursor = self.rows[p].parent;
+            }
+            out.push(DisplayRow { row, depth });
+        }
+        out
+    }
+}
+
 /// The file stem (`<flow_id>.json` as written by the launcher, or whatever
 /// the user picked), never node content.
 pub fn flow_id_for(path: &Path) -> String {
@@ -178,5 +306,138 @@ mod tests {
     fn flow_id_is_the_file_stem() {
         assert_eq!(flow_id_for(Path::new("C:/x/abc-123.json")), "abc-123");
         assert_eq!(flow_id_for(Path::new("")), "flow");
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    use crate::flow_explorer::test_support::fixture_path;
+
+    fn pane() -> FlowPane {
+        FlowPane::open(&fixture_path()).unwrap()
+    }
+
+    #[test]
+    fn set_view_reports_change() {
+        let mut p = pane();
+        assert!(!p.set_view(FlowView::CallStack));
+        assert!(p.set_view(FlowView::Graph));
+        assert_eq!(p.view, FlowView::Graph);
+        assert!(!p.set_view(FlowView::Graph));
+    }
+
+    #[test]
+    fn source_level_opens_every_located_node_and_other_levels_close_them() {
+        let mut p = pane();
+        p.set_level(FlowLevel::Source);
+        let located = p.flow.nodes.iter().filter(|n| n.location.is_some()).count();
+        assert_eq!(p.src_open.len(), located);
+        assert!(located > 0);
+        p.set_level(FlowLevel::Code);
+        assert!(p.src_open.is_empty());
+        assert_eq!(p.level, FlowLevel::Code);
+    }
+
+    #[test]
+    fn toggle_collapsed_ignores_leaves_and_round_trips() {
+        let mut p = pane();
+        let leaf = p.rows.len() - 1;
+        assert_eq!(p.rows[leaf].child_count, 0);
+        assert!(!p.toggle_collapsed(leaf));
+        assert!(!p.toggle_collapsed(usize::MAX));
+        assert!(p.toggle_collapsed(0));
+        assert!(p.collapsed.contains(&0));
+        assert_eq!(p.display_rows().len(), 1);
+        assert!(p.toggle_collapsed(0));
+        assert_eq!(p.display_rows().len(), p.rows.len());
+    }
+
+    #[test]
+    fn collapse_all_then_expand_all() {
+        let mut p = pane();
+        p.collapse_all();
+        assert_eq!(p.collapsed.len(), 9);
+        assert_eq!(p.display_rows().len(), 1);
+        p.expand_all();
+        assert!(p.collapsed.is_empty());
+        assert_eq!(p.display_rows().len(), 11);
+    }
+
+    #[test]
+    fn toggle_src_only_for_located_nodes() {
+        let mut p = pane();
+        assert_eq!(p.toggle_src("ui.cmd-enter"), None);
+        assert_eq!(p.toggle_src("nope"), None);
+        assert_eq!(p.toggle_src("Editor.tsx::handleKeyDown"), Some(true));
+        assert!(p.src_open.contains("Editor.tsx::handleKeyDown"));
+        assert_eq!(p.toggle_src("Editor.tsx::handleKeyDown"), Some(false));
+        assert!(p.src_open.is_empty());
+    }
+
+    #[test]
+    fn code_level_shows_tree_depths_verbatim() {
+        let p = pane();
+        let rows = p.display_rows();
+        assert_eq!(rows.len(), 11);
+        for d in &rows {
+            assert_eq!(d.depth, p.rows[d.row].depth);
+        }
+    }
+
+    #[test]
+    fn events_level_keeps_events_their_emitters_and_handlers() {
+        let mut p = pane();
+        p.set_level(FlowLevel::Events);
+        let rows = p.display_rows();
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|d| p.rows[d.row].node_id.as_str())
+            .collect();
+        // Fixture chain: ui.cmd-enter (event, entry) -> handleKeyDown ->
+        // submit -> useAgentSession.prompt -> rpc.sessions.prompt (event)
+        // -> RPCHandler.upgrade -> ... -> HaloAgentSession.prompt ->
+        // rpc.sessions.prompt.resolves (event) -> invalidateQueries.
+        assert_eq!(
+            ids,
+            vec![
+                "ui.cmd-enter",
+                "Editor.tsx::handleKeyDown",
+                "useAgentSession.ts::prompt",
+                "rpc.sessions.prompt",
+                "main.ts::RPCHandler.upgrade",
+                "HaloAgentSession.ts::prompt",
+                "rpc.sessions.prompt.resolves",
+                "useAgentSession.ts::invalidateQueries",
+            ]
+        );
+        let depths: Vec<usize> = rows.iter().map(|d| d.depth).collect();
+        assert_eq!(depths, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn events_level_still_honours_collapse() {
+        let mut p = pane();
+        p.set_level(FlowLevel::Events);
+        // Collapse the useAgentSession.prompt row: everything under it goes.
+        let row = p
+            .rows
+            .iter()
+            .position(|r| r.node_id == "useAgentSession.ts::prompt")
+            .unwrap();
+        assert!(p.toggle_collapsed(row));
+        let ids: Vec<&str> = p
+            .display_rows()
+            .iter()
+            .map(|d| p.rows[d.row].node_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ui.cmd-enter",
+                "Editor.tsx::handleKeyDown",
+                "useAgentSession.ts::prompt"
+            ]
+        );
     }
 }

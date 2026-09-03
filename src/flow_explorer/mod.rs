@@ -18,7 +18,7 @@ pub use model::{
     parse_flow, resolve_repo_root, Carrier, DiffRange, DiffStatus, Edge, EdgeKind, Flow, FlowMode,
     FlowParseError, FlowValidationError, Location, Node, NodeKind, Process, FLOW_SCHEMA_VERSION,
 };
-pub use pane::{flow_id_for, FlowLevel, FlowPane, FlowView};
+pub use pane::{flow_id_for, DisplayRow, FlowLevel, FlowPane, FlowView};
 pub use tree::{
     collapsible_rows, derive_tree, visible_rows, RowMarker, TreeRow, MAX_TREE_DEPTH, MAX_TREE_ROWS,
 };

@@ -5229,6 +5229,65 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
     true
 }
 
+/// View-state commands of the active Flow Explorer pane: `flow.view:<name>`,
+/// `flow.level:<name>`, `flow.expand_all`, `flow.collapse_all`,
+/// `flow.toggle:<row>` and `flow.src:<node id>`. `None` when `command` is
+/// none of these (or names an unknown view/level/row), `Some(false)` when
+/// the active pane is not a flow, `Some(true)` once the pane handled it.
+fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+    use crate::flow_explorer::{FlowLevel, FlowView};
+
+    enum FlowCommand<'a> {
+        View(FlowView),
+        Level(FlowLevel),
+        ExpandAll,
+        CollapseAll,
+        Toggle(usize),
+        Src(&'a str),
+    }
+
+    let parsed = if let Some(name) = command.strip_prefix("flow.view:") {
+        FlowCommand::View(FlowView::parse(name)?)
+    } else if let Some(name) = command.strip_prefix("flow.level:") {
+        FlowCommand::Level(FlowLevel::parse(name)?)
+    } else if command == "flow.expand_all" {
+        FlowCommand::ExpandAll
+    } else if command == "flow.collapse_all" {
+        FlowCommand::CollapseAll
+    } else if let Some(row) = command.strip_prefix("flow.toggle:") {
+        FlowCommand::Toggle(row.parse().ok()?)
+    } else {
+        FlowCommand::Src(command.strip_prefix("flow.src:")?)
+    };
+
+    let pane_id = state.active_pane.0;
+    let Some(pane) = state.flows.get_mut(&pane_id) else {
+        return Some(false);
+    };
+    // Copies only when a frame snapshot still holds the previous version.
+    let pane = std::sync::Arc::make_mut(pane);
+    match parsed {
+        FlowCommand::View(view) => {
+            if pane.set_view(view) {
+                let mut record = FlowEventRecord::new("flow.view_changed", "info", &pane.flow_id);
+                record.view = Some(view.as_str());
+                record_flow_event(&record);
+            }
+        }
+        FlowCommand::Level(level) => pane.set_level(level),
+        FlowCommand::ExpandAll => pane.expand_all(),
+        FlowCommand::CollapseAll => pane.collapse_all(),
+        FlowCommand::Toggle(row) => {
+            pane.toggle_collapsed(row);
+        }
+        FlowCommand::Src(id) => {
+            pane.toggle_src(id);
+        }
+    }
+    Some(true)
+}
+
 /// Handle `flow.open:<path>`: open the flow document in a new Flow
 /// Explorer tab, or surface a failure toast. Emits `flow.open` /
 /// `flow.open_failed` telemetry either way.
@@ -5655,6 +5714,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             dispatch_editor_open_path(state, path)
         }
         "editor.open" => dispatch_editor_open_dialog(state),
+        other if let Some(handled) = dispatch_flow_command(state, other) => handled,
         other if let Some(path) = other.strip_prefix("flow.open:") => {
             dispatch_flow_open_path(state, path)
         }
@@ -16594,5 +16654,86 @@ mod flow_pane_tests {
         assert!(is_palette_safe_dispatch("flow.open"));
         assert!(is_palette_safe_dispatch("flow.view:panes"));
         assert!(!is_palette_safe_dispatch("flowers"));
+    }
+
+    fn active_flow(state: &AppState) -> &crate::flow_explorer::FlowPane {
+        state
+            .flows
+            .get(&state.active_pane.0)
+            .expect("active pane is a flow")
+    }
+
+    #[test]
+    fn flow_view_and_level_commands_act_on_the_active_pane() {
+        use crate::flow_explorer::{FlowLevel, FlowView};
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.view:graph"));
+        assert_eq!(active_flow(&state).view, FlowView::Graph);
+        assert!(dispatch(&mut state, "flow.level:source"));
+        assert_eq!(active_flow(&state).level, FlowLevel::Source);
+        assert_eq!(active_flow(&state).src_open.len(), 8);
+        // Unknown names are not flow commands at all.
+        assert!(!dispatch(&mut state, "flow.view:sequence"));
+        assert_eq!(active_flow(&state).view, FlowView::Graph);
+        assert!(!dispatch(&mut state, "flow.level:loud"));
+        assert!(!dispatch(&mut state, "flow.toggle:x"));
+    }
+
+    #[test]
+    fn flow_toggle_expand_collapse_and_src_commands() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.collapse_all"));
+        assert_eq!(active_flow(&state).collapsed.len(), 9);
+        assert!(dispatch(&mut state, "flow.expand_all"));
+        assert!(active_flow(&state).collapsed.is_empty());
+        assert!(dispatch(&mut state, "flow.toggle:3"));
+        assert!(active_flow(&state).collapsed.contains(&3));
+        assert!(dispatch(&mut state, "flow.toggle:3"));
+        assert!(active_flow(&state).collapsed.is_empty());
+        assert!(dispatch(&mut state, "flow.src:Editor.tsx::handleKeyDown"));
+        assert!(active_flow(&state)
+            .src_open
+            .contains("Editor.tsx::handleKeyDown"));
+        // A node without a location is recognised but changes nothing.
+        assert!(dispatch(&mut state, "flow.src:ui.cmd-enter"));
+        assert_eq!(active_flow(&state).src_open.len(), 1);
+    }
+
+    #[test]
+    fn flow_commands_without_an_active_flow_pane_are_noops() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "flow.view:graph"));
+        assert!(!dispatch(&mut state, "flow.expand_all"));
+        assert!(!dispatch(&mut state, "flow.toggle:0"));
+        assert!(state.flows.is_empty());
+    }
+
+    #[test]
+    fn flow_commands_only_touch_the_active_flow_pane() {
+        use crate::flow_explorer::FlowView;
+        let mut state = test_state();
+        let first = open_fixture(&mut state);
+        let second = open_fixture(&mut state);
+        assert_ne!(first, second);
+        assert!(dispatch(&mut state, "flow.view:panes"));
+        assert_eq!(state.flows[&second].view, FlowView::Panes);
+        assert_eq!(state.flows[&first].view, FlowView::CallStack);
+    }
+
+    #[test]
+    fn flow_commands_do_not_mutate_an_outstanding_snapshot() {
+        use crate::flow_explorer::FlowView;
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        let snap = state.ui_snapshot();
+        assert!(dispatch(&mut state, "flow.view:graph"));
+        assert_eq!(snap.flow_panes[&pane_id].view, FlowView::CallStack);
+        assert_eq!(state.flows[&pane_id].view, FlowView::Graph);
+        assert_eq!(
+            state.ui_snapshot().flow_panes[&pane_id].view,
+            FlowView::Graph
+        );
     }
 }

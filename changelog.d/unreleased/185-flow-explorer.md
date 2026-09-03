@@ -19,3 +19,4 @@
   across restarts (the JSON stays on disk under the profile's `flows/`
   directory and can be reopened). Every open and close is recorded in
   `flow-events.jsonl` next to the editor's log, with reasons for failures.
+- Flow Explorer call stack view: view and level tabs, expand/collapse, process-coloured tree rows with descriptions, locations and `src` buttons, and a legend of processes and event carriers (`flow.view:`, `flow.level:`, `flow.expand_all`, `flow.collapse_all`, `flow.toggle:<row>`, `flow.src:<id>`).

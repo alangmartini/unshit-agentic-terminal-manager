@@ -7275,3 +7275,288 @@ body.dragging-pane {
   font-size: 10px;
   color: var(--fg-tertiary);
 }
+
+/* Toolbar: view tabs, level tabs, expand/collapse. */
+.flow-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border-hair);
+  font-size: 11px;
+  color: var(--fg-tertiary);
+  overflow: hidden;
+}
+
+.flow-toolbar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.flow-toolbar-label {
+  color: var(--fg-tertiary);
+  margin-right: 2px;
+}
+
+.flow-toolbar-spacer {
+  flex: 1;
+}
+
+.flow-tab,
+.flow-tool {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--fg-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.flow-tool {
+  border-color: var(--border-soft);
+}
+
+.flow-tab:hover,
+.flow-tool:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+}
+
+.flow-tab.active {
+  color: var(--fg-primary);
+  background: var(--bg-elevated);
+  border-color: var(--border-soft);
+}
+
+.flow-tab.disabled,
+.flow-tab.disabled:hover {
+  color: var(--fg-ghost);
+  background: transparent;
+  cursor: default;
+}
+
+/* Call stack tree. */
+.flow-tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 0;
+}
+
+.flow-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 14px 2px 12px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.flow-row:hover {
+  background: var(--bg-hover);
+}
+
+.flow-row.selected {
+  background: var(--bg-selected);
+}
+
+.flow-row.diff-added {
+  border-left-color: var(--sage);
+}
+
+.flow-row.diff-removed {
+  border-left-color: var(--rust);
+}
+
+.flow-row.diff-modified {
+  border-left-color: var(--azure);
+}
+
+.flow-indent {
+  width: 18px;
+  flex-shrink: 0;
+}
+
+.flow-connector {
+  color: var(--fg-muted);
+  flex-shrink: 0;
+}
+
+.flow-diff-marker {
+  width: 8px;
+  flex-shrink: 0;
+  color: var(--fg-tertiary);
+}
+
+.flow-row.diff-added .flow-diff-marker {
+  color: var(--sage);
+}
+
+.flow-row.diff-removed .flow-diff-marker {
+  color: var(--rust);
+}
+
+.flow-row.diff-modified .flow-diff-marker {
+  color: var(--azure);
+}
+
+/* Shrink order in a narrow pane: the location gives way first (shrink 3),
+   then chips and the description down to their floors; the name never
+   shrinks. Floors keep every cell above zero width, which the renderer
+   would otherwise paint untruncated. */
+.flow-name {
+  flex: 0 0 auto;
+  color: var(--fg-primary);
+  white-space: nowrap;
+}
+
+.flow-proc-0 {
+  color: var(--azure);
+}
+
+.flow-proc-1 {
+  color: var(--amber-300);
+}
+
+.flow-proc-2 {
+  color: var(--violet);
+}
+
+.flow-proc-3 {
+  color: var(--ember);
+}
+
+.flow-proc-4 {
+  color: var(--sage);
+}
+
+.flow-proc-5 {
+  color: var(--rust);
+}
+
+.flow-carrier,
+.flow-tag {
+  flex: 0 1 auto;
+  min-width: 24px;
+  font-size: 9px;
+  padding: 0 5px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  color: var(--fg-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-badge {
+  color: var(--violet);
+  flex-shrink: 0;
+}
+
+/* The description takes what the location leaves; below 120px the
+   location shrinks (and ellipsizes) instead, so neither ever collapses to
+   a zero-width box the renderer would paint untruncated. */
+.flow-desc {
+  flex: 1 1 auto;
+  min-width: 48px;
+  color: var(--fg-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-loc {
+  flex: 0 3 auto;
+  min-width: 40px;
+  color: var(--fg-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-src {
+  padding: 0 6px;
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.flow-src:hover,
+.flow-src.active {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+}
+
+/* Legend: processes, carriers, service state. */
+.flow-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 14px;
+  border-top: 1px solid var(--border-hair);
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  overflow: hidden;
+}
+
+.flow-legend-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.flow-legend-label {
+  color: var(--fg-tertiary);
+  margin-left: 10px;
+}
+
+.flow-legend-label.first {
+  margin-left: 0;
+}
+
+.flow-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  color: var(--fg-secondary);
+  background: var(--bg-subtle);
+  flex-shrink: 0;
+}
+
+.flow-chip-icon {
+  width: 11px;
+  height: 11px;
+  flex-shrink: 0;
+}
+
+.flow-chip.flow-chip-state {
+  color: var(--amber-300);
+  border-color: var(--amber-300);
+}
+
+.flow-placeholder {
+  display: block;
+  padding: 12px 14px;
+  font-size: 11px;
+  color: var(--fg-tertiary);
+}
