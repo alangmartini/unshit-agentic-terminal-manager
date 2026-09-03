@@ -87,6 +87,7 @@ The audit surfaced adjacent hazards that are not yet fixed:
 
 - [ ] **Learning mode using agent skills**
   - **Source idea:** https://gist.github.com/ThariqS/1389dcdff9eba4789887a2211370f06b
+  - **Status (2026-09-03):** the PR-mode half shipped as the **Flow Explorer** (`specs/flow-explorer.md`): an agent skill models one flow of a change as JSON and the app renders it as a call stack, Miller columns and a graph (`flow.review`). The teaching loop (restate, checklist, quiz) is still open and can be layered on the same pane.
   - **Goal:** Add an interactive teaching mode where an agent skill guides the user through code understanding instead of only executing commands.
   - **Core flow:**
     - Start from a task, file, commit, branch diff, or PR.
