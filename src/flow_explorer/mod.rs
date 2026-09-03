@@ -46,6 +46,13 @@ pub mod test_support {
             .join("tests/fixtures/flow-explorer/send-a-prompt.json")
     }
 
+    /// The same flow in review mode: a diff range, two modified nodes,
+    /// one added and one removed helper.
+    pub fn review_fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/flow-explorer/send-a-prompt.review.json")
+    }
+
     pub fn load_fixture() -> Flow {
         let bytes = std::fs::read(fixture_path()).expect("fixture readable");
         parse_flow(&bytes).expect("fixture parses and validates")

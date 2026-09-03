@@ -155,6 +155,9 @@ fn meta_line(pane: &FlowPane) -> String {
     if let Some(git_ref) = &flow.git_ref {
         parts.push(git_ref.clone());
     }
+    if let Some(range) = &flow.diff_range {
+        parts.push(format!("{}..{}", range.base, range.head));
+    }
     parts.join(" \u{00B7} ")
 }
 
@@ -671,10 +674,22 @@ fn build_legend(pane: &FlowPane) -> ElementDef {
                 .with_child(ElementDef::new(Tag::Span).with_text(carrier.label())),
         );
     }
-    ElementDef::new(Tag::Div)
+    let mut legend = ElementDef::new(Tag::Div)
         .with_class("flow-legend")
         .with_child(processes)
-        .with_child(carriers)
+        .with_child(carriers);
+    if pane.flow.mode == FlowMode::Review {
+        let mut diff = ElementDef::new(Tag::Div)
+            .with_class("flow-legend-row")
+            .with_child(legend_label("diff", true));
+        for status in [DiffStatus::Added, DiffStatus::Removed, DiffStatus::Modified] {
+            let text = format!("{} {}", status.marker().unwrap_or(""), status.slug());
+            diff = diff
+                .with_child(chip(&text).with_class(format!("flow-chip-diff-{}", status.slug())));
+        }
+        legend = legend.with_child(diff);
+    }
+    legend
 }
 
 fn legend_label(text: &str, first: bool) -> ElementDef {
@@ -1148,5 +1163,51 @@ mod tests {
         );
         assert_eq!(all(&body, &["flow-col-loc"]).len(), 2);
         assert_eq!(all(&body, &["flow-kind"]).len(), 2);
+    }
+
+    #[test]
+    fn review_fixture_shows_the_range_and_a_diff_legend() {
+        use crate::flow_explorer::test_support::review_fixture_path;
+
+        let explain = build_flow_pane_body(PaneId(1), false, &pane(), &shared());
+        assert_eq!(all(&explain, &["flow-legend-row"]).len(), 2);
+        assert!(first(&explain, &["flow-chip-diff-added"]).is_none());
+
+        let mut p = FlowPane::open(&review_fixture_path()).unwrap();
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        let meta = text_of(first(&body, &["flow-meta"]).unwrap());
+        assert!(meta.contains("review"), "{meta}");
+        assert!(meta.contains("main..feat/prompt-restore"), "{meta}");
+        assert_eq!(all(&body, &["flow-legend-row"]).len(), 3);
+        let chips: Vec<String> = [
+            "flow-chip-diff-added",
+            "flow-chip-diff-removed",
+            "flow-chip-diff-modified",
+        ]
+        .iter()
+        .map(|c| text_of(first(&body, &[c]).unwrap()))
+        .collect();
+        assert_eq!(chips, vec!["+ added", "- removed", "~ modified"]);
+        assert_eq!(all(&body, &["flow-row", "diff-removed"]).len(), 1);
+        assert_eq!(all(&body, &["flow-row", "diff-modified"]).len(), 2);
+        assert_eq!(all(&body, &["flow-row", "diff-added"]).len(), 1);
+
+        // The panes view carries the same status onto items and heads.
+        p.set_view(FlowView::Panes);
+        p.path = vec!["ui.cmd-enter".into(), "Editor.tsx::handleKeyDown".into()];
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        assert_eq!(
+            all(&body, &["flow-item", "diff-modified"]).len(),
+            1,
+            "submit in the calls list"
+        );
+        p.path.push("AgentPane.tsx::submit".into());
+        let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
+        assert_eq!(all(&body, &["flow-col-head", "diff-modified"]).len(), 1);
+        assert_eq!(
+            all(&body, &["flow-item", "diff-removed"]).len(),
+            1,
+            "clearDraft in the calls list"
+        );
     }
 }

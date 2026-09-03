@@ -1069,3 +1069,44 @@ mod column_edge_tests {
         assert!(!p.column_edge(false));
     }
 }
+
+#[cfg(test)]
+mod review_fixture_tests {
+    use super::*;
+    use crate::flow_explorer::test_support::review_fixture_path;
+    use crate::flow_explorer::{DiffStatus, FlowMode};
+
+    #[test]
+    fn review_fixture_opens_with_statuses_and_a_range() {
+        let p = FlowPane::open(&review_fixture_path()).unwrap();
+        assert_eq!(p.flow.mode, FlowMode::Review);
+        let range = p.flow.diff_range.as_ref().expect("diff range");
+        assert_eq!(
+            (range.base.as_str(), range.head.as_str()),
+            ("main", "feat/prompt-restore")
+        );
+        let count = |status: DiffStatus| p.flow.nodes.iter().filter(|n| n.status == status).count();
+        assert_eq!(count(DiffStatus::Added), 1);
+        assert_eq!(count(DiffStatus::Removed), 1);
+        assert_eq!(count(DiffStatus::Modified), 2);
+        assert_eq!(count(DiffStatus::Same), 8);
+        // The removed helper hangs off submit in the call stack and carries no
+        // location (it no longer exists at head).
+        let removed = p
+            .rows
+            .iter()
+            .find(|r| r.node_id == "AgentPane.tsx::clearDraft")
+            .unwrap();
+        assert_eq!(
+            removed.parent.map(|i| p.rows[i].node_id.as_str()),
+            Some("AgentPane.tsx::submit")
+        );
+        assert!(p
+            .flow
+            .node("AgentPane.tsx::clearDraft")
+            .unwrap()
+            .location
+            .is_none());
+        assert_eq!(p.flow_id, "send-a-prompt.review");
+    }
+}

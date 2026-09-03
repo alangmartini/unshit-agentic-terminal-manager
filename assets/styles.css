@@ -7834,3 +7834,19 @@ body.dragging-pane {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Review mode: the legend names the three rails. */
+.flow-chip.flow-chip-diff-added {
+  color: var(--sage);
+  border-color: var(--sage);
+}
+
+.flow-chip.flow-chip-diff-removed {
+  color: var(--rust);
+  border-color: var(--rust);
+}
+
+.flow-chip.flow-chip-diff-modified {
+  color: var(--azure);
+  border-color: var(--azure);
+}
