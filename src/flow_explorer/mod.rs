@@ -12,6 +12,8 @@ pub mod highlight;
 pub mod ingest;
 pub mod model;
 pub mod pane;
+pub mod poller;
+pub mod producer;
 pub mod snippet;
 pub mod telemetry;
 pub mod tree;
@@ -24,14 +26,25 @@ pub use model::{
     FlowParseError, FlowValidationError, Location, Node, NodeKind, Process, FLOW_SCHEMA_VERSION,
 };
 pub use pane::{flow_id_for, ColumnItem, ColumnSection, DisplayRow, FlowLevel, FlowPane, FlowView};
+pub use poller::{PendingFlow, PollOutcome};
+pub use producer::{build_prompt, launch_prompt, MAX_REQUEST_CHARS};
 pub use snippet::{load_snippet, Snippet, SnippetError, CONTEXT_LINES, MAX_SNIPPET_BYTES};
 pub use tree::{
     collapsible_rows, derive_tree, visible_rows, RowMarker, TreeRow, MAX_TREE_DEPTH, MAX_TREE_ROWS,
 };
 
-/// Where app-launched flows are written and where the manual picker
-/// starts: `<data_dir>/flows/`.
+/// Tests redirect launches away from the real profile.
+#[cfg(test)]
+pub(crate) static FLOWS_DIR_FOR_TESTS: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+/// Where app-launched flows (and their prompt files) are written and
+/// where the manual picker starts: `<data_dir>/flows/`.
 pub fn flows_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = FLOWS_DIR_FOR_TESTS.get() {
+        return Some(dir.clone());
+    }
     crate::profile::data_dir().map(|dir| dir.join("flows"))
 }
 

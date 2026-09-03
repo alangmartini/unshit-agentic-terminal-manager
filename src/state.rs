@@ -250,6 +250,15 @@ pub enum ConfirmDialog {
         names: Vec<String>,
         tab: Option<usize>,
     },
+    /// Flow Explorer request: the text typed for `flow.explain` /
+    /// `flow.review` (a flow name or a `base..head`). Commits via
+    /// `dialog.flow_commit`; `error` is the precondition message shown
+    /// under the input when the launch could not start.
+    FlowRequest {
+        mode: crate::flow_explorer::FlowMode,
+        buffer: String,
+        error: Option<String>,
+    },
 }
 
 /// Outcome of resolving the user's persisted close preference when the
@@ -910,6 +919,10 @@ pub struct AppState {
     /// with the per-frame snapshot through `Arc`; mutate through
     /// `Arc::make_mut` on the dispatch path only.
     pub flows: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
+    /// Agent launches waiting for their flow JSON, keyed by the launch
+    /// pane id. Read by the poll thread through `flow_poll_snapshot` and
+    /// dropped when the launch pane closes.
+    pub flow_pending: std::collections::HashMap<u32, crate::flow_explorer::poller::PendingFlow>,
     /// Durable provider conversation metadata keyed by pane id. This
     /// is deliberately separate from `Pane` so it never leaks into
     /// generic labels or the terminal renderer.
@@ -1453,6 +1466,7 @@ pub fn seed_state() -> AppState {
         terminals: std::collections::HashMap::new(),
         editors: std::collections::HashMap::new(),
         flows: std::collections::HashMap::new(),
+        flow_pending: std::collections::HashMap::new(),
         agent_restarts: std::collections::HashMap::new(),
         pending_agent_resumes: std::collections::HashMap::new(),
         agent_resume_attempts: std::collections::HashMap::new(),
@@ -4410,6 +4424,7 @@ fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
 }
 
 fn forget_agent_restore(state: &mut AppState, pane_id: u32) {
+    forget_flow_launch(state, pane_id);
     state.agent_restarts.remove(&pane_id);
     state.pending_agent_resumes.remove(&pane_id);
     state.agent_resume_attempts.remove(&pane_id);
@@ -5501,6 +5516,316 @@ fn dispatch_flow_open_dialog(state: &mut AppState) -> bool {
     )
 }
 
+/// `flow.explain` / `flow.review`: open the request dialog.
+fn dispatch_flow_request_dialog(
+    state: &mut AppState,
+    mode: crate::flow_explorer::FlowMode,
+) -> bool {
+    state.ctx_menu = None;
+    state.confirm_dialog = Some(ConfirmDialog::FlowRequest {
+        mode,
+        buffer: String::new(),
+        error: None,
+    });
+    true
+}
+
+/// `dialog.flow_commit`: launch from the dialog's buffer. A precondition
+/// failure reopens the dialog with the reason inline, like the rename
+/// dialog does for a failed RPC.
+fn dispatch_flow_commit(state: &mut AppState) -> bool {
+    let Some(ConfirmDialog::FlowRequest {
+        mode,
+        buffer,
+        error: _,
+    }) = state.confirm_dialog.take()
+    else {
+        return false;
+    };
+    if let Err(message) = dispatch_flow_launch(state, mode, &buffer) {
+        state.confirm_dialog = Some(ConfirmDialog::FlowRequest {
+            mode,
+            buffer,
+            error: Some(message),
+        });
+    }
+    true
+}
+
+/// `flow.explain:<request>` / `flow.review:<range>`: launch without the
+/// dialog (startup dispatch, tests). Failures surface as a toast.
+fn dispatch_flow_launch_direct(
+    state: &mut AppState,
+    mode: crate::flow_explorer::FlowMode,
+    request: &str,
+) -> bool {
+    if let Err(message) = dispatch_flow_launch(state, mode, request) {
+        push_error_toast(state, format!("flow {}: {}", mode.as_str(), message));
+    }
+    true
+}
+
+fn inside_git_checkout(dir: &std::path::Path) -> bool {
+    dir.ancestors()
+        .any(|ancestor| ancestor.join(".git").exists())
+}
+
+/// Distinguishes launches that start in the same millisecond (tests).
+static FLOW_LAUNCH_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Launch the producer agent for `mode` in the active workspace: writes
+/// the full prompt next to the future output under the profile's
+/// `flows/` directory, opens an agent tab in the workspace directory
+/// (not a worktree, so uncommitted changes are visible) with a one-line
+/// argv prompt pointing at it, and registers the output path for the
+/// poll thread. `Err` is a user-facing precondition message.
+pub fn dispatch_flow_launch(
+    state: &mut AppState,
+    mode: crate::flow_explorer::FlowMode,
+    request: &str,
+) -> Result<(), String> {
+    use crate::flow_explorer::poller::PendingFlow;
+    use crate::flow_explorer::producer;
+    use crate::flow_explorer::telemetry::record_flow_event;
+    use crate::flow_explorer::FlowMode;
+
+    let request = producer::normalize_request(request);
+    if request.chars().count() > producer::MAX_REQUEST_CHARS {
+        return Err(format!(
+            "keep the request under {} characters",
+            producer::MAX_REQUEST_CHARS
+        ));
+    }
+    let cwd = active_workspace_cwd(state)
+        .filter(|dir| dir.is_dir())
+        .ok_or_else(|| "the active workspace has no working directory".to_string())?;
+    if mode == FlowMode::Review && !inside_git_checkout(&cwd) {
+        return Err(
+            "review needs a git checkout; the workspace directory is not inside one".to_string(),
+        );
+    }
+    let flows_dir = crate::flow_explorer::flows_dir()
+        .ok_or_else(|| "no data directory to write flows into".to_string())?;
+    std::fs::create_dir_all(&flows_dir)
+        .map_err(|e| format!("could not create {}: {e}", flows_dir.display()))?;
+
+    let started_unix_ms = crate::agent_restore::now_unix_ms();
+    let seq = FLOW_LAUNCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let flow_id = format!("{}-{started_unix_ms}-{seq}", mode.as_str());
+    let output_path = flows_dir.join(format!("{flow_id}.json"));
+    let prompt_path = flows_dir.join(format!("{flow_id}.prompt.md"));
+    let prompt = producer::build_prompt(mode, &request, &output_path);
+    crate::persist::atomic_write(&prompt_path, prompt.as_bytes())
+        .map_err(|e| format!("could not write the prompt file: {e}"))?;
+    let launch_prompt = producer::launch_prompt(&prompt_path, &output_path);
+
+    let agent = crate::quick_prompt::QuickPromptStore::load().agent;
+    let (shell_spec, session_id) = match agent {
+        crate::quick_prompt::Agent::Claude => {
+            let session_id = crate::agent_restore::generate_session_id();
+            let shell = flow_claude_shell_spec(&launch_prompt, &session_id, &flows_dir);
+            (shell, Some(session_id))
+        }
+        crate::quick_prompt::Agent::Codex => (
+            crate::quick_prompt::spawn::codex_shell_spec(&launch_prompt),
+            None,
+        ),
+    };
+    let agent_name = match agent {
+        crate::quick_prompt::Agent::Claude => "claude",
+        crate::quick_prompt::Agent::Codex => "codex",
+    };
+    let restart = crate::agent_restore::AgentRestart {
+        agent: agent.into(),
+        cwd: crate::agent_restore::normalized_cwd(&cwd),
+        resume_mode: match agent {
+            crate::quick_prompt::Agent::Claude => {
+                crate::agent_restore::AgentResumeMode::Interactive
+            }
+            crate::quick_prompt::Agent::Codex => crate::agent_restore::AgentResumeMode::CodexExec,
+        },
+        session_id,
+        observed_at_unix_ms: started_unix_ms,
+        managed: true,
+        launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+    };
+    let expected_pane = state.next_id;
+    mutate_add_quick_prompt_tab(state, &launch_prompt, &cwd, &shell_spec, restart);
+    // The new tab is active on every return path of the helper.
+    let launch_pane = state.active_pane.0;
+    debug_assert_eq!(launch_pane, expected_pane, "quick prompt tab takes next_id");
+    mutate_rename_pane(state, launch_pane, &format!("flow: {}", mode.as_str()));
+
+    let pending = PendingFlow {
+        flow_id,
+        output_path,
+        mode,
+        agent: agent_name,
+        started_unix_ms,
+    };
+    let path_str = pending.output_path.to_string_lossy().into_owned();
+    record_flow_event(&flow_launch_record(
+        &pending,
+        &path_str,
+        "flow.launch",
+        "info",
+    ));
+    record_diagnostic_pty_event(
+        state,
+        format!(
+            "flow_launch pane={launch_pane} mode={} agent={agent_name}",
+            mode.as_str()
+        ),
+    );
+    state.flow_pending.insert(launch_pane, pending);
+    crate::persist::save_workspaces(state);
+    Ok(())
+}
+
+/// Claude launch for a flow: the Quick Prompt spec plus `--add-dir` on
+/// the flows directory, so the one write the agent must make lands in a
+/// directory Claude treats as a working directory (users who auto-accept
+/// edits get no prompt; everyone else approves a single write). The pair
+/// goes first because `--add-dir` is variadic and would swallow a
+/// following positional prompt.
+fn flow_claude_shell_spec(
+    launch_prompt: &str,
+    session_id: &str,
+    flows_dir: &std::path::Path,
+) -> crate::shell::ShellSpec {
+    let mut shell = crate::agent_restore::claude_initial_shell_spec(launch_prompt, session_id)
+        .expect("generated Claude session id must be valid");
+    shell.args.insert(0, "--add-dir".to_string());
+    shell
+        .args
+        .insert(1, flows_dir.to_string_lossy().into_owned());
+    shell
+}
+
+/// A telemetry record pre-filled with a pending launch's identity; the
+/// caller sets the outcome-specific fields.
+fn flow_launch_record<'a>(
+    pending: &'a crate::flow_explorer::poller::PendingFlow,
+    path_str: &'a str,
+    event: &'static str,
+    level: &'static str,
+) -> crate::flow_explorer::telemetry::FlowEventRecord<'a> {
+    let mut record =
+        crate::flow_explorer::telemetry::FlowEventRecord::new(event, level, &pending.flow_id);
+    record.path = Some(path_str);
+    record.mode = Some(pending.mode.as_str());
+    record.agent = Some(pending.agent);
+    record
+}
+
+/// Drop the pending launch of a closing pane. Reached from every terminal
+/// pane teardown path through `forget_agent_restore`.
+fn forget_flow_launch(state: &mut AppState, pane_id: u32) {
+    let Some(pending) = state.flow_pending.remove(&pane_id) else {
+        return;
+    };
+    let path_str = pending.output_path.to_string_lossy().into_owned();
+    let mut record = flow_launch_record(&pending, &path_str, "flow.timeout", "info");
+    record.reason = Some("pane_closed");
+    record.elapsed_ms =
+        Some(crate::agent_restore::now_unix_ms().saturating_sub(pending.started_unix_ms));
+    crate::flow_explorer::telemetry::record_flow_event(&record);
+}
+
+/// Snapshot for the poll thread: every pending launch, cloned so the lock
+/// is held for microseconds. Sorted by pane id for determinism.
+pub fn flow_poll_snapshot(
+    state: &AppState,
+) -> Vec<(u32, crate::flow_explorer::poller::PendingFlow)> {
+    let mut entries: Vec<_> = state
+        .flow_pending
+        .iter()
+        .map(|(pane_id, pending)| (*pane_id, pending.clone()))
+        .collect();
+    entries.sort_by_key(|(pane_id, _)| *pane_id);
+    entries
+}
+
+/// Apply poll results under the lock. Returns `true` when state changed.
+/// An outcome for a launch that is already gone (its pane closed between
+/// the snapshot and this call) is ignored, so nothing opens twice.
+pub fn apply_flow_poll(
+    state: &mut AppState,
+    outcomes: Vec<(u32, crate::flow_explorer::poller::PollOutcome)>,
+    now_unix_ms: u64,
+) -> bool {
+    use crate::flow_explorer::poller::{PollOutcome, PENDING_TIMEOUT_MS};
+    use crate::flow_explorer::telemetry::record_flow_event;
+
+    let mut changed = false;
+    for (pane_id, outcome) in outcomes {
+        if outcome.is_pending() {
+            continue;
+        }
+        let Some(pending) = state.flow_pending.remove(&pane_id) else {
+            continue;
+        };
+        let elapsed_ms = Some(now_unix_ms.saturating_sub(pending.started_unix_ms));
+        let path_str = pending.output_path.to_string_lossy().into_owned();
+        match outcome {
+            PollOutcome::Pending => {}
+            PollOutcome::Ready(pane) => {
+                let mut record = flow_launch_record(&pending, &path_str, "flow.ready", "info");
+                record.node_count = Some(pane.flow.nodes.len() as u64);
+                record.edge_count = Some(pane.flow.edges.len() as u64);
+                record.elapsed_ms = elapsed_ms;
+                record_flow_event(&record);
+                let flow_pane = mutate_add_flow_tab(state, *pane);
+                record_diagnostic_pty_event(
+                    state,
+                    format!(
+                        "flow_ready launch_pane={pane_id} pane={} mode={}",
+                        flow_pane.0,
+                        pending.mode.as_str()
+                    ),
+                );
+            }
+            PollOutcome::Failed {
+                reason,
+                message,
+                os_error,
+            } => {
+                let mut record =
+                    flow_launch_record(&pending, &path_str, "flow.parse_failed", "warn");
+                record.reason = Some(reason);
+                record.os_error = os_error;
+                record.elapsed_ms = elapsed_ms;
+                record_flow_event(&record);
+                record_diagnostic_pty_event(
+                    state,
+                    format!("flow_parse_failed pane={pane_id} reason={reason}"),
+                );
+                push_error_toast(state, format!("flow {}: {message}", pending.mode.as_str()));
+            }
+            PollOutcome::TimedOut => {
+                let mut record = flow_launch_record(&pending, &path_str, "flow.timeout", "warn");
+                record.reason = Some("deadline");
+                record.elapsed_ms = elapsed_ms;
+                record_flow_event(&record);
+                record_diagnostic_pty_event(state, format!("flow_timeout pane={pane_id}"));
+                push_error_toast(
+                    state,
+                    format!(
+                        "flow {}: the agent did not write a flow within {} minutes",
+                        pending.mode.as_str(),
+                        PENDING_TIMEOUT_MS / 60_000
+                    ),
+                );
+            }
+        }
+        changed = true;
+    }
+    if changed {
+        crate::persist::save_workspaces(state);
+    }
+    changed
+}
+
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
     match command {
         "modal.close" => {
@@ -5556,6 +5881,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 ConfirmDialog::CloseApp { .. }
                     | ConfirmDialog::RenameSession { .. }
                     | ConfirmDialog::CloseEditor { .. }
+                    | ConfirmDialog::FlowRequest { .. }
             ) {
                 return false;
             }
@@ -5568,7 +5894,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 }
                 ConfirmDialog::CloseApp { .. }
                 | ConfirmDialog::RenameSession { .. }
-                | ConfirmDialog::CloseEditor { .. } => {
+                | ConfirmDialog::CloseEditor { .. }
+                | ConfirmDialog::FlowRequest { .. } => {
                     unreachable!("filtered above")
                 }
             }
@@ -5884,6 +6211,19 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             dispatch_flow_open_path(state, path)
         }
         "flow.open" => dispatch_flow_open_dialog(state),
+        "flow.explain" => {
+            dispatch_flow_request_dialog(state, crate::flow_explorer::FlowMode::Explain)
+        }
+        "flow.review" => {
+            dispatch_flow_request_dialog(state, crate::flow_explorer::FlowMode::Review)
+        }
+        other if let Some(request) = other.strip_prefix("flow.explain:") => {
+            dispatch_flow_launch_direct(state, crate::flow_explorer::FlowMode::Explain, request)
+        }
+        other if let Some(range) = other.strip_prefix("flow.review:") => {
+            dispatch_flow_launch_direct(state, crate::flow_explorer::FlowMode::Review, range)
+        }
+        "dialog.flow_commit" => dispatch_flow_commit(state),
         "editor.save" => dispatch_editor_save(state),
         "tab.new_worktree" => {
             let repo_cwd = active_workspace_cwd(state)
@@ -8365,6 +8705,7 @@ pub(crate) mod tests {
             terminals: std::collections::HashMap::new(),
             editors: std::collections::HashMap::new(),
             flows: std::collections::HashMap::new(),
+            flow_pending: std::collections::HashMap::new(),
             agent_restarts: std::collections::HashMap::new(),
             pending_agent_resumes: std::collections::HashMap::new(),
             agent_resume_attempts: std::collections::HashMap::new(),
@@ -17082,5 +17423,175 @@ mod flow_pane_tests {
             .snippet("SessionRegistry.ts::open")
             .is_some());
         assert!(!dispatch(&mut state, "flow.graph.crumb:x"));
+    }
+
+    fn flows_scratch_dir() -> PathBuf {
+        crate::flow_explorer::FLOWS_DIR_FOR_TESTS
+            .get_or_init(|| {
+                std::env::temp_dir().join(format!("tm-flow-launch-{}", std::process::id()))
+            })
+            .clone()
+    }
+
+    fn workspace_with_path(path: Option<PathBuf>) -> Workspace {
+        Workspace {
+            num: 1,
+            name: "ws".to_string(),
+            path,
+            collapsed: false,
+            terminals_expanded: true,
+            terminal_entries: vec![],
+            subtabs: vec![],
+            git_branch: GitBranch::Pending,
+            tabs: vec![],
+            active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
+        }
+    }
+
+    #[test]
+    fn flow_claude_launch_adds_the_flows_dir_before_the_session_id() {
+        let session_id = crate::agent_restore::generate_session_id();
+        let shell = flow_claude_shell_spec(
+            "read the file",
+            &session_id,
+            std::path::Path::new("C:/data/flows"),
+        );
+        assert_eq!(
+            shell.args,
+            vec![
+                "--add-dir",
+                "C:/data/flows",
+                "--session-id",
+                session_id.as_str(),
+                "read the file",
+            ]
+        );
+    }
+
+    #[test]
+    fn flow_request_dialog_opens_and_rejects_bad_preconditions() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "flow.explain"));
+        assert!(matches!(
+            state.confirm_dialog,
+            Some(ConfirmDialog::FlowRequest {
+                mode: crate::flow_explorer::FlowMode::Explain,
+                ..
+            })
+        ));
+        assert!(
+            !dispatch(&mut state, "dialog.confirm"),
+            "the generic confirm never launches"
+        );
+        assert!(dispatch(&mut state, "dialog.flow_commit"));
+        match &state.confirm_dialog {
+            Some(ConfirmDialog::FlowRequest {
+                error: Some(message),
+                ..
+            }) => assert!(message.contains("working directory"), "{message}"),
+            other => panic!("dialog should reopen with the reason, got {other:?}"),
+        }
+        assert!(dispatch(&mut state, "dialog.cancel"));
+        assert!(state.confirm_dialog.is_none());
+
+        let dir = std::env::temp_dir().join(format!("tm-flow-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        state.workspaces = vec![workspace_with_path(Some(dir.clone()))];
+        state.active_workspace = 0;
+        assert!(dispatch(&mut state, "flow.review:main..HEAD"));
+        assert_eq!(state.toasts.len(), 1, "direct launches toast their failure");
+        assert!(state.flow_pending.is_empty());
+        assert_eq!(state.tabs.len(), 1, "no agent tab without a checkout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flow_launch_opens_an_agent_tab_and_the_poll_opens_the_flow() {
+        use crate::flow_explorer::poller::PollOutcome;
+
+        let mut state = test_state();
+        let scratch = flows_scratch_dir();
+        state.workspaces = vec![workspace_with_path(Some(PathBuf::from(env!(
+            "CARGO_MANIFEST_DIR"
+        ))))];
+        state.active_workspace = 0;
+
+        assert!(dispatch(&mut state, "flow.explain:Send a Quick Prompt"));
+        assert_eq!(state.toasts.len(), 0, "launch succeeded");
+        assert_eq!(state.tabs.len(), 2, "the agent tab was added");
+        let launch_pane = state.active_pane.0;
+        let pending = state
+            .flow_pending
+            .get(&launch_pane)
+            .cloned()
+            .expect("launch registered on the agent pane");
+        assert_eq!(pending.mode, crate::flow_explorer::FlowMode::Explain);
+        assert!(
+            ["claude", "codex"].contains(&pending.agent),
+            "the launch uses the Quick Prompt default agent, got {}",
+            pending.agent
+        );
+        assert_eq!(pending.output_path.parent(), Some(scratch.as_path()));
+        let prompt_path = scratch.join(format!("{}.prompt.md", pending.flow_id));
+        let prompt = std::fs::read_to_string(&prompt_path).expect("prompt file written");
+        assert!(prompt.contains("Mode: explain\n"));
+        assert!(prompt.contains("Request: Send a Quick Prompt\n"));
+        assert!(prompt.contains(&format!(
+            "Write the result to: {}\n",
+            pending.output_path.display()
+        )));
+        assert_eq!(
+            pane_title_by_id(&state, launch_pane).as_deref(),
+            Some("flow: explain")
+        );
+        assert_eq!(
+            flow_poll_snapshot(&state),
+            vec![(launch_pane, pending.clone())]
+        );
+
+        // Ready: the flow opens as its own tab and the launch is forgotten.
+        let ready = crate::flow_explorer::FlowPane::open(&fixture_path()).expect("fixture");
+        assert!(apply_flow_poll(
+            &mut state,
+            vec![(launch_pane, PollOutcome::Ready(Box::new(ready)))],
+            pending.started_unix_ms + 5,
+        ));
+        assert!(state.flow_pending.is_empty());
+        assert_eq!(state.flows.len(), 1);
+        assert_eq!(state.tabs.len(), 3);
+        assert!(state.flows.contains_key(&state.active_pane.0));
+
+        // An outcome for a launch that is already gone is ignored.
+        assert!(!apply_flow_poll(
+            &mut state,
+            vec![(launch_pane, PollOutcome::TimedOut)],
+            0
+        ));
+        assert_eq!(state.toasts.len(), 0);
+
+        // Failures toast and forget.
+        state.flow_pending.insert(launch_pane, pending.clone());
+        assert!(apply_flow_poll(
+            &mut state,
+            vec![(
+                launch_pane,
+                PollOutcome::Failed {
+                    reason: "invalid_json",
+                    message: "explain-1.json: bad".to_string(),
+                    os_error: None,
+                }
+            )],
+            0,
+        ));
+        assert_eq!(state.toasts.len(), 1);
+        assert!(state.flow_pending.is_empty());
+
+        // Closing the launch pane drops its pending entry.
+        state.flow_pending.insert(launch_pane, pending);
+        forget_agent_restore(&mut state, launch_pane);
+        assert!(state.flow_pending.is_empty());
+
+        let _ = std::fs::remove_file(prompt_path);
     }
 }

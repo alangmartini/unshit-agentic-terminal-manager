@@ -1357,6 +1357,10 @@ fn main() {
     // after the sink exists, so a resolution that finishes early still has
     // somewhere to deliver its rebuild request.
     crate::git_watch::resolve_all_in_background(shared.clone(), window_event_sink.clone());
+    // Flow Explorer launches are polled off-thread; started here for the
+    // same reason, so an agent that finishes early has a sink to rebuild
+    // through.
+    crate::flow_explorer::poller::start(shared.clone(), window_event_sink.clone());
 
     // Same reasoning for the panes the first frame will not show: reattach
     // them alongside window and GPU bring-up rather than in front of it.
