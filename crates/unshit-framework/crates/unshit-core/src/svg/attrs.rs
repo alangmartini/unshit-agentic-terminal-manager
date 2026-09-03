@@ -217,7 +217,7 @@ pub fn parse_points(input: &str) -> Result<Vec<(f32, f32)>, SvgAttrError> {
     if nums.is_empty() || (nums.len() & 1) != 0 {
         return Err(SvgAttrError::InvalidPoints);
     }
-    Ok(nums.chunks_exact(2).map(|c| (c[0], c[1])).collect())
+    Ok(nums.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).collect())
 }
 
 /// Parse a `stroke-linecap` value.
