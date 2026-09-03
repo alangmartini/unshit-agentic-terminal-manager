@@ -187,7 +187,10 @@ fn attach_one(shared: &SharedState, target: &Target, grid: &InitialGrid) -> Outc
     let (workspace_id, pane_id) = (*workspace_id, *pane_id);
 
     let mut guard = shared.lock_recover();
-    if guard.terminals.contains_key(&pane_id) || guard.editors.contains_key(&pane_id) {
+    if guard.terminals.contains_key(&pane_id)
+        || guard.editors.contains_key(&pane_id)
+        || guard.flows.contains_key(&pane_id)
+    {
         return Outcome::Skipped;
     }
     let spawn_plan =

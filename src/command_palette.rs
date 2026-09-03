@@ -169,6 +169,18 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         enabled: true,
     },
     PaletteAction {
+        id: "flow_open",
+        label: "Open flow\u{2026}",
+        description: "Open a Flow Explorer document (flow JSON).",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::Workspace,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "flow.open",
+        keywords: &["flow", "explorer", "review", "open", "json", "diff"],
+        enabled: true,
+    },
+    PaletteAction {
         id: "new_worktree",
         label: "New worktree tab",
         description: "Open a new tab on a fresh git worktree of this workspace.",
@@ -1218,6 +1230,7 @@ mod tests {
                 "new_terminal",
                 "open_file",
                 "save_file",
+                "flow_open",
                 "new_worktree",
                 "close_pane",
                 "arrange_grid_2x2",
@@ -1354,6 +1367,7 @@ mod tests {
                         | "quick_prompt.open"
                         | "editor.open"
                         | "editor.save"
+                        | "flow.open"
                 )
             })));
         assert!(items
@@ -1390,6 +1404,7 @@ mod tests {
                         "new_terminal",
                         "open_file",
                         "save_file",
+                        "flow_open",
                         "new_worktree",
                         "close_pane",
                     ],

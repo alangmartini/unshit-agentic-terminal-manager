@@ -7238,3 +7238,40 @@ body.dragging-pane {
   margin-top: 2px;
   letter-spacing: 0.06em;
 }
+
+/* ============================================================
+   FLOW EXPLORER PANE
+   Agent-authored flow model rendered as a call-stack tree, Miller
+   columns and a swim-lane graph.
+   ============================================================ */
+
+.app .pane-body.flow-pane {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--fg-primary);
+}
+
+.flow-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.flow-title {
+  font-size: 13px;
+  color: var(--fg-primary);
+}
+
+.flow-summary {
+  font-size: 11px;
+  color: var(--fg-secondary);
+}
+
+.flow-meta {
+  font-size: 10px;
+  color: var(--fg-tertiary);
+}

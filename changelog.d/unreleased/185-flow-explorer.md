@@ -12,3 +12,10 @@
   document), and a committed fixture transcribed from the reference video.
   Location paths a Windows agent writes with backslashes are normalized
   rather than rejected.
+- A flow opens as its own pane: **Open flow…** in the command palette (or
+  `flow.open:<path>` from the startup dispatch hook) reads a flow JSON, shows
+  its title, summary and counts, and lives beside terminals and editors in
+  the tab strip. Flow panes never enter the PTY paths and are not persisted
+  across restarts (the JSON stays on disk under the profile's `flows/`
+  directory and can be reopened). Every open and close is recorded in
+  `flow-events.jsonl` next to the editor's log, with reasons for failures.

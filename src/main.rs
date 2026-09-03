@@ -29,6 +29,7 @@ pub mod shell;
 pub mod startup;
 pub mod startup_perf;
 pub mod state;
+pub mod telemetry_sink;
 pub mod terminal;
 pub mod theme;
 pub mod ui;

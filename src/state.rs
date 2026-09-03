@@ -906,6 +906,10 @@ pub struct AppState {
     /// present here is a file-editor pane and must never enter PTY
     /// spawn/resize/write paths.
     pub editors: std::collections::HashMap<u32, crate::editor::EditorPane>,
+    /// Flow Explorer panes keyed by pane id, mirroring `editors`. Shared
+    /// with the per-frame snapshot through `Arc`; mutate through
+    /// `Arc::make_mut` on the dispatch path only.
+    pub flows: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
     /// Durable provider conversation metadata keyed by pane id. This
     /// is deliberately separate from `Pane` so it never leaks into
     /// generic labels or the terminal renderer.
@@ -1175,6 +1179,11 @@ impl AppState {
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
             editor_panes: self.editors.keys().copied().collect(),
+            flow_panes: self
+                .flows
+                .iter()
+                .map(|(&id, pane)| (id, pane.clone()))
+                .collect(),
         }
     }
 
@@ -1278,6 +1287,8 @@ pub struct UiSnapshot {
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
     /// Pane ids rendered by the file editor instead of a terminal.
     pub editor_panes: std::collections::HashSet<u32>,
+    /// Flow Explorer panes rendered instead of a terminal, by pane id.
+    pub flow_panes: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
 }
 
 fn current_folder_name() -> String {
@@ -1441,6 +1452,7 @@ pub fn seed_state() -> AppState {
         pty_manager: crate::pty::DaemonPty::new(),
         terminals: std::collections::HashMap::new(),
         editors: std::collections::HashMap::new(),
+        flows: std::collections::HashMap::new(),
         agent_restarts: std::collections::HashMap::new(),
         pending_agent_resumes: std::collections::HashMap::new(),
         agent_resume_attempts: std::collections::HashMap::new(),
@@ -1765,6 +1777,58 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     state.row_ratios = vec![1.0];
     state.col_ratios = vec![vec![1.0]];
     pane_id
+}
+
+/// Open a Flow Explorer pane as a new single-pane tab. Mirrors
+/// `mutate_add_editor_tab`: no PTY; the pane id maps into `state.flows`.
+pub fn mutate_add_flow_tab(state: &mut AppState, pane: crate::flow_explorer::FlowPane) -> PaneId {
+    save_tab_state(state);
+
+    let id_num = state.next_id;
+    state.next_id += 1;
+    let pane_id = PaneId(id_num);
+
+    let title = pane.title().to_string();
+    state.flows.insert(id_num, std::sync::Arc::new(pane));
+
+    let pane = Pane {
+        id: pane_id,
+        title: title.clone(),
+        subtitle: "flow".to_string(),
+        pid: 0,
+        cpu: 0.0,
+    };
+
+    let tab = TerminalTab {
+        id: format!("t{}", id_num),
+        name: title,
+        subtitle: "flow".to_string(),
+        status: TabStatus::Idle,
+        panes: vec![vec![pane.clone()]],
+        active_pane: pane_id,
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+
+    state.tabs.push(tab);
+    state.active_tab = state.tabs.len() - 1;
+
+    state.panes = vec![vec![pane]];
+    state.active_pane = pane_id;
+    state.row_ratios = vec![1.0];
+    state.col_ratios = vec![vec![1.0]];
+    pane_id
+}
+
+/// Drop a Flow Explorer pane's state on close. Returns `true` when
+/// `pane_id` was a flow pane, so callers skip the PTY teardown.
+pub fn remove_flow_pane(state: &mut AppState, pane_id: u32) -> bool {
+    let Some(pane) = state.flows.remove(&pane_id) else {
+        return false;
+    };
+    record_flow_pane_event(&pane, "flow.close", "info", None);
+    record_diagnostic_pty_event(state, format!("flow_close pane={}", pane_id));
+    true
 }
 
 /// Refresh the pane/tab titles for an editor pane from its dirty state
@@ -2124,6 +2188,9 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
         if let Some(editor) = state.editors.remove(id) {
             record_editor_closed(&editor);
             record_diagnostic_pty_event(state, format!("editor_close pane={} scope=tab", id));
+            continue;
+        }
+        if remove_flow_pane(state, *id) {
             continue;
         }
         state.pty_manager.destroy(*id);
@@ -2654,7 +2721,7 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         // Editor pane: no PTY/terminal state to tear down.
         record_editor_closed(&editor);
         record_diagnostic_pty_event(state, format!("editor_close pane={} scope=pane", target.0));
-    } else {
+    } else if !remove_flow_pane(state, target.0) {
         // Destroy the PTY and terminal.
         state.pty_manager.destroy(target.0);
         state.terminals.remove(&target.0);
@@ -3444,6 +3511,9 @@ pub fn mutate_kill_workspace_terminals(state: &mut AppState, ws_idx: usize) {
     for id in &pane_ids {
         if let Some(editor) = state.editors.remove(id) {
             record_editor_closed(&editor);
+            continue;
+        }
+        if remove_flow_pane(state, *id) {
             continue;
         }
         state.pty_manager.destroy(*id);
@@ -4756,6 +4826,7 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "editor.save"
     ) || command.starts_with("workspace.switch:")
         || command.starts_with("terminal.focus:")
+        || command.starts_with("flow.")
 }
 
 fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
@@ -4816,21 +4887,35 @@ pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
     let _ = EDITOR_OPEN_HOOKS.set(std::sync::Arc::new(hooks));
 }
 
-/// Handle `editor.open` (no path): run the native file picker on a
-/// worker thread so the state lock and render loop stay free, then
-/// route the picked path through `editor.open:<path>`.
+/// Handle `editor.open` (no path): native file picker, routed back
+/// through `editor.open:<path>`.
 fn dispatch_editor_open_dialog(state: &mut AppState) -> bool {
+    let start_dir = active_workspace_cwd(state);
+    spawn_file_picker(state, "Open file", None, start_dir, |path| {
+        format!("editor.open:{}", path.display())
+    })
+}
+
+/// Run the native file picker on a worker thread so the state lock and
+/// render loop stay free, then dispatch `command_for(picked)` into the
+/// app. One dialog at a time; a second request while one is open is a
+/// no-op.
+fn spawn_file_picker(
+    state: &mut AppState,
+    title: &'static str,
+    filter: Option<(&'static str, &'static [&'static str])>,
+    start_dir: Option<PathBuf>,
+    command_for: impl Fn(&std::path::Path) -> String + Send + 'static,
+) -> bool {
     use std::sync::atomic::Ordering;
 
     let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
-        push_error_toast(state, "Open file dialog is not available");
+        push_error_toast(state, format!("{title} dialog is not available"));
         return true;
     };
-    // One dialog at a time; a second request while open is a no-op.
     if EDITOR_DIALOG_OPEN.swap(true, Ordering::SeqCst) {
         return true;
     }
-    let start_dir = active_workspace_cwd(state);
     std::thread::spawn(move || {
         // Drop guard so a panicking picker cannot leave the one-dialog
         // latch stuck `true` for the rest of the process.
@@ -4842,15 +4927,17 @@ fn dispatch_editor_open_dialog(state: &mut AppState) -> bool {
         }
         let _latch = DialogOpenGuard;
 
-        let mut dialog = rfd::FileDialog::new().set_title("Open file");
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        if let Some((name, extensions)) = filter {
+            dialog = dialog.add_filter(name, extensions);
+        }
         if let Some(dir) = start_dir.filter(|d| d.exists()) {
             dialog = dialog.set_directory(dir);
         }
-        let picked = dialog.pick_file();
-        if let Some(path) = picked {
+        if let Some(path) = dialog.pick_file() {
             {
                 let mut guard = hooks.shared.lock_recover();
-                dispatch(&mut guard, &format!("editor.open:{}", path.display()));
+                dispatch(&mut guard, &command_for(&path));
             }
             (hooks.request_rebuild)();
         }
@@ -4881,6 +4968,26 @@ fn record_editor_pane_event(
         reason,
         os_error: None,
     });
+}
+
+/// Emit one flow lifecycle event carrying the pane's flow id, source path
+/// and counts — never node names, prose or source text.
+fn record_flow_pane_event(
+    pane: &crate::flow_explorer::FlowPane,
+    event: &'static str,
+    level: &'static str,
+    reason: Option<&'static str>,
+) {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+
+    let path_str = pane.source_path.to_string_lossy().into_owned();
+    let mut record = FlowEventRecord::new(event, level, &pane.flow_id);
+    record.path = Some(&path_str);
+    record.mode = Some(pane.flow.mode.as_str());
+    record.node_count = Some(pane.flow.nodes.len() as u64);
+    record.edge_count = Some(pane.flow.edges.len() as u64);
+    record.reason = reason;
+    record_flow_event(&record);
 }
 
 /// Save one editor pane to disk with telemetry and a failure toast.
@@ -5120,6 +5227,54 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
         }
     }
     true
+}
+
+/// Handle `flow.open:<path>`: open the flow document in a new Flow
+/// Explorer tab, or surface a failure toast. Emits `flow.open` /
+/// `flow.open_failed` telemetry either way.
+pub fn dispatch_flow_open_path(state: &mut AppState, raw_path: &str) -> bool {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        push_error_toast(state, "Open flow: no path given");
+        return true;
+    }
+    let path = std::path::PathBuf::from(trimmed);
+    match crate::flow_explorer::FlowPane::open(&path) {
+        Ok(pane) => {
+            record_flow_pane_event(&pane, "flow.open", "info", None);
+            let pane_id = mutate_add_flow_tab(state, pane);
+            record_diagnostic_pty_event(state, format!("flow_open pane={}", pane_id.0));
+        }
+        Err(err) => {
+            let flow_id = crate::flow_explorer::flow_id_for(&path);
+            let path_str = path.to_string_lossy().into_owned();
+            let mut record = FlowEventRecord::new("flow.open_failed", "warn", &flow_id);
+            record.path = Some(&path_str);
+            record.reason = Some(err.reason());
+            record.os_error = err.os_error();
+            record_flow_event(&record);
+            record_diagnostic_pty_event(state, format!("flow_open_failed reason={}", err.reason()));
+            push_error_toast(state, err.message(&path));
+        }
+    }
+    true
+}
+
+/// Handle `flow.open` (no path): native JSON picker starting in the
+/// profile's `flows/` directory, routed back through `flow.open:<path>`.
+fn dispatch_flow_open_dialog(state: &mut AppState) -> bool {
+    let start_dir = crate::flow_explorer::flows_dir()
+        .filter(|dir| dir.is_dir())
+        .or_else(|| active_workspace_cwd(state));
+    spawn_file_picker(
+        state,
+        "Open flow",
+        Some(("Flow JSON", &["json"])),
+        start_dir,
+        |path| format!("flow.open:{}", path.display()),
+    )
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
@@ -5500,6 +5655,10 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             dispatch_editor_open_path(state, path)
         }
         "editor.open" => dispatch_editor_open_dialog(state),
+        other if let Some(path) = other.strip_prefix("flow.open:") => {
+            dispatch_flow_open_path(state, path)
+        }
+        "flow.open" => dispatch_flow_open_dialog(state),
         "editor.save" => dispatch_editor_save(state),
         "tab.new_worktree" => {
             let repo_cwd = active_workspace_cwd(state)
@@ -5919,7 +6078,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             let pane_id = state.active_pane.0;
             // Editor panes are titled by their file name + dirty marker;
             // session rename is a terminal concept and must not clobber it.
-            if state.editors.contains_key(&pane_id) {
+            if state.editors.contains_key(&pane_id) || state.flows.contains_key(&pane_id) {
                 return false;
             }
             dispatch(state, &format!("tab.request_rename:{pane_id}"))
@@ -7980,6 +8139,7 @@ pub(crate) mod tests {
             pty_manager: crate::pty::DaemonPty::new(),
             terminals: std::collections::HashMap::new(),
             editors: std::collections::HashMap::new(),
+            flows: std::collections::HashMap::new(),
             agent_restarts: std::collections::HashMap::new(),
             pending_agent_resumes: std::collections::HashMap::new(),
             agent_resume_attempts: std::collections::HashMap::new(),
@@ -16322,5 +16482,117 @@ mod tests_mouse_selection_copy_paste {
     fn normalize_pasted_text_noop_when_plain() {
         // Plain text with no markers or special newlines should be unchanged.
         assert_eq!(normalize_pasted_text("ls -al"), "ls -al");
+    }
+}
+
+#[cfg(test)]
+mod flow_pane_tests {
+    use super::tests::test_state;
+    use super::*;
+    use crate::flow_explorer::test_support::fixture_path;
+
+    fn open_fixture(state: &mut AppState) -> u32 {
+        assert!(dispatch(
+            state,
+            &format!("flow.open:{}", fixture_path().display())
+        ));
+        state.active_pane.0
+    }
+
+    #[test]
+    fn dispatch_flow_open_creates_flow_tab() {
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.flows.len(), 1);
+        assert!(
+            state.flows.contains_key(&pane_id),
+            "active pane is the flow"
+        );
+        assert!(
+            !state.terminals.contains_key(&pane_id),
+            "no terminal spawned"
+        );
+        assert!(!state.editors.contains_key(&pane_id));
+        assert_eq!(state.panes[0][0].title, "Send a prompt");
+        assert_eq!(state.panes[0][0].subtitle, "flow");
+        assert_eq!(state.tabs[state.active_tab].name, "Send a prompt");
+        assert!(state.toasts.is_empty());
+    }
+
+    #[test]
+    fn dispatch_flow_open_snapshot_marks_flow_pane() {
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        let snap = state.ui_snapshot();
+        let pane = snap
+            .flow_panes
+            .get(&pane_id)
+            .expect("flow pane in snapshot");
+        assert_eq!(pane.title(), "Send a prompt");
+        assert_eq!(pane.rows.len(), 11);
+        assert!(!snap.editor_panes.contains(&pane_id));
+    }
+
+    #[test]
+    fn dispatch_flow_open_missing_file_toasts_without_a_tab() {
+        let mut state = test_state();
+        assert!(dispatch(
+            &mut state,
+            "flow.open:C:/definitely/not/a/real/flow.json"
+        ));
+        assert_eq!(state.tabs.len(), 1);
+        assert!(state.flows.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_flow_open_empty_path_toasts() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "flow.open:  "));
+        assert!(state.flows.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_flow_open_dialog_without_hooks_toasts() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "flow.open"));
+        assert_eq!(state.toasts.len(), 1);
+        assert!(state.flows.is_empty());
+    }
+
+    #[test]
+    fn close_flow_pane_removes_flow_state() {
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        mutate_close_pane(&mut state, PaneId(pane_id));
+        assert!(state.flows.is_empty());
+        assert_eq!(state.tabs.len(), 1);
+        assert!(!state.terminals.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn close_tab_removes_flow_state() {
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        assert!(dispatch(&mut state, "tab.close.active"));
+        assert!(!state.flows.contains_key(&pane_id));
+        assert_eq!(state.tabs.len(), 1);
+    }
+
+    #[test]
+    fn rename_is_refused_for_flow_panes() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(!dispatch(&mut state, "session.rename_active"));
+        assert!(state.confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn flow_dispatch_prefix_is_palette_safe() {
+        assert!(is_palette_safe_dispatch("flow.open"));
+        assert!(is_palette_safe_dispatch("flow.view:panes"));
+        assert!(!is_palette_safe_dispatch("flowers"));
     }
 }

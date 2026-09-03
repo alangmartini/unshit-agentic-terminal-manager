@@ -384,6 +384,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                     // editor with a shell session.
                                     if !guard.terminals.contains_key(id)
                                         && !guard.editors.contains_key(id)
+                                        && !guard.flows.contains_key(id)
                                     {
                                         let spawn_plan = crate::state::pane_agent_spawn_plan(
                                             &guard,

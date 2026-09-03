@@ -7,16 +7,27 @@
 //! render path or spawns processes; producers and ingestion are layered on
 //! top by the app state.
 
+pub mod ingest;
 pub mod model;
+pub mod pane;
+pub mod telemetry;
 pub mod tree;
 
+pub use ingest::{ingest_file, IngestError, MAX_FLOW_JSON_BYTES};
 pub use model::{
     parse_flow, resolve_repo_root, Carrier, DiffRange, DiffStatus, Edge, EdgeKind, Flow, FlowMode,
     FlowParseError, FlowValidationError, Location, Node, NodeKind, Process, FLOW_SCHEMA_VERSION,
 };
+pub use pane::{flow_id_for, FlowLevel, FlowPane, FlowView};
 pub use tree::{
     collapsible_rows, derive_tree, visible_rows, RowMarker, TreeRow, MAX_TREE_DEPTH, MAX_TREE_ROWS,
 };
+
+/// Where app-launched flows are written and where the manual picker
+/// starts: `<data_dir>/flows/`.
+pub fn flows_dir() -> Option<std::path::PathBuf> {
+    crate::profile::data_dir().map(|dir| dir.join("flows"))
+}
 
 /// Shared fixture helpers for unit tests across the module and the UI.
 #[cfg(test)]
