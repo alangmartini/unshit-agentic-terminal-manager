@@ -426,6 +426,12 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
     // where nothing can reach them. `.m-menu` sets `overflow: visible`, so
     // the clipped part is simply unreachable, not scrollable.
     let (menu_w, menu_h) = estimate_menu_size(&menu);
+    // The root carries `FontScale` when the user raised the config font size,
+    // which grows every row's line box. Scaling the whole estimate (padding
+    // included) over-estimates a little, which is the safe direction.
+    let menu_h = menu_h
+        * (snap.config_font_size_pt as f32 / crate::state::DEFAULT_CONFIG_FONT_SIZE_PT as f32)
+            .max(1.0);
     let sf = if snap.scale_factor > 0.0 {
         snap.scale_factor
     } else {
@@ -1790,6 +1796,22 @@ mod tests {
 
     // -- context menu placement (stays inside the window) --------------------
 
+    /// The `Top` inset the overlay applied to the rendered menu, in CSS px.
+    fn menu_top_inset(overlay: &ElementDef) -> f32 {
+        use unshit::core::style::parse::StyleDeclaration;
+        use unshit::core::style::types::Dimension;
+
+        find_by_class(overlay, "ctx-menu")
+            .expect("menu must render")
+            .style_overrides
+            .iter()
+            .find_map(|s| match s {
+                StyleDeclaration::Top(Dimension::Px(v)) => Some(*v),
+                _ => None,
+            })
+            .expect("menu must carry a Top inset")
+    }
+
     /// Right-clicking a workspace near the bottom of the window used to leave
     /// the danger zone ("Kill all terminals" / "Remove workspace") below the
     /// window edge, where it could not be clicked at all.
@@ -1861,8 +1883,6 @@ mod tests {
     /// with the fixed-position class but no inset would land at the origin.
     #[test]
     fn ctx_menu_overlay_positions_the_menu() {
-        use unshit::core::style::parse::StyleDeclaration;
-
         let shared = make_shared();
         {
             let mut st = shared.lock().unwrap();
@@ -1877,18 +1897,42 @@ mod tests {
         }
         let snap = shared.lock().unwrap().ui_snapshot();
         let overlay = build_ctx_menu_overlay(&snap, &shared);
-        let menu = find_by_class(&overlay, "ctx-menu").expect("menu must render");
-        let top = menu
-            .style_overrides
-            .iter()
-            .find_map(|s| match s {
-                StyleDeclaration::Top(unshit::core::style::types::Dimension::Px(v)) => Some(*v),
-                _ => None,
-            })
-            .expect("menu must carry a Top inset");
+        let top = menu_top_inset(&overlay);
         assert!(
             top < 520.0,
             "menu opened near the bottom must be pulled up, got {top}"
+        );
+    }
+
+    /// A raised config font size grows every menu row, so the placement
+    /// estimate has to grow with it or the danger zone clips again for
+    /// exactly the users who bumped the UI font.
+    #[test]
+    fn larger_config_font_pulls_the_menu_further_from_the_edge() {
+        let shared = make_shared();
+        let baseline = {
+            let mut st = shared.lock().unwrap();
+            st.window_width = 900.0;
+            st.window_height = 560.0;
+            st.scale_factor = 1.0;
+            st.config_font_size_pt = crate::state::DEFAULT_CONFIG_FONT_SIZE_PT;
+            st.ctx_menu = Some(crate::state::CtxMenu {
+                x: 40.0,
+                y: 520.0,
+                target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+            });
+            st.ui_snapshot()
+        };
+        let enlarged = {
+            let mut st = shared.lock().unwrap();
+            st.config_font_size_pt = crate::state::DEFAULT_CONFIG_FONT_SIZE_PT * 2;
+            st.ui_snapshot()
+        };
+
+        assert!(
+            menu_top_inset(&build_ctx_menu_overlay(&enlarged, &shared))
+                < menu_top_inset(&build_ctx_menu_overlay(&baseline, &shared)),
+            "a larger UI font must push the menu further up from the edge"
         );
     }
 
