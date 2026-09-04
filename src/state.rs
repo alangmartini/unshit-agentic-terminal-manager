@@ -952,6 +952,11 @@ pub struct AppState {
     /// Last known physical pixel dimensions of the terminal grid element.
     pub last_grid_width: f32,
     pub last_grid_height: f32,
+    /// Last known physical pixel dimensions of the whole window (the UI
+    /// root element). Overlays anchored to a cursor position need the
+    /// viewport box, not the terminal grid subrect, to stay on screen.
+    pub window_width: f32,
+    pub window_height: f32,
     /// Flex-grow ratios for each row. Length matches `panes.len()`.
     pub row_ratios: Vec<f32>,
     /// Flex-grow ratios for columns within each row. `col_ratios[r].len()` matches `panes[r].len()`.
@@ -1160,6 +1165,8 @@ impl AppState {
             tabbar_rect: self.tabbar_rect,
             last_grid_width: self.last_grid_width,
             last_grid_height: self.last_grid_height,
+            window_width: self.window_width,
+            window_height: self.window_height,
             scale_factor: self.scale_factor,
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
@@ -1263,6 +1270,10 @@ pub struct UiSnapshot {
     pub last_grid_width: f32,
     /// Last measured physical height of the terminal-grid container.
     pub last_grid_height: f32,
+    /// Last measured physical size of the window (UI root). Zero until the
+    /// first root resize lands; consumers must treat zero as "unknown".
+    pub window_width: f32,
+    pub window_height: f32,
     /// Display scale factor so callers can convert physical pixels
     /// (stored for last_grid_*) back to CSS coordinates that compose
     /// with tabbar_rect and DragState cursor.
@@ -1477,6 +1488,8 @@ pub fn seed_state() -> AppState {
         cell_width_ratio: 0.6,
         last_grid_width: 0.0,
         last_grid_height: 0.0,
+        window_width: 0.0,
+        window_height: 0.0,
         row_ratios: vec![1.0],
         col_ratios: vec![vec![1.0]],
         resize_drag: None,
@@ -5995,6 +6008,37 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 false
             }
         }
+        // `ctx_menu.open_workspace:<idx>:<x>:<y>` (CSS px). Interactive opens
+        // run inline in the sidebar's `on_context_menu` handler and never
+        // reach `dispatch`, so overlay-placement e2e scripts have no other
+        // way in. Coordinates are the cursor anchor, exactly as the handler
+        // stores them.
+        cmd if cmd.starts_with("ctx_menu.open_workspace:") => {
+            let mut parts = cmd
+                .trim_start_matches("ctx_menu.open_workspace:")
+                .split(':');
+            let idx = parts.next().and_then(|v| v.parse::<usize>().ok());
+            let x = parts.next().and_then(|v| v.parse::<f32>().ok());
+            let y = parts.next().and_then(|v| v.parse::<f32>().ok());
+            match (idx, x, y) {
+                (Some(idx), Some(x), Some(y)) if idx < state.workspaces.len() => {
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "workspace",
+                        x,
+                        y,
+                        state.window_width / state.scale_factor.max(1e-3),
+                        state.window_height / state.scale_factor.max(1e-3),
+                    );
+                    state.ctx_menu = Some(CtxMenu {
+                        x,
+                        y,
+                        target: CtxMenuTarget::Workspace { idx },
+                    });
+                    true
+                }
+                _ => false,
+            }
+        }
         "modal.open" => {
             if state.settings_open {
                 // Re-pressing the settings hotkey while open closes the
@@ -8716,6 +8760,8 @@ pub(crate) mod tests {
             cell_width_ratio: 0.6,
             last_grid_width: 0.0,
             last_grid_height: 0.0,
+            window_width: 0.0,
+            window_height: 0.0,
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
             resize_drag: None,

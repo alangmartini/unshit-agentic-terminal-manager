@@ -28,6 +28,7 @@ enum TelemetryRecord {
     SlowFrame(SlowFrameRecord),
     GlyphDrop(GlyphDropRecord),
     PtyGeometry(PtyGeometryRecord),
+    CtxMenuOpen(CtxMenuOpenRecord),
 }
 
 impl TelemetryRecord {
@@ -36,6 +37,7 @@ impl TelemetryRecord {
             Self::SlowFrame(record) => record.event,
             Self::GlyphDrop(record) => record.event,
             Self::PtyGeometry(record) => record.event,
+            Self::CtxMenuOpen(record) => record.event,
         }
     }
 
@@ -44,6 +46,7 @@ impl TelemetryRecord {
             Self::SlowFrame(record) => &record.correlation_id,
             Self::GlyphDrop(record) => &record.correlation_id,
             Self::PtyGeometry(record) => &record.correlation_id,
+            Self::CtxMenuOpen(record) => &record.correlation_id,
         }
     }
 }
@@ -80,6 +83,27 @@ impl PtyResizeOutcome {
             Self::DroppedUnmapped | Self::DroppedDisconnected | Self::RpcFailed => "warn",
         }
     }
+}
+
+/// Content-free record of a context menu opening at the cursor. Carries the
+/// anchor and the measured window box so an off-screen menu ("the Remove
+/// workspace row is unreachable") can be diagnosed from the log alone --
+/// never the workspace name, pane title, or any other user content.
+#[derive(Debug, Serialize)]
+struct CtxMenuOpenRecord {
+    timestamp_unix_ms: u64,
+    event: &'static str,
+    level: &'static str,
+    correlation_id: String,
+    /// Bounded vocabulary: "workspace", "tab", "tab_name".
+    target: &'static str,
+    /// Cursor anchor in CSS px, as stored on the menu state.
+    x: f32,
+    y: f32,
+    /// Window box in CSS px. Zero until the root's first resize lands, which
+    /// is itself the signature of "menu placed without clamping".
+    window_width: f32,
+    window_height: f32,
 }
 
 /// Content-free record of a pane geometry change and its fate. Carries
@@ -278,6 +302,35 @@ pub fn record_pty_resize(
         rows,
         outcome,
         error_kind,
+    }));
+}
+
+/// Record a context menu opening, with the viewport box it was clamped
+/// against. Enqueueing is non-blocking, so this is safe to call from the
+/// input callback that opens the menu.
+pub fn record_ctx_menu_open(
+    target: &'static str,
+    x: f32,
+    y: f32,
+    window_width: f32,
+    window_height: f32,
+) {
+    enqueue(TelemetryRecord::CtxMenuOpen(CtxMenuOpenRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event: "ui.ctx_menu_open",
+        // Warn when the window box is still unmeasured: placement then falls
+        // back to the raw cursor and rows can land off screen.
+        level: if window_width <= 0.0 || window_height <= 0.0 {
+            "warn"
+        } else {
+            "debug"
+        },
+        correlation_id: process_correlation_id().to_string(),
+        target,
+        x,
+        y,
+        window_width,
+        window_height,
     }));
 }
 

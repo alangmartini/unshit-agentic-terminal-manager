@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Context menus no longer open off the bottom (or right) of the window.**
+  Right-clicking a workspace low in the sidebar placed the menu straight at
+  the cursor, so its danger zone -- "Kill all terminals" and "Remove
+  workspace" -- fell past the window edge, where it could not be clicked and
+  did not scroll. Menus are now pulled back inside the window before they are
+  drawn, and a `ui.ctx_menu_open` event records the anchor and window box so
+  a mis-placed menu can be diagnosed from telemetry.
+
 ## [0.3.3] - 2026-08-30
 
 Startup got an overhaul. The window now appears already drawn and answering

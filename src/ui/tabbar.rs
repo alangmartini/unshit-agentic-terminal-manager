@@ -235,6 +235,13 @@ fn build_tab(
                     st.ctx_menu = None;
                 } else {
                     let sf = st.scale_factor;
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "tab_name",
+                        x / sf,
+                        y / sf,
+                        st.window_width / sf,
+                        st.window_height / sf,
+                    );
                     st.ctx_menu = Some(CtxMenu {
                         x: x / sf,
                         y: y / sf,
