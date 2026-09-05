@@ -952,9 +952,11 @@ pub struct AppState {
     /// Last known physical pixel dimensions of the terminal grid element.
     pub last_grid_width: f32,
     pub last_grid_height: f32,
-    /// Last known physical pixel dimensions of the whole window (the UI
-    /// root element). Overlays anchored to a cursor position need the
-    /// viewport box, not the terminal grid subrect, to stay on screen.
+    /// Last known physical pixel dimensions of the whole window, tracked by
+    /// `on_resize` on the `.app` root. Overlays anchored to a cursor position
+    /// need the viewport box, not the terminal grid subrect, to stay on
+    /// screen. `0.0` until the first layout pass; consumers must treat zero
+    /// as "unknown" and fall back to unclamped placement.
     pub window_width: f32,
     pub window_height: f32,
     /// Flex-grow ratios for each row. Length matches `panes.len()`.
@@ -1270,8 +1272,9 @@ pub struct UiSnapshot {
     pub last_grid_width: f32,
     /// Last measured physical height of the terminal-grid container.
     pub last_grid_height: f32,
-    /// Last measured physical size of the window (UI root). Zero until the
-    /// first root resize lands; consumers must treat zero as "unknown".
+    /// Last measured physical size of the window (the `.app` root). `0.0`
+    /// means "not measured yet"; overlay placement then falls back to the
+    /// unclamped cursor coordinates.
     pub window_width: f32,
     pub window_height: f32,
     /// Display scale factor so callers can convert physical pixels
@@ -6008,19 +6011,18 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 false
             }
         }
-        // `ctx_menu.open_workspace:<idx>:<x>:<y>` (CSS px). Interactive opens
-        // run inline in the sidebar's `on_context_menu` handler and never
-        // reach `dispatch`, so overlay-placement e2e scripts have no other
-        // way in. Coordinates are the cursor anchor, exactly as the handler
-        // stores them.
-        cmd if cmd.starts_with("ctx_menu.open_workspace:") => {
-            let mut parts = cmd
-                .trim_start_matches("ctx_menu.open_workspace:")
-                .split(':');
-            let idx = parts.next().and_then(|v| v.parse::<usize>().ok());
-            let x = parts.next().and_then(|v| v.parse::<f32>().ok());
-            let y = parts.next().and_then(|v| v.parse::<f32>().ok());
-            match (idx, x, y) {
+        // E2E/diagnostic hook: opens the workspace context menu at explicit
+        // CSS coordinates, mirroring what the sidebar right-click handler
+        // stores. Interactive opens never route through dispatch (they run
+        // inline in `on_context_menu`), so this exists for driven sessions
+        // (TM_STARTUP_DISPATCH) to exercise overlay placement.
+        other if other.starts_with("ctx_menu.open_workspace:") => {
+            let mut parts = other["ctx_menu.open_workspace:".len()..].split(':');
+            match (
+                parts.next().and_then(|v| v.parse::<usize>().ok()),
+                parts.next().and_then(|v| v.parse::<f32>().ok()),
+                parts.next().and_then(|v| v.parse::<f32>().ok()),
+            ) {
                 (Some(idx), Some(x), Some(y)) if idx < state.workspaces.len() => {
                     crate::renderer_telemetry::record_ctx_menu_open(
                         "workspace",
@@ -11139,6 +11141,33 @@ pub(crate) mod tests {
     fn ctx_menu_close_returns_false_when_already_closed() {
         let mut state = test_state();
         assert!(!dispatch(&mut state, "ctx_menu.close"));
+    }
+
+    #[test]
+    fn ctx_menu_open_workspace_dispatch_sets_menu_state() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "ctx_menu.open_workspace:0:12.5:60"));
+        match state.ctx_menu.as_ref() {
+            Some(CtxMenu {
+                x,
+                y,
+                target: CtxMenuTarget::Workspace { idx },
+            }) => {
+                assert_eq!(*idx, 0);
+                assert_eq!(*x, 12.5);
+                assert_eq!(*y, 60.0);
+            }
+            other => panic!("expected workspace ctx menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctx_menu_open_workspace_dispatch_rejects_bad_input() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:99:10:10"));
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:0:abc:10"));
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:0:10"));
+        assert!(state.ctx_menu.is_none());
     }
 
     #[test]

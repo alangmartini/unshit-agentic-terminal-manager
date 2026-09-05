@@ -294,12 +294,17 @@ fn build_tree(
         });
 
     let titlebar = with_custom_surface_style(build_titlebar(snap, shared, window_events), snap);
-    // The root spans the whole window. Cursor-anchored overlays (context
-    // menus) need that box to know when they would run off screen, and no
-    // other element measures it: `last_grid_*` is the terminal subrect only.
+    // The `.app` root always spans the window. Cursor-anchored overlays
+    // (context menus) need that box to know when they would run off screen,
+    // and no other element measures it: `last_grid_*` is the terminal
+    // subrect only. `on_resize` reports physical pixels, like `last_grid_*`;
+    // consumers divide by `scale_factor`.
     let root_resize_shared = shared.clone();
     let mut root = ElementDef::new(Tag::Div)
         .on_resize(move |w, h| {
+            if w <= 0.0 || h <= 0.0 {
+                return;
+            }
             mutate_with(&root_resize_shared, |st| {
                 st.window_width = w;
                 st.window_height = h;

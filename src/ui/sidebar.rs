@@ -386,6 +386,9 @@ fn build_sidebar_footer(state: &UiSnapshot) -> ElementDef {
 }
 
 pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    use unshit::core::style::parse::StyleDeclaration;
+    use unshit::core::style::types::Dimension;
+
     let ctx = match &snap.ctx_menu {
         Some(c) => c,
         None => return ElementDef::new(Tag::Div).with_class("ctx-menu-hidden"),
@@ -432,58 +435,66 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
     let menu_h = menu_h
         * (snap.config_font_size_pt as f32 / crate::state::DEFAULT_CONFIG_FONT_SIZE_PT as f32)
             .max(1.0);
-    let sf = if snap.scale_factor > 0.0 {
-        snap.scale_factor
-    } else {
-        1.0
+    // Window size is stored in physical pixels, like `last_grid_*`; the menu
+    // metrics and the stored cursor anchor are both CSS px.
+    let sf = snap.scale_factor.max(1e-3);
+    let win_w = snap.window_width / sf;
+    let win_h = snap.window_height / sf;
+
+    let menu = menu.with_style(StyleDeclaration::Left(Dimension::Px(ctx_menu_clamped_x(
+        ctx.x, win_w, menu_w,
+    ))));
+    let menu = match ctx_menu_v_anchor(ctx.y, win_h, menu_h) {
+        CtxMenuVAnchor::Top(top) => menu.with_style(StyleDeclaration::Top(Dimension::Px(top))),
+        CtxMenuVAnchor::Bottom(inset) => {
+            menu.with_style(StyleDeclaration::Bottom(Dimension::Px(inset)))
+        }
     };
-    let (left, top) = clamp_menu_position(
-        ctx.x,
-        ctx.y,
-        snap.window_width / sf,
-        snap.window_height / sf,
-        menu_w,
-        menu_h,
-    );
-    let menu = menu
-        .with_style(unshit::core::style::parse::StyleDeclaration::Left(
-            unshit::core::style::types::Dimension::Px(left),
-        ))
-        .with_style(unshit::core::style::parse::StyleDeclaration::Top(
-            unshit::core::style::types::Dimension::Px(top),
-        ));
 
     backdrop.with_child(menu)
 }
 
-/// Breathing room kept between a context menu and the window edge, in CSS px.
-const MENU_EDGE_GAP: f32 = 6.0;
+/// Margin kept between a context menu edge and the window edge, CSS px.
+const CTX_MENU_EDGE_MARGIN: f32 = 8.0;
 
-/// Slide a cursor-anchored menu back inside the viewport.
-///
-/// Menus open at the cursor; when they do not fit below or to the right of
-/// it they are pulled up / left until they do, and never past the top-left
-/// origin (a menu taller than the window keeps its head visible). A
-/// viewport dimension of zero means "not measured yet" and is left alone.
-fn clamp_menu_position(
-    x: f32,
-    y: f32,
-    win_w: f32,
-    win_h: f32,
-    menu_w: f32,
-    menu_h: f32,
-) -> (f32, f32) {
-    let axis = |pos: f32, win: f32, size: f32| -> f32 {
-        if win <= 0.0 {
-            return pos;
-        }
-        let max = win - size - MENU_EDGE_GAP;
-        if max <= 0.0 {
-            return MENU_EDGE_GAP.min(win);
-        }
-        pos.clamp(0.0, max)
-    };
-    (axis(x, win_w, menu_w), axis(y, win_h, menu_h))
+/// Vertical anchor for a `position: fixed` context menu opened at cursor
+/// `y` inside a window `win_h` tall (both CSS px).
+enum CtxMenuVAnchor {
+    /// `top: y` — the classic drop-down below the cursor.
+    Top(f32),
+    /// `bottom: inset` — the menu grows upward from a pinned bottom edge,
+    /// which keeps every row in-window without knowing the menu height.
+    Bottom(f32),
+}
+
+/// Picks the anchor edge. `est_h` deliberately OVERESTIMATES the menu
+/// height: it only decides which edge to anchor to and never sizes
+/// anything, so erring large merely flips or pins slightly early, while
+/// erring small would let the menu clip at the window bottom.
+fn ctx_menu_v_anchor(y: f32, win_h: f32, est_h: f32) -> CtxMenuVAnchor {
+    // win_h == 0.0 means the window has never been measured (fresh state,
+    // structural tests): keep the historical unclamped drop-down.
+    if win_h <= 0.0 || y + est_h + CTX_MENU_EDGE_MARGIN <= win_h {
+        CtxMenuVAnchor::Top(y)
+    } else if y >= est_h + CTX_MENU_EDGE_MARGIN {
+        // Enough room above the cursor: flip up, menu bottom at the cursor.
+        // The max() only matters for driven/dispatched coordinates that
+        // land past the window bottom; a real cursor y never exceeds win_h.
+        CtxMenuVAnchor::Bottom((win_h - y).max(CTX_MENU_EDGE_MARGIN))
+    } else {
+        // Window shorter than the menu either way: pin to the bottom edge
+        // so the danger actions stay visible and clickable.
+        CtxMenuVAnchor::Bottom(CTX_MENU_EDGE_MARGIN)
+    }
+}
+
+/// Clamps the menu's left edge so a fixed-width menu stays in-window.
+/// `win_w == 0.0` (unmeasured) leaves the cursor coordinate untouched.
+fn ctx_menu_clamped_x(x: f32, win_w: f32, menu_w: f32) -> f32 {
+    if win_w <= 0.0 {
+        return x;
+    }
+    x.min((win_w - menu_w - CTX_MENU_EDGE_MARGIN).max(CTX_MENU_EDGE_MARGIN))
 }
 
 // Row metrics mirroring assets/styles.css. They only decide *whether* a
@@ -1737,6 +1748,126 @@ mod tests {
         );
     }
 
+    // -- context menu window clamping --
+
+    fn harness_with_ctx_menu(win_w: f32, win_h: f32, x: f32, y: f32) -> TestHarness {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.scale_factor = 1.0;
+            guard.window_width = win_w;
+            guard.window_height = win_h;
+            guard.ctx_menu = Some(crate::state::CtxMenu {
+                x,
+                y,
+                target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+            });
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let tree_shared = shared.clone();
+        let css = include_str!("../../assets/styles.css");
+        let mut harness = TestHarness::new(
+            css,
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_child(build_ctx_menu_overlay(&snap, &tree_shared)),
+            },
+            win_w,
+            win_h,
+        );
+        harness.step();
+        harness
+    }
+
+    #[test]
+    fn workspace_ctx_menu_pins_to_bottom_in_short_window() {
+        // Regression: in a window shorter than the menu, the raw Top(y)
+        // placement ran the danger zone ("Kill all terminals" / "Remove
+        // workspace") past the window bottom, leaving it invisible and
+        // unclickable.
+        let harness = harness_with_ctx_menu(600.0, 260.0, 20.0, 120.0);
+        let menu = harness
+            .query(".m-menu")
+            .expect("workspace ctx menu should render");
+        let bottom = menu.layout_rect.y + menu.layout_rect.height;
+        assert!(
+            bottom <= 260.0 + 0.5,
+            "menu must not cross the window bottom, got bottom {bottom} (rect {:?})",
+            menu.layout_rect
+        );
+        let danger = harness
+            .query(".m-danger")
+            .expect("danger zone should render");
+        let danger_bottom = danger.layout_rect.y + danger.layout_rect.height;
+        assert!(
+            danger_bottom <= 260.0 + 0.5,
+            "danger rows must stay inside the window, got bottom {danger_bottom}"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_flips_up_near_window_bottom() {
+        // Cursor near the bottom of a tall window: the menu flips so its
+        // bottom edge sits at the cursor instead of overflowing below.
+        let harness = harness_with_ctx_menu(1280.0, 720.0, 20.0, 650.0);
+        let menu = harness
+            .query(".m-menu")
+            .expect("workspace ctx menu should render");
+        let bottom = menu.layout_rect.y + menu.layout_rect.height;
+        assert!(
+            (bottom - 650.0).abs() <= 0.5,
+            "flipped menu bottom should sit at the cursor y, got {bottom}"
+        );
+        assert!(
+            menu.layout_rect.y >= 0.0,
+            "flipped menu must not cross the window top, got y {}",
+            menu.layout_rect.y
+        );
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_prefers_dropdown_when_it_fits() {
+        assert!(matches!(
+            ctx_menu_v_anchor(100.0, 720.0, 270.0),
+            CtxMenuVAnchor::Top(y) if y == 100.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_flips_up_when_only_space_above() {
+        assert!(matches!(
+            ctx_menu_v_anchor(650.0, 720.0, 270.0),
+            CtxMenuVAnchor::Bottom(inset) if inset == 70.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_pins_when_window_too_short() {
+        assert!(matches!(
+            ctx_menu_v_anchor(120.0, 260.0, 270.0),
+            CtxMenuVAnchor::Bottom(inset) if inset == CTX_MENU_EDGE_MARGIN
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_unmeasured_window_falls_through_to_cursor() {
+        // window_h == 0.0 (never measured) must keep the historical
+        // unclamped drop-down so structural tests and fresh state behave.
+        assert!(matches!(
+            ctx_menu_v_anchor(650.0, 0.0, 270.0),
+            CtxMenuVAnchor::Top(y) if y == 650.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_clamped_x_keeps_fixed_width_menu_in_window() {
+        assert_eq!(ctx_menu_clamped_x(20.0, 600.0, 222.0), 20.0);
+        assert_eq!(ctx_menu_clamped_x(500.0, 600.0, 222.0), 370.0);
+        // Unmeasured window: cursor coordinate passes through untouched.
+        assert_eq!(ctx_menu_clamped_x(500.0, 0.0, 222.0), 500.0);
+    }
+
     #[test]
     fn workspace_names_avoid_broken_medium_font_path() {
         let css = include_str!("../../assets/styles.css").replace("\r\n", "\n");
@@ -1796,8 +1927,9 @@ mod tests {
 
     // -- context menu placement (stays inside the window) --------------------
 
-    /// The `Top` inset the overlay applied to the rendered menu, in CSS px.
-    fn menu_top_inset(overlay: &ElementDef) -> f32 {
+    /// The vertical inset the overlay applied to the rendered menu, as
+    /// (is_bottom_anchored, value in CSS px).
+    fn menu_v_inset(overlay: &ElementDef) -> (bool, f32) {
         use unshit::core::style::parse::StyleDeclaration;
         use unshit::core::style::types::Dimension;
 
@@ -1806,55 +1938,11 @@ mod tests {
             .style_overrides
             .iter()
             .find_map(|s| match s {
-                StyleDeclaration::Top(Dimension::Px(v)) => Some(*v),
+                StyleDeclaration::Top(Dimension::Px(v)) => Some((false, *v)),
+                StyleDeclaration::Bottom(Dimension::Px(v)) => Some((true, *v)),
                 _ => None,
             })
-            .expect("menu must carry a Top inset")
-    }
-
-    /// Right-clicking a workspace near the bottom of the window used to leave
-    /// the danger zone ("Kill all terminals" / "Remove workspace") below the
-    /// window edge, where it could not be clicked at all.
-    #[test]
-    fn menu_near_bottom_edge_is_pulled_up_to_fit() {
-        let (_left, top) = clamp_menu_position(40.0, 520.0, 900.0, 560.0, 222.0, 180.0);
-        assert!(
-            top + 180.0 <= 560.0,
-            "menu bottom must stay inside the window, got top {top}"
-        );
-    }
-
-    #[test]
-    fn menu_near_right_edge_is_pulled_left_to_fit() {
-        let (left, _top) = clamp_menu_position(860.0, 40.0, 900.0, 560.0, 222.0, 180.0);
-        assert!(
-            left + 222.0 <= 900.0,
-            "menu right edge must stay inside the window, got left {left}"
-        );
-    }
-
-    #[test]
-    fn menu_that_fits_opens_exactly_at_the_cursor() {
-        let (left, top) = clamp_menu_position(120.0, 80.0, 900.0, 560.0, 222.0, 180.0);
-        assert_eq!((left, top), (120.0, 80.0));
-    }
-
-    /// A menu taller than the window keeps its head (and the header naming
-    /// the target) on screen rather than scrolling its top out of view.
-    #[test]
-    fn menu_taller_than_window_stays_pinned_to_the_top() {
-        let (_left, top) = clamp_menu_position(40.0, 300.0, 900.0, 120.0, 222.0, 400.0);
-        assert!(top <= MENU_EDGE_GAP, "expected top pinned, got {top}");
-    }
-
-    /// Before the first root resize the window box is unknown; placement must
-    /// then fall back to the raw cursor instead of collapsing to the corner.
-    #[test]
-    fn unmeasured_window_leaves_the_cursor_anchor_alone() {
-        assert_eq!(
-            clamp_menu_position(310.0, 470.0, 0.0, 0.0, 222.0, 180.0),
-            (310.0, 470.0)
-        );
+            .expect("menu must carry a vertical inset")
     }
 
     /// The estimate drives the clamp, so it must cover the whole workspace
@@ -1879,8 +1967,9 @@ mod tests {
         );
     }
 
-    /// The overlay, not the builders, applies the position now. A menu built
+    /// The overlay, not the builders, applies the position now: a menu built
     /// with the fixed-position class but no inset would land at the origin.
+    /// Opened low in the window, it anchors from the bottom instead.
     #[test]
     fn ctx_menu_overlay_positions_the_menu() {
         let shared = make_shared();
@@ -1896,19 +1985,20 @@ mod tests {
             });
         }
         let snap = shared.lock().unwrap().ui_snapshot();
-        let overlay = build_ctx_menu_overlay(&snap, &shared);
-        let top = menu_top_inset(&overlay);
+        let (bottom_anchored, inset) = menu_v_inset(&build_ctx_menu_overlay(&snap, &shared));
+        assert!(bottom_anchored, "menu opened near the bottom must flip up");
         assert!(
-            top < 520.0,
-            "menu opened near the bottom must be pulled up, got {top}"
+            (inset - 40.0).abs() <= 0.5,
+            "flipped menu bottom should sit at the cursor, got inset {inset}"
         );
     }
 
     /// A raised config font size grows every menu row, so the placement
     /// estimate has to grow with it or the danger zone clips again for
-    /// exactly the users who bumped the UI font.
+    /// exactly the users who bumped the UI font. At this cursor the menu
+    /// fits below at the default font and no longer does when it doubles.
     #[test]
-    fn larger_config_font_pulls_the_menu_further_from_the_edge() {
+    fn larger_config_font_changes_the_anchor_edge() {
         let shared = make_shared();
         let baseline = {
             let mut st = shared.lock().unwrap();
@@ -1918,7 +2008,7 @@ mod tests {
             st.config_font_size_pt = crate::state::DEFAULT_CONFIG_FONT_SIZE_PT;
             st.ctx_menu = Some(crate::state::CtxMenu {
                 x: 40.0,
-                y: 520.0,
+                y: 300.0,
                 target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
             });
             st.ui_snapshot()
@@ -1929,10 +2019,14 @@ mod tests {
             st.ui_snapshot()
         };
 
+        assert_eq!(
+            menu_v_inset(&build_ctx_menu_overlay(&baseline, &shared)),
+            (false, 300.0),
+            "at the default font the menu still fits below the cursor"
+        );
         assert!(
-            menu_top_inset(&build_ctx_menu_overlay(&enlarged, &shared))
-                < menu_top_inset(&build_ctx_menu_overlay(&baseline, &shared)),
-            "a larger UI font must push the menu further up from the edge"
+            menu_v_inset(&build_ctx_menu_overlay(&enlarged, &shared)).0,
+            "a doubled UI font must stop the menu dropping past the edge"
         );
     }
 
