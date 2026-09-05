@@ -25,11 +25,17 @@
 param(
     [string]$Out = "resource-stats-shot.png",
     [string]$ExeDir = "",
+    # Startup dispatch after the pane's shell exists. The default splits so
+    # a pane header is visible and pastes the busy one-liner; append
+    # `;settings.section:sessions` to capture the Sessions panel instead.
+    [string]$Dispatch = "pane.split_right;terminal.paste",
     # Long enough for the busy loop to start and for at least two sampler
     # ticks (CPU needs a baseline tick before it shows a number).
     [int]$SettleMs = 12000,
     [int]$BusySeconds = 45,
     [int]$Width = 1100,
+    # Window origin; lower it for tall captures so the bottom stays on screen.
+    [int]$Top = 320,
     [int]$Height = 600
 )
 
@@ -82,7 +88,7 @@ Set-Clipboard -Value $oneLiner
 
 # The pane header only renders in multi-pane tabs; the paste lands in the
 # active pane's already-spawned shell.
-$dispatch = "pane.split_right;terminal.paste"
+$dispatch = $Dispatch
 
 $launched = $null
 $isolation = Enter-TmIsolation -Tag 'resshot'
@@ -108,14 +114,14 @@ try {
     if ($handle -eq [IntPtr]::Zero) { throw 'No window within 20s' }
 
     # Deterministic size, no activation (SWP_NOACTIVATE = 0x10, SWP_NOZORDER = 0x4).
-    [ResShotWin]::SetWindowPos($handle, [IntPtr]::Zero, 40, 320, $Width, $Height, 0x14) | Out-Null
+    [ResShotWin]::SetWindowPos($handle, [IntPtr]::Zero, 40, $Top, $Width, $Height, 0x14) | Out-Null
     Start-Sleep -Milliseconds $SettleMs
 
     # The first handle can be the splash window, which is destroyed once the
     # GPU surface is up; resolve again after settling and reposition.
     $again = [ResShotWin]::LargestVisibleWindow([uint32]$proc.Id)
     if ($again -ne [IntPtr]::Zero) { $handle = $again }
-    [ResShotWin]::SetWindowPos($handle, [IntPtr]::Zero, 40, 320, $Width, $Height, 0x14) | Out-Null
+    [ResShotWin]::SetWindowPos($handle, [IntPtr]::Zero, 40, $Top, $Width, $Height, 0x14) | Out-Null
     Start-Sleep -Milliseconds 1500
 
     $rect = New-Object ResShotWin+RECT
