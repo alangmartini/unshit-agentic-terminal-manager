@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-05
+
+Three agent-workflow features land together. Flow Explorer is a new kind of
+pane: an agent writes a small JSON model of one user-facing flow through a
+codebase and the app renders it as a call stack, as Miller columns or as a
+swim-lane graph, with a review mode that marks what a change touched. The
+sidebar splits every workspace into `terminals` and `agents`, recognises agent
+CLIs from their window titles, and gains a New agent shortcut, palette rows, a
+context-menu flyout and a `terminal-manager agent` command. And the status bar,
+pane headers, sidebar rows and Sessions panel now show live CPU and memory for
+each pane's whole process tree instead of placeholders. Agent launches through
+`claude.cmd` / `codex.cmd` keep their quoted arguments, context menus stay
+inside the window, and Claude Code's `✳` title glyph renders instead of a box.
+
+### Added
+
+- **Flow Explorer: a native pane that shows an agent-authored model of one
+  user-facing flow through a codebase, instead of a raw diff.** The agent
+  writes a small JSON document (nodes tagged with the process they run in
+  and the carrier an event travels over, ordered edges, entry points, and
+  per-node diff status for review mode); the app renders it. This slice
+  lands the data model: two-phase parsing so a producer's own failure
+  reason reaches the user instead of a "missing field" error, validation
+  that reports every problem at once, bounded call-stack tree derivation
+  (cycles become "shown above" leaves; depth and row caps stop a hostile
+  document), and a committed fixture transcribed from the reference video.
+  Location paths a Windows agent writes with backslashes are normalized
+  rather than rejected.
+- A flow opens as its own pane: **Open flow…** in the command palette (or
+  `flow.open:<path>` from the startup dispatch hook) reads a flow JSON, shows
+  its title, summary and counts, and lives beside terminals and editors in
+  the tab strip. Flow panes never enter the PTY paths and are not persisted
+  across restarts (the JSON stays on disk under the profile's `flows/`
+  directory and can be reopened). Every open and close is recorded in
+  `flow-events.jsonl` next to the editor's log, with reasons for failures.
+- Flow Explorer call stack view: view and level tabs, expand/collapse, process-coloured tree rows with descriptions, locations and `src` buttons, and a legend of processes and event carriers (`flow.view:`, `flow.level:`, `flow.expand_all`, `flow.collapse_all`, `flow.toggle:<row>`, `flow.src:<id>`).
+- Flow Explorer inline source: the `src` button (and the source level) opens a syntax-coloured excerpt of the node's location with line numbers and the located range highlighted; excerpts are read once per node from the flow's repo root (path-contained, 256 KiB cap) and a stale location renders "source not available" instead of failing.
+- Flow Explorer keyboard navigation: Up/Down/Home/End/PageUp/PageDown move a row cursor, Right expands or steps into a child, Left collapses or steps out, Enter/Space toggles, `s` opens the source, `e`/`c` expand or collapse all, Ctrl+1/2/3 switch views; clicking a row selects it and the cursor follows collapses and level changes.
+- Flow Explorer panes view: Miller columns from the flow overview through each chosen node (name, kind, process, carrier, tags, description, payload, calls / resolves / handled by / handles lists and the source excerpt); older columns collapse to rotated strips, `flow.select:<col>:<id>` and `flow.focus:<col>` drive it, and the shared cursor keys move a column cursor.
+- Flow Explorer review mode: a review flow (`mode: review` with a `diff_range`) shows `base..head` in the header, a `+ added / - removed / ~ modified` legend row, and per-node diff rails and markers in both the call stack and the panes view; `tests/fixtures/flow-explorer/send-a-prompt.review.json` is the reference.
+- Flow Explorer graph view: swim lanes per process with function boxes, events folded into numbered edges labelled `carrier · event` (dotted for `resolves`), a breadcrumb that zooms into a badge's receiver (`flow.graph.zoom:<id>`, `flow.graph.crumb:<n>`), a `depth: 1 2 3 all` filter (`flow.graph.depth:<d>`), and box clicks that open the panes view on that node's call chain (`flow.graph.details:<id>`).
+- Flow Explorer producer: **Explain flow…** and **Review change as flows…** in the command palette ask for a flow name or a `base..head`, then launch the default Quick Prompt agent in the workspace directory with the shipped `flow-explorer` skill (`assets/flow-explorer/SKILL.md`, also copyable into `~/.claude/skills/`); a background poll opens the finished flow as a new tab and toasts a broken one (`flow.launch`, `flow.ready`, `flow.parse_failed`, `flow.timeout` in `flow-events.jsonl`). `flow.explain:<request>` / `flow.review:<range>` launch without the dialog.
+
+- **Agents subtab in the workspace sidebar.** Every workspace now shows two
+  pane lists, `terminals` and `agents`, each with its own count and fold.
+  A pane lands under `agents` when the app launched the agent itself, when
+  a provider SessionStart hook reported it, or, with no setup at all, when
+  the guest window title identifies a known agent CLI (Claude Code's
+  status-glyph titles, `Claude`, `Codex`, `Gemini`, `OpenCode`, `Aider`,
+  `Copilot`, `OpenRouter`). Title-based membership clears again when the
+  title stops matching, so a shell that ran `claude` returns to
+  `terminals` once the agent exits. Agent rows and their tabs in the tab
+  strip carry an agent glyph, and membership survives a restart
+  (`agent_tag` on the persisted pane; older files still load and are
+  re-classified from the saved title).
+- **New agent, everywhere.** `Ctrl+Shift+A` (editable as *New agent*
+  under Settings › Keybinds), the palette rows *New agent* / *New Claude
+  Code agent* / *New Codex agent*, a **New agent ›** flyout on the
+  workspace and subtab context menus listing the installed agent CLIs,
+  and `terminal-manager agent [claude|codex|gemini|opencode|aider|copilot]
+  [--workspace-id N]` from any terminal (defaults to the calling
+  terminal's workspace and brings the window forward) all open a tab
+  running the agent in the workspace directory (honouring the worktree
+  tabs toggle). Claude launches with a pre-generated `--session-id` so
+  the existing crash-recovery record is exact; Codex runs interactively.
+- Right-clicking the `agents` subtab offers **Kill all agents**, which
+  kills only the workspace's agent panes after a confirmation and leaves
+  plain terminals untouched; the `terminals` subtab menu carries the
+  shell flyout and **Kill all terminals**.
+- Structured `agent-events.jsonl` under the profile directory records
+  classification transitions, launches, kills and CLI requests
+  (`agent.classified`, `agent.untagged`, `agent.launch`,
+  `agent.launch_failed`, `agent.kill_all`, `agent.cli`) with profile,
+  source and reason fields and never the guest title text.
+
+- `settings.section:<name>` (e.g. `settings.section:sessions`) opens settings on that section and `sidebar.width:<px>` sets the sidebar width, both usable from `TM_STARTUP_DISPATCH`. `scripts/resource-stats-shot.ps1 -Dispatch/-Top` select the startup dispatch and window origin so the same script captures the Sessions panel and the widened sidebar.
+
+- `resource-events.jsonl` in the profile config dir: `resource.monitor_started`, a one-per-minute `resource.summary` (tick cost, processes, unsampled processes, daemon list failures, current totals) and `resource.list_failed` / `resource.list_recovered` transitions, so "the numbers look wrong" can be diagnosed from telemetry alone.
+- `scripts/resource-stats-shot.ps1`: puts a busy child under a pane's shell in an isolated profile and captures the live figures.
+
 ### Fixed
 
 - **Context menus no longer open off the bottom (or right) of the window.**
@@ -18,6 +98,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shorter than the menu either way, and clamps its left edge near the right
   side of the window. A `ui.ctx_menu_open` event records the anchor and
   window box so a mis-placed menu can be diagnosed from telemetry.
+
+- Windows agent launches through `claude.cmd` / `codex.cmd` (Quick Prompt, crash resume, Flow Explorer) lost their arguments whenever more than one of them needed quotes: the PTY daemon started the batch file directly and `cmd.exe` stripped the first and last quote of the command line, so a prompt with spaces produced `'C:\Users\Alan' is not recognized...` instead of an agent. Batch programs now run as `cmd.exe /d /c call <script> <args>`, which keeps every quoted argument intact.
+
+- The status bar's `cpu` / `mem` / `↓ k/s` figures and the pane header's `pid · cpu` never showed what the terminals were actually costing: CPU and throughput were never sampled, memory only updated when the Sessions panel was opened (and then counted the shell alone), the clock stayed at `00:00` and every pane header read `pid 0 · 0.0%`. A background sampler now walks each session's whole process tree once a second — the shell, the agent it runs, that agent's node children and any `git` it spawns — and the status bar shows the machine-wide CPU share and working set of the UI, the daemon and every tree combined. Pane headers show the pane's own tree as `pid 1234 · 3.2% · 412 MiB`. Figures that are not known yet (first tick, daemon unreachable) read `--` instead of a misleading `0.0`. `↓ k/s` is PTY output received from the daemon across all sessions. The clock ticks.
+- The status bar's right side read `utf-8` and `bash · 5.2` no matter what was running. It now shows the active tab's process trees summed (`tab 4.2% · 164 MiB · 5 procs`) and the focused pane's real shell and pid (`powershell · pid 16192`, taken from the sampled root process image rather than the pane's seeded subtitle), so a single-pane tab has a per-tab figure without being split; `--` while unknown.
+- Sidebar terminal rows carry a `cpu · mem` chip (`4.1% · 164M`) for the pane's tree once the sampler has attributed it, giving an at-a-glance comparison across tabs. The chip appears from a 300 px sidebar upward; the default 252 px cannot hold name, branch and usage without crushing the name.
+- The Sessions panel's memory figures counted each shell alone and only changed when the panel was opened. Rows, the `terminals` bucket, the workspace roll-up and the total now prefer the live tree figure (each row shows its process count), the rows follow the daemon's list every 10 s and go `stale` when the daemon cannot be listed, and the `ptyd` bucket includes the console hosts the daemon spawns, so it reads larger than before.
+
+- **Status symbols in sidebar rows and tab titles.** Labels rendered a solid
+  box where a guest window title carried `✳` (Claude Code's idle title
+  prefix) or another text-presentation symbol the UI font lacks. The
+  platform font fallback resolved such characters to the color-emoji face,
+  whose glyphs the renderer can only flatten into their silhouette; they are
+  now re-shaped onto the monochrome symbol face, so `✳ Workspace` reads as
+  intended while explicit emoji sequences (`✳️`) and full emoji are left
+  unchanged. Text measurement and the terminal grid use the same shaping,
+  and the fallback rate is recorded as `renderer.symbol_fallback` (counts
+  only) in the profile's `renderer-events.jsonl`.
 
 ## [0.3.3] - 2026-08-30
 
@@ -567,7 +665,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.0...v0.3.1
