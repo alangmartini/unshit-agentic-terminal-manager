@@ -1900,7 +1900,10 @@ input, select {
   flex-direction: column;
   padding: var(--sp-1) 0 var(--sp-2);
   overflow: hidden;
-  max-height: 300px;
+  /* Two unfolded pane lists (terminals + agents) must fit; the body is
+     overflow: hidden for the collapse animation, so a low cap clips the
+     second list silently. */
+  max-height: 900px;
   transition: max-height var(--dur-norm) var(--ease-std);
 }
 
@@ -2079,6 +2082,22 @@ input, select {
 .terminal-entry .branch-tag {
   flex-shrink: 999;
   min-width: 56px;
+}
+
+/* Agent glyph in front of an agent pane's sidebar row and its tab. A
+   definite box (fixed width + inline-flex) so the flex row reserves space. */
+.terminal-entry .entry-agent-ic,
+.tab .tab-agent-ic {
+  display: inline-flex;
+  align-items: center;
+  width: 12px;
+  flex-shrink: 0;
+  color: var(--amber-300);
+}
+
+.tab.active .tab-agent-ic,
+.terminal-entry.active .entry-agent-ic {
+  color: var(--amber-200);
 }
 
 .sidebar-footer {
@@ -3195,6 +3214,11 @@ body.dragging-pane {
 }
 .m-sub-anchor:hover .m-flyout { display: flex; }
 .m-flyout.flip { left: auto; right: 217px; }
+
+/* Agent rows in the "New agent" flyout: label plus a dimmed program hint. */
+.m-agent .m-label { color: var(--fg-secondary); white-space: nowrap; }
+.m-agent:hover .m-label { color: var(--fg-primary); }
+.m-agent .m-kbd { color: var(--fg-muted); }
 
 .m-shell .sh-name-wrap {
   display: flex;
