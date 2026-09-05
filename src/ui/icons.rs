@@ -408,6 +408,7 @@ pub fn subtab_icon_for(kind: SubtabIcon) -> SvgNode {
         SubtabIcon::GitBranch => icon_git_branch(),
         SubtabIcon::Folder => icon_folder(),
         SubtabIcon::EnvList => icon_env_list(),
+        SubtabIcon::Agent => icon_agent(),
     }
 }
 

@@ -325,6 +325,42 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         enabled: true,
     },
     PaletteAction {
+        id: "new_agent",
+        label: "New agent",
+        description: "Open a new tab running the default agent CLI in the active workspace.",
+        group: PaletteGroup::Session,
+        icon: PaletteIcon::Agent,
+        keybind: Some(KeybindAction::NewAgent),
+        shortcut_label: None,
+        dispatch: "agent.new",
+        keywords: &["new", "agent", "tab", "start", "launch"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "new_claude_agent",
+        label: "New Claude Code agent",
+        description: "Open a new tab running Claude Code in the active workspace.",
+        group: PaletteGroup::Session,
+        icon: PaletteIcon::Agent,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "agent.new:claude",
+        keywords: &["new", "agent", "claude", "anthropic", "tab"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "new_codex_agent",
+        label: "New Codex agent",
+        description: "Open a new tab running Codex in the active workspace.",
+        group: PaletteGroup::Session,
+        icon: PaletteIcon::Agent,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "agent.new:codex",
+        keywords: &["new", "agent", "codex", "openai", "tab"],
+        enabled: true,
+    },
+    PaletteAction {
         id: "open_settings",
         label: "Open settings",
         description: "Open app settings.",
@@ -1267,6 +1303,9 @@ mod tests {
                 "restart_session",
                 "clear_scrollback",
                 "spawn_agent",
+                "new_agent",
+                "new_claude_agent",
+                "new_codex_agent",
                 "open_settings",
                 "change_theme",
                 "toggle_worktree_tabs",
@@ -1391,6 +1430,9 @@ mod tests {
                         | "sidebar.toggle"
                         | "modal.open"
                         | "quick_prompt.open"
+                        | "agent.new"
+                        | "agent.new:claude"
+                        | "agent.new:codex"
                         | "editor.open"
                         | "editor.save"
                         | "flow.open"
@@ -1456,6 +1498,9 @@ mod tests {
                         "restart_session",
                         "clear_scrollback",
                         "spawn_agent",
+                        "new_agent",
+                        "new_claude_agent",
+                        "new_codex_agent",
                     ],
                 ),
                 (

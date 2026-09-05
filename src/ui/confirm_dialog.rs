@@ -42,6 +42,17 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
             "Kill all",
             shared,
         ),
+        ConfirmDialog::KillAgents { name, count, .. } => build_simple_confirm_card(
+            "Kill all agents in workspace",
+            &format!(
+                "{} agent pane{} in workspace \"{}\" will be killed. Plain terminals stay open. This cannot be undone.",
+                count,
+                if *count == 1 { "" } else { "s" },
+                name
+            ),
+            "Kill agents",
+            shared,
+        ),
         ConfirmDialog::KillAll { count } => build_simple_confirm_card(
             "Kill all terminals",
             &format!(

@@ -218,6 +218,7 @@ mod tests {
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
             ctx_menu: None,
+            agent_pane_ids: Default::default(),
             confirm_dialog: None,
             terminal_count: 0,
             active_terminal_cols: 80,

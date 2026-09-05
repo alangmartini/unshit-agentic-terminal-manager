@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 pub mod agent_restore;
+pub mod agents;
 pub mod bench;
 pub mod bridge;
 pub mod browser;
