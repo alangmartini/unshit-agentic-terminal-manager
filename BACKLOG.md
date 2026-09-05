@@ -85,8 +85,16 @@ The audit surfaced adjacent hazards that are not yet fixed:
 
 ## Product ideas
 
+- [ ] **Agents subtab follow-ups** (`specs/agents-tab.md`, shipped 2026-09-05)
+  - **Process-tree detection:** classify a pane by walking the PTY child processes (`claude.exe`, `codex.exe`, `node` running an agent entry point) so an agent whose title is suppressed or customised still lands under `agents`; the title rule stays as the fallback.
+  - **Verify guest titles:** the Codex, Gemini, OpenCode, Aider and Copilot needles come from the binary names, not from observed titles; check each CLI on Windows and add glyph or prefix rules where the title differs.
+  - **OpenRouter:** today only a title needle (there is no OpenRouter CLI to launch). Decide whether "open router" meant a specific client and add a launchable profile for it.
+  - **Per-workspace default agent** and remembering the last-launched profile for `Ctrl+Shift+A`.
+  - **Status glyph in labels:** Claude Code's `✳ Claude Code` title shows the glyph as a filled box in the sidebar and tab strip (the colour-glyph limitation in `terminal-emoji-color-rendering`). Either add the Claude status glyphs to the vector-marker set or strip them from the label once the pane is classified.
+
 - [ ] **Learning mode using agent skills**
   - **Source idea:** https://gist.github.com/ThariqS/1389dcdff9eba4789887a2211370f06b
+  - **Status (2026-09-03):** the PR-mode half shipped as the **Flow Explorer** (`specs/flow-explorer.md`): an agent skill models one flow of a change as JSON and the app renders it as a call stack, Miller columns and a graph (`flow.review`). The teaching loop (restate, checklist, quiz) is still open and can be layered on the same pane.
   - **Goal:** Add an interactive teaching mode where an agent skill guides the user through code understanding instead of only executing commands.
   - **Core flow:**
     - Start from a task, file, commit, branch diff, or PR.

@@ -213,8 +213,12 @@ impl Session {
             .map(|s| s.to_string())
             .unwrap_or_else(crate::pty::default_shell);
 
-        let mut cmd = CommandBuilder::new(&shell);
-        for arg in crate::pty::build_spawn_args(&shell, shell_args, cwd) {
+        let (program, args) = crate::pty::batch_launch(
+            &shell,
+            crate::pty::build_spawn_args(&shell, shell_args, cwd),
+        );
+        let mut cmd = CommandBuilder::new(&program);
+        for arg in args {
             cmd.arg(arg);
         }
         if let Some(dir) = cwd {
@@ -759,6 +763,45 @@ mod tests {
         );
 
         session.kill();
+    }
+
+    /// Batch files go through `cmd.exe /d /c call` so quoted arguments
+    /// survive cmd's `/c` quote stripping (a spaced script path plus a
+    /// spaced prompt is the Quick Prompt / Flow Explorer launch shape).
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_file_receives_quoted_arguments_intact() {
+        let dir = std::env::temp_dir().join(format!("ptyd batch {}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("echoargs.cmd");
+        std::fs::write(&script, b"@echo off\r\necho ARGS=[%*]\r\n").expect("script");
+        let shell_args = vec![
+            "--session-id".to_string(),
+            "abc".to_string(),
+            "a prompt with spaces".to_string(),
+        ];
+        let (mut session, _token, mut rx) = Session::spawn(
+            13,
+            120,
+            24,
+            None,
+            Some(script.to_str().expect("utf-8 path")),
+            &shell_args,
+            0,
+            0,
+            None,
+        )
+        .expect("spawn batch session");
+
+        let got = drain_for(&mut rx, Duration::from_millis(2500)).await;
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.contains("ARGS=[--session-id abc \"a prompt with spaces\"]"),
+            "quoted arguments must reach the script intact, got: {text:?}"
+        );
+
+        session.kill();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

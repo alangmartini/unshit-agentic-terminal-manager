@@ -26,11 +26,10 @@ pub fn build_drag_overlay(state: &UiSnapshot) -> Option<ElementDef> {
             .flat_map(|row| row.iter())
             .find(|p| p.id == pane_id)?;
         (pane.title.clone(), pane.subtitle.clone())
-    } else if let Some(tab_id) = state.drag.dragged_tab() {
+    } else {
+        let tab_id = state.drag.dragged_tab()?;
         let tab = state.tabs.iter().find(|t| t.id == tab_id)?;
         (tab.name.clone(), tab.subtitle.clone())
-    } else {
-        return None;
     };
 
     // Small down/right offset keeps the ghost next to the cursor

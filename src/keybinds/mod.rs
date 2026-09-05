@@ -20,6 +20,7 @@ use unshit::core::shortcut::KeyCombo;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeybindAction {
     NewTerminal,
+    NewAgent,
     CloseTab,
     SplitRight,
     SplitDown,
@@ -72,6 +73,7 @@ impl KeybindAction {
     /// Every variant, in display order.
     pub const ALL: &'static [KeybindAction] = &[
         Self::NewTerminal,
+        Self::NewAgent,
         Self::CloseTab,
         Self::SplitRight,
         Self::SplitDown,
@@ -99,6 +101,7 @@ impl KeybindAction {
     pub fn id(self) -> &'static str {
         match self {
             Self::NewTerminal => "new_terminal",
+            Self::NewAgent => "new_agent",
             Self::CloseTab => "close_tab",
             Self::SplitRight => "split_right",
             Self::SplitDown => "split_down",
@@ -132,6 +135,7 @@ impl KeybindAction {
     pub fn label(self) -> &'static str {
         match self {
             Self::NewTerminal => "New terminal",
+            Self::NewAgent => "New agent",
             Self::CloseTab => "Close tab",
             Self::SplitRight => "Split right",
             Self::SplitDown => "Split down",
@@ -160,6 +164,9 @@ impl KeybindAction {
     pub fn description(self) -> &'static str {
         match self {
             Self::NewTerminal => "Open a new terminal tab",
+            Self::NewAgent => {
+                "Open a new tab running the default agent CLI in the active workspace"
+            }
             Self::CloseTab => "Close the current tab",
             Self::SplitRight => "Open a new pane to the right",
             Self::SplitDown => "Open a new pane below",
@@ -195,6 +202,7 @@ impl KeybindAction {
             | Self::FocusUp
             | Self::FocusDown => KeybindGroup::Panes,
             Self::NewTerminal
+            | Self::NewAgent
             | Self::CloseTab
             | Self::NextTab
             | Self::PrevTab
@@ -218,6 +226,7 @@ impl KeybindAction {
     pub fn dispatch_command(self) -> &'static str {
         match self {
             Self::NewTerminal => "tab.new",
+            Self::NewAgent => "agent.new",
             Self::CloseTab => "tab.close.active",
             Self::SplitRight => "pane.split_right",
             Self::SplitDown => "pane.split_down",
@@ -250,6 +259,9 @@ impl KeybindAction {
     pub fn default_combo_str(self) -> &'static str {
         match self {
             Self::NewTerminal => "Ctrl+T",
+            // Ctrl+Shift chord: plain Ctrl+A must keep reaching the
+            // terminal (readline line-start, select-all in TUIs).
+            Self::NewAgent => "Ctrl+Shift+A",
             Self::CloseTab => "Ctrl+Shift+W",
             Self::SplitRight => "Ctrl+D",
             Self::SplitDown => "Ctrl+Shift+D",
@@ -291,8 +303,19 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_has_twenty_two_variants() {
-        assert_eq!(KeybindAction::ALL.len(), 22);
+    fn all_has_twenty_three_variants() {
+        assert_eq!(KeybindAction::ALL.len(), 23);
+    }
+
+    #[test]
+    fn new_agent_is_a_ctrl_shift_chord_in_the_tabs_group() {
+        assert_eq!(KeybindAction::NewAgent.default_combo_str(), "Ctrl+Shift+A");
+        assert_eq!(KeybindAction::NewAgent.dispatch_command(), "agent.new");
+        assert_eq!(KeybindAction::NewAgent.group(), KeybindGroup::Tabs);
+        assert_eq!(
+            KeybindAction::from_id("new_agent"),
+            Some(KeybindAction::NewAgent)
+        );
     }
 
     #[test]

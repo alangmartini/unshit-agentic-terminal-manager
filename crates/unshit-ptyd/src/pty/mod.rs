@@ -289,9 +289,70 @@ pub fn build_spawn_args(shell: &str, user_args: &[String], cwd: Option<&Path>) -
     args
 }
 
+/// Windows runs a `.cmd`/`.bat` program through `cmd.exe`, and cmd's `/c`
+/// parsing strips the first and last quote of a command line that starts
+/// with a quote and holds more than two of them. That breaks every batch
+/// launch whose path or arguments need quoting: `claude.cmd --session-id
+/// x "a prompt"` turns into `'C:\Users\Alan' is not recognized`. Spawning
+/// `cmd.exe /d /c call <script> <args...>` puts `call` first so nothing is
+/// stripped and each quoted argument reaches the script intact (`call`
+/// doubles carets, its one documented quirk). Other programs and other
+/// platforms are returned unchanged.
+pub fn batch_launch(program: &str, args: Vec<String>) -> (String, Vec<String>) {
+    if cfg!(windows) && is_batch_program(program) {
+        let mut wrapped = Vec::with_capacity(args.len() + 4);
+        wrapped.extend(["/d", "/c", "call"].map(String::from));
+        wrapped.push(program.to_string());
+        wrapped.extend(args);
+        ("cmd.exe".to_string(), wrapped)
+    } else {
+        (program.to_string(), args)
+    }
+}
+
+fn is_batch_program(program: &str) -> bool {
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".cmd") || lower.ends_with(".bat")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_programs_launch_through_cmd_call() {
+        let args = vec![
+            "--session-id".to_string(),
+            "x".to_string(),
+            "a prompt".to_string(),
+        ];
+        let (program, wrapped) = batch_launch("claude.cmd", args.clone());
+        assert_eq!(program, "cmd.exe");
+        assert_eq!(
+            wrapped,
+            vec![
+                "/d",
+                "/c",
+                "call",
+                "claude.cmd",
+                "--session-id",
+                "x",
+                "a prompt"
+            ]
+        );
+        let (program, wrapped) = batch_launch("C:\\Tools\\Bin Dir\\codex.CMD", vec![]);
+        assert_eq!(program, "cmd.exe");
+        assert_eq!(
+            wrapped,
+            vec!["/d", "/c", "call", "C:\\Tools\\Bin Dir\\codex.CMD"]
+        );
+        let (program, wrapped) = batch_launch("pwsh.exe", args.clone());
+        assert_eq!(program, "pwsh.exe");
+        assert_eq!(wrapped, args);
+        assert!(!is_batch_program("C:\\cmd.bat\\node.exe"));
+    }
 
     #[test]
     fn new_creates_empty_manager() {

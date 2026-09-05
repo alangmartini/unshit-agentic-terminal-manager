@@ -17,6 +17,7 @@ use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{AlignItems, CssPosition, Dimension, JustifyContent};
 
+use crate::flow_explorer::FlowMode;
 use crate::state::{
     dispatch, finalize_close_dialog_choice, mutate_with, ConfirmDialog, SharedState, UiSnapshot,
 };
@@ -39,6 +40,17 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
                 name
             ),
             "Kill all",
+            shared,
+        ),
+        ConfirmDialog::KillAgents { name, count, .. } => build_simple_confirm_card(
+            "Kill all agents in workspace",
+            &format!(
+                "{} agent pane{} in workspace \"{}\" will be killed. Plain terminals stay open. This cannot be undone.",
+                count,
+                if *count == 1 { "" } else { "s" },
+                name
+            ),
+            "Kill agents",
             shared,
         ),
         ConfirmDialog::KillAll { count } => build_simple_confirm_card(
@@ -70,6 +82,11 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
         ConfirmDialog::CloseEditor { names, tab, .. } => {
             build_close_editor_card(names, tab.is_some(), shared)
         }
+        ConfirmDialog::FlowRequest {
+            mode,
+            buffer,
+            error,
+        } => build_flow_request_card(*mode, buffer, error.as_deref(), shared),
     };
 
     let backdrop_shared = shared.clone();
@@ -690,6 +707,123 @@ fn build_rename_session_card(
     )
 }
 
+/// The Flow Explorer request dialog: one line of text (a flow name, or a
+/// `base..head`) and an "Ask agent" button that dispatches
+/// `dialog.flow_commit`. A precondition failure comes back as `error`
+/// under the input, the same way the rename dialog reports a failed RPC.
+fn build_flow_request_card(
+    mode: FlowMode,
+    buffer: &str,
+    error: Option<&str>,
+    shared: &SharedState,
+) -> ElementDef {
+    let (title, body, placeholder) = match mode {
+        FlowMode::Explain => (
+            "Explain a flow",
+            "Name the user-facing flow to explain, the way you would describe it to a \
+             colleague. Leave empty for the main flow of the repository.",
+            "e.g. Send a prompt",
+        ),
+        FlowMode::Review => (
+            "Review a change as flows",
+            "Which change? A base..head range or a branch name. Leave empty for the default \
+             branch up to HEAD, uncommitted changes included.",
+            "e.g. main..HEAD",
+        ),
+    };
+    let input_shared = shared.clone();
+    let submit_shared = shared.clone();
+    let input = ElementDef::new(Tag::Input)
+        .with_class("confirm-dialog-input")
+        .with_placeholder(placeholder)
+        .with_value(buffer)
+        .with_autofocus(true)
+        .on_change(move |text| {
+            let typed = text.to_string();
+            mutate_with(&input_shared, |st| {
+                if let Some(ConfirmDialog::FlowRequest { buffer, error, .. }) =
+                    st.confirm_dialog.as_mut()
+                {
+                    *buffer = typed;
+                    *error = None;
+                }
+            });
+        })
+        .on_submit(move |text| {
+            let typed = text.to_string();
+            mutate_with(&submit_shared, |st| {
+                if let Some(ConfirmDialog::FlowRequest { buffer, .. }) = st.confirm_dialog.as_mut()
+                {
+                    *buffer = typed;
+                }
+                dispatch(st, "dialog.flow_commit");
+            });
+        });
+
+    let cancel_shared = shared.clone();
+    let cancel = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-button")
+        .with_class("cancel")
+        .on_click(move || {
+            mutate_with(&cancel_shared, |st| {
+                dispatch(st, "dialog.cancel");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Cancel".to_string()));
+
+    let ask_shared = shared.clone();
+    let ask = ElementDef::new(Tag::Button)
+        .with_class("confirm-dialog-button")
+        .with_class("primary")
+        .on_click(move || {
+            mutate_with(&ask_shared, |st| {
+                dispatch(st, "dialog.flow_commit");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Ask agent".to_string()));
+
+    let mut card = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-card")
+        .with_class("confirm-dialog-simple-card")
+        .with_class("confirm-dialog-rename-card")
+        .with_class("confirm-dialog-flow-card")
+        .with_id(format!("confirm-dialog-flow-{}", mode.as_str()))
+        .on_click(|| {})
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-title")
+                .with_text(title.to_string()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-body")
+                .with_text(body.to_string()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-body")
+                .with_text(
+                    "The agent runs in the workspace directory; the flow opens as a new tab \
+                     when it finishes."
+                        .to_string(),
+                ),
+        )
+        .with_child(input);
+    if let Some(msg) = error {
+        card = card.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("rename-session-error")
+                .with_text(msg.to_string()),
+        );
+    }
+    card.with_child(
+        ElementDef::new(Tag::Div)
+            .with_class("confirm-dialog-buttons")
+            .with_child(cancel)
+            .with_child(ask),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1256,6 +1390,49 @@ mod tests {
             }
             other => panic!("expected CloseApp dialog, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn flow_request_dialog_submit_reopens_with_the_precondition_error() {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.workspaces.clear();
+            guard.confirm_dialog = Some(ConfirmDialog::FlowRequest {
+                mode: FlowMode::Review,
+                buffer: String::new(),
+                error: None,
+            });
+        }
+        let snap = s.lock().unwrap().ui_snapshot();
+        let el = build_confirm_dialog_overlay(&snap, &s);
+        let card = &el.children[0];
+        assert_eq!(card.id.as_deref(), Some("confirm-dialog-flow-review"));
+        assert!(card
+            .classes
+            .iter()
+            .any(|cls| cls == "confirm-dialog-flow-card"));
+        let input = card
+            .children
+            .iter()
+            .find(|c| c.classes.iter().any(|cls| cls == "confirm-dialog-input"))
+            .expect("input");
+        assert_eq!(input.placeholder.as_deref(), Some("e.g. main..HEAD"));
+        (input.on_submit.as_ref().unwrap())("main..HEAD");
+        let guard = s.lock().unwrap();
+        match &guard.confirm_dialog {
+            Some(ConfirmDialog::FlowRequest {
+                mode: FlowMode::Review,
+                buffer,
+                error: Some(message),
+            }) => {
+                assert_eq!(buffer, "main..HEAD");
+                assert!(message.contains("working directory"), "{message}");
+            }
+            other => panic!("expected the dialog to reopen with an error, got {other:?}"),
+        }
+        assert!(guard.flow_pending.is_empty());
+        assert_eq!(guard.tabs.len(), snap.tabs.len(), "no agent tab was opened");
     }
 
     #[test]

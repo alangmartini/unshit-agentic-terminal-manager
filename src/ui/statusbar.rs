@@ -218,6 +218,7 @@ mod tests {
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
             ctx_menu: None,
+            agent_pane_ids: Default::default(),
             confirm_dialog: None,
             terminal_count: 0,
             active_terminal_cols: 80,
@@ -239,12 +240,15 @@ mod tests {
             tabbar_rect: crate::drag::Rect::default(),
             last_grid_width: 0.0,
             last_grid_height: 0.0,
+            window_width: 0.0,
+            window_height: 0.0,
             scale_factor: 1.0,
             default_shell: crate::shell::ShellSpec::default(),
             quick_prompt: None,
             terminal_link_hover: None,
             pending_agent_resumes: BTreeMap::new(),
             editor_panes: std::collections::HashSet::new(),
+            flow_panes: std::collections::HashMap::new(),
         }
     }
 

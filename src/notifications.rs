@@ -49,6 +49,16 @@ pub enum NotificationIpcRequest {
         pane_id: u32,
         capability: String,
     },
+    /// `terminal-manager agent [<profile>] [--workspace-id N]`: open a
+    /// new agent tab. `profile` is a `crate::agents` id (default agent
+    /// when absent); `workspace_id` is the daemon routing id (active
+    /// workspace when absent).
+    NewAgent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +85,11 @@ pub enum CliCommand {
         target: Option<NotificationTarget>,
         capability: Option<String>,
     },
+    NewAgent {
+        socket: PathBuf,
+        profile: Option<String>,
+        workspace_id: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +97,7 @@ enum CliMode {
     Notify,
     Activate,
     SessionHook(crate::agent_restore::AgentKind),
+    NewAgent,
 }
 
 #[derive(Default)]
@@ -91,6 +107,7 @@ struct CliFields {
     socket: Option<PathBuf>,
     workspace_id: Option<u32>,
     pane_id: Option<u32>,
+    profile: Option<String>,
 }
 
 pub fn handle_cli_from_env<I, S>(args: I) -> Option<i32>
@@ -172,6 +189,17 @@ where
                 },
             )
         }
+        CliCommand::NewAgent {
+            socket,
+            profile,
+            workspace_id,
+        } => send_cli_request_blocking(
+            &socket,
+            NotificationIpcRequest::NewAgent {
+                profile,
+                workspace_id,
+            },
+        ),
     };
 
     match result {
@@ -219,6 +247,7 @@ where
             };
             CliMode::SessionHook(agent)
         }
+        "agent" | "new-agent" => CliMode::NewAgent,
         _ => return Ok(None),
     };
 
@@ -260,6 +289,17 @@ where
                 }
                 CliMode::Notify if fields.text.is_none() => {
                     fields.text = Some(positional.to_string());
+                }
+                CliMode::NewAgent if fields.profile.is_none() => {
+                    if crate::agents::parse_launchable_id(positional).is_none() {
+                        let known: Vec<&str> =
+                            crate::agents::launchable_profiles().map(|p| p.id).collect();
+                        return Err(format!(
+                            "unknown agent {positional:?}; known agents: {}",
+                            known.join(", ")
+                        ));
+                    }
+                    fields.profile = Some(positional.to_string());
                 }
                 CliMode::SessionHook(_) => {
                     return Err(format!("unexpected positional argument {positional:?}"));
@@ -321,6 +361,20 @@ where
             capability: get_env(ENV_AGENT_HOOK_CAPABILITY)
                 .filter(|value| is_valid_hook_capability(value)),
         })),
+        CliMode::NewAgent => {
+            if fields.title.is_some() || fields.text.is_some() {
+                return Err("agent does not accept notification content".into());
+            }
+            Ok(Some(CliCommand::NewAgent {
+                socket,
+                profile: fields.profile,
+                // Inside a managed terminal the environment names the
+                // calling workspace, so the tab opens next to the caller.
+                workspace_id: fields
+                    .workspace_id
+                    .or_else(|| parse_env_u32(&get_env, ENV_WORKSPACE_ID)),
+            }))
+        }
     }
 }
 
@@ -357,7 +411,7 @@ fn require_non_empty(value: Option<String>, field: &str) -> Result<String, Strin
 }
 
 fn notification_usage() -> &'static str {
-    "usage: terminal-manager notify --title <title> --text <text> [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager activate [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager session-hook <claude|codex>"
+    "usage: terminal-manager notify --title <title> --text <text> [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager activate [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager agent [claude|codex|gemini|opencode|aider|copilot] [--workspace-id <id>] [--socket <path>]\n       terminal-manager session-hook <claude|codex>"
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -751,8 +805,79 @@ fn apply_ipc_request(
             effect.rebuild = changed;
             effect.accepted = saved;
         }
+        NotificationIpcRequest::NewAgent {
+            profile,
+            workspace_id,
+        } => {
+            let outcome = mutate_with(shared, |state| {
+                apply_new_agent_request(state, profile.as_deref(), workspace_id)
+            });
+            effect.rebuild = outcome.is_ok();
+            effect.activate_window = outcome.is_ok();
+            effect.accepted = outcome.is_ok();
+            if let Err(reason) = outcome {
+                log::warn!(
+                    "{{\"event\":\"agent.cli\",\"level\":\"warn\",\"outcome\":\"rejected\",\"reason\":{reason:?},\"workspace_id\":{workspace_id:?}}}"
+                );
+            }
+        }
     }
     effect
+}
+
+/// Resolve and run a `NewAgent` IPC request against live state. Returns
+/// the machine-readable rejection reason so both the log line and the
+/// telemetry record name the same cause.
+fn apply_new_agent_request(
+    state: &mut crate::state::AppState,
+    profile: Option<&str>,
+    workspace_id: Option<u32>,
+) -> Result<(), &'static str> {
+    let correlation_id = state.restore_correlation_id.clone();
+    let mut event =
+        crate::agents::telemetry::AgentEventRecord::new("agent.cli", "info", &correlation_id);
+    event.source = Some("cli");
+    event.workspace_id = workspace_id;
+    let ws_idx = match workspace_id {
+        Some(id) => state.workspaces.iter().position(|w| w.num == id),
+        None => Some(state.active_workspace),
+    };
+    let Some(ws_idx) = ws_idx else {
+        event.level = "warn";
+        event.outcome = Some("rejected");
+        event.reason = Some("workspace_not_found");
+        crate::agents::telemetry::record(&event);
+        return Err("workspace_not_found");
+    };
+    let profile = match profile {
+        None => crate::agents::default_profile(),
+        Some(raw) => match crate::agents::parse_launchable_id(raw) {
+            Some(profile) => profile,
+            None => {
+                event.level = "warn";
+                event.outcome = Some("rejected");
+                event.reason = Some("unknown_profile");
+                crate::agents::telemetry::record(&event);
+                return Err("unknown_profile");
+            }
+        },
+    };
+    event.profile = Some(profile.id);
+    if ws_idx != state.active_workspace {
+        crate::state::mutate_switch_workspace(state, ws_idx);
+    }
+    if !crate::state::mutate_add_agent_tab(state, profile, "cli") {
+        event.level = "warn";
+        event.outcome = Some("rejected");
+        event.reason = Some("not_launchable");
+        crate::agents::telemetry::record(&event);
+        return Err("not_launchable");
+    }
+    crate::persist::save_workspaces(state);
+    event.outcome = Some("opened");
+    event.pane_id = Some(state.active_pane.0);
+    crate::agents::telemetry::record(&event);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1393,5 +1518,155 @@ mod tests {
             state.agent_restarts[&1].session_id.as_deref(),
             Some(session_id)
         );
+    }
+}
+
+#[cfg(test)]
+mod agents_tab_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env_map(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = values
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn parse_agent_command_takes_profile_and_workspace_from_flags_or_env() {
+        let parsed = parse_cli_args(
+            [
+                "agent",
+                "codex",
+                "--workspace-id",
+                "3",
+                "--socket",
+                "s.sock",
+            ],
+            |_| None,
+        )
+        .expect("parse")
+        .expect("command");
+        assert_eq!(
+            parsed,
+            CliCommand::NewAgent {
+                socket: PathBuf::from("s.sock"),
+                profile: Some("codex".into()),
+                workspace_id: Some(3),
+            }
+        );
+
+        let parsed = parse_cli_args(
+            ["agent"],
+            env_map(&[
+                (ENV_NOTIFY_SOCKET, "env.sock"),
+                (ENV_WORKSPACE_ID, "7"),
+                (ENV_PANE_ID, "2"),
+            ]),
+        )
+        .expect("parse")
+        .expect("command");
+        assert_eq!(
+            parsed,
+            CliCommand::NewAgent {
+                socket: PathBuf::from("env.sock"),
+                profile: None,
+                workspace_id: Some(7),
+            }
+        );
+
+        let outside = parse_cli_args(["new-agent"], |_| None)
+            .expect("parse")
+            .expect("command");
+        assert!(matches!(
+            outside,
+            CliCommand::NewAgent {
+                profile: None,
+                workspace_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_agent_command_rejects_unknown_profiles_and_notification_flags() {
+        let err = parse_cli_args(["agent", "nope"], |_| None).expect_err("unknown agent");
+        assert!(err.contains("unknown agent"), "{err}");
+        assert!(err.contains("claude"), "{err}");
+        assert!(parse_cli_args(["agent", "claude", "--title", "x"], |_| None).is_err());
+        assert!(parse_cli_args(["agent", "claude", "codex"], |_| None).is_err());
+        assert!(parse_cli_args(["agent", "openrouter"], |_| None).is_err());
+    }
+
+    #[test]
+    fn new_agent_ipc_round_trips_with_snake_case_kind() {
+        let request = NotificationIpcRequest::NewAgent {
+            profile: Some("claude".into()),
+            workspace_id: Some(2),
+        };
+        let body = serde_json::to_string(&request).expect("serialize");
+        assert!(body.contains(r#""kind":"new_agent""#), "{body}");
+        assert_eq!(
+            serde_json::from_str::<NotificationIpcRequest>(&body).expect("deserialize"),
+            request
+        );
+        let bare: NotificationIpcRequest =
+            serde_json::from_str(r#"{"kind":"new_agent"}"#).expect("bare request");
+        assert_eq!(
+            bare,
+            NotificationIpcRequest::NewAgent {
+                profile: None,
+                workspace_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn new_agent_ipc_opens_a_tab_in_the_named_workspace_and_activates_the_window() {
+        let state = crate::state::seed_state();
+        let target_num = state.workspaces[1].num;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let effect = apply_ipc_request(
+            &shared,
+            NotificationIpcRequest::NewAgent {
+                profile: Some("codex".into()),
+                workspace_id: Some(target_num),
+            },
+            Path::new("unused.sock"),
+        );
+        assert!(effect.accepted);
+        assert!(effect.rebuild);
+        assert!(effect.activate_window);
+        let guard = shared.lock().expect("state");
+        assert_eq!(guard.active_workspace, 1);
+        assert_eq!(guard.pane_agents[&guard.active_pane.0].profile, "codex");
+    }
+
+    #[test]
+    fn new_agent_ipc_rejects_unknown_workspace_or_title_only_profile() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(crate::state::seed_state()));
+        let tabs_before = shared.lock().expect("state").tabs.len();
+        let effect = apply_ipc_request(
+            &shared,
+            NotificationIpcRequest::NewAgent {
+                profile: None,
+                workspace_id: Some(999),
+            },
+            Path::new("unused.sock"),
+        );
+        assert!(!effect.accepted);
+        assert!(!effect.activate_window);
+        let effect = apply_ipc_request(
+            &shared,
+            NotificationIpcRequest::NewAgent {
+                profile: Some("openrouter".into()),
+                workspace_id: None,
+            },
+            Path::new("unused.sock"),
+        );
+        assert!(!effect.accepted);
+        assert_eq!(shared.lock().expect("state").tabs.len(), tabs_before);
     }
 }

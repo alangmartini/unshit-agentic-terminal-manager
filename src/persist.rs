@@ -33,6 +33,11 @@ pub struct PersistedPane {
     /// no record, preserving the existing fresh-shell behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_restart: Option<crate::agent_restore::AgentRestart>,
+    /// Which agent the pane was running and how the app found out, so
+    /// the `agents` subtab is correct on the first frame after a relaunch.
+    /// Legacy files default to none and are re-classified from `title`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_tag: Option<crate::agents::AgentTag>,
 }
 
 /// A persisted terminal tab: its pane grid plus the split ratios needed
@@ -113,26 +118,37 @@ fn persisted_tab(
     tab: &TerminalTab,
     custom_titled: &HashSet<u32>,
     agent_restarts: &std::collections::HashMap<u32, crate::agent_restore::AgentRestart>,
+    pane_agents: &std::collections::HashMap<u32, crate::agents::AgentTag>,
 ) -> PersistedTab {
-    let managed_agent = tab
+    // The tab takes the label of its first agent pane: a managed one if
+    // any, else the first launched one.
+    let managed = tab
         .panes
         .iter()
         .flatten()
-        .filter_map(|pane| agent_restarts.get(&pane.id.0))
-        .find(|restart| restart.managed)
-        .map(|restart| restart.agent);
+        .filter_map(|pane| agent_restarts.get(&pane.id.0).map(|r| (pane.id.0, r)))
+        .find(|(_, restart)| restart.managed);
+    let launched = tab
+        .panes
+        .iter()
+        .flatten()
+        .filter_map(|pane| pane_agents.get(&pane.id.0).map(|t| (pane.id.0, t)))
+        .find(|(_, tag)| tag.source == crate::agents::AgentTagSource::Launched);
+    let (managed_agent, tag, custom) = match (managed, launched) {
+        (Some((pane_id, restart)), _) => (Some(restart.agent), pane_agents.get(&pane_id), false),
+        (None, Some((pane_id, tag))) => (None, Some(tag), custom_titled.contains(&pane_id)),
+        (None, None) => (None, None, false),
+    };
     PersistedTab {
         id: tab.id.clone(),
-        name: managed_agent
-            .map(|agent| format!("qp: {}", agent.label()))
-            .unwrap_or_else(|| tab.name.clone()),
+        name: persisted_agent_label(&tab.name, managed_agent, tag, custom),
         subtitle: tab.subtitle.clone(),
         panes: tab
             .panes
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|p| persisted_pane(p, custom_titled, agent_restarts))
+                    .map(|p| persisted_pane(p, custom_titled, agent_restarts, pane_agents))
                     .collect()
             })
             .collect(),
@@ -146,34 +162,66 @@ fn persisted_pane(
     pane: &Pane,
     custom_titled: &HashSet<u32>,
     agent_restarts: &std::collections::HashMap<u32, crate::agent_restore::AgentRestart>,
+    pane_agents: &std::collections::HashMap<u32, crate::agents::AgentTag>,
 ) -> PersistedPane {
     let agent_restart = agent_restarts.get(&pane.id.0).cloned();
+    let agent_tag = pane_agents.get(&pane.id.0).cloned();
     let managed_agent = agent_restart
         .as_ref()
         .filter(|restart| restart.managed)
         .map(|restart| restart.agent);
+    let custom = custom_titled.contains(&pane.id.0);
+    let title = persisted_agent_label(
+        &pane.title,
+        managed_agent,
+        agent_tag.as_ref(),
+        managed_agent.is_none() && custom,
+    );
     PersistedPane {
         id: pane.id.0,
-        title: managed_agent
-            .map(|agent| format!("qp: {}", agent.label()))
-            .unwrap_or_else(|| pane.title.clone()),
+        title,
         subtitle: pane.subtitle.clone(),
-        custom_title: managed_agent.is_none() && custom_titled.contains(&pane.id.0),
+        custom_title: managed_agent.is_none() && custom,
         agent_restart,
+        agent_tag,
     }
 }
 
-/// Remove editor panes from a persisted tab. Editor panes are not
-/// restored across restarts (SPEC: no editor-session persistence), so
+/// Label written to disk for a pane or tab the app launched an agent in.
+///
+/// Agent panes never persist the live guest title: Claude and Codex put
+/// the conversation summary in it. A managed Quick Prompt tab keeps its
+/// `qp: <provider>` label, any other launched agent keeps its profile
+/// label, and a user rename (`custom`) wins over both because the user
+/// typed it. Everything else persists as-is.
+fn persisted_agent_label(
+    live: &str,
+    managed_agent: Option<crate::agent_restore::AgentKind>,
+    agent_tag: Option<&crate::agents::AgentTag>,
+    custom: bool,
+) -> String {
+    let launched = agent_tag.filter(|tag| tag.source == crate::agents::AgentTagSource::Launched);
+    match (managed_agent, launched) {
+        (Some(_), Some(tag)) if !live.starts_with("qp: ") => tag.label(),
+        (Some(agent), _) => format!("qp: {}", agent.label()),
+        (None, Some(_)) if custom => live.to_string(),
+        (None, Some(tag)) => tag.label(),
+        (None, None) => live.to_string(),
+    }
+}
+
+/// Remove transient panes (editors and Flow Explorer panes) from a
+/// persisted tab. Neither is restored across restarts (SPEC: no
+/// editor-session persistence; a flow is reopened from its JSON), so
 /// persisting them would respawn them as terminal panes on load. Ratios
 /// are absorbed into a neighbor exactly like a live pane close. Returns
 /// `false` when the tab has no panes left and should be dropped.
-fn strip_editor_panes(tab: &mut PersistedTab, editor_ids: &HashSet<u32>) -> bool {
+fn strip_transient_panes(tab: &mut PersistedTab, transient_ids: &HashSet<u32>) -> bool {
     let mut row = 0;
     while row < tab.panes.len() {
         let mut col = 0;
         while col < tab.panes[row].len() {
-            if editor_ids.contains(&tab.panes[row][col].id) {
+            if transient_ids.contains(&tab.panes[row][col].id) {
                 tab.panes[row].remove(col);
                 if let Some(ratios) = tab.col_ratios.get_mut(row) {
                     if col < ratios.len() {
@@ -207,26 +255,26 @@ fn strip_editor_panes(tab: &mut PersistedTab, editor_ids: &HashSet<u32>) -> bool
     if tab.panes.is_empty() {
         return false;
     }
-    if editor_ids.contains(&tab.active_pane) {
+    if transient_ids.contains(&tab.active_pane) {
         tab.active_pane = tab.panes[0][0].id;
     }
     true
 }
 
-/// Drop editor panes (and tabs that only contained editors) from a
+/// Drop transient panes (and tabs that only contained them) from a
 /// workspace's persisted tabs, remapping the active tab index.
-fn strip_editor_tabs(
+fn strip_transient_tabs(
     tabs: Vec<PersistedTab>,
     active_tab: usize,
-    editor_ids: &HashSet<u32>,
+    transient_ids: &HashSet<u32>,
 ) -> (Vec<PersistedTab>, usize) {
-    if editor_ids.is_empty() {
+    if transient_ids.is_empty() {
         return (tabs, active_tab);
     }
     let mut kept = Vec::with_capacity(tabs.len());
     let mut new_active = 0usize;
     for (idx, mut tab) in tabs.into_iter().enumerate() {
-        if strip_editor_panes(&mut tab, editor_ids) {
+        if strip_transient_panes(&mut tab, transient_ids) {
             if idx <= active_tab {
                 new_active = kept.len();
             }
@@ -244,14 +292,20 @@ fn strip_editor_tabs(
 fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize) {
     let custom_titled = &state.custom_titled_panes;
     let agent_restarts = &state.agent_restarts;
-    let editor_ids: HashSet<u32> = state.editors.keys().copied().collect();
+    let pane_agents = &state.pane_agents;
+    let transient_ids: HashSet<u32> = state
+        .editors
+        .keys()
+        .chain(state.flows.keys())
+        .copied()
+        .collect();
     if ws_idx == state.active_workspace {
         let tabs = state
             .tabs
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                let mut pt = persisted_tab(tab, custom_titled, agent_restarts);
+                let mut pt = persisted_tab(tab, custom_titled, agent_restarts, pane_agents);
                 if i == state.active_tab {
                     // Overlay the live (authoritative) pane grid for the
                     // active tab; `state.tabs[active_tab]` is only synced
@@ -261,7 +315,9 @@ fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize)
                         .iter()
                         .map(|row| {
                             row.iter()
-                                .map(|p| persisted_pane(p, custom_titled, agent_restarts))
+                                .map(|p| {
+                                    persisted_pane(p, custom_titled, agent_restarts, pane_agents)
+                                })
                                 .collect()
                         })
                         .collect();
@@ -272,16 +328,16 @@ fn workspace_tabs(state: &AppState, ws_idx: usize) -> (Vec<PersistedTab>, usize)
                 pt
             })
             .collect();
-        strip_editor_tabs(tabs, state.active_tab, &editor_ids)
+        strip_transient_tabs(tabs, state.active_tab, &transient_ids)
     } else {
         let ws = &state.workspaces[ws_idx];
-        strip_editor_tabs(
+        strip_transient_tabs(
             ws.tabs
                 .iter()
-                .map(|t| persisted_tab(t, custom_titled, agent_restarts))
+                .map(|t| persisted_tab(t, custom_titled, agent_restarts, pane_agents))
                 .collect(),
             ws.active_tab,
-            &editor_ids,
+            &transient_ids,
         )
     }
 }
@@ -617,6 +673,41 @@ mod tests {
     }
 
     #[test]
+    fn flow_tabs_are_not_persisted() {
+        let mut state = seed_state();
+        let fixture = crate::flow_explorer::test_support::fixture_path();
+        assert!(crate::state::dispatch(
+            &mut state,
+            &format!("flow.open:{}", fixture.display())
+        ));
+        // An editor beside it: both kinds strip through the same path.
+        let file = std::env::temp_dir().join(format!("tm-persist-flow-{}.txt", std::process::id()));
+        std::fs::write(&file, "hello").unwrap();
+        assert!(crate::state::dispatch(
+            &mut state,
+            &format!("editor.open:{}", file.display())
+        ));
+        assert_eq!(state.tabs.len(), 3);
+
+        let persisted = PersistedState::from_state(&state);
+        let ws = &persisted.workspaces[state.active_workspace];
+        assert_eq!(ws.tabs.len(), 1, "only the terminal tab persists");
+        let persisted_pane_ids: Vec<u32> = ws
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.iter().flatten().map(|p| p.id))
+            .collect();
+        for id in state.flows.keys().chain(state.editors.keys()) {
+            assert!(
+                !persisted_pane_ids.contains(id),
+                "transient pane {id} leaked into persistence"
+            );
+        }
+        assert!(ws.active_tab < ws.tabs.len());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
     fn round_trip_preserves_workspaces() {
         let state = seed_state();
         let persisted = PersistedState::from_state(&state);
@@ -932,5 +1023,61 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+}
+
+#[cfg(test)]
+mod agents_tab_tests {
+    use super::*;
+    use crate::agents::{AgentTag, AgentTagSource};
+    use crate::state::seed_state;
+
+    #[test]
+    fn agent_tag_round_trips_and_is_omitted_for_plain_terminals() {
+        let mut state = seed_state();
+        state
+            .pane_agents
+            .insert(1, AgentTag::new("gemini", AgentTagSource::Title));
+        let body = serde_json::to_string(&PersistedState::from_state(&state)).expect("serialize");
+        assert!(
+            body.contains(r#""agent_tag":{"profile":"gemini","source":"title"}"#),
+            "{body}"
+        );
+        let restored: PersistedState = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(
+            restored.workspaces[0].tabs[0].panes[0][0].agent_tag,
+            Some(AgentTag::new("gemini", AgentTagSource::Title))
+        );
+
+        let plain = serde_json::to_string(&PersistedState::from_state(&seed_state())).unwrap();
+        assert!(!plain.contains("agent_tag"));
+    }
+
+    #[test]
+    fn legacy_pane_without_the_field_loads_with_no_tag() {
+        let pane: PersistedPane = serde_json::from_str(
+            r#"{"id":7,"title":"✳ Claude Code","subtitle":"bash","custom_title":false}"#,
+        )
+        .expect("legacy pane");
+        assert!(pane.agent_tag.is_none());
+        assert!(pane.agent_restart.is_none());
+    }
+
+    #[test]
+    fn launched_managed_agents_persist_the_profile_label_not_the_guest_title() {
+        let mut state = seed_state();
+        let profile = crate::agents::profile("claude").unwrap();
+        assert!(crate::state::mutate_add_agent_tab(
+            &mut state, profile, "command"
+        ));
+        // The guest title lands later and carries the conversation
+        // summary; it must never reach disk for a managed agent.
+        state.panes[0][0].title = "\u{2733} SECRET_SUMMARY_9c1e".into();
+        state.tabs[state.active_tab].name = "\u{2733} SECRET_SUMMARY_9c1e".into();
+        let body = serde_json::to_string(&PersistedState::from_state(&state)).expect("serialize");
+        assert!(!body.contains("SECRET_SUMMARY"), "{body}");
+        assert!(body.contains("Claude Code"), "{body}");
+        assert!(!body.contains("qp: Claude"), "{body}");
+        assert!(body.contains(r#""source":"launched""#), "{body}");
     }
 }

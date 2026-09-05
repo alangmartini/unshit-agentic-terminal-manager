@@ -1900,7 +1900,10 @@ input, select {
   flex-direction: column;
   padding: var(--sp-1) 0 var(--sp-2);
   overflow: hidden;
-  max-height: 300px;
+  /* Two unfolded pane lists (terminals + agents) must fit; the body is
+     overflow: hidden for the collapse animation, so a low cap clips the
+     second list silently. */
+  max-height: 900px;
   transition: max-height var(--dur-norm) var(--ease-std);
 }
 
@@ -2079,6 +2082,22 @@ input, select {
 .terminal-entry .branch-tag {
   flex-shrink: 999;
   min-width: 56px;
+}
+
+/* Agent glyph in front of an agent pane's sidebar row and its tab. A
+   definite box (fixed width + inline-flex) so the flex row reserves space. */
+.terminal-entry .entry-agent-ic,
+.tab .tab-agent-ic {
+  display: inline-flex;
+  align-items: center;
+  width: 12px;
+  flex-shrink: 0;
+  color: var(--amber-300);
+}
+
+.tab.active .tab-agent-ic,
+.terminal-entry.active .entry-agent-ic {
+  color: var(--amber-200);
 }
 
 .sidebar-footer {
@@ -3195,6 +3214,11 @@ body.dragging-pane {
 }
 .m-sub-anchor:hover .m-flyout { display: flex; }
 .m-flyout.flip { left: auto; right: 217px; }
+
+/* Agent rows in the "New agent" flyout: label plus a dimmed program hint. */
+.m-agent .m-label { color: var(--fg-secondary); white-space: nowrap; }
+.m-agent:hover .m-label { color: var(--fg-primary); }
+.m-agent .m-kbd { color: var(--fg-muted); }
 
 .m-shell .sh-name-wrap {
   display: flex;
@@ -7237,4 +7261,813 @@ body.dragging-pane {
   text-align: center;
   margin-top: 2px;
   letter-spacing: 0.06em;
+}
+
+/* ============================================================
+   FLOW EXPLORER PANE
+   Agent-authored flow model rendered as a call-stack tree, Miller
+   columns and a swim-lane graph.
+   ============================================================ */
+
+.app .pane-body.flow-pane {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--fg-primary);
+}
+
+.flow-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.flow-title {
+  font-size: 13px;
+  color: var(--fg-primary);
+}
+
+.flow-summary {
+  font-size: 11px;
+  color: var(--fg-secondary);
+}
+
+.flow-meta {
+  font-size: 10px;
+  color: var(--fg-tertiary);
+}
+
+/* Toolbar: view tabs, level tabs, expand/collapse. */
+.flow-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border-hair);
+  font-size: 11px;
+  color: var(--fg-tertiary);
+  overflow: hidden;
+}
+
+.flow-toolbar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.flow-toolbar-label {
+  color: var(--fg-tertiary);
+  margin-right: 2px;
+}
+
+.flow-toolbar-spacer {
+  flex: 1;
+}
+
+.flow-tab,
+.flow-tool {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--fg-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.flow-tool {
+  border-color: var(--border-soft);
+}
+
+.flow-tab:hover,
+.flow-tool:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+}
+
+.flow-tab.active {
+  color: var(--fg-primary);
+  background: var(--bg-elevated);
+  border-color: var(--border-soft);
+}
+
+.flow-tab.disabled,
+.flow-tab.disabled:hover {
+  color: var(--fg-ghost);
+  background: transparent;
+  cursor: default;
+}
+
+/* Call stack tree. */
+.flow-tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 0;
+}
+
+.flow-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 14px 2px 12px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.flow-row:hover {
+  background: var(--bg-hover);
+}
+
+.flow-row.selected {
+  background: var(--bg-selected);
+}
+
+.flow-row.diff-added {
+  border-left-color: var(--sage);
+}
+
+.flow-row.diff-removed {
+  border-left-color: var(--rust);
+}
+
+.flow-row.diff-modified {
+  border-left-color: var(--azure);
+}
+
+.flow-indent {
+  width: 18px;
+  flex-shrink: 0;
+}
+
+.flow-connector {
+  color: var(--fg-muted);
+  flex-shrink: 0;
+}
+
+.flow-diff-marker {
+  width: 8px;
+  flex-shrink: 0;
+  color: var(--fg-tertiary);
+}
+
+.flow-row.diff-added .flow-diff-marker {
+  color: var(--sage);
+}
+
+.flow-row.diff-removed .flow-diff-marker {
+  color: var(--rust);
+}
+
+.flow-row.diff-modified .flow-diff-marker {
+  color: var(--azure);
+}
+
+/* Shrink order in a narrow pane: the location gives way first (shrink 3),
+   then chips and the description down to their floors; the name never
+   shrinks. Floors keep every cell above zero width, which the renderer
+   would otherwise paint untruncated. */
+.flow-name {
+  flex: 0 0 auto;
+  color: var(--fg-primary);
+  white-space: nowrap;
+}
+
+.flow-proc-0 {
+  color: var(--azure);
+}
+
+.flow-proc-1 {
+  color: var(--amber-300);
+}
+
+.flow-proc-2 {
+  color: var(--violet);
+}
+
+.flow-proc-3 {
+  color: var(--ember);
+}
+
+.flow-proc-4 {
+  color: var(--sage);
+}
+
+.flow-proc-5 {
+  color: var(--rust);
+}
+
+.flow-carrier,
+.flow-tag {
+  flex: 0 1 auto;
+  min-width: 24px;
+  font-size: 9px;
+  padding: 0 5px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  color: var(--fg-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-badge {
+  color: var(--violet);
+  flex-shrink: 0;
+}
+
+/* The description takes what the location leaves; below 120px the
+   location shrinks (and ellipsizes) instead, so neither ever collapses to
+   a zero-width box the renderer would paint untruncated. */
+.flow-desc {
+  flex: 1 1 auto;
+  min-width: 48px;
+  color: var(--fg-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-loc {
+  flex: 0 3 auto;
+  min-width: 40px;
+  color: var(--fg-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-src {
+  padding: 0 6px;
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.flow-src:hover,
+.flow-src.active {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+}
+
+/* Legend: processes, carriers, service state. */
+.flow-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 14px;
+  border-top: 1px solid var(--border-hair);
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  overflow: hidden;
+}
+
+.flow-legend-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.flow-legend-label {
+  color: var(--fg-tertiary);
+  margin-left: 10px;
+}
+
+.flow-legend-label.first {
+  margin-left: 0;
+}
+
+.flow-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  color: var(--fg-secondary);
+  background: var(--bg-subtle);
+  flex-shrink: 0;
+}
+
+.flow-chip-icon {
+  width: 11px;
+  height: 11px;
+  flex-shrink: 0;
+}
+
+.flow-chip.flow-chip-state {
+  color: var(--amber-300);
+  border-color: var(--amber-300);
+}
+
+.flow-placeholder {
+  display: block;
+  padding: 12px 14px;
+  font-size: 11px;
+  color: var(--fg-tertiary);
+}
+
+/* Inline source snippet under a call-stack row. */
+.flow-snippet-row {
+  display: flex;
+  align-items: flex-start;
+  padding: 2px 14px 6px 12px;
+}
+
+.flow-snippet {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 6px 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  background: var(--bg-subtle);
+  overflow: hidden;
+}
+
+.flow-snippet-path {
+  padding: 0 10px 4px 10px;
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.flow-snippet-line {
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: hidden;
+}
+
+.flow-snippet-line.hl {
+  background: var(--bg-hover);
+}
+
+.flow-gutter {
+  color: var(--fg-muted);
+  padding-right: 12px;
+  flex-shrink: 0;
+  text-align: right;
+}
+
+.flow-snippet-line.hl .flow-gutter {
+  color: var(--fg-tertiary);
+}
+
+.tok-keyword {
+  color: var(--rust);
+}
+
+.tok-str {
+  color: var(--sage);
+}
+
+.tok-number {
+  color: var(--azure);
+}
+
+.tok-comment {
+  color: var(--fg-tertiary);
+}
+
+.tok-ident {
+  color: var(--fg-primary);
+}
+
+.tok-punct {
+  color: var(--fg-secondary);
+}
+
+.flow-snippet-error {
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--fg-tertiary);
+}
+
+/* Panes view: Miller columns. Columns older than the last two collapse
+   to strips whose label is rotated; the rotation is paint-only, so the
+   label box is sized by hand (240px wide, centred on a 28px strip). */
+.flow-panes {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.flow-col {
+  flex: 1 1 0px;
+  min-width: 200px;
+  max-width: 480px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-right: 1px solid var(--border-soft);
+  overflow-y: auto;
+  overflow-x: hidden;
+  font-size: 11px;
+}
+
+.flow-col.focused {
+  background: var(--bg-subtle);
+}
+
+.flow-col.collapsed {
+  flex: 0 0 auto;
+  width: 28px;
+  min-width: 28px;
+  padding: 0;
+  position: relative;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.flow-col.collapsed:hover {
+  background: var(--bg-hover);
+}
+
+.flow-col-vlabel {
+  position: absolute;
+  left: -106px;
+  top: 130px;
+  width: 240px;
+  height: 20px;
+  transform: rotate(-90deg);
+  text-align: center;
+  font-size: 11px;
+  color: var(--fg-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.flow-col-head {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-hair);
+  border-left: 2px solid transparent;
+}
+
+.flow-col-head.diff-added,
+.flow-col-head.diff-removed,
+.flow-col-head.diff-modified {
+  padding-left: 6px;
+}
+
+.flow-col-head.diff-added {
+  border-left-color: var(--sage);
+}
+
+.flow-col-head.diff-removed {
+  border-left-color: var(--rust);
+}
+
+.flow-col-head.diff-modified {
+  border-left-color: var(--azure);
+}
+
+.flow-col-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+.flow-col-title {
+  font-size: 12px;
+  color: var(--fg-primary);
+}
+
+.flow-col-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.flow-col-desc {
+  color: var(--fg-secondary);
+}
+
+.flow-col-payload,
+.flow-col-next {
+  font-size: 10px;
+  color: var(--fg-tertiary);
+}
+
+.flow-section {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.flow-section .flow-snippet {
+  flex: 0 0 auto;
+}
+
+.flow-section-label {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--fg-tertiary);
+  margin-bottom: 2px;
+}
+
+.flow-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: var(--fg-primary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-left: 2px solid transparent;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.flow-item:hover {
+  background: var(--bg-hover);
+}
+
+.flow-item.active {
+  background: var(--bg-elevated);
+  border-color: var(--border-soft);
+}
+
+.flow-item.cursor {
+  border-color: var(--amber-300);
+}
+
+.flow-item.diff-added {
+  border-left-color: var(--sage);
+}
+
+.flow-item.diff-removed {
+  border-left-color: var(--rust);
+}
+
+.flow-item.diff-modified {
+  border-left-color: var(--azure);
+}
+
+.flow-item-name {
+  flex: 0 1 auto;
+  min-width: 40px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-col-loc {
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Review mode: the legend names the three rails. */
+.flow-chip.flow-chip-diff-added {
+  color: var(--sage);
+  border-color: var(--sage);
+}
+
+.flow-chip.flow-chip-diff-removed {
+  color: var(--rust);
+  border-color: var(--rust);
+}
+
+.flow-chip.flow-chip-diff-modified {
+  color: var(--azure);
+  border-color: var(--azure);
+}
+
+/* Graph view: swim lanes. Geometry is computed in Rust (flow_explorer::graph)
+   and applied as inline left/top/width/height; these rules only paint. */
+.flow-graph {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.flow-graph-bar {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border-hair);
+  font-size: 11px;
+  color: var(--fg-tertiary);
+}
+
+.flow-crumbs {
+  flex: 1 1 auto;
+  min-width: 120px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.flow-crumb {
+  padding: 1px 6px;
+  font-size: 11px;
+  color: var(--fg-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.flow-crumb:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+}
+
+.flow-crumb.current,
+.flow-crumb.current:hover {
+  color: var(--fg-primary);
+  background: transparent;
+  cursor: default;
+}
+
+.flow-crumb-sep {
+  color: var(--fg-muted);
+}
+
+.flow-graph-tools {
+  flex: 0 1 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.flow-graph-hint {
+  color: var(--fg-tertiary);
+  margin-right: 8px;
+  white-space: normal;
+  max-width: 360px;
+}
+
+.flow-depth-group {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.flow-graph-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--bg-base);
+}
+
+.flow-graph-canvas {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.flow-lane {
+  position: absolute;
+  border: 1px solid var(--border-hair);
+  border-radius: var(--r-md);
+  background: var(--bg-subtle);
+}
+
+.flow-lane-pill {
+  position: absolute;
+  left: 12px;
+  top: 10px;
+  padding: 2px 10px;
+  font-size: 11px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  white-space: nowrap;
+}
+
+.flow-graph-edges {
+  position: absolute;
+  color: var(--fg-muted);
+}
+
+.flow-graph-node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  background: var(--bg-elevated);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.flow-graph-node:hover {
+  background: var(--bg-hover);
+}
+
+.flow-graph-node.event {
+  border-radius: 999px;
+  padding-left: 16px;
+  justify-content: center;
+}
+
+.flow-graph-node.diff-added {
+  border-left-color: var(--sage);
+}
+
+.flow-graph-node.diff-removed {
+  border-left-color: var(--rust);
+}
+
+.flow-graph-node.diff-modified {
+  border-left-color: var(--azure);
+}
+
+.flow-graph-node-name {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.flow-graph-node-desc {
+  font-size: 10px;
+  color: var(--fg-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.flow-graph-badge {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 10px;
+  color: var(--bg-base);
+  background: var(--violet);
+  border: 1px solid var(--violet);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.flow-graph-badge:hover {
+  background: var(--amber-300);
+  border-color: var(--amber-300);
+}
+
+.flow-graph-edge-label {
+  position: absolute;
+  font-size: 10px;
+  color: var(--fg-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

@@ -34,7 +34,9 @@ fn render(css: &str) -> Option<Vec<u8>> {
 /// all excluded, so any hit is the colored shadow.
 fn reddish(pixels: &[u8]) -> usize {
     pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| {
             let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
             r > 80 && r >= g + 40 && r >= b + 40
@@ -48,7 +50,9 @@ fn reddish(pixels: &[u8]) -> usize {
 /// bug decouples brightness from alpha (rgb blows out regardless).
 fn glow_red_energy(pixels: &[u8]) -> u64 {
     pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| {
             let (r, g, b) = (p[0] as i64, p[1] as i64, p[2] as i64);
             if r > g + 30 && r > b + 30 {

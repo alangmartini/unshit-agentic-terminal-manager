@@ -1,8 +1,8 @@
 use unshit::core::element::*;
 
 use crate::state::{
-    mutate_add_workspace_with_path, mutate_with, CtxMenu, SharedState, Subtab, TerminalEntry,
-    UiSnapshot, Workspace,
+    mutate_add_workspace_with_path, mutate_with, CtxMenu, SharedState, Subtab, SubtabKind,
+    TerminalEntry, UiSnapshot, Workspace,
 };
 use crate::ui::icons::*;
 
@@ -110,6 +110,13 @@ fn build_workspace(
                     // Divide by scale_factor: cursor coords are physical pixels,
                     // but Dimension::Px values get multiplied by scale_all_styles.
                     let sf = st.scale_factor;
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "workspace",
+                        x / sf,
+                        y / sf,
+                        st.window_width / sf,
+                        st.window_height / sf,
+                    );
                     st.ctx_menu = Some(CtxMenu {
                         x: x / sf,
                         y: y / sf,
@@ -145,7 +152,9 @@ fn build_workspace(
             ElementDef::new(Tag::Span)
                 .with_class("workspace-meta")
                 .with_class("ws-meta")
-                .with_text(workspace.terminal_entries.len().to_string()),
+                .with_text(
+                    (workspace.terminal_entries.len() + workspace.agent_entries.len()).to_string(),
+                ),
         );
 
     let mut body = ElementDef::new(Tag::Div).with_class("workspace-body");
@@ -158,13 +167,27 @@ fn build_workspace(
             is_active,
             shared,
         ));
-        if subtab.label == "terminals"
-            && workspace.terminals_expanded
-            && !workspace.terminal_entries.is_empty()
-        {
-            let mut entries = ElementDef::new(Tag::Div).with_class("terminal-entries");
-            let count = workspace.terminal_entries.len();
-            for (t_idx, entry) in workspace.terminal_entries.iter().enumerate() {
+        // Each pane list unfolds under its own subtab: `terminals` holds
+        // plain shells, `agents` the panes running an agent CLI.
+        let (expanded, list, list_class) = match SubtabKind::parse(&subtab.label) {
+            Some(SubtabKind::Terminals) => (
+                workspace.terminals_expanded,
+                &workspace.terminal_entries,
+                "terminal-entries",
+            ),
+            Some(SubtabKind::Agents) => (
+                workspace.agents_expanded,
+                &workspace.agent_entries,
+                "agent-entries",
+            ),
+            None => continue,
+        };
+        if expanded && !list.is_empty() {
+            let mut entries = ElementDef::new(Tag::Div)
+                .with_class("terminal-entries")
+                .with_class(list_class);
+            let count = list.len();
+            for (t_idx, entry) in list.iter().enumerate() {
                 entries = entries.with_child(build_terminal_entry(
                     workspace_index,
                     entry,
@@ -203,13 +226,50 @@ fn build_subtab(
         btn = btn.with_class("disabled");
     }
 
-    if subtab.label == "terminals" {
+    let kind = SubtabKind::parse(&subtab.label);
+    if let Some(kind) = kind {
+        btn = btn.with_class(format!("subtab-{}", kind.label()));
         let s = shared.clone();
         let wi = workspace_index;
         btn = btn.on_click(move || {
             mutate_with(&s, |st| {
                 if let Some(ws) = st.workspaces.get_mut(wi) {
-                    ws.terminals_expanded = !ws.terminals_expanded;
+                    match kind {
+                        SubtabKind::Terminals => {
+                            ws.terminals_expanded = !ws.terminals_expanded;
+                        }
+                        SubtabKind::Agents => ws.agents_expanded = !ws.agents_expanded,
+                    }
+                }
+            });
+        });
+        // Right-click: the scoped menu ("New terminal ›" / "New agent ›"
+        // plus the matching kill action). Toggles closed when the menu
+        // is already open for this very subtab, like the workspace row.
+        let ctx_shared = shared.clone();
+        btn = btn.on_context_menu(move |x, y| {
+            mutate_with(&ctx_shared, |st| {
+                let same = matches!(
+                    st.ctx_menu.as_ref().map(|m| &m.target),
+                    Some(crate::state::CtxMenuTarget::Subtab { idx, kind: k })
+                        if *idx == wi && *k == kind
+                );
+                if same {
+                    st.ctx_menu = None;
+                } else {
+                    let sf = st.scale_factor;
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "subtab",
+                        x / sf,
+                        y / sf,
+                        st.window_width / sf,
+                        st.window_height / sf,
+                    );
+                    st.ctx_menu = Some(CtxMenu {
+                        x: x / sf,
+                        y: y / sf,
+                        target: crate::state::CtxMenuTarget::Subtab { idx: wi, kind },
+                    });
                 }
             });
         });
@@ -228,12 +288,12 @@ fn build_subtab(
         });
     }
 
-    if subtab.label == "terminals" {
-        let chevron = if workspace.terminals_expanded {
-            "\u{25BE}"
-        } else {
-            "\u{25B8}"
+    if let Some(kind) = kind {
+        let expanded = match kind {
+            SubtabKind::Terminals => workspace.terminals_expanded,
+            SubtabKind::Agents => workspace.agents_expanded,
         };
+        let chevron = if expanded { "\u{25BE}" } else { "\u{25B8}" };
         btn = btn.with_child(
             ElementDef::new(Tag::Span)
                 .with_class("subtab-chevron")
@@ -306,6 +366,13 @@ fn build_terminal_entry(
                     st.ctx_menu = None;
                 } else {
                     let sf = st.scale_factor;
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "tab",
+                        x / sf,
+                        y / sf,
+                        st.window_width / sf,
+                        st.window_height / sf,
+                    );
                     st.ctx_menu = Some(CtxMenu {
                         x: x / sf,
                         y: y / sf,
@@ -318,13 +385,20 @@ fn build_terminal_entry(
             ElementDef::new(Tag::Span)
                 .with_class("tree-glyph")
                 .with_text(glyph),
-        )
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("terminal-entry-name")
-                .with_class("sb-label")
-                .with_text(entry.name.clone()),
         );
+    if entry.agent.is_some() {
+        // Agent rows carry the agent glyph so a renamed or plain-titled
+        // agent pane is still recognisable at a glance.
+        row = row
+            .with_class("agent")
+            .with_child(svg_icon(icon_agent()).with_class("entry-agent-ic"));
+    }
+    row = row.with_child(
+        ElementDef::new(Tag::Span)
+            .with_class("terminal-entry-name")
+            .with_class("sb-label")
+            .with_text(entry.name.clone()),
+    );
     if is_active {
         row = row.with_class("active");
     }
@@ -372,6 +446,9 @@ fn build_sidebar_footer(state: &UiSnapshot) -> ElementDef {
 }
 
 pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    use unshit::core::style::parse::StyleDeclaration;
+    use unshit::core::style::types::Dimension;
+
     let ctx = match &snap.ctx_menu {
         Some(c) => c,
         None => return ElementDef::new(Tag::Div).with_class("ctx-menu-hidden"),
@@ -396,17 +473,154 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
     let menu = match &ctx.target {
         crate::state::CtxMenuTarget::Workspace { idx } => {
             let installed = crate::shell::discover_installed();
-            build_workspace_ctx_menu(snap, shared, ctx.x, ctx.y, *idx, &installed)
+            let agents = crate::agents::menu_profiles();
+            build_workspace_ctx_menu(snap, shared, *idx, &installed, &agents)
         }
         crate::state::CtxMenuTarget::Tab { pane_id } => {
-            build_tab_ctx_menu(snap, shared, ctx.x, ctx.y, *pane_id, false)
+            build_tab_ctx_menu(snap, shared, *pane_id, false)
         }
         crate::state::CtxMenuTarget::TabName { pane_id } => {
-            build_tab_ctx_menu(snap, shared, ctx.x, ctx.y, *pane_id, true)
+            build_tab_ctx_menu(snap, shared, *pane_id, true)
+        }
+        crate::state::CtxMenuTarget::Subtab { idx, kind } => {
+            let installed = crate::shell::discover_installed();
+            let agents = crate::agents::menu_profiles();
+            build_subtab_ctx_menu(snap, shared, *idx, *kind, &installed, &agents)
+        }
+    };
+
+    // Position last: the menu is `position: fixed` and would otherwise be
+    // laid out straight at the cursor, which pushes its lower rows (the
+    // danger zone holding "Remove workspace") past the bottom of the window
+    // where nothing can reach them. `.m-menu` sets `overflow: visible`, so
+    // the clipped part is simply unreachable, not scrollable.
+    let (menu_w, menu_h) = estimate_menu_size(&menu);
+    // The root carries `FontScale` when the user raised the config font size,
+    // which grows every row's line box. Scaling the whole estimate (padding
+    // included) over-estimates a little, which is the safe direction.
+    // The 1.1 factor is asymmetry insurance: the estimate only picks the anchor
+    // edge, and under-estimating flips the decision, so the whole overflow
+    // clips. Flipping up a little early costs nothing.
+    let menu_h = menu_h
+        * (snap.config_font_size_pt as f32 / crate::state::DEFAULT_CONFIG_FONT_SIZE_PT as f32)
+            .max(1.0)
+        * 1.1;
+    // Window size is stored in physical pixels, like `last_grid_*`; the menu
+    // metrics and the stored cursor anchor are both CSS px.
+    let sf = snap.scale_factor.max(1e-3);
+    let win_w = snap.window_width / sf;
+    let win_h = snap.window_height / sf;
+
+    let menu = menu.with_style(StyleDeclaration::Left(Dimension::Px(ctx_menu_clamped_x(
+        ctx.x, win_w, menu_w,
+    ))));
+    let menu = match ctx_menu_v_anchor(ctx.y, win_h, menu_h) {
+        CtxMenuVAnchor::Top(top) => menu.with_style(StyleDeclaration::Top(Dimension::Px(top))),
+        CtxMenuVAnchor::Bottom(inset) => {
+            menu.with_style(StyleDeclaration::Bottom(Dimension::Px(inset)))
         }
     };
 
     backdrop.with_child(menu)
+}
+
+/// Margin kept between a context menu edge and the window edge, CSS px.
+const CTX_MENU_EDGE_MARGIN: f32 = 8.0;
+
+/// Vertical anchor for a `position: fixed` context menu opened at cursor
+/// `y` inside a window `win_h` tall (both CSS px).
+enum CtxMenuVAnchor {
+    /// `top: y` — the classic drop-down below the cursor.
+    Top(f32),
+    /// `bottom: inset` — the menu grows upward from a pinned bottom edge,
+    /// which keeps every row in-window without knowing the menu height.
+    Bottom(f32),
+}
+
+/// Picks the anchor edge. `est_h` deliberately OVERESTIMATES the menu
+/// height: it only decides which edge to anchor to and never sizes
+/// anything, so erring large merely flips or pins slightly early, while
+/// erring small would let the menu clip at the window bottom.
+fn ctx_menu_v_anchor(y: f32, win_h: f32, est_h: f32) -> CtxMenuVAnchor {
+    // win_h == 0.0 means the window has never been measured (fresh state,
+    // structural tests): keep the historical unclamped drop-down.
+    if win_h <= 0.0 || y + est_h + CTX_MENU_EDGE_MARGIN <= win_h {
+        CtxMenuVAnchor::Top(y)
+    } else if y >= est_h + CTX_MENU_EDGE_MARGIN {
+        // Enough room above the cursor: flip up, menu bottom at the cursor.
+        // The max() only matters for driven/dispatched coordinates that
+        // land past the window bottom; a real cursor y never exceeds win_h.
+        CtxMenuVAnchor::Bottom((win_h - y).max(CTX_MENU_EDGE_MARGIN))
+    } else {
+        // Window shorter than the menu either way: pin to the bottom edge
+        // so the danger actions stay visible and clickable.
+        CtxMenuVAnchor::Bottom(CTX_MENU_EDGE_MARGIN)
+    }
+}
+
+/// Clamps the menu's left edge so a fixed-width menu stays in-window.
+/// `win_w == 0.0` (unmeasured) leaves the cursor coordinate untouched.
+fn ctx_menu_clamped_x(x: f32, win_w: f32, menu_w: f32) -> f32 {
+    if win_w <= 0.0 {
+        return x;
+    }
+    x.min((win_w - menu_w - CTX_MENU_EDGE_MARGIN).max(CTX_MENU_EDGE_MARGIN))
+}
+
+// Row metrics mirroring assets/styles.css. They only decide *whether* a
+// menu is nudged away from an edge, so erring slightly high is safe: it
+// nudges a menu that would just barely have fit, and never leaves one
+// clipped.
+const MENU_PAD_Y: f32 = 10.0; // .ctx-menu padding: 5px top + bottom
+const MENU_HEAD_H: f32 = 40.0; // .m-head padding + text + rule + margin
+const MENU_ROW_H: f32 = 34.0; // .m-row padding 7+7 + line box
+const MENU_LEGACY_HEAD_H: f32 = 32.0; // .ctx-menu-header
+const MENU_LEGACY_ROW_H: f32 = 30.0; // .ctx-menu-item
+const MENU_SEP_H: f32 = 10.0; // .ctx-menu-separator + margins
+const MENU_DANGER_FENCE_H: f32 = 10.0; // .m-danger margin + padding + border
+const MENU_WIDE_W: f32 = 222.0; // .m-menu width
+const MENU_LEGACY_W: f32 = 200.0; // .ctx-menu min-width plus slack
+
+/// Rough laid-out size of a built context menu, in CSS px.
+///
+/// The engine measures the element tree only after this frame is built, so
+/// placement has to work from the row inventory instead. The hover flyout
+/// is skipped: it is absolutely positioned and adds nothing to the menu's
+/// own box.
+fn estimate_menu_size(menu: &ElementDef) -> (f32, f32) {
+    fn has(el: &ElementDef, class: &str) -> bool {
+        el.classes.iter().any(|c| c == class)
+    }
+    fn walk(el: &ElementDef, acc: &mut f32) {
+        if has(el, "m-flyout") {
+            return;
+        }
+        if has(el, "m-head") {
+            *acc += MENU_HEAD_H;
+        } else if has(el, "m-row") {
+            *acc += MENU_ROW_H;
+        } else if has(el, "ctx-menu-header") {
+            *acc += MENU_LEGACY_HEAD_H;
+        } else if has(el, "ctx-menu-item") {
+            *acc += MENU_LEGACY_ROW_H;
+        } else if has(el, "ctx-menu-separator") {
+            *acc += MENU_SEP_H;
+        } else if has(el, "m-danger") {
+            *acc += MENU_DANGER_FENCE_H;
+        }
+        for child in &el.children {
+            walk(child, acc);
+        }
+    }
+
+    let mut height = MENU_PAD_Y;
+    walk(menu, &mut height);
+    let width = if menu.classes.iter().any(|c| c == "m-menu") {
+        MENU_WIDE_W
+    } else {
+        MENU_LEGACY_W
+    };
+    (width, height)
 }
 
 fn ctx_menu_item(label: &str, shared: &SharedState, command: String) -> ElementDef {
@@ -603,17 +817,188 @@ fn workspace_flyout_shell_items(
     items
 }
 
+/// One agent row inside a "New agent" flyout. Same skeleton as
+/// `flyout_shell_row` so the flyout CSS and `estimate_menu_size` treat
+/// both alike; the trailing `m-kbd` hint names the launch program.
+fn flyout_agent_row(
+    profile: &crate::agents::AgentProfile,
+    shared: &SharedState,
+    command: String,
+) -> ElementDef {
+    let s = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-item")
+        .with_class("m-row")
+        .with_class("m-agent")
+        .on_click(move || {
+            mutate_with(&s, |st| {
+                crate::state::dispatch(st, &command);
+            });
+        })
+        .with_child(svg_icon(icon_agent()).with_class("m-ic"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("ctx-menu-item-label")
+                .with_class("m-label")
+                .with_text(profile.label.to_string()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("m-kbd")
+                .with_text(profile.program.to_string()),
+        )
+}
+
+/// Contents of the "New agent" flyout: an `Agent` section header and one
+/// row per launchable profile (`crate::agents::menu_profiles`).
+fn workspace_flyout_agent_items(
+    ws_idx: usize,
+    agents: &[&crate::agents::AgentProfile],
+    shared: &SharedState,
+) -> Vec<ElementDef> {
+    let mut items: Vec<ElementDef> = Vec::new();
+    items.push(ctx_menu_section_header("Agent").with_class("m-section"));
+    for profile in agents {
+        items.push(flyout_agent_row(
+            profile,
+            shared,
+            format!("workspace.new_agent:{ws_idx}:{}", profile.id),
+        ));
+    }
+    items
+}
+
+/// "New agent ›" submenu anchor: clicking the row launches the default
+/// agent, hovering reveals one row per launchable profile.
+fn new_agent_sub_anchor(
+    ws_idx: usize,
+    agents: &[&crate::agents::AgentProfile],
+    shared: &SharedState,
+) -> ElementDef {
+    let mut flyout = ElementDef::new(Tag::Div).with_class("m-flyout");
+    for item in workspace_flyout_agent_items(ws_idx, agents, shared) {
+        flyout = flyout.with_child(item);
+    }
+    ElementDef::new(Tag::Div)
+        .with_class("m-sub-anchor")
+        .with_child(
+            m_menu_row(
+                svg_icon(icon_agent()),
+                "New agent",
+                None,
+                true,
+                false,
+                shared,
+                format!("workspace.new_agent:{ws_idx}"),
+            )
+            .with_class("m-sub-trigger")
+            .with_class("m-new-agent"),
+        )
+        .with_child(flyout)
+}
+
+/// "New terminal ›" submenu anchor with the installed-shell flyout.
+fn new_terminal_sub_anchor(
+    ws_idx: usize,
+    current_shell: &crate::shell::ShellSpec,
+    installed: &[std::path::PathBuf],
+    shared: &SharedState,
+) -> ElementDef {
+    let mut flyout = ElementDef::new(Tag::Div).with_class("m-flyout");
+    for item in workspace_flyout_shell_items(ws_idx, current_shell, installed, shared) {
+        flyout = flyout.with_child(item);
+    }
+    ElementDef::new(Tag::Div)
+        .with_class("m-sub-anchor")
+        .with_child(
+            m_menu_row(
+                svg_icon(icon_plus()),
+                "New terminal",
+                None,
+                true,
+                false,
+                shared,
+                format!("workspace.new_terminal:{ws_idx}"),
+            )
+            .with_class("m-sub-trigger"),
+        )
+        .with_child(flyout)
+}
+
+/// Context menu for a `terminals` / `agents` subtab row: the matching
+/// "New ... ›" flyout and, fenced in the danger zone, the kill action
+/// scoped to that list only.
+fn build_subtab_ctx_menu(
+    snap: &UiSnapshot,
+    shared: &SharedState,
+    ws_idx: usize,
+    kind: SubtabKind,
+    installed: &[std::path::PathBuf],
+    agents: &[&crate::agents::AgentProfile],
+) -> ElementDef {
+    let ws = snap.workspaces.get(ws_idx);
+    let ws_name = ws.map(|w| w.name.clone()).unwrap_or_default();
+    let current_shell = ws.map(|w| w.shell.clone()).unwrap_or_default();
+
+    let (head_icon, anchor, danger_row) = match kind {
+        SubtabKind::Terminals => (
+            icon_terminal(),
+            new_terminal_sub_anchor(ws_idx, &current_shell, installed, shared),
+            m_menu_row(
+                svg_icon(icon_ban()),
+                "Kill all terminals",
+                None,
+                false,
+                true,
+                shared,
+                format!("workspace.request_kill_all:{ws_idx}"),
+            ),
+        ),
+        SubtabKind::Agents => (
+            icon_agent(),
+            new_agent_sub_anchor(ws_idx, agents, shared),
+            m_menu_row(
+                svg_icon(icon_ban()),
+                "Kill all agents",
+                None,
+                false,
+                true,
+                shared,
+                format!("workspace.request_kill_agents:{ws_idx}"),
+            ),
+        ),
+    };
+
+    let header = ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-header")
+        .with_class("m-head")
+        .with_child(svg_icon(head_icon).with_class("m-head-ic"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("nm")
+                .with_text(format!("{ws_name} \u{00B7} {}", kind.label())),
+        );
+
+    ElementDef::new(Tag::Div)
+        .with_class("ctx-menu")
+        .with_class("m-menu")
+        .with_class(format!("m-menu-{}", kind.label()))
+        .with_child(header)
+        .with_child(anchor)
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("m-danger")
+                .with_child(danger_row),
+        )
+}
+
 fn build_workspace_ctx_menu(
     snap: &UiSnapshot,
     shared: &SharedState,
-    x: f32,
-    y: f32,
     ws_idx: usize,
     installed: &[std::path::PathBuf],
+    agents: &[&crate::agents::AgentProfile],
 ) -> ElementDef {
-    use unshit::core::style::parse::StyleDeclaration;
-    use unshit::core::style::types::Dimension;
-
     let ws = snap.workspaces.get(ws_idx);
     let ws_name = ws.map(|w| w.name.clone()).unwrap_or_default();
     let is_collapsed = ws.map(|w| w.collapsed).unwrap_or(false);
@@ -634,26 +1019,10 @@ fn build_workspace_ctx_menu(
 
     // "New terminal" is a submenu anchor: hovering reveals the shell flyout
     // that pops out to the side. Clicking the row still spawns a terminal
-    // with the workspace's resolved default shell.
-    let mut flyout = ElementDef::new(Tag::Div).with_class("m-flyout");
-    for item in workspace_flyout_shell_items(ws_idx, &current_shell, installed, shared) {
-        flyout = flyout.with_child(item);
-    }
-    let sub_anchor = ElementDef::new(Tag::Div)
-        .with_class("m-sub-anchor")
-        .with_child(
-            m_menu_row(
-                svg_icon(icon_plus()),
-                "New terminal",
-                None,
-                true,
-                false,
-                shared,
-                format!("workspace.new_terminal:{ws_idx}"),
-            )
-            .with_class("m-sub-trigger"),
-        )
-        .with_child(flyout);
+    // with the workspace's resolved default shell. "New agent" is its
+    // twin for agent CLIs.
+    let sub_anchor = new_terminal_sub_anchor(ws_idx, &current_shell, installed, shared);
+    let agent_anchor = new_agent_sub_anchor(ws_idx, agents, shared);
 
     // Danger zone: grouped and fenced behind a top border + faint rust wash.
     let mut danger = ElementDef::new(Tag::Div)
@@ -682,8 +1051,6 @@ fn build_workspace_ctx_menu(
     ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
         .with_class("m-menu")
-        .with_style(StyleDeclaration::Left(Dimension::Px(x)))
-        .with_style(StyleDeclaration::Top(Dimension::Px(y)))
         .with_child(header)
         .with_child(m_menu_row(
             svg_icon(icon_diamond()),
@@ -698,6 +1065,7 @@ fn build_workspace_ctx_menu(
             format!("workspace.switch:{ws_idx}"),
         ))
         .with_child(sub_anchor)
+        .with_child(agent_anchor)
         .with_child(m_menu_row(
             svg_icon(icon_collapse()),
             collapse_label,
@@ -713,14 +1081,9 @@ fn build_workspace_ctx_menu(
 fn build_tab_ctx_menu(
     snap: &UiSnapshot,
     shared: &SharedState,
-    x: f32,
-    y: f32,
     pane_id: u32,
     include_export: bool,
 ) -> ElementDef {
-    use unshit::core::style::parse::StyleDeclaration;
-    use unshit::core::style::types::Dimension;
-
     // Header shows the current pane title so the user can tell which
     // session they are about to rename / kill. Fall back to the pane
     // id if no matching pane is found, which only happens if the menu
@@ -730,8 +1093,6 @@ fn build_tab_ctx_menu(
 
     let mut menu = ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
-        .with_style(StyleDeclaration::Left(Dimension::Px(x)))
-        .with_style(StyleDeclaration::Top(Dimension::Px(y)))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("ctx-menu-header")
@@ -820,6 +1181,8 @@ mod tests {
             collapsed,
             terminals_expanded: false,
             terminal_entries: vec![],
+            agents_expanded: false,
+            agent_entries: vec![],
             subtabs: vec![
                 Subtab {
                     label: "terminals".to_string(),
@@ -1071,6 +1434,7 @@ mod tests {
             branch_muted: true,
             branch_error: false,
             pane_id: crate::state::PaneId(0),
+            agent: None,
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
@@ -1086,6 +1450,7 @@ mod tests {
             branch_muted: false,
             branch_error: false,
             pane_id: crate::state::PaneId(42),
+            agent: None,
         };
         let row = build_terminal_entry(0, &entry, true, true, &shared);
 
@@ -1218,7 +1583,7 @@ mod tests {
             });
         }
         let snap = shared.lock().unwrap().ui_snapshot();
-        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 77, false);
+        let menu = build_tab_ctx_menu(&snap, &shared, 77, false);
         let header = find_by_class(&menu, "ctx-menu-header").expect("ctx menu header");
 
         assert_eq!(text_of(header), Some("saved-pane-title"));
@@ -1228,7 +1593,7 @@ mod tests {
     fn tab_name_ctx_menu_includes_export_item() {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
-        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 1, true);
+        let menu = build_tab_ctx_menu(&snap, &shared, 1, true);
         let text = collect_text_recursive(&menu);
 
         assert!(text.contains("Rename session"));
@@ -1239,7 +1604,7 @@ mod tests {
     fn sidebar_tab_ctx_menu_omits_export_item() {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
-        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 1, false);
+        let menu = build_tab_ctx_menu(&snap, &shared, 1, false);
         let text = collect_text_recursive(&menu);
 
         assert!(text.contains("Rename session"));
@@ -1254,6 +1619,7 @@ mod tests {
             branch_muted: false,
             branch_error: false,
             pane_id: crate::state::PaneId(0),
+            agent: None,
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
@@ -1268,6 +1634,7 @@ mod tests {
             branch_muted: false,
             branch_error: true,
             pane_id: crate::state::PaneId(0),
+            agent: None,
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
@@ -1282,6 +1649,7 @@ mod tests {
             branch_muted: false,
             branch_error: false,
             pane_id: crate::state::PaneId(0),
+            agent: None,
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
@@ -1618,6 +1986,126 @@ mod tests {
         );
     }
 
+    // -- context menu window clamping --
+
+    fn harness_with_ctx_menu(win_w: f32, win_h: f32, x: f32, y: f32) -> TestHarness {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.scale_factor = 1.0;
+            guard.window_width = win_w;
+            guard.window_height = win_h;
+            guard.ctx_menu = Some(crate::state::CtxMenu {
+                x,
+                y,
+                target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+            });
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let tree_shared = shared.clone();
+        let css = include_str!("../../assets/styles.css");
+        let mut harness = TestHarness::new(
+            css,
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_child(build_ctx_menu_overlay(&snap, &tree_shared)),
+            },
+            win_w,
+            win_h,
+        );
+        harness.step();
+        harness
+    }
+
+    #[test]
+    fn workspace_ctx_menu_pins_to_bottom_in_short_window() {
+        // Regression: in a window shorter than the menu, the raw Top(y)
+        // placement ran the danger zone ("Kill all terminals" / "Remove
+        // workspace") past the window bottom, leaving it invisible and
+        // unclickable.
+        let harness = harness_with_ctx_menu(600.0, 260.0, 20.0, 120.0);
+        let menu = harness
+            .query(".m-menu")
+            .expect("workspace ctx menu should render");
+        let bottom = menu.layout_rect.y + menu.layout_rect.height;
+        assert!(
+            bottom <= 260.0 + 0.5,
+            "menu must not cross the window bottom, got bottom {bottom} (rect {:?})",
+            menu.layout_rect
+        );
+        let danger = harness
+            .query(".m-danger")
+            .expect("danger zone should render");
+        let danger_bottom = danger.layout_rect.y + danger.layout_rect.height;
+        assert!(
+            danger_bottom <= 260.0 + 0.5,
+            "danger rows must stay inside the window, got bottom {danger_bottom}"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_flips_up_near_window_bottom() {
+        // Cursor near the bottom of a tall window: the menu flips so its
+        // bottom edge sits at the cursor instead of overflowing below.
+        let harness = harness_with_ctx_menu(1280.0, 720.0, 20.0, 650.0);
+        let menu = harness
+            .query(".m-menu")
+            .expect("workspace ctx menu should render");
+        let bottom = menu.layout_rect.y + menu.layout_rect.height;
+        assert!(
+            (bottom - 650.0).abs() <= 0.5,
+            "flipped menu bottom should sit at the cursor y, got {bottom}"
+        );
+        assert!(
+            menu.layout_rect.y >= 0.0,
+            "flipped menu must not cross the window top, got y {}",
+            menu.layout_rect.y
+        );
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_prefers_dropdown_when_it_fits() {
+        assert!(matches!(
+            ctx_menu_v_anchor(100.0, 720.0, 270.0),
+            CtxMenuVAnchor::Top(y) if y == 100.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_flips_up_when_only_space_above() {
+        assert!(matches!(
+            ctx_menu_v_anchor(650.0, 720.0, 270.0),
+            CtxMenuVAnchor::Bottom(inset) if inset == 70.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_pins_when_window_too_short() {
+        assert!(matches!(
+            ctx_menu_v_anchor(120.0, 260.0, 270.0),
+            CtxMenuVAnchor::Bottom(inset) if inset == CTX_MENU_EDGE_MARGIN
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_unmeasured_window_falls_through_to_cursor() {
+        // window_h == 0.0 (never measured) must keep the historical
+        // unclamped drop-down so structural tests and fresh state behave.
+        assert!(matches!(
+            ctx_menu_v_anchor(650.0, 0.0, 270.0),
+            CtxMenuVAnchor::Top(y) if y == 650.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_clamped_x_keeps_fixed_width_menu_in_window() {
+        assert_eq!(ctx_menu_clamped_x(20.0, 600.0, 222.0), 20.0);
+        assert_eq!(ctx_menu_clamped_x(500.0, 600.0, 222.0), 370.0);
+        // Unmeasured window: cursor coordinate passes through untouched.
+        assert_eq!(ctx_menu_clamped_x(500.0, 0.0, 222.0), 500.0);
+    }
+
     #[test]
     fn workspace_names_avoid_broken_medium_font_path() {
         let css = include_str!("../../assets/styles.css").replace("\r\n", "\n");
@@ -1675,12 +2163,118 @@ mod tests {
         collect_text_recursive(el).contains(needle)
     }
 
+    // -- context menu placement (stays inside the window) --------------------
+
+    /// The vertical inset the overlay applied to the rendered menu, as
+    /// (is_bottom_anchored, value in CSS px).
+    fn menu_v_inset(overlay: &ElementDef) -> (bool, f32) {
+        use unshit::core::style::parse::StyleDeclaration;
+        use unshit::core::style::types::Dimension;
+
+        find_by_class(overlay, "ctx-menu")
+            .expect("menu must render")
+            .style_overrides
+            .iter()
+            .find_map(|s| match s {
+                StyleDeclaration::Top(Dimension::Px(v)) => Some((false, *v)),
+                StyleDeclaration::Bottom(Dimension::Px(v)) => Some((true, *v)),
+                _ => None,
+            })
+            .expect("menu must carry a vertical inset")
+    }
+
+    /// The estimate drives the clamp, so it must cover the whole workspace
+    /// menu -- header, rows, danger fence -- while ignoring the hover flyout,
+    /// which is absolutely positioned and adds nothing to the menu's box.
+    #[test]
+    fn workspace_menu_size_estimate_covers_rows_and_ignores_flyout() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed: Vec<std::path::PathBuf> = (0..16)
+            .map(|idx| std::path::PathBuf::from(format!("/opt/shells/shell{idx}")))
+            .collect();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
+        let (w, h) = estimate_menu_size(&menu);
+
+        assert_eq!(w, MENU_WIDE_W, "workspace menu uses the .m-menu width");
+        // Header + Set active + New terminal + New agent + Collapse + Kill
+        // all (+ Remove when several workspaces exist), never the 16
+        // flyout shell rows.
+        assert!(
+            (140.0..=270.0).contains(&h),
+            "estimate should cover the visible rows only, got {h}"
+        );
+    }
+
+    /// The overlay, not the builders, applies the position now: a menu built
+    /// with the fixed-position class but no inset would land at the origin.
+    /// Opened low in the window, it anchors from the bottom instead.
+    #[test]
+    fn ctx_menu_overlay_positions_the_menu() {
+        let shared = make_shared();
+        {
+            let mut st = shared.lock().unwrap();
+            st.window_width = 900.0;
+            st.window_height = 560.0;
+            st.scale_factor = 1.0;
+            st.ctx_menu = Some(crate::state::CtxMenu {
+                x: 40.0,
+                y: 520.0,
+                target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+            });
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let (bottom_anchored, inset) = menu_v_inset(&build_ctx_menu_overlay(&snap, &shared));
+        assert!(bottom_anchored, "menu opened near the bottom must flip up");
+        assert!(
+            (inset - 40.0).abs() <= 0.5,
+            "flipped menu bottom should sit at the cursor, got inset {inset}"
+        );
+    }
+
+    /// A raised config font size grows every menu row, so the placement
+    /// estimate has to grow with it or the danger zone clips again for
+    /// exactly the users who bumped the UI font. At this cursor the menu
+    /// fits below at the default font and no longer does when it doubles.
+    #[test]
+    fn larger_config_font_changes_the_anchor_edge() {
+        let shared = make_shared();
+        let baseline = {
+            let mut st = shared.lock().unwrap();
+            st.window_width = 900.0;
+            st.window_height = 560.0;
+            st.scale_factor = 1.0;
+            st.config_font_size_pt = crate::state::DEFAULT_CONFIG_FONT_SIZE_PT;
+            st.ctx_menu = Some(crate::state::CtxMenu {
+                x: 40.0,
+                y: 250.0,
+                target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+            });
+            st.ui_snapshot()
+        };
+        let enlarged = {
+            let mut st = shared.lock().unwrap();
+            st.config_font_size_pt = crate::state::DEFAULT_CONFIG_FONT_SIZE_PT * 2;
+            st.ui_snapshot()
+        };
+
+        assert_eq!(
+            menu_v_inset(&build_ctx_menu_overlay(&baseline, &shared)),
+            (false, 250.0),
+            "at the default font the menu still fits below the cursor"
+        );
+        assert!(
+            menu_v_inset(&build_ctx_menu_overlay(&enlarged, &shared)).0,
+            "a doubled UI font must stop the menu dropping past the edge"
+        );
+    }
+
     #[test]
     fn workspace_ctx_menu_includes_shell_subsection_header() {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
         let text = collect_text_recursive(&menu);
         assert!(
             text.contains("Shell"),
@@ -1693,7 +2287,7 @@ mod tests {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
         let items = collect_with_class(&menu, "ctx-menu-item");
         assert!(
             items.iter().any(|el| item_text_contains(el, "pwsh")),
@@ -1719,7 +2313,7 @@ mod tests {
         let installed: Vec<std::path::PathBuf> = (0..16)
             .map(|idx| std::path::PathBuf::from(format!("/opt/shells/shell{idx}")))
             .collect();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
         let items = collect_with_class(&menu, "ctx-menu-item");
 
         let new_terminal_idx = items
@@ -1763,7 +2357,7 @@ mod tests {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
 
         let set_active = collect_with_class(&menu, "ctx-menu-item")
             .into_iter()
@@ -1791,7 +2385,7 @@ mod tests {
             std::path::PathBuf::from("/usr/bin/pwsh"),
             std::path::PathBuf::from("/usr/bin/zsh"),
         ];
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
         let pwsh = collect_with_class(&menu, "m-shell")
             .into_iter()
             .find(|el| item_text_contains(el, "pwsh"))
@@ -1822,7 +2416,7 @@ mod tests {
         }
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
         let active_items: Vec<&ElementDef> = collect_with_class(&menu, "ctx-menu-item")
             .into_iter()
             .filter(|el| has_class(el, "active"))
@@ -1845,7 +2439,7 @@ mod tests {
         }
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
         let text = collect_text_recursive(&menu);
         assert!(
             text.contains("Use app default"),
@@ -1859,7 +2453,7 @@ mod tests {
         let snap = shared.lock().unwrap().ui_snapshot();
         assert!(snap.workspaces[0].shell.is_empty());
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
         let text = collect_text_recursive(&menu);
         assert!(
             !text.contains("Use app default"),
@@ -1872,7 +2466,7 @@ mod tests {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = vec![std::path::PathBuf::from("/usr/bin/pwsh")];
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
         let pwsh_item = collect_with_class(&menu, "ctx-menu-item")
             .into_iter()
             .find(|el| item_text_contains(el, "pwsh"))
@@ -1894,7 +2488,7 @@ mod tests {
         }
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed, &[]);
         let item = collect_with_class(&menu, "ctx-menu-item")
             .into_iter()
             .find(|el| item_text_contains(el, "Use app default"))
@@ -1904,6 +2498,181 @@ mod tests {
         assert!(
             guard.workspaces[0].shell.is_empty(),
             "clicking Use app default must clear the workspace override"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agents_tab_tests {
+    use super::*;
+    use crate::agents::{AgentTag, AgentTagSource};
+    use crate::state::{seed_state, SharedState};
+    use std::sync::{Arc, Mutex};
+
+    fn has_class(el: &ElementDef, class: &str) -> bool {
+        el.classes.iter().any(|c| c == class)
+    }
+
+    fn find_by_class<'a>(el: &'a ElementDef, class: &str) -> Option<&'a ElementDef> {
+        if has_class(el, class) {
+            return Some(el);
+        }
+        el.children.iter().find_map(|c| find_by_class(c, class))
+    }
+
+    fn find_all_by_class<'a>(el: &'a ElementDef, class: &str, out: &mut Vec<&'a ElementDef>) {
+        if has_class(el, class) {
+            out.push(el);
+        }
+        for child in &el.children {
+            find_all_by_class(child, class, out);
+        }
+    }
+
+    fn text_recursive(el: &ElementDef) -> String {
+        let mut out = String::new();
+        if let ElementContent::Text(t) = &el.content {
+            out.push_str(t);
+            out.push(' ');
+        }
+        for child in &el.children {
+            out.push_str(&text_recursive(child));
+        }
+        out
+    }
+
+    /// Seed state plus one extra tab whose pane is a title-classified
+    /// Claude pane. Pane 1 stays a plain terminal.
+    fn shared_with_agent_pane() -> (SharedState, u32) {
+        let mut state = seed_state();
+        crate::state::mutate_add_tab(&mut state);
+        let pane = state.active_pane.0;
+        state
+            .pane_agents
+            .insert(pane, AgentTag::new("claude", AgentTagSource::Title));
+        state.workspaces[0].agents_expanded = true;
+        state.workspaces[0].terminals_expanded = true;
+        (Arc::new(Mutex::new(state)), pane)
+    }
+
+    #[test]
+    fn workspace_body_lists_agent_panes_under_the_agents_subtab_only() {
+        let (shared, agent_pane) = shared_with_agent_pane();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_sidebar(&snap, &shared);
+
+        let agents_subtab = find_by_class(&el, "subtab-agents").expect("agents subtab row");
+        assert!(text_recursive(agents_subtab).contains("agents"));
+        assert!(
+            find_by_class(agents_subtab, "subtab-icon").is_some(),
+            "agents subtab carries the agent icon"
+        );
+        assert!(find_by_class(&el, "subtab-terminals").is_some());
+
+        let agent_list = find_by_class(&el, "agent-entries").expect("agent entries list");
+        let mut agent_rows = Vec::new();
+        find_all_by_class(agent_list, "terminal-entry", &mut agent_rows);
+        assert_eq!(agent_rows.len(), 1);
+        assert!(has_class(agent_rows[0], "agent"));
+        assert!(find_by_class(agent_rows[0], "entry-agent-ic").is_some());
+
+        let mut lists = Vec::new();
+        find_all_by_class(&el, "terminal-entries", &mut lists);
+        let terminal_list = lists
+            .iter()
+            .find(|l| !has_class(l, "agent-entries"))
+            .expect("plain terminal list");
+        let mut terminal_rows = Vec::new();
+        find_all_by_class(terminal_list, "terminal-entry", &mut terminal_rows);
+        assert_eq!(terminal_rows.len(), 1);
+        assert!(!has_class(terminal_rows[0], "agent"));
+        assert!(find_by_class(terminal_rows[0], "entry-agent-ic").is_none());
+        // Workspace header count spans both lists.
+        let meta = find_by_class(&el, "ws-meta").expect("workspace meta");
+        assert_eq!(text_recursive(meta).trim(), "2");
+        let _ = agent_pane;
+    }
+
+    #[test]
+    fn collapsed_agents_list_hides_its_rows_but_keeps_the_count() {
+        let (shared, _) = shared_with_agent_pane();
+        shared.lock().unwrap().workspaces[0].agents_expanded = false;
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_sidebar(&snap, &shared);
+        assert!(find_by_class(&el, "agent-entries").is_none());
+        let agents_subtab = find_by_class(&el, "subtab-agents").expect("agents subtab row");
+        let count = find_by_class(agents_subtab, "subtab-count").expect("count badge");
+        assert_eq!(text_recursive(count).trim(), "1");
+        let chevron = find_by_class(agents_subtab, "subtab-chevron").expect("chevron");
+        assert_eq!(text_recursive(chevron).trim(), "\u{25B8}");
+    }
+
+    fn overlay_for(kind: SubtabKind) -> (SharedState, ElementDef) {
+        let (shared, _) = shared_with_agent_pane();
+        shared.lock().unwrap().ctx_menu = Some(CtxMenu {
+            x: 10.0,
+            y: 10.0,
+            target: crate::state::CtxMenuTarget::Subtab { idx: 0, kind },
+        });
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_ctx_menu_overlay(&snap, &shared);
+        (shared, el)
+    }
+
+    #[test]
+    fn agents_subtab_ctx_menu_offers_new_agent_flyout_and_kill_agents() {
+        let (_shared, el) = overlay_for(SubtabKind::Agents);
+        let menu = find_by_class(&el, "m-menu-agents").expect("agents menu");
+        let text = text_recursive(menu);
+        assert!(text.contains("New agent"), "{text}");
+        assert!(text.contains("Kill all agents"), "{text}");
+        assert!(!text.contains("Kill all terminals"), "{text}");
+        assert!(!text.contains("New terminal"), "{text}");
+        let mut rows = Vec::new();
+        find_all_by_class(menu, "m-agent", &mut rows);
+        assert!(!rows.is_empty(), "flyout lists at least one agent");
+        assert!(rows.iter().all(|r| find_by_class(r, "m-ic").is_some()));
+        assert!(find_by_class(menu, "m-danger").is_some());
+        assert!(find_by_class(menu, "m-flyout").is_some());
+    }
+
+    #[test]
+    fn terminals_subtab_ctx_menu_offers_shells_and_kill_terminals() {
+        let (_shared, el) = overlay_for(SubtabKind::Terminals);
+        let menu = find_by_class(&el, "m-menu-terminals").expect("terminals menu");
+        let text = text_recursive(menu);
+        assert!(text.contains("New terminal"), "{text}");
+        assert!(text.contains("Kill all terminals"), "{text}");
+        assert!(!text.contains("Kill all agents"), "{text}");
+        assert!(find_by_class(menu, "m-agent").is_none());
+    }
+
+    #[test]
+    fn workspace_ctx_menu_gains_a_new_agent_flyout() {
+        let shared: SharedState = Arc::new(Mutex::new(seed_state()));
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let agents: Vec<&crate::agents::AgentProfile> =
+            crate::agents::launchable_profiles().collect();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &[], &agents);
+        let trigger = find_by_class(&menu, "m-new-agent").expect("New agent row");
+        assert!(text_recursive(trigger).contains("New agent"));
+        let mut rows = Vec::new();
+        find_all_by_class(&menu, "m-agent", &mut rows);
+        assert_eq!(rows.len(), agents.len());
+        assert!(text_recursive(rows[0]).contains("Claude Code"));
+        assert!(text_recursive(rows[0]).contains("claude"), "program hint");
+    }
+
+    #[test]
+    fn subtab_menu_estimate_counts_visible_rows_and_ignores_the_flyout() {
+        let (_shared, el) = overlay_for(SubtabKind::Agents);
+        let menu = find_by_class(&el, "m-menu-agents").expect("agents menu");
+        let (w, h) = estimate_menu_size(menu);
+        assert_eq!(w, MENU_WIDE_W);
+        let expected = MENU_PAD_Y + MENU_HEAD_H + 2.0 * MENU_ROW_H + MENU_DANGER_FENCE_H;
+        assert!(
+            (h - expected).abs() < 0.01,
+            "header + New agent + Kill all agents + fence, got {h}, expected {expected}"
         );
     }
 }

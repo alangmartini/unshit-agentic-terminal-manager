@@ -408,6 +408,73 @@ pub fn subtab_icon_for(kind: SubtabIcon) -> SvgNode {
         SubtabIcon::GitBranch => icon_git_branch(),
         SubtabIcon::Folder => icon_folder(),
         SubtabIcon::EnvList => icon_env_list(),
+        SubtabIcon::Agent => icon_agent(),
+    }
+}
+
+/// Legend icon for an event carrier (Flow Explorer). 16 px grid, stroke
+/// only, so each reads at the 11 px chip size next to its label.
+pub fn icon_carrier(carrier: crate::flow_explorer::Carrier) -> SvgNode {
+    use crate::flow_explorer::Carrier;
+    let attrs = root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Round);
+    match carrier {
+        // Pointer arrow: something a person clicked or typed.
+        Carrier::Ui => group(
+            attrs,
+            vec![path_d("M4 2L4 12L7 9.5L9 13.5L11 12.5L9 8.5L12.5 8Z")],
+        ),
+        // Two opposing arrows: a message channel between processes.
+        Carrier::Ipc => group(
+            attrs,
+            vec![
+                path_d("M2 5H12M10 3L12 5L10 7"),
+                path_d("M14 11H4M6 9L4 11L6 13"),
+            ],
+        ),
+        // Bolt: a remote call that resolves later.
+        Carrier::Rpc => group(attrs, vec![path_d("M9 2L4 9H8L7 14L12 7H8Z")]),
+        // Globe.
+        Carrier::Http => group(
+            attrs,
+            vec![
+                circle(8.0, 8.0, 5.5),
+                path_d("M2.5 8H13.5"),
+                path_d("M8 2.5C6 5 6 11 8 13.5"),
+                path_d("M8 2.5C10 5 10 11 8 13.5"),
+            ],
+        ),
+        // Folder.
+        Carrier::Fs => group(attrs, vec![path_d("M2 4H6.5L8 6H14V12.5H2Z")]),
+        // Box with a plus: a spawned process.
+        Carrier::Process => group(
+            attrs,
+            vec![
+                rect(2.5, 2.5, 11.0, 11.0, 1.5),
+                path_d("M5.5 8H10.5"),
+                path_d("M8 5.5V10.5"),
+            ],
+        ),
+        // Three linked nodes.
+        Carrier::Network => group(
+            attrs,
+            vec![
+                circle(4.0, 4.0, 1.8),
+                circle(12.0, 4.0, 1.8),
+                circle(8.0, 12.0, 1.8),
+                line(5.8, 4.0, 10.2, 4.0),
+                line(5.0, 5.5, 7.0, 10.4),
+                line(11.0, 5.5, 9.0, 10.4),
+            ],
+        ),
+        // Chip with pins.
+        Carrier::InMemory => group(
+            attrs,
+            vec![
+                rect(4.5, 4.5, 7.0, 7.0, 1.0),
+                path_d("M2 6.5H4.5M2 9.5H4.5M11.5 6.5H14M11.5 9.5H14"),
+                path_d("M6.5 2V4.5M9.5 2V4.5M6.5 11.5V14M9.5 11.5V14"),
+            ],
+        ),
     }
 }
 

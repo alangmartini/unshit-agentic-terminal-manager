@@ -41,11 +41,13 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             tabs = tabs.with_child(build_tab_drop_placeholder());
         }
         let is_dragging = dragging_source_id.as_deref() == Some(tab.id.as_str());
+        let is_agent = agent_pane_ids_in_tab(state, index, tab);
         tabs = tabs.with_child(build_tab(
             index,
             tab,
             index == state.active_tab,
             is_dragging,
+            is_agent,
             sizing,
             shared,
         ));
@@ -150,11 +152,29 @@ fn build_tab_drop_placeholder() -> ElementDef {
         .with_key("tab-drop-placeholder")
 }
 
+/// True when any pane of the tab at `index` is an agent pane. The active
+/// tab's panes live in the snapshot's live fields, not in `tab.panes`.
+fn agent_pane_ids_in_tab(state: &UiSnapshot, index: usize, tab: &TerminalTab) -> bool {
+    if state.agent_pane_ids.is_empty() {
+        return false;
+    }
+    let panes = if index == state.active_tab {
+        &state.panes
+    } else {
+        &tab.panes
+    };
+    panes
+        .iter()
+        .flatten()
+        .any(|p| state.agent_pane_ids.contains(&p.id.0))
+}
+
 fn build_tab(
     index: usize,
     tab: &TerminalTab,
     is_active: bool,
     is_dragging_source: bool,
+    is_agent: bool,
     sizing: TabSizing,
     shared: &SharedState,
 ) -> ElementDef {
@@ -185,6 +205,10 @@ fn build_tab(
     }
     if is_dragging_source {
         btn = btn.with_class("dragging");
+    }
+
+    if is_agent {
+        btn = btn.with_class("agent");
     }
     let activate_state = shared.clone();
     btn = btn.on_click(move || {
@@ -235,6 +259,13 @@ fn build_tab(
                     st.ctx_menu = None;
                 } else {
                     let sf = st.scale_factor;
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "tab_name",
+                        x / sf,
+                        y / sf,
+                        st.window_width / sf,
+                        st.window_height / sf,
+                    );
                     st.ctx_menu = Some(CtxMenu {
                         x: x / sf,
                         y: y / sf,
@@ -247,27 +278,30 @@ fn build_tab(
         });
 
     let close_state = shared.clone();
-    btn.with_child(
+    let mut btn = btn.with_child(
         ElementDef::new(Tag::Span)
             .with_class("tab-status")
             .with_class(status_class.to_string()),
-    )
-    .with_child(tab_name)
-    .with_child(
-        ElementDef::new(Tag::Span)
-            .with_class("tab-subtitle")
-            .with_text(tab.subtitle.clone()),
-    )
-    .with_child(
-        ElementDef::new(Tag::Span)
-            .with_class("tab-close")
-            .with_text("\u{00D7}")
-            .on_click(move || {
-                mutate_with(&close_state, |st| {
-                    crate::state::request_close_tab(st, index)
-                });
-            }),
-    )
+    );
+    if is_agent {
+        btn = btn.with_child(svg_icon(icon_agent()).with_class("tab-agent-ic"));
+    }
+    btn.with_child(tab_name)
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("tab-subtitle")
+                .with_text(tab.subtitle.clone()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("tab-close")
+                .with_text("\u{00D7}")
+                .on_click(move || {
+                    mutate_with(&close_state, |st| {
+                        crate::state::request_close_tab(st, index)
+                    });
+                }),
+        )
 }
 
 #[cfg(test)]
@@ -418,7 +452,7 @@ mod tests {
     fn tab_active() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, true, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, true, false, false, TabSizing::default(), &shared);
 
         assert_eq!(el.tag, Tag::Button);
         assert!(has_class(&el, "tab"));
@@ -429,7 +463,7 @@ mod tests {
     fn tab_inactive() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
 
         assert!(has_class(&el, "tab"));
         assert!(!has_class(&el, "active"));
@@ -450,7 +484,7 @@ mod tests {
             mode: TabWidthMode::Fixed,
             width_px: 260,
         };
-        let el = build_tab(0, &tab, false, false, sizing, &shared);
+        let el = build_tab(0, &tab, false, false, false, sizing, &shared);
         // Fixed mode pins width + min-width + max-width to the same px so
         // the tab neither grows nor shrinks off the configured value.
         assert_eq!(inline_px_width(&el), Some(260.0));
@@ -472,7 +506,7 @@ mod tests {
             mode: TabWidthMode::FitContent,
             width_px: 260,
         };
-        let el = build_tab(0, &tab, false, false, sizing, &shared);
+        let el = build_tab(0, &tab, false, false, false, sizing, &shared);
         // Fit-content sets no inline width; the `.app.tabs-width-fit` rules
         // in the stylesheet do the shrink-wrapping instead.
         assert!(inline_px_width(&el).is_none());
@@ -486,7 +520,7 @@ mod tests {
     fn tab_status_running() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
         let status = find_by_class(&el, "tab-status").unwrap();
         assert!(has_class(status, "running"));
     }
@@ -495,7 +529,7 @@ mod tests {
     fn tab_status_idle() {
         let shared = make_shared();
         let tab = make_tab("vim", TabStatus::Idle);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
         let status = find_by_class(&el, "tab-status").unwrap();
         assert!(has_class(status, "idle"));
     }
@@ -504,7 +538,7 @@ mod tests {
     fn tab_status_stopped() {
         let shared = make_shared();
         let tab = make_tab("done", TabStatus::Stopped);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
         let status = find_by_class(&el, "tab-status").unwrap();
         assert!(has_class(status, "stopped"));
     }
@@ -513,7 +547,7 @@ mod tests {
     fn tab_shows_name_and_subtitle() {
         let shared = make_shared();
         let tab = make_tab("myshell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
 
         let name_el = find_by_class(&el, "tab-name").unwrap();
         assert_eq!(text_of(name_el), Some("myshell"));
@@ -526,7 +560,7 @@ mod tests {
     fn tab_has_close_button() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
 
         let close = find_by_class(&el, "tab-close").unwrap();
         assert_eq!(text_of(close), Some("\u{00D7}"));
@@ -536,7 +570,7 @@ mod tests {
     fn tab_children_order() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
 
         // Expected order: status, name, subtitle, close
         assert_eq!(el.children.len(), 4);
@@ -673,7 +707,7 @@ mod tests {
     fn tab_has_click_handler_for_activation() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
         assert!(el.on_click.is_some());
     }
 
@@ -681,7 +715,7 @@ mod tests {
     fn tab_context_menu_is_only_on_tab_name() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
         let name = find_by_class(&el, "tab-name").expect("tab name");
 
         assert!(
@@ -698,7 +732,7 @@ mod tests {
     fn tab_name_right_click_opens_export_context_menu() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
         let name = find_by_class(&el, "tab-name").expect("tab name");
 
         (name
@@ -717,7 +751,7 @@ mod tests {
     fn tab_close_has_click_handler() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, false, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, false, false, TabSizing::default(), &shared);
         let close = find_by_class(&el, "tab-close").unwrap();
         assert!(close.on_click.is_some());
     }
@@ -726,7 +760,7 @@ mod tests {
     fn tab_has_dragging_class_when_source_of_drag() {
         let shared = make_shared();
         let tab = make_tab("shell", TabStatus::Running);
-        let el = build_tab(0, &tab, false, true, TabSizing::default(), &shared);
+        let el = build_tab(0, &tab, false, true, false, TabSizing::default(), &shared);
         assert!(has_class(&el, "dragging"));
     }
 
@@ -935,5 +969,51 @@ mod tests {
             find_by_class(&el, "tab-drop-placeholder").is_none(),
             "placeholder must not render when cursor is outside the tab bar"
         );
+    }
+}
+
+#[cfg(test)]
+mod agents_tab_tests {
+    use super::*;
+    use crate::state::seed_state;
+
+    fn has_class(el: &ElementDef, class: &str) -> bool {
+        el.classes.iter().any(|c| c == class)
+    }
+
+    fn find_by_class<'a>(el: &'a ElementDef, class: &str) -> Option<&'a ElementDef> {
+        if has_class(el, class) {
+            return Some(el);
+        }
+        el.children.iter().find_map(|c| find_by_class(c, class))
+    }
+
+    #[test]
+    fn agent_tabs_carry_the_agent_class_and_glyph() {
+        let mut state = seed_state();
+        crate::state::mutate_add_tab(&mut state);
+        let pane = state.active_pane.0;
+        state.pane_agents.insert(
+            pane,
+            crate::agents::AgentTag::new("codex", crate::agents::AgentTagSource::Title),
+        );
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let bar = build_tabbar(&snap, &shared);
+        let strip = bar
+            .children
+            .iter()
+            .find(|c| c.id.as_deref() == Some("tabs"))
+            .expect("tab strip");
+        let tabs: Vec<&ElementDef> = strip
+            .children
+            .iter()
+            .filter(|c| has_class(c, "tab"))
+            .collect();
+        assert_eq!(tabs.len(), 2);
+        assert!(!has_class(tabs[0], "agent"));
+        assert!(find_by_class(tabs[0], "tab-agent-ic").is_none());
+        assert!(has_class(tabs[1], "agent"));
+        assert!(find_by_class(tabs[1], "tab-agent-ic").is_some());
     }
 }

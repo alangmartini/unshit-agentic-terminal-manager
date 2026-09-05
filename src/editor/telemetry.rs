@@ -6,7 +6,6 @@
 //! Events are emitted only on lifecycle transitions (open/save/close),
 //! keeping telemetry off the keystroke hot path.
 
-use std::io::Write;
 use std::path::Path;
 
 use serde::Serialize;
@@ -35,11 +34,7 @@ pub struct EditorEventRecord<'a> {
 }
 
 pub fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
+    crate::telemetry_sink::now_unix_ms()
 }
 
 /// Append an editor event to the bounded JSONL sink. Failures degrade to
@@ -62,30 +57,11 @@ pub fn default_path() -> Option<std::path::PathBuf> {
 }
 
 fn record_to(path: &Path, event: &EditorEventRecord<'_>) -> std::io::Result<()> {
-    const MAX_LOG_BYTES: u64 = 512 * 1024;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if path
-        .metadata()
-        .map(|metadata| metadata.len() >= MAX_LOG_BYTES)
-        .unwrap_or(false)
-    {
-        let rotated = path.with_extension("jsonl.1");
-        if rotated.exists() {
-            std::fs::remove_file(&rotated)?;
-        }
-        std::fs::rename(path, rotated)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let mut line = serde_json::to_vec(event).map_err(std::io::Error::other)?;
-    line.push(b'\n');
-    file.write_all(&line)?;
-    file.flush()
+    crate::telemetry_sink::append_rotating_jsonl(
+        path,
+        event,
+        crate::telemetry_sink::DEFAULT_MAX_LOG_BYTES,
+    )
 }
 
 #[cfg(test)]

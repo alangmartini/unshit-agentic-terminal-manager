@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 pub mod agent_restore;
+pub mod agents;
 pub mod bench;
 pub mod bridge;
 pub mod browser;
@@ -14,6 +15,7 @@ pub mod daemon;
 pub mod diagnostics;
 pub mod drag;
 pub mod editor;
+pub mod flow_explorer;
 pub mod git;
 pub mod git_watch;
 pub mod keybinds;
@@ -28,6 +30,7 @@ pub mod shell;
 pub mod startup;
 pub mod startup_perf;
 pub mod state;
+pub mod telemetry_sink;
 pub mod terminal;
 pub mod theme;
 pub mod ui;
@@ -292,7 +295,22 @@ fn build_tree(
         });
 
     let titlebar = with_custom_surface_style(build_titlebar(snap, shared, window_events), snap);
+    // The `.app` root always spans the window. Cursor-anchored overlays
+    // (context menus) need that box to know when they would run off screen,
+    // and no other element measures it: `last_grid_*` is the terminal
+    // subrect only. `on_resize` reports physical pixels, like `last_grid_*`;
+    // consumers divide by `scale_factor`.
+    let root_resize_shared = shared.clone();
     let mut root = ElementDef::new(Tag::Div)
+        .on_resize(move |w, h| {
+            if w <= 0.0 || h <= 0.0 {
+                return;
+            }
+            mutate_with(&root_resize_shared, |st| {
+                st.window_width = w;
+                st.window_height = h;
+            });
+        })
         .with_class("app")
         .with_class(crate::theme::theme_class_name(&snap.theme))
         .with_class(format!("density-{}", snap.ui_density.id()))
@@ -1355,6 +1373,10 @@ fn main() {
     // after the sink exists, so a resolution that finishes early still has
     // somewhere to deliver its rebuild request.
     crate::git_watch::resolve_all_in_background(shared.clone(), window_event_sink.clone());
+    // Flow Explorer launches are polled off-thread; started here for the
+    // same reason, so an agent that finishes early has a sink to rebuild
+    // through.
+    crate::flow_explorer::poller::start(shared.clone(), window_event_sink.clone());
 
     // Same reasoning for the panes the first frame will not show: reattach
     // them alongside window and GPU bring-up rather than in front of it.

@@ -200,6 +200,34 @@ pub enum CtxMenuTarget {
     /// This target carries extra debugging/export actions that should not
     /// appear on sidebar terminal rows.
     TabName { pane_id: u32 },
+    /// Menu opened on a workspace subtab row (`terminals` / `agents`).
+    /// Offers the matching "New ..." flyout and the scoped kill action.
+    Subtab { idx: usize, kind: SubtabKind },
+}
+
+/// The two pane lists a workspace shows in the sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubtabKind {
+    Terminals,
+    Agents,
+}
+
+impl SubtabKind {
+    /// Sidebar label and dispatch token.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Terminals => "terminals",
+            Self::Agents => "agents",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "terminals" => Some(Self::Terminals),
+            "agents" => Some(Self::Agents),
+            _ => None,
+        }
+    }
 }
 
 /// Pending destructive action awaiting user confirmation via the confirm
@@ -216,6 +244,14 @@ pub enum ConfirmDialog {
     /// of live terminals sampled at open time and is only used for the
     /// modal body text.
     KillAll { count: usize },
+    /// Kill only the agent panes inside the workspace at `workspace_idx`,
+    /// leaving plain terminals alone. `count` is sampled at open time for
+    /// the modal body.
+    KillAgents {
+        workspace_idx: usize,
+        name: String,
+        count: usize,
+    },
     /// Window close intent awaiting a decision between keep-running,
     /// kill-all, or cancel. `remember` is the live checkbox value: when
     /// true, the clicked action is also persisted via the close toggles
@@ -249,6 +285,15 @@ pub enum ConfirmDialog {
         pane_ids: Vec<u32>,
         names: Vec<String>,
         tab: Option<usize>,
+    },
+    /// Flow Explorer request: the text typed for `flow.explain` /
+    /// `flow.review` (a flow name or a `base..head`). Commits via
+    /// `dialog.flow_commit`; `error` is the precondition message shown
+    /// under the input when the launch could not start.
+    FlowRequest {
+        mode: crate::flow_explorer::FlowMode,
+        buffer: String,
+        error: Option<String>,
     },
 }
 
@@ -714,7 +759,13 @@ pub struct Workspace {
     pub path: Option<PathBuf>,
     pub collapsed: bool,
     pub terminals_expanded: bool,
+    /// Panes not running an agent, listed under the `terminals` subtab.
     pub terminal_entries: Vec<TerminalEntry>,
+    /// Whether the `agents` list is unfolded. Independent of
+    /// `terminals_expanded` so the user can keep one list open.
+    pub agents_expanded: bool,
+    /// Agent panes (see `crate::agents`), listed under the `agents` subtab.
+    pub agent_entries: Vec<TerminalEntry>,
     pub subtabs: Vec<Subtab>,
     pub git_branch: GitBranch,
     /// Per-workspace tab list. When this workspace is active, `AppState.tabs`
@@ -746,6 +797,7 @@ pub enum SubtabIcon {
     GitBranch,
     Folder,
     EnvList,
+    Agent,
 }
 
 #[derive(Clone, Debug)]
@@ -757,6 +809,8 @@ pub struct TerminalEntry {
     /// Pane this entry represents. Links the sidebar row to a real pane so
     /// clicks can focus that pane in that workspace.
     pub pane_id: PaneId,
+    /// Recognised agent for this pane, `None` for a plain terminal.
+    pub agent: Option<crate::agents::AgentTag>,
 }
 
 #[derive(Clone, Debug)]
@@ -906,6 +960,14 @@ pub struct AppState {
     /// present here is a file-editor pane and must never enter PTY
     /// spawn/resize/write paths.
     pub editors: std::collections::HashMap<u32, crate::editor::EditorPane>,
+    /// Flow Explorer panes keyed by pane id, mirroring `editors`. Shared
+    /// with the per-frame snapshot through `Arc`; mutate through
+    /// `Arc::make_mut` on the dispatch path only.
+    pub flows: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
+    /// Agent launches waiting for their flow JSON, keyed by the launch
+    /// pane id. Read by the poll thread through `flow_poll_snapshot` and
+    /// dropped when the launch pane closes.
+    pub flow_pending: std::collections::HashMap<u32, crate::flow_explorer::poller::PendingFlow>,
     /// Durable provider conversation metadata keyed by pane id. This
     /// is deliberately separate from `Pane` so it never leaks into
     /// generic labels or the terminal renderer.
@@ -925,6 +987,11 @@ pub struct AppState {
         std::collections::HashMap<u32, crate::agent_restore::AgentLaunchPhase>,
     /// Correlates structured restoration telemetry for this UI run.
     pub restore_correlation_id: String,
+    /// Agent classification per pane (see `crate::agents`). Launched and
+    /// hook tags stay until the pane closes; title tags clear when the
+    /// guest title stops matching. `agent_restarts` takes precedence when
+    /// both know a pane.
+    pub pane_agents: std::collections::HashMap<u32, crate::agents::AgentTag>,
     /// Panes whose title was set by the user (rename dialog). A pane in
     /// this set keeps its manual name; titles reported by the guest
     /// program via OSC 0/2 are ignored until the rename is cleared.
@@ -935,6 +1002,13 @@ pub struct AppState {
     /// Last known physical pixel dimensions of the terminal grid element.
     pub last_grid_width: f32,
     pub last_grid_height: f32,
+    /// Last known physical pixel dimensions of the whole window, tracked by
+    /// `on_resize` on the `.app` root. Overlays anchored to a cursor position
+    /// need the viewport box, not the terminal grid subrect, to stay on
+    /// screen. `0.0` until the first layout pass; consumers must treat zero
+    /// as "unknown" and fall back to unclamped placement.
+    pub window_width: f32,
+    pub window_height: f32,
     /// Flex-grow ratios for each row. Length matches `panes.len()`.
     pub row_ratios: Vec<f32>,
     /// Flex-grow ratios for columns within each row. `col_ratios[r].len()` matches `panes[r].len()`.
@@ -1057,6 +1131,7 @@ impl AppState {
                 branch_muted,
                 branch_error,
                 pane_id: p.id,
+                agent: agent_tag_for_pane(self, p.id.0),
             };
             let entries: Vec<TerminalEntry> = if idx == active_idx {
                 // Active workspace: live panes for the active tab, saved
@@ -1088,13 +1163,41 @@ impl AppState {
                     .flat_map(|tab| tab.panes.iter().flatten().map(&entry_from))
                     .collect()
             };
+            // Split by agent membership: agent panes only ever show under
+            // `agents`, everything else under `terminals`. A subtab is
+            // "active" when it holds the workspace's active pane so the
+            // amber rail follows focus between the two lists.
+            let (agent_entries, terminal_entries): (Vec<TerminalEntry>, Vec<TerminalEntry>) =
+                entries.into_iter().partition(|e| e.agent.is_some());
+            let active_pane = if idx == active_idx {
+                Some(self.active_pane)
+            } else {
+                ws.tabs.get(ws.active_tab).map(|t| t.active_pane)
+            };
             for sub in &mut ws.subtabs {
-                if sub.label == "terminals" {
-                    sub.count = Some(entries.len() as u32);
+                match SubtabKind::parse(&sub.label) {
+                    Some(SubtabKind::Terminals) => {
+                        sub.count = Some(terminal_entries.len() as u32);
+                        sub.active = active_pane
+                            .is_some_and(|p| terminal_entries.iter().any(|e| e.pane_id == p));
+                    }
+                    Some(SubtabKind::Agents) => {
+                        sub.count = Some(agent_entries.len() as u32);
+                        sub.active = active_pane
+                            .is_some_and(|p| agent_entries.iter().any(|e| e.pane_id == p));
+                    }
+                    None => {}
                 }
             }
-            ws.terminal_entries = entries;
+            ws.terminal_entries = terminal_entries;
+            ws.agent_entries = agent_entries;
         }
+        let agent_pane_ids: BTreeSet<u32> = self
+            .pane_agents
+            .keys()
+            .chain(self.agent_restarts.keys())
+            .copied()
+            .collect();
         let (active_terminal_cols, active_terminal_rows) = self
             .terminals
             .get(&self.active_pane.0)
@@ -1138,11 +1241,14 @@ impl AppState {
             row_ratios: self.row_ratios.clone(),
             col_ratios: self.col_ratios.clone(),
             ctx_menu: self.ctx_menu.clone(),
+            agent_pane_ids,
             keybinds: self.keybinds.clone(),
             drag: self.drag.clone(),
             tabbar_rect: self.tabbar_rect,
             last_grid_width: self.last_grid_width,
             last_grid_height: self.last_grid_height,
+            window_width: self.window_width,
+            window_height: self.window_height,
             scale_factor: self.scale_factor,
             confirm_dialog: self.confirm_dialog.clone(),
             terminal_count: self.terminals.len(),
@@ -1175,6 +1281,11 @@ impl AppState {
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
             editor_panes: self.editors.keys().copied().collect(),
+            flow_panes: self
+                .flows
+                .iter()
+                .map(|(&id, pane)| (id, pane.clone()))
+                .collect(),
         }
     }
 
@@ -1233,6 +1344,9 @@ pub struct UiSnapshot {
     pub row_ratios: Vec<f32>,
     pub col_ratios: Vec<Vec<f32>>,
     pub ctx_menu: Option<CtxMenu>,
+    /// Every pane currently classified as an agent pane, across all
+    /// workspaces. The tab strip marks tabs whose panes appear here.
+    pub agent_pane_ids: BTreeSet<u32>,
     pub keybinds: crate::keybinds::KeybindsState,
     pub drag: crate::drag::DragState,
     pub tabbar_rect: crate::drag::Rect,
@@ -1241,6 +1355,11 @@ pub struct UiSnapshot {
     pub last_grid_width: f32,
     /// Last measured physical height of the terminal-grid container.
     pub last_grid_height: f32,
+    /// Last measured physical size of the window (the `.app` root). `0.0`
+    /// means "not measured yet"; overlay placement then falls back to the
+    /// unclamped cursor coordinates.
+    pub window_width: f32,
+    pub window_height: f32,
     /// Display scale factor so callers can convert physical pixels
     /// (stored for last_grid_*) back to CSS coordinates that compose
     /// with tabbar_rect and DragState cursor.
@@ -1278,6 +1397,8 @@ pub struct UiSnapshot {
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
     /// Pane ids rendered by the file editor instead of a terminal.
     pub editor_panes: std::collections::HashSet<u32>,
+    /// Flow Explorer panes rendered instead of a terminal, by pane id.
+    pub flow_panes: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
 }
 
 fn current_folder_name() -> String {
@@ -1297,15 +1418,9 @@ pub fn seed_state() -> AppState {
             collapsed: false,
             terminals_expanded: true,
             terminal_entries: vec![],
-            subtabs: vec![Subtab {
-                label: "terminals".to_string(),
-                count: Some(1),
-                pulse: false,
-                active: true,
-                disabled: false,
-                icon: Some(SubtabIcon::Terminal),
-                tree_glyph: "\u{2514}",
-            }],
+            agents_expanded: true,
+            agent_entries: vec![],
+            subtabs: default_subtabs(1, true),
             git_branch: GitBranch::Pending,
             tabs: vec![],
             active_tab: 0,
@@ -1318,15 +1433,9 @@ pub fn seed_state() -> AppState {
             collapsed: false,
             terminals_expanded: false,
             terminal_entries: vec![],
-            subtabs: vec![Subtab {
-                label: "terminals".to_string(),
-                count: Some(0),
-                pulse: false,
-                active: false,
-                disabled: false,
-                icon: Some(SubtabIcon::Terminal),
-                tree_glyph: "\u{2514}",
-            }],
+            agents_expanded: false,
+            agent_entries: vec![],
+            subtabs: default_subtabs(0, false),
             git_branch: GitBranch::Absent,
             tabs: vec![],
             active_tab: 0,
@@ -1339,15 +1448,9 @@ pub fn seed_state() -> AppState {
             collapsed: true,
             terminals_expanded: false,
             terminal_entries: vec![],
-            subtabs: vec![Subtab {
-                label: "terminals".to_string(),
-                count: Some(0),
-                pulse: false,
-                active: false,
-                disabled: false,
-                icon: Some(SubtabIcon::Terminal),
-                tree_glyph: "\u{2514}",
-            }],
+            agents_expanded: false,
+            agent_entries: vec![],
+            subtabs: default_subtabs(0, false),
             git_branch: GitBranch::Absent,
             tabs: vec![],
             active_tab: 0,
@@ -1360,15 +1463,9 @@ pub fn seed_state() -> AppState {
             collapsed: true,
             terminals_expanded: false,
             terminal_entries: vec![],
-            subtabs: vec![Subtab {
-                label: "terminals".to_string(),
-                count: Some(0),
-                pulse: false,
-                active: false,
-                disabled: false,
-                icon: None,
-                tree_glyph: "\u{2514}",
-            }],
+            agents_expanded: false,
+            agent_entries: vec![],
+            subtabs: default_subtabs(0, false),
             git_branch: GitBranch::Absent,
             tabs: vec![],
             active_tab: 0,
@@ -1441,16 +1538,21 @@ pub fn seed_state() -> AppState {
         pty_manager: crate::pty::DaemonPty::new(),
         terminals: std::collections::HashMap::new(),
         editors: std::collections::HashMap::new(),
+        flows: std::collections::HashMap::new(),
+        flow_pending: std::collections::HashMap::new(),
         agent_restarts: std::collections::HashMap::new(),
         pending_agent_resumes: std::collections::HashMap::new(),
         agent_resume_attempts: std::collections::HashMap::new(),
         agent_resume_preflights: std::collections::HashMap::new(),
         restore_correlation_id: crate::agent_restore::generate_session_id(),
+        pane_agents: std::collections::HashMap::new(),
         custom_titled_panes: std::collections::HashSet::new(),
         scale_factor: 1.0,
         cell_width_ratio: 0.6,
         last_grid_width: 0.0,
         last_grid_height: 0.0,
+        window_width: 0.0,
+        window_height: 0.0,
         row_ratios: vec![1.0],
         col_ratios: vec![vec![1.0]],
         resize_drag: None,
@@ -1767,6 +1869,58 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     pane_id
 }
 
+/// Open a Flow Explorer pane as a new single-pane tab. Mirrors
+/// `mutate_add_editor_tab`: no PTY; the pane id maps into `state.flows`.
+pub fn mutate_add_flow_tab(state: &mut AppState, pane: crate::flow_explorer::FlowPane) -> PaneId {
+    save_tab_state(state);
+
+    let id_num = state.next_id;
+    state.next_id += 1;
+    let pane_id = PaneId(id_num);
+
+    let title = pane.title().to_string();
+    state.flows.insert(id_num, std::sync::Arc::new(pane));
+
+    let pane = Pane {
+        id: pane_id,
+        title: title.clone(),
+        subtitle: "flow".to_string(),
+        pid: 0,
+        cpu: 0.0,
+    };
+
+    let tab = TerminalTab {
+        id: format!("t{}", id_num),
+        name: title,
+        subtitle: "flow".to_string(),
+        status: TabStatus::Idle,
+        panes: vec![vec![pane.clone()]],
+        active_pane: pane_id,
+        row_ratios: vec![1.0],
+        col_ratios: vec![vec![1.0]],
+    };
+
+    state.tabs.push(tab);
+    state.active_tab = state.tabs.len() - 1;
+
+    state.panes = vec![vec![pane]];
+    state.active_pane = pane_id;
+    state.row_ratios = vec![1.0];
+    state.col_ratios = vec![vec![1.0]];
+    pane_id
+}
+
+/// Drop a Flow Explorer pane's state on close. Returns `true` when
+/// `pane_id` was a flow pane, so callers skip the PTY teardown.
+pub fn remove_flow_pane(state: &mut AppState, pane_id: u32) -> bool {
+    let Some(pane) = state.flows.remove(&pane_id) else {
+        return false;
+    };
+    record_flow_pane_event(&pane, "flow.close", "info", None);
+    record_diagnostic_pty_event(state, format!("flow_close pane={}", pane_id));
+    true
+}
+
 /// Refresh the pane/tab titles for an editor pane from its dirty state
 /// (`● name` while unsaved changes exist). No-op for non-editor panes.
 pub fn sync_editor_pane_title(state: &mut AppState, pane_id: u32) {
@@ -1821,8 +1975,59 @@ pub fn mutate_add_quick_prompt_tab(
     _prompt: &str,
     cwd: &std::path::Path,
     shell: &crate::shell::ShellSpec,
-    mut restart: crate::agent_restore::AgentRestart,
+    restart: crate::agent_restore::AgentRestart,
 ) {
+    // The daemon-owned session list and persisted layout survive UI restarts,
+    // so both the session label and tab title stay provider-generic and never
+    // contain the Quick Prompt text.
+    let title = quick_prompt_tab_title(restart.agent);
+    let profile_id = crate::agents::profile_for_restore_kind(restart.agent)
+        .map(|p| p.id)
+        .unwrap_or(crate::agents::DEFAULT_PROFILE_ID);
+    mutate_add_agent_tab_with(
+        state,
+        AgentLaunch {
+            cwd,
+            shell,
+            title,
+            restart: Some(restart),
+            profile_id,
+            source: "quick_prompt",
+        },
+    );
+}
+
+/// Everything `mutate_add_agent_tab_with` needs to open one agent tab.
+pub struct AgentLaunch<'a> {
+    pub cwd: &'a std::path::Path,
+    pub shell: &'a crate::shell::ShellSpec,
+    /// Pane/tab title and daemon session name. Must never carry prompt
+    /// text: both outlive the UI process.
+    pub title: String,
+    /// Recovery record for providers `crate::agent_restore` can resume;
+    /// `None` for agents the app only launches.
+    pub restart: Option<crate::agent_restore::AgentRestart>,
+    /// `crate::agents::AgentProfile::id` for the pane's agent tag.
+    pub profile_id: &'static str,
+    /// Launch origin for telemetry: `quick_prompt`, `command`,
+    /// `ctx_menu`, `cli`.
+    pub source: &'static str,
+}
+
+/// Open a new single-pane tab running an agent. The pane is tagged as an
+/// agent pane (`pane_agents`) before the spawn request leaves so the
+/// sidebar lists it under `agents` from its first frame, and a recovery
+/// record, when given, is persisted before the daemon can create the
+/// process (see `persist_agent_metadata`).
+pub fn mutate_add_agent_tab_with(state: &mut AppState, launch: AgentLaunch<'_>) {
+    let AgentLaunch {
+        cwd,
+        shell,
+        title,
+        restart,
+        profile_id,
+        source,
+    } = launch;
     save_tab_state(state);
 
     let id_num = state.next_id;
@@ -1839,14 +2044,9 @@ pub fn mutate_add_quick_prompt_tab(
     );
 
     let workspace_id = active_workspace_num(state);
-    let provider = restart.agent;
-    restart.launch_phase = crate::agent_restore::AgentLaunchPhase::ConfirmingResume;
+    let provider = restart.as_ref().map(|r| r.agent);
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
-    // The daemon-owned session list and persisted layout survive UI restarts,
-    // so both the session label and tab title stay provider-generic and never
-    // contain the Quick Prompt text.
-    let session_name = quick_prompt_tab_title(provider);
-    let title = session_name.clone();
+    let session_name = title.clone();
     let pane = Pane {
         id: pane_id,
         title: title.clone(),
@@ -1872,24 +2072,48 @@ pub fn mutate_add_quick_prompt_tab(
     state.active_pane = pane_id;
     state.row_ratios = vec![1.0];
     state.col_ratios = vec![vec![1.0]];
-    state.agent_restarts.insert(id_num, restart);
+    state.pane_agents.insert(
+        id_num,
+        crate::agents::AgentTag::new(profile_id, crate::agents::AgentTagSource::Launched),
+    );
+    if let Some(ws) = state.workspaces.get_mut(state.active_workspace) {
+        ws.agents_expanded = true;
+    }
+    if let Some(mut restart) = restart {
+        restart.launch_phase = crate::agent_restore::AgentLaunchPhase::ConfirmingResume;
+        state.agent_restarts.insert(id_num, restart);
+    }
+
+    let correlation_id = state.restore_correlation_id.clone();
+    let mut launch_event =
+        crate::agents::telemetry::AgentEventRecord::new("agent.launch", "info", &correlation_id);
+    launch_event.workspace_id = Some(workspace_id);
+    launch_event.pane_id = Some(id_num);
+    launch_event.profile = Some(profile_id);
+    launch_event.source = Some(source);
 
     // Stage the pane, routing key, provider, launch phase, cwd, and known id
     // before the spawn request can reach the daemon. If the response or UI is
     // lost after process creation, the next launch can safely reattach it.
-    if !persist_agent_metadata(
-        state,
-        provider,
-        workspace_id,
-        id_num,
-        "quick_prompt_preflight",
-    ) {
-        state.agent_restarts.remove(&id_num);
-        terminal.process_bytes(b"error: agent recovery metadata could not be saved\r\n");
-        state
-            .terminals
-            .insert(id_num, Arc::new(Mutex::new(terminal)));
-        return;
+    if let Some(provider) = provider {
+        let preflight_source: &'static str = if source == "quick_prompt" {
+            "quick_prompt_preflight"
+        } else {
+            "agent_tab_preflight"
+        };
+        if !persist_agent_metadata(state, provider, workspace_id, id_num, preflight_source) {
+            state.agent_restarts.remove(&id_num);
+            terminal.process_bytes(b"error: agent recovery metadata could not be saved\r\n");
+            state
+                .terminals
+                .insert(id_num, Arc::new(Mutex::new(terminal)));
+            launch_event.level = "error";
+            launch_event.event = "agent.launch_failed";
+            launch_event.outcome = Some("rejected");
+            launch_event.error_kind = Some("workspace_write");
+            crate::agents::telemetry::record(&launch_event);
+            return;
+        }
     }
 
     match state.pty_manager.spawn_in_named(
@@ -1922,17 +2146,21 @@ pub fn mutate_add_quick_prompt_tab(
                     },
                 );
             }
-            let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
-                &state.restore_correlation_id,
-                crate::agent_restore::telemetry::EventName::ResumeSpawned,
-                crate::agent_restore::telemetry::Level::Info,
-            );
-            event.provider = Some(provider);
-            event.workspace_id = Some(workspace_id);
-            event.pane_id = Some(id_num);
-            event.source = Some("quick_prompt");
-            event.outcome = Some("spawned");
-            crate::agent_restore::telemetry::record(&event);
+            launch_event.outcome = Some("spawned");
+            crate::agents::telemetry::record(&launch_event);
+            if let Some(provider) = provider {
+                let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+                    &state.restore_correlation_id,
+                    crate::agent_restore::telemetry::EventName::ResumeSpawned,
+                    crate::agent_restore::telemetry::Level::Info,
+                );
+                event.provider = Some(provider);
+                event.workspace_id = Some(workspace_id);
+                event.pane_id = Some(id_num);
+                event.source = Some(source);
+                event.outcome = Some("spawned");
+                crate::agent_restore::telemetry::record(&event);
+            }
         }
         Err(error) => {
             let authoritative = agent_spawn_failure_is_authoritative(&error);
@@ -1950,32 +2178,167 @@ pub fn mutate_add_quick_prompt_tab(
                 crate::persist::save_workspaces(state);
             }
             log::error!(
-                r#"{{"event":"quick_prompt_spawn_failed","workspace_id":{workspace_id},"pane_id":{id_num},"provider":{:?},"outcome":"{}","error_kind":"{}"}}"#,
-                match provider {
-                    crate::agent_restore::AgentKind::Claude => "claude",
-                    crate::agent_restore::AgentKind::Codex => "codex",
-                },
+                r#"{{"event":"agent_spawn_failed","workspace_id":{workspace_id},"pane_id":{id_num},"profile":{:?},"source":{:?},"outcome":"{}","error_kind":"{}"}}"#,
+                profile_id,
+                source,
                 outcome,
                 error_kind,
             );
-            let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
-                &state.restore_correlation_id,
-                crate::agent_restore::telemetry::EventName::ResumeFailed,
-                crate::agent_restore::telemetry::Level::Error,
-            );
-            event.provider = Some(provider);
-            event.workspace_id = Some(workspace_id);
-            event.pane_id = Some(id_num);
-            event.source = Some("quick_prompt");
-            event.outcome = Some(outcome);
-            event.error_kind = Some(error_kind);
-            crate::agent_restore::telemetry::record(&event);
+            launch_event.level = "error";
+            launch_event.event = "agent.launch_failed";
+            launch_event.outcome = Some(outcome);
+            launch_event.error_kind = Some(error_kind);
+            crate::agents::telemetry::record(&launch_event);
+            if let Some(provider) = provider {
+                let mut event = crate::agent_restore::telemetry::RestoreEvent::new(
+                    &state.restore_correlation_id,
+                    crate::agent_restore::telemetry::EventName::ResumeFailed,
+                    crate::agent_restore::telemetry::Level::Error,
+                );
+                event.provider = Some(provider);
+                event.workspace_id = Some(workspace_id);
+                event.pane_id = Some(id_num);
+                event.source = Some(source);
+                event.outcome = Some(outcome);
+                event.error_kind = Some(error_kind);
+                crate::agent_restore::telemetry::record(&event);
+            }
             terminal.process_bytes(format!("error: {}\r\n", error).as_bytes());
             state
                 .terminals
                 .insert(id_num, Arc::new(Mutex::new(terminal)));
         }
     }
+}
+
+/// Directory a "New agent" tab starts in: the active workspace path,
+/// swapped for a fresh worktree when the worktree-tabs toggle is on and
+/// the workspace is a repository (the same rule `tab.new` follows). Falls
+/// back to the process cwd so the launch always has an absolute path for
+/// the recovery record.
+fn agent_launch_cwd(state: &mut AppState) -> PathBuf {
+    let base = active_workspace_cwd(state).filter(|cwd| cwd.exists());
+    if toggle_on(state, ToggleKey::WorktreeTabs) {
+        if let Some(repo) = base
+            .as_ref()
+            .filter(|cwd| crate::quick_prompt::spawn::is_inside_work_tree(cwd))
+        {
+            match crate::quick_prompt::spawn::prepare_tab_worktree(repo) {
+                Ok(target) => return target.path,
+                Err(e) => {
+                    log::error!("worktree_tab_failed mode=agent error={e}");
+                    push_error_toast(
+                        state,
+                        format!("Worktree failed ({e}); starting the agent in the workspace"),
+                    );
+                }
+            }
+        }
+    }
+    base.or_else(|| std::env::current_dir().ok())
+        .map(|cwd| crate::agent_restore::normalized_cwd(&cwd))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Command line and recovery record for launching `profile` in `cwd`.
+/// Claude gets a pre-generated session id (`--session-id`) so the record
+/// is exact; Codex runs interactively and is rediscovered by cwd; agents
+/// without a resume provider get no record at all.
+pub fn agent_launch_plan(
+    profile: &crate::agents::AgentProfile,
+    cwd: &std::path::Path,
+) -> (
+    crate::shell::ShellSpec,
+    Option<crate::agent_restore::AgentRestart>,
+) {
+    let mut args: Vec<String> = profile.args.iter().map(|s| s.to_string()).collect();
+    let restart = profile.restore_kind.map(|kind| {
+        let session_id = match kind {
+            crate::agent_restore::AgentKind::Claude => {
+                let id = crate::agent_restore::generate_session_id();
+                args.push("--session-id".to_string());
+                args.push(id.clone());
+                Some(id)
+            }
+            crate::agent_restore::AgentKind::Codex => None,
+        };
+        crate::agent_restore::AgentRestart {
+            agent: kind,
+            cwd: cwd.to_path_buf(),
+            resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+            session_id,
+            observed_at_unix_ms: crate::agent_restore::now_unix_ms(),
+            managed: true,
+            launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+        }
+    });
+    let shell = crate::shell::ShellSpec {
+        program: profile.program_name(),
+        args,
+    };
+    (shell, restart)
+}
+
+/// Open a new tab running `profile` in the active workspace (see
+/// `agent_launch_plan` for the command line). Returns false for a
+/// title-only profile that cannot be launched.
+pub fn mutate_add_agent_tab(
+    state: &mut AppState,
+    profile: &'static crate::agents::AgentProfile,
+    source: &'static str,
+) -> bool {
+    if !profile.launchable() {
+        return false;
+    }
+    let cwd = agent_launch_cwd(state);
+    let (shell, restart) = agent_launch_plan(profile, &cwd);
+    mutate_add_agent_tab_with(
+        state,
+        AgentLaunch {
+            cwd: &cwd,
+            shell: &shell,
+            title: profile.label.to_string(),
+            restart,
+            profile_id: profile.id,
+            source,
+        },
+    );
+    true
+}
+
+/// `agent.new[:<profile>]`: resolve the profile (default = first
+/// installed launchable agent), open the tab, persist. An unknown or
+/// title-only id is a user-visible error, not a silent no-op.
+fn dispatch_agent_new(state: &mut AppState, raw: Option<&str>, source: &'static str) -> bool {
+    state.ctx_menu = None;
+    let profile = match raw.map(str::trim).filter(|r| !r.is_empty()) {
+        None => crate::agents::default_profile(),
+        Some(raw) => match crate::agents::parse_launchable_id(raw) {
+            Some(profile) => profile,
+            None => {
+                let mut event = crate::agents::telemetry::AgentEventRecord::new(
+                    "agent.launch_failed",
+                    "warn",
+                    &state.restore_correlation_id,
+                );
+                event.workspace_id = Some(active_workspace_num(state));
+                event.source = Some(source);
+                event.reason = Some("unknown_profile");
+                crate::agents::telemetry::record(&event);
+                let known: Vec<&str> = crate::agents::launchable_profiles().map(|p| p.id).collect();
+                push_error_toast(
+                    state,
+                    format!("Unknown agent {raw:?}. Known agents: {}", known.join(", ")),
+                );
+                return false;
+            }
+        },
+    };
+    if !mutate_add_agent_tab(state, profile, source) {
+        return false;
+    }
+    crate::persist::save_workspaces(state);
+    true
 }
 
 /// Tab/pane title for a worktree tab: the worktree directory name
@@ -2126,6 +2489,9 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
             record_diagnostic_pty_event(state, format!("editor_close pane={} scope=tab", id));
             continue;
         }
+        if remove_flow_pane(state, *id) {
+            continue;
+        }
         state.pty_manager.destroy(*id);
         state.terminals.remove(id);
         forget_agent_restore(state, *id);
@@ -2155,6 +2521,130 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
 
 /// Build a workspace with its branch unresolved.
 ///
+/// The two pane lists every workspace shows: `terminals` first, `agents`
+/// last (it carries the closing tree glyph). `ui_snapshot` recomputes
+/// counts and the active flag on every frame; the values here only
+/// matter until then.
+pub fn default_subtabs(terminal_count: u32, terminals_active: bool) -> Vec<Subtab> {
+    vec![
+        Subtab {
+            label: SubtabKind::Terminals.label().to_string(),
+            count: Some(terminal_count),
+            pulse: false,
+            active: terminals_active,
+            disabled: false,
+            icon: Some(SubtabIcon::Terminal),
+            tree_glyph: "\u{251C}",
+        },
+        Subtab {
+            label: SubtabKind::Agents.label().to_string(),
+            count: Some(0),
+            pulse: false,
+            active: false,
+            disabled: false,
+            icon: Some(SubtabIcon::Agent),
+            tree_glyph: "\u{2514}",
+        },
+    ]
+}
+
+/// The workspace's subtab for `kind`, looked up by label so the order of
+/// `Workspace::subtabs` is never load-bearing.
+pub fn subtab_mut(workspace: &mut Workspace, kind: SubtabKind) -> Option<&mut Subtab> {
+    workspace
+        .subtabs
+        .iter_mut()
+        .find(|sub| sub.label == kind.label())
+}
+
+/// The agent a pane runs, if any. A resume record (`agent_restarts`,
+/// fed by managed launches and provider hooks) outranks a title
+/// observation because it names an exact provider session.
+pub fn agent_tag_for_pane(state: &AppState, pane_id: u32) -> Option<crate::agents::AgentTag> {
+    if let Some(record) = state.agent_restarts.get(&pane_id) {
+        let profile = crate::agents::profile_for_restore_kind(record.agent)
+            .map(|p| p.id)
+            .unwrap_or(crate::agents::DEFAULT_PROFILE_ID);
+        let source = if record.managed {
+            crate::agents::AgentTagSource::Launched
+        } else {
+            crate::agents::AgentTagSource::Hook
+        };
+        return Some(crate::agents::AgentTag::new(profile, source));
+    }
+    state.pane_agents.get(&pane_id).cloned()
+}
+
+pub fn is_agent_pane(state: &AppState, pane_id: u32) -> bool {
+    state.agent_restarts.contains_key(&pane_id) || state.pane_agents.contains_key(&pane_id)
+}
+
+/// Re-evaluate the title-derived agent tag of `pane_id` against a fresh
+/// guest title. Launched and hook tags are never touched here; a title
+/// tag is added when the title identifies an agent and dropped when it
+/// stops doing so (the agent exited back to the shell). Returns true
+/// when membership changed. Emits one `agent.classified` /
+/// `agent.untagged` record per transition, never per title update.
+pub fn classify_pane_title(state: &mut AppState, pane_id: u32, raw_title: &str) -> bool {
+    use crate::agents::{AgentTag, AgentTagSource};
+
+    let existing = state.pane_agents.get(&pane_id).cloned();
+    if existing
+        .as_ref()
+        .is_some_and(|tag| tag.source != AgentTagSource::Title)
+    {
+        return false;
+    }
+    match crate::agents::classify_title(raw_title) {
+        Some((profile, reason)) => {
+            if existing
+                .as_ref()
+                .is_some_and(|tag| tag.profile == profile.id)
+            {
+                return false;
+            }
+            state
+                .pane_agents
+                .insert(pane_id, AgentTag::new(profile.id, AgentTagSource::Title));
+            expand_agents_subtab_for_pane(state, pane_id);
+            let mut event = crate::agents::telemetry::AgentEventRecord::new(
+                "agent.classified",
+                "info",
+                &state.restore_correlation_id,
+            );
+            event.workspace_id = workspace_num_for_pane(state, pane_id);
+            event.pane_id = Some(pane_id);
+            event.profile = Some(profile.id);
+            event.source = Some(AgentTagSource::Title.as_str());
+            event.reason = Some(reason.as_str());
+            crate::agents::telemetry::record(&event);
+            true
+        }
+        None => {
+            let Some(previous) = existing else {
+                return false;
+            };
+            state.pane_agents.remove(&pane_id);
+            let mut event = crate::agents::telemetry::AgentEventRecord::new(
+                "agent.untagged",
+                "info",
+                &state.restore_correlation_id,
+            );
+            event.workspace_id = workspace_num_for_pane(state, pane_id);
+            event.pane_id = Some(pane_id);
+            event.profile = Some(
+                crate::agents::profile(&previous.profile)
+                    .map(|p| p.id)
+                    .unwrap_or("unknown"),
+            );
+            event.source = Some(AgentTagSource::Title.as_str());
+            event.reason = Some("title_cleared");
+            crate::agents::telemetry::record(&event);
+            true
+        }
+    }
+}
+
 /// Detection is intentionally NOT done here. This runs once per restored
 /// workspace during startup, and a `git` spawn each time put ~30ms per
 /// workspace in front of the first frame. `crate::git_watch` fills the branch
@@ -2167,15 +2657,9 @@ pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace
         collapsed: false,
         terminals_expanded: true,
         terminal_entries: vec![],
-        subtabs: vec![Subtab {
-            label: "terminals".to_string(),
-            count: Some(0),
-            pulse: false,
-            active: false,
-            disabled: false,
-            icon: Some(SubtabIcon::Terminal),
-            tree_glyph: "\u{2514}",
-        }],
+        agents_expanded: true,
+        agent_entries: vec![],
+        subtabs: default_subtabs(0, false),
         git_branch: GitBranch::Pending,
         tabs: vec![],
         active_tab: 0,
@@ -2197,6 +2681,7 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
     let mut max_pane_id = 0u32;
     let mut custom_titled = std::collections::HashSet::new();
     let mut agent_restarts = std::collections::HashMap::new();
+    let mut pane_agents = std::collections::HashMap::new();
     let mut used_workspace_nums = std::collections::HashSet::new();
     let active_idx = persisted
         .active_workspace
@@ -2231,6 +2716,7 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
                     &mut max_pane_id,
                     &mut custom_titled,
                     &mut agent_restarts,
+                    &mut pane_agents,
                 )
             })
             .collect();
@@ -2240,7 +2726,8 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
             entry.active_tab.min(tabs.len() - 1)
         };
         ws.terminals_expanded = !tabs.is_empty();
-        if let Some(sub) = ws.subtabs.get_mut(0) {
+        ws.agents_expanded = !tabs.is_empty();
+        if let Some(sub) = subtab_mut(&mut ws, SubtabKind::Terminals) {
             sub.count = Some(tabs.len() as u32);
             sub.active = i == active_idx;
         }
@@ -2252,6 +2739,7 @@ pub fn restore_layout(state: &mut AppState, persisted: &crate::persist::Persiste
     state.active_workspace = active_idx;
     state.custom_titled_panes = custom_titled;
     state.agent_restarts = agent_restarts;
+    state.pane_agents = pane_agents;
     state.pending_agent_resumes.clear();
     state.agent_resume_attempts.clear();
     state.agent_resume_preflights.clear();
@@ -2275,6 +2763,7 @@ fn terminal_tab_from_persisted(
     max_pane_id: &mut u32,
     custom_titled: &mut std::collections::HashSet<u32>,
     agent_restarts: &mut std::collections::HashMap<u32, crate::agent_restore::AgentRestart>,
+    pane_agents: &mut std::collections::HashMap<u32, crate::agents::AgentTag>,
 ) -> Option<TerminalTab> {
     let panes: Vec<Vec<Pane>> = pt
         .panes
@@ -2292,6 +2781,22 @@ fn terminal_tab_from_persisted(
                         .filter(|restart| restart.cwd.is_absolute())
                     {
                         agent_restarts.insert(pp.id, restart.clone());
+                    }
+                    if let Some(tag) = pp.agent_tag.as_ref() {
+                        pane_agents.insert(pp.id, tag.clone());
+                    } else if pp.agent_restart.is_none() && !pp.custom_title {
+                        // Files written before the tag existed: the
+                        // persisted label is the last guest title, so
+                        // classify it the way the live path would have.
+                        if let Some((profile, _)) = crate::agents::classify_title(&pp.title) {
+                            pane_agents.insert(
+                                pp.id,
+                                crate::agents::AgentTag::new(
+                                    profile.id,
+                                    crate::agents::AgentTagSource::Title,
+                                ),
+                            );
+                        }
                     }
                     Pane {
                         id: PaneId(pp.id),
@@ -2401,7 +2906,7 @@ fn seed_default_tab(state: &mut AppState, max_pane_id: &mut u32) {
         ws.tabs = vec![tab];
         ws.active_tab = 0;
         ws.terminals_expanded = true;
-        if let Some(sub) = ws.subtabs.get_mut(0) {
+        if let Some(sub) = subtab_mut(ws, SubtabKind::Terminals) {
             sub.count = Some(1);
         }
     }
@@ -2654,7 +3159,7 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         // Editor pane: no PTY/terminal state to tear down.
         record_editor_closed(&editor);
         record_diagnostic_pty_event(state, format!("editor_close pane={} scope=pane", target.0));
-    } else {
+    } else if !remove_flow_pane(state, target.0) {
         // Destroy the PTY and terminal.
         state.pty_manager.destroy(target.0);
         state.terminals.remove(&target.0);
@@ -3446,6 +3951,9 @@ pub fn mutate_kill_workspace_terminals(state: &mut AppState, ws_idx: usize) {
             record_editor_closed(&editor);
             continue;
         }
+        if remove_flow_pane(state, *id) {
+            continue;
+        }
         state.pty_manager.destroy(*id);
         state.terminals.remove(id);
         forget_agent_restore(state, *id);
@@ -3461,6 +3969,84 @@ pub fn mutate_kill_workspace_terminals(state: &mut AppState, ws_idx: usize) {
     }
     state.workspaces[ws_idx].tabs.clear();
     state.workspaces[ws_idx].active_tab = 0;
+}
+
+/// Pane ids inside workspace `ws_idx`, live fields for the active
+/// workspace and saved tabs otherwise.
+fn workspace_pane_ids(state: &AppState, ws_idx: usize) -> Vec<u32> {
+    let mut pane_ids: Vec<u32> = Vec::new();
+    if ws_idx >= state.workspaces.len() {
+        return pane_ids;
+    }
+    if ws_idx == state.active_workspace {
+        for row in &state.panes {
+            for p in row {
+                pane_ids.push(p.id.0);
+            }
+        }
+        for (tab_idx, tab) in state.tabs.iter().enumerate() {
+            if tab_idx == state.active_tab {
+                continue;
+            }
+            for row in &tab.panes {
+                for p in row {
+                    pane_ids.push(p.id.0);
+                }
+            }
+        }
+    } else {
+        for tab in &state.workspaces[ws_idx].tabs {
+            for row in &tab.panes {
+                for p in row {
+                    pane_ids.push(p.id.0);
+                }
+            }
+        }
+    }
+    pane_ids
+}
+
+/// Agent panes inside workspace `ws_idx` (see `is_agent_pane`).
+pub fn workspace_agent_pane_ids(state: &AppState, ws_idx: usize) -> Vec<u32> {
+    workspace_pane_ids(state, ws_idx)
+        .into_iter()
+        .filter(|id| is_agent_pane(state, *id))
+        .collect()
+}
+
+/// Kill only the agent panes of workspace `ws_idx`; plain terminals and
+/// their layout survive. Returns how many panes went. Layout pruning
+/// reuses the close-app "keep these panes" path so split ratios collapse
+/// the same way a manual pane close would.
+pub fn mutate_kill_workspace_agents(state: &mut AppState, ws_idx: usize) -> usize {
+    let agent_ids = workspace_agent_pane_ids(state, ws_idx);
+    if agent_ids.is_empty() {
+        return 0;
+    }
+    let doomed: BTreeSet<u32> = agent_ids.iter().copied().collect();
+    let kept: BTreeSet<u32> = close_app_pane_ids(state)
+        .into_iter()
+        .filter(|id| !doomed.contains(id))
+        .collect();
+    for id in &agent_ids {
+        if remove_flow_pane(state, *id) {
+            continue;
+        }
+        state.pty_manager.destroy(*id);
+        state.terminals.remove(id);
+        state.custom_titled_panes.remove(id);
+        forget_agent_restore(state, *id);
+    }
+    prune_close_layout_to_kept_panes(state, &kept);
+    let mut event = crate::agents::telemetry::AgentEventRecord::new(
+        "agent.kill_all",
+        "info",
+        &state.restore_correlation_id,
+    );
+    event.workspace_id = state.workspaces.get(ws_idx).map(|w| w.num);
+    event.outcome = Some("killed");
+    crate::agents::telemetry::record(&event);
+    agent_ids.len()
 }
 
 fn toggle_on(state: &AppState, key: ToggleKey) -> bool {
@@ -3595,8 +4181,9 @@ fn prune_close_layout_to_kept_panes(state: &mut AppState, kept_pane_ids: &BTreeS
             workspace.active_tab = workspace.active_tab.min(workspace.tabs.len() - 1);
             workspace.terminals_expanded = true;
         }
-        if let Some(subtab) = workspace.subtabs.get_mut(0) {
-            subtab.count = Some(workspace.tabs.len() as u32);
+        let tab_count = workspace.tabs.len() as u32;
+        if let Some(subtab) = subtab_mut(workspace, SubtabKind::Terminals) {
+            subtab.count = Some(tab_count);
         }
     }
     load_workspace_state(state);
@@ -4212,6 +4799,19 @@ pub fn mark_agent_resume_stream_ended(
     true
 }
 
+/// Open the `agents` fold of the workspace that holds `pane_id` so a pane
+/// that just became an agent is visible in the tree without a click. A
+/// fold the user closed by hand reopens on the next classification, which
+/// mirrors how the `terminals` fold opens when a tab is added.
+fn expand_agents_subtab_for_pane(state: &mut AppState, pane_id: u32) {
+    let Some(num) = workspace_num_for_pane(state, pane_id) else {
+        return;
+    };
+    if let Some(ws) = state.workspaces.iter_mut().find(|ws| ws.num == num) {
+        ws.agents_expanded = true;
+    }
+}
+
 fn workspace_num_for_pane(state: &AppState, pane_id: u32) -> Option<u32> {
     let active_contains = state
         .panes
@@ -4340,6 +4940,8 @@ fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
 }
 
 fn forget_agent_restore(state: &mut AppState, pane_id: u32) {
+    forget_flow_launch(state, pane_id);
+    state.pane_agents.remove(&pane_id);
     state.agent_restarts.remove(&pane_id);
     state.pending_agent_resumes.remove(&pane_id);
     state.agent_resume_attempts.remove(&pane_id);
@@ -4386,15 +4988,6 @@ const OSC_TITLE_MAX_CHARS: usize = 64;
 /// empty result falls back to the generic "shell" label. Returns true
 /// when a pane label actually changed.
 pub fn mutate_apply_osc_title(state: &mut AppState, pane_id: u32, raw_title: &str) -> bool {
-    if state.custom_titled_panes.contains(&pane_id) {
-        return false;
-    }
-    let new_title = crate::command_palette::sanitize_display_label(
-        prettify_osc_title(raw_title),
-        "shell".to_string(),
-        OSC_TITLE_MAX_CHARS,
-    );
-
     let current = state
         .panes
         .iter()
@@ -4411,6 +5004,20 @@ pub fn mutate_apply_osc_title(state: &mut AppState, pane_id: u32, raw_title: &st
     let Some(current) = current else {
         return false;
     };
+    // Agent membership follows the raw guest title even when the label
+    // is pinned by a manual rename: a renamed Claude pane still belongs
+    // under `agents`. The return value stays "did the label change"; the
+    // bridge rebuilds after every output batch anyway, so a membership
+    // change reaches the sidebar on the next frame.
+    classify_pane_title(state, pane_id, raw_title);
+    if state.custom_titled_panes.contains(&pane_id) {
+        return false;
+    }
+    let new_title = crate::command_palette::sanitize_display_label(
+        prettify_osc_title(raw_title),
+        "shell".to_string(),
+        OSC_TITLE_MAX_CHARS,
+    );
     if current == new_title {
         return false;
     }
@@ -4756,6 +5363,7 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "editor.save"
     ) || command.starts_with("workspace.switch:")
         || command.starts_with("terminal.focus:")
+        || command.starts_with("flow.")
 }
 
 fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
@@ -4816,21 +5424,35 @@ pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
     let _ = EDITOR_OPEN_HOOKS.set(std::sync::Arc::new(hooks));
 }
 
-/// Handle `editor.open` (no path): run the native file picker on a
-/// worker thread so the state lock and render loop stay free, then
-/// route the picked path through `editor.open:<path>`.
+/// Handle `editor.open` (no path): native file picker, routed back
+/// through `editor.open:<path>`.
 fn dispatch_editor_open_dialog(state: &mut AppState) -> bool {
+    let start_dir = active_workspace_cwd(state);
+    spawn_file_picker(state, "Open file", None, start_dir, |path| {
+        format!("editor.open:{}", path.display())
+    })
+}
+
+/// Run the native file picker on a worker thread so the state lock and
+/// render loop stay free, then dispatch `command_for(picked)` into the
+/// app. One dialog at a time; a second request while one is open is a
+/// no-op.
+fn spawn_file_picker(
+    state: &mut AppState,
+    title: &'static str,
+    filter: Option<(&'static str, &'static [&'static str])>,
+    start_dir: Option<PathBuf>,
+    command_for: impl Fn(&std::path::Path) -> String + Send + 'static,
+) -> bool {
     use std::sync::atomic::Ordering;
 
     let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
-        push_error_toast(state, "Open file dialog is not available");
+        push_error_toast(state, format!("{title} dialog is not available"));
         return true;
     };
-    // One dialog at a time; a second request while open is a no-op.
     if EDITOR_DIALOG_OPEN.swap(true, Ordering::SeqCst) {
         return true;
     }
-    let start_dir = active_workspace_cwd(state);
     std::thread::spawn(move || {
         // Drop guard so a panicking picker cannot leave the one-dialog
         // latch stuck `true` for the rest of the process.
@@ -4842,15 +5464,17 @@ fn dispatch_editor_open_dialog(state: &mut AppState) -> bool {
         }
         let _latch = DialogOpenGuard;
 
-        let mut dialog = rfd::FileDialog::new().set_title("Open file");
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        if let Some((name, extensions)) = filter {
+            dialog = dialog.add_filter(name, extensions);
+        }
         if let Some(dir) = start_dir.filter(|d| d.exists()) {
             dialog = dialog.set_directory(dir);
         }
-        let picked = dialog.pick_file();
-        if let Some(path) = picked {
+        if let Some(path) = dialog.pick_file() {
             {
                 let mut guard = hooks.shared.lock_recover();
-                dispatch(&mut guard, &format!("editor.open:{}", path.display()));
+                dispatch(&mut guard, &command_for(&path));
             }
             (hooks.request_rebuild)();
         }
@@ -4881,6 +5505,26 @@ fn record_editor_pane_event(
         reason,
         os_error: None,
     });
+}
+
+/// Emit one flow lifecycle event carrying the pane's flow id, source path
+/// and counts — never node names, prose or source text.
+fn record_flow_pane_event(
+    pane: &crate::flow_explorer::FlowPane,
+    event: &'static str,
+    level: &'static str,
+    reason: Option<&'static str>,
+) {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+
+    let path_str = pane.source_path.to_string_lossy().into_owned();
+    let mut record = FlowEventRecord::new(event, level, &pane.flow_id);
+    record.path = Some(&path_str);
+    record.mode = Some(pane.flow.mode.as_str());
+    record.node_count = Some(pane.flow.nodes.len() as u64);
+    record.edge_count = Some(pane.flow.edges.len() as u64);
+    record.reason = reason;
+    record_flow_event(&record);
 }
 
 /// Save one editor pane to disk with telemetry and a failure toast.
@@ -5122,6 +5766,588 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
     true
 }
 
+/// View-state commands of the active Flow Explorer pane: `flow.view:<name>`,
+/// `flow.level:<name>`, `flow.expand_all`, `flow.collapse_all`,
+/// `flow.toggle:<row>` and `flow.src:<node id>`. `None` when `command` is
+/// none of these (or names an unknown view/level/row), `Some(false)` when
+/// the active pane is not a flow, `Some(true)` once the pane handled it.
+fn dispatch_flow_command(state: &mut AppState, command: &str) -> Option<bool> {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+    use crate::flow_explorer::{DepthFilter, FlowLevel, FlowView};
+
+    enum FlowCommand<'a> {
+        View(FlowView),
+        Level(FlowLevel),
+        ExpandAll,
+        CollapseAll,
+        Toggle(usize),
+        Src(&'a str),
+        SelectRow(usize),
+        SelectMove(i64),
+        SelectEdge(bool),
+        SelectInto,
+        SelectOut,
+        SelectNone,
+        ToggleSelected,
+        SrcSelected,
+        Select(usize, &'a str),
+        Focus(usize),
+        GraphZoom(&'a str),
+        GraphCrumb(usize),
+        GraphDepth(DepthFilter),
+        GraphDetails(&'a str),
+    }
+
+    let parsed = if let Some(name) = command.strip_prefix("flow.view:") {
+        FlowCommand::View(FlowView::parse(name)?)
+    } else if let Some(name) = command.strip_prefix("flow.level:") {
+        FlowCommand::Level(FlowLevel::parse(name)?)
+    } else if command == "flow.expand_all" {
+        FlowCommand::ExpandAll
+    } else if command == "flow.collapse_all" {
+        FlowCommand::CollapseAll
+    } else if let Some(row) = command.strip_prefix("flow.toggle:") {
+        FlowCommand::Toggle(row.parse().ok()?)
+    } else if let Some(row) = command.strip_prefix("flow.select_row:") {
+        FlowCommand::SelectRow(row.parse().ok()?)
+    } else if let Some(delta) = command.strip_prefix("flow.select_move:") {
+        FlowCommand::SelectMove(delta.parse().ok()?)
+    } else if command == "flow.select_first" {
+        FlowCommand::SelectEdge(false)
+    } else if command == "flow.select_last" {
+        FlowCommand::SelectEdge(true)
+    } else if command == "flow.select_into" {
+        FlowCommand::SelectInto
+    } else if command == "flow.select_out" {
+        FlowCommand::SelectOut
+    } else if command == "flow.select_none" {
+        FlowCommand::SelectNone
+    } else if command == "flow.toggle_selected" {
+        FlowCommand::ToggleSelected
+    } else if command == "flow.src_selected" {
+        FlowCommand::SrcSelected
+    } else if let Some(rest) = command.strip_prefix("flow.select:") {
+        let (col, id) = rest.split_once(':')?;
+        FlowCommand::Select(col.parse().ok()?, id)
+    } else if let Some(col) = command.strip_prefix("flow.focus:") {
+        FlowCommand::Focus(col.parse().ok()?)
+    } else if let Some(id) = command.strip_prefix("flow.graph.zoom:") {
+        FlowCommand::GraphZoom(id)
+    } else if let Some(index) = command.strip_prefix("flow.graph.crumb:") {
+        FlowCommand::GraphCrumb(index.parse().ok()?)
+    } else if let Some(name) = command.strip_prefix("flow.graph.depth:") {
+        FlowCommand::GraphDepth(DepthFilter::parse(name)?)
+    } else if let Some(id) = command.strip_prefix("flow.graph.details:") {
+        FlowCommand::GraphDetails(id)
+    } else {
+        FlowCommand::Src(command.strip_prefix("flow.src:")?)
+    };
+
+    let pane_id = state.active_pane.0;
+    let Some(pane) = state.flows.get_mut(&pane_id) else {
+        return Some(false);
+    };
+    // Copies only when a frame snapshot still holds the previous version.
+    let pane = std::sync::Arc::make_mut(pane);
+    // The cursor keys are shared: they drive the row cursor in the call
+    // stack and the column cursor in the panes view.
+    let panes = pane.view == FlowView::Panes;
+    match parsed {
+        FlowCommand::View(view) => {
+            if pane.set_view(view) {
+                let mut record = FlowEventRecord::new("flow.view_changed", "info", &pane.flow_id);
+                record.view = Some(view.as_str());
+                record_flow_event(&record);
+            }
+        }
+        FlowCommand::Level(level) => {
+            pane.set_level(level);
+            for id in pane.unloaded_open_snippets() {
+                load_flow_snippet(pane, &id);
+            }
+        }
+        FlowCommand::ExpandAll => pane.expand_all(),
+        FlowCommand::CollapseAll => pane.collapse_all(),
+        FlowCommand::Toggle(row) => {
+            // A click both selects and toggles, like a file tree.
+            pane.select_row(row);
+            pane.toggle_collapsed(row);
+        }
+        FlowCommand::Src(id) => {
+            if pane.toggle_src(id) == Some(true) {
+                load_flow_snippet(pane, id);
+            }
+        }
+        FlowCommand::SelectRow(row) => {
+            pane.select_row(row);
+        }
+        FlowCommand::SelectMove(delta) => {
+            if panes {
+                pane.column_move(delta);
+            } else {
+                pane.move_selection(delta);
+            }
+        }
+        FlowCommand::SelectEdge(end) => {
+            if panes {
+                pane.column_edge(end);
+            } else {
+                pane.select_edge(end);
+            }
+        }
+        FlowCommand::SelectInto | FlowCommand::ToggleSelected if panes => {
+            if pane.column_enter() {
+                load_focused_flow_snippet(pane);
+            }
+        }
+        FlowCommand::SelectInto => {
+            pane.select_into();
+        }
+        FlowCommand::SelectOut => {
+            if panes {
+                pane.column_back();
+            } else {
+                pane.select_out();
+            }
+        }
+        FlowCommand::SelectNone => {
+            if panes {
+                pane.column_clear();
+            } else {
+                pane.clear_selection();
+            }
+        }
+        FlowCommand::ToggleSelected => {
+            if let Some(row) = pane.selected_row {
+                pane.toggle_collapsed(row);
+            }
+        }
+        FlowCommand::Select(col, id) => {
+            if pane.select_column(col, id) {
+                load_focused_flow_snippet(pane);
+            }
+        }
+        FlowCommand::Focus(col) => {
+            pane.focus_column(col);
+        }
+        FlowCommand::GraphZoom(id) => {
+            pane.graph_zoom(id);
+        }
+        FlowCommand::GraphCrumb(index) => {
+            pane.graph_crumb(index);
+        }
+        FlowCommand::GraphDepth(depth) => {
+            pane.graph_set_depth(depth);
+        }
+        FlowCommand::GraphDetails(id) => {
+            let before = pane.view;
+            if pane.focus_node(id) {
+                load_focused_flow_snippet(pane);
+                if pane.view != before {
+                    let mut record =
+                        FlowEventRecord::new("flow.view_changed", "info", &pane.flow_id);
+                    record.view = Some(pane.view.as_str());
+                    record_flow_event(&record);
+                }
+            }
+        }
+        FlowCommand::SrcSelected => {
+            if let Some(id) = pane.selected_node_id().map(str::to_owned) {
+                if pane.toggle_src(&id) == Some(true) {
+                    load_flow_snippet(pane, &id);
+                }
+            }
+        }
+    }
+    // Collapses and level changes can hide the selected row.
+    pane.clamp_selection();
+    Some(true)
+}
+
+/// Load a node's source excerpt into the pane cache (a small synchronous
+/// read on the dispatch path, never during render) and report fresh
+/// failures that are not the expected stale-flow cases.
+fn load_flow_snippet(pane: &mut crate::flow_explorer::FlowPane, node_id: &str) {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+
+    if pane.ensure_snippet(node_id) != Some(true) {
+        return;
+    }
+    if let Some(Err(err)) = pane.snippet(node_id) {
+        if !err.is_expected() {
+            let mut record =
+                FlowEventRecord::new("flow.snippet_load_failed", "warn", &pane.flow_id);
+            record.reason = Some(err.reason());
+            record_flow_event(&record);
+        }
+    }
+}
+
+/// The panes view shows the focused node's excerpt, so focusing loads it.
+fn load_focused_flow_snippet(pane: &mut crate::flow_explorer::FlowPane) {
+    if let Some(id) = pane.path.last().cloned() {
+        load_flow_snippet(pane, &id);
+    }
+}
+
+/// Handle `flow.open:<path>`: open the flow document in a new Flow
+/// Explorer tab, or surface a failure toast. Emits `flow.open` /
+/// `flow.open_failed` telemetry either way.
+pub fn dispatch_flow_open_path(state: &mut AppState, raw_path: &str) -> bool {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        push_error_toast(state, "Open flow: no path given");
+        return true;
+    }
+    let path = std::path::PathBuf::from(trimmed);
+    match crate::flow_explorer::FlowPane::open(&path) {
+        Ok(pane) => {
+            record_flow_pane_event(&pane, "flow.open", "info", None);
+            let pane_id = mutate_add_flow_tab(state, pane);
+            record_diagnostic_pty_event(state, format!("flow_open pane={}", pane_id.0));
+        }
+        Err(err) => {
+            let flow_id = crate::flow_explorer::flow_id_for(&path);
+            let path_str = path.to_string_lossy().into_owned();
+            let mut record = FlowEventRecord::new("flow.open_failed", "warn", &flow_id);
+            record.path = Some(&path_str);
+            record.reason = Some(err.reason());
+            record.os_error = err.os_error();
+            record_flow_event(&record);
+            record_diagnostic_pty_event(state, format!("flow_open_failed reason={}", err.reason()));
+            push_error_toast(state, err.message(&path));
+        }
+    }
+    true
+}
+
+/// Handle `flow.open` (no path): native JSON picker starting in the
+/// profile's `flows/` directory, routed back through `flow.open:<path>`.
+fn dispatch_flow_open_dialog(state: &mut AppState) -> bool {
+    let start_dir = crate::flow_explorer::flows_dir()
+        .filter(|dir| dir.is_dir())
+        .or_else(|| active_workspace_cwd(state));
+    spawn_file_picker(
+        state,
+        "Open flow",
+        Some(("Flow JSON", &["json"])),
+        start_dir,
+        |path| format!("flow.open:{}", path.display()),
+    )
+}
+
+/// `flow.explain` / `flow.review`: open the request dialog.
+fn dispatch_flow_request_dialog(
+    state: &mut AppState,
+    mode: crate::flow_explorer::FlowMode,
+) -> bool {
+    state.ctx_menu = None;
+    state.confirm_dialog = Some(ConfirmDialog::FlowRequest {
+        mode,
+        buffer: String::new(),
+        error: None,
+    });
+    true
+}
+
+/// `dialog.flow_commit`: launch from the dialog's buffer. A precondition
+/// failure reopens the dialog with the reason inline, like the rename
+/// dialog does for a failed RPC.
+fn dispatch_flow_commit(state: &mut AppState) -> bool {
+    let Some(ConfirmDialog::FlowRequest {
+        mode,
+        buffer,
+        error: _,
+    }) = state.confirm_dialog.take()
+    else {
+        return false;
+    };
+    if let Err(message) = dispatch_flow_launch(state, mode, &buffer) {
+        state.confirm_dialog = Some(ConfirmDialog::FlowRequest {
+            mode,
+            buffer,
+            error: Some(message),
+        });
+    }
+    true
+}
+
+/// `flow.explain:<request>` / `flow.review:<range>`: launch without the
+/// dialog (startup dispatch, tests). Failures surface as a toast.
+fn dispatch_flow_launch_direct(
+    state: &mut AppState,
+    mode: crate::flow_explorer::FlowMode,
+    request: &str,
+) -> bool {
+    if let Err(message) = dispatch_flow_launch(state, mode, request) {
+        push_error_toast(state, format!("flow {}: {}", mode.as_str(), message));
+    }
+    true
+}
+
+fn inside_git_checkout(dir: &std::path::Path) -> bool {
+    dir.ancestors()
+        .any(|ancestor| ancestor.join(".git").exists())
+}
+
+/// Distinguishes launches that start in the same millisecond (tests).
+static FLOW_LAUNCH_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Launch the producer agent for `mode` in the active workspace: writes
+/// the full prompt next to the future output under the profile's
+/// `flows/` directory, opens an agent tab in the workspace directory
+/// (not a worktree, so uncommitted changes are visible) with a one-line
+/// argv prompt pointing at it, and registers the output path for the
+/// poll thread. `Err` is a user-facing precondition message.
+pub fn dispatch_flow_launch(
+    state: &mut AppState,
+    mode: crate::flow_explorer::FlowMode,
+    request: &str,
+) -> Result<(), String> {
+    use crate::flow_explorer::poller::PendingFlow;
+    use crate::flow_explorer::producer;
+    use crate::flow_explorer::telemetry::record_flow_event;
+    use crate::flow_explorer::FlowMode;
+
+    let request = producer::normalize_request(request);
+    if request.chars().count() > producer::MAX_REQUEST_CHARS {
+        return Err(format!(
+            "keep the request under {} characters",
+            producer::MAX_REQUEST_CHARS
+        ));
+    }
+    let cwd = active_workspace_cwd(state)
+        .filter(|dir| dir.is_dir())
+        .ok_or_else(|| "the active workspace has no working directory".to_string())?;
+    if mode == FlowMode::Review && !inside_git_checkout(&cwd) {
+        return Err(
+            "review needs a git checkout; the workspace directory is not inside one".to_string(),
+        );
+    }
+    let flows_dir = crate::flow_explorer::flows_dir()
+        .ok_or_else(|| "no data directory to write flows into".to_string())?;
+    std::fs::create_dir_all(&flows_dir)
+        .map_err(|e| format!("could not create {}: {e}", flows_dir.display()))?;
+
+    let started_unix_ms = crate::agent_restore::now_unix_ms();
+    let seq = FLOW_LAUNCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let flow_id = format!("{}-{started_unix_ms}-{seq}", mode.as_str());
+    let output_path = flows_dir.join(format!("{flow_id}.json"));
+    let prompt_path = flows_dir.join(format!("{flow_id}.prompt.md"));
+    let prompt = producer::build_prompt(mode, &request, &output_path);
+    crate::persist::atomic_write(&prompt_path, prompt.as_bytes())
+        .map_err(|e| format!("could not write the prompt file: {e}"))?;
+    let launch_prompt = producer::launch_prompt(&prompt_path, &output_path);
+
+    let agent = crate::quick_prompt::QuickPromptStore::load().agent;
+    let (shell_spec, session_id) = match agent {
+        crate::quick_prompt::Agent::Claude => {
+            let session_id = crate::agent_restore::generate_session_id();
+            let shell = flow_claude_shell_spec(&launch_prompt, &session_id, &flows_dir);
+            (shell, Some(session_id))
+        }
+        crate::quick_prompt::Agent::Codex => (
+            crate::quick_prompt::spawn::codex_shell_spec(&launch_prompt),
+            None,
+        ),
+    };
+    let agent_name = match agent {
+        crate::quick_prompt::Agent::Claude => "claude",
+        crate::quick_prompt::Agent::Codex => "codex",
+    };
+    let restart = crate::agent_restore::AgentRestart {
+        agent: agent.into(),
+        cwd: crate::agent_restore::normalized_cwd(&cwd),
+        resume_mode: match agent {
+            crate::quick_prompt::Agent::Claude => {
+                crate::agent_restore::AgentResumeMode::Interactive
+            }
+            crate::quick_prompt::Agent::Codex => crate::agent_restore::AgentResumeMode::CodexExec,
+        },
+        session_id,
+        observed_at_unix_ms: started_unix_ms,
+        managed: true,
+        launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+    };
+    let expected_pane = state.next_id;
+    mutate_add_quick_prompt_tab(state, &launch_prompt, &cwd, &shell_spec, restart);
+    // The new tab is active on every return path of the helper.
+    let launch_pane = state.active_pane.0;
+    debug_assert_eq!(launch_pane, expected_pane, "quick prompt tab takes next_id");
+    mutate_rename_pane(state, launch_pane, &format!("flow: {}", mode.as_str()));
+
+    let pending = PendingFlow {
+        flow_id,
+        output_path,
+        mode,
+        agent: agent_name,
+        started_unix_ms,
+    };
+    let path_str = pending.output_path.to_string_lossy().into_owned();
+    record_flow_event(&flow_launch_record(
+        &pending,
+        &path_str,
+        "flow.launch",
+        "info",
+    ));
+    record_diagnostic_pty_event(
+        state,
+        format!(
+            "flow_launch pane={launch_pane} mode={} agent={agent_name}",
+            mode.as_str()
+        ),
+    );
+    state.flow_pending.insert(launch_pane, pending);
+    crate::persist::save_workspaces(state);
+    Ok(())
+}
+
+/// Claude launch for a flow: the Quick Prompt spec plus `--add-dir` on
+/// the flows directory, so the one write the agent must make lands in a
+/// directory Claude treats as a working directory (users who auto-accept
+/// edits get no prompt; everyone else approves a single write). The pair
+/// goes first because `--add-dir` is variadic and would swallow a
+/// following positional prompt.
+fn flow_claude_shell_spec(
+    launch_prompt: &str,
+    session_id: &str,
+    flows_dir: &std::path::Path,
+) -> crate::shell::ShellSpec {
+    let mut shell = crate::agent_restore::claude_initial_shell_spec(launch_prompt, session_id)
+        .expect("generated Claude session id must be valid");
+    shell.args.insert(0, "--add-dir".to_string());
+    shell
+        .args
+        .insert(1, flows_dir.to_string_lossy().into_owned());
+    shell
+}
+
+/// A telemetry record pre-filled with a pending launch's identity; the
+/// caller sets the outcome-specific fields.
+fn flow_launch_record<'a>(
+    pending: &'a crate::flow_explorer::poller::PendingFlow,
+    path_str: &'a str,
+    event: &'static str,
+    level: &'static str,
+) -> crate::flow_explorer::telemetry::FlowEventRecord<'a> {
+    let mut record =
+        crate::flow_explorer::telemetry::FlowEventRecord::new(event, level, &pending.flow_id);
+    record.path = Some(path_str);
+    record.mode = Some(pending.mode.as_str());
+    record.agent = Some(pending.agent);
+    record
+}
+
+/// Drop the pending launch of a closing pane. Reached from every terminal
+/// pane teardown path through `forget_agent_restore`.
+fn forget_flow_launch(state: &mut AppState, pane_id: u32) {
+    let Some(pending) = state.flow_pending.remove(&pane_id) else {
+        return;
+    };
+    let path_str = pending.output_path.to_string_lossy().into_owned();
+    let mut record = flow_launch_record(&pending, &path_str, "flow.timeout", "info");
+    record.reason = Some("pane_closed");
+    record.elapsed_ms =
+        Some(crate::agent_restore::now_unix_ms().saturating_sub(pending.started_unix_ms));
+    crate::flow_explorer::telemetry::record_flow_event(&record);
+}
+
+/// Snapshot for the poll thread: every pending launch, cloned so the lock
+/// is held for microseconds. Sorted by pane id for determinism.
+pub fn flow_poll_snapshot(
+    state: &AppState,
+) -> Vec<(u32, crate::flow_explorer::poller::PendingFlow)> {
+    let mut entries: Vec<_> = state
+        .flow_pending
+        .iter()
+        .map(|(pane_id, pending)| (*pane_id, pending.clone()))
+        .collect();
+    entries.sort_by_key(|(pane_id, _)| *pane_id);
+    entries
+}
+
+/// Apply poll results under the lock. Returns `true` when state changed.
+/// An outcome for a launch that is already gone (its pane closed between
+/// the snapshot and this call) is ignored, so nothing opens twice.
+pub fn apply_flow_poll(
+    state: &mut AppState,
+    outcomes: Vec<(u32, crate::flow_explorer::poller::PollOutcome)>,
+    now_unix_ms: u64,
+) -> bool {
+    use crate::flow_explorer::poller::{PollOutcome, PENDING_TIMEOUT_MS};
+    use crate::flow_explorer::telemetry::record_flow_event;
+
+    let mut changed = false;
+    for (pane_id, outcome) in outcomes {
+        if outcome.is_pending() {
+            continue;
+        }
+        let Some(pending) = state.flow_pending.remove(&pane_id) else {
+            continue;
+        };
+        let elapsed_ms = Some(now_unix_ms.saturating_sub(pending.started_unix_ms));
+        let path_str = pending.output_path.to_string_lossy().into_owned();
+        match outcome {
+            PollOutcome::Pending => {}
+            PollOutcome::Ready(pane) => {
+                let mut record = flow_launch_record(&pending, &path_str, "flow.ready", "info");
+                record.node_count = Some(pane.flow.nodes.len() as u64);
+                record.edge_count = Some(pane.flow.edges.len() as u64);
+                record.elapsed_ms = elapsed_ms;
+                record_flow_event(&record);
+                let flow_pane = mutate_add_flow_tab(state, *pane);
+                record_diagnostic_pty_event(
+                    state,
+                    format!(
+                        "flow_ready launch_pane={pane_id} pane={} mode={}",
+                        flow_pane.0,
+                        pending.mode.as_str()
+                    ),
+                );
+            }
+            PollOutcome::Failed {
+                reason,
+                message,
+                os_error,
+            } => {
+                let mut record =
+                    flow_launch_record(&pending, &path_str, "flow.parse_failed", "warn");
+                record.reason = Some(reason);
+                record.os_error = os_error;
+                record.elapsed_ms = elapsed_ms;
+                record_flow_event(&record);
+                record_diagnostic_pty_event(
+                    state,
+                    format!("flow_parse_failed pane={pane_id} reason={reason}"),
+                );
+                push_error_toast(state, format!("flow {}: {message}", pending.mode.as_str()));
+            }
+            PollOutcome::TimedOut => {
+                let mut record = flow_launch_record(&pending, &path_str, "flow.timeout", "warn");
+                record.reason = Some("deadline");
+                record.elapsed_ms = elapsed_ms;
+                record_flow_event(&record);
+                record_diagnostic_pty_event(state, format!("flow_timeout pane={pane_id}"));
+                push_error_toast(
+                    state,
+                    format!(
+                        "flow {}: the agent did not write a flow within {} minutes",
+                        pending.mode.as_str(),
+                        PENDING_TIMEOUT_MS / 60_000
+                    ),
+                );
+            }
+        }
+        changed = true;
+    }
+    if changed {
+        crate::persist::save_workspaces(state);
+    }
+    changed
+}
+
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
     match command {
         "modal.close" => {
@@ -5177,6 +6403,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 ConfirmDialog::CloseApp { .. }
                     | ConfirmDialog::RenameSession { .. }
                     | ConfirmDialog::CloseEditor { .. }
+                    | ConfirmDialog::FlowRequest { .. }
             ) {
                 return false;
             }
@@ -5187,9 +6414,13 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 ConfirmDialog::KillAll { .. } => {
                     mutate_kill_all_terminals(state);
                 }
+                ConfirmDialog::KillAgents { workspace_idx, .. } => {
+                    mutate_kill_workspace_agents(state, workspace_idx);
+                }
                 ConfirmDialog::CloseApp { .. }
                 | ConfirmDialog::RenameSession { .. }
-                | ConfirmDialog::CloseEditor { .. } => {
+                | ConfirmDialog::CloseEditor { .. }
+                | ConfirmDialog::FlowRequest { .. } => {
                     unreachable!("filtered above")
                 }
             }
@@ -5287,6 +6518,36 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 true
             } else {
                 false
+            }
+        }
+        // E2E/diagnostic hook: opens the workspace context menu at explicit
+        // CSS coordinates, mirroring what the sidebar right-click handler
+        // stores. Interactive opens never route through dispatch (they run
+        // inline in `on_context_menu`), so this exists for driven sessions
+        // (TM_STARTUP_DISPATCH) to exercise overlay placement.
+        other if other.starts_with("ctx_menu.open_workspace:") => {
+            let mut parts = other["ctx_menu.open_workspace:".len()..].split(':');
+            match (
+                parts.next().and_then(|v| v.parse::<usize>().ok()),
+                parts.next().and_then(|v| v.parse::<f32>().ok()),
+                parts.next().and_then(|v| v.parse::<f32>().ok()),
+            ) {
+                (Some(idx), Some(x), Some(y)) if idx < state.workspaces.len() => {
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "workspace",
+                        x,
+                        y,
+                        state.window_width / state.scale_factor.max(1e-3),
+                        state.window_height / state.scale_factor.max(1e-3),
+                    );
+                    state.ctx_menu = Some(CtxMenu {
+                        x,
+                        y,
+                        target: CtxMenuTarget::Workspace { idx },
+                    });
+                    true
+                }
+                _ => false,
             }
         }
         "modal.open" => {
@@ -5500,6 +6761,24 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             dispatch_editor_open_path(state, path)
         }
         "editor.open" => dispatch_editor_open_dialog(state),
+        other if let Some(handled) = dispatch_flow_command(state, other) => handled,
+        other if let Some(path) = other.strip_prefix("flow.open:") => {
+            dispatch_flow_open_path(state, path)
+        }
+        "flow.open" => dispatch_flow_open_dialog(state),
+        "flow.explain" => {
+            dispatch_flow_request_dialog(state, crate::flow_explorer::FlowMode::Explain)
+        }
+        "flow.review" => {
+            dispatch_flow_request_dialog(state, crate::flow_explorer::FlowMode::Review)
+        }
+        other if let Some(request) = other.strip_prefix("flow.explain:") => {
+            dispatch_flow_launch_direct(state, crate::flow_explorer::FlowMode::Explain, request)
+        }
+        other if let Some(range) = other.strip_prefix("flow.review:") => {
+            dispatch_flow_launch_direct(state, crate::flow_explorer::FlowMode::Review, range)
+        }
+        "dialog.flow_commit" => dispatch_flow_commit(state),
         "editor.save" => dispatch_editor_save(state),
         "tab.new_worktree" => {
             let repo_cwd = active_workspace_cwd(state)
@@ -5820,6 +7099,73 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             false
         }
+        "agent.new" => dispatch_agent_new(state, None, "command"),
+        other if let Some(id) = other.strip_prefix("agent.new:") => {
+            dispatch_agent_new(state, Some(id), "command")
+        }
+        other if let Some(rest) = other.strip_prefix("workspace.new_agent:") => {
+            let (idx, id) = match rest.split_once(':') {
+                Some((idx, id)) => (idx, Some(id)),
+                None => (rest, None),
+            };
+            let Ok(idx) = idx.parse::<usize>() else {
+                return false;
+            };
+            state.ctx_menu = None;
+            if idx >= state.workspaces.len() {
+                return false;
+            }
+            mutate_switch_workspace(state, idx);
+            dispatch_agent_new(state, id, "ctx_menu")
+        }
+        other if let Some(rest) = other.strip_prefix("workspace.request_kill_agents:") => {
+            let Ok(idx) = rest.parse::<usize>() else {
+                return false;
+            };
+            state.ctx_menu = None;
+            let count = workspace_agent_pane_ids(state, idx).len();
+            let Some(ws) = state.workspaces.get(idx) else {
+                return false;
+            };
+            if count == 0 {
+                push_error_toast(state, format!("No agents running in \"{}\"", ws.name));
+                return true;
+            }
+            state.confirm_dialog = Some(ConfirmDialog::KillAgents {
+                workspace_idx: idx,
+                name: ws.name.clone(),
+                count,
+            });
+            true
+        }
+        // Driven-session twin of the sidebar subtab right-click, mirroring
+        // `ctx_menu.open_workspace`: `<idx>:<terminals|agents>:<x>:<y>`.
+        other if let Some(rest) = other.strip_prefix("ctx_menu.open_subtab:") => {
+            let mut parts = rest.split(':');
+            match (
+                parts.next().and_then(|v| v.parse::<usize>().ok()),
+                parts.next().and_then(SubtabKind::parse),
+                parts.next().and_then(|v| v.parse::<f32>().ok()),
+                parts.next().and_then(|v| v.parse::<f32>().ok()),
+            ) {
+                (Some(idx), Some(kind), Some(x), Some(y)) if idx < state.workspaces.len() => {
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "subtab",
+                        x,
+                        y,
+                        state.window_width / state.scale_factor.max(1e-3),
+                        state.window_height / state.scale_factor.max(1e-3),
+                    );
+                    state.ctx_menu = Some(CtxMenu {
+                        x,
+                        y,
+                        target: CtxMenuTarget::Subtab { idx, kind },
+                    });
+                    true
+                }
+                _ => false,
+            }
+        }
         "app.request_kill_all_terminals" => {
             state.confirm_dialog = Some(ConfirmDialog::KillAll {
                 count: state.terminals.len(),
@@ -5919,7 +7265,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             let pane_id = state.active_pane.0;
             // Editor panes are titled by their file name + dirty marker;
             // session rename is a terminal concept and must not clobber it.
-            if state.editors.contains_key(&pane_id) {
+            if state.editors.contains_key(&pane_id) || state.flows.contains_key(&pane_id) {
                 return false;
             }
             dispatch(state, &format!("tab.request_rename:{pane_id}"))
@@ -7980,16 +9326,21 @@ pub(crate) mod tests {
             pty_manager: crate::pty::DaemonPty::new(),
             terminals: std::collections::HashMap::new(),
             editors: std::collections::HashMap::new(),
+            flows: std::collections::HashMap::new(),
+            flow_pending: std::collections::HashMap::new(),
             agent_restarts: std::collections::HashMap::new(),
             pending_agent_resumes: std::collections::HashMap::new(),
             agent_resume_attempts: std::collections::HashMap::new(),
             agent_resume_preflights: std::collections::HashMap::new(),
             restore_correlation_id: crate::agent_restore::generate_session_id(),
+            pane_agents: std::collections::HashMap::new(),
             custom_titled_panes: std::collections::HashSet::new(),
             scale_factor: 1.0,
             cell_width_ratio: 0.6,
             last_grid_width: 0.0,
             last_grid_height: 0.0,
+            window_width: 0.0,
+            window_height: 0.0,
             row_ratios: vec![1.0],
             col_ratios: vec![vec![1.0]],
             resize_drag: None,
@@ -10367,6 +11718,33 @@ pub(crate) mod tests {
     fn ctx_menu_close_returns_false_when_already_closed() {
         let mut state = test_state();
         assert!(!dispatch(&mut state, "ctx_menu.close"));
+    }
+
+    #[test]
+    fn ctx_menu_open_workspace_dispatch_sets_menu_state() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "ctx_menu.open_workspace:0:12.5:60"));
+        match state.ctx_menu.as_ref() {
+            Some(CtxMenu {
+                x,
+                y,
+                target: CtxMenuTarget::Workspace { idx },
+            }) => {
+                assert_eq!(*idx, 0);
+                assert_eq!(*x, 12.5);
+                assert_eq!(*y, 60.0);
+            }
+            other => panic!("expected workspace ctx menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctx_menu_open_workspace_dispatch_rejects_bad_input() {
+        let mut state = seed_state();
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:99:10:10"));
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:0:abc:10"));
+        assert!(!dispatch(&mut state, "ctx_menu.open_workspace:0:10"));
+        assert!(state.ctx_menu.is_none());
     }
 
     #[test]
@@ -14608,6 +15986,8 @@ pub(crate) mod tests {
             collapsed: false,
             terminals_expanded: true,
             terminal_entries: vec![],
+            agents_expanded: false,
+            agent_entries: vec![],
             subtabs: vec![],
             git_branch: GitBranch::Absent,
             tabs: vec![tab],
@@ -14996,6 +16376,7 @@ pub(crate) mod tests {
                             title: String::new(),
                             subtitle: String::new(),
                             custom_title: false,
+                            agent_tag: None,
                             agent_restart: None,
                         }]],
                         active_pane: 9,
@@ -16322,5 +17703,912 @@ mod tests_mouse_selection_copy_paste {
     fn normalize_pasted_text_noop_when_plain() {
         // Plain text with no markers or special newlines should be unchanged.
         assert_eq!(normalize_pasted_text("ls -al"), "ls -al");
+    }
+}
+
+#[cfg(test)]
+mod flow_pane_tests {
+    use super::tests::test_state;
+    use super::*;
+    use crate::flow_explorer::test_support::fixture_path;
+
+    fn open_fixture(state: &mut AppState) -> u32 {
+        assert!(dispatch(
+            state,
+            &format!("flow.open:{}", fixture_path().display())
+        ));
+        state.active_pane.0
+    }
+
+    #[test]
+    fn dispatch_flow_open_creates_flow_tab() {
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.flows.len(), 1);
+        assert!(
+            state.flows.contains_key(&pane_id),
+            "active pane is the flow"
+        );
+        assert!(
+            !state.terminals.contains_key(&pane_id),
+            "no terminal spawned"
+        );
+        assert!(!state.editors.contains_key(&pane_id));
+        assert_eq!(state.panes[0][0].title, "Send a prompt");
+        assert_eq!(state.panes[0][0].subtitle, "flow");
+        assert_eq!(state.tabs[state.active_tab].name, "Send a prompt");
+        assert!(state.toasts.is_empty());
+    }
+
+    #[test]
+    fn dispatch_flow_open_snapshot_marks_flow_pane() {
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        let snap = state.ui_snapshot();
+        let pane = snap
+            .flow_panes
+            .get(&pane_id)
+            .expect("flow pane in snapshot");
+        assert_eq!(pane.title(), "Send a prompt");
+        assert_eq!(pane.rows.len(), 11);
+        assert!(!snap.editor_panes.contains(&pane_id));
+    }
+
+    #[test]
+    fn dispatch_flow_open_missing_file_toasts_without_a_tab() {
+        let mut state = test_state();
+        assert!(dispatch(
+            &mut state,
+            "flow.open:C:/definitely/not/a/real/flow.json"
+        ));
+        assert_eq!(state.tabs.len(), 1);
+        assert!(state.flows.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_flow_open_empty_path_toasts() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "flow.open:  "));
+        assert!(state.flows.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_flow_open_dialog_without_hooks_toasts() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "flow.open"));
+        assert_eq!(state.toasts.len(), 1);
+        assert!(state.flows.is_empty());
+    }
+
+    #[test]
+    fn close_flow_pane_removes_flow_state() {
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        mutate_close_pane(&mut state, PaneId(pane_id));
+        assert!(state.flows.is_empty());
+        assert_eq!(state.tabs.len(), 1);
+        assert!(!state.terminals.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn close_tab_removes_flow_state() {
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        assert!(dispatch(&mut state, "tab.close.active"));
+        assert!(!state.flows.contains_key(&pane_id));
+        assert_eq!(state.tabs.len(), 1);
+    }
+
+    #[test]
+    fn rename_is_refused_for_flow_panes() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(!dispatch(&mut state, "session.rename_active"));
+        assert!(state.confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn flow_dispatch_prefix_is_palette_safe() {
+        assert!(is_palette_safe_dispatch("flow.open"));
+        assert!(is_palette_safe_dispatch("flow.view:panes"));
+        assert!(!is_palette_safe_dispatch("flowers"));
+    }
+
+    fn active_flow(state: &AppState) -> &crate::flow_explorer::FlowPane {
+        state
+            .flows
+            .get(&state.active_pane.0)
+            .expect("active pane is a flow")
+    }
+
+    #[test]
+    fn flow_view_and_level_commands_act_on_the_active_pane() {
+        use crate::flow_explorer::{FlowLevel, FlowView};
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.view:graph"));
+        assert_eq!(active_flow(&state).view, FlowView::Graph);
+        assert!(dispatch(&mut state, "flow.level:source"));
+        assert_eq!(active_flow(&state).level, FlowLevel::Source);
+        assert_eq!(active_flow(&state).src_open.len(), 8);
+        // Unknown names are not flow commands at all.
+        assert!(!dispatch(&mut state, "flow.view:sequence"));
+        assert_eq!(active_flow(&state).view, FlowView::Graph);
+        assert!(!dispatch(&mut state, "flow.level:loud"));
+        assert!(!dispatch(&mut state, "flow.toggle:x"));
+    }
+
+    #[test]
+    fn flow_toggle_expand_collapse_and_src_commands() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.collapse_all"));
+        assert_eq!(active_flow(&state).collapsed.len(), 9);
+        assert!(dispatch(&mut state, "flow.expand_all"));
+        assert!(active_flow(&state).collapsed.is_empty());
+        assert!(dispatch(&mut state, "flow.toggle:3"));
+        assert!(active_flow(&state).collapsed.contains(&3));
+        assert!(dispatch(&mut state, "flow.toggle:3"));
+        assert!(active_flow(&state).collapsed.is_empty());
+        assert!(dispatch(&mut state, "flow.src:Editor.tsx::handleKeyDown"));
+        assert!(active_flow(&state)
+            .src_open
+            .contains("Editor.tsx::handleKeyDown"));
+        // A node without a location is recognised but changes nothing.
+        assert!(dispatch(&mut state, "flow.src:ui.cmd-enter"));
+        assert_eq!(active_flow(&state).src_open.len(), 1);
+    }
+
+    #[test]
+    fn flow_commands_without_an_active_flow_pane_are_noops() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "flow.view:graph"));
+        assert!(!dispatch(&mut state, "flow.expand_all"));
+        assert!(!dispatch(&mut state, "flow.toggle:0"));
+        assert!(state.flows.is_empty());
+    }
+
+    #[test]
+    fn flow_commands_only_touch_the_active_flow_pane() {
+        use crate::flow_explorer::FlowView;
+        let mut state = test_state();
+        let first = open_fixture(&mut state);
+        let second = open_fixture(&mut state);
+        assert_ne!(first, second);
+        assert!(dispatch(&mut state, "flow.view:panes"));
+        assert_eq!(state.flows[&second].view, FlowView::Panes);
+        assert_eq!(state.flows[&first].view, FlowView::CallStack);
+    }
+
+    #[test]
+    fn flow_commands_do_not_mutate_an_outstanding_snapshot() {
+        use crate::flow_explorer::FlowView;
+        let mut state = test_state();
+        let pane_id = open_fixture(&mut state);
+        let snap = state.ui_snapshot();
+        assert!(dispatch(&mut state, "flow.view:graph"));
+        assert_eq!(snap.flow_panes[&pane_id].view, FlowView::CallStack);
+        assert_eq!(state.flows[&pane_id].view, FlowView::Graph);
+        assert_eq!(
+            state.ui_snapshot().flow_panes[&pane_id].view,
+            FlowView::Graph
+        );
+    }
+
+    #[test]
+    fn flow_src_command_loads_the_snippet_once() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.src:SessionRegistry.ts::open"));
+        let pane = active_flow(&state);
+        assert!(pane.src_open.contains("SessionRegistry.ts::open"));
+        let snippet = pane
+            .snippet("SessionRegistry.ts::open")
+            .expect("loaded on open")
+            .as_ref()
+            .expect("fixture source exists");
+        assert_eq!(snippet.hl_start, 31);
+        // Closing keeps the cache; reopening does not reload.
+        assert!(dispatch(&mut state, "flow.src:SessionRegistry.ts::open"));
+        assert!(!active_flow(&state)
+            .src_open
+            .contains("SessionRegistry.ts::open"));
+        assert!(active_flow(&state)
+            .snippet("SessionRegistry.ts::open")
+            .is_some());
+    }
+
+    #[test]
+    fn flow_source_level_loads_every_open_snippet() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.level:source"));
+        let pane = active_flow(&state);
+        assert_eq!(pane.src_open.len(), 8);
+        assert!(pane.unloaded_open_snippets().is_empty());
+        assert!(
+            pane.snippets.values().all(|r| r.is_ok()),
+            "{:?}",
+            pane.snippets
+        );
+    }
+
+    #[test]
+    fn flow_selection_commands_drive_the_cursor() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert_eq!(active_flow(&state).selected_row, None);
+        assert!(dispatch(&mut state, "flow.select_move:1"));
+        assert_eq!(active_flow(&state).selected_row, Some(0));
+        assert!(dispatch(&mut state, "flow.select_last"));
+        assert_eq!(active_flow(&state).selected_row, Some(10));
+        assert!(dispatch(&mut state, "flow.select_out"));
+        assert_eq!(active_flow(&state).selected_row, Some(9));
+        assert!(dispatch(&mut state, "flow.select_first"));
+        assert!(dispatch(&mut state, "flow.select_into"));
+        assert_eq!(active_flow(&state).selected_row, Some(1));
+        assert!(dispatch(&mut state, "flow.toggle_selected"));
+        assert!(active_flow(&state).collapsed.contains(&1));
+        assert!(dispatch(&mut state, "flow.src_selected"));
+        assert!(active_flow(&state)
+            .src_open
+            .contains("Editor.tsx::handleKeyDown"));
+        assert!(active_flow(&state)
+            .snippet("Editor.tsx::handleKeyDown")
+            .is_some());
+        // Row 4 is hidden under the collapsed row 1; expand first.
+        assert!(dispatch(&mut state, "flow.expand_all"));
+        assert!(dispatch(&mut state, "flow.select_row:4"));
+        assert_eq!(active_flow(&state).selected_row, Some(4));
+        assert!(dispatch(&mut state, "flow.select_none"));
+        assert_eq!(active_flow(&state).selected_row, None);
+        assert!(!dispatch(&mut state, "flow.select_move:x"));
+    }
+
+    #[test]
+    fn flow_toggle_click_selects_and_collapse_clamps_selection() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.select_row:8"));
+        assert!(dispatch(&mut state, "flow.toggle:4"));
+        assert_eq!(
+            active_flow(&state).selected_row,
+            Some(4),
+            "clamped to the collapsed ancestor"
+        );
+        assert!(active_flow(&state).collapsed.contains(&4));
+        assert!(dispatch(&mut state, "flow.toggle:4"));
+        assert_eq!(active_flow(&state).selected_row, Some(4));
+        assert!(dispatch(&mut state, "flow.select_row:2"));
+        assert!(dispatch(&mut state, "flow.level:events"));
+        assert_eq!(active_flow(&state).selected_row, Some(1));
+    }
+
+    #[test]
+    fn flow_select_and_focus_commands_drive_the_columns() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.view:panes"));
+        assert!(dispatch(&mut state, "flow.select:0:ui.cmd-enter"));
+        assert!(dispatch(
+            &mut state,
+            "flow.select:1:Editor.tsx::handleKeyDown"
+        ));
+        assert_eq!(
+            active_flow(&state).path,
+            vec!["ui.cmd-enter", "Editor.tsx::handleKeyDown"]
+        );
+        assert!(
+            active_flow(&state)
+                .snippet("Editor.tsx::handleKeyDown")
+                .is_some(),
+            "focusing a node loads its excerpt"
+        );
+        assert!(dispatch(&mut state, "flow.select:0:AgentPane.tsx::submit"));
+        assert_eq!(active_flow(&state).path.len(), 2, "not an entry: ignored");
+        assert!(dispatch(&mut state, "flow.select_move:1"));
+        assert_eq!(active_flow(&state).column_cursor, Some(0));
+        assert!(dispatch(&mut state, "flow.select_into"));
+        assert_eq!(active_flow(&state).path.len(), 3);
+        assert_eq!(active_flow(&state).path[2], "AgentPane.tsx::submit");
+        assert!(active_flow(&state)
+            .snippet("AgentPane.tsx::submit")
+            .is_some());
+        assert!(dispatch(&mut state, "flow.select_out"));
+        assert_eq!(active_flow(&state).path.len(), 2);
+        assert_eq!(active_flow(&state).column_cursor, Some(0));
+        assert!(dispatch(&mut state, "flow.select_last"));
+        assert_eq!(active_flow(&state).column_cursor, Some(1));
+        assert!(dispatch(&mut state, "flow.toggle_selected"));
+        assert_eq!(
+            active_flow(&state).path.len(),
+            3,
+            "enter opens the cursor item"
+        );
+        assert_eq!(active_flow(&state).path[2], "ui.cmd-enter");
+        assert!(dispatch(&mut state, "flow.select_none"));
+        assert_eq!(active_flow(&state).column_cursor, None);
+        assert!(dispatch(&mut state, "flow.focus:0"));
+        assert!(active_flow(&state).path.is_empty());
+        assert_eq!(
+            active_flow(&state).selected_row,
+            None,
+            "the call-stack cursor is untouched"
+        );
+        assert!(!dispatch(&mut state, "flow.select:x:y"));
+        assert!(!dispatch(&mut state, "flow.focus:x"));
+    }
+
+    #[test]
+    fn flow_graph_commands_zoom_crumb_depth_and_details() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.view:graph"));
+        assert_eq!(active_flow(&state).graph_layout().nodes.len(), 9);
+        assert!(dispatch(
+            &mut state,
+            "flow.graph.zoom:main.ts::RPCHandler.upgrade"
+        ));
+        assert_eq!(
+            active_flow(&state).graph_crumbs,
+            vec!["main.ts::RPCHandler.upgrade"]
+        );
+        assert_eq!(active_flow(&state).graph_layout().nodes.len(), 5);
+        assert!(dispatch(&mut state, "flow.graph.depth:1"));
+        assert_eq!(active_flow(&state).graph_layout().nodes.len(), 2);
+        assert!(!dispatch(&mut state, "flow.graph.depth:9"));
+        assert!(dispatch(&mut state, "flow.graph.crumb:0"));
+        assert!(active_flow(&state).graph_crumbs.is_empty());
+        assert!(dispatch(
+            &mut state,
+            "flow.graph.details:SessionRegistry.ts::open"
+        ));
+        assert_eq!(
+            active_flow(&state).view,
+            crate::flow_explorer::FlowView::Panes
+        );
+        assert_eq!(
+            active_flow(&state).path.last().map(String::as_str),
+            Some("SessionRegistry.ts::open")
+        );
+        assert!(active_flow(&state)
+            .snippet("SessionRegistry.ts::open")
+            .is_some());
+        assert!(!dispatch(&mut state, "flow.graph.crumb:x"));
+    }
+
+    fn flows_scratch_dir() -> PathBuf {
+        crate::flow_explorer::FLOWS_DIR_FOR_TESTS
+            .get_or_init(|| {
+                std::env::temp_dir().join(format!("tm-flow-launch-{}", std::process::id()))
+            })
+            .clone()
+    }
+
+    fn workspace_with_path(path: Option<PathBuf>) -> Workspace {
+        Workspace {
+            num: 1,
+            name: "ws".to_string(),
+            path,
+            collapsed: false,
+            terminals_expanded: true,
+            terminal_entries: vec![],
+            agents_expanded: false,
+            agent_entries: vec![],
+            subtabs: vec![],
+            git_branch: GitBranch::Pending,
+            tabs: vec![],
+            active_tab: 0,
+            shell: crate::shell::ShellSpec::default(),
+        }
+    }
+
+    #[test]
+    fn flow_claude_launch_adds_the_flows_dir_before_the_session_id() {
+        let session_id = crate::agent_restore::generate_session_id();
+        let shell = flow_claude_shell_spec(
+            "read the file",
+            &session_id,
+            std::path::Path::new("C:/data/flows"),
+        );
+        assert_eq!(
+            shell.args,
+            vec![
+                "--add-dir",
+                "C:/data/flows",
+                "--session-id",
+                session_id.as_str(),
+                "read the file",
+            ]
+        );
+    }
+
+    #[test]
+    fn flow_request_dialog_opens_and_rejects_bad_preconditions() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "flow.explain"));
+        assert!(matches!(
+            state.confirm_dialog,
+            Some(ConfirmDialog::FlowRequest {
+                mode: crate::flow_explorer::FlowMode::Explain,
+                ..
+            })
+        ));
+        assert!(
+            !dispatch(&mut state, "dialog.confirm"),
+            "the generic confirm never launches"
+        );
+        assert!(dispatch(&mut state, "dialog.flow_commit"));
+        match &state.confirm_dialog {
+            Some(ConfirmDialog::FlowRequest {
+                error: Some(message),
+                ..
+            }) => assert!(message.contains("working directory"), "{message}"),
+            other => panic!("dialog should reopen with the reason, got {other:?}"),
+        }
+        assert!(dispatch(&mut state, "dialog.cancel"));
+        assert!(state.confirm_dialog.is_none());
+
+        let dir = std::env::temp_dir().join(format!("tm-flow-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        state.workspaces = vec![workspace_with_path(Some(dir.clone()))];
+        state.active_workspace = 0;
+        assert!(dispatch(&mut state, "flow.review:main..HEAD"));
+        assert_eq!(state.toasts.len(), 1, "direct launches toast their failure");
+        assert!(state.flow_pending.is_empty());
+        assert_eq!(state.tabs.len(), 1, "no agent tab without a checkout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flow_launch_opens_an_agent_tab_and_the_poll_opens_the_flow() {
+        use crate::flow_explorer::poller::PollOutcome;
+
+        let mut state = test_state();
+        let scratch = flows_scratch_dir();
+        state.workspaces = vec![workspace_with_path(Some(PathBuf::from(env!(
+            "CARGO_MANIFEST_DIR"
+        ))))];
+        state.active_workspace = 0;
+
+        assert!(dispatch(&mut state, "flow.explain:Send a Quick Prompt"));
+        assert_eq!(state.toasts.len(), 0, "launch succeeded");
+        assert_eq!(state.tabs.len(), 2, "the agent tab was added");
+        let launch_pane = state.active_pane.0;
+        let pending = state
+            .flow_pending
+            .get(&launch_pane)
+            .cloned()
+            .expect("launch registered on the agent pane");
+        assert_eq!(pending.mode, crate::flow_explorer::FlowMode::Explain);
+        assert!(
+            ["claude", "codex"].contains(&pending.agent),
+            "the launch uses the Quick Prompt default agent, got {}",
+            pending.agent
+        );
+        assert_eq!(pending.output_path.parent(), Some(scratch.as_path()));
+        let prompt_path = scratch.join(format!("{}.prompt.md", pending.flow_id));
+        let prompt = std::fs::read_to_string(&prompt_path).expect("prompt file written");
+        assert!(prompt.contains("Mode: explain\n"));
+        assert!(prompt.contains("Request: Send a Quick Prompt\n"));
+        assert!(prompt.contains(&format!(
+            "Write the result to: {}\n",
+            pending.output_path.display()
+        )));
+        assert_eq!(
+            pane_title_by_id(&state, launch_pane).as_deref(),
+            Some("flow: explain")
+        );
+        assert_eq!(
+            flow_poll_snapshot(&state),
+            vec![(launch_pane, pending.clone())]
+        );
+
+        // Ready: the flow opens as its own tab and the launch is forgotten.
+        let ready = crate::flow_explorer::FlowPane::open(&fixture_path()).expect("fixture");
+        assert!(apply_flow_poll(
+            &mut state,
+            vec![(launch_pane, PollOutcome::Ready(Box::new(ready)))],
+            pending.started_unix_ms + 5,
+        ));
+        assert!(state.flow_pending.is_empty());
+        assert_eq!(state.flows.len(), 1);
+        assert_eq!(state.tabs.len(), 3);
+        assert!(state.flows.contains_key(&state.active_pane.0));
+
+        // An outcome for a launch that is already gone is ignored.
+        assert!(!apply_flow_poll(
+            &mut state,
+            vec![(launch_pane, PollOutcome::TimedOut)],
+            0
+        ));
+        assert_eq!(state.toasts.len(), 0);
+
+        // Failures toast and forget.
+        state.flow_pending.insert(launch_pane, pending.clone());
+        assert!(apply_flow_poll(
+            &mut state,
+            vec![(
+                launch_pane,
+                PollOutcome::Failed {
+                    reason: "invalid_json",
+                    message: "explain-1.json: bad".to_string(),
+                    os_error: None,
+                }
+            )],
+            0,
+        ));
+        assert_eq!(state.toasts.len(), 1);
+        assert!(state.flow_pending.is_empty());
+
+        // Closing the launch pane drops its pending entry.
+        state.flow_pending.insert(launch_pane, pending);
+        forget_agent_restore(&mut state, launch_pane);
+        assert!(state.flow_pending.is_empty());
+
+        let _ = std::fs::remove_file(prompt_path);
+    }
+}
+
+#[cfg(test)]
+mod agents_tab_tests {
+    use super::tests::test_state;
+    use super::*;
+    use crate::agents::{AgentTag, AgentTagSource};
+
+    fn subtab_rows(ws: &Workspace) -> Vec<(String, Option<u32>, bool)> {
+        ws.subtabs
+            .iter()
+            .map(|s| (s.label.clone(), s.count, s.active))
+            .collect()
+    }
+
+    fn pane_ids(entries: &[TerminalEntry]) -> Vec<u32> {
+        entries.iter().map(|e| e.pane_id.0).collect()
+    }
+
+    #[test]
+    fn every_workspace_carries_a_terminals_and_an_agents_subtab() {
+        let state = seed_state();
+        for ws in &state.workspaces {
+            let labels: Vec<&str> = ws.subtabs.iter().map(|s| s.label.as_str()).collect();
+            assert_eq!(labels, vec!["terminals", "agents"], "{}", ws.name);
+            assert_eq!(ws.subtabs[1].icon, Some(SubtabIcon::Agent));
+        }
+        let fresh = new_workspace(9, "x".into(), None);
+        assert!(fresh.subtabs.iter().any(|s| s.label == "agents"));
+    }
+
+    #[test]
+    fn snapshot_splits_agent_panes_from_terminals_and_counts_each_list() {
+        let mut state = seed_state();
+        mutate_add_tab(&mut state);
+        let agent_pane = state.active_pane.0;
+        state
+            .pane_agents
+            .insert(agent_pane, AgentTag::new("claude", AgentTagSource::Title));
+
+        let snap = state.ui_snapshot();
+        let ws = &snap.workspaces[snap.active_workspace];
+        assert_eq!(pane_ids(&ws.terminal_entries), vec![1]);
+        assert_eq!(pane_ids(&ws.agent_entries), vec![agent_pane]);
+        assert_eq!(
+            ws.agent_entries[0]
+                .agent
+                .as_ref()
+                .map(|t| t.profile.as_str()),
+            Some("claude")
+        );
+        assert!(ws.terminal_entries[0].agent.is_none());
+        // The agent pane is the active one, so the amber rail sits on
+        // `agents`, not on `terminals`.
+        assert_eq!(
+            subtab_rows(ws),
+            vec![
+                ("terminals".to_string(), Some(1), false),
+                ("agents".to_string(), Some(1), true),
+            ]
+        );
+        assert!(snap.agent_pane_ids.contains(&agent_pane));
+        assert!(!snap.agent_pane_ids.contains(&1));
+    }
+
+    #[test]
+    fn hook_and_managed_records_count_as_agent_panes_without_a_title_tag() {
+        let mut state = seed_state();
+        state.agent_restarts.insert(
+            1,
+            crate::agent_restore::AgentRestart {
+                agent: crate::agent_restore::AgentKind::Codex,
+                cwd: std::env::current_dir().unwrap(),
+                resume_mode: crate::agent_restore::AgentResumeMode::Interactive,
+                session_id: None,
+                observed_at_unix_ms: 1,
+                managed: false,
+                launch_phase: crate::agent_restore::AgentLaunchPhase::Confirmed,
+            },
+        );
+        let tag = agent_tag_for_pane(&state, 1).expect("hook record tags the pane");
+        assert_eq!(tag.profile, "codex");
+        assert_eq!(tag.source, AgentTagSource::Hook);
+        let snap = state.ui_snapshot();
+        assert_eq!(pane_ids(&snap.workspaces[0].agent_entries), vec![1]);
+        assert!(snap.workspaces[0].terminal_entries.is_empty());
+    }
+
+    #[test]
+    fn title_classification_adds_keeps_and_clears_the_tag_on_transitions() {
+        let mut state = seed_state();
+        assert!(!classify_pane_title(&mut state, 1, "Windows PowerShell"));
+        assert!(!is_agent_pane(&state, 1));
+
+        assert!(classify_pane_title(&mut state, 1, "\u{2733} Claude Code"));
+        assert_eq!(
+            state.pane_agents.get(&1),
+            Some(&AgentTag::new("claude", AgentTagSource::Title))
+        );
+        // Same agent, new title: no transition, no churn.
+        assert!(!classify_pane_title(
+            &mut state,
+            1,
+            "\u{25D0} Editing sidebar.rs"
+        ));
+        // Back to the shell: the title tag clears.
+        assert!(classify_pane_title(&mut state, 1, "C:\\dev\\project"));
+        assert!(!is_agent_pane(&state, 1));
+    }
+
+    #[test]
+    fn launched_tags_are_never_overwritten_by_titles() {
+        let mut state = seed_state();
+        state
+            .pane_agents
+            .insert(1, AgentTag::new("codex", AgentTagSource::Launched));
+        assert!(!classify_pane_title(&mut state, 1, "\u{2733} Claude Code"));
+        assert!(!classify_pane_title(&mut state, 1, "bash"));
+        assert_eq!(state.pane_agents[&1].profile, "codex");
+    }
+
+    #[test]
+    fn osc_title_classifies_even_when_the_pane_label_is_pinned_by_a_rename() {
+        let mut state = seed_state();
+        mutate_rename_pane(&mut state, 1, "my agent");
+        // The pinned label does not change, so the return value (label
+        // changed) stays false; the classification still runs.
+        assert!(!mutate_apply_osc_title(
+            &mut state,
+            1,
+            "\u{2733} Claude Code"
+        ));
+        assert_eq!(
+            state.panes[0][0].title, "my agent",
+            "manual name still wins"
+        );
+        assert!(is_agent_pane(&state, 1));
+        assert!(
+            state.workspaces[0].agents_expanded,
+            "the agents fold opens on the first classification"
+        );
+        // An unknown pane never gets a stray tag.
+        assert!(!mutate_apply_osc_title(
+            &mut state,
+            999,
+            "\u{2733} Claude Code"
+        ));
+        assert!(!state.pane_agents.contains_key(&999));
+    }
+
+    #[test]
+    fn closing_a_pane_forgets_its_agent_tag() {
+        let mut state = seed_state();
+        mutate_add_tab(&mut state);
+        let pane = state.active_pane.0;
+        state
+            .pane_agents
+            .insert(pane, AgentTag::new("gemini", AgentTagSource::Title));
+        let active_tab = state.active_tab;
+        mutate_close_tab(&mut state, active_tab);
+        assert!(!state.pane_agents.contains_key(&pane));
+    }
+
+    #[test]
+    fn claude_launch_plan_pins_an_exact_session_id_into_the_command_line() {
+        let profile = crate::agents::profile("claude").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let (shell, restart) = agent_launch_plan(profile, &cwd);
+        assert_eq!(shell.program, profile.program_name());
+        assert_eq!(shell.args[0], "--session-id");
+        assert!(crate::agent_restore::is_valid_session_id(&shell.args[1]));
+        let record = restart.expect("claude is resumable");
+        assert_eq!(record.agent, crate::agent_restore::AgentKind::Claude);
+        assert!(record.managed);
+        assert_eq!(record.session_id.as_deref(), Some(shell.args[1].as_str()));
+        assert_eq!(record.cwd, cwd);
+        assert_eq!(
+            record.resume_mode,
+            crate::agent_restore::AgentResumeMode::Interactive
+        );
+    }
+
+    #[test]
+    fn codex_launch_plan_runs_interactively_and_is_rediscovered_by_cwd() {
+        let profile = crate::agents::profile("codex").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let (shell, restart) = agent_launch_plan(profile, &cwd);
+        assert_eq!(shell.program, profile.program_name());
+        assert!(shell.args.is_empty());
+        let record = restart.expect("codex is resumable");
+        assert!(record.session_id.is_none());
+        assert!(record.managed);
+        assert_eq!(
+            record.resume_mode,
+            crate::agent_restore::AgentResumeMode::Interactive
+        );
+        let (_, none) = agent_launch_plan(crate::agents::profile("gemini").unwrap(), &cwd);
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn new_claude_agent_tab_is_tagged_launched_and_spawns_the_planned_command() {
+        let mut state = seed_state();
+        let profile = crate::agents::profile("claude").unwrap();
+        assert!(mutate_add_agent_tab(&mut state, profile, "command"));
+        let pane = state.active_pane.0;
+        assert_eq!(state.panes[0][0].title, "Claude Code");
+        assert_eq!(state.tabs[state.active_tab].name, "Claude Code");
+        assert_eq!(
+            state.pane_agents.get(&pane),
+            Some(&AgentTag::new("claude", AgentTagSource::Launched))
+        );
+        // The spawn request is recorded before the daemon round trip, so
+        // it is observable even though no daemon runs under test.
+        let shell = state.pty_manager.spawn_shell(pane).expect("spawn recorded");
+        assert_eq!(shell.program, profile.program_name());
+        assert_eq!(shell.args[0], "--session-id");
+        assert!(crate::agent_restore::is_valid_session_id(&shell.args[1]));
+        let cwd = state.pty_manager.spawn_cwd(pane).expect("cwd recorded");
+        assert!(cwd.is_absolute());
+        let snap = state.ui_snapshot();
+        assert_eq!(pane_ids(&snap.workspaces[0].agent_entries), vec![pane]);
+        assert_eq!(pane_ids(&snap.workspaces[0].terminal_entries), vec![1]);
+    }
+
+    #[test]
+    fn agents_without_a_resume_provider_get_only_the_tag() {
+        let mut state = seed_state();
+        let profile = crate::agents::profile("gemini").unwrap();
+        assert!(mutate_add_agent_tab(&mut state, profile, "ctx_menu"));
+        let pane = state.active_pane.0;
+        assert!(!state.agent_restarts.contains_key(&pane));
+        assert_eq!(state.pane_agents[&pane].profile, "gemini");
+        assert_eq!(state.panes[0][0].title, "Gemini CLI");
+    }
+
+    #[test]
+    fn title_only_profiles_cannot_be_launched() {
+        let mut state = seed_state();
+        let before = state.tabs.len();
+        let profile = crate::agents::profile("openrouter").unwrap();
+        assert!(!mutate_add_agent_tab(&mut state, profile, "command"));
+        assert_eq!(state.tabs.len(), before);
+    }
+
+    #[test]
+    fn agent_new_dispatch_with_a_profile_opens_the_tab_in_the_active_workspace() {
+        let mut state = seed_state();
+        let before = state.tabs.len();
+        assert!(dispatch(&mut state, "agent.new:codex"));
+        assert_eq!(state.tabs.len(), before + 1);
+        assert_eq!(state.pane_agents[&state.active_pane.0].profile, "codex");
+    }
+
+    #[test]
+    fn agent_new_dispatch_rejects_unknown_profiles_with_a_toast() {
+        let mut state = seed_state();
+        let before = state.tabs.len();
+        assert!(!dispatch(&mut state, "agent.new:nope"));
+        assert_eq!(state.tabs.len(), before);
+        assert!(state
+            .toasts
+            .iter()
+            .any(|t| t.message.contains("Unknown agent")));
+    }
+
+    #[test]
+    fn workspace_new_agent_switches_workspaces_first() {
+        let mut state = seed_state();
+        assert_eq!(state.active_workspace, 0);
+        assert!(dispatch(&mut state, "workspace.new_agent:1:claude"));
+        assert_eq!(state.active_workspace, 1);
+        assert_eq!(state.pane_agents[&state.active_pane.0].profile, "claude");
+        assert!(state.ctx_menu.is_none());
+    }
+
+    #[test]
+    fn kill_agents_request_opens_a_scoped_dialog_and_confirm_spares_terminals() {
+        let mut state = seed_state();
+        state.terminals.insert(
+            1,
+            Arc::new(Mutex::new(crate::terminal::Terminal::new(24, 80))),
+        );
+        // Pane 1 stays a terminal; two agent tabs join it.
+        dispatch(&mut state, "agent.new:claude");
+        let agent_a = state.active_pane.0;
+        dispatch(&mut state, "agent.new:codex");
+        let agent_b = state.active_pane.0;
+
+        assert!(dispatch(&mut state, "workspace.request_kill_agents:0"));
+        assert_eq!(
+            state.confirm_dialog,
+            Some(ConfirmDialog::KillAgents {
+                workspace_idx: 0,
+                name: state.workspaces[0].name.clone(),
+                count: 2,
+            })
+        );
+        assert!(dispatch(&mut state, "dialog.confirm"));
+        assert!(state.confirm_dialog.is_none());
+        let remaining: Vec<u32> = state.panes.iter().flatten().map(|p| p.id.0).collect();
+        assert_eq!(remaining, vec![1]);
+        assert_eq!(state.tabs.len(), 1);
+        for id in [agent_a, agent_b] {
+            assert!(!state.pane_agents.contains_key(&id));
+            assert!(!state.agent_restarts.contains_key(&id));
+            assert!(!state.terminals.contains_key(&id));
+        }
+        assert!(state.terminals.contains_key(&1));
+    }
+
+    #[test]
+    fn kill_agents_request_without_agents_is_a_toast_not_a_dialog() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "workspace.request_kill_agents:0"));
+        assert!(state.confirm_dialog.is_none());
+        assert!(state
+            .toasts
+            .iter()
+            .any(|t| t.message.contains("No agents running")));
+    }
+
+    #[test]
+    fn ctx_menu_open_subtab_dispatch_targets_the_subtab() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "ctx_menu.open_subtab:0:agents:40:80"));
+        match state.ctx_menu.as_ref().map(|m| (&m.target, m.x, m.y)) {
+            Some((CtxMenuTarget::Subtab { idx, kind }, x, y)) => {
+                assert_eq!(*idx, 0);
+                assert_eq!(*kind, SubtabKind::Agents);
+                assert_eq!((x, y), (40.0, 80.0));
+            }
+            other => panic!("unexpected menu {other:?}"),
+        }
+        assert!(!dispatch(&mut state, "ctx_menu.open_subtab:0:bogus:1:1"));
+        assert!(!dispatch(&mut state, "ctx_menu.open_subtab:99:agents:1:1"));
+    }
+
+    #[test]
+    fn restore_layout_rehydrates_tags_and_classifies_legacy_titles() {
+        let mut persisted = crate::persist::PersistedState::from_state(&seed_state());
+        let pane = &mut persisted.workspaces[0].tabs[0].panes[0][0];
+        pane.title = "\u{2733} Claude Code".into();
+        pane.agent_tag = None;
+        let mut state = test_state();
+        restore_layout(&mut state, &persisted);
+        assert_eq!(
+            state.pane_agents.get(&1),
+            Some(&AgentTag::new("claude", AgentTagSource::Title))
+        );
+
+        let pane = &mut persisted.workspaces[0].tabs[0].panes[0][0];
+        pane.title = "renamed".into();
+        pane.custom_title = true;
+        pane.agent_tag = Some(AgentTag::new("aider", AgentTagSource::Launched));
+        let mut state = test_state();
+        restore_layout(&mut state, &persisted);
+        assert_eq!(state.pane_agents[&1].profile, "aider");
+        assert!(state.custom_titled_panes.contains(&1));
     }
 }

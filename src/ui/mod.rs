@@ -2,6 +2,7 @@ pub mod command_palette;
 pub mod confirm_dialog;
 pub mod drag_overlay;
 pub mod editor_pane;
+pub mod flow_pane;
 pub mod fps_overlay;
 pub mod icons;
 pub mod settings;

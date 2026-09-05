@@ -107,7 +107,7 @@ pub fn capture_screen(path: &Path) -> Result<(), String> {
             return Err("GetDIBits failed while capturing screenshot".to_owned());
         }
 
-        for px in bgra.chunks_exact_mut(4) {
+        for px in bgra.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
             px[3] = 255;
         }
