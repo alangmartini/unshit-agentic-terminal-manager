@@ -16,6 +16,7 @@ pub mod scroll;
 pub mod shortcut;
 pub mod style;
 pub mod svg;
+pub mod text_fallback;
 pub mod toast;
 pub mod trace;
 pub mod tree;
