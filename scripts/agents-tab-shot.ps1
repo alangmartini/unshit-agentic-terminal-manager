@@ -7,10 +7,12 @@
   Verification shot for the sidebar "agents" subtab (issue #186). Without
   any agent CLI installed and without provider hooks, the app must still
   file a pane under `agents` purely from the guest window title: the script
-  sets the workspace shell to a PowerShell whose -Command writes a Claude
-  Code style title (ConPTY forwards SetConsoleTitle as OSC 0), opens a new
-  tab with it, then opens the agents-subtab context menu so "New agent" and
-  "Kill all agents" are visible in the capture.
+  sets the workspace shell to a PowerShell running a small -File script
+  that reports a Claude Code style title (ConPTY forwards SetConsoleTitle
+  as OSC 0), opens a new tab with it, then opens the agents-subtab context
+  menu so "New agent" and "Kill all agents" are visible in the capture.
+  Pass -NoMenu for the bare tree and -ExtraDispatch to append commands
+  (e.g. 'agent.new:bogus' to land agent.launch_failed).
 
   Drives the app through TM_STARTUP_DISPATCH (no synthesized input, no focus
   stealing) and captures with PrintWindow(PW_RENDERFULLCONTENT). Runs under a
