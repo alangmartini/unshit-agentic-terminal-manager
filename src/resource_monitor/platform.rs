@@ -5,12 +5,20 @@
 //! Only Windows is implemented (the app is Windows-only today). Other
 //! platforms report `None` from every probe, which the UI renders as `--`.
 
+use std::collections::HashMap;
+
 use super::cpu::ProcSample;
 use super::tree::ProcessRecord;
 
 /// Snapshot of every process on the machine as `(pid, parent pid)`.
 pub fn enumerate_processes() -> Option<Vec<ProcessRecord>> {
-    imp::enumerate_processes()
+    enumerate_processes_named().map(|(records, _)| records)
+}
+
+/// The process table plus each pid's image name (`pwsh.exe`), read from
+/// the same snapshot so the two never disagree.
+pub fn enumerate_processes_named() -> Option<(Vec<ProcessRecord>, HashMap<u32, String>)> {
+    imp::enumerate_processes_named()
 }
 
 /// Creation time, cumulative CPU time and working set of one process.
@@ -37,7 +45,7 @@ pub fn logical_cpus() -> usize {
 
 #[cfg(windows)]
 mod imp {
-    use super::{ProcSample, ProcessRecord};
+    use super::{HashMap, ProcSample, ProcessRecord};
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE, SYSTEMTIME};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -62,10 +70,12 @@ mod imp {
         }
     }
 
-    pub fn enumerate_processes() -> Option<Vec<ProcessRecord>> {
+    pub fn enumerate_processes_named() -> Option<(Vec<ProcessRecord>, HashMap<u32, String>)> {
         // SAFETY: the snapshot handle is checked against INVALID_HANDLE_VALUE
         // before use and closed on every path out. PROCESSENTRY32W is plain
         // data; dwSize is set as the API requires before the first call.
+        // szExeFile is a fixed NUL-terminated UTF-16 buffer; the slice stops
+        // at the first NUL or the buffer end.
         unsafe {
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
@@ -74,16 +84,28 @@ mod imp {
             let mut entry: PROCESSENTRY32W = std::mem::zeroed();
             entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
             let mut out = Vec::with_capacity(512);
+            let mut names = HashMap::with_capacity(512);
             let mut ok = Process32FirstW(snapshot, &mut entry);
             while ok != 0 {
                 out.push(ProcessRecord {
                     pid: entry.th32ProcessID,
                     parent_pid: entry.th32ParentProcessID,
                 });
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                if len > 0 {
+                    names.insert(
+                        entry.th32ProcessID,
+                        String::from_utf16_lossy(&entry.szExeFile[..len]),
+                    );
+                }
                 ok = Process32NextW(snapshot, &mut entry);
             }
             CloseHandle(snapshot);
-            Some(out)
+            Some((out, names))
         }
     }
 
@@ -144,9 +166,9 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use super::{ProcSample, ProcessRecord};
+    use super::{HashMap, ProcSample, ProcessRecord};
 
-    pub fn enumerate_processes() -> Option<Vec<ProcessRecord>> {
+    pub fn enumerate_processes_named() -> Option<(Vec<ProcessRecord>, HashMap<u32, String>)> {
         None
     }
 

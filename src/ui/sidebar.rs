@@ -355,7 +355,31 @@ fn build_terminal_entry(
     }
     row = row.with_child(tag);
 
+    // The pane's process-tree usage, only once the sampler has attributed
+    // the pane's shell: an unknown pane gets no chip rather than `0.0%`.
+    if let Some(usage) = &entry.usage {
+        row = row.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("terminal-entry-usage")
+                .with_class("tnum")
+                .with_text(usage_chip_text(usage)),
+        );
+    }
+
     row
+}
+
+/// `4.2% · 164M` for a sidebar row; `--%` while the CPU baseline is still
+/// one tick away. Short units because the row also carries a branch chip.
+pub(crate) fn usage_chip_text(usage: &crate::resource_monitor::TreeUsage) -> String {
+    let cpu = match usage.cpu_pct {
+        Some(pct) => format!("{pct:.1}%"),
+        None => "--%".to_string(),
+    };
+    format!(
+        "{cpu} \u{00B7} {}",
+        crate::resource_monitor::format_short_bytes(usage.mem_bytes)
+    )
 }
 
 fn build_sidebar_footer(state: &UiSnapshot) -> ElementDef {
@@ -1205,6 +1229,7 @@ mod tests {
             branch_muted: true,
             branch_error: false,
             pane_id: crate::state::PaneId(0),
+            usage: None,
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
@@ -1220,6 +1245,7 @@ mod tests {
             branch_muted: false,
             branch_error: false,
             pane_id: crate::state::PaneId(42),
+            usage: None,
         };
         let row = build_terminal_entry(0, &entry, true, true, &shared);
 
@@ -1329,6 +1355,107 @@ mod tests {
         );
     }
 
+    /// Lay the sidebar out at `sidebar_px` with a sampled pane and return
+    /// (name width, branch chip width, usage chip width, row right edge,
+    /// usage chip right edge); the chip figures are `None` when no chip
+    /// rendered.
+    fn usage_row_layout(sidebar_px: u32) -> (f32, f32, Option<f32>, f32, Option<f32>) {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.sidebar_width = sidebar_px as f32;
+            guard.workspaces[0].terminals_expanded = true;
+            guard.workspaces[0].git_branch =
+                crate::state::GitBranch::Known("worktree-wondrous-booping-bentley".to_string());
+            guard.panes[0][0].title = "powershell".to_string();
+            guard.panes[0][0].pid = 4242;
+            guard.resource_trees.insert(
+                4242,
+                crate::resource_monitor::TreeUsage {
+                    cpu_pct: Some(4.2),
+                    mem_bytes: 163 << 20,
+                    process_count: 4,
+                    root_exe: None,
+                },
+            );
+        }
+        let state = shared.lock().unwrap().ui_snapshot();
+        let tree_shared = shared.clone();
+        let tree_state = state.clone();
+        // The app sizes `.sidebar` from `sidebar_width` at the root layout;
+        // the harness has no root, so pin the width the same way.
+        let css = format!(
+            "{}\n.sidebar-test-root {{ display: flex; width: {sidebar_px}px; height: 720px; }}\n.sidebar-test-root .sidebar {{ width: {sidebar_px}px; min-width: {sidebar_px}px; max-width: {sidebar_px}px; }}",
+            include_str!("../../assets/styles.css")
+        );
+        let mut harness = TestHarness::new(
+            &css,
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("sidebar-test-root")
+                    .with_child(build_sidebar(&tree_state, &tree_shared)),
+            },
+            1280.0,
+            720.0,
+        );
+        harness.step();
+        let name = harness.query(".terminal-entry-name").expect("name");
+        let branch = harness
+            .query(".terminal-entry .branch-tag")
+            .expect("branch");
+        let usage = harness.query(".terminal-entry-usage");
+        let row = harness.query(".terminal-entry").expect("row");
+        let sidebar = harness.query(".sidebar").expect("sidebar");
+        eprintln!(
+            "sidebar {sidebar_px}px -> sidebar {:?} row {:?} name {:?} branch {:?} usage {:?}",
+            sidebar.layout_rect,
+            row.layout_rect,
+            name.layout_rect,
+            branch.layout_rect,
+            usage.as_ref().map(|u| u.layout_rect)
+        );
+        (
+            name.layout_rect.width,
+            branch.layout_rect.width,
+            usage.as_ref().map(|u| u.layout_rect.width),
+            row.layout_rect.x + row.layout_rect.width,
+            usage
+                .as_ref()
+                .map(|u| u.layout_rect.x + u.layout_rect.width),
+        )
+    }
+
+    #[test]
+    fn usage_chip_is_dropped_at_the_default_sidebar_width() {
+        // 252px cannot hold name + branch + usage: the chip yields entirely
+        // rather than crushing the name to an ellipsis.
+        let (name, _branch, usage, _row_end, _usage_end) = usage_row_layout(252);
+        assert!(usage.is_none(), "no usage chip at 252px, got {usage:?}px");
+        assert!(name >= 70.0, "name still readable: {name}px");
+    }
+
+    #[test]
+    fn usage_chip_never_crushes_the_entry_name_on_wider_sidebars() {
+        for sidebar_px in [320, 505] {
+            let (name, branch, usage, row_end, usage_end) = usage_row_layout(sidebar_px);
+            let usage = usage.unwrap_or_else(|| panic!("usage chip at {sidebar_px}px"));
+            let usage_end = usage_end.expect("usage chip end");
+            assert!(
+                name >= 70.0,
+                "sidebar {sidebar_px}px: name crushed to {name}px (branch {branch}px, usage {usage}px)"
+            );
+            assert!(
+                usage >= 40.0,
+                "sidebar {sidebar_px}px: usage chip itself unreadable at {usage}px"
+            );
+            assert!(
+                usage_end <= row_end + 0.5,
+                "sidebar {sidebar_px}px: usage chip overflows the row ({usage_end} > {row_end})"
+            );
+        }
+    }
+
     #[test]
     fn tab_ctx_menu_header_uses_saved_pane_title() {
         let shared = make_shared();
@@ -1389,6 +1516,7 @@ mod tests {
             branch_muted: false,
             branch_error: false,
             pane_id: crate::state::PaneId(0),
+            usage: None,
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
@@ -1403,6 +1531,7 @@ mod tests {
             branch_muted: false,
             branch_error: true,
             pane_id: crate::state::PaneId(0),
+            usage: None,
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
@@ -1417,10 +1546,59 @@ mod tests {
             branch_muted: false,
             branch_error: false,
             pane_id: crate::state::PaneId(0),
+            usage: None,
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
         let branch_tag = find_by_class(&el, "branch-tag").expect("branch-tag not found");
         assert!(!has_class(branch_tag, "error"));
+    }
+
+    #[test]
+    fn terminal_entry_without_sampled_usage_has_no_usage_chip() {
+        let entry = TerminalEntry {
+            name: "zsh".to_string(),
+            branch: "main".to_string(),
+            branch_muted: false,
+            branch_error: false,
+            pane_id: crate::state::PaneId(0),
+            usage: None,
+        };
+        let el = build_terminal_entry(0, &entry, false, false, &make_shared());
+        assert!(
+            find_by_class(&el, "terminal-entry-usage").is_none(),
+            "an unattributed pane must not read 0.0%"
+        );
+    }
+
+    #[test]
+    fn terminal_entry_usage_chip_shows_the_tree_figures() {
+        let entry = TerminalEntry {
+            name: "claude".to_string(),
+            branch: "main".to_string(),
+            branch_muted: false,
+            branch_error: false,
+            pane_id: crate::state::PaneId(3),
+            usage: Some(crate::resource_monitor::TreeUsage {
+                cpu_pct: Some(4.16),
+                mem_bytes: 164 << 20,
+                process_count: 5,
+                root_exe: None,
+            }),
+        };
+        let el = build_terminal_entry(0, &entry, false, false, &make_shared());
+        let chip = find_by_class(&el, "terminal-entry-usage").expect("usage chip");
+        assert_eq!(text_of(chip), Some("4.2% \u{00B7} 164M"));
+        // The chip trails the branch tag so the branch keeps absorbing overflow.
+        let last = el.children.last().expect("children");
+        assert!(has_class(last, "terminal-entry-usage"));
+
+        let baseline_pending = crate::resource_monitor::TreeUsage {
+            cpu_pct: None,
+            mem_bytes: 1 << 30,
+            process_count: 1,
+            root_exe: None,
+        };
+        assert_eq!(usage_chip_text(&baseline_pending), "--% \u{00B7} 1.0G");
     }
 
     #[test]

@@ -16,7 +16,10 @@
 //!    just spawned, not only the shell ([`tree`]),
 //! 3. reads each attributed process's CPU time and working set and diffs
 //!    CPU against the previous tick ([`cpu`]),
-//! 4. writes the totals and per-pane figures into `AppState` and requests a
+//! 4. writes the totals, the per-pane figures, the per-root tree map
+//!    (`AppState::resource_trees`, read by the status bar's tab item, the
+//!    sidebar chips and the Sessions panel) and, when the daemon was just
+//!    listed, the Sessions panel rows into `AppState`, then requests a
 //!    rebuild **only if a displayed value changed**.
 //!
 //! Unknown is rendered as `--`, never as `0.0`: before the first CPU diff,
@@ -39,7 +42,7 @@ use std::time::{Duration, Instant};
 use unshit::app::{EventSink, ExternalEvent};
 
 use crate::pty::SessionLister;
-use crate::state::{AppState, MutexExt, SharedState};
+use crate::state::{AppState, MutexExt, SessionSnapshot, SharedState};
 use cpu::{CpuTracker, ProcSample};
 use telemetry::ResourceEventRecord;
 
@@ -69,6 +72,30 @@ pub struct PaneResources {
     pub process_count: u32,
 }
 
+/// Usage of one process tree, keyed in `AppState::resource_trees` by its
+/// root pid: the UI, the daemon or a session's shell. The Sessions panel,
+/// the sidebar chips and the status bar's tab item read it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TreeUsage {
+    /// `None` until a second tick provides a baseline.
+    pub cpu_pct: Option<f32>,
+    /// Working set summed over the tree.
+    pub mem_bytes: u64,
+    pub process_count: u32,
+    /// Image name of the root process (`pwsh.exe`), the shell that is
+    /// actually running rather than whatever the pane was seeded with.
+    pub root_exe: Option<String>,
+}
+
+/// The daemon's session list as of a roots refresh. Applied to the state
+/// so the Sessions panel rows follow the daemon without a manual refresh.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DaemonListing {
+    pub daemon_pid: Option<u32>,
+    pub daemon_memory_rss_bytes: Option<u64>,
+    pub sessions: Vec<SessionSnapshot>,
+}
+
 /// What one tick found. Every total is `None` when it is not known.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResourceReport {
@@ -80,6 +107,12 @@ pub struct ResourceReport {
     pub net_kbps: Option<f32>,
     pub clock_hhmm: Option<String>,
     pub panes: Vec<PaneResources>,
+    /// Every sampled tree by root pid; empty when nothing could be sampled.
+    pub trees: HashMap<u32, TreeUsage>,
+    /// Fresh daemon rows when the roots were refreshed this tick.
+    pub listing: Option<DaemonListing>,
+    /// Whether the daemon could not be listed, so cached rows may be stale.
+    pub listing_failed: bool,
 }
 
 /// Write a report into the state. Returns whether anything the status bar
@@ -93,6 +126,15 @@ pub fn apply_report(state: &mut AppState, report: &ResourceReport) -> bool {
     state.net_kbps = report.net_kbps;
     if let Some(clock) = &report.clock_hhmm {
         state.clock_hhmm.clone_from(clock);
+    }
+    state.resource_trees.clone_from(&report.trees);
+    if let Some(listing) = &report.listing {
+        state.daemon_pid = listing.daemon_pid;
+        state.daemon_memory_rss_bytes = listing.daemon_memory_rss_bytes;
+        state.sessions.clone_from(&listing.sessions);
+        state.sessions_stale = false;
+    } else if report.listing_failed {
+        state.sessions_stale = true;
     }
 
     let by_pane: HashMap<u32, &PaneResources> =
@@ -142,28 +184,92 @@ fn all_panes(state: &AppState) -> impl Iterator<Item = &crate::state::Pane> {
 }
 
 /// Everything the UI renders from resource data, quantised to what is
-/// visible (one decimal of percent, two of GiB, whole MiB per pane).
+/// visible (one decimal of percent, two of GiB, whole MiB per tree).
 #[derive(Debug, PartialEq, Eq)]
 struct DisplayKey {
     cpu_tenths: Option<i64>,
     mem_hundredths: Option<i64>,
     net_tenths: Option<i64>,
     clock: String,
-    panes: Vec<(u32, u32, i64, u64)>,
+    /// Pane id, pid, cpu tenths, whole MiB, process count: what the pane
+    /// header, the sidebar chip and the status bar's tab item show.
+    panes: Vec<(u32, u32, i64, u64, u32)>,
+    /// What the Sessions panel shows, only while it is open; a closed panel
+    /// must not cost a rebuild when an unowned session's memory moves.
+    sessions_panel: Option<SessionsPanelKey>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SessionsPanelKey {
+    /// Root pid, cpu tenths (`-1` unknown), whole MiB, process count.
+    trees: Vec<(u32, i64, u64, u32)>,
+    rows: Vec<SessionSnapshot>,
+    daemon_pid: Option<u32>,
+    daemon_mem_mib: Option<u64>,
+    stale: bool,
 }
 
 impl DisplayKey {
     fn of(state: &AppState) -> Self {
         let tenths = |v: f32| (v * 10.0).round() as i64;
+        let count_of = |pid: u32| {
+            state
+                .resource_trees
+                .get(&pid)
+                .map_or(0, |t| t.process_count)
+        };
+        let sessions_open = state.settings_open
+            && state.settings_section == crate::state::SettingsSection::Sessions;
         Self {
             cpu_tenths: state.cpu_pct.map(tenths),
             mem_hundredths: state.mem_gb.map(|v| (v * 100.0).round() as i64),
             net_tenths: state.net_kbps.map(tenths),
             clock: state.clock_hhmm.clone(),
             panes: all_panes(state)
-                .map(|p| (p.id.0, p.pid, tenths(p.cpu), p.mem_bytes >> 20))
+                .map(|p| {
+                    (
+                        p.id.0,
+                        p.pid,
+                        tenths(p.cpu),
+                        p.mem_bytes >> 20,
+                        count_of(p.pid),
+                    )
+                })
                 .collect(),
+            sessions_panel: sessions_open.then(|| {
+                let mut trees: Vec<(u32, i64, u64, u32)> = state
+                    .resource_trees
+                    .iter()
+                    .map(|(&pid, t)| {
+                        (
+                            pid,
+                            t.cpu_pct.map_or(-1, tenths),
+                            t.mem_bytes >> 20,
+                            t.process_count,
+                        )
+                    })
+                    .collect();
+                trees.sort_unstable();
+                SessionsPanelKey {
+                    trees,
+                    rows: state.sessions.clone(),
+                    daemon_pid: state.daemon_pid,
+                    daemon_mem_mib: state.daemon_memory_rss_bytes.map(|b| b >> 20),
+                    stale: state.sessions_stale,
+                }
+            }),
         }
+    }
+}
+
+/// `412M` / `1.2G`: the sidebar chip has room for little more.
+pub fn format_short_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let value = bytes as f64;
+    if value >= MIB * 1024.0 {
+        format!("{:.1}G", value / (MIB * 1024.0))
+    } else {
+        format!("{:.0}M", value / MIB)
     }
 }
 
@@ -241,6 +347,9 @@ struct RootsCache {
     /// Whether the daemon has ever been listed; until then totals are
     /// unknown rather than "UI only".
     ever_listed: bool,
+    /// Rows from the latest successful list, handed to the next report
+    /// once so the Sessions panel follows the daemon.
+    fresh: Option<DaemonListing>,
 }
 
 struct Monitor {
@@ -295,6 +404,8 @@ impl Monitor {
         let output_bytes = crate::pty::output_bytes_total();
         let mut report = ResourceReport {
             clock_hhmm: platform::local_time_hhmm(),
+            listing: self.roots.fresh.take(),
+            listing_failed: self.roots.failing,
             ..ResourceReport::default()
         };
 
@@ -344,6 +455,23 @@ impl Monitor {
                     })
                     .collect();
                 self.roots.daemon_pid = snapshot.daemon_pid;
+                self.roots.fresh = Some(DaemonListing {
+                    daemon_pid: snapshot.daemon_pid,
+                    daemon_memory_rss_bytes: snapshot.daemon_memory_rss_bytes,
+                    sessions: snapshot
+                        .sessions
+                        .iter()
+                        .map(|s| SessionSnapshot {
+                            session_id: s.id,
+                            pane_id: s.pane_id,
+                            workspace_id: s.workspace_id,
+                            name: s.name.clone(),
+                            pid: s.pid,
+                            memory_rss_bytes: s.memory_rss_bytes,
+                            alive: s.alive,
+                        })
+                        .collect(),
+                });
                 self.roots.owned = owned;
                 self.roots.refreshed_at = Some(Instant::now());
                 self.roots.ever_listed = true;
@@ -374,7 +502,7 @@ impl Monitor {
     }
 
     fn sample_trees(&mut self, report: &mut ResourceReport, now_100ns: u64, now_wall: Instant) {
-        let Some(table) = platform::enumerate_processes() else {
+        let Some((table, image_names)) = platform::enumerate_processes_named() else {
             self.last_processes = 0;
             self.last_unsampled = 0;
             return;
@@ -426,21 +554,33 @@ impl Monitor {
             .as_ref()
             .map(|_| cpu::percent(total_cpu, wall_delta_100ns, self.logical_cpus));
 
+        report.trees = per_root
+            .iter()
+            .map(|(&root, &(cpu_delta, mem, count))| {
+                let usage = TreeUsage {
+                    cpu_pct: deltas
+                        .as_ref()
+                        .map(|_| cpu::percent(cpu_delta, wall_delta_100ns, self.logical_cpus)),
+                    mem_bytes: mem,
+                    process_count: count,
+                    root_exe: image_names.get(&root).cloned(),
+                };
+                (root, usage)
+            })
+            .collect();
         report.panes = self
             .roots
             .sessions
             .iter()
             .filter_map(|session| {
                 let pane_id = session.pane_id?;
-                let (cpu_delta, mem, count) = per_root.get(&session.pid).copied()?;
+                let usage = report.trees.get(&session.pid)?;
                 Some(PaneResources {
                     pane_id,
                     pid: session.pid,
-                    cpu_pct: deltas
-                        .as_ref()
-                        .map(|_| cpu::percent(cpu_delta, wall_delta_100ns, self.logical_cpus)),
-                    mem_bytes: mem,
-                    process_count: count,
+                    cpu_pct: usage.cpu_pct,
+                    mem_bytes: usage.mem_bytes,
+                    process_count: usage.process_count,
                 })
             })
             .collect();
@@ -497,6 +637,7 @@ mod tests {
                 mem_bytes: 512 << 20,
                 process_count: 3,
             }],
+            ..ResourceReport::default()
         };
 
         assert!(apply_report(&mut state, &report));
@@ -550,6 +691,7 @@ mod tests {
                 mem_bytes: 100 << 20,
                 process_count: 1,
             }],
+            ..ResourceReport::default()
         };
         assert!(apply_report(&mut state, &report));
         assert!(!apply_report(&mut state, &report), "identical report");
@@ -640,5 +782,123 @@ mod tests {
         assert_eq!(COUNT.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(monitor.ticks, 0, "accumulators reset after a summary");
         assert_eq!(monitor.max_tick, Duration::ZERO);
+    }
+
+    #[test]
+    fn trees_and_daemon_rows_land_in_state_for_the_sessions_panel() {
+        let mut state = seed_state();
+        state.sessions_stale = true;
+        let mut trees = HashMap::new();
+        trees.insert(
+            4242,
+            TreeUsage {
+                cpu_pct: Some(2.0),
+                mem_bytes: 300 << 20,
+                process_count: 4,
+                root_exe: None,
+            },
+        );
+        let report = ResourceReport {
+            trees,
+            listing: Some(DaemonListing {
+                daemon_pid: Some(77),
+                daemon_memory_rss_bytes: Some(20 << 20),
+                sessions: vec![SessionSnapshot {
+                    session_id: 9,
+                    pane_id: 1,
+                    workspace_id: 1,
+                    name: None,
+                    pid: Some(4242),
+                    memory_rss_bytes: Some(30 << 20),
+                    alive: true,
+                }],
+            }),
+            ..ResourceReport::default()
+        };
+        apply_report(&mut state, &report);
+        assert_eq!(state.resource_trees[&4242].process_count, 4);
+        assert_eq!(state.daemon_pid, Some(77));
+        assert_eq!(state.daemon_memory_rss_bytes, Some(20 << 20));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].pid, Some(4242));
+        assert!(!state.sessions_stale, "a fresh listing clears stale");
+
+        let failed = ResourceReport {
+            listing_failed: true,
+            ..ResourceReport::default()
+        };
+        apply_report(&mut state, &failed);
+        assert!(
+            state.sessions_stale,
+            "a failed listing marks cached rows stale"
+        );
+        assert!(
+            state.resource_trees.is_empty(),
+            "nothing sampled, nothing claimed"
+        );
+        assert_eq!(state.sessions.len(), 1, "the cached rows themselves stay");
+    }
+
+    #[test]
+    fn unowned_tree_changes_rebuild_only_while_the_sessions_panel_is_open() {
+        let mut state = seed_state();
+        let mut report = ResourceReport {
+            clock_hhmm: Some("10:00".into()),
+            ..ResourceReport::default()
+        };
+        report.trees.insert(
+            555,
+            TreeUsage {
+                cpu_pct: Some(1.0),
+                mem_bytes: 10 << 20,
+                process_count: 1,
+                root_exe: None,
+            },
+        );
+        assert!(apply_report(&mut state, &report));
+        report.trees.get_mut(&555).unwrap().mem_bytes = 200 << 20;
+        assert!(
+            !apply_report(&mut state, &report),
+            "closed panel: no pane shows pid 555, so nothing visible changed"
+        );
+
+        state.settings_open = true;
+        state.settings_section = crate::state::SettingsSection::Sessions;
+        report.trees.get_mut(&555).unwrap().mem_bytes = 300 << 20;
+        assert!(
+            apply_report(&mut state, &report),
+            "open panel renders the tree, so the change is visible"
+        );
+    }
+
+    #[test]
+    fn a_pane_tree_process_count_change_is_visible_in_the_status_bar() {
+        let mut state = seed_state();
+        let pane_id = first_pane_id(&state);
+        let mut report = ResourceReport {
+            panes: vec![PaneResources {
+                pane_id,
+                pid: 7,
+                cpu_pct: Some(1.0),
+                mem_bytes: 100 << 20,
+                process_count: 1,
+            }],
+            ..ResourceReport::default()
+        };
+        report.trees.insert(
+            7,
+            TreeUsage {
+                cpu_pct: Some(1.0),
+                mem_bytes: 100 << 20,
+                process_count: 1,
+                root_exe: None,
+            },
+        );
+        assert!(apply_report(&mut state, &report));
+        report.trees.get_mut(&7).unwrap().process_count = 2;
+        assert!(
+            apply_report(&mut state, &report),
+            "the tab item shows the process count"
+        );
     }
 }

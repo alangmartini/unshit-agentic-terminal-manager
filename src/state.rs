@@ -324,6 +324,13 @@ impl SettingsSection {
             SettingsSection::DangerZone,
         ]
     }
+
+    /// Inverse of [`label`](Self::label); `danger-zone` is accepted too so
+    /// the id survives a shell command line.
+    pub fn from_label(label: &str) -> Option<Self> {
+        let wanted = label.trim().to_ascii_lowercase().replace('-', " ");
+        Self::all().into_iter().find(|s| s.label() == wanted)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -757,6 +764,12 @@ pub enum SubtabIcon {
     EnvList,
 }
 
+/// Sidebar width (CSS px) below which terminal rows drop their usage chip.
+/// At the default 252px the name, the branch chip and `4.2% · 163M` cannot
+/// share one row without crushing the name to an ellipsis; the figures
+/// stay one click away in the pane header and the status bar.
+pub const SIDEBAR_USAGE_MIN_WIDTH: f32 = 300.0;
+
 #[derive(Clone, Debug)]
 pub struct TerminalEntry {
     pub name: String,
@@ -766,6 +779,9 @@ pub struct TerminalEntry {
     /// Pane this entry represents. Links the sidebar row to a real pane so
     /// clicks can focus that pane in that workspace.
     pub pane_id: PaneId,
+    /// Live usage of the pane's process tree, `None` until the resource
+    /// monitor has attributed the pane's shell. Rendered as a chip.
+    pub usage: Option<crate::resource_monitor::TreeUsage>,
 }
 
 #[derive(Clone, Debug)]
@@ -1009,6 +1025,11 @@ pub struct AppState {
     /// the user sees that the cached rows may not match the daemon.
     /// Cleared on the next successful refresh.
     pub sessions_stale: bool,
+    /// Live usage of every process tree the resource monitor sampled, by
+    /// root pid (UI, daemon, session shells). Written once a second; the
+    /// Sessions panel, sidebar chips and status bar read it. Empty while
+    /// nothing could be sampled.
+    pub resource_trees: std::collections::HashMap<u32, crate::resource_monitor::TreeUsage>,
     /// Monotonic count of frames presented while app diagnostics are enabled.
     pub diagnostic_frame_counter: u64,
     /// Wall-clock time for the last presented frame, in Unix epoch
@@ -1093,6 +1114,9 @@ impl AppState {
                 branch_muted,
                 branch_error,
                 pane_id: p.id,
+                usage: (p.pid != 0 && self.sidebar_width >= SIDEBAR_USAGE_MIN_WIDTH)
+                    .then(|| self.resource_trees.get(&p.pid).cloned())
+                    .flatten(),
             };
             let entries: Vec<TerminalEntry> = if idx == active_idx {
                 // Active workspace: live panes for the active tab, saved
@@ -1192,6 +1216,7 @@ impl AppState {
             daemon_pid: self.daemon_pid,
             daemon_memory_rss_bytes: self.daemon_memory_rss_bytes,
             sessions_stale: self.sessions_stale,
+            resource_trees: self.resource_trees.clone(),
             diagnostic_scroll_samples: self.diagnostic_scroll_samples.iter().cloned().collect(),
             toasts: self
                 .toasts
@@ -1315,6 +1340,11 @@ pub struct UiSnapshot {
     /// Mirrors `AppState::sessions_stale`. `true` when the most recent
     /// `list_sessions` RPC failed and the cached rows may be stale.
     pub sessions_stale: bool,
+    /// Live usage of every process tree the resource monitor sampled, by
+    /// root pid (UI, daemon, session shells). Written once a second; the
+    /// Sessions panel, sidebar chips and status bar read it. Empty while
+    /// nothing could be sampled.
+    pub resource_trees: std::collections::HashMap<u32, crate::resource_monitor::TreeUsage>,
     /// Recent smooth-scroll samples from framework diagnostics.
     pub diagnostic_scroll_samples: Vec<DiagnosticScrollSample>,
     /// Flat projection of the live `ToastStore`. Push order preserved.
@@ -1528,6 +1558,7 @@ pub fn seed_state() -> AppState {
         daemon_pid: None,
         daemon_memory_rss_bytes: None,
         sessions_stale: false,
+        resource_trees: std::collections::HashMap::new(),
         diagnostic_frame_counter: 0,
         diagnostic_last_present_unix_ms: None,
         diagnostic_scroll_samples: VecDeque::new(),
@@ -6544,6 +6575,34 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             dispatch_terminal_export_info_for_pane(state, pane_id)
         }
+        // Set the sidebar width in CSS px (`sidebar.width:360`), clamped
+        // like the resizer drag. Scriptable so e2e shots can exercise the
+        // width-dependent sidebar rows without a synthesized drag.
+        other if other.starts_with("sidebar.width:") => {
+            let Ok(px) = other["sidebar.width:".len()..].trim().parse::<f32>() else {
+                return false;
+            };
+            if !px.is_finite() {
+                return false;
+            }
+            state.sidebar_width = px.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+            true
+        }
+        // Open settings on a named section (`settings.section:sessions`).
+        // Scriptable through TM_STARTUP_DISPATCH so e2e shots can land on a
+        // panel without synthesized clicks.
+        other if other.starts_with("settings.section:") => {
+            let Some(section) = SettingsSection::from_label(&other["settings.section:".len()..])
+            else {
+                return false;
+            };
+            state.settings_open = true;
+            state.settings_section = section;
+            if section == SettingsSection::Sessions {
+                refresh_sessions(state);
+            }
+            true
+        }
         other if other.starts_with("tab.switch:") => {
             if let Ok(index) = other["tab.switch:".len()..].parse::<usize>() {
                 if index < state.tabs.len() && state.active_tab != index {
@@ -8796,6 +8855,7 @@ pub(crate) mod tests {
             daemon_pid: None,
             daemon_memory_rss_bytes: None,
             sessions_stale: false,
+            resource_trees: std::collections::HashMap::new(),
             diagnostic_frame_counter: 0,
             diagnostic_last_present_unix_ms: None,
             diagnostic_scroll_samples: VecDeque::new(),
@@ -10464,6 +10524,49 @@ pub(crate) mod tests {
 
         // Invalid number returns false
         assert!(!dispatch(&mut state, "tab.switch:abc"));
+    }
+
+    #[test]
+    fn settings_section_dispatch_opens_settings_on_the_named_section() {
+        let mut state = seed_state();
+        assert!(!state.settings_open);
+        assert!(dispatch(&mut state, "settings.section:sessions"));
+        assert!(state.settings_open);
+        assert_eq!(state.settings_section, SettingsSection::Sessions);
+
+        assert!(dispatch(&mut state, "settings.section:danger-zone"));
+        assert_eq!(state.settings_section, SettingsSection::DangerZone);
+        assert!(
+            state.settings_open,
+            "selecting a section never toggles settings closed"
+        );
+
+        assert!(
+            !dispatch(&mut state, "settings.section:nope"),
+            "an unknown section is not handled"
+        );
+        assert_eq!(
+            SettingsSection::from_label("Keybinds"),
+            Some(SettingsSection::Keybinds)
+        );
+        assert_eq!(SettingsSection::from_label(""), None);
+    }
+
+    #[test]
+    fn sidebar_width_dispatch_clamps_like_the_resizer() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "sidebar.width:360"));
+        assert_eq!(state.sidebar_width, 360.0);
+        assert!(dispatch(&mut state, "sidebar.width:10"));
+        assert_eq!(state.sidebar_width, MIN_SIDEBAR_WIDTH);
+        assert!(dispatch(&mut state, "sidebar.width:9000"));
+        assert_eq!(state.sidebar_width, MAX_SIDEBAR_WIDTH);
+        assert!(!dispatch(&mut state, "sidebar.width:wide"));
+        assert!(!dispatch(&mut state, "sidebar.width:NaN"));
+        assert_eq!(
+            state.sidebar_width, MAX_SIDEBAR_WIDTH,
+            "rejected input leaves width alone"
+        );
     }
 
     #[test]
