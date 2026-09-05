@@ -911,6 +911,7 @@ mod tests {
                     subtitle: "bash".into(),
                     pid: 0,
                     cpu: 0.0,
+                    mem_bytes: 0,
                 },
                 crate::state::Pane {
                     id: crate::state::PaneId(8),
@@ -918,6 +919,7 @@ mod tests {
                     subtitle: "claude".into(),
                     pid: 0,
                     cpu: 0.0,
+                    mem_bytes: 0,
                 },
             ]];
             guard.confirm_dialog = Some(close_app_dialog(2, false, &[7, 8]));
@@ -1302,6 +1304,7 @@ mod tests {
                 subtitle: "".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]];
             guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
                 pane_id: 3,
@@ -1374,6 +1377,7 @@ mod tests {
                 subtitle: "bash".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]];
             guard.confirm_dialog = Some(close_app_dialog(1, false, &[1]));
         }
@@ -1446,6 +1450,7 @@ mod tests {
                 subtitle: "".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]];
             guard.confirm_dialog = Some(ConfirmDialog::RenameSession {
                 pane_id: 5,

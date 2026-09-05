@@ -1870,29 +1870,42 @@ fn build_sessions_section(state: &UiSnapshot, shared: &SharedState) -> ElementDe
     }
 
     for s in &state.sessions {
-        section = section.with_child(session_row(s, shared));
+        section = section.with_child(session_row(state, s, shared));
     }
     section
 }
 
+/// Working set of the process tree rooted at `pid` when the resource
+/// monitor has sampled it, else the shell-only figure the daemon reported
+/// on the last refresh. Every memory figure on the panel goes through
+/// here so rows, buckets and the total agree.
+fn tree_memory(state: &UiSnapshot, pid: Option<u32>, shell_only: Option<u64>) -> Option<u64> {
+    pid.and_then(|pid| state.resource_trees.get(&pid))
+        .map(|tree| tree.mem_bytes)
+        .or(shell_only)
+}
+
+fn session_memory(state: &UiSnapshot, session: &crate::state::SessionSnapshot) -> Option<u64> {
+    tree_memory(state, session.pid, session.memory_rss_bytes)
+}
+
 fn build_memory_dashboard(state: &UiSnapshot) -> ElementDef {
-    let terminal_total = sum_known_bytes(state.sessions.iter().map(|s| s.memory_rss_bytes));
-    let total = sum_known_bytes([
-        state.ui_memory_rss_bytes,
-        state.daemon_memory_rss_bytes,
-        terminal_total,
-    ]);
+    let terminal_total = sum_known_bytes(state.sessions.iter().map(|s| session_memory(state, s)));
+    let ui_memory = tree_memory(state, Some(state.ui_pid), state.ui_memory_rss_bytes);
+    let daemon_memory = tree_memory(state, state.daemon_pid, state.daemon_memory_rss_bytes);
+    let total = sum_known_bytes([ui_memory, daemon_memory, terminal_total]);
+    let live = !state.resource_trees.is_empty();
 
     let mut buckets = ElementDef::new(Tag::Div).with_class("session-memory-buckets");
     buckets = buckets
         .with_child(memory_bucket(
             "ui",
-            state.ui_memory_rss_bytes,
+            ui_memory,
             Some(format!("pid {}", state.ui_pid)),
         ))
         .with_child(memory_bucket(
             "ptyd",
-            state.daemon_memory_rss_bytes,
+            daemon_memory,
             state.daemon_pid.map(|pid| format!("pid {pid}")),
         ))
         .with_child(memory_bucket(
@@ -1924,7 +1937,11 @@ fn build_memory_dashboard(state: &UiSnapshot) -> ElementDef {
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("session-memory-hint")
-                        .with_text("working set sampled on refresh"),
+                        .with_text(if live {
+                            "live process trees, sampled 1/s"
+                        } else {
+                            "shell-only, from the last refresh"
+                        }),
                 ),
         )
         .with_child(buckets)
@@ -1969,7 +1986,7 @@ fn workspace_memory_summaries(state: &UiSnapshot) -> Vec<WorkspaceMemorySummary>
             .entry(session.workspace_id)
             .or_insert((0, 0, false));
         entry.0 += 1;
-        if let Some(bytes) = session.memory_rss_bytes {
+        if let Some(bytes) = session_memory(state, session) {
             entry.1 = entry.1.saturating_add(bytes);
             entry.2 = true;
         }
@@ -2053,7 +2070,11 @@ fn format_memory_bytes(bytes: u64) -> String {
     }
 }
 
-fn session_row(s: &crate::state::SessionSnapshot, shared: &SharedState) -> ElementDef {
+fn session_row(
+    state: &UiSnapshot,
+    s: &crate::state::SessionSnapshot,
+    shared: &SharedState,
+) -> ElementDef {
     let label = s.name.clone().unwrap_or_else(|| match s.pid {
         Some(p) => format!("shell ({p})"),
         None => format!("shell (session {})", s.session_id),
@@ -2099,9 +2120,20 @@ fn session_row(s: &crate::state::SessionSnapshot, shared: &SharedState) -> Eleme
             });
         });
 
+    // The tree figure carries its process count so "why is this shell 1.2
+    // GiB" answers itself; the shell-only fallback has no count to show.
+    let memory_text = match s.pid.and_then(|pid| state.resource_trees.get(&pid)) {
+        Some(tree) => format!(
+            "{} \u{00B7} {} proc{}",
+            format_memory_bytes(tree.mem_bytes),
+            tree.process_count,
+            if tree.process_count == 1 { "" } else { "s" }
+        ),
+        None => memory_value(s.memory_rss_bytes),
+    };
     let memory = ElementDef::new(Tag::Span)
         .with_class("session-memory-pill")
-        .with_text(memory_value(s.memory_rss_bytes));
+        .with_text(memory_text);
 
     ElementDef::new(Tag::Div)
         .with_class("setting-row")
@@ -4735,6 +4767,60 @@ mod tests {
         assert!(text.contains("250.0 MiB"), "dashboard text: {text}");
         assert!(text.contains("pid 10"), "dashboard text: {text}");
         assert!(text.contains("pid 20"), "dashboard text: {text}");
+    }
+
+    #[test]
+    fn sessions_panel_prefers_live_tree_memory_over_shell_only_figures() {
+        let mut state = seed_state();
+        state.settings_section = SettingsSection::Sessions;
+        state.ui_pid = 10;
+        state.ui_memory_rss_bytes = Some(100 * 1024 * 1024);
+        state.daemon_pid = Some(20);
+        state.daemon_memory_rss_bytes = Some(50 * 1024 * 1024);
+        state.sessions = vec![crate::state::SessionSnapshot {
+            session_id: 1,
+            pane_id: 1,
+            workspace_id: 1,
+            name: Some("agent".into()),
+            pid: Some(1234),
+            memory_rss_bytes: Some(25 * 1024 * 1024),
+            alive: true,
+        }];
+        // The sampler saw the shell's whole tree: five processes, 400 MiB.
+        state.resource_trees.insert(
+            1234,
+            crate::resource_monitor::TreeUsage {
+                cpu_pct: Some(3.0),
+                mem_bytes: 400 * 1024 * 1024,
+                process_count: 5,
+                root_exe: None,
+            },
+        );
+        // ptyd's tree includes the console hosts it spawned.
+        state.resource_trees.insert(
+            20,
+            crate::resource_monitor::TreeUsage {
+                cpu_pct: Some(0.0),
+                mem_bytes: 80 * 1024 * 1024,
+                process_count: 3,
+                root_exe: None,
+            },
+        );
+        let snap = state.ui_snapshot();
+        let el = build_sessions_section(&snap, &make_shared());
+        let text = collect_text_recursive(&el);
+
+        assert!(
+            text.contains("400.0 MiB \u{00B7} 5 procs"),
+            "row pill: {text}"
+        );
+        assert!(
+            !text.contains("25.0 MiB"),
+            "the shell-only figure must not leak once the tree is known: {text}"
+        );
+        // ui 100 (no tree sampled, shell-only) + ptyd 80 + terminals 400.
+        assert!(text.contains("580.0 MiB"), "total: {text}");
+        assert!(text.contains("live process trees"), "hint: {text}");
     }
 
     #[test]

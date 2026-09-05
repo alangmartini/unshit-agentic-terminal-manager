@@ -384,8 +384,24 @@ fn build_agent_resume_chip(
         )
 }
 
+/// `pid 1234 · 3.2% · 412 MiB` for the pane's whole process tree, or
+/// `pid -- · --` while the resource monitor has nothing for the pane
+/// (no session yet, daemon unreachable, editor pane). Unknown is never
+/// shown as a zero.
+pub(crate) fn pane_meta_text(pane: &Pane) -> String {
+    if pane.pid == 0 {
+        return "pid -- \u{00B7} --".to_string();
+    }
+    format!(
+        "pid {} \u{00B7} {:.1}% \u{00B7} {}",
+        pane.pid,
+        pane.cpu,
+        crate::resource_monitor::format_compact_bytes(pane.mem_bytes)
+    )
+}
+
 fn build_pane_header(pane: &Pane, shared: &SharedState) -> ElementDef {
-    let meta = format!("pid {} \u{00B7} {:.1}%", pane.pid, pane.cpu);
+    let meta = pane_meta_text(pane);
     let pane_id = pane.id;
     let split_h_state = shared.clone();
     let split_v_state = shared.clone();
@@ -1197,6 +1213,7 @@ mod tests {
             subtitle: "bash".to_string(),
             pid: 1234,
             cpu: 5.3,
+            mem_bytes: 412 << 20,
         }
     }
 
@@ -1207,7 +1224,23 @@ mod tests {
             subtitle: "bash".to_string(),
             pid: 42,
             cpu: 1.5,
+            mem_bytes: 100 << 20,
         }
+    }
+
+    #[test]
+    fn pane_meta_shows_tree_usage_or_dashes_never_zeros() {
+        let pane = make_pane(1);
+        assert_eq!(
+            pane_meta_text(&pane),
+            "pid 42 \u{00B7} 1.5% \u{00B7} 100 MiB"
+        );
+
+        let mut unknown = make_pane(2);
+        unknown.pid = 0;
+        unknown.cpu = 0.0;
+        unknown.mem_bytes = 0;
+        assert_eq!(pane_meta_text(&unknown), "pid -- \u{00B7} --");
     }
 
     /// Build a minimal shared state for testing. Does not spawn any real PTY.
@@ -2389,6 +2422,7 @@ mod tests {
             subtitle: "bash".into(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         };
         let header = build_pane_header(&pane, &shared);
         let grip = &header.children[0].children[0];

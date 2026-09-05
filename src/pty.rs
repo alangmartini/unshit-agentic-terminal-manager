@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -96,6 +97,38 @@ struct Inner {
     /// by [`DaemonPty::take_write_errors`]; the bridge polls it and
     /// surfaces failures as toasts. Phase 2 of #135.
     write_error_rx: std_mpsc::Receiver<WriteError>,
+}
+
+/// Clone of the worker's command channel that only lists sessions. See
+/// [`DaemonPty::session_lister`].
+#[derive(Clone)]
+pub struct SessionLister {
+    cmd_tx: tokio_mpsc::UnboundedSender<Command>,
+}
+
+impl SessionLister {
+    /// Blocking list with the same two-second bound as every other
+    /// request/reply on the shim: long enough for any normal local IPC,
+    /// short enough that a stuck daemon does not stall the caller forever.
+    pub fn list(&self) -> io::Result<SessionListSnapshot> {
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<SessionListSnapshot>>(1);
+        self.cmd_tx
+            .send(Command::List { reply: reply_tx })
+            .map_err(|_| worker_gone())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| worker_gone())?
+    }
+}
+
+/// Every PTY output byte the UI has received from the daemon, across all
+/// sessions, since the process started. The resource monitor diffs it once
+/// a second for the status bar's throughput figure. Relaxed: a counter,
+/// never used for synchronisation.
+static OUTPUT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn output_bytes_total() -> u64 {
+    OUTPUT_BYTES_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Failure delivered from the worker for a fire-and-forget write that
@@ -824,19 +857,17 @@ impl DaemonPty {
     }
 
     pub fn list_sessions_snapshot(&mut self) -> io::Result<SessionListSnapshot> {
-        let inner = self.inner.as_mut().ok_or_else(not_connected)?;
-        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<SessionListSnapshot>>(1);
-        inner
-            .cmd_tx
-            .send(Command::List { reply: reply_tx })
-            .map_err(|_| worker_gone())?;
-        // A short timeout keeps connect_to from hanging indefinitely if
-        // the daemon is unresponsive. Two seconds is long enough for
-        // any normal local IPC and short enough that a stuck daemon
-        // does not stall UI startup forever.
-        reply_rx
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| worker_gone())?
+        self.session_lister().ok_or_else(not_connected)?.list()
+    }
+
+    /// A handle that can list the daemon's sessions without borrowing the
+    /// shim, so a background thread (the resource monitor) can do the
+    /// round trip without holding the `AppState` lock. `None` while
+    /// disconnected; callers re-ask each time so a reconnect is picked up.
+    pub fn session_lister(&self) -> Option<SessionLister> {
+        self.inner.as_ref().map(|inner| SessionLister {
+            cmd_tx: inner.cmd_tx.clone(),
+        })
     }
 
     /// Set or clear the display name of a session. An empty `name`
@@ -1461,6 +1492,7 @@ async fn event_loop(mut events: tokio_mpsc::Receiver<ServerEvent>, sinks: Sessio
     while let Some(ev) = events.recv().await {
         match ev {
             ServerEvent::Output { session_id, bytes } => {
+                OUTPUT_BYTES_TOTAL.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 let Ok(mut routes) = sinks.lock() else {
                     return;
                 };

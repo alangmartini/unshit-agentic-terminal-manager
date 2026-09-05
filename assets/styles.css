@@ -2100,6 +2100,25 @@ input, select {
   color: var(--amber-200);
 }
 
+/* Live `cpu · mem` of the pane's process tree. Absent while usage is
+   unknown and below SIDEBAR_USAGE_MIN_WIDTH (state.rs). When present it
+   yields after the branch chip and twice as fast as the name, down to a
+   floor that keeps the cpu figure legible; past that the name ellipsises. */
+.terminal-entry-usage {
+  flex-shrink: 2;
+  min-width: 45px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--t-xs);
+  line-height: 1.4;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+.terminal-entry.active .terminal-entry-usage {
+  color: var(--amber-200);
+}
+
 .sidebar-footer {
   display: flex;
   flex-direction: column;
@@ -2925,6 +2944,12 @@ body.dragging-pane {
   display: flex;
   align-items: center;
   gap: var(--sp-6);
+}
+
+/* The spacer between the groups collapses to zero in a narrow window;
+   keep a gap so "k/s" never runs into "tab". */
+.statusbar-right {
+  padding-left: var(--sp-6);
 }
 
 .sb-cell {
