@@ -137,7 +137,7 @@ mod tests {
         dir.join("keybindings.json")
     }
 
-    fn remove_temp(path: &PathBuf) {
+    fn remove_temp(path: &std::path::Path) {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -106,15 +106,11 @@ impl Grid {
         }
         let start = row * self.cols + col.min(self.cols);
         let end = (row + 1) * self.cols;
-        for slot in &mut self.cells[start..end] {
-            *slot = Cell::BLANK;
-        }
+        self.cells[start..end].fill(Cell::BLANK);
     }
 
     pub fn erase_all(&mut self) {
-        for slot in &mut self.cells {
-            *slot = Cell::BLANK;
-        }
+        self.cells.fill(Cell::BLANK);
     }
 
     /// Remove the top `n` rows and return them in top-first order. The

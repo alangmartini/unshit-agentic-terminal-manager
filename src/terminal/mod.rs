@@ -1993,7 +1993,7 @@ impl<'a> Perform for Performer<'a> {
         let raw = |idx: usize| -> u16 { pv.get(idx).copied().unwrap_or(0) };
 
         let preserves_pending_wrap = matches!(action, 'm' | 'c' | 'n' | 'q')
-            || (intermediates == [b'?'] && matches!(action, 'h' | 'l'));
+            || (intermediates == b"?" && matches!(action, 'h' | 'l'));
         if !preserves_pending_wrap {
             t.clear_pending_wrap();
         }
@@ -2298,7 +2298,7 @@ impl<'a> Perform for Performer<'a> {
             // Other private modes (application keypad, etc.) are ignored.
             // Bracketed paste (2004) is tracked locally so `terminal.paste`
             // can wrap pasted bodies in `ESC[200~`/`ESC[201~`.
-            'h' if intermediates == [b'?'] => {
+            'h' if intermediates == b"?" => {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(true),
@@ -2313,7 +2313,7 @@ impl<'a> Perform for Performer<'a> {
                     }
                 }
             }
-            'l' if intermediates == [b'?'] => {
+            'l' if intermediates == b"?" => {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(false),
@@ -2347,7 +2347,7 @@ impl<'a> Perform for Performer<'a> {
             }
             // DA2 - Secondary Device Attributes: `CSI > c` or `CSI > 0 c`.
             // Reply `CSI > 0 ; 95 ; 0 c` mirrors xterm patch 95.
-            'c' if intermediates == [b'>'] => {
+            'c' if intermediates == b">" => {
                 t.pending_response.extend_from_slice(b"\x1b[>0;95;0c");
             }
             // DSR - Device Status Report: `CSI 5 n` "are you ok?".
@@ -2368,7 +2368,7 @@ impl<'a> Perform for Performer<'a> {
             // between compact and bordered layouts. Reply with a DCS
             // string `DCS > | name version ST` so the probe succeeds
             // and Claude picks the rich path.
-            'q' if intermediates == [b'>'] => {
+            'q' if intermediates == b">" => {
                 t.pending_response
                     .extend_from_slice(b"\x1bP>|godly-terminal 0.1\x1b\\");
             }

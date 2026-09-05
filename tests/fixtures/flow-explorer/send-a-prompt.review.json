@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "title": "Send a prompt",
+  "summary": "Reviewing feat/prompt-restore against main: submit now restores the draft when the prompt fails, the hook waits for the whole agent run, and the sidebar refetches sessions when the call resolves.",
+  "repo_root": "repo",
+  "git_ref": "feat/prompt-restore@fixture",
+  "mode": "review",
+  "processes": [
+    {
+      "id": "outside",
+      "label": "Human"
+    },
+    {
+      "id": "renderer",
+      "label": "Renderer"
+    },
+    {
+      "id": "preload",
+      "label": "Preload"
+    },
+    {
+      "id": "main",
+      "label": "Main process"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "ui.cmd-enter",
+      "name": "Cmd/Ctrl+Enter in the composer",
+      "kind": "event",
+      "process": "outside",
+      "carrier": "ui",
+      "description": "plain Enter is a newline"
+    },
+    {
+      "id": "Editor.tsx::handleKeyDown",
+      "name": "Editor.handleKeyDown",
+      "kind": "function",
+      "process": "renderer",
+      "description": "Enter with meta or ctrl calls onSubmit.",
+      "location": {
+        "file": "apps/electron/src/renderer/main/agent/Editor.tsx",
+        "line": 93,
+        "end_line": 100
+      }
+    },
+    {
+      "id": "AgentPane.tsx::submit",
+      "name": "Composer.submit",
+      "kind": "function",
+      "process": "renderer",
+      "description": "Trims the draft, clears it, and restores it when the prompt fails.",
+      "tags": [
+        "draft"
+      ],
+      "location": {
+        "file": "apps/electron/src/renderer/main/agent/AgentPane.tsx",
+        "line": 119,
+        "end_line": 126
+      },
+      "status": "modified"
+    },
+    {
+      "id": "AgentPane.tsx::clearDraft",
+      "name": "Composer.clearDraft",
+      "kind": "function",
+      "process": "renderer",
+      "description": "Cleared the draft before the prompt resolved, so a failed prompt lost the text.",
+      "tags": [
+        "draft"
+      ],
+      "status": "removed"
+    },
+    {
+      "id": "useAgentSession.ts::prompt",
+      "name": "useAgentSession.prompt",
+      "kind": "function",
+      "process": "renderer",
+      "description": "Needs readySessionId. Calls sessions.prompt and waits for the whole agent run; the reply streams in through the sessions.events subscription that the mount effect opened.",
+      "tags": [
+        "readySessionId",
+        "state"
+      ],
+      "location": {
+        "file": "apps/electron/src/renderer/main/agent/useAgentSession.ts",
+        "line": 89,
+        "end_line": 118
+      },
+      "status": "modified"
+    },
+    {
+      "id": "rpc.sessions.prompt",
+      "name": "sessions.prompt",
+      "kind": "event",
+      "carrier": "rpc",
+      "description": "resolves when the agent run ends",
+      "payload": "{ sessionId, text } over the MessagePort",
+      "hidden_children": 1
+    },
+    {
+      "id": "main.ts::RPCHandler.upgrade",
+      "name": "RPCHandler.upgrade(port1)",
+      "kind": "function",
+      "process": "main",
+      "description": "Dispatches to haloRpcRouter with haloServer.context; logs oRPC requests and errors.",
+      "location": {
+        "file": "apps/electron/src/main/main.ts",
+        "line": 211,
+        "end_line": 235
+      }
+    },
+    {
+      "id": "sessionsRouter.ts::prompt",
+      "name": "sessionsRouter.prompt",
+      "kind": "function",
+      "process": "main",
+      "description": "Logs { event: 'prompt', sessionId, textLength }, opens the session and awaits its prompt.",
+      "location": {
+        "file": "packages/server/src/rpc/sessionsRouter.ts",
+        "line": 51,
+        "end_line": 60
+      }
+    },
+    {
+      "id": "SessionRegistry.ts::open",
+      "name": "SessionRegistry.open",
+      "kind": "function",
+      "process": "main",
+      "description": "Returns the live session. The events subscription already open for this id keeps streaming into it.",
+      "location": {
+        "file": "packages/server/src/sessions/SessionRegistry.ts",
+        "line": 31,
+        "end_line": 41
+      }
+    },
+    {
+      "id": "HaloAgentSession.ts::prompt",
+      "name": "HaloAgentSession.prompt",
+      "kind": "function",
+      "process": "main",
+      "description": "Rejects empty text. piSession.prompt with streamingBehavior: stream, then emits agent_end.",
+      "location": {
+        "file": "packages/server/src/sessions/HaloAgentSession.ts",
+        "line": 202,
+        "end_line": 214
+      }
+    },
+    {
+      "id": "rpc.sessions.prompt.resolves",
+      "name": "sessions.prompt resolves",
+      "kind": "event",
+      "carrier": "rpc",
+      "description": "void, after agent_end",
+      "hidden_children": 1
+    },
+    {
+      "id": "useAgentSession.ts::invalidateQueries",
+      "name": "queryClient.invalidateQueries(['sessions'])",
+      "kind": "function",
+      "process": "renderer",
+      "description": "Refetches every sessions query so the sidebar picks up the new title.",
+      "tags": [
+        "readySessionId",
+        "state"
+      ],
+      "location": {
+        "file": "apps/electron/src/renderer/main/agent/useAgentSession.ts",
+        "line": 114,
+        "end_line": 117
+      },
+      "status": "added"
+    }
+  ],
+  "edges": [
+    {
+      "from": "ui.cmd-enter",
+      "to": "Editor.tsx::handleKeyDown",
+      "kind": "handled_by"
+    },
+    {
+      "from": "Editor.tsx::handleKeyDown",
+      "to": "AgentPane.tsx::submit",
+      "kind": "calls"
+    },
+    {
+      "from": "AgentPane.tsx::submit",
+      "to": "AgentPane.tsx::clearDraft",
+      "kind": "calls"
+    },
+    {
+      "from": "AgentPane.tsx::submit",
+      "to": "useAgentSession.ts::prompt",
+      "kind": "calls"
+    },
+    {
+      "from": "useAgentSession.ts::prompt",
+      "to": "rpc.sessions.prompt",
+      "kind": "calls"
+    },
+    {
+      "from": "rpc.sessions.prompt",
+      "to": "main.ts::RPCHandler.upgrade",
+      "kind": "handled_by"
+    },
+    {
+      "from": "main.ts::RPCHandler.upgrade",
+      "to": "sessionsRouter.ts::prompt",
+      "kind": "calls"
+    },
+    {
+      "from": "sessionsRouter.ts::prompt",
+      "to": "SessionRegistry.ts::open",
+      "kind": "calls"
+    },
+    {
+      "from": "sessionsRouter.ts::prompt",
+      "to": "HaloAgentSession.ts::prompt",
+      "kind": "calls"
+    },
+    {
+      "from": "HaloAgentSession.ts::prompt",
+      "to": "rpc.sessions.prompt.resolves",
+      "kind": "resolves"
+    },
+    {
+      "from": "rpc.sessions.prompt.resolves",
+      "to": "useAgentSession.ts::invalidateQueries",
+      "kind": "handled_by"
+    }
+  ],
+  "entries": [
+    "ui.cmd-enter"
+  ],
+  "next_flow": "The agent run itself is the next flow.",
+  "diff_range": {
+    "base": "main",
+    "head": "feat/prompt-restore"
+  }
+}

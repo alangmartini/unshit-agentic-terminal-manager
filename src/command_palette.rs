@@ -169,6 +169,42 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         enabled: true,
     },
     PaletteAction {
+        id: "flow_open",
+        label: "Open flow\u{2026}",
+        description: "Open a Flow Explorer document (flow JSON).",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::Workspace,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "flow.open",
+        keywords: &["flow", "explorer", "review", "open", "json", "diff"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "flow_explain",
+        label: "Explain flow\u{2026}",
+        description: "Ask the agent to model one user-facing flow of this workspace.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::Workspace,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "flow.explain",
+        keywords: &["flow", "explorer", "explain", "agent", "walkthrough"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "flow_review",
+        label: "Review change as flows\u{2026}",
+        description: "Ask the agent to review a base..head range as the flows it touches.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::Workspace,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "flow.review",
+        keywords: &["flow", "review", "diff", "change", "agent", "pr"],
+        enabled: true,
+    },
+    PaletteAction {
         id: "new_worktree",
         label: "New worktree tab",
         description: "Open a new tab on a fresh git worktree of this workspace.",
@@ -1218,6 +1254,9 @@ mod tests {
                 "new_terminal",
                 "open_file",
                 "save_file",
+                "flow_open",
+                "flow_explain",
+                "flow_review",
                 "new_worktree",
                 "close_pane",
                 "arrange_grid_2x2",
@@ -1354,6 +1393,9 @@ mod tests {
                         | "quick_prompt.open"
                         | "editor.open"
                         | "editor.save"
+                        | "flow.open"
+                        | "flow.explain"
+                        | "flow.review"
                 )
             })));
         assert!(items
@@ -1390,6 +1432,9 @@ mod tests {
                         "new_terminal",
                         "open_file",
                         "save_file",
+                        "flow_open",
+                        "flow_explain",
+                        "flow_review",
                         "new_worktree",
                         "close_pane",
                     ],

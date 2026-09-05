@@ -96,16 +96,12 @@ impl DirtyRows {
 
     /// Mark all rows as dirty.
     pub fn mark_all(&mut self) {
-        for word in &mut self.bits {
-            *word = u64::MAX;
-        }
+        self.bits.fill(u64::MAX);
     }
 
     /// Clear all dirty flags.
     pub fn clear(&mut self) {
-        for word in &mut self.bits {
-            *word = 0;
-        }
+        self.bits.fill(0);
     }
 
     /// Returns true if any row is dirty.

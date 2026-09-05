@@ -715,7 +715,7 @@ impl Perform for Performer<'_> {
             'c' if intermediates.is_empty() => {
                 t.pending_response.extend_from_slice(b"\x1b[?1;2c");
             }
-            'c' if intermediates == [b'>'] => {
+            'c' if intermediates == b">" => {
                 t.pending_response.extend_from_slice(b"\x1b[>0;95;0c");
             }
             'n' if intermediates.is_empty() && pv.first() == Some(&5) => {
@@ -725,7 +725,7 @@ impl Perform for Performer<'_> {
                 let reply = format!("\x1b[{};{}R", t.cursor_row + 1, t.cursor_col + 1);
                 t.pending_response.extend_from_slice(reply.as_bytes());
             }
-            'q' if intermediates == [b'>'] => {
+            'q' if intermediates == b">" => {
                 t.pending_response
                     .extend_from_slice(b"\x1bP>|godly-terminal 0.1\x1b\\");
             }
