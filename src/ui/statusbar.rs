@@ -101,7 +101,7 @@ fn build_statusbar_left(state: &UiSnapshot) -> ElementDef {
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("tnum")
-                        .with_text(format!("{:.1}", state.cpu_pct)),
+                        .with_text(stat_text(state.cpu_pct, 1)),
                 )
                 .with_child(ElementDef::new(Tag::Span).with_text("%")),
         )
@@ -113,7 +113,7 @@ fn build_statusbar_left(state: &UiSnapshot) -> ElementDef {
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("tnum")
-                        .with_text(format!("{:.2}", state.mem_gb)),
+                        .with_text(stat_text(state.mem_gb, 2)),
                 )
                 .with_child(ElementDef::new(Tag::Span).with_text("G")),
         )
@@ -125,10 +125,20 @@ fn build_statusbar_left(state: &UiSnapshot) -> ElementDef {
                 .with_child(
                     ElementDef::new(Tag::Span)
                         .with_class("tnum")
-                        .with_text(format!("{:.1}", state.net_kbps)),
+                        .with_text(stat_text(state.net_kbps, 1)),
                 )
                 .with_child(ElementDef::new(Tag::Span).with_text("k/s")),
         )
+}
+
+/// A sampled figure with `decimals` places, or `--` when the resource
+/// monitor does not know it yet. A dash is honest; `0.0` would claim the
+/// tabs cost nothing.
+fn stat_text(value: Option<f32>, decimals: usize) -> String {
+    match value {
+        Some(v) => format!("{v:.decimals$}"),
+        None => "--".to_string(),
+    }
 }
 
 fn build_statusbar_right(state: &UiSnapshot) -> ElementDef {
@@ -193,6 +203,7 @@ mod tests {
                 subtitle: "bash".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]],
             active_pane: PaneId(1),
             settings_open: false,
@@ -230,9 +241,9 @@ mod tests {
             sessions_stale: false,
             diagnostic_scroll_samples: Vec::new(),
             toasts: Vec::new(),
-            cpu_pct: 0.0,
-            mem_gb: 0.0,
-            net_kbps: 0.0,
+            cpu_pct: None,
+            mem_gb: None,
+            net_kbps: None,
             clock_hhmm: "00:00".into(),
             keybinds: crate::keybinds::KeybindsState::default(),
             drag: crate::drag::DragState::default(),
@@ -336,6 +347,7 @@ mod tests {
                     subtitle: "bash".into(),
                     pid: 0,
                     cpu: 0.0,
+                    mem_bytes: 0,
                 }]],
                 active_pane: PaneId(1),
                 row_ratios: vec![1.0],
@@ -352,6 +364,7 @@ mod tests {
                     subtitle: "cargo".into(),
                     pid: 0,
                     cpu: 0.0,
+                    mem_bytes: 0,
                 }]],
                 active_pane: PaneId(2),
                 row_ratios: vec![1.0],
@@ -368,6 +381,7 @@ mod tests {
                     subtitle: "bash".into(),
                     pid: 0,
                     cpu: 0.0,
+                    mem_bytes: 0,
                 }]],
                 active_pane: PaneId(3),
                 row_ratios: vec![1.0],
@@ -384,6 +398,7 @@ mod tests {
                     subtitle: "bash".into(),
                     pid: 0,
                     cpu: 0.0,
+                    mem_bytes: 0,
                 }]],
                 active_pane: PaneId(4),
                 row_ratios: vec![1.0],
@@ -397,21 +412,21 @@ mod tests {
     #[test]
     fn statusbar_with_high_cpu() {
         let mut snap = minimal_snapshot();
-        snap.cpu_pct = 99.9;
+        snap.cpu_pct = Some(99.9);
         let _elem = build_statusbar(&snap);
     }
 
     #[test]
     fn statusbar_with_high_mem() {
         let mut snap = minimal_snapshot();
-        snap.mem_gb = 128.55;
+        snap.mem_gb = Some(128.55);
         let _elem = build_statusbar(&snap);
     }
 
     #[test]
     fn statusbar_with_high_net() {
         let mut snap = minimal_snapshot();
-        snap.net_kbps = 9999.9;
+        snap.net_kbps = Some(9999.9);
         let _elem = build_statusbar(&snap);
     }
 
@@ -425,10 +440,39 @@ mod tests {
     #[test]
     fn statusbar_with_zero_values() {
         let mut snap = minimal_snapshot();
-        snap.cpu_pct = 0.0;
-        snap.mem_gb = 0.0;
-        snap.net_kbps = 0.0;
+        snap.cpu_pct = Some(0.0);
+        snap.mem_gb = Some(0.0);
+        snap.net_kbps = Some(0.0);
         let _elem = build_statusbar(&snap);
+    }
+
+    fn item_text(el: &ElementDef, id: &str) -> String {
+        el.children
+            .iter()
+            .find(|c| c.id.as_deref() == Some(id))
+            .map(collect_text)
+            .unwrap_or_else(|| panic!("no #{id} in status bar"))
+    }
+
+    #[test]
+    fn unknown_resource_figures_render_as_dashes_not_zeros() {
+        let snap = minimal_snapshot();
+        let left = build_statusbar_left(&snap);
+        assert_eq!(item_text(&left, "status-cpu"), "cpu --%");
+        assert_eq!(item_text(&left, "status-mem"), "mem --G");
+        assert_eq!(item_text(&left, "status-net"), "\u{2193} --k/s");
+    }
+
+    #[test]
+    fn known_resource_figures_render_with_fixed_precision() {
+        let mut snap = minimal_snapshot();
+        snap.cpu_pct = Some(12.34);
+        snap.mem_gb = Some(3.456);
+        snap.net_kbps = Some(0.06);
+        let left = build_statusbar_left(&snap);
+        assert_eq!(item_text(&left, "status-cpu"), "cpu 12.3%");
+        assert_eq!(item_text(&left, "status-mem"), "mem 3.46G");
+        assert_eq!(item_text(&left, "status-net"), "\u{2193} 0.1k/s");
     }
 
     #[test]

@@ -797,8 +797,14 @@ pub struct Pane {
     pub id: PaneId,
     pub title: String,
     pub subtitle: String,
+    /// Shell pid backing the pane's session, `0` when unknown. Written by
+    /// the resource monitor; read by the pane header.
     pub pid: u32,
+    /// Machine-wide CPU share of the pane's whole process tree (shell and
+    /// every descendant). Meaningful only while `pid != 0`.
     pub cpu: f32,
+    /// Working set summed over the pane's process tree, in bytes.
+    pub mem_bytes: u64,
 }
 
 /// Snapshot captured at the start of a pane resizer drag.
@@ -904,9 +910,15 @@ pub struct AppState {
     pub window_maximized: bool,
     /// Sidebar width at the start of a drag, `None` when not dragging.
     pub sidebar_drag_start: Option<f32>,
-    pub cpu_pct: f32,
-    pub mem_gb: f32,
-    pub net_kbps: f32,
+    /// Machine-wide CPU share of the UI, the daemon and every session's
+    /// process tree. `None` until the resource monitor has a baseline or
+    /// while the daemon cannot be listed; rendered as `--`.
+    pub cpu_pct: Option<f32>,
+    /// Working set of the same trees in GiB; `None` when unknown.
+    pub mem_gb: Option<f32>,
+    /// PTY output received from the daemon, KiB/s; `None` before the
+    /// first interval completes.
+    pub net_kbps: Option<f32>,
     pub clock_hhmm: String,
     pub next_id: u32,
     pub pty_manager: crate::pty::DaemonPty,
@@ -1257,9 +1269,15 @@ pub struct UiSnapshot {
     /// Mirrors `AppState::window_maximized` so titlebar controls can
     /// render maximize or restore affordances from state.
     pub window_maximized: bool,
-    pub cpu_pct: f32,
-    pub mem_gb: f32,
-    pub net_kbps: f32,
+    /// Machine-wide CPU share of the UI, the daemon and every session's
+    /// process tree. `None` until the resource monitor has a baseline or
+    /// while the daemon cannot be listed; rendered as `--`.
+    pub cpu_pct: Option<f32>,
+    /// Working set of the same trees in GiB; `None` when unknown.
+    pub mem_gb: Option<f32>,
+    /// PTY output received from the daemon, KiB/s; `None` before the
+    /// first interval completes.
+    pub net_kbps: Option<f32>,
     pub clock_hhmm: String,
     pub row_ratios: Vec<f32>,
     pub col_ratios: Vec<Vec<f32>>,
@@ -1420,6 +1438,7 @@ pub fn seed_state() -> AppState {
         subtitle: "bash".to_string(),
         pid: 0,
         cpu: 0.0,
+        mem_bytes: 0,
     };
     let panes = vec![vec![default_pane.clone()]];
 
@@ -1471,9 +1490,9 @@ pub fn seed_state() -> AppState {
         sidebar_width: 252.0,
         window_maximized: false,
         sidebar_drag_start: None,
-        cpu_pct: 0.0,
-        mem_gb: 0.0,
-        net_kbps: 0.0,
+        cpu_pct: None,
+        mem_gb: None,
+        net_kbps: None,
         clock_hhmm: "00:00".to_string(),
         next_id: 2,
         pty_manager: crate::pty::DaemonPty::new(),
@@ -1744,6 +1763,7 @@ pub fn mutate_add_tab(state: &mut AppState) {
         subtitle: "bash".to_string(),
         pid: 0,
         cpu: 0.0,
+        mem_bytes: 0,
     };
 
     let tab = TerminalTab {
@@ -1786,6 +1806,7 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
         subtitle: "editor".to_string(),
         pid: 0,
         cpu: 0.0,
+        mem_bytes: 0,
     };
 
     let tab = TerminalTab {
@@ -1827,6 +1848,7 @@ pub fn mutate_add_flow_tab(state: &mut AppState, pane: crate::flow_explorer::Flo
         subtitle: "flow".to_string(),
         pid: 0,
         cpu: 0.0,
+        mem_bytes: 0,
     };
 
     let tab = TerminalTab {
@@ -1947,6 +1969,7 @@ pub fn mutate_add_quick_prompt_tab(
         subtitle: shell.program.clone(),
         pid: 0,
         cpu: 0.0,
+        mem_bytes: 0,
     };
     let tab = TerminalTab {
         id: format!("t{}", id_num),
@@ -2143,6 +2166,7 @@ pub fn mutate_add_worktree_tab(state: &mut AppState, worktree_path: &std::path::
         subtitle: "bash".to_string(),
         pid: 0,
         cpu: 0.0,
+        mem_bytes: 0,
     };
 
     let tab = TerminalTab {
@@ -2404,6 +2428,7 @@ fn terminal_tab_from_persisted(
                         },
                         pid: 0,
                         cpu: 0.0,
+                        mem_bytes: 0,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -2477,6 +2502,7 @@ fn seed_default_tab(state: &mut AppState, max_pane_id: &mut u32) {
         subtitle: "bash".to_string(),
         pid: 0,
         cpu: 0.0,
+        mem_bytes: 0,
     };
     let tab = TerminalTab {
         id: format!("t{}", id_num),
@@ -2667,6 +2693,7 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
         subtitle: "bash".to_string(),
         pid: 0,
         cpu: 0.0,
+        mem_bytes: 0,
     };
     state.panes[row_idx].insert(col_idx + 1, new_pane);
     // Split the existing column ratio in half with the new pane.
@@ -2731,6 +2758,7 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
         subtitle: "bash".to_string(),
         pid: 0,
         cpu: 0.0,
+        mem_bytes: 0,
     };
     state.panes.insert(row_idx + 1, vec![new_pane]);
     // Split the existing row ratio in half with the new row.
@@ -4362,25 +4390,14 @@ pub fn refresh_sessions(state: &mut AppState) {
                     alive: info.alive,
                 })
                 .collect();
-            state.mem_gb = total_known_memory_bytes(state) as f32 / 1024.0 / 1024.0 / 1024.0;
             state.sessions_stale = false;
         }
         Err(e) => {
             log::warn!("refresh_sessions: list_sessions failed: {e}");
-            state.mem_gb = total_known_memory_bytes(state) as f32 / 1024.0 / 1024.0 / 1024.0;
             state.sessions_stale = true;
             push_error_toast(state, format!("refresh failed: {e}"));
         }
     }
-}
-
-pub fn total_known_memory_bytes(state: &AppState) -> u64 {
-    state
-        .ui_memory_rss_bytes
-        .into_iter()
-        .chain(state.daemon_memory_rss_bytes)
-        .chain(state.sessions.iter().filter_map(|s| s.memory_rss_bytes))
-        .sum()
 }
 
 /// Kill a session directly by session id without requiring a local
@@ -8701,6 +8718,7 @@ pub(crate) mod tests {
             subtitle: "bash".to_string(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         };
         let panes = vec![vec![pane]];
         let tabs = vec![TerminalTab {
@@ -8742,9 +8760,9 @@ pub(crate) mod tests {
             sidebar_width: 252.0,
             window_maximized: false,
             sidebar_drag_start: None,
-            cpu_pct: 0.0,
-            mem_gb: 0.0,
-            net_kbps: 0.0,
+            cpu_pct: None,
+            mem_gb: None,
+            net_kbps: None,
             clock_hhmm: "12:00".to_string(),
             next_id: 2,
             pty_manager: crate::pty::DaemonPty::new(),
@@ -9101,6 +9119,7 @@ pub(crate) mod tests {
             subtitle: "".to_string(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         };
         state.panes.push(vec![pane2]);
         assert_eq!(find_pane_coord(&state, PaneId(5)), Some((1, 0)));
@@ -11288,6 +11307,7 @@ pub(crate) mod tests {
                 subtitle: "".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]],
             active_pane: PaneId(42),
             row_ratios: vec![1.0],
@@ -11364,6 +11384,7 @@ pub(crate) mod tests {
                 subtitle: "".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]],
             active_pane: PaneId(77),
             row_ratios: vec![1.0],
@@ -11535,6 +11556,7 @@ pub(crate) mod tests {
                 subtitle: "bash".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             },
             Pane {
                 id: PaneId(2),
@@ -11542,6 +11564,7 @@ pub(crate) mod tests {
                 subtitle: "bash".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             },
         ]];
         state.active_pane = PaneId(2);
@@ -11633,6 +11656,7 @@ pub(crate) mod tests {
             subtitle: "bash".into(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         };
         state.panes[0].push(pane_two.clone());
         state.col_ratios[0] = vec![0.5, 0.5];
@@ -11694,6 +11718,7 @@ pub(crate) mod tests {
             subtitle: "".into(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         }]];
         assert!(dispatch(&mut state, "tab.request_rename:42"));
         match state.confirm_dialog.as_ref() {
@@ -11748,6 +11773,7 @@ pub(crate) mod tests {
                 subtitle: "bash".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]],
             active_pane: PaneId(77),
             row_ratios: vec![1.0],
@@ -11785,6 +11811,7 @@ pub(crate) mod tests {
             subtitle: "".into(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         }]];
         state.confirm_dialog = Some(ConfirmDialog::RenameSession {
             pane_id: 7,
@@ -11805,6 +11832,7 @@ pub(crate) mod tests {
             subtitle: "".into(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         }]];
         state.confirm_dialog = Some(ConfirmDialog::RenameSession {
             pane_id: 7,
@@ -11918,35 +11946,6 @@ pub(crate) mod tests {
             msg.starts_with("refresh failed:"),
             "expected refresh-failure toast, got {msg:?}"
         );
-    }
-
-    #[test]
-    fn total_known_memory_bytes_sums_ui_daemon_and_sessions() {
-        let mut state = seed_state();
-        state.ui_memory_rss_bytes = Some(10);
-        state.daemon_memory_rss_bytes = Some(20);
-        state.sessions = vec![
-            SessionSnapshot {
-                session_id: 1,
-                pane_id: 1,
-                workspace_id: 1,
-                name: None,
-                pid: None,
-                memory_rss_bytes: Some(30),
-                alive: true,
-            },
-            SessionSnapshot {
-                session_id: 2,
-                pane_id: 2,
-                workspace_id: 1,
-                name: None,
-                pid: None,
-                memory_rss_bytes: None,
-                alive: true,
-            },
-        ];
-
-        assert_eq!(total_known_memory_bytes(&state), 60);
     }
 
     #[test]
@@ -12633,6 +12632,7 @@ pub(crate) mod tests {
                 subtitle: "".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]],
             active_pane: PaneId(9),
             row_ratios: vec![1.0],
@@ -12681,6 +12681,7 @@ pub(crate) mod tests {
                 subtitle: "bash".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]],
             active_pane: PaneId(9),
             row_ratios: vec![1.0],
@@ -13193,6 +13194,7 @@ pub(crate) mod tests {
                 subtitle: "bash".to_string(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             });
             state.active_pane = PaneId(id);
         }
@@ -13247,6 +13249,7 @@ pub(crate) mod tests {
                 subtitle: "bash".to_string(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]);
             state.active_pane = PaneId(id);
         }
@@ -13386,6 +13389,7 @@ pub(crate) mod tests {
                         subtitle: "bash".to_string(),
                         pid: 0,
                         cpu: 0.0,
+                        mem_bytes: 0,
                     })
                     .collect()
             })
@@ -13877,6 +13881,7 @@ pub(crate) mod tests {
                 subtitle: "bash".into(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             }]],
             active_pane: pane_id,
             row_ratios: vec![1.0],
@@ -14042,6 +14047,7 @@ pub(crate) mod tests {
             subtitle: "bash".into(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         });
         state.tabs[1].col_ratios[0].push(1.0);
 
@@ -14307,6 +14313,7 @@ pub(crate) mod tests {
             subtitle: "bash".into(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         });
         state.tabs[1].col_ratios[0].push(1.0);
         let target = state.panes[0][0].id;
@@ -15389,6 +15396,7 @@ pub(crate) mod tests {
                 subtitle: "bash".to_string(),
                 pid: 0,
                 cpu: 0.0,
+                mem_bytes: 0,
             })
             .collect()];
         let first_id = PaneId(pane_ids[0]);
@@ -15504,6 +15512,7 @@ pub(crate) mod tests {
             subtitle: "bash".to_string(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         });
         state.col_ratios[0].push(0.5);
         state.col_ratios[0][0] = 0.5;
@@ -16243,6 +16252,7 @@ pub(crate) mod tests {
             subtitle: "bash".into(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         });
         state.active_pane = PaneId(1);
         state

@@ -1299,6 +1299,7 @@ mod tests {
             subtitle: "bash".to_string(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         };
         state.workspaces[1].tabs = vec![TerminalTab {
             id: "t7".to_string(),
@@ -1528,6 +1529,7 @@ mod tests {
             subtitle: "bash".to_string(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         };
         state.tabs.push(TerminalTab {
             id: "t9".to_string(),

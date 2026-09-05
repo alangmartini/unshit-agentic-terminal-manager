@@ -25,6 +25,7 @@ pub mod profile;
 pub mod pty;
 pub mod quick_prompt;
 pub mod renderer_telemetry;
+pub mod resource_monitor;
 pub mod shell;
 pub mod startup;
 pub mod startup_perf;
@@ -1384,6 +1385,12 @@ fn main() {
         window_event_sink.clone(),
     );
 
+    // Status-bar cpu/mem/throughput, the clock and the per-pane
+    // `pid · cpu · mem` headers all come from one sampler thread; nothing
+    // else writes them. Started after the sink exists for the same reason
+    // as the two calls above.
+    crate::resource_monitor::start(shared.clone(), window_event_sink.clone());
+
     // Hand the editor's file-open dialog thread a way back into app
     // state and the render loop (see `dispatch_editor_open_dialog`).
     {
@@ -1605,6 +1612,7 @@ mod tests {
             subtitle: "bash".to_string(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         };
         let bottom = crate::state::Pane {
             id: crate::state::PaneId(2),

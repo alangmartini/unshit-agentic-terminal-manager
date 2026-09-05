@@ -329,6 +329,7 @@ mod tests {
             subtitle: "bash".to_string(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         };
         TerminalTab {
             id: format!("t-{}", name),
@@ -752,6 +753,7 @@ mod tests {
             subtitle: "bash".into(),
             pid: 0,
             cpu: 0.0,
+            mem_bytes: 0,
         };
         let second_tab = TerminalTab {
             id: "t-other".into(),

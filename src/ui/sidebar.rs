@@ -1345,6 +1345,7 @@ mod tests {
                     subtitle: "bash".into(),
                     pid: 0,
                     cpu: 0.0,
+                    mem_bytes: 0,
                 }]],
                 active_pane: crate::state::PaneId(77),
                 row_ratios: vec![1.0],
