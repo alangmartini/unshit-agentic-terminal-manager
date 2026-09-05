@@ -432,9 +432,13 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
     // The root carries `FontScale` when the user raised the config font size,
     // which grows every row's line box. Scaling the whole estimate (padding
     // included) over-estimates a little, which is the safe direction.
+    // The 1.1 factor is asymmetry insurance: the estimate only picks the anchor
+    // edge, and under-estimating flips the decision, so the whole overflow
+    // clips. Flipping up a little early costs nothing.
     let menu_h = menu_h
         * (snap.config_font_size_pt as f32 / crate::state::DEFAULT_CONFIG_FONT_SIZE_PT as f32)
-            .max(1.0);
+            .max(1.0)
+        * 1.1;
     // Window size is stored in physical pixels, like `last_grid_*`; the menu
     // metrics and the stored cursor anchor are both CSS px.
     let sf = snap.scale_factor.max(1e-3);
@@ -2008,7 +2012,7 @@ mod tests {
             st.config_font_size_pt = crate::state::DEFAULT_CONFIG_FONT_SIZE_PT;
             st.ctx_menu = Some(crate::state::CtxMenu {
                 x: 40.0,
-                y: 300.0,
+                y: 250.0,
                 target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
             });
             st.ui_snapshot()
@@ -2021,7 +2025,7 @@ mod tests {
 
         assert_eq!(
             menu_v_inset(&build_ctx_menu_overlay(&baseline, &shared)),
-            (false, 300.0),
+            (false, 250.0),
             "at the default font the menu still fits below the cursor"
         );
         assert!(
