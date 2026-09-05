@@ -110,6 +110,13 @@ fn build_workspace(
                     // Divide by scale_factor: cursor coords are physical pixels,
                     // but Dimension::Px values get multiplied by scale_all_styles.
                     let sf = st.scale_factor;
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "workspace",
+                        x / sf,
+                        y / sf,
+                        st.window_width / sf,
+                        st.window_height / sf,
+                    );
                     st.ctx_menu = Some(CtxMenu {
                         x: x / sf,
                         y: y / sf,
@@ -306,6 +313,13 @@ fn build_terminal_entry(
                     st.ctx_menu = None;
                 } else {
                     let sf = st.scale_factor;
+                    crate::renderer_telemetry::record_ctx_menu_open(
+                        "tab",
+                        x / sf,
+                        y / sf,
+                        st.window_width / sf,
+                        st.window_height / sf,
+                    );
                     st.ctx_menu = Some(CtxMenu {
                         x: x / sf,
                         y: y / sf,
@@ -372,6 +386,9 @@ fn build_sidebar_footer(state: &UiSnapshot) -> ElementDef {
 }
 
 pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    use unshit::core::style::parse::StyleDeclaration;
+    use unshit::core::style::types::Dimension;
+
     let ctx = match &snap.ctx_menu {
         Some(c) => c,
         None => return ElementDef::new(Tag::Div).with_class("ctx-menu-hidden"),
@@ -396,17 +413,148 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
     let menu = match &ctx.target {
         crate::state::CtxMenuTarget::Workspace { idx } => {
             let installed = crate::shell::discover_installed();
-            build_workspace_ctx_menu(snap, shared, ctx.x, ctx.y, *idx, &installed)
+            build_workspace_ctx_menu(snap, shared, *idx, &installed)
         }
         crate::state::CtxMenuTarget::Tab { pane_id } => {
-            build_tab_ctx_menu(snap, shared, ctx.x, ctx.y, *pane_id, false)
+            build_tab_ctx_menu(snap, shared, *pane_id, false)
         }
         crate::state::CtxMenuTarget::TabName { pane_id } => {
-            build_tab_ctx_menu(snap, shared, ctx.x, ctx.y, *pane_id, true)
+            build_tab_ctx_menu(snap, shared, *pane_id, true)
+        }
+    };
+
+    // Position last: the menu is `position: fixed` and would otherwise be
+    // laid out straight at the cursor, which pushes its lower rows (the
+    // danger zone holding "Remove workspace") past the bottom of the window
+    // where nothing can reach them. `.m-menu` sets `overflow: visible`, so
+    // the clipped part is simply unreachable, not scrollable.
+    let (menu_w, menu_h) = estimate_menu_size(&menu);
+    // The root carries `FontScale` when the user raised the config font size,
+    // which grows every row's line box. Scaling the whole estimate (padding
+    // included) over-estimates a little, which is the safe direction.
+    // The 1.1 factor is asymmetry insurance: the estimate only picks the anchor
+    // edge, and under-estimating flips the decision, so the whole overflow
+    // clips. Flipping up a little early costs nothing.
+    let menu_h = menu_h
+        * (snap.config_font_size_pt as f32 / crate::state::DEFAULT_CONFIG_FONT_SIZE_PT as f32)
+            .max(1.0)
+        * 1.1;
+    // Window size is stored in physical pixels, like `last_grid_*`; the menu
+    // metrics and the stored cursor anchor are both CSS px.
+    let sf = snap.scale_factor.max(1e-3);
+    let win_w = snap.window_width / sf;
+    let win_h = snap.window_height / sf;
+
+    let menu = menu.with_style(StyleDeclaration::Left(Dimension::Px(ctx_menu_clamped_x(
+        ctx.x, win_w, menu_w,
+    ))));
+    let menu = match ctx_menu_v_anchor(ctx.y, win_h, menu_h) {
+        CtxMenuVAnchor::Top(top) => menu.with_style(StyleDeclaration::Top(Dimension::Px(top))),
+        CtxMenuVAnchor::Bottom(inset) => {
+            menu.with_style(StyleDeclaration::Bottom(Dimension::Px(inset)))
         }
     };
 
     backdrop.with_child(menu)
+}
+
+/// Margin kept between a context menu edge and the window edge, CSS px.
+const CTX_MENU_EDGE_MARGIN: f32 = 8.0;
+
+/// Vertical anchor for a `position: fixed` context menu opened at cursor
+/// `y` inside a window `win_h` tall (both CSS px).
+enum CtxMenuVAnchor {
+    /// `top: y` — the classic drop-down below the cursor.
+    Top(f32),
+    /// `bottom: inset` — the menu grows upward from a pinned bottom edge,
+    /// which keeps every row in-window without knowing the menu height.
+    Bottom(f32),
+}
+
+/// Picks the anchor edge. `est_h` deliberately OVERESTIMATES the menu
+/// height: it only decides which edge to anchor to and never sizes
+/// anything, so erring large merely flips or pins slightly early, while
+/// erring small would let the menu clip at the window bottom.
+fn ctx_menu_v_anchor(y: f32, win_h: f32, est_h: f32) -> CtxMenuVAnchor {
+    // win_h == 0.0 means the window has never been measured (fresh state,
+    // structural tests): keep the historical unclamped drop-down.
+    if win_h <= 0.0 || y + est_h + CTX_MENU_EDGE_MARGIN <= win_h {
+        CtxMenuVAnchor::Top(y)
+    } else if y >= est_h + CTX_MENU_EDGE_MARGIN {
+        // Enough room above the cursor: flip up, menu bottom at the cursor.
+        // The max() only matters for driven/dispatched coordinates that
+        // land past the window bottom; a real cursor y never exceeds win_h.
+        CtxMenuVAnchor::Bottom((win_h - y).max(CTX_MENU_EDGE_MARGIN))
+    } else {
+        // Window shorter than the menu either way: pin to the bottom edge
+        // so the danger actions stay visible and clickable.
+        CtxMenuVAnchor::Bottom(CTX_MENU_EDGE_MARGIN)
+    }
+}
+
+/// Clamps the menu's left edge so a fixed-width menu stays in-window.
+/// `win_w == 0.0` (unmeasured) leaves the cursor coordinate untouched.
+fn ctx_menu_clamped_x(x: f32, win_w: f32, menu_w: f32) -> f32 {
+    if win_w <= 0.0 {
+        return x;
+    }
+    x.min((win_w - menu_w - CTX_MENU_EDGE_MARGIN).max(CTX_MENU_EDGE_MARGIN))
+}
+
+// Row metrics mirroring assets/styles.css. They only decide *whether* a
+// menu is nudged away from an edge, so erring slightly high is safe: it
+// nudges a menu that would just barely have fit, and never leaves one
+// clipped.
+const MENU_PAD_Y: f32 = 10.0; // .ctx-menu padding: 5px top + bottom
+const MENU_HEAD_H: f32 = 40.0; // .m-head padding + text + rule + margin
+const MENU_ROW_H: f32 = 34.0; // .m-row padding 7+7 + line box
+const MENU_LEGACY_HEAD_H: f32 = 32.0; // .ctx-menu-header
+const MENU_LEGACY_ROW_H: f32 = 30.0; // .ctx-menu-item
+const MENU_SEP_H: f32 = 10.0; // .ctx-menu-separator + margins
+const MENU_DANGER_FENCE_H: f32 = 10.0; // .m-danger margin + padding + border
+const MENU_WIDE_W: f32 = 222.0; // .m-menu width
+const MENU_LEGACY_W: f32 = 200.0; // .ctx-menu min-width plus slack
+
+/// Rough laid-out size of a built context menu, in CSS px.
+///
+/// The engine measures the element tree only after this frame is built, so
+/// placement has to work from the row inventory instead. The hover flyout
+/// is skipped: it is absolutely positioned and adds nothing to the menu's
+/// own box.
+fn estimate_menu_size(menu: &ElementDef) -> (f32, f32) {
+    fn has(el: &ElementDef, class: &str) -> bool {
+        el.classes.iter().any(|c| c == class)
+    }
+    fn walk(el: &ElementDef, acc: &mut f32) {
+        if has(el, "m-flyout") {
+            return;
+        }
+        if has(el, "m-head") {
+            *acc += MENU_HEAD_H;
+        } else if has(el, "m-row") {
+            *acc += MENU_ROW_H;
+        } else if has(el, "ctx-menu-header") {
+            *acc += MENU_LEGACY_HEAD_H;
+        } else if has(el, "ctx-menu-item") {
+            *acc += MENU_LEGACY_ROW_H;
+        } else if has(el, "ctx-menu-separator") {
+            *acc += MENU_SEP_H;
+        } else if has(el, "m-danger") {
+            *acc += MENU_DANGER_FENCE_H;
+        }
+        for child in &el.children {
+            walk(child, acc);
+        }
+    }
+
+    let mut height = MENU_PAD_Y;
+    walk(menu, &mut height);
+    let width = if menu.classes.iter().any(|c| c == "m-menu") {
+        MENU_WIDE_W
+    } else {
+        MENU_LEGACY_W
+    };
+    (width, height)
 }
 
 fn ctx_menu_item(label: &str, shared: &SharedState, command: String) -> ElementDef {
@@ -606,14 +754,9 @@ fn workspace_flyout_shell_items(
 fn build_workspace_ctx_menu(
     snap: &UiSnapshot,
     shared: &SharedState,
-    x: f32,
-    y: f32,
     ws_idx: usize,
     installed: &[std::path::PathBuf],
 ) -> ElementDef {
-    use unshit::core::style::parse::StyleDeclaration;
-    use unshit::core::style::types::Dimension;
-
     let ws = snap.workspaces.get(ws_idx);
     let ws_name = ws.map(|w| w.name.clone()).unwrap_or_default();
     let is_collapsed = ws.map(|w| w.collapsed).unwrap_or(false);
@@ -682,8 +825,6 @@ fn build_workspace_ctx_menu(
     ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
         .with_class("m-menu")
-        .with_style(StyleDeclaration::Left(Dimension::Px(x)))
-        .with_style(StyleDeclaration::Top(Dimension::Px(y)))
         .with_child(header)
         .with_child(m_menu_row(
             svg_icon(icon_diamond()),
@@ -713,14 +854,9 @@ fn build_workspace_ctx_menu(
 fn build_tab_ctx_menu(
     snap: &UiSnapshot,
     shared: &SharedState,
-    x: f32,
-    y: f32,
     pane_id: u32,
     include_export: bool,
 ) -> ElementDef {
-    use unshit::core::style::parse::StyleDeclaration;
-    use unshit::core::style::types::Dimension;
-
     // Header shows the current pane title so the user can tell which
     // session they are about to rename / kill. Fall back to the pane
     // id if no matching pane is found, which only happens if the menu
@@ -730,8 +866,6 @@ fn build_tab_ctx_menu(
 
     let mut menu = ElementDef::new(Tag::Div)
         .with_class("ctx-menu")
-        .with_style(StyleDeclaration::Left(Dimension::Px(x)))
-        .with_style(StyleDeclaration::Top(Dimension::Px(y)))
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("ctx-menu-header")
@@ -1218,7 +1352,7 @@ mod tests {
             });
         }
         let snap = shared.lock().unwrap().ui_snapshot();
-        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 77, false);
+        let menu = build_tab_ctx_menu(&snap, &shared, 77, false);
         let header = find_by_class(&menu, "ctx-menu-header").expect("ctx menu header");
 
         assert_eq!(text_of(header), Some("saved-pane-title"));
@@ -1228,7 +1362,7 @@ mod tests {
     fn tab_name_ctx_menu_includes_export_item() {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
-        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 1, true);
+        let menu = build_tab_ctx_menu(&snap, &shared, 1, true);
         let text = collect_text_recursive(&menu);
 
         assert!(text.contains("Rename session"));
@@ -1239,7 +1373,7 @@ mod tests {
     fn sidebar_tab_ctx_menu_omits_export_item() {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
-        let menu = build_tab_ctx_menu(&snap, &shared, 0.0, 0.0, 1, false);
+        let menu = build_tab_ctx_menu(&snap, &shared, 1, false);
         let text = collect_text_recursive(&menu);
 
         assert!(text.contains("Rename session"));
@@ -1618,6 +1752,126 @@ mod tests {
         );
     }
 
+    // -- context menu window clamping --
+
+    fn harness_with_ctx_menu(win_w: f32, win_h: f32, x: f32, y: f32) -> TestHarness {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.scale_factor = 1.0;
+            guard.window_width = win_w;
+            guard.window_height = win_h;
+            guard.ctx_menu = Some(crate::state::CtxMenu {
+                x,
+                y,
+                target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+            });
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let tree_shared = shared.clone();
+        let css = include_str!("../../assets/styles.css");
+        let mut harness = TestHarness::new(
+            css,
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_child(build_ctx_menu_overlay(&snap, &tree_shared)),
+            },
+            win_w,
+            win_h,
+        );
+        harness.step();
+        harness
+    }
+
+    #[test]
+    fn workspace_ctx_menu_pins_to_bottom_in_short_window() {
+        // Regression: in a window shorter than the menu, the raw Top(y)
+        // placement ran the danger zone ("Kill all terminals" / "Remove
+        // workspace") past the window bottom, leaving it invisible and
+        // unclickable.
+        let harness = harness_with_ctx_menu(600.0, 260.0, 20.0, 120.0);
+        let menu = harness
+            .query(".m-menu")
+            .expect("workspace ctx menu should render");
+        let bottom = menu.layout_rect.y + menu.layout_rect.height;
+        assert!(
+            bottom <= 260.0 + 0.5,
+            "menu must not cross the window bottom, got bottom {bottom} (rect {:?})",
+            menu.layout_rect
+        );
+        let danger = harness
+            .query(".m-danger")
+            .expect("danger zone should render");
+        let danger_bottom = danger.layout_rect.y + danger.layout_rect.height;
+        assert!(
+            danger_bottom <= 260.0 + 0.5,
+            "danger rows must stay inside the window, got bottom {danger_bottom}"
+        );
+    }
+
+    #[test]
+    fn workspace_ctx_menu_flips_up_near_window_bottom() {
+        // Cursor near the bottom of a tall window: the menu flips so its
+        // bottom edge sits at the cursor instead of overflowing below.
+        let harness = harness_with_ctx_menu(1280.0, 720.0, 20.0, 650.0);
+        let menu = harness
+            .query(".m-menu")
+            .expect("workspace ctx menu should render");
+        let bottom = menu.layout_rect.y + menu.layout_rect.height;
+        assert!(
+            (bottom - 650.0).abs() <= 0.5,
+            "flipped menu bottom should sit at the cursor y, got {bottom}"
+        );
+        assert!(
+            menu.layout_rect.y >= 0.0,
+            "flipped menu must not cross the window top, got y {}",
+            menu.layout_rect.y
+        );
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_prefers_dropdown_when_it_fits() {
+        assert!(matches!(
+            ctx_menu_v_anchor(100.0, 720.0, 270.0),
+            CtxMenuVAnchor::Top(y) if y == 100.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_flips_up_when_only_space_above() {
+        assert!(matches!(
+            ctx_menu_v_anchor(650.0, 720.0, 270.0),
+            CtxMenuVAnchor::Bottom(inset) if inset == 70.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_pins_when_window_too_short() {
+        assert!(matches!(
+            ctx_menu_v_anchor(120.0, 260.0, 270.0),
+            CtxMenuVAnchor::Bottom(inset) if inset == CTX_MENU_EDGE_MARGIN
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_v_anchor_unmeasured_window_falls_through_to_cursor() {
+        // window_h == 0.0 (never measured) must keep the historical
+        // unclamped drop-down so structural tests and fresh state behave.
+        assert!(matches!(
+            ctx_menu_v_anchor(650.0, 0.0, 270.0),
+            CtxMenuVAnchor::Top(y) if y == 650.0
+        ));
+    }
+
+    #[test]
+    fn ctx_menu_clamped_x_keeps_fixed_width_menu_in_window() {
+        assert_eq!(ctx_menu_clamped_x(20.0, 600.0, 222.0), 20.0);
+        assert_eq!(ctx_menu_clamped_x(500.0, 600.0, 222.0), 370.0);
+        // Unmeasured window: cursor coordinate passes through untouched.
+        assert_eq!(ctx_menu_clamped_x(500.0, 0.0, 222.0), 500.0);
+    }
+
     #[test]
     fn workspace_names_avoid_broken_medium_font_path() {
         let css = include_str!("../../assets/styles.css").replace("\r\n", "\n");
@@ -1675,12 +1929,117 @@ mod tests {
         collect_text_recursive(el).contains(needle)
     }
 
+    // -- context menu placement (stays inside the window) --------------------
+
+    /// The vertical inset the overlay applied to the rendered menu, as
+    /// (is_bottom_anchored, value in CSS px).
+    fn menu_v_inset(overlay: &ElementDef) -> (bool, f32) {
+        use unshit::core::style::parse::StyleDeclaration;
+        use unshit::core::style::types::Dimension;
+
+        find_by_class(overlay, "ctx-menu")
+            .expect("menu must render")
+            .style_overrides
+            .iter()
+            .find_map(|s| match s {
+                StyleDeclaration::Top(Dimension::Px(v)) => Some((false, *v)),
+                StyleDeclaration::Bottom(Dimension::Px(v)) => Some((true, *v)),
+                _ => None,
+            })
+            .expect("menu must carry a vertical inset")
+    }
+
+    /// The estimate drives the clamp, so it must cover the whole workspace
+    /// menu -- header, rows, danger fence -- while ignoring the hover flyout,
+    /// which is absolutely positioned and adds nothing to the menu's box.
+    #[test]
+    fn workspace_menu_size_estimate_covers_rows_and_ignores_flyout() {
+        let shared = make_shared();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let installed: Vec<std::path::PathBuf> = (0..16)
+            .map(|idx| std::path::PathBuf::from(format!("/opt/shells/shell{idx}")))
+            .collect();
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
+        let (w, h) = estimate_menu_size(&menu);
+
+        assert_eq!(w, MENU_WIDE_W, "workspace menu uses the .m-menu width");
+        // Header + Set active + New terminal + Collapse + Kill all (+ Remove
+        // when several workspaces exist), never the 16 flyout shell rows.
+        assert!(
+            (140.0..=230.0).contains(&h),
+            "estimate should cover the visible rows only, got {h}"
+        );
+    }
+
+    /// The overlay, not the builders, applies the position now: a menu built
+    /// with the fixed-position class but no inset would land at the origin.
+    /// Opened low in the window, it anchors from the bottom instead.
+    #[test]
+    fn ctx_menu_overlay_positions_the_menu() {
+        let shared = make_shared();
+        {
+            let mut st = shared.lock().unwrap();
+            st.window_width = 900.0;
+            st.window_height = 560.0;
+            st.scale_factor = 1.0;
+            st.ctx_menu = Some(crate::state::CtxMenu {
+                x: 40.0,
+                y: 520.0,
+                target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+            });
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let (bottom_anchored, inset) = menu_v_inset(&build_ctx_menu_overlay(&snap, &shared));
+        assert!(bottom_anchored, "menu opened near the bottom must flip up");
+        assert!(
+            (inset - 40.0).abs() <= 0.5,
+            "flipped menu bottom should sit at the cursor, got inset {inset}"
+        );
+    }
+
+    /// A raised config font size grows every menu row, so the placement
+    /// estimate has to grow with it or the danger zone clips again for
+    /// exactly the users who bumped the UI font. At this cursor the menu
+    /// fits below at the default font and no longer does when it doubles.
+    #[test]
+    fn larger_config_font_changes_the_anchor_edge() {
+        let shared = make_shared();
+        let baseline = {
+            let mut st = shared.lock().unwrap();
+            st.window_width = 900.0;
+            st.window_height = 560.0;
+            st.scale_factor = 1.0;
+            st.config_font_size_pt = crate::state::DEFAULT_CONFIG_FONT_SIZE_PT;
+            st.ctx_menu = Some(crate::state::CtxMenu {
+                x: 40.0,
+                y: 250.0,
+                target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+            });
+            st.ui_snapshot()
+        };
+        let enlarged = {
+            let mut st = shared.lock().unwrap();
+            st.config_font_size_pt = crate::state::DEFAULT_CONFIG_FONT_SIZE_PT * 2;
+            st.ui_snapshot()
+        };
+
+        assert_eq!(
+            menu_v_inset(&build_ctx_menu_overlay(&baseline, &shared)),
+            (false, 250.0),
+            "at the default font the menu still fits below the cursor"
+        );
+        assert!(
+            menu_v_inset(&build_ctx_menu_overlay(&enlarged, &shared)).0,
+            "a doubled UI font must stop the menu dropping past the edge"
+        );
+    }
+
     #[test]
     fn workspace_ctx_menu_includes_shell_subsection_header() {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
         let text = collect_text_recursive(&menu);
         assert!(
             text.contains("Shell"),
@@ -1693,7 +2052,7 @@ mod tests {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
         let items = collect_with_class(&menu, "ctx-menu-item");
         assert!(
             items.iter().any(|el| item_text_contains(el, "pwsh")),
@@ -1719,7 +2078,7 @@ mod tests {
         let installed: Vec<std::path::PathBuf> = (0..16)
             .map(|idx| std::path::PathBuf::from(format!("/opt/shells/shell{idx}")))
             .collect();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
         let items = collect_with_class(&menu, "ctx-menu-item");
 
         let new_terminal_idx = items
@@ -1763,7 +2122,7 @@ mod tests {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
 
         let set_active = collect_with_class(&menu, "ctx-menu-item")
             .into_iter()
@@ -1791,7 +2150,7 @@ mod tests {
             std::path::PathBuf::from("/usr/bin/pwsh"),
             std::path::PathBuf::from("/usr/bin/zsh"),
         ];
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
         let pwsh = collect_with_class(&menu, "m-shell")
             .into_iter()
             .find(|el| item_text_contains(el, "pwsh"))
@@ -1822,7 +2181,7 @@ mod tests {
         }
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
         let active_items: Vec<&ElementDef> = collect_with_class(&menu, "ctx-menu-item")
             .into_iter()
             .filter(|el| has_class(el, "active"))
@@ -1845,7 +2204,7 @@ mod tests {
         }
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
         let text = collect_text_recursive(&menu);
         assert!(
             text.contains("Use app default"),
@@ -1859,7 +2218,7 @@ mod tests {
         let snap = shared.lock().unwrap().ui_snapshot();
         assert!(snap.workspaces[0].shell.is_empty());
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
         let text = collect_text_recursive(&menu);
         assert!(
             !text.contains("Use app default"),
@@ -1872,7 +2231,7 @@ mod tests {
         let shared = make_shared();
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = vec![std::path::PathBuf::from("/usr/bin/pwsh")];
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
         let pwsh_item = collect_with_class(&menu, "ctx-menu-item")
             .into_iter()
             .find(|el| item_text_contains(el, "pwsh"))
@@ -1894,7 +2253,7 @@ mod tests {
         }
         let snap = shared.lock().unwrap().ui_snapshot();
         let installed = fake_installed();
-        let menu = build_workspace_ctx_menu(&snap, &shared, 0.0, 0.0, 0, &installed);
+        let menu = build_workspace_ctx_menu(&snap, &shared, 0, &installed);
         let item = collect_with_class(&menu, "ctx-menu-item")
             .into_iter()
             .find(|el| item_text_contains(el, "Use app default"))
