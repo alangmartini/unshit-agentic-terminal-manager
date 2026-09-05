@@ -18,6 +18,11 @@ static LAST_SLOW_FRAME_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_GLYPH_DROP_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
 static SLOW_FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static GLYPH_DROP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LAST_SYMBOL_FALLBACK_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
+static SYMBOL_FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Symbol-fallback re-shapes seen in frames that fell inside the sample
+/// interval; folded into the next emitted record so the total is exact.
+static PENDING_SYMBOL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static QUEUE_WARNING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Envelope for the async writer queue. `untagged` keeps each variant's own
@@ -27,6 +32,7 @@ static QUEUE_WARNING_ACTIVE: AtomicBool = AtomicBool::new(false);
 enum TelemetryRecord {
     SlowFrame(SlowFrameRecord),
     GlyphDrop(GlyphDropRecord),
+    SymbolFallback(SymbolFallbackRecord),
     PtyGeometry(PtyGeometryRecord),
 }
 
@@ -35,6 +41,7 @@ impl TelemetryRecord {
         match self {
             Self::SlowFrame(record) => record.event,
             Self::GlyphDrop(record) => record.event,
+            Self::SymbolFallback(record) => record.event,
             Self::PtyGeometry(record) => record.event,
         }
     }
@@ -43,6 +50,7 @@ impl TelemetryRecord {
         match self {
             Self::SlowFrame(record) => &record.correlation_id,
             Self::GlyphDrop(record) => &record.correlation_id,
+            Self::SymbolFallback(record) => &record.correlation_id,
             Self::PtyGeometry(record) => &record.correlation_id,
         }
     }
@@ -134,6 +142,42 @@ impl GlyphDropRecord {
             cache_bypasses: metrics.glyph_cache_bypasses,
             glyph_count: metrics.glyph_count,
             atlas_fill_ratio: metrics.atlas_fill_ratio,
+            batch_build_us: metrics.batch_build_us,
+        }
+    }
+}
+
+/// Content-free record of text runs / grid cells re-shaped onto the
+/// monochrome symbol face because the platform font fallback resolved a
+/// text-presentation symbol (✳ in a guest title, ⏺ in agent output) to a
+/// color-emoji face the renderer can only flatten into a box. Informational:
+/// it is the rate at which the fix in `unshit_core::text_fallback` fires,
+/// and the first thing to check if such a box ever comes back. `reshapes`
+/// is exact across the sample interval (frames inside it accumulate).
+#[derive(Debug, Serialize)]
+struct SymbolFallbackRecord {
+    timestamp_unix_ms: u64,
+    event: &'static str,
+    level: &'static str,
+    correlation_id: String,
+    sample_sequence: u64,
+    sample_interval_ms: u64,
+    reshapes: u64,
+    glyph_count: u32,
+    batch_build_us: u64,
+}
+
+impl SymbolFallbackRecord {
+    fn new(metrics: &FrameMetrics, reshapes: u64, timestamp_unix_ms: u64) -> Self {
+        Self {
+            timestamp_unix_ms,
+            event: "renderer.symbol_fallback",
+            level: "info",
+            correlation_id: process_correlation_id().to_string(),
+            sample_sequence: SYMBOL_FALLBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            sample_interval_ms: SLOW_FRAME_SAMPLE_INTERVAL_MS,
+            reshapes,
+            glyph_count: metrics.glyph_count,
             batch_build_us: metrics.batch_build_us,
         }
     }
@@ -334,6 +378,43 @@ pub fn record_glyph_drops(metrics: &FrameMetrics) {
 
     enqueue(TelemetryRecord::GlyphDrop(GlyphDropRecord::from_metrics(
         metrics,
+        timestamp_unix_ms,
+    )));
+}
+
+/// Record frames whose text shaping fell back to the monochrome symbol face
+/// (see [`SymbolFallbackRecord`]). Counts from frames inside the sample
+/// interval accumulate into the next record instead of being dropped, so
+/// the persisted totals stay exact while the file grows at most once per
+/// interval.
+pub fn record_symbol_fallbacks(metrics: &FrameMetrics) {
+    if metrics.glyph_symbol_fallbacks == 0 {
+        return;
+    }
+    PENDING_SYMBOL_FALLBACKS.fetch_add(metrics.glyph_symbol_fallbacks, Ordering::Relaxed);
+
+    let timestamp_unix_ms = now_unix_ms();
+    let previous = LAST_SYMBOL_FALLBACK_SAMPLE_MS.load(Ordering::Relaxed);
+    if timestamp_unix_ms.saturating_sub(previous) < SLOW_FRAME_SAMPLE_INTERVAL_MS
+        || LAST_SYMBOL_FALLBACK_SAMPLE_MS
+            .compare_exchange(
+                previous,
+                timestamp_unix_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        return;
+    }
+
+    let reshapes = PENDING_SYMBOL_FALLBACKS.swap(0, Ordering::Relaxed);
+    if reshapes == 0 {
+        return;
+    }
+    enqueue(TelemetryRecord::SymbolFallback(SymbolFallbackRecord::new(
+        metrics,
+        reshapes,
         timestamp_unix_ms,
     )));
 }
@@ -566,5 +647,45 @@ mod tests {
         // Content-free contract: counts only, never rendered text.
         assert!(value.get("text").is_none());
         assert!(value.get("terminal_output").is_none());
+    }
+
+    #[test]
+    fn symbol_fallback_event_is_persisted_with_counts_and_no_content() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir()
+            .join(format!(
+                "tm-renderer-symbol-fallback-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("renderer-events.jsonl");
+        let metrics = FrameMetrics {
+            glyph_symbol_fallbacks: 2,
+            glyph_count: 812,
+            batch_build_us: 1_900,
+            ..FrameMetrics::default()
+        };
+        let record = TelemetryRecord::SymbolFallback(SymbolFallbackRecord::new(&metrics, 5, 123));
+        let (sender, worker) = spawn_writer(path.clone()).expect("spawn telemetry writer");
+
+        sender.send(record).expect("enqueue symbol fallback");
+        drop(sender);
+        worker.join().expect("join telemetry writer");
+
+        let body = std::fs::read_to_string(&path).expect("read telemetry");
+        let value: serde_json::Value =
+            serde_json::from_str(body.trim()).expect("valid JSONL record");
+        assert_eq!(value["event"], "renderer.symbol_fallback");
+        assert_eq!(value["level"], "info");
+        assert_eq!(
+            value["reshapes"], 5,
+            "accumulated total, not the frame's own count"
+        );
+        assert_eq!(value["glyph_count"], 812);
+        assert_eq!(value["timestamp_unix_ms"], 123);
+        // Content-free contract: never the label or title that was re-shaped.
+        assert!(value.get("text").is_none());
+        assert!(value.get("title").is_none());
+        assert!(value.get("symbol_family").is_none());
     }
 }

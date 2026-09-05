@@ -47,6 +47,11 @@ static GLYPH_CACHE_BYPASSES: AtomicU64 = AtomicU64::new(0);
 pub struct GlyphDropStats {
     pub raster_failures: u64,
     pub cache_bypasses: u64,
+    /// Text runs / grid cells re-shaped onto the monochrome symbol face
+    /// because the platform fallback picked a color-emoji face for a
+    /// text-presentation symbol (see `unshit_core::text_fallback`). Not a
+    /// failure; it is the rate at which that fallback fires.
+    pub symbol_fallbacks: u64,
 }
 
 /// Drain the glyph-drop counters accumulated since the previous call.
@@ -54,6 +59,7 @@ pub fn take_glyph_drop_stats() -> GlyphDropStats {
     GlyphDropStats {
         raster_failures: GLYPH_RASTER_FAILURES.swap(0, Ordering::Relaxed),
         cache_bypasses: GLYPH_CACHE_BYPASSES.swap(0, Ordering::Relaxed),
+        symbol_fallbacks: unshit_core::text_fallback::take_symbol_fallback_count(),
     }
 }
 
@@ -148,6 +154,7 @@ use unshit_core::svg::types::{
     PathCommand, StrokeLineCap, StrokeLineJoin, SvgAttrs, SvgNode, SvgPaint, SvgPrimitive,
     SvgTransform, ViewBox,
 };
+use unshit_core::text_fallback::set_text_with_symbol_fallback;
 use unshit_core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 use unshit_core::tree::NodeArena;
 
@@ -3432,13 +3439,16 @@ fn emit_text_glyphs_cached(
         let metrics = Metrics::new(font_size, font_size * line_height);
         let mut buffer = Buffer::new(font_system, metrics);
         buffer.set_size(font_system, max_width.map(|w| w.max(1.0)), None);
-        buffer.set_text(
+        // Text-presentation symbols the family lacks (✳ in a guest title)
+        // are re-shaped onto a monochrome symbol face instead of the
+        // color-emoji face, whose glyphs this path can only flatten.
+        set_text_with_symbol_fallback(
+            &mut buffer,
             font_system,
             text,
             text_attrs(font_family, font_weight, font_style),
             Shaping::Advanced,
         );
-        buffer.shape_until_scroll(font_system, false);
 
         let mut cached_glyphs = Vec::new();
         let mut run_failed = false;
@@ -5459,8 +5469,16 @@ fn emit_grid_cell_glyph(
         // Silence unused on non-windows.
         let _ = family_name;
         let attrs = terminal_text_attrs(family, cell.attrs);
-        buffer.set_text(font_system, ch_str, attrs, cosmic_text::Shaping::Advanced);
-        buffer.shape_until_scroll(font_system, false);
+        // Miss path only (the ShapeCache keeps the result): a symbol the
+        // terminal font lacks that resolved to the color-emoji face is
+        // re-shaped onto the monochrome symbol face, matching the UI path.
+        set_text_with_symbol_fallback(
+            buffer,
+            font_system,
+            ch_str,
+            attrs,
+            cosmic_text::Shaping::Advanced,
+        );
 
         let shaped = buffer.layout_runs().find_map(|run| {
             run.glyphs
@@ -7501,6 +7519,44 @@ mod tests {
         let w =
             measure_monospace_cell_width_for_family(&mut fs, "Consolas", font_size, line_height);
         assert!(w > 0.0, "family-specific cell width must be positive, got {w}");
+    }
+
+    /// The sidebar/tab-label regression: ✳ (U+2733, Claude Code's idle title
+    /// prefix) is absent from the UI font, and cosmic-text's Windows fallback
+    /// reaches Segoe UI Emoji (a color glyph this path flattens into a box)
+    /// before Segoe UI Symbol. After the symbol retry the same shaping entry
+    /// point must hand swash a glyph that rasterizes as a coverage mask.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ui_text_symbol_fallback_rasterizes_eight_spoked_asterisk_as_mask() {
+        let mut fs = FontSystem::new();
+        let mut swash = SwashCache::new();
+        let metrics = Metrics::new(14.0, 14.0 * 1.4);
+        let mut buffer = Buffer::new(&mut fs, metrics);
+        buffer.set_size(&mut fs, Some(400.0), None);
+        let retried = set_text_with_symbol_fallback(
+            &mut buffer,
+            &mut fs,
+            "\u{2733} Workspace",
+            text_attrs("Segoe UI", FontWeight::Normal, FontStyle::Normal),
+            Shaping::Advanced,
+        );
+        assert!(retried, "the label must hit the color-emoji fallback and retry");
+
+        let glyph = buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.to_vec())
+            .next()
+            .expect("the asterisk shapes to a glyph");
+        let physical = glyph.physical((0.0, 0.0), 1.0);
+        let image =
+            swash.get_image_uncached(&mut fs, physical.cache_key).expect("the asterisk rasterizes");
+        assert_eq!(
+            image.content,
+            cosmic_text::SwashContent::Mask,
+            "a color raster here would be flattened into the solid box the fix removes"
+        );
+        assert!(image.placement.width > 0 && image.placement.height > 0);
     }
 
     /// Different line_height values must not change the measured advance width,

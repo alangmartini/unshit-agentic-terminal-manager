@@ -470,6 +470,12 @@ pub struct FrameMetrics {
     /// of a glyph failure (they re-emit, and retry the glyph, every frame
     /// until rasterization succeeds).
     pub glyph_cache_bypasses: u64,
+    /// Text runs / grid cells re-shaped onto the monochrome symbol face
+    /// this frame because the platform font fallback resolved a
+    /// text-presentation symbol (✳, ⏺, ...) to a color-emoji face the
+    /// renderer can only flatten. Cache-miss work only; a steady nonzero
+    /// value means a shaped-text cache is thrashing.
+    pub glyph_symbol_fallbacks: u64,
     pub atlas_fill_ratio: f32,
     pub gpu_upload_bytes: u64,
     pub damage_area_px: u64,
@@ -1981,6 +1987,7 @@ fn finalize_frame_metrics(
     let drop_stats = batch::take_glyph_drop_stats();
     metrics.glyph_raster_failures = drop_stats.raster_failures;
     metrics.glyph_cache_bypasses = drop_stats.cache_bypasses;
+    metrics.glyph_symbol_fallbacks = drop_stats.symbol_fallbacks;
     state.glyph_drop_failures_accum =
         state.glyph_drop_failures_accum.saturating_add(drop_stats.raster_failures);
     state.glyph_drop_bypasses_accum =
@@ -7259,6 +7266,7 @@ mod tests {
             glyph_count: 512,
             glyph_raster_failures: 3,
             glyph_cache_bypasses: 2,
+            glyph_symbol_fallbacks: 1,
             atlas_fill_ratio: 0.75,
             gpu_upload_bytes: 8192,
             damage_area_px: 1920 * 1080,

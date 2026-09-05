@@ -1197,6 +1197,7 @@ fn main() {
                 crate::bench::record_frame(m);
                 crate::renderer_telemetry::record_slow_frame(m);
                 crate::renderer_telemetry::record_glyph_drops(m);
+                crate::renderer_telemetry::record_symbol_fallbacks(m);
                 // record_frame returns true when the visible overlay is
                 // due a rebuild (throttled to ~4Hz inside fps_overlay),
                 // so a visible overlay no longer forces a full rebuild

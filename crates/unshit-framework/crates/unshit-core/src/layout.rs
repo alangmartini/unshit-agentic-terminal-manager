@@ -626,13 +626,15 @@ fn shaped_buffer(
     let metrics = Metrics::new(font_size, font_size * line_height);
     let mut buffer = Buffer::new(font_system, metrics);
     buffer.set_size(font_system, max_width, None);
-    buffer.set_text(
+    // Same shaping as the renderer's UI text path, so a symbol re-shaped
+    // onto the monochrome symbol face is measured with that face's advance.
+    crate::text_fallback::set_text_with_symbol_fallback(
+        &mut buffer,
         font_system,
         text,
         text_attrs(font_family, font_weight, font_style),
         Shaping::Advanced,
     );
-    buffer.shape_until_scroll(font_system, false);
     buffer
 }
 
