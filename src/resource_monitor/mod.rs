@@ -183,15 +183,17 @@ pub fn format_compact_bytes(bytes: u64) -> String {
 /// loop exists: `sink` may still be empty, in which case the tick simply
 /// does not request a rebuild and the next one does.
 pub fn start(shared: SharedState, sink: Arc<OnceLock<EventSink>>) {
-    let mut started = ResourceEventRecord::new("resource.monitor_started", "info");
-    started.interval_ms = Some(SAMPLE_INTERVAL.as_millis() as u64);
-    started.logical_cpus = Some(platform::logical_cpus());
-    started.platform_supported = Some(cfg!(windows));
-    telemetry::record(&started);
-
     let spawned = std::thread::Builder::new()
         .name("resource-monitor".into())
         .spawn(move || {
+            // The start record is a synchronous file write; it belongs on
+            // this thread, not on the startup path that spawned it.
+            let mut started = ResourceEventRecord::new("resource.monitor_started", "info");
+            started.interval_ms = Some(SAMPLE_INTERVAL.as_millis() as u64);
+            started.logical_cpus = Some(platform::logical_cpus());
+            started.platform_supported = Some(cfg!(windows));
+            telemetry::record(&started);
+
             let mut monitor = Monitor::new();
             loop {
                 let tick_started = Instant::now();
