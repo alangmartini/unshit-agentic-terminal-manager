@@ -45,6 +45,8 @@ The UI and the daemon talk over a user-scoped **named pipe**. On startup the UI 
 
 Download the latest installer from the [Releases](https://github.com/alangmartini/unshit-agentic-terminal-manager/releases) page and run it. It installs per-user (no administrator prompt), adds a Start Menu shortcut, and registers an uninstaller in Add/Remove Programs. Both executables (`terminal-manager.exe` and `unshit-ptyd.exe`) are packaged together — keep them in the same folder if you move the install.
 
+After that first install the app updates itself. It checks GitHub Releases shortly after startup and, once per new version, offers to install it; **Settings › Updates** has a *check for updates* button, an *install and restart* button and the switch for the startup check. Installing downloads the release installer, verifies its size and SHA-256 digest, saves your workspace layout, stops the session daemon and hands off to the installer, which waits for the app to exit, installs silently and relaunches it. Your workspaces and tabs come back with fresh shells; running programs in the terminals do not survive the restart, so the prompt never installs on its own. See [specs/self-update.md](specs/self-update.md) for the contract and the `TM_UPDATE_*` environment variables.
+
 **Platform:** Windows (`x86_64-pc-windows-msvc`). The renderer uses wgpu, defaulting to Vulkan and falling back to Direct3D 12; you can force a backend with `UNSHIT_RENDER_BACKEND=vulkan|dx12`.
 
 ### For developers (build from source)
