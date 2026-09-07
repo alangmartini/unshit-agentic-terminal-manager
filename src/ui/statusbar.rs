@@ -317,6 +317,7 @@ mod tests {
             ctx_menu: None,
             agent_pane_ids: Default::default(),
             confirm_dialog: None,
+            update: Default::default(),
             terminal_count: 0,
             active_terminal_cols: 80,
             active_terminal_rows: 24,

@@ -295,6 +295,13 @@ pub enum ConfirmDialog {
         buffer: String,
         error: Option<String>,
     },
+    /// Self-update offer: a newer release than the running build is known
+    /// (`AppState::update`). Opened once per version by the startup check
+    /// and on demand via `update.show_dialog`. Resolves through
+    /// `update.install` / `update.later` / `update.open_release_page`, never
+    /// through the generic `dialog.confirm`, so a stray Enter cannot start
+    /// an install that closes every session.
+    UpdateAvailable,
 }
 
 /// Outcome of resolving the user's persisted close preference when the
@@ -335,6 +342,7 @@ pub enum SettingsSection {
     Keybinds,
     Sessions,
     Notifications,
+    Updates,
     DangerZone,
 }
 
@@ -346,17 +354,19 @@ impl SettingsSection {
             SettingsSection::Keybinds => "keybinds",
             SettingsSection::Sessions => "sessions",
             SettingsSection::Notifications => "notifications",
+            SettingsSection::Updates => "updates",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 6] {
+    pub fn all() -> [SettingsSection; 7] {
         [
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
             SettingsSection::Sessions,
             SettingsSection::Notifications,
+            SettingsSection::Updates,
             SettingsSection::DangerZone,
         ]
     }
@@ -717,6 +727,9 @@ pub enum ToggleKey {
     /// command. Surfaced separately so Settings can offer explicit repair or
     /// removal without claiming this copy will start at sign-in.
     StartAtLoginStale,
+    /// Look for a newer release a few seconds after launch and offer it
+    /// once per version (Settings ▸ Updates). Defaults on; persisted.
+    CheckUpdatesOnStartup,
 }
 
 impl ToggleKey {
@@ -728,6 +741,7 @@ impl ToggleKey {
             ToggleKey::AutoResumeAgents => "auto-resume-agents",
             ToggleKey::StartAtLogin => "start-at-login",
             ToggleKey::StartAtLoginStale => "start-at-login-stale",
+            ToggleKey::CheckUpdatesOnStartup => "check-updates-on-startup",
         }
     }
 }
@@ -1059,6 +1073,10 @@ pub struct AppState {
     /// Pending destructive action awaiting confirmation. `None` when no
     /// confirm modal is showing.
     pub confirm_dialog: Option<ConfirmDialog>,
+    /// Self-update machinery: last check result, download progress, the
+    /// once-per-version prompt bookkeeping and whether this exe is a
+    /// registered install. Driven by `crate::updater`.
+    pub update: crate::updater::UpdateState,
     /// Daemon-known sessions, refreshed on demand via
     /// [`refresh_sessions`]. Empty when the daemon has never been
     /// polled or when the last poll returned no sessions.
@@ -1287,6 +1305,7 @@ impl AppState {
             window_height: self.window_height,
             scale_factor: self.scale_factor,
             confirm_dialog: self.confirm_dialog.clone(),
+            update: self.update.clone(),
             terminal_count: self.terminals.len(),
             active_terminal_cols,
             active_terminal_rows,
@@ -1408,6 +1427,9 @@ pub struct UiSnapshot {
     /// with tabbar_rect and DragState cursor.
     pub scale_factor: f32,
     pub confirm_dialog: Option<ConfirmDialog>,
+    /// Mirror of `AppState::update` for Settings ▸ Updates and the offer
+    /// dialog.
+    pub update: crate::updater::UpdateState,
     /// Total number of live terminals across every workspace. Read from
     /// `state.terminals.len()` so the danger-zone button can show an
     /// accurate count without the UI having to reach into the map.
@@ -1549,6 +1571,7 @@ pub fn seed_state() -> AppState {
     toggles.insert(ToggleKey::AutoResumeAgents, false);
     toggles.insert(ToggleKey::StartAtLogin, false);
     toggles.insert(ToggleKey::StartAtLoginStale, false);
+    toggles.insert(ToggleKey::CheckUpdatesOnStartup, true);
 
     AppState {
         workspaces,
@@ -1612,6 +1635,7 @@ pub fn seed_state() -> AppState {
         drag: crate::drag::DragState::default(),
         tabbar_rect: crate::drag::Rect::default(),
         confirm_dialog: None,
+        update: crate::updater::UpdateState::default(),
         sessions: Vec::new(),
         ui_pid: std::process::id(),
         ui_memory_rss_bytes: unshit_ptyd::memory::current_resident_set_bytes(),
@@ -6452,6 +6476,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                     | ConfirmDialog::RenameSession { .. }
                     | ConfirmDialog::CloseEditor { .. }
                     | ConfirmDialog::FlowRequest { .. }
+                    | ConfirmDialog::UpdateAvailable
             ) {
                 return false;
             }
@@ -6468,7 +6493,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 ConfirmDialog::CloseApp { .. }
                 | ConfirmDialog::RenameSession { .. }
                 | ConfirmDialog::CloseEditor { .. }
-                | ConfirmDialog::FlowRequest { .. } => {
+                | ConfirmDialog::FlowRequest { .. }
+                | ConfirmDialog::UpdateAvailable => {
                     unreachable!("filtered above")
                 }
             }
@@ -7097,6 +7123,15 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             state.sidebar_width = px.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
             true
         }
+        // Self-update (`crate::updater`). `update.check` and `update.install`
+        // start worker threads; results come back through the updater's
+        // apply functions under the state lock.
+        "update.check" => crate::updater::begin_check(state, crate::updater::CheckSource::Manual),
+        "update.install" => crate::updater::begin_install(state),
+        "update.later" => crate::updater::dismiss_prompt(state),
+        "update.open_release_page" => crate::updater::open_release_page(state),
+        "update.startup_check.toggle" => crate::updater::toggle_startup_check(state),
+        "update.show_dialog" => crate::updater::show_prompt(state),
         // Open settings on a named section (`settings.section:sessions`).
         // Scriptable through TM_STARTUP_DISPATCH so e2e shots can land on a
         // panel without synthesized clicks.
@@ -9426,6 +9461,7 @@ pub(crate) mod tests {
             drag: crate::drag::DragState::default(),
             tabbar_rect: crate::drag::Rect::default(),
             confirm_dialog: None,
+            update: crate::updater::UpdateState::default(),
             sessions: Vec::new(),
             ui_pid: std::process::id(),
             ui_memory_rss_bytes: None,
@@ -9463,15 +9499,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn settings_section_all_returns_six() {
+    fn settings_section_all_returns_seven() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         assert_eq!(all[0], SettingsSection::Appearance);
         assert_eq!(all[1], SettingsSection::Shell);
         assert_eq!(all[2], SettingsSection::Keybinds);
         assert_eq!(all[3], SettingsSection::Sessions);
         assert_eq!(all[4], SettingsSection::Notifications);
-        assert_eq!(all[5], SettingsSection::DangerZone);
+        assert_eq!(all[5], SettingsSection::Updates);
+        assert_eq!(all[6], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------

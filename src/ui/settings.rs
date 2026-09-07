@@ -107,6 +107,7 @@ fn build_settings_page_rail(state: &UiSnapshot, shared: &SharedState) -> Element
                     active,
                     shared,
                 ))
+                .with_child(settings_nav_item(SettingsSection::Updates, active, shared))
                 .with_child(settings_nav_item(
                     SettingsSection::DangerZone,
                     active,
@@ -138,6 +139,7 @@ fn settings_section_title(section: SettingsSection) -> &'static str {
         SettingsSection::Keybinds => "Keybinds",
         SettingsSection::Sessions => "Sessions",
         SettingsSection::Notifications => "Notifications",
+        SettingsSection::Updates => "Updates",
         SettingsSection::DangerZone => "Danger Zone",
     }
 }
@@ -173,6 +175,7 @@ fn settings_nav_class(section: SettingsSection) -> &'static str {
         SettingsSection::Sessions => "nav-sessions",
         SettingsSection::Keybinds => "nav-keybinds",
         SettingsSection::Notifications => "nav-notifications",
+        SettingsSection::Updates => "nav-updates",
         SettingsSection::DangerZone => "nav-danger-zone",
     }
 }
@@ -184,6 +187,7 @@ fn settings_nav_icon(section: SettingsSection) -> SvgNode {
         SettingsSection::Keybinds => icon_chevrons(),
         SettingsSection::Sessions => icon_folder(),
         SettingsSection::Notifications => icon_bell(),
+        SettingsSection::Updates => icon_download(),
         SettingsSection::DangerZone => icon_settings_nav_close(),
     }
 }
@@ -221,6 +225,9 @@ fn settings_section_desc(active: SettingsSection) -> &'static str {
             "Login startup, agent recovery, daemon sessions, and workspace attachment."
         }
         SettingsSection::Notifications => "Desktop notifications and focused panes.",
+        SettingsSection::Updates => {
+            "Check GitHub Releases for a newer build, install it in place, and choose whether to look at startup."
+        }
         SettingsSection::DangerZone => "Destructive session and close behavior.",
     }
 }
@@ -238,6 +245,7 @@ fn build_settings_page_body(state: &UiSnapshot, shared: &SharedState) -> Element
         SettingsSection::Keybinds => body.with_child(build_keybinds_section(state, shared)),
         SettingsSection::Sessions => body.with_child(build_sessions_section(state, shared)),
         SettingsSection::Notifications => body.with_child(build_notifications_section(shared)),
+        SettingsSection::Updates => body.with_child(build_updates_section(state, shared)),
         SettingsSection::DangerZone => body.with_child(build_danger_zone_section(state, shared)),
     };
     body
@@ -1151,6 +1159,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         SettingsSection::Keybinds => build_keybinds_section(state, shared),
         SettingsSection::Sessions => build_sessions_section(state, shared),
         SettingsSection::Notifications => build_notifications_section(shared),
+        SettingsSection::Updates => build_updates_section(state, shared),
         SettingsSection::DangerZone => build_danger_zone_section(state, shared),
     };
     ElementDef::new(Tag::Div)
@@ -1571,6 +1580,165 @@ fn build_notifications_section(shared: &SharedState) -> ElementDef {
         "test notification",
         "sends a notification targeted at the active workspace and terminal",
         test_notification,
+    ))
+}
+
+/// Settings ▸ Updates: current version + check button, the newer release
+/// with its install (or release-page) button and download progress, and
+/// the startup-check toggle. Everything renders from `UiSnapshot::update`;
+/// clicks dispatch `update.*` commands (see `crate::updater`).
+fn build_updates_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    use crate::updater::{progress_percent, progress_text, UpdatePhase, UpdateState};
+
+    let update = &state.update;
+    let busy = update.busy();
+
+    let check_shared = shared.clone();
+    let mut check = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("ghost")
+        .with_id("settings-update-check")
+        .with_text(if matches!(update.phase, UpdatePhase::Checking) {
+            "checking…"
+        } else {
+            "check for updates"
+        })
+        .on_click(move || {
+            mutate_with(&check_shared, |st| {
+                dispatch(st, "update.check");
+            });
+        });
+    if busy {
+        check = check.with_class("busy");
+    }
+
+    let version_label = format!("Terminal Manager v{}", UpdateState::current_version());
+    let status = update.status_line();
+    let mut status_row = setting_row(&version_label, &status, check)
+        .with_id("settings-update-status")
+        .with_class(format!("update-phase-{}", update.phase.as_str()));
+    if matches!(update.phase, UpdatePhase::Failed) {
+        status_row = status_row.with_class("update-failed");
+    }
+
+    let mut section = section_shell("updates")
+        .with_class(format!("update-phase-{}", update.phase.as_str()))
+        .with_child(status_row);
+
+    if let Some(release) = update.newer_release() {
+        let label = if release.title.trim().is_empty() || release.title == release.tag {
+            format!("v{}", release.version)
+        } else {
+            format!("v{} · {}", release.version, release.title)
+        };
+        let notes_shared = shared.clone();
+        let notes = ElementDef::new(Tag::Button)
+            .with_class("btn")
+            .with_class("ghost")
+            .with_id("settings-update-notes")
+            .with_text("what's new")
+            .on_click(move || {
+                mutate_with(&notes_shared, |st| {
+                    dispatch(st, "update.open_release_page");
+                });
+            });
+        let (desc, action) = if update.is_installed_copy() {
+            let install_shared = shared.clone();
+            let mut install = ElementDef::new(Tag::Button)
+                .with_class("btn")
+                .with_class("primary")
+                .with_id("settings-update-install")
+                .with_text(match update.phase {
+                    UpdatePhase::Downloading { .. } => "downloading…",
+                    UpdatePhase::Verifying => "verifying…",
+                    UpdatePhase::Installing => "installing…",
+                    UpdatePhase::Failed => "try again",
+                    _ => "install and restart",
+                })
+                .on_click(move || {
+                    mutate_with(&install_shared, |st| {
+                        dispatch(st, "update.install");
+                    });
+                });
+            if busy {
+                install = install.with_class("busy");
+            }
+            (
+                "Downloads the installer, closes every terminal session, installs the new version and reopens Terminal Manager. Workspaces and tabs come back with fresh shells.",
+                install,
+            )
+        } else {
+            let open_shared = shared.clone();
+            let open = ElementDef::new(Tag::Button)
+                .with_class("btn")
+                .with_class("ghost")
+                .with_id("settings-update-open-release")
+                .with_text("open release page")
+                .on_click(move || {
+                    mutate_with(&open_shared, |st| {
+                        dispatch(st, "update.open_release_page");
+                    });
+                });
+            (
+                "This copy was not set up by the installer, so it cannot replace itself. The release page has the installer for a manual update.",
+                open,
+            )
+        };
+        let controls = ElementDef::new(Tag::Div)
+            .with_class("update-controls")
+            .with_child(notes)
+            .with_child(action);
+        // Two wide buttons would squeeze the grid's text column to a few
+        // characters; this row stacks text above controls instead.
+        section = section.with_child(
+            setting_row(&label, desc, controls)
+                .with_id("settings-update-release")
+                .with_class("update-release-row"),
+        );
+
+        if let UpdatePhase::Downloading { received, total } = update.phase {
+            let percent = progress_percent(received, total).unwrap_or(0);
+            let fill = ElementDef::new(Tag::Div)
+                .with_class("update-progress-fill")
+                .with_style(StyleDeclaration::Width(Dimension::Percent(f32::from(
+                    percent,
+                ))));
+            let bar = ElementDef::new(Tag::Div)
+                .with_class("update-progress")
+                .with_child(fill);
+            section = section.with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("update-progress-row")
+                    .with_id("settings-update-progress")
+                    .with_child(bar)
+                    .with_child(
+                        ElementDef::new(Tag::Span)
+                            .with_class("update-progress-text")
+                            .with_text(progress_text(received, total)),
+                    ),
+            );
+        }
+    }
+
+    let startup_on = is_on(state, ToggleKey::CheckUpdatesOnStartup);
+    let toggle_shared = shared.clone();
+    let mut toggle = ElementDef::new(Tag::Button)
+        .with_class("login-startup-toggle")
+        .with_id("settings-update-startup-toggle")
+        .with_tab_index(0)
+        .with_text(if startup_on { "on" } else { "off" })
+        .on_click(move || {
+            mutate_with(&toggle_shared, |st| {
+                dispatch(st, "update.startup_check.toggle");
+            });
+        });
+    if startup_on {
+        toggle = toggle.with_class("on");
+    }
+    section.with_child(setting_row(
+        "check at startup",
+        "Looks for a new release a few seconds after launch and offers it once per version. Nothing is downloaded until you choose to install.",
+        toggle,
     ))
 }
 
@@ -3841,13 +4009,15 @@ mod tests {
         let shell = &nav.children[2];
         let keybinds = &nav.children[5];
         let notifications = &nav.children[6];
-        let danger = &nav.children[7];
+        let updates = &nav.children[7];
+        let danger = &nav.children[8];
 
         assert!(shell.classes.contains(&"nav-shell".to_string()));
         assert!(keybinds.classes.contains(&"nav-keybinds".to_string()));
         assert!(notifications
             .classes
             .contains(&"nav-notifications".to_string()));
+        assert!(updates.classes.contains(&"nav-updates".to_string()));
         assert!(danger.classes.contains(&"nav-danger-zone".to_string()));
 
         (shell.on_click.as_ref().unwrap())();
@@ -3903,10 +4073,10 @@ mod tests {
     }
 
     #[test]
-    fn modal_nav_has_six_items() {
+    fn modal_nav_has_seven_items() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::Appearance, &shared);
-        assert_eq!(el.children.len(), 6);
+        assert_eq!(el.children.len(), 7);
     }
 
     #[test]
@@ -3948,10 +4118,17 @@ mod tests {
     }
 
     #[test]
+    fn modal_nav_marks_updates_active() {
+        let shared = make_shared();
+        let el = build_modal_nav(SettingsSection::Updates, &shared);
+        assert!(el.children[5].classes.contains(&"active".to_string()));
+    }
+
+    #[test]
     fn modal_nav_marks_danger_zone_active() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::DangerZone, &shared);
-        assert!(el.children[5].classes.contains(&"active".to_string()));
+        assert!(el.children[6].classes.contains(&"active".to_string()));
     }
 
     #[test]
@@ -4583,7 +4760,7 @@ mod tests {
     fn nav_item_click_changes_to_danger_zone() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::Appearance, &shared);
-        (el.children[5].on_click.as_ref().unwrap())();
+        (el.children[6].on_click.as_ref().unwrap())();
         assert_eq!(
             shared.lock().unwrap().settings_section,
             SettingsSection::DangerZone
@@ -5105,5 +5282,173 @@ mod tests {
             return true;
         }
         el.children.iter().any(|c| has_class_anywhere(c, class))
+    }
+
+    // -- updates section --------------------------------------------------------
+
+    fn newer_release() -> crate::updater::ReleaseInfo {
+        crate::updater::ReleaseInfo {
+            version: semver::Version::new(99, 0, 0),
+            tag: "v99.0.0".into(),
+            title: "ninety-nine".into(),
+            html_url: "https://example.invalid/releases/tag/v99.0.0".into(),
+            installer: Some(crate::updater::InstallerAsset {
+                name: "terminal-manager-99.0.0-setup.exe".into(),
+                url: "https://example.invalid/setup.exe".into(),
+                size: 1000,
+                sha256: None,
+            }),
+        }
+    }
+
+    fn state_with_newer_release(
+        scope: Option<crate::updater::InstallScope>,
+    ) -> crate::state::AppState {
+        let mut state = seed_state();
+        state.settings_section = SettingsSection::Updates;
+        state.update.install_scope = scope;
+        crate::updater::apply_check_result(
+            &mut state,
+            crate::updater::CheckSource::Manual,
+            Ok(newer_release()),
+        );
+        state
+    }
+
+    #[test]
+    fn updates_section_is_in_the_rail_and_both_bodies() {
+        let snap = make_snapshot_section(SettingsSection::Updates);
+        let shared = make_shared();
+        let page = build_settings_page(&snap, &shared);
+        assert!(has_class_anywhere(&page, "nav-updates"));
+        assert!(find_by_id(&page, "settings-update-check").is_some());
+        assert!(find_by_id(&page, "settings-update-startup-toggle").is_some());
+        let modal = build_settings_modal(&snap, &shared);
+        assert!(find_by_id(&modal, "settings-update-check").is_some());
+        assert_eq!(settings_section_title(SettingsSection::Updates), "Updates");
+        assert_eq!(settings_nav_class(SettingsSection::Updates), "nav-updates");
+        assert!(settings_section_desc(SettingsSection::Updates).contains("GitHub Releases"));
+    }
+
+    #[test]
+    fn updates_section_idle_shows_version_and_no_install_button() {
+        let snap = make_snapshot_section(SettingsSection::Updates);
+        let section = build_updates_section(&snap, &make_shared());
+        let text = collect_text_recursive(&section);
+        assert!(text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+        let check = find_by_id(&section, "settings-update-check").expect("check button");
+        assert_eq!(text_of(check), Some("check for updates"));
+        assert!(!check.classes.contains(&"busy".to_string()));
+        assert!(find_by_id(&section, "settings-update-install").is_none());
+        assert!(find_by_id(&section, "settings-update-release").is_none());
+        assert!(find_by_id(&section, "settings-update-progress").is_none());
+        assert!(has_class_anywhere(&section, "update-phase-idle"));
+        // The startup check defaults on.
+        let toggle = find_by_id(&section, "settings-update-startup-toggle").expect("toggle");
+        assert!(toggle.classes.contains(&"on".to_string()));
+        assert_eq!(text_of(toggle), Some("on"));
+    }
+
+    #[test]
+    fn updates_section_installed_copy_offers_install_and_restart() {
+        let state = state_with_newer_release(Some(crate::updater::InstallScope::CurrentUser));
+        let section = build_updates_section(&state.ui_snapshot(), &make_shared());
+        let install = find_by_id(&section, "settings-update-install").expect("install button");
+        assert_eq!(text_of(install), Some("install and restart"));
+        assert!(install.classes.contains(&"primary".to_string()));
+        assert!(find_by_id(&section, "settings-update-notes").is_some());
+        assert!(find_by_id(&section, "settings-update-open-release").is_none());
+        let text = collect_text_recursive(&section);
+        assert!(text.contains("99.0.0"));
+        assert!(text.contains("ninety-nine"));
+        assert!(text.contains("closes every terminal session"));
+        assert!(has_class_anywhere(&section, "update-phase-available"));
+        // Text stacks above the two wide buttons instead of sharing a grid row.
+        let release = find_by_id(&section, "settings-update-release").expect("release row");
+        assert!(release.classes.contains(&"update-release-row".to_string()));
+    }
+
+    #[test]
+    fn updates_section_unmanaged_copy_points_at_the_release_page() {
+        let state = state_with_newer_release(None);
+        let section = build_updates_section(&state.ui_snapshot(), &make_shared());
+        assert!(find_by_id(&section, "settings-update-install").is_none());
+        let open = find_by_id(&section, "settings-update-open-release").expect("open button");
+        assert_eq!(text_of(open), Some("open release page"));
+        assert!(collect_text_recursive(&section).contains("not set up by the installer"));
+    }
+
+    #[test]
+    fn updates_section_shows_progress_while_downloading_and_error_when_failed() {
+        let mut state = state_with_newer_release(Some(crate::updater::InstallScope::AllUsers));
+        assert!(dispatch(&mut state, "update.install"));
+        crate::updater::apply_download_progress(&mut state, 250, 1000);
+        let section = build_updates_section(&state.ui_snapshot(), &make_shared());
+        let progress = find_by_id(&section, "settings-update-progress").expect("progress row");
+        assert!(collect_text_recursive(progress).contains("25%"));
+        assert!(has_class_anywhere(progress, "update-progress-fill"));
+        let install = find_by_id(&section, "settings-update-install").expect("install button");
+        assert_eq!(text_of(install), Some("downloading…"));
+        assert!(install.classes.contains(&"busy".to_string()));
+        let check = find_by_id(&section, "settings-update-check").expect("check button");
+        assert!(check.classes.contains(&"busy".to_string()));
+
+        crate::updater::apply_download_failed(
+            &mut state,
+            &crate::updater::feed::DownloadError::DigestMismatch,
+        );
+        let section = build_updates_section(&state.ui_snapshot(), &make_shared());
+        assert!(has_class_anywhere(&section, "update-failed"));
+        assert!(collect_text_recursive(&section).contains("SHA-256"));
+        let install = find_by_id(&section, "settings-update-install").expect("install button");
+        assert_eq!(text_of(install), Some("try again"));
+        assert!(find_by_id(&section, "settings-update-progress").is_none());
+    }
+
+    #[test]
+    fn updates_toggle_reflects_the_persisted_setting() {
+        let mut state = seed_state();
+        state
+            .toggles
+            .insert(ToggleKey::CheckUpdatesOnStartup, false);
+        let section = build_updates_section(&state.ui_snapshot(), &make_shared());
+        let toggle = find_by_id(&section, "settings-update-startup-toggle").expect("toggle");
+        assert!(!toggle.classes.contains(&"on".to_string()));
+        assert_eq!(text_of(toggle), Some("off"));
+    }
+
+    #[test]
+    fn updates_page_lays_out_in_the_harness_with_a_visible_install_button() {
+        let state = state_with_newer_release(Some(crate::updater::InstallScope::CurrentUser));
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("settings")
+                    .with_class("theme-amber")
+                    .with_child(build_settings_page(&snap, &tree_shared)),
+            },
+            1280.0,
+            800.0,
+        );
+        harness.step();
+
+        for selector in [".nav-updates", ".update-controls", ".login-startup-toggle"] {
+            let el = harness.query(selector).expect(selector);
+            assert!(
+                el.layout_rect.width > 0.0 && el.layout_rect.height > 0.0,
+                "{selector} should have non-zero layout, got {:?}",
+                el.layout_rect
+            );
+            assert!(
+                el.layout_rect.x >= 0.0 && el.layout_rect.x + el.layout_rect.width <= 1280.0,
+                "{selector} should be horizontally visible, got {:?}",
+                el.layout_rect
+            );
+        }
     }
 }

@@ -118,6 +118,14 @@ pub fn data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(namespace_dir_name(active_profile())))
 }
 
+/// Cache directory for this instance (downloaded installers), namespaced
+/// by profile. On Windows this is `%LOCALAPPDATA%`, which unlike
+/// [`data_dir`] (`%APPDATA%`, roaming) is never synced between machines,
+/// so large disposable files belong here.
+pub fn cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join(namespace_dir_name(active_profile())))
+}
+
 /// Marker appended to window titles so a dev/test instance is visually
 /// distinguishable from the installed app in the taskbar and alt-tab.
 pub fn title_suffix() -> String {

@@ -133,6 +133,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { workspace = true }
 dhat = { version = "0.3", optional = true }
+# Self-update (src/updater): GitHub Releases feed over the platform TLS stack
+# (schannel), installer digest verification, and semver ordering of tags.
+ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
+sha2 = "0.10"
+semver = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
