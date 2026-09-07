@@ -87,6 +87,7 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
             buffer,
             error,
         } => build_flow_request_card(*mode, buffer, error.as_deref(), shared),
+        ConfirmDialog::UpdateAvailable => build_update_card(&snap.update, shared),
     };
 
     let backdrop_shared = shared.clone();
@@ -821,6 +822,172 @@ fn build_flow_request_card(
             .with_class("confirm-dialog-buttons")
             .with_child(cancel)
             .with_child(ask),
+    )
+}
+
+/// Card for the `UpdateAvailable` dialog: the newer version, what
+/// installing does, and Later / What's new / Install and restart. While a
+/// download or install is running it shows progress and a single Hide
+/// button; the work continues and stays visible in Settings ▸ Updates.
+/// Copies not set up by the installer get "Open release page" instead of
+/// an in-place install. No button is autofocused, so a stray Enter cannot
+/// trigger anything here.
+fn build_update_card(update: &crate::updater::UpdateState, shared: &SharedState) -> ElementDef {
+    use crate::updater::{progress_percent, progress_text, UpdatePhase, UpdateState};
+
+    let current = UpdateState::current_version();
+    let version_text = update
+        .newer_release()
+        .map(|release| format!("v{}", release.version))
+        .unwrap_or_else(|| "a newer version".to_string());
+    let (headline, detail): (String, String) = match &update.phase {
+        UpdatePhase::Downloading { received, total } => (
+            format!("Downloading {version_text}…"),
+            progress_text(*received, *total),
+        ),
+        UpdatePhase::Verifying => (
+            format!("Verifying {version_text}…"),
+            "Checking the installer against the release's SHA-256 digest.".to_string(),
+        ),
+        UpdatePhase::Installing => (
+            format!("Installing {version_text}…"),
+            "Terminal Manager closes now and reopens on the new version.".to_string(),
+        ),
+        UpdatePhase::Failed => (
+            "The update could not be installed.".to_string(),
+            update
+                .error
+                .clone()
+                .unwrap_or_else(|| "Try again, or open the release page.".to_string()),
+        ),
+        _ => (
+            format!("Terminal Manager {version_text} is ready to install. You're running v{current}."),
+            "Installing closes every terminal session and restarts the app. Your workspaces and tabs come back with fresh shells."
+                .to_string(),
+        ),
+    };
+
+    let mut card = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-card")
+        .with_class("confirm-dialog-simple-card")
+        .with_class("confirm-dialog-update-card")
+        .with_class(format!("update-phase-{}", update.phase.as_str()))
+        .with_id("confirm-dialog-update")
+        .on_click(|| {})
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-title")
+                .with_text("Update available".to_string()),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-body")
+                .with_class("update-dialog-headline")
+                .with_text(headline),
+        );
+    if !detail.is_empty() {
+        let mut detail_el = ElementDef::new(Tag::Div)
+            .with_class("confirm-dialog-body")
+            .with_class("update-dialog-detail")
+            .with_text(detail);
+        if matches!(update.phase, UpdatePhase::Failed) {
+            detail_el = detail_el.with_class("update-dialog-error");
+        }
+        card = card.with_child(detail_el);
+    }
+    if let UpdatePhase::Downloading { received, total } = update.phase {
+        let percent = progress_percent(received, total).unwrap_or(0);
+        card = card.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("update-progress")
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("update-progress-fill")
+                        .with_style(StyleDeclaration::Width(Dimension::Percent(f32::from(
+                            percent,
+                        )))),
+                ),
+        );
+    }
+
+    let mut buttons = ElementDef::new(Tag::Div).with_class("confirm-dialog-buttons");
+    if update.busy() {
+        let hide_shared = shared.clone();
+        buttons = buttons.with_child(
+            ElementDef::new(Tag::Button)
+                .with_class("confirm-dialog-button")
+                .with_class("cancel")
+                .with_class("ghost")
+                .with_id("update-dialog-hide")
+                .on_click(move || {
+                    mutate_with(&hide_shared, |st| {
+                        dispatch(st, "update.later");
+                    });
+                })
+                .with_child(ElementDef::new(Tag::Span).with_text("Hide".to_string())),
+        );
+        return card.with_child(buttons);
+    }
+
+    let later_shared = shared.clone();
+    let later = ElementDef::new(Tag::Button)
+        .with_class("confirm-dialog-button")
+        .with_class("cancel")
+        .with_class("ghost")
+        .with_id("update-dialog-later")
+        .on_click(move || {
+            mutate_with(&later_shared, |st| {
+                dispatch(st, "update.later");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Later".to_string()));
+    let notes_shared = shared.clone();
+    let notes = ElementDef::new(Tag::Button)
+        .with_class("confirm-dialog-button")
+        .with_class("ghost")
+        .with_id("update-dialog-notes")
+        .on_click(move || {
+            mutate_with(&notes_shared, |st| {
+                dispatch(st, "update.open_release_page");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("What's new".to_string()));
+    let primary = if update.is_installed_copy() {
+        let install_shared = shared.clone();
+        ElementDef::new(Tag::Button)
+            .with_class("confirm-dialog-button")
+            .with_class("primary")
+            .with_id("update-dialog-install")
+            .on_click(move || {
+                mutate_with(&install_shared, |st| {
+                    dispatch(st, "update.install");
+                });
+            })
+            .with_child(ElementDef::new(Tag::Span).with_text(
+                if matches!(update.phase, UpdatePhase::Failed) {
+                    "Try again".to_string()
+                } else {
+                    "Install and restart".to_string()
+                },
+            ))
+    } else {
+        let open_shared = shared.clone();
+        ElementDef::new(Tag::Button)
+            .with_class("confirm-dialog-button")
+            .with_class("primary")
+            .with_id("update-dialog-open-release")
+            .on_click(move || {
+                mutate_with(&open_shared, |st| {
+                    dispatch(st, "update.open_release_page");
+                });
+            })
+            .with_child(ElementDef::new(Tag::Span).with_text("Open release page".to_string()))
+    };
+    card.with_child(
+        buttons
+            .with_child(later)
+            .with_child(notes)
+            .with_child(primary),
     )
 }
 
@@ -1614,6 +1781,215 @@ mod tests {
             out.extend(find_all_by_class(child, class));
         }
         out
+    }
+
+    // -- update dialog ----------------------------------------------------------
+
+    fn find_by_id<'a>(el: &'a ElementDef, target: &str) -> Option<&'a ElementDef> {
+        if el.id.as_deref() == Some(target) {
+            return Some(el);
+        }
+        el.children.iter().find_map(|c| find_by_id(c, target))
+    }
+
+    fn newer_release() -> crate::updater::ReleaseInfo {
+        crate::updater::ReleaseInfo {
+            version: semver::Version::new(99, 0, 0),
+            tag: "v99.0.0".into(),
+            title: "ninety-nine".into(),
+            html_url: "https://example.invalid/releases/tag/v99.0.0".into(),
+            installer: Some(crate::updater::InstallerAsset {
+                name: "terminal-manager-99.0.0-setup.exe".into(),
+                url: "https://example.invalid/setup.exe".into(),
+                size: 1000,
+                sha256: None,
+            }),
+        }
+    }
+
+    /// Shared state with a newer release known and the offer dialog open,
+    /// after `setup` adjusted the state (scope, phase).
+    fn update_dialog_state(setup: impl FnOnce(&mut crate::state::AppState)) -> SharedState {
+        let s = shared();
+        {
+            let mut guard = s.lock().unwrap();
+            guard.update.install_scope = Some(crate::updater::InstallScope::CurrentUser);
+            crate::updater::apply_check_result(
+                &mut guard,
+                crate::updater::CheckSource::Manual,
+                Ok(newer_release()),
+            );
+            guard.confirm_dialog = Some(ConfirmDialog::UpdateAvailable);
+            setup(&mut guard);
+        }
+        s
+    }
+
+    #[test]
+    fn update_dialog_offers_later_notes_and_install() {
+        let s = update_dialog_state(|_| {});
+        let snap = s.lock().unwrap().ui_snapshot();
+        let overlay = build_confirm_dialog_overlay(&snap, &s);
+        assert!(find_by_class(&overlay, "confirm-dialog-update-card").is_some());
+        assert!(has_class_anywhere(&overlay, "update-phase-available"));
+        let text = text_anywhere(&overlay);
+        assert!(text.contains("Update available"));
+        assert!(text.contains("v99.0.0"));
+        assert!(text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("closes every terminal session"));
+        assert!(find_by_id(&overlay, "update-dialog-later").is_some());
+        assert!(find_by_id(&overlay, "update-dialog-notes").is_some());
+        let install = find_by_id(&overlay, "update-dialog-install").expect("install button");
+        assert!(install.classes.contains(&"primary".to_string()));
+        assert!(text_anywhere(install).contains("Install and restart"));
+        assert!(find_by_id(&overlay, "update-dialog-open-release").is_none());
+        assert!(find_by_id(&overlay, "update-dialog-hide").is_none());
+    }
+
+    #[test]
+    fn update_dialog_for_unmanaged_copy_opens_release_page_instead() {
+        let s = update_dialog_state(|st| st.update.install_scope = None);
+        let snap = s.lock().unwrap().ui_snapshot();
+        let overlay = build_confirm_dialog_overlay(&snap, &s);
+        assert!(find_by_id(&overlay, "update-dialog-install").is_none());
+        let open = find_by_id(&overlay, "update-dialog-open-release").expect("open button");
+        assert!(text_anywhere(open).contains("Open release page"));
+    }
+
+    #[test]
+    fn update_dialog_while_downloading_shows_progress_and_only_hide() {
+        let s = update_dialog_state(|st| {
+            assert!(dispatch(st, "update.install"));
+            crate::updater::apply_download_progress(st, 500, 1000);
+        });
+        let snap = s.lock().unwrap().ui_snapshot();
+        let overlay = build_confirm_dialog_overlay(&snap, &s);
+        assert!(has_class_anywhere(&overlay, "update-progress-fill"));
+        assert!(text_anywhere(&overlay).contains("50%"));
+        assert!(find_by_id(&overlay, "update-dialog-hide").is_some());
+        assert!(find_by_id(&overlay, "update-dialog-install").is_none());
+        assert!(find_by_id(&overlay, "update-dialog-later").is_none());
+        assert!(find_by_id(&overlay, "update-dialog-notes").is_none());
+    }
+
+    #[test]
+    fn update_dialog_failed_shows_error_and_try_again() {
+        let s = update_dialog_state(|st| {
+            assert!(dispatch(st, "update.install"));
+            crate::updater::apply_download_failed(
+                st,
+                &crate::updater::feed::DownloadError::DigestMismatch,
+            );
+        });
+        let snap = s.lock().unwrap().ui_snapshot();
+        let overlay = build_confirm_dialog_overlay(&snap, &s);
+        assert!(has_class_anywhere(&overlay, "update-dialog-error"));
+        assert!(text_anywhere(&overlay).contains("SHA-256"));
+        let install = find_by_id(&overlay, "update-dialog-install").expect("retry button");
+        assert!(text_anywhere(install).contains("Try again"));
+        assert!(find_by_id(&overlay, "update-dialog-later").is_some());
+    }
+
+    #[test]
+    fn update_dialog_later_and_backdrop_dismiss_without_installing() {
+        let s = update_dialog_state(|_| {});
+        let snap = s.lock().unwrap().ui_snapshot();
+        let overlay = build_confirm_dialog_overlay(&snap, &s);
+        let later = find_by_id(&overlay, "update-dialog-later").expect("later button");
+        (later.on_click.as_ref().expect("later has a click handler"))();
+        {
+            let guard = s.lock().unwrap();
+            assert!(guard.confirm_dialog.is_none());
+            assert_eq!(guard.update.phase, crate::updater::UpdatePhase::Available);
+        }
+
+        // Reopen and click the backdrop: same outcome, nothing downloaded.
+        s.lock().unwrap().confirm_dialog = Some(ConfirmDialog::UpdateAvailable);
+        let snap = s.lock().unwrap().ui_snapshot();
+        let overlay = build_confirm_dialog_overlay(&snap, &s);
+        (overlay.on_click.as_ref().expect("backdrop click"))();
+        let guard = s.lock().unwrap();
+        assert!(guard.confirm_dialog.is_none());
+        assert_eq!(guard.update.phase, crate::updater::UpdatePhase::Available);
+    }
+
+    #[test]
+    fn update_dialog_install_click_starts_the_download() {
+        let s = update_dialog_state(|_| {});
+        let snap = s.lock().unwrap().ui_snapshot();
+        let overlay = build_confirm_dialog_overlay(&snap, &s);
+        let install = find_by_id(&overlay, "update-dialog-install").expect("install button");
+        (install
+            .on_click
+            .as_ref()
+            .expect("install has a click handler"))();
+        let guard = s.lock().unwrap();
+        // No worker hooks in tests: the phase flips and the dialog stays to show progress.
+        assert!(matches!(
+            guard.update.phase,
+            crate::updater::UpdatePhase::Downloading {
+                received: 0,
+                total: 1000
+            }
+        ));
+        assert_eq!(guard.confirm_dialog, Some(ConfirmDialog::UpdateAvailable));
+    }
+
+    #[test]
+    fn update_dialog_lays_out_in_the_harness() {
+        let s = update_dialog_state(|_| {});
+        let tree_shared = s.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || {
+                let snap = tree_shared.lock().unwrap().ui_snapshot();
+                ElementTree {
+                    root: ElementDef::new(Tag::Div)
+                        .with_class("app")
+                        .with_child(build_confirm_dialog_overlay(&snap, &tree_shared)),
+                }
+            },
+            1280.0,
+            800.0,
+        );
+        harness.step();
+
+        let card = harness
+            .query(".confirm-dialog-update-card")
+            .expect("update card laid out");
+        assert!(
+            card.layout_rect.width > 200.0 && card.layout_rect.height > 100.0,
+            "card has a real footprint, got {:?}",
+            card.layout_rect
+        );
+        for selector in [
+            ".confirm-dialog-buttons",
+            ".primary",
+            ".update-dialog-headline",
+        ] {
+            let el = harness.query(selector).expect(selector);
+            assert!(
+                el.layout_rect.width > 0.0 && el.layout_rect.height > 0.0,
+                "{selector} should have non-zero layout, got {:?}",
+                el.layout_rect
+            );
+        }
+        // The primary button hover state is styled (same contract as the
+        // other cards), so a hovered Install is visibly different.
+        let before = harness
+            .query(".primary")
+            .unwrap()
+            .computed_style
+            .background
+            .clone();
+        harness.hover_on(".primary");
+        let after = harness
+            .query(".primary")
+            .unwrap()
+            .computed_style
+            .background
+            .clone();
+        assert_ne!(after, before);
     }
 
     fn text_anywhere(el: &ElementDef) -> String {

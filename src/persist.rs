@@ -111,6 +111,16 @@ pub struct PersistedState {
     /// inference only runs in `seed_state` for true first runs.
     #[serde(default)]
     pub default_shell: ShellSpec,
+    /// Self-update: look for a newer release a few seconds after launch.
+    /// `None` (legacy files, first runs) means the default, which is on, so
+    /// upgraders start getting offers without opting in; the toggle in
+    /// Settings ▸ Updates persists an explicit value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_updates_on_startup: Option<bool>,
+    /// Self-update: the release version the startup offer was last shown
+    /// for, so each version is offered once at startup and never nags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_prompted_version: Option<String>,
 }
 
 /// Capture a single tab's pane grid into its persisted form.
@@ -384,6 +394,14 @@ impl PersistedState {
                 .copied()
                 .unwrap_or(false),
             default_shell: state.default_shell.clone(),
+            check_updates_on_startup: Some(
+                state
+                    .toggles
+                    .get(&crate::state::ToggleKey::CheckUpdatesOnStartup)
+                    .copied()
+                    .unwrap_or(true),
+            ),
+            update_prompted_version: state.update.prompted_version.clone(),
         }
     }
 
@@ -743,6 +761,8 @@ mod tests {
             worktree_tabs: false,
             auto_resume_agents: false,
             default_shell: ShellSpec::default(),
+            check_updates_on_startup: None,
+            update_prompted_version: None,
         };
         persisted.write_to(&path).unwrap();
         let loaded = PersistedState::read_from(&path).unwrap();
@@ -806,6 +826,38 @@ mod tests {
         assert_eq!(split_tab.panes.len(), 1);
         assert_eq!(split_tab.panes[0].len(), 2);
         assert_eq!(split_tab.col_ratios[0].len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn round_trip_preserves_update_settings_and_legacy_defaults_to_on() {
+        let mut state = seed_state();
+        state
+            .toggles
+            .insert(crate::state::ToggleKey::CheckUpdatesOnStartup, false);
+        state.update.prompted_version = Some("0.9.0".to_string());
+        let persisted = PersistedState::from_state(&state);
+        let path = unique_temp_path("update-settings-round-trip");
+        persisted.write_to(&path).unwrap();
+        let loaded = PersistedState::read_from(&path).unwrap();
+        assert_eq!(loaded.check_updates_on_startup, Some(false));
+        assert_eq!(loaded.update_prompted_version.as_deref(), Some("0.9.0"));
+
+        // Before any prompt the version key is omitted entirely.
+        let fresh = PersistedState::from_state(&seed_state());
+        let json = serde_json::to_string(&fresh).unwrap();
+        assert!(!json.contains("update_prompted_version"));
+        assert!(json.contains("\"check_updates_on_startup\":true"));
+
+        // A config predating the feature reads as "default", i.e. on.
+        let legacy = r#"{
+            "workspaces": [{"name":"alpha","path":null,"collapsed":false}],
+            "active_workspace": 0
+        }"#;
+        let legacy: PersistedState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(legacy.check_updates_on_startup, None);
+        assert!(legacy.check_updates_on_startup.unwrap_or(true));
+        assert_eq!(legacy.update_prompted_version, None);
         let _ = std::fs::remove_file(&path);
     }
 

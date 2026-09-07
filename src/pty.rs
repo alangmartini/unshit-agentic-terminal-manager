@@ -226,6 +226,14 @@ enum Command {
         name: Option<String>,
         reply: std_mpsc::SyncSender<io::Result<()>>,
     },
+    /// Ask the daemon process to exit. `force` kills every live session
+    /// first; without it the daemon refuses while sessions are alive. Used
+    /// by the self-update hand-off, which must free `unshit-ptyd.exe` for
+    /// the installer to replace it.
+    ShutdownDaemon {
+        force: bool,
+        reply: std_mpsc::SyncSender<io::Result<()>>,
+    },
 }
 
 struct EnsureReply {
@@ -888,6 +896,26 @@ impl DaemonPty {
             .map_err(|_| worker_gone())?
     }
 
+    /// Ask the daemon to exit and wait for its acknowledgement. `force`
+    /// kills every live session first (the daemon refuses otherwise).
+    /// Blocks the caller for at most five seconds; the self-update hand-off
+    /// calls this right before the UI exits so the installer can replace
+    /// both binaries.
+    pub fn shutdown_daemon_blocking(&mut self, force: bool) -> io::Result<()> {
+        let inner = self.inner.as_mut().ok_or_else(not_connected)?;
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel::<io::Result<()>>(1);
+        inner
+            .cmd_tx
+            .send(Command::ShutdownDaemon {
+                force,
+                reply: reply_tx,
+            })
+            .map_err(|_| worker_gone())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| worker_gone())?
+    }
+
     /// Resolve the session id for a pane, if this shim spawned or
     /// reattached one for it. Used by the UI so rename / kill actions
     /// keyed on a pane_id can reach the daemon.
@@ -1432,6 +1460,28 @@ fn worker_main(
                 } => {
                     let result = match client.rename_session(session_id, name).await {
                         Ok(()) => Ok(()),
+                        Err(ProtocolError::Io(e)) => Err(e),
+                        Err(other) => Err(io::Error::other(other.to_string())),
+                    };
+                    let _ = reply.send(result);
+                }
+                Command::ShutdownDaemon { force, reply } => {
+                    let response = if force {
+                        client.shutdown_force().await
+                    } else {
+                        client.shutdown().await
+                    };
+                    let result = match response {
+                        Ok(Response::ShutdownAck { ok: true, .. }) => Ok(()),
+                        Ok(Response::ShutdownAck {
+                            ok: false, reason, ..
+                        }) => Err(io::Error::other(
+                            reason.unwrap_or_else(|| "daemon refused to shut down".to_string()),
+                        )),
+                        Ok(Response::Error { code, message, .. }) => {
+                            Err(daemon_response_error(&code, &message))
+                        }
+                        Ok(_) => Err(io::Error::other("unexpected reply to shutdown")),
                         Err(ProtocolError::Io(e)) => Err(e),
                         Err(other) => Err(io::Error::other(other.to_string())),
                     };

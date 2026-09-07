@@ -347,6 +347,14 @@ pub fn icon_settings() -> SvgNode {
     )
 }
 
+/// Down arrow onto a tray: the Settings ▸ Updates rail item.
+pub fn icon_download() -> SvgNode {
+    group(
+        root_attrs(1.4, StrokeLineCap::Round, StrokeLineJoin::Round),
+        vec![path_d("M8 2.5v7M5 6.5l3 3 3-3M3 12.5h10")],
+    )
+}
+
 pub fn icon_help() -> SvgNode {
     group(
         root_attrs(1.2, StrokeLineCap::Round, StrokeLineJoin::Round),

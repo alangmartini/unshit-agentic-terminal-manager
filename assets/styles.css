@@ -8096,3 +8096,84 @@ body.dragging-pane {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ============================================================ */
+/* SELF-UPDATE (Settings > Updates, update-available dialog)     */
+/* ============================================================ */
+
+.set-page-nav-item.nav-updates svg {
+  top: 1px;
+}
+
+.set-page-nav-item.nav-updates span {
+  position: relative;
+  top: 1px;
+}
+
+.update-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+.btn.busy {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.update-failed .setting-desc {
+  color: var(--accent-danger, #d75f5f);
+}
+
+.update-progress-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 0 var(--sp-3) var(--sp-3) var(--sp-3);
+}
+
+.update-progress {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-soft);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.update-progress-fill {
+  height: 100%;
+  background: var(--amber-400);
+}
+
+.update-progress-text {
+  font-size: 11px;
+  color: var(--fg-tertiary);
+  white-space: nowrap;
+}
+
+.confirm-dialog-update-card {
+  max-width: 460px;
+}
+
+.confirm-dialog-update-card .update-progress {
+  margin-top: 10px;
+  margin-bottom: 4px;
+}
+
+.confirm-dialog-update-card .update-dialog-error {
+  color: var(--accent-danger, #d75f5f);
+}
+
+/* The release row carries two wide buttons; stack text above controls so
+   the description keeps the full column width. */
+.setting-row.update-release-row {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.update-release-row .update-controls {
+  justify-content: flex-end;
+  margin-top: var(--sp-2);
+}
