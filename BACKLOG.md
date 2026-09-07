@@ -132,10 +132,12 @@ The audit surfaced adjacent hazards that are not yet fixed:
   browser; the GitHub feed already carries the Markdown body. Render it in the
   update dialog (a read-only scroller) once a Markdown-to-element pass exists.
 - [ ] **Missing digest policy.** GitHub only publishes `digest` for assets
-  uploaded after mid-2025. The updater accepts a size-only match when the feed
-  has no digest and records `"outcome":"size_only"`; consider publishing a
-  `SHA256SUMS` asset from the release script and refusing to install without
-  either.
+  uploaded after mid-2025; it does for this repo's releases (verified against
+  the 0.4.0 installer on 2026-09-07 by the ignored
+  `live_release_installer_downloads_and_verifies` test). The updater still
+  accepts a size-only match when the feed has no digest and records
+  `"outcome":"size_only"`; consider publishing a `SHA256SUMS` asset from the
+  release script and refusing to install without either.
 - [ ] **Delta / background download.** The installer (~30 MB) downloads only
   after the user clicks install. Pre-downloading when the prompt appears
   would make the click instant; needs a disk-usage cap and cleanup policy

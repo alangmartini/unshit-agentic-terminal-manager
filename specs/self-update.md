@@ -144,8 +144,9 @@ Installer side (`packaging/terminal-manager.iss`, `-non-gpu.iss`, `[Code]`):
   as the original user with `ewNoWait` whenever `/SELFUPDATE=1` and the parent
   is gone, on success and on failure alike, so a failed update still brings the
   old app back.
-- `PrivilegesRequiredOverridesAllowed=dialog commandline` lets the app pass the
-  scope switch; `/ALLUSERS` triggers a UAC prompt.
+- `PrivilegesRequiredOverridesAllowed=commandline` lets the app pass the scope
+  switch (`/ALLUSERS` triggers a UAC prompt) without adding an install-mode
+  dialog to manual installs (`dialog` is deliberately not allowed).
 
 Install scope detection (`updater::install`): the exe's directory is compared to
 `InstallLocation` under
@@ -261,8 +262,16 @@ Error text is never used as a label; URLs and paths are not logged.
   a `file://` feed advertising the second, and asserts the installer log
   (parent wait, both executables free, success, relaunch), the relaunched
   process, `DisplayVersion 99.0.0`, and the telemetry chain from both the old
-  and the relaunched app; then it uninstalls and removes every trace. Run it
-  after touching `src/updater`, the daemon shutdown or the `.iss` `[Code]`.
+  and the relaunched app; then it uninstalls and removes every trace. It also
+  keeps `unshit-ptyd.exe` open for a few seconds after the app exits
+  (`-HoldDaemonExeSeconds`, default 3) and asserts the installer log shows a
+  non-zero wait, so the free-file retry loop is proven to run, not just to
+  compile. Run it after touching `src/updater`, the daemon shutdown or the
+  `.iss` `[Code]`.
+- `cargo test -p terminal-manager live_release_installer_downloads_and_verifies -- --ignored --nocapture`
+  downloads the latest published installer over HTTPS (feed, redirect to the
+  asset host, digest) into a temp dir and deletes it again. Nothing is
+  launched. Run it once per change to `feed.rs` or `transport.rs`.
 - Never run the real installer from a dev tree on a machine with the app
   installed: same AppId, it would replace the user's install. The rehearsal
   script exists so that this is never necessary.

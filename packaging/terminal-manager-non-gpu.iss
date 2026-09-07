@@ -27,7 +27,7 @@ VersionInfoVersion={#MyAppVersion}
 PrivilegesRequired=lowest
 ; `commandline` lets the app's self-update pass /CURRENTUSER or /ALLUSERS so a
 ; silent upgrade keeps the scope of the existing install.
-PrivilegesRequiredOverridesAllowed=dialog commandline
+PrivilegesRequiredOverridesAllowed=commandline
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 DefaultGroupName={#MyAppName}

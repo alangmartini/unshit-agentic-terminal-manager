@@ -18,7 +18,10 @@
     3. asserts the app exits by itself, the installer log shows the parent
        wait, both executables free, "Installation process succeeded" and the
        relaunch, a new app process appears from the install dir, and the
-       rehearsal's uninstall key reports DisplayVersion 99.0.0;
+       rehearsal's uninstall key reports DisplayVersion 99.0.0. The script
+       keeps unshit-ptyd.exe open itself for -HoldDaemonExeSeconds after the
+       app has exited, so the installer's free-file retry loop is actually
+       taken (the log must show a non-zero "free after" for the daemon);
     4. stops the relaunched app and the isolated daemon, uninstalls, and
        removes the generated .iss files, installers, feed and profile dirs.
 
@@ -31,6 +34,10 @@
   Directory holding terminal-manager.exe and unshit-ptyd.exe. Default target\release.
 .PARAMETER Iscc
   Path to ISCC.exe. Default: the per-user Inno Setup 6 install.
+.PARAMETER HoldDaemonExeSeconds
+  How long to keep the installed unshit-ptyd.exe open after the app exits, to
+  make the installer wait for it. 0 skips the hold. Default 3 (the installer
+  gives up after 30).
 .PARAMETER KeepArtifacts
   Leave the generated .iss files, installers and logs in place for inspection.
 #>
@@ -38,6 +45,7 @@
 param(
     [string]$ReleaseDir = "",
     [string]$Iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+    [ValidateRange(0, 25)][int]$HoldDaemonExeSeconds = 3,
     [switch]$KeepArtifacts
 )
 
@@ -64,6 +72,7 @@ $issTarget = Join-Path $repoRoot 'packaging\_rehearsal-target.iss'
 $isolation = $null
 $relaunched = $null
 $feedDir = $null
+$hold = $null
 
 function Replace-Required([string]$text, [string]$pattern, [string]$replacement, [string]$what) {
     if ($text -notmatch $pattern) { throw "packaging\terminal-manager.iss no longer contains $what; update scripts\update-rehearsal.ps1" }
@@ -121,6 +130,12 @@ try {
     $env:TM_UPDATE_STARTUP_DELAY_MS = '600000'
     $env:TM_UPDATE_INSTALL_SCOPE = 'user'   # the rehearsal AppId is not the one install.rs looks up
     $env:TM_STARTUP_DISPATCH = 'settings.section:updates;update.install'
+    # A read-shared handle on the daemon exe denies the installer's exclusive
+    # write open (a sharing violation) without stopping the app from launching
+    # the daemon, so the installer's retry loop has to run until it is released.
+    if ($HoldDaemonExeSeconds -gt 0) {
+        $hold = [System.IO.File]::Open((Join-Path $installDir 'unshit-ptyd.exe'), [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    }
     $errLog = Join-Path $work 'app.err.txt'
     try {
         $app = Start-Process -FilePath (Join-Path $installDir 'terminal-manager.exe') -WorkingDirectory $installDir -PassThru -RedirectStandardError $errLog
@@ -131,6 +146,12 @@ try {
     Write-Host "launched pid=$($app.Id) with update.install"
     if (-not $app.WaitForExit(90000)) { throw 'the app did not exit within 90 s after update.install' }
     Write-Host "app exited on its own (code $($app.ExitCode))"
+    if ($hold) {
+        Start-Sleep -Seconds $HoldDaemonExeSeconds
+        $hold.Dispose()
+        $hold = $null
+        Write-Host "released the unshit-ptyd.exe hold $HoldDaemonExeSeconds s after the app exited"
+    }
 
     # --- 4. the installer must relaunch the app from the install dir ---------------
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -155,6 +176,14 @@ try {
     foreach ($needle in 'Self-update: waiting for parent pid', 'unshit-ptyd.exe free after', 'terminal-manager.exe free after', 'Installation process succeeded.', 'Self-update: relaunching') {
         if ($logText -notlike "*$needle*") { throw "installer log lacks '$needle'; see $($installerLog.FullName)" }
     }
+    if ($HoldDaemonExeSeconds -gt 0) {
+        $m = [regex]::Match($logText, 'unshit-ptyd\.exe free after (\d+) ms')
+        if (-not $m.Success) { throw 'installer log has no timed "free after" line for unshit-ptyd.exe' }
+        $waitedMs = [int]$m.Groups[1].Value
+        $expectedMs = [int]($HoldDaemonExeSeconds * 1000 / 2)
+        if ($waitedMs -lt $expectedMs) { throw "the installer found unshit-ptyd.exe free after $waitedMs ms while it was held for ${HoldDaemonExeSeconds}s; the retry loop did not run" }
+        Write-Host "installer waited $waitedMs ms for unshit-ptyd.exe (held ${HoldDaemonExeSeconds}s): retry loop exercised"
+    }
     Write-Host '--- installer log (Self-update lines) ---'
     Get-Content -LiteralPath $installerLog.FullName | Select-String -Pattern 'Self-update|Installation process succeeded' | ForEach-Object { $_.Line }
     $events = @(Get-Content -LiteralPath (Join-Path $isolation.ConfigDir 'update-events.jsonl'))
@@ -170,6 +199,7 @@ try {
     Write-Host "rehearsal OK: $baseVersion -> 99.0.0 installed in place, app relaunched (pid $($relaunched.Id)), $($events.Count) telemetry lines"
 } finally {
     $ErrorActionPreference = 'Continue'
+    if ($hold) { try { $hold.Dispose() } catch {} }
     if ($relaunched) { try { Stop-Process -Id $relaunched.Id -Force } catch {} }
     Get-Process -Name terminal-manager -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -and $_.Path.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase) } |

@@ -597,4 +597,50 @@ mod tests {
         assert_eq!(downloaded.bytes, 1234);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The production HTTPS path end to end: the live GitHub feed, the
+    /// redirect from github.com to the release-asset host, an installer-sized
+    /// TLS stream and whatever digest GitHub publishes for the asset. Nothing
+    /// is launched; the file is deleted again. Run on demand:
+    /// `cargo test -p terminal-manager live_release_installer_downloads_and_verifies -- --ignored --nocapture`
+    #[test]
+    #[ignore = "network: downloads the latest published installer"]
+    fn live_release_installer_downloads_and_verifies() {
+        let transport = Transport::new(false);
+        let release =
+            fetch_latest(&transport, crate::updater::DEFAULT_FEED_URL).expect("live feed");
+        let asset = release
+            .installer
+            .as_ref()
+            .expect("the latest release carries a *-setup.exe asset");
+        eprintln!(
+            "latest {} ({}): {} is {} bytes, digest {}",
+            release.version,
+            release.tag,
+            asset.name,
+            asset.size,
+            if asset.sha256.is_some() {
+                "published"
+            } else {
+                "absent"
+            }
+        );
+        let dir = std::env::temp_dir().join(format!("tm-live-download-{}", std::process::id()));
+        let mut last = (0u64, 0u64);
+        let downloaded = download_installer(&transport, asset, &dir, &mut |done, total| {
+            last = (done, total);
+        })
+        .expect("download");
+        eprintln!(
+            "downloaded {} in {} ms, digest verified: {}",
+            downloaded.path.display(),
+            downloaded.elapsed_ms,
+            downloaded.verified_digest
+        );
+        assert!(downloaded.path.is_file());
+        assert_eq!(downloaded.bytes, asset.size);
+        assert_eq!(last, (asset.size, asset.size));
+        assert_eq!(downloaded.verified_digest, asset.sha256.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

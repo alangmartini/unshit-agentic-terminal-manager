@@ -31,8 +31,9 @@ VersionInfoVersion={#MyAppVersion}
 ; --- Per-user install: no admin, no UAC ---
 PrivilegesRequired=lowest
 ; `commandline` lets the app's self-update pass /CURRENTUSER or /ALLUSERS so a
-; silent upgrade keeps the scope of the existing install.
-PrivilegesRequiredOverridesAllowed=dialog commandline
+; silent upgrade keeps the scope of the existing install. Not `dialog`: that
+; would add an install-mode prompt to every manual install.
+PrivilegesRequiredOverridesAllowed=commandline
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 DefaultGroupName={#MyAppName}
