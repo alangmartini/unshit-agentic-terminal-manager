@@ -135,7 +135,10 @@ image = { workspace = true }
 dhat = { version = "0.3", optional = true }
 # Self-update (src/updater): GitHub Releases feed over the platform TLS stack
 # (schannel), installer digest verification, and semver ordering of tags.
-ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
+# `native-tls` (not `native-tls-no-default`): only the former turns on the cfg
+# the HTTPS connector checks; with the latter every https:// request panics
+# "provider is NativeTls but feature is not enabled".
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
 sha2 = "0.10"
 semver = "1"
 

@@ -2,10 +2,13 @@
 
 Status: built 2026-09-07 on `worktree-soft-petting-wave`. The in-app half
 (check, prompt, settings, download, verify, hand-off) is exercised end to end
-against a fake feed by `scripts/update-shot.ps1`. The installer half (wait for
-the parent, install silently, relaunch) ships in the `.iss` files of this tree
-and is first exercised for real when the release *after* the one that carries
-this code is installed through the app.
+against a fake feed by `scripts/update-shot.ps1`, and the installer half (wait
+for the parent and for both executables, install silently, relaunch) by
+`scripts/update-rehearsal.ps1`, which installs and updates a separately
+identified "TM Rehearsal" copy built from the real `.iss` and binaries. The
+manual check was also run against the live GitHub feed. The first update of a
+user's real install happens when the release *after* the one that carries this
+code is installed through the app.
 
 ## Objective
 
@@ -131,8 +134,12 @@ Installer arguments:
 Installer side (`packaging/terminal-manager.iss`, `-non-gpu.iss`, `[Code]`):
 
 - `PrepareToInstall` waits up to 60 s for `/PARENTPID` to exit
-  (`OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject`) and aborts with a
-  message if it does not, so files are never replaced under a running app.
+  (`OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject`), then up to 30 s for
+  `unshit-ptyd.exe` and `terminal-manager.exe` to open for exclusive write
+  (`CreateFileW(GENERIC_WRITE, share 0)`), and aborts with a message if either
+  does not happen. The daemon acknowledges `Shutdown` *before* its process is
+  gone, so the file check, not the pid, is what proves the daemon binary can
+  be replaced; a silent install would otherwise hit "file in use" and abort.
 - `DeinitializeSetup` relaunches `/RELAUNCH` (or `{app}\terminal-manager.exe`)
   as the original user with `ewNoWait` whenever `/SELFUPDATE=1` and the parent
   is gone, on success and on failure alike, so a failed update still brings the
@@ -172,7 +179,7 @@ relevant, `source` (`startup|manual|install`), `latest_version`, `outcome`,
 | `update.release_page_opened` / `update.release_page_failed` | What's new / open release page |
 | `update.install_redirected` | install requested on an unmanaged copy |
 | `update.download_started` / `update.download_completed` / `update.download_failed` | completed carries `outcome` = `digest_verified`/`size_only`, `bytes`, `elapsed_ms` |
-| `update.stale_downloads_removed` | startup sweep of old `.partial`/installer files |
+| `update.stale_downloads_removed` | startup sweep of old `.partial`/installer files (the relaunched app deletes the installer it was just updated by); `bytes` = bytes freed, `total_bytes` = number of files |
 | `update.layout_persisted` / `update.install_launched` / `update.install_failed` | the hand-off; launched carries the installer `pid` and `scope` |
 | `update.daemon_shutdown` / `update.exiting` | last two lines before the process exits |
 | `update.worker_spawn_failed` | a check or download thread could not start |
@@ -243,8 +250,22 @@ Error text is never used as a label; URLs and paths are not logged.
   `workspaces.json` kept its tabs and that the installer landed under the
   profile's `updates` dir. The isolated daemon is confirmed gone by the pipe
   no longer existing.
+- `pwsh scripts/update-shot.ps1 -Mode settings -FeedUrl <url>` runs the manual
+  check against a real HTTPS feed (the GitHub URL) from a dev build; expect
+  `check_completed` with `up_to_date` or `available`. This is what caught the
+  `native-tls` feature mistake: `file://` runs never touch the TLS connector.
+- `pwsh scripts/update-rehearsal.ps1` exercises the installer half: it derives
+  two installers from `packaging/terminal-manager.iss` under a different AppId,
+  name and output name (and a harmless `[UninstallRun]` taskkill), installs the
+  first into `%LOCALAPPDATA%\tm-rehearsal`, updates it through the app against
+  a `file://` feed advertising the second, and asserts the installer log
+  (parent wait, both executables free, success, relaunch), the relaunched
+  process, `DisplayVersion 99.0.0`, and the telemetry chain from both the old
+  and the relaunched app; then it uninstalls and removes every trace. Run it
+  after touching `src/updater`, the daemon shutdown or the `.iss` `[Code]`.
 - Never run the real installer from a dev tree on a machine with the app
-  installed: same AppId, it would replace the user's install.
+  installed: same AppId, it would replace the user's install. The rehearsal
+  script exists so that this is never necessary.
 
 ## Boundaries
 

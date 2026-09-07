@@ -1465,6 +1465,9 @@ fn main() {
     // startup (screenshot scripts, desktop regression). Not a user
     // surface; commands run with the same rights as any local keybind.
     if let Ok(commands) = std::env::var("TM_STARTUP_DISPATCH") {
+        // One-shot: children must not inherit it. The self-update installer
+        // (and the app it relaunches) would otherwise replay `update.install`.
+        std::env::remove_var("TM_STARTUP_DISPATCH");
         let mut guard = shared.lock_recover();
         for command in commands.split(';').filter(|c| !c.trim().is_empty()) {
             let handled = crate::state::dispatch(&mut guard, command.trim());

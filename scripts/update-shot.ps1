@@ -45,6 +45,9 @@ param(
     # Behave like a copy that was not set up by the installer.
     [switch]$Unmanaged,
     [string]$ExeDir = "",
+    # Use a real feed (e.g. the GitHub releases/latest URL) instead of the fake
+    # v99.0.0 one; only meaningful with -Mode settings (check, no install).
+    [string]$FeedUrl = "",
     [int]$SettleMs = 7000,
     [int]$Width = 1000,
     [int]$Height = 640
@@ -132,7 +135,7 @@ switch ($Mode) {
 $launched = $null
 $isolation = Enter-TmIsolation -Tag 'updshot'
 $errLog = "$Out.err.txt"
-$env:TM_UPDATE_FEED_URL = To-FileUrl $feedPath
+if ($FeedUrl) { $env:TM_UPDATE_FEED_URL = $FeedUrl } else { $env:TM_UPDATE_FEED_URL = To-FileUrl $feedPath }
 $env:TM_UPDATE_STARTUP_DELAY_MS = "$startupDelay"
 if ($Unmanaged) { $env:TM_UPDATE_INSTALL_SCOPE = 'none' } else { $env:TM_UPDATE_INSTALL_SCOPE = 'user' }
 if ($dispatch) { $env:TM_STARTUP_DISPATCH = $dispatch }

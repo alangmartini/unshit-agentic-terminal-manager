@@ -93,12 +93,26 @@ function WaitForSingleObject(hHandle: THandle; dwMilliseconds: DWORD): DWORD;
   external 'WaitForSingleObject@kernel32.dll stdcall';
 function CloseHandle(hObject: THandle): BOOL;
   external 'CloseHandle@kernel32.dll stdcall';
+{ Integer-typed handle variants so the -1 (INVALID_HANDLE_VALUE) comparison is
+  independent of THandle's width. Kernel handle values fit in 32 bits. }
+function CreateFileW(lpFileName: String; dwDesiredAccess: DWORD; dwShareMode: DWORD;
+  lpSecurityAttributes: Cardinal; dwCreationDisposition: DWORD; dwFlagsAndAttributes: DWORD;
+  hTemplateFile: Cardinal): Integer;
+  external 'CreateFileW@kernel32.dll stdcall';
+function CloseFileHandle(hObject: Integer): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
 
 const
   SYNCHRONIZE = $00100000;
   WAIT_OBJECT_0 = $00000000;
   WAIT_TIMEOUT = $00000102;
   PARENT_EXIT_TIMEOUT_MS = 60000;
+  GENERIC_WRITE = $40000000;
+  OPEN_EXISTING = 3;
+  { FILE_ATTRIBUTE_NORMAL is predefined by Inno's script runtime. }
+  INVALID_HANDLE_VALUE_I = -1;
+  FILE_POLL_MS = 250;
+  FILE_FREE_TIMEOUT_MS = 30000;
 
 function IsSelfUpdate(): Boolean;
 begin
@@ -129,16 +143,55 @@ begin
   Result := WaitResult <> WAIT_TIMEOUT;
 end;
 
+{ True once the file can be opened for exclusive write access, i.e. no process
+  has it mapped as a running image any more (or it does not exist). The daemon
+  acknowledges its shutdown before its process is gone, so this check, not the
+  parent pid, is what proves unshit-ptyd.exe can be replaced. }
+function WaitForFileWritable(const Path: String; TimeoutMs: Integer): Boolean;
+var
+  Handle: Integer;
+  Waited: Integer;
+begin
+  Result := True;
+  if not FileExists(Path) then Exit;
+  Waited := 0;
+  repeat
+    Handle := CreateFileW(Path, GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if Handle <> INVALID_HANDLE_VALUE_I then
+    begin
+      CloseFileHandle(Handle);
+      Log(Format('Self-update: %s free after %d ms', [Path, Waited]));
+      Exit;
+    end;
+    Sleep(FILE_POLL_MS);
+    Waited := Waited + FILE_POLL_MS;
+  until Waited >= TimeoutMs;
+  Result := False;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Pid: Integer;
+  Exe: String;
 begin
   Result := '';
   if not IsSelfUpdate() then Exit;
   Pid := SelfUpdateParentPid();
   Log(Format('Self-update: waiting for parent pid %d to exit', [Pid]));
   if not WaitForProcessExit(Pid, PARENT_EXIT_TIMEOUT_MS) then
+  begin
     Result := Format('Terminal Manager (pid %d) did not exit within %d seconds. Close it and run the installer again.', [Pid, PARENT_EXIT_TIMEOUT_MS div 1000]);
+    Exit;
+  end;
+  Exe := ExpandConstant('{app}\{#MyDaemonExeName}');
+  if not WaitForFileWritable(Exe, FILE_FREE_TIMEOUT_MS) then
+  begin
+    Result := Format('The session daemon (%s) is still running after %d seconds. Close it and run the installer again.', [Exe, FILE_FREE_TIMEOUT_MS div 1000]);
+    Exit;
+  end;
+  Exe := ExpandConstant('{app}\{#MyAppExeName}');
+  if not WaitForFileWritable(Exe, FILE_FREE_TIMEOUT_MS) then
+    Result := Format('%s is still in use after %d seconds. Close every Terminal Manager window and run the installer again.', [Exe, FILE_FREE_TIMEOUT_MS div 1000]);
 end;
 
 procedure DeinitializeSetup();

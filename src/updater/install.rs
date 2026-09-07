@@ -219,6 +219,26 @@ pub fn log_path_for(installer: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Reads the real uninstall key of the app installed on this machine.
+    /// Ignored because it depends on the machine; run it once per installer
+    /// change with `--ignored --nocapture` to prove the registry read works
+    /// on real data (buffer, terminator, path shape).
+    #[test]
+    #[ignore]
+    fn real_registry_install_location_is_readable() {
+        let user = read_install_location(RegistryRoot::CurrentUser);
+        let machine = read_install_location(RegistryRoot::LocalMachine);
+        eprintln!("HKCU InstallLocation = {user:?}");
+        eprintln!("HKLM InstallLocation = {machine:?}");
+        let found = user
+            .or(machine)
+            .expect("Terminal Manager is registered in HKCU or HKLM on this machine");
+        assert!(
+            Path::new(&found).join("terminal-manager.exe").is_file(),
+            "InstallLocation {found} does not contain terminal-manager.exe"
+        );
+    }
+
     #[test]
     fn scope_matches_exe_directory_against_install_location() {
         let exe = Path::new(
