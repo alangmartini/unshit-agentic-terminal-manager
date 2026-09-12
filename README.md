@@ -113,6 +113,8 @@ The result is `dist\terminal-manager-0.4.0-setup.exe`.
 
 Git review offers **Unified** and **Side by side** views. Split view pairs the old and new lines, shares vertical scrolling, and wraps long lines within each column. Narrow windows can scroll horizontally to see both columns. Switching views keeps the loaded file and range, returns to the first page, and does not query Git again.
 
+Use **Filter files** to narrow the changed-file list by path, including a renamed file's former path. Matching ignores case and accepts either slash style. Filtering leaves the open patch in place and shows a notice if it is outside the results. **Clear filter** restores the complete list; no Git query is needed.
+
 ## Configuration
 
 User data is stored under your platform config and data directories:

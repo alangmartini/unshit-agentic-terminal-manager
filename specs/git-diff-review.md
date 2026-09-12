@@ -5,6 +5,11 @@ Use the focused session's recorded launch directory (including worktree tabs),
 falling back to the active workspace directory. Capture it when opening.
 
 ## Behavior
+- Filter the changed-file list by case-insensitive substring of the current or
+  former path (rename), accepting either slash style. Show matching/total counts,
+  clear control, and no-results text. Filtering keeps the open patch and its page,
+  marks when it is outside the filter, resets file-list pagination, and never runs
+  Git. Cache matching original file indices on filter/report changes.
 - Unified / Side by side toggle keeps the loaded range and file. Side by side
   pairs each contiguous deletion/addition block by position, preserves hunk and
   binary metadata, and attaches no-final-newline notes to the correct side.

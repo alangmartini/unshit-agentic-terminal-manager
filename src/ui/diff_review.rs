@@ -153,21 +153,29 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
 fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
     let report = review.report.as_ref().unwrap();
     let mut files = ElementDef::new(Tag::Div).with_class("diff-files");
-    if report.files.len() > PAGE_FILES {
+    if review.file_matches.len() > PAGE_FILES {
         files = files.with_child(
             ElementDef::new(Tag::Div)
                 .with_class("diff-pagination")
                 .with_child(button(shared, "Previous files", "diff.files_prev"))
-                .with_child(button(shared, "Next files", "diff.files_next")),
+                .with_child(button(shared, "Next files", "diff.files_next"))
+                .with_child(label(
+                    "diff-file-stats",
+                    format!(
+                        "Page {} / {}",
+                        review.file_page + 1,
+                        review.file_matches.len().div_ceil(PAGE_FILES)
+                    ),
+                )),
         );
     }
-    for (index, file) in report
-        .files
+    for &index in review
+        .file_matches
         .iter()
-        .enumerate()
         .skip(review.file_page * PAGE_FILES)
         .take(PAGE_FILES)
     {
+        let file = &report.files[index];
         let name = file
             .old_path
             .as_ref()
@@ -186,9 +194,25 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
         }
         files = files.with_child(entry);
     }
+    if review.file_matches.is_empty() {
+        files = files.with_child(label(
+            "diff-filter-empty",
+            "No files match this filter. Clear it to show all changed files.",
+        ));
+    }
+    let sidebar = ElementDef::new(Tag::Div)
+        .with_class("diff-file-sidebar")
+        .with_child(build_file_filter(shared, review))
+        .with_child(files);
     let mut patch = ElementDef::new(Tag::Div).with_class("diff-patch-panel");
     if let Some(file) = report.files.get(review.selected) {
         patch = patch.with_child(label("diff-path", &file.path));
+        if !review.file_matches.contains(&review.selected) {
+            patch = patch.with_child(label(
+                "diff-filter-notice",
+                "The open file is outside this filter. Select a matching file or clear the filter.",
+            ));
+        }
     }
     if review.loading {
         patch = patch.with_child(label("diff-empty", "Loading file diff…"));
@@ -244,8 +268,37 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
     }
     ElementDef::new(Tag::Div)
         .with_class("diff-columns")
-        .with_child(files)
+        .with_child(sidebar)
         .with_child(patch)
+}
+
+fn build_file_filter(shared: &SharedState, review: &Review) -> ElementDef {
+    let change = shared.clone();
+    let input = ElementDef::new(Tag::Input)
+        .with_class("diff-filter-input")
+        .with_class("diff-input")
+        .with_id("diff-file-filter")
+        .with_key(format!("file-filter-{}", review.file_filter_reset))
+        .with_tab_index(0)
+        .with_placeholder("Filter files by path")
+        .with_value(&review.file_filter)
+        .on_change(move |text| {
+            mutate_with(&change, |st| dispatch(st, &format!("diff.filter:{text}")));
+        });
+    let total = review.report.as_ref().map_or(0, |r| r.files.len());
+    ElementDef::new(Tag::Div)
+        .with_class("diff-file-filter")
+        .with_child(label("diff-field-label", "Filter files"))
+        .with_child(input)
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("diff-filter-actions")
+                .with_child(label(
+                    "diff-filter-count",
+                    format!("{} of {total} files", review.file_matches.len()),
+                ))
+                .with_child(button(shared, "Clear filter", "diff.filter_clear")),
+        )
 }
 
 #[cfg(test)]
@@ -274,6 +327,7 @@ mod tests {
         review.lines = Arc::new(parse_patch("diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -12,3 +12,4 @@ fn main() {\n     let app = App::new();\n-    app.run();\n+    app.with_review_panel();\n+    app.run();\n }\n"));
         state.diff_review = Some(review);
         let review = state.diff_review.as_mut().unwrap();
+        review.set_file_filter("");
         review.split_rows = Arc::new(crate::diff_review::split::align(&review.lines));
         Arc::new(Mutex::new(state))
     }
@@ -326,6 +380,75 @@ mod tests {
             harness.locator_by_text("Close · Esc").click();
             assert!(shared.lock_recover().diff_review.is_none());
         }
+    }
+
+    #[test]
+    fn file_filter_input_empty_state_clear_and_selection() {
+        let shared = fixture();
+        {
+            let mut state = shared.lock_recover();
+            let review = state.diff_review.as_mut().unwrap();
+            Arc::make_mut(review.report.as_mut().unwrap())
+                .files
+                .push(File {
+                    path: "README.md".into(),
+                    old_path: Some("docs/Old.md".into()),
+                    added: Some(1),
+                    removed: Some(0),
+                });
+            review.set_file_filter("");
+        }
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            || tree(&shared),
+            800.0,
+            720.0,
+        );
+        harness.step();
+        harness.locator("#diff-file-filter").fill("no");
+        harness.rebuild(|| tree(&shared));
+        harness.step();
+        harness.type_text("-match");
+        assert_eq!(
+            shared
+                .lock_recover()
+                .diff_review
+                .as_ref()
+                .unwrap()
+                .file_filter,
+            "no-match"
+        );
+        harness.rebuild(|| tree(&shared));
+        harness.step();
+        assert!(harness.query_all(".diff-file").is_empty());
+        assert!(harness.query(".diff-filter-empty").is_some());
+        assert!(harness.query(".diff-filter-notice").is_some());
+        assert!(
+            harness.query(".diff-removed").is_some(),
+            "open patch stays visible"
+        );
+        harness.locator_by_text("Clear filter").click();
+        harness.rebuild(|| tree(&shared));
+        harness.step();
+        assert_eq!(harness.query_all(".diff-file").len(), 2);
+        assert_eq!(
+            harness
+                .query("#diff-file-filter")
+                .unwrap()
+                .input_value
+                .as_deref(),
+            Some("")
+        );
+        assert!(harness.query(".diff-filter-notice").is_none());
+        harness.locator("#diff-file-filter").fill("OLD");
+        harness.rebuild(|| tree(&shared));
+        harness.step();
+        assert_eq!(harness.query_all(".diff-file").len(), 1);
+        harness.locator(".diff-file").click();
+        assert_eq!(
+            shared.lock_recover().diff_review.as_ref().unwrap().selected,
+            1
+        );
     }
 
     #[test]

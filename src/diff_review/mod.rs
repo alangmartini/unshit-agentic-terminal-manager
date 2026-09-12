@@ -24,6 +24,10 @@ pub struct Review {
     pub selected: usize,
     pub page: usize,
     pub file_page: usize,
+    pub file_filter: String,
+    /// Inputs own their live buffer; only explicit Clear remounts the input.
+    pub file_filter_reset: u64,
+    pub file_matches: Arc<Vec<usize>>,
 }
 
 impl Review {
@@ -43,6 +47,9 @@ impl Review {
             selected: 0,
             page: 0,
             file_page: 0,
+            file_filter: String::new(),
+            file_filter_reset: 0,
+            file_matches: Arc::default(),
         }
     }
 
@@ -52,6 +59,37 @@ impl Review {
         } else {
             self.lines.len()
         }
+    }
+
+    pub fn set_file_filter(&mut self, query: &str) {
+        self.file_filter = query.chars().take(256).collect();
+        self.rebuild_file_matches();
+    }
+
+    fn rebuild_file_matches(&mut self) {
+        let needle = self.file_filter.trim().replace('\\', "/").to_lowercase();
+        self.file_matches = Arc::new(
+            self.report
+                .as_ref()
+                .map(|report| {
+                    report
+                        .files
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, file)| {
+                            let matches = |path: &str| {
+                                path.replace('\\', "/").to_lowercase().contains(&needle)
+                            };
+                            (needle.is_empty()
+                                || matches(&file.path)
+                                || file.old_path.as_deref().is_some_and(matches))
+                            .then_some(index)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        self.file_page = 0;
     }
 }
 
@@ -130,7 +168,14 @@ fn apply(
     review.loading = false;
     match report {
         Ok(report) => {
+            let changed = !review
+                .report
+                .as_ref()
+                .is_some_and(|old| Arc::ptr_eq(old, &report));
             review.report = Some(report);
+            if changed {
+                review.rebuild_file_matches();
+            }
             match lines {
                 Some(Ok(patch)) => {
                     review.lines = patch.lines;
@@ -174,6 +219,7 @@ fn refresh(review: &mut Review) {
                 review.request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 review.loading = false;
                 review.report = None;
+                review.file_matches = Arc::default();
                 review.lines = Arc::default();
                 review.split_rows = Arc::default();
                 review.error = Some("Choose between 1 and 10000 commits.".into());
@@ -182,6 +228,7 @@ fn refresh(review: &mut Review) {
         },
     };
     review.report = None;
+    review.file_matches = Arc::default();
     review.selected = 0;
     review.file_page = 0;
     submit(review, Query::Range(review.root.clone(), range));
@@ -213,6 +260,13 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         return false;
     };
     match command {
+        "diff.filter_clear" => {
+            review.set_file_filter("");
+            review.file_filter_reset = review.file_filter_reset.wrapping_add(1);
+        }
+        other if let Some(query) = other.strip_prefix("diff.filter:") => {
+            review.set_file_filter(query)
+        }
         "diff.view:unified" | "diff.view:split" => {
             let split = command == "diff.view:split";
             if review.side_by_side == split {
@@ -233,12 +287,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         "diff.prev" => review.page = review.page.saturating_sub(1),
         "diff.next" if (review.page + 1) * PAGE_LINES < review.row_count() => review.page += 1,
         "diff.files_prev" => review.file_page = review.file_page.saturating_sub(1),
-        "diff.files_next"
-            if review
-                .report
-                .as_ref()
-                .is_some_and(|r| (review.file_page + 1) * PAGE_FILES < r.files.len()) =>
-        {
+        "diff.files_next" if (review.file_page + 1) * PAGE_FILES < review.file_matches.len() => {
             review.file_page += 1
         }
         _ => {
@@ -262,6 +311,105 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
 mod tests {
     use super::*;
     use crate::state::seed_state;
+
+    #[test]
+    fn file_filter_matches_current_and_renamed_paths_without_reloading_patch() {
+        let mut review = Review::new(".".into());
+        review.report = Some(Arc::new(git::Report {
+            root: ".".into(),
+            base: "base".into(),
+            head: "head".into(),
+            label: "test".into(),
+            files: vec![
+                git::File {
+                    path: "src/Main.rs".into(),
+                    old_path: None,
+                    added: Some(1),
+                    removed: Some(0),
+                },
+                git::File {
+                    path: "assets/new.css".into(),
+                    old_path: Some("styles/OLD.css".into()),
+                    added: Some(0),
+                    removed: Some(0),
+                },
+                git::File {
+                    path: "README.md".into(),
+                    old_path: None,
+                    added: Some(1),
+                    removed: Some(0),
+                },
+            ],
+        }));
+        let lines = review.lines.clone();
+        review.selected = 2;
+        review.page = 3;
+        review.file_page = 2;
+        review.request = 42;
+        review.loading = true;
+        review.set_file_filter(" SRC\\main ");
+        assert_eq!(&*review.file_matches, &[0]);
+        assert_eq!(review.file_page, 0);
+        review.set_file_filter("STYLES/old");
+        assert_eq!(&*review.file_matches, &[1]);
+        review.set_file_filter("absent");
+        assert!(review.file_matches.is_empty());
+        review.set_file_filter("");
+        assert_eq!(&*review.file_matches, &[0, 1, 2]);
+        assert_eq!(review.selected, 2);
+        assert_eq!(review.page, 3);
+        assert_eq!(review.request, 42);
+        assert!(review.loading);
+        assert!(Arc::ptr_eq(&review.lines, &lines));
+    }
+
+    #[test]
+    fn filtered_pagination_uses_original_indices_and_survives_patch_results() {
+        let mut state = seed_state();
+        let mut review = Review::new(".".into());
+        let file = git::File {
+            path: "unmatched".into(),
+            old_path: None,
+            added: Some(1),
+            removed: Some(0),
+        };
+        let mut files = vec![file.clone()];
+        files.extend((0..201).map(|n| git::File {
+            path: format!("src/file{n}.rs"),
+            ..file.clone()
+        }));
+        let report = Arc::new(git::Report {
+            root: ".".into(),
+            base: "base".into(),
+            head: "head".into(),
+            label: "test".into(),
+            files,
+        });
+        review.report = Some(report.clone());
+        review.set_file_filter("src/");
+        state.diff_review = Some(review);
+        assert!(dispatch(&mut state, "diff.files_next"));
+        let index = state.diff_review.as_ref().unwrap().file_matches[PAGE_FILES];
+        assert_eq!(index, 101);
+        assert!(dispatch(&mut state, &format!("diff.file:{index}")));
+        let review = state.diff_review.as_ref().unwrap();
+        let id = review.request;
+        let matches = review.file_matches.clone();
+        assert_eq!(review.selected, 101);
+        assert!(apply(&mut state, id, Ok(report.clone()), None));
+        let review = state.diff_review.as_ref().unwrap();
+        assert_eq!(review.file_page, 1);
+        assert!(Arc::ptr_eq(&matches, &review.file_matches));
+        assert!(dispatch(&mut state, "diff.files_next"));
+        assert!(!dispatch(&mut state, "diff.files_next"));
+        let mut refreshed = (*report).clone();
+        refreshed.files.truncate(1);
+        assert!(apply(&mut state, id, Ok(Arc::new(refreshed)), None));
+        let review = state.diff_review.as_ref().unwrap();
+        assert!(review.file_matches.is_empty());
+        assert_eq!(review.file_filter, "src/");
+        assert_eq!(review.file_page, 0);
+    }
 
     #[test]
     fn view_switch_reuses_patch_and_paginates_aligned_rows() {
