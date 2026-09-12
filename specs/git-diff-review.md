@@ -5,6 +5,11 @@ Use the focused session's recorded launch directory (including worktree tabs),
 falling back to the active workspace directory. Capture it when opening.
 
 ## Behavior
+- Unified / Side by side toggle keeps the loaded range and file. Side by side
+  pairs each contiguous deletion/addition block by position, preserves hunk and
+  binary metadata, and attaches no-final-newline notes to the correct side.
+  Align before pagination; share vertical scrolling and use a minimum column
+  width with horizontal scrolling on narrow windows. Default remains unified.
 - Last N commits (first-parent history), unpushed commits against the locally
   known push target, and a base branch/ref comparison using merge-base.
 - Show the exact resolved range, file list, additions/deletions, and a unified

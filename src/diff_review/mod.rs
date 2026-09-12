@@ -1,4 +1,5 @@
 pub mod git;
+pub mod split;
 
 use crate::state::{AppState, MutexExt, SharedState};
 use std::path::PathBuf;
@@ -18,6 +19,8 @@ pub struct Review {
     pub error: Option<String>,
     pub report: Option<Arc<git::Report>>,
     pub lines: Arc<Vec<git::Line>>,
+    pub split_rows: Arc<Vec<split::Row>>,
+    pub side_by_side: bool,
     pub selected: usize,
     pub page: usize,
     pub file_page: usize,
@@ -35,9 +38,34 @@ impl Review {
             error: None,
             report: None,
             lines: Arc::default(),
+            split_rows: Arc::default(),
+            side_by_side: false,
             selected: 0,
             page: 0,
             file_page: 0,
+        }
+    }
+
+    pub fn row_count(&self) -> usize {
+        if self.side_by_side {
+            self.split_rows.len()
+        } else {
+            self.lines.len()
+        }
+    }
+}
+
+struct LoadedPatch {
+    lines: Arc<Vec<git::Line>>,
+    split_rows: Arc<Vec<split::Row>>,
+}
+
+impl LoadedPatch {
+    fn new(lines: Vec<git::Line>) -> Self {
+        let split_rows = Arc::new(split::align(&lines));
+        Self {
+            lines: Arc::new(lines),
+            split_rows,
         }
     }
 }
@@ -76,10 +104,11 @@ pub fn start(shared: SharedState, sink: unshit::app::EventSink) {
             Query::Range(root, range) => (git::load(&root, &range).map(Arc::new), 0),
             Query::File(report, index) => (Ok(report), index),
         };
-        let lines = report
-            .as_ref()
-            .ok()
-            .and_then(|r| r.files.get(selected).map(|f| git::patch(r, f)));
+        let lines = report.as_ref().ok().and_then(|r| {
+            r.files
+                .get(selected)
+                .map(|f| git::patch(r, f).map(LoadedPatch::new))
+        });
         let mut state = shared.lock_recover();
         let applied = apply(&mut state, job.id, report, lines);
         drop(state);
@@ -93,7 +122,7 @@ fn apply(
     state: &mut AppState,
     id: u64,
     report: Result<Arc<git::Report>, String>,
-    lines: Option<Result<Vec<git::Line>, String>>,
+    lines: Option<Result<LoadedPatch, String>>,
 ) -> bool {
     let Some(review) = state.diff_review.as_mut().filter(|r| r.request == id) else {
         return false;
@@ -103,7 +132,10 @@ fn apply(
         Ok(report) => {
             review.report = Some(report);
             match lines {
-                Some(Ok(lines)) => review.lines = Arc::new(lines),
+                Some(Ok(patch)) => {
+                    review.lines = patch.lines;
+                    review.split_rows = patch.split_rows;
+                }
                 Some(Err(error)) => review.error = Some(error),
                 None => {}
             }
@@ -116,6 +148,7 @@ fn apply(
 fn submit(review: &mut Review, query: Query) {
     review.request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     review.lines = Arc::default();
+    review.split_rows = Arc::default();
     review.page = 0;
     review.error = None;
     let Some(queue) = QUEUE.get() else {
@@ -142,6 +175,7 @@ fn refresh(review: &mut Review) {
                 review.loading = false;
                 review.report = None;
                 review.lines = Arc::default();
+                review.split_rows = Arc::default();
                 review.error = Some("Choose between 1 and 10000 commits.".into());
                 return;
             }
@@ -179,6 +213,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         return false;
     };
     match command {
+        "diff.view:unified" | "diff.view:split" => {
+            let split = command == "diff.view:split";
+            if review.side_by_side == split {
+                return false;
+            }
+            review.side_by_side = split;
+            review.page = 0;
+        }
         "diff.refresh" => refresh(review),
         "diff.mode:last" | "diff.mode:unpushed" | "diff.mode:base" => {
             review.mode = match command {
@@ -189,7 +231,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             refresh(review);
         }
         "diff.prev" => review.page = review.page.saturating_sub(1),
-        "diff.next" if (review.page + 1) * PAGE_LINES < review.lines.len() => review.page += 1,
+        "diff.next" if (review.page + 1) * PAGE_LINES < review.row_count() => review.page += 1,
         "diff.files_prev" => review.file_page = review.file_page.saturating_sub(1),
         "diff.files_next"
             if review
@@ -220,6 +262,37 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
 mod tests {
     use super::*;
     use crate::state::seed_state;
+
+    #[test]
+    fn view_switch_reuses_patch_and_paginates_aligned_rows() {
+        let mut state = seed_state();
+        let mut review = Review::new(".".into());
+        let patch = format!(
+            "@@ -1,201 +1,201 @@\n{}{}",
+            "-before\n".repeat(201),
+            "+after\n".repeat(201)
+        );
+        review.lines = Arc::new(git::parse_patch(&patch));
+        review.split_rows = Arc::new(split::align(&review.lines));
+        let original = review.lines.clone();
+        review.request = 42;
+        review.loading = true;
+        state.diff_review = Some(review);
+        assert!(dispatch(&mut state, "diff.view:split"));
+        assert!(dispatch(&mut state, "diff.next"));
+        assert!(!dispatch(&mut state, "diff.next"));
+        let review = state.diff_review.as_ref().unwrap();
+        assert_eq!(review.page, 1);
+        assert_eq!(review.row_count(), 202);
+        assert_eq!(review.request, 42);
+        assert!(review.loading);
+        assert!(Arc::ptr_eq(&review.lines, &original));
+        assert!(dispatch(&mut state, "diff.view:unified"));
+        let review = state.diff_review.as_ref().unwrap();
+        assert_eq!(review.page, 0);
+        assert_eq!(review.row_count(), 403);
+        assert!(Arc::ptr_eq(&review.lines, &original));
+    }
 
     #[test]
     fn late_results_cannot_overwrite_new_selection_or_reopen_closed_review() {

@@ -1,4 +1,5 @@
 //! Local Git review, rendered from immutable snapshots without filesystem IO.
+mod split;
 use crate::diff_review::{Review, PAGE_FILES, PAGE_LINES};
 use crate::state::{dispatch, mutate_with, SharedState, UiSnapshot};
 use unshit::core::element::*;
@@ -82,6 +83,18 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
             .with_child(input(shared, review, review.mode == "last"));
     }
     toolbar = toolbar.with_child(button(shared, "Refresh", "diff.refresh"));
+    let mut views = ElementDef::new(Tag::Div).with_class("diff-view-switch");
+    for (split, title, command) in [
+        (false, "Unified", "diff.view:unified"),
+        (true, "Side by side", "diff.view:split"),
+    ] {
+        let mut view = button(shared, title, command);
+        if review.side_by_side == split {
+            view = view.with_class("diff-active");
+        }
+        views = views.with_child(view);
+    }
+    toolbar = toolbar.with_child(views);
     let header = ElementDef::new(Tag::Div)
         .with_class("diff-header")
         .with_child(label("diff-title", "Changes"))
@@ -124,10 +137,17 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
     if let Some(error) = &review.error {
         content = content.with_child(label("diff-error", error));
     }
-    ElementDef::new(Tag::Div).with_class("diff-overlay").with_id("diff-review")
+    ElementDef::new(Tag::Div)
+        .with_class("diff-overlay")
+        .with_id("diff-review")
         .on_click(|| {})
-        .with_child(header).with_child(toolbar).with_child(content)
-        .with_child(label("diff-footer", "LOCAL GIT REVIEW   ·   Unified diff   ·   Read only   ·   Refresh uses local refs; no automatic fetch"))
+        .with_child(header)
+        .with_child(toolbar)
+        .with_child(content)
+        .with_child(label(
+            "diff-footer",
+            "LOCAL GIT REVIEW   ·   Read only   ·   Refresh uses local refs; no automatic fetch",
+        ))
 }
 
 fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
@@ -176,32 +196,36 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
         let mut lines = ElementDef::new(Tag::Div)
             .with_class("diff-lines")
             .with_id(format!(
-                "diff-lines-{}-{}-{}",
-                review.request, review.selected, review.page
+                "diff-lines-{}-{}-{}-{}",
+                review.request, review.selected, review.page, review.side_by_side
             ));
-        for line in review
-            .lines
-            .iter()
-            .skip(review.page * PAGE_LINES)
-            .take(PAGE_LINES)
-        {
-            lines = lines.with_child(
-                ElementDef::new(Tag::Div)
-                    .with_class("diff-line")
-                    .with_class(format!("diff-{}", line.kind))
-                    .with_child(label(
-                        "diff-gutter",
-                        line.old.map(|n| n.to_string()).unwrap_or_default(),
-                    ))
-                    .with_child(label(
-                        "diff-gutter",
-                        line.new.map(|n| n.to_string()).unwrap_or_default(),
-                    ))
-                    .with_child(label("diff-code", &line.text)),
-            );
+        if review.side_by_side {
+            lines = lines.with_child(split::build(review));
+        } else {
+            for line in review
+                .lines
+                .iter()
+                .skip(review.page * PAGE_LINES)
+                .take(PAGE_LINES)
+            {
+                lines = lines.with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("diff-line")
+                        .with_class(format!("diff-{}", line.kind))
+                        .with_child(label(
+                            "diff-gutter",
+                            line.old.map(|n| n.to_string()).unwrap_or_default(),
+                        ))
+                        .with_child(label(
+                            "diff-gutter",
+                            line.new.map(|n| n.to_string()).unwrap_or_default(),
+                        ))
+                        .with_child(label("diff-code", &line.text)),
+                );
+            }
         }
         patch = patch.with_child(lines);
-        if review.lines.len() > PAGE_LINES {
+        if review.row_count() > PAGE_LINES {
             patch = patch.with_child(
                 ElementDef::new(Tag::Div)
                     .with_class("diff-pagination")
@@ -211,7 +235,7 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
                         format!(
                             "Page {} / {}",
                             review.page + 1,
-                            review.lines.len().div_ceil(PAGE_LINES)
+                            review.row_count().div_ceil(PAGE_LINES)
                         ),
                     ))
                     .with_child(button(shared, "Next", "diff.next")),
@@ -249,6 +273,8 @@ mod tests {
         }));
         review.lines = Arc::new(parse_patch("diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -12,3 +12,4 @@ fn main() {\n     let app = App::new();\n-    app.run();\n+    app.with_review_panel();\n+    app.run();\n }\n"));
         state.diff_review = Some(review);
+        let review = state.diff_review.as_mut().unwrap();
+        review.split_rows = Arc::new(crate::diff_review::split::align(&review.lines));
         Arc::new(Mutex::new(state))
     }
 
@@ -303,11 +329,109 @@ mod tests {
     }
 
     #[test]
+    fn split_view_toggle_alignment_and_horizontal_scrolling() {
+        for width in [800.0, 1280.0] {
+            let shared = fixture();
+            let mut harness = TestHarness::new(
+                include_str!("../../assets/styles.css"),
+                || tree(&shared),
+                width,
+                720.0,
+            );
+            harness.step();
+            harness.locator_by_text("Side by side").click();
+            assert!(
+                shared
+                    .lock_recover()
+                    .diff_review
+                    .as_ref()
+                    .unwrap()
+                    .side_by_side
+            );
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            let old = harness.query_all(".diff-split-old");
+            let new = harness.query_all(".diff-split-new");
+            assert_eq!(old.len(), 4);
+            assert_eq!(old.len(), new.len());
+            for (old, new) in old.iter().zip(&new) {
+                assert!((old.layout_rect.y - new.layout_rect.y).abs() < 1.0);
+                assert!((old.layout_rect.height - new.layout_rect.height).abs() < 1.0);
+                assert!((old.layout_rect.width - new.layout_rect.width).abs() < 2.0);
+                assert!(new.layout_rect.x >= old.layout_rect.x + old.layout_rect.width - 1.0);
+            }
+            assert!(old[2].classes.iter().any(|c| c == "diff-split-gap"));
+            let viewport = harness.query(".diff-lines").unwrap().layout_rect;
+            if width == 800.0 {
+                let table = harness.query(".diff-split-table").unwrap().layout_rect;
+                assert!(table.width > viewport.width);
+                harness.mouse_wheel(viewport.x + 40.0, viewport.y + 40.0, -150.0, 0.0);
+                assert!(harness.query(".diff-lines").unwrap().scroll_x > 0.0);
+            }
+            harness.locator_by_text("Unified").click();
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            assert!(harness.query(".diff-split-table").is_none());
+            assert!(harness.query(".diff-removed").is_some());
+        }
+    }
+
+    #[test]
+    fn split_wrapped_rows_and_notes_share_height_and_vertical_scroll() {
+        let shared = fixture();
+        {
+            let mut state = shared.lock_recover();
+            let review = state.diff_review.as_mut().unwrap();
+            let patch = format!(
+                "@@ -1,81 +1,81 @@\n-old\n\\ No newline at end of file\n+{}\n{}",
+                "long replacement text ".repeat(30),
+                " context\n".repeat(80)
+            );
+            review.lines = Arc::new(parse_patch(&patch));
+            review.split_rows = Arc::new(crate::diff_review::split::align(&review.lines));
+            review.side_by_side = true;
+        }
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            || tree(&shared),
+            1280.0,
+            720.0,
+        );
+        harness.step();
+        let old = harness.query(".diff-split-old").unwrap().layout_rect;
+        let new = harness.query(".diff-split-new").unwrap().layout_rect;
+        assert!(new.height > 44.0, "long replacement should wrap: {new:?}");
+        assert!((old.height - new.height).abs() < 1.0);
+        let gutter = harness
+            .query(".diff-split-new .diff-gutter")
+            .unwrap()
+            .layout_rect;
+        assert!((gutter.y - new.y).abs() < 1.0);
+        assert!(
+            gutter.height < new.height,
+            "line number must stay at the top of a wrapped line"
+        );
+        assert!(harness.query(".diff-split-old .diff-split-note").is_some());
+        assert!(harness.query(".diff-split-new .diff-split-note").is_none());
+        let viewport = harness.query(".diff-lines").unwrap().layout_rect;
+        harness.mouse_wheel(viewport.x + 60.0, viewport.y + 60.0, 0.0, -150.0);
+        assert!(harness.query(".diff-lines").unwrap().scroll_y > 0.0);
+    }
+
+    #[test]
     fn diff_review_visual_dump_when_requested() {
         let Some(path) = std::env::var_os("TM_DIFF_VISUAL_DUMP") else {
             return;
         };
         let shared = fixture();
+        if std::env::var("TM_DIFF_VISUAL_MODE").as_deref() == Ok("split") {
+            shared
+                .lock_recover()
+                .diff_review
+                .as_mut()
+                .unwrap()
+                .side_by_side = true;
+        }
         let mut harness = TestHarness::new(
             include_str!("../../assets/styles.css"),
             || tree(&shared),
