@@ -963,6 +963,7 @@ pub struct AppState {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub diff_review: Option<crate::diff_review::Review>,
     pub palette_query: String,
     pub palette_active: usize,
     pub sidebar_collapsed: bool,
@@ -1318,6 +1319,7 @@ impl AppState {
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
             editor_panes: self.editors.keys().copied().collect(),
+            diff_review: self.diff_review.clone(),
             flow_panes: self
                 .flows
                 .iter()
@@ -1445,6 +1447,7 @@ pub struct UiSnapshot {
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
     /// Pane ids rendered by the file editor instead of a terminal.
     pub editor_panes: std::collections::HashSet<u32>,
+    pub diff_review: Option<crate::diff_review::Review>,
     /// Flow Explorer panes rendered instead of a terminal, by pane id.
     pub flow_panes: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
 }
@@ -1573,6 +1576,7 @@ pub fn seed_state() -> AppState {
         tab_width_px: DEFAULT_TAB_WIDTH_PX,
         toggles,
         palette_open: false,
+        diff_review: None,
         palette_query: String::new(),
         palette_active: 0,
         sidebar_collapsed: false,
@@ -5409,6 +5413,7 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "quick_prompt.open"
             | "editor.open"
             | "editor.save"
+            | "diff.open"
     ) || command.starts_with("workspace.switch:")
         || command.starts_with("terminal.focus:")
         || command.starts_with("flow.")
@@ -6397,9 +6402,15 @@ pub fn apply_flow_poll(
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
+    if command.starts_with("diff.") {
+        return crate::diff_review::dispatch(state, command);
+    }
     match command {
         "modal.close" => {
             let mut changed = false;
+            if state.diff_review.take().is_some() {
+                changed = true;
+            }
             if state.ctx_menu.is_some() {
                 state.ctx_menu = None;
                 changed = true;
@@ -9389,6 +9400,7 @@ pub(crate) mod tests {
             tab_width_px: DEFAULT_TAB_WIDTH_PX,
             toggles: BTreeMap::new(),
             palette_open: false,
+            diff_review: None,
             palette_query: String::new(),
             palette_active: 0,
             sidebar_collapsed: false,

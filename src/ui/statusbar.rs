@@ -279,6 +279,7 @@ mod tests {
 
     fn minimal_snapshot() -> UiSnapshot {
         UiSnapshot {
+            diff_review: None,
             workspaces: vec![],
             active_workspace: 0,
             tabs: vec![],

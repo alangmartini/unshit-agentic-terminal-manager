@@ -100,6 +100,8 @@ The result is `dist\terminal-manager-0.4.0-setup.exe`.
 
 ## Usage
 
+- **Git diff review:** click **Review diff** in the titlebar, or find **Review Git diff** in the command palette. Choose **Last N commits** (first-parent history), **Unpushed** (the locally known push target), or **Compare base** (a branch, tag, or SHA; changes since its common ancestor with HEAD). Select a file to inspect the numbered unified patch. Enter a count/base and press Enter or **Refresh** to reload; Escape closes the view. Uses the focused session's recorded launch directory when available, otherwise the workspace directory. Staged and working-tree edits are excluded. It does not fetch or modify the repository. Large patches paginate; individual Git queries have a 4 MiB preview limit and 15-second timeout.
+
 - **Tabs:** `Ctrl+T` opens a new terminal; `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle tabs; `Ctrl+Shift+W` closes a tab.
 - **Splits:** `Ctrl+D` splits right, `Ctrl+Shift+D` splits down, `Ctrl+W` unsplits. Move focus between panes with `Ctrl+Alt+Arrow`; `Ctrl+Arrow` remains available to terminal applications for word navigation.
 - **Command palette:** `Ctrl+Shift+P`. Type to fuzzy-search, or prefix your query with `>`, `@`, `:`, or `/` to scope the search. `Enter` runs the highlighted item, `Esc` clears the query then closes.
