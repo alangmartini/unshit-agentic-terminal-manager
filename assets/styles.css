@@ -8161,3 +8161,94 @@ body.dragging-pane {
 .diff-hunk-status { font-size: 12px; color: var(--fg-secondary); }
 .diff-navigation-disabled { color: var(--fg-tertiary); cursor: default; }
 .diff-hunk-current { background: var(--bg-selected); border-left: 3px solid var(--border-focus); }
+/* -- Editor find bar ------------------------------------------------- */
+/* One row above the grid, inside the pane body. It is laid out with the
+   grid below it, not floated over it, so it never covers the line the
+   cursor is on -- the whole point of a find bar being that you can read
+   the match. */
+
+.editor-find-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 4px 6px;
+  margin-bottom: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+}
+
+.editor-find-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 6px;
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+  color: var(--fg-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  cursor: text;
+  caret-color: var(--amber-100);
+}
+
+.editor-find-input:focus {
+  border-color: var(--amber-400);
+  outline: none;
+  box-shadow: 0 0 0 1px var(--accent-a35);
+}
+
+.editor-find-counter {
+  flex: 0 0 auto;
+  min-width: 62px;
+  font-size: 11px;
+  color: var(--fg-secondary);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.editor-find-button {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  font-size: 11px;
+  color: var(--fg-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.editor-find-button:hover {
+  color: var(--fg-primary);
+  background: var(--bg-base);
+}
+
+/* The Aa toggle is the only one of the four that carries state. */
+.editor-find-button.on {
+  color: var(--bg-base);
+  background: var(--amber-300);
+  border-color: var(--amber-300);
+}
+
+/* -- Flow hand-offs to the editor and the diff pane -------------------- */
+/* `edit` and `diff` sit beside `src` on a node row and share its shape;
+   the range chip in the header opens the whole change. */
+
+.flow-range-chip {
+  align-self: flex-start;
+  padding: 0 6px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.flow-range-chip:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+}

@@ -139,41 +139,49 @@ mod tests {
         Arc::new(Mutex::new(state))
     }
 
-    #[test]
-    fn distinct_paths_are_resolved_once_each() {
-        let fixture = std::env::temp_dir().join(format!(
-            "git-watch-{}-{}",
+    /// A repository of our own, on a branch we made.
+    ///
+    /// Not `CARGO_MANIFEST_DIR`: `actions/checkout` leaves a pull request
+    /// build on a detached HEAD, and [`crate::git::detect_git_branch`]
+    /// reports that as no branch at all — correctly, because that is what
+    /// the sidebar should show. A test that asserts on the branch of
+    /// whatever checkout it happens to be compiled in fails in CI for a
+    /// reason that has nothing to do with the code it covers.
+    fn repo_on_a_branch() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "tm-git-watch-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        let repo = fixture.join("repo");
-        let plain = fixture.join("plain");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&plain).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp repo");
         for args in [
-            vec!["init", "-q", "-b", "test-branch"],
-            vec![
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "--allow-empty",
-                "-qm",
-                "fixture",
-            ],
+            &["init", "-q", "-b", "test-branch"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test"][..],
+            &["config", "commit.gpgsign", "false"][..],
+            &["commit", "--allow-empty", "-q", "-m", "x"][..],
         ] {
-            assert!(crate::git::git_command(&repo)
+            let status = crate::git::git_command(&dir)
                 .args(args)
                 .status()
-                .unwrap()
-                .success());
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {dir:?}");
         }
+        dir
+    }
+
+    #[test]
+    fn distinct_paths_are_resolved_once_each() {
+        let repo = repo_on_a_branch();
+        // A directory that is no repository at all, to prove Absent is
+        // reported for the path that earned it and not inherited from a
+        // sibling that shares the resolver pass.
+        let plain = repo.with_extension("plain");
+        std::fs::create_dir_all(&plain).expect("create plain dir");
         let targets = vec![
             (1, repo.clone()),
             (2, repo.clone()),
@@ -201,7 +209,9 @@ mod tests {
         let detached = resolve(&targets);
         assert_eq!(detached.len(), 2);
         assert_eq!(detached[&repo], GitBranch::Absent);
-        std::fs::remove_dir_all(fixture).unwrap();
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&plain);
     }
 
     #[test]

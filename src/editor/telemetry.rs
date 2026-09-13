@@ -24,6 +24,11 @@ pub struct EditorEventRecord<'a> {
     pub file_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_count: Option<u64>,
+    /// 1-based line a navigation event landed on. Distinct from
+    /// `line_count`: a query for "where do people jump to" must not read
+    /// a jump target as a file size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
     /// Machine-readable failure reason (`too_large`, `invalid_utf8`, `io`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
@@ -98,6 +103,7 @@ mod tests {
             path: Some("C:/tmp/example.rs"),
             file_bytes: Some(42),
             line_count: Some(3),
+            line: None,
             reason: None,
             os_error: None,
         };
@@ -130,6 +136,7 @@ mod tests {
             path: Some("C:/tmp/huge.bin"),
             file_bytes: Some(999_999_999),
             line_count: None,
+            line: None,
             reason: Some("too_large"),
             os_error: None,
         };

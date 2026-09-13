@@ -95,7 +95,7 @@ scripts/flow-explorer-shot.ps1         isolated screenshot of any dispatch seque
 
 ## Boundaries
 
-* The app never runs git for this feature and never edits repository files; the agent does the analysis in the workspace cwd.
+* The Flow pane never runs git for this feature and never edits repository files; the agent does the analysis in the workspace cwd. **Amended 2026-09-13** (`specs/editor-navigation-and-diff.md`): the `d` key and the header's `base..head` chip hand off to a *diff pane*, which does run `git diff` — on a background thread, never on the UI thread, and never with user text as a flag. The Flow pane itself still spawns nothing.
 * Snippets are read only from inside `repo_root` (canonicalised containment check), capped at 256 KiB, UTF-8 only.
 * No file watcher crate: pending launches are polled once a second by one thread; opened flows are not re-read unless reopened.
 * Pending launches live in memory only: a UI restart forgets them. The agent still writes its JSON under `flows/`, and **Open flow…** picks it up.

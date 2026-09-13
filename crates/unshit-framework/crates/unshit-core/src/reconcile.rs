@@ -258,6 +258,7 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     element.on_click = def.on_click.clone();
     element.on_context_menu = def.on_context_menu.clone();
     element.on_drag = def.on_drag.clone();
+    element.drag_autorepeat = def.drag_autorepeat;
     element.on_resize = def.on_resize.clone();
     element.handlers = def.handlers.clone();
     element.placeholder = def.placeholder.clone();
@@ -533,6 +534,7 @@ pub fn build_subtree(
     element.captures_keyboard = def.captures_keyboard;
     element.on_context_menu = def.on_context_menu.clone();
     element.on_drag = def.on_drag.clone();
+    element.drag_autorepeat = def.drag_autorepeat;
     element.on_resize = def.on_resize.clone();
     element.handlers = def.handlers.clone();
     element.placeholder = def.placeholder.clone();

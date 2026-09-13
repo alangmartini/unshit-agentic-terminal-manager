@@ -259,6 +259,13 @@ pub struct Element {
     pub on_click: Option<Arc<dyn Fn() + Send + Sync>>,
     pub on_context_menu: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
     pub on_drag: Option<Arc<dyn Fn(&crate::event::DragEvent) + Send + Sync>>,
+    /// Opt-in for framework drag auto-repeat: while this element's
+    /// `on_drag` drag is active and the pointer rests outside its content
+    /// box, the framework re-dispatches `DragPhase::Update` once per
+    /// animation frame (zero deltas, same position) so the handler can
+    /// keep scrolling toward the pointer without further mouse motion.
+    /// See [`crate::event::drag_autorepeat_event`].
+    pub drag_autorepeat: bool,
     pub on_resize: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
 
     // Previous layout dimensions (for resize detection)
@@ -370,6 +377,7 @@ impl Element {
             on_click: None,
             on_context_menu: None,
             on_drag: None,
+            drag_autorepeat: false,
             on_resize: None,
             prev_width: 0.0,
             prev_height: 0.0,
@@ -465,6 +473,7 @@ impl Element {
         self.on_click = def.on_click.clone();
         self.on_context_menu = def.on_context_menu.clone();
         self.on_drag = def.on_drag.clone();
+        self.drag_autorepeat = def.drag_autorepeat;
         self.on_resize = def.on_resize.clone();
         self.resize_axis = def.resize_axis;
         self.on_pane_resize = def.on_pane_resize.clone();
@@ -527,6 +536,8 @@ pub struct ElementDef {
     pub captures_keyboard: bool,
     pub on_context_menu: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
     pub on_drag: Option<Arc<dyn Fn(&crate::event::DragEvent) + Send + Sync>>,
+    /// See [`Element::drag_autorepeat`]; set via [`ElementDef::with_drag_autorepeat`].
+    pub drag_autorepeat: bool,
     pub on_resize: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
     pub handlers: SmallVec<[(crate::event::EventType, EventHandler); 2]>,
     pub resize_axis: Option<ResizeAxis>,
@@ -582,6 +593,7 @@ impl ElementDef {
             captures_keyboard: false,
             on_context_menu: None,
             on_drag: None,
+            drag_autorepeat: false,
             on_resize: None,
             handlers: SmallVec::new(),
             resize_axis: None,
@@ -620,6 +632,15 @@ impl ElementDef {
 
     pub fn on_drag(mut self, f: impl Fn(&crate::event::DragEvent) + Send + Sync + 'static) -> Self {
         self.on_drag = Some(Arc::new(f));
+        self
+    }
+
+    /// Opt this element's drag into framework auto-repeat: while the
+    /// pointer rests outside the content box mid-drag, `on_drag` receives
+    /// a `DragPhase::Update` every animation frame. Meaningful only with
+    /// [`ElementDef::on_drag`]; see [`Element::drag_autorepeat`].
+    pub fn with_drag_autorepeat(mut self) -> Self {
+        self.drag_autorepeat = true;
         self
     }
 
@@ -904,6 +925,8 @@ pub struct ElementDefBump<'a> {
     pub captures_keyboard: bool,
     pub on_context_menu: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
     pub on_drag: Option<Arc<dyn Fn(&crate::event::DragEvent) + Send + Sync>>,
+    /// See [`Element::drag_autorepeat`].
+    pub drag_autorepeat: bool,
     pub on_resize: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
     pub handlers: bumpalo::collections::Vec<'a, (crate::event::EventType, EventHandler)>,
     pub resize_axis: Option<ResizeAxis>,
@@ -943,6 +966,7 @@ impl<'a> ElementDefBump<'a> {
             captures_keyboard: false,
             on_context_menu: None,
             on_drag: None,
+            drag_autorepeat: false,
             on_resize: None,
             handlers: bumpalo::collections::Vec::new_in(bump),
             resize_axis: None,
@@ -1045,6 +1069,7 @@ impl<'a> ElementDefBump<'a> {
             captures_keyboard: self.captures_keyboard,
             on_context_menu: self.on_context_menu.clone(),
             on_drag: self.on_drag.clone(),
+            drag_autorepeat: self.drag_autorepeat,
             on_resize: self.on_resize.clone(),
             handlers: self.handlers.iter().cloned().collect(),
             resize_axis: self.resize_axis,
