@@ -1364,7 +1364,15 @@ impl AppState {
                 .iter()
                 .map(|(&id, pane)| (id, pane.clone()))
                 .collect(),
-            file_index: self.file_index.clone(),
+            // Quick open must never serve another workspace's tree. The
+            // live index outlives a switch until a rebuild lands, and for
+            // a workspace with no directory no rebuild is ever scheduled,
+            // so gate on the root here rather than trusting whatever is
+            // in the field.
+            file_index: self
+                .file_index
+                .clone()
+                .filter(|index| active_workspace_cwd(self).as_deref() == Some(index.root.as_path())),
             file_index_building: self.file_index_building,
         }
     }
@@ -1792,6 +1800,8 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
     }
     save_workspace_state(state);
     state.active_workspace = new_index;
+    // The index describes the workspace we just left.
+    state.file_index = None;
     load_workspace_state(state);
 }
 
@@ -5353,19 +5363,44 @@ fn clear_palette_query(state: &mut AppState) {
 fn set_palette_query(state: &mut AppState, query: String) {
     state.palette_query = crate::command_palette::sanitize_palette_query(&query);
     reset_palette_selection(state);
+    ensure_file_index_for_query(state);
 }
 
 fn palette_push_query_char(state: &mut AppState, ch: char) -> bool {
     let mut candidate = state.palette_query.clone();
     candidate.push(ch);
     state.palette_query = crate::command_palette::sanitize_palette_query(&candidate);
+    ensure_file_index_for_query(state);
     true
 }
 
 fn palette_backspace_query(state: &mut AppState) -> bool {
     state.palette_query.pop();
     reset_palette_selection(state);
+    ensure_file_index_for_query(state);
     true
+}
+
+/// Start the quick-open index whenever the query lands in Files mode.
+///
+/// The mode is derived from the query's `/` prefix, so it is reachable by
+/// typing and by the `/ files` pill as well as by `palette.files` — and
+/// only the last of those used to build anything. The other two left
+/// `file_index: None` with nothing running, which the palette rendered as
+/// a permanent "Indexing…" over a build that was never started.
+fn ensure_file_index_for_query(state: &mut AppState) {
+    if query_wants_file_index(&state.palette_query) {
+        ensure_file_index(state);
+    }
+}
+
+/// Whether a palette query puts the palette in Files mode. Split out from
+/// the call above because the build itself needs `EDITOR_OPEN_HOOKS`,
+/// which unit tests do not install — this keeps the routing decision
+/// testable on its own.
+fn query_wants_file_index(query: &str) -> bool {
+    crate::command_palette::parse_palette_query(query).mode
+        == crate::command_palette::PaletteMode::Files
 }
 
 fn palette_delete_query(state: &mut AppState) -> bool {
@@ -8191,10 +8226,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             let Ok(index) = other["palette.hover:".len()..].parse::<usize>() else {
                 return false;
             };
-            if index >= palette_result_count(state) {
+            // Cheapest check first: `palette_result_count` rebuilds the
+            // whole result set, which in Files mode ranks every indexed
+            // path, and a mouse moving across the list fires this arm at
+            // pointer-sample rate for the row that is already active.
+            if state.palette_active == index {
                 return false;
             }
-            if state.palette_active == index {
+            if index >= palette_result_count(state) {
                 return false;
             }
             state.palette_active = index;
@@ -17615,6 +17654,64 @@ pub(crate) mod tests {
         let ws = state.workspaces.last().unwrap();
         assert_eq!(ws.name, format!("workspace-{}", expected_num));
         assert!(ws.path.is_none());
+    }
+
+    #[test]
+    fn every_way_into_files_mode_asks_for_an_index() {
+        // `palette.files`, the `/ files` pill (`palette.query:/`) and
+        // simply typing `/` all reach Files mode; only the first used to
+        // build an index, so the other two showed "Indexing…" forever.
+        for query in ["/", "/main", "/src/state.rs", "  /x"] {
+            assert!(query_wants_file_index(query), "{query:?} is Files mode");
+        }
+        for query in ["", "diff", ">save", "@tab", "#agent"] {
+            assert!(!query_wants_file_index(query), "{query:?} is not");
+        }
+    }
+
+    #[test]
+    fn switching_workspaces_drops_the_previous_file_index() {
+        let mut state = seed_state();
+        mutate_add_workspace_with_path(&mut state, Some(PathBuf::from("/tmp/ws-a")));
+        let a = state.active_workspace;
+        mutate_add_workspace_with_path(&mut state, Some(PathBuf::from("/tmp/ws-b")));
+        state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
+            root: PathBuf::from("/tmp/ws-b"),
+            entries: Vec::new(),
+            source: crate::file_index::IndexSource::Git,
+            truncated: false,
+            built_at: std::time::Instant::now(),
+        }));
+        mutate_switch_workspace(&mut state, a);
+        assert!(
+            state.file_index.is_none(),
+            "quick open would have listed the other workspace's files"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_hides_an_index_built_for_another_root() {
+        let mut state = seed_state();
+        mutate_add_workspace_with_path(&mut state, Some(PathBuf::from("/tmp/ws-a")));
+        state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
+            root: PathBuf::from("/tmp/ws-elsewhere"),
+            entries: Vec::new(),
+            source: crate::file_index::IndexSource::Git,
+            truncated: false,
+            built_at: std::time::Instant::now(),
+        }));
+        assert!(
+            state.ui_snapshot().file_index.is_none(),
+            "an index for another root must not reach the palette"
+        );
+        state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
+            root: PathBuf::from("/tmp/ws-a"),
+            entries: Vec::new(),
+            source: crate::file_index::IndexSource::Git,
+            truncated: false,
+            built_at: std::time::Instant::now(),
+        }));
+        assert!(state.ui_snapshot().file_index.is_some(), "the real one does");
     }
 
     #[test]

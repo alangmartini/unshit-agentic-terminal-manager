@@ -745,9 +745,13 @@ pub fn build_palette_results(snap: &UiSnapshot, input: &str) -> PaletteResults {
         let groups = group_items(items);
         let empty_state = if !groups.is_empty() {
             None
-        } else if snap.file_index_building || snap.file_index.is_none() {
+        } else if snap.file_index_building {
             // "No matching files" while the walk is still running would
             // be a lie, and the user would retype instead of waiting.
+            // The converse is just as bad: "Indexing…" with no build
+            // running (a workspace with no directory) is a spinner that
+            // can never resolve, so that case falls through to the real
+            // empty state below.
             Some(PaletteEmptyState {
                 mode: parsed.mode,
                 title: "Indexing\u{2026}".to_string(),
