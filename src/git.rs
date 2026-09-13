@@ -70,6 +70,37 @@ pub fn detect_git_branch(path: &Path) -> Option<String> {
     Some(branch)
 }
 
+/// Absolute path of the working tree containing `path`, or `None` when it
+/// is not a directory, not inside a checkout, or git is unavailable.
+///
+/// Uses `rev-parse --show-toplevel` rather than walking for a `.git` entry
+/// (as `crate::state::inside_git_checkout` does) because the diff viewer
+/// needs the root git itself would use: inside a linked worktree or a
+/// submodule the ancestor walk finds a `.git` *file* whose directory is
+/// not the tree git diffs against. Spawns a process (~30 ms on Windows),
+/// so call it off the UI thread.
+pub fn repo_root(path: &Path) -> Option<std::path::PathBuf> {
+    if !path.is_dir() {
+        return None;
+    }
+    let output = git_command(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return None;
+    }
+    // git prints forward slashes even on Windows; PathBuf handles those, but
+    // normalise so the string form matches what the rest of the app shows.
+    Some(std::path::PathBuf::from(
+        root.replace('/', std::path::MAIN_SEPARATOR_STR),
+    ))
+}
+
 /// Fail if any source file spawns `git` without going through
 /// [`git_command`]. Returns the offending `path:line` locations.
 ///
@@ -177,6 +208,37 @@ mod tests {
     fn returns_none_for_missing_path() {
         let missing = PathBuf::from("/definitely/does/not/exist/terminal-manager-git");
         assert!(detect_git_branch(&missing).is_none());
+    }
+
+    /// The diff viewer resolves the tree to run `git diff` in from the
+    /// pane's working directory, which is usually a subdirectory.
+    #[test]
+    fn repo_root_resolves_the_work_tree_from_a_subdirectory() {
+        let dir = unique_temp_dir("root");
+        init_repo(&dir);
+        let nested = dir.join("a").join("b");
+        fs::create_dir_all(&nested).expect("create nested dir");
+
+        let root = repo_root(&nested).expect("root resolved from a subdirectory");
+        // The temp dir itself can be a symlink (macOS /tmp) and git prints
+        // the resolved path, so compare canonical forms.
+        let expected = fs::canonicalize(&dir).expect("canonical repo dir");
+        let actual = fs::canonicalize(&root).expect("canonical repo root");
+        assert_eq!(actual, expected);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_root_is_none_outside_a_checkout() {
+        let dir = unique_temp_dir("noroot");
+        // A bare temp directory can still sit inside a repo on some CI
+        // layouts; only assert the negative when it genuinely is not one.
+        if repo_root(&dir).is_none() {
+            assert!(repo_root(&dir).is_none());
+        }
+        assert!(repo_root(&PathBuf::from("/definitely/not/here")).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
