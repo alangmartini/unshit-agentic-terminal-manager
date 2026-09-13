@@ -30,3 +30,5 @@ packaging/source-*.png
 # Throwaway screenshot-verification artifacts (previews + captured log dumps)
 preview-*.png
 preview-*.png.err.txt
+shot-*.png
+shot-*.png.err.txt

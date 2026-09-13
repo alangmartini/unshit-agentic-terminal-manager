@@ -139,9 +139,44 @@ mod tests {
         Arc::new(Mutex::new(state))
     }
 
+    /// A repository of our own, on a branch we made.
+    ///
+    /// Not `CARGO_MANIFEST_DIR`: `actions/checkout` leaves a pull request
+    /// build on a detached HEAD, and [`crate::git::detect_git_branch`]
+    /// reports that as no branch at all — correctly, because that is what
+    /// the sidebar should show. A test that asserts on the branch of
+    /// whatever checkout it happens to be compiled in fails in CI for a
+    /// reason that has nothing to do with the code it covers.
+    fn repo_on_a_branch() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "tm-git-watch-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp repo");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test"][..],
+            &["config", "commit.gpgsign", "false"][..],
+            &["commit", "--allow-empty", "-q", "-m", "x"][..],
+        ] {
+            let status = crate::git::git_command(&dir)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {dir:?}");
+        }
+        dir
+    }
+
     #[test]
     fn distinct_paths_are_resolved_once_each() {
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo = repo_on_a_branch();
         let targets = vec![
             (1, repo.clone()),
             (2, repo.clone()),
@@ -158,6 +193,8 @@ mod tests {
             "shared repositories must not be probed once per workspace"
         );
         assert!(matches!(resolved[&repo], GitBranch::Known(_)));
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

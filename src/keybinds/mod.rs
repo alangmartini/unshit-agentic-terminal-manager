@@ -35,6 +35,8 @@ pub enum KeybindAction {
     QuickPromptOpen,
     RenameSession,
     OpenFile,
+    QuickOpen,
+    DiffOpen,
     EditorSave,
     ToggleSidebar,
     OpenSettings,
@@ -88,6 +90,8 @@ impl KeybindAction {
         Self::QuickPromptOpen,
         Self::RenameSession,
         Self::OpenFile,
+        Self::QuickOpen,
+        Self::DiffOpen,
         Self::EditorSave,
         Self::ToggleSidebar,
         Self::OpenSettings,
@@ -116,6 +120,8 @@ impl KeybindAction {
             Self::QuickPromptOpen => "quick_prompt_open",
             Self::RenameSession => "rename_session",
             Self::OpenFile => "open_file",
+            Self::QuickOpen => "quick_open",
+            Self::DiffOpen => "diff_open",
             Self::EditorSave => "editor_save",
             Self::ToggleSidebar => "toggle_sidebar",
             Self::OpenSettings => "open_settings",
@@ -150,6 +156,8 @@ impl KeybindAction {
             Self::QuickPromptOpen => "Quick prompt",
             Self::RenameSession => "Rename session",
             Self::OpenFile => "Open file",
+            Self::QuickOpen => "Quick open",
+            Self::DiffOpen => "Diff against…",
             Self::EditorSave => "Save file",
             Self::ToggleSidebar => "Toggle sidebar",
             Self::OpenSettings => "Settings",
@@ -181,6 +189,8 @@ impl KeybindAction {
             Self::QuickPromptOpen => "Open the quick prompt",
             Self::RenameSession => "Edit the active session label",
             Self::OpenFile => "Open a file in the built-in editor",
+            Self::QuickOpen => "Find a file in the workspace by name and open it",
+            Self::DiffOpen => "Review a git range as a read-only diff pane",
             Self::EditorSave => "Save the focused editor pane (Ctrl+S also works in the editor)",
             Self::ToggleSidebar => "Show or hide the workspace sidebar",
             Self::OpenSettings => "Open the settings window",
@@ -207,8 +217,11 @@ impl KeybindAction {
             | Self::NextTab
             | Self::PrevTab
             | Self::RenameSession => KeybindGroup::Tabs,
-            Self::CommandPalette | Self::QuickPromptOpen => KeybindGroup::Navigation,
-            Self::OpenFile
+            Self::CommandPalette | Self::QuickPromptOpen | Self::QuickOpen => {
+                KeybindGroup::Navigation
+            }
+            Self::DiffOpen
+            | Self::OpenFile
             | Self::EditorSave
             | Self::ToggleSidebar
             | Self::OpenSettings
@@ -241,6 +254,8 @@ impl KeybindAction {
             Self::QuickPromptOpen => "quick_prompt.open",
             Self::RenameSession => "session.rename_active",
             Self::OpenFile => "editor.open",
+            Self::QuickOpen => "palette.files",
+            Self::DiffOpen => "diff.open",
             Self::EditorSave => "editor.save",
             Self::ToggleSidebar => "sidebar.toggle",
             Self::OpenSettings => "modal.open",
@@ -279,6 +294,15 @@ impl KeybindAction {
             // Ctrl+Shift chords: plain Ctrl+O / Ctrl+S must keep
             // reaching terminal programs (nano, readline, XOFF).
             Self::OpenFile => "Ctrl+Shift+O",
+            // Zed and VS Code put quick open on Ctrl+P, which readline
+            // uses for "previous command" in every shell this app hosts.
+            // The rule that moved Open file and Save off plain Ctrl+O /
+            // Ctrl+S applies here too: Ctrl+Shift+E matches VS Code's
+            // Explorer and leaves the terminal alone. Rebind it to
+            // Ctrl+P if you want the editor convention.
+            Self::QuickOpen => "Ctrl+Shift+E",
+            // Ctrl+Shift+G is Source Control in VS Code.
+            Self::DiffOpen => "Ctrl+Shift+G",
             Self::EditorSave => "Ctrl+Shift+S",
             Self::ToggleSidebar => "Ctrl+B",
             Self::OpenSettings => "Ctrl+,",
@@ -303,8 +327,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_has_twenty_three_variants() {
-        assert_eq!(KeybindAction::ALL.len(), 23);
+    fn all_has_twenty_five_variants() {
+        assert_eq!(KeybindAction::ALL.len(), 25);
     }
 
     #[test]

@@ -347,6 +347,9 @@ mod tests {
             pending_agent_resumes: BTreeMap::new(),
             editor_panes: std::collections::HashSet::new(),
             flow_panes: std::collections::HashMap::new(),
+            file_index: None,
+            file_index_building: false,
+            editor_find_bars: std::collections::HashMap::new(),
         }
     }
 

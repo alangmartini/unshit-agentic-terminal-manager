@@ -13,8 +13,10 @@ pub mod browser;
 pub mod command_palette;
 pub mod daemon;
 pub mod diagnostics;
+pub mod diff;
 pub mod drag;
 pub mod editor;
+pub mod file_index;
 pub mod flow_explorer;
 pub mod git;
 pub mod git_watch;
@@ -31,6 +33,7 @@ pub mod shell;
 pub mod startup;
 pub mod startup_perf;
 pub mod state;
+pub mod syntax;
 pub mod telemetry_sink;
 pub mod terminal;
 pub mod theme;
@@ -1437,13 +1440,33 @@ fn main() {
     // Dev/automation hook: dispatch `;`-separated state commands once at
     // startup (screenshot scripts, desktop regression). Not a user
     // surface; commands run with the same rights as any local keybind.
+    //
+    // The lock is taken per command, not once for the batch, so the
+    // pseudo-command `sleep:<ms>` can hand it to a background worker:
+    // without that, an e2e chain can never observe anything a worker
+    // produces (a loaded diff pane, a built file index) and can only ever
+    // drive the synchronous half of a feature.
     if let Ok(commands) = std::env::var("TM_STARTUP_DISPATCH") {
-        let mut guard = shared.lock_recover();
         for command in commands.split(';').filter(|c| !c.trim().is_empty()) {
-            let handled = crate::state::dispatch(&mut guard, command.trim());
+            let command = command.trim();
+            if let Some(ms) = command.strip_prefix("sleep:") {
+                let ms: u64 = ms.parse().unwrap_or(0);
+                // Bounded: a typo must not wedge startup before the event
+                // loop is even entered.
+                let ms = ms.min(30_000);
+                log::info!(
+                    "{{\"event\":\"startup.dispatch_sleep\",\"level\":\"info\",\"ms\":{ms}}}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                continue;
+            }
+            let handled = {
+                let mut guard = shared.lock_recover();
+                crate::state::dispatch(&mut guard, command)
+            };
             log::info!(
                 "{{\"event\":\"startup.dispatch\",\"level\":\"info\",\"command\":{:?},\"handled\":{}}}",
-                command.trim(),
+                command,
                 handled
             );
         }
