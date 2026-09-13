@@ -4489,10 +4489,37 @@ impl ApplicationHandler for AppHandler {
                                         modifiers: combo.modifiers,
                                         text: event.text.as_ref().map(|t| t.to_string()),
                                     });
+                                    let mut reveal_id = None;
                                     if let Some(element) = state.arena.get(focused_id) {
                                         for (et, handler) in &element.handlers {
                                             if *et == EventType::KeyboardCapture {
-                                                handler(&kbd_event);
+                                                if let Some(response) = handler(&kbd_event) {
+                                                    if let Ok(request) = response.downcast::<unshit_core::event::RequestScrollIntoView>() {
+                                                        reveal_id = Some(request.0);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(id) = reveal_id {
+                                        let target = state
+                                            .arena
+                                            .iter()
+                                            .find(|(_, element)| {
+                                                element.id.as_deref() == Some(id.as_str())
+                                            })
+                                            .map(|(node, _)| node);
+                                        if let Some(target) = target {
+                                            if let Some(container) = scroll::scroll_into_view(
+                                                &mut state.arena,
+                                                &state.taffy,
+                                                target,
+                                            ) {
+                                                if state.smooth_scroll.is_some_and(|animation| {
+                                                    animation.node_id == container
+                                                }) {
+                                                    state.smooth_scroll = None;
+                                                }
                                             }
                                         }
                                     }
