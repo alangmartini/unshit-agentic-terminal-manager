@@ -6332,7 +6332,14 @@ fn dispatch_editor_find(state: &mut AppState, command: FindCommand) -> bool {
     };
     match command {
         FindCommand::Open => {
+            // Ctrl+F on an already-open bar re-seeds the query from the
+            // selection rather than starting a new find session; recording
+            // it would break the open/closed pairing the sink is read for.
+            let was_closed = editor.find.is_none();
             editor.find_open();
+            if !was_closed {
+                return true;
+            }
             let path = editor.path.to_string_lossy().into_owned();
             let correlation_id = editor.correlation_id.clone();
             record_editor_event(&EditorEventRecord {
@@ -6810,12 +6817,27 @@ fn flow_node_location(
 
 /// One `flow.handoff` record per `o` / `d`: which hand-off, and whether
 /// the node had a location to aim at. Never the node id or its label.
-fn record_flow_handoff(pane: &crate::flow_explorer::FlowPane, kind: &'static str, located: bool) {
+fn record_flow_handoff(
+    pane: &crate::flow_explorer::FlowPane,
+    kind: &'static str,
+    aim: &'static str,
+) {
     use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
     let mut record = FlowEventRecord::new("flow.handoff", "info", &pane.flow_id);
     record.kind = Some(kind);
-    record.reason = Some(if located { "located" } else { "no_location" });
+    record.reason = Some(aim);
     record_flow_event(&record);
+}
+
+/// `located` / `no_location` for a hand-off that named a node, `range` for
+/// one that did not. Folding the last two together would read as "most
+/// nodes have no source location", which is a different bug report.
+fn handoff_aim(node_id: Option<&str>, located: bool) -> &'static str {
+    match (node_id, located) {
+        (None, _) => "range",
+        (Some(_), true) => "located",
+        (Some(_), false) => "no_location",
+    }
 }
 
 /// `flow.edit:<id>`: open the node's file in an editor at its line.
@@ -6824,7 +6846,11 @@ fn dispatch_flow_edit(state: &mut AppState, node_id: &str) -> bool {
         return false;
     };
     let location = flow_node_location(&pane, node_id);
-    record_flow_handoff(&pane, "edit", location.is_some());
+    record_flow_handoff(
+        &pane,
+        "edit",
+        handoff_aim(Some(node_id), location.is_some()),
+    );
     let Some(location) = location else {
         push_error_toast(state, "This node has no source location");
         return true;
@@ -6846,7 +6872,7 @@ fn dispatch_flow_diff(state: &mut AppState, node_id: Option<&str>) -> bool {
     // An id that resolves to no location still opens the whole range:
     // the user asked to see the diff, and the scroll target is a bonus.
     let location = node_id.and_then(|id| flow_node_location(&pane, id));
-    record_flow_handoff(&pane, "diff", location.is_some());
+    record_flow_handoff(&pane, "diff", handoff_aim(node_id, location.is_some()));
     let Some(range) = pane.flow.diff_range.as_ref() else {
         push_error_toast(state, "This flow has no diff range");
         return true;
@@ -11878,6 +11904,43 @@ pub(crate) mod tests {
                 "{command} must fall through on a terminal pane"
             );
         }
+    }
+
+    /// Ctrl+F on an open bar re-seeds the query from the selection; it is
+    /// not a new find session, and must not be recorded as one or
+    /// `editor.find_open` stops pairing with `editor.find_closed`.
+    #[test]
+    fn reopening_the_find_bar_keeps_it_open_and_keeps_the_query() {
+        let mut state = test_state();
+        let path = editor_temp_file("find_reopen", b"alpha\nbeta\nalpha\n");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+
+        assert!(dispatch(&mut state, "editor.find"));
+        assert!(dispatch(&mut state, "editor.find_query:alpha"));
+        assert!(
+            dispatch(&mut state, "editor.find"),
+            "a second open still claims the key"
+        );
+        let find = state.editors[&pane_id]
+            .find
+            .as_ref()
+            .expect("the bar stays open");
+        assert_eq!(find.query, "alpha", "the query survives the re-open");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The range chip hands off without naming a node at all, which is a
+    /// different signal from a node that carries no source location.
+    #[test]
+    fn handoff_aim_separates_a_range_request_from_a_node_without_a_location() {
+        assert_eq!(handoff_aim(None, false), "range");
+        assert_eq!(handoff_aim(None, true), "range");
+        assert_eq!(handoff_aim(Some("node-1"), true), "located");
+        assert_eq!(handoff_aim(Some("node-1"), false), "no_location");
     }
 
     #[test]
