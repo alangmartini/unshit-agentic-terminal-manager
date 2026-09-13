@@ -44,6 +44,12 @@ const CLAMP_SUFFIX: &str = " …";
 /// runs out.
 const TRUNCATION_NOTICE: &str = "… diff truncated: too many rows to display";
 
+/// Text of the [`DiffRowKind::Meta`] row appended when git wrote more than
+/// the stdout cap. Separate from [`TRUNCATION_NOTICE`] because the cause
+/// is different: the row budget was fine, git's output was not.
+const OUTPUT_CUT_NOTICE: &str =
+    "… diff truncated: git produced more output than can be shown";
+
 /// Text of the [`DiffRowKind::Meta`] row that stands in for a combined
 /// (merge) diff. We refuse to parse `@@@` hunks rather than mis-attribute
 /// their two marker columns to the wrong side.
@@ -172,6 +178,33 @@ pub struct DiffDocument {
 }
 
 impl DiffDocument {
+    /// Append the "git wrote more than we read" row.
+    ///
+    /// The row budget has its own notice; this one is for the byte cap,
+    /// which used to be reported to telemetry and nowhere else, so a diff
+    /// whose tail git never got to write rendered as a complete one.
+    /// Dropped when there is no file at all, so `rows[i].file` stays a
+    /// valid index into `files`.
+    pub fn mark_output_truncated(&mut self) {
+        self.truncated = true;
+        if self.files.is_empty() {
+            return;
+        }
+        let file = self
+            .rows
+            .last()
+            .map(|row| row.file)
+            .unwrap_or(0)
+            .min(self.files.len() as u32 - 1);
+        self.lines.push(OUTPUT_CUT_NOTICE.to_string());
+        self.rows.push(DiffRowInfo {
+            kind: DiffRowKind::Meta,
+            file,
+            old_no: None,
+            new_no: None,
+        });
+    }
+
     /// Total hunks across all files — the `hunks` field of `diff.ready`.
     pub fn hunk_count(&self) -> usize {
         self.files.iter().map(|f| f.hunk_rows.len()).sum()

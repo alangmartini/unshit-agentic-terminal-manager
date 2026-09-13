@@ -20,6 +20,10 @@ use super::spec::DiffSpec;
 /// (raw plus parsed document).
 pub const MAX_DIFF_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 
+/// Cap on git's stderr. Only the first non-empty line is ever shown, so
+/// this exists to bound a filter that logs per file, not to keep text.
+const MAX_DIFF_STDERR_BYTES: usize = 64 * 1024;
+
 /// What a finished diff job produced.
 #[derive(Debug)]
 pub enum DiffOutcome {
@@ -55,7 +59,10 @@ pub fn run_diff(spec: &DiffSpec, repo_root: &Path) -> DiffOutcome {
     // octal-escaped. `--no-ext-diff` ignores a user's configured external
     // differ, which would produce something this parser cannot read (and
     // could launch a GUI). `--no-color` because a config may force colour
-    // even when stdout is not a tty.
+    // even when stdout is not a tty. `--src-prefix`/`--dst-prefix` pin
+    // what `strip_side_prefix` assumes: under the user's `diff.noprefix`
+    // (or a custom `diff.srcPrefix`) git emits `c/main.c`, and the parser
+    // would strip a real top-level directory off every path in the diff.
     cmd.args([
         "-c",
         "core.quotepath=false",
@@ -63,6 +70,8 @@ pub fn run_diff(spec: &DiffSpec, repo_root: &Path) -> DiffOutcome {
         "--no-color",
         "--no-ext-diff",
         "--find-renames",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
         "-U3",
     ]);
     for arg in spec.git_args() {
@@ -83,6 +92,29 @@ pub fn run_diff(spec: &DiffSpec, repo_root: &Path) -> DiffOutcome {
             }
         }
     };
+
+    // stdout and stderr have to be drained concurrently. Reading stdout
+    // to EOF first deadlocks the worker whenever git fills the stderr
+    // pipe before it finishes writing stdout — LFS filter chatter, a
+    // `textconv` driver that logs per file, per-file convert warnings —
+    // because git then blocks on its stderr write and never closes
+    // stdout, and nothing in this function has a timeout. The pane would
+    // sit on "Loading diff…" for the life of the process.
+    let stderr_reader = child.stderr.take().and_then(|mut pipe| {
+        std::thread::Builder::new()
+            .name("diff-stderr".into())
+            .spawn(move || {
+                let mut buf = Vec::new();
+                // Bounded so a chatty filter cannot grow this without
+                // limit; only the first non-empty line is ever shown.
+                let _ = pipe
+                    .by_ref()
+                    .take(MAX_DIFF_STDERR_BYTES as u64)
+                    .read_to_end(&mut buf);
+                buf
+            })
+            .ok()
+    });
 
     // Read at most the cap plus one byte, so "exactly the cap" is not
     // reported as truncated.
@@ -107,10 +139,14 @@ pub fn run_diff(spec: &DiffSpec, repo_root: &Path) -> DiffOutcome {
         let _ = child.kill();
     }
 
-    // `wait_with_output` drains stderr and reaps the child. stdout was
-    // taken above, so this only reads the error stream.
-    let finished = match child.wait_with_output() {
-        Ok(finished) => finished,
+    // Both pipes are at EOF (or the child was killed), so reaping cannot
+    // block. A stderr reader that failed to spawn dropped its pipe, which
+    // makes git's writes fail rather than block — degraded, not wedged.
+    let stderr_bytes = stderr_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let status = match child.wait() {
+        Ok(status) => status,
         Err(e) => {
             return DiffOutcome::Failed {
                 reason: "git_error",
@@ -120,8 +156,8 @@ pub fn run_diff(spec: &DiffSpec, repo_root: &Path) -> DiffOutcome {
         }
     };
 
-    if !finished.status.success() && !stdout_truncated {
-        let stderr = String::from_utf8_lossy(&finished.stderr);
+    if !status.success() && !stdout_truncated {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         let message = stderr
             .lines()
             .map(str::trim)
@@ -140,7 +176,15 @@ pub fn run_diff(spec: &DiffSpec, repo_root: &Path) -> DiffOutcome {
     // rather than failing the whole review.
     let stdout_bytes = stdout.len();
     let text = String::from_utf8_lossy(&stdout);
-    let document = parse_unified_diff(&text);
+    let mut document = parse_unified_diff(&text);
+    if stdout_truncated {
+        // Until now the byte cap was reported to telemetry and nowhere
+        // else, so a cut diff rendered as a complete one and a reviewer
+        // scrolling to the end saw an ordinary row. The cut can land
+        // mid-line, so the last row may be a partial one; the notice
+        // below it is what says so.
+        document.mark_output_truncated();
+    }
     DiffOutcome::Ready {
         document,
         stdout_bytes,
