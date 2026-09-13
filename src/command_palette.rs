@@ -220,6 +220,42 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         enabled: true,
     },
     PaletteAction {
+        id: "editor_indent",
+        label: "Indent lines",
+        description: "Indent the selected lines in the focused editor pane.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: None,
+        shortcut_label: Some("Tab"),
+        dispatch: "editor.indent",
+        keywords: &["indent", "tab", "editor", "shift", "right"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "editor_outdent",
+        label: "Outdent lines",
+        description: "Remove one indent step from the selected lines.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: None,
+        shortcut_label: Some("Shift+Tab"),
+        dispatch: "editor.outdent",
+        keywords: &["outdent", "dedent", "unindent", "tab", "editor", "left"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "editor_toggle_comment",
+        label: "Toggle line comment",
+        description: "Comment or uncomment the selected lines.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: None,
+        shortcut_label: Some("Ctrl+/"),
+        dispatch: "editor.toggle_comment",
+        keywords: &["comment", "uncomment", "toggle", "editor", "slash"],
+        enabled: true,
+    },
+    PaletteAction {
         id: "save_file",
         label: "Save file",
         description: "Save the focused editor pane to disk.",
@@ -1466,6 +1502,9 @@ mod tests {
                 "diff_range",
                 "editor_goto_line",
                 "editor_find",
+                "editor_indent",
+                "editor_outdent",
+                "editor_toggle_comment",
                 "save_file",
                 "flow_open",
                 "flow_explain",
@@ -1664,6 +1703,9 @@ mod tests {
                         | "editor.save"
                         | "editor.goto"
                         | "editor.find"
+                        | "editor.indent"
+                        | "editor.outdent"
+                        | "editor.toggle_comment"
                         | "palette.files"
                         | "diff.open"
                         | "diff.open:HEAD"
@@ -1710,6 +1752,9 @@ mod tests {
                         "diff_range",
                         "editor_goto_line",
                         "editor_find",
+                        "editor_indent",
+                        "editor_outdent",
+                        "editor_toggle_comment",
                         "save_file",
                         "flow_open",
                         "flow_explain",

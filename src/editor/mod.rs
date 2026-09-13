@@ -275,6 +275,12 @@ impl EditorPane {
         self.sync_cursor_into_grid();
     }
 
+    /// The language highlighting was resolved to, which is also what
+    /// decides the line-comment token for `editor.toggle_comment`.
+    pub fn language(&self) -> crate::syntax::Language {
+        self.syntax.language()
+    }
+
     pub fn is_diff(&self) -> bool {
         matches!(self.kind, EditorKind::Diff(_))
     }

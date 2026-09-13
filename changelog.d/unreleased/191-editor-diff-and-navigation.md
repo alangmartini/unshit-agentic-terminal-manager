@@ -1,5 +1,19 @@
 ### Added
 
+- **Editing polish in the file editor.** `Enter` carries the line's indent
+  onto the new line, keeping tabs as tabs. `Home` goes to the first
+  non-blank character and to column 0 on a second press. `Tab` and
+  `Shift+Tab` indent and outdent the selected lines as one undo step,
+  keeping the selection so the chord repeats; with nothing selected `Tab`
+  lands on the next tab stop. `Ctrl+/` comments or uncomments the selected
+  lines with the language's own line comment, aligned at the shallowest
+  indent of the block and leaving blank lines alone. All three are also
+  palette commands (`editor.indent`, `editor.outdent`,
+  `editor.toggle_comment`). Languages with no line comment — JSON, CSS,
+  Markdown — have nothing for `Ctrl+/` to toggle, so there it does
+  nothing; the editor sink records `editor.comment_unsupported` when it
+  happens so the inert chord is tellable from a broken one.
+
 - **Diff review pane.** `Ctrl+Shift+G` (or the palette's "Diff against…" /
   "Show uncommitted changes") opens a read-only pane showing a git range as
   a stacked unified diff, with old/new line numbers, `+`/`-` markers and

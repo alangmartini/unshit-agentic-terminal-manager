@@ -252,6 +252,31 @@ selection indent/outdent by four spaces, `Ctrl+/` toggles the language's
 line comment. Each is a pure `EditorBuffer` operation with unit tests; none
 touches the framework.
 
+**Shipped 2026-09-13, with these decisions.** `Enter` copies the indent
+*literally* (a tab-indented file stays tab-indented) and truncates it at
+the cursor, so `Enter` pressed inside the indent does not duplicate
+whitespace the cursor has not passed. `Tab` with no selection lands on the
+next tab stop rather than always inserting four, and coalesces into the
+typing undo run like any other keystroke. A line-wise command takes the
+selection's line span, excluding a line the selection only touches at
+column 0 — the shape dragging downward produces — and rewrites the whole
+span as one undo record, restoring the selection so the chord repeats.
+`Shift+Tab` removes a tab or up to four spaces, whichever is there, and a
+span that would not change records nothing at all rather than pushing an
+empty undo group and a dirty flag. The comment toggle uncomments only when
+*every* non-blank line is already commented, aligns new prefixes at the
+shallowest indent of the block, and leaves blank lines blank so commenting
+never writes trailing whitespace. `Tab`, `Shift+Tab` and `Ctrl+/` route
+through `editor.indent` / `editor.outdent` / `editor.toggle_comment` so
+the palette can offer them and `TM_STARTUP_DISPATCH` can drive them.
+
+A language with no line comment (JSON, CSS, Markdown) makes `Ctrl+/` a
+no-op. That is the one thing here the telemetry records —
+`editor.comment_unsupported`, with the language as its `reason` — because
+from the user's side an inert chord is indistinguishable from a dead
+keybind. Nothing on the success path is recorded: these are keystroke
+commands and the sink is not for the keystroke path.
+
 ## Commands
 
 All commands go through `state::dispatch` and are therefore usable from
@@ -264,6 +289,7 @@ required kind so the key falls through.
 | `editor.open_at:<line>[.<col>]:<path>` | open/focus and jump |
 | `editor.goto` / `editor.goto:<line>[:<col>]` | dialog / jump in the active editor |
 | `editor.find`, `editor.find_close`, `editor.find_next`, `editor.find_prev`, `editor.find_query:<text>`, `editor.find_case` | find bar |
+| `editor.indent`, `editor.outdent`, `editor.toggle_comment` | line-wise editing in the active writable editor |
 | `diff.open` / `diff.open:<range>` | dialog / diff pane |
 | `diff.next_hunk`, `diff.prev_hunk`, `diff.next_file`, `diff.prev_file`, `diff.open_file` | active diff pane |
 | `flow.diff`, `flow.diff:<id>`, `flow.edit:<id>` | Flow hand-offs |
@@ -271,7 +297,8 @@ required kind so the key falls through.
 | `dialog.goto_commit`, `dialog.diff_commit` | dialog submits |
 | `terminal.paste`, `terminal.copy` | now editor-aware |
 
-Palette allowlist additions: `editor.goto`, `editor.find`, `diff.open`,
+Palette allowlist additions: `editor.goto`, `editor.find`,
+`editor.indent`, `editor.outdent`, `editor.toggle_comment`, `diff.open`,
 `diff.open:HEAD`, `flow.diff`, `palette.files`, and the `editor.open:`
 prefix.
 
@@ -283,6 +310,9 @@ prefix.
 | global (rebindable) | `Ctrl+Shift+G` | diff against… |
 | editor pane | `Ctrl+F`, `F3`, `Shift+F3`, `Escape` | find bar |
 | editor pane | `Ctrl+G` | go to line |
+| editor pane | `Tab`, `Shift+Tab` | indent / outdent |
+| editor pane | `Ctrl+/` | toggle line comment |
+| editor pane | `Home` | first non-blank, then column 0 |
 | editor pane | `Ctrl+V`, `Ctrl+Shift+V`, `Shift+Insert`, `Ctrl+Shift+C` | paste / copy (fixed) |
 | diff pane | `n` `p` `]` `[` `Enter` `o` | hunk / file / open |
 | flow pane | `o` `d` | edit / diff the selected node |

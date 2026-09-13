@@ -44,7 +44,7 @@ pub(crate) fn handle_editor_key(
     pane_id: u32,
     kb: &unshit::core::event::KeyboardEvent,
 ) -> Option<bool> {
-    use crate::editor::{Damage, TAB_SPACES};
+    use crate::editor::Damage;
 
     let ctrl = kb.modifiers.contains(Modifiers::CTRL);
     let alt = kb.modifiers.contains(Modifiers::ALT);
@@ -91,7 +91,25 @@ pub(crate) fn handle_editor_key(
             Key::Char('g') | Key::Char('G') => {
                 return Some(crate::state::dispatch(st, "editor.goto"));
             }
+            // Ctrl+/ is not a registered chord, so it reaches the pane.
+            Key::Char('/') => {
+                return Some(crate::state::dispatch(st, "editor.toggle_comment"));
+            }
             _ => {}
+        }
+    }
+
+    // Tab and Shift+Tab go through dispatch rather than straight to the
+    // buffer so the palette can offer them and an e2e chain can drive
+    // them: `TM_STARTUP_DISPATCH` has no way to send a keystroke.
+    if !ctrl && !alt && st.editors.contains_key(&pane_id) {
+        if kb.key == Key::Tab {
+            let command = if shift {
+                "editor.outdent"
+            } else {
+                "editor.indent"
+            };
+            return Some(crate::state::dispatch(st, command));
         }
     }
 
@@ -188,10 +206,7 @@ pub(crate) fn handle_editor_key(
             b.move_end(shift);
             Damage::None
         }),
-        Key::Enter if !ctrl && !alt => editor.apply_edit(|b| b.insert_newline()),
-        Key::Tab if !ctrl && !alt && !shift => {
-            editor.apply_edit(|b| b.insert_typed(&" ".repeat(TAB_SPACES)))
-        }
+        Key::Enter if !ctrl && !alt => editor.apply_edit(|b| b.insert_newline_auto_indent()),
         Key::Backspace => editor.apply_edit(|b| b.backspace(ctrl)),
         Key::Delete => editor.apply_edit(|b| b.delete_forward(ctrl)),
         Key::Char('a') | Key::Char('A') if ctrl && !shift && !alt => editor.apply(|b| {
@@ -881,6 +896,34 @@ mod tests {
             state.editors.get(&1).unwrap().buffer.line(0),
             Some("helloworld")
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Tab and Shift+Tab go through dispatch, so the palette can offer
+    /// them and an e2e chain can drive them.
+    #[test]
+    fn tab_indents_and_shift_tab_outdents() {
+        let (mut state, path) = editor_state();
+        assert_eq!(handle_editor_key(&mut state, 1, &key(Key::Tab)), Some(true));
+        assert!(state.editors[&1].buffer.to_text().starts_with("    "));
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key_mod(Key::Tab, Modifiers::SHIFT)),
+            Some(true)
+        );
+        assert!(!state.editors[&1].buffer.to_text().starts_with(" "));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Enter carries the indent; the plain `insert_newline` did not.
+    #[test]
+    fn enter_keeps_the_indent_of_the_line_it_split() {
+        let (mut state, path) = editor_state();
+        handle_editor_key(&mut state, 1, &key(Key::Tab));
+        handle_editor_key(&mut state, 1, &key(Key::End));
+        handle_editor_key(&mut state, 1, &key(Key::Enter));
+        let text = state.editors[&1].buffer.to_text();
+        let second = text.lines().nth(1).expect("a second line");
+        assert!(second.starts_with("    "), "{second:?}");
         let _ = std::fs::remove_file(path);
     }
 

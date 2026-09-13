@@ -5616,6 +5616,9 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "editor.save"
             | "editor.goto"
             | "editor.find"
+            | "editor.indent"
+            | "editor.outdent"
+            | "editor.toggle_comment"
             | "palette.files"
             | "diff.open"
     ) || command.starts_with("workspace.switch:")
@@ -5666,6 +5669,63 @@ fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
     if picked_file {
         record_quickopen_pick(state);
     }
+    true
+}
+
+/// Which way `editor.indent` / `editor.outdent` moves the text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReindentCommand {
+    Indent,
+    Outdent,
+}
+
+/// `editor.indent` / `editor.outdent`: Tab and Shift+Tab.
+///
+/// Unclaimed when the active pane is not a writable editor, so Tab still
+/// reaches the shell in a terminal pane and a diff pane keeps it for
+/// nothing (`apply_edit` refuses a read-only buffer anyway).
+fn dispatch_editor_reindent(state: &mut AppState, command: ReindentCommand) -> bool {
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    if editor.read_only {
+        return false;
+    }
+    editor.apply_edit(|buffer| match command {
+        ReindentCommand::Indent => buffer.indent(),
+        ReindentCommand::Outdent => buffer.outdent(),
+    });
+    true
+}
+
+/// `editor.toggle_comment`: `Ctrl+/`.
+///
+/// A language with no line comment — JSON, CSS, Markdown — has nothing to
+/// toggle. That no-op is the one thing here worth a telemetry line: it is
+/// indistinguishable from a dead keybind from the user's side, and this
+/// is the record that tells a later reader which it was. Nothing on the
+/// success path is recorded; these are keystroke commands and the sink is
+/// not for the keystroke path.
+fn dispatch_editor_toggle_comment(state: &mut AppState) -> bool {
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    if editor.read_only {
+        return false;
+    }
+    let language = editor.language();
+    let Some(prefix) = language.line_comment_prefix() else {
+        record_editor_pane_event(
+            editor,
+            "editor.comment_unsupported",
+            "info",
+            Some(language.as_str()),
+        );
+        return true;
+    };
+    editor.apply_edit(|buffer| buffer.toggle_line_comment(prefix));
     true
 }
 
@@ -8078,6 +8138,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         other if let Some(id) = other.strip_prefix("flow.edit:") => dispatch_flow_edit(state, id),
         "dialog.flow_commit" => dispatch_flow_commit(state),
+        "editor.indent" => dispatch_editor_reindent(state, ReindentCommand::Indent),
+        "editor.outdent" => dispatch_editor_reindent(state, ReindentCommand::Outdent),
+        "editor.toggle_comment" => dispatch_editor_toggle_comment(state),
         "editor.save" => dispatch_editor_save(state),
         "tab.new_worktree" => {
             let repo_cwd = active_workspace_cwd(state)
@@ -12315,6 +12378,88 @@ pub(crate) mod tests {
             .map(|toast| toast.message.clone())
             .expect("a toast says why nothing happened");
         assert!(message.contains("Find in file"), "{message:?}");
+    }
+
+    #[test]
+    fn indent_outdent_and_comment_are_unclaimed_off_a_writable_editor() {
+        let mut state = test_state();
+        for command in ["editor.indent", "editor.outdent", "editor.toggle_comment"] {
+            assert!(
+                !dispatch(&mut state, command),
+                "{command} must fall through on a terminal pane"
+            );
+        }
+
+        // A diff pane is read-only: the commands must not claim the key
+        // only to refuse the edit.
+        let _ = open_loading_diff(&mut state, "HEAD");
+        for command in ["editor.indent", "editor.outdent", "editor.toggle_comment"] {
+            assert!(!dispatch(&mut state, command), "{command} on a diff pane");
+        }
+    }
+
+    #[test]
+    fn the_editing_polish_commands_reach_the_buffer() {
+        let mut state = test_state();
+        let path = editor_temp_file("polish", b"fn main() {}\n");
+        // Opened as `.txt`, so re-point the pane at a language with a
+        // line comment by opening a real `.rs` file instead.
+        let rs = path.with_extension("rs");
+        std::fs::write(&rs, "fn main() {}\n").expect("write");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", rs.display())
+        ));
+        let pane_id = state.active_pane.0;
+
+        assert!(dispatch(&mut state, "editor.indent"));
+        assert_eq!(
+            state.editors[&pane_id].buffer.to_text(),
+            "    fn main() {}\n"
+        );
+
+        assert!(dispatch(&mut state, "editor.toggle_comment"));
+        assert_eq!(
+            state.editors[&pane_id].buffer.to_text(),
+            "    // fn main() {}\n"
+        );
+        assert!(dispatch(&mut state, "editor.toggle_comment"));
+        assert_eq!(
+            state.editors[&pane_id].buffer.to_text(),
+            "    fn main() {}\n"
+        );
+
+        assert!(dispatch(&mut state, "editor.outdent"));
+        assert_eq!(state.editors[&pane_id].buffer.to_text(), "fn main() {}\n");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(rs);
+    }
+
+    /// JSON, CSS and Markdown have no line comment, so the chord is a
+    /// no-op — the one case here worth a telemetry line, because from the
+    /// user's side it is indistinguishable from a dead keybind.
+    #[test]
+    fn comment_toggle_is_claimed_but_inert_where_the_language_has_no_prefix() {
+        let mut state = test_state();
+        let path = editor_temp_file("nocomment", b"{}\n");
+        let json = path.with_extension("json");
+        std::fs::write(&json, "{}\n").expect("write");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", json.display())
+        ));
+        let pane_id = state.active_pane.0;
+
+        assert!(
+            dispatch(&mut state, "editor.toggle_comment"),
+            "claimed, so the key does not reach anything else"
+        );
+        assert_eq!(state.editors[&pane_id].buffer.to_text(), "{}\n");
+        assert!(!state.editors[&pane_id].dirty);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(json);
     }
 
     #[test]
