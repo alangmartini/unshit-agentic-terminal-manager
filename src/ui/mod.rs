@@ -1,5 +1,6 @@
 pub mod command_palette;
 pub mod confirm_dialog;
+pub mod diff_review;
 pub mod drag_overlay;
 pub mod editor_pane;
 pub mod flow_pane;

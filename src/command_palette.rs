@@ -100,6 +100,18 @@ pub struct PaletteAction {
 
 pub const SAFE_ACTIONS: &[PaletteAction] = &[
     PaletteAction {
+        id: "git_diff_review",
+        label: "Review Git diff",
+        description: "Review last N commits, unpushed commits, or changes against a base branch.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::Workspace,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "review.open",
+        keywords: &["git", "diff", "pr", "review", "commits", "push", "changes"],
+        enabled: true,
+    },
+    PaletteAction {
         id: "rename_current_terminal",
         label: "Rename current terminal",
         description: "Rename the focused terminal session.",
@@ -1492,6 +1504,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "git_diff_review",
                 "rename_current_terminal",
                 "split_pane_right",
                 "split_pane_down",
@@ -1701,6 +1714,7 @@ mod tests {
                         | "agent.new:codex"
                         | "editor.open"
                         | "editor.save"
+                        | "review.open"
                         | "editor.goto"
                         | "editor.find"
                         | "editor.indent"
@@ -1743,6 +1757,7 @@ mod tests {
                 (
                     PaletteGroup::Commands,
                     vec![
+                        "git_diff_review",
                         "split_pane_right",
                         "split_pane_down",
                         "new_terminal",

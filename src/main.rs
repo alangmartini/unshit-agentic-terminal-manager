@@ -14,6 +14,7 @@ pub mod command_palette;
 pub mod daemon;
 pub mod diagnostics;
 pub mod diff;
+pub mod diff_review;
 pub mod drag;
 pub mod editor;
 pub mod file_index;
@@ -333,12 +334,14 @@ fn build_tree(
         root = root.with_style(StyleDeclaration::FontScale(config_font_scale));
     }
 
-    if snap.settings_open {
+    // Review owns the content area, like Settings. Keep daemon sessions
+    // alive while avoiding layout and painting of the obscured terminals.
+    if snap.settings_open && snap.diff_review.is_none() {
         root = root
             .with_class("settings")
             .with_child(build_settings_page(snap, shared))
             .with_child(with_custom_surface_style(build_statusbar(snap), snap));
-    } else {
+    } else if snap.diff_review.is_none() {
         root = root.with_child(
             ElementDef::new(Tag::Div)
                 .with_class("layout")
@@ -366,6 +369,7 @@ fn build_tree(
 
     ElementTree {
         root: root
+            .with_child(crate::ui::diff_review::build(snap, shared))
             .with_child(build_ctx_menu_overlay(snap, shared))
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
                 snap, shared,
@@ -1374,6 +1378,7 @@ fn main() {
         },
     );
     let _ = window_event_sink.set(app.event_sink());
+    crate::diff_review::start(shared.clone(), app.event_sink());
 
     // Branch names are decoration, so they are resolved after the window is
     // on its way up rather than in front of it. Started here, immediately

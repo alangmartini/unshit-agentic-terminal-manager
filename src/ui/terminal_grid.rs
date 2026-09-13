@@ -149,11 +149,12 @@ pub fn build_terminal_grid(
             // A confirm dialog counts as much as the palette or settings:
             // the grid keeps capturing otherwise, so any keystroke the
             // modal does not hold focus for is typed into the document
-            // underneath it.
+            // underneath it. The Git review overlay is modal the same way.
             let capture_keyboard = is_active
                 && !state.settings_open
                 && !state.palette_open
-                && state.confirm_dialog.is_none();
+                && state.confirm_dialog.is_none()
+                && state.diff_review.is_none();
             let pane_el = build_pane(
                 pane,
                 is_active,
@@ -2049,6 +2050,20 @@ mod tests {
             !content.captures_keyboard,
             "active pane must not capture keyboard while command palette is open"
         );
+    }
+
+    #[test]
+    fn diff_review_prevents_terminal_keyboard_capture() {
+        let mut state = seed_state();
+        state.diff_review = Some(crate::diff_review::Review::new(".".into()));
+        let pane = state.panes[0][0].clone();
+        state.active_pane = pane.id;
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane.id.0, CellGrid::new(24, 80));
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        assert!(!find_terminal_content(&el).unwrap().captures_keyboard);
     }
 
     /// A confirm dialog is as modal as the palette or settings. While it

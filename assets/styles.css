@@ -8097,6 +8097,70 @@ body.dragging-pane {
   text-overflow: ellipsis;
 }
 
+/* Local Git review: bounded file navigation and a numbered unified patch. */
+.diff-overlay { position: fixed; top: 44px; right: 12px; bottom: 12px; left: 12px; z-index: 80; display: flex; flex-direction: column; background: var(--bg-base); color: var(--fg-primary); border: 1px solid var(--border-strong); border-radius: 8px; overflow: hidden; }
+.diff-header { display: flex; flex-direction: row; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--border-default); flex-shrink: 0; }
+.diff-title { font-size: 18px; font-weight: 600; }
+.diff-subtitle { flex: 1; min-width: 0; font-size: 12px; color: var(--fg-secondary); overflow: hidden; }
+.diff-toolbar { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 16px; background: var(--bg-subtle); flex-shrink: 0; }
+.diff-button { padding: 6px 10px; border: 1px solid var(--border-default); border-radius: 4px; background: var(--bg-elevated); color: var(--fg-primary); font-size: 12px; cursor: pointer; flex-shrink: 0; }
+.diff-button:hover { background: var(--bg-hover); }
+.diff-button:focus { border-color: var(--border-focus); }
+.diff-active { background: var(--bg-selected); border-color: var(--border-focus); color: var(--amber-100); }
+.diff-field-label { font-size: 12px; color: var(--fg-secondary); }
+.diff-input { width: 180px; height: 30px; padding: 4px 8px; background: var(--bg-base); color: var(--fg-primary); border: 1px solid var(--border-default); border-radius: 4px; font-size: 12px; }
+.diff-input:focus { border-color: var(--border-focus); }
+.diff-content { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.diff-summary { padding: 10px 16px; font-size: 12px; color: var(--fg-secondary); white-space: pre-wrap; flex-shrink: 0; border-bottom: 1px solid var(--border-default); }
+.diff-columns { display: flex; flex-direction: row; flex: 1; min-height: 0; }
+.diff-files { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; padding: 8px; gap: 4px; }
+.diff-file { display: flex; flex-direction: column; align-items: flex-start; padding: 8px; gap: 4px; }
+.diff-file-name { font-size: 12px; white-space: pre-wrap; }
+.diff-file-stats { font-size: 11px; color: var(--fg-secondary); }
+.diff-patch-panel { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.diff-path-header { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; background: var(--bg-subtle); border-bottom: 1px solid var(--border-default); flex-shrink: 0; }
+.diff-path { font-size: 12px; flex-grow: 1; min-width: 0; }
+.diff-review-progress { padding: 0 12px 8px; font-size: 12px; color: var(--fg-secondary); flex-shrink: 0; }
+.diff-viewed-label { font-size: 11px; color: var(--fg-secondary); }
+.diff-lines { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+.diff-line { display: flex; flex-direction: row; flex-shrink: 0; min-height: 22px; }
+.diff-gutter { width: 48px; flex-shrink: 0; padding: 2px 8px; font-size: 12px; color: var(--fg-secondary); text-align: right; }
+.diff-code { padding: 2px 8px; font-family: "JetBrains Mono"; font-size: 12px; white-space: pre; flex-shrink: 0; }
+.diff-added { background: rgba(82, 140, 64, 0.22); }
+.diff-removed { background: rgba(201, 85, 58, 0.20); }
+.diff-hunk { background: rgba(106, 162, 173, 0.16); color: var(--azure); }
+.diff-meta { color: var(--fg-secondary); }
+.diff-empty { padding: 32px; font-size: 14px; color: var(--fg-secondary); white-space: pre-wrap; }
+.diff-error { padding: 12px 16px; font-size: 13px; background: rgba(201, 85, 58, 0.18); white-space: pre-wrap; flex-shrink: 0; }
+.diff-footer { padding: 8px 16px; font-size: 11px; color: var(--fg-secondary); border-top: 1px solid var(--border-default); flex-shrink: 0; }
+.diff-pagination { display: flex; flex-direction: row; align-items: center; gap: 8px; padding: 8px; flex-shrink: 0; }
+.diff-page-label { font-size: 12px; color: var(--fg-secondary); }
+
+.diff-view-switch { display: flex; flex-direction: row; gap: 4px; }
+.diff-split-table { display: flex; flex-direction: column; width: 100%; min-width: 640px; flex-shrink: 0; }
+.diff-split-heading { display: flex; flex-direction: row; flex-shrink: 0; background: var(--bg-subtle); border-bottom: 1px solid var(--border-default); }
+.diff-split-side-label { flex: 1; min-width: 0; padding: 8px 12px; font-size: 12px; color: var(--fg-secondary); }
+.diff-split-row { display: flex; flex-direction: row; flex-shrink: 0; min-height: 22px; }
+.diff-split-cell { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.diff-split-old { border-right: 1px solid var(--border-default); }
+.diff-split-source { display: flex; flex-direction: row; align-items: flex-start; }
+.diff-split-code { flex: 1; min-width: 0; flex-shrink: 1; white-space: pre-wrap; }
+.diff-split-note { padding: 2px 8px 4px 48px; font-size: 11px; color: var(--fg-secondary); white-space: pre-wrap; }
+.diff-split-gap { background: var(--bg-subtle); }
+
+.diff-file-sidebar { width: 260px; min-width: 160px; flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border-default); }
+.diff-file-filter { display: flex; flex-direction: column; gap: 8px; padding: 8px; flex-shrink: 0; border-bottom: 1px solid var(--border-default); }
+.diff-filter-input { width: 100%; min-width: 0; }
+.diff-filter-actions { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 4px; }
+.diff-filter-count { font-size: 11px; color: var(--fg-secondary); }
+.diff-filter-empty { padding: 8px; font-size: 12px; color: var(--fg-secondary); white-space: pre-wrap; }
+.diff-filter-notice { padding: 8px 12px; font-size: 12px; color: var(--fg-secondary); background: var(--bg-subtle); flex-shrink: 0; white-space: pre-wrap; }
+.diff-files .diff-pagination { flex-wrap: wrap; padding: 0; }
+
+.diff-hunk-navigation { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border-default); flex-shrink: 0; }
+.diff-hunk-status { font-size: 12px; color: var(--fg-secondary); }
+.diff-navigation-disabled { color: var(--fg-tertiary); cursor: default; }
+.diff-hunk-current { background: var(--bg-selected); border-left: 3px solid var(--border-focus); }
 /* -- Editor find bar ------------------------------------------------- */
 /* One row above the grid, inside the pane body. It is laid out with the
    grid below it, not floated over it, so it never covers the line the

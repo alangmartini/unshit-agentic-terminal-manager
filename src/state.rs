@@ -980,6 +980,7 @@ pub struct AppState {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub diff_review: Option<crate::diff_review::Review>,
     pub palette_query: String,
     pub palette_active: usize,
     pub sidebar_collapsed: bool,
@@ -1346,6 +1347,7 @@ impl AppState {
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
             editor_panes: self.editors.keys().copied().collect(),
+            diff_review: self.diff_review.clone(),
             editor_find_bars: self
                 .editors
                 .iter()
@@ -1512,6 +1514,7 @@ pub struct UiSnapshot {
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
     /// Pane ids rendered by the file editor instead of a terminal.
     pub editor_panes: std::collections::HashSet<u32>,
+    pub diff_review: Option<crate::diff_review::Review>,
     /// Find bars that are currently open, by pane id. Only what the bar
     /// renders, so the tree build never reaches into a live pane.
     pub editor_find_bars: std::collections::HashMap<u32, EditorFindView>,
@@ -1649,6 +1652,7 @@ pub fn seed_state() -> AppState {
         tab_width_px: DEFAULT_TAB_WIDTH_PX,
         toggles,
         palette_open: false,
+        diff_review: None,
         palette_query: String::new(),
         palette_active: 0,
         sidebar_collapsed: false,
@@ -5618,6 +5622,7 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "quick_prompt.open"
             | "editor.open"
             | "editor.save"
+            | "review.open"
             | "editor.goto"
             | "editor.find"
             | "editor.indent"
@@ -7661,6 +7666,9 @@ pub fn apply_flow_poll(
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
+    if command.starts_with("review.") {
+        return crate::diff_review::dispatch(state, command);
+    }
     match command {
         "modal.close" => {
             // The find bar is the innermost surface Escape can close, and
@@ -7677,6 +7685,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 return true;
             }
             let mut changed = false;
+            if state.diff_review.take().is_some() {
+                changed = true;
+            }
             if state.ctx_menu.is_some() {
                 state.ctx_menu = None;
                 changed = true;
@@ -10918,6 +10929,7 @@ pub(crate) mod tests {
             tab_width_px: DEFAULT_TAB_WIDTH_PX,
             toggles: BTreeMap::new(),
             palette_open: false,
+            diff_review: None,
             palette_query: String::new(),
             palette_active: 0,
             sidebar_collapsed: false,
