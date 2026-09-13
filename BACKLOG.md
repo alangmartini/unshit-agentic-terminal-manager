@@ -122,6 +122,21 @@ The audit surfaced adjacent hazards that are not yet fixed:
   a debugger with page heap enabled to name the allocation; until then run the
   suite with `--test-threads=1` for a clean signal.
 
+- [ ] **Clipboard round-trip tests race every other process on the machine**
+  — `terminal_copy_in_an_editor_pane_copies_the_selection` and its paste
+  siblings write to the real Windows clipboard and read it straight back.
+  `clipboard_access_guard()` serialises them inside the test binary, but the
+  clipboard is machine-global: the framework's own
+  `crates/unshit-framework/crates/unshit-test/tests/clipboard.rs` has a
+  `clear()` test, a second `cargo test` run or the developer pressing Ctrl+C
+  in any window will do the same, and the read then returns `""`. Observed
+  once on 2026-09-13 (`selection must reach the clipboard, got ""`) and clean
+  on the three runs either side of it. That file also warns that creating
+  `arboard::Clipboard` instances concurrently on Windows can corrupt the heap,
+  which is worth weighing against the entry above. Fixing it properly means a
+  cross-process lock (a named mutex or a lock file both binaries agree on), or
+  a clipboard seam the tests can fake.
+
 ## Product ideas
 
 - [ ] **Agents subtab follow-ups** (`specs/agents-tab.md`, shipped 2026-09-05)
