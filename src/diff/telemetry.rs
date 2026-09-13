@@ -57,6 +57,14 @@ pub struct DiffEventRecord<'a> {
     /// `hunk` or `file`, for `diff.nav`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
+    /// Hunk steps taken in this pane, reported once on `diff.closed`.
+    /// Counted rather than logged per keystroke: `n`/`p`/`]`/`[` are bare
+    /// keys, so a held key drove one synchronous file write per repeat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hunk_steps: Option<u64>,
+    /// File steps taken in this pane, reported alongside `hunk_steps`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_steps: Option<u64>,
 }
 
 impl<'a> DiffEventRecord<'a> {
@@ -83,6 +91,8 @@ impl<'a> DiffEventRecord<'a> {
             path: None,
             line: None,
             kind: None,
+            hunk_steps: None,
+            file_steps: None,
         }
     }
 }

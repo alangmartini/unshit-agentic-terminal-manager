@@ -6001,6 +6001,32 @@ pub fn request_close_tab(state: &mut AppState, index: usize) {
     crate::persist::save_workspaces(state);
 }
 
+/// Send a navigation event to the diff sink when the pane is a diff one,
+/// and report whether it was sent.
+///
+/// Go-to-line and find work on a diff pane, but its `path` is a
+/// repository *directory* and its correlation id belongs to the diff job,
+/// so the editor sink would count a directory as a file and hand a reader
+/// an id with no `editor.open` behind it. Same split as
+/// [`record_editor_closed`].
+fn record_on_diff_sink(
+    editor: &crate::editor::EditorPane,
+    event: &'static str,
+    line: Option<u64>,
+) -> bool {
+    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+    let Some(view) = editor.diff() else {
+        return false;
+    };
+    let label = view.spec.label();
+    let mut record = DiffEventRecord::new(event, "info", &view.job_id);
+    record.range = Some(&label);
+    record.rows = Some(view.rows.len() as u64);
+    record.line = line;
+    record_diff_event(&record);
+    true
+}
+
 /// Durably close out an editor pane's lifecycle in the JSONL sink so the
 /// correlation chain (open → saves → close) is replayable from telemetry
 /// alone. `reason: "dirty"` at warn level marks unsaved changes that died
@@ -6016,6 +6042,10 @@ fn record_editor_closed(editor: &crate::editor::EditorPane) {
         record.range = Some(&label);
         record.rows = Some(view.rows.len() as u64);
         record.files = Some(view.files.len() as u64);
+        // What the pane was used for, counted rather than logged per
+        // keystroke; zeroes say the diff was opened and never walked.
+        record.hunk_steps = Some(view.hunk_steps);
+        record.file_steps = Some(view.file_steps);
         record_diff_event(&record);
         return;
     }
@@ -6290,6 +6320,9 @@ fn record_editor_line_event(state: &mut AppState, pane_id: u32, event: &'static 
     let Some(editor) = state.editors.get(&pane_id) else {
         return;
     };
+    if record_on_diff_sink(editor, "diff.goto", Some(line as u64)) {
+        return;
+    }
     let path = editor.path.to_string_lossy().into_owned();
     record_editor_event(&EditorEventRecord {
         timestamp_unix_ms: now_unix_ms(),
@@ -6384,6 +6417,9 @@ fn dispatch_editor_find(state: &mut AppState, command: FindCommand) -> bool {
             if !was_closed {
                 return true;
             }
+            if record_on_diff_sink(editor, "diff.find_open", None) {
+                return true;
+            }
             let path = editor.path.to_string_lossy().into_owned();
             let correlation_id = editor.correlation_id.clone();
             record_editor_event(&EditorEventRecord {
@@ -6405,6 +6441,9 @@ fn dispatch_editor_find(state: &mut AppState, command: FindCommand) -> bool {
             let Some(closed) = editor.find_close() else {
                 return false;
             };
+            if record_on_diff_sink(editor, "diff.find_closed", None) {
+                return true;
+            }
             let path = editor.path.to_string_lossy().into_owned();
             let correlation_id = editor.correlation_id.clone();
             record_editor_event(&EditorEventRecord {
@@ -6804,22 +6843,15 @@ fn dispatch_diff_nav(state: &mut AppState, forward: bool, hunk: bool) -> bool {
         editor.diff_step_file(forward)
     };
     if moved {
-        record_diff_nav(state, pane_id, if hunk { "hunk" } else { "file" });
+        if let Some(view) = editor.kind.as_diff_mut() {
+            if hunk {
+                view.hunk_steps += 1;
+            } else {
+                view.file_steps += 1;
+            }
+        }
     }
     true
-}
-
-fn record_diff_nav(state: &AppState, pane_id: u32, kind: &'static str) {
-    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
-    let Some(view) = state.editors.get(&pane_id).and_then(|e| e.diff()) else {
-        return;
-    };
-    let label = view.spec.label();
-    let mut record = DiffEventRecord::new("diff.nav", "info", &view.job_id);
-    record.pane_id = Some(pane_id);
-    record.range = Some(&label);
-    record.kind = Some(kind);
-    record_diff_event(&record);
 }
 
 /// `diff.open_file`: open the file under the diff cursor in an editor,

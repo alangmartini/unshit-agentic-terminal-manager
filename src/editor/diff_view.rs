@@ -132,6 +132,13 @@ pub struct DiffView {
     gutter_w: usize,
     old_digits: usize,
     new_digits: usize,
+    /// Hunk and file steps taken in this pane. Reported once on
+    /// `diff.closed` instead of one sink write per keystroke — the keys
+    /// that drive them are bare and auto-repeat, and at ~160 bytes a line
+    /// a long review used to rotate the diff sink's own 512 KiB budget
+    /// out from under the `diff.request` records it exists to hold.
+    pub hunk_steps: u64,
+    pub file_steps: u64,
     /// Block-comment state entering each row, parallel to `rows`.
     ///
     /// A diff is not a contiguous document but a hunk is, so this is
@@ -157,6 +164,8 @@ impl DiffView {
             gutter_w: 2,
             old_digits: 0,
             new_digits: 0,
+            hunk_steps: 0,
+            file_steps: 0,
             block_states: Vec::new(),
             truncated: false,
         }
