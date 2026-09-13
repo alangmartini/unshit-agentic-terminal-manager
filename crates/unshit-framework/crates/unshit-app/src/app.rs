@@ -581,6 +581,7 @@ struct AppState {
     dw_rasterizer: DwRasterizer,
     interaction: InteractionState,
     needs_rebuild: bool,
+    pending_scroll_into_view: Option<String>,
     needs_restyle: bool,
     needs_relayout: bool,
     /// When `Some`, the next `needs_restyle` pass cascades from this node
@@ -3060,6 +3061,7 @@ impl AppHandler {
             dw_rasterizer,
             interaction: InteractionState::default(),
             needs_rebuild: false,
+            pending_scroll_into_view: None,
             needs_restyle: false,
             needs_relayout: false,
             restyle_root: None,
@@ -3208,6 +3210,10 @@ impl ApplicationHandler for AppHandler {
         for event in self.event_rx.try_iter() {
             match event {
                 ExternalEvent::RequestRebuild => {
+                    coalescer.observe(true);
+                }
+                ExternalEvent::ScrollIntoView(id) => {
+                    state.pending_scroll_into_view = Some(id);
                     coalescer.observe(true);
                 }
                 ExternalEvent::RequestRedraw => {
@@ -5164,6 +5170,25 @@ impl ApplicationHandler for AppHandler {
                         metrics.layout_us = t3.elapsed().as_micros() as u64;
                     }
 
+                    if let Some(id) = state.pending_scroll_into_view.take() {
+                        let target = state
+                            .arena
+                            .iter()
+                            .find(|(_, element)| element.id.as_deref() == Some(id.as_str()))
+                            .map(|(node, _)| node);
+                        if let Some(target) = target {
+                            if let Some(container) =
+                                scroll::scroll_into_view(&mut state.arena, &state.taffy, target)
+                            {
+                                if state
+                                    .smooth_scroll
+                                    .is_some_and(|animation| animation.node_id == container)
+                                {
+                                    state.smooth_scroll = None;
+                                }
+                            }
+                        }
+                    }
                     metrics.node_count = state.arena.len();
                     state.needs_rebuild = false;
                     state.needs_restyle = false;

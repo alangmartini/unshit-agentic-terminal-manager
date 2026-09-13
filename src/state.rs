@@ -5322,6 +5322,61 @@ pub fn sync_explorer(state: &mut AppState) {
     }
 }
 
+fn dispatch_explorer_reveal(state: &mut AppState) -> bool {
+    let Some(editor) = state.editors.get(&state.active_pane.0) else {
+        push_error_toast(state, "Open a file in the editor to reveal it in Explorer.");
+        return true;
+    };
+    let target = editor.path.clone();
+    let Some(root) = active_workspace_cwd(state) else {
+        push_error_toast(state, "This workspace has no folder to reveal files in.");
+        return true;
+    };
+    state.explorer.active = true;
+    state.sidebar_collapsed = false;
+    sync_explorer(state);
+    let generation = state.explorer.generation;
+    let selected = state.explorer.selected.clone();
+    let pane = state.active_pane;
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return true;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-reveal".into())
+        .spawn(move || {
+            let result = crate::explorer::reveal_path(&root, &target);
+            let mut state = hooks.shared.lock_recover();
+            if state.explorer.generation != generation
+                || state.active_pane != pane
+                || state.explorer.selected != selected
+                || !state.explorer.active
+                || state.sidebar_collapsed
+            {
+                return;
+            }
+            match result {
+                Ok((target, listings)) => {
+                    for (path, listing) in listings {
+                        state.explorer.expanded.insert(path.clone());
+                        state.explorer.accept(generation, path, listing);
+                    }
+                    state.explorer.selected = Some(target.clone());
+                    drop(state);
+                    (hooks.request_reveal)(format!("explorer:{}", target.display()));
+                }
+                Err(error) => {
+                    push_error_toast(&mut state, format!("Could not reveal file: {error}"));
+                    drop(state);
+                    (hooks.request_rebuild)();
+                }
+            }
+        })
+    {
+        push_error_toast(state, format!("Could not reveal file: {error}"));
+    }
+    true
+}
+
 pub fn load_explorer_directory(state: &mut AppState, path: PathBuf) {
     use crate::explorer::Listing;
     if state.explorer.listings.contains_key(&path) {
@@ -5837,6 +5892,7 @@ fn editor_viewport_dims(state: &AppState) -> (usize, usize) {
 pub struct EditorOpenHooks {
     pub shared: SharedState,
     pub request_rebuild: Box<dyn Fn() + Send + Sync>,
+    pub request_reveal: Box<dyn Fn(String) + Send + Sync>,
 }
 
 static EDITOR_OPEN_HOOKS: std::sync::OnceLock<std::sync::Arc<EditorOpenHooks>> =
@@ -8359,6 +8415,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if other.starts_with("tab.reorder:") => {
             persist_layout_if(dispatch_tab_reorder(state, other), state)
         }
+        "explorer.reveal" => dispatch_explorer_reveal(state),
         "explorer.toggle" => {
             if state.explorer.active && !state.sidebar_collapsed {
                 state.explorer.keyboard_focus = false;

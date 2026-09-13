@@ -3,6 +3,38 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Read only the target's ancestor chain, on a worker. Map canonical paths
+/// back to the workspace spelling so row ids agree with ordinary listings.
+pub fn reveal_path(
+    root: &Path,
+    target: &Path,
+) -> Result<(PathBuf, Vec<(PathBuf, Listing)>), String> {
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let canonical_target = target.canonicalize().map_err(|e| e.to_string())?;
+    let relative = canonical_target
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "The active file is outside this workspace.".to_string())?;
+    let target = root.join(relative);
+    let mut directory = root.to_owned();
+    let mut listings = Vec::new();
+    let components: Vec<_> = relative.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let listing = read_directory(&directory);
+        let child = directory.join(component);
+        match &listing {
+            Listing::Ready(entries)
+                if entries.iter().any(|entry| {
+                    entry.path == child && (index == components.len() - 1 || entry.directory)
+                }) => {}
+            Listing::Error(error) => return Err(error.clone()),
+            _ => return Err("The file is no longer available in this workspace.".into()),
+        }
+        listings.push((directory, listing));
+        directory = child;
+    }
+    Ok((target, listings))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub path: PathBuf,
@@ -197,6 +229,29 @@ pub fn read_directory(path: &Path) -> Listing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reveal_reads_ancestor_chain_and_rejects_outside_or_missing_files() {
+        let base = std::env::temp_dir().join(format!("tm-reveal-{}", std::process::id()));
+        let root = base.join("project");
+        let file = root.join("nested folder").join("deep").join("example.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "example").unwrap();
+        std::fs::write(base.join("outside.txt"), "outside").unwrap();
+        let (selected, listings) = reveal_path(&root, &file).unwrap();
+        assert_eq!(selected, file);
+        assert_eq!(listings.len(), 3);
+        let mut explorer = Explorer::default();
+        explorer.set_root(Some(root.clone()));
+        for (path, listing) in listings {
+            explorer.expanded.insert(path.clone());
+            explorer.accept(explorer.generation, path, listing);
+        }
+        assert!(explorer.visible_paths().contains(&selected));
+        assert!(reveal_path(&root, &base.join("outside.txt")).is_err());
+        assert!(reveal_path(&root, &root.join("missing.txt")).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn recovery_prunes_deleted_children_and_does_not_strand_pending_loads() {

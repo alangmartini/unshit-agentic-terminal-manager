@@ -46,7 +46,12 @@ pub fn build_explorer(snapshot: &UiSnapshot, shared: &SharedState) -> ElementDef
                     .with_class("sidebar-title")
                     .with_text("explorer"),
             )
-            .with_child(command_button("Refresh", "explorer.refresh", shared)),
+            .with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("sidebar-head-actions")
+                    .with_child(command_button("Reveal", "explorer.reveal", shared))
+                    .with_child(command_button("Refresh", "explorer.refresh", shared)),
+            ),
     );
     let keyboard_state = shared.clone();
     let mut tree = ElementDef::new(Tag::Div)

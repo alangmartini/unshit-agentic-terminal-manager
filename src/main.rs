@@ -1412,8 +1412,14 @@ fn main() {
     {
         let hooks_shared = shared.clone();
         let hooks_sink = window_event_sink.clone();
+        let reveal_sink = window_event_sink.clone();
         crate::state::register_editor_open_hooks(crate::state::EditorOpenHooks {
             shared: hooks_shared,
+            request_reveal: Box::new(move |id| {
+                if let Some(sink) = reveal_sink.get() {
+                    let _ = sink.send(unshit::app::ExternalEvent::ScrollIntoView(id));
+                }
+            }),
             request_rebuild: Box::new(move || {
                 if let Some(sink) = hooks_sink.get() {
                     let _ = sink.send(unshit::app::ExternalEvent::RequestRebuild);

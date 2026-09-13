@@ -22,3 +22,8 @@ Open editor buffers are never reloaded by this check. Workspace switches
 clear the tree, and results from an earlier workspace or refresh are discarded.
 Loading, unreadable folders, empty folders and workspaces without a folder have
 explicit messages. The existing sidebar resize handle controls explorer width.
+
+Reveal opens the active editor file in the tree: it loads and expands ancestor
+folders, selects the file, and scrolls it into view. Files outside the active
+workspace produce a message. Disk reads stay on a worker; switching panes or
+workspaces, hiding Explorer, or moving selection cancels a pending reveal.
