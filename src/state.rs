@@ -1771,7 +1771,7 @@ pub fn grouped_tab_indices(
     active_pane: PaneId,
     is_agent: impl Fn(u32) -> bool,
 ) -> Vec<usize> {
-    let agents = is_agent(active_pane.0);
+    let active_is_agent = is_agent(active_pane.0);
     tabs.iter()
         .enumerate()
         .filter_map(|(index, tab)| {
@@ -1784,7 +1784,7 @@ pub fn grouped_tab_indices(
                 || panes
                     .iter()
                     .flatten()
-                    .any(|pane| is_agent(pane.id.0) == agents))
+                    .any(|pane| is_agent(pane.id.0) == active_is_agent))
             .then_some(index)
         })
         .collect()
@@ -1801,7 +1801,7 @@ fn visible_tab_indices(state: &AppState) -> Vec<usize> {
 }
 
 /// Translate a visible insertion slot back into the workspace's tab order.
-pub fn grouped_tab_drop_index(
+fn grouped_tab_drop_index(
     cursor_x: f32,
     cursor_y: f32,
     rect: crate::drag::Rect,

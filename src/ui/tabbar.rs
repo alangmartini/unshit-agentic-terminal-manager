@@ -37,15 +37,15 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         state.active_pane,
         |id| state.agent_pane_ids.contains(&id),
     );
-    let placeholder_index = pane_drag_insertion_index(state);
+    let placeholder_slot = pane_drag_insertion_slot(state, visible.len());
     let dragging_source_id = state.drag.dragged_tab().map(|s| s.to_string());
     let sizing = TabSizing {
         mode: state.tab_width_mode,
         width_px: state.tab_width_px,
     };
-    for &index in &visible {
+    for (slot, &index) in visible.iter().enumerate() {
         let tab = &state.tabs[index];
-        if Some(index) == placeholder_index {
+        if Some(slot) == placeholder_slot {
             tabs = tabs.with_child(build_tab_drop_placeholder());
         }
         let is_dragging = dragging_source_id.as_deref() == Some(tab.id.as_str());
@@ -60,9 +60,7 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             shared,
         ));
     }
-    if placeholder_index.is_some()
-        && placeholder_index == Some(visible.last().map_or(0, |index| index + 1))
-    {
+    if placeholder_slot == Some(visible.len()) {
         tabs = tabs.with_child(build_tab_drop_placeholder());
     }
     let add_state = shared.clone();
@@ -149,18 +147,12 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
 }
 
 /// When a pane drag is active and the cursor is over the tab bar,
-/// returns the slot at which a dropped tab would be inserted so the
-/// renderer can place a visual placeholder there. `None` otherwise.
-fn pane_drag_insertion_index(state: &UiSnapshot) -> Option<usize> {
+/// returns the slot (an index into the visible tab list) at which a
+/// dropped tab would be inserted so the renderer can place a visual
+/// placeholder there. `None` otherwise.
+fn pane_drag_insertion_slot(state: &UiSnapshot, visible_len: usize) -> Option<usize> {
     let (cursor_x, cursor_y) = state.drag.cursor()?;
-    let visible = crate::state::grouped_tab_indices(
-        &state.tabs,
-        state.active_tab,
-        &state.panes,
-        state.active_pane,
-        |id| state.agent_pane_ids.contains(&id),
-    );
-    crate::state::grouped_tab_drop_index(cursor_x, cursor_y, state.tabbar_rect, &visible)
+    crate::drag::resolve_tabbar_drop(cursor_x, cursor_y, state.tabbar_rect, visible_len)
 }
 
 fn build_tab_drop_placeholder() -> ElementDef {
