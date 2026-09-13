@@ -30,13 +30,21 @@ impl Default for TabSizing {
 
 pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let mut tabs = ElementDef::new(Tag::Div).with_class("tabs").with_id("tabs");
+    let visible = crate::state::grouped_tab_indices(
+        &state.tabs,
+        state.active_tab,
+        &state.panes,
+        state.active_pane,
+        |id| state.agent_pane_ids.contains(&id),
+    );
     let placeholder_index = pane_drag_insertion_index(state);
     let dragging_source_id = state.drag.dragged_tab().map(|s| s.to_string());
     let sizing = TabSizing {
         mode: state.tab_width_mode,
         width_px: state.tab_width_px,
     };
-    for (index, tab) in state.tabs.iter().enumerate() {
+    for &index in &visible {
+        let tab = &state.tabs[index];
         if Some(index) == placeholder_index {
             tabs = tabs.with_child(build_tab_drop_placeholder());
         }
@@ -52,7 +60,9 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             shared,
         ));
     }
-    if placeholder_index == Some(state.tabs.len()) {
+    if placeholder_index.is_some()
+        && placeholder_index == Some(visible.last().map_or(0, |index| index + 1))
+    {
         tabs = tabs.with_child(build_tab_drop_placeholder());
     }
     let add_state = shared.clone();
@@ -143,7 +153,14 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
 /// renderer can place a visual placeholder there. `None` otherwise.
 fn pane_drag_insertion_index(state: &UiSnapshot) -> Option<usize> {
     let (cursor_x, cursor_y) = state.drag.cursor()?;
-    crate::drag::resolve_tabbar_drop(cursor_x, cursor_y, state.tabbar_rect, state.tabs.len())
+    let visible = crate::state::grouped_tab_indices(
+        &state.tabs,
+        state.active_tab,
+        &state.panes,
+        state.active_pane,
+        |id| state.agent_pane_ids.contains(&id),
+    );
+    crate::state::grouped_tab_drop_index(cursor_x, cursor_y, state.tabbar_rect, &visible)
 }
 
 fn build_tab_drop_placeholder() -> ElementDef {
@@ -371,6 +388,34 @@ mod tests {
     }
 
     // -- build_tabbar --
+
+    #[test]
+    fn tab_groups_filter_top_bar_after_sidebar_selection() {
+        let shared = make_shared();
+        let mut state = shared.lock().unwrap();
+        crate::state::mutate_add_tab(&mut state);
+        let agent_id = state.active_pane.0;
+        state.pane_agents.insert(
+            agent_id,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        for index in [1, 0, 1] {
+            let workspace_id = state.workspaces[state.active_workspace].num;
+            let pane_id = state.tabs[index].active_pane.0;
+            assert!(crate::state::focus_workspace_pane_by_num(
+                &mut state,
+                workspace_id,
+                pane_id
+            ));
+            let el = build_tabbar(&state.ui_snapshot(), &shared);
+            let tabs = &el.children[0];
+            assert_eq!(tabs.children.len(), 2, "one matching tab plus add");
+            assert_eq!(
+                tabs.children[0].key.as_deref(),
+                Some(format!("tab:{}", state.tabs[index].id).as_str())
+            );
+        }
+    }
 
     #[test]
     fn tabbar_structure() {
@@ -1012,10 +1057,15 @@ mod agents_tab_tests {
             .iter()
             .filter(|c| has_class(c, "tab"))
             .collect();
-        assert_eq!(tabs.len(), 2);
-        assert!(!has_class(tabs[0], "agent"));
-        assert!(find_by_class(tabs[0], "tab-agent-ic").is_none());
-        assert!(has_class(tabs[1], "agent"));
-        assert!(find_by_class(tabs[1], "tab-agent-ic").is_some());
+        assert_eq!(tabs.len(), 1);
+        assert!(has_class(tabs[0], "agent"));
+        assert!(find_by_class(tabs[0], "tab-agent-ic").is_some());
+
+        crate::state::mutate_switch_tab(&mut shared.lock().unwrap(), 0);
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let bar = build_tabbar(&snap, &shared);
+        let shell = find_by_class(&bar, "tab").expect("shell tab");
+        assert!(!has_class(shell, "agent"));
+        assert!(find_by_class(shell, "tab-agent-ic").is_none());
     }
 }
