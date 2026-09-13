@@ -1838,25 +1838,42 @@ mod tests {
         assert_eq!(sel.focus.0, 2, "focus is pinned to the new top row (`L2`)");
 
         // Held still past the edge: the auto-repeat tick keeps scrolling,
-        // metered by wall clock (12 lines/s one row past the edge).
-        std::thread::sleep(std::time::Duration::from_millis(120));
+        // metered by wall clock (12 lines/s one row past the edge). Backdate
+        // the meter by a second instead of sleeping: that asks for 12 lines
+        // and the scrollback only holds two more, so however long the tick
+        // itself takes the outcome is exact.
+        {
+            let mut st = shared.lock().unwrap();
+            let auto = st
+                .terminal_drag_autoscroll
+                .as_mut()
+                .expect("auto-scroll is armed while the pointer rests past the edge");
+            auto.last_tick = auto
+                .last_tick
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("the monotonic clock is past its first second");
+        }
         assert!(
             harness.tick_drag_autorepeat(),
             "the grid opted in, so it keeps receiving drag updates"
         );
         harness.step();
-        assert_eq!(scroll_offset_of(&shared, 1), 2);
+        assert_eq!(
+            scroll_offset_of(&shared, 1),
+            3,
+            "scrolls as far as the scrollback goes"
+        );
         let sel = selection_of(&shared, 1);
-        assert_eq!((sel.anchor.0, sel.focus.0), (5, 1));
+        assert_eq!((sel.anchor.0, sel.focus.0), (5, 0));
 
         // Releasing ends the drag: no further auto-repeat, view stays put,
         // selection survives.
         harness.mouse_up(x, rect.y - 8.0);
         harness.step();
         assert!(!harness.tick_drag_autorepeat());
-        assert_eq!(scroll_offset_of(&shared, 1), 2);
+        assert_eq!(scroll_offset_of(&shared, 1), 3);
         let sel = selection_of(&shared, 1);
-        assert_eq!((sel.anchor.0, sel.focus.0), (5, 1));
+        assert_eq!((sel.anchor.0, sel.focus.0), (5, 0));
         assert!(
             shared.lock().unwrap().terminal_drag_autoscroll.is_none(),
             "auto-scroll bookkeeping is closed out on release"
