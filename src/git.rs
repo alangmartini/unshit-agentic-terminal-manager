@@ -262,9 +262,18 @@ mod tests {
         let dir = unique_temp_dir("noroot");
         // A bare temp directory can still sit inside a repo on some CI
         // layouts; only assert the negative when it genuinely is not one.
+        // Asserting `repo_root(&dir).is_none()` again inside the guard
+        // would restate the condition and pass however `repo_root`
+        // behaves, so assert a *different* fact that the same git call
+        // decides: a directory with no repository has no branch either.
         if repo_root(&dir).is_none() {
-            assert!(repo_root(&dir).is_none());
+            assert!(detect_git_branch(&dir).is_none());
+            let nested = dir.join("nested");
+            let _ = fs::create_dir_all(&nested);
+            assert!(repo_root(&nested).is_none());
         }
+        // Short-circuits on `!path.is_dir()` before git runs, so this
+        // pins the guard rather than git's verdict.
         assert!(repo_root(&PathBuf::from("/definitely/not/here")).is_none());
         let _ = fs::remove_dir_all(&dir);
     }

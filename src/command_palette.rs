@@ -494,6 +494,11 @@ pub struct PaletteGroupView {
     pub group: PaletteGroup,
     pub title: String,
     pub items: Vec<PaletteItem>,
+    /// What the group header's count should read, when the plain row
+    /// count would mislead. Quick open caps its rows, so `50 of 312`
+    /// there is the difference between "your file is not indexed" and
+    /// "keep typing". Computed here so the renderer stays dumb.
+    pub count_label: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -691,7 +696,8 @@ pub fn fuzzy_match(query: &str, text: &str) -> Option<FuzzyScore> {
 ///
 /// The palette list is not virtualised, so every row becomes an element in
 /// the tree; 50 is what fits a tall window without making a rebuild
-/// expensive. The footer says when more matched.
+/// expensive. The group header's count says when more matched, so a cap
+/// never reads as "your file is not indexed".
 pub const FILE_ROW_LIMIT: usize = 50;
 
 /// Quick-open rows for `query`, already ranked.
@@ -700,11 +706,14 @@ pub const FILE_ROW_LIMIT: usize = 50;
 /// [`crate::file_index::rank`], which knows to weight a basename hit above
 /// a path hit — re-ranking them with the generic matcher would throw that
 /// away — so [`build_palette_results`] skips `filter_and_rank` for them.
-fn file_items(snap: &UiSnapshot, query: &str) -> Vec<PaletteItem> {
+/// Returns the rows and how many files matched in total, which is not the
+/// same number: the list is capped at [`FILE_ROW_LIMIT`].
+fn file_items(snap: &UiSnapshot, query: &str) -> (Vec<PaletteItem>, usize) {
     let Some(index) = snap.file_index.as_ref() else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    crate::file_index::rank(index, query, FILE_ROW_LIMIT)
+    let (ranked, matched) = crate::file_index::rank_counted(index, query, FILE_ROW_LIMIT);
+    let items = ranked
         .into_iter()
         .filter_map(|ranked| {
             let entry = index.entries.get(ranked.idx)?;
@@ -733,7 +742,8 @@ fn file_items(snap: &UiSnapshot, query: &str) -> Vec<PaletteItem> {
                 status: None,
             })
         })
-        .collect()
+        .collect();
+    (items, matched)
 }
 
 pub fn build_palette_results(snap: &UiSnapshot, input: &str) -> PaletteResults {
@@ -741,8 +751,23 @@ pub fn build_palette_results(snap: &UiSnapshot, input: &str) -> PaletteResults {
     // Files mode arrives ranked by the file index; everything else is
     // ranked below by the generic matcher.
     if parsed.mode == PaletteMode::Files {
-        let items = file_items(snap, &parsed.query);
-        let groups = group_items(items);
+        let (items, matched) = file_items(snap, &parsed.query);
+        let shown = items.len();
+        let mut groups = group_items(items);
+        if matched > shown {
+            // The cap is the whole reason this label exists: without it
+            // the header reads "50" and a user whose file ranked 51st
+            // concludes it is not indexed. A `+` says the index itself
+            // stopped short of the tree.
+            let partial = snap
+                .file_index
+                .as_ref()
+                .is_some_and(|index| index.truncated);
+            let suffix = if partial { "+" } else { "" };
+            for group in &mut groups {
+                group.count_label = Some(format!("{shown} of {matched}{suffix}"));
+            }
+        }
         let empty_state = if !groups.is_empty() {
             None
         } else if snap.file_index_building {
@@ -1254,6 +1279,7 @@ fn group_items(items: Vec<PaletteItem>) -> Vec<PaletteGroupView> {
                 group: *group,
                 title: group.title().to_string(),
                 items: grouped,
+                count_label: None,
             })
         })
         .collect();

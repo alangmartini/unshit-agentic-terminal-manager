@@ -200,9 +200,12 @@ fn build_group(
             .with_child(ElementDef::new(Tag::Span).with_text(group.title.clone()))
             .with_child(ElementDef::new(Tag::Span).with_class("rule"))
             .with_child(
-                ElementDef::new(Tag::Span)
-                    .with_class("gcount")
-                    .with_text(group.items.len().to_string()),
+                ElementDef::new(Tag::Span).with_class("gcount").with_text(
+                    group
+                        .count_label
+                        .clone()
+                        .unwrap_or_else(|| group.items.len().to_string()),
+                ),
             ),
     );
 

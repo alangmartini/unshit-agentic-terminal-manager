@@ -3114,6 +3114,20 @@ pub fn mutate_remove_workspace(state: &mut AppState, idx: usize) {
         .map(|pane| pane.id.0)
         .collect::<Vec<_>>();
     for pane_id in pane_ids {
+        // Editor and flow panes live in their own side maps, and removing
+        // a workspace used to destroy only the PTY half. An editor left
+        // behind is unreachable from any tab but still in `state.editors`
+        // for the life of the process: it never records its `close`, and
+        // a diff job finishing afterwards still finds it and fills it
+        // with a document nobody can read. `mutate_close_pane` and
+        // `mutate_close_tab` have always pruned all three.
+        if let Some(editor) = state.editors.remove(&pane_id) {
+            record_editor_closed(&editor);
+            continue;
+        }
+        if remove_flow_pane(state, pane_id) {
+            continue;
+        }
         state.pty_manager.destroy(pane_id);
         state.terminals.remove(&pane_id);
         state.custom_titled_panes.remove(&pane_id);
@@ -5637,6 +5651,14 @@ fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
     let handled = dispatch(state, &command);
     if handled {
         close_command_palette(state);
+    } else {
+        // The chord version of a command like `editor.find` stays
+        // unclaimed on purpose, so Ctrl+F reaches the shell in a terminal
+        // pane. A palette row has no such fall-through: leaving the
+        // palette open with nothing happening reads as a click that did
+        // not register, and the user clicks again.
+        close_command_palette(state);
+        push_error_toast(state, format!("{} is not available here", item.label));
     }
     // Quick open is the one palette mode whose rows are data rather than a
     // fixed catalogue, so "did the index actually get used" is only
@@ -19558,9 +19580,11 @@ mod flow_pane_tests {
         let pane_id = state.active_pane.0;
         let editor = state.editors.get(&pane_id).expect("editor pane opened");
         assert!(editor.path.ends_with("Editor.tsx"), "{:?}", editor.path);
-        // The fixture node points at line 93; a shorter file clamps the
-        // jump rather than failing it.
-        assert!(editor.buffer.cursor().line <= 92);
+        // The fixture node points at line 93 of a 101-line file, so the
+        // clamp never fires and 92 is the only correct answer. `<= 92`
+        // was also satisfied by a cursor left at line 0, i.e. by the jump
+        // not happening at all.
+        assert_eq!(editor.buffer.cursor().line, 92);
         assert!(state.toasts.is_empty());
     }
 

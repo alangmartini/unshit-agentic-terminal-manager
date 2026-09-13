@@ -478,19 +478,31 @@ fn normalize_separators(input: &str) -> String {
 /// index order, which is already sorted by path — a stable "browse the repo"
 /// list rather than an arbitrary one.
 pub fn rank(index: &FileIndex, query: &str, limit: usize) -> Vec<RankedFile> {
+    rank_counted(index, query, limit).0
+}
+
+/// [`rank`], plus how many entries matched before `limit` cut the list.
+///
+/// The palette shows at most `limit` rows, and without the total a user
+/// whose file ranked 51st concludes it is not in the index and retypes.
+pub fn rank_counted(index: &FileIndex, query: &str, limit: usize) -> (Vec<RankedFile>, usize) {
     if limit == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return index
-            .entries
-            .iter()
-            .take(limit)
-            .enumerate()
-            .map(|(idx, _)| RankedFile { idx, score: 0 })
-            .collect();
+        // No query: every entry "matches", so the total is the index.
+        return (
+            index
+                .entries
+                .iter()
+                .take(limit)
+                .enumerate()
+                .map(|(idx, _)| RankedFile { idx, score: 0 })
+                .collect(),
+            index.entries.len(),
+        );
     }
 
     // `fuzzy_match` allocates two lowercase copies per call; at 50 000
@@ -538,8 +550,9 @@ pub fn rank(index: &FileIndex, query: &str, limit: usize) -> Vec<RankedFile> {
             .cmp(&a.score)
             .then_with(|| index.entries[a.idx].rel.cmp(&index.entries[b.idx].rel))
     });
+    let matched = ranked.len();
     ranked.truncate(limit);
-    ranked
+    (ranked, matched)
 }
 
 /// True when every byte of `needle` appears in `haystack`, in order,

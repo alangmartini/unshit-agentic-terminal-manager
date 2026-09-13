@@ -224,7 +224,8 @@ from the workspace root, falling back to a bounded walk (skips `.git`,
 it is older than 30 s at the moment the mode opens; the palette shows
 "Indexing…" until the first build lands. Matching reuses `fuzzy_match` with
 a basename bonus; at most 50 rows are shown (the palette has no
-virtualisation) with a footer note when more matched. Selecting a row
+virtualisation) and the group header reads `50 of 312` when more
+matched, so the cap never reads as "not indexed". Selecting a row
 dispatches `editor.open:<abs path>`; the allowlist admits the
 `editor.open:` prefix because rows only ever come from the index.
 
