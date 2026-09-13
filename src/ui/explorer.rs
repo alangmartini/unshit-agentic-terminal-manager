@@ -40,18 +40,14 @@ pub fn build_explorer(snapshot: &UiSnapshot, shared: &SharedState) -> ElementDef
     let mut panel = ElementDef::new(Tag::Div).with_class("file-explorer");
     panel = panel.with_child(
         ElementDef::new(Tag::Div)
-            .with_class("sidebar-head")
-            .with_child(
-                ElementDef::new(Tag::Span)
-                    .with_class("sidebar-title")
-                    .with_text("explorer"),
-            )
-            .with_child(
-                ElementDef::new(Tag::Div)
-                    .with_class("sidebar-head-actions")
-                    .with_child(command_button("Reveal", "explorer.reveal", shared))
-                    .with_child(command_button("Refresh", "explorer.refresh", shared)),
-            ),
+            .with_class("explorer-toolbar")
+            .with_child(command_button("Reveal", "explorer.reveal", shared))
+            .with_child(command_button("Refresh", "explorer.refresh", shared))
+            .with_child(command_button(
+                "Collapse all",
+                "explorer.collapse_all",
+                shared,
+            )),
     );
     let keyboard_state = shared.clone();
     let mut tree = ElementDef::new(Tag::Div)

@@ -27,3 +27,6 @@ Reveal opens the active editor file in the tree: it loads and expands ancestor
 folders, selects the file, and scrolls it into view. Files outside the active
 workspace produce a message. Disk reads stay on a worker; switching panes or
 workspaces, hiding Explorer, or moving selection cancels a pending reveal.
+
+Collapse all folds every descendant folder, selects and reveals the workspace
+root, and cancels a pending Reveal. Cached listings remain available.

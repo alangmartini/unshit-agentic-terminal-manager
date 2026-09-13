@@ -58,9 +58,19 @@ pub struct Explorer {
     pub listings: BTreeMap<PathBuf, Arc<Listing>>,
     pub selected: Option<PathBuf>,
     pub generation: u64,
+    pub reveal_revision: u64,
 }
 
 impl Explorer {
+    pub fn collapse_all(&mut self) {
+        self.reveal_revision = self.reveal_revision.wrapping_add(1);
+        self.expanded.clear();
+        if let Some(root) = &self.root {
+            self.expanded.insert(root.clone());
+        }
+        self.selected = self.root.clone();
+    }
+
     pub fn set_root(&mut self, root: Option<PathBuf>) {
         if self.root != root {
             self.root = root;
@@ -229,6 +239,23 @@ pub fn read_directory(path: &Path) -> Listing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapse_all_keeps_root_and_cache_but_cancels_pending_reveal() {
+        let root = PathBuf::from("project");
+        let mut explorer = Explorer::default();
+        explorer.set_root(Some(root.clone()));
+        explorer.expanded.insert(root.join("deep"));
+        explorer.selected = Some(root.join("deep/file"));
+        let cached = Arc::new(Listing::Ready(vec![]));
+        explorer.listings.insert(root.clone(), cached.clone());
+        let revision = explorer.reveal_revision;
+        explorer.collapse_all();
+        assert_eq!(explorer.expanded, BTreeSet::from([root.clone()]));
+        assert_eq!(explorer.selected, Some(root.clone()));
+        assert!(Arc::ptr_eq(&cached, &explorer.listings[&root]));
+        assert_ne!(revision, explorer.reveal_revision);
+    }
 
     #[test]
     fn reveal_reads_ancestor_chain_and_rejects_outside_or_missing_files() {

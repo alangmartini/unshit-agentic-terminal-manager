@@ -5337,6 +5337,8 @@ fn dispatch_explorer_reveal(state: &mut AppState) -> bool {
     sync_explorer(state);
     let generation = state.explorer.generation;
     let selected = state.explorer.selected.clone();
+    state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
+    let revision = state.explorer.reveal_revision;
     let pane = state.active_pane;
     let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
         return true;
@@ -5347,6 +5349,7 @@ fn dispatch_explorer_reveal(state: &mut AppState) -> bool {
             let result = crate::explorer::reveal_path(&root, &target);
             let mut state = hooks.shared.lock_recover();
             if state.explorer.generation != generation
+                || state.explorer.reveal_revision != revision
                 || state.active_pane != pane
                 || state.explorer.selected != selected
                 || !state.explorer.active
@@ -8416,6 +8419,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             persist_layout_if(dispatch_tab_reorder(state, other), state)
         }
         "explorer.reveal" => dispatch_explorer_reveal(state),
+        "explorer.collapse_all" => {
+            state.explorer.collapse_all();
+            state.explorer.keyboard_focus = true;
+            if let (Some(root), Some(hooks)) = (&state.explorer.root, EDITOR_OPEN_HOOKS.get()) {
+                (hooks.request_reveal)(format!("explorer:{}", root.display()));
+            }
+            true
+        }
         "explorer.toggle" => {
             if state.explorer.active && !state.sidebar_collapsed {
                 state.explorer.keyboard_focus = false;

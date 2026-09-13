@@ -8271,3 +8271,6 @@ body.dragging-pane {
 .explorer-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .explorer-message { padding: 8px 16px; color: var(--fg-tertiary); font-size: var(--t-xs); }
 .sidebar.collapsed .file-explorer, .sidebar.collapsed .sidebar-tabs { display: none; }
+
+.explorer-toolbar { display: flex; flex-wrap: wrap; flex-shrink: 0; padding: 4px; border-bottom: 1px solid var(--border-hair); }
+.explorer-toolbar .explorer-action { flex: 1; white-space: nowrap; }
