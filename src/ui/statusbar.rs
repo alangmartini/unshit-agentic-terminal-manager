@@ -349,6 +349,7 @@ mod tests {
             flow_panes: std::collections::HashMap::new(),
             file_index: None,
             file_index_building: false,
+            editor_find_bars: std::collections::HashMap::new(),
         }
     }
 

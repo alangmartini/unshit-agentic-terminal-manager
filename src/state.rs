@@ -1343,6 +1343,22 @@ impl AppState {
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
             editor_panes: self.editors.keys().copied().collect(),
+            editor_find_bars: self
+                .editors
+                .iter()
+                .filter_map(|(&id, editor)| {
+                    editor.find.as_ref().map(|find| {
+                        (
+                            id,
+                            EditorFindView {
+                                query: find.query.clone(),
+                                counter: find.counter_label(),
+                                case_sensitive: find.case_sensitive,
+                            },
+                        )
+                    })
+                })
+                .collect(),
             flow_panes: self
                 .flows
                 .iter()
@@ -1368,6 +1384,20 @@ impl AppState {
     pub fn terminal_handle(&self, pane_id: u32) -> Option<SharedTerminal> {
         self.terminals.get(&pane_id).cloned()
     }
+}
+
+/// Everything the find bar of one editor pane renders.
+///
+/// A projection rather than a borrow of `FindState`: the bar is built
+/// during the element-tree pass, which must not hold the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditorFindView {
+    /// The live query, so the input keeps what was typed across rebuilds.
+    pub query: String,
+    /// Already formatted: `3 of 12`, `No results`, or empty.
+    pub counter: String,
+    /// The explicit `Aa` toggle, not the smart-case result.
+    pub case_sensitive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1472,6 +1502,9 @@ pub struct UiSnapshot {
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
     /// Pane ids rendered by the file editor instead of a terminal.
     pub editor_panes: std::collections::HashSet<u32>,
+    /// Find bars that are currently open, by pane id. Only what the bar
+    /// renders, so the tree build never reaches into a live pane.
+    pub editor_find_bars: std::collections::HashMap<u32, EditorFindView>,
     /// Flow Explorer panes rendered instead of a terminal, by pane id.
     pub flow_panes: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
     /// Quick-open index behind the palette's Files mode. `None` while the
@@ -19214,6 +19247,75 @@ mod flow_pane_tests {
             &format!("flow.open:{}", fixture_path().display())
         ));
         state.active_pane.0
+    }
+
+    fn open_review_fixture(state: &mut AppState) -> u32 {
+        use crate::flow_explorer::test_support::review_fixture_path;
+        assert!(dispatch(
+            state,
+            &format!("flow.open:{}", review_fixture_path().display())
+        ));
+        state.active_pane.0
+    }
+
+    // -- hand-offs to the editor and the diff pane --------------------------
+
+    #[test]
+    fn flow_edit_opens_the_node_file_at_its_line() {
+        let mut state = test_state();
+        open_review_fixture(&mut state);
+
+        assert!(dispatch(&mut state, "flow.edit:Editor.tsx::handleKeyDown"));
+        let pane_id = state.active_pane.0;
+        let editor = state.editors.get(&pane_id).expect("editor pane opened");
+        assert!(editor.path.ends_with("Editor.tsx"), "{:?}", editor.path);
+        // The fixture node points at line 93; a shorter file clamps the
+        // jump rather than failing it.
+        assert!(editor.buffer.cursor().line <= 92);
+        assert!(state.toasts.is_empty());
+    }
+
+    /// Node ids carry `::` and `.`, so the id is the last segment of the
+    /// command and must not be split on either.
+    #[test]
+    fn flow_edit_on_a_node_without_a_location_toasts() {
+        let mut state = test_state();
+        open_review_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.edit:ui.cmd-enter"));
+        assert!(state.editors.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn flow_diff_opens_the_flows_range_as_a_diff_pane() {
+        let mut state = test_state();
+        open_review_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.diff"));
+        let editor = state
+            .editors
+            .get(&state.active_pane.0)
+            .expect("diff pane opened");
+        assert!(editor.is_diff());
+        // The producer's head is a branch, so the range stays two-sided.
+        assert_eq!(editor.display_name, "diff: main..feat/prompt-restore");
+    }
+
+    #[test]
+    fn flow_diff_without_a_range_toasts_instead_of_opening_a_pane() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.diff"));
+        assert!(state.editors.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    /// On a terminal pane these are not flow commands at all: leaving
+    /// them unclaimed keeps the key reaching the shell.
+    #[test]
+    fn flow_handoffs_are_unclaimed_without_a_flow_pane() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "flow.diff"));
+        assert!(!dispatch(&mut state, "flow.edit:whatever"));
     }
 
     #[test]

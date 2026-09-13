@@ -328,6 +328,7 @@ fn build_pane(
             pane.id,
             capture_keyboard,
             state.terminal_font_size_pt,
+            state.editor_find_bars.get(&pane.id.0),
             shared,
             grids,
         )

@@ -82,7 +82,53 @@ pub(crate) fn handle_editor_key(
                 let editor = st.editors.get_mut(&pane_id)?;
                 return Some(editor.apply_edit(|b| b.delete_selection()));
             }
+            // Find and go-to-line are pane-local for the same reason
+            // Ctrl+S is: registering them globally would take Ctrl+F
+            // (forward-char) and Ctrl+G (abort) away from every shell.
+            Key::Char('f') | Key::Char('F') => {
+                return Some(crate::state::dispatch(st, "editor.find"));
+            }
+            Key::Char('g') | Key::Char('G') => {
+                return Some(crate::state::dispatch(st, "editor.goto"));
+            }
             _ => {}
+        }
+    }
+
+    // F3 / Shift+F3 step matches with the grid focused, and Escape closes
+    // the bar. Escape also reaches here as the system `modal.close`
+    // cascade; both paths end in `editor.find_close`.
+    if !ctrl && !alt && st.editors.contains_key(&pane_id) {
+        match kb.key {
+            Key::F(3) => {
+                let command = if shift {
+                    "editor.find_prev"
+                } else {
+                    "editor.find_next"
+                };
+                return Some(crate::state::dispatch(st, command));
+            }
+            Key::Escape if st.editors[&pane_id].find.is_some() => {
+                return Some(crate::state::dispatch(st, "editor.find_close"));
+            }
+            _ => {}
+        }
+    }
+
+    // A read-only pane has no text entry, so plain letters are free for
+    // navigation. Resolved before the editing arms below, which would
+    // otherwise try to insert them.
+    if !ctrl && !alt && st.editors.get(&pane_id).is_some_and(|e| e.is_diff()) {
+        let command = match kb.key {
+            Key::Char('n') | Key::Char('N') => Some("diff.next_hunk"),
+            Key::Char('p') | Key::Char('P') => Some("diff.prev_hunk"),
+            Key::Char(']') => Some("diff.next_file"),
+            Key::Char('[') => Some("diff.prev_file"),
+            Key::Char('o') | Key::Char('O') | Key::Enter => Some("diff.open_file"),
+            _ => None,
+        };
+        if let Some(command) = command {
+            return Some(crate::state::dispatch(st, command));
         }
     }
 
@@ -303,12 +349,87 @@ pub(crate) fn handle_editor_drag(
     })
 }
 
+/// One-row find bar above the grid, inside the pane body.
+///
+/// The input is a framework `Tag::Input`, so while it has focus keys go to
+/// it and never to the capturing grid: `Enter` submits (next match),
+/// `Escape` is the system `modal.close`, whose cascade closes the bar. When
+/// the element disappears the framework's focus fallback hands keys back to
+/// the grid, which is why closing needs no explicit refocus.
+fn build_find_bar(
+    pane_id: PaneId,
+    find: &crate::state::EditorFindView,
+    shared: &SharedState,
+) -> ElementDef {
+    let change_shared = shared.clone();
+    let submit_shared = shared.clone();
+    let input = ElementDef::new(Tag::Input)
+        .with_class("editor-find-input")
+        .with_placeholder("Find")
+        .with_value(&find.query)
+        .with_autofocus(true)
+        .on_change(move |text| {
+            let query = format!("editor.find_query:{text}");
+            mutate_with(&change_shared, |st| {
+                crate::state::dispatch(st, &query);
+            });
+        })
+        .on_submit(move |text| {
+            // The query can arrive here without a preceding change event
+            // (paste-and-Enter), so set it before stepping.
+            let query = format!("editor.find_query:{text}");
+            mutate_with(&submit_shared, |st| {
+                crate::state::dispatch(st, &query);
+                crate::state::dispatch(st, "editor.find_next");
+            });
+        });
+
+    let mut bar = ElementDef::new(Tag::Div)
+        .with_class("editor-find-bar")
+        .with_id(format!("editor-find-bar-{}", pane_id.0))
+        .with_child(input)
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("editor-find-counter")
+                .with_text(find.counter.clone()),
+        );
+
+    for (label, command, class, active) in [
+        (
+            "Aa",
+            "editor.find_case",
+            "editor-find-case",
+            find.case_sensitive,
+        ),
+        ("\u{2191}", "editor.find_prev", "editor-find-step", false),
+        ("\u{2193}", "editor.find_next", "editor-find-step", false),
+        ("\u{00d7}", "editor.find_close", "editor-find-close", false),
+    ] {
+        let button_shared = shared.clone();
+        let mut button = ElementDef::new(Tag::Button)
+            .with_class("editor-find-button")
+            .with_class(class)
+            .on_click(move || {
+                mutate_with(&button_shared, |st| {
+                    crate::state::dispatch(st, command);
+                });
+            })
+            .with_child(ElementDef::new(Tag::Span).with_text(label.to_string()));
+        if active {
+            button = button.with_class("on");
+        }
+        bar = bar.with_child(button);
+    }
+    bar
+}
+
 /// Build the editor pane body. `capture_keyboard` is true for the active
 /// pane only, exactly like terminal panes.
 pub fn build_editor_pane_body(
     pane_id: PaneId,
     capture_keyboard: bool,
     font_size_pt: u32,
+    find: Option<&crate::state::EditorFindView>,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
@@ -317,6 +438,10 @@ pub fn build_editor_pane_body(
     let Some(grid) = grids.get(&pane_id.0) else {
         return body;
     };
+
+    if let Some(find) = find {
+        body = body.with_child(build_find_bar(pane_id, find, shared).with_key("editor-find-bar"));
+    }
 
     let mut grid_el = ElementDef::new(Tag::Div)
         .with_class("terminal-content")
@@ -527,7 +652,7 @@ mod tests {
     fn editor_pane_body_renders_grid_with_content() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
         assert!(el.classes.contains(&"pane-body".to_string()));
         assert_eq!(el.children.len(), 1);
         let grid_el = &el.children[0];
@@ -541,7 +666,7 @@ mod tests {
     fn active_editor_pane_captures_keyboard() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
         assert!(el.children[0].captures_keyboard);
         let _ = std::fs::remove_file(path);
     }
@@ -550,7 +675,7 @@ mod tests {
     fn inactive_editor_pane_does_not_capture_keyboard() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, &shared, &grids);
         assert!(!el.children[0].captures_keyboard);
         let _ = std::fs::remove_file(path);
     }
@@ -561,7 +686,7 @@ mod tests {
     fn inactive_editor_pane_still_registers_scroll_handler() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, &shared, &grids);
         assert!(
             el.children[0]
                 .handlers
@@ -576,7 +701,7 @@ mod tests {
     fn missing_grid_renders_empty_body() {
         let (shared, path) = shared_with_editor();
         let grids = std::collections::HashMap::new();
-        let el = build_editor_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
         assert!(el.children.is_empty());
         let _ = std::fs::remove_file(path);
     }
@@ -854,7 +979,7 @@ mod tests {
             Arc::new(Mutex::new(state))
         };
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
         let handler = el.children[0]
             .handlers
             .iter()
@@ -884,7 +1009,7 @@ mod tests {
     fn editor_pane_registers_mouse_handlers_even_when_inactive() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, &shared, &grids);
         let grid_el = &el.children[0];
         assert!(
             grid_el
@@ -1063,7 +1188,7 @@ mod tests {
             Arc::new(Mutex::new(state))
         };
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
         let handler = el.children[0]
             .handlers
             .iter()
@@ -1104,5 +1229,157 @@ mod tests {
         assert!(editor.grid.cursor_visible());
         assert_eq!(editor.grid.cursor_row(), 9);
         let _ = std::fs::remove_file(path);
+    }
+
+    // -- find bar and diff keys ---------------------------------------------
+
+    fn text_of(el: &ElementDef) -> String {
+        let mut out = String::new();
+        if let ElementContent::Text(text) = &el.content {
+            out.push_str(text);
+        }
+        for child in &el.children {
+            out.push_str(&text_of(child));
+        }
+        out
+    }
+
+    fn find_view(query: &str, counter: &str) -> crate::state::EditorFindView {
+        crate::state::EditorFindView {
+            query: query.to_string(),
+            counter: counter.to_string(),
+            case_sensitive: false,
+        }
+    }
+
+    #[test]
+    fn find_bar_renders_above_the_grid_with_its_query_and_counter() {
+        let (shared, path) = shared_with_editor();
+        let grids = grids_for(&shared);
+        let view = find_view("row 1", "2 of 11");
+        let el = build_editor_pane_body(PaneId(1), true, 13, Some(&view), &shared, &grids);
+
+        assert_eq!(el.children.len(), 2, "bar, then grid");
+        let bar = &el.children[0];
+        assert!(bar.classes.contains(&"editor-find-bar".to_string()));
+        // The grid stays last so the bar never covers the matched line.
+        assert!(el.children[1]
+            .classes
+            .contains(&"editor-content".to_string()));
+
+        let input = &bar.children[0];
+        assert_eq!(input.value.as_deref(), Some("row 1"));
+        assert!(input.autofocus, "the bar takes focus when it opens");
+        let counter = &bar.children[1];
+        assert_eq!(text_of(counter), "2 of 11");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn find_bar_is_absent_when_no_search_is_open() {
+        let (shared, path) = shared_with_editor();
+        let grids = grids_for(&shared);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        assert_eq!(el.children.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Ctrl+F and Ctrl+G are deliberately pane-local rather than global
+    /// keybinds: registered chords are resolved before terminal capture,
+    /// which would take forward-char and abort away from every shell.
+    #[test]
+    fn ctrl_f_opens_the_find_bar_and_escape_closes_it() {
+        let (mut state, path) = editor_state();
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key_mod(Key::Char('f'), Modifiers::CTRL)),
+            Some(true)
+        );
+        assert!(state.editors[&1].find.is_some());
+
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key(Key::Escape)),
+            Some(true)
+        );
+        assert!(state.editors[&1].find.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// With no bar open, Escape must stay unclaimed so it reaches
+    /// whatever else wants it.
+    #[test]
+    fn escape_without_a_find_bar_is_unclaimed() {
+        let (mut state, path) = editor_state();
+        assert_eq!(handle_editor_key(&mut state, 1, &key(Key::Escape)), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ctrl_g_opens_the_go_to_line_prompt() {
+        let (mut state, path) = editor_state();
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key_mod(Key::Char('g'), Modifiers::CTRL)),
+            Some(true)
+        );
+        assert!(matches!(
+            state.confirm_dialog,
+            Some(crate::state::ConfirmDialog::GotoLine { .. })
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn f3_steps_matches_with_the_grid_focused() {
+        let (mut state, path) = editor_state();
+        handle_editor_key(&mut state, 1, &key_mod(Key::Char('f'), Modifiers::CTRL));
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key(Key::F(3))),
+            Some(true)
+        );
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &key_mod(Key::F(3), Modifiers::SHIFT)),
+            Some(true)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A diff pane cannot be typed into, so plain letters navigate it.
+    /// The same keys on a file pane must still insert text.
+    #[test]
+    fn plain_letters_navigate_a_diff_pane_but_type_in_a_file_pane() {
+        let (mut state, path) = editor_state();
+        assert_eq!(
+            handle_editor_key(&mut state, 1, &char_key('n')),
+            Some(true),
+            "a file pane types the letter"
+        );
+        assert!(state.editors[&1].buffer.line(0).unwrap().starts_with('n'));
+        let _ = std::fs::remove_file(path);
+
+        let mut state = seed_state();
+        let spec = crate::diff::DiffSpec::parse("HEAD").expect("range");
+        state.editors.insert(
+            1,
+            crate::editor::EditorPane::diff_loading(
+                spec,
+                std::env::temp_dir(),
+                "diff-test".to_string(),
+                10,
+                40,
+                crate::editor::EditorColors::default(),
+            ),
+        );
+        let before = state.editors[&1].buffer.to_text();
+        for k in ['n', 'p', 'o', '[', ']'] {
+            assert_eq!(
+                handle_editor_key(&mut state, 1, &char_key(k)),
+                Some(true),
+                "{k} must be claimed as navigation"
+            );
+        }
+        assert_eq!(
+            state.editors[&1].buffer.to_text(),
+            before,
+            "navigation keys never reach the buffer"
+        );
     }
 }
