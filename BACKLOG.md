@@ -96,6 +96,19 @@ The audit surfaced adjacent hazards that are not yet fixed:
   `specs/flow-explorer.md` A3.2 documents the Ctrl+1/2/3 behaviour and has to be
   amended with whatever lands.
 
+- [ ] **The call stack view paints nothing** — a flow pane opened on either
+  committed fixture shows its header, toolbar and legend but an empty body
+  in the default `call stack` view; `graph` renders the same flow correctly,
+  and `flow.expand_all` / `flow.select_first` change nothing. Not a data
+  problem and not new: `call_stack_renders_one_row_per_visible_tree_row` and
+  `review_fixture_shows_the_range_and_a_diff_legend` both find their
+  `.flow-row` elements in the built tree, and a build of `46877f1` (v0.4.0
+  code, before any editor work) reproduces the blank body exactly. So the
+  rows exist and the engine gives them no size — start at `.flow-tree`
+  (`flex: 1; min-height: 0; overflow-y: auto`) inside `.pane-body` and at
+  whether the engine honours that combination, the way `.flow-graph` escapes
+  it by being absolutely placed with explicit dimensions.
+
 ## Test and tooling follow-ups
 
 - [ ] **Intermittent `STATUS_HEAP_CORRUPTION` (0xc0000374) at test-process exit**
