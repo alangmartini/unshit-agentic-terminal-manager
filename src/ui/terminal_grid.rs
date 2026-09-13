@@ -146,7 +146,14 @@ pub fn build_terminal_grid(
                 .and_then(|r| r.get(col_idx))
                 .copied()
                 .unwrap_or(1.0);
-            let capture_keyboard = is_active && !state.settings_open && !state.palette_open;
+            // A confirm dialog counts as much as the palette or settings:
+            // the grid keeps capturing otherwise, so any keystroke the
+            // modal does not hold focus for is typed into the document
+            // underneath it.
+            let capture_keyboard = is_active
+                && !state.settings_open
+                && !state.palette_open
+                && state.confirm_dialog.is_none();
             let pane_el = build_pane(
                 pane,
                 is_active,

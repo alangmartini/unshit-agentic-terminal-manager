@@ -786,7 +786,12 @@ fn build_text_prompt_card(prompt: TextPrompt<'_>, shared: &SharedState) -> Eleme
         .with_child(ElementDef::new(Tag::Span).with_text("Cancel".to_string()));
 
     let commit_shared = shared.clone();
-    let commit = ElementDef::new(Tag::Button)
+    // A Div, like Cancel beside it: a focusable `Tag::Button` here took
+    // focus on click, and when the commit re-rendered the card with an
+    // inline error the focused node was destroyed, dropping focus into
+    // the pane behind the modal. Enter still commits — the input's
+    // `on_submit` is the keyboard path.
+    let commit = ElementDef::new(Tag::Div)
         .with_class("confirm-dialog-button")
         .with_class("primary")
         .on_click(move || {
@@ -796,6 +801,7 @@ fn build_text_prompt_card(prompt: TextPrompt<'_>, shared: &SharedState) -> Eleme
         })
         .with_child(ElementDef::new(Tag::Span).with_text(submit_label.to_string()));
 
+    let error_id = id.clone();
     let mut card = ElementDef::new(Tag::Div)
         .with_class("confirm-dialog-card")
         .with_class("confirm-dialog-simple-card")
@@ -819,6 +825,11 @@ fn build_text_prompt_card(prompt: TextPrompt<'_>, shared: &SharedState) -> Eleme
     if let Some(msg) = error {
         card = card.with_child(
             ElementDef::new(Tag::Div)
+                // Keyed: reconciliation matches unkeyed children by
+                // position, so an error row appearing between the input
+                // and the buttons would otherwise be reconciled *onto*
+                // the buttons row and deallocate the controls in it.
+                .with_id(format!("{error_id}-error"))
                 .with_class("rename-session-error")
                 .with_text(msg.to_string()),
         );

@@ -356,6 +356,14 @@ pub(crate) fn handle_editor_drag(
 /// `Escape` is the system `modal.close`, whose cascade closes the bar. When
 /// the element disappears the framework's focus fallback hands keys back to
 /// the grid, which is why closing needs no explicit refocus.
+///
+/// That only holds while nothing else in the bar can take focus, so the
+/// four controls are clickable `Tag::Div`s rather than `Tag::Button`s:
+/// `Tag::Button` is focusable, and one click on `Aa` or an arrow moved
+/// focus off the input, whereupon the framework relocated it to the
+/// capturing grid and the next typed character replaced the selected
+/// match in the document instead of refining the query. Autofocus fires
+/// on build, not on reconcile, so the input could not take it back.
 fn build_find_bar(
     pane_id: PaneId,
     find: &crate::state::EditorFindView,
@@ -406,7 +414,7 @@ fn build_find_bar(
         ("\u{00d7}", "editor.find_close", "editor-find-close", false),
     ] {
         let button_shared = shared.clone();
-        let mut button = ElementDef::new(Tag::Button)
+        let mut button = ElementDef::new(Tag::Div)
             .with_class("editor-find-button")
             .with_class(class)
             .on_click(move || {
