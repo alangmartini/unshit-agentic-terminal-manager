@@ -514,6 +514,12 @@ impl EditorPane {
     /// target (acceptable for the MVP; symlinked files are rare on
     /// Windows).
     pub fn save(&mut self) -> std::io::Result<u64> {
+        // Last line of defence for a diff pane, whose `path` is the
+        // repository root: writing there would replace a directory entry
+        // with the rendered diff. Callers refuse first; this refuses too.
+        if self.read_only {
+            return Ok(self.file_bytes);
+        }
         let mut text = self.buffer.to_text();
         if self.line_ending == LineEnding::CrLf {
             text = text.replace('\n', "\r\n");

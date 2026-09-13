@@ -279,6 +279,19 @@ pub fn icon_folder() -> SvgNode {
     )
 }
 
+/// A sheet with a folded corner: quick-open rows and the Files palette
+/// mode, where `icon_folder` would read as "directory".
+pub fn icon_file() -> SvgNode {
+    group(
+        root_attrs(1.4, StrokeLineCap::Butt, StrokeLineJoin::Miter),
+        vec![
+            path_d("M4 2.5h5l3 3v8H4z"),
+            // The fold, drawn as its own stroke so it reads at 16px.
+            path_d("M9 2.5v3h3"),
+        ],
+    )
+}
+
 pub fn icon_env_list() -> SvgNode {
     let mut dot_a = circle(5.0, 4.0, 0.5);
     dot_a.attrs.fill = Some(SvgPaint::Current);

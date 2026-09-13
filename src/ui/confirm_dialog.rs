@@ -87,6 +87,12 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
             buffer,
             error,
         } => build_flow_request_card(*mode, buffer, error.as_deref(), shared),
+        ConfirmDialog::GotoLine { buffer, error, .. } => {
+            build_goto_line_card(buffer, error.as_deref(), shared)
+        }
+        ConfirmDialog::DiffRequest { buffer, error } => {
+            build_diff_request_card(buffer, error.as_deref(), shared)
+        }
     };
 
     let backdrop_shared = shared.clone();
@@ -711,6 +717,120 @@ fn build_rename_session_card(
 /// `base..head`) and an "Ask agent" button that dispatches
 /// `dialog.flow_commit`. A precondition failure comes back as `error`
 /// under the input, the same way the rename dialog reports a failed RPC.
+/// The three one-line text prompts (Flow request, go-to-line, diff
+/// against) differ only in their words and which dialog variant they
+/// write back into, so they share one builder.
+struct TextPrompt<'a> {
+    /// Element id, for screenshot assertions and element-tree tests.
+    id: String,
+    /// Extra class beyond the shared prompt-card classes.
+    extra_class: &'a str,
+    title: &'a str,
+    /// One paragraph per entry, in order.
+    bodies: &'a [&'a str],
+    placeholder: &'a str,
+    value: &'a str,
+    error: Option<&'a str>,
+    submit_label: &'a str,
+    /// Dispatched by Enter and by the primary button.
+    commit_command: &'static str,
+    /// Copies the input's live text into the dialog. The commit handler
+    /// takes the dialog out of state, so it only ever sees what this
+    /// wrote back; a non-capturing `fn` keeps each call site's variant
+    /// explicit.
+    set_buffer: fn(&mut crate::state::AppState, String),
+}
+
+fn build_text_prompt_card(prompt: TextPrompt<'_>, shared: &SharedState) -> ElementDef {
+    let TextPrompt {
+        id,
+        extra_class,
+        title,
+        bodies,
+        placeholder,
+        value,
+        error,
+        submit_label,
+        commit_command,
+        set_buffer,
+    } = prompt;
+
+    let input_shared = shared.clone();
+    let submit_shared = shared.clone();
+    let input = ElementDef::new(Tag::Input)
+        .with_class("confirm-dialog-input")
+        .with_placeholder(placeholder)
+        .with_value(value)
+        .with_autofocus(true)
+        .on_change(move |text| {
+            let typed = text.to_string();
+            mutate_with(&input_shared, |st| set_buffer(st, typed));
+        })
+        .on_submit(move |text| {
+            let typed = text.to_string();
+            mutate_with(&submit_shared, |st| {
+                set_buffer(st, typed);
+                dispatch(st, commit_command);
+            });
+        });
+
+    let cancel_shared = shared.clone();
+    let cancel = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-button")
+        .with_class("cancel")
+        .on_click(move || {
+            mutate_with(&cancel_shared, |st| {
+                dispatch(st, "dialog.cancel");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Cancel".to_string()));
+
+    let commit_shared = shared.clone();
+    let commit = ElementDef::new(Tag::Button)
+        .with_class("confirm-dialog-button")
+        .with_class("primary")
+        .on_click(move || {
+            mutate_with(&commit_shared, |st| {
+                dispatch(st, commit_command);
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text(submit_label.to_string()));
+
+    let mut card = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-card")
+        .with_class("confirm-dialog-simple-card")
+        .with_class("confirm-dialog-rename-card")
+        .with_class(extra_class)
+        .with_id(id)
+        .on_click(|| {})
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-title")
+                .with_text(title.to_string()),
+        );
+    for body in bodies {
+        card = card.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-body")
+                .with_text((*body).to_string()),
+        );
+    }
+    card = card.with_child(input);
+    if let Some(msg) = error {
+        card = card.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("rename-session-error")
+                .with_text(msg.to_string()),
+        );
+    }
+    card.with_child(
+        ElementDef::new(Tag::Div)
+            .with_class("confirm-dialog-buttons")
+            .with_child(cancel)
+            .with_child(commit),
+    )
+}
+
 fn build_flow_request_card(
     mode: FlowMode,
     buffer: &str,
@@ -731,96 +851,87 @@ fn build_flow_request_card(
             "e.g. main..HEAD",
         ),
     };
-    let input_shared = shared.clone();
-    let submit_shared = shared.clone();
-    let input = ElementDef::new(Tag::Input)
-        .with_class("confirm-dialog-input")
-        .with_placeholder(placeholder)
-        .with_value(buffer)
-        .with_autofocus(true)
-        .on_change(move |text| {
-            let typed = text.to_string();
-            mutate_with(&input_shared, |st| {
+    build_text_prompt_card(
+        TextPrompt {
+            id: format!("confirm-dialog-flow-{}", mode.as_str()),
+            extra_class: "confirm-dialog-flow-card",
+            title,
+            bodies: &[
+                body,
+                "The agent runs in the workspace directory; the flow opens as a new tab \
+                 when it finishes.",
+            ],
+            placeholder,
+            value: buffer,
+            error,
+            submit_label: "Ask agent",
+            commit_command: "dialog.flow_commit",
+            set_buffer: |st, typed| {
                 if let Some(ConfirmDialog::FlowRequest { buffer, error, .. }) =
                     st.confirm_dialog.as_mut()
                 {
                     *buffer = typed;
                     *error = None;
                 }
-            });
-        })
-        .on_submit(move |text| {
-            let typed = text.to_string();
-            mutate_with(&submit_shared, |st| {
-                if let Some(ConfirmDialog::FlowRequest { buffer, .. }) = st.confirm_dialog.as_mut()
+            },
+        },
+        shared,
+    )
+}
+
+fn build_goto_line_card(buffer: &str, error: Option<&str>, shared: &SharedState) -> ElementDef {
+    build_text_prompt_card(
+        TextPrompt {
+            id: "confirm-dialog-goto-line".to_string(),
+            extra_class: "confirm-dialog-goto-card",
+            title: "Go to line",
+            bodies: &[
+                "A 1-based line number, optionally followed by `:column`. Numbers past the \
+                 end of the file land on the last line.",
+            ],
+            placeholder: "e.g. 120 or 120:8",
+            value: buffer,
+            error,
+            submit_label: "Go",
+            commit_command: "dialog.goto_commit",
+            set_buffer: |st, typed| {
+                if let Some(ConfirmDialog::GotoLine { buffer, error, .. }) =
+                    st.confirm_dialog.as_mut()
                 {
                     *buffer = typed;
+                    *error = None;
                 }
-                dispatch(st, "dialog.flow_commit");
-            });
-        });
+            },
+        },
+        shared,
+    )
+}
 
-    let cancel_shared = shared.clone();
-    let cancel = ElementDef::new(Tag::Div)
-        .with_class("confirm-dialog-button")
-        .with_class("cancel")
-        .on_click(move || {
-            mutate_with(&cancel_shared, |st| {
-                dispatch(st, "dialog.cancel");
-            });
-        })
-        .with_child(ElementDef::new(Tag::Span).with_text("Cancel".to_string()));
-
-    let ask_shared = shared.clone();
-    let ask = ElementDef::new(Tag::Button)
-        .with_class("confirm-dialog-button")
-        .with_class("primary")
-        .on_click(move || {
-            mutate_with(&ask_shared, |st| {
-                dispatch(st, "dialog.flow_commit");
-            });
-        })
-        .with_child(ElementDef::new(Tag::Span).with_text("Ask agent".to_string()));
-
-    let mut card = ElementDef::new(Tag::Div)
-        .with_class("confirm-dialog-card")
-        .with_class("confirm-dialog-simple-card")
-        .with_class("confirm-dialog-rename-card")
-        .with_class("confirm-dialog-flow-card")
-        .with_id(format!("confirm-dialog-flow-{}", mode.as_str()))
-        .on_click(|| {})
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("confirm-dialog-title")
-                .with_text(title.to_string()),
-        )
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("confirm-dialog-body")
-                .with_text(body.to_string()),
-        )
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("confirm-dialog-body")
-                .with_text(
-                    "The agent runs in the workspace directory; the flow opens as a new tab \
-                     when it finishes."
-                        .to_string(),
-                ),
-        )
-        .with_child(input);
-    if let Some(msg) = error {
-        card = card.with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("rename-session-error")
-                .with_text(msg.to_string()),
-        );
-    }
-    card.with_child(
-        ElementDef::new(Tag::Div)
-            .with_class("confirm-dialog-buttons")
-            .with_child(cancel)
-            .with_child(ask),
+fn build_diff_request_card(buffer: &str, error: Option<&str>, shared: &SharedState) -> ElementDef {
+    build_text_prompt_card(
+        TextPrompt {
+            id: "confirm-dialog-diff-request".to_string(),
+            extra_class: "confirm-dialog-diff-card",
+            title: "Diff against…",
+            bodies: &[
+                "A revision, `base..head`, or `base...head` to diff against the merge base. \
+                 `HEAD` shows the uncommitted work in the workspace.",
+            ],
+            placeholder: "e.g. HEAD or main..HEAD",
+            value: buffer,
+            error,
+            submit_label: "Show diff",
+            commit_command: "dialog.diff_commit",
+            set_buffer: |st, typed| {
+                if let Some(ConfirmDialog::DiffRequest { buffer, error }) =
+                    st.confirm_dialog.as_mut()
+                {
+                    *buffer = typed;
+                    *error = None;
+                }
+            },
+        },
+        shared,
     )
 }
 

@@ -249,6 +249,7 @@ fn record_index_event(index: &FileIndex) {
         path: Some(root.as_ref()),
         file_bytes: None,
         line_count: Some(index.entries.len() as u64),
+        line: None,
         reason: Some(index.source.as_reason()),
         os_error: None,
     });

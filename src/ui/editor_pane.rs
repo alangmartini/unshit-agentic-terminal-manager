@@ -80,7 +80,7 @@ pub(crate) fn handle_editor_key(
             Key::Char('x') | Key::Char('X') => {
                 crate::state::dispatch_editor_copy(st, pane_id);
                 let editor = st.editors.get_mut(&pane_id)?;
-                return Some(editor.apply(|b| b.delete_selection()));
+                return Some(editor.apply_edit(|b| b.delete_selection()));
             }
             _ => {}
         }
@@ -142,23 +142,27 @@ pub(crate) fn handle_editor_key(
             b.move_end(shift);
             Damage::None
         }),
-        Key::Enter if !ctrl && !alt => editor.apply(|b| b.insert_newline()),
+        Key::Enter if !ctrl && !alt => editor.apply_edit(|b| b.insert_newline()),
         Key::Tab if !ctrl && !alt && !shift => {
-            editor.apply(|b| b.insert_typed(&" ".repeat(TAB_SPACES)))
+            editor.apply_edit(|b| b.insert_typed(&" ".repeat(TAB_SPACES)))
         }
-        Key::Backspace => editor.apply(|b| b.backspace(ctrl)),
-        Key::Delete => editor.apply(|b| b.delete_forward(ctrl)),
+        Key::Backspace => editor.apply_edit(|b| b.backspace(ctrl)),
+        Key::Delete => editor.apply_edit(|b| b.delete_forward(ctrl)),
         Key::Char('a') | Key::Char('A') if ctrl && !shift && !alt => editor.apply(|b| {
             b.select_all();
             Damage::None
         }),
         // Undo / redo.
-        Key::Char('z') | Key::Char('Z') if ctrl && !shift && !alt => editor.apply(|b| b.undo()),
-        Key::Char('y') | Key::Char('Y') if ctrl && !shift && !alt => editor.apply(|b| b.redo()),
-        Key::Char('z') | Key::Char('Z') if ctrl && shift && !alt => editor.apply(|b| b.redo()),
+        Key::Char('z') | Key::Char('Z') if ctrl && !shift && !alt => {
+            editor.apply_edit(|b| b.undo())
+        }
+        Key::Char('y') | Key::Char('Y') if ctrl && !shift && !alt => {
+            editor.apply_edit(|b| b.redo())
+        }
+        Key::Char('z') | Key::Char('Z') if ctrl && shift && !alt => editor.apply_edit(|b| b.redo()),
         _ if !ctrl && !alt => {
             let text = insert_text_for(kb)?;
-            editor.apply(|b| b.insert_typed(&text))
+            editor.apply_edit(|b| b.insert_typed(&text))
         }
         // AltGr arrives as CTRL+ALT on Windows. Only composed text may
         // insert here — never the bare `Key::Char` fallback, so plain
@@ -173,7 +177,7 @@ pub(crate) fn handle_editor_key(
             if printable.is_empty() {
                 return None;
             }
-            editor.apply(|b| b.insert_typed(&printable))
+            editor.apply_edit(|b| b.insert_typed(&printable))
         }
         _ => return None,
     };

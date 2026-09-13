@@ -9,9 +9,9 @@ use crate::command_palette::{
 };
 use crate::state::{dispatch, mutate_with, SharedState, UiSnapshot};
 use crate::ui::icons::{
-    icon_agent, icon_balance, icon_close, icon_folder, icon_fullscreen_corners, icon_grid,
-    icon_magnifier, icon_plus, icon_settings, icon_sidebar_toggle, icon_split_h, icon_split_v,
-    icon_terminal, svg_icon,
+    icon_agent, icon_balance, icon_close, icon_file, icon_folder, icon_fullscreen_corners,
+    icon_grid, icon_magnifier, icon_plus, icon_settings, icon_sidebar_toggle, icon_split_h,
+    icon_split_v, icon_terminal, svg_icon,
 };
 
 #[derive(Clone, Copy)]
@@ -46,10 +46,10 @@ const MODE_HINTS: &[ModeMeta] = &[
         chip_class: "m-nav",
     },
     ModeMeta {
-        mode: PaletteMode::Scrollback,
+        mode: PaletteMode::Files,
         prefix: "/",
-        label: "scrollback",
-        placeholder: "search terminal output",
+        label: "files",
+        placeholder: "file name in this workspace",
         chip_class: "m-search",
     },
 ];
@@ -342,7 +342,7 @@ fn mode_icon(mode: PaletteMode) -> ElementDef {
         PaletteMode::Actions => svg_icon(icon_settings()),
         PaletteMode::Agents => svg_icon(icon_agent()),
         PaletteMode::Navigation => svg_icon(icon_folder()),
-        PaletteMode::Scrollback => svg_icon(icon_terminal()),
+        PaletteMode::Files => svg_icon(icon_file()),
     }
 }
 
@@ -361,6 +361,7 @@ fn icon_for(icon: PaletteIcon) -> ElementDef {
         PaletteIcon::Agent => svg_icon(icon_agent()),
         PaletteIcon::Workspace => svg_icon(icon_folder()),
         PaletteIcon::Tab => svg_icon(icon_grid()),
+        PaletteIcon::File => svg_icon(icon_file()),
     }
 }
 

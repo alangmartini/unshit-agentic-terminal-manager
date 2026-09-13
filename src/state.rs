@@ -295,6 +295,23 @@ pub enum ConfirmDialog {
         buffer: String,
         error: Option<String>,
     },
+    /// Go-to-line prompt for the editor pane that was active when it
+    /// opened. The pane is pinned at open time because the dialog steals
+    /// focus: resolving "the active editor" at commit time would follow a
+    /// focus change made between opening and submitting. Commits via
+    /// `dialog.goto_commit`.
+    GotoLine {
+        pane_id: u32,
+        buffer: String,
+        error: Option<String>,
+    },
+    /// "Diff against…" prompt. Commits via `dialog.diff_commit`; `error`
+    /// carries a range that did not parse, shown under the input so the
+    /// typed text survives the correction.
+    DiffRequest {
+        buffer: String,
+        error: Option<String>,
+    },
 }
 
 /// Outcome of resolving the user's persisted close preference when the
@@ -992,6 +1009,14 @@ pub struct AppState {
     /// with the per-frame snapshot through `Arc`; mutate through
     /// `Arc::make_mut` on the dispatch path only.
     pub flows: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
+    /// Quick-open index of the active workspace. `None` until the first
+    /// build lands, which is what makes the palette say "Indexing...".
+    /// Shared with the snapshot through `Arc` because it holds up to
+    /// 50 000 entries and is rebuilt far less often than a frame.
+    pub file_index: Option<std::sync::Arc<crate::file_index::FileIndex>>,
+    /// True while a build is in flight, so a second `palette.files` does
+    /// not start a second walk of the same tree.
+    pub file_index_building: bool,
     /// Agent launches waiting for their flow JSON, keyed by the launch
     /// pane id. Read by the poll thread through `flow_poll_snapshot` and
     /// dropped when the launch pane closes.
@@ -1323,6 +1348,8 @@ impl AppState {
                 .iter()
                 .map(|(&id, pane)| (id, pane.clone()))
                 .collect(),
+            file_index: self.file_index.clone(),
+            file_index_building: self.file_index_building,
         }
     }
 
@@ -1447,6 +1474,12 @@ pub struct UiSnapshot {
     pub editor_panes: std::collections::HashSet<u32>,
     /// Flow Explorer panes rendered instead of a terminal, by pane id.
     pub flow_panes: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
+    /// Quick-open index behind the palette's Files mode. `None` while the
+    /// first build is still running.
+    pub file_index: Option<std::sync::Arc<crate::file_index::FileIndex>>,
+    /// Mirrors `AppState::file_index_building` so the palette can say
+    /// "Indexing..." instead of "no matching files".
+    pub file_index_building: bool,
 }
 
 fn current_folder_name() -> String {
@@ -1588,6 +1621,8 @@ pub fn seed_state() -> AppState {
         terminals: std::collections::HashMap::new(),
         editors: std::collections::HashMap::new(),
         flows: std::collections::HashMap::new(),
+        file_index: None,
+        file_index_building: false,
         flow_pending: std::collections::HashMap::new(),
         agent_restarts: std::collections::HashMap::new(),
         pending_agent_resumes: std::collections::HashMap::new(),
@@ -1739,7 +1774,11 @@ pub fn focus_workspace_pane_by_num(state: &mut AppState, workspace_id: u32, pane
 }
 
 fn focus_workspace_pane_by_index(state: &mut AppState, workspace_idx: usize, pane_id: u32) -> bool {
-    if workspace_idx >= state.workspaces.len() {
+    // The active workspace's tabs are the live `state.tabs`, not a copy in
+    // `state.workspaces` — so it stays addressable even when that list is
+    // empty, which is the shape of a seeded state and of the first run
+    // before any workspace has been persisted.
+    if workspace_idx != state.active_workspace && workspace_idx >= state.workspaces.len() {
         return false;
     }
 
@@ -1889,12 +1928,15 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     let pane_id = PaneId(id_num);
 
     let title = editor.display_name.clone();
+    // The subtitle is what the tab strip and pane header show under the
+    // name; a diff pane is not a file and should not claim to be one.
+    let subtitle = if editor.is_diff() { "diff" } else { "editor" };
     state.editors.insert(id_num, editor);
 
     let pane = Pane {
         id: pane_id,
         title: title.clone(),
-        subtitle: "editor".to_string(),
+        subtitle: subtitle.to_string(),
         pid: 0,
         cpu: 0.0,
         mem_bytes: 0,
@@ -1903,7 +1945,7 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     let tab = TerminalTab {
         id: format!("t{}", id_num),
         name: title,
-        subtitle: "editor".to_string(),
+        subtitle: subtitle.to_string(),
         status: TabStatus::Idle,
         panes: vec![vec![pane.clone()]],
         active_pane: pane_id,
@@ -3887,12 +3929,26 @@ pub fn mutate_tab_width_px_delta(state: &mut AppState, delta: i32) -> bool {
     true
 }
 
+/// Re-resolve every editor pane's palette after a theme change.
+///
+/// Editor grids carry real colours rather than palette indices — they
+/// bypass the terminal's palette remap — so nothing recolours them on the
+/// next paint the way a terminal grid recolours itself. Each pane
+/// repaints only if its resolved colours actually differ.
+pub fn recolor_editor_panes(state: &mut AppState) {
+    let colors = editor_colors(state);
+    for editor in state.editors.values_mut() {
+        editor.set_colors(colors);
+    }
+}
+
 pub fn mutate_theme(state: &mut AppState, theme_id: &str) -> bool {
     let resolved = theme::resolve_theme_id(theme_id).to_string();
     if state.theme == resolved {
         return false;
     }
     state.theme = resolved;
+    recolor_editor_panes(state);
     true
 }
 
@@ -3912,6 +3968,7 @@ pub fn mutate_custom_theme_color(
     theme::set_custom_theme_color(&mut state.custom_theme, slot, color);
     state.theme = theme::CUSTOM_THEME_ID.to_string();
     state.last_terminal_theme_painted.clear();
+    recolor_editor_panes(state);
     true
 }
 
@@ -3923,6 +3980,7 @@ pub fn reset_custom_theme(state: &mut AppState) -> bool {
     state.custom_theme = default;
     state.theme = theme::CUSTOM_THEME_ID.to_string();
     state.last_terminal_theme_painted.clear();
+    recolor_editor_panes(state);
     true
 }
 
@@ -3949,6 +4007,7 @@ pub fn reset_appearance(state: &mut AppState) -> bool {
     state.tab_width_px = DEFAULT_TAB_WIDTH_PX;
     sync_terminal_size_to_font_metrics(state);
     state.last_terminal_theme_painted.clear();
+    recolor_editor_panes(state);
     changed
 }
 
@@ -5163,6 +5222,71 @@ fn open_command_palette(state: &mut AppState) {
     clear_palette_query(state);
 }
 
+/// `palette.files`: open the palette straight into Files mode.
+///
+/// The `/` prefix is the mode, so seeding the query with it is the whole
+/// switch; the index build is kicked off here rather than on the first
+/// keystroke so the rows are usually there by the time anything is typed.
+fn dispatch_palette_files(state: &mut AppState) -> bool {
+    open_command_palette(state);
+    state.palette_query = "/".to_string();
+    state.palette_active = 0;
+    ensure_file_index(state);
+    true
+}
+
+/// Build (or rebuild) the quick-open index for the active workspace on a
+/// worker thread, unless a fresh one for the same root is already here.
+///
+/// Enumerating a checkout spawns a process and touches the filesystem —
+/// never on the UI thread. Until the first build lands the palette shows
+/// "Indexing…" rather than "no matching files".
+fn ensure_file_index(state: &mut AppState) {
+    let Some(root) = active_workspace_cwd(state) else {
+        return;
+    };
+    let fresh = state.file_index.as_ref().is_some_and(|index| {
+        index.root == root
+            && !crate::file_index::is_stale(index, crate::file_index::DEFAULT_INDEX_MAX_AGE)
+    });
+    if fresh || state.file_index_building {
+        return;
+    }
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        // No shared state to write back into (unit tests, headless):
+        // leave the index alone rather than blocking the caller on a
+        // filesystem walk.
+        return;
+    };
+    state.file_index_building = true;
+    let spawned = std::thread::Builder::new()
+        .name("quickopen-index".into())
+        .spawn(move || {
+            let index = crate::file_index::build_index(&root);
+            {
+                let mut guard = hooks.shared.lock_recover();
+                guard.file_index_building = false;
+                // A workspace switch during the walk makes this index
+                // describe the wrong tree; the next open rebuilds it.
+                if active_workspace_cwd(&guard).as_deref() == Some(index.root.as_path()) {
+                    guard.file_index = Some(std::sync::Arc::new(index));
+                }
+            }
+            (hooks.request_rebuild)();
+        })
+        .is_ok();
+    if !spawned {
+        state.file_index_building = false;
+        log::warn!(
+            "{{\"event\":\"quickopen.index_spawn_failed\",\"level\":\"warn\",\"root\":{:?}}}",
+            state
+                .file_index
+                .as_ref()
+                .map(|index| index.root.display().to_string())
+        );
+    }
+}
+
 fn close_command_palette(state: &mut AppState) -> bool {
     let changed =
         state.palette_open || !state.palette_query.is_empty() || state.palette_active != 0;
@@ -5409,9 +5533,18 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "quick_prompt.open"
             | "editor.open"
             | "editor.save"
+            | "editor.goto"
+            | "editor.find"
+            | "palette.files"
+            | "diff.open"
     ) || command.starts_with("workspace.switch:")
         || command.starts_with("terminal.focus:")
         || command.starts_with("flow.")
+        || command.starts_with("diff.open:")
+        // Quick-open rows carry an absolute path from the workspace's own
+        // file index, never user text, so opening one is as safe as the
+        // `editor.open` dialog it replaces.
+        || command.starts_with("editor.open:")
 }
 
 fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
@@ -5550,6 +5683,7 @@ fn record_editor_pane_event(
         path: Some(&path_str),
         file_bytes: Some(editor.file_bytes),
         line_count: Some(editor.buffer.line_count() as u64),
+        line: None,
         reason,
         os_error: None,
     });
@@ -5607,6 +5741,7 @@ pub fn save_editor_pane(state: &mut AppState, pane_id: u32) -> bool {
                 path: Some(&path_str),
                 file_bytes: None,
                 line_count: None,
+                line: None,
                 reason: Some("io"),
                 os_error: e.raw_os_error(),
             });
@@ -5628,8 +5763,14 @@ pub fn save_editor_pane(state: &mut AppState, pane_id: u32) -> bool {
 /// through unclaimed.
 fn dispatch_editor_save(state: &mut AppState) -> bool {
     let pane_id = state.active_pane.0;
-    if !state.editors.contains_key(&pane_id) {
+    let Some(editor) = state.editors.get(&pane_id) else {
         return false;
+    };
+    // A diff pane has no file behind it; `EditorPane::save` would happily
+    // write the rendered diff over the repo root. Claim the key and do
+    // nothing, which is also what Ctrl+S does in every diff viewer.
+    if editor.read_only {
+        return true;
     }
     save_editor_pane(state, pane_id);
     true
@@ -5647,6 +5788,12 @@ fn dispatch_editor_save(state: &mut AppState) -> bool {
 /// `EditorBuffer::insert_str` does the editor-side normalisation (CRLF and
 /// lone CR to LF). Returns whether the buffer changed.
 pub(crate) fn dispatch_editor_paste(state: &mut AppState, pane_id: u32) -> bool {
+    // A diff pane accepts copy but ignores paste. Bail before touching the
+    // clipboard so a read failure cannot toast at a pane that would have
+    // refused the text anyway.
+    if state.editors.get(&pane_id).is_some_and(|e| e.read_only) {
+        return false;
+    }
     let text = match state.clipboard.read_text() {
         Ok(text) => text,
         Err(e) => {
@@ -5665,7 +5812,7 @@ pub(crate) fn dispatch_editor_paste(state: &mut AppState, pane_id: u32) -> bool 
     let Some(editor) = state.editors.get_mut(&pane_id) else {
         return false;
     };
-    let changed = editor.apply(|b| b.insert_str(&text));
+    let changed = editor.apply_edit(|b| b.insert_str(&text));
     if changed {
         if let Some(editor) = state.editors.get(&pane_id) {
             record_editor_pane_event(editor, "editor.paste", "info", None);
@@ -5815,6 +5962,28 @@ fn close_editor_dialog_scope(state: &mut AppState, pane_ids: &[u32], tab: Option
 /// surface a refusal/failure toast. Emits `editor.open` /
 /// `editor.open_failed` telemetry either way.
 pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
+    dispatch_editor_open_at(state, raw_path, None)
+}
+
+/// The editor palette for the active theme. Editor grids never pass
+/// through the terminal palette remap, so a pane resolves real colours
+/// once here and again on every theme change.
+pub fn editor_colors(state: &AppState) -> crate::editor::EditorColors {
+    crate::editor::EditorColors::for_theme(&state.theme, &state.custom_theme)
+}
+
+/// Open `raw_path`, or focus the pane that already has it, then jump to
+/// `line` (1-based) when one is given.
+///
+/// Opening the same file twice used to produce two independent buffers of
+/// the same file, whose saves would clobber each other. Focusing the
+/// existing pane is both what every editor does and the only safe
+/// behaviour here (see BACKLOG "duplicate open").
+pub fn dispatch_editor_open_at(
+    state: &mut AppState,
+    raw_path: &str,
+    line: Option<(usize, Option<usize>)>,
+) -> bool {
     use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
 
     let trimmed = raw_path.trim();
@@ -5824,9 +5993,26 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
     }
     let path = std::path::PathBuf::from(trimmed);
     let path_str = path.to_string_lossy().into_owned();
+
+    if let Some(existing) = find_editor_pane_for_path(state, &path) {
+        if focus_pane_anywhere(state, PaneId(existing)) {
+            if let Some((line_1, col_1)) = line {
+                if let Some(editor) = state.editors.get_mut(&existing) {
+                    editor.goto_line(line_1, col_1);
+                }
+            }
+            record_editor_focus_existing(state, existing, &path_str, line.map(|(l, _)| l));
+            return true;
+        }
+    }
+
     let (rows, cols) = editor_viewport_dims(state);
-    match crate::editor::EditorPane::open(&path, rows, cols) {
-        Ok(editor) => {
+    let colors = editor_colors(state);
+    match crate::editor::EditorPane::open_with_colors(&path, rows, cols, colors) {
+        Ok(mut editor) => {
+            if let Some((line_1, col_1)) = line {
+                editor.goto_line(line_1, col_1);
+            }
             record_editor_event(&EditorEventRecord {
                 timestamp_unix_ms: now_unix_ms(),
                 event: "editor.open",
@@ -5835,6 +6021,7 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
                 path: Some(&path_str),
                 file_bytes: Some(editor.file_bytes),
                 line_count: Some(editor.buffer.line_count() as u64),
+                line: line.map(|(l, _)| l as u64),
                 reason: None,
                 os_error: None,
             });
@@ -5855,6 +6042,7 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
                 path: Some(&path_str),
                 file_bytes,
                 line_count: None,
+                line: None,
                 reason: Some(err.reason()),
                 os_error: match &err {
                     crate::editor::OpenError::Io(e) => e.raw_os_error(),
@@ -5868,6 +6056,718 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
             push_error_toast(state, err.message(&path));
         }
     }
+    true
+}
+
+/// Pane id of an editor holding `path`, in any workspace.
+///
+/// Compares canonicalised paths so `src/state.rs` and an absolute spelling
+/// of the same file are one pane; falls back to the raw path when
+/// canonicalisation fails (a deleted file, a permission error), which is
+/// still correct for the common "the same string twice" case.
+fn find_editor_pane_for_path(state: &AppState, path: &std::path::Path) -> Option<u32> {
+    let target = std::fs::canonicalize(path).ok();
+    state
+        .editors
+        .iter()
+        .filter(|(_, editor)| !editor.is_diff())
+        .find(
+            |(_, editor)| match (&target, std::fs::canonicalize(&editor.path).ok()) {
+                (Some(a), Some(b)) => a == &b,
+                _ => editor.path == path,
+            },
+        )
+        .map(|(id, _)| *id)
+}
+
+/// Focus `pane` wherever it lives, switching workspace and tab as needed.
+fn focus_pane_anywhere(state: &mut AppState, pane: PaneId) -> bool {
+    // The active workspace first: its tabs are the live ones, and it is
+    // also the only workspace that exists at all in a seeded state.
+    if focus_workspace_pane_by_index(state, state.active_workspace, pane.0) {
+        return true;
+    }
+    for ws_idx in 0..state.workspaces.len() {
+        if ws_idx == state.active_workspace {
+            continue;
+        }
+        if focus_workspace_pane_by_index(state, ws_idx, pane.0) {
+            return true;
+        }
+    }
+    false
+}
+
+fn record_editor_focus_existing(
+    state: &mut AppState,
+    pane_id: u32,
+    path: &str,
+    line: Option<usize>,
+) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+    let Some(editor) = state.editors.get(&pane_id) else {
+        return;
+    };
+    record_editor_event(&EditorEventRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event: "editor.focus_existing",
+        level: "info",
+        correlation_id: &editor.correlation_id,
+        path: Some(path),
+        file_bytes: Some(editor.file_bytes),
+        line_count: Some(editor.buffer.line_count() as u64),
+        line: line.map(|l| l as u64),
+        reason: None,
+        os_error: None,
+    });
+    record_diagnostic_pty_event(state, format!("editor_focus_existing pane={pane_id}"));
+}
+
+/// Handle `editor.open_at:<line>[.<col>]:<path>`.
+///
+/// The line comes **first** because a Windows path contains a colon
+/// (`C:\src\main.rs`), so a trailing `:<line>` cannot be split off
+/// unambiguously. The column, when given, is separated by a dot for the
+/// same reason.
+fn dispatch_editor_open_at_command(state: &mut AppState, arg: &str) -> bool {
+    let Some((position, path)) = arg.split_once(':') else {
+        push_error_toast(state, "Open at: expected editor.open_at:<line>:<path>");
+        return true;
+    };
+    let (line_text, col_text) = match position.split_once('.') {
+        Some((l, c)) => (l, Some(c)),
+        None => (position, None),
+    };
+    let Ok(line) = line_text.trim().parse::<usize>() else {
+        push_error_toast(
+            state,
+            format!("Open at: '{line_text}' is not a line number"),
+        );
+        return true;
+    };
+    let col = col_text.and_then(|c| c.trim().parse::<usize>().ok());
+    dispatch_editor_open_at(state, path, Some((line.max(1), col)))
+}
+
+/// Handle `editor.goto:<line>[:<col>]` on the active editor pane. No
+/// path is involved, so the column can use a colon here.
+fn dispatch_editor_goto(state: &mut AppState, arg: &str) -> bool {
+    let pane_id = state.active_pane.0;
+    if !state.editors.contains_key(&pane_id) {
+        return false;
+    }
+    let (line_text, col_text) = match arg.split_once(':') {
+        Some((l, c)) => (l, Some(c)),
+        None => (arg, None),
+    };
+    let Ok(line) = line_text.trim().parse::<usize>() else {
+        push_error_toast(state, format!("Go to line: '{line_text}' is not a number"));
+        return true;
+    };
+    let col = col_text.and_then(|c| c.trim().parse::<usize>().ok());
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    let landed = editor.goto_line(line.max(1), col);
+    record_editor_line_event(state, pane_id, "editor.goto", landed);
+    true
+}
+
+fn record_editor_line_event(state: &mut AppState, pane_id: u32, event: &'static str, line: usize) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+    let Some(editor) = state.editors.get(&pane_id) else {
+        return;
+    };
+    let path = editor.path.to_string_lossy().into_owned();
+    record_editor_event(&EditorEventRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event,
+        level: "info",
+        correlation_id: &editor.correlation_id,
+        path: Some(&path),
+        file_bytes: None,
+        line_count: Some(editor.buffer.line_count() as u64),
+        line: Some(line as u64),
+        reason: None,
+        os_error: None,
+    });
+}
+
+/// `editor.goto`: open the go-to-line prompt for the active editor.
+///
+/// Unclaimed when the active pane is not an editor, so the chord falls
+/// through to the terminal rather than opening a dialog with nothing to
+/// jump in.
+fn dispatch_editor_goto_dialog(state: &mut AppState) -> bool {
+    let pane_id = state.active_pane.0;
+    if !state.editors.contains_key(&pane_id) {
+        return false;
+    }
+    state.ctx_menu = None;
+    state.confirm_dialog = Some(ConfirmDialog::GotoLine {
+        pane_id,
+        buffer: String::new(),
+        error: None,
+    });
+    true
+}
+
+/// `dialog.goto_commit`: jump using the prompt's buffer. A bad number
+/// reopens the dialog with the reason inline so the typed text survives.
+fn dispatch_goto_commit(state: &mut AppState) -> bool {
+    let Some(ConfirmDialog::GotoLine {
+        pane_id,
+        buffer,
+        error: _,
+    }) = state.confirm_dialog.take()
+    else {
+        return false;
+    };
+    let text = buffer.trim().to_string();
+    if text.is_empty() {
+        return true;
+    }
+    let (line_text, col_text) = match text.split_once(':') {
+        Some((l, c)) => (l, Some(c)),
+        None => (text.as_str(), None),
+    };
+    let Ok(line) = line_text.trim().parse::<usize>() else {
+        let message = format!("'{}' is not a line number", line_text.trim());
+        state.confirm_dialog = Some(ConfirmDialog::GotoLine {
+            pane_id,
+            buffer,
+            error: Some(message),
+        });
+        return true;
+    };
+    let col = col_text.and_then(|c| c.trim().parse::<usize>().ok());
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return true;
+    };
+    let landed = editor.goto_line(line.max(1), col);
+    record_editor_line_event(state, pane_id, "editor.goto", landed);
+    true
+}
+
+// -- find in file ---------------------------------------------------------
+
+/// `editor.find*`: the find bar of the active editor pane.
+///
+/// Every arm is unclaimed when the active pane is not an editor, so the
+/// chords keep falling through to the terminal.
+fn dispatch_editor_find(state: &mut AppState, command: FindCommand) -> bool {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    match command {
+        FindCommand::Open => {
+            editor.find_open();
+        }
+        FindCommand::Close => {
+            // Nothing open: leave the key unclaimed so Escape can fall
+            // through to whatever else wants to close.
+            let Some(closed) = editor.find_close() else {
+                return false;
+            };
+            let path = editor.path.to_string_lossy().into_owned();
+            let correlation_id = editor.correlation_id.clone();
+            record_editor_event(&EditorEventRecord {
+                timestamp_unix_ms: now_unix_ms(),
+                event: "editor.find_closed",
+                level: "info",
+                correlation_id: &correlation_id,
+                path: Some(&path),
+                file_bytes: None,
+                // The number of hits the session ended with — never the
+                // query, which is user text.
+                line_count: Some(closed.matches.len() as u64),
+                line: None,
+                reason: None,
+                os_error: None,
+            });
+        }
+        FindCommand::Next => {
+            editor.find_step(true);
+        }
+        FindCommand::Prev => {
+            editor.find_step(false);
+        }
+        FindCommand::ToggleCase => {
+            editor.find_toggle_case();
+        }
+        FindCommand::Query(text) => {
+            editor.find_set_query(text);
+        }
+    }
+    true
+}
+
+/// The find-bar verbs, so one handler covers six dispatch strings.
+enum FindCommand<'a> {
+    Open,
+    Close,
+    Next,
+    Prev,
+    ToggleCase,
+    Query(&'a str),
+}
+
+// -- diff review pane -----------------------------------------------------
+
+/// Everything one diff pane needs to exist and then fill itself in.
+struct DiffRequest {
+    spec: crate::diff::DiffSpec,
+    /// Where to run git. `None` means "resolve it from `start_dir` on the
+    /// worker thread" — `git rev-parse` costs a process spawn (~30 ms on
+    /// Windows) and must not run on the UI thread. The Flow hand-off
+    /// already knows the root and skips the spawn.
+    repo_root: Option<PathBuf>,
+    /// Directory the root is resolved from when `repo_root` is `None`.
+    start_dir: PathBuf,
+    /// Where the request came from, for telemetry: `dialog`, `palette`,
+    /// `flow`, `dispatch`.
+    origin: &'static str,
+    /// Scroll target applied once the document lands: a repo-relative
+    /// path and, when known, a line inside it (the Flow hand-off).
+    reveal: Option<(String, Option<u32>)>,
+}
+
+/// `diff.open`: open the "Diff against…" prompt, prefilled with `HEAD`.
+fn dispatch_diff_dialog(state: &mut AppState) -> bool {
+    state.ctx_menu = None;
+    state.confirm_dialog = Some(ConfirmDialog::DiffRequest {
+        buffer: "HEAD".to_string(),
+        error: None,
+    });
+    true
+}
+
+/// `dialog.diff_commit`: open the pane for the prompt's range. A range
+/// that does not parse reopens the dialog with the reason inline rather
+/// than toasting and discarding what was typed.
+fn dispatch_diff_commit(state: &mut AppState) -> bool {
+    let Some(ConfirmDialog::DiffRequest { buffer, error: _ }) = state.confirm_dialog.take() else {
+        return false;
+    };
+    match crate::diff::DiffSpec::parse(&buffer) {
+        Ok(spec) => {
+            open_diff_pane(state, spec, None, "dialog", None);
+        }
+        Err(message) => {
+            state.confirm_dialog = Some(ConfirmDialog::DiffRequest {
+                buffer,
+                error: Some(message),
+            });
+        }
+    }
+    true
+}
+
+/// `diff.open:<range>`: open the pane directly (startup dispatch, the
+/// palette, tests). A bad range toasts; nothing is created.
+fn dispatch_diff_open_range(state: &mut AppState, range: &str) -> bool {
+    match crate::diff::DiffSpec::parse(range) {
+        Ok(spec) => {
+            open_diff_pane(state, spec, None, "dispatch", None);
+        }
+        Err(message) => {
+            record_diff_rejected(&message);
+            push_error_toast(state, format!("Diff: {message}"));
+        }
+    }
+    true
+}
+
+fn record_diff_rejected(message: &str) {
+    use crate::diff::telemetry::{generate_job_id, record_diff_event, DiffEventRecord};
+    let job_id = generate_job_id();
+    let mut record = DiffEventRecord::new("diff.rejected", "warn", &job_id);
+    record.reason = Some("bad_range");
+    // The message names the *role* that failed ("base revision may not
+    // start with '-'"), never the text the user typed.
+    let _ = message;
+    record_diff_event(&record);
+}
+
+/// Create the pane for `spec` and start its git job. Returns the new
+/// pane's id, or `None` when there is no directory to run git in.
+///
+/// The pane appears immediately with a "Loading…" buffer so the tab is
+/// focusable, scrollable and closeable while git runs; the result is
+/// applied later under a brief state lock, or dropped if the pane went
+/// away meanwhile.
+fn open_diff_pane(
+    state: &mut AppState,
+    spec: crate::diff::DiffSpec,
+    repo_root: Option<PathBuf>,
+    origin: &'static str,
+    reveal: Option<(String, Option<u32>)>,
+) -> Option<PaneId> {
+    let start_dir = match repo_root.clone().or_else(|| active_workspace_cwd(state)) {
+        Some(dir) => dir,
+        None => {
+            push_error_toast(state, "Diff: the workspace has no directory");
+            return None;
+        }
+    };
+    spawn_diff_job(
+        state,
+        DiffRequest {
+            spec,
+            repo_root,
+            start_dir,
+            origin,
+            reveal,
+        },
+    )
+}
+
+fn spawn_diff_job(state: &mut AppState, request: DiffRequest) -> Option<PaneId> {
+    use crate::diff::telemetry::{generate_job_id, record_diff_event, DiffEventRecord};
+
+    let DiffRequest {
+        spec,
+        repo_root,
+        start_dir,
+        origin,
+        reveal,
+    } = request;
+
+    let job_id = generate_job_id();
+    let label = spec.label();
+    {
+        let root_display = start_dir.to_string_lossy().into_owned();
+        let mut record = DiffEventRecord::new("diff.request", "info", &job_id);
+        record.range = Some(&label);
+        record.repo_root = Some(&root_display);
+        record.origin = Some(origin);
+        record_diff_event(&record);
+    }
+
+    let (rows, cols) = editor_viewport_dims(state);
+    let colors = editor_colors(state);
+    let pane = crate::editor::EditorPane::diff_loading(
+        spec.clone(),
+        repo_root.clone().unwrap_or_else(|| start_dir.clone()),
+        job_id.clone(),
+        rows,
+        cols,
+        colors,
+    );
+    let pane_id = mutate_add_editor_tab(state, pane);
+    record_diagnostic_pty_event(
+        state,
+        format!("diff_open pane={} job={}", pane_id.0, job_id),
+    );
+
+    // No hooks means no shared state to write back into: unit tests, and
+    // any future headless caller. The pane stays in its Loading state,
+    // which is exactly what a test asserting "the tab was created"
+    // wants, and `set_diff_document` is covered directly.
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return Some(pane_id);
+    };
+
+    let thread_name = format!("git-diff-{job_id}");
+    let worker_job_id = job_id.clone();
+    let worker_label = label.clone();
+    let spawned = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let root = match repo_root {
+                Some(root) => Some(root),
+                None => crate::git::repo_root(&start_dir),
+            };
+            let Some(root) = root else {
+                apply_diff_failure(
+                    &hooks,
+                    pane_id.0,
+                    &worker_job_id,
+                    &worker_label,
+                    "not_a_repo",
+                    format!("{} is not inside a git repository", start_dir.display()),
+                    0,
+                );
+                return;
+            };
+            let outcome = crate::diff::run_diff(&spec, &root);
+            apply_diff_outcome(
+                &hooks,
+                pane_id.0,
+                &worker_job_id,
+                &worker_label,
+                &root,
+                outcome,
+                reveal,
+            );
+        })
+        .is_ok();
+    if !spawned {
+        let mut record = DiffEventRecord::new("diff.failed", "error", &job_id);
+        record.range = Some(&label);
+        record.reason = Some("spawn");
+        record.pane_id = Some(pane_id.0);
+        record_diff_event(&record);
+        if let Some(editor) = state.editors.get_mut(&pane_id.0) {
+            editor.set_diff_error("could not start the diff worker thread".to_string());
+        }
+    }
+    Some(pane_id)
+}
+
+/// Write a finished job's result into its pane, or drop it when the pane
+/// is gone or has been reused for a different job.
+fn apply_diff_outcome(
+    hooks: &std::sync::Arc<EditorOpenHooks>,
+    pane_id: u32,
+    job_id: &str,
+    label: &str,
+    root: &std::path::Path,
+    outcome: crate::diff::DiffOutcome,
+    reveal: Option<(String, Option<u32>)>,
+) {
+    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+    use crate::diff::DiffOutcome;
+
+    match outcome {
+        DiffOutcome::Ready {
+            document,
+            stdout_bytes,
+            stdout_truncated,
+            elapsed_ms,
+        } => {
+            let mut record = DiffEventRecord::new("diff.ready", "info", job_id);
+            record.pane_id = Some(pane_id);
+            record.range = Some(label);
+            record.files = Some(document.files.len() as u64);
+            record.hunks = Some(document.hunk_count() as u64);
+            record.rows = Some(document.rows.len() as u64);
+            record.stdout_bytes = Some(stdout_bytes as u64);
+            record.elapsed_ms = Some(elapsed_ms);
+            record.truncated = Some(stdout_truncated || document.truncated);
+            record_diff_event(&record);
+
+            {
+                let mut guard = hooks.shared.lock_recover();
+                if !diff_pane_still_ours(&guard, pane_id, job_id) {
+                    record_diff_dropped(job_id, pane_id, label);
+                    return;
+                }
+                if let Some(editor) = guard.editors.get_mut(&pane_id) {
+                    // The worker resolved the real work tree; the pane was
+                    // created with the directory we started from.
+                    editor.path = root.to_path_buf();
+                    if let Some(view) = editor.kind.as_diff_mut() {
+                        view.repo_root = root.to_path_buf();
+                    }
+                    editor.set_diff_document(&document);
+                    if let Some((rel, line)) = reveal {
+                        editor.diff_reveal_location(&rel, line);
+                    }
+                }
+                sync_editor_pane_title(&mut guard, pane_id);
+            }
+            (hooks.request_rebuild)();
+        }
+        DiffOutcome::Failed {
+            reason,
+            message,
+            elapsed_ms,
+        } => {
+            apply_diff_failure(hooks, pane_id, job_id, label, reason, message, elapsed_ms);
+        }
+    }
+}
+
+fn apply_diff_failure(
+    hooks: &std::sync::Arc<EditorOpenHooks>,
+    pane_id: u32,
+    job_id: &str,
+    label: &str,
+    reason: &'static str,
+    message: String,
+    elapsed_ms: u64,
+) {
+    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+
+    let mut record = DiffEventRecord::new("diff.failed", "error", job_id);
+    record.pane_id = Some(pane_id);
+    record.range = Some(label);
+    record.reason = Some(reason);
+    record.elapsed_ms = Some(elapsed_ms);
+    record_diff_event(&record);
+
+    {
+        let mut guard = hooks.shared.lock_recover();
+        if !diff_pane_still_ours(&guard, pane_id, job_id) {
+            record_diff_dropped(job_id, pane_id, label);
+            return;
+        }
+        if let Some(editor) = guard.editors.get_mut(&pane_id) {
+            editor.set_diff_error(message.clone());
+        }
+        push_error_toast(&mut guard, format!("Diff {label}: {message}"));
+    }
+    (hooks.request_rebuild)();
+}
+
+/// True when `pane_id` is still a diff pane waiting on exactly this job.
+/// Guards against the pane being closed, or its tab id being reused by a
+/// later pane, while git was running.
+fn diff_pane_still_ours(state: &AppState, pane_id: u32, job_id: &str) -> bool {
+    state
+        .editors
+        .get(&pane_id)
+        .and_then(|editor| editor.diff())
+        .is_some_and(|view| view.job_id == job_id)
+}
+
+fn record_diff_dropped(job_id: &str, pane_id: u32, label: &str) {
+    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+    let mut record = DiffEventRecord::new("diff.dropped", "info", job_id);
+    record.pane_id = Some(pane_id);
+    record.range = Some(label);
+    record.reason = Some("pane_closed");
+    record_diff_event(&record);
+}
+
+/// `diff.next_hunk` / `diff.prev_hunk` / `diff.next_file` /
+/// `diff.prev_file` on the active diff pane. Unclaimed when the active
+/// pane is not a diff, so the letter keys stay free everywhere else.
+fn dispatch_diff_nav(state: &mut AppState, forward: bool, hunk: bool) -> bool {
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    if !editor.is_diff() {
+        return false;
+    }
+    let moved = if hunk {
+        editor.diff_step_hunk(forward)
+    } else {
+        editor.diff_step_file(forward)
+    };
+    if moved {
+        record_diff_nav(state, pane_id, if hunk { "hunk" } else { "file" });
+    }
+    true
+}
+
+fn record_diff_nav(state: &AppState, pane_id: u32, kind: &'static str) {
+    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+    let Some(view) = state.editors.get(&pane_id).and_then(|e| e.diff()) else {
+        return;
+    };
+    let label = view.spec.label();
+    let mut record = DiffEventRecord::new("diff.nav", "info", &view.job_id);
+    record.pane_id = Some(pane_id);
+    record.range = Some(&label);
+    record.kind = Some(kind);
+    record_diff_event(&record);
+}
+
+/// `diff.open_file`: open the file under the diff cursor in an editor,
+/// at the line the cursor sits on in the new version.
+fn dispatch_diff_open_file(state: &mut AppState) -> bool {
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get(&pane_id) else {
+        return false;
+    };
+    if !editor.is_diff() {
+        return false;
+    }
+    let Some((path, line)) = editor.diff_open_target() else {
+        // A header row, a spacer, or a deleted file: there is nothing on
+        // disk to open. Say so rather than opening the repository root.
+        push_error_toast(state, "No file to open on this row");
+        return true;
+    };
+    {
+        use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+        if let Some(view) = state.editors.get(&pane_id).and_then(|e| e.diff()) {
+            let label = view.spec.label();
+            let path_display = path.to_string_lossy().into_owned();
+            let mut record = DiffEventRecord::new("diff.open_file", "info", &view.job_id);
+            record.pane_id = Some(pane_id);
+            record.range = Some(&label);
+            record.path = Some(&path_display);
+            record.line = Some(u64::from(line));
+            record_diff_event(&record);
+        }
+    }
+    dispatch_editor_open_at(
+        state,
+        &path.to_string_lossy(),
+        Some((line.max(1) as usize, None)),
+    )
+}
+
+// -- Flow hand-offs -------------------------------------------------------
+
+/// The Flow pane these commands act on: the active one.
+///
+/// `None` means the command was not meant for us, so the caller leaves it
+/// unclaimed rather than toasting at a terminal.
+fn active_flow_pane(state: &AppState) -> Option<std::sync::Arc<crate::flow_explorer::FlowPane>> {
+    state.flows.get(&state.active_pane.0).cloned()
+}
+
+/// One node's source location, by id.
+///
+/// Node ids contain `::` and `.`, so every `flow.*:<id>` command puts the
+/// id last and this is the only place that has to know it.
+fn flow_node_location(
+    pane: &crate::flow_explorer::FlowPane,
+    node_id: &str,
+) -> Option<crate::flow_explorer::Location> {
+    pane.flow.node(node_id)?.location.clone()
+}
+
+/// `flow.edit:<id>`: open the node's file in an editor at its line.
+fn dispatch_flow_edit(state: &mut AppState, node_id: &str) -> bool {
+    let Some(pane) = active_flow_pane(state) else {
+        return false;
+    };
+    let Some(location) = flow_node_location(&pane, node_id) else {
+        push_error_toast(state, "This node has no source location");
+        return true;
+    };
+    let path = pane.repo_root.join(&location.file);
+    dispatch_editor_open_at(
+        state,
+        &path.to_string_lossy(),
+        Some((location.line.max(1) as usize, None)),
+    )
+}
+
+/// `flow.diff` / `flow.diff:<id>`: open the flow's range as a diff pane,
+/// scrolled to the node's file (and its line) when an id is given.
+fn dispatch_flow_diff(state: &mut AppState, node_id: Option<&str>) -> bool {
+    let Some(pane) = active_flow_pane(state) else {
+        return false;
+    };
+    // An id that resolves to no location still opens the whole range:
+    // the user asked to see the diff, and the scroll target is a bonus.
+    let location = node_id.and_then(|id| flow_node_location(&pane, id));
+    let Some(range) = pane.flow.diff_range.as_ref() else {
+        push_error_toast(state, "This flow has no diff range");
+        return true;
+    };
+    let spec = match crate::diff::DiffSpec::from_flow_range(&range.base, &range.head) {
+        Ok(spec) => spec,
+        Err(message) => {
+            record_diff_rejected(&message);
+            push_error_toast(state, format!("Diff: {message}"));
+            return true;
+        }
+    };
+    // Flow paths are already repo-root-relative, which is exactly what a
+    // unified diff's headers carry.
+    let reveal = location.map(|loc| (loc.file, Some(loc.line)));
+    open_diff_pane(state, spec, Some(pane.repo_root.clone()), "flow", reveal);
     true
 }
 
@@ -6456,6 +7356,19 @@ pub fn apply_flow_poll(
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
     match command {
         "modal.close" => {
+            // The find bar is the innermost surface Escape can close, and
+            // it lives inside a pane rather than over the app. Close it
+            // first, but only when nothing is stacked on top: with a
+            // dialog or the palette open, focus is up there and Escape
+            // belongs to it.
+            let overlay_open = state.ctx_menu.is_some()
+                || state.settings_open
+                || state.confirm_dialog.is_some()
+                || state.palette_open
+                || state.quick_prompt.is_some();
+            if !overlay_open && dispatch_editor_find(state, FindCommand::Close) {
+                return true;
+            }
             let mut changed = false;
             if state.ctx_menu.is_some() {
                 state.ctx_menu = None;
@@ -6503,12 +7416,17 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             // RenameSession commits via `dialog.rename_commit` so the
             // handler can read the buffer before clearing. CloseEditor
             // resolves via `dialog.editor_save_close` / `_discard_close`.
+            // Every text-input dialog commits through its own
+            // `dialog.*_commit` for the same reason: the typed buffer has
+            // to be read before the dialog is cleared.
             if matches!(
                 dlg,
                 ConfirmDialog::CloseApp { .. }
                     | ConfirmDialog::RenameSession { .. }
                     | ConfirmDialog::CloseEditor { .. }
                     | ConfirmDialog::FlowRequest { .. }
+                    | ConfirmDialog::GotoLine { .. }
+                    | ConfirmDialog::DiffRequest { .. }
             ) {
                 return false;
             }
@@ -6525,7 +7443,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 ConfirmDialog::CloseApp { .. }
                 | ConfirmDialog::RenameSession { .. }
                 | ConfirmDialog::CloseEditor { .. }
-                | ConfirmDialog::FlowRequest { .. } => {
+                | ConfirmDialog::FlowRequest { .. }
+                | ConfirmDialog::GotoLine { .. }
+                | ConfirmDialog::DiffRequest { .. } => {
                     unreachable!("filtered above")
                 }
             }
@@ -6865,7 +7785,33 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if let Some(path) = other.strip_prefix("editor.open:") => {
             dispatch_editor_open_path(state, path)
         }
+        other if let Some(arg) = other.strip_prefix("editor.open_at:") => {
+            dispatch_editor_open_at_command(state, arg)
+        }
         "editor.open" => dispatch_editor_open_dialog(state),
+        "editor.goto" => dispatch_editor_goto_dialog(state),
+        other if let Some(arg) = other.strip_prefix("editor.goto:") => {
+            dispatch_editor_goto(state, arg)
+        }
+        "dialog.goto_commit" => dispatch_goto_commit(state),
+        "editor.find" => dispatch_editor_find(state, FindCommand::Open),
+        "editor.find_close" => dispatch_editor_find(state, FindCommand::Close),
+        "editor.find_next" => dispatch_editor_find(state, FindCommand::Next),
+        "editor.find_prev" => dispatch_editor_find(state, FindCommand::Prev),
+        "editor.find_case" => dispatch_editor_find(state, FindCommand::ToggleCase),
+        other if let Some(text) = other.strip_prefix("editor.find_query:") => {
+            dispatch_editor_find(state, FindCommand::Query(text))
+        }
+        "diff.open" => dispatch_diff_dialog(state),
+        other if let Some(range) = other.strip_prefix("diff.open:") => {
+            dispatch_diff_open_range(state, range)
+        }
+        "dialog.diff_commit" => dispatch_diff_commit(state),
+        "diff.next_hunk" => dispatch_diff_nav(state, true, true),
+        "diff.prev_hunk" => dispatch_diff_nav(state, false, true),
+        "diff.next_file" => dispatch_diff_nav(state, true, false),
+        "diff.prev_file" => dispatch_diff_nav(state, false, false),
+        "diff.open_file" => dispatch_diff_open_file(state),
         other if let Some(handled) = dispatch_flow_command(state, other) => handled,
         other if let Some(path) = other.strip_prefix("flow.open:") => {
             dispatch_flow_open_path(state, path)
@@ -6883,6 +7829,11 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if let Some(range) = other.strip_prefix("flow.review:") => {
             dispatch_flow_launch_direct(state, crate::flow_explorer::FlowMode::Review, range)
         }
+        "flow.diff" => dispatch_flow_diff(state, None),
+        other if let Some(id) = other.strip_prefix("flow.diff:") => {
+            dispatch_flow_diff(state, Some(id))
+        }
+        other if let Some(id) = other.strip_prefix("flow.edit:") => dispatch_flow_edit(state, id),
         "dialog.flow_commit" => dispatch_flow_commit(state),
         "editor.save" => dispatch_editor_save(state),
         "tab.new_worktree" => {
@@ -7048,6 +7999,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             true
         }
+        "palette.files" => dispatch_palette_files(state),
         "palette.close" => close_command_palette(state),
         other if other.starts_with("palette.query:") => {
             if !state.palette_open {
@@ -9476,6 +10428,8 @@ pub(crate) mod tests {
             terminals: std::collections::HashMap::new(),
             editors: std::collections::HashMap::new(),
             flows: std::collections::HashMap::new(),
+            file_index: None,
+            file_index_building: false,
             flow_pending: std::collections::HashMap::new(),
             agent_restarts: std::collections::HashMap::new(),
             pending_agent_resumes: std::collections::HashMap::new(),
@@ -10725,6 +11679,273 @@ pub(crate) mod tests {
         assert!(dispatch(&mut state, "editor.open:  "));
         assert!(state.editors.is_empty());
         assert_eq!(state.toasts.len(), 1);
+    }
+
+    /// Two buffers over one file would let two saves clobber each other,
+    /// and nothing in the UI would say which pane was stale. BACKLOG
+    /// "duplicate open" asks for exactly this.
+    #[test]
+    fn opening_the_same_file_twice_focuses_the_existing_pane() {
+        let mut state = test_state();
+        let path = editor_temp_file("dedupe", b"alpha\nbeta\ngamma\n");
+        let command = format!("editor.open:{}", path.display());
+
+        assert!(dispatch(&mut state, &command));
+        let first = state.active_pane.0;
+        assert_eq!(state.editors.len(), 1);
+
+        // Move somewhere else so "focused" is an observable change.
+        dispatch(&mut state, "tab.new");
+        assert_ne!(state.active_pane.0, first);
+
+        assert!(dispatch(&mut state, &command));
+        assert_eq!(state.editors.len(), 1, "no second buffer for the same file");
+        assert_eq!(state.active_pane.0, first, "the existing pane was focused");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The line comes before the path because a Windows path contains a
+    /// colon: `editor.open_at:12.5:C:\src\main.rs` has to split on the
+    /// *first* colon after the position, not the last.
+    #[test]
+    fn editor_open_at_jumps_to_a_line_and_column() {
+        let mut state = test_state();
+        let path = editor_temp_file("open_at", b"one\ntwo\nthree\nfour\nfive\n");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open_at:3.4:{}", path.display())
+        ));
+        let editor = &state.editors[&state.active_pane.0];
+        assert_eq!(editor.buffer.cursor().line, 2, "1-based line 3");
+        assert_eq!(editor.buffer.cursor().col, 3, "1-based column 4");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_open_at_focuses_an_open_pane_and_jumps_in_it() {
+        let mut state = test_state();
+        let path = editor_temp_file("open_at_existing", b"a\nb\nc\nd\ne\nf\n");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+        dispatch(&mut state, "tab.new");
+
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open_at:5:{}", path.display())
+        ));
+        assert_eq!(state.editors.len(), 1);
+        assert_eq!(state.active_pane.0, pane_id);
+        assert_eq!(state.editors[&pane_id].buffer.cursor().line, 4);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_open_at_without_a_line_number_toasts() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "editor.open_at:nope:C:/x.txt"));
+        assert!(state.editors.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn editor_goto_clamps_past_the_end_of_the_file() {
+        let mut state = test_state();
+        let path = editor_temp_file("goto", b"one\ntwo\nthree");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        assert!(dispatch(&mut state, "editor.goto:9999"));
+        let editor = &state.editors[&state.active_pane.0];
+        assert_eq!(editor.buffer.cursor().line, editor.max_top_line());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The chords are editor-local: on a terminal pane they must stay
+    /// unclaimed so the key reaches the shell.
+    #[test]
+    fn editor_navigation_commands_are_unclaimed_on_a_terminal_pane() {
+        let mut state = test_state();
+        for command in [
+            "editor.goto",
+            "editor.goto:3",
+            "editor.find",
+            "editor.find_next",
+            "editor.find_close",
+            "diff.next_hunk",
+            "diff.open_file",
+        ] {
+            assert!(
+                !dispatch(&mut state, command),
+                "{command} must fall through on a terminal pane"
+            );
+        }
+    }
+
+    #[test]
+    fn goto_dialog_reopens_with_an_error_for_a_bad_number() {
+        let mut state = test_state();
+        let path = editor_temp_file("goto_dialog", b"one\ntwo\nthree");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+
+        assert!(dispatch(&mut state, "editor.goto"));
+        let Some(ConfirmDialog::GotoLine {
+            pane_id: dialog_pane,
+            ..
+        }) = state.confirm_dialog.as_ref()
+        else {
+            panic!("go-to-line dialog expected, got {:?}", state.confirm_dialog);
+        };
+        assert_eq!(*dialog_pane, pane_id, "the dialog pins its pane");
+
+        if let Some(ConfirmDialog::GotoLine { buffer, .. }) = state.confirm_dialog.as_mut() {
+            *buffer = "abc".to_string();
+        }
+        assert!(dispatch(&mut state, "dialog.goto_commit"));
+        let Some(ConfirmDialog::GotoLine { buffer, error, .. }) = state.confirm_dialog.as_ref()
+        else {
+            panic!("dialog should reopen with the typed text");
+        };
+        assert_eq!(buffer, "abc");
+        assert!(error.is_some(), "the reason is shown inline");
+
+        if let Some(ConfirmDialog::GotoLine { buffer, .. }) = state.confirm_dialog.as_mut() {
+            *buffer = "2".to_string();
+        }
+        assert!(dispatch(&mut state, "dialog.goto_commit"));
+        assert!(state.confirm_dialog.is_none());
+        assert_eq!(state.editors[&pane_id].buffer.cursor().line, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `dialog.confirm` must never resolve a dialog that carries typed
+    /// text: the commit handler has to read the buffer before the dialog
+    /// is cleared, and the `unreachable!` in that arm would fire.
+    #[test]
+    fn generic_confirm_ignores_the_text_prompt_dialogs() {
+        let mut state = test_state();
+        state.confirm_dialog = Some(ConfirmDialog::GotoLine {
+            pane_id: 1,
+            buffer: "3".to_string(),
+            error: None,
+        });
+        assert!(!dispatch(&mut state, "dialog.confirm"));
+        assert!(state.confirm_dialog.is_some());
+
+        state.confirm_dialog = Some(ConfirmDialog::DiffRequest {
+            buffer: "HEAD".to_string(),
+            error: None,
+        });
+        assert!(!dispatch(&mut state, "dialog.confirm"));
+        assert!(state.confirm_dialog.is_some());
+    }
+
+    // -- diff review pane ---------------------------------------------------
+
+    /// A diff pane in tests: no `EDITOR_OPEN_HOOKS` are registered, so
+    /// `open_diff_pane` creates the tab and leaves it in its Loading
+    /// state instead of spawning git. That is the shape every state-level
+    /// assertion below needs; the git path is covered in `diff::job`.
+    fn open_loading_diff(state: &mut AppState, range: &str) -> u32 {
+        mutate_add_workspace_with_path(state, Some(std::env::temp_dir()));
+        assert!(dispatch(state, &format!("diff.open:{range}")));
+        state.active_pane.0
+    }
+
+    #[test]
+    fn diff_open_creates_a_read_only_pane_titled_after_the_range() {
+        let mut state = test_state();
+        let pane_id = open_loading_diff(&mut state, "main..feature");
+        let editor = &state.editors[&pane_id];
+        assert!(editor.is_diff());
+        assert!(editor.read_only);
+        assert_eq!(editor.display_name, "diff: main..feature");
+        assert_eq!(state.panes[0][0].subtitle, "diff");
+        assert!(state.toasts.is_empty());
+    }
+
+    /// The one that matters: a range must never become a git flag.
+    #[test]
+    fn diff_open_rejects_a_range_that_would_become_a_git_flag() {
+        let mut state = test_state();
+        mutate_add_workspace_with_path(&mut state, Some(std::env::temp_dir()));
+        assert!(dispatch(&mut state, "diff.open:--output=/tmp/pwned"));
+        assert!(state.editors.is_empty(), "no pane for a rejected range");
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn diff_dialog_keeps_the_typed_range_when_it_does_not_parse() {
+        let mut state = test_state();
+        mutate_add_workspace_with_path(&mut state, Some(std::env::temp_dir()));
+        assert!(dispatch(&mut state, "diff.open"));
+        let Some(ConfirmDialog::DiffRequest { buffer, .. }) = state.confirm_dialog.as_ref() else {
+            panic!("diff dialog expected");
+        };
+        assert_eq!(buffer, "HEAD", "prefilled with the uncommitted-work range");
+
+        if let Some(ConfirmDialog::DiffRequest { buffer, .. }) = state.confirm_dialog.as_mut() {
+            *buffer = "--output=x".to_string();
+        }
+        assert!(dispatch(&mut state, "dialog.diff_commit"));
+        let Some(ConfirmDialog::DiffRequest { buffer, error }) = state.confirm_dialog.as_ref()
+        else {
+            panic!("the dialog should reopen with the reason inline");
+        };
+        assert_eq!(buffer, "--output=x");
+        assert!(error.is_some());
+        assert!(state.editors.is_empty());
+    }
+
+    /// A diff pane is read-only end to end: the clipboard path, the key
+    /// handler's own arms, and `editor.save` all refuse it.
+    #[test]
+    fn a_diff_pane_refuses_edits_and_saves() {
+        let mut state = test_state();
+        let pane_id = open_loading_diff(&mut state, "HEAD");
+        let before = state.editors[&pane_id].buffer.to_text();
+
+        assert!(!dispatch_editor_paste(&mut state, pane_id));
+        assert!(!state
+            .editors
+            .get_mut(&pane_id)
+            .expect("diff pane")
+            .apply_edit(|b| b.insert_typed("x")));
+        assert!(dispatch(&mut state, "editor.save"), "the key is claimed");
+
+        assert_eq!(state.editors[&pane_id].buffer.to_text(), before);
+        assert!(!state.editors[&pane_id].dirty);
+    }
+
+    #[test]
+    fn diff_navigation_claims_its_keys_on_a_diff_pane() {
+        let mut state = test_state();
+        let pane_id = open_loading_diff(&mut state, "HEAD");
+        // The placeholder document has no hunks, so nothing moves — but
+        // the commands must still be claimed so `n`/`p` never reach a
+        // shell that is not there.
+        for command in [
+            "diff.next_hunk",
+            "diff.prev_hunk",
+            "diff.next_file",
+            "diff.prev_file",
+        ] {
+            assert!(dispatch(&mut state, command), "{command}");
+        }
+        assert!(dispatch(&mut state, "diff.open_file"));
+        assert_eq!(
+            state.toasts.len(),
+            1,
+            "a placeholder row has no file to open"
+        );
+        assert!(state.editors[&pane_id].is_diff());
     }
 
     #[test]
