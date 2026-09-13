@@ -1,34 +1,37 @@
 //! Agent registry and classification for the sidebar **agents** subtab.
 //!
 //! A pane is an *agent pane* when it runs an agent CLI (Claude Code, Codex,
-//! Gemini CLI, ...). Membership comes from three signals, strongest first:
+//! Gemini CLI, ...). Membership comes from four signals, strongest first:
 //!
 //! 1. **Launched** — the app started the agent itself (New agent, Quick
 //!    Prompt). Recorded at spawn time.
 //! 2. **Hook** — a provider SessionStart hook reported the session
 //!    (`terminal-manager session-hook`). Lives in `AppState::agent_restarts`.
-//! 3. **Title** — the guest program's window title (OSC 0/2) identifies a
-//!    known agent. This is the only signal that needs no setup, so it is
-//!    the primary path for a user who types `claude` into a shell. It is
-//!    also the only signal that clears again: when the title stops
-//!    matching (the agent exited back to the shell) the pane returns to
-//!    the terminals list.
+//! 3. **Process** — the background resource monitor recognizes a native
+//!    executable or a known runtime entrypoint beneath the session shell.
+//!    This works without title updates or hooks and clears on process exit.
+//! 4. **Title** — the guest program's window title (OSC 0/2) identifies a
+//!    known agent. A fallback for harnesses not recognized by process; it
+//!    clears when the guest title stops matching.
 //!
-//! The profile table below is static on purpose: adding an agent is one
-//! row, and nothing here touches the resume machinery in
+//! The profile table below is static on purpose: adding native/title
+//! recognition is one row; hosted entrypoints live in `process`. Nothing
+//! here touches the resume machinery in
 //! `crate::agent_restore`, which keeps its own two-variant `AgentKind`.
 
 use serde::{Deserialize, Serialize};
 
+pub mod process;
 pub mod telemetry;
 
-/// How a pane earned its agent tag. Order is significance: a `Launched`
-/// tag is never overwritten by a `Title` observation.
+/// How a pane earned its agent tag. Launched/hook evidence wins over
+/// process observations, which in turn win over title observations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTagSource {
     Launched,
     Hook,
+    Process,
     Title,
 }
 
@@ -37,6 +40,7 @@ impl AgentTagSource {
         match self {
             Self::Launched => "launched",
             Self::Hook => "hook",
+            Self::Process => "process",
             Self::Title => "title",
         }
     }
@@ -75,7 +79,7 @@ pub struct AgentProfile {
     /// Human label for menus, palette rows and pane titles.
     pub label: &'static str,
     /// Executable to launch, without the Windows `.cmd` suffix; empty
-    /// when the profile is recognised by title only and cannot be
+    /// when the profile is detection-only and cannot be
     /// launched from the app.
     pub program: &'static str,
     /// Extra launch arguments.
@@ -157,8 +161,8 @@ pub const PROFILES: &[AgentProfile] = &[
         title_needles: &["copilot"],
         restore_kind: None,
     },
-    // Title-only: there is no single `openrouter` executable, but agent
-    // CLIs backed by OpenRouter commonly put the name in their title.
+    // Detection-only: OpenRouter-backed tools use different harnesses,
+    // so there is no default launch command for this provider profile.
     AgentProfile {
         id: "openrouter",
         label: "OpenRouter agent",
