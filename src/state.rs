@@ -5845,7 +5845,50 @@ static EDITOR_DIALOG_OPEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
-    let _ = EDITOR_OPEN_HOOKS.set(std::sync::Arc::new(hooks));
+    let hooks = std::sync::Arc::new(hooks);
+    if EDITOR_OPEN_HOOKS.set(hooks.clone()).is_ok() {
+        if let Err(error) = std::thread::Builder::new()
+            .name("explorer-refresh".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if refresh_explorer_once(&hooks.shared) {
+                    (hooks.request_rebuild)();
+                }
+            })
+        {
+            log::warn!("Could not start explorer refresh: {error}");
+        }
+    }
+}
+
+/// Filesystem work runs only on the refresh worker, outside the state lock.
+/// One batch produces at most one rebuild, and quiet/hidden trees produce none.
+fn refresh_explorer_once(shared: &SharedState) -> bool {
+    let (generation, targets) = {
+        let state = shared.lock_recover();
+        if !state.explorer.active || state.sidebar_collapsed {
+            return false;
+        }
+        (state.explorer.generation, state.explorer.refresh_targets())
+    };
+    let updates: Vec<_> = targets
+        .into_iter()
+        .map(|(path, previous)| {
+            let listing = crate::explorer::read_directory(&path);
+            (path, previous, listing)
+        })
+        .collect();
+    let mut state = shared.lock_recover();
+    if !state.explorer.active || state.sidebar_collapsed {
+        return false;
+    }
+    let mut changed = false;
+    for (path, previous, listing) in updates {
+        changed |= state
+            .explorer
+            .update_listing(generation, path, &previous, listing);
+    }
+    changed
 }
 
 /// Handle `editor.open` (no path): native file picker, routed back
@@ -13360,6 +13403,83 @@ pub(crate) mod tests {
             state.sidebar_width, MAX_SIDEBAR_WIDTH,
             "rejected input leaves width alone"
         );
+    }
+
+    #[test]
+    fn explorer_automatic_refresh_tracks_create_rename_delete_and_pauses_when_hidden() {
+        let root = std::env::temp_dir().join(format!("tm-explorer-poll-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        let file = root.join("folder").join("before.txt");
+        std::fs::write(&file, "before").unwrap();
+        let shared = Arc::new(std::sync::Mutex::new(seed_state()));
+        {
+            let mut state = shared.lock_recover();
+            state.workspaces[0].path = Some(root.clone());
+            dispatch(&mut state, "explorer.show");
+            let generation = state.explorer.generation;
+            state.explorer.accept(
+                generation,
+                root.clone(),
+                crate::explorer::read_directory(&root),
+            );
+            state.explorer.expanded.insert(root.join("folder"));
+            state.explorer.accept(
+                generation,
+                root.join("folder"),
+                crate::explorer::read_directory(&root.join("folder")),
+            );
+            state.explorer.selected = Some(file.clone());
+            dispatch_editor_open_path(&mut state, &file.to_string_lossy());
+        }
+        assert!(
+            !refresh_explorer_once(&shared),
+            "quiet folders must not rebuild"
+        );
+        std::fs::write(root.join("new.txt"), "new").unwrap();
+        assert!(refresh_explorer_once(&shared));
+        assert_eq!(shared.lock_recover().explorer.selected, Some(file.clone()));
+        assert!(shared
+            .lock_recover()
+            .explorer
+            .expanded
+            .contains(&root.join("folder")));
+        std::fs::write(&file, "changed externally").unwrap();
+        assert!(
+            !refresh_explorer_once(&shared),
+            "content-only changes do not change the tree"
+        );
+        assert_eq!(
+            shared
+                .lock_recover()
+                .editors
+                .values()
+                .next()
+                .unwrap()
+                .buffer
+                .line(0),
+            Some("before")
+        );
+        std::fs::rename(&file, root.join("folder").join("after.txt")).unwrap();
+        assert!(refresh_explorer_once(&shared));
+        assert_eq!(
+            shared.lock_recover().explorer.selected,
+            Some(root.join("folder"))
+        );
+        assert_eq!(
+            shared.lock_recover().editors.len(),
+            1,
+            "tree refresh must keep editor buffers open"
+        );
+        shared.lock_recover().sidebar_collapsed = true;
+        std::fs::remove_file(root.join("new.txt")).unwrap();
+        assert!(!refresh_explorer_once(&shared));
+        shared.lock_recover().sidebar_collapsed = false;
+        assert!(
+            refresh_explorer_once(&shared),
+            "reopening catches up with hidden changes"
+        );
+        assert!(!refresh_explorer_once(&shared));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

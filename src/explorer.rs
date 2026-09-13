@@ -3,14 +3,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub directory: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Listing {
     Loading,
     Ready(Vec<Entry>),
@@ -72,9 +72,103 @@ impl Explorer {
     }
 
     pub fn accept(&mut self, generation: u64, path: PathBuf, listing: Listing) {
-        if generation == self.generation {
+        if generation == self.generation
+            && (self.is_directory(&path)
+                || self
+                    .listings
+                    .get(&path)
+                    .is_some_and(|listing| matches!(listing.as_ref(), Listing::Loading)))
+        {
             self.listings.insert(path, Arc::new(listing));
         }
+    }
+
+    /// Snapshot only visible directory listings. Arc identity lets the worker
+    /// reject results superseded by a manual refresh or a newer load.
+    pub fn refresh_targets(&self) -> Vec<(PathBuf, Arc<Listing>)> {
+        self.listings
+            .iter()
+            .filter(|(path, listing)| {
+                !matches!(listing.as_ref(), Listing::Loading)
+                    && (Some(*path) == self.root.as_ref()
+                        || (self.expanded.contains(*path)
+                            && path
+                                .ancestors()
+                                .skip(1)
+                                .take_while(|p| Some(*p) != self.root.as_deref())
+                                .all(|parent| self.expanded.contains(parent))
+                            && self
+                                .root
+                                .as_ref()
+                                .is_some_and(|root| self.expanded.contains(root))))
+            })
+            .map(|(path, listing)| (path.clone(), listing.clone()))
+            .collect()
+    }
+
+    /// Apply a directory delta without collapsing surviving folders or
+    /// touching open editor buffers. Returns false for quiet/stale checks.
+    pub fn update_listing(
+        &mut self,
+        generation: u64,
+        path: PathBuf,
+        previous: &Arc<Listing>,
+        listing: Listing,
+    ) -> bool {
+        if generation != self.generation
+            || !self
+                .listings
+                .get(&path)
+                .is_some_and(|current| Arc::ptr_eq(current, previous))
+            || previous.as_ref() == &listing
+        {
+            return false;
+        }
+        if let Listing::Ready(new) = &listing {
+            let surviving: BTreeMap<_, _> = new
+                .iter()
+                .map(|entry| (&entry.path, entry.directory))
+                .collect();
+            // Inspect cached descendants too: an intervening read error may
+            // have replaced the previous Ready listing.
+            let mut removed = BTreeSet::new();
+            for candidate in self
+                .listings
+                .keys()
+                .chain(self.expanded.iter())
+                .chain(self.selected.iter())
+            {
+                let Ok(relative) = candidate.strip_prefix(&path) else {
+                    continue;
+                };
+                let mut components = relative.components();
+                let Some(child) = components.next() else {
+                    continue;
+                };
+                let child = path.join(child);
+                let needs_directory = components.next().is_some()
+                    || self.listings.contains_key(candidate)
+                    || self.expanded.contains(candidate);
+                if !surviving
+                    .get(&child)
+                    .is_some_and(|directory| !needs_directory || *directory)
+                {
+                    removed.insert(child);
+                }
+            }
+            let deleted = |candidate: &Path| {
+                candidate
+                    .ancestors()
+                    .any(|ancestor| removed.contains(ancestor))
+            };
+            self.expanded.retain(|p| !deleted(p));
+            self.listings.retain(|p, _| !deleted(p));
+            if self.selected.as_ref().is_some_and(|p| deleted(p)) {
+                self.selected = Some(path.clone());
+            }
+        }
+        self.listings.insert(path, Arc::new(listing));
+        true
     }
 }
 
@@ -103,6 +197,110 @@ pub fn read_directory(path: &Path) -> Listing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_prunes_deleted_children_and_does_not_strand_pending_loads() {
+        let root = PathBuf::from("project");
+        let child = root.join("child");
+        let mut explorer = Explorer::default();
+        explorer.set_root(Some(root.clone()));
+        let generation = explorer.generation;
+        explorer.accept(generation, root.clone(), Listing::Error("temporary".into()));
+        explorer
+            .listings
+            .insert(child.clone(), Arc::new(Listing::Loading));
+        explorer.expanded.insert(child.clone());
+        explorer.selected = Some(child.join("gone.txt"));
+        explorer.accept(generation, child.clone(), Listing::Ready(vec![]));
+        assert!(
+            matches!(explorer.listings[&child].as_ref(), Listing::Ready(_)),
+            "parent read error must not strand a pending load"
+        );
+        let previous = explorer.listings[&root].clone();
+        assert!(explorer.update_listing(
+            generation,
+            root.clone(),
+            &previous,
+            Listing::Ready(vec![])
+        ));
+        assert_eq!(explorer.selected, Some(root));
+        assert!(!explorer.listings.contains_key(&child));
+        assert!(!explorer.expanded.contains(&child));
+        assert_eq!(explorer.refresh_targets().len(), 1);
+    }
+
+    #[test]
+    fn refresh_preserves_expansion_and_selection_but_prunes_deleted_subtrees() {
+        let root = PathBuf::from("project");
+        let folder = root.join("folder");
+        let file = folder.join("file.txt");
+        let listing = Listing::Ready(vec![Entry {
+            path: folder.clone(),
+            name: "folder".into(),
+            directory: true,
+        }]);
+        let mut explorer = Explorer::default();
+        explorer.set_root(Some(root.clone()));
+        explorer.accept(explorer.generation, root.clone(), listing.clone());
+        explorer.expanded.insert(folder.clone());
+        explorer.accept(explorer.generation, folder.clone(), Listing::Ready(vec![]));
+        explorer.selected = Some(file.clone());
+        let previous = explorer.listings[&root].clone();
+        assert!(!explorer.update_listing(explorer.generation, root.clone(), &previous, listing));
+        assert_eq!(explorer.selected, Some(file));
+        assert_eq!(explorer.refresh_targets().len(), 2);
+        explorer.expanded.remove(&root);
+        assert_eq!(
+            explorer.refresh_targets().len(),
+            1,
+            "collapsed descendants are not scanned"
+        );
+        explorer.expanded.insert(root.clone());
+        assert!(explorer.update_listing(
+            explorer.generation,
+            root.clone(),
+            &previous,
+            Listing::Ready(vec![])
+        ));
+        assert_eq!(explorer.selected, Some(root.clone()));
+        assert!(!explorer.expanded.contains(&folder));
+        assert!(!explorer.listings.contains_key(&folder));
+        explorer.accept(explorer.generation, folder.clone(), Listing::Ready(vec![]));
+        assert!(
+            !explorer.listings.contains_key(&folder),
+            "late initial loads cannot resurrect a deleted folder"
+        );
+        assert!(!explorer.update_listing(
+            explorer.generation,
+            root,
+            &previous,
+            Listing::Error("stale".into())
+        ));
+    }
+
+    #[test]
+    fn automatic_refresh_rejects_results_after_manual_refresh_or_workspace_switch() {
+        let root = PathBuf::from("project");
+        let mut explorer = Explorer::default();
+        explorer.set_root(Some(root.clone()));
+        explorer.accept(explorer.generation, root.clone(), Listing::Ready(vec![]));
+        let previous = explorer.listings[&root].clone();
+        let generation = explorer.generation;
+        explorer.refresh();
+        assert!(!explorer.update_listing(
+            generation,
+            root.clone(),
+            &previous,
+            Listing::Ready(vec![])
+        ));
+        explorer.set_root(Some(PathBuf::from("other")));
+        assert!(!explorer.update_listing(
+            generation,
+            root,
+            &previous,
+            Listing::Error("old".into())
+        ));
+    }
 
     #[test]
     fn workspace_switch_and_refresh_reject_old_results() {

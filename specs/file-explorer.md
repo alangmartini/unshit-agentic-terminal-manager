@@ -14,7 +14,11 @@ to the active pane.
 Directories load on demand on worker threads, with folders sorted before files.
 Hidden and ignored entries remain accessible, including empty directories.
 Directory symlinks are not traversed. Refresh clears cached listings and reloads
-the root; external filesystem changes appear on refresh. Workspace switches
+the root. While Explorer is visible, a background check refreshes visible folders
+about once a second. Unchanged listings cause no rebuild. Additions, renames and
+deletions preserve surviving expanded folders and selection; deleting a selected
+entry selects its parent. Hidden panels pause checks and catch up when reopened.
+Open editor buffers are never reloaded by this check. Workspace switches
 clear the tree, and results from an earlier workspace or refresh are discarded.
 Loading, unreadable folders, empty folders and workspaces without a folder have
 explicit messages. The existing sidebar resize handle controls explorer width.
