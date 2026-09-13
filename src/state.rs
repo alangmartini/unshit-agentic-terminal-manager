@@ -5635,6 +5635,63 @@ fn dispatch_editor_save(state: &mut AppState) -> bool {
     true
 }
 
+/// Paste the clipboard into `pane_id`'s editor buffer as one undo step.
+///
+/// Reached from `terminal.paste` (Ctrl+V, Ctrl+Shift+V, Shift+Insert are
+/// registered system bindings, so the shortcut resolver claims them before
+/// the pane's keyboard capture handler ever sees them) and from the
+/// editor's own Ctrl+V arm, which stays live in case the binding is
+/// overridden. Terminal paste normalisation deliberately does NOT apply:
+/// `normalize_pasted_text` promotes newlines to CR for the shell, which
+/// would collapse a multi-line paste into a single buffer line.
+/// `EditorBuffer::insert_str` does the editor-side normalisation (CRLF and
+/// lone CR to LF). Returns whether the buffer changed.
+pub(crate) fn dispatch_editor_paste(state: &mut AppState, pane_id: u32) -> bool {
+    let text = match state.clipboard.read_text() {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("editor.paste: clipboard read failed: {e}");
+            push_error_toast(state, format!("paste failed: {e}"));
+            return false;
+        }
+    };
+    // Empty covers a genuinely empty clipboard and the non-text payloads
+    // arboard maps to an empty string (image, file list). Silently doing
+    // nothing matches every editor; the terminal's image/file-path
+    // fallback would insert a temp path into the document.
+    if text.is_empty() {
+        return false;
+    }
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    let changed = editor.apply(|b| b.insert_str(&text));
+    if changed {
+        if let Some(editor) = state.editors.get(&pane_id) {
+            record_editor_pane_event(editor, "editor.paste", "info", None);
+        }
+        sync_editor_pane_title(state, pane_id);
+    }
+    changed
+}
+
+/// Copy `pane_id`'s editor selection to the clipboard. Returns `false`
+/// when there is nothing selected so the chord falls through unclaimed,
+/// mirroring the terminal copy path.
+pub(crate) fn dispatch_editor_copy(state: &mut AppState, pane_id: u32) -> bool {
+    let Some(editor) = state.editors.get(&pane_id) else {
+        return false;
+    };
+    let Some(text) = editor.buffer.selected_text() else {
+        return false;
+    };
+    if let Err(e) = state.clipboard.write_text(&text) {
+        log::warn!("editor.copy: clipboard write failed: {e}");
+        push_error_toast(state, format!("copy failed: {e}"));
+    }
+    true
+}
+
 /// Dirty editor panes among `pane_ids`, with their display names.
 fn dirty_editor_panes(state: &AppState, pane_ids: &[u32]) -> (Vec<u32>, Vec<String>) {
     pane_ids
@@ -7769,6 +7826,15 @@ fn dispatch_terminal_export_info(state: &mut AppState) -> bool {
 /// clipboard payload cannot forge an "end of paste" mid-string.
 /// See the TODO on [`normalize_pasted_text`].
 fn dispatch_terminal_paste(state: &mut AppState) -> bool {
+    // Ctrl+V and friends are registered system bindings, so they reach
+    // this command even when the focused pane is an editor. Route those
+    // into the buffer instead of failing the PTY check below with
+    // "paste failed: no terminal in focus".
+    let active = state.active_pane.0;
+    if state.editors.contains_key(&active) {
+        dispatch_editor_paste(state, active);
+        return true;
+    }
     // Read first: if the system says no clipboard at all, surface that
     // before chasing pane / PTY issues.
     let raw = match state.clipboard.read_text() {
@@ -7930,6 +7996,12 @@ pub fn active_pane_has_selection(state: &AppState) -> bool {
 /// and the conditional `Ctrl+C`-with-selection path.
 fn dispatch_terminal_copy(state: &mut AppState) -> bool {
     let pane_id = state.active_pane.0;
+    // Ctrl+Shift+C is a registered system binding and reaches editor
+    // panes too; copy their buffer selection rather than looking for a
+    // terminal selection that can never exist.
+    if state.editors.contains_key(&pane_id) {
+        return dispatch_editor_copy(state, pane_id);
+    }
     let sel = match state.terminal_selections.get(&pane_id).copied() {
         Some(sel) if !sel.is_empty() => sel,
         _ => return false,
@@ -10774,13 +10846,10 @@ pub(crate) mod tests {
         // dialog that would clobber the filename+dirty title.
         assert!(!dispatch(&mut state, "session.rename_active"));
         assert!(state.confirm_dialog.is_none());
-        // Paste writes to a PTY the editor pane does not have; the write
-        // fails internally without panicking or corrupting the buffer.
-        // The dispatch reads the real OS clipboard, so hold the guard.
-        let before = state.editors[&state.active_pane.0].buffer.to_text();
-        let _lock = clipboard_access_guard();
-        dispatch(&mut state, "terminal.paste");
-        assert_eq!(state.editors[&state.active_pane.0].buffer.to_text(), before);
+        // `terminal.paste` is deliberately NOT in this list: Ctrl+V is a
+        // registered system binding, so it is the only way a paste can
+        // reach an editor pane. It routes into the buffer instead — see
+        // `terminal_paste_in_an_editor_pane_inserts_into_the_buffer`.
         let _ = std::fs::remove_file(path);
     }
 
@@ -10978,6 +11047,99 @@ pub(crate) mod tests {
             &format!("editor.open:{}", path.display())
         ));
         assert_eq!(resolve_close_action(&mut state), CloseAction::KeepRunning);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Open `contents` in an editor tab and return its pane id and path.
+    fn open_editor(state: &mut AppState, tag: &str, contents: &[u8]) -> (u32, std::path::PathBuf) {
+        let path = editor_temp_file(tag, contents);
+        assert!(dispatch(state, &format!("editor.open:{}", path.display())));
+        (state.active_pane.0, path)
+    }
+
+    /// REGRESSION: Ctrl+V / Ctrl+Shift+V / Shift+Insert are registered
+    /// system bindings, so the framework's shortcut resolver claims them
+    /// during keyboard capture and the editor's own key arm never runs.
+    /// `terminal.paste` used to fail its PTY check and toast "paste
+    /// failed: no terminal in focus", making paste impossible in an
+    /// editor pane. It must reach the buffer instead.
+    #[test]
+    fn terminal_paste_in_an_editor_pane_inserts_into_the_buffer() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let (pane_id, path) = open_editor(&mut state, "paste", b"alpha\n");
+        let _ = state.clipboard.write_text("beta");
+        let toasts_before = state.toasts.len();
+
+        assert!(dispatch(&mut state, "terminal.paste"));
+
+        let editor = &state.editors[&pane_id];
+        assert!(
+            editor.buffer.to_text().contains("beta"),
+            "clipboard text must land in the buffer, got {:?}",
+            editor.buffer.to_text()
+        );
+        assert!(editor.dirty, "a paste marks the buffer dirty");
+        assert_eq!(
+            state.toasts.len(),
+            toasts_before,
+            "paste into an editor must not toast a terminal focus error"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Terminal paste promotes newlines to CR for the shell; an editor
+    /// paste must not, or a multi-line clipboard payload would collapse
+    /// into one line.
+    #[test]
+    fn terminal_paste_in_an_editor_pane_keeps_multiple_lines() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let (pane_id, path) = open_editor(&mut state, "pastecrlf", b"");
+        let _ = state.clipboard.write_text("one\r\ntwo\nthree");
+
+        assert!(dispatch(&mut state, "terminal.paste"));
+
+        let editor = &state.editors[&pane_id];
+        assert_eq!(editor.buffer.line_count(), 3, "CRLF and LF both split");
+        assert_eq!(editor.buffer.line(0), Some("one"));
+        assert_eq!(editor.buffer.line(2), Some("three"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Ctrl+Shift+C is a registered system binding too, so `terminal.copy`
+    /// has to serve editor panes.
+    #[test]
+    fn terminal_copy_in_an_editor_pane_copies_the_selection() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let (pane_id, path) = open_editor(&mut state, "copy", b"gamma\n");
+        let _ = state.clipboard.write_text("stale");
+        state.editors.get_mut(&pane_id).expect("editor").apply(|b| {
+            b.select_all();
+            crate::editor::Damage::None
+        });
+
+        assert!(dispatch(&mut state, "terminal.copy"));
+
+        let copied = state.clipboard.read_text().unwrap_or_default();
+        assert!(
+            copied.contains("gamma"),
+            "selection must reach the clipboard, got {copied:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// With nothing selected the chord stays unclaimed, matching the
+    /// terminal path, so it can fall through to other handlers.
+    #[test]
+    fn terminal_copy_in_an_editor_pane_without_selection_is_unclaimed() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let (_pane_id, path) = open_editor(&mut state, "copynone", b"delta\n");
+
+        assert!(!dispatch(&mut state, "terminal.copy"));
+
         let _ = std::fs::remove_file(path);
     }
 

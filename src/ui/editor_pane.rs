@@ -60,6 +60,32 @@ pub(crate) fn handle_editor_key(
         return None;
     }
 
+    // Clipboard chords resolve before the buffer borrow below so they can
+    // share the state-level helpers with `terminal.paste` / `terminal.copy`.
+    // Those commands are the paths that actually fire today: Ctrl+V,
+    // Ctrl+Shift+V, Shift+Insert and Ctrl+Shift+C are registered system
+    // bindings, and the framework resolves registered chords before handing
+    // a key to a capturing pane. These arms stay live for the unbound case
+    // and keep cut/copy/paste behaviour in one place. Copy and cut consume
+    // the key even without a selection so nothing leaks to other handlers.
+    if ctrl && !alt && !shift && st.editors.contains_key(&pane_id) {
+        match kb.key {
+            Key::Char('c') | Key::Char('C') => {
+                crate::state::dispatch_editor_copy(st, pane_id);
+                return Some(false);
+            }
+            Key::Char('v') | Key::Char('V') => {
+                return Some(crate::state::dispatch_editor_paste(st, pane_id));
+            }
+            Key::Char('x') | Key::Char('X') => {
+                crate::state::dispatch_editor_copy(st, pane_id);
+                let editor = st.editors.get_mut(&pane_id)?;
+                return Some(editor.apply(|b| b.delete_selection()));
+            }
+            _ => {}
+        }
+    }
+
     let editor = st.editors.get_mut(&pane_id)?;
     let page = page_step(editor.grid.rows());
 
@@ -126,33 +152,6 @@ pub(crate) fn handle_editor_key(
             b.select_all();
             Damage::None
         }),
-        // Clipboard. Copy/cut consume the key even without a selection
-        // so nothing leaks toward other handlers.
-        Key::Char('c') | Key::Char('C') if ctrl && !shift && !alt => {
-            if let Some(text) = editor.buffer.selected_text() {
-                if let Err(e) = st.clipboard.write_text(&text) {
-                    log::warn!("editor copy: clipboard write failed: {e}");
-                }
-            }
-            false
-        }
-        Key::Char('x') | Key::Char('X') if ctrl && !shift && !alt => {
-            match editor.buffer.selected_text() {
-                Some(text) => {
-                    if let Err(e) = st.clipboard.write_text(&text) {
-                        log::warn!("editor cut: clipboard write failed: {e}");
-                    }
-                    editor.apply(|b| b.delete_selection())
-                }
-                None => false,
-            }
-        }
-        Key::Char('v') | Key::Char('V') if ctrl && !shift && !alt => {
-            match st.clipboard.read_text() {
-                Ok(text) if !text.is_empty() => editor.apply(|b| b.insert_str(&text)),
-                _ => false,
-            }
-        }
         // Undo / redo.
         Key::Char('z') | Key::Char('Z') if ctrl && !shift && !alt => editor.apply(|b| b.undo()),
         Key::Char('y') | Key::Char('Y') if ctrl && !shift && !alt => editor.apply(|b| b.redo()),
