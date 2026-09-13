@@ -85,6 +85,16 @@ pub struct TreeUsage {
     /// Image name of the root process (`pwsh.exe`), the shell that is
     /// actually running rather than whatever the pane was seeded with.
     pub root_exe: Option<String>,
+    /// Sampled members, shared cheaply with UI snapshots.
+    pub processes: Arc<[ProcessUsage]>,
+}
+
+/// Working set of an individual process from the same tick as its tree total.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessUsage {
+    pub pid: u32,
+    pub name: String,
+    pub mem_bytes: u64,
 }
 
 /// The daemon's session list as of a roots refresh. Applied to the state
@@ -197,6 +207,7 @@ struct DisplayKey {
     /// What the Sessions panel shows, only while it is open; a closed panel
     /// must not cost a rebuild when an unowned session's memory moves.
     sessions_panel: Option<SessionsPanelKey>,
+    process_details: Vec<(u32, String, u64)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -236,6 +247,20 @@ impl DisplayKey {
                     )
                 })
                 .collect(),
+            process_details: if state.process_details_open {
+                let mut rows: Vec<_> = state
+                    .panes
+                    .iter()
+                    .flatten()
+                    .filter_map(|pane| state.resource_trees.get(&pane.pid))
+                    .flat_map(|tree| tree.processes.iter())
+                    .map(|p| (p.pid, p.name.clone(), p.mem_bytes))
+                    .collect();
+                rows.sort_unstable();
+                rows
+            } else {
+                Vec::new()
+            },
             sessions_panel: sessions_open.then(|| {
                 let mut trees: Vec<(u32, i64, u64, u32)> = state
                     .resource_trees
@@ -539,12 +564,21 @@ impl Monitor {
             .unwrap_or(0);
 
         let mut per_root: HashMap<u32, (u64, u64, u32)> = HashMap::new();
+        let mut members: HashMap<u32, Vec<ProcessUsage>> = HashMap::new();
         for sample in &attributed {
             let root = owner[&sample.pid];
             let entry = per_root.entry(root).or_default();
             entry.0 += deltas.as_ref().map_or(0, |d| d[&sample.pid]);
             entry.1 += sample.working_set_bytes;
             entry.2 += 1;
+            members.entry(root).or_default().push(ProcessUsage {
+                pid: sample.pid,
+                name: image_names
+                    .get(&sample.pid)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown process".into()),
+                mem_bytes: sample.working_set_bytes,
+            });
         }
 
         let total_cpu: u64 = per_root.values().map(|v| v.0).sum();
@@ -564,6 +598,7 @@ impl Monitor {
                     mem_bytes: mem,
                     process_count: count,
                     root_exe: image_names.get(&root).cloned(),
+                    processes: members.remove(&root).unwrap_or_default().into(),
                 };
                 (root, usage)
             })
@@ -785,6 +820,72 @@ mod tests {
     }
 
     #[test]
+    fn process_detail_changes_only_rebuild_when_open() {
+        let mut state = seed_state();
+        let pane_id = state.panes[0][0].id.0;
+        let mut report = ResourceReport {
+            panes: vec![PaneResources {
+                pane_id,
+                pid: 42,
+                cpu_pct: None,
+                mem_bytes: 100,
+                process_count: 1,
+            }],
+            trees: HashMap::from([(
+                42,
+                TreeUsage {
+                    mem_bytes: 100,
+                    process_count: 1,
+                    processes: vec![ProcessUsage {
+                        pid: 42,
+                        name: "shell.exe".into(),
+                        mem_bytes: 100,
+                    }]
+                    .into(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        apply_report(&mut state, &report);
+        report.trees.get_mut(&42).unwrap().processes = vec![ProcessUsage {
+            pid: 43,
+            name: "node.exe".into(),
+            mem_bytes: 100,
+        }]
+        .into();
+        assert!(!apply_report(&mut state, &report));
+        state.process_details_open = true;
+        report.trees.get_mut(&42).unwrap().processes = vec![ProcessUsage {
+            pid: 44,
+            name: "git.exe".into(),
+            mem_bytes: 100,
+        }]
+        .into();
+        assert!(apply_report(&mut state, &report));
+        assert!(!apply_report(&mut state, &report));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sampled_process_members_match_tree_totals() {
+        let mut monitor = Monitor::with_emitter(|_| {});
+        let mut report = ResourceReport::default();
+        monitor.sample_trees(&mut report, platform::now_100ns(), Instant::now());
+        let tree = &report.trees[&std::process::id()];
+        assert!(!tree.processes.is_empty());
+        assert_eq!(tree.process_count as usize, tree.processes.len());
+        assert_eq!(
+            tree.mem_bytes,
+            tree.processes.iter().map(|p| p.mem_bytes).sum::<u64>()
+        );
+        assert!(tree
+            .processes
+            .iter()
+            .any(|p| p.pid == std::process::id() && !p.name.is_empty()));
+    }
+
+    #[test]
     fn trees_and_daemon_rows_land_in_state_for_the_sessions_panel() {
         let mut state = seed_state();
         state.sessions_stale = true;
@@ -796,6 +897,7 @@ mod tests {
                 mem_bytes: 300 << 20,
                 process_count: 4,
                 root_exe: None,
+                processes: Default::default(),
             },
         );
         let report = ResourceReport {
@@ -853,6 +955,7 @@ mod tests {
                 mem_bytes: 10 << 20,
                 process_count: 1,
                 root_exe: None,
+                processes: Default::default(),
             },
         );
         assert!(apply_report(&mut state, &report));
@@ -892,6 +995,7 @@ mod tests {
                 mem_bytes: 100 << 20,
                 process_count: 1,
                 root_exe: None,
+                processes: Default::default(),
             },
         );
         assert!(apply_report(&mut state, &report));
