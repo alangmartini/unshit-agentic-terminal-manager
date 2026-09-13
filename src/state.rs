@@ -1369,10 +1369,9 @@ impl AppState {
             // a workspace with no directory no rebuild is ever scheduled,
             // so gate on the root here rather than trusting whatever is
             // in the field.
-            file_index: self
-                .file_index
-                .clone()
-                .filter(|index| active_workspace_cwd(self).as_deref() == Some(index.root.as_path())),
+            file_index: self.file_index.clone().filter(|index| {
+                active_workspace_cwd(self).as_deref() == Some(index.root.as_path())
+            }),
             file_index_building: self.file_index_building,
         }
     }
@@ -17879,7 +17878,10 @@ pub(crate) mod tests {
             truncated: false,
             built_at: std::time::Instant::now(),
         }));
-        assert!(state.ui_snapshot().file_index.is_some(), "the real one does");
+        assert!(
+            state.ui_snapshot().file_index.is_some(),
+            "the real one does"
+        );
     }
 
     #[test]

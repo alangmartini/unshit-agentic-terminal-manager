@@ -945,7 +945,10 @@ impl EditorPane {
             return None;
         }
         // Never `join`: `file.path` came out of git's own output.
-        Some((crate::git::resolve_in_repo(&view.repo_root, &file.path)?, line))
+        Some((
+            crate::git::resolve_in_repo(&view.repo_root, &file.path)?,
+            line,
+        ))
     }
 }
 

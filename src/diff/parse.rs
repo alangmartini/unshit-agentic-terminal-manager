@@ -47,8 +47,7 @@ const TRUNCATION_NOTICE: &str = "… diff truncated: too many rows to display";
 /// Text of the [`DiffRowKind::Meta`] row appended when git wrote more than
 /// the stdout cap. Separate from [`TRUNCATION_NOTICE`] because the cause
 /// is different: the row budget was fine, git's output was not.
-const OUTPUT_CUT_NOTICE: &str =
-    "… diff truncated: git produced more output than can be shown";
+const OUTPUT_CUT_NOTICE: &str = "… diff truncated: git produced more output than can be shown";
 
 /// Text of the [`DiffRowKind::Meta`] row that stands in for a combined
 /// (merge) diff. We refuse to parse `@@@` hunks rather than mis-attribute
