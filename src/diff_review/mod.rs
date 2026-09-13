@@ -306,7 +306,7 @@ fn refresh(review: &mut Review) {
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
-    if command == "diff.open" {
+    if command == "review.open" {
         let root = state
             .pty_manager
             .spawn_cwd(state.active_pane.0)
@@ -324,14 +324,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         state.diff_review = Some(review);
         return true;
     }
-    if command == "diff.close" {
+    if command == "review.close" {
         return state.diff_review.take().is_some();
     }
     let Some(review) = state.diff_review.as_mut() else {
         return false;
     };
     match command {
-        "diff.viewed" => {
+        "review.viewed" => {
             if review.loading
                 || review.error.is_some()
                 || !review
@@ -346,56 +346,56 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 viewed.insert(review.selected);
             }
         }
-        "diff.hunk_prev" | "diff.hunk_next" => {
-            let Some(index) = review.hunk_target(command == "diff.hunk_next") else {
+        "review.hunk_prev" | "review.hunk_next" => {
+            let Some(index) = review.hunk_target(command == "review.hunk_next") else {
                 return false;
             };
             review.active_hunk = Some(index);
             review.row_start = review.hunk_row(index);
         }
-        "diff.file_start" if review.row_start > 0 || review.active_hunk.is_some() => {
+        "review.file_start" if review.row_start > 0 || review.active_hunk.is_some() => {
             review.row_start = 0;
             review.active_hunk = None;
         }
-        "diff.filter_clear" => {
+        "review.filter_clear" => {
             review.set_file_filter("");
             review.file_filter_reset = review.file_filter_reset.wrapping_add(1);
         }
-        other if let Some(query) = other.strip_prefix("diff.filter:") => {
+        other if let Some(query) = other.strip_prefix("review.filter:") => {
             review.set_file_filter(query)
         }
-        "diff.view:unified" | "diff.view:split" => {
-            let split = command == "diff.view:split";
+        "review.view:unified" | "review.view:split" => {
+            let split = command == "review.view:split";
             if review.side_by_side == split {
                 return false;
             }
             review.side_by_side = split;
             review.row_start = review.active_hunk.map_or(0, |index| review.hunk_row(index));
         }
-        "diff.refresh" => refresh(review),
-        "diff.mode:last" | "diff.mode:unpushed" | "diff.mode:base" => {
+        "review.refresh" => refresh(review),
+        "review.mode:last" | "review.mode:unpushed" | "review.mode:base" => {
             review.mode = match command {
-                "diff.mode:base" => "base",
-                "diff.mode:unpushed" => "unpushed",
+                "review.mode:base" => "base",
+                "review.mode:unpushed" => "unpushed",
                 _ => "last",
             };
             refresh(review);
         }
-        "diff.prev" if review.row_start > 0 => {
+        "review.prev" if review.row_start > 0 => {
             review.row_start = review.row_start.saturating_sub(PAGE_LINES);
             review.active_hunk = None;
         }
-        "diff.next" if review.row_start + PAGE_LINES < review.row_count() => {
+        "review.next" if review.row_start + PAGE_LINES < review.row_count() => {
             review.row_start += PAGE_LINES;
             review.active_hunk = None;
         }
-        "diff.files_prev" => review.file_page = review.file_page.saturating_sub(1),
-        "diff.files_next" if (review.file_page + 1) * PAGE_FILES < review.file_matches.len() => {
+        "review.files_prev" => review.file_page = review.file_page.saturating_sub(1),
+        "review.files_next" if (review.file_page + 1) * PAGE_FILES < review.file_matches.len() => {
             review.file_page += 1
         }
         _ => {
             let Some(index) = command
-                .strip_prefix("diff.file:")
+                .strip_prefix("review.file:")
                 .and_then(|n| n.parse::<usize>().ok())
             else {
                 return false;
@@ -429,28 +429,28 @@ mod tests {
             });
         let lines = review.lines.clone();
         let request = review.request;
-        assert!(dispatch(&mut state, "diff.viewed"));
+        assert!(dispatch(&mut state, "review.viewed"));
         let report = state.diff_review.as_ref().unwrap().report.clone().unwrap();
         assert!(apply(&mut state, request, Ok(report), None));
         assert!(state.diff_review.as_ref().unwrap().viewed.contains(&0));
-        assert!(dispatch(&mut state, "diff.filter:missing"));
-        assert!(dispatch(&mut state, "diff.view:split"));
+        assert!(dispatch(&mut state, "review.filter:missing"));
+        assert!(dispatch(&mut state, "review.view:split"));
         let review = state.diff_review.as_ref().unwrap();
         assert!(review.viewed.contains(&0));
         assert_eq!(review.request, request);
         assert!(Arc::ptr_eq(&lines, &review.lines));
-        assert!(dispatch(&mut state, "diff.viewed"));
+        assert!(dispatch(&mut state, "review.viewed"));
         assert!(state.diff_review.as_ref().unwrap().viewed.is_empty());
         state.diff_review.as_mut().unwrap().loading = true;
-        assert!(!dispatch(&mut state, "diff.viewed"));
+        assert!(!dispatch(&mut state, "review.viewed"));
         state.diff_review.as_mut().unwrap().loading = false;
         state.diff_review.as_mut().unwrap().error = Some("Patch unavailable".into());
-        assert!(!dispatch(&mut state, "diff.viewed"));
+        assert!(!dispatch(&mut state, "review.viewed"));
         state.diff_review.as_mut().unwrap().error = None;
-        assert!(dispatch(&mut state, "diff.viewed"));
-        assert!(dispatch(&mut state, "diff.refresh"));
+        assert!(dispatch(&mut state, "review.viewed"));
+        assert!(dispatch(&mut state, "review.refresh"));
         assert!(state.diff_review.as_ref().unwrap().viewed.is_empty());
-        assert!(!dispatch(&mut state, "diff.viewed"));
+        assert!(!dispatch(&mut state, "review.viewed"));
     }
 
     fn state_with_patch(text: &str) -> AppState {
@@ -479,36 +479,36 @@ mod tests {
         let patch = format!("diff --git a/a b/a\n@@ -1,211 +1,211 @@\n{}{} same\n@@ -900 +900 @@\n-before\n+after\n", "-old\n".repeat(210), "+new\n".repeat(210));
         let mut state = state_with_patch(&patch);
         let lines = state.diff_review.as_ref().unwrap().lines.clone();
-        assert!(!dispatch(&mut state, "diff.hunk_prev"));
-        assert!(dispatch(&mut state, "diff.hunk_next"));
+        assert!(!dispatch(&mut state, "review.hunk_prev"));
+        assert!(dispatch(&mut state, "review.hunk_next"));
         assert_eq!(state.diff_review.as_ref().unwrap().row_start, 1);
-        assert!(dispatch(&mut state, "diff.hunk_next"));
+        assert!(dispatch(&mut state, "review.hunk_next"));
         assert_eq!(state.diff_review.as_ref().unwrap().row_start, 423);
         assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, Some(1));
-        assert!(!dispatch(&mut state, "diff.hunk_next"));
-        assert!(dispatch(&mut state, "diff.view:split"));
+        assert!(!dispatch(&mut state, "review.hunk_next"));
+        assert!(dispatch(&mut state, "review.view:split"));
         assert_eq!(state.diff_review.as_ref().unwrap().row_start, 213);
         assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, Some(1));
-        assert!(dispatch(&mut state, "diff.hunk_prev"));
-        assert!(!dispatch(&mut state, "diff.hunk_prev"));
+        assert!(dispatch(&mut state, "review.hunk_prev"));
+        assert!(!dispatch(&mut state, "review.hunk_prev"));
         let review = state.diff_review.as_ref().unwrap();
         assert_eq!(review.request, 42);
         assert!(Arc::ptr_eq(&lines, &review.lines));
-        assert!(dispatch(&mut state, "diff.next"));
+        assert!(dispatch(&mut state, "review.next"));
         assert_eq!(state.diff_review.as_ref().unwrap().row_start, 201);
         assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, None);
-        assert!(dispatch(&mut state, "diff.hunk_next"));
+        assert!(dispatch(&mut state, "review.hunk_next"));
         assert_eq!(state.diff_review.as_ref().unwrap().row_start, 213);
-        assert!(dispatch(&mut state, "diff.file_start"));
+        assert!(dispatch(&mut state, "review.file_start"));
         assert_eq!(state.diff_review.as_ref().unwrap().row_start, 0);
         assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, None);
-        assert!(!dispatch(&mut state, "diff.file_start"));
-        assert!(dispatch(&mut state, "diff.hunk_next"));
+        assert!(!dispatch(&mut state, "review.file_start"));
+        assert!(dispatch(&mut state, "review.hunk_next"));
         state.diff_review.as_mut().unwrap().count = "0".into();
-        assert!(dispatch(&mut state, "diff.refresh"));
+        assert!(dispatch(&mut state, "review.refresh"));
         assert!(state.diff_review.as_ref().unwrap().hunks.is_empty());
         assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, None);
-        assert!(!dispatch(&mut state, "diff.hunk_next"));
+        assert!(!dispatch(&mut state, "review.hunk_next"));
     }
 
     #[test]
@@ -520,8 +520,8 @@ mod tests {
         ] {
             let mut state = state_with_patch(text);
             assert!(state.diff_review.as_ref().unwrap().hunks.is_empty());
-            assert!(!dispatch(&mut state, "diff.hunk_prev"));
-            assert!(!dispatch(&mut state, "diff.hunk_next"));
+            assert!(!dispatch(&mut state, "review.hunk_prev"));
+            assert!(!dispatch(&mut state, "review.hunk_next"));
         }
     }
 
@@ -601,10 +601,10 @@ mod tests {
         review.report = Some(report.clone());
         review.set_file_filter("src/");
         state.diff_review = Some(review);
-        assert!(dispatch(&mut state, "diff.files_next"));
+        assert!(dispatch(&mut state, "review.files_next"));
         let index = state.diff_review.as_ref().unwrap().file_matches[PAGE_FILES];
         assert_eq!(index, 101);
-        assert!(dispatch(&mut state, &format!("diff.file:{index}")));
+        assert!(dispatch(&mut state, &format!("review.file:{index}")));
         let review = state.diff_review.as_ref().unwrap();
         let id = review.request;
         let matches = review.file_matches.clone();
@@ -613,8 +613,8 @@ mod tests {
         let review = state.diff_review.as_ref().unwrap();
         assert_eq!(review.file_page, 1);
         assert!(Arc::ptr_eq(&matches, &review.file_matches));
-        assert!(dispatch(&mut state, "diff.files_next"));
-        assert!(!dispatch(&mut state, "diff.files_next"));
+        assert!(dispatch(&mut state, "review.files_next"));
+        assert!(!dispatch(&mut state, "review.files_next"));
         let mut refreshed = (*report).clone();
         refreshed.files.truncate(1);
         assert!(apply(&mut state, id, Ok(Arc::new(refreshed)), None));
@@ -639,16 +639,16 @@ mod tests {
         review.request = 42;
         review.loading = true;
         state.diff_review = Some(review);
-        assert!(dispatch(&mut state, "diff.view:split"));
-        assert!(dispatch(&mut state, "diff.next"));
-        assert!(!dispatch(&mut state, "diff.next"));
+        assert!(dispatch(&mut state, "review.view:split"));
+        assert!(dispatch(&mut state, "review.next"));
+        assert!(!dispatch(&mut state, "review.next"));
         let review = state.diff_review.as_ref().unwrap();
         assert_eq!(review.row_start, PAGE_LINES);
         assert_eq!(review.row_count(), 202);
         assert_eq!(review.request, 42);
         assert!(review.loading);
         assert!(Arc::ptr_eq(&review.lines, &original));
-        assert!(dispatch(&mut state, "diff.view:unified"));
+        assert!(dispatch(&mut state, "review.view:unified"));
         let review = state.diff_review.as_ref().unwrap();
         assert_eq!(review.row_start, 0);
         assert_eq!(review.row_count(), 403);
@@ -670,7 +670,7 @@ mod tests {
             state.diff_review.as_ref().unwrap().error.as_deref(),
             Some("current")
         );
-        assert!(dispatch(&mut state, "diff.close"));
+        assert!(dispatch(&mut state, "review.close"));
         assert!(!apply(&mut state, 42, Err("closed".into()), None));
         assert!(state.diff_review.is_none());
     }

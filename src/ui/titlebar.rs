@@ -120,7 +120,7 @@ pub fn build_titlebar(
                         .with_tab_index(0)
                         .with_text("Review diff")
                         .on_click(move || {
-                            mutate_with(&diff_state, |st| dispatch(st, "diff.open"));
+                            mutate_with(&diff_state, |st| dispatch(st, "review.open"));
                         }),
                 )
                 .with_child(

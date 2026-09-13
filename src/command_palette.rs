@@ -104,7 +104,7 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         icon: PaletteIcon::Workspace,
         keybind: None,
         shortcut_label: None,
-        dispatch: "diff.open",
+        dispatch: "review.open",
         keywords: &["git", "diff", "pr", "review", "commits", "push", "changes"],
         enabled: true,
     },
@@ -1449,7 +1449,7 @@ mod tests {
                         | "agent.new:codex"
                         | "editor.open"
                         | "editor.save"
-                        | "diff.open"
+                        | "review.open"
                         | "flow.open"
                         | "flow.explain"
                         | "flow.review"

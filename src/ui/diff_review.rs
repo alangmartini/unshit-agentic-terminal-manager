@@ -50,7 +50,7 @@ fn input(shared: &SharedState, review: &Review, count: bool) -> ElementDef {
             });
         })
         .on_submit(move |_| {
-            mutate_with(&submit, |st| dispatch(st, "diff.refresh"));
+            mutate_with(&submit, |st| dispatch(st, "review.refresh"));
         })
 }
 
@@ -64,7 +64,7 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         ("unpushed", "Unpushed"),
         ("base", "Compare base"),
     ] {
-        let mut tab = button(shared, title, format!("diff.mode:{mode}"));
+        let mut tab = button(shared, title, format!("review.mode:{mode}"));
         if review.mode == mode {
             tab = tab.with_class("diff-active");
         }
@@ -82,11 +82,11 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
             ))
             .with_child(input(shared, review, review.mode == "last"));
     }
-    toolbar = toolbar.with_child(button(shared, "Refresh", "diff.refresh"));
+    toolbar = toolbar.with_child(button(shared, "Refresh", "review.refresh"));
     let mut views = ElementDef::new(Tag::Div).with_class("diff-view-switch");
     for (split, title, command) in [
-        (false, "Unified", "diff.view:unified"),
-        (true, "Side by side", "diff.view:split"),
+        (false, "Unified", "review.view:unified"),
+        (true, "Side by side", "review.view:split"),
     ] {
         let mut view = button(shared, title, command);
         if review.side_by_side == split {
@@ -99,7 +99,7 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_class("diff-header")
         .with_child(label("diff-title", "Changes"))
         .with_child(label("diff-subtitle", review.root.display().to_string()))
-        .with_child(button(shared, "Close · Esc", "diff.close").with_autofocus(true));
+        .with_child(button(shared, "Close · Esc", "review.close").with_autofocus(true));
     let mut content = ElementDef::new(Tag::Div).with_class("diff-content");
     if let Some(report) = &review.report {
         let added: usize = report.files.iter().filter_map(|f| f.added).sum();
@@ -165,8 +165,8 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
         files = files.with_child(
             ElementDef::new(Tag::Div)
                 .with_class("diff-pagination")
-                .with_child(button(shared, "Previous files", "diff.files_prev"))
-                .with_child(button(shared, "Next files", "diff.files_next"))
+                .with_child(button(shared, "Previous files", "review.files_prev"))
+                .with_child(button(shared, "Next files", "review.files_next"))
                 .with_child(label(
                     "diff-file-stats",
                     format!(
@@ -193,7 +193,7 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
             (Some(a), Some(d)) => format!("+{a}  -{d}"),
             _ => "Binary".into(),
         };
-        let mut entry = button(shared, "", format!("diff.file:{index}"))
+        let mut entry = button(shared, "", format!("review.file:{index}"))
             .with_class("diff-file")
             .with_child(label("diff-file-name", name))
             .with_child(label("diff-file-stats", stats));
@@ -230,7 +230,7 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
                     } else {
                         "Mark viewed"
                     },
-                    "diff.viewed",
+                    "review.viewed",
                 )
                 .with_id("diff-viewed-toggle")
                 .with_class(if viewed {
@@ -300,7 +300,7 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
             patch = patch.with_child(
                 ElementDef::new(Tag::Div)
                     .with_class("diff-pagination")
-                    .with_child(button(shared, "Previous", "diff.prev"))
+                    .with_child(button(shared, "Previous", "review.prev"))
                     .with_child(label(
                         "diff-page-label",
                         format!(
@@ -310,7 +310,7 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
                             review.row_count()
                         ),
                     ))
-                    .with_child(button(shared, "Next", "diff.next")),
+                    .with_child(button(shared, "Next", "review.next")),
             );
         }
     }
@@ -331,7 +331,7 @@ fn build_file_filter(shared: &SharedState, review: &Review) -> ElementDef {
         .with_placeholder("Filter files by path")
         .with_value(&review.file_filter)
         .on_change(move |text| {
-            mutate_with(&change, |st| dispatch(st, &format!("diff.filter:{text}")));
+            mutate_with(&change, |st| dispatch(st, &format!("review.filter:{text}")));
         });
     let total = review.report.as_ref().map_or(0, |r| r.files.len());
     ElementDef::new(Tag::Div)
@@ -345,7 +345,7 @@ fn build_file_filter(shared: &SharedState, review: &Review) -> ElementDef {
                     "diff-filter-count",
                     format!("{} of {total} files", review.file_matches.len()),
                 ))
-                .with_child(button(shared, "Clear filter", "diff.filter_clear")),
+                .with_child(button(shared, "Clear filter", "review.filter_clear")),
         )
 }
 
@@ -363,17 +363,17 @@ fn build_hunk_navigation(shared: &SharedState, review: &Review) -> ElementDef {
     for (text, command, enabled) in [
         (
             "Previous hunk",
-            "diff.hunk_prev",
+            "review.hunk_prev",
             review.hunk_target(false).is_some(),
         ),
         (
             "Next hunk",
-            "diff.hunk_next",
+            "review.hunk_next",
             review.hunk_target(true).is_some(),
         ),
         (
             "File start",
-            "diff.file_start",
+            "review.file_start",
             review.row_start > 0 || review.active_hunk.is_some(),
         ),
     ] {
@@ -784,10 +784,10 @@ mod tests {
                 .side_by_side = true;
         }
         if std::env::var("TM_DIFF_VISUAL_HUNK").as_deref() == Ok("1") {
-            dispatch(&mut shared.lock_recover(), "diff.hunk_next");
+            dispatch(&mut shared.lock_recover(), "review.hunk_next");
         }
         if std::env::var("TM_DIFF_VISUAL_VIEWED").as_deref() == Ok("1") {
-            dispatch(&mut shared.lock_recover(), "diff.viewed");
+            dispatch(&mut shared.lock_recover(), "review.viewed");
         }
         let mut harness = TestHarness::new(
             include_str!("../../assets/styles.css"),

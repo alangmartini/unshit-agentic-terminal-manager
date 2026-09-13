@@ -5413,7 +5413,7 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "quick_prompt.open"
             | "editor.open"
             | "editor.save"
-            | "diff.open"
+            | "review.open"
     ) || command.starts_with("workspace.switch:")
         || command.starts_with("terminal.focus:")
         || command.starts_with("flow.")
@@ -6402,7 +6402,7 @@ pub fn apply_flow_poll(
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
-    if command.starts_with("diff.") {
+    if command.starts_with("review.") {
         return crate::diff_review::dispatch(state, command);
     }
     match command {
