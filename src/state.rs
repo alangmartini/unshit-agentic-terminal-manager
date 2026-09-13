@@ -5598,33 +5598,42 @@ fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
         return false;
     }
 
-    // Quick open is the one palette mode whose rows are data rather than
-    // a fixed catalogue, so "which kind of row got picked" is the only
-    // way to tell later that the index was actually useful.
-    if item.kind == crate::command_palette::PaletteItemKind::File {
-        use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
-        let correlation_id = crate::editor::generate_correlation_id();
-        record_editor_event(&EditorEventRecord {
-            timestamp_unix_ms: now_unix_ms(),
-            event: "quickopen.pick",
-            level: "info",
-            correlation_id: &correlation_id,
-            // The path the user chose, which the editor sink records on
-            // the `editor.open` that follows anyway. Never the query.
-            path: Some(command.trim_start_matches("editor.open:")),
-            file_bytes: None,
-            line_count: None,
-            line: None,
-            reason: None,
-            os_error: None,
-        });
-    }
-
+    let picked_file = item.kind == crate::command_palette::PaletteItemKind::File;
     let handled = dispatch(state, &command);
     if handled {
         close_command_palette(state);
     }
+    // Quick open is the one palette mode whose rows are data rather than a
+    // fixed catalogue, so "did the index actually get used" is only
+    // answerable from a pick event. Recorded after the dispatch, on the
+    // pane the pick produced (or refocused), so the id joins pick -> open
+    // -> save -> close instead of naming nothing.
+    if picked_file && handled {
+        record_quickopen_pick(state);
+    }
     handled
+}
+
+/// `quickopen.pick` for the editor pane the palette just focused. Carries
+/// that pane's correlation id and path; never the query the user typed.
+fn record_quickopen_pick(state: &AppState) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+    let Some(editor) = state.editors.get(&state.active_pane.0) else {
+        return;
+    };
+    let path = editor.path.to_string_lossy().into_owned();
+    record_editor_event(&EditorEventRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event: "quickopen.pick",
+        level: "info",
+        correlation_id: &editor.correlation_id,
+        path: Some(&path),
+        file_bytes: None,
+        line_count: None,
+        line: None,
+        reason: None,
+        os_error: None,
+    });
 }
 
 /// Viewport dimensions for a new editor pane, derived the same way new
@@ -6628,6 +6637,37 @@ fn apply_diff_outcome(
             stdout_truncated,
             elapsed_ms,
         } => {
+            // Ownership first, telemetry after, and neither the sink write
+            // nor the rebuild inside the lock: a worker that blocks on the
+            // state lock across a file append blocks the UI thread behind
+            // it. `diff.ready` then means exactly "a pane is showing this",
+            // so counting it answers "how many diffs did people see".
+            let applied = {
+                let mut guard = hooks.shared.lock_recover();
+                if diff_pane_still_ours(&guard, pane_id, job_id) {
+                    if let Some(editor) = guard.editors.get_mut(&pane_id) {
+                        // The worker resolved the real work tree; the pane
+                        // was created with the directory we started from.
+                        editor.path = root.to_path_buf();
+                        if let Some(view) = editor.kind.as_diff_mut() {
+                            view.repo_root = root.to_path_buf();
+                        }
+                        editor.set_diff_document(&document);
+                        if let Some((rel, line)) = reveal {
+                            editor.diff_reveal_location(&rel, line);
+                        }
+                    }
+                    sync_editor_pane_title(&mut guard, pane_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !applied {
+                record_diff_dropped(job_id, pane_id, label, Some(elapsed_ms));
+                return;
+            }
+
             let mut record = DiffEventRecord::new("diff.ready", "info", job_id);
             record.pane_id = Some(pane_id);
             record.range = Some(label);
@@ -6638,27 +6678,6 @@ fn apply_diff_outcome(
             record.elapsed_ms = Some(elapsed_ms);
             record.truncated = Some(stdout_truncated || document.truncated);
             record_diff_event(&record);
-
-            {
-                let mut guard = hooks.shared.lock_recover();
-                if !diff_pane_still_ours(&guard, pane_id, job_id) {
-                    record_diff_dropped(job_id, pane_id, label);
-                    return;
-                }
-                if let Some(editor) = guard.editors.get_mut(&pane_id) {
-                    // The worker resolved the real work tree; the pane was
-                    // created with the directory we started from.
-                    editor.path = root.to_path_buf();
-                    if let Some(view) = editor.kind.as_diff_mut() {
-                        view.repo_root = root.to_path_buf();
-                    }
-                    editor.set_diff_document(&document);
-                    if let Some((rel, line)) = reveal {
-                        editor.diff_reveal_location(&rel, line);
-                    }
-                }
-                sync_editor_pane_title(&mut guard, pane_id);
-            }
             (hooks.request_rebuild)();
         }
         DiffOutcome::Failed {
@@ -6682,24 +6701,31 @@ fn apply_diff_failure(
 ) {
     use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
 
+    // Same shape as the success path: a failure nobody is left to see is a
+    // drop, not a `diff.failed` naming a pane that no longer exists.
+    let applied = {
+        let mut guard = hooks.shared.lock_recover();
+        if diff_pane_still_ours(&guard, pane_id, job_id) {
+            if let Some(editor) = guard.editors.get_mut(&pane_id) {
+                editor.set_diff_error(message.clone());
+            }
+            push_error_toast(&mut guard, format!("Diff {label}: {message}"));
+            true
+        } else {
+            false
+        }
+    };
+    if !applied {
+        record_diff_dropped(job_id, pane_id, label, Some(elapsed_ms));
+        return;
+    }
+
     let mut record = DiffEventRecord::new("diff.failed", "error", job_id);
     record.pane_id = Some(pane_id);
     record.range = Some(label);
     record.reason = Some(reason);
     record.elapsed_ms = Some(elapsed_ms);
     record_diff_event(&record);
-
-    {
-        let mut guard = hooks.shared.lock_recover();
-        if !diff_pane_still_ours(&guard, pane_id, job_id) {
-            record_diff_dropped(job_id, pane_id, label);
-            return;
-        }
-        if let Some(editor) = guard.editors.get_mut(&pane_id) {
-            editor.set_diff_error(message.clone());
-        }
-        push_error_toast(&mut guard, format!("Diff {label}: {message}"));
-    }
     (hooks.request_rebuild)();
 }
 
@@ -6714,12 +6740,15 @@ fn diff_pane_still_ours(state: &AppState, pane_id: u32, job_id: &str) -> bool {
         .is_some_and(|view| view.job_id == job_id)
 }
 
-fn record_diff_dropped(job_id: &str, pane_id: u32, label: &str) {
+/// The job finished but its pane is gone. `elapsed_ms` rides along so the
+/// sink can still answer "how much git time went to diffs nobody read".
+fn record_diff_dropped(job_id: &str, pane_id: u32, label: &str, elapsed_ms: Option<u64>) {
     use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
     let mut record = DiffEventRecord::new("diff.dropped", "info", job_id);
     record.pane_id = Some(pane_id);
     record.range = Some(label);
     record.reason = Some("pane_closed");
+    record.elapsed_ms = elapsed_ms;
     record_diff_event(&record);
 }
 

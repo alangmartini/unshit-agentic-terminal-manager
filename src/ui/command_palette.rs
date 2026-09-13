@@ -271,13 +271,40 @@ fn build_right_cell(item: &PaletteItem) -> ElementDef {
     if let Some(shortcut) = &item.shortcut {
         right = right.with_child(build_kbd_combo(shortcut));
     } else if let Some(dispatch) = &item.dispatch {
-        right = right.with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("cp-meta")
-                .with_text(dispatch.clone()),
-        );
+        // A file row's dispatch is `editor.open:<absolute path>`, which
+        // repeats what the row already shows and is long enough to matter:
+        // the row is a grid whose right column is `auto`, so a long hint
+        // squeezes the label column to nothing and the engine paints the
+        // overflow rather than clipping it, leaving the two on top of each
+        // other. A file row shows its directory there instead — the card is
+        // always `.compact`, which hides `.cp-sub`, so this is the only
+        // place `mod.rs` can be told from `mod.rs`.
+        let hint = if item.kind == PaletteItemKind::File {
+            item.description.clone()
+        } else {
+            dispatch.clone()
+        };
+        if !hint.is_empty() {
+            right = right.with_child(
+                ElementDef::new(Tag::Span)
+                    .with_class("cp-meta")
+                    .with_text(elide_meta(&hint)),
+            );
+        }
     }
     right
+}
+
+/// Hard cap on the right-hand hint. No dispatch string is worth collapsing
+/// the row's own label, and `text-overflow: ellipsis` is not enough on its
+/// own here because the column sizes itself to the untruncated text first.
+fn elide_meta(text: &str) -> String {
+    const MAX_CHARS: usize = 40;
+    if text.chars().count() <= MAX_CHARS {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(MAX_CHARS - 1).collect();
+    format!("{head}\u{2026}")
 }
 
 fn build_kbd_combo(shortcut: &str) -> ElementDef {
@@ -581,6 +608,57 @@ mod tests {
         let guard = shared.lock().unwrap();
         assert!(!guard.palette_open);
         assert!(guard.settings_open);
+    }
+
+    /// A file row's dispatch is `editor.open:<absolute path>`. Painting it
+    /// in the right-hand column sized that column to the whole path, left
+    /// the label column nothing, and the engine painted both on top of each
+    /// other instead of clipping.
+    #[test]
+    fn file_rows_do_not_paint_their_dispatch_path_in_the_right_cell() {
+        let mut state = seed_state();
+        state.palette_open = true;
+        state.palette_query = "/grid".to_string();
+        state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
+            root: std::path::PathBuf::from("C:/a/deep/workspace/root/that/keeps/on/going"),
+            entries: vec![crate::file_index::FileEntry {
+                rel: "src/editor/grid.rs".to_string(),
+                name_start: "src/editor/".len(),
+            }],
+            source: crate::file_index::IndexSource::Git,
+            truncated: false,
+            built_at: std::time::Instant::now(),
+        }));
+        let shared = shared_with(state);
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_command_palette_overlay(&snap, &shared);
+        let row = find_by_class(&el, "cp-item").expect("a file row");
+        let text = text_anywhere(row);
+
+        assert!(text.contains("grid.rs"), "the row names the file: {text:?}");
+        assert!(
+            text.contains("src/editor"),
+            "the row shows the directory so two mod.rs rows differ: {text:?}"
+        );
+        assert!(
+            !text.contains("editor.open:"),
+            "the dispatch string must not be painted: {text:?}"
+        );
+        assert!(
+            !text.contains("C:/a/deep"),
+            "and not the absolute root either: {text:?}"
+        );
+    }
+
+    /// Every other hint is capped too, so no row can ever size its right
+    /// column past its own label.
+    #[test]
+    fn a_long_dispatch_hint_is_elided() {
+        let long = format!("editor.open:{}", "x".repeat(200));
+        let elided = elide_meta(&long);
+        assert!(elided.chars().count() <= 40, "got {elided:?}");
+        assert!(elided.ends_with('\u{2026}'), "got {elided:?}");
+        assert_eq!(elide_meta("diff.open:HEAD"), "diff.open:HEAD");
     }
 
     #[test]

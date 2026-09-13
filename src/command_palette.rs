@@ -713,8 +713,12 @@ fn file_items(snap: &UiSnapshot, query: &str) -> Vec<PaletteItem> {
                 id: format!("file:{}", entry.rel),
                 label: entry.name().to_string(),
                 // The parent directory, so two `mod.rs` rows are telling
-                // apart at a glance.
-                description: entry.rel.clone(),
+                // apart at a glance. Not the whole relative path: the
+                // basename is already the label, and the row renders this
+                // beside it rather than under it.
+                description: entry.rel[..entry.name_start]
+                    .trim_end_matches('/')
+                    .to_string(),
                 group: PaletteGroup::Files,
                 kind: PaletteItemKind::File,
                 icon: PaletteIcon::File,

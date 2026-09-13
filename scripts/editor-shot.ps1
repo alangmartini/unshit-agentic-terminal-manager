@@ -14,6 +14,11 @@
   -File opens that file. -Dispatch overrides the whole chain, e.g.
     "editor.open_at:120:C:\src\state.rs;editor.find;editor.find_query:fn "
     "diff.open:HEAD~1"
+  `sleep:<ms>` is a pseudo-command in that chain: it releases the state lock
+  and waits, which is the only way an e2e chain can observe something a
+  background worker produced (a loaded diff pane, a built file index)
+  before dispatching the command that depends on it, e.g.
+    "diff.open:HEAD~1;sleep:2500;diff.next_hunk;diff.open_file"
   Runs under a throwaway TM_PROFILE so the installed app's daemon, sessions
   and config are never touched.
 #>

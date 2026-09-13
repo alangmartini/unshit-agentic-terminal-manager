@@ -20,7 +20,8 @@
   weighting the file name above the rest of the path. The list comes from
   `git ls-files` where the workspace is a checkout and from a bounded walk
   where it is not, built on a background thread and refreshed when it is
-  older than 30 seconds.
+  older than 30 seconds. Each row is the file name with its directory
+  beside it, so seventeen `mod.rs` rows are still tellable apart.
 
 - **Go to line and open-at.** `editor.goto` (palette: "Go to line…") jumps
   in the focused editor, and `editor.open_at:<line>[.<col>]:<path>` opens a
