@@ -17,6 +17,7 @@ pub mod diff;
 pub mod diff_review;
 pub mod drag;
 pub mod editor;
+pub mod explorer;
 pub mod file_index;
 pub mod flow_explorer;
 pub mod git;
@@ -267,11 +268,14 @@ fn build_tree(
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
     window_events: Option<unshit::app::EventSink>,
 ) -> ElementTree {
+    let sidebar_width = if snap.sidebar_collapsed {
+        48.0
+    } else {
+        snap.sidebar_width
+    };
     let sidebar = with_custom_surface_style(build_sidebar(snap, shared), snap)
-        .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
-        .with_style(StyleDeclaration::MinWidth(Dimension::Px(
-            snap.sidebar_width,
-        )));
+        .with_style(StyleDeclaration::Width(Dimension::Px(sidebar_width)))
+        .with_style(StyleDeclaration::MinWidth(Dimension::Px(sidebar_width)));
 
     let drag_shared = shared.clone();
     let sidebar_resizer = ElementDef::new(Tag::Div)

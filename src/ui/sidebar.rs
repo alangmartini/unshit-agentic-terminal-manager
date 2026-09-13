@@ -7,6 +7,21 @@ use crate::state::{
 use crate::ui::icons::*;
 
 pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let mut sidebar = ElementDef::new(Tag::Div)
+        .with_class("sidebar")
+        .with_class("role-aside")
+        .with_id("sidebar");
+    if state.sidebar_collapsed {
+        sidebar = sidebar.with_class("collapsed");
+    }
+    if state.explorer.active {
+        if state.sidebar_collapsed {
+            return sidebar;
+        }
+        return sidebar
+            .with_child(super::explorer::build_tabs(state, shared))
+            .with_child(super::explorer::build_explorer(state, shared));
+    }
     let mut scroll = ElementDef::new(Tag::Div).with_class("sidebar-scroll");
     for (w_idx, workspace) in state.workspaces.iter().enumerate() {
         scroll = scroll.with_child(build_workspace(
@@ -18,15 +33,12 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         ));
     }
 
-    let mut sidebar = ElementDef::new(Tag::Div)
-        .with_class("sidebar")
-        .with_class("role-aside")
-        .with_id("sidebar");
-    if state.sidebar_collapsed {
-        sidebar = sidebar.with_class("collapsed");
-    }
     sidebar
-        .with_child(build_sidebar_head(shared))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_child(super::explorer::build_tabs(state, shared))
+                .with_child(build_sidebar_head(shared)),
+        )
         .with_child(scroll)
         .with_child(build_sidebar_footer(state))
 }
@@ -1248,6 +1260,23 @@ mod tests {
         assert_eq!(el.id.as_deref(), Some("sidebar"));
         // head, scroll, real ptyd footer
         assert_eq!(el.children.len(), 3);
+    }
+
+    #[test]
+    fn hidden_explorer_has_no_keyboard_capture() {
+        let shared = make_shared();
+        {
+            let mut state = shared.lock().unwrap();
+            crate::state::dispatch(&mut state, "explorer.show");
+            crate::state::dispatch(&mut state, "explorer.toggle");
+            assert!(!state.explorer.keyboard_focus);
+        }
+        let snapshot = shared.lock().unwrap().ui_snapshot();
+        let sidebar = build_sidebar(&snapshot, &shared);
+        assert!(
+            sidebar.children.is_empty(),
+            "hidden tree must not intercept terminal keys"
+        );
     }
 
     #[test]

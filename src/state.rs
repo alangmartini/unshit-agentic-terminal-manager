@@ -983,6 +983,7 @@ pub struct AppState {
     pub diff_review: Option<crate::diff_review::Review>,
     pub palette_query: String,
     pub palette_active: usize,
+    pub explorer: crate::explorer::Explorer,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Last window maximized state reported by the framework.
@@ -1296,6 +1297,7 @@ impl AppState {
             palette_open: self.palette_open,
             palette_query: self.palette_query.clone(),
             palette_active: self.palette_active,
+            explorer: self.explorer.clone(),
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
             window_maximized: self.window_maximized,
@@ -1438,6 +1440,7 @@ pub struct UiSnapshot {
     pub palette_open: bool,
     pub palette_query: String,
     pub palette_active: usize,
+    pub explorer: crate::explorer::Explorer,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Mirrors `AppState::window_maximized` so titlebar controls can
@@ -1655,6 +1658,7 @@ pub fn seed_state() -> AppState {
         diff_review: None,
         palette_query: String::new(),
         palette_active: 0,
+        explorer: crate::explorer::Explorer::default(),
         sidebar_collapsed: false,
         sidebar_width: 252.0,
         window_maximized: false,
@@ -1810,6 +1814,7 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
     // The index describes the workspace we just left.
     state.file_index = None;
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 pub fn focus_workspace_pane_by_num(state: &mut AppState, workspace_id: u32, pane_id: u32) -> bool {
@@ -3150,6 +3155,7 @@ pub fn mutate_remove_workspace(state: &mut AppState, idx: usize) {
         old_active
     };
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 pub fn find_pane_coord(state: &AppState, target: PaneId) -> Option<(usize, usize)> {
@@ -4369,6 +4375,7 @@ fn prune_close_layout_to_kept_panes(state: &mut AppState, kept_pane_ids: &BTreeS
         }
     }
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 /// Resolve the close-button click against the persisted preference
@@ -5305,6 +5312,53 @@ fn dispatch_palette_files(state: &mut AppState) -> bool {
 /// Enumerating a checkout spawns a process and touches the filesystem —
 /// never on the UI thread. Until the first build lands the palette shows
 /// "Indexing…" rather than "no matching files".
+pub fn sync_explorer(state: &mut AppState) {
+    let root = active_workspace_cwd(state);
+    state.explorer.set_root(root.clone());
+    if state.explorer.active && !state.sidebar_collapsed {
+        if let Some(root) = root {
+            load_explorer_directory(state, root);
+        }
+    }
+}
+
+pub fn load_explorer_directory(state: &mut AppState, path: PathBuf) {
+    use crate::explorer::Listing;
+    if state.explorer.listings.contains_key(&path) {
+        return;
+    }
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return;
+    };
+    let generation = state.explorer.generation;
+    state
+        .explorer
+        .listings
+        .insert(path.clone(), Arc::new(Listing::Loading));
+    let worker_path = path.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-list".into())
+        .spawn(move || {
+            let listing = crate::explorer::read_directory(&worker_path);
+            {
+                let mut state = hooks.shared.lock_recover();
+                state.explorer.accept(generation, worker_path, listing);
+            }
+            (hooks.request_rebuild)();
+        })
+    {
+        state
+            .explorer
+            .accept(generation, path, Listing::Error(error.to_string()));
+    }
+}
+
+/// Build (or rebuild) the quick-open index for the active workspace on a
+/// worker thread, unless a fresh one for the same root is already here.
+///
+/// Enumerating a checkout spawns a process and touches the filesystem ?
+/// never on the UI thread. Until the first build lands the palette shows
+/// "Indexing?" rather than "no matching files".
 fn ensure_file_index(state: &mut AppState) {
     let Some(root) = active_workspace_cwd(state) else {
         return;
@@ -5618,6 +5672,7 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "tabs.worktree_mode.toggle"
             | "pane.close"
             | "sidebar.toggle"
+            | "explorer.toggle"
             | "modal.open"
             | "quick_prompt.open"
             | "editor.open"
@@ -8261,8 +8316,39 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if other.starts_with("tab.reorder:") => {
             persist_layout_if(dispatch_tab_reorder(state, other), state)
         }
+        "explorer.toggle" => {
+            if state.explorer.active && !state.sidebar_collapsed {
+                state.explorer.keyboard_focus = false;
+                state.sidebar_collapsed = true;
+            } else {
+                state.explorer.active = true;
+                state.explorer.keyboard_focus = true;
+                state.sidebar_collapsed = false;
+                sync_explorer(state);
+            }
+            true
+        }
+        "explorer.show" => {
+            state.explorer.active = true;
+            state.explorer.keyboard_focus = true;
+            state.sidebar_collapsed = false;
+            sync_explorer(state);
+            true
+        }
+        "explorer.refresh" => {
+            state.explorer.refresh();
+            sync_explorer(state);
+            true
+        }
+        "sidebar.workspaces" => {
+            state.explorer.active = false;
+            state.sidebar_collapsed = false;
+            true
+        }
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
+            state.explorer.keyboard_focus = false;
+            sync_explorer(state);
             true
         }
         "workspace.add" => {
@@ -10932,6 +11018,7 @@ pub(crate) mod tests {
             diff_review: None,
             palette_query: String::new(),
             palette_active: 0,
+            explorer: crate::explorer::Explorer::default(),
             sidebar_collapsed: false,
             sidebar_width: 252.0,
             window_maximized: false,
@@ -13273,6 +13360,26 @@ pub(crate) mod tests {
             state.sidebar_width, MAX_SIDEBAR_WIDTH,
             "rejected input leaves width alone"
         );
+    }
+
+    #[test]
+    fn explorer_toggle_preserves_workspace_access_and_browses_active_root() {
+        let mut state = seed_state();
+        state.workspaces[0].path = Some(PathBuf::from("project"));
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(state.explorer.active);
+        assert!(!state.sidebar_collapsed);
+        assert_eq!(
+            state.explorer.root.as_deref(),
+            Some(std::path::Path::new("project"))
+        );
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(state.sidebar_collapsed);
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(!state.sidebar_collapsed);
+        assert!(dispatch(&mut state, "sidebar.workspaces"));
+        assert!(!state.explorer.active);
+        assert!(!state.sidebar_collapsed);
     }
 
     #[test]
