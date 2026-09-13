@@ -2,6 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Read only the target's ancestor chain, on a worker. Map canonical paths
 /// back to the workspace spelling so row ids agree with ordinary listings.
@@ -59,10 +60,13 @@ pub struct Explorer {
     pub selected: Option<PathBuf>,
     pub generation: u64,
     pub reveal_revision: u64,
+    pub typeahead: String,
+    pub typed_at: Option<Instant>,
 }
 
 impl Explorer {
     pub fn collapse_all(&mut self) {
+        self.clear_typeahead();
         self.reveal_revision = self.reveal_revision.wrapping_add(1);
         self.expanded.clear();
         if let Some(root) = &self.root {
@@ -79,6 +83,7 @@ impl Explorer {
     }
 
     pub fn refresh(&mut self) {
+        self.clear_typeahead();
         self.generation = self.generation.wrapping_add(1);
         self.listings.clear();
         self.expanded.clear();
@@ -86,6 +91,56 @@ impl Explorer {
         if let Some(root) = &self.root {
             self.expanded.insert(root.clone());
         }
+    }
+
+    pub fn clear_typeahead(&mut self) {
+        self.typeahead.clear();
+        self.typed_at = None;
+    }
+
+    pub fn type_to_select(&mut self, character: char, now: Instant) -> bool {
+        if character.is_control() {
+            return false;
+        }
+        let input = character.to_lowercase().collect::<String>();
+        let continuing = self
+            .typed_at
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1));
+        let cycle = continuing && self.typeahead == input;
+        if !continuing || cycle {
+            self.typeahead = input;
+        } else {
+            self.typeahead.push_str(&input);
+        }
+        self.typed_at = Some(now);
+        let paths = self.visible_paths();
+        if paths.is_empty() {
+            return true;
+        }
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|selected| paths.iter().position(|p| p == selected))
+            .unwrap_or(0);
+        let start = if continuing && !cycle {
+            current
+        } else {
+            (current + 1) % paths.len()
+        };
+        for offset in 0..paths.len() {
+            let path = &paths[(start + offset) % paths.len()];
+            if path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .to_lowercase()
+                .starts_with(&self.typeahead)
+            {
+                self.selected = Some(path.clone());
+                break;
+            }
+        }
+        true
     }
 
     pub fn visible_paths(&self) -> Vec<PathBuf> {
@@ -239,6 +294,53 @@ pub fn read_directory(path: &Path) -> Listing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typeahead_matches_prefix_cycles_wraps_and_resets_after_pause() {
+        let root = PathBuf::from("project");
+        let mut explorer = Explorer::default();
+        explorer.set_root(Some(root.clone()));
+        explorer.accept(
+            explorer.generation,
+            root.clone(),
+            Listing::Ready(
+                ["scripts", "specs", "src", "zebra.rs"]
+                    .iter()
+                    .map(|name| Entry {
+                        path: root.join(name),
+                        name: (*name).into(),
+                        directory: true,
+                    })
+                    .collect(),
+            ),
+        );
+        let now = Instant::now();
+        explorer.type_to_select('S', now);
+        assert_eq!(explorer.selected, Some(root.join("scripts")));
+        explorer.type_to_select('s', now);
+        assert_eq!(explorer.selected, Some(root.join("specs")));
+        explorer.type_to_select('s', now);
+        assert_eq!(explorer.selected, Some(root.join("src")));
+        explorer.type_to_select('r', now);
+        explorer.type_to_select('c', now);
+        assert_eq!(explorer.selected, Some(root.join("src")));
+        explorer.type_to_select('z', now + Duration::from_secs(2));
+        assert_eq!(explorer.selected, Some(root.join("zebra.rs")));
+        explorer.type_to_select('s', now + Duration::from_secs(4));
+        assert_eq!(
+            explorer.selected,
+            Some(root.join("scripts")),
+            "search wraps"
+        );
+        explorer.type_to_select('x', now + Duration::from_secs(6));
+        assert_eq!(
+            explorer.selected,
+            Some(root.join("scripts")),
+            "no match keeps selection"
+        );
+        explorer.clear_typeahead();
+        assert!(explorer.typeahead.is_empty());
+    }
 
     #[test]
     fn collapse_all_keeps_root_and_cache_but_cancels_pending_reveal() {

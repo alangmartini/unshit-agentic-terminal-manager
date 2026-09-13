@@ -30,3 +30,8 @@ workspaces, hiding Explorer, or moving selection cancels a pending reveal.
 
 Collapse all folds every descendant folder, selects and reveals the workspace
 root, and cancels a pending Reveal. Cached listings remain available.
+
+When the tree has keyboard focus, type a name to select a visible entry by
+case-insensitive prefix. Repeating a single letter cycles through matches.
+A one-second pause starts a new prefix. Navigation keys or a click clear the
+prefix. Matching scrolls the selected row into view without opening it.

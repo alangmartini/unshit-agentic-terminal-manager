@@ -1,7 +1,7 @@
 use std::path::Path;
 use unshit::core::element::*;
 use unshit::core::event::{
-    Event, EventType, Key, KeyEventKind, RequestRebuild, RequestScrollIntoView,
+    Event, EventType, Key, KeyEventKind, Modifiers, RequestRebuild, RequestScrollIntoView,
 };
 use unshit::core::style::parse::StyleDeclaration;
 
@@ -58,7 +58,10 @@ pub fn build_explorer(snapshot: &UiSnapshot, shared: &SharedState) -> ElementDef
         .with_autofocus(explorer.keyboard_focus)
         .on(EventType::KeyboardCapture, move |event| {
             if let Event::Keyboard(key) = event {
-                if key.kind == KeyEventKind::Pressed && key.modifiers.is_empty() {
+                if key.kind == KeyEventKind::Pressed
+                    && (key.modifiers.is_empty()
+                        || (key.modifiers == Modifiers::SHIFT && matches!(key.key, Key::Char(_))))
+                {
                     let changed = mutate_with(&keyboard_state, |state| handle_key(state, key.key));
                     if changed {
                         if let Some(path) =
@@ -85,7 +88,9 @@ pub fn build_explorer(snapshot: &UiSnapshot, shared: &SharedState) -> ElementDef
     } else {
         tree = tree.with_child(message("Select a workspace folder to browse files."));
     }
-    panel.with_child(tree)
+    panel
+        .with_child(tree)
+        .with_child(message("Type a name to jump"))
 }
 
 fn message(text: &str) -> ElementDef {
@@ -179,6 +184,7 @@ fn row(
     )
     .on_click(move || {
         mutate_with(&click_state, |state| {
+            state.explorer.clear_typeahead();
             state.explorer.keyboard_focus = directory;
             state.explorer.selected = Some(path.clone());
             if directory {
@@ -194,6 +200,12 @@ fn row(
 }
 
 fn handle_key(state: &mut crate::state::AppState, key: Key) -> bool {
+    if let Key::Char(character) = key {
+        return state
+            .explorer
+            .type_to_select(character, std::time::Instant::now());
+    }
+    state.explorer.clear_typeahead();
     let Some(path) = state
         .explorer
         .selected
