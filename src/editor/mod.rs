@@ -955,6 +955,68 @@ mod tests {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A `.rs` file, so the pane opens with Rust highlighting on.
+    fn temp_rust_file(contents: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tm-editor-rs-{}-{}.rs",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, contents).expect("write temp file");
+        path
+    }
+
+    /// Foreground of the first non-blank cell of `row`, i.e. the colour
+    /// of the row's first token once the gutter is past.
+    fn first_text_fg(pane: &EditorPane, row: usize) -> Option<unshit::core::style::types::Color> {
+        (pane.gutter_cells()..pane.grid.cols()).find_map(|col| {
+            let cell = pane.grid.get_cell(row, col)?;
+            (cell.ch != '\0' && cell.ch != ' ').then_some(cell.fg)
+        })
+    }
+
+    /// Typing `/` `*` damages one line and changes what every line below
+    /// it means. Repainting only the damaged row left the rest of the
+    /// viewport coloured as code, and scrolling preserved the stale cells
+    /// rather than healing it.
+    #[test]
+    fn opening_a_block_comment_recolours_the_rows_below_it() {
+        let path = temp_rust_file("let a = 1;\nlet b = 2;\nlet c = 3;\n");
+        let mut pane = EditorPane::open(&path, 8, 40).expect("open");
+        let colors = pane.colors;
+
+        let before = first_text_fg(&pane, 1).expect("row 1 painted");
+        assert_eq!(before, colors.keyword, "`let` starts out a keyword");
+
+        // Open a block comment at the very top of the file.
+        pane.apply_edit(|b| {
+            b.set_cursor(Position { line: 0, col: 0 }, false);
+            b.insert_str("/*")
+        });
+
+        assert_eq!(
+            first_text_fg(&pane, 1),
+            Some(colors.comment),
+            "row 1 is inside the comment now"
+        );
+        assert_eq!(
+            first_text_fg(&pane, 2),
+            Some(colors.comment),
+            "and so is row 2"
+        );
+
+        // Closing it again puts them back.
+        pane.apply_edit(|b| {
+            b.set_cursor(Position { line: 0, col: 2 }, false);
+            b.insert_str("*/")
+        });
+        assert_eq!(first_text_fg(&pane, 1), Some(colors.keyword));
+        assert_eq!(first_text_fg(&pane, 2), Some(colors.keyword));
+
+        let _ = std::fs::remove_file(path);
+    }
+
     fn temp_file(contents: &[u8]) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(

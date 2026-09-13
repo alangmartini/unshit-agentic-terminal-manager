@@ -656,6 +656,67 @@ mod tests {
             .collect()
     }
 
+    fn any_focusable(el: &ElementDef) -> Option<&ElementDef> {
+        // Mirrors the framework's own rule: `Tag::Button` and
+        // `Tag::Select` are focusable, as is a tab-indexed element.
+        if matches!(el.tag, Tag::Button | Tag::Select) || el.tab_index.is_some() {
+            return Some(el);
+        }
+        el.children.iter().find_map(any_focusable)
+    }
+
+    /// Clicking a find-bar control used to move focus off the query input
+    /// and onto the capturing grid, so the next character typed to refine
+    /// the query replaced the selected match in the document instead.
+    #[test]
+    fn no_find_bar_control_can_take_focus_from_the_query_input() {
+        let (shared, path) = shared_with_editor();
+        {
+            let mut guard = shared.lock().expect("state lock");
+            crate::state::dispatch(&mut guard, "editor.find");
+        }
+        let find = {
+            let guard = shared.lock().expect("state lock");
+            guard
+                .ui_snapshot()
+                .editor_find_bars
+                .get(&1)
+                .cloned()
+                .expect("find bar open")
+        };
+        let bar = build_find_bar(PaneId(1), &find, &shared);
+
+        // The input itself is the one thing that may hold focus.
+        let focusable = any_focusable(&bar);
+        assert!(
+            focusable.is_none_or(|el| el.tag == Tag::Input),
+            "only the query input may be focusable, found {:?}",
+            focusable.map(|el| el.tag)
+        );
+        // ...and all four controls are still there and still clickable.
+        let buttons: Vec<&ElementDef> = {
+            fn walk<'a>(el: &'a ElementDef, out: &mut Vec<&'a ElementDef>) {
+                if el.classes.iter().any(|c| c == "editor-find-button") {
+                    out.push(el);
+                }
+                for child in &el.children {
+                    walk(child, out);
+                }
+            }
+            let mut out = Vec::new();
+            walk(&bar, &mut out);
+            out
+        };
+        assert_eq!(buttons.len(), 4, "Aa, up, down, close");
+        for button in buttons {
+            assert!(
+                button.on_click.is_some(),
+                "a control the user can see must still be clickable"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn editor_pane_body_renders_grid_with_content() {
         let (shared, path) = shared_with_editor();

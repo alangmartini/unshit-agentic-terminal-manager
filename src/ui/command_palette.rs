@@ -619,11 +619,16 @@ mod tests {
     /// other instead of clipping.
     #[test]
     fn file_rows_do_not_paint_their_dispatch_path_in_the_right_cell() {
+        let root = std::path::PathBuf::from("C:/a/deep/workspace/root/that/keeps/on/going");
         let mut state = seed_state();
         state.palette_open = true;
         state.palette_query = "/grid".to_string();
+        // The snapshot only publishes an index built for the active
+        // workspace, so the two roots have to agree.
+        let active = state.active_workspace;
+        state.workspaces[active].path = Some(root.clone());
         state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
-            root: std::path::PathBuf::from("C:/a/deep/workspace/root/that/keeps/on/going"),
+            root,
             entries: vec![crate::file_index::FileEntry {
                 rel: "src/editor/grid.rs".to_string(),
                 name_start: "src/editor/".len(),

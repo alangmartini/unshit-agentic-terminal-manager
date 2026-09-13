@@ -5649,26 +5649,25 @@ fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
 
     let picked_file = item.kind == crate::command_palette::PaletteItemKind::File;
     let handled = dispatch(state, &command);
-    if handled {
-        close_command_palette(state);
-    } else {
-        // The chord version of a command like `editor.find` stays
-        // unclaimed on purpose, so Ctrl+F reaches the shell in a terminal
-        // pane. A palette row has no such fall-through: leaving the
-        // palette open with nothing happening reads as a click that did
-        // not register, and the user clicks again.
-        close_command_palette(state);
+    // Either way the pick itself is consumed, so the palette closes. The
+    // chord version of a command like `editor.find` stays unclaimed on
+    // purpose, so Ctrl+F reaches the shell in a terminal pane; a palette
+    // row has no such fall-through, and leaving it open with nothing
+    // happening reads as a click that did not register.
+    close_command_palette(state);
+    if !handled {
         push_error_toast(state, format!("{} is not available here", item.label));
+        return true;
     }
     // Quick open is the one palette mode whose rows are data rather than a
     // fixed catalogue, so "did the index actually get used" is only
     // answerable from a pick event. Recorded after the dispatch, on the
     // pane the pick produced (or refocused), so the id joins pick -> open
     // -> save -> close instead of naming nothing.
-    if picked_file && handled {
+    if picked_file {
         record_quickopen_pick(state);
     }
-    handled
+    true
 }
 
 /// `quickopen.pick` for the editor pane the palette just focused. Carries
@@ -12208,6 +12207,115 @@ pub(crate) mod tests {
 
         assert_eq!(state.editors[&pane_id].buffer.to_text(), before);
         assert!(!state.editors[&pane_id].dirty);
+    }
+
+    /// A loaded diff pane, so navigation has somewhere to go.
+    fn open_ready_diff(state: &mut AppState) -> u32 {
+        let pane_id = open_loading_diff(state, "HEAD");
+        let text = [
+            "diff --git a/one.rs b/one.rs",
+            "--- a/one.rs",
+            "+++ b/one.rs",
+            "@@ -1,1 +1,1 @@",
+            "-a",
+            "+b",
+            "@@ -9,1 +9,1 @@",
+            "-c",
+            "+d",
+            "diff --git a/two.rs b/two.rs",
+            "--- a/two.rs",
+            "+++ b/two.rs",
+            "@@ -1,1 +1,1 @@",
+            "-e",
+            "+f",
+            "",
+        ]
+        .join("\n");
+        let document = crate::diff::parse_unified_diff(&text);
+        state
+            .editors
+            .get_mut(&pane_id)
+            .expect("diff pane")
+            .set_diff_document(&document);
+        pane_id
+    }
+
+    /// `n`/`p`/`]`/`[` are bare keys that auto-repeat, so they must not
+    /// each write a line to the sink. The counts ride on the pane and are
+    /// reported once, on `diff.closed`.
+    #[test]
+    fn walking_a_diff_counts_steps_on_the_pane() {
+        let mut state = test_state();
+        let pane_id = open_ready_diff(&mut state);
+        assert_eq!(state.editors[&pane_id].diff().expect("view").hunk_steps, 0);
+
+        assert!(dispatch(&mut state, "diff.next_hunk"));
+        assert!(dispatch(&mut state, "diff.next_hunk"));
+        assert!(dispatch(&mut state, "diff.next_file"));
+
+        let view = state.editors[&pane_id].diff().expect("view");
+        assert_eq!(view.hunk_steps, 2);
+        assert_eq!(view.file_steps, 1);
+
+        // A step that cannot move must not be counted. The fixture has
+        // two files and the cursor is already on the second, so this is
+        // claimed (the key must never reach a shell) but goes nowhere.
+        assert!(dispatch(&mut state, "diff.next_file"));
+        assert_eq!(
+            state.editors[&pane_id].diff().expect("view").file_steps,
+            1,
+            "a step that could not move must not be counted"
+        );
+    }
+
+    /// Removing a workspace used to tear down only the PTY half of its
+    /// panes, leaving an editor in `state.editors` that no tab could
+    /// reach — and that a diff job finishing later would still fill.
+    #[test]
+    fn removing_a_workspace_closes_the_editor_panes_inside_it() {
+        let mut state = test_state();
+        // Two: the last workspace is never removable.
+        mutate_add_workspace_with_path(&mut state, Some(std::env::temp_dir()));
+        mutate_add_workspace_with_path(&mut state, Some(std::env::temp_dir()));
+        let doomed = state.active_workspace;
+        assert_eq!(state.workspaces.len(), 2);
+        let path = editor_temp_file("ws_remove", b"alpha\nbeta");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+        assert!(state.editors.contains_key(&pane_id));
+
+        mutate_remove_workspace(&mut state, doomed);
+
+        assert!(
+            !state.editors.contains_key(&pane_id),
+            "the pane outlived every tab that could reach it"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A palette row has no fall-through: the chord stays unclaimed so
+    /// Ctrl+F reaches the shell, but a click that does nothing and leaves
+    /// the palette open reads as a click that did not register.
+    #[test]
+    fn a_palette_pick_that_cannot_run_closes_the_palette_and_says_so() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(state.palette_open);
+
+        // The active pane is a terminal, so `editor.find` is unclaimed.
+        assert!(dispatch(&mut state, "palette.execute:editor_find"));
+
+        assert!(!state.palette_open, "the palette must not stay open");
+        let message = state
+            .toasts
+            .iter()
+            .next()
+            .map(|toast| toast.message.clone())
+            .expect("a toast says why nothing happened");
+        assert!(message.contains("Find in file"), "{message:?}");
     }
 
     #[test]

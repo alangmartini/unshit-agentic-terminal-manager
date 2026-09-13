@@ -456,6 +456,102 @@ mod tests {
         (view, doc)
     }
 
+    /// A multi-line `/* … */` inside a hunk used to paint its first line
+    /// as a comment and every line after it as code, because each row was
+    /// tokenized from a blank slate.
+    #[test]
+    fn a_block_comment_inside_a_hunk_stays_open_across_its_rows() {
+        let text = [
+            "diff --git a/src/a.rs b/src/a.rs",
+            "--- a/src/a.rs",
+            "+++ b/src/a.rs",
+            "@@ -1,1 +1,4 @@",
+            "+/** Reads the config.",
+            "+ *",
+            "+ * Returns None if absent.",
+            "+ */",
+            " fn read() {}",
+            "",
+        ]
+        .join("\n");
+        let doc = parse_unified_diff(&text);
+        let mut view = DiffView::loading(
+            DiffSpec::parse("HEAD").expect("spec"),
+            PathBuf::from("C:/repo"),
+            "diff-block".to_string(),
+        );
+        view.adopt(&doc);
+
+        let opener = doc
+            .lines
+            .iter()
+            .position(|line| line.starts_with("/** Reads"))
+            .expect("the opening row");
+        assert!(!view.block_state_at(opener), "the comment opens here");
+        for row in opener + 1..=opener + 3 {
+            assert!(
+                view.block_state_at(row),
+                "row {row} ({:?}) is still inside the comment",
+                doc.lines[row]
+            );
+        }
+        // The context row after `*/` is back in code.
+        assert!(!view.block_state_at(opener + 4));
+    }
+
+    /// A `/*` deleted on a `-` row must not comment out the `+` rows that
+    /// replace it: the two sides are different versions of the file.
+    #[test]
+    fn a_comment_opened_on_the_old_side_does_not_leak_into_the_new_one() {
+        let text = [
+            "diff --git a/src/a.rs b/src/a.rs",
+            "--- a/src/a.rs",
+            "+++ b/src/a.rs",
+            "@@ -1,2 +1,2 @@",
+            "-/* was a comment",
+            "-   still a comment */",
+            "+let x = 1;",
+            "+let y = 2;",
+            "",
+        ]
+        .join("\n");
+        let doc = parse_unified_diff(&text);
+        let mut view = DiffView::loading(
+            DiffSpec::parse("HEAD").expect("spec"),
+            PathBuf::from("C:/repo"),
+            "diff-sides".to_string(),
+        );
+        view.adopt(&doc);
+
+        let removed = doc
+            .lines
+            .iter()
+            .position(|line| line.starts_with("/* was"))
+            .expect("the removed opener");
+        assert!(!view.block_state_at(removed));
+        assert!(view.block_state_at(removed + 1), "old side carries on");
+        assert!(
+            !view.block_state_at(removed + 2),
+            "the added line is code, not a continuation of the deleted comment"
+        );
+        assert!(!view.block_state_at(removed + 3));
+    }
+
+    /// Headers separate hunks, so nothing carries across one.
+    #[test]
+    fn a_header_row_resets_the_block_state() {
+        let (view, doc) = view();
+        for (index, row) in view.rows.iter().enumerate() {
+            if !row.kind.is_content() {
+                assert!(
+                    !view.block_state_at(index),
+                    "row {index} ({:?}) is not content",
+                    doc.lines[index]
+                );
+            }
+        }
+    }
+
     #[test]
     fn adopting_a_document_takes_its_rows_and_files() {
         let (view, doc) = view();

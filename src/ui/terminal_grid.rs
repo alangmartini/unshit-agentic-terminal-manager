@@ -2020,6 +2020,33 @@ mod tests {
         );
     }
 
+    /// A confirm dialog is as modal as the palette or settings. While it
+    /// is up, any keystroke it does not hold focus for used to reach the
+    /// capturing grid and be typed into the pane behind it.
+    #[test]
+    fn active_pane_does_not_capture_keyboard_when_a_confirm_dialog_is_open() {
+        let mut state = seed_state();
+        let pane = state.panes[0][0].clone();
+        state.active_pane = pane.id;
+        state.confirm_dialog = Some(crate::state::ConfirmDialog::GotoLine {
+            pane_id: pane.id.0,
+            buffer: "abc".to_string(),
+            error: Some("Not a line number".to_string()),
+        });
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane.id.0, CellGrid::new(24, 80));
+
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        let content = find_terminal_content(&el)
+            .expect("terminal-content element should exist when grid is present");
+        assert!(
+            !content.captures_keyboard,
+            "active pane must not capture keyboard while a confirm dialog is open"
+        );
+    }
+
     /// Active pane must register an on_resize handler so the PTY dimensions
     /// stay in sync with the visible grid area.
     #[test]

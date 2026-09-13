@@ -1564,13 +1564,61 @@ mod tests {
             Some(PaletteMode::Agents)
         );
 
-        // No index has been built in a bare snapshot, so Files mode
-        // reports that it is still indexing rather than "no matches".
+        // A bare snapshot has no index and nothing building one, so the
+        // honest answer is the real empty state. "Indexing…" here would
+        // be a spinner that can never resolve.
         let files = build_palette_results(&snap, "/");
         assert!(files.groups.is_empty());
         let empty = files.empty_state.as_ref().expect("empty state");
         assert_eq!(empty.mode, PaletteMode::Files);
+        assert_eq!(empty.title, "No matching files");
+
+        // It says "Indexing…" exactly while a build is running.
+        let mut building = snap.clone();
+        building.file_index_building = true;
+        let files = build_palette_results(&building, "/");
+        let empty = files.empty_state.as_ref().expect("empty state");
         assert!(empty.title.starts_with("Indexing"), "got {:?}", empty.title);
+    }
+
+    /// Quick open caps its list, and a header reading "50" with no
+    /// qualifier is how a user whose file ranked 51st concludes it is not
+    /// in the index.
+    #[test]
+    fn the_files_header_says_when_more_matched_than_it_shows() {
+        let mut state = seed_state();
+        let root = std::path::PathBuf::from("/tmp/ws");
+        let active = state.active_workspace;
+        state.workspaces[active].path = Some(root.clone());
+        let entries: Vec<crate::file_index::FileEntry> = (0..FILE_ROW_LIMIT + 12)
+            .map(|i| crate::file_index::FileEntry {
+                rel: format!("src/thing{i}.rs"),
+                name_start: "src/".len(),
+            })
+            .collect();
+        let total = entries.len();
+        state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
+            root,
+            entries,
+            source: crate::file_index::IndexSource::Git,
+            truncated: false,
+            built_at: std::time::Instant::now(),
+        }));
+        let snap = state.ui_snapshot();
+
+        let results = build_palette_results(&snap, "/thing");
+        let group = results.groups.first().expect("a files group");
+        assert_eq!(group.items.len(), FILE_ROW_LIMIT);
+        assert_eq!(
+            group.count_label.as_deref(),
+            Some(format!("{FILE_ROW_LIMIT} of {total}").as_str())
+        );
+
+        // A query that fits shows the plain count.
+        let results = build_palette_results(&snap, "/thing7.rs");
+        let group = results.groups.first().expect("a files group");
+        assert!(group.items.len() < FILE_ROW_LIMIT);
+        assert_eq!(group.count_label, None);
     }
 
     #[test]
@@ -1880,9 +1928,9 @@ mod tests {
                 .empty_state
                 .as_ref()
                 .map(|empty| empty.title.as_str()),
-            // No index in a bare snapshot: the honest answer is that it
-            // has not been built, not that nothing matched.
-            Some("Indexing…")
+            // No index in a bare snapshot and no build running, so the
+            // honest answer is the empty state, not a spinner.
+            Some("No matching files")
         );
     }
 

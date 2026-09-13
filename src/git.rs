@@ -258,6 +258,34 @@ mod tests {
     }
 
     #[test]
+    fn resolve_in_repo_refuses_anything_that_leaves_the_root() {
+        let root = PathBuf::from("C:/repo");
+        assert_eq!(
+            resolve_in_repo(&root, "src/state.rs"),
+            Some(root.join("src").join("state.rs"))
+        );
+        assert_eq!(
+            resolve_in_repo(&root, "./src/state.rs"),
+            Some(root.join("src").join("state.rs"))
+        );
+        // git reports paths with forward slashes; Windows accepts both.
+        for escape in [
+            "../outside.rs",
+            "src/../../outside.rs",
+            "..\\..\\Users\\Public\\run.ps1",
+            "/etc/passwd",
+            "C:/Users/me/.ssh/config",
+            "C:\\Users\\me\\.ssh\\config",
+            "\\\\server\\share\\x",
+        ] {
+            assert_eq!(resolve_in_repo(&root, escape), None, "{escape:?} escapes");
+        }
+        // The root itself is a directory, not a file to open.
+        assert_eq!(resolve_in_repo(&root, ""), None);
+        assert_eq!(resolve_in_repo(&root, "."), None);
+    }
+
+    #[test]
     fn repo_root_is_none_outside_a_checkout() {
         let dir = unique_temp_dir("noroot");
         // A bare temp directory can still sit inside a repo on some CI

@@ -583,17 +583,17 @@ fn unquote_path(raw: &str) -> String {
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'));
     match inner.and_then(decode_c_quoted) {
-        // A decoded path is only usable while it is still one line and
-        // still printable. git quotes control characters whatever
-        // `core.quotepath` says, so a newline escape in a (legal, on
-        // Linux) file name decodes to a real line break, which
-        // `finish_file` writes into
-        // `lines` — and one extra line there breaks the
-        // `lines.len() == rows.len()` invariant every row lookup depends
-        // on, so every row below it paints with its neighbour's gutter,
-        // tint and language. Keeping the escaped form is what this
-        // function already does for anything it cannot decode.
-        Some(decoded) if !decoded.chars().any(char::is_control) => decoded,
+        // A decoded path is only usable while it is still one line. git
+        // quotes control characters whatever `core.quotepath` says, so a
+        // newline escape in a (legal, on Linux) file name decodes to a
+        // real line break, which `finish_file` writes into `lines` — and
+        // one extra line there breaks the `lines.len() == rows.len()`
+        // invariant every row lookup depends on, so every row below it
+        // paints with its neighbour's gutter, tint and language. Only
+        // these two are refused: a tab in a name is legal and harmless
+        // here, and keeping the escaped form is what this function
+        // already does for anything it cannot decode.
+        Some(decoded) if !decoded.contains(['\n', '\r']) => decoded,
         _ => raw.to_string(),
     }
 }
@@ -1389,6 +1389,39 @@ mod tests {
         assert_eq!(doc.files[0].lang, Language::Rust);
     }
 
+    /// The byte cap used to be reported to telemetry and nowhere else, so
+    /// a diff whose tail git never wrote rendered as a complete one.
+    #[test]
+    fn an_output_cut_adds_a_row_saying_so() {
+        let mut document = parse_unified_diff(&fixture(SIMPLE));
+        let rows_before = document.rows.len();
+        assert!(!document.truncated);
+
+        document.mark_output_truncated();
+
+        assert!(document.truncated);
+        assert_eq!(document.rows.len(), rows_before + 1);
+        assert_eq!(document.lines.len(), document.rows.len(), "invariant");
+        let last = document.lines.last().expect("a row");
+        assert!(last.contains("truncated"), "{last:?}");
+        assert_eq!(document.rows[rows_before].kind, DiffRowKind::Meta);
+        assert!(
+            (document.rows[rows_before].file as usize) < document.files.len(),
+            "rows[i].file stays a valid index into files"
+        );
+    }
+
+    /// Nothing to attribute the notice to, and no row may name a file
+    /// that is not there.
+    #[test]
+    fn an_output_cut_with_no_files_adds_no_row() {
+        let mut document = parse_unified_diff("");
+        document.mark_output_truncated();
+        assert!(document.truncated);
+        assert!(document.rows.is_empty());
+        assert_eq!(document.lines.len(), document.rows.len());
+    }
+
     // An escape we cannot decode must fall back to the raw text rather than
     // drop the path on the floor.
     #[test]
@@ -1397,6 +1430,12 @@ mod tests {
         assert_eq!(unquote_path(raw), raw);
         // Valid escapes still decode when mixed with plain bytes.
         assert_eq!(unquote_path(r#""a/x\ty""#), "a/x\ty");
+        // ...but not a line break: it would become an extra buffer
+        // line and desync every row decoration below the file header.
+        let newline = r#""a/we\nird.txt""#;
+        assert_eq!(unquote_path(newline), newline);
+        let carriage = r#""a/we\rird.txt""#;
+        assert_eq!(unquote_path(carriage), carriage);
         // Unquoted paths pass through untouched.
         assert_eq!(unquote_path("a/plain.rs"), "a/plain.rs");
         // Only the prefixes git actually emits are stripped.

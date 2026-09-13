@@ -134,6 +134,36 @@ mod tests {
             .collect()
     }
 
+    /// `state_at` leaves `valid_len == line + 1`, so the record-forward
+    /// branch has to test that, not `line == valid_len` — which never
+    /// matched, and made every painted line tokenize twice.
+    #[test]
+    fn painting_lines_in_order_extends_the_cache_by_one_each_time() {
+        let b = buf("/* a\n b\n c */\nlet x = 1;\nlet y = 2;");
+        let mut cache = SyntaxCache::new(Language::Rust);
+        for line in 0..b.line_count() {
+            cache.spans_for(&b, line);
+            assert_eq!(
+                cache.valid_len,
+                line + 2,
+                "line {line} must leave the next line's state cached"
+            );
+        }
+    }
+
+    /// A language with no block comments has no state to carry, so the
+    /// cache must not grow a `bool` per painted line that nothing reads.
+    #[test]
+    fn a_language_without_block_comments_caches_nothing() {
+        let b = buf("echo one\necho two\necho three");
+        let mut cache = SyntaxCache::new(Language::Shell);
+        for line in 0..b.line_count() {
+            cache.spans_for(&b, line);
+        }
+        assert_eq!(cache.valid_len, 0);
+        assert!(cache.states.is_empty());
+    }
+
     #[test]
     fn plain_text_produces_no_spans() {
         let b = buf("let x = 1;");

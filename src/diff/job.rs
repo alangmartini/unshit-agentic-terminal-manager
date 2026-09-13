@@ -247,6 +247,38 @@ mod tests {
         }
     }
 
+    /// `strip_side_prefix` drops a leading `a/`, `b/`, `c/`... whether or
+    /// not git emitted one, so the command has to guarantee it did. Under
+    /// the user's own `diff.noprefix` a real top-level directory named
+    /// `c` used to be eaten from every path in the diff.
+    #[test]
+    fn a_top_level_directory_survives_the_user_s_diff_noprefix() {
+        let dir = temp_repo("noprefix");
+        let status = crate::git::git_command(&dir)
+            .args(["config", "diff.noprefix", "true"])
+            .status()
+            .expect("run git");
+        assert!(status.success());
+
+        fs::create_dir_all(dir.join("c")).expect("create c/");
+        fs::write(dir.join("c/main.c"), "int main(void) { return 0; }\n").expect("write");
+        commit(&dir, "initial");
+        fs::write(dir.join("c/main.c"), "int main(void) { return 1; }\n").expect("edit");
+
+        let spec = DiffSpec::parse("HEAD").expect("spec");
+        match run_diff(&spec, &dir) {
+            DiffOutcome::Ready { document, .. } => {
+                assert_eq!(document.files.len(), 1);
+                assert_eq!(
+                    document.files[0].path, "c/main.c",
+                    "the top-level `c` directory must survive"
+                );
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The default range: uncommitted work against HEAD. This is what
     /// `diff.open` with no argument shows, so it has to work on a repo
     /// with edits that were never staged.
