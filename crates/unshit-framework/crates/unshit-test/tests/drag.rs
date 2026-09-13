@@ -458,3 +458,95 @@ fn threshold_is_euclidean_not_axis_aligned() {
 
     assert_eq!(drag_log2.len(), 0, "2.83px euclidean distance should not exceed 4px threshold");
 }
+
+/// Framework drag auto-repeat: a handle that opted in via
+/// `with_drag_autorepeat` keeps receiving `DragPhase::Update` from
+/// `tick_drag_autorepeat` while the pointer rests past its edge, with the
+/// pointer's last position and zero per-event deltas, and stops once the
+/// pointer is back inside or the button is released.
+#[test]
+fn drag_autorepeat_ticks_while_pointer_rests_outside_opted_in_handle() {
+    let drag_log = DragLog::new();
+    let drag_h = drag_log.handler();
+
+    let tree_fn = move || ElementTree {
+        root: ElementDef::new(Tag::Div).with_class("root").with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("handle")
+                .on_drag({
+                    let h = drag_h.clone();
+                    move |ev| h(ev)
+                })
+                .with_drag_autorepeat(),
+        ),
+    };
+
+    let mut h = TestHarness::new(drag_css(), tree_fn, 800.0, 600.0);
+    h.step();
+
+    // `.handle` is 100x50 at the origin: press inside, drag below its edge.
+    h.mouse_down(50.0, 25.0);
+    h.step();
+    h.mouse_move(50.0, 80.0);
+    h.step();
+    // The move that crosses the threshold delivers Start and the first
+    // Update together.
+    assert_eq!(drag_log.phases(), vec![DragPhase::Start, DragPhase::Update]);
+
+    // Held still past the edge: every tick re-dispatches an Update at the
+    // same position with zero per-event deltas.
+    assert!(h.tick_drag_autorepeat());
+    assert!(h.tick_drag_autorepeat());
+    assert_eq!(
+        drag_log.phases(),
+        vec![DragPhase::Start, DragPhase::Update, DragPhase::Update, DragPhase::Update]
+    );
+    let last = drag_log.entries()[3].clone();
+    assert_eq!((last.x, last.y), (50.0, 80.0));
+    assert_eq!((last.delta_x, last.delta_y), (0.0, 0.0));
+    assert_eq!((last.total_delta_x, last.total_delta_y), (0.0, 55.0));
+
+    // Back inside the handle: nothing to repeat.
+    h.mouse_move(50.0, 40.0);
+    h.step();
+    assert!(!h.tick_drag_autorepeat());
+    let before = drag_log.len();
+
+    // Released outside: the drag is over, so no further repeats either.
+    h.mouse_move(50.0, 90.0);
+    h.mouse_up(50.0, 90.0);
+    h.step();
+    assert!(!h.tick_drag_autorepeat());
+    assert_eq!(drag_log.phases().last(), Some(&DragPhase::End));
+    assert_eq!(
+        drag_log.len(),
+        before + 2,
+        "one Update from the move and the End from the release, nothing synthetic"
+    );
+}
+
+/// Without the opt-in a drag resting outside its handle is left alone.
+#[test]
+fn drag_autorepeat_is_opt_in() {
+    let drag_log = DragLog::new();
+    let drag_h = drag_log.handler();
+
+    let tree_fn = move || ElementTree {
+        root: ElementDef::new(Tag::Div).with_class("root").with_child(
+            ElementDef::new(Tag::Div).with_class("handle").on_drag({
+                let h = drag_h.clone();
+                move |ev| h(ev)
+            }),
+        ),
+    };
+
+    let mut h = TestHarness::new(drag_css(), tree_fn, 800.0, 600.0);
+    h.step();
+    h.mouse_down(50.0, 25.0);
+    h.step();
+    h.mouse_move(50.0, 80.0);
+    h.step();
+
+    assert!(!h.tick_drag_autorepeat());
+    assert_eq!(drag_log.phases(), vec![DragPhase::Start, DragPhase::Update]);
+}
