@@ -924,7 +924,8 @@ impl EditorPane {
         if file.status == crate::diff::DiffFileStatus::Deleted {
             return None;
         }
-        Some((view.repo_root.join(&file.path), line))
+        // Never `join`: `file.path` came out of git's own output.
+        Some((crate::git::resolve_in_repo(&view.repo_root, &file.path)?, line))
     }
 }
 

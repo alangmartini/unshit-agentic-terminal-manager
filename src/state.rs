@@ -6833,8 +6833,9 @@ fn dispatch_diff_open_file(state: &mut AppState) -> bool {
         return false;
     }
     let Some((path, line)) = editor.diff_open_target() else {
-        // A header row, a spacer, or a deleted file: there is nothing on
-        // disk to open. Say so rather than opening the repository root.
+        // A header row, a spacer, a deleted file, or a path that would
+        // resolve outside the repository: there is nothing on disk to
+        // open. Say so rather than opening the repository root.
         push_error_toast(state, "No file to open on this row");
         return true;
     };
@@ -6919,7 +6920,12 @@ fn dispatch_flow_edit(state: &mut AppState, node_id: &str) -> bool {
         push_error_toast(state, "This node has no source location");
         return true;
     };
-    let path = pane.repo_root.join(&location.file);
+    // A flow document is produced by an agent, so its `file` is untrusted
+    // input; `join` with an absolute one would discard the root entirely.
+    let Some(path) = crate::git::resolve_in_repo(&pane.repo_root, &location.file) else {
+        push_error_toast(state, "This node's source path is outside the repository");
+        return true;
+    };
     dispatch_editor_open_at(
         state,
         &path.to_string_lossy(),

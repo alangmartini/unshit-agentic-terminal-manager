@@ -583,8 +583,18 @@ fn unquote_path(raw: &str) -> String {
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'));
     match inner.and_then(decode_c_quoted) {
-        Some(decoded) => decoded,
-        None => raw.to_string(),
+        // A decoded path is only usable while it is still one line and
+        // still printable. git quotes control characters whatever
+        // `core.quotepath` says, so a newline escape in a (legal, on
+        // Linux) file name decodes to a real line break, which
+        // `finish_file` writes into
+        // `lines` — and one extra line there breaks the
+        // `lines.len() == rows.len()` invariant every row lookup depends
+        // on, so every row below it paints with its neighbour's gutter,
+        // tint and language. Keeping the escaped form is what this
+        // function already does for anything it cannot decode.
+        Some(decoded) if !decoded.chars().any(char::is_control) => decoded,
+        _ => raw.to_string(),
     }
 }
 

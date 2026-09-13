@@ -79,6 +79,34 @@ pub fn detect_git_branch(path: &Path) -> Option<String> {
 /// submodule the ancestor walk finds a `.git` *file* whose directory is
 /// not the tree git diffs against. Spawns a process (~30 ms on Windows),
 /// so call it off the UI thread.
+/// Resolve a repository-relative path against `root`, refusing anything
+/// that would land outside it.
+///
+/// The right-hand side is never trusted: a diff path is parsed straight
+/// out of `git diff` output and a flow location is whatever the producer
+/// wrote. `Path::join` silently discards `root` for an absolute
+/// right-hand side, and `..` walks out of the checkout — and the pane
+/// that opens is a writable editor, so `Ctrl+S` would then write there.
+/// A hostile name need not even exist in the work tree: `git diff A..B`
+/// reads the trees directly, so `core.protectNTFS` never sees it.
+pub fn resolve_in_repo(root: &Path, relative: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+
+    let mut resolved = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            // `..`, a leading separator, a drive letter or a UNC prefix.
+            // None of them appear in a path git reports relative to the
+            // repository root, and every one of them escapes it.
+            _ => return None,
+        }
+    }
+    // `root` itself is a directory, not a file to open.
+    (resolved != root).then_some(resolved)
+}
+
 pub fn repo_root(path: &Path) -> Option<std::path::PathBuf> {
     if !path.is_dir() {
         return None;
