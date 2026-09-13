@@ -46,15 +46,24 @@ jobs:
         run: |
           $hasClaude = $null -ne (Get-Command claude -ErrorAction SilentlyContinue)
           $hasToken = -not [string]::IsNullOrWhiteSpace($env:CLAUDE_CODE_OAUTH_TOKEN)
+          $hasLogin = $false
+          if ($hasClaude -and -not $hasToken) {
+            try {
+              $auth = claude auth status | ConvertFrom-Json
+              $hasLogin = ($LASTEXITCODE -eq 0) -and ($auth.loggedIn -eq $true)
+            } catch {
+              $hasLogin = $false
+            }
+          }
           $hasApp = (-not [string]::IsNullOrWhiteSpace($env:APP_ID)) -and (-not [string]::IsNullOrWhiteSpace($env:APP_PRIVATE_KEY))
-          $ready = $hasClaude -and $hasToken
+          $ready = $hasClaude -and ($hasToken -or $hasLogin)
           "ready=$($ready.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "has_app=$($hasApp.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
           if (-not $ready) {
             "Agentic PR review cannot run." >> $env:GITHUB_STEP_SUMMARY
             "" >> $env:GITHUB_STEP_SUMMARY
-            "Required: Claude Code CLI plus CLAUDE_CODE_OAUTH_TOKEN configured on the runner." >> $env:GITHUB_STEP_SUMMARY
+            "Required: Claude Code CLI with CLAUDE_CODE_OAUTH_TOKEN or an authenticated CLI session for the runner account." >> $env:GITHUB_STEP_SUMMARY
             exit 1
           }
 

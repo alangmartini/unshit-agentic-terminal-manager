@@ -141,12 +141,44 @@ mod tests {
 
     #[test]
     fn distinct_paths_are_resolved_once_each() {
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixture = std::env::temp_dir().join(format!(
+            "git-watch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = fixture.join("repo");
+        let plain = fixture.join("plain");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "test-branch"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            assert!(crate::git::git_command(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
         let targets = vec![
             (1, repo.clone()),
             (2, repo.clone()),
             (3, repo.clone()),
-            (4, std::env::temp_dir()),
+            (4, plain.clone()),
         ];
 
         let resolved = resolve(&targets);
@@ -157,7 +189,19 @@ mod tests {
             2,
             "shared repositories must not be probed once per workspace"
         );
-        assert!(matches!(resolved[&repo], GitBranch::Known(_)));
+        assert_eq!(resolved[&repo], GitBranch::Known("test-branch".into()));
+        assert_eq!(resolved[&plain], GitBranch::Absent);
+        // CI checks out a detached merge commit. Branch detection must still
+        // resolve each path, reporting Absent for that repository.
+        assert!(crate::git::git_command(&repo)
+            .args(["checkout", "--detach", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let detached = resolve(&targets);
+        assert_eq!(detached.len(), 2);
+        assert_eq!(detached[&repo], GitBranch::Absent);
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
