@@ -278,7 +278,7 @@ prefix.
 
 | Scope | Chord | Action |
 |---|---|---|
-| global (rebindable) | `Ctrl+P` | quick open |
+| global (rebindable) | `Ctrl+Shift+E` | quick open |
 | global (rebindable) | `Ctrl+Shift+G` | diff against… |
 | editor pane | `Ctrl+F`, `F3`, `Shift+F3`, `Escape` | find bar |
 | editor pane | `Ctrl+G` | go to line |
@@ -288,26 +288,43 @@ prefix.
 
 `Ctrl+Shift+F` stays the FPS overlay toggle; `Ctrl+1..9` stay tab switches.
 
+**Amended during implementation (2026-09-13):** quick open ships on
+`Ctrl+Shift+E`, not the `Ctrl+P` this spec first named. Registered chords
+are resolved before terminal keyboard capture, so a global `Ctrl+P` would
+take readline's "previous command" away from every shell the app hosts —
+the same reason `src/keybinds/mod.rs` already moved Open file and Save off
+plain `Ctrl+O` / `Ctrl+S`. `Ctrl+Shift+E` is VS Code's Explorer chord and
+leaves the terminal alone; the action is rebindable to `Ctrl+P` for anyone
+who prefers the editor convention.
+
 ## Telemetry
 
 Lifecycle only, never per keystroke, never file content or query text.
 
-`editor-events.jsonl` (existing sink) gains: `editor.goto {pane_id, line}`,
-`editor.open_at {pane_id, path, line, focused_existing}`,
-`editor.find_open {pane_id}`, `editor.find_close {pane_id, query_len, matches, capped}`,
-`quickopen.index {root, source: "git"|"walk", entries, truncated, elapsed_ms}`,
-`quickopen.pick {path}`, `editor.paste {pane_id, bytes}` (bytes only).
+`editor-events.jsonl` (existing sink) gains: `editor.goto {path, line}`,
+`editor.focus_existing {path, line}` (an open that focused a pane instead
+of creating one), `editor.find_open {path}`, `editor.find_closed {path,
+line_count}` where `line_count` is the number of hits the session ended
+with, `quickopen.index {path: root, line_count: entries, reason:
+"git"|"walk"}`, `quickopen.pick {path}`, `editor.paste {path}`.
+`editor.open` gains `line` when the open carried a jump target.
+
+The record grew a `line` field distinct from `line_count` so a navigation
+target is never recorded where a query would read it as a file size.
 
 `diff-events.jsonl` (new sink, same rotating writer): `diff.request
 {job_id, pane_id, range, repo_root, origin: "dialog"|"palette"|"flow"|"dispatch"}`,
 `diff.ready {job_id, pane_id, files, hunks, rows, stdout_bytes, elapsed_ms, truncated}`,
-`diff.failed {job_id, pane_id, reason: "not_a_repo"|"bad_range"|"git_error"|"too_large"|"spawn", elapsed_ms}`,
-`diff.dropped {job_id}` (pane closed before the result), `diff.open_file
+`diff.failed {job_id, pane_id, reason: "not_a_repo"|"git_error"|"too_large"|"spawn", elapsed_ms}`,
+`diff.rejected {job_id, reason: "bad_range"}` (refused before a pane
+exists, so it carries no pane id and never the typed text),
+`diff.dropped {job_id, pane_id, reason: "pane_closed"}` (the pane was closed, or its id reused, before the result landed), `diff.open_file
 {pane_id, path, line}`, `diff.nav {pane_id, kind: "hunk"|"file"}` (one per
 key press is acceptable: these are deliberate navigation actions, not
 typing), `diff.closed {pane_id, rows, age_ms}`.
 
-`flow-events.jsonl` gains `flow.handoff {pane_id, kind: "edit"|"diff", has_location}`.
+`flow-events.jsonl` gains `flow.handoff {flow_id, kind: "edit"|"diff",
+reason: "located"|"no_location"}`.
 
 ## Boundaries
 

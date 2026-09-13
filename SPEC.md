@@ -15,6 +15,12 @@ in-file search, soft wrap, multiple cursors, IME preedit, a file tree, and LSP â
 but the architecture (per-cell fg/bg attributes on `CellGrid`, a standalone buffer
 module) must leave those straightforward to add later.
 
+> **Update (2026-09-13):** syntax highlighting and in-file search are no longer
+> deferred â€” both shipped with the diff review pane and navigation work
+> specced in `specs/editor-navigation-and-diff.md`, on the architecture below.
+> Soft wrap, multiple cursors, IME preedit, a file tree, LSP and persistence
+> stay deferred.
+
 Key architectural facts this spec is built on (verified in the codebase):
 
 - `CellGrid` (`crates/unshit-framework/crates/unshit-core/src/cell_grid.rs`) is the
@@ -245,6 +251,7 @@ Never:
   `cargo test -p terminal-manager` all pass.
 
 ## Open Questions
-- None blocking for the MVP as scoped. Deferred items (syntax highlighting, in-file
-  search, soft wrap, multi-cursor, IME, file tree, persistence) are listed in the
-  Objective and intentionally out of scope.
+- None blocking for the MVP as scoped. Deferred items (soft wrap, multi-cursor,
+  IME, file tree, persistence) are listed in the Objective and intentionally out of
+  scope. Syntax highlighting and in-file search shipped later, under
+  `specs/editor-navigation-and-diff.md`.
