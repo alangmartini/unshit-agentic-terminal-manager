@@ -126,6 +126,7 @@ User data is stored under your platform config and data directories:
 | What | Location |
 |------|----------|
 | Workspaces, tabs, and pane layout | `%APPDATA%\com.godly.terminal\workspaces.json` |
+| Custom agent detection rules | `%APPDATA%\com.godly.terminal\agent-detection.json` |
 | Quick Prompt agent worktrees | `%APPDATA%\com.godly.terminal\worktrees\` |
 | Redacted agent recovery events | `%APPDATA%\com.godly.terminal\agent-restore-events.jsonl` |
 | Renderer performance/recovery events | `%APPDATA%\com.godly.terminal\renderer-events.jsonl` |
@@ -146,6 +147,36 @@ User data is stored under your platform config and data directories:
 - **Recovery hooks** are merged into Claude Code and Codex user hook settings without replacing unrelated hooks. Disabling automatic launch keeps them installed so manual recovery can continue capturing ids; **Remove recovery hooks** removes only entries marked as managed by Terminal Manager.
 - **Windows login startup** stores a quoted absolute executable path directly in the current user's `Run` key. It does not use a command shell, request administrator access, or enable agent recovery consent. The installer removes only Terminal Manager's owned value during uninstall.
 - **Recovery IPC and files** are owner-scoped: clients verify the connected server's Windows SID or Unix uid before sending hook metadata, Unix servers reject other-owner peers, hook edits refuse symlinks/reparse points, and recovery state/telemetry use owner-private files. If the final close-state save fails, Terminal Manager stays open and offers a retry instead of allowing stale agent metadata to return on the next launch.
+
+### Custom agent detection
+
+Create `agent-detection.json` beside `workspaces.json` to recognize a harness that the built-in detector does not know. Copy [the example configuration](assets/agent-detection.example.json) and replace its names and paths:
+
+```json
+{
+  "rules": [
+    { "profile": "my-agent", "executable": "my-agent.exe" },
+    {
+      "profile": "openrouter",
+      "executable": "node.exe",
+      "args_prefix": ["C:/tools/router/cli.js"]
+    },
+    {
+      "profile": "my-python-agent",
+      "executable": "python.exe",
+      "args_prefix": ["-m", "my_agent"]
+    }
+  ]
+}
+```
+
+The Windows background monitor reloads this file once per second. Changes apply to running panes; deleting the file or setting `rules` to `[]` removes custom detection. Invalid edits keep the last valid rules active and log a warning. Repo builds use `%APPDATA%\com.godly.terminal.dev`; named profiles use `com.godly.terminal.<profile>`. `TM_CONFIG_DIR` overrides the directory.
+
+- `profile` is an existing profile ID (`claude`, `codex`, `gemini`, `opencode`, `aider`, `copilot`, `openrouter`) or a custom name displayed in Agents. Use 1–64 lowercase ASCII letters, digits, hyphens or underscores, starting with a letter or digit.
+- `executable` matches the running process's basename, ignoring case and an optional `.exe` suffix. Use the actual process image, not a `.cmd`/`.ps1` launcher. Paths and wildcards are not accepted.
+- `args_prefix` matches consecutive, complete arguments immediately after the executable. Shells and runtimes require it; include enough arguments to identify the harness, not just generic runtime flags. Quoted spaces are supported. Arguments containing `/` or `\` ignore slash style and ASCII case; all other arguments are case-sensitive. No substring search, environment expansion or command execution occurs.
+- For each process, built-in detection wins over custom rules; otherwise, the first matching rule wins. The outermost detected harness wins when agents launch other agents. Rules classify panes only; they do not add launch commands or conversation recovery. Process tags clear when a successful scan no longer finds a match; explicit launches and hooks retain priority.
+- Files are limited to 64 KiB and 64 rules. Each executable is at most 128 bytes; each prefix has at most 16 arguments of at most 1024 bytes each. Unknown JSON fields are rejected so typos do not silently broaden a rule.
 
 ## Development
 

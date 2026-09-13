@@ -2,7 +2,7 @@
 
 use super::{profile, AgentProfile};
 
-fn executable_stem(image: &str) -> String {
+pub(super) fn executable_stem(image: &str) -> String {
     let name = image
         .rsplit(['/', '\\'])
         .next()
@@ -73,7 +73,7 @@ pub fn classify_process(image: &str, command_line: Option<&str>) -> Option<&'sta
 /// Read only the command's executable and entrypoint. Preserve Windows path
 /// separators and quoted spaces; reject malformed/embedded quoting. This is
 /// intentionally not a shell parser and never executes or expands anything.
-fn next_argument<'a>(remaining: &mut &'a str) -> Option<&'a str> {
+pub(super) fn next_argument<'a>(remaining: &mut &'a str) -> Option<&'a str> {
     let text = remaining.trim_start();
     if let Some(quoted) = text.strip_prefix('"').or_else(|| text.strip_prefix('\'')) {
         let quote = text.chars().next()?;

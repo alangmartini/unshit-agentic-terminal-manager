@@ -2741,9 +2741,10 @@ pub fn classify_pane_process(state: &mut AppState, pane_id: u32, profile_id: Opt
     {
         return false;
     }
-    let next = profile_id
-        .and_then(crate::agents::profile)
-        .map(|profile| AgentTag::new(profile.id, AgentTagSource::Process));
+    if profile_id.is_some_and(|id| !crate::agents::rules::valid_profile_id(id)) {
+        return false;
+    }
+    let next = profile_id.map(|id| AgentTag::new(id, AgentTagSource::Process));
     // A negative process scan only clears its own evidence. A title can
     // identify a harness whose runtime/entrypoint we do not recognize yet.
     if next.is_none() && !existing.is_some_and(|tag| tag.source == AgentTagSource::Process) {
@@ -20807,6 +20808,16 @@ mod agents_tab_tests {
         }
         assert!(!classify_pane_process(&mut state, 999, Some("codex")));
         assert!(!state.pane_agents.contains_key(&999));
+    }
+
+    #[test]
+    fn custom_process_profile_appears_in_agents_and_clears_on_exit() {
+        let mut state = seed_state();
+        assert!(classify_pane_process(&mut state, 1, Some("my-router")));
+        assert_eq!(agent_tag_for_pane(&state, 1).unwrap().label(), "my-router");
+        assert!(!state.ui_snapshot().workspaces[0].agent_entries.is_empty());
+        assert!(classify_pane_process(&mut state, 1, None));
+        assert!(!is_agent_pane(&state, 1));
     }
 
     #[test]

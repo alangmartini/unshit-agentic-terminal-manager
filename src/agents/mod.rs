@@ -22,6 +22,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod process;
+pub mod rules;
 pub mod telemetry;
 
 /// How a pane earned its agent tag. Launched/hook evidence wins over

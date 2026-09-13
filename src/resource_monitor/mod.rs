@@ -122,7 +122,7 @@ pub struct ResourceReport {
 pub struct ProcessAgentObservation {
     pub pane_id: u32,
     pub session_id: u64,
-    pub profile: Option<&'static str>,
+    pub profile: Option<String>,
 }
 
 /// Write a report into the state. Returns whether anything the status bar
@@ -172,7 +172,7 @@ pub fn apply_report(state: &mut AppState, report: &ResourceReport) -> bool {
             agents_changed |= crate::state::classify_pane_process(
                 state,
                 observation.pane_id,
-                observation.profile,
+                observation.profile.as_deref(),
             );
         }
     }
@@ -377,6 +377,7 @@ struct RootsCache {
 
 struct Monitor {
     tracker: CpuTracker,
+    detection_rules: crate::agents::rules::RulesFile,
     roots: RootsCache,
     logical_cpus: usize,
     last_tick: Option<(Instant, u64)>,
@@ -400,6 +401,9 @@ impl Monitor {
     fn with_emitter(emit: fn(&ResourceEventRecord)) -> Self {
         Self {
             tracker: CpuTracker::new(),
+            detection_rules: crate::agents::rules::RulesFile::new(
+                crate::profile::config_dir().map(|dir| dir.join("agent-detection.json")),
+            ),
             roots: RootsCache::default(),
             logical_cpus: platform::logical_cpus(),
             last_tick: None,
@@ -414,6 +418,7 @@ impl Monitor {
     }
 
     fn tick(&mut self, shared: &SharedState) -> ResourceReport {
+        self.detection_rules.refresh();
         let (lister, owned) = {
             let guard = shared.lock_recover();
             let mut owned: Vec<(u32, u64)> = guard.pty_manager.sessions_iter().collect();
@@ -555,6 +560,7 @@ impl Monitor {
                 &table,
                 &owner,
                 &image_names,
+                &self.detection_rules.rules,
                 platform::process_command_line,
             );
         }
@@ -653,6 +659,7 @@ fn observe_agents(
     table: &[tree::ProcessRecord],
     owner: &HashMap<u32, u32>,
     image_names: &HashMap<u32, String>,
+    rules: &crate::agents::rules::DetectionRules,
     mut command_line: impl FnMut(u32) -> Option<String>,
 ) -> Vec<ProcessAgentObservation> {
     use crate::agents::process::{classify_process, needs_command_line};
@@ -683,15 +690,18 @@ fn observe_agents(
                 unknown = true;
                 continue;
             };
-            let command = if needs_command_line(image) {
+            let command = if needs_command_line(image) || rules.needs_command_line(image) {
                 let command = command_line(pid);
                 unknown |= command.is_none();
                 command
             } else {
                 None
             };
-            if let Some(agent) = classify_process(image, command.as_deref()) {
-                profile = Some(agent.id);
+            if let Some(id) = classify_process(image, command.as_deref())
+                .map(|agent| agent.id)
+                .or_else(|| rules.classify(image, command.as_deref()))
+            {
+                profile = Some(id.to_string());
                 break;
             }
         }
@@ -714,6 +724,57 @@ mod tests {
 
     fn first_pane_id(state: &AppState) -> u32 {
         state.panes[0][0].id.0
+    }
+
+    #[test]
+    fn custom_rules_detect_additional_runtimes_and_removal_preserves_builtins() {
+        let sessions = [
+            SessionRoot {
+                pid: 10,
+                pane_id: Some(1),
+                session_id: 100,
+            },
+            SessionRoot {
+                pid: 20,
+                pane_id: Some(2),
+                session_id: 200,
+            },
+        ];
+        let table = [
+            tree::ProcessRecord {
+                pid: 10,
+                parent_pid: 0,
+            },
+            tree::ProcessRecord {
+                pid: 20,
+                parent_pid: 0,
+            },
+        ];
+        let names = HashMap::from([(10, "codex.exe".into()), (20, "deno.exe".into())]);
+        let owner = tree::attribute(&table, &HashSet::from([10, 20]), |_| None);
+        let rules = crate::agents::rules::DetectionRules::parse(r#"{"rules":[
+            {"profile":"custom-router","executable":"deno","args_prefix":["run","C:/tools/agent.ts"]},
+            {"profile":"wrong-agent","executable":"codex"}
+        ]}"#).unwrap();
+        let observations = observe_agents(&sessions, &table, &owner, &names, &rules, |pid| {
+            assert_eq!(pid, 20, "query only the custom runtime");
+            Some(r#"deno run "C:\tools\agent.ts" --prompt text"#.into())
+        });
+        assert_eq!(observations[0].profile.as_deref(), Some("codex"));
+        assert_eq!(observations[1].profile.as_deref(), Some("custom-router"));
+        let observations = observe_agents(
+            &sessions,
+            &table,
+            &owner,
+            &names,
+            &crate::agents::rules::DetectionRules::default(),
+            |_| panic!("no runtime needs a query"),
+        );
+        assert_eq!(observations[0].profile.as_deref(), Some("codex"));
+        assert_eq!(
+            observations[1].profile, None,
+            "removing the rule clears custom detection"
+        );
     }
 
     #[test]
@@ -762,7 +823,8 @@ mod tests {
         ]);
         let roots = HashSet::from([10, 20]);
         let owner = tree::attribute(&table, &roots, |_| None);
-        let observed = observe_agents(&sessions, &table, &owner, &names, |pid| {
+        let rules = crate::agents::rules::DetectionRules::default();
+        let observed = observe_agents(&sessions, &table, &owner, &names, &rules, |pid| {
             assert_eq!(pid, 11, "never query unrelated sessions");
             Some(r#"node "C:\Users\Test User\node_modules\@github\copilot\npm-loader.js""#.into())
         });
@@ -771,19 +833,21 @@ mod tests {
             vec![ProcessAgentObservation {
                 pane_id: 1,
                 session_id: 100,
-                profile: Some("copilot"),
+                profile: Some("copilot".into()),
             }],
             "outer harness wins over the nested agent"
         );
         table.retain(|p| p.pid != 12);
         let owner = tree::attribute(&table, &roots, |_| None);
         assert!(
-            observe_agents(&sessions, &table, &owner, &names, |_| None).is_empty(),
+            observe_agents(&sessions, &table, &owner, &names, &rules, |_| None).is_empty(),
             "an unreadable runtime leaves membership unknown"
         );
         table.retain(|p| p.pid != 11);
         let owner = tree::attribute(&table, &roots, |_| None);
-        let observed = observe_agents(&sessions, &table, &owner, &names, |_| panic!("no runtime"));
+        let observed = observe_agents(&sessions, &table, &owner, &names, &rules, |_| {
+            panic!("no runtime")
+        });
         assert_eq!(
             observed[0].profile, None,
             "shell remains after the agent exits"
@@ -802,7 +866,7 @@ mod tests {
         report.agents.push(ProcessAgentObservation {
             pane_id,
             session_id: 42,
-            profile: Some("codex"),
+            profile: Some("codex".into()),
         });
         assert!(apply_report(&mut state, &report));
         assert!(crate::state::is_agent_pane(&state, pane_id));
