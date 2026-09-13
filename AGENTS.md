@@ -63,6 +63,9 @@ Bug fixes should include a regression test when the behavior can be tested witho
   history yourself. This bans attribution, not vocabulary: naming an agent
   CLI as the *subject* of a change is correct (`feat(agents): classify
   Claude Code pane titles`), because this product integrates those CLIs.
+  A global `commit-msg` hook (`~/.githooks/commit-msg`) rejects these
+  strings; never bypass it with `--no-verify` or by overriding
+  `core.hooksPath` — fix the message instead.
 - Do not rewrite, reset, or revert user changes unless explicitly asked.
 - When resolving merges around app configuration, verify callbacks such as `on_close`, `on_scale_factor`, and `on_cell_metrics` are still wired.
 - Merge parallel or agent-produced work one branch at a time and verify after each merge.
