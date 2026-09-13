@@ -34,6 +34,7 @@ pub fn build_tree_from_def(
     element.captures_keyboard = def.captures_keyboard;
     element.on_context_menu = def.on_context_menu.clone();
     element.on_drag = def.on_drag.clone();
+    element.drag_autorepeat = def.drag_autorepeat;
     element.on_resize = def.on_resize.clone();
     element.resize_axis = def.resize_axis;
     element.on_pane_resize = def.on_pane_resize.clone();

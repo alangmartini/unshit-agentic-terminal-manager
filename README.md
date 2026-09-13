@@ -120,6 +120,7 @@ User data is stored under your platform config and data directories:
 | Redacted agent recovery events | `%APPDATA%\com.godly.terminal\agent-restore-events.jsonl` |
 | Renderer performance/recovery events | `%APPDATA%\com.godly.terminal\renderer-events.jsonl` |
 | Agent tab classification, launch and kill events | `%APPDATA%\com.godly.terminal\agent-events.jsonl` |
+| Terminal mode changes (alternate screen, mouse reporting) and selection auto-scroll events | `%APPDATA%\com.godly.terminal\terminal-events.jsonl` |
 | Opt-in Windows login startup | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`Unshit Terminal Manager` value) |
 
 - **Keybindings** are editable in **Settings → Keybinds**. Each action keeps a stable id and is persisted as JSON; defaults follow Windows conventions (see the table above).

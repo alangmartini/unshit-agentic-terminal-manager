@@ -423,6 +423,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                     snap_rows, snap_cols,
                                                 );
                                                 terminal.apply_snapshot(&snapshot);
+                                                terminal.set_telemetry_pane(*id);
                                                 guard.terminals.insert(
                                                     *id,
                                                     std::sync::Arc::new(std::sync::Mutex::new(
@@ -455,10 +456,11 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                 );
                                             }
                                             Ok((None, reader)) => {
-                                                let terminal = crate::terminal::Terminal::new(
+                                                let mut terminal = crate::terminal::Terminal::new(
                                                     rows as usize,
                                                     cols as usize,
                                                 );
+                                                terminal.set_telemetry_pane(*id);
                                                 guard.terminals.insert(
                                                     *id,
                                                     std::sync::Arc::new(std::sync::Mutex::new(
@@ -507,6 +509,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                                                     rows as usize,
                                                     cols as usize,
                                                 );
+                                                terminal.set_telemetry_pane(*id);
                                                 terminal.process_bytes(
                                                     format!(
                                                         "Failed to spawn shell: {}\r\n",

@@ -518,6 +518,7 @@ pub(crate) fn build_tree_from_def(
     element.captures_keyboard = def.captures_keyboard;
     element.on_context_menu = def.on_context_menu.clone();
     element.on_drag = def.on_drag.clone();
+    element.drag_autorepeat = def.drag_autorepeat;
     element.on_resize = def.on_resize.clone();
     // Generic `.on(EventType, ..)` handlers, mirroring the production
     // reconciler (`reconcile::element_from_def`). Without this the harness
