@@ -3,20 +3,11 @@ use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{CssPosition, Dimension};
 
-use crate::resource_monitor::{format_compact_bytes, ProcessUsage};
+use crate::resource_monitor::{active_tab_processes, format_compact_bytes, ProcessUsage};
 use crate::state::{dispatch, mutate_with, SharedState, UiSnapshot};
 
 fn tab_processes(snap: &UiSnapshot) -> Vec<&ProcessUsage> {
-    let mut rows: Vec<_> = snap
-        .panes
-        .iter()
-        .flatten()
-        .filter(|pane| pane.pid != 0)
-        .filter_map(|pane| snap.resource_trees.get(&pane.pid))
-        .flat_map(|tree| tree.processes.iter())
-        .collect();
-    rows.sort_unstable_by_key(|p| p.pid);
-    rows.dedup_by_key(|p| p.pid);
+    let mut rows = active_tab_processes(&snap.panes, &snap.resource_trees);
     rows.sort_unstable_by_key(|p| (std::cmp::Reverse(p.mem_bytes), p.pid));
     rows
 }
