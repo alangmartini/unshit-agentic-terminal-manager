@@ -42,6 +42,11 @@ pub struct FlowEventRecord<'a> {
     /// View name for `flow.view_changed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub view: Option<&'static str>,
+    /// Sub-kind of an event that has variants, e.g. `edit` / `diff` for
+    /// `flow.handoff`. Bounded to a handful of literals so it stays a
+    /// usable group-by key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
 }
 
 impl<'a> FlowEventRecord<'a> {
@@ -61,6 +66,7 @@ impl<'a> FlowEventRecord<'a> {
             elapsed_ms: None,
             os_error: None,
             view: None,
+            kind: None,
         }
     }
 }

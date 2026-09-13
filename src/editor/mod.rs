@@ -6,7 +6,11 @@
 //! display grid — the render tree never sees the whole file.
 
 pub mod buffer;
+pub mod colors;
+pub mod diff_view;
+pub mod find;
 pub mod grid;
+pub mod highlight;
 pub mod telemetry;
 
 use std::path::{Path, PathBuf};
@@ -14,6 +18,11 @@ use std::path::{Path, PathBuf};
 use unshit::core::cell_grid::CellGrid;
 
 pub use buffer::{Damage, EditorBuffer, LineEnding, Position, TAB_SPACES};
+pub use colors::EditorColors;
+pub use diff_view::{DiffLoad, DiffView, EditorKind};
+pub use find::FindState;
+use grid::RowPaint;
+use highlight::SyntaxCache;
 
 /// Files above this size are refused (MVP guard; see SPEC.md).
 pub const MAX_EDITOR_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -115,11 +124,36 @@ pub struct EditorPane {
     /// Live viewport grid, cloned into the render tree each frame just
     /// like a terminal's display grid.
     pub grid: CellGrid,
+    /// Resolved from the active theme when the pane opens and again on
+    /// every theme change; editor grids bypass the terminal palette
+    /// remap, so colours have to be real at paint time.
+    pub colors: EditorColors,
+    /// Refuses every buffer mutation and every save. Diff panes are
+    /// read-only; a file pane never is.
+    pub read_only: bool,
+    pub kind: EditorKind,
+    /// `Some` while the find bar is open.
+    pub find: Option<FindState>,
+    /// Block-comment state per line, extended lazily as the viewport
+    /// moves and invalidated from the first line each edit damages.
+    syntax: SyntaxCache,
 }
 
 impl EditorPane {
     pub fn open(path: &Path, rows: usize, cols: usize) -> Result<Self, OpenError> {
+        Self::open_with_colors(path, rows, cols, EditorColors::default())
+    }
+
+    /// Open `path` with an explicit palette. The app always uses this so
+    /// a new pane matches the current theme from its first frame.
+    pub fn open_with_colors(
+        path: &Path,
+        rows: usize,
+        cols: usize,
+        colors: EditorColors,
+    ) -> Result<Self, OpenError> {
         let (buffer, line_ending, file_bytes) = load_file(path)?;
+        let language = crate::syntax::Language::from_path(&path.to_string_lossy());
         let mut pane = Self {
             path: path.to_path_buf(),
             display_name: display_name(path),
@@ -132,10 +166,127 @@ impl EditorPane {
             line_ending,
             file_bytes,
             grid: CellGrid::new(rows.max(1), cols.max(1)),
+            colors,
+            read_only: false,
+            kind: EditorKind::File,
+            find: None,
+            syntax: SyntaxCache::new(language),
         };
         pane.repaint_viewport();
         pane.sync_cursor_into_grid();
         Ok(pane)
+    }
+
+    /// A diff pane with nothing in it yet. The tab appears immediately
+    /// and git fills it in from a worker thread, so a slow diff never
+    /// blocks the UI.
+    pub fn diff_loading(
+        spec: crate::diff::DiffSpec,
+        repo_root: PathBuf,
+        job_id: String,
+        rows: usize,
+        cols: usize,
+        colors: EditorColors,
+    ) -> Self {
+        let label = spec.label();
+        let mut pane = Self {
+            // Diff panes have no file of their own. The repo root stands
+            // in so `path`-keyed logic (duplicate-open checks, telemetry)
+            // has something stable and non-empty.
+            path: repo_root.clone(),
+            display_name: format!("diff: {label}"),
+            buffer: EditorBuffer::from_text(&format!("Loading diff {label}…")),
+            top_line: 0,
+            h_offset: 0,
+            dirty: false,
+            saved_top_group: 0,
+            correlation_id: job_id.clone(),
+            line_ending: LineEnding::Lf,
+            file_bytes: 0,
+            grid: CellGrid::new(rows.max(1), cols.max(1)),
+            colors,
+            read_only: true,
+            kind: EditorKind::Diff(Box::new(DiffView::loading(spec, repo_root, job_id))),
+            find: None,
+            syntax: SyntaxCache::new(crate::syntax::Language::Plain),
+        };
+        pane.repaint_viewport();
+        pane.sync_cursor_into_grid();
+        pane
+    }
+
+    /// Replace a diff pane's placeholder with a parsed document.
+    /// Decorations and buffer lines are swapped together — they index
+    /// each other, so they can never be set separately.
+    pub fn set_diff_document(&mut self, document: &crate::diff::DiffDocument) {
+        let Some(view) = self.kind.as_diff_mut() else {
+            return;
+        };
+        view.adopt(document);
+        let text = if document.lines.is_empty() {
+            let label = view.spec.label();
+            if view.spec.is_working_tree() {
+                format!("No uncommitted changes against {label}.")
+            } else {
+                format!("No changes for {label}.")
+            }
+        } else {
+            document.lines.join("\n")
+        };
+        self.replace_read_only_text(&text);
+    }
+
+    /// Show a failure in place of a diff pane's content.
+    pub fn set_diff_error(&mut self, message: String) {
+        let text = match self.kind.as_diff_mut() {
+            Some(view) => {
+                view.fail(message.clone());
+                format!("Could not diff {}:\n{}", view.spec.label(), message)
+            }
+            None => message,
+        };
+        self.replace_read_only_text(&text);
+    }
+
+    /// Swap the whole buffer of a read-only pane and repaint. Undo
+    /// history is reset with it: a diff document is not editable, so
+    /// there is nothing to undo back to.
+    fn replace_read_only_text(&mut self, text: &str) {
+        self.buffer = EditorBuffer::from_text(text);
+        self.saved_top_group = self.buffer.top_group_id();
+        self.dirty = false;
+        self.top_line = 0;
+        self.h_offset = 0;
+        self.syntax = SyntaxCache::new(crate::syntax::Language::Plain);
+        if let Some(find) = self.find.as_mut() {
+            find.refresh(&self.buffer, Position { line: 0, col: 0 });
+        }
+        self.repaint_viewport();
+        self.sync_cursor_into_grid();
+    }
+
+    /// Re-resolve colours after a theme change and repaint everything.
+    pub fn set_colors(&mut self, colors: EditorColors) {
+        if self.colors == colors {
+            return;
+        }
+        self.colors = colors;
+        self.repaint_viewport();
+        self.sync_cursor_into_grid();
+    }
+
+    /// The language highlighting was resolved to, which is also what
+    /// decides the line-comment token for `editor.toggle_comment`.
+    pub fn language(&self) -> crate::syntax::Language {
+        self.syntax.language()
+    }
+
+    pub fn is_diff(&self) -> bool {
+        matches!(self.kind, EditorKind::Diff(_))
+    }
+
+    pub fn diff(&self) -> Option<&DiffView> {
+        self.kind.as_diff()
     }
 
     /// Largest allowed `top_line`: keeps at least one buffer line in view.
@@ -143,14 +294,96 @@ impl EditorPane {
         self.buffer.line_count().saturating_sub(1)
     }
 
+    /// Paint viewport row `row` from the buffer line it shows, with
+    /// every decoration this pane carries.
+    ///
+    /// Fields are destructured so the syntax cache can be borrowed
+    /// mutably (it extends itself) while the grid is written and the
+    /// buffer is read — three disjoint fields of the same struct.
+    fn paint_row(&mut self, row: usize) {
+        let Self {
+            grid,
+            buffer,
+            syntax,
+            colors,
+            find,
+            kind,
+            top_line,
+            h_offset,
+            ..
+        } = self;
+        let line_idx = *top_line + row;
+        let cursor_line = buffer.cursor().line;
+        let selection = buffer.selection();
+        let gutter_w = match kind.as_diff() {
+            Some(view) => view.gutter_width(),
+            None => grid::gutter_width(buffer.line_count()),
+        };
+
+        // Diff decorations first: they decide the gutter text, the tint
+        // and whether the row is source code at all.
+        let mut gutter_buf = String::new();
+        let mut paint = RowPaint::plain(*h_offset, gutter_w, selection, colors);
+        if let Some(view) = kind.as_diff() {
+            view.gutter_text(line_idx, &mut gutter_buf);
+            paint.gutter_text = Some(gutter_buf.as_str());
+            paint.gutter_fg = view.gutter_fg(line_idx, colors);
+            paint.row_bg = view.row_bg(line_idx, colors);
+            paint.fg_override = view.fg_override(line_idx, colors);
+            paint.bold = view.is_bold(line_idx);
+            let language = view.language_at(line_idx);
+            if syntax.language() != language {
+                *syntax = SyntaxCache::new(language);
+            }
+        } else if line_idx == cursor_line && selection.is_none() {
+            // The cursor line is only marked when nothing is selected,
+            // so the two highlights never fight.
+            paint.row_bg = Some(colors.current_line_bg);
+        }
+
+        // Diff content rows are tokenized one at a time — each carries
+        // its own file's language — but not from a blank slate: the rows
+        // inside one hunk are consecutive lines of one file, so the
+        // block-comment state entering each of them is precomputed at
+        // load and handed in here. Starting every row at `false` painted
+        // the second and later lines of a `/* … */` as code.
+        let spans_owner;
+        if paint.fg_override.is_none() {
+            let mut block = kind
+                .as_diff()
+                .is_some_and(|view| view.block_state_at(line_idx));
+            if kind.as_diff().is_some() {
+                let mut scratch = Vec::new();
+                if syntax.is_active() {
+                    crate::syntax::tokenize_spans(
+                        buffer.line(line_idx).unwrap_or(""),
+                        syntax.language(),
+                        &mut block,
+                        &mut scratch,
+                    );
+                }
+                spans_owner = scratch;
+                paint.spans = &spans_owner;
+            } else {
+                paint.spans = syntax.spans_for(buffer, line_idx);
+            }
+        }
+
+        let find_slice;
+        if let Some(state) = find.as_ref() {
+            find_slice = state.matches_on_line(line_idx).copied().collect::<Vec<_>>();
+            paint.finds = &find_slice;
+            paint.current_find = state.current_match().filter(|m| m.line == line_idx);
+        }
+
+        grid::paint_row(grid, row, line_idx, buffer, &paint);
+    }
+
     fn repaint_viewport(&mut self) {
-        grid::repaint_all(
-            &mut self.grid,
-            &self.buffer,
-            self.top_line,
-            self.h_offset,
-            self.buffer.selection(),
-        );
+        for row in 0..self.grid.rows() {
+            self.grid.reset_line_identity(row);
+            self.paint_row(row);
+        }
     }
 
     fn repaint_visible_row(&mut self, line_idx: usize) {
@@ -161,17 +394,7 @@ impl EditorPane {
         if row >= self.grid.rows() {
             return;
         }
-        let gutter_w = grid::gutter_width(self.buffer.line_count());
-        let selection = self.buffer.selection();
-        grid::paint_row(
-            &mut self.grid,
-            row,
-            line_idx,
-            &self.buffer,
-            self.h_offset,
-            gutter_w,
-            selection,
-        );
+        self.paint_row(row);
     }
 
     /// Position the grid cursor at the buffer cursor, hiding it when it
@@ -181,7 +404,7 @@ impl EditorPane {
         let cursor = self.buffer.cursor();
         let rows = self.grid.rows();
         let cols = self.grid.cols();
-        let gutter_w = grid::gutter_width(self.buffer.line_count());
+        let gutter_w = self.gutter_cells();
         let visual_col = self.buffer.visual_col(cursor);
         let in_vertical = cursor.line >= self.top_line && cursor.line < self.top_line + rows;
         let visible_col = visual_col >= self.h_offset;
@@ -202,17 +425,24 @@ impl EditorPane {
         if clamped == self.top_line {
             return false;
         }
-        grid::scroll_viewport(
-            &mut self.grid,
-            &self.buffer,
-            self.top_line,
-            clamped,
-            self.h_offset,
-            self.buffer.selection(),
-        );
-        self.top_line = clamped;
+        self.scroll_painted(clamped);
         self.sync_cursor_into_grid();
         true
+    }
+
+    /// Move the painted viewport to `top`, reusing the rows that survive
+    /// the move so the renderer's line cache stays warm.
+    fn scroll_painted(&mut self, top: usize) {
+        let plan = grid::plan_scroll(&mut self.grid, self.top_line, top);
+        self.top_line = top;
+        match plan {
+            grid::ScrollPlan::Full => self.repaint_viewport(),
+            grid::ScrollPlan::Rows(rows) => {
+                for row in rows {
+                    self.paint_row(row);
+                }
+            }
+        }
     }
 
     pub fn scroll_by(&mut self, delta: isize) -> bool {
@@ -244,9 +474,13 @@ impl EditorPane {
         true
     }
 
-    /// Gutter width in cells for the current document.
+    /// Gutter width in cells for the current document. Diff panes carry
+    /// two number columns and a marker, so their gutter is wider.
     pub fn gutter_cells(&self) -> usize {
-        grid::gutter_width(self.buffer.line_count())
+        match self.kind.as_diff() {
+            Some(view) => view.gutter_width(),
+            None => grid::gutter_width(self.buffer.line_count()),
+        }
     }
 
     /// Buffer position rendered at viewport cell (`row`, `col_cell`).
@@ -291,6 +525,12 @@ impl EditorPane {
     /// target (acceptable for the MVP; symlinked files are rare on
     /// Windows).
     pub fn save(&mut self) -> std::io::Result<u64> {
+        // Last line of defence for a diff pane, whose `path` is the
+        // repository root: writing there would replace a directory entry
+        // with the rendered diff. Callers refuse first; this refuses too.
+        if self.read_only {
+            return Ok(self.file_bytes);
+        }
         let mut text = self.buffer.to_text();
         if self.line_ending == LineEnding::CrLf {
             text = text.replace('\n', "\r\n");
@@ -328,7 +568,7 @@ impl EditorPane {
     fn ensure_cursor_visible(&mut self) -> bool {
         let cursor = self.buffer.cursor();
         let rows = self.grid.rows();
-        let gutter_w = grid::gutter_width(self.buffer.line_count());
+        let gutter_w = self.gutter_cells();
         let content_cols = self.grid.cols().saturating_sub(gutter_w).max(1);
         let visual_col = self.buffer.visual_col(cursor);
 
@@ -354,15 +594,7 @@ impl EditorPane {
             return true;
         }
         if new_top != self.top_line {
-            grid::scroll_viewport(
-                &mut self.grid,
-                &self.buffer,
-                self.top_line,
-                new_top,
-                self.h_offset,
-                self.buffer.selection(),
-            );
-            self.top_line = new_top;
+            self.scroll_painted(new_top);
         }
         false
     }
@@ -382,7 +614,24 @@ impl EditorPane {
         let new_sel = self.buffer.selection();
         let content_changed = damage != buffer::Damage::None;
         if content_changed {
+            // A read-only pane must never reach here with real damage:
+            // `apply_edit` refuses first. Guard anyway so a future caller
+            // cannot quietly make a diff pane editable.
+            debug_assert!(
+                !self.read_only,
+                "read-only pane mutated: {}",
+                self.display_name
+            );
             self.dirty = self.buffer.top_group_id() != self.saved_top_group;
+            // Comment state below the edit is no longer trustworthy.
+            let first = match damage {
+                buffer::Damage::Line(line) | buffer::Damage::From(line) => line,
+                buffer::Damage::None => 0,
+            };
+            self.syntax.invalidate_from(first);
+            if let Some(find) = self.find.as_mut() {
+                find.refresh(&self.buffer, new_cursor);
+            }
         }
         if !content_changed && new_cursor == old_cursor && new_sel == old_sel {
             return false;
@@ -409,7 +658,22 @@ impl EditorPane {
                         self.repaint_visible_row(l);
                     }
                 }
-                buffer::Damage::Line(line) => self.repaint_visible_row(line),
+                buffer::Damage::Line(line) => {
+                    // Typing `/` `*` damages one line but changes what
+                    // every line under it means. The cache below the edit
+                    // was just dropped; without repainting them too the
+                    // rows keep their old colours, and scrolling
+                    // preserves the stale cells rather than healing it.
+                    // Bounded by the viewport, and only for the languages
+                    // that have block comments at all.
+                    if self.syntax.language().has_block_comments() {
+                        for l in line.max(self.top_line)..=last_visible {
+                            self.repaint_visible_row(l);
+                        }
+                    } else {
+                        self.repaint_visible_row(line);
+                    }
+                }
                 buffer::Damage::None => {}
             }
             // Repaint lines whose selection membership changed. The
@@ -424,9 +688,273 @@ impl EditorPane {
                     }
                 }
             }
+            // The cursor-line highlight moves with the cursor, so both
+            // the line it left and the line it reached have to be
+            // repainted — including when only the selection state
+            // changed, which turns the highlight off and on.
+            if old_cursor.line != new_cursor.line || old_sel.is_some() != new_sel.is_some() {
+                self.repaint_visible_row(old_cursor.line);
+                self.repaint_visible_row(new_cursor.line);
+            }
         }
         self.sync_cursor_into_grid();
         true
+    }
+
+    /// Run a buffer mutation, refusing it on a read-only pane.
+    ///
+    /// Every editing command goes through here rather than [`apply`],
+    /// which stays available for cursor and selection moves (a diff pane
+    /// is read-only, not inert — you can still select and copy in it).
+    pub fn apply_edit<F: FnOnce(&mut EditorBuffer) -> buffer::Damage>(&mut self, op: F) -> bool {
+        if self.read_only {
+            return false;
+        }
+        self.apply(op)
+    }
+
+    /// Move the cursor to `pos` and bring it into view, centring the
+    /// target when it is outside the current viewport. Used by go-to-
+    /// line, find and the Flow hand-offs: landing on the very first or
+    /// last row of the pane hides the context that makes a jump useful.
+    pub fn reveal(&mut self, pos: Position, extend: bool) -> bool {
+        // `set_cursor` clamps the column; the line has to be clamped here
+        // too because the scroll target is computed from it.
+        let clamped = Position {
+            line: pos.line.min(self.max_top_line()),
+            col: pos.col,
+        };
+        let rows = self.grid.rows();
+        let visible = clamped.line >= self.top_line && clamped.line < self.top_line + rows;
+        if !visible {
+            let target = clamped.line.saturating_sub(rows / 2);
+            let clamped_top = target.min(self.max_top_line());
+            if clamped_top != self.top_line {
+                self.scroll_painted(clamped_top);
+            }
+        }
+        self.apply(|b| {
+            b.set_cursor(clamped, extend);
+            buffer::Damage::None
+        })
+    }
+
+    /// Jump to a 1-based line (and optional 1-based column), clamped to
+    /// the document. Returns the line actually landed on.
+    pub fn goto_line(&mut self, line_1: usize, col_1: Option<usize>) -> usize {
+        let line = line_1.saturating_sub(1).min(self.max_top_line());
+        let col = match col_1 {
+            Some(c) => self.buffer.col_for_char_index(line, c.saturating_sub(1)),
+            None => 0,
+        };
+        self.reveal(Position { line, col }, false);
+        line + 1
+    }
+
+    // -- find bar ---------------------------------------------------------
+
+    /// Open the find bar, seeding it from a single-line selection (the
+    /// "search for what I highlighted" reflex) or keeping the previous
+    /// query. Returns the query it opened with.
+    pub fn find_open(&mut self) -> String {
+        let seed = match self.buffer.selection() {
+            Some((start, end)) if start.line == end.line && start != end => {
+                self.buffer.selected_text()
+            }
+            _ => None,
+        };
+        let mut state = self.find.take().unwrap_or_default();
+        if let Some(text) = seed {
+            state.query = text;
+        }
+        state.refresh(&self.buffer, self.buffer.cursor());
+        self.find = Some(state);
+        self.repaint_viewport();
+        self.find
+            .as_ref()
+            .map(|f| f.query.clone())
+            .unwrap_or_default()
+    }
+
+    /// Close the find bar, keeping the query for the next time it opens.
+    /// Returns the closed state for telemetry.
+    pub fn find_close(&mut self) -> Option<FindState> {
+        let state = self.find.take()?;
+        self.repaint_viewport();
+        Some(state)
+    }
+
+    /// Set the query and re-run the search, keeping the selected match
+    /// near the cursor.
+    pub fn find_set_query(&mut self, query: &str) -> bool {
+        let Some(state) = self.find.as_mut() else {
+            return false;
+        };
+        if state.query == query {
+            return false;
+        }
+        state.query = query.to_string();
+        let near = self.buffer.cursor();
+        if let Some(state) = self.find.as_mut() {
+            state.refresh(&self.buffer, near);
+        }
+        self.reveal_current_match();
+        true
+    }
+
+    /// Flip the explicit case-sensitivity toggle.
+    pub fn find_toggle_case(&mut self) -> bool {
+        let Some(state) = self.find.as_mut() else {
+            return false;
+        };
+        state.case_sensitive = !state.case_sensitive;
+        let near = self.buffer.cursor();
+        if let Some(state) = self.find.as_mut() {
+            state.refresh(&self.buffer, near);
+        }
+        self.reveal_current_match();
+        true
+    }
+
+    /// Step to the next (`forward`) or previous match and reveal it.
+    pub fn find_step(&mut self, forward: bool) -> bool {
+        let Some(state) = self.find.as_mut() else {
+            return false;
+        };
+        let stepped = if forward { state.next() } else { state.prev() };
+        if stepped.is_none() {
+            return false;
+        }
+        self.reveal_current_match();
+        true
+    }
+
+    /// Select the current match and scroll it into view. Always
+    /// repaints the viewport: the tint on every other match moves too.
+    fn reveal_current_match(&mut self) {
+        let Some(found) = self.find.as_ref().and_then(|f| f.current_match()) else {
+            self.repaint_viewport();
+            return;
+        };
+        self.reveal(
+            Position {
+                line: found.line,
+                col: found.start,
+            },
+            false,
+        );
+        // Select the hit so Ctrl+C copies it and the cursor sits at its
+        // start, matching what every editor does on "find next".
+        self.apply(|b| {
+            b.set_cursor(
+                Position {
+                    line: found.line,
+                    col: found.start,
+                },
+                false,
+            );
+            b.set_cursor(
+                Position {
+                    line: found.line,
+                    col: found.end,
+                },
+                true,
+            );
+            buffer::Damage::None
+        });
+        self.repaint_viewport();
+    }
+
+    // -- diff navigation --------------------------------------------------
+
+    /// Move the cursor to the next or previous hunk header, scrolled to
+    /// the top of the viewport so the whole hunk is visible below it.
+    pub fn diff_step_hunk(&mut self, forward: bool) -> bool {
+        self.diff_step(forward, true)
+    }
+
+    pub fn diff_step_file(&mut self, forward: bool) -> bool {
+        self.diff_step(forward, false)
+    }
+
+    fn diff_step(&mut self, forward: bool, hunk: bool) -> bool {
+        let from = self.buffer.cursor().line;
+        let Some(view) = self.kind.as_diff() else {
+            return false;
+        };
+        let target = match (hunk, forward) {
+            (true, true) => view.next_hunk(from),
+            (true, false) => view.prev_hunk(from),
+            (false, true) => view.next_file(from),
+            (false, false) => view.prev_file(from),
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        // A header at the top of the viewport shows its hunk; centring it
+        // would waste half the pane on the previous hunk's tail.
+        let top = target.min(self.max_top_line());
+        if top != self.top_line {
+            self.scroll_painted(top);
+        }
+        self.apply(|b| {
+            b.set_cursor(
+                Position {
+                    line: target,
+                    col: 0,
+                },
+                false,
+            );
+            buffer::Damage::None
+        });
+        true
+    }
+
+    /// Scroll a diff pane to `rel`'s section, and to `line` within it
+    /// when the diff contains that line. Used by the Flow hand-off.
+    pub fn diff_reveal_location(&mut self, rel: &str, line: Option<u32>) -> bool {
+        let target = {
+            let Some(view) = self.kind.as_diff() else {
+                return false;
+            };
+            match line {
+                Some(line) => view.find_line_row(rel, line),
+                None => view.find_file_row(rel),
+            }
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let top = target.min(self.max_top_line());
+        if top != self.top_line {
+            self.scroll_painted(top);
+        }
+        self.apply(|b| {
+            b.set_cursor(
+                Position {
+                    line: target,
+                    col: 0,
+                },
+                false,
+            );
+            buffer::Damage::None
+        });
+        true
+    }
+
+    /// The file and 1-based new-file line under the cursor of a diff
+    /// pane, for "open this in an editor".
+    pub fn diff_open_target(&self) -> Option<(PathBuf, u32)> {
+        let view = self.kind.as_diff()?;
+        let (file, line) = view.open_target(self.buffer.cursor().line)?;
+        if file.status == crate::diff::DiffFileStatus::Deleted {
+            return None;
+        }
+        // Never `join`: `file.path` came out of git's own output.
+        Some((
+            crate::git::resolve_in_repo(&view.repo_root, &file.path)?,
+            line,
+        ))
     }
 }
 
@@ -435,6 +963,68 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A `.rs` file, so the pane opens with Rust highlighting on.
+    fn temp_rust_file(contents: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tm-editor-rs-{}-{}.rs",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, contents).expect("write temp file");
+        path
+    }
+
+    /// Foreground of the first non-blank cell of `row`, i.e. the colour
+    /// of the row's first token once the gutter is past.
+    fn first_text_fg(pane: &EditorPane, row: usize) -> Option<unshit::core::style::types::Color> {
+        (pane.gutter_cells()..pane.grid.cols()).find_map(|col| {
+            let cell = pane.grid.get_cell(row, col)?;
+            (cell.ch != '\0' && cell.ch != ' ').then_some(cell.fg)
+        })
+    }
+
+    /// Typing `/` `*` damages one line and changes what every line below
+    /// it means. Repainting only the damaged row left the rest of the
+    /// viewport coloured as code, and scrolling preserved the stale cells
+    /// rather than healing it.
+    #[test]
+    fn opening_a_block_comment_recolours_the_rows_below_it() {
+        let path = temp_rust_file("let a = 1;\nlet b = 2;\nlet c = 3;\n");
+        let mut pane = EditorPane::open(&path, 8, 40).expect("open");
+        let colors = pane.colors;
+
+        let before = first_text_fg(&pane, 1).expect("row 1 painted");
+        assert_eq!(before, colors.keyword, "`let` starts out a keyword");
+
+        // Open a block comment at the very top of the file.
+        pane.apply_edit(|b| {
+            b.set_cursor(Position { line: 0, col: 0 }, false);
+            b.insert_str("/*")
+        });
+
+        assert_eq!(
+            first_text_fg(&pane, 1),
+            Some(colors.comment),
+            "row 1 is inside the comment now"
+        );
+        assert_eq!(
+            first_text_fg(&pane, 2),
+            Some(colors.comment),
+            "and so is row 2"
+        );
+
+        // Closing it again puts them back.
+        pane.apply_edit(|b| {
+            b.set_cursor(Position { line: 0, col: 2 }, false);
+            b.insert_str("*/")
+        });
+        assert_eq!(first_text_fg(&pane, 1), Some(colors.keyword));
+        assert_eq!(first_text_fg(&pane, 2), Some(colors.keyword));
+
+        let _ = std::fs::remove_file(path);
+    }
 
     fn temp_file(contents: &[u8]) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

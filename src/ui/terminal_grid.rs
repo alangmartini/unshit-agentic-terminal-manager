@@ -146,7 +146,14 @@ pub fn build_terminal_grid(
                 .and_then(|r| r.get(col_idx))
                 .copied()
                 .unwrap_or(1.0);
-            let capture_keyboard = is_active && !state.settings_open && !state.palette_open;
+            // A confirm dialog counts as much as the palette or settings:
+            // the grid keeps capturing otherwise, so any keystroke the
+            // modal does not hold focus for is typed into the document
+            // underneath it.
+            let capture_keyboard = is_active
+                && !state.settings_open
+                && !state.palette_open
+                && state.confirm_dialog.is_none();
             let pane_el = build_pane(
                 pane,
                 is_active,
@@ -328,6 +335,7 @@ fn build_pane(
             pane.id,
             capture_keyboard,
             state.terminal_font_size_pt,
+            state.editor_find_bars.get(&pane.id.0),
             shared,
             grids,
         )
@@ -2009,6 +2017,33 @@ mod tests {
         assert!(
             !content.captures_keyboard,
             "active pane must not capture keyboard while command palette is open"
+        );
+    }
+
+    /// A confirm dialog is as modal as the palette or settings. While it
+    /// is up, any keystroke it does not hold focus for used to reach the
+    /// capturing grid and be typed into the pane behind it.
+    #[test]
+    fn active_pane_does_not_capture_keyboard_when_a_confirm_dialog_is_open() {
+        let mut state = seed_state();
+        let pane = state.panes[0][0].clone();
+        state.active_pane = pane.id;
+        state.confirm_dialog = Some(crate::state::ConfirmDialog::GotoLine {
+            pane_id: pane.id.0,
+            buffer: "abc".to_string(),
+            error: Some("Not a line number".to_string()),
+        });
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane.id.0, CellGrid::new(24, 80));
+
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        let content = find_terminal_content(&el)
+            .expect("terminal-content element should exist when grid is present");
+        assert!(
+            !content.captures_keyboard,
+            "active pane must not capture keyboard while a confirm dialog is open"
         );
     }
 

@@ -132,6 +132,26 @@ fn end_of_text(start: Position, text: &str) -> Position {
     }
 }
 
+/// Byte offset of the first non-whitespace character, or the line length
+/// when the line is blank. The line's indent is `line[..indent_end(line)]`.
+fn indent_end(line: &str) -> usize {
+    line.find(|c: char| !c.is_whitespace())
+        .unwrap_or(line.len())
+}
+
+/// How many leading bytes one outdent step removes: a single tab, or up to
+/// [`TAB_SPACES`] spaces — whatever is actually there, so a line indented
+/// by two does not keep them.
+fn outdent_width(line: &str) -> usize {
+    if line.starts_with('\t') {
+        return 1;
+    }
+    line.bytes()
+        .take(TAB_SPACES)
+        .take_while(|b| *b == b' ')
+        .count()
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -472,10 +492,18 @@ impl EditorBuffer {
         self.move_vertical(delta_lines, extend);
     }
 
+    /// Home: to the first non-whitespace character, and to column 0 when
+    /// already there.
+    ///
+    /// On an indented line the text is what people mean by "the start of
+    /// the line" nine times out of ten; the second press is the escape
+    /// hatch for the rest. A line that is entirely whitespace has no text
+    /// to stop at, so the first stop is its end — same as VS Code.
     pub fn move_home(&mut self, extend: bool) {
         self.sticky_chars = None;
         self.begin_move(extend);
-        self.cursor.col = 0;
+        let indent = indent_end(&self.lines[self.cursor.line]);
+        self.cursor.col = if self.cursor.col == indent { 0 } else { indent };
     }
 
     pub fn move_end(&mut self, extend: bool) {
@@ -808,6 +836,20 @@ impl EditorBuffer {
         self.insert_str("\n")
     }
 
+    /// Enter, carrying the line's leading whitespace onto the new line.
+    ///
+    /// Copied literally, so a tab-indented file stays tab-indented, and
+    /// truncated at the cursor so Enter pressed *inside* the indent does
+    /// not duplicate whitespace the cursor has not passed. With a
+    /// selection the indent comes from the line the selection starts on,
+    /// which is the line the text ends up on.
+    pub fn insert_newline_auto_indent(&mut self) -> Damage {
+        let start = self.selection().map_or(self.cursor, |(start, _)| start);
+        let line = &self.lines[start.line];
+        let indent = line[..indent_end(line).min(start.col)].to_string();
+        self.insert_with_kind(&format!("\n{indent}"), GroupKind::Other)
+    }
+
     /// Backspace: delete selection, or the char (Ctrl: word) before the
     /// cursor, joining lines at column 0.
     pub fn backspace(&mut self, word: bool) -> Damage {
@@ -845,6 +887,213 @@ impl EditorBuffer {
             )
         };
         self.record_replace(start, self.cursor, "", kind)
+    }
+
+    /// The inclusive line range a line-wise command acts on.
+    ///
+    /// A selection that ends at column 0 stops at the line above: that is
+    /// the shape dragging down through a line produces, and including it
+    /// would indent one more line than is highlighted.
+    fn line_span(&self) -> (usize, usize) {
+        match self.selection() {
+            None => (self.cursor.line, self.cursor.line),
+            Some((start, end)) => {
+                let last = if end.col == 0 && end.line > start.line {
+                    end.line - 1
+                } else {
+                    end.line
+                };
+                (start.line, last)
+            }
+        }
+    }
+
+    /// Largest char boundary at or before `col` on `line`.
+    fn floor_boundary(&self, line: usize, col: usize) -> usize {
+        let text = &self.lines[line];
+        let mut col = col.min(text.len());
+        while col > 0 && !text.is_char_boundary(col) {
+            col -= 1;
+        }
+        col
+    }
+
+    /// Point the newest undo record's post-state at `pos`, so redo leaves
+    /// the caret where the command did rather than at the end of the
+    /// rewritten block.
+    fn set_last_cursor_after(&mut self, pos: Position) {
+        if let Some(record) = self
+            .undo
+            .last_mut()
+            .and_then(|group| group.records.last_mut())
+        {
+            record.cursor_after = pos;
+        }
+    }
+
+    /// Replace lines `first..=last` wholesale, as ONE undo step.
+    ///
+    /// One record rather than one per line: indenting six lines is one
+    /// thing the user did, and six undo steps to take it back is not what
+    /// any editor does. A selection is restored over the same lines so the
+    /// chord repeats; without one the caret rides `cursor_delta`, which is
+    /// how far its own line's text moved.
+    fn rewrite_lines(
+        &mut self,
+        first: usize,
+        last: usize,
+        new_lines: Vec<String>,
+        cursor_delta: isize,
+    ) -> Damage {
+        debug_assert_eq!(new_lines.len(), last - first + 1);
+        if new_lines
+            .iter()
+            .enumerate()
+            .all(|(offset, line)| *line == self.lines[first + offset])
+        {
+            // Nothing to do. `record_replace` would otherwise push an undo
+            // group that changes nothing and mark the buffer dirty —
+            // Shift+Tab on an unindented block, say.
+            return Damage::None;
+        }
+
+        let selected = self.selection().is_some();
+        let cursor_line = self.cursor.line;
+        let cursor_col = self.cursor.col;
+        let start = Position {
+            line: first,
+            col: 0,
+        };
+        let end = Position {
+            line: last,
+            col: self.lines[last].len(),
+        };
+        let damage = self.record_replace(start, end, &new_lines.join("\n"), GroupKind::Other);
+
+        let (cursor, anchor) = if selected {
+            (
+                Position {
+                    line: last,
+                    col: self.lines[last].len(),
+                },
+                Some(start),
+            )
+        } else {
+            let len = self.lines[cursor_line].len() as isize;
+            let col = (cursor_col as isize + cursor_delta).clamp(0, len) as usize;
+            (
+                Position {
+                    line: cursor_line,
+                    col: self.floor_boundary(cursor_line, col),
+                },
+                None,
+            )
+        };
+        self.cursor = cursor;
+        self.anchor = anchor;
+        self.set_last_cursor_after(cursor);
+        self.sticky_chars = None;
+        damage
+    }
+
+    /// Tab: indent the selected lines, or insert one indent step.
+    ///
+    /// Without a selection Tab is a typing key and lands on the next tab
+    /// stop rather than always four columns — a caret at column 2 wants
+    /// two spaces, not six.
+    pub fn indent(&mut self) -> Damage {
+        if self.selection().is_none() {
+            let width = TAB_SPACES - (self.visual_col(self.cursor) % TAB_SPACES);
+            return self.insert_typed(&" ".repeat(width));
+        }
+        let (first, last) = self.line_span();
+        let pad = " ".repeat(TAB_SPACES);
+        let new_lines: Vec<String> = (first..=last)
+            .map(|line| {
+                // A blank line gains nothing: indenting it writes trailing
+                // whitespace that survives into the file.
+                if self.lines[line].is_empty() {
+                    String::new()
+                } else {
+                    format!("{pad}{}", self.lines[line])
+                }
+            })
+            .collect();
+        self.rewrite_lines(first, last, new_lines, 0)
+    }
+
+    /// Shift+Tab: remove one indent step from the selected lines, or from
+    /// the cursor's line when nothing is selected.
+    pub fn outdent(&mut self) -> Damage {
+        let (first, last) = self.line_span();
+        let cursor_line = self.cursor.line;
+        let mut cursor_delta = 0isize;
+        let new_lines: Vec<String> = (first..=last)
+            .map(|line| {
+                let text = &self.lines[line];
+                let removed = outdent_width(text);
+                if line == cursor_line {
+                    cursor_delta = -(removed as isize);
+                }
+                text[removed..].to_string()
+            })
+            .collect();
+        self.rewrite_lines(first, last, new_lines, cursor_delta)
+    }
+
+    /// `Ctrl+/`: add or remove `prefix` on the selected lines.
+    ///
+    /// Adding puts every prefix at the shallowest indent of the non-blank
+    /// lines so the comment column stays straight, and skips blank lines
+    /// so commenting a block does not leave trailing whitespace behind.
+    /// Removing also takes back the space that adding inserts. The verdict
+    /// is "uncomment" only when *every* non-blank line is already
+    /// commented, which is what makes the chord a toggle.
+    pub fn toggle_line_comment(&mut self, prefix: &str) -> Damage {
+        let (first, last) = self.line_span();
+        let non_blank: Vec<usize> = (first..=last)
+            .filter(|line| !self.lines[*line].trim().is_empty())
+            .collect();
+        if non_blank.is_empty() {
+            return Damage::None;
+        }
+        let uncomment = non_blank
+            .iter()
+            .all(|line| self.lines[*line].trim_start().starts_with(prefix));
+        let column = non_blank
+            .iter()
+            .map(|line| indent_end(&self.lines[*line]))
+            .min()
+            .unwrap_or(0);
+
+        let cursor_line = self.cursor.line;
+        let mut cursor_delta = 0isize;
+        let new_lines: Vec<String> = (first..=last)
+            .map(|line| {
+                let text = &self.lines[line];
+                if text.trim().is_empty() {
+                    return text.clone();
+                }
+                let (rewritten, delta) = if uncomment {
+                    let at = indent_end(text);
+                    let rest = &text[at + prefix.len()..];
+                    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                    let removed = text.len() - at - rest.len();
+                    (format!("{}{}", &text[..at], rest), -(removed as isize))
+                } else {
+                    let at = self.floor_boundary(line, column);
+                    (
+                        format!("{}{prefix} {}", &text[..at], &text[at..]),
+                        prefix.len() as isize + 1,
+                    )
+                };
+                if line == cursor_line {
+                    cursor_delta = delta;
+                }
+                rewritten
+            })
+            .collect();
+        self.rewrite_lines(first, last, new_lines, cursor_delta)
     }
 
     /// Delete: delete selection, or the char (Ctrl: word) after the
@@ -1136,6 +1385,169 @@ mod tests {
         b.set_cursor(at(1, 1), false);
         b.move_down(false);
         assert_eq!(b.cursor(), at(1, 3));
+    }
+
+    #[test]
+    fn smart_home_toggles_between_the_text_and_column_zero() {
+        let mut b = buf("    let x = 1;");
+        b.set_cursor(at(0, 12), false);
+        b.move_home(false);
+        assert_eq!(b.cursor(), at(0, 4), "first press lands on the text");
+        b.move_home(false);
+        assert_eq!(b.cursor(), at(0, 0), "second press on the real start");
+        b.move_home(false);
+        assert_eq!(b.cursor(), at(0, 4), "and back again");
+
+        // A line with no indent has only one stop.
+        let mut b = buf("plain");
+        b.set_cursor(at(0, 3), false);
+        b.move_home(false);
+        assert_eq!(b.cursor(), at(0, 0));
+        b.move_home(false);
+        assert_eq!(b.cursor(), at(0, 0));
+    }
+
+    #[test]
+    fn enter_carries_the_indent_without_duplicating_it() {
+        let mut b = buf("    let x = 1;");
+        b.set_cursor(at(0, 14), false);
+        b.insert_newline_auto_indent();
+        assert_eq!(b.to_text(), "    let x = 1;\n    ");
+        assert_eq!(b.cursor(), at(1, 4));
+
+        // Tabs stay tabs.
+        let mut b = buf("\t\tdeep");
+        b.move_end(false);
+        b.insert_newline_auto_indent();
+        assert_eq!(b.to_text(), "\t\tdeep\n\t\t");
+
+        // Inside the indent: only the whitespace the cursor has passed.
+        let mut b = buf("      six");
+        b.set_cursor(at(0, 2), false);
+        b.insert_newline_auto_indent();
+        assert_eq!(b.to_text(), "  \n      six");
+        assert_eq!(b.cursor(), at(1, 2));
+    }
+
+    #[test]
+    fn tab_without_a_selection_lands_on_the_next_tab_stop() {
+        let mut b = buf("ab");
+        b.move_end(false);
+        b.indent();
+        assert_eq!(b.to_text(), "ab  ", "column 2 needs two, not four");
+        b.indent();
+        assert_eq!(b.to_text(), "ab      ");
+    }
+
+    #[test]
+    fn indenting_a_selection_is_one_undo_step_and_keeps_the_selection() {
+        let mut b = buf("one\ntwo\nthree");
+        b.set_cursor(at(0, 0), false);
+        b.set_cursor(at(2, 5), true);
+        b.indent();
+        assert_eq!(b.to_text(), "    one\n    two\n    three");
+        assert!(
+            b.selection().is_some(),
+            "the selection survives so Tab repeats"
+        );
+        b.indent();
+        assert_eq!(b.to_text(), "        one\n        two\n        three");
+
+        b.undo();
+        assert_eq!(b.to_text(), "    one\n    two\n    three");
+        b.undo();
+        assert_eq!(b.to_text(), "one\ntwo\nthree", "one step per command");
+    }
+
+    /// Dragging down through a line ends the selection at column 0 of the
+    /// next one, which is not a line the user highlighted.
+    #[test]
+    fn a_selection_ending_at_column_zero_leaves_the_line_below_alone() {
+        let mut b = buf("one\ntwo\nthree");
+        b.set_cursor(at(0, 0), false);
+        b.set_cursor(at(2, 0), true);
+        b.indent();
+        assert_eq!(b.to_text(), "    one\n    two\nthree");
+    }
+
+    #[test]
+    fn a_blank_line_in_an_indented_block_stays_blank() {
+        let mut b = buf("one\n\ntwo");
+        b.set_cursor(at(0, 0), false);
+        b.set_cursor(at(2, 3), true);
+        b.indent();
+        assert_eq!(b.to_text(), "    one\n\n    two");
+    }
+
+    #[test]
+    fn outdent_removes_a_tab_or_up_to_one_step_of_spaces() {
+        let mut b = buf("\tone\n      two\n  three\nflush");
+        b.set_cursor(at(0, 0), false);
+        b.set_cursor(at(3, 5), true);
+        b.outdent();
+        assert_eq!(b.to_text(), "one\n  two\nthree\nflush");
+    }
+
+    #[test]
+    fn outdent_on_an_unindented_line_changes_nothing_at_all() {
+        let mut b = buf("flush\nalso flush");
+        b.set_cursor(at(0, 2), false);
+        let before = b.clone();
+        assert_eq!(b.outdent(), Damage::None);
+        assert_eq!(b, before, "no edit, no undo group, no dirty flag");
+    }
+
+    #[test]
+    fn comment_toggle_aligns_at_the_shallowest_indent_and_round_trips() {
+        let mut b = buf("    one\n        two\n    three");
+        b.set_cursor(at(0, 0), false);
+        b.set_cursor(at(2, 9), true);
+
+        b.toggle_line_comment("//");
+        assert_eq!(
+            b.to_text(),
+            "    // one\n    //     two\n    // three",
+            "every prefix in the same column"
+        );
+
+        b.toggle_line_comment("//");
+        assert_eq!(b.to_text(), "    one\n        two\n    three");
+    }
+
+    /// A block is "commented" only when every non-blank line is, so a
+    /// half-commented block comments the rest rather than uncommenting.
+    #[test]
+    fn comment_toggle_comments_a_half_commented_block() {
+        let mut b = buf("// one\ntwo");
+        b.set_cursor(at(0, 0), false);
+        b.set_cursor(at(1, 3), true);
+        b.toggle_line_comment("//");
+        assert_eq!(b.to_text(), "// // one\n// two");
+    }
+
+    #[test]
+    fn comment_toggle_leaves_blank_lines_blank() {
+        let mut b = buf("one\n\ntwo");
+        b.set_cursor(at(0, 0), false);
+        b.set_cursor(at(2, 3), true);
+        b.toggle_line_comment("#");
+        assert_eq!(b.to_text(), "# one\n\n# two");
+        b.toggle_line_comment("#");
+        assert_eq!(b.to_text(), "one\n\ntwo");
+    }
+
+    /// No selection: the cursor's own line, and the caret rides the text
+    /// it was sitting in front of.
+    #[test]
+    fn comment_toggle_without_a_selection_takes_the_cursor_line() {
+        let mut b = buf("one\ntwo");
+        b.set_cursor(at(1, 1), false);
+        b.toggle_line_comment("//");
+        assert_eq!(b.to_text(), "one\n// two");
+        assert_eq!(b.cursor(), at(1, 4));
+        b.toggle_line_comment("//");
+        assert_eq!(b.to_text(), "one\ntwo");
+        assert_eq!(b.cursor(), at(1, 1));
     }
 
     #[test]

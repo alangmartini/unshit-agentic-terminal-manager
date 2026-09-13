@@ -4,31 +4,42 @@
 //! renderer's damage tracking and the `LineQuadCache`'s stable-line-id
 //! replay. Only the visible window is ever painted; scrolls move rows
 //! with `shift_rows` so unchanged lines keep their identity (and their
-//! cached quads) across the move. Selection is painted as cell
-//! background directly into the live grid — selection changes damage
-//! exactly the lines they touch.
+//! cached quads) across the move. Everything a row shows — gutter,
+//! selection, syntax colour, search hits, diff tints — is cell `fg`/`bg`:
+//! the renderer has no overlay or per-row decoration seam, so colour is
+//! the only lever there is.
+//!
+//! Row *content* comes from the buffer; everything else comes from
+//! [`RowPaint`], which the pane fills in. Keeping the decisions in the
+//! pane (which line is the cursor's, which byte ranges matched a search,
+//! what a diff row means) leaves this module a pure painter.
 
-use unshit::core::cell_grid::{Cell, CellGrid, ANSI_16};
+use unshit::core::cell_grid::{Cell, CellAttrs, CellGrid};
 use unshit::core::style::types::Color;
 
-use super::buffer::{EditorBuffer, Position};
+use crate::syntax::Span;
 
-/// Dim gray for gutter line numbers (ANSI bright black).
-const GUTTER_FG: Color = ANSI_16[8];
-const TEXT_FG: Color = Color::WHITE;
-/// Selection background (VS Code dark `#264f78`).
-const SELECTION_BG: Color = Color {
-    r: 0x26,
-    g: 0x4f,
-    b: 0x78,
-    a: 0xff,
-};
+use super::buffer::{EditorBuffer, Position};
+use super::colors::EditorColors;
+use super::find::Match;
 
 /// Gutter width in cells: right-aligned line number plus one space,
 /// with a 3-digit floor so short files don't jitter the text column.
 pub fn gutter_width(line_count: usize) -> usize {
     let digits = line_count.max(1).ilog10() as usize + 1;
     digits.max(3) + 1
+}
+
+/// Gutter width for a diff document: two right-aligned line-number
+/// columns (old and new), then the `+`/`-` marker, each separated by one
+/// space — `"  1   1 + "`. Three-digit floor per column, matching
+/// [`gutter_width`], so short diffs do not sit flush against the text.
+///
+/// Must stay in lockstep with `DiffView::gutter_text`, which writes
+/// exactly this many cells.
+pub fn diff_gutter_width(max_old: u32, max_new: u32) -> usize {
+    let digits = |n: u32| (n.max(1).ilog10() as usize + 1).max(3);
+    digits(max_old) + 1 + digits(max_new) + 1 + 1 + 1
 }
 
 /// Is byte offset `col` of `line_idx` inside the ordered selection?
@@ -43,6 +54,107 @@ fn in_selection(sel: Option<(Position, Position)>, line_idx: usize, col: usize) 
     pos >= start && pos < end
 }
 
+/// Everything a row needs beyond the grid and the buffer.
+///
+/// Built per row by the pane. The lifetimes all borrow pane-owned
+/// scratch, so painting a viewport allocates nothing.
+pub struct RowPaint<'a> {
+    /// Visual columns (tabs expanded) skipped at the left of the line.
+    pub h_offset: usize,
+    pub gutter_w: usize,
+    pub selection: Option<(Position, Position)>,
+    pub colors: &'a EditorColors,
+    /// Token spans tiling the line, or empty for no highlighting.
+    pub spans: &'a [Span],
+    /// Background for the whole row, under everything but the selection
+    /// (diff add/remove tints, the cursor line).
+    pub row_bg: Option<Color>,
+    /// Replaces the line number, for diff panes. An empty string paints
+    /// a blank gutter (header rows).
+    pub gutter_text: Option<&'a str>,
+    /// Colour of the gutter text.
+    pub gutter_fg: Color,
+    /// Forces one colour for the whole line, overriding syntax (diff
+    /// file and hunk headers, the "loading" placeholder).
+    pub fg_override: Option<Color>,
+    /// Bold the whole line (diff file headers).
+    pub bold: bool,
+    /// Search hits on this line, as byte ranges.
+    pub finds: &'a [Match],
+    /// The one hit the find bar considers current, if it is on this line.
+    pub current_find: Option<Match>,
+}
+
+impl<'a> RowPaint<'a> {
+    /// A plain file row: line-numbered gutter, no decorations.
+    pub fn plain(
+        h_offset: usize,
+        gutter_w: usize,
+        selection: Option<(Position, Position)>,
+        colors: &'a EditorColors,
+    ) -> Self {
+        Self {
+            h_offset,
+            gutter_w,
+            selection,
+            colors,
+            spans: &[],
+            row_bg: None,
+            gutter_text: None,
+            gutter_fg: colors.gutter,
+            fg_override: None,
+            bold: false,
+            finds: &[],
+            current_find: None,
+        }
+    }
+
+    /// Foreground for byte offset `byte` of the line.
+    fn fg_at(&self, byte: usize) -> Color {
+        if let Some(fg) = self.fg_override {
+            return fg;
+        }
+        // Spans tile the line in order, so a linear scan is exact; lines
+        // are short enough that a binary search would not pay for itself.
+        for span in self.spans {
+            if byte < span.end {
+                return if byte >= span.start {
+                    self.colors.token(span.kind)
+                } else {
+                    self.colors.text
+                };
+            }
+        }
+        self.colors.text
+    }
+
+    /// Background for byte offset `byte`, in priority order: selection
+    /// beats the current search hit, which beats other hits, which beat
+    /// the row tint.
+    fn bg_at(&self, line_idx: usize, byte: usize) -> Color {
+        if in_selection(self.selection, line_idx, byte) {
+            return self.colors.selection_bg;
+        }
+        if let Some(current) = self.current_find {
+            if byte >= current.start && byte < current.end {
+                return self.colors.find_current_bg;
+            }
+        }
+        if self.finds.iter().any(|m| byte >= m.start && byte < m.end) {
+            return self.colors.find_bg;
+        }
+        self.row_bg.unwrap_or(Color::TRANSPARENT)
+    }
+
+    fn attrs(&self) -> CellAttrs {
+        if self.bold {
+            CellAttrs::BOLD
+        } else {
+            CellAttrs::empty()
+        }
+    }
+}
+
 /// Paint one grid row from `line_idx` of the buffer. Rows past the end
 /// of the buffer are blank (no gutter number, mirroring code editors).
 pub fn paint_row(
@@ -50,9 +162,7 @@ pub fn paint_row(
     row: usize,
     line_idx: usize,
     buffer: &EditorBuffer,
-    h_offset: usize,
-    gutter_w: usize,
-    selection: Option<(Position, Position)>,
+    paint: &RowPaint<'_>,
 ) {
     let cols = grid.cols();
     let Some(line) = buffer.line(line_idx) else {
@@ -62,55 +172,33 @@ pub fn paint_row(
         return;
     };
 
-    // Right-aligned line number, one trailing space of separation.
-    let number = (line_idx + 1).to_string();
-    let digit_cells = gutter_w.saturating_sub(1);
-    let pad = digit_cells.saturating_sub(number.len());
-    for col in 0..gutter_w.min(cols) {
-        let ch = if col >= pad && col < pad + number.len() {
-            number.as_bytes()[col - pad] as char
-        } else {
-            ' '
-        };
-        grid.set_cell(
-            row,
-            col,
-            Cell {
-                ch,
-                fg: GUTTER_FG,
-                ..Default::default()
-            },
-        );
-    }
+    paint_gutter(grid, row, line_idx, paint, cols);
 
     // Content cells from visual column `h_offset` onward. Tabs expand
     // to their next stop and paint as spaces (selection background
     // covers the whole span); byte offsets ride along so selection
     // membership is exact even mid-tab.
-    let mut col = gutter_w;
+    let attrs = paint.attrs();
+    let mut col = paint.gutter_w;
     let mut vcol = 0usize;
     'content: for (byte, ch) in line.char_indices() {
         let width = super::buffer::char_width_at(ch, vcol);
         for k in 0..width {
-            if vcol + k < h_offset {
+            if vcol + k < paint.h_offset {
                 continue;
             }
             if col >= cols {
                 break 'content;
             }
-            let bg = if in_selection(selection, line_idx, byte) {
-                SELECTION_BG
-            } else {
-                Color::TRANSPARENT
-            };
             let display = if ch == '\t' { ' ' } else { ch };
             grid.set_cell(
                 row,
                 col,
                 Cell {
                     ch: display,
-                    fg: TEXT_FG,
-                    bg,
+                    fg: paint.fg_at(byte),
+                    bg: paint.bg_at(line_idx, byte),
+                    attrs,
                     ..Default::default()
                 },
             );
@@ -120,243 +208,365 @@ pub fn paint_row(
     }
     // A selection that continues past the end of this line paints one
     // trailing marker cell (the newline), like every code editor.
-    if col < cols && in_selection(selection, line_idx, line.len()) {
+    if col < cols && in_selection(paint.selection, line_idx, line.len()) {
         grid.set_cell(
             row,
             col,
             Cell {
                 ch: ' ',
-                fg: TEXT_FG,
-                bg: SELECTION_BG,
+                fg: paint.colors.text,
+                bg: paint.colors.selection_bg,
                 ..Default::default()
             },
         );
         col += 1;
     }
+    // A row tint (diff add/remove, cursor line) covers the full width,
+    // not just the text: a half-tinted row reads as a rendering bug. The
+    // renderer merges same-background cells into one quad, so this costs
+    // nothing extra.
+    let trailing = match paint.row_bg {
+        Some(bg) => Cell {
+            bg,
+            ..Default::default()
+        },
+        None => Cell::default(),
+    };
     for c in col..cols {
-        grid.set_cell(row, c, Cell::default());
+        grid.set_cell(row, c, trailing);
     }
 }
 
-/// Repaint every viewport row from scratch, resetting each row's line
-/// identity. Used on load, resize, horizontal scroll, and viewport jumps
-/// larger than the viewport itself, where identity continuity is moot.
-pub fn repaint_all(
+/// Paint the gutter: either the buffer line number or the text the pane
+/// supplied (diff panes show old and new numbers plus a marker).
+fn paint_gutter(
     grid: &mut CellGrid,
-    buffer: &EditorBuffer,
-    top_line: usize,
-    h_offset: usize,
-    selection: Option<(Position, Position)>,
+    row: usize,
+    line_idx: usize,
+    paint: &RowPaint<'_>,
+    cols: usize,
 ) {
-    let gutter_w = gutter_width(buffer.line_count());
-    for row in 0..grid.rows() {
-        grid.reset_line_identity(row);
-        paint_row(
-            grid,
+    let owned;
+    let text: &str = match paint.gutter_text {
+        Some(text) => text,
+        None => {
+            // Right-aligned line number, one trailing space of separation.
+            let number = (line_idx + 1).to_string();
+            let digit_cells = paint.gutter_w.saturating_sub(1);
+            let pad = digit_cells.saturating_sub(number.len());
+            owned = format!("{:pad$}{} ", "", number, pad = pad);
+            &owned
+        }
+    };
+    let mut chars = text.chars();
+    for col in 0..paint.gutter_w.min(cols) {
+        let ch = chars.next().unwrap_or(' ');
+        grid.set_cell(
             row,
-            top_line + row,
-            buffer,
-            h_offset,
-            gutter_w,
-            selection,
+            col,
+            Cell {
+                ch,
+                fg: paint.gutter_fg,
+                bg: paint.row_bg.unwrap_or(Color::TRANSPARENT),
+                ..Default::default()
+            },
         );
     }
 }
 
-/// Scroll the painted viewport from `old_top` to `new_top`, shifting
-/// surviving rows (stable line ids ride along) and painting only the
-/// newly exposed rows.
-pub fn scroll_viewport(
-    grid: &mut CellGrid,
-    buffer: &EditorBuffer,
-    old_top: usize,
-    new_top: usize,
-    h_offset: usize,
-    selection: Option<(Position, Position)>,
-) {
+/// What [`plan_scroll`] left for the caller to repaint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrollPlan {
+    /// The move was too large to shift: repaint every row.
+    Full,
+    /// Rows `start..end` were newly exposed and need painting; the rest
+    /// kept their content and their line identity.
+    Rows(std::ops::Range<usize>),
+}
+
+/// Shift the painted viewport from `old_top` to `new_top`, preserving the
+/// line identity (and cached quads) of the rows that survive the move,
+/// and report which rows the caller must repaint.
+///
+/// Control is inverted — this does not paint — because what a row shows
+/// depends on pane state (syntax cache, search hits, diff decorations)
+/// that this module deliberately knows nothing about.
+pub fn plan_scroll(grid: &mut CellGrid, old_top: usize, new_top: usize) -> ScrollPlan {
     if new_top == old_top {
-        return;
+        return ScrollPlan::Rows(0..0);
     }
     let rows = grid.rows();
     let delta = new_top.abs_diff(old_top);
     if delta >= rows {
-        repaint_all(grid, buffer, new_top, h_offset, selection);
-        return;
+        return ScrollPlan::Full;
     }
-    let gutter_w = gutter_width(buffer.line_count());
     let keep = rows - delta;
     if new_top > old_top {
         // Content moves up: rows delta..rows shift to 0..keep.
         grid.shift_rows(0, delta, keep);
         for row in keep..rows {
             grid.reset_line_identity(row);
-            paint_row(
-                grid,
-                row,
-                new_top + row,
-                buffer,
-                h_offset,
-                gutter_w,
-                selection,
-            );
         }
+        ScrollPlan::Rows(keep..rows)
     } else {
         // Content moves down: rows 0..keep shift to delta..rows.
         grid.shift_rows(delta, 0, keep);
         for row in 0..delta {
             grid.reset_line_identity(row);
-            paint_row(
-                grid,
-                row,
-                new_top + row,
-                buffer,
-                h_offset,
-                gutter_w,
-                selection,
-            );
         }
+        ScrollPlan::Rows(0..delta)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax::TokenKind;
 
-    fn buffer_of(n: usize) -> EditorBuffer {
-        let text: Vec<String> = (0..n).map(|i| format!("line {}", i)).collect();
-        EditorBuffer::from_text(&text.join("\n"))
-    }
-
-    fn row_text(grid: &CellGrid, row: usize) -> String {
+    fn grid_row_text(grid: &CellGrid, row: usize) -> String {
         (0..grid.cols())
             .map(|c| {
-                let ch = grid.get_cell(row, c).map(|cell| cell.ch).unwrap_or('\0');
-                if ch == '\0' {
-                    ' '
-                } else {
-                    ch
+                // `Cell::default()` holds NUL, which is how a blank cell
+                // is stored; render it as the space it paints as.
+                match grid.get_cell(row, c).map(|cell| cell.ch) {
+                    Some('\0') | None => ' ',
+                    Some(ch) => ch,
                 }
             })
-            .collect::<String>()
-            .trim_end()
-            .to_string()
+            .collect()
+    }
+
+    fn paint(buffer: &EditorBuffer, paint: &RowPaint<'_>, line: usize) -> CellGrid {
+        let mut grid = CellGrid::new(3, 40);
+        paint_row(&mut grid, 0, line, buffer, paint);
+        grid
     }
 
     #[test]
-    fn gutter_width_scales_with_line_count() {
+    fn gutter_width_has_a_three_digit_floor_and_grows_with_the_file() {
         assert_eq!(gutter_width(1), 4);
         assert_eq!(gutter_width(999), 4);
         assert_eq!(gutter_width(1000), 5);
     }
 
     #[test]
-    fn repaint_renders_gutter_and_content() {
-        let buffer = buffer_of(50);
-        let mut grid = CellGrid::new(4, 20);
-        repaint_all(&mut grid, &buffer, 0, 0, None);
-        assert_eq!(row_text(&grid, 0), "  1 line 0");
-        assert_eq!(row_text(&grid, 3), "  4 line 3");
+    fn paints_the_line_number_and_the_text() {
+        let buffer = EditorBuffer::from_text("alpha\nbeta");
+        let colors = EditorColors::default();
+        let p = RowPaint::plain(0, gutter_width(2), None, &colors);
+        let grid = paint(&buffer, &p, 1);
+        assert!(grid_row_text(&grid, 0).starts_with("  2 beta"));
     }
 
     #[test]
-    fn rows_past_buffer_end_are_blank() {
-        let buffer = buffer_of(2);
-        let mut grid = CellGrid::new(4, 20);
-        repaint_all(&mut grid, &buffer, 0, 0, None);
-        assert_eq!(row_text(&grid, 2), "");
-        assert_eq!(row_text(&grid, 3), "");
+    fn rows_past_the_end_of_the_buffer_are_blank() {
+        let buffer = EditorBuffer::from_text("only");
+        let colors = EditorColors::default();
+        let p = RowPaint::plain(0, gutter_width(1), None, &colors);
+        let grid = paint(&buffer, &p, 5);
+        assert_eq!(grid_row_text(&grid, 0).trim(), "");
     }
 
     #[test]
-    fn scroll_down_keeps_line_ids_of_surviving_rows() {
-        let buffer = buffer_of(100);
-        let mut grid = CellGrid::new(10, 20);
-        repaint_all(&mut grid, &buffer, 0, 0, None);
-        let ids_before = grid.line_ids().to_vec();
-        scroll_viewport(&mut grid, &buffer, 0, 3, 0, None);
-        let ids_after = grid.line_ids().to_vec();
-        // Rows 3..10 moved to 0..7 and kept their identities.
-        assert_eq!(&ids_after[0..7], &ids_before[3..10]);
-        // Content matches the new window.
-        assert_eq!(row_text(&grid, 0), "  4 line 3");
-        assert_eq!(row_text(&grid, 9), " 13 line 12");
-    }
-
-    #[test]
-    fn scroll_up_restores_earlier_lines() {
-        let buffer = buffer_of(100);
-        let mut grid = CellGrid::new(10, 20);
-        repaint_all(&mut grid, &buffer, 20, 0, None);
-        scroll_viewport(&mut grid, &buffer, 20, 18, 0, None);
-        assert_eq!(row_text(&grid, 0), " 19 line 18");
-        assert_eq!(row_text(&grid, 2), " 21 line 20");
-    }
-
-    #[test]
-    fn jump_larger_than_viewport_repaints() {
-        let buffer = buffer_of(100);
-        let mut grid = CellGrid::new(10, 20);
-        repaint_all(&mut grid, &buffer, 0, 0, None);
-        scroll_viewport(&mut grid, &buffer, 0, 50, 0, None);
-        assert_eq!(row_text(&grid, 0), " 51 line 50");
-    }
-
-    #[test]
-    fn tabs_expand_to_tab_stops() {
-        let buffer = EditorBuffer::from_text("\tx\nab\tc");
-        let mut grid = CellGrid::new(2, 16);
-        repaint_all(&mut grid, &buffer, 0, 0, None);
-        // gutter "  1 " + tab expands to 4 cells + 'x'.
-        assert_eq!(row_text(&grid, 0), "  1     x");
-        // "ab" then a tab from visual col 2 to the stop at 4, then 'c'.
-        assert_eq!(row_text(&grid, 1), "  2 ab  c");
-    }
-
-    #[test]
-    fn selection_covers_whole_tab_span() {
-        let buffer = EditorBuffer::from_text("\tx");
-        let mut grid = CellGrid::new(1, 16);
-        let sel = Some((Position { line: 0, col: 0 }, Position { line: 0, col: 1 }));
-        repaint_all(&mut grid, &buffer, 0, 0, sel);
-        let gutter_w = gutter_width(1);
-        for k in 0..4 {
-            assert_eq!(
-                grid.get_cell(0, gutter_w + k).unwrap().bg,
-                SELECTION_BG,
-                "cell {k} of the tab span must carry the selection bg"
-            );
-        }
+    fn selection_paints_the_selected_cells_only() {
+        let buffer = EditorBuffer::from_text("abcdef");
+        let colors = EditorColors::default();
+        let sel = Some((Position { line: 0, col: 1 }, Position { line: 0, col: 3 }));
+        let p = RowPaint::plain(0, gutter_width(1), sel, &colors);
+        let grid = paint(&buffer, &p, 0);
+        let g = gutter_width(1);
+        assert_eq!(grid.get_cell(0, g).unwrap().bg, Color::TRANSPARENT, "'a'");
         assert_eq!(
-            grid.get_cell(0, gutter_w + 4).unwrap().bg,
-            Color::TRANSPARENT
+            grid.get_cell(0, g + 1).unwrap().bg,
+            colors.selection_bg,
+            "'b'"
+        );
+        assert_eq!(
+            grid.get_cell(0, g + 2).unwrap().bg,
+            colors.selection_bg,
+            "'c'"
+        );
+        assert_eq!(
+            grid.get_cell(0, g + 3).unwrap().bg,
+            Color::TRANSPARENT,
+            "'d'"
+        );
+    }
+
+    /// Syntax spans must reach the cells: this is the whole point of
+    /// threading them through the painter.
+    #[test]
+    fn token_spans_colour_the_cells_they_cover() {
+        let buffer = EditorBuffer::from_text("let x = 1;");
+        let colors = EditorColors::default();
+        let spans = vec![
+            Span {
+                start: 0,
+                end: 3,
+                kind: TokenKind::Keyword,
+            },
+            Span {
+                start: 3,
+                end: 8,
+                kind: TokenKind::Ident,
+            },
+            Span {
+                start: 8,
+                end: 9,
+                kind: TokenKind::Number,
+            },
+            Span {
+                start: 9,
+                end: 10,
+                kind: TokenKind::Punct,
+            },
+        ];
+        let mut p = RowPaint::plain(0, gutter_width(1), None, &colors);
+        p.spans = &spans;
+        let grid = paint(&buffer, &p, 0);
+        let g = gutter_width(1);
+        assert_eq!(
+            grid.get_cell(0, g).unwrap().fg,
+            colors.keyword,
+            "'l' of let"
+        );
+        assert_eq!(grid.get_cell(0, g + 8).unwrap().fg, colors.number, "the 1");
+        assert_eq!(grid.get_cell(0, g + 9).unwrap().fg, colors.punct, "the ;");
+    }
+
+    /// Priority matters: a search hit inside a selection must not make
+    /// the selection look broken.
+    #[test]
+    fn background_priority_is_selection_then_current_hit_then_hit_then_tint() {
+        let buffer = EditorBuffer::from_text("aaaa bbbb cccc");
+        let colors = EditorColors::default();
+        let finds = vec![
+            Match {
+                line: 0,
+                start: 0,
+                end: 4,
+            },
+            Match {
+                line: 0,
+                start: 5,
+                end: 9,
+            },
+            Match {
+                line: 0,
+                start: 10,
+                end: 14,
+            },
+        ];
+        let mut p = RowPaint::plain(
+            0,
+            gutter_width(1),
+            Some((Position { line: 0, col: 0 }, Position { line: 0, col: 2 })),
+            &colors,
+        );
+        p.finds = &finds;
+        p.current_find = Some(finds[1]);
+        p.row_bg = Some(colors.diff_added_bg);
+        let grid = paint(&buffer, &p, 0);
+        let g = gutter_width(1);
+        assert_eq!(
+            grid.get_cell(0, g).unwrap().bg,
+            colors.selection_bg,
+            "selected"
+        );
+        assert_eq!(
+            grid.get_cell(0, g + 2).unwrap().bg,
+            colors.find_bg,
+            "other hit"
+        );
+        assert_eq!(
+            grid.get_cell(0, g + 5).unwrap().bg,
+            colors.find_current_bg,
+            "current hit"
+        );
+        assert_eq!(
+            grid.get_cell(0, g + 4).unwrap().bg,
+            colors.diff_added_bg,
+            "gap between hits keeps the row tint"
+        );
+    }
+
+    /// A diff row's tint has to reach the end of the pane, or rows look
+    /// ragged where the code happens to be short.
+    #[test]
+    fn a_row_tint_covers_the_full_width() {
+        let buffer = EditorBuffer::from_text("short");
+        let colors = EditorColors::default();
+        let mut p = RowPaint::plain(0, gutter_width(1), None, &colors);
+        p.row_bg = Some(colors.diff_removed_bg);
+        let grid = paint(&buffer, &p, 0);
+        let last = grid.cols() - 1;
+        assert_eq!(grid.get_cell(0, last).unwrap().bg, colors.diff_removed_bg);
+        assert_eq!(
+            grid.get_cell(0, 0).unwrap().bg,
+            colors.diff_removed_bg,
+            "gutter"
         );
     }
 
     #[test]
-    fn h_offset_skips_leading_chars() {
-        let buffer = EditorBuffer::from_text("abcdefgh");
-        let mut grid = CellGrid::new(1, 8);
-        repaint_all(&mut grid, &buffer, 0, 2, None);
-        // gutter "  1 " then content starting at 'c'.
-        assert_eq!(row_text(&grid, 0), "  1 cdef");
+    fn supplied_gutter_text_replaces_the_line_number() {
+        let buffer = EditorBuffer::from_text("code");
+        let colors = EditorColors::default();
+        let mut p = RowPaint::plain(0, 10, None, &colors);
+        p.gutter_text = Some(" 12  13 + ");
+        let grid = paint(&buffer, &p, 0);
+        assert!(
+            grid_row_text(&grid, 0).starts_with(" 12  13 + code"),
+            "got {:?}",
+            grid_row_text(&grid, 0)
+        );
     }
 
     #[test]
-    fn selection_paints_background_on_selected_cells() {
-        let buffer = EditorBuffer::from_text("hello\nworld");
-        let mut grid = CellGrid::new(2, 12);
-        let sel = Some((Position { line: 0, col: 1 }, Position { line: 1, col: 2 }));
-        repaint_all(&mut grid, &buffer, 0, 0, sel);
-        let gutter_w = gutter_width(2);
-        // 'h' unselected, 'e'..'o' selected on line 0, plus the
-        // trailing newline marker cell.
-        let bg_of = |row: usize, col: usize| grid.get_cell(row, col).unwrap().bg;
-        assert_eq!(bg_of(0, gutter_w), Color::TRANSPARENT);
-        assert_eq!(bg_of(0, gutter_w + 1), SELECTION_BG);
-        assert_eq!(bg_of(0, gutter_w + 4), SELECTION_BG);
-        assert_eq!(bg_of(0, gutter_w + 5), SELECTION_BG); // newline marker
-        assert_eq!(bg_of(1, gutter_w), SELECTION_BG); // 'w'
-        assert_eq!(bg_of(1, gutter_w + 1), SELECTION_BG); // 'o'
-        assert_eq!(bg_of(1, gutter_w + 2), Color::TRANSPARENT); // 'r'
+    fn fg_override_wins_over_spans() {
+        let buffer = EditorBuffer::from_text("@@ -1 +1 @@");
+        let colors = EditorColors::default();
+        let spans = vec![Span {
+            start: 0,
+            end: 11,
+            kind: TokenKind::Keyword,
+        }];
+        let mut p = RowPaint::plain(0, gutter_width(1), None, &colors);
+        p.spans = &spans;
+        p.fg_override = Some(colors.diff_hunk_fg);
+        let grid = paint(&buffer, &p, 0);
+        assert_eq!(
+            grid.get_cell(0, gutter_width(1)).unwrap().fg,
+            colors.diff_hunk_fg
+        );
+    }
+
+    #[test]
+    fn horizontal_offset_skips_leading_columns() {
+        let buffer = EditorBuffer::from_text("0123456789");
+        let colors = EditorColors::default();
+        let p = RowPaint::plain(4, gutter_width(1), None, &colors);
+        let grid = paint(&buffer, &p, 0);
+        let g = gutter_width(1);
+        assert_eq!(grid.get_cell(0, g).unwrap().ch, '4');
+    }
+
+    /// Scrolling by less than a viewport must reuse the rows that stay:
+    /// that reuse is what keeps the renderer's line cache warm.
+    #[test]
+    fn plan_scroll_shifts_rows_and_reports_only_the_exposed_ones() {
+        let mut grid = CellGrid::new(10, 20);
+        assert_eq!(plan_scroll(&mut grid, 0, 3), ScrollPlan::Rows(7..10));
+        assert_eq!(plan_scroll(&mut grid, 3, 0), ScrollPlan::Rows(0..3));
+        assert_eq!(plan_scroll(&mut grid, 0, 0), ScrollPlan::Rows(0..0));
+        assert_eq!(plan_scroll(&mut grid, 0, 10), ScrollPlan::Full);
+        assert_eq!(plan_scroll(&mut grid, 50, 0), ScrollPlan::Full);
+    }
+
+    #[test]
+    fn diff_gutter_width_holds_two_number_columns_and_a_marker() {
+        // Three-digit floor on both sides: "  1   1 + " is 10 cells.
+        assert_eq!(diff_gutter_width(1, 1), 10);
+        assert_eq!(diff_gutter_width(1200, 1200), 12);
     }
 }

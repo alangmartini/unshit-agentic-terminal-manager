@@ -587,16 +587,43 @@ fn record_to<T: Serialize>(path: &Path, event: &T) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn renderer_recovery_event_is_queryable_and_contains_no_terminal_content() {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir()
-            .join(format!(
-                "tm-renderer-telemetry-{}-{}",
+    /// A telemetry file in a directory of its own, removed when the test
+    /// that made it ends.
+    ///
+    /// The directory is named after the process id, and Windows hands the
+    /// same process id out again. Without the sweep in `new` a later run
+    /// lands on the file an earlier one left behind, [`record_to`] appends
+    /// to it — it is an append-only sink — and the test reads two JSON
+    /// objects where it asserts on one.
+    struct TelemetryFile(std::path::PathBuf);
+
+    impl TelemetryFile {
+        fn new(prefix: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "{prefix}-{}-{}",
                 std::process::id(),
                 COUNTER.fetch_add(1, Ordering::Relaxed)
-            ))
-            .join("renderer-events.jsonl");
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("renderer-events.jsonl")
+        }
+    }
+
+    impl Drop for TelemetryFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn renderer_recovery_event_is_queryable_and_contains_no_terminal_content() {
+        let telemetry = TelemetryFile::new("tm-renderer-telemetry");
+        let path = telemetry.path();
         let record = RendererRecoveryRecord {
             timestamp_unix_ms: 123,
             event: "renderer.glyph_atlas_recovery",
@@ -626,14 +653,8 @@ mod tests {
 
     #[test]
     fn slow_frame_event_is_persisted_by_worker_with_queryable_stage_scope() {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir()
-            .join(format!(
-                "tm-renderer-slow-frame-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ))
-            .join("renderer-events.jsonl");
+        let telemetry = TelemetryFile::new("tm-renderer-slow-frame");
+        let path = telemetry.path();
         let metrics = FrameMetrics {
             total_us: 73_230,
             style_resolve_us: 63_830,
@@ -667,14 +688,8 @@ mod tests {
 
     #[test]
     fn glyph_drop_event_is_persisted_with_queryable_counts_and_no_content() {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir()
-            .join(format!(
-                "tm-renderer-glyph-drop-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ))
-            .join("renderer-events.jsonl");
+        let telemetry = TelemetryFile::new("tm-renderer-glyph-drop");
+        let path = telemetry.path();
         let metrics = FrameMetrics {
             glyph_raster_failures: 7,
             glyph_cache_bypasses: 3,
@@ -704,14 +719,8 @@ mod tests {
 
     #[test]
     fn symbol_fallback_event_is_persisted_with_counts_and_no_content() {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir()
-            .join(format!(
-                "tm-renderer-symbol-fallback-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ))
-            .join("renderer-events.jsonl");
+        let telemetry = TelemetryFile::new("tm-renderer-symbol-fallback");
+        let path = telemetry.path();
         let metrics = FrameMetrics {
             glyph_symbol_fallbacks: 2,
             glyph_count: 812,

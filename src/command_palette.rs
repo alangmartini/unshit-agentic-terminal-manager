@@ -13,7 +13,7 @@ pub enum PaletteMode {
     Actions,
     Agents,
     Navigation,
-    Scrollback,
+    Files,
 }
 
 impl PaletteMode {
@@ -23,7 +23,7 @@ impl PaletteMode {
             Self::Actions => "commands",
             Self::Agents => "agents",
             Self::Navigation => "navigation",
-            Self::Scrollback => "scrollback",
+            Self::Files => "files",
         }
     }
 }
@@ -48,6 +48,7 @@ pub enum PaletteGroup {
     App,
     Agents,
     Navigation,
+    Files,
 }
 
 impl PaletteGroup {
@@ -59,6 +60,7 @@ impl PaletteGroup {
             Self::App => "app",
             Self::Agents => "agents",
             Self::Navigation => "navigation",
+            Self::Files => "files",
         }
     }
 }
@@ -79,6 +81,7 @@ pub enum PaletteIcon {
     Workspace,
     Tab,
     Session,
+    File,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +157,102 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         shortcut_label: None,
         dispatch: "editor.open",
         keywords: &["open", "file", "edit", "editor", "text"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "quick_open",
+        label: "Go to file\u{2026}",
+        description: "Find a file in this workspace by name.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: Some(KeybindAction::QuickOpen),
+        shortcut_label: None,
+        dispatch: "palette.files",
+        keywords: &["file", "open", "quick", "goto", "find", "fuzzy"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "diff_uncommitted",
+        label: "Show uncommitted changes",
+        description: "Review the working tree against HEAD in a read-only diff pane.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: None,
+        shortcut_label: None,
+        dispatch: "diff.open:HEAD",
+        keywords: &["diff", "git", "changes", "uncommitted", "review", "pr"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "diff_range",
+        label: "Diff against\u{2026}",
+        description: "Review a revision or base..head range in a read-only diff pane.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: Some(KeybindAction::DiffOpen),
+        shortcut_label: None,
+        dispatch: "diff.open",
+        keywords: &["diff", "git", "range", "branch", "compare", "review"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "editor_goto_line",
+        label: "Go to line\u{2026}",
+        description: "Jump to a line in the focused editor pane.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: None,
+        shortcut_label: Some("Ctrl+G"),
+        dispatch: "editor.goto",
+        keywords: &["goto", "line", "jump", "editor", "navigate"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "editor_find",
+        label: "Find in file",
+        description: "Open the find bar in the focused editor pane.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: None,
+        shortcut_label: Some("Ctrl+F"),
+        dispatch: "editor.find",
+        keywords: &["find", "search", "editor", "text", "match"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "editor_indent",
+        label: "Indent lines",
+        description: "Indent the selected lines in the focused editor pane.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: None,
+        shortcut_label: Some("Tab"),
+        dispatch: "editor.indent",
+        keywords: &["indent", "tab", "editor", "shift", "right"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "editor_outdent",
+        label: "Outdent lines",
+        description: "Remove one indent step from the selected lines.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: None,
+        shortcut_label: Some("Shift+Tab"),
+        dispatch: "editor.outdent",
+        keywords: &["outdent", "dedent", "unindent", "tab", "editor", "left"],
+        enabled: true,
+    },
+    PaletteAction {
+        id: "editor_toggle_comment",
+        label: "Toggle line comment",
+        description: "Comment or uncomment the selected lines.",
+        group: PaletteGroup::Commands,
+        icon: PaletteIcon::File,
+        keybind: None,
+        shortcut_label: Some("Ctrl+/"),
+        dispatch: "editor.toggle_comment",
+        keywords: &["comment", "uncomment", "toggle", "editor", "slash"],
         enabled: true,
     },
     PaletteAction {
@@ -406,6 +505,7 @@ pub enum PaletteItemKind {
     Terminal,
     Session,
     Agent,
+    File,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -430,6 +530,11 @@ pub struct PaletteGroupView {
     pub group: PaletteGroup,
     pub title: String,
     pub items: Vec<PaletteItem>,
+    /// What the group header's count should read, when the plain row
+    /// count would mislead. Quick open caps its rows, so `50 of 312`
+    /// there is the difference between "your file is not indexed" and
+    /// "keep typing". Computed here so the renderer stays dumb.
+    pub count_label: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -485,7 +590,7 @@ pub fn parse_palette_query(input: &str) -> ParsedPaletteQuery {
         Some('>') => (PaletteMode::Actions, &trimmed['>'.len_utf8()..]),
         Some('@') => (PaletteMode::Agents, &trimmed['@'.len_utf8()..]),
         Some(':') => (PaletteMode::Navigation, &trimmed[':'.len_utf8()..]),
-        Some('/') => (PaletteMode::Scrollback, &trimmed['/'.len_utf8()..]),
+        Some('/') => (PaletteMode::Files, &trimmed['/'.len_utf8()..]),
         _ => (PaletteMode::Actions, trimmed),
     };
     ParsedPaletteQuery {
@@ -623,8 +728,108 @@ pub fn fuzzy_match(query: &str, text: &str) -> Option<FuzzyScore> {
     Some(FuzzyScore { score, indices })
 }
 
+/// Rows shown at most in Files mode.
+///
+/// The palette list is not virtualised, so every row becomes an element in
+/// the tree; 50 is what fits a tall window without making a rebuild
+/// expensive. The group header's count says when more matched, so a cap
+/// never reads as "your file is not indexed".
+pub const FILE_ROW_LIMIT: usize = 50;
+
+/// Quick-open rows for `query`, already ranked.
+///
+/// Unlike every other mode these rows come pre-scored from
+/// [`crate::file_index::rank`], which knows to weight a basename hit above
+/// a path hit — re-ranking them with the generic matcher would throw that
+/// away — so [`build_palette_results`] skips `filter_and_rank` for them.
+/// Returns the rows and how many files matched in total, which is not the
+/// same number: the list is capped at [`FILE_ROW_LIMIT`].
+fn file_items(snap: &UiSnapshot, query: &str) -> (Vec<PaletteItem>, usize) {
+    let Some(index) = snap.file_index.as_ref() else {
+        return (Vec::new(), 0);
+    };
+    let (ranked, matched) = crate::file_index::rank_counted(index, query, FILE_ROW_LIMIT);
+    let items = ranked
+        .into_iter()
+        .filter_map(|ranked| {
+            let entry = index.entries.get(ranked.idx)?;
+            let absolute = index.absolute_path(ranked.idx)?;
+            Some(PaletteItem {
+                id: format!("file:{}", entry.rel),
+                label: entry.name().to_string(),
+                // The parent directory, so two `mod.rs` rows are telling
+                // apart at a glance. Not the whole relative path: the
+                // basename is already the label, and the row renders this
+                // beside it rather than under it.
+                description: entry.rel[..entry.name_start]
+                    .trim_end_matches('/')
+                    .to_string(),
+                group: PaletteGroup::Files,
+                kind: PaletteItemKind::File,
+                icon: PaletteIcon::File,
+                // Rows only ever come from the index, which is why the
+                // palette allowlist can admit the `editor.open:` prefix.
+                dispatch: Some(format!("editor.open:{}", absolute.display())),
+                keybind: None,
+                shortcut: None,
+                keywords: Vec::new(),
+                enabled: true,
+                score: None,
+                status: None,
+            })
+        })
+        .collect();
+    (items, matched)
+}
+
 pub fn build_palette_results(snap: &UiSnapshot, input: &str) -> PaletteResults {
     let parsed = parse_palette_query(input);
+    // Files mode arrives ranked by the file index; everything else is
+    // ranked below by the generic matcher.
+    if parsed.mode == PaletteMode::Files {
+        let (items, matched) = file_items(snap, &parsed.query);
+        let shown = items.len();
+        let mut groups = group_items(items);
+        if matched > shown {
+            // The cap is the whole reason this label exists: without it
+            // the header reads "50" and a user whose file ranked 51st
+            // concludes it is not indexed. A `+` says the index itself
+            // stopped short of the tree.
+            let partial = snap
+                .file_index
+                .as_ref()
+                .is_some_and(|index| index.truncated);
+            let suffix = if partial { "+" } else { "" };
+            for group in &mut groups {
+                group.count_label = Some(format!("{shown} of {matched}{suffix}"));
+            }
+        }
+        let empty_state = if !groups.is_empty() {
+            None
+        } else if snap.file_index_building {
+            // "No matching files" while the walk is still running would
+            // be a lie, and the user would retype instead of waiting.
+            // The converse is just as bad: "Indexing…" with no build
+            // running (a workspace with no directory) is a spinner that
+            // can never resolve, so that case falls through to the real
+            // empty state below.
+            Some(PaletteEmptyState {
+                mode: parsed.mode,
+                title: "Indexing\u{2026}".to_string(),
+                message: "Listing the files of this workspace. Results appear as soon as \
+                          the index lands."
+                    .to_string(),
+            })
+        } else {
+            Some(empty_state(parsed.mode, &parsed.query))
+        };
+        return PaletteResults {
+            mode: parsed.mode,
+            query: parsed.query,
+            groups,
+            empty_state,
+        };
+    }
     let mut items = match parsed.mode {
         PaletteMode::Unified => {
             let mut items = action_items(snap);
@@ -640,7 +845,8 @@ pub fn build_palette_results(snap: &UiSnapshot, input: &str) -> PaletteResults {
             items.extend(session_items(snap));
             items
         }
-        PaletteMode::Scrollback => Vec::new(),
+        // Handled above: its rows arrive ranked.
+        PaletteMode::Files => Vec::new(),
     };
 
     items = filter_and_rank(items, &parsed.query);
@@ -1109,6 +1315,7 @@ fn group_items(items: Vec<PaletteItem>) -> Vec<PaletteGroupView> {
                 group: *group,
                 title: group.title().to_string(),
                 items: grouped,
+                count_label: None,
             })
         })
         .collect();
@@ -1134,6 +1341,7 @@ const GROUP_ORDER: &[PaletteGroup] = &[
     PaletteGroup::App,
     PaletteGroup::Agents,
     PaletteGroup::Navigation,
+    PaletteGroup::Files,
 ];
 
 fn group_rank(group: PaletteGroup) -> usize {
@@ -1170,9 +1378,9 @@ fn empty_state(mode: PaletteMode, query: &str) -> PaletteEmptyState {
             "No agents available",
             "No real agent metadata is connected to terminal state yet.",
         ),
-        PaletteMode::Scrollback => (
-            "No searchable scrollback",
-            "No read-only terminal scrollback source is available yet.",
+        PaletteMode::Files => (
+            "No matching files",
+            "No file in the workspace index matches. The index is built when this \n             mode opens; a workspace with no directory has none.",
         ),
     };
 
@@ -1225,9 +1433,9 @@ mod tests {
         assert_eq!(navigation.mode, PaletteMode::Navigation);
         assert_eq!(navigation.query, "api");
 
-        let scrollback = parse_palette_query("/ error");
-        assert_eq!(scrollback.mode, PaletteMode::Scrollback);
-        assert_eq!(scrollback.query, "error");
+        let files = parse_palette_query("/ state.rs");
+        assert_eq!(files.mode, PaletteMode::Files);
+        assert_eq!(files.query, "state.rs");
     }
 
     #[test]
@@ -1289,6 +1497,14 @@ mod tests {
                 "split_pane_down",
                 "new_terminal",
                 "open_file",
+                "quick_open",
+                "diff_uncommitted",
+                "diff_range",
+                "editor_goto_line",
+                "editor_find",
+                "editor_indent",
+                "editor_outdent",
+                "editor_toggle_comment",
                 "save_file",
                 "flow_open",
                 "flow_explain",
@@ -1387,12 +1603,61 @@ mod tests {
             Some(PaletteMode::Agents)
         );
 
-        let scrollback = build_palette_results(&snap, "/");
-        assert!(scrollback.groups.is_empty());
+        // A bare snapshot has no index and nothing building one, so the
+        // honest answer is the real empty state. "Indexing…" here would
+        // be a spinner that can never resolve.
+        let files = build_palette_results(&snap, "/");
+        assert!(files.groups.is_empty());
+        let empty = files.empty_state.as_ref().expect("empty state");
+        assert_eq!(empty.mode, PaletteMode::Files);
+        assert_eq!(empty.title, "No matching files");
+
+        // It says "Indexing…" exactly while a build is running.
+        let mut building = snap.clone();
+        building.file_index_building = true;
+        let files = build_palette_results(&building, "/");
+        let empty = files.empty_state.as_ref().expect("empty state");
+        assert!(empty.title.starts_with("Indexing"), "got {:?}", empty.title);
+    }
+
+    /// Quick open caps its list, and a header reading "50" with no
+    /// qualifier is how a user whose file ranked 51st concludes it is not
+    /// in the index.
+    #[test]
+    fn the_files_header_says_when_more_matched_than_it_shows() {
+        let mut state = seed_state();
+        let root = std::path::PathBuf::from("/tmp/ws");
+        let active = state.active_workspace;
+        state.workspaces[active].path = Some(root.clone());
+        let entries: Vec<crate::file_index::FileEntry> = (0..FILE_ROW_LIMIT + 12)
+            .map(|i| crate::file_index::FileEntry {
+                rel: format!("src/thing{i}.rs"),
+                name_start: "src/".len(),
+            })
+            .collect();
+        let total = entries.len();
+        state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
+            root,
+            entries,
+            source: crate::file_index::IndexSource::Git,
+            truncated: false,
+            built_at: std::time::Instant::now(),
+        }));
+        let snap = state.ui_snapshot();
+
+        let results = build_palette_results(&snap, "/thing");
+        let group = results.groups.first().expect("a files group");
+        assert_eq!(group.items.len(), FILE_ROW_LIMIT);
         assert_eq!(
-            scrollback.empty_state.as_ref().map(|empty| empty.mode),
-            Some(PaletteMode::Scrollback)
+            group.count_label.as_deref(),
+            Some(format!("{FILE_ROW_LIMIT} of {total}").as_str())
         );
+
+        // A query that fits shows the plain count.
+        let results = build_palette_results(&snap, "/thing7.rs");
+        let group = results.groups.first().expect("a files group");
+        assert!(group.items.len() < FILE_ROW_LIMIT);
+        assert_eq!(group.count_label, None);
     }
 
     #[test]
@@ -1436,6 +1701,14 @@ mod tests {
                         | "agent.new:codex"
                         | "editor.open"
                         | "editor.save"
+                        | "editor.goto"
+                        | "editor.find"
+                        | "editor.indent"
+                        | "editor.outdent"
+                        | "editor.toggle_comment"
+                        | "palette.files"
+                        | "diff.open"
+                        | "diff.open:HEAD"
                         | "flow.open"
                         | "flow.explain"
                         | "flow.review"
@@ -1474,6 +1747,14 @@ mod tests {
                         "split_pane_down",
                         "new_terminal",
                         "open_file",
+                        "quick_open",
+                        "diff_uncommitted",
+                        "diff_range",
+                        "editor_goto_line",
+                        "editor_find",
+                        "editor_indent",
+                        "editor_outdent",
+                        "editor_toggle_comment",
                         "save_file",
                         "flow_open",
                         "flow_explain",
@@ -1673,7 +1954,7 @@ mod tests {
     }
 
     #[test]
-    fn scrollback_mode_does_not_show_fake_or_unbacked_rows() {
+    fn files_mode_does_not_show_fake_or_unbacked_rows() {
         let state = seed_state();
         let snap = state.ui_snapshot();
 
@@ -1692,7 +1973,9 @@ mod tests {
                 .empty_state
                 .as_ref()
                 .map(|empty| empty.title.as_str()),
-            Some("No searchable scrollback")
+            // No index in a bare snapshot and no build running, so the
+            // honest answer is the empty state, not a spinner.
+            Some("No matching files")
         );
     }
 
