@@ -73,7 +73,14 @@ impl SyntaxCache {
         tokenize_spans(text, self.lang, &mut state, &mut self.scratch);
         // Record the resulting state for the next line so sequential
         // painting (the common case) never re-scans.
-        if line == self.valid_len {
+        //
+        // `state_at` above leaves `valid_len == line + 1`, so the entry
+        // this pushes is the one for `line + 1`. Testing `line ==
+        // valid_len` instead never matched for a block-comment language
+        // — every painted line was tokenized twice — and for a language
+        // without block comments it pushed entries `state_at` never
+        // reads.
+        if self.valid_len == line + 1 {
             self.states.push(state);
             self.valid_len += 1;
         }

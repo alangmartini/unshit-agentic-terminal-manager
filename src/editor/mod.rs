@@ -335,12 +335,17 @@ impl EditorPane {
             paint.row_bg = Some(colors.current_line_bg);
         }
 
-        // Diff content rows are individually tokenized: each carries its
-        // own file's language and no cross-line comment state (a diff is
-        // not a contiguous document).
+        // Diff content rows are tokenized one at a time — each carries
+        // its own file's language — but not from a blank slate: the rows
+        // inside one hunk are consecutive lines of one file, so the
+        // block-comment state entering each of them is precomputed at
+        // load and handed in here. Starting every row at `false` painted
+        // the second and later lines of a `/* … */` as code.
         let spans_owner;
         if paint.fg_override.is_none() {
-            let mut block = false;
+            let mut block = kind
+                .as_diff()
+                .is_some_and(|view| view.block_state_at(line_idx));
             if kind.as_diff().is_some() {
                 let mut scratch = Vec::new();
                 if syntax.is_active() {
@@ -647,7 +652,22 @@ impl EditorPane {
                         self.repaint_visible_row(l);
                     }
                 }
-                buffer::Damage::Line(line) => self.repaint_visible_row(line),
+                buffer::Damage::Line(line) => {
+                    // Typing `/` `*` damages one line but changes what
+                    // every line under it means. The cache below the edit
+                    // was just dropped; without repainting them too the
+                    // rows keep their old colours, and scrolling
+                    // preserves the stale cells rather than healing it.
+                    // Bounded by the viewport, and only for the languages
+                    // that have block comments at all.
+                    if self.syntax.language().has_block_comments() {
+                        for l in line.max(self.top_line)..=last_visible {
+                            self.repaint_visible_row(l);
+                        }
+                    } else {
+                        self.repaint_visible_row(line);
+                    }
+                }
                 buffer::Damage::None => {}
             }
             // Repaint lines whose selection membership changed. The

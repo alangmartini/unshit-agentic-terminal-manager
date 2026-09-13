@@ -54,6 +54,70 @@ pub enum DiffLoad {
     Failed(String),
 }
 
+/// Block-comment state entering every row of a parsed document.
+///
+/// Only rows inside a hunk can inherit anything: a file header, a hunk
+/// header, a spacer or a meta row resets both sides to "not in a
+/// comment". The two sides are tracked apart because a hunk interleaves
+/// them — a `/*` deleted on a `-` row must not comment out the `+` rows
+/// that replace it — and they are advanced together on a context row,
+/// which belongs to both. The common case (the sides agree) tokenizes
+/// each row exactly once.
+///
+/// Files whose language has no block comments contribute `false` without
+/// being tokenized at all, which is most of a typical diff.
+fn block_states(
+    lines: &[String],
+    rows: &[crate::diff::DiffRowInfo],
+    files: &[crate::diff::DiffFileInfo],
+) -> Vec<bool> {
+    let mut states = Vec::with_capacity(rows.len());
+    let mut old_side = false;
+    let mut new_side = false;
+    let mut scratch = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let lang = files
+            .get(row.file as usize)
+            .map(|f| f.lang)
+            .unwrap_or(Language::Plain);
+        if !row.kind.is_content() || !lang.has_block_comments() {
+            // Headers and spacers separate hunks; a language without
+            // block comments can never be in one.
+            old_side = false;
+            new_side = false;
+            states.push(false);
+            continue;
+        }
+        let text = lines.get(index).map(String::as_str).unwrap_or("");
+        let mut run = |state: &mut bool| {
+            crate::syntax::tokenize_spans(text, lang, state, &mut scratch);
+        };
+        match row.kind {
+            crate::diff::DiffRowKind::Added => {
+                states.push(new_side);
+                run(&mut new_side);
+            }
+            crate::diff::DiffRowKind::Removed => {
+                states.push(old_side);
+                run(&mut old_side);
+            }
+            // Context: the same text on both sides. Colour it by the new
+            // side, which is the version the reviewer is reading.
+            _ => {
+                states.push(new_side);
+                if old_side == new_side {
+                    run(&mut new_side);
+                    old_side = new_side;
+                } else {
+                    run(&mut new_side);
+                    run(&mut old_side);
+                }
+            }
+        }
+    }
+    states
+}
+
 /// A diff pane's decorations and navigation index.
 pub struct DiffView {
     pub spec: DiffSpec,
@@ -68,6 +132,13 @@ pub struct DiffView {
     gutter_w: usize,
     old_digits: usize,
     new_digits: usize,
+    /// Block-comment state entering each row, parallel to `rows`.
+    ///
+    /// A diff is not a contiguous document but a hunk is, so this is
+    /// computed once at load: reset at every header, and tracked per side
+    /// so a `/*` on a removed line does not colour the added lines that
+    /// replace it.
+    block_states: Vec<bool>,
     pub truncated: bool,
 }
 
@@ -86,6 +157,7 @@ impl DiffView {
             gutter_w: 2,
             old_digits: 0,
             new_digits: 0,
+            block_states: Vec::new(),
             truncated: false,
         }
     }
@@ -112,14 +184,22 @@ impl DiffView {
         self.gutter_w = super::grid::diff_gutter_width(max_old, max_new);
         self.rows = document.rows.clone();
         self.files = document.files.clone();
+        self.block_states = block_states(&document.lines, &document.rows, &document.files);
         self.truncated = document.truncated;
         self.load = DiffLoad::Ready;
+    }
+
+    /// Block-comment state entering `index`; `false` for any row outside
+    /// a hunk, and for every row of a language without block comments.
+    pub fn block_state_at(&self, index: usize) -> bool {
+        self.block_states.get(index).copied().unwrap_or(false)
     }
 
     pub fn fail(&mut self, message: String) {
         self.load = DiffLoad::Failed(message);
         self.rows.clear();
         self.files.clear();
+        self.block_states.clear();
         self.gutter_w = 2;
     }
 
