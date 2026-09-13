@@ -945,6 +945,7 @@ fn main() {
                 let cols = snapshot.grid.cols();
                 let mut terminal = crate::terminal::Terminal::new(rows, cols);
                 terminal.apply_snapshot(&snapshot);
+                terminal.set_telemetry_pane(pane_id);
                 guard.terminals.insert(
                     pane_id,
                     std::sync::Arc::new(std::sync::Mutex::new(terminal)),
@@ -972,8 +973,9 @@ fn main() {
                 );
             }
             Ok((None, reader)) => {
-                let terminal =
+                let mut terminal =
                     crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
+                terminal.set_telemetry_pane(pane_id);
                 guard.terminals.insert(
                     pane_id,
                     std::sync::Arc::new(std::sync::Mutex::new(terminal)),
@@ -1695,6 +1697,216 @@ mod tests {
             guard.active_pane,
             crate::state::PaneId(2),
             "scrolling must not move keyboard focus"
+        );
+    }
+
+    /// One pane over a 3x5 terminal holding `L0`..`L5`: `L0`..`L2` in
+    /// scrollback, `L3`..`L5` live, so absolute line `n` shows text `Ln`.
+    /// Returns the shared state, a harness over the real tree, and the
+    /// grid's layout rect (`.terminal-content` has no padding, so pointer
+    /// coordinates relative to it are the drag's `local_x`/`local_y`).
+    fn selection_drag_fixture() -> (SharedState, TestHarness, unshit::core::element::LayoutRect) {
+        use unshit::core::cell_grid::CellGrid;
+
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        let mut state = seed_state();
+        let pane = crate::state::Pane {
+            id: crate::state::PaneId(1),
+            title: "one".to_string(),
+            subtitle: "bash".to_string(),
+            pid: 0,
+            cpu: 0.0,
+            mem_bytes: 0,
+        };
+        state.panes = vec![vec![pane]];
+        state.row_ratios = vec![1.0];
+        state.col_ratios = vec![vec![1.0]];
+        state.tabs[0].panes = state.panes.clone();
+        state.tabs[0].row_ratios = state.row_ratios.clone();
+        state.tabs[0].col_ratios = state.col_ratios.clone();
+        state.active_pane = crate::state::PaneId(1);
+        state.tabs[0].active_pane = crate::state::PaneId(1);
+
+        let mut term = crate::terminal::Terminal::new(3, 5);
+        term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5");
+        state.terminals.insert(1, Arc::new(Mutex::new(term)));
+
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1u32, CellGrid::new(3, 5));
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&tree_snap, &tree_shared, &grids, None),
+            1280.0,
+            900.0,
+        );
+        harness.step();
+
+        let contents = harness.query_all(".terminal-content");
+        assert_eq!(contents.len(), 1, "the pane must render a grid");
+        let rect = contents[0].layout_rect;
+        (shared, harness, rect)
+    }
+
+    fn selection_of(shared: &SharedState, pane: u32) -> crate::state::TermSelection {
+        shared
+            .lock()
+            .unwrap()
+            .terminal_selections
+            .get(&pane)
+            .copied()
+            .expect("a live selection")
+    }
+
+    fn scroll_offset_of(shared: &SharedState, pane: u32) -> usize {
+        shared
+            .lock()
+            .unwrap()
+            .terminals
+            .get(&pane)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .scroll_offset()
+    }
+
+    /// A wheel notch mid-drag scrolls the view under the selection without
+    /// moving its anchor: the anchor stays on the text it was pressed on
+    /// and only the focus follows the pointer's new absolute line.
+    #[test]
+    fn selection_anchor_survives_a_wheel_scroll_mid_drag() {
+        let (shared, mut harness, rect) = selection_drag_fixture();
+        let cell_h = 20.0;
+        let x = rect.x + 25.0;
+
+        // Press on live row 0 (`L3`, absolute line 3), drag to row 2 (`L5`).
+        harness.mouse_down(x, rect.y + 0.5 * cell_h);
+        harness.step();
+        harness.mouse_move(x, rect.y + 2.5 * cell_h);
+        harness.step();
+        let sel = selection_of(&shared, 1);
+        assert_eq!((sel.anchor.0, sel.focus.0), (3, 5));
+
+        // Wheel up one line while the button is still held.
+        harness.mouse_wheel(x, rect.y + 2.5 * cell_h, 0.0, cell_h);
+        harness.step();
+        assert_eq!(scroll_offset_of(&shared, 1), 1);
+
+        // The pointer barely moves, but the row under it now shows `L4`.
+        harness.mouse_move(x + 1.0, rect.y + 2.5 * cell_h);
+        harness.step();
+        let sel = selection_of(&shared, 1);
+        assert_eq!(
+            sel.anchor.0, 3,
+            "anchor must stay on the line it was pressed on"
+        );
+        assert_eq!(
+            sel.focus.0, 4,
+            "focus follows the pointer's absolute line after the scroll"
+        );
+    }
+
+    /// Dragging past the top edge auto-scrolls the scrollback toward the
+    /// pointer and pins the focus to the (now older) top row while the
+    /// anchor stays put; holding still keeps scrolling through the
+    /// framework's drag auto-repeat, and releasing ends it.
+    #[test]
+    fn drag_past_the_top_edge_autoscrolls_and_keeps_the_anchor() {
+        let (shared, mut harness, rect) = selection_drag_fixture();
+        let cell_h = 20.0;
+        let x = rect.x + 25.0;
+
+        // Press on live row 2 (`L5`), drag above the pane's top edge.
+        harness.mouse_down(x, rect.y + 2.5 * cell_h);
+        harness.step();
+        harness.mouse_move(x, rect.y - 8.0);
+        harness.step();
+        assert_eq!(
+            scroll_offset_of(&shared, 1),
+            1,
+            "the first overshooting update scrolls a line at once"
+        );
+        let sel = selection_of(&shared, 1);
+        assert_eq!(
+            sel.anchor.0, 5,
+            "anchor stays on the line it was pressed on"
+        );
+        assert_eq!(sel.focus.0, 2, "focus is pinned to the new top row (`L2`)");
+
+        // Held still past the edge: the auto-repeat tick keeps scrolling,
+        // metered by wall clock (12 lines/s one row past the edge).
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(
+            harness.tick_drag_autorepeat(),
+            "the grid opted in, so it keeps receiving drag updates"
+        );
+        harness.step();
+        assert_eq!(scroll_offset_of(&shared, 1), 2);
+        let sel = selection_of(&shared, 1);
+        assert_eq!((sel.anchor.0, sel.focus.0), (5, 1));
+
+        // Releasing ends the drag: no further auto-repeat, view stays put,
+        // selection survives.
+        harness.mouse_up(x, rect.y - 8.0);
+        harness.step();
+        assert!(!harness.tick_drag_autorepeat());
+        assert_eq!(scroll_offset_of(&shared, 1), 2);
+        let sel = selection_of(&shared, 1);
+        assert_eq!((sel.anchor.0, sel.focus.0), (5, 1));
+        assert!(
+            shared.lock().unwrap().terminal_drag_autoscroll.is_none(),
+            "auto-scroll bookkeeping is closed out on release"
+        );
+    }
+
+    /// A pane whose program owns the mouse (Claude Code in its alternate
+    /// screen, vim, less with mouse support) scrolls its own viewport, so
+    /// dragging past its edge must not move our scrollback under the
+    /// highlight.
+    #[test]
+    fn drag_past_the_edge_does_not_autoscroll_a_mouse_reporting_pane() {
+        let (shared, mut harness, rect) = selection_drag_fixture();
+        let cell_h = 20.0;
+        let x = rect.x + 25.0;
+        shared
+            .lock()
+            .unwrap()
+            .terminals
+            .get(&1)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .process_bytes(b"\x1b[?1000h");
+
+        harness.mouse_down(x, rect.y + 2.5 * cell_h);
+        harness.step();
+        harness.mouse_move(x, rect.y - 8.0);
+        harness.step();
+        assert!(harness.tick_drag_autorepeat());
+        harness.step();
+
+        assert_eq!(
+            scroll_offset_of(&shared, 1),
+            0,
+            "the program owns the viewport"
+        );
+        let sel = selection_of(&shared, 1);
+        assert_eq!(
+            (sel.anchor.0, sel.focus.0),
+            (5, 3),
+            "focus clamps to the live top row"
+        );
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .terminal_drag_autoscroll
+                .and_then(|auto| auto.blocked),
+            Some("mouse_reporting")
         );
     }
 

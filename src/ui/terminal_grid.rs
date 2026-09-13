@@ -1127,35 +1127,66 @@ fn build_pane_body(
 
         let sel_drag_shared = shared.clone();
         let sel_drag_pane = pane_id;
-        grid_el = grid_el.on_drag(move |ev| {
-            if ev.button != MouseButton::Left {
-                return;
-            }
-            let (lx, ly) = (ev.local_x, ev.local_y);
-            match ev.phase {
-                DragPhase::Start | DragPhase::Update => {
-                    mutate_with(&sel_drag_shared, |st| {
-                        let x_offset = terminal_content_x_offset();
-                        let scale = terminal_cell_width_scale();
-                        if let Some(cell) = crate::state::terminal_cell_at(
-                            st,
-                            sel_drag_pane.0,
-                            lx,
-                            ly,
-                            x_offset,
-                            scale,
-                        ) {
-                            crate::state::handle_terminal_drag(st, sel_drag_pane.0, cell);
-                        }
-                    });
+        grid_el = grid_el
+            .on_drag(move |ev| {
+                if ev.button != MouseButton::Left {
+                    return;
                 }
-                DragPhase::End => {
-                    mutate_with(&sel_drag_shared, |st| {
-                        crate::state::finish_terminal_drag(st, sel_drag_pane.0);
-                    });
+                let (lx, ly) = (ev.local_x, ev.local_y);
+                match ev.phase {
+                    DragPhase::Start | DragPhase::Update => {
+                        mutate_with(&sel_drag_shared, |st| {
+                            let x_offset = terminal_content_x_offset();
+                            let scale = terminal_cell_width_scale();
+                            // Past the top or bottom edge: scroll the
+                            // scrollback toward the pointer first (rate
+                            // limited; the framework re-dispatches this
+                            // update every frame while the pointer rests
+                            // outside the grid), then let the clamped
+                            // hit-test below pin the focus to the edge row.
+                            let overshoot = crate::state::terminal_drag_overshoot_rows_for_pane(
+                                st,
+                                sel_drag_pane.0,
+                                ly,
+                            );
+                            let now = std::time::Instant::now();
+                            if overshoot != 0 {
+                                crate::state::terminal_drag_autoscroll(
+                                    st,
+                                    sel_drag_pane.0,
+                                    overshoot,
+                                    now,
+                                );
+                            } else {
+                                crate::state::end_terminal_drag_autoscroll(
+                                    st,
+                                    sel_drag_pane.0,
+                                    "reentered",
+                                    now,
+                                );
+                            }
+                            if let Some(cell) = crate::state::terminal_cell_at(
+                                st,
+                                sel_drag_pane.0,
+                                lx,
+                                ly,
+                                x_offset,
+                                scale,
+                            ) {
+                                crate::state::handle_terminal_drag(st, sel_drag_pane.0, cell);
+                            }
+                        });
+                    }
+                    DragPhase::End => {
+                        mutate_with(&sel_drag_shared, |st| {
+                            crate::state::finish_terminal_drag(st, sel_drag_pane.0);
+                        });
+                    }
                 }
-            }
-        });
+            })
+            // Keep the drag update flowing while the pointer rests past the
+            // pane edge so the auto-scroll above runs without mouse motion.
+            .with_drag_autorepeat();
 
         // Right-click pastes into this pane (classic Windows console
         // behavior). Focus the pane first so the paste targets it even when

@@ -16,6 +16,7 @@ use vte::{Params, Perform};
 
 pub mod keys;
 pub mod paste_image;
+pub mod telemetry;
 
 /// Maximum number of scrollback lines retained per terminal.
 const MAX_SCROLLBACK: usize = 10_000;
@@ -158,6 +159,10 @@ pub struct Terminal {
     /// live `scrollback ++ screen` buffer to form a stable *absolute* line
     /// id that selections anchor to, so they survive scrolling and output.
     evicted_lines: u64,
+    /// Pane id stamped on this terminal's `terminal-events.jsonl` records
+    /// (see [`telemetry`]). `None` for terminals created outside the UI
+    /// (tests, tooling), which then emit nothing.
+    telemetry_pane: Option<u32>,
 }
 
 /// Recognized HTTP(S) link and its inclusive cell span on one terminal line.
@@ -423,6 +428,7 @@ impl Terminal {
             mouse_sgr: false,
             mouse_wheel_accum: 0.0,
             evicted_lines: 0,
+            telemetry_pane: None,
         }
     }
 
@@ -1227,6 +1233,54 @@ impl Terminal {
         self.mouse_report_1000 || self.mouse_report_1002 || self.mouse_report_1003
     }
 
+    /// Whether the alternate screen buffer (DECSET 47/1047/1049) is
+    /// active: a full-screen TUI owns the grid and there is no scrollback
+    /// of its content to reveal.
+    pub fn alt_screen_active(&self) -> bool {
+        self.alt_grid.is_some()
+    }
+
+    /// Stamp the pane id onto this terminal's telemetry records so mode
+    /// changes land in `terminal-events.jsonl` keyed by pane.
+    pub fn set_telemetry_pane(&mut self, pane: u32) {
+        self.telemetry_pane = Some(pane);
+    }
+
+    /// Toggle one mouse-reporting mode (DECSET/DECRST 1000/1002/1003/1006),
+    /// recording `terminal.mode_changed` only on an actual transition so a
+    /// TUI that re-asserts its modes on every repaint costs nothing.
+    fn set_mouse_mode(&mut self, mode: u16, enabled: bool) {
+        let slot = match mode {
+            1000 => &mut self.mouse_report_1000,
+            1002 => &mut self.mouse_report_1002,
+            1003 => &mut self.mouse_report_1003,
+            1006 => &mut self.mouse_sgr,
+            _ => return,
+        };
+        if *slot == enabled {
+            return;
+        }
+        *slot = enabled;
+        self.record_mode_change(mode, enabled);
+    }
+
+    /// Emit `terminal.mode_changed` for a DEC private mode transition.
+    /// Silent for terminals without a pane id (tests, tooling).
+    fn record_mode_change(&self, mode: u16, enabled: bool) {
+        let Some(pane) = self.telemetry_pane else {
+            return;
+        };
+        telemetry::record_terminal_event(&telemetry::TerminalEventRecord {
+            timestamp_unix_ms: telemetry::now_unix_ms(),
+            event: "terminal.mode_changed",
+            level: "info",
+            pane,
+            mode: Some(mode),
+            enabled: Some(enabled),
+            ..Default::default()
+        });
+    }
+
     /// Encode vertical wheel motion as mouse-wheel *button* reports for
     /// the running program, one report per whole line of motion.
     ///
@@ -1730,6 +1784,7 @@ impl Terminal {
         if self.alt_grid.is_some() {
             return;
         }
+        self.record_mode_change(1049, true);
         // A scrolled-back view (or an in-flight wheel animation) must not
         // survive into the alt screen: `display_grid` composes scrollback
         // above the live grid regardless of alt mode, so a TUI launched
@@ -1764,6 +1819,7 @@ impl Terminal {
         let Some(mut main) = self.alt_grid.take() else {
             return;
         };
+        self.record_mode_change(1049, false);
         // Mirror `enter_alt_screen`: a view scrolled while the TUI owned
         // the screen (wheel over `less`, etc.) snaps back to the live
         // prompt on exit rather than dropping the user at a stale
@@ -2302,10 +2358,7 @@ impl<'a> Perform for Performer<'a> {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(true),
-                        1000 => t.mouse_report_1000 = true,
-                        1002 => t.mouse_report_1002 = true,
-                        1003 => t.mouse_report_1003 = true,
-                        1006 => t.mouse_sgr = true,
+                        1000 | 1002 | 1003 | 1006 => t.set_mouse_mode(mode, true),
                         2004 => t.bracketed_paste = true,
                         2026 => t.synchronized_output_active = true,
                         47 | 1047 | 1049 => t.enter_alt_screen(),
@@ -2317,10 +2370,7 @@ impl<'a> Perform for Performer<'a> {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(false),
-                        1000 => t.mouse_report_1000 = false,
-                        1002 => t.mouse_report_1002 = false,
-                        1003 => t.mouse_report_1003 = false,
-                        1006 => t.mouse_sgr = false,
+                        1000 | 1002 | 1003 | 1006 => t.set_mouse_mode(mode, false),
                         2004 => t.bracketed_paste = false,
                         2026 => t.synchronized_output_active = false,
                         47 | 1047 | 1049 => t.exit_alt_screen(),

@@ -1121,6 +1121,9 @@ pub struct AppState {
     pub terminal_link_hover_repaint: std::collections::HashSet<u32>,
     /// Last left-press on a terminal, for double/triple-click promotion.
     pub terminal_click: Option<TerminalClick>,
+    /// Live selection edge auto-scroll for the drag in progress, if the
+    /// pointer has overshot a pane edge. See [`terminal_drag_autoscroll`].
+    pub terminal_drag_autoscroll: Option<TerminalDragAutoscroll>,
     /// App wide default shell. Empty means "let the daemon's own
     /// `default_shell()` decide". Per workspace overrides land in
     /// Task 6 and take precedence via `shell::resolve`.
@@ -1631,6 +1634,7 @@ pub fn seed_state() -> AppState {
         terminal_link_hover: None,
         terminal_link_hover_repaint: std::collections::HashSet::new(),
         terminal_click: None,
+        terminal_drag_autoscroll: None,
         default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
         quick_prompt: None,
     }
@@ -8238,13 +8242,204 @@ pub fn handle_terminal_drag(state: &mut AppState, pane: u32, cell: (u64, usize))
 }
 
 /// Finish a drag: drop a collapsed (empty) selection so a click-without-drag
-/// leaves no stale highlight.
+/// leaves no stale highlight, and close out any edge auto-scroll.
 pub fn finish_terminal_drag(state: &mut AppState, pane: u32) {
+    end_terminal_drag_autoscroll(state, pane, "released", std::time::Instant::now());
     if let Some(sel) = state.terminal_selections.get(&pane).copied() {
         if sel.is_empty() {
             clear_terminal_selection(state, pane);
         }
     }
+}
+
+// -- selection edge auto-scroll ---------------------------------------------
+//
+// Dragging a selection past the top or bottom edge of a pane scrolls its
+// scrollback toward the pointer, the way every desktop terminal does, so a
+// block longer than the viewport can be selected in one gesture. The
+// framework re-dispatches the drag update once per animation frame while
+// the pointer rests outside the grid (`ElementDef::with_drag_autorepeat`);
+// the rate below is wall-clock based so that cadence never sets the speed.
+// The selection itself is anchored to absolute lines, so scrolling under
+// it moves nothing: only the focus, pinned to the edge row by the clamped
+// hit-test, advances.
+
+/// Lines per second of edge auto-scroll per row of pointer overshoot: one
+/// row past the edge scrolls at this rate, each further row adds the same
+/// again.
+pub const AUTOSCROLL_LINES_PER_SEC_PER_ROW: f32 = 12.0;
+/// Ceiling on the auto-scroll rate however far the pointer travels.
+pub const AUTOSCROLL_MAX_LINES_PER_SEC: f32 = 120.0;
+
+/// Bookkeeping for one selection drag's edge auto-scroll, kept from the
+/// first overshooting drag update until the drag ends or the pointer comes
+/// back inside the pane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalDragAutoscroll {
+    pub pane: u32,
+    pub started_at: std::time::Instant,
+    /// Wall clock of the last rate computation.
+    pub last_tick: std::time::Instant,
+    /// Fractional lines owed to the next tick. Seeded at `1.0` so the
+    /// first overshooting update scrolls a line immediately.
+    pub carry: f32,
+    /// Signed lines applied so far (positive = toward older history).
+    pub lines: i64,
+    /// Set when the pane's program owns the viewport and auto-scroll was
+    /// refused; the refusal is recorded once per drag.
+    pub blocked: Option<&'static str>,
+}
+
+/// Rows the pointer sits past a pane's text grid: negative above the top
+/// edge, positive below the bottom edge (row `rows` counts as one past),
+/// zero inside. Pure.
+pub fn terminal_drag_overshoot_rows(local_y: f32, cell_h: f32, rows: usize) -> i32 {
+    if !local_y.is_finite() || !cell_h.is_finite() || cell_h <= 0.0 || rows == 0 {
+        return 0;
+    }
+    if local_y < 0.0 {
+        return -((-local_y / cell_h).ceil().clamp(1.0, 10_000.0) as i32);
+    }
+    let bottom = rows as f32 * cell_h;
+    if local_y >= bottom {
+        return ((local_y - bottom) / cell_h).floor().min(10_000.0) as i32 + 1;
+    }
+    0
+}
+
+/// [`terminal_drag_overshoot_rows`] for `pane`'s live grid using the
+/// renderer's published cell height. Zero when metrics are not ready or
+/// the pane has no terminal.
+pub fn terminal_drag_overshoot_rows_for_pane(state: &AppState, pane: u32, local_y: f32) -> i32 {
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let Some(handle) = state.terminals.get(&pane) else {
+        return 0;
+    };
+    let rows = handle.lock_recover().grid().rows();
+    terminal_drag_overshoot_rows(local_y, cell_h, rows)
+}
+
+/// Edge auto-scroll step for a selection drag on `pane`. `overshoot_rows`
+/// is the pointer's distance past the grid in rows (negative = above the
+/// top edge, positive = below), as from [`terminal_drag_overshoot_rows`];
+/// zero is a no-op. Scrolls the scrollback toward the pointer at
+/// [`AUTOSCROLL_LINES_PER_SEC_PER_ROW`] per row of overshoot, capped at
+/// [`AUTOSCROLL_MAX_LINES_PER_SEC`], metered against `now` so the caller's
+/// cadence does not set the speed; the first overshooting update always
+/// scrolls one line so the gesture responds instantly. Returns the signed
+/// lines applied (positive = toward older history).
+///
+/// Refused — with a `terminal.selection_autoscroll_blocked` record once per
+/// drag — when the running program owns the mouse (DECSET 1000/1002/1003)
+/// or the alternate screen: such a program scrolls its own viewport by
+/// rewriting the same rows, so moving our scrollback would slide the
+/// highlight over content it never covered (and there is nothing of the
+/// program's content to reveal).
+pub fn terminal_drag_autoscroll(
+    state: &mut AppState,
+    pane: u32,
+    overshoot_rows: i32,
+    now: std::time::Instant,
+) -> i32 {
+    if overshoot_rows == 0 {
+        return 0;
+    }
+    let Some(handle) = state.terminals.get(&pane).cloned() else {
+        return 0;
+    };
+    let mut auto = match state.terminal_drag_autoscroll {
+        Some(auto) if auto.pane == pane => auto,
+        _ => TerminalDragAutoscroll {
+            pane,
+            started_at: now,
+            last_tick: now,
+            carry: 1.0,
+            lines: 0,
+            blocked: None,
+        },
+    };
+    let mut terminal = handle.lock_recover();
+    let refusal = if terminal.mouse_reporting_active() {
+        Some("mouse_reporting")
+    } else if terminal.alt_screen_active() {
+        Some("alt_screen")
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        drop(terminal);
+        if auto.blocked.is_none() {
+            auto.blocked = Some(reason);
+            crate::terminal::telemetry::record_terminal_event(
+                &crate::terminal::telemetry::TerminalEventRecord {
+                    timestamp_unix_ms: crate::terminal::telemetry::now_unix_ms(),
+                    event: "terminal.selection_autoscroll_blocked",
+                    level: "info",
+                    pane,
+                    reason: Some(reason),
+                    ..Default::default()
+                },
+            );
+        }
+        state.terminal_drag_autoscroll = Some(auto);
+        return 0;
+    }
+    // Positive scrolls toward older history (pointer above the top edge).
+    let direction: i32 = if overshoot_rows < 0 { 1 } else { -1 };
+    let dt = now.saturating_duration_since(auto.last_tick).as_secs_f32();
+    let rate = (overshoot_rows.unsigned_abs() as f32 * AUTOSCROLL_LINES_PER_SEC_PER_ROW)
+        .min(AUTOSCROLL_MAX_LINES_PER_SEC);
+    // Bound the owed lines so a stalled frame cannot dump a screenful.
+    auto.carry = (auto.carry + rate * dt).min(AUTOSCROLL_MAX_LINES_PER_SEC);
+    let whole = auto.carry.floor() as i32;
+    auto.carry -= whole as f32;
+    auto.last_tick = now;
+    let applied = if whole > 0 {
+        terminal.scroll_view_by_lines((direction * whole) as f32)
+    } else {
+        0
+    };
+    drop(terminal);
+    auto.lines += applied as i64;
+    state.terminal_drag_autoscroll = Some(auto);
+    if applied != 0 {
+        mark_terminal_selection_dirty(state, pane);
+    }
+    applied
+}
+
+/// End `pane`'s selection edge auto-scroll (`reason`: `released` on
+/// drag end, `reentered` when the pointer came back inside the grid),
+/// summarizing it as one `terminal.selection_autoscroll` record when it
+/// scrolled anything. No-op without live bookkeeping for `pane`.
+pub fn end_terminal_drag_autoscroll(
+    state: &mut AppState,
+    pane: u32,
+    reason: &'static str,
+    now: std::time::Instant,
+) {
+    let Some(auto) = state
+        .terminal_drag_autoscroll
+        .take_if(|auto| auto.pane == pane)
+    else {
+        return;
+    };
+    if auto.lines == 0 {
+        return;
+    }
+    crate::terminal::telemetry::record_terminal_event(
+        &crate::terminal::telemetry::TerminalEventRecord {
+            timestamp_unix_ms: crate::terminal::telemetry::now_unix_ms(),
+            event: "terminal.selection_autoscroll",
+            level: "info",
+            pane,
+            direction: Some(if auto.lines > 0 { "up" } else { "down" }),
+            lines: Some(auto.lines),
+            duration_ms: Some(now.saturating_duration_since(auto.started_at).as_millis() as u64),
+            reason: Some(reason),
+            ..Default::default()
+        },
+    );
 }
 
 /// Parse `shell.set_default:<json>` and apply. The json must
@@ -9445,6 +9640,7 @@ pub(crate) mod tests {
             terminal_link_hover: None,
             terminal_link_hover_repaint: std::collections::HashSet::new(),
             terminal_click: None,
+            terminal_drag_autoscroll: None,
             default_shell: crate::shell::ShellSpec::default(),
             quick_prompt: None,
         }
@@ -18723,5 +18919,170 @@ mod agents_tab_tests {
         restore_layout(&mut state, &persisted);
         assert_eq!(state.pane_agents[&1].profile, "aider");
         assert!(state.custom_titled_panes.contains(&1));
+    }
+}
+
+#[cfg(test)]
+mod drag_autoscroll_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A state whose pane `pane` holds a 3x5 terminal with `lines` lines of
+    /// output, i.e. `lines - 3` lines of scrollback above the live grid.
+    fn state_with_scrollback(pane: u32, lines: usize) -> AppState {
+        let mut st = seed_state();
+        let mut term = crate::terminal::Terminal::new(3, 5);
+        for i in 0..lines {
+            term.process_bytes(format!("L{i}\r\n").as_bytes());
+        }
+        st.terminals.insert(pane, Arc::new(Mutex::new(term)));
+        st
+    }
+
+    fn offset(st: &AppState, pane: u32) -> usize {
+        st.terminals[&pane].lock().unwrap().scroll_offset()
+    }
+
+    #[test]
+    fn overshoot_rows_maps_pixels_past_the_grid_to_signed_rows() {
+        assert_eq!(terminal_drag_overshoot_rows(10.0, 20.0, 3), 0);
+        assert_eq!(terminal_drag_overshoot_rows(59.9, 20.0, 3), 0);
+        assert_eq!(terminal_drag_overshoot_rows(60.0, 20.0, 3), 1);
+        assert_eq!(terminal_drag_overshoot_rows(85.0, 20.0, 3), 2);
+        assert_eq!(terminal_drag_overshoot_rows(-0.5, 20.0, 3), -1);
+        assert_eq!(terminal_drag_overshoot_rows(-20.5, 20.0, 3), -2);
+        // Degenerate metrics never count as overshoot.
+        assert_eq!(terminal_drag_overshoot_rows(-5.0, 0.0, 3), 0);
+        assert_eq!(terminal_drag_overshoot_rows(-5.0, 20.0, 0), 0);
+        assert_eq!(terminal_drag_overshoot_rows(f32::NAN, 20.0, 3), 0);
+    }
+
+    #[test]
+    fn first_overshoot_scrolls_one_line_at_once_then_meters_by_wall_clock() {
+        let mut st = state_with_scrollback(1, 40);
+        set_terminal_selection(&mut st, 1, TermSelection::new((39, 0), SelectMode::Cell));
+        st.terminal_selection_repaint.clear();
+        let t0 = Instant::now();
+
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, t0), 1);
+        assert_eq!(offset(&st, 1), 1);
+        // Same instant: nothing owed yet.
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, t0), 0);
+        // One row of overshoot is 12 lines/s: half a second owes 6 lines.
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, -1, t0 + Duration::from_millis(500)),
+            6
+        );
+        assert_eq!(offset(&st, 1), 7);
+        assert!(
+            st.terminal_selection_repaint.contains(&1),
+            "scrolling under a selection must repaint its highlight"
+        );
+        assert_eq!(st.terminal_drag_autoscroll.map(|auto| auto.lines), Some(7));
+    }
+
+    #[test]
+    fn rate_grows_with_overshoot_and_is_capped() {
+        let mut st = state_with_scrollback(1, 500);
+        let t0 = Instant::now();
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -4, t0), 1);
+        // Four rows past the edge is 48 lines/s: a quarter second owes 12.
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, -4, t0 + Duration::from_millis(250)),
+            12
+        );
+        // A hundred rows would be 1200 lines/s; capped at 120, half a
+        // second owes 60.
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, -100, t0 + Duration::from_millis(750)),
+            60
+        );
+        assert_eq!(offset(&st, 1), 73);
+    }
+
+    #[test]
+    fn below_the_bottom_scrolls_toward_live_and_stops_at_the_bottom() {
+        let mut st = state_with_scrollback(1, 40);
+        st.terminals[&1].lock().unwrap().scroll_view_up(5);
+        let t0 = Instant::now();
+
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, 1, t0), -1);
+        assert_eq!(offset(&st, 1), 4);
+        // A second at 12 lines/s owes 12, but only 4 remain above the live
+        // bottom.
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, 1, t0 + Duration::from_secs(1)),
+            -4
+        );
+        assert_eq!(offset(&st, 1), 0);
+        assert_eq!(st.terminal_drag_autoscroll.map(|auto| auto.lines), Some(-5));
+    }
+
+    #[test]
+    fn refused_while_the_program_owns_the_mouse_and_recorded_once() {
+        let mut st = state_with_scrollback(1, 40);
+        st.terminals[&1]
+            .lock()
+            .unwrap()
+            .process_bytes(b"\x1b[?1000h");
+        let t0 = Instant::now();
+
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, t0), 0);
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, -1, t0 + Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(offset(&st, 1), 0);
+        assert_eq!(
+            st.terminal_drag_autoscroll.map(|auto| auto.blocked),
+            Some(Some("mouse_reporting"))
+        );
+        assert!(!st.terminal_selection_repaint.contains(&1));
+    }
+
+    #[test]
+    fn refused_in_the_alternate_screen() {
+        let mut st = state_with_scrollback(1, 40);
+        st.terminals[&1]
+            .lock()
+            .unwrap()
+            .process_bytes(b"\x1b[?1049h");
+
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, Instant::now()), 0);
+        assert_eq!(
+            st.terminal_drag_autoscroll.map(|auto| auto.blocked),
+            Some(Some("alt_screen"))
+        );
+    }
+
+    #[test]
+    fn ending_clears_bookkeeping_and_finishing_the_drag_ends_it() {
+        let mut st = state_with_scrollback(1, 40);
+        let t0 = Instant::now();
+
+        terminal_drag_autoscroll(&mut st, 1, -1, t0);
+        end_terminal_drag_autoscroll(&mut st, 1, "reentered", t0);
+        assert!(st.terminal_drag_autoscroll.is_none());
+
+        // A fresh overshoot after re-entry responds immediately again.
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, t0), 1);
+        finish_terminal_drag(&mut st, 1);
+        assert!(st.terminal_drag_autoscroll.is_none());
+
+        // Another pane's bookkeeping is left alone.
+        terminal_drag_autoscroll(&mut st, 1, -1, t0);
+        end_terminal_drag_autoscroll(&mut st, 2, "released", t0);
+        assert!(st.terminal_drag_autoscroll.is_some());
+    }
+
+    #[test]
+    fn missing_pane_or_zero_overshoot_is_a_no_op() {
+        let mut st = state_with_scrollback(1, 40);
+        let t0 = Instant::now();
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, 0, t0), 0);
+        assert_eq!(terminal_drag_autoscroll(&mut st, 99, -1, t0), 0);
+        assert!(st.terminal_drag_autoscroll.is_none());
+        assert_eq!(offset(&st, 1), 0);
     }
 }
