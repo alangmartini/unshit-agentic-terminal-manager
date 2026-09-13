@@ -2,6 +2,7 @@ pub mod git;
 pub mod split;
 
 use crate::state::{AppState, MutexExt, SharedState};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -49,6 +50,8 @@ pub struct Review {
     /// Inputs own their live buffer; only explicit Clear remounts the input.
     pub file_filter_reset: u64,
     pub file_matches: Arc<Vec<usize>>,
+    /// File indices belong to the current range; reset before refreshing it.
+    pub viewed: Arc<HashSet<usize>>,
 }
 
 impl Review {
@@ -73,6 +76,7 @@ impl Review {
             file_filter: String::new(),
             file_filter_reset: 0,
             file_matches: Arc::default(),
+            viewed: Arc::default(),
         }
     }
 
@@ -239,6 +243,7 @@ fn apply(
                 .is_some_and(|old| Arc::ptr_eq(old, &report));
             review.report = Some(report);
             if changed {
+                review.viewed = Arc::default();
                 review.rebuild_file_matches();
             }
             match lines {
@@ -276,6 +281,7 @@ fn submit(review: &mut Review, query: Query) {
 }
 
 fn refresh(review: &mut Review) {
+    review.viewed = Arc::default();
     let range = match review.mode {
         "unpushed" => git::Range::Unpushed,
         "base" => git::Range::Base(review.base_ref.clone()),
@@ -325,6 +331,21 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         return false;
     };
     match command {
+        "diff.viewed" => {
+            if review.loading
+                || review.error.is_some()
+                || !review
+                    .report
+                    .as_ref()
+                    .is_some_and(|r| review.selected < r.files.len())
+            {
+                return false;
+            }
+            let viewed = Arc::make_mut(&mut review.viewed);
+            if !viewed.remove(&review.selected) {
+                viewed.insert(review.selected);
+            }
+        }
         "diff.hunk_prev" | "diff.hunk_next" => {
             let Some(index) = review.hunk_target(command == "diff.hunk_next") else {
                 return false;
@@ -393,6 +414,44 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
 mod tests {
     use super::*;
     use crate::state::seed_state;
+
+    #[test]
+    fn viewed_files_survive_navigation_but_reset_on_refresh() {
+        let mut state = state_with_patch("@@ -1 +1 @@\n-old\n+new\n");
+        let review = state.diff_review.as_mut().unwrap();
+        Arc::make_mut(review.report.as_mut().unwrap())
+            .files
+            .push(git::File {
+                path: "a.rs".into(),
+                old_path: None,
+                added: Some(1),
+                removed: Some(1),
+            });
+        let lines = review.lines.clone();
+        let request = review.request;
+        assert!(dispatch(&mut state, "diff.viewed"));
+        let report = state.diff_review.as_ref().unwrap().report.clone().unwrap();
+        assert!(apply(&mut state, request, Ok(report), None));
+        assert!(state.diff_review.as_ref().unwrap().viewed.contains(&0));
+        assert!(dispatch(&mut state, "diff.filter:missing"));
+        assert!(dispatch(&mut state, "diff.view:split"));
+        let review = state.diff_review.as_ref().unwrap();
+        assert!(review.viewed.contains(&0));
+        assert_eq!(review.request, request);
+        assert!(Arc::ptr_eq(&lines, &review.lines));
+        assert!(dispatch(&mut state, "diff.viewed"));
+        assert!(state.diff_review.as_ref().unwrap().viewed.is_empty());
+        state.diff_review.as_mut().unwrap().loading = true;
+        assert!(!dispatch(&mut state, "diff.viewed"));
+        state.diff_review.as_mut().unwrap().loading = false;
+        state.diff_review.as_mut().unwrap().error = Some("Patch unavailable".into());
+        assert!(!dispatch(&mut state, "diff.viewed"));
+        state.diff_review.as_mut().unwrap().error = None;
+        assert!(dispatch(&mut state, "diff.viewed"));
+        assert!(dispatch(&mut state, "diff.refresh"));
+        assert!(state.diff_review.as_ref().unwrap().viewed.is_empty());
+        assert!(!dispatch(&mut state, "diff.viewed"));
+    }
 
     fn state_with_patch(text: &str) -> AppState {
         let mut state = seed_state();

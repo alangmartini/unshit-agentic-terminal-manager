@@ -115,6 +115,8 @@ Git review offers **Unified** and **Side by side** views. Split view pairs the o
 
 Use **Previous hunk** / **Next hunk** to jump between changed sections of the open file. The target header appears at the top and the counter shows your position. **File start** returns to the beginning. Navigation crosses row-page boundaries without reloading Git; the footer shows the visible row range. Binary and metadata-only patches have no text hunks.
 
+Click **Mark viewed** after reviewing a file; **Viewed · Undo** clears the mark. The sidebar labels viewed files, and the progress count includes all files in the range, regardless of the path filter. Marks survive file navigation and layout changes without hiding the patch. Refreshing/changing the range or closing the review clears them. Marks are kept only for the current review session.
+
 Use **Filter files** to narrow the changed-file list by path, including a renamed file's former path. Matching ignores case and accepts either slash style. Filtering leaves the open patch in place and shows a notice if it is outside the results. **Clear filter** restores the complete list; no Git query is needed.
 
 ## Configuration

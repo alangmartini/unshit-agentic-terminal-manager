@@ -32,6 +32,12 @@ falling back to the active workspace directory. Capture it when opening.
 - Escape closes review; typing into range fields never reaches a terminal.
 
 ## Implementation and verification
+Files can be marked viewed and unmarked from their patch header. Show viewed
+labels in the sidebar and a whole-range progress count independent of filtering.
+Keep marks across file navigation and layout changes; clear them on range refresh
+or close. Disable marking while loading or after a patch error. No persistence
+or Git writes are involved.
+
 Rust and the existing native unshit element/CSS toolkit; no new dependencies.
 `src/diff_review/` owns Git queries and review state; `src/ui/diff_review.rs`
 renders it. App snapshot, titlebar and palette provide integration.

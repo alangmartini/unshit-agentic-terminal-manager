@@ -122,6 +122,14 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
                 "No changes in this range.\nWorking-tree and staged edits are not included.",
             ));
         } else {
+            content = content.with_child(label(
+                "diff-review-progress",
+                format!(
+                    "{} of {} files viewed",
+                    review.viewed.len(),
+                    report.files.len()
+                ),
+            ));
             content = content.with_child(build_files_and_patch(shared, review));
         }
     } else {
@@ -192,6 +200,9 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
         if index == review.selected {
             entry = entry.with_class("diff-active");
         }
+        if review.viewed.contains(&index) {
+            entry = entry.with_child(label("diff-viewed-label", "Viewed"));
+        }
         files = files.with_child(entry);
     }
     if review.file_matches.is_empty() {
@@ -206,7 +217,30 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
         .with_child(files);
     let mut patch = ElementDef::new(Tag::Div).with_class("diff-patch-panel");
     if let Some(file) = report.files.get(review.selected) {
-        patch = patch.with_child(label("diff-path", &file.path));
+        let mut header = ElementDef::new(Tag::Div)
+            .with_class("diff-path-header")
+            .with_child(label("diff-path", &file.path));
+        if !review.loading && review.error.is_none() {
+            let viewed = review.viewed.contains(&review.selected);
+            header = header.with_child(
+                button(
+                    shared,
+                    if viewed {
+                        "Viewed · Undo"
+                    } else {
+                        "Mark viewed"
+                    },
+                    "diff.viewed",
+                )
+                .with_id("diff-viewed-toggle")
+                .with_class(if viewed {
+                    "diff-active"
+                } else {
+                    "diff-unviewed"
+                }),
+            );
+        }
+        patch = patch.with_child(header);
         if !review.file_matches.contains(&review.selected) {
             patch = patch.with_child(label(
                 "diff-filter-notice",
@@ -394,6 +428,39 @@ mod tests {
             &Default::default(),
             None,
         )
+    }
+
+    #[test]
+    fn viewed_toggle_updates_progress_without_hiding_the_patch() {
+        for width in [800.0, 1280.0] {
+            let shared = fixture();
+            let mut harness = TestHarness::new(
+                include_str!("../../assets/styles.css"),
+                || tree(&shared),
+                width,
+                720.0,
+            );
+            harness.step();
+            let toggle = harness.query("#diff-viewed-toggle").unwrap().layout_rect;
+            assert!(toggle.width > 0.0 && toggle.x + toggle.width <= width);
+            harness.locator("#diff-viewed-toggle").click();
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            assert_eq!(
+                harness.query(".diff-review-progress").unwrap().content,
+                ElementContent::Text("1 of 1 files viewed".into())
+            );
+            assert!(harness.query(".diff-viewed-label").is_some());
+            assert!(harness.query(".diff-added").is_some());
+            harness.locator("#diff-viewed-toggle").click();
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            assert_eq!(
+                harness.query(".diff-review-progress").unwrap().content,
+                ElementContent::Text("0 of 1 files viewed".into())
+            );
+            assert!(harness.query(".diff-viewed-label").is_none());
+        }
     }
 
     #[test]
@@ -718,6 +785,9 @@ mod tests {
         }
         if std::env::var("TM_DIFF_VISUAL_HUNK").as_deref() == Ok("1") {
             dispatch(&mut shared.lock_recover(), "diff.hunk_next");
+        }
+        if std::env::var("TM_DIFF_VISUAL_VIEWED").as_deref() == Ok("1") {
+            dispatch(&mut shared.lock_recover(), "diff.viewed");
         }
         let mut harness = TestHarness::new(
             include_str!("../../assets/styles.css"),
