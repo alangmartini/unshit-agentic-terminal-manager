@@ -113,6 +113,16 @@ pub struct ResourceReport {
     pub listing: Option<DaemonListing>,
     /// Whether the daemon could not be listed, so cached rows may be stale.
     pub listing_failed: bool,
+    /// Process observations for owned sessions. Missing rows mean unknown,
+    /// while a row with no profile means a successful scan found no agent.
+    pub agents: Vec<ProcessAgentObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessAgentObservation {
+    pub pane_id: u32,
+    pub session_id: u64,
+    pub profile: Option<String>,
 }
 
 /// Write a report into the state. Returns whether anything the status bar
@@ -154,7 +164,19 @@ pub fn apply_report(state: &mut AppState, report: &ResourceReport) -> bool {
         }
     }
 
-    DisplayKey::of(state) != before
+    let mut agents_changed = false;
+    for observation in &report.agents {
+        // The pane may have closed or reattached while the sampler was
+        // outside the state lock. Never apply evidence from its old session.
+        if state.pty_manager.session_id(observation.pane_id) == Some(observation.session_id) {
+            agents_changed |= crate::state::classify_pane_process(
+                state,
+                observation.pane_id,
+                observation.profile.as_deref(),
+            );
+        }
+    }
+    agents_changed || DisplayKey::of(state) != before
 }
 
 /// Every pane the UI can show: the active tab's live layout lives in
@@ -332,6 +354,7 @@ pub fn start(shared: SharedState, sink: Arc<OnceLock<EventSink>>) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionRoot {
     pid: u32,
+    session_id: u64,
     pane_id: Option<u32>,
 }
 
@@ -354,6 +377,7 @@ struct RootsCache {
 
 struct Monitor {
     tracker: CpuTracker,
+    detection_rules: crate::agents::rules::RulesFile,
     roots: RootsCache,
     logical_cpus: usize,
     last_tick: Option<(Instant, u64)>,
@@ -377,6 +401,9 @@ impl Monitor {
     fn with_emitter(emit: fn(&ResourceEventRecord)) -> Self {
         Self {
             tracker: CpuTracker::new(),
+            detection_rules: crate::agents::rules::RulesFile::new(
+                crate::profile::config_dir().map(|dir| dir.join("agent-detection.json")),
+            ),
             roots: RootsCache::default(),
             logical_cpus: platform::logical_cpus(),
             last_tick: None,
@@ -391,6 +418,7 @@ impl Monitor {
     }
 
     fn tick(&mut self, shared: &SharedState) -> ResourceReport {
+        self.detection_rules.refresh();
         let (lister, owned) = {
             let guard = shared.lock_recover();
             let mut owned: Vec<(u32, u64)> = guard.pty_manager.sessions_iter().collect();
@@ -450,6 +478,7 @@ impl Monitor {
                     .filter_map(|s| {
                         Some(SessionRoot {
                             pid: s.pid?,
+                            session_id: s.id,
                             pane_id: pane_for.get(&s.id).copied(),
                         })
                     })
@@ -524,6 +553,17 @@ impl Monitor {
         let owner = tree::attribute(&table, &roots, |pid| {
             samples.get(&pid).map(|s| s.creation_100ns)
         });
+
+        if !self.roots.failing {
+            report.agents = observe_agents(
+                &self.roots.sessions,
+                &table,
+                &owner,
+                &image_names,
+                &self.detection_rules.rules,
+                platform::process_command_line,
+            );
+        }
 
         let attributed: Vec<ProcSample> = owner
             .keys()
@@ -612,6 +652,71 @@ impl Monitor {
     }
 }
 
+/// Reuse the monitor's attributed tree. Prefer the outermost harness when
+/// it launches another agent, and ignore processes from other UI sessions.
+fn observe_agents(
+    sessions: &[SessionRoot],
+    table: &[tree::ProcessRecord],
+    owner: &HashMap<u32, u32>,
+    image_names: &HashMap<u32, String>,
+    rules: &crate::agents::rules::DetectionRules,
+    mut command_line: impl FnMut(u32) -> Option<String>,
+) -> Vec<ProcessAgentObservation> {
+    use crate::agents::process::{classify_process, needs_command_line};
+    let parents: HashMap<u32, u32> = table.iter().map(|p| (p.pid, p.parent_pid)).collect();
+    let mut observations = Vec::new();
+    for session in sessions.iter().filter(|s| s.pane_id.is_some()) {
+        let mut pids: Vec<u32> = table
+            .iter()
+            .filter(|p| owner.get(&p.pid) == Some(&session.pid))
+            .map(|p| p.pid)
+            .collect();
+        pids.sort_unstable_by_key(|&pid| {
+            let mut at = pid;
+            let mut depth = 0;
+            while at != session.pid && depth < table.len() {
+                let Some(&parent) = parents.get(&at) else {
+                    break;
+                };
+                at = parent;
+                depth += 1;
+            }
+            (depth, pid)
+        });
+        let mut profile = None;
+        let mut unknown = false;
+        for pid in pids {
+            let Some(image) = image_names.get(&pid) else {
+                unknown = true;
+                continue;
+            };
+            let command = if needs_command_line(image) || rules.needs_command_line(image) {
+                let command = command_line(pid);
+                unknown |= command.is_none();
+                command
+            } else {
+                None
+            };
+            if let Some(id) = classify_process(image, command.as_deref())
+                .map(|agent| agent.id)
+                .or_else(|| rules.classify(image, command.as_deref()))
+            {
+                profile = Some(id.to_string());
+                break;
+            }
+        }
+        // Failure to read an interpreter does not prove an agent exited.
+        if profile.is_some() || !unknown {
+            observations.push(ProcessAgentObservation {
+                pane_id: session.pane_id.unwrap(),
+                session_id: session.session_id,
+                profile,
+            });
+        }
+    }
+    observations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +724,165 @@ mod tests {
 
     fn first_pane_id(state: &AppState) -> u32 {
         state.panes[0][0].id.0
+    }
+
+    #[test]
+    fn custom_rules_detect_additional_runtimes_and_removal_preserves_builtins() {
+        let sessions = [
+            SessionRoot {
+                pid: 10,
+                pane_id: Some(1),
+                session_id: 100,
+            },
+            SessionRoot {
+                pid: 20,
+                pane_id: Some(2),
+                session_id: 200,
+            },
+        ];
+        let table = [
+            tree::ProcessRecord {
+                pid: 10,
+                parent_pid: 0,
+            },
+            tree::ProcessRecord {
+                pid: 20,
+                parent_pid: 0,
+            },
+        ];
+        let names = HashMap::from([(10, "codex.exe".into()), (20, "deno.exe".into())]);
+        let owner = tree::attribute(&table, &HashSet::from([10, 20]), |_| None);
+        let rules = crate::agents::rules::DetectionRules::parse(r#"{"rules":[
+            {"profile":"custom-router","executable":"deno","args_prefix":["run","C:/tools/agent.ts"]},
+            {"profile":"wrong-agent","executable":"codex"}
+        ]}"#).unwrap();
+        let observations = observe_agents(&sessions, &table, &owner, &names, &rules, |pid| {
+            assert_eq!(pid, 20, "query only the custom runtime");
+            Some(r#"deno run "C:\tools\agent.ts" --prompt text"#.into())
+        });
+        assert_eq!(observations[0].profile.as_deref(), Some("codex"));
+        assert_eq!(observations[1].profile.as_deref(), Some("custom-router"));
+        let observations = observe_agents(
+            &sessions,
+            &table,
+            &owner,
+            &names,
+            &crate::agents::rules::DetectionRules::default(),
+            |_| panic!("no runtime needs a query"),
+        );
+        assert_eq!(observations[0].profile.as_deref(), Some("codex"));
+        assert_eq!(
+            observations[1].profile, None,
+            "removing the rule clears custom detection"
+        );
+    }
+
+    #[test]
+    fn process_scan_detects_wrapped_agents_in_owned_trees_and_handles_exit() {
+        use tree::ProcessRecord;
+        let sessions = vec![
+            SessionRoot {
+                pid: 10,
+                pane_id: Some(1),
+                session_id: 100,
+            },
+            SessionRoot {
+                pid: 20,
+                pane_id: None,
+                session_id: 200,
+            },
+        ];
+        let mut table = vec![
+            ProcessRecord {
+                pid: 10,
+                parent_pid: 1,
+            },
+            ProcessRecord {
+                pid: 11,
+                parent_pid: 10,
+            },
+            ProcessRecord {
+                pid: 12,
+                parent_pid: 11,
+            },
+            ProcessRecord {
+                pid: 20,
+                parent_pid: 1,
+            },
+            ProcessRecord {
+                pid: 21,
+                parent_pid: 20,
+            },
+        ];
+        let names = HashMap::from([
+            (10, "pwsh.exe".into()),
+            (11, "node.exe".into()),
+            (12, "claude.exe".into()),
+            (20, "pwsh.exe".into()),
+            (21, "node.exe".into()),
+        ]);
+        let roots = HashSet::from([10, 20]);
+        let owner = tree::attribute(&table, &roots, |_| None);
+        let rules = crate::agents::rules::DetectionRules::default();
+        let observed = observe_agents(&sessions, &table, &owner, &names, &rules, |pid| {
+            assert_eq!(pid, 11, "never query unrelated sessions");
+            Some(r#"node "C:\Users\Test User\node_modules\@github\copilot\npm-loader.js""#.into())
+        });
+        assert_eq!(
+            observed,
+            vec![ProcessAgentObservation {
+                pane_id: 1,
+                session_id: 100,
+                profile: Some("copilot".into()),
+            }],
+            "outer harness wins over the nested agent"
+        );
+        table.retain(|p| p.pid != 12);
+        let owner = tree::attribute(&table, &roots, |_| None);
+        assert!(
+            observe_agents(&sessions, &table, &owner, &names, &rules, |_| None).is_empty(),
+            "an unreadable runtime leaves membership unknown"
+        );
+        table.retain(|p| p.pid != 11);
+        let owner = tree::attribute(&table, &roots, |_| None);
+        let observed = observe_agents(&sessions, &table, &owner, &names, &rules, |_| {
+            panic!("no runtime")
+        });
+        assert_eq!(
+            observed[0].profile, None,
+            "shell remains after the agent exits"
+        );
+    }
+
+    #[test]
+    fn process_observations_move_panes_and_only_rebuild_on_transitions() {
+        let mut state = seed_state();
+        let pane_id = first_pane_id(&state);
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(pane_id, 42);
+        let mut report = ResourceReport::default();
+        apply_report(&mut state, &report);
+        report.agents.push(ProcessAgentObservation {
+            pane_id,
+            session_id: 42,
+            profile: Some("codex".into()),
+        });
+        assert!(apply_report(&mut state, &report));
+        assert!(crate::state::is_agent_pane(&state, pane_id));
+        assert!(!apply_report(&mut state, &report));
+        // An unavailable sample does not claim the process exited.
+        assert!(!apply_report(&mut state, &ResourceReport::default()));
+        assert!(crate::state::is_agent_pane(&state, pane_id));
+        // A stale report cannot clear a pane now attached to another session.
+        report.agents[0].session_id = 41;
+        report.agents[0].profile = None;
+        assert!(!apply_report(&mut state, &report));
+        assert!(crate::state::is_agent_pane(&state, pane_id));
+        report.agents[0].session_id = 42;
+        assert!(apply_report(&mut state, &report));
+        assert!(!crate::state::is_agent_pane(&state, pane_id));
+        assert!(!apply_report(&mut state, &report));
     }
 
     #[test]

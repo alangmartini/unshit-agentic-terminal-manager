@@ -1,0 +1,18 @@
+{
+  "rules": [
+    {
+      "profile": "my-agent",
+      "executable": "my-agent.exe"
+    },
+    {
+      "profile": "openrouter",
+      "executable": "node.exe",
+      "args_prefix": ["C:/tools/router/cli.js"]
+    },
+    {
+      "profile": "my-python-agent",
+      "executable": "python.exe",
+      "args_prefix": ["-m", "my_agent"]
+    }
+  ]
+}

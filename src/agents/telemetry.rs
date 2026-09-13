@@ -32,7 +32,7 @@ pub struct AgentEventRecord<'a> {
     /// `AgentProfile::id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<&'a str>,
-    /// Tag source (`launched` / `hook` / `title`) or launch origin
+    /// Tag source (`launched` / `hook` / `process` / `title`) or launch origin
     /// (`command` / `ctx_menu` / `cli` / `quick_prompt`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<&'static str>,
