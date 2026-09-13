@@ -110,6 +110,14 @@ jobs:
           "ready=$($ready.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "has_app=$($hasApp.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
+          # Which credential the agent step will actually use. The gate and
+          # the agent resolve auth separately, so naming the path here is what
+          # tells a green gate followed by a "Not logged in" agent apart from
+          # a runner that was never logged in at all.
+          $authPath = if ($hasToken) { "token" } elseif ($hasLogin) { "runner-login" } else { "none" }
+          "auth_path=$authPath" >> $env:GITHUB_OUTPUT
+          "Claude auth path: $authPath" >> $env:GITHUB_STEP_SUMMARY
+
           if (-not $ready) {
             "Automated repair cannot run." >> $env:GITHUB_STEP_SUMMARY
             "" >> $env:GITHUB_STEP_SUMMARY
@@ -206,12 +214,20 @@ jobs:
 
           $previousErrorActionPreference = $ErrorActionPreference
           $ErrorActionPreference = 'Continue'
+          # --safe-mode, not --bare. Both drop the developer hooks, plugins,
+          # MCP servers and CLAUDE.md that this runner would otherwise inherit
+          # from the shared $USERPROFILE, which matters because the agent runs
+          # with --dangerously-skip-permissions. But --bare also refuses every
+          # credential except ANTHROPIC_API_KEY ("OAuth and keychain are never
+          # read"), so with only a subscription login on the runner it exits
+          # "Not logged in - please run /login" one second in. --safe-mode
+          # disables the same customizations and leaves auth working.
           try {
             $prompt | claude -p `
               --model claude-sonnet-5 `
               --effort high `
               --dangerously-skip-permissions `
-              --bare
+              --safe-mode
             $claudeExitCode = $LASTEXITCODE
           } finally {
             $ErrorActionPreference = $previousErrorActionPreference
