@@ -5598,6 +5598,28 @@ fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
         return false;
     }
 
+    // Quick open is the one palette mode whose rows are data rather than
+    // a fixed catalogue, so "which kind of row got picked" is the only
+    // way to tell later that the index was actually useful.
+    if item.kind == crate::command_palette::PaletteItemKind::File {
+        use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+        let correlation_id = crate::editor::generate_correlation_id();
+        record_editor_event(&EditorEventRecord {
+            timestamp_unix_ms: now_unix_ms(),
+            event: "quickopen.pick",
+            level: "info",
+            correlation_id: &correlation_id,
+            // The path the user chose, which the editor sink records on
+            // the `editor.open` that follows anyway. Never the query.
+            path: Some(command.trim_start_matches("editor.open:")),
+            file_bytes: None,
+            line_count: None,
+            line: None,
+            reason: None,
+            os_error: None,
+        });
+    }
+
     let handled = dispatch(state, &command);
     if handled {
         close_command_palette(state);
@@ -5940,6 +5962,19 @@ pub fn request_close_tab(state: &mut AppState, index: usize) {
 /// alone. `reason: "dirty"` at warn level marks unsaved changes that died
 /// with the pane.
 fn record_editor_closed(editor: &crate::editor::EditorPane) {
+    // A diff pane's lifecycle belongs in the diff sink beside the request
+    // that created it; its `path` is a repository root, which the editor
+    // sink would record as a file.
+    if let Some(view) = editor.diff() {
+        use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+        let label = view.spec.label();
+        let mut record = DiffEventRecord::new("diff.closed", "info", &view.job_id);
+        record.range = Some(&label);
+        record.rows = Some(view.rows.len() as u64);
+        record.files = Some(view.files.len() as u64);
+        record_diff_event(&record);
+        return;
+    }
     let level = if editor.dirty { "warn" } else { "info" };
     record_editor_pane_event(
         editor,
@@ -6298,6 +6333,20 @@ fn dispatch_editor_find(state: &mut AppState, command: FindCommand) -> bool {
     match command {
         FindCommand::Open => {
             editor.find_open();
+            let path = editor.path.to_string_lossy().into_owned();
+            let correlation_id = editor.correlation_id.clone();
+            record_editor_event(&EditorEventRecord {
+                timestamp_unix_ms: now_unix_ms(),
+                event: "editor.find_open",
+                level: "info",
+                correlation_id: &correlation_id,
+                path: Some(&path),
+                file_bytes: None,
+                line_count: None,
+                line: None,
+                reason: None,
+                os_error: None,
+            });
         }
         FindCommand::Close => {
             // Nothing open: leave the key unclaimed so Escape can fall
@@ -6759,12 +6808,24 @@ fn flow_node_location(
     pane.flow.node(node_id)?.location.clone()
 }
 
+/// One `flow.handoff` record per `o` / `d`: which hand-off, and whether
+/// the node had a location to aim at. Never the node id or its label.
+fn record_flow_handoff(pane: &crate::flow_explorer::FlowPane, kind: &'static str, located: bool) {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+    let mut record = FlowEventRecord::new("flow.handoff", "info", &pane.flow_id);
+    record.kind = Some(kind);
+    record.reason = Some(if located { "located" } else { "no_location" });
+    record_flow_event(&record);
+}
+
 /// `flow.edit:<id>`: open the node's file in an editor at its line.
 fn dispatch_flow_edit(state: &mut AppState, node_id: &str) -> bool {
     let Some(pane) = active_flow_pane(state) else {
         return false;
     };
-    let Some(location) = flow_node_location(&pane, node_id) else {
+    let location = flow_node_location(&pane, node_id);
+    record_flow_handoff(&pane, "edit", location.is_some());
+    let Some(location) = location else {
         push_error_toast(state, "This node has no source location");
         return true;
     };
@@ -6785,6 +6846,7 @@ fn dispatch_flow_diff(state: &mut AppState, node_id: Option<&str>) -> bool {
     // An id that resolves to no location still opens the whole range:
     // the user asked to see the diff, and the scroll target is a bonus.
     let location = node_id.and_then(|id| flow_node_location(&pane, id));
+    record_flow_handoff(&pane, "diff", location.is_some());
     let Some(range) = pane.flow.diff_range.as_ref() else {
         push_error_toast(state, "This flow has no diff range");
         return true;

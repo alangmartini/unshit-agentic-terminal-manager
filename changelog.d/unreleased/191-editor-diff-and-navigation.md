@@ -38,6 +38,14 @@
   `editor.find_case` stepping and configuring it. Escape closes the bar
   before any other surface.
 
+- **Telemetry covers the new surfaces.** `quickopen.pick`,
+  `editor.find_open` and `editor.find_closed` land in `editor-events.jsonl`,
+  `flow.handoff` (with `kind` = `edit` or `diff`) in `flow-events.jsonl`, and
+  closing a diff pane is recorded as `diff.closed` in `diff-events.jsonl`
+  beside the request that opened it, instead of an `editor.close` naming a
+  repository root as a file. Event names and counts only — never a
+  query string, a node label, or diff content.
+
 ### Changed
 
 - **Opening a file that is already open focuses that pane** instead of
