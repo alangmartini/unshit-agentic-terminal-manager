@@ -18,7 +18,7 @@ pub(super) fn build(review: &Review) -> ElementDef {
         .split_rows
         .iter()
         .enumerate()
-        .skip(review.page * PAGE_LINES)
+        .skip(review.row_start)
         .take(PAGE_LINES)
     {
         let row = match row {
@@ -31,9 +31,15 @@ pub(super) fn build(review: &Review) -> ElementDef {
                 pair(review, Some(&cell), Some(&cell))
             }
             Row::Shared(line) => {
+                let active = review.is_active_hunk_line(*line);
                 let line = &review.lines[*line];
                 ElementDef::new(Tag::Div)
                     .with_class("diff-line")
+                    .with_class(if active {
+                        "diff-hunk-current"
+                    } else {
+                        "diff-row"
+                    })
                     .with_class(format!("diff-{}", line.kind))
                     .with_child(label("diff-code", &line.text).with_class("diff-split-code"))
             }

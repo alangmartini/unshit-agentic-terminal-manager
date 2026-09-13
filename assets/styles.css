@@ -8153,3 +8153,8 @@ body.dragging-pane {
 .diff-filter-empty { padding: 8px; font-size: 12px; color: var(--fg-secondary); white-space: pre-wrap; }
 .diff-filter-notice { padding: 8px 12px; font-size: 12px; color: var(--fg-secondary); background: var(--bg-subtle); flex-shrink: 0; white-space: pre-wrap; }
 .diff-files .diff-pagination { flex-wrap: wrap; padding: 0; }
+
+.diff-hunk-navigation { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border-default); flex-shrink: 0; }
+.diff-hunk-status { font-size: 12px; color: var(--fg-secondary); }
+.diff-navigation-disabled { color: var(--fg-tertiary); cursor: default; }
+.diff-hunk-current { background: var(--bg-selected); border-left: 3px solid var(--border-focus); }

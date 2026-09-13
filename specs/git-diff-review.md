@@ -5,6 +5,12 @@ Use the focused session's recorded launch directory (including worktree tabs),
 falling back to the active workspace directory. Capture it when opening.
 
 ## Behavior
+- Previous/Next hunk controls navigate within the open file, highlight the target,
+  and show its ordinal/total. A jump starts a bounded row window at the hunk header
+  in either view, without another Git query. Switching views keeps a selected hunk.
+  Ordinary row paging clears hunk selection; File start returns to the beginning.
+  Loading another file/range resets navigation; binary/metadata-only patches have
+  no navigable hunks. Row-range labels make non-page-aligned jumps explicit.
 - Filter the changed-file list by case-insensitive substring of the current or
   former path (rename), accepting either slash style. Show matching/total counts,
   clear control, and no-results text. Filtering keeps the open patch and its page,

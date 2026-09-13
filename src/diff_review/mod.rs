@@ -9,6 +9,25 @@ pub const PAGE_LINES: usize = 200;
 pub const PAGE_FILES: usize = 100;
 
 #[derive(Clone, Debug)]
+pub struct Hunk {
+    pub unified_row: usize,
+    pub split_row: usize,
+}
+
+pub fn collect_hunks(lines: &[git::Line], rows: &[split::Row]) -> Vec<Hunk> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(split_row, row)| match row {
+            split::Row::Shared(line) if lines[*line].kind == "hunk" => Some(Hunk {
+                unified_row: *line,
+                split_row,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
 pub struct Review {
     pub root: PathBuf,
     pub mode: &'static str,
@@ -22,7 +41,9 @@ pub struct Review {
     pub split_rows: Arc<Vec<split::Row>>,
     pub side_by_side: bool,
     pub selected: usize,
-    pub page: usize,
+    pub row_start: usize,
+    pub hunks: Arc<Vec<Hunk>>,
+    pub active_hunk: Option<usize>,
     pub file_page: usize,
     pub file_filter: String,
     /// Inputs own their live buffer; only explicit Clear remounts the input.
@@ -45,7 +66,9 @@ impl Review {
             split_rows: Arc::default(),
             side_by_side: false,
             selected: 0,
-            page: 0,
+            row_start: 0,
+            hunks: Arc::default(),
+            active_hunk: None,
             file_page: 0,
             file_filter: String::new(),
             file_filter_reset: 0,
@@ -64,6 +87,45 @@ impl Review {
     pub fn set_file_filter(&mut self, query: &str) {
         self.file_filter = query.chars().take(256).collect();
         self.rebuild_file_matches();
+    }
+
+    fn hunk_row(&self, index: usize) -> usize {
+        let hunk = &self.hunks[index];
+        if self.side_by_side {
+            hunk.split_row
+        } else {
+            hunk.unified_row
+        }
+    }
+
+    pub fn hunk_target(&self, forward: bool) -> Option<usize> {
+        if self.loading {
+            return None;
+        }
+        if let Some(index) = self.active_hunk {
+            if forward {
+                (index + 1 < self.hunks.len()).then_some(index + 1)
+            } else {
+                index.checked_sub(1)
+            }
+        } else if forward {
+            (0..self.hunks.len()).find(|&index| self.hunk_row(index) >= self.row_start)
+        } else {
+            (0..self.hunks.len()).rfind(|&index| self.hunk_row(index) < self.row_start)
+        }
+    }
+
+    pub fn is_active_hunk_line(&self, line: usize) -> bool {
+        self.active_hunk
+            .is_some_and(|index| self.hunks[index].unified_row == line)
+    }
+
+    fn clear_patch(&mut self) {
+        self.lines = Arc::default();
+        self.split_rows = Arc::default();
+        self.hunks = Arc::default();
+        self.active_hunk = None;
+        self.row_start = 0;
     }
 
     fn rebuild_file_matches(&mut self) {
@@ -96,14 +158,17 @@ impl Review {
 struct LoadedPatch {
     lines: Arc<Vec<git::Line>>,
     split_rows: Arc<Vec<split::Row>>,
+    hunks: Arc<Vec<Hunk>>,
 }
 
 impl LoadedPatch {
     fn new(lines: Vec<git::Line>) -> Self {
         let split_rows = Arc::new(split::align(&lines));
+        let hunks = Arc::new(collect_hunks(&lines, &split_rows));
         Self {
             lines: Arc::new(lines),
             split_rows,
+            hunks,
         }
     }
 }
@@ -180,6 +245,9 @@ fn apply(
                 Some(Ok(patch)) => {
                     review.lines = patch.lines;
                     review.split_rows = patch.split_rows;
+                    review.hunks = patch.hunks;
+                    review.active_hunk = None;
+                    review.row_start = 0;
                 }
                 Some(Err(error)) => review.error = Some(error),
                 None => {}
@@ -192,9 +260,7 @@ fn apply(
 
 fn submit(review: &mut Review, query: Query) {
     review.request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    review.lines = Arc::default();
-    review.split_rows = Arc::default();
-    review.page = 0;
+    review.clear_patch();
     review.error = None;
     let Some(queue) = QUEUE.get() else {
         review.loading = false;
@@ -220,8 +286,7 @@ fn refresh(review: &mut Review) {
                 review.loading = false;
                 review.report = None;
                 review.file_matches = Arc::default();
-                review.lines = Arc::default();
-                review.split_rows = Arc::default();
+                review.clear_patch();
                 review.error = Some("Choose between 1 and 10000 commits.".into());
                 return;
             }
@@ -260,6 +325,17 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         return false;
     };
     match command {
+        "diff.hunk_prev" | "diff.hunk_next" => {
+            let Some(index) = review.hunk_target(command == "diff.hunk_next") else {
+                return false;
+            };
+            review.active_hunk = Some(index);
+            review.row_start = review.hunk_row(index);
+        }
+        "diff.file_start" if review.row_start > 0 || review.active_hunk.is_some() => {
+            review.row_start = 0;
+            review.active_hunk = None;
+        }
         "diff.filter_clear" => {
             review.set_file_filter("");
             review.file_filter_reset = review.file_filter_reset.wrapping_add(1);
@@ -273,7 +349,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 return false;
             }
             review.side_by_side = split;
-            review.page = 0;
+            review.row_start = review.active_hunk.map_or(0, |index| review.hunk_row(index));
         }
         "diff.refresh" => refresh(review),
         "diff.mode:last" | "diff.mode:unpushed" | "diff.mode:base" => {
@@ -284,8 +360,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             refresh(review);
         }
-        "diff.prev" => review.page = review.page.saturating_sub(1),
-        "diff.next" if (review.page + 1) * PAGE_LINES < review.row_count() => review.page += 1,
+        "diff.prev" if review.row_start > 0 => {
+            review.row_start = review.row_start.saturating_sub(PAGE_LINES);
+            review.active_hunk = None;
+        }
+        "diff.next" if review.row_start + PAGE_LINES < review.row_count() => {
+            review.row_start += PAGE_LINES;
+            review.active_hunk = None;
+        }
         "diff.files_prev" => review.file_page = review.file_page.saturating_sub(1),
         "diff.files_next" if (review.file_page + 1) * PAGE_FILES < review.file_matches.len() => {
             review.file_page += 1
@@ -311,6 +393,78 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
 mod tests {
     use super::*;
     use crate::state::seed_state;
+
+    fn state_with_patch(text: &str) -> AppState {
+        let mut state = seed_state();
+        let mut review = Review::new(".".into());
+        review.request = 42;
+        state.diff_review = Some(review);
+        let report = Arc::new(git::Report {
+            root: ".".into(),
+            base: "base".into(),
+            head: "head".into(),
+            label: "test".into(),
+            files: vec![],
+        });
+        assert!(apply(
+            &mut state,
+            42,
+            Ok(report),
+            Some(Ok(LoadedPatch::new(git::parse_patch(text))))
+        ));
+        state
+    }
+
+    #[test]
+    fn hunk_navigation_crosses_pages_without_reloading_git() {
+        let patch = format!("diff --git a/a b/a\n@@ -1,211 +1,211 @@\n{}{} same\n@@ -900 +900 @@\n-before\n+after\n", "-old\n".repeat(210), "+new\n".repeat(210));
+        let mut state = state_with_patch(&patch);
+        let lines = state.diff_review.as_ref().unwrap().lines.clone();
+        assert!(!dispatch(&mut state, "diff.hunk_prev"));
+        assert!(dispatch(&mut state, "diff.hunk_next"));
+        assert_eq!(state.diff_review.as_ref().unwrap().row_start, 1);
+        assert!(dispatch(&mut state, "diff.hunk_next"));
+        assert_eq!(state.diff_review.as_ref().unwrap().row_start, 423);
+        assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, Some(1));
+        assert!(!dispatch(&mut state, "diff.hunk_next"));
+        assert!(dispatch(&mut state, "diff.view:split"));
+        assert_eq!(state.diff_review.as_ref().unwrap().row_start, 213);
+        assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, Some(1));
+        assert!(dispatch(&mut state, "diff.hunk_prev"));
+        assert!(!dispatch(&mut state, "diff.hunk_prev"));
+        let review = state.diff_review.as_ref().unwrap();
+        assert_eq!(review.request, 42);
+        assert!(Arc::ptr_eq(&lines, &review.lines));
+        assert!(dispatch(&mut state, "diff.next"));
+        assert_eq!(state.diff_review.as_ref().unwrap().row_start, 201);
+        assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, None);
+        assert!(dispatch(&mut state, "diff.hunk_next"));
+        assert_eq!(state.diff_review.as_ref().unwrap().row_start, 213);
+        assert!(dispatch(&mut state, "diff.file_start"));
+        assert_eq!(state.diff_review.as_ref().unwrap().row_start, 0);
+        assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, None);
+        assert!(!dispatch(&mut state, "diff.file_start"));
+        assert!(dispatch(&mut state, "diff.hunk_next"));
+        state.diff_review.as_mut().unwrap().count = "0".into();
+        assert!(dispatch(&mut state, "diff.refresh"));
+        assert!(state.diff_review.as_ref().unwrap().hunks.is_empty());
+        assert_eq!(state.diff_review.as_ref().unwrap().active_hunk, None);
+        assert!(!dispatch(&mut state, "diff.hunk_next"));
+    }
+
+    #[test]
+    fn metadata_only_patches_have_no_hunk_navigation() {
+        for text in [
+            "",
+            "diff --git a/a b/a\nBinary files a/a and b/a differ\n",
+            "diff --git a/a b/b\nrename from a\nrename to b\n",
+        ] {
+            let mut state = state_with_patch(text);
+            assert!(state.diff_review.as_ref().unwrap().hunks.is_empty());
+            assert!(!dispatch(&mut state, "diff.hunk_prev"));
+            assert!(!dispatch(&mut state, "diff.hunk_next"));
+        }
+    }
 
     #[test]
     fn file_filter_matches_current_and_renamed_paths_without_reloading_patch() {
@@ -343,7 +497,7 @@ mod tests {
         }));
         let lines = review.lines.clone();
         review.selected = 2;
-        review.page = 3;
+        review.row_start = 3 * PAGE_LINES;
         review.file_page = 2;
         review.request = 42;
         review.loading = true;
@@ -357,7 +511,7 @@ mod tests {
         review.set_file_filter("");
         assert_eq!(&*review.file_matches, &[0, 1, 2]);
         assert_eq!(review.selected, 2);
-        assert_eq!(review.page, 3);
+        assert_eq!(review.row_start, 3 * PAGE_LINES);
         assert_eq!(review.request, 42);
         assert!(review.loading);
         assert!(Arc::ptr_eq(&review.lines, &lines));
@@ -430,14 +584,14 @@ mod tests {
         assert!(dispatch(&mut state, "diff.next"));
         assert!(!dispatch(&mut state, "diff.next"));
         let review = state.diff_review.as_ref().unwrap();
-        assert_eq!(review.page, 1);
+        assert_eq!(review.row_start, PAGE_LINES);
         assert_eq!(review.row_count(), 202);
         assert_eq!(review.request, 42);
         assert!(review.loading);
         assert!(Arc::ptr_eq(&review.lines, &original));
         assert!(dispatch(&mut state, "diff.view:unified"));
         let review = state.diff_review.as_ref().unwrap();
-        assert_eq!(review.page, 0);
+        assert_eq!(review.row_start, 0);
         assert_eq!(review.row_count(), 403);
         assert!(Arc::ptr_eq(&review.lines, &original));
     }

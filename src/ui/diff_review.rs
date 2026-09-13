@@ -217,24 +217,37 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
     if review.loading {
         patch = patch.with_child(label("diff-empty", "Loading file diff…"));
     } else {
+        patch = patch.with_child(build_hunk_navigation(shared, review));
+        let scroll_key = format!(
+            "diff-lines-{}-{}-{}-{}-{:?}",
+            review.request,
+            review.selected,
+            review.row_start,
+            review.side_by_side,
+            review.active_hunk
+        );
         let mut lines = ElementDef::new(Tag::Div)
             .with_class("diff-lines")
-            .with_id(format!(
-                "diff-lines-{}-{}-{}-{}",
-                review.request, review.selected, review.page, review.side_by_side
-            ));
+            .with_id(scroll_key.clone())
+            .with_key(scroll_key);
         if review.side_by_side {
             lines = lines.with_child(split::build(review));
         } else {
-            for line in review
+            for (index, line) in review
                 .lines
                 .iter()
-                .skip(review.page * PAGE_LINES)
+                .enumerate()
+                .skip(review.row_start)
                 .take(PAGE_LINES)
             {
                 lines = lines.with_child(
                     ElementDef::new(Tag::Div)
                         .with_class("diff-line")
+                        .with_class(if review.is_active_hunk_line(index) {
+                            "diff-hunk-current"
+                        } else {
+                            "diff-row"
+                        })
                         .with_class(format!("diff-{}", line.kind))
                         .with_child(label(
                             "diff-gutter",
@@ -257,9 +270,10 @@ fn build_files_and_patch(shared: &SharedState, review: &Review) -> ElementDef {
                     .with_child(label(
                         "diff-page-label",
                         format!(
-                            "Page {} / {}",
-                            review.page + 1,
-                            review.row_count().div_ceil(PAGE_LINES)
+                            "Rows {}–{} of {}",
+                            review.row_start + 1,
+                            (review.row_start + PAGE_LINES).min(review.row_count()),
+                            review.row_count()
                         ),
                     ))
                     .with_child(button(shared, "Next", "diff.next")),
@@ -301,6 +315,43 @@ fn build_file_filter(shared: &SharedState, review: &Review) -> ElementDef {
         )
 }
 
+fn build_hunk_navigation(shared: &SharedState, review: &Review) -> ElementDef {
+    let status = if review.hunks.is_empty() {
+        "No text hunks".to_string()
+    } else if let Some(index) = review.active_hunk {
+        format!("Hunk {} of {}", index + 1, review.hunks.len())
+    } else {
+        format!("{} hunks", review.hunks.len())
+    };
+    let mut bar = ElementDef::new(Tag::Div)
+        .with_class("diff-hunk-navigation")
+        .with_child(label("diff-hunk-status", status));
+    for (text, command, enabled) in [
+        (
+            "Previous hunk",
+            "diff.hunk_prev",
+            review.hunk_target(false).is_some(),
+        ),
+        (
+            "Next hunk",
+            "diff.hunk_next",
+            review.hunk_target(true).is_some(),
+        ),
+        (
+            "File start",
+            "diff.file_start",
+            review.row_start > 0 || review.active_hunk.is_some(),
+        ),
+    ] {
+        bar = bar.with_child(if enabled {
+            button(shared, text, command)
+        } else {
+            label("diff-button", text).with_class("diff-navigation-disabled")
+        });
+    }
+    bar
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +380,10 @@ mod tests {
         let review = state.diff_review.as_mut().unwrap();
         review.set_file_filter("");
         review.split_rows = Arc::new(crate::diff_review::split::align(&review.lines));
+        review.hunks = Arc::new(crate::diff_review::collect_hunks(
+            &review.lines,
+            &review.split_rows,
+        ));
         Arc::new(Mutex::new(state))
     }
 
@@ -379,6 +434,108 @@ mod tests {
             );
             harness.locator_by_text("Close · Esc").click();
             assert!(shared.lock_recover().diff_review.is_none());
+        }
+    }
+
+    #[test]
+    fn hunk_buttons_reveal_targets_and_reset_scroll_in_both_views() {
+        for side_by_side in [false, true] {
+            let shared = fixture();
+            {
+                let mut state = shared.lock_recover();
+                let review = state.diff_review.as_mut().unwrap();
+                let patch = format!(
+                    "@@ -1,211 +1,211 @@\n{}{} same\n@@ -900 +900 @@\n-before\n+after\n",
+                    "-old\n".repeat(210),
+                    "+new\n".repeat(210)
+                );
+                review.lines = Arc::new(parse_patch(&patch));
+                review.split_rows = Arc::new(crate::diff_review::split::align(&review.lines));
+                review.hunks = Arc::new(crate::diff_review::collect_hunks(
+                    &review.lines,
+                    &review.split_rows,
+                ));
+                review.side_by_side = side_by_side;
+            }
+            let mut harness = TestHarness::new(
+                include_str!("../../assets/styles.css"),
+                || tree(&shared),
+                800.0,
+                720.0,
+            );
+            harness.step();
+            let viewport = harness.query(".diff-lines").unwrap().layout_rect;
+            harness.mouse_wheel(viewport.x + 60.0, viewport.y + 60.0, 0.0, -150.0);
+            assert!(harness.query(".diff-lines").unwrap().scroll_y > 0.0);
+            for expected in [0, 1] {
+                harness.locator_by_text("Next hunk").click();
+                harness.rebuild(|| tree(&shared));
+                harness.step();
+                let viewport = harness.query(".diff-lines").unwrap();
+                assert_eq!(viewport.scroll_y, 0.0);
+                let current = harness.query(".diff-hunk-current").unwrap().layout_rect;
+                assert!(current.y >= viewport.layout_rect.y);
+                assert!(
+                    current.y < viewport.layout_rect.y + 48.0,
+                    "hunk must be visible at top: {current:?}"
+                );
+                assert_eq!(
+                    shared
+                        .lock_recover()
+                        .diff_review
+                        .as_ref()
+                        .unwrap()
+                        .active_hunk,
+                    Some(expected)
+                );
+                assert!(
+                    harness.query_all(".diff-line").len()
+                        + harness.query_all(".diff-split-row").len()
+                        <= PAGE_LINES
+                );
+            }
+            let last = shared
+                .lock_recover()
+                .diff_review
+                .as_ref()
+                .unwrap()
+                .row_start;
+            assert!(last >= PAGE_LINES);
+            harness.locator_by_text("Next hunk").click();
+            assert_eq!(
+                shared
+                    .lock_recover()
+                    .diff_review
+                    .as_ref()
+                    .unwrap()
+                    .row_start,
+                last
+            );
+            harness.locator_by_text("Previous hunk").click();
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            assert_eq!(
+                shared
+                    .lock_recover()
+                    .diff_review
+                    .as_ref()
+                    .unwrap()
+                    .active_hunk,
+                Some(0)
+            );
+            harness.locator_by_text("File start").click();
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            assert!(harness.query(".diff-hunk-current").is_none());
+            assert_eq!(
+                shared
+                    .lock_recover()
+                    .diff_review
+                    .as_ref()
+                    .unwrap()
+                    .row_start,
+                0
+            );
         }
     }
 
@@ -512,6 +669,10 @@ mod tests {
             );
             review.lines = Arc::new(parse_patch(&patch));
             review.split_rows = Arc::new(crate::diff_review::split::align(&review.lines));
+            review.hunks = Arc::new(crate::diff_review::collect_hunks(
+                &review.lines,
+                &review.split_rows,
+            ));
             review.side_by_side = true;
         }
         let mut harness = TestHarness::new(
@@ -554,6 +715,9 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .side_by_side = true;
+        }
+        if std::env::var("TM_DIFF_VISUAL_HUNK").as_deref() == Ok("1") {
+            dispatch(&mut shared.lock_recover(), "diff.hunk_next");
         }
         let mut harness = TestHarness::new(
             include_str!("../../assets/styles.css"),
