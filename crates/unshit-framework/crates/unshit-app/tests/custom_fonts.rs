@@ -33,6 +33,26 @@ fn baseline_count(fs: &FontSystem) -> usize {
     fs.db().len()
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+fn directwrite_primary_font_resolves_bundled_paths_and_embedded_bytes() {
+    use unshit_renderer::dw_rasterizer::{CustomFontSource, DwRasterizer};
+
+    let path = fixture_path("FiraMono-Medium.ttf");
+    let bytes: Arc<[u8]> = Arc::from(std::fs::read(&path).unwrap());
+    let from_path = DwRasterizer::new_with_custom_font_paths("Fira Mono", vec![path]);
+    let from_bytes =
+        DwRasterizer::new_with_custom_fonts("Fira Mono", vec![CustomFontSource::Bytes(bytes)]);
+    for rasterizer in [&from_path, &from_bytes] {
+        assert_eq!(rasterizer.font_family, "Fira Mono", "bundled face must not become Consolas");
+        // Fira Mono has a 600/1000 em fixed advance. Check the actual face,
+        // not only the stored name that cosmic-text will use for shaping.
+        assert!((rasterizer.measure_advance_width('M', 20.0) - 12.0).abs() < 0.001);
+        let glyph = rasterizer.rasterize_glyph('M', 20.0).expect("embedded face stays alive");
+        assert!(glyph.width > 0 && glyph.height > 0);
+    }
+}
+
 #[test]
 fn config_fonts_bytes_land_in_font_system() {
     let bytes = std::fs::read(fixture_path("FiraMono-Medium.ttf")).unwrap();

@@ -34,7 +34,10 @@ pub(crate) fn use_subpixel_text_shader() -> bool {
 }
 
 fn default_subpixel_text_enabled() -> bool {
-    cfg!(target_os = "windows")
+    // Match Windows Terminal's grayscale default. Colored subpixel masks
+    // introduce visible fringes on neutral text, especially on dark surfaces.
+    // Keep the explicit override for displays/users that prefer subpixel text.
+    false
 }
 
 #[cfg(test)]
@@ -49,11 +52,8 @@ mod tests {
     }
 
     #[test]
-    fn text_rendering_default_matches_platform_policy() {
-        assert_eq!(
-            subpixel_text_enabled_from_env(None, None, default_subpixel_text_enabled()),
-            cfg!(target_os = "windows")
-        );
+    fn text_rendering_defaults_to_grayscale() {
+        assert!(!subpixel_text_enabled_from_env(None, None, default_subpixel_text_enabled()));
     }
 
     #[test]
