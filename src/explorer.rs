@@ -82,10 +82,19 @@ pub struct Explorer {
     pub reveal_revision: u64,
     pub typeahead: String,
     pub typed_at: Option<Instant>,
+    pub restore_selection: bool,
+    locations: Arc<BTreeMap<PathBuf, SavedLocation>>,
+}
+
+#[derive(Clone, Debug)]
+struct SavedLocation {
+    expanded: BTreeSet<PathBuf>,
+    selected: Option<PathBuf>,
 }
 
 impl Explorer {
     pub fn collapse_all(&mut self) {
+        self.restore_selection = false;
         self.clear_typeahead();
         self.reveal_revision = self.reveal_revision.wrapping_add(1);
         self.expanded.clear();
@@ -97,12 +106,27 @@ impl Explorer {
 
     pub fn set_root(&mut self, root: Option<PathBuf>) {
         if self.root != root {
+            if let Some(previous) = &self.root {
+                Arc::make_mut(&mut self.locations).insert(
+                    previous.clone(),
+                    SavedLocation {
+                        expanded: self.expanded.clone(),
+                        selected: self.selected.clone(),
+                    },
+                );
+            }
             self.root = root;
             self.refresh();
+            if let Some(location) = self.root.as_ref().and_then(|root| self.locations.get(root)) {
+                self.expanded = location.expanded.clone();
+                self.selected = location.selected.clone();
+                self.restore_selection = self.selected.is_some();
+            }
         }
     }
 
     pub fn refresh(&mut self) {
+        self.restore_selection = false;
         self.clear_typeahead();
         self.generation = self.generation.wrapping_add(1);
         self.listings.clear();
@@ -196,8 +220,25 @@ impl Explorer {
                     .get(&path)
                     .is_some_and(|listing| matches!(listing.as_ref(), Listing::Loading)))
         {
-            self.listings.insert(path, Arc::new(listing));
+            let previous = self
+                .listings
+                .entry(path.clone())
+                .or_insert_with(|| Arc::new(Listing::Loading))
+                .clone();
+            self.update_listing(generation, path, &previous, listing);
         }
+    }
+
+    pub fn directory_visible(&self, path: &Path) -> bool {
+        Some(path) == self.root.as_deref()
+            || (self
+                .root
+                .as_ref()
+                .is_some_and(|root| self.expanded.contains(root))
+                && path
+                    .ancestors()
+                    .take_while(|parent| Some(*parent) != self.root.as_deref())
+                    .all(|parent| self.expanded.contains(parent)))
     }
 
     /// Snapshot only visible directory listings. Arc identity lets the worker
@@ -206,18 +247,7 @@ impl Explorer {
         self.listings
             .iter()
             .filter(|(path, listing)| {
-                !matches!(listing.as_ref(), Listing::Loading)
-                    && (Some(*path) == self.root.as_ref()
-                        || (self.expanded.contains(*path)
-                            && path
-                                .ancestors()
-                                .skip(1)
-                                .take_while(|p| Some(*p) != self.root.as_deref())
-                                .all(|parent| self.expanded.contains(parent))
-                            && self
-                                .root
-                                .as_ref()
-                                .is_some_and(|root| self.expanded.contains(root))))
+                !matches!(listing.as_ref(), Listing::Loading) && self.directory_visible(path)
             })
             .map(|(path, listing)| (path.clone(), listing.clone()))
             .collect()
@@ -316,6 +346,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_navigation_restores_location_and_reloads_current_entries() {
+        let first = PathBuf::from("first");
+        let second = PathBuf::from("second");
+        let folder = first.join("folder");
+        let mut explorer = Explorer::default();
+        explorer.set_root(Some(first.clone()));
+        explorer.expanded.insert(folder.clone());
+        explorer.selected = Some(folder.join("removed.txt"));
+        let old_generation = explorer.generation;
+        explorer.set_root(Some(second.clone()));
+        assert_eq!(explorer.expanded, BTreeSet::from([second.clone()]));
+        explorer.expanded.clear(); // This workspace's root was collapsed.
+        explorer.set_root(Some(first.clone()));
+        assert!(explorer.restore_selection);
+        assert!(explorer.expanded.contains(&folder));
+        assert_eq!(explorer.selected, Some(folder.join("removed.txt")));
+        assert!(
+            explorer.listings.is_empty(),
+            "returning reloads disk listings"
+        );
+        assert_ne!(explorer.generation, old_generation);
+        explorer.accept(
+            explorer.generation,
+            first.clone(),
+            Listing::Ready(vec![Entry {
+                path: folder.clone(),
+                name: "folder".into(),
+                directory: true,
+            }]),
+        );
+        explorer.accept(explorer.generation, folder.clone(), Listing::Ready(vec![]));
+        assert_eq!(
+            explorer.selected,
+            Some(folder),
+            "deleted selection falls back to parent"
+        );
+        explorer.set_root(Some(second));
+        assert!(
+            explorer.expanded.is_empty(),
+            "collapsed root is remembered independently"
+        );
+        explorer.set_root(None);
+        assert!(explorer.listings.is_empty());
+    }
+
+    #[test]
     fn copied_paths_preserve_names_and_use_portable_relative_separators() {
         let root = std::env::temp_dir().join("project");
         let file = root.join("nested folder").join("café.rs");
@@ -376,6 +452,30 @@ mod tests {
         );
         explorer.clear_typeahead();
         assert!(explorer.typeahead.is_empty());
+    }
+
+    #[test]
+    fn initial_load_cannot_overwrite_newer_reveal_listing() {
+        let root = PathBuf::from("project");
+        let mut explorer = Explorer::default();
+        explorer.set_root(Some(root.clone()));
+        let pending = Arc::new(Listing::Loading);
+        explorer.listings.insert(root.clone(), pending.clone());
+        let fresh = Listing::Ready(vec![Entry {
+            path: root.join("new.txt"),
+            name: "new.txt".into(),
+            directory: false,
+        }]);
+        explorer.accept(explorer.generation, root.clone(), fresh.clone());
+        explorer.selected = Some(root.join("new.txt"));
+        assert!(!explorer.update_listing(
+            explorer.generation,
+            root.clone(),
+            &pending,
+            Listing::Ready(vec![])
+        ));
+        assert_eq!(explorer.listings[&root].as_ref(), &fresh);
+        assert_eq!(explorer.selected, Some(root.join("new.txt")));
     }
 
     #[test]

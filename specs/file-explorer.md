@@ -40,3 +40,9 @@ Right-click a file or folder for Copy path (absolute) and Copy relative path
 (workspace-relative, using forward slashes). Copying the root relatively yields
 `.`. The menu retains the clicked path and workspace even if selection changes.
 Clipboard failures produce a message rather than claiming success.
+
+During the app session, each workspace folder remembers expanded directories
+and selection. Switching back reloads visible directories from disk, restores
+expansion, and reveals the saved selection. Removed entries fall back to their
+nearest surviving parent. Manual navigation cancels a pending selection restore.
+This navigation history is kept in memory; it is not persisted across restarts.

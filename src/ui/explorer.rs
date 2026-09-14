@@ -189,6 +189,8 @@ fn row(
         if let Some(root) = &context_root {
             mutate_with(&context_state, |state| {
                 state.explorer.clear_typeahead();
+                state.explorer.restore_selection = false;
+                state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
                 state.explorer.selected = Some(context_path.clone());
                 let scale = state.scale_factor.max(1e-3);
                 state.ctx_menu = Some(crate::state::CtxMenu {
@@ -205,6 +207,8 @@ fn row(
     .on_click(move || {
         mutate_with(&click_state, |state| {
             state.explorer.clear_typeahead();
+            state.explorer.restore_selection = false;
+            state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
             state.explorer.keyboard_focus = directory;
             state.explorer.selected = Some(path.clone());
             if directory {
@@ -220,6 +224,8 @@ fn row(
 }
 
 fn handle_key(state: &mut crate::state::AppState, key: Key) -> bool {
+    state.explorer.restore_selection = false;
+    state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
     if let Key::Char(character) = key {
         return state
             .explorer
@@ -278,6 +284,19 @@ mod tests {
     use super::*;
     use crate::explorer::Entry;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn collapsing_selected_folder_cancels_pending_reveal() {
+        let mut state = crate::state::seed_state();
+        let root = std::path::PathBuf::from("project");
+        state.explorer.set_root(Some(root.clone()));
+        state.explorer.selected = Some(root.clone());
+        let revision = state.explorer.reveal_revision;
+        handle_key(&mut state, Key::ArrowLeft);
+        assert_eq!(state.explorer.selected, Some(root.clone()));
+        assert!(!state.explorer.expanded.contains(&root));
+        assert_ne!(state.explorer.reveal_revision, revision);
+    }
 
     #[test]
     fn keyboard_browses_visible_rows_and_opens_file_in_existing_editor() {

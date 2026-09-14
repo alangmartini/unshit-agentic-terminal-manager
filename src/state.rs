@@ -5321,6 +5321,42 @@ pub fn sync_explorer(state: &mut AppState) {
         if let Some(root) = root {
             load_explorer_directory(state, root);
         }
+        continue_explorer_restore(state);
+    }
+}
+
+fn load_expanded_explorer_directories(state: &mut AppState) {
+    if !state.explorer.active || state.sidebar_collapsed {
+        return;
+    }
+    let pending: Vec<_> = state
+        .explorer
+        .expanded
+        .iter()
+        .filter(|path| {
+            state.explorer.directory_visible(path)
+                && state.explorer.is_directory(path)
+                && !state.explorer.listings.contains_key(*path)
+        })
+        .cloned()
+        .collect();
+    for path in pending {
+        load_explorer_directory(state, path);
+    }
+}
+
+fn continue_explorer_restore(state: &mut AppState) {
+    load_expanded_explorer_directories(state);
+    if !state.explorer.active || state.sidebar_collapsed || !state.explorer.restore_selection {
+        return;
+    }
+    if let (Some(selected), Some(hooks)) =
+        (state.explorer.selected.clone(), EDITOR_OPEN_HOOKS.get())
+    {
+        if state.explorer.visible_paths().contains(&selected) {
+            state.explorer.restore_selection = false;
+            (hooks.request_reveal)(format!("explorer:{}", selected.display()));
+        }
     }
 }
 
@@ -5391,10 +5427,11 @@ pub fn load_explorer_directory(state: &mut AppState, path: PathBuf) {
         return;
     };
     let generation = state.explorer.generation;
+    let pending = Arc::new(Listing::Loading);
     state
         .explorer
         .listings
-        .insert(path.clone(), Arc::new(Listing::Loading));
+        .insert(path.clone(), pending.clone());
     let worker_path = path.clone();
     if let Err(error) = std::thread::Builder::new()
         .name("explorer-list".into())
@@ -5402,7 +5439,16 @@ pub fn load_explorer_directory(state: &mut AppState, path: PathBuf) {
             let listing = crate::explorer::read_directory(&worker_path);
             {
                 let mut state = hooks.shared.lock_recover();
-                state.explorer.accept(generation, worker_path, listing);
+                if state.explorer.generation != generation {
+                    return;
+                }
+                if !state
+                    .explorer
+                    .update_listing(generation, worker_path, &pending, listing)
+                {
+                    return;
+                }
+                continue_explorer_restore(&mut state);
             }
             (hooks.request_rebuild)();
         })
@@ -5948,6 +5994,9 @@ fn refresh_explorer_once(shared: &SharedState) -> bool {
         changed |= state
             .explorer
             .update_listing(generation, path, &previous, listing);
+    }
+    if changed {
+        continue_explorer_restore(&mut state);
     }
     changed
 }
