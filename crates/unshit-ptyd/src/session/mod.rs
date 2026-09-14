@@ -1034,8 +1034,18 @@ mod tests {
             Session::spawn(5, 80, 24, None, Some(test_shell()), &shell_args, 0, 0, None)
                 .expect("spawn one-shot session");
 
+        // Act as the attached terminal, including replies to host queries.
+        // Modern ConPTY asks for DA1 before running the child; silently
+        // discarding that query incurs its three-second startup timeout.
+        let mut client_terminal = Terminal::new(24, 80, 0);
         let closed = tokio::time::timeout(Duration::from_secs(3), async {
-            while rx.recv().await.is_some() {}
+            while let Some(bytes) = rx.recv().await {
+                client_terminal.process_bytes(&bytes);
+                let response = client_terminal.take_pending_response();
+                if !response.is_empty() {
+                    session.write(&response).await.expect("reply to host query");
+                }
+            }
         })
         .await;
         assert!(
