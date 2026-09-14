@@ -5308,16 +5308,23 @@ fn dispatch_palette_files(state: &mut AppState) -> bool {
     true
 }
 
-/// Build (or rebuild) the quick-open index for the active workspace on a
-/// worker thread, unless a fresh one for the same root is already here.
-///
-/// Enumerating a checkout spawns a process and touches the filesystem —
-/// never on the UI thread. Until the first build lands the palette shows
-/// "Indexing…" rather than "no matching files".
+/// Whether the explorer tree is the visible sidebar panel.
+fn explorer_visible(state: &AppState) -> bool {
+    state.explorer.active && !state.sidebar_collapsed
+}
+
+/// Open the explorer panel on the active workspace's root, without moving
+/// keyboard focus into its tree.
+fn show_explorer(state: &mut AppState) {
+    state.explorer.active = true;
+    state.sidebar_collapsed = false;
+    sync_explorer(state);
+}
+
 pub fn sync_explorer(state: &mut AppState) {
     let root = active_workspace_cwd(state);
     state.explorer.set_root(root.clone());
-    if state.explorer.active && !state.sidebar_collapsed {
+    if explorer_visible(state) {
         if let Some(root) = root {
             load_explorer_directory(state, root);
         }
@@ -5326,7 +5333,7 @@ pub fn sync_explorer(state: &mut AppState) {
 }
 
 fn load_expanded_explorer_directories(state: &mut AppState) {
-    if !state.explorer.active || state.sidebar_collapsed {
+    if !explorer_visible(state) {
         return;
     }
     let pending: Vec<_> = state
@@ -5347,7 +5354,7 @@ fn load_expanded_explorer_directories(state: &mut AppState) {
 
 fn continue_explorer_restore(state: &mut AppState) {
     load_expanded_explorer_directories(state);
-    if !state.explorer.active || state.sidebar_collapsed || !state.explorer.restore_selection {
+    if !explorer_visible(state) || !state.explorer.restore_selection {
         return;
     }
     if let (Some(selected), Some(hooks)) =
@@ -5355,7 +5362,7 @@ fn continue_explorer_restore(state: &mut AppState) {
     {
         if state.explorer.visible_paths().contains(&selected) {
             state.explorer.restore_selection = false;
-            (hooks.request_reveal)(format!("explorer:{}", selected.display()));
+            (hooks.request_reveal)(crate::explorer::row_id(&selected));
         }
     }
 }
@@ -5370,9 +5377,7 @@ fn dispatch_explorer_reveal(state: &mut AppState) -> bool {
         push_error_toast(state, "This workspace has no folder to reveal files in.");
         return true;
     };
-    state.explorer.active = true;
-    state.sidebar_collapsed = false;
-    sync_explorer(state);
+    show_explorer(state);
     let generation = state.explorer.generation;
     let selected = state.explorer.selected.clone();
     state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
@@ -5390,8 +5395,7 @@ fn dispatch_explorer_reveal(state: &mut AppState) -> bool {
                 || state.explorer.reveal_revision != revision
                 || state.active_pane != pane
                 || state.explorer.selected != selected
-                || !state.explorer.active
-                || state.sidebar_collapsed
+                || !explorer_visible(&state)
             {
                 return;
             }
@@ -5403,7 +5407,7 @@ fn dispatch_explorer_reveal(state: &mut AppState) -> bool {
                     }
                     state.explorer.selected = Some(target.clone());
                     drop(state);
-                    (hooks.request_reveal)(format!("explorer:{}", target.display()));
+                    (hooks.request_reveal)(crate::explorer::row_id(&target));
                 }
                 Err(error) => {
                     push_error_toast(&mut state, format!("Could not reveal file: {error}"));
@@ -5462,9 +5466,9 @@ pub fn load_explorer_directory(state: &mut AppState, path: PathBuf) {
 /// Build (or rebuild) the quick-open index for the active workspace on a
 /// worker thread, unless a fresh one for the same root is already here.
 ///
-/// Enumerating a checkout spawns a process and touches the filesystem ?
+/// Enumerating a checkout spawns a process and touches the filesystem —
 /// never on the UI thread. Until the first build lands the palette shows
-/// "Indexing?" rather than "no matching files".
+/// "Indexing…" rather than "no matching files".
 fn ensure_file_index(state: &mut AppState) {
     let Some(root) = active_workspace_cwd(state) else {
         return;
@@ -5973,7 +5977,7 @@ pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
 fn refresh_explorer_once(shared: &SharedState) -> bool {
     let (generation, targets) = {
         let state = shared.lock_recover();
-        if !state.explorer.active || state.sidebar_collapsed {
+        if !explorer_visible(&state) {
             return false;
         }
         (state.explorer.generation, state.explorer.refresh_targets())
@@ -5986,7 +5990,7 @@ fn refresh_explorer_once(shared: &SharedState) -> bool {
         })
         .collect();
     let mut state = shared.lock_recover();
-    if !state.explorer.active || state.sidebar_collapsed {
+    if !explorer_visible(&state) {
         return false;
     }
     let mut changed = false;
@@ -8496,27 +8500,23 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             state.explorer.collapse_all();
             state.explorer.keyboard_focus = true;
             if let (Some(root), Some(hooks)) = (&state.explorer.root, EDITOR_OPEN_HOOKS.get()) {
-                (hooks.request_reveal)(format!("explorer:{}", root.display()));
+                (hooks.request_reveal)(crate::explorer::row_id(root));
             }
             true
         }
         "explorer.toggle" => {
-            if state.explorer.active && !state.sidebar_collapsed {
+            if explorer_visible(state) {
                 state.explorer.keyboard_focus = false;
                 state.sidebar_collapsed = true;
             } else {
-                state.explorer.active = true;
+                show_explorer(state);
                 state.explorer.keyboard_focus = true;
-                state.sidebar_collapsed = false;
-                sync_explorer(state);
             }
             true
         }
         "explorer.show" => {
-            state.explorer.active = true;
+            show_explorer(state);
             state.explorer.keyboard_focus = true;
-            state.sidebar_collapsed = false;
-            sync_explorer(state);
             true
         }
         "explorer.refresh" => {

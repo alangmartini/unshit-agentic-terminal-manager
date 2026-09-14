@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Shared element/reveal id for a row, so the UI, the reveal worker, and the
+/// scroll-into-view request all agree on how a path is addressed.
+pub fn row_id(path: &Path) -> String {
+    format!("explorer:{}", path.display())
+}
+
 pub fn path_for_clipboard(root: &Path, path: &Path, relative: bool) -> Result<String, String> {
     if relative {
         let path = path
@@ -93,10 +99,17 @@ struct SavedLocation {
 }
 
 impl Explorer {
-    pub fn collapse_all(&mut self) {
+    /// Manual navigation cancels any in-flight programmatic reveal (a
+    /// `set_root` restore or an `explorer.reveal` in-progress lookup) so it
+    /// cannot clobber the user's new selection when it lands.
+    pub fn cancel_pending_reveal(&mut self) {
         self.restore_selection = false;
-        self.clear_typeahead();
         self.reveal_revision = self.reveal_revision.wrapping_add(1);
+    }
+
+    pub fn collapse_all(&mut self) {
+        self.cancel_pending_reveal();
+        self.clear_typeahead();
         self.expanded.clear();
         if let Some(root) = &self.root {
             self.expanded.insert(root.clone());
@@ -208,8 +221,19 @@ impl Explorer {
     }
 
     pub fn is_directory(&self, path: &Path) -> bool {
-        self.root.as_deref() == Some(path) || path.parent().and_then(|parent| self.listings.get(parent))
-            .is_some_and(|listing| matches!(listing.as_ref(), Listing::Ready(entries) if entries.iter().any(|entry| entry.path == path && entry.directory)))
+        if self.root.as_deref() == Some(path) {
+            return true;
+        }
+        let Some(Listing::Ready(siblings)) = path
+            .parent()
+            .and_then(|parent| self.listings.get(parent))
+            .map(AsRef::as_ref)
+        else {
+            return false;
+        };
+        siblings
+            .iter()
+            .any(|entry| entry.path == path && entry.directory)
     }
 
     pub fn accept(&mut self, generation: u64, path: PathBuf, listing: Listing) {

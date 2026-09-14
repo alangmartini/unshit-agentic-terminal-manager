@@ -67,9 +67,8 @@ pub fn build_explorer(snapshot: &UiSnapshot, shared: &SharedState) -> ElementDef
                         if let Some(path) =
                             mutate_with(&keyboard_state, |state| state.explorer.selected.clone())
                         {
-                            return Some(Box::new(RequestScrollIntoView(format!(
-                                "explorer:{}",
-                                path.display()
+                            return Some(Box::new(RequestScrollIntoView(crate::explorer::row_id(
+                                &path,
                             ))));
                         }
                         return Some(Box::new(RequestRebuild));
@@ -149,9 +148,10 @@ fn row(
     let context_state = shared.clone();
     let context_path = path.clone();
     let context_root = explorer.root.clone();
+    let id = crate::explorer::row_id(&path);
     let mut row = ElementDef::new(Tag::Button)
-        .with_id(format!("explorer:{}", path.display()))
-        .with_key(format!("explorer:{}", path.display()))
+        .with_id(id.clone())
+        .with_key(id)
         .with_class("explorer-row")
         .with_style(StyleDeclaration::PaddingLeft(8.0 + depth as f32 * 16.0));
     if explorer.selected.as_ref() == Some(&path) {
@@ -188,9 +188,8 @@ fn row(
     .on_context_menu(move |x, y| {
         if let Some(root) = &context_root {
             mutate_with(&context_state, |state| {
+                state.explorer.cancel_pending_reveal();
                 state.explorer.clear_typeahead();
-                state.explorer.restore_selection = false;
-                state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
                 state.explorer.selected = Some(context_path.clone());
                 let scale = state.scale_factor.max(1e-3);
                 state.ctx_menu = Some(crate::state::CtxMenu {
@@ -206,9 +205,8 @@ fn row(
     })
     .on_click(move || {
         mutate_with(&click_state, |state| {
+            state.explorer.cancel_pending_reveal();
             state.explorer.clear_typeahead();
-            state.explorer.restore_selection = false;
-            state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
             state.explorer.keyboard_focus = directory;
             state.explorer.selected = Some(path.clone());
             if directory {
@@ -224,8 +222,7 @@ fn row(
 }
 
 fn handle_key(state: &mut crate::state::AppState, key: Key) -> bool {
-    state.explorer.restore_selection = false;
-    state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
+    state.explorer.cancel_pending_reveal();
     if let Key::Char(character) = key {
         return state
             .explorer

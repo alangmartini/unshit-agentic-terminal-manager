@@ -717,6 +717,26 @@ struct AppState {
     frame_arena: FrameArena,
 }
 
+/// Reveal an element by its HTML id in its nearest scroll container, and
+/// cancel any in-flight smooth-scroll animation that would move it away
+/// again. No-op when the id has no live element or no scrollable ancestor.
+fn reveal_element_by_id(state: &mut AppState, id: &str) {
+    let Some(target) = state
+        .arena
+        .iter()
+        .find(|(_, element)| element.id.as_deref() == Some(id))
+        .map(|(node, _)| node)
+    else {
+        return;
+    };
+    let Some(container) = scroll::scroll_into_view(&mut state.arena, &state.taffy, target) else {
+        return;
+    };
+    if state.smooth_scroll.is_some_and(|animation| animation.node_id == container) {
+        state.smooth_scroll = None;
+    }
+}
+
 const WINDOW_RESIZE_GRIP_SIZE: f32 = 14.0;
 
 fn window_resize_direction(
@@ -4508,26 +4528,7 @@ impl ApplicationHandler for AppHandler {
                                         }
                                     }
                                     if let Some(id) = reveal_id {
-                                        let target = state
-                                            .arena
-                                            .iter()
-                                            .find(|(_, element)| {
-                                                element.id.as_deref() == Some(id.as_str())
-                                            })
-                                            .map(|(node, _)| node);
-                                        if let Some(target) = target {
-                                            if let Some(container) = scroll::scroll_into_view(
-                                                &mut state.arena,
-                                                &state.taffy,
-                                                target,
-                                            ) {
-                                                if state.smooth_scroll.is_some_and(|animation| {
-                                                    animation.node_id == container
-                                                }) {
-                                                    state.smooth_scroll = None;
-                                                }
-                                            }
-                                        }
+                                        reveal_element_by_id(state, &id);
                                     }
                                     state.needs_rebuild = true;
                                     state.window.request_redraw();
@@ -5171,23 +5172,7 @@ impl ApplicationHandler for AppHandler {
                     }
 
                     if let Some(id) = state.pending_scroll_into_view.take() {
-                        let target = state
-                            .arena
-                            .iter()
-                            .find(|(_, element)| element.id.as_deref() == Some(id.as_str()))
-                            .map(|(node, _)| node);
-                        if let Some(target) = target {
-                            if let Some(container) =
-                                scroll::scroll_into_view(&mut state.arena, &state.taffy, target)
-                            {
-                                if state
-                                    .smooth_scroll
-                                    .is_some_and(|animation| animation.node_id == container)
-                                {
-                                    state.smooth_scroll = None;
-                                }
-                            }
-                        }
+                        reveal_element_by_id(state, &id);
                     }
                     metrics.node_count = state.arena.len();
                     state.needs_rebuild = false;
