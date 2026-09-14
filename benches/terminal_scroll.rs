@@ -27,5 +27,23 @@ fn terminal_scroll(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, terminal_scroll);
+fn daemon_terminal_parse(c: &mut Criterion) {
+    let mut input = Vec::with_capacity(80 * 1024);
+    for _ in 0..1024 {
+        input.extend_from_slice(
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEF\r\n",
+        );
+    }
+    c.bench_function("daemon_terminal_parse/1024_lines", |b| {
+        let mut terminal = unshit_terminal_core::Terminal::new(37, 125, 10_000);
+        b.iter(|| {
+            for chunk in input.chunks(4096) {
+                terminal.process_bytes(black_box(chunk));
+            }
+            black_box(terminal.grid());
+        });
+    });
+}
+
+criterion_group!(benches, terminal_scroll, daemon_terminal_parse);
 criterion_main!(benches);
