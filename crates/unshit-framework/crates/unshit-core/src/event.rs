@@ -29,6 +29,12 @@ pub enum EventType {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RequestRebuild;
 
+/// Response from a keyboard-capture handler to reveal an existing element by
+/// its HTML id in its nearest scroll container. Keyboard capture still rebuilds
+/// the tree normally, so the handler may also update selection state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestScrollIntoView(pub String);
+
 /// Events related to IME (Input Method Editor) composition, used for CJK and other complex input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {

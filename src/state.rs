@@ -190,6 +190,8 @@ pub struct CtxMenu {
 /// set the overlay renders and which dispatch commands it emits.
 #[derive(Clone, Debug)]
 pub enum CtxMenuTarget {
+    /// File/folder menu retains its original workspace root across navigation.
+    Explorer { path: PathBuf, root: PathBuf },
     /// Menu opened on a workspace row in the sidebar.
     Workspace { idx: usize },
     /// Menu opened on a tab in the tabbar. Carries the active pane id
@@ -983,6 +985,7 @@ pub struct AppState {
     pub diff_review: Option<crate::diff_review::Review>,
     pub palette_query: String,
     pub palette_active: usize,
+    pub explorer: crate::explorer::Explorer,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Last window maximized state reported by the framework.
@@ -1296,6 +1299,7 @@ impl AppState {
             palette_open: self.palette_open,
             palette_query: self.palette_query.clone(),
             palette_active: self.palette_active,
+            explorer: self.explorer.clone(),
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
             window_maximized: self.window_maximized,
@@ -1438,6 +1442,7 @@ pub struct UiSnapshot {
     pub palette_open: bool,
     pub palette_query: String,
     pub palette_active: usize,
+    pub explorer: crate::explorer::Explorer,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Mirrors `AppState::window_maximized` so titlebar controls can
@@ -1655,6 +1660,7 @@ pub fn seed_state() -> AppState {
         diff_review: None,
         palette_query: String::new(),
         palette_active: 0,
+        explorer: crate::explorer::Explorer::default(),
         sidebar_collapsed: false,
         sidebar_width: 252.0,
         window_maximized: false,
@@ -1810,6 +1816,7 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
     // The index describes the workspace we just left.
     state.file_index = None;
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 pub fn focus_workspace_pane_by_num(state: &mut AppState, workspace_id: u32, pane_id: u32) -> bool {
@@ -3150,6 +3157,7 @@ pub fn mutate_remove_workspace(state: &mut AppState, idx: usize) {
         old_active
     };
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 pub fn find_pane_coord(state: &AppState, target: PaneId) -> Option<(usize, usize)> {
@@ -4369,6 +4377,7 @@ fn prune_close_layout_to_kept_panes(state: &mut AppState, kept_pane_ids: &BTreeS
         }
     }
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 /// Resolve the close-button click against the persisted preference
@@ -5299,6 +5308,161 @@ fn dispatch_palette_files(state: &mut AppState) -> bool {
     true
 }
 
+/// Whether the explorer tree is the visible sidebar panel.
+fn explorer_visible(state: &AppState) -> bool {
+    state.explorer.active && !state.sidebar_collapsed
+}
+
+/// Open the explorer panel on the active workspace's root, without moving
+/// keyboard focus into its tree.
+fn show_explorer(state: &mut AppState) {
+    state.explorer.active = true;
+    state.sidebar_collapsed = false;
+    sync_explorer(state);
+}
+
+pub fn sync_explorer(state: &mut AppState) {
+    let root = active_workspace_cwd(state);
+    state.explorer.set_root(root.clone());
+    if explorer_visible(state) {
+        if let Some(root) = root {
+            load_explorer_directory(state, root);
+        }
+        continue_explorer_restore(state);
+    }
+}
+
+fn load_expanded_explorer_directories(state: &mut AppState) {
+    if !explorer_visible(state) {
+        return;
+    }
+    let pending: Vec<_> = state
+        .explorer
+        .expanded
+        .iter()
+        .filter(|path| {
+            state.explorer.directory_visible(path)
+                && state.explorer.is_directory(path)
+                && !state.explorer.listings.contains_key(*path)
+        })
+        .cloned()
+        .collect();
+    for path in pending {
+        load_explorer_directory(state, path);
+    }
+}
+
+fn continue_explorer_restore(state: &mut AppState) {
+    load_expanded_explorer_directories(state);
+    if !explorer_visible(state) || !state.explorer.restore_selection {
+        return;
+    }
+    if let (Some(selected), Some(hooks)) =
+        (state.explorer.selected.clone(), EDITOR_OPEN_HOOKS.get())
+    {
+        if state.explorer.visible_paths().contains(&selected) {
+            state.explorer.restore_selection = false;
+            (hooks.request_reveal)(crate::explorer::row_id(&selected));
+        }
+    }
+}
+
+fn dispatch_explorer_reveal(state: &mut AppState) -> bool {
+    let Some(editor) = state.editors.get(&state.active_pane.0) else {
+        push_error_toast(state, "Open a file in the editor to reveal it in Explorer.");
+        return true;
+    };
+    let target = editor.path.clone();
+    let Some(root) = active_workspace_cwd(state) else {
+        push_error_toast(state, "This workspace has no folder to reveal files in.");
+        return true;
+    };
+    show_explorer(state);
+    let generation = state.explorer.generation;
+    let selected = state.explorer.selected.clone();
+    state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
+    let revision = state.explorer.reveal_revision;
+    let pane = state.active_pane;
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return true;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-reveal".into())
+        .spawn(move || {
+            let result = crate::explorer::reveal_path(&root, &target);
+            let mut state = hooks.shared.lock_recover();
+            if state.explorer.generation != generation
+                || state.explorer.reveal_revision != revision
+                || state.active_pane != pane
+                || state.explorer.selected != selected
+                || !explorer_visible(&state)
+            {
+                return;
+            }
+            match result {
+                Ok((target, listings)) => {
+                    for (path, listing) in listings {
+                        state.explorer.expanded.insert(path.clone());
+                        state.explorer.accept(generation, path, listing);
+                    }
+                    state.explorer.selected = Some(target.clone());
+                    drop(state);
+                    (hooks.request_reveal)(crate::explorer::row_id(&target));
+                }
+                Err(error) => {
+                    push_error_toast(&mut state, format!("Could not reveal file: {error}"));
+                    drop(state);
+                    (hooks.request_rebuild)();
+                }
+            }
+        })
+    {
+        push_error_toast(state, format!("Could not reveal file: {error}"));
+    }
+    true
+}
+
+pub fn load_explorer_directory(state: &mut AppState, path: PathBuf) {
+    use crate::explorer::Listing;
+    if state.explorer.listings.contains_key(&path) {
+        return;
+    }
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return;
+    };
+    let generation = state.explorer.generation;
+    let pending = Arc::new(Listing::Loading);
+    state
+        .explorer
+        .listings
+        .insert(path.clone(), pending.clone());
+    let worker_path = path.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-list".into())
+        .spawn(move || {
+            let listing = crate::explorer::read_directory(&worker_path);
+            {
+                let mut state = hooks.shared.lock_recover();
+                if state.explorer.generation != generation {
+                    return;
+                }
+                if !state
+                    .explorer
+                    .update_listing(generation, worker_path, &pending, listing)
+                {
+                    return;
+                }
+                continue_explorer_restore(&mut state);
+            }
+            (hooks.request_rebuild)();
+        })
+    {
+        state
+            .explorer
+            .accept(generation, path, Listing::Error(error.to_string()));
+    }
+}
+
 /// Build (or rebuild) the quick-open index for the active workspace on a
 /// worker thread, unless a fresh one for the same root is already here.
 ///
@@ -5618,6 +5782,7 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "tabs.worktree_mode.toggle"
             | "pane.close"
             | "sidebar.toggle"
+            | "explorer.toggle"
             | "modal.open"
             | "quick_prompt.open"
             | "editor.open"
@@ -5782,6 +5947,7 @@ fn editor_viewport_dims(state: &AppState) -> (usize, usize) {
 pub struct EditorOpenHooks {
     pub shared: SharedState,
     pub request_rebuild: Box<dyn Fn() + Send + Sync>,
+    pub request_reveal: Box<dyn Fn(String) + Send + Sync>,
 }
 
 static EDITOR_OPEN_HOOKS: std::sync::OnceLock<std::sync::Arc<EditorOpenHooks>> =
@@ -5790,7 +5956,53 @@ static EDITOR_DIALOG_OPEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
-    let _ = EDITOR_OPEN_HOOKS.set(std::sync::Arc::new(hooks));
+    let hooks = std::sync::Arc::new(hooks);
+    if EDITOR_OPEN_HOOKS.set(hooks.clone()).is_ok() {
+        if let Err(error) = std::thread::Builder::new()
+            .name("explorer-refresh".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if refresh_explorer_once(&hooks.shared) {
+                    (hooks.request_rebuild)();
+                }
+            })
+        {
+            log::warn!("Could not start explorer refresh: {error}");
+        }
+    }
+}
+
+/// Filesystem work runs only on the refresh worker, outside the state lock.
+/// One batch produces at most one rebuild, and quiet/hidden trees produce none.
+fn refresh_explorer_once(shared: &SharedState) -> bool {
+    let (generation, targets) = {
+        let state = shared.lock_recover();
+        if !explorer_visible(&state) {
+            return false;
+        }
+        (state.explorer.generation, state.explorer.refresh_targets())
+    };
+    let updates: Vec<_> = targets
+        .into_iter()
+        .map(|(path, previous)| {
+            let listing = crate::explorer::read_directory(&path);
+            (path, previous, listing)
+        })
+        .collect();
+    let mut state = shared.lock_recover();
+    if !explorer_visible(&state) {
+        return false;
+    }
+    let mut changed = false;
+    for (path, previous, listing) in updates {
+        changed |= state
+            .explorer
+            .update_listing(generation, path, &previous, listing);
+    }
+    if changed {
+        continue_explorer_restore(&mut state);
+    }
+    changed
 }
 
 /// Handle `editor.open` (no path): native file picker, routed back
@@ -8261,8 +8473,66 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if other.starts_with("tab.reorder:") => {
             persist_layout_if(dispatch_tab_reorder(state, other), state)
         }
+        "explorer.copy_relative" | "explorer.copy_absolute" => {
+            let Some(CtxMenuTarget::Explorer { path, root }) =
+                state.ctx_menu.as_ref().map(|menu| &menu.target)
+            else {
+                return false;
+            };
+            let result = crate::explorer::path_for_clipboard(
+                root,
+                path,
+                command == "explorer.copy_relative",
+            );
+            state.ctx_menu = None;
+            match result {
+                Ok(path) => {
+                    if let Err(error) = state.clipboard.write_text(path) {
+                        push_error_toast(state, format!("Could not copy path: {error}"));
+                    }
+                }
+                Err(error) => push_error_toast(state, error),
+            }
+            true
+        }
+        "explorer.reveal" => dispatch_explorer_reveal(state),
+        "explorer.collapse_all" => {
+            state.explorer.collapse_all();
+            state.explorer.keyboard_focus = true;
+            if let (Some(root), Some(hooks)) = (&state.explorer.root, EDITOR_OPEN_HOOKS.get()) {
+                (hooks.request_reveal)(crate::explorer::row_id(root));
+            }
+            true
+        }
+        "explorer.toggle" => {
+            if explorer_visible(state) {
+                state.explorer.keyboard_focus = false;
+                state.sidebar_collapsed = true;
+            } else {
+                show_explorer(state);
+                state.explorer.keyboard_focus = true;
+            }
+            true
+        }
+        "explorer.show" => {
+            show_explorer(state);
+            state.explorer.keyboard_focus = true;
+            true
+        }
+        "explorer.refresh" => {
+            state.explorer.refresh();
+            sync_explorer(state);
+            true
+        }
+        "sidebar.workspaces" => {
+            state.explorer.active = false;
+            state.sidebar_collapsed = false;
+            true
+        }
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
+            state.explorer.keyboard_focus = false;
+            sync_explorer(state);
             true
         }
         "workspace.add" => {
@@ -10932,6 +11202,7 @@ pub(crate) mod tests {
             diff_review: None,
             palette_query: String::new(),
             palette_active: 0,
+            explorer: crate::explorer::Explorer::default(),
             sidebar_collapsed: false,
             sidebar_width: 252.0,
             window_maximized: false,
@@ -13273,6 +13544,138 @@ pub(crate) mod tests {
             state.sidebar_width, MAX_SIDEBAR_WIDTH,
             "rejected input leaves width alone"
         );
+    }
+
+    #[test]
+    fn explorer_automatic_refresh_tracks_create_rename_delete_and_pauses_when_hidden() {
+        let root = std::env::temp_dir().join(format!("tm-explorer-poll-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        let file = root.join("folder").join("before.txt");
+        std::fs::write(&file, "before").unwrap();
+        let shared = Arc::new(std::sync::Mutex::new(seed_state()));
+        {
+            let mut state = shared.lock_recover();
+            state.workspaces[0].path = Some(root.clone());
+            dispatch(&mut state, "explorer.show");
+            let generation = state.explorer.generation;
+            state.explorer.accept(
+                generation,
+                root.clone(),
+                crate::explorer::read_directory(&root),
+            );
+            state.explorer.expanded.insert(root.join("folder"));
+            state.explorer.accept(
+                generation,
+                root.join("folder"),
+                crate::explorer::read_directory(&root.join("folder")),
+            );
+            state.explorer.selected = Some(file.clone());
+            dispatch_editor_open_path(&mut state, &file.to_string_lossy());
+        }
+        assert!(
+            !refresh_explorer_once(&shared),
+            "quiet folders must not rebuild"
+        );
+        std::fs::write(root.join("new.txt"), "new").unwrap();
+        assert!(refresh_explorer_once(&shared));
+        assert_eq!(shared.lock_recover().explorer.selected, Some(file.clone()));
+        assert!(shared
+            .lock_recover()
+            .explorer
+            .expanded
+            .contains(&root.join("folder")));
+        std::fs::write(&file, "changed externally").unwrap();
+        assert!(
+            !refresh_explorer_once(&shared),
+            "content-only changes do not change the tree"
+        );
+        assert_eq!(
+            shared
+                .lock_recover()
+                .editors
+                .values()
+                .next()
+                .unwrap()
+                .buffer
+                .line(0),
+            Some("before")
+        );
+        std::fs::rename(&file, root.join("folder").join("after.txt")).unwrap();
+        assert!(refresh_explorer_once(&shared));
+        assert_eq!(
+            shared.lock_recover().explorer.selected,
+            Some(root.join("folder"))
+        );
+        assert_eq!(
+            shared.lock_recover().editors.len(),
+            1,
+            "tree refresh must keep editor buffers open"
+        );
+        shared.lock_recover().sidebar_collapsed = true;
+        std::fs::remove_file(root.join("new.txt")).unwrap();
+        assert!(!refresh_explorer_once(&shared));
+        shared.lock_recover().sidebar_collapsed = false;
+        assert!(
+            refresh_explorer_once(&shared),
+            "reopening catches up with hidden changes"
+        );
+        assert!(!refresh_explorer_once(&shared));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn explorer_copy_uses_context_path_instead_of_current_selection() {
+        let _lock = clipboard_access_guard();
+        let mut state = seed_state();
+        let root = std::env::temp_dir().join("copy-project");
+        let path = root.join("folder name").join("example.rs");
+        state.explorer.selected = Some(root.join("different.rs"));
+        for (command, expected) in [
+            (
+                "explorer.copy_relative",
+                "folder name/example.rs".to_string(),
+            ),
+            (
+                "explorer.copy_absolute",
+                path.to_string_lossy().into_owned(),
+            ),
+        ] {
+            state.ctx_menu = Some(CtxMenu {
+                x: 0.0,
+                y: 0.0,
+                target: CtxMenuTarget::Explorer {
+                    path: path.clone(),
+                    root: root.clone(),
+                },
+            });
+            assert!(dispatch(&mut state, command));
+            assert_eq!(state.clipboard.read_text().unwrap(), expected);
+            assert!(state.ctx_menu.is_none());
+        }
+        assert!(
+            !dispatch(&mut state, "explorer.copy_relative"),
+            "no menu target means no copy"
+        );
+    }
+
+    #[test]
+    fn explorer_toggle_preserves_workspace_access_and_browses_active_root() {
+        let mut state = seed_state();
+        state.workspaces[0].path = Some(PathBuf::from("project"));
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(state.explorer.active);
+        assert!(!state.sidebar_collapsed);
+        assert_eq!(
+            state.explorer.root.as_deref(),
+            Some(std::path::Path::new("project"))
+        );
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(state.sidebar_collapsed);
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(!state.sidebar_collapsed);
+        assert!(dispatch(&mut state, "sidebar.workspaces"));
+        assert!(!state.explorer.active);
+        assert!(!state.sidebar_collapsed);
     }
 
     #[test]

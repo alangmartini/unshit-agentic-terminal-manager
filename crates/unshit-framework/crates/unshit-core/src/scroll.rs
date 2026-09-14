@@ -3,6 +3,83 @@ use crate::layout::TextMeasureCtx;
 use crate::style::types::Overflow;
 use crate::tree::NodeArena;
 
+#[cfg(test)]
+mod reveal_tests {
+    use super::*;
+    use crate::dirty::DirtyFlags;
+    use crate::element::{Element, LayoutRect, Tag};
+    use taffy::prelude::TaffyMaxContent;
+
+    fn fixture() -> (NodeArena, taffy::TaffyTree<TextMeasureCtx>, NodeId, NodeId) {
+        let mut taffy = taffy::TaffyTree::new();
+        let child = taffy
+            .new_leaf(taffy::Style {
+                size: taffy::Size {
+                    width: taffy::Dimension::Length(400.0),
+                    height: taffy::Dimension::Length(500.0),
+                },
+                flex_shrink: 0.0,
+                ..Default::default()
+            })
+            .unwrap();
+        let parent = taffy
+            .new_with_children(
+                taffy::Style {
+                    size: taffy::Size {
+                        width: taffy::Dimension::Length(100.0),
+                        height: taffy::Dimension::Length(100.0),
+                    },
+                    ..Default::default()
+                },
+                &[child],
+            )
+            .unwrap();
+        taffy.compute_layout(parent, taffy::Size::MAX_CONTENT).unwrap();
+        let mut arena = NodeArena::new();
+        let mut container = Element::new(Tag::Div);
+        container.taffy_node = Some(parent);
+        container.layout_rect = LayoutRect { x: 10.0, y: 20.0, width: 100.0, height: 100.0 };
+        container.computed_style.overflow_x = Overflow::Scroll;
+        container.computed_style.overflow_y = Overflow::Scroll;
+        container.dirty = DirtyFlags::empty();
+        let container = arena.alloc(container);
+        let mut row = Element::new(Tag::Button);
+        row.layout_rect = LayoutRect { x: 160.0, y: 220.0, width: 30.0, height: 28.0 };
+        row.dirty = DirtyFlags::empty();
+        let row = arena.alloc(row);
+        arena.append_child(container, row);
+        (arena, taffy, container, row)
+    }
+
+    #[test]
+    fn reveals_offscreen_row_on_both_axes_and_invalidates_paint() {
+        let (mut arena, taffy, container, row) = fixture();
+        assert_eq!(scroll_into_view(&mut arena, &taffy, row), Some(container));
+        let element = arena.get(container).unwrap();
+        assert_eq!((element.scroll_x, element.scroll_y), (80.0, 128.0));
+        assert!(element.dirty.contains(DirtyFlags::PAINT));
+        assert!(arena.get(row).unwrap().dirty.contains(DirtyFlags::PAINT));
+        arena.get_mut(row).unwrap().layout_rect.x = 10.0;
+        arena.get_mut(row).unwrap().layout_rect.y = 20.0;
+        scroll_into_view(&mut arena, &taffy, row);
+        let element = arena.get(container).unwrap();
+        assert_eq!((element.scroll_x, element.scroll_y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn already_visible_row_keeps_offsets_and_clean_paint() {
+        let (mut arena, taffy, container, row) = fixture();
+        let element = arena.get_mut(container).unwrap();
+        element.scroll_x = 100.0;
+        element.scroll_y = 160.0;
+        assert_eq!(scroll_into_view(&mut arena, &taffy, row), Some(container));
+        let element = arena.get(container).unwrap();
+        assert_eq!((element.scroll_x, element.scroll_y), (100.0, 160.0));
+        assert!(!element.dirty.contains(DirtyFlags::PAINT));
+        assert!(!arena.get(row).unwrap().dirty.contains(DirtyFlags::PAINT));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants (shared with renderer)
 // ---------------------------------------------------------------------------
@@ -178,6 +255,49 @@ pub fn set_scroll_position(arena: &mut NodeArena, node_id: NodeId, x: f32, y: f3
     }
 
     changed
+}
+
+/// Reveal a laid-out descendant in its nearest scroll container with the
+/// smallest offset change. Returns the container even when already visible,
+/// allowing callers to cancel an animation that would move it away again.
+pub fn scroll_into_view(
+    arena: &mut NodeArena,
+    taffy: &taffy::TaffyTree<TextMeasureCtx>,
+    target: NodeId,
+) -> Option<NodeId> {
+    let element = arena.get(target)?;
+    let rect = element.layout_rect;
+    let container = find_scroll_container(arena, element.parent)?;
+    let element = arena.get(container)?;
+    let viewport = element.layout_rect;
+    let max_scroll = compute_max_scroll(arena, taffy, container);
+    fn reveal(start: f32, size: f32, offset: f32, viewport: f32, max: f32) -> f32 {
+        // An oversized target cannot fit; retain its visible portion, or bring
+        // its nearest edge into view when entirely outside the viewport.
+        let end = start + size;
+        let next = if start < offset && end > offset + viewport {
+            offset
+        } else if start < offset {
+            start
+        } else if end > offset + viewport {
+            (end - viewport).min(start)
+        } else {
+            offset
+        };
+        next.clamp(0.0, max)
+    }
+    let x = if element.computed_style.overflow_x == Overflow::Scroll {
+        reveal(rect.x - viewport.x, rect.width, element.scroll_x, viewport.width, max_scroll.0)
+    } else {
+        element.scroll_x
+    };
+    let y = if element.computed_style.overflow_y == Overflow::Scroll {
+        reveal(rect.y - viewport.y, rect.height, element.scroll_y, viewport.height, max_scroll.1)
+    } else {
+        element.scroll_y
+    };
+    set_scroll_position(arena, container, x, y);
+    Some(container)
 }
 
 /// Apply wheel-style deltas to a scroll container and dirty affected paint.
