@@ -25,11 +25,10 @@ use unshit_terminal_core::{Snapshot, Terminal};
 /// Default scrollback cap per session. Matches SPEC.md section 3 F3.
 const DEFAULT_SCROLLBACK: usize = 10_000;
 
-/// Size of the read buffer fed into the mpsc. Matches the value used
-/// elsewhere in the UI bridge so throughput characteristics do not drift
-/// between slice 3a (daemon owns PTYs, UI still in-process) and later
-/// slices.
-const READ_BUF_LEN: usize = 4096;
+/// Consume large host writes in one read when available. Reads still return
+/// immediately for short interactive output; this is a capacity, not a minimum.
+/// The 64-message output channel can retain at most 4 MiB of these chunks.
+const READ_BUF_LEN: usize = 64 * 1024;
 
 pub const ENV_NOTIFY_SOCKET: &str = "TM_NOTIFY_SOCKET";
 pub const ENV_WORKSPACE_ID: &str = "TM_WORKSPACE_ID";
