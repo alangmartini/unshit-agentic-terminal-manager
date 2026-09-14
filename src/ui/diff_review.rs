@@ -70,7 +70,7 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         }
         toolbar = toolbar.with_child(tab);
     }
-    if review.mode != "unpushed" {
+    if matches!(review.mode, "last" | "base") {
         toolbar = toolbar
             .with_child(label(
                 "diff-field-label",
@@ -82,7 +82,9 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
             ))
             .with_child(input(shared, review, review.mode == "last"));
     }
-    toolbar = toolbar.with_child(button(shared, "Refresh", "review.refresh"));
+    toolbar = toolbar
+        .with_child(button(shared, "Open patch…", "review.patch_open").with_id("diff-open-patch"))
+        .with_child(button(shared, "Refresh", "review.refresh"));
     let mut views = ElementDef::new(Tag::Div).with_class("diff-view-switch");
     for (split, title, command) in [
         (false, "Unified", "review.view:unified"),
@@ -98,21 +100,38 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let header = ElementDef::new(Tag::Div)
         .with_class("diff-header")
         .with_child(label("diff-title", "Changes"))
-        .with_child(label("diff-subtitle", review.root.display().to_string()))
+        .with_child(label(
+            "diff-subtitle",
+            if review.mode == "patch" {
+                review.patch_path.as_ref().unwrap_or(&review.root)
+            } else {
+                &review.root
+            }
+            .display()
+            .to_string(),
+        ))
         .with_child(button(shared, "Close · Esc", "review.close").with_autofocus(true));
     let mut content = ElementDef::new(Tag::Div).with_class("diff-content");
     if let Some(report) = &review.report {
         let added: usize = report.files.iter().filter_map(|f| f.added).sum();
         let removed: usize = report.files.iter().filter_map(|f| f.removed).sum();
+        let range = if report.patches.is_some() {
+            "Patch file".to_string()
+        } else {
+            format!(
+                "{} → {}",
+                report.base.chars().take(8).collect::<String>(),
+                report.head.chars().take(8).collect::<String>()
+            )
+        };
         content = content.with_child(label(
             "diff-summary",
             format!(
-                "{} files   +{}  -{}   ·   {} → {}\n{}",
+                "{} files   +{}  -{}   ·   {}\n{}",
                 report.files.len(),
                 added,
                 removed,
-                &report.base[..8],
-                &report.head[..8],
+                range,
                 report.label
             ),
         ));
@@ -136,9 +155,13 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         content = content.with_child(label(
             "diff-empty",
             if review.loading {
-                "Reading Git history…"
+                if review.mode == "patch" {
+                    "Reading patch file…"
+                } else {
+                    "Reading Git history…"
+                }
             } else {
-                "Choose a range and refresh to review committed changes."
+                "Choose a Git range, open a patch file, or drop a .patch here."
             },
         ));
     }
@@ -154,7 +177,11 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_child(content)
         .with_child(label(
             "diff-footer",
-            "LOCAL GIT REVIEW   ·   Read only   ·   Refresh uses local refs; no automatic fetch",
+            if review.mode == "patch" {
+                "PATCH REVIEW   ·   Read only   ·   Drop a .patch or .diff file to open it"
+            } else {
+                "LOCAL GIT REVIEW   ·   Read only   ·   Refresh uses local refs; no automatic fetch"
+            },
         ))
 }
 
@@ -398,6 +425,7 @@ mod tests {
         let mut state = seed_state();
         let mut review = Review::new("C:/projects/unshit".into());
         review.report = Some(Arc::new(Report {
+            patches: None,
             root: review.root.clone(),
             base: "a123456789".into(),
             head: "b123456789".into(),
@@ -428,6 +456,71 @@ mod tests {
             &Default::default(),
             None,
         )
+    }
+
+    fn import_fixture(shared: &SharedState, path: &std::path::Path) {
+        let report = crate::diff_review::patch_file::load(path).unwrap();
+        let mut state = shared.lock_recover();
+        let review = state.diff_review.as_mut().unwrap();
+        review.mode = "patch";
+        review.patch_path = Some(path.to_path_buf());
+        review.lines = Arc::new(report.patches.as_ref().unwrap()[0].clone());
+        review.split_rows = Arc::new(crate::diff_review::split::align(&review.lines));
+        review.hunks = Arc::new(crate::diff_review::collect_hunks(
+            &review.lines,
+            &review.split_rows,
+        ));
+        review.report = Some(Arc::new(report));
+        review.set_file_filter("");
+    }
+
+    #[test]
+    fn imported_patch_renders_and_keeps_review_controls() {
+        let path = std::env::temp_dir().join(format!("review-ui-{}.patch", std::process::id()));
+        std::fs::write(
+            &path,
+            "diff --git a/example.rs b/example.rs\n@@ -12 +12 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let shared = fixture();
+        import_fixture(&shared, &path);
+        std::fs::remove_file(&path).unwrap();
+        for width in [800.0, 1280.0] {
+            let mut harness = TestHarness::new(
+                include_str!("../../assets/styles.css"),
+                || tree(&shared),
+                width,
+                720.0,
+            );
+            harness.step();
+            assert!(harness.query("#diff-open-patch").is_some());
+            assert!(harness.query("#diff-count").is_none());
+            assert!(harness.query(".diff-added").is_some());
+            assert!(harness.query(".diff-removed").is_some());
+            let summary = harness.query(".diff-summary").unwrap();
+            assert!(
+                matches!(summary.content, ElementContent::Text(ref text) if text.contains("1 files   +1  -1") && text.contains("Patch file"))
+            );
+            dispatch(&mut shared.lock_recover(), "review.hunk_next");
+            dispatch(&mut shared.lock_recover(), "review.view:split");
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            assert_eq!(
+                shared
+                    .lock_recover()
+                    .diff_review
+                    .as_ref()
+                    .unwrap()
+                    .active_hunk,
+                Some(0)
+            );
+            assert!(harness.query(".diff-added").is_some());
+            assert_eq!(
+                harness.query(".diff-split-side-label").unwrap().content,
+                ElementContent::Text("Before".into())
+            );
+            dispatch(&mut shared.lock_recover(), "review.view:unified");
+        }
     }
 
     #[test]
@@ -775,6 +868,9 @@ mod tests {
             return;
         };
         let shared = fixture();
+        if let Some(patch) = std::env::var_os("TM_DIFF_VISUAL_PATCH") {
+            import_fixture(&shared, std::path::Path::new(&patch));
+        }
         if std::env::var("TM_DIFF_VISUAL_MODE").as_deref() == Ok("split") {
             shared
                 .lock_recover()

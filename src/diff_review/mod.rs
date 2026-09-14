@@ -1,4 +1,5 @@
 pub mod git;
+pub mod patch_file;
 pub mod split;
 
 use crate::state::{AppState, MutexExt, SharedState};
@@ -32,6 +33,7 @@ pub fn collect_hunks(lines: &[git::Line], rows: &[split::Row]) -> Vec<Hunk> {
 pub struct Review {
     pub root: PathBuf,
     pub mode: &'static str,
+    pub patch_path: Option<PathBuf>,
     pub count: String,
     pub base_ref: String,
     pub request: u64,
@@ -59,6 +61,7 @@ impl Review {
         Self {
             root,
             mode: "last",
+            patch_path: None,
             count: "1".into(),
             base_ref: "main".into(),
             request: 0,
@@ -179,6 +182,7 @@ impl LoadedPatch {
 
 enum Query {
     Range(PathBuf, git::Range),
+    PatchFile(PathBuf),
     File(Arc<git::Report>, usize),
 }
 struct Job {
@@ -210,11 +214,15 @@ pub fn start(shared: SharedState, sink: unshit::app::EventSink) {
         let (report, selected) = match job.query {
             Query::Range(root, range) => (git::load(&root, &range).map(Arc::new), 0),
             Query::File(report, index) => (Ok(report), index),
+            Query::PatchFile(path) => (patch_file::load(&path).map(Arc::new), 0),
         };
         let lines = report.as_ref().ok().and_then(|r| {
-            r.files
-                .get(selected)
-                .map(|f| git::patch(r, f).map(LoadedPatch::new))
+            r.files.get(selected).map(|f| {
+                r.patches
+                    .as_ref()
+                    .map_or_else(|| git::patch(r, f), |patches| Ok(patches[selected].clone()))
+                    .map(LoadedPatch::new)
+            })
         });
         let mut state = shared.lock_recover();
         let applied = apply(&mut state, job.id, report, lines);
@@ -282,6 +290,16 @@ fn submit(review: &mut Review, query: Query) {
 
 fn refresh(review: &mut Review) {
     review.viewed = Arc::default();
+    if review.mode == "patch" {
+        review.report = None;
+        review.file_matches = Arc::default();
+        review.selected = 0;
+        review.file_page = 0;
+        if let Some(path) = review.patch_path.clone() {
+            submit(review, Query::PatchFile(path));
+        }
+        return;
+    }
     let range = match review.mode {
         "unpushed" => git::Range::Unpushed,
         "base" => git::Range::Base(review.base_ref.clone()),
@@ -305,7 +323,34 @@ fn refresh(review: &mut Review) {
     submit(review, Query::Range(review.root.clone(), range));
 }
 
+pub fn accept_drop(state: &mut AppState, paths: &[PathBuf]) -> bool {
+    if state.diff_review.is_none() || paths.len() != 1 {
+        return false;
+    }
+    let path = &paths[0];
+    if !path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("patch") || ext.eq_ignore_ascii_case("diff"))
+    {
+        return false;
+    }
+    dispatch(state, &format!("review.patch:{}", path.display()))
+}
+
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
+    if let Some(path) = command.strip_prefix("review.patch:") {
+        if state.diff_review.is_none() {
+            state.diff_review = Some(Review::new(
+                crate::state::active_workspace_cwd(state).unwrap_or_default(),
+            ));
+        }
+        let review = state.diff_review.as_mut().unwrap();
+        review.mode = "patch";
+        review.patch_path = Some(PathBuf::from(path));
+        refresh(review);
+        return true;
+    }
     if command == "review.open" {
         let root = state
             .pty_manager
@@ -416,6 +461,23 @@ mod tests {
     use crate::state::seed_state;
 
     #[test]
+    fn patch_drop_requires_review_and_one_supported_file() {
+        let mut state = seed_state();
+        let path = PathBuf::from("C:/Downloads/Fix query + highlight.PATCH");
+        assert!(!accept_drop(&mut state, std::slice::from_ref(&path)));
+        state.diff_review = Some(Review::new("C:/repo".into()));
+        assert!(!accept_drop(&mut state, &["notes.txt".into()]));
+        assert!(!accept_drop(&mut state, &[path.clone(), path.clone()]));
+        assert!(accept_drop(&mut state, std::slice::from_ref(&path)));
+        let review = state.diff_review.as_ref().unwrap();
+        assert_eq!(review.mode, "patch");
+        assert_eq!(review.patch_path.as_ref(), Some(&path));
+        assert_eq!(review.root, PathBuf::from("C:/repo"));
+        assert!(dispatch(&mut state, "review.mode:last"));
+        assert_eq!(state.diff_review.as_ref().unwrap().mode, "last");
+    }
+
+    #[test]
     fn viewed_files_survive_navigation_but_reset_on_refresh() {
         let mut state = state_with_patch("@@ -1 +1 @@\n-old\n+new\n");
         let review = state.diff_review.as_mut().unwrap();
@@ -459,6 +521,7 @@ mod tests {
         review.request = 42;
         state.diff_review = Some(review);
         let report = Arc::new(git::Report {
+            patches: None,
             root: ".".into(),
             base: "base".into(),
             head: "head".into(),
@@ -529,6 +592,7 @@ mod tests {
     fn file_filter_matches_current_and_renamed_paths_without_reloading_patch() {
         let mut review = Review::new(".".into());
         review.report = Some(Arc::new(git::Report {
+            patches: None,
             root: ".".into(),
             base: "base".into(),
             head: "head".into(),
@@ -592,6 +656,7 @@ mod tests {
             ..file.clone()
         }));
         let report = Arc::new(git::Report {
+            patches: None,
             root: ".".into(),
             base: "base".into(),
             head: "head".into(),
