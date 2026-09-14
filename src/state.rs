@@ -190,6 +190,8 @@ pub struct CtxMenu {
 /// set the overlay renders and which dispatch commands it emits.
 #[derive(Clone, Debug)]
 pub enum CtxMenuTarget {
+    /// File/folder menu retains its original workspace root across navigation.
+    Explorer { path: PathBuf, root: PathBuf },
     /// Menu opened on a workspace row in the sidebar.
     Workspace { idx: usize },
     /// Menu opened on a tab in the tabbar. Carries the active pane id
@@ -8418,6 +8420,28 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if other.starts_with("tab.reorder:") => {
             persist_layout_if(dispatch_tab_reorder(state, other), state)
         }
+        "explorer.copy_relative" | "explorer.copy_absolute" => {
+            let Some(CtxMenuTarget::Explorer { path, root }) =
+                state.ctx_menu.as_ref().map(|menu| &menu.target)
+            else {
+                return false;
+            };
+            let result = crate::explorer::path_for_clipboard(
+                root,
+                path,
+                command == "explorer.copy_relative",
+            );
+            state.ctx_menu = None;
+            match result {
+                Ok(path) => {
+                    if let Err(error) = state.clipboard.write_text(path) {
+                        push_error_toast(state, format!("Could not copy path: {error}"));
+                    }
+                }
+                Err(error) => push_error_toast(state, error),
+            }
+            true
+        }
         "explorer.reveal" => dispatch_explorer_reveal(state),
         "explorer.collapse_all" => {
             state.explorer.collapse_all();
@@ -13548,6 +13572,41 @@ pub(crate) mod tests {
         );
         assert!(!refresh_explorer_once(&shared));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn explorer_copy_uses_context_path_instead_of_current_selection() {
+        let _lock = clipboard_access_guard();
+        let mut state = seed_state();
+        let root = std::env::temp_dir().join("copy-project");
+        let path = root.join("folder name").join("example.rs");
+        state.explorer.selected = Some(root.join("different.rs"));
+        for (command, expected) in [
+            (
+                "explorer.copy_relative",
+                "folder name/example.rs".to_string(),
+            ),
+            (
+                "explorer.copy_absolute",
+                path.to_string_lossy().into_owned(),
+            ),
+        ] {
+            state.ctx_menu = Some(CtxMenu {
+                x: 0.0,
+                y: 0.0,
+                target: CtxMenuTarget::Explorer {
+                    path: path.clone(),
+                    root: root.clone(),
+                },
+            });
+            assert!(dispatch(&mut state, command));
+            assert_eq!(state.clipboard.read_text().unwrap(), expected);
+            assert!(state.ctx_menu.is_none());
+        }
+        assert!(
+            !dispatch(&mut state, "explorer.copy_relative"),
+            "no menu target means no copy"
+        );
     }
 
     #[test]

@@ -4,6 +4,26 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub fn path_for_clipboard(root: &Path, path: &Path, relative: bool) -> Result<String, String> {
+    if relative {
+        let path = path
+            .strip_prefix(root)
+            .map_err(|_| "The file is outside this workspace.".to_string())?;
+        if path.as_os_str().is_empty() {
+            return Ok(".".into());
+        }
+        Ok(path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"))
+    } else {
+        std::path::absolute(path)
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Read only the target's ancestor chain, on a worker. Map canonical paths
 /// back to the workspace spelling so row ids agree with ordinary listings.
 pub fn reveal_path(
@@ -294,6 +314,22 @@ pub fn read_directory(path: &Path) -> Listing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_paths_preserve_names_and_use_portable_relative_separators() {
+        let root = std::env::temp_dir().join("project");
+        let file = root.join("nested folder").join("café.rs");
+        assert_eq!(
+            path_for_clipboard(&root, &file, true).unwrap(),
+            "nested folder/café.rs"
+        );
+        assert_eq!(path_for_clipboard(&root, &root, true).unwrap(), ".");
+        assert_eq!(
+            path_for_clipboard(&root, &file, false).unwrap(),
+            file.to_string_lossy()
+        );
+        assert!(path_for_clipboard(&root, &root.with_file_name("elsewhere"), true).is_err());
+    }
 
     #[test]
     fn typeahead_matches_prefix_cycles_wraps_and_resets_after_pause() {

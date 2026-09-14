@@ -146,6 +146,9 @@ fn row(
     let expanded = explorer.expanded.contains(path);
     let path = path.to_owned();
     let click_state = shared.clone();
+    let context_state = shared.clone();
+    let context_path = path.clone();
+    let context_root = explorer.root.clone();
     let mut row = ElementDef::new(Tag::Button)
         .with_id(format!("explorer:{}", path.display()))
         .with_key(format!("explorer:{}", path.display()))
@@ -182,6 +185,23 @@ fn row(
             .with_class("explorer-name")
             .with_text(name),
     )
+    .on_context_menu(move |x, y| {
+        if let Some(root) = &context_root {
+            mutate_with(&context_state, |state| {
+                state.explorer.clear_typeahead();
+                state.explorer.selected = Some(context_path.clone());
+                let scale = state.scale_factor.max(1e-3);
+                state.ctx_menu = Some(crate::state::CtxMenu {
+                    x: x / scale,
+                    y: y / scale,
+                    target: crate::state::CtxMenuTarget::Explorer {
+                        path: context_path.clone(),
+                        root: root.clone(),
+                    },
+                });
+            });
+        }
+    })
     .on_click(move || {
         mutate_with(&click_state, |state| {
             state.explorer.clear_typeahead();

@@ -35,3 +35,8 @@ When the tree has keyboard focus, type a name to select a visible entry by
 case-insensitive prefix. Repeating a single letter cycles through matches.
 A one-second pause starts a new prefix. Navigation keys or a click clear the
 prefix. Matching scrolls the selected row into view without opening it.
+
+Right-click a file or folder for Copy path (absolute) and Copy relative path
+(workspace-relative, using forward slashes). Copying the root relatively yields
+`.`. The menu retains the clicked path and workspace even if selection changes.
+Clipboard failures produce a message rather than claiming success.

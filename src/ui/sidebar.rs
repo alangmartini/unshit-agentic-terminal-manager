@@ -507,6 +507,18 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
         });
 
     let menu = match &ctx.target {
+        crate::state::CtxMenuTarget::Explorer { .. } => ElementDef::new(Tag::Div)
+            .with_class("ctx-menu")
+            .with_child(ctx_menu_item(
+                "Copy relative path",
+                shared,
+                "explorer.copy_relative".into(),
+            ))
+            .with_child(ctx_menu_item(
+                "Copy path",
+                shared,
+                "explorer.copy_absolute".into(),
+            )),
         crate::state::CtxMenuTarget::Workspace { idx } => {
             let installed = crate::shell::discover_installed();
             let agents = crate::agents::menu_profiles();
