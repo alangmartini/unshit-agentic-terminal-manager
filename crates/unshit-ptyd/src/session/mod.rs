@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use unshit_terminal_core::{Snapshot, Terminal};
 
@@ -144,11 +144,28 @@ struct OutputState {
     /// atomic decision: an attach either installs its sender before shutdown
     /// clears it, or observes a closed reader and fails.
     reader_open: bool,
+    /// The sole reader has parsed a chunk whose delivery has not finished.
+    pending_delivery: bool,
+    last_progress: std::time::Instant,
 }
 
 struct OutputSink {
     token: AttachmentToken,
     tx: mpsc::Sender<Vec<u8>>,
+    // The sink owns the sole sender. Replacing or removing it cancels any
+    // reader waiting to deliver to this attachment, even if its receiver lives.
+    cancellation: watch::Sender<()>,
+}
+
+impl OutputSink {
+    fn new(token: AttachmentToken, tx: mpsc::Sender<Vec<u8>>) -> Self {
+        let (cancellation, _) = watch::channel(());
+        Self {
+            token,
+            tx,
+            cancellation,
+        }
+    }
 }
 
 impl Session {
@@ -275,12 +292,11 @@ impl Session {
 
         let attachment_token = 1;
         let output = Arc::new(Mutex::new(OutputState {
-            current: Some(OutputSink {
-                token: attachment_token,
-                tx,
-            }),
+            current: Some(OutputSink::new(attachment_token, tx)),
             next_token: 2,
             reader_open: true,
+            pending_delivery: false,
+            last_progress: std::time::Instant::now(),
         }));
         let reader_output = Arc::clone(&output);
 
@@ -314,8 +330,8 @@ impl Session {
     }
 
     /// Replaces the current output sender with a fresh channel and
-    /// returns the matching receiver. Any prior receiver is dropped;
-    /// the reader stops forwarding to it on the next chunk.
+    /// returns the matching receiver. A reader waiting on the prior
+    /// attachment is released; subsequent chunks use the new attachment.
     pub fn attach(&self) -> Option<(AttachmentToken, mpsc::Receiver<Vec<u8>>)> {
         self.attach_with_snapshot(0)
             .map(|(token, _snapshot, output)| (token, output))
@@ -348,7 +364,7 @@ impl Session {
         output.next_token = token
             .checked_add(1)
             .expect("session attachment token space exhausted");
-        output.current = Some(OutputSink { token, tx });
+        output.current = Some(OutputSink::new(token, tx));
         let snapshot = terminal.snapshot(scrollback_lines);
         Some((token, snapshot, rx))
     }
@@ -417,6 +433,9 @@ impl Session {
     ///
     /// Safe to call multiple times; subsequent calls are no-ops.
     pub fn kill(&mut self) {
+        // Release a reader waiting on client capacity before PTY teardown,
+        // which can itself wait for the output pipe to drain on Windows.
+        close_output(&self.output);
         if let Some(handle) = self.child_watch_task.take() {
             handle.abort();
         }
@@ -432,7 +451,6 @@ impl Session {
         if let Some(handle) = self.reader_task.take() {
             handle.abort();
         }
-        close_output(&self.output);
     }
 
     /// Reports whether the child is still running.
@@ -646,17 +664,37 @@ async fn watch_child_exit(
             Err(_) => true,
         };
         if exited {
-            // Give the reader a bounded window to drain output the child
-            // wrote immediately before exit. Unix PTYs usually reach EOF in
-            // this window and close themselves; ConPTY may keep the read
-            // pending until the pseudoconsole is torn down, so the watcher
-            // still provides the eventual close required by the UI.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            close_output(&output);
+            // ConPTY may never report EOF after the primary child exits.
+            // Close after a quiet drain window, but not while a slow client
+            // holds a pending delivery. Detach/kill can still cancel it.
+            // This remains a fallback heuristic, not proof of native-pipe EOF.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if close_idle_output(&output) {
+                    break;
+                }
+            }
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+fn close_idle_output(output: &Arc<Mutex<OutputState>>) -> bool {
+    let mut output = output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !output.reader_open {
+        return true;
+    }
+    if output.pending_delivery
+        || output.last_progress.elapsed() < std::time::Duration::from_millis(100)
+    {
+        return false;
+    }
+    output.reader_open = false;
+    output.current = None;
+    true
 }
 
 fn close_output(output: &Arc<Mutex<OutputState>>) {
@@ -682,18 +720,35 @@ fn run_reader_inner(
                         continue;
                     };
                     term.process_bytes(&buf[..n]);
-                    output
-                        .lock()
-                        .ok()
-                        .and_then(|guard| guard.current.as_ref().map(|sink| sink.tx.clone()))
+                    output.lock().ok().and_then(|mut guard| {
+                        guard.last_progress = std::time::Instant::now();
+                        let sink = guard
+                            .current
+                            .as_ref()
+                            .map(|sink| (sink.tx.clone(), sink.cancellation.subscribe()));
+                        guard.pending_delivery = sink.is_some();
+                        sink
+                    })
                 };
-                if let Some(tx) = tx_opt {
-                    // Non-blocking: if the current client is slow or gone
-                    // we drop the chunk and rely on the terminal plus
-                    // scrollback as the source of truth. Never exit the
-                    // reader when the receiver is gone; a later attach
-                    // should still observe live output.
-                    let _ = tx.try_send(buf[..n].to_vec());
+                if let Some((tx, mut cancelled)) = tx_opt {
+                    if let Err(mpsc::error::TrySendError::Full(bytes)) =
+                        tx.try_send(buf[..n].to_vec())
+                    {
+                        // Only the dedicated blocking PTY reader waits, with
+                        // neither terminal nor output mutex held. Snapshot
+                        // attachment already includes this parsed chunk, so
+                        // cancellation must not resend it to the new sink.
+                        tokio::runtime::Handle::current().block_on(async {
+                            tokio::select! {
+                                _ = tx.send(bytes) => {},
+                                _ = cancelled.changed() => {},
+                            }
+                        });
+                    }
+                    if let Ok(mut guard) = output.lock() {
+                        guard.pending_delivery = false;
+                        guard.last_progress = std::time::Instant::now();
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -726,6 +781,143 @@ mod tests {
         {
             "/bin/sh"
         }
+    }
+
+    #[tokio::test]
+    async fn full_output_queue_preserves_pending_bytes_until_drained() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(b"head".to_vec()).unwrap();
+        let output = Arc::new(Mutex::new(OutputState {
+            current: Some(OutputSink::new(1, tx)),
+            next_token: 2,
+            reader_open: true,
+            pending_delivery: false,
+            last_progress: std::time::Instant::now(),
+        }));
+        let terminal = Arc::new(Mutex::new(Terminal::new(2, 10, 0)));
+        let reader_output = Arc::clone(&output);
+        let mut task = tokio::task::spawn_blocking(move || {
+            run_reader(
+                Box::new(std::io::Cursor::new(b"tail")),
+                reader_output,
+                terminal,
+            );
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut task)
+                .await
+                .is_err(),
+            "a full queue must hold pending output instead of dropping it"
+        );
+        output.lock().unwrap().last_progress = std::time::Instant::now() - Duration::from_secs(1);
+        assert!(
+            !close_idle_output(&output),
+            "exit must not cancel a pending delivery"
+        );
+        assert_eq!(rx.recv().await.unwrap(), b"head");
+        assert_eq!(rx.recv().await.unwrap(), b"tail");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rx.recv().await.is_none());
+    }
+
+    async fn cancel_full_output_queue(replace: bool, close: bool) {
+        struct Chunks(std::collections::VecDeque<Vec<u8>>);
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let Some(chunk) = self.0.pop_front() else {
+                    return Ok(0);
+                };
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+        }
+        let (tx, mut old_rx) = mpsc::channel(1);
+        tx.try_send(b"head".to_vec()).unwrap();
+        let output = Arc::new(Mutex::new(OutputState {
+            current: Some(OutputSink::new(1, tx)),
+            next_token: 2,
+            reader_open: true,
+            pending_delivery: false,
+            last_progress: std::time::Instant::now(),
+        }));
+        let terminal = Arc::new(Mutex::new(Terminal::new(2, 10, 0)));
+        let reader_output = Arc::clone(&output);
+        let reader_terminal = Arc::clone(&terminal);
+        let mut task = tokio::task::spawn_blocking(move || {
+            run_reader(
+                Box::new(Chunks([b"old".to_vec(), b"new".to_vec()].into())),
+                reader_output,
+                reader_terminal,
+            );
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut task)
+            .await
+            .is_err());
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        // Match attach's atomic terminal -> output boundary. The old chunk
+        // belongs to this snapshot, so it must not also enter the new stream.
+        {
+            let terminal = terminal.lock().unwrap();
+            assert!(grid_text(&terminal.snapshot(0)).contains("old"));
+            let mut output = output.lock().unwrap();
+            if !close {
+                output.current = if replace {
+                    Some(OutputSink::new(2, new_tx))
+                } else {
+                    None
+                };
+            }
+        }
+        if close {
+            close_output(&output);
+        }
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_rx.recv().await.unwrap(), b"head");
+        assert!(old_rx.recv().await.is_none());
+        if replace {
+            assert_eq!(new_rx.recv().await.unwrap(), b"new");
+            assert!(new_rx.recv().await.is_none());
+        }
+        assert!(grid_text(&terminal.lock().unwrap().snapshot(0)).contains("oldnew"));
+    }
+
+    #[tokio::test]
+    async fn replacement_cancels_old_pending_delivery_without_replaying_snapshot_bytes() {
+        cancel_full_output_queue(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn detach_cancels_pending_delivery_while_old_receiver_stays_alive() {
+        cancel_full_output_queue(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_a_reader_waiting_on_a_full_queue() {
+        cancel_full_output_queue(false, true).await;
+    }
+
+    #[test]
+    fn child_exit_waits_for_a_quiet_output_window() {
+        let (tx, _rx) = mpsc::channel(1);
+        let output = Arc::new(Mutex::new(OutputState {
+            current: Some(OutputSink::new(1, tx)),
+            next_token: 2,
+            reader_open: true,
+            pending_delivery: false,
+            last_progress: std::time::Instant::now(),
+        }));
+        assert!(!close_idle_output(&output));
+        output.lock().unwrap().last_progress = std::time::Instant::now() - Duration::from_secs(1);
+        assert!(close_idle_output(&output));
+        let output = output.lock().unwrap();
+        assert!(!output.reader_open);
+        assert!(output.current.is_none());
     }
 
     /// Drains the receiver for up to `timeout` ms, returning the
@@ -1180,9 +1372,11 @@ mod tests {
         let terminal = Arc::new(Mutex::new(Terminal::new(24, 80, 0)));
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
         let output = Arc::new(Mutex::new(OutputState {
-            current: Some(OutputSink { token: 1, tx }),
+            current: Some(OutputSink::new(1, tx)),
             next_token: 2,
             reader_open: true,
+            pending_delivery: false,
+            last_progress: std::time::Instant::now(),
         }));
 
         // Call directly on the current thread so any escaped panic
