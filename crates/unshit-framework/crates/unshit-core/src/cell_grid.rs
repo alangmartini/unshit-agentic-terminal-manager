@@ -164,7 +164,8 @@ impl Cell {
 /// pattern. `first_dirty_col..=last_dirty_col` is inclusive on both ends and
 /// invalid (no damage) when `first_dirty_col > last_dirty_col`.
 ///
-/// The monotonic `seqno` is bumped on every cell write on that row. The
+/// The monotonic `seqno` is bumped by mutations affecting that row. A bulk
+/// write may replace multiple cells with one increment. The
 /// renderer checkpoints the last seqno it rendered and may skip a row when
 /// the stored seqno matches the checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +175,7 @@ pub struct LineDamage {
     /// Last dirty column (inclusive). `0` when the row is clean (paired with
     /// `first_dirty_col == u16::MAX` to indicate clean state).
     pub last_dirty_col: u16,
-    /// Monotonically increasing write counter for this row. The renderer
+    /// Monotonically increasing mutation version for this row. The renderer
     /// compares this against its last-seen value to decide whether the row
     /// needs re-rendering even when `first_dirty_col..=last_dirty_col` was
     /// already processed by an earlier pass this frame.
@@ -912,6 +913,20 @@ impl CellGrid {
         }
     }
 
+    /// Fill a logical row with `cell` and mark all its columns dirty.
+    /// The row retains its line identity; callers replacing a logical line
+    /// can separately call [`Self::reset_line_identity`]. Out-of-bounds rows
+    /// and zero-column grids are unchanged.
+    pub fn fill_row(&mut self, row: usize, cell: Cell) {
+        if row >= self.rows || self.cols == 0 {
+            return;
+        }
+        self.cells.fill_row(row, cell);
+        let start = row * self.cols;
+        self.dirty[start..start + self.cols].fill(true);
+        self.line_damage[row].mark_range(0, Self::last_col_u16(self.cols));
+    }
+
     /// Read the cell at `(row, col)`. Returns `None` if out of bounds.
     pub fn get_cell(&self, row: usize, col: usize) -> Option<&Cell> {
         self.idx(row, col).map(|i| &self.cells[i])
@@ -1356,6 +1371,59 @@ mod tests {
                 g.line_damage_for(row).map(|ld| ld.is_clean()).unwrap_or(false),
                 "row {row} must remain clean after a write to row 3",
             );
+        }
+    }
+
+    #[test]
+    fn fill_row_updates_wrapped_cells_and_damage_without_changing_identity() {
+        for target in 0..4 {
+            let mut grid = CellGrid::new(4, 5);
+            for row in 0..4 {
+                for col in 0..5 {
+                    grid.set_cell(row, col, Cell::with_char((b'a' + row as u8) as char));
+                }
+            }
+            for _ in 0..9 {
+                grid.shift_rows(0, 1, 3);
+                grid.clear_dirty();
+                // Warm the logical snapshot before mutation, including when
+                // its physical row order wraps around the backing storage.
+                let before = grid.cells().to_vec();
+                let ids = grid.line_ids.clone();
+                let damage = grid.line_damage.clone();
+                let fill = Cell { ch: '?', attrs: CellAttrs::BOLD, ..Cell::default() };
+                grid.fill_row(target, fill);
+                assert_eq!(grid.line_ids, ids);
+                for row in 0..4 {
+                    for col in 0..5 {
+                        let expected = if row == target { fill } else { before[row * 5 + col] };
+                        assert_eq!(grid.get_cell(row, col), Some(&expected));
+                        assert_eq!(grid.cells()[row * 5 + col], expected);
+                        assert_eq!(grid.dirty[row * 5 + col], row == target);
+                    }
+                    let actual = grid.line_damage[row];
+                    if row == target {
+                        assert_eq!((actual.first_dirty_col, actual.last_dirty_col), (0, 4));
+                        assert!(actual.seqno > damage[row].seqno);
+                    } else {
+                        assert_eq!(actual, damage[row]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fill_row_ignores_empty_grids_and_out_of_bounds_rows() {
+        for (rows, cols) in [(0, 0), (0, 5), (4, 0), (4, 5)] {
+            let mut grid = CellGrid::new(rows, cols);
+            let before = grid.clone();
+            grid.fill_row(rows, Cell::with_char('x'));
+            grid.fill_row(usize::MAX, Cell::with_char('x'));
+            if cols == 0 {
+                grid.fill_row(0, Cell::with_char('x'));
+            }
+            assert_eq!(grid, before);
         }
     }
 

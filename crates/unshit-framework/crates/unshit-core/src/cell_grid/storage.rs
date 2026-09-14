@@ -91,6 +91,14 @@ impl Storage {
         self.origin = 0;
     }
 
+    pub(super) fn fill_row(&mut self, row: usize, cell: Cell) {
+        self.contiguous.take();
+        // The origin and every row start are column-aligned, so even a
+        // wrapped logical row occupies one contiguous physical slice.
+        let start = self.physical_index(row * self.cols);
+        self.cells[start..start + self.cols].fill(cell);
+    }
+
     pub(super) fn fill_from(&mut self, start: usize, cell: Cell) {
         // At most two physical slices cover a logical suffix.
         assert!(start <= self.cells.len());

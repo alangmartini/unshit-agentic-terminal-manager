@@ -27,6 +27,33 @@ fn terminal_scroll(c: &mut Criterion) {
     }
 }
 
+fn terminal_row_clear(c: &mut Criterion) {
+    for (rows, cols) in [(37, 125), (80, 240)] {
+        for (name, bulk) in [("per_cell", false), ("bulk", true)] {
+            c.bench_function(&format!("terminal_row_clear/{rows}x{cols}/{name}"), |b| {
+                let mut grid = CellGrid::new(rows, cols);
+                let blank = Cell::with_char(' ');
+                b.iter(|| {
+                    for _ in 0..64 {
+                        grid.shift_rows(0, 1, rows - 1);
+                        if bulk {
+                            grid.fill_row(rows - 1, blank);
+                        } else {
+                            for col in 0..cols {
+                                grid.set_cell(rows - 1, col, blank);
+                            }
+                        }
+                        grid.reset_line_identity(rows - 1);
+                    }
+                    let snapshot = grid.clone();
+                    black_box(snapshot.cells());
+                    black_box(snapshot.line_ids());
+                });
+            });
+        }
+    }
+}
+
 fn daemon_terminal_parse(c: &mut Criterion) {
     let mut input = Vec::with_capacity(80 * 1024);
     for _ in 0..1024 {
@@ -45,5 +72,10 @@ fn daemon_terminal_parse(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, terminal_scroll, daemon_terminal_parse);
+criterion_group!(
+    benches,
+    terminal_scroll,
+    terminal_row_clear,
+    daemon_terminal_parse
+);
 criterion_main!(benches);

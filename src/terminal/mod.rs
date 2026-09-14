@@ -1747,9 +1747,7 @@ impl Terminal {
             attrs: CellAttrs::empty(),
             wide_continuation: false,
         };
-        for col in 0..self.cols {
-            self.grid.set_cell(row, col, blank);
-        }
+        self.grid.fill_row(row, blank);
         self.grid.reset_line_identity(row);
     }
 
