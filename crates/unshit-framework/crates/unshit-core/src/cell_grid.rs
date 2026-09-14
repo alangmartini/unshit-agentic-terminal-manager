@@ -927,6 +927,13 @@ impl CellGrid {
         self.line_damage[row].mark_range(0, Self::last_col_u16(self.cols));
     }
 
+    /// Borrow the cells in a logical row without copying or flattening the
+    /// grid. Returns an empty slice for a valid zero-column row, or `None`
+    /// when `row` is out of bounds. Damage and line identity are unchanged.
+    pub fn row_cells(&self, row: usize) -> Option<&[Cell]> {
+        (row < self.rows).then(|| self.cells.row_cells(row))
+    }
+
     /// Read the cell at `(row, col)`. Returns `None` if out of bounds.
     pub fn get_cell(&self, row: usize, col: usize) -> Option<&Cell> {
         self.idx(row, col).map(|i| &self.cells[i])
@@ -1371,6 +1378,37 @@ mod tests {
                 g.line_damage_for(row).map(|ld| ld.is_clean()).unwrap_or(false),
                 "row {row} must remain clean after a write to row 3",
             );
+        }
+    }
+
+    #[test]
+    fn row_cells_follows_logical_order_without_mutating_the_grid() {
+        for (rows, cols) in [(0, 0), (0, 5), (4, 0), (4, 5)] {
+            let mut grid = CellGrid::new(rows, cols);
+            for row in 0..rows {
+                for col in 0..cols {
+                    grid.set_cell(
+                        row,
+                        col,
+                        Cell::with_char((b'a' + (row * cols + col) as u8) as char),
+                    );
+                }
+            }
+            for _ in 0..9 {
+                if rows > 0 {
+                    grid.shift_rows(0, 1, rows - 1);
+                }
+                grid.clear_dirty();
+                let before = grid.clone();
+                for row in 0..rows {
+                    let expected: Vec<_> =
+                        (0..cols).map(|col| *grid.get_cell(row, col).unwrap()).collect();
+                    assert_eq!(grid.row_cells(row), Some(expected.as_slice()));
+                }
+                assert_eq!(grid.row_cells(rows), None);
+                assert_eq!(grid.row_cells(usize::MAX), None);
+                assert_eq!(grid, before);
+            }
         }
     }
 

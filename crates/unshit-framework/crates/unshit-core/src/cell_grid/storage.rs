@@ -91,6 +91,15 @@ impl Storage {
         self.origin = 0;
     }
 
+    pub(super) fn row_cells(&self, row: usize) -> &[Cell] {
+        if self.cols == 0 {
+            return &[];
+        }
+        // Rows remain physically contiguous even when their logical order wraps.
+        let start = self.physical_index(row * self.cols);
+        &self.cells[start..start + self.cols]
+    }
+
     pub(super) fn fill_row(&mut self, row: usize, cell: Cell) {
         self.contiguous.take();
         // The origin and every row start are column-aligned, so even a

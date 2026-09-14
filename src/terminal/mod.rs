@@ -1664,10 +1664,11 @@ impl Terminal {
 
         // Only the full-screen region feeds scrollback.
         if self.region_is_full_screen() {
-            let mut row = Vec::with_capacity(self.cols);
-            for col in 0..self.cols {
-                row.push(self.grid.get_cell(top, col).copied().unwrap_or_default());
-            }
+            let row = self
+                .grid
+                .row_cells(top)
+                .expect("full-screen scroll row must be inside the grid")
+                .to_vec();
             self.scrollback.push_back(row);
             if self.scrollback.len() > MAX_SCROLLBACK {
                 self.scrollback.pop_front();
