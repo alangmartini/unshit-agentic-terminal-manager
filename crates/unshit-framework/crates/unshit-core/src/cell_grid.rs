@@ -12,6 +12,8 @@ use std::time::Instant;
 use crate::style::types::Color;
 use bitflags::bitflags;
 
+mod storage;
+
 /// Global cell metrics published by the renderer. Application code reads
 /// these to compute PTY column/row counts that match the renderer exactly.
 static GLOBAL_CELL_W: AtomicU32 = AtomicU32::new(0);
@@ -298,7 +300,7 @@ impl BgRun {
 pub struct CellGrid {
     rows: usize,
     cols: usize,
-    cells: Vec<Cell>,
+    cells: storage::Storage,
     /// Per-cell dirty bits. When a cell is modified via `set_cell`, its
     /// corresponding entry is set to `true`. The renderer reads and clears
     /// these to determine which cells need re-batching.
@@ -466,7 +468,7 @@ impl CellGrid {
         Self {
             rows,
             cols,
-            cells: vec![Cell::default(); len],
+            cells: storage::Storage::new(vec![Cell::default(); len], cols),
             dirty: vec![true; len],
             line_damage,
             line_ids,
@@ -549,7 +551,7 @@ impl CellGrid {
             let n = src.len().min(self.cols);
             new_row[..n].copy_from_slice(&src[..n]);
         }
-        self.cells.splice(0..0, new_row);
+        self.cells.prepend_row(new_row);
         self.dirty.splice(0..0, std::iter::repeat_n(true, self.cols));
         let mut damage = LineDamage::default();
         damage.mark_range(0, Self::last_col_u16(self.cols));
@@ -559,9 +561,10 @@ impl CellGrid {
         self.cursor_row = (self.cursor_row + 1).min(self.rows.saturating_sub(1));
     }
 
-    /// Access the underlying cell slice (read-only).
+    /// Access cells in logical row order (read-only). A wrapped live grid
+    /// materializes a contiguous view once; cloned snapshots are already contiguous.
     pub fn cells(&self) -> &[Cell] {
-        &self.cells
+        self.cells.as_slice()
     }
 
     /// Access the dirty-tracking slice (read-only).
@@ -984,7 +987,7 @@ impl CellGrid {
         self.cells.copy_within(shift..total, 0);
 
         let clear_start = total - shift;
-        self.cells[clear_start..].fill(Cell::default());
+        self.cells.fill_from(clear_start, Cell::default());
 
         self.dirty.fill(true);
 
@@ -1029,7 +1032,7 @@ impl CellGrid {
             let src_start = r * self.cols;
             let dst_start = r * new_cols;
             new_cells[dst_start..dst_start + copy_cols]
-                .copy_from_slice(&self.cells[src_start..src_start + copy_cols]);
+                .copy_from_slice(&self.cells.as_slice()[src_start..src_start + copy_cols]);
         }
 
         // Preserve line identity for rows that survive the resize. New rows
@@ -1046,7 +1049,7 @@ impl CellGrid {
 
         self.rows = new_rows;
         self.cols = new_cols;
-        self.cells = new_cells;
+        self.cells = storage::Storage::new(new_cells, new_cols);
         self.dirty = vec![true; new_rows * new_cols];
         // Rebuild `line_damage` sized to `new_rows` and mark every row fully
         // damaged with a fresh seqno so renderers re-render regardless of
@@ -1060,6 +1063,70 @@ impl CellGrid {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn wrapped_scroll_snapshots_survive_mutation_resize_and_overscan() {
+        let mut grid = CellGrid::new(4, 5);
+        let mut expected = vec![Cell::default(); 20];
+        for step in 0..13 {
+            grid.clear_dirty();
+            let ids = grid.line_ids().to_vec();
+            grid.scroll_up(1);
+            expected.copy_within(5..20, 0);
+            expected[15..].fill(Cell::default());
+            assert_eq!(grid.cells(), expected);
+            assert_eq!(&grid.line_ids()[..3], &ids[1..]);
+            assert!(!ids.contains(&grid.line_ids()[3]));
+            assert!(grid.dirty_flags().iter().all(|dirty| *dirty));
+            assert!(grid.line_damage()[..3].iter().all(LineDamage::is_clean));
+            assert_eq!(grid.line_damage()[3].first_dirty_col, 0);
+            assert_eq!(grid.line_damage()[3].last_dirty_col, 4);
+            let snapshot = grid.clone();
+            let cell = Cell::with_char(char::from_u32(65 + step).unwrap());
+            grid.set_cell(3, 2, cell);
+            expected[17] = cell;
+            assert_eq!(grid.cells(), expected);
+            assert_eq!(snapshot.get_cell(3, 2), Some(&Cell::default()));
+            assert_eq!(grid.get_cell(3, 2), Some(&cell));
+        }
+        let kept_ids = grid.line_ids().to_vec();
+        grid.resize(6, 7);
+        let mut resized = vec![Cell::default(); 42];
+        for row in 0..4 {
+            resized[row * 7..row * 7 + 5].copy_from_slice(&expected[row * 5..row * 5 + 5]);
+        }
+        assert_eq!(grid.cells(), resized);
+        assert_eq!(&grid.line_ids()[..4], kept_ids);
+        assert!(grid.dirty_flags().iter().all(|dirty| *dirty));
+        assert!(grid.line_damage().iter().all(|damage| !damage.is_clean()));
+        let ids = grid.line_ids().to_vec();
+        let overscan = vec![Cell::with_char('O'); 7];
+        grid.insert_overscan_row_top(Some(&overscan), u64::MAX);
+        resized.splice(0..0, overscan);
+        assert_eq!(grid.cells(), resized);
+        assert_eq!(grid.line_ids()[0], u64::MAX);
+        assert_eq!(&grid.line_ids()[1..], ids);
+        assert_eq!(grid.rows(), 7);
+        assert!(grid.dirty_flags()[..7].iter().all(|dirty| *dirty));
+        assert!(!grid.line_damage()[0].is_clean());
+    }
+
+    #[test]
+    fn zero_dimension_grids_can_scroll_resize_and_insert_overscan() {
+        for (rows, cols) in [(0, 5), (4, 0), (0, 0)] {
+            let mut grid = CellGrid::new(rows, cols);
+            grid.scroll_up(1);
+            grid.shift_rows(0, 1, 3);
+            assert!(grid.cells().is_empty());
+            grid.insert_overscan_row_top(None, u64::MAX);
+            assert_eq!(grid.cells().len(), cols);
+            grid.resize(3, 4);
+            assert_eq!(grid.cells(), vec![Cell::default(); 12]);
+            grid.scroll_up(1);
+            grid.set_cell(2, 3, Cell::with_char('x'));
+            assert_eq!(grid.cells()[11], Cell::with_char('x'));
+        }
+    }
     use super::*;
 
     #[test]
