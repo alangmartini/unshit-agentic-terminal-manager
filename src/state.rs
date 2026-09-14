@@ -7666,6 +7666,16 @@ pub fn apply_flow_poll(
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
+    if command == "review.patch_open" {
+        let start_dir = active_workspace_cwd(state);
+        return spawn_file_picker(
+            state,
+            "Open patch",
+            Some(("Patch files", &["patch", "diff"])),
+            start_dir,
+            |path| format!("review.patch:{}", path.display()),
+        );
+    }
     if command.starts_with("review.") {
         return crate::diff_review::dispatch(state, command);
     }
