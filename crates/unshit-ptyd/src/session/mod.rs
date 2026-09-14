@@ -133,8 +133,10 @@ pub struct Session {
 struct PtyPair {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
+    master: SharedMaster,
 }
+
+type SharedMaster = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
 
 struct OutputState {
     current: Option<OutputSink>,
@@ -144,9 +146,6 @@ struct OutputState {
     /// atomic decision: an attach either installs its sender before shutdown
     /// clears it, or observes a closed reader and fails.
     reader_open: bool,
-    /// The sole reader has parsed a chunk whose delivery has not finished.
-    pending_delivery: bool,
-    last_progress: std::time::Instant,
 }
 
 struct OutputSink {
@@ -280,6 +279,10 @@ impl Session {
             .try_clone_reader()
             .map_err(std::io::Error::other)?;
         let writer = pty.master.take_writer().map_err(std::io::Error::other)?;
+        // The slave also owns the pseudoconsole. Release it before starting
+        // the exit watcher so taking the master really initiates shutdown.
+        drop(pty.slave);
+        let master = Arc::new(Mutex::new(Some(pty.master)));
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
 
@@ -295,8 +298,6 @@ impl Session {
             current: Some(OutputSink::new(attachment_token, tx)),
             next_token: 2,
             reader_open: true,
-            pending_delivery: false,
-            last_progress: std::time::Instant::now(),
         }));
         let reader_output = Arc::clone(&output);
 
@@ -304,14 +305,14 @@ impl Session {
             run_reader(reader, reader_output, reader_terminal);
         });
         let child_watch_task =
-            tokio::spawn(watch_child_exit(Arc::clone(&child), Arc::clone(&output)));
+            tokio::spawn(watch_child_exit(Arc::clone(&child), Arc::clone(&master)));
 
         let session = Self {
             id,
             pty: Some(PtyPair {
                 child,
                 writer,
-                master: pty.master,
+                master,
             }),
             cols,
             rows,
@@ -356,8 +357,8 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !output.reader_open || !self.child_running() {
-            output.reader_open = false;
-            output.current = None;
+            // A rejected late attachment must not cancel the existing
+            // receiver while it drains the exited child's final output.
             return None;
         }
         let token = output.next_token;
@@ -408,7 +409,17 @@ impl Session {
                 pixel_width: 0,
                 pixel_height: 0,
             };
-            if pty.master.resize(new_size).is_ok() {
+            let resized = pty
+                .master
+                .lock()
+                .ok()
+                .and_then(|master| {
+                    master
+                        .as_ref()
+                        .map(|master| master.resize(new_size).is_ok())
+                })
+                .unwrap_or(false);
+            if resized {
                 self.cols = cols;
                 self.rows = rows;
                 if let Ok(mut term) = self.terminal.lock() {
@@ -446,7 +457,7 @@ impl Session {
             }
             // Explicitly drop the writer/master so the reader sees EOF.
             drop(pty.writer);
-            drop(pty.master);
+            close_master(&pty.master);
         }
         if let Some(handle) = self.reader_task.take() {
             handle.abort();
@@ -654,47 +665,31 @@ fn run_reader(
     close_output(&output);
 }
 
-async fn watch_child_exit(
-    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-    output: Arc<Mutex<OutputState>>,
-) {
+async fn watch_child_exit(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>, master: SharedMaster) {
     loop {
         let exited = match child.lock() {
             Ok(mut child) => !matches!(child.try_wait(), Ok(None)),
             Err(_) => true,
         };
         if exited {
-            // ConPTY may never report EOF after the primary child exits.
-            // Close after a quiet drain window, but not while a slow client
-            // holds a pending delivery. Detach/kill can still cancel it.
-            // This remains a fallback heuristic, not proof of native-pipe EOF.
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if close_idle_output(&output) {
-                    break;
-                }
-            }
+            // ClosePseudoConsole can emit final output and block while it
+            // drains on older Windows. The independent reader keeps running
+            // and alone closes the output channel on real EOF/error.
+            let _ = tokio::task::spawn_blocking(move || close_master(&master)).await;
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
-fn close_idle_output(output: &Arc<Mutex<OutputState>>) -> bool {
-    let mut output = output
+fn close_master(master: &SharedMaster) {
+    let master = master
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !output.reader_open {
-        return true;
-    }
-    if output.pending_delivery
-        || output.last_progress.elapsed() < std::time::Duration::from_millis(100)
-    {
-        return false;
-    }
-    output.reader_open = false;
-    output.current = None;
-    true
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    // Never hold the ownership mutex during platform teardown: resize and
+    // explicit kill must be able to observe that shutdown has already begun.
+    drop(master);
 }
 
 fn close_output(output: &Arc<Mutex<OutputState>>) {
@@ -720,14 +715,11 @@ fn run_reader_inner(
                         continue;
                     };
                     term.process_bytes(&buf[..n]);
-                    output.lock().ok().and_then(|mut guard| {
-                        guard.last_progress = std::time::Instant::now();
-                        let sink = guard
+                    output.lock().ok().and_then(|guard| {
+                        guard
                             .current
                             .as_ref()
-                            .map(|sink| (sink.tx.clone(), sink.cancellation.subscribe()));
-                        guard.pending_delivery = sink.is_some();
-                        sink
+                            .map(|sink| (sink.tx.clone(), sink.cancellation.subscribe()))
                     })
                 };
                 if let Some((tx, mut cancelled)) = tx_opt {
@@ -744,10 +736,6 @@ fn run_reader_inner(
                                 _ = cancelled.changed() => {},
                             }
                         });
-                    }
-                    if let Ok(mut guard) = output.lock() {
-                        guard.pending_delivery = false;
-                        guard.last_progress = std::time::Instant::now();
                     }
                 }
             }
@@ -791,8 +779,6 @@ mod tests {
             current: Some(OutputSink::new(1, tx)),
             next_token: 2,
             reader_open: true,
-            pending_delivery: false,
-            last_progress: std::time::Instant::now(),
         }));
         let terminal = Arc::new(Mutex::new(Terminal::new(2, 10, 0)));
         let reader_output = Arc::clone(&output);
@@ -808,11 +794,6 @@ mod tests {
                 .await
                 .is_err(),
             "a full queue must hold pending output instead of dropping it"
-        );
-        output.lock().unwrap().last_progress = std::time::Instant::now() - Duration::from_secs(1);
-        assert!(
-            !close_idle_output(&output),
-            "exit must not cancel a pending delivery"
         );
         assert_eq!(rx.recv().await.unwrap(), b"head");
         assert_eq!(rx.recv().await.unwrap(), b"tail");
@@ -840,8 +821,6 @@ mod tests {
             current: Some(OutputSink::new(1, tx)),
             next_token: 2,
             reader_open: true,
-            pending_delivery: false,
-            last_progress: std::time::Instant::now(),
         }));
         let terminal = Arc::new(Mutex::new(Terminal::new(2, 10, 0)));
         let reader_output = Arc::clone(&output);
@@ -900,24 +879,6 @@ mod tests {
     #[tokio::test]
     async fn shutdown_releases_a_reader_waiting_on_a_full_queue() {
         cancel_full_output_queue(false, true).await;
-    }
-
-    #[test]
-    fn child_exit_waits_for_a_quiet_output_window() {
-        let (tx, _rx) = mpsc::channel(1);
-        let output = Arc::new(Mutex::new(OutputState {
-            current: Some(OutputSink::new(1, tx)),
-            next_token: 2,
-            reader_open: true,
-            pending_delivery: false,
-            last_progress: std::time::Instant::now(),
-        }));
-        assert!(!close_idle_output(&output));
-        output.lock().unwrap().last_progress = std::time::Instant::now() - Duration::from_secs(1);
-        assert!(close_idle_output(&output));
-        let output = output.lock().unwrap();
-        assert!(!output.reader_open);
-        assert!(output.current.is_none());
     }
 
     /// Drains the receiver for up to `timeout` ms, returning the
@@ -1082,6 +1043,84 @@ mod tests {
             "natural PTY EOF must close the output channel even while the Session remains registered"
         );
 
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_exit_preserves_tail_while_terminal_parser_is_busy() {
+        #[cfg(windows)]
+        let (shell, args) = (
+            "powershell.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Start-Sleep -Milliseconds 200; [Console]::Write('exit-tail-marker')".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (shell, args) = (
+            "/bin/sh",
+            vec!["-c".into(), "sleep 0.2; printf exit-tail-marker".into()],
+        );
+        let (mut session, _token, mut rx) =
+            Session::spawn(6, 80, 24, None, Some(shell), &args, 0, 0, None).unwrap();
+        // A busy parser/snapshot must not let child exit close the stream
+        // before the reader can parse and forward bytes it already read.
+        let terminal = Arc::clone(&session.terminal);
+        let guard = terminal.lock().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while session.child_running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.child_running());
+        std::thread::sleep(Duration::from_millis(300));
+        drop(guard);
+        let bytes = drain_for(&mut rx, Duration::from_secs(5)).await;
+        assert!(String::from_utf8_lossy(&bytes).contains("exit-tail-marker"));
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .is_none());
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_late_attach_preserves_the_existing_final_drain() {
+        #[cfg(windows)]
+        let (shell, args) = (
+            "powershell.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Start-Sleep -Milliseconds 200; [Console]::Write('late-attach-tail')".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (shell, args) = (
+            "/bin/sh",
+            vec!["-c".into(), "sleep 0.2; printf late-attach-tail".into()],
+        );
+        let (mut session, _token, mut rx) =
+            Session::spawn(7, 80, 24, None, Some(shell), &args, 0, 0, None).unwrap();
+        {
+            let output = session.output.lock().unwrap();
+            let tx = &output.current.as_ref().unwrap().tx;
+            while tx.try_send(b"queued".to_vec()).is_ok() {}
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while session.child_running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.child_running());
+        assert!(session.attach().is_none());
+        let bytes = drain_for(&mut rx, Duration::from_secs(5)).await;
+        assert!(String::from_utf8_lossy(&bytes).contains("late-attach-tail"));
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .is_none());
         session.kill();
     }
 
@@ -1375,8 +1414,6 @@ mod tests {
             current: Some(OutputSink::new(1, tx)),
             next_token: 2,
             reader_open: true,
-            pending_delivery: false,
-            last_progress: std::time::Instant::now(),
         }));
 
         // Call directly on the current thread so any escaped panic
