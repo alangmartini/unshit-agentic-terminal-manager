@@ -13,7 +13,7 @@ name = "unshit_terminal_core"
 path = "src/lib.rs"
 
 [dependencies]
-vte = "0.13"
+vte = "0.15"
 bitflags = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 

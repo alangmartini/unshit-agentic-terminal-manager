@@ -173,10 +173,8 @@ impl Terminal {
 
     pub fn process_bytes(&mut self, bytes: &[u8]) {
         let mut parser = std::mem::take(&mut self.parser);
-        for &byte in bytes {
-            let mut performer = Performer { terminal: self };
-            parser.advance(&mut performer, byte);
-        }
+        let mut performer = Performer { terminal: self };
+        parser.advance(&mut performer, bytes);
         self.parser = parser;
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
@@ -461,7 +459,14 @@ struct Performer<'a> {
 
 impl Perform for Performer<'_> {
     fn print(&mut self, c: char) {
-        self.terminal.put_char(c);
+        // VTE 0.15 routes a split UTF-8 C1 codepoint through print, while
+        // ground_dispatch routes an unsplit one through execute. Normalize
+        // the callback so PTY read boundaries cannot change terminal state.
+        if matches!(c, '\u{80}'..='\u{9f}') {
+            self.execute(c as u8);
+        } else {
+            self.terminal.put_char(c);
+        }
     }
 
     fn execute(&mut self, byte: u8) {
@@ -859,6 +864,28 @@ fn reset_attrs(t: &mut Terminal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_controls_and_escape_sequences_are_independent_of_chunk_boundaries() {
+        let mut input = String::from("\u{e9}\u{754c}\u{1f600}\x1b[31m");
+        for code in 0x80..=0x9f {
+            input.push('A');
+            input.push(char::from_u32(code).unwrap());
+            input.push('B');
+        }
+        input.push_str("\x1b[0m\x1b]2;title\u{754c}\x07\x1b[>c");
+        let parse = |chunk_size| {
+            let mut terminal = Terminal::new(2, 80, 100);
+            for chunk in input.as_bytes().chunks(chunk_size) {
+                terminal.process_bytes(chunk);
+            }
+            (terminal.grid().clone(), terminal.take_pending_response())
+        };
+        let expected = parse(input.len());
+        for chunk_size in 1..input.len() {
+            assert_eq!(parse(chunk_size), expected, "chunk size {chunk_size}");
+        }
+    }
 
     fn row_text(t: &Terminal, row: usize) -> String {
         let cells = t.grid().row(row).unwrap();
