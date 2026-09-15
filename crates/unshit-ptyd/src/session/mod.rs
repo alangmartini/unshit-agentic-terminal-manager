@@ -18,18 +18,22 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use unshit_terminal_core::{Snapshot, Terminal};
 
 /// Default scrollback cap per session. Matches SPEC.md section 3 F3.
 const DEFAULT_SCROLLBACK: usize = 10_000;
 
-/// Size of the read buffer fed into the mpsc. Matches the value used
-/// elsewhere in the UI bridge so throughput characteristics do not drift
-/// between slice 3a (daemon owns PTYs, UI still in-process) and later
-/// slices.
-const READ_BUF_LEN: usize = 4096;
+/// Consume large host writes in one read when available. Reads still return
+/// immediately for short interactive output; this is a capacity, not a minimum.
+/// The 64-message output channel can retain at most 4 MiB of these chunks.
+const READ_BUF_LEN: usize = 64 * 1024;
+
+/// Bound queued read-ahead to 512 KiB per session. The native scratch buffer,
+/// pending send, and parsed chunk each add at most 64 KiB. The existing
+/// output queue is separate.
+const READ_AHEAD_CHUNKS: usize = 8;
 
 pub const ENV_NOTIFY_SOCKET: &str = "TM_NOTIFY_SOCKET";
 pub const ENV_WORKSPACE_ID: &str = "TM_WORKSPACE_ID";
@@ -134,8 +138,10 @@ pub struct Session {
 struct PtyPair {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
+    master: SharedMaster,
 }
+
+type SharedMaster = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
 
 struct OutputState {
     current: Option<OutputSink>,
@@ -150,6 +156,20 @@ struct OutputState {
 struct OutputSink {
     token: AttachmentToken,
     tx: mpsc::Sender<Vec<u8>>,
+    // The sink owns the sole sender. Replacing or removing it cancels any
+    // reader waiting to deliver to this attachment, even if its receiver lives.
+    cancellation: watch::Sender<()>,
+}
+
+impl OutputSink {
+    fn new(token: AttachmentToken, tx: mpsc::Sender<Vec<u8>>) -> Self {
+        let (cancellation, _) = watch::channel(());
+        Self {
+            token,
+            tx,
+            cancellation,
+        }
+    }
 }
 
 impl Session {
@@ -264,6 +284,10 @@ impl Session {
             .try_clone_reader()
             .map_err(std::io::Error::other)?;
         let writer = pty.master.take_writer().map_err(std::io::Error::other)?;
+        // The slave also owns the pseudoconsole. Release it before starting
+        // the exit watcher so taking the master really initiates shutdown.
+        drop(pty.slave);
+        let master = Arc::new(Mutex::new(Some(pty.master)));
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
 
@@ -276,10 +300,7 @@ impl Session {
 
         let attachment_token = 1;
         let output = Arc::new(Mutex::new(OutputState {
-            current: Some(OutputSink {
-                token: attachment_token,
-                tx,
-            }),
+            current: Some(OutputSink::new(attachment_token, tx)),
             next_token: 2,
             reader_open: true,
         }));
@@ -289,14 +310,14 @@ impl Session {
             run_reader(reader, reader_output, reader_terminal);
         });
         let child_watch_task =
-            tokio::spawn(watch_child_exit(Arc::clone(&child), Arc::clone(&output)));
+            tokio::spawn(watch_child_exit(Arc::clone(&child), Arc::clone(&master)));
 
         let session = Self {
             id,
             pty: Some(PtyPair {
                 child,
                 writer,
-                master: pty.master,
+                master,
             }),
             cols,
             rows,
@@ -315,8 +336,8 @@ impl Session {
     }
 
     /// Replaces the current output sender with a fresh channel and
-    /// returns the matching receiver. Any prior receiver is dropped;
-    /// the reader stops forwarding to it on the next chunk.
+    /// returns the matching receiver. A reader waiting on the prior
+    /// attachment is released; subsequent chunks use the new attachment.
     pub fn attach(&self) -> Option<(AttachmentToken, mpsc::Receiver<Vec<u8>>)> {
         self.attach_with_snapshot(0)
             .map(|(token, _snapshot, output)| (token, output))
@@ -341,15 +362,15 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !output.reader_open || !self.child_running() {
-            output.reader_open = false;
-            output.current = None;
+            // A rejected late attachment must not cancel the existing
+            // receiver while it drains the exited child's final output.
             return None;
         }
         let token = output.next_token;
         output.next_token = token
             .checked_add(1)
             .expect("session attachment token space exhausted");
-        output.current = Some(OutputSink { token, tx });
+        output.current = Some(OutputSink::new(token, tx));
         let snapshot = terminal.snapshot(scrollback_lines);
         Some((token, snapshot, rx))
     }
@@ -393,7 +414,17 @@ impl Session {
                 pixel_width: 0,
                 pixel_height: 0,
             };
-            if pty.master.resize(new_size).is_ok() {
+            let resized = pty
+                .master
+                .lock()
+                .ok()
+                .and_then(|master| {
+                    master
+                        .as_ref()
+                        .map(|master| master.resize(new_size).is_ok())
+                })
+                .unwrap_or(false);
+            if resized {
                 self.cols = cols;
                 self.rows = rows;
                 if let Ok(mut term) = self.terminal.lock() {
@@ -418,6 +449,9 @@ impl Session {
     ///
     /// Safe to call multiple times; subsequent calls are no-ops.
     pub fn kill(&mut self) {
+        // Release a reader waiting on client capacity before PTY teardown,
+        // which can itself wait for the output pipe to drain on Windows.
+        close_output(&self.output);
         if let Some(handle) = self.child_watch_task.take() {
             handle.abort();
         }
@@ -428,12 +462,11 @@ impl Session {
             }
             // Explicitly drop the writer/master so the reader sees EOF.
             drop(pty.writer);
-            drop(pty.master);
+            close_master(&pty.master);
         }
         if let Some(handle) = self.reader_task.take() {
             handle.abort();
         }
-        close_output(&self.output);
     }
 
     /// Reports whether the child is still running.
@@ -637,27 +670,31 @@ fn run_reader(
     close_output(&output);
 }
 
-async fn watch_child_exit(
-    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-    output: Arc<Mutex<OutputState>>,
-) {
+async fn watch_child_exit(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>, master: SharedMaster) {
     loop {
         let exited = match child.lock() {
             Ok(mut child) => !matches!(child.try_wait(), Ok(None)),
             Err(_) => true,
         };
         if exited {
-            // Give the reader a bounded window to drain output the child
-            // wrote immediately before exit. Unix PTYs usually reach EOF in
-            // this window and close themselves; ConPTY may keep the read
-            // pending until the pseudoconsole is torn down, so the watcher
-            // still provides the eventual close required by the UI.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            close_output(&output);
+            // ClosePseudoConsole can emit final output and block while it
+            // drains on older Windows. The independent reader keeps running
+            // and alone closes the output channel on real EOF/error.
+            let _ = tokio::task::spawn_blocking(move || close_master(&master)).await;
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+fn close_master(master: &SharedMaster) {
+    let master = master
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    // Never hold the ownership mutex during platform teardown: resize and
+    // explicit kill must be able to observe that shutdown has already begun.
+    drop(master);
 }
 
 fn close_output(output: &Arc<Mutex<OutputState>>) {
@@ -669,35 +706,84 @@ fn close_output(output: &Arc<Mutex<OutputState>>) {
 }
 
 fn run_reader_inner(
-    mut reader: Box<dyn Read + Send>,
+    reader: Box<dyn Read + Send>,
     output: Arc<Mutex<OutputState>>,
     terminal: Arc<Mutex<Terminal>>,
 ) {
+    let (read_tx, read_rx) = std::sync::mpsc::sync_channel(READ_AHEAD_CHUNKS);
+    let native_reader = match std::thread::Builder::new()
+        .name("pty-read-ahead".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_pty_chunks(reader, read_tx);
+            }));
+            if let Err(payload) = result {
+                log::error!(
+                    "native PTY reader panicked: {}",
+                    panic_payload_str(&payload)
+                );
+            }
+        }) {
+        Ok(thread) => thread,
+        Err(error) => {
+            log::error!("could not start native PTY reader: {error}");
+            return;
+        }
+    };
+
+    // Only parsing publishes data. Native read-ahead does not change snapshot
+    // boundaries: the terminal and attachment locks still select the sink for
+    // each parsed chunk. Dropping this receiver also releases a queued sender.
+    for bytes in read_rx {
+        let tx_opt = {
+            let Ok(mut term) = terminal.lock() else {
+                continue;
+            };
+            term.process_bytes(&bytes);
+            output.lock().ok().and_then(|guard| {
+                guard
+                    .current
+                    .as_ref()
+                    .map(|sink| (sink.tx.clone(), sink.cancellation.subscribe()))
+            })
+        };
+        if let Some((tx, mut cancelled)) = tx_opt {
+            if let Err(mpsc::error::TrySendError::Full(bytes)) = tx.try_send(bytes) {
+                // Wait outside both locks. Attachment already includes this
+                // chunk, so cancellation must not resend it to a new sink.
+                tokio::runtime::Handle::current().block_on(async {
+                    tokio::select! {
+                        _ = tx.send(bytes) => {},
+                        _ = cancelled.changed() => {},
+                    }
+                });
+            }
+        }
+    }
+    // Channel EOF means every queued chunk was processed and the native
+    // reader has dropped its sender. Joining cannot wait on another read.
+    // On a parser panic, unwinding instead drops the receiver and detaches
+    // the thread: generic Read cannot be interrupted here. Session teardown
+    // closes the PTY handles; run_reader must close output without waiting.
+    if let Err(payload) = native_reader.join() {
+        log::error!(
+            "native PTY reader thread failed: {}",
+            panic_payload_str(&payload)
+        );
+    }
+}
+
+fn read_pty_chunks(mut reader: Box<dyn Read + Send>, tx: std::sync::mpsc::SyncSender<Vec<u8>>) {
     let mut buf = vec![0u8; READ_BUF_LEN];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => {
-                let tx_opt = {
-                    let Ok(mut term) = terminal.lock() else {
-                        continue;
-                    };
-                    term.process_bytes(&buf[..n]);
-                    output
-                        .lock()
-                        .ok()
-                        .and_then(|guard| guard.current.as_ref().map(|sink| sink.tx.clone()))
-                };
-                if let Some(tx) = tx_opt {
-                    // Non-blocking: if the current client is slow or gone
-                    // we drop the chunk and rely on the terminal plus
-                    // scrollback as the source of truth. Never exit the
-                    // reader when the receiver is gone; a later attach
-                    // should still observe live output.
-                    let _ = tx.try_send(buf[..n].to_vec());
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    return;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return,
         }
     }
@@ -727,6 +813,233 @@ mod tests {
         {
             "/bin/sh"
         }
+    }
+
+    #[test]
+    fn dropping_read_ahead_receiver_releases_a_full_native_queue() {
+        struct RepeatingReader(std::sync::mpsc::Sender<()>);
+        impl Read for RepeatingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf[0] = b'x';
+                let _ = self.0.send(());
+                Ok(1)
+            }
+        }
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            read_pty_chunks(Box::new(RepeatingReader(progress_tx)), tx);
+            let _ = done_tx.send(());
+        });
+        for _ in 0..2 {
+            progress_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("native read");
+        }
+        // One chunk is queued and another is waiting to send. Consumer
+        // unwinding must release the producer without draining either chunk.
+        drop(rx);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("native reader exits");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn native_reader_panic_preserves_already_queued_output() {
+        struct PanicAfterTail(bool);
+        impl Read for PanicAfterTail {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(!self.0, "synthetic native reader failure after tail");
+                self.0 = true;
+                let tail = b"tail-before-panic";
+                buf[..tail.len()].copy_from_slice(tail);
+                Ok(tail.len())
+            }
+        }
+        let terminal = Arc::new(Mutex::new(Terminal::new(24, 80, 0)));
+        let (tx, mut rx) = mpsc::channel(4);
+        let output = Arc::new(Mutex::new(OutputState {
+            current: Some(OutputSink::new(1, tx)),
+            next_token: 2,
+            reader_open: true,
+        }));
+        run_reader(
+            Box::new(PanicAfterTail(false)),
+            Arc::clone(&output),
+            Arc::clone(&terminal),
+        );
+        assert_eq!(rx.try_recv().unwrap(), b"tail-before-panic");
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
+        assert!(grid_text(&terminal.lock().unwrap().snapshot(0)).contains("tail-before-panic"));
+        assert!(!output.lock().unwrap().reader_open);
+    }
+
+    #[test]
+    fn blocked_parser_allows_bounded_native_read_ahead() {
+        struct CountingReader {
+            remaining: usize,
+            progress: std::sync::mpsc::Sender<usize>,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Ok(0);
+                }
+                self.remaining -= 1;
+                buf.fill(b'x');
+                let _ = self.progress.send(buf.len());
+                Ok(buf.len())
+            }
+        }
+        let terminal = Arc::new(Mutex::new(Terminal::new(24, 80, 0)));
+        let output = Arc::new(Mutex::new(OutputState {
+            current: None,
+            next_token: 1,
+            reader_open: true,
+        }));
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let terminal_guard = terminal.lock().unwrap();
+        let reader_terminal = Arc::clone(&terminal);
+        let worker = std::thread::spawn(move || {
+            run_reader(
+                Box::new(CountingReader {
+                    remaining: 70,
+                    progress: progress_tx,
+                }),
+                output,
+                reader_terminal,
+            )
+        });
+        let first = progress_rx.recv_timeout(Duration::from_secs(2));
+        let mut reads = usize::from(first.is_ok());
+        let mut read_bytes = first.unwrap_or(0);
+        while let Ok(bytes) = progress_rx.recv_timeout(Duration::from_millis(200)) {
+            reads += 1;
+            read_bytes += bytes;
+        }
+        drop(terminal_guard);
+        worker
+            .join()
+            .expect("reader finishes after the parser is released");
+        assert!(reads > 1, "native reads must overlap a blocked parser");
+        // At most 512 KiB queued, one chunk held by the parser, and one
+        // native read waiting to enqueue. This also rejects unbounded prefetch.
+        assert!(
+            read_bytes <= 512 * 1024 + 2 * READ_BUF_LEN,
+            "read-ahead exceeded its memory bound: {read_bytes} bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_output_queue_preserves_pending_bytes_until_drained() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(b"head".to_vec()).unwrap();
+        let output = Arc::new(Mutex::new(OutputState {
+            current: Some(OutputSink::new(1, tx)),
+            next_token: 2,
+            reader_open: true,
+        }));
+        let terminal = Arc::new(Mutex::new(Terminal::new(2, 10, 0)));
+        let reader_output = Arc::clone(&output);
+        let mut task = tokio::task::spawn_blocking(move || {
+            run_reader(
+                Box::new(std::io::Cursor::new(b"tail")),
+                reader_output,
+                terminal,
+            );
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut task)
+                .await
+                .is_err(),
+            "a full queue must hold pending output instead of dropping it"
+        );
+        assert_eq!(rx.recv().await.unwrap(), b"head");
+        assert_eq!(rx.recv().await.unwrap(), b"tail");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rx.recv().await.is_none());
+    }
+
+    async fn cancel_full_output_queue(replace: bool, close: bool) {
+        struct Chunks(std::collections::VecDeque<Vec<u8>>);
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let Some(chunk) = self.0.pop_front() else {
+                    return Ok(0);
+                };
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+        }
+        let (tx, mut old_rx) = mpsc::channel(1);
+        tx.try_send(b"head".to_vec()).unwrap();
+        let output = Arc::new(Mutex::new(OutputState {
+            current: Some(OutputSink::new(1, tx)),
+            next_token: 2,
+            reader_open: true,
+        }));
+        let terminal = Arc::new(Mutex::new(Terminal::new(2, 10, 0)));
+        let reader_output = Arc::clone(&output);
+        let reader_terminal = Arc::clone(&terminal);
+        let mut task = tokio::task::spawn_blocking(move || {
+            run_reader(
+                Box::new(Chunks([b"old".to_vec(), b"new".to_vec()].into())),
+                reader_output,
+                reader_terminal,
+            );
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut task)
+            .await
+            .is_err());
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        // Match attach's atomic terminal -> output boundary. The old chunk
+        // belongs to this snapshot, so it must not also enter the new stream.
+        {
+            let terminal = terminal.lock().unwrap();
+            assert!(grid_text(&terminal.snapshot(0)).contains("old"));
+            let mut output = output.lock().unwrap();
+            if !close {
+                output.current = if replace {
+                    Some(OutputSink::new(2, new_tx))
+                } else {
+                    None
+                };
+            }
+        }
+        if close {
+            close_output(&output);
+        }
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_rx.recv().await.unwrap(), b"head");
+        assert!(old_rx.recv().await.is_none());
+        if replace {
+            assert_eq!(new_rx.recv().await.unwrap(), b"new");
+            assert!(new_rx.recv().await.is_none());
+        }
+        assert!(grid_text(&terminal.lock().unwrap().snapshot(0)).contains("oldnew"));
+    }
+
+    #[tokio::test]
+    async fn replacement_cancels_old_pending_delivery_without_replaying_snapshot_bytes() {
+        cancel_full_output_queue(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn detach_cancels_pending_delivery_while_old_receiver_stays_alive() {
+        cancel_full_output_queue(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_a_reader_waiting_on_a_full_queue() {
+        cancel_full_output_queue(false, true).await;
     }
 
     /// Drains the receiver for up to `timeout` ms, returning the
@@ -882,8 +1195,18 @@ mod tests {
             Session::spawn(5, 80, 24, None, Some(test_shell()), &shell_args, 0, 0, None)
                 .expect("spawn one-shot session");
 
+        // Act as the attached terminal, including replies to host queries.
+        // Modern ConPTY asks for DA1 before running the child; silently
+        // discarding that query incurs its three-second startup timeout.
+        let mut client_terminal = Terminal::new(24, 80, 0);
         let closed = tokio::time::timeout(Duration::from_secs(3), async {
-            while rx.recv().await.is_some() {}
+            while let Some(bytes) = rx.recv().await {
+                client_terminal.process_bytes(&bytes);
+                let response = client_terminal.take_pending_response();
+                if !response.is_empty() {
+                    session.write(&response).await.expect("reply to host query");
+                }
+            }
         })
         .await;
         assert!(
@@ -891,6 +1214,84 @@ mod tests {
             "natural PTY EOF must close the output channel even while the Session remains registered"
         );
 
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_exit_preserves_tail_while_terminal_parser_is_busy() {
+        #[cfg(windows)]
+        let (shell, args) = (
+            "powershell.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Start-Sleep -Milliseconds 200; [Console]::Write('exit-tail-marker')".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (shell, args) = (
+            "/bin/sh",
+            vec!["-c".into(), "sleep 0.2; printf exit-tail-marker".into()],
+        );
+        let (mut session, _token, mut rx) =
+            Session::spawn(6, 80, 24, None, Some(shell), &args, 0, 0, None).unwrap();
+        // A busy parser/snapshot must not let child exit close the stream
+        // before the reader can parse and forward bytes it already read.
+        let terminal = Arc::clone(&session.terminal);
+        let guard = terminal.lock().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while session.child_running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.child_running());
+        std::thread::sleep(Duration::from_millis(300));
+        drop(guard);
+        let bytes = drain_for(&mut rx, Duration::from_secs(5)).await;
+        assert!(String::from_utf8_lossy(&bytes).contains("exit-tail-marker"));
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .is_none());
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_late_attach_preserves_the_existing_final_drain() {
+        #[cfg(windows)]
+        let (shell, args) = (
+            "powershell.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Start-Sleep -Milliseconds 200; [Console]::Write('late-attach-tail')".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (shell, args) = (
+            "/bin/sh",
+            vec!["-c".into(), "sleep 0.2; printf late-attach-tail".into()],
+        );
+        let (mut session, _token, mut rx) =
+            Session::spawn(7, 80, 24, None, Some(shell), &args, 0, 0, None).unwrap();
+        {
+            let output = session.output.lock().unwrap();
+            let tx = &output.current.as_ref().unwrap().tx;
+            while tx.try_send(b"queued".to_vec()).is_ok() {}
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while session.child_running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.child_running());
+        assert!(session.attach().is_none());
+        let bytes = drain_for(&mut rx, Duration::from_secs(5)).await;
+        assert!(String::from_utf8_lossy(&bytes).contains("late-attach-tail"));
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .is_none());
         session.kill();
     }
 
@@ -1181,7 +1582,7 @@ mod tests {
         let terminal = Arc::new(Mutex::new(Terminal::new(24, 80, 0)));
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
         let output = Arc::new(Mutex::new(OutputState {
-            current: Some(OutputSink { token: 1, tx }),
+            current: Some(OutputSink::new(1, tx)),
             next_token: 2,
             reader_open: true,
         }));

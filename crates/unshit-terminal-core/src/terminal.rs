@@ -173,10 +173,8 @@ impl Terminal {
 
     pub fn process_bytes(&mut self, bytes: &[u8]) {
         let mut parser = std::mem::take(&mut self.parser);
-        for &byte in bytes {
-            let mut performer = Performer { terminal: self };
-            parser.advance(&mut performer, byte);
-        }
+        let mut performer = Performer { terminal: self };
+        parser.advance(&mut performer, bytes);
         self.parser = parser;
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
     }
@@ -281,10 +279,13 @@ impl Terminal {
     }
 
     fn scroll_up_and_capture(&mut self) {
-        let evicted = self.grid.scroll_up();
-        if !evicted.is_empty() {
-            self.scrollback.push(evicted);
+        if self.cols == 0 {
+            return;
         }
+        if let Some(row) = self.grid.row(0) {
+            self.scrollback.push_cells(row);
+        }
+        self.grid.scroll_up_discard();
     }
 
     fn clear_pending_wrap(&mut self) {
@@ -461,7 +462,14 @@ struct Performer<'a> {
 
 impl Perform for Performer<'_> {
     fn print(&mut self, c: char) {
-        self.terminal.put_char(c);
+        // VTE 0.15 routes a split UTF-8 C1 codepoint through print, while
+        // ground_dispatch routes an unsplit one through execute. Normalize
+        // the callback so PTY read boundaries cannot change terminal state.
+        if matches!(c, '\u{80}'..='\u{9f}') {
+            self.execute(c as u8);
+        } else {
+            self.terminal.put_char(c);
+        }
     }
 
     fn execute(&mut self, byte: u8) {
@@ -859,6 +867,65 @@ fn reset_attrs(t: &mut Terminal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_capture_reuse_matches_owned_capture_across_resizes_and_limits() {
+        for limit in [0, 1, 3] {
+            for (rows, cols) in [(0, 0), (4, 0), (1, 1), (4, 17)] {
+                let mut actual = Terminal::new(rows, cols, limit);
+                let mut expected = Terminal::new(rows, cols, limit);
+                for step in 0..30 {
+                    if step == 10 || step == 20 {
+                        let width = if step == 10 { 2 } else { 31 };
+                        actual.resize(rows, width);
+                        expected.resize(rows, width);
+                    }
+                    for row in 0..actual.rows {
+                        for col in 0..actual.cols {
+                            let cell = Cell {
+                                ch: char::from_u32(65 + step + row as u32).unwrap(),
+                                ..Cell::BLANK
+                            };
+                            actual.grid.set(row, col, cell);
+                            expected.grid.set(row, col, cell);
+                        }
+                    }
+                    actual.scroll_up_and_capture();
+                    let evicted = expected.grid.scroll_up();
+                    if !evicted.is_empty() {
+                        expected.scrollback.push(evicted);
+                    }
+                    assert_eq!(actual.snapshot(usize::MAX), expected.snapshot(usize::MAX));
+                    assert_eq!(
+                        actual.scrollback.max_lines(),
+                        expected.scrollback.max_lines()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_controls_and_escape_sequences_are_independent_of_chunk_boundaries() {
+        let mut input = String::from("\u{e9}\u{754c}\u{1f600}\x1b[31m");
+        for code in 0x80..=0x9f {
+            input.push('A');
+            input.push(char::from_u32(code).unwrap());
+            input.push('B');
+        }
+        input.push_str("\x1b[0m\x1b]2;title\u{754c}\x07\x1b[>c");
+        let parse = |chunk_size| {
+            let mut terminal = Terminal::new(2, 80, 100);
+            for chunk in input.as_bytes().chunks(chunk_size) {
+                terminal.process_bytes(chunk);
+            }
+            (terminal.grid().clone(), terminal.take_pending_response())
+        };
+        let expected = parse(input.len());
+        for chunk_size in 1..input.len() {
+            assert_eq!(parse(chunk_size), expected, "chunk size {chunk_size}");
+        }
+    }
 
     fn row_text(t: &Terminal, row: usize) -> String {
         let cells = t.grid().row(row).unwrap();
