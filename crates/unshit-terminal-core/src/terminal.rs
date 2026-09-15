@@ -279,10 +279,13 @@ impl Terminal {
     }
 
     fn scroll_up_and_capture(&mut self) {
-        let evicted = self.grid.scroll_up();
-        if !evicted.is_empty() {
-            self.scrollback.push(evicted);
+        if self.cols == 0 {
+            return;
         }
+        if let Some(row) = self.grid.row(0) {
+            self.scrollback.push_cells(row);
+        }
+        self.grid.scroll_up_discard();
     }
 
     fn clear_pending_wrap(&mut self) {
@@ -864,6 +867,43 @@ fn reset_attrs(t: &mut Terminal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_capture_reuse_matches_owned_capture_across_resizes_and_limits() {
+        for limit in [0, 1, 3] {
+            for (rows, cols) in [(0, 0), (4, 0), (1, 1), (4, 17)] {
+                let mut actual = Terminal::new(rows, cols, limit);
+                let mut expected = Terminal::new(rows, cols, limit);
+                for step in 0..30 {
+                    if step == 10 || step == 20 {
+                        let width = if step == 10 { 2 } else { 31 };
+                        actual.resize(rows, width);
+                        expected.resize(rows, width);
+                    }
+                    for row in 0..actual.rows {
+                        for col in 0..actual.cols {
+                            let cell = Cell {
+                                ch: char::from_u32(65 + step + row as u32).unwrap(),
+                                ..Cell::BLANK
+                            };
+                            actual.grid.set(row, col, cell);
+                            expected.grid.set(row, col, cell);
+                        }
+                    }
+                    actual.scroll_up_and_capture();
+                    let evicted = expected.grid.scroll_up();
+                    if !evicted.is_empty() {
+                        expected.scrollback.push(evicted);
+                    }
+                    assert_eq!(actual.snapshot(usize::MAX), expected.snapshot(usize::MAX));
+                    assert_eq!(
+                        actual.scrollback.max_lines(),
+                        expected.scrollback.max_lines()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn utf8_controls_and_escape_sequences_are_independent_of_chunk_boundaries() {

@@ -161,6 +161,13 @@ impl Grid {
         self.rows = new_rows;
     }
 
+    /// Advance the grid after the caller has captured any needed first-row data.
+    pub(crate) fn scroll_up_discard(&mut self) {
+        if self.rows > 0 && self.cols > 0 {
+            self.cells.advance_row(self.cols);
+        }
+    }
+
     pub fn scroll_up(&mut self) -> Vec<Cell> {
         if self.rows == 0 || self.cols == 0 {
             return Vec::new();
@@ -174,6 +181,33 @@ mod tests {
     use super::*;
     use crate::cell::CellAttrs;
     use crate::color::Color;
+
+    #[test]
+    fn scroll_without_capture_matches_capturing_scroll_through_rotations() {
+        for (rows, cols) in [(0, 0), (0, 5), (4, 0), (1, 1), (4, 5)] {
+            let mut actual = Grid::new(rows, cols);
+            let mut expected = actual.clone();
+            for step in 0..20 {
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let cell = Cell {
+                            ch: char::from_u32(65 + step + col as u32).unwrap(),
+                            ..Cell::BLANK
+                        };
+                        actual.set(row, col, cell);
+                        expected.set(row, col, cell);
+                    }
+                }
+                actual.scroll_up_discard();
+                let _ = expected.scroll_up();
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    bincode::serialize(&actual).unwrap(),
+                    bincode::serialize(&expected).unwrap()
+                );
+            }
+        }
+    }
 
     #[test]
     fn new_grid_is_blank_with_cursor_at_origin() {

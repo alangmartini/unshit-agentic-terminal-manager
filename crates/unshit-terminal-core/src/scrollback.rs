@@ -40,6 +40,28 @@ impl Scrollback {
         }
     }
 
+    /// Copy a row into history, reusing the oldest row's allocation when full.
+    /// Release oversized buffers after a width shrink; retain at most twice
+    /// the incoming width (with a four-cell minimum). Empty rows retain no allocation.
+    pub(crate) fn push_cells(&mut self, cells: &[Cell]) {
+        if self.max_lines == 0 {
+            return;
+        }
+        let mut line = if self.lines.len() >= self.max_lines {
+            self.lines.pop_front().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let capacity_limit = cells.len().saturating_mul(2).max(4);
+        if cells.is_empty() || line.capacity() > capacity_limit {
+            line = Vec::new();
+        } else {
+            line.clear();
+        }
+        line.extend_from_slice(cells);
+        self.push(line);
+    }
+
     pub fn lines(&self) -> impl Iterator<Item = &Vec<Cell>> {
         self.lines.iter()
     }
@@ -68,6 +90,89 @@ impl Scrollback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_push_matches_owned_push_across_limits_and_width_changes() {
+        for limit in [0, 1, 3, 10] {
+            let mut actual = Scrollback::new(limit);
+            let mut expected = Scrollback::new(limit);
+            for (step, width) in [0, 1, 8, 2, 17, 3, 0, 5]
+                .into_iter()
+                .cycle()
+                .take(80)
+                .enumerate()
+            {
+                let row = vec![
+                    Cell {
+                        ch: char::from_u32(65 + step as u32).unwrap(),
+                        ..Cell::BLANK
+                    };
+                    width
+                ];
+                actual.push_cells(&row);
+                expected.push(row);
+                assert_eq!(actual.max_lines(), expected.max_lines());
+                assert_eq!(actual.tail(usize::MAX), expected.tail(usize::MAX));
+                assert_eq!(
+                    bincode::serialize(&actual).unwrap(),
+                    bincode::serialize(&expected).unwrap()
+                );
+                if step % 13 == 0 {
+                    assert_eq!(actual.pop_back_n(2), expected.pop_back_n(2));
+                }
+                if step % 19 == 0 {
+                    actual.clear();
+                    expected.clear();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_push_releases_oversized_rows_after_width_shrink() {
+        let mut history = Scrollback::new(3);
+        for _ in 0..3 {
+            history.push_cells(&vec![Cell::BLANK; 1024]);
+        }
+        assert!(history.lines.iter().all(|line| line.capacity() >= 1024));
+        for _ in 0..3 {
+            history.push_cells(&[Cell::BLANK; 7]);
+        }
+        assert!(history
+            .lines
+            .iter()
+            .all(|line| line.len() == 7 && line.capacity() <= 14));
+        for _ in 0..3 {
+            history.push_cells(&[]);
+        }
+        assert!(history
+            .lines
+            .iter()
+            .all(|line| line.is_empty() && line.capacity() == 0));
+        for _ in 0..12 {
+            history.push_cells(&[Cell::BLANK]);
+        }
+        assert!(history
+            .lines
+            .iter()
+            .all(|line| line.len() == 1 && line.capacity() <= 4));
+    }
+
+    #[test]
+    fn borrowed_push_preserves_owned_behavior_for_oversized_history() {
+        for limit in [0, 2] {
+            let mut actual = Scrollback {
+                lines: [sample('a'), sample('b'), sample('c')].into(),
+                max_lines: limit,
+            };
+            let bytes = serde_json::to_vec(&actual).unwrap();
+            actual = serde_json::from_slice(&bytes).unwrap();
+            let mut expected = actual.clone();
+            actual.push_cells(&sample('d'));
+            expected.push(sample('d'));
+            assert_eq!(actual.tail(usize::MAX), expected.tail(usize::MAX));
+        }
+    }
 
     fn sample(ch: char) -> Vec<Cell> {
         vec![Cell { ch, ..Cell::BLANK }]

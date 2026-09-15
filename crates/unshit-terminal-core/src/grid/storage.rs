@@ -58,9 +58,13 @@ impl Storage {
         // Grid rows always align with physical rows, so a row never straddles
         // the wrap. The old first row becomes the new blank last row.
         let evicted = self.row(0, cols).to_vec();
+        self.advance_row(cols);
+        evicted
+    }
+
+    pub(super) fn advance_row(&mut self, cols: usize) {
         self.row_mut(0, cols).fill(Cell::BLANK);
         self.start = self.physical(cols);
-        evicted
     }
 
     fn iter(&self) -> impl Iterator<Item = &Cell> {
