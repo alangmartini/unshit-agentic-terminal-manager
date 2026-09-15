@@ -100,6 +100,13 @@ impl Storage {
         &self.cells[start..start + self.cols]
     }
 
+    pub(super) fn write_row(&mut self, row: usize, col: usize, cells: &[Cell]) {
+        self.contiguous.take();
+        // The caller clips to one logical row, which is physically contiguous.
+        let start = self.physical_index(row * self.cols + col);
+        self.cells[start..start + cells.len()].copy_from_slice(cells);
+    }
+
     pub(super) fn fill_row(&mut self, row: usize, cell: Cell) {
         self.contiguous.take();
         // The origin and every row start are column-aligned, so even a

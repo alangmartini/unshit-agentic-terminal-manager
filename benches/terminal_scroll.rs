@@ -100,11 +100,39 @@ fn daemon_terminal_parse(c: &mut Criterion) {
     });
 }
 
+fn terminal_row_write(c: &mut Criterion) {
+    for count in [1, 8, 32, 78, 128] {
+        let cells: Vec<_> = (0..count)
+            .map(|i| Cell::with_char((b'A' + (i % 26) as u8) as char))
+            .collect();
+        for (name, bulk) in [("per_cell", false), ("bulk", true)] {
+            c.bench_function(&format!("terminal_row_write/{count}_cells/{name}"), |b| {
+                let mut grid = CellGrid::new(37, 240);
+                b.iter(|| {
+                    for _ in 0..64 {
+                        grid.shift_rows(0, 1, 36);
+                        let cells = black_box(cells.as_slice());
+                        if bulk {
+                            grid.set_row_cells(36, 0, cells);
+                        } else {
+                            for (col, cell) in cells.iter().enumerate() {
+                                grid.set_cell(36, col, *cell);
+                            }
+                        }
+                    }
+                    black_box(grid.clone());
+                });
+            });
+        }
+    }
+}
+
 criterion_group!(
     benches,
     terminal_scroll,
     terminal_row_clear,
     terminal_row_copy,
+    terminal_row_write,
     daemon_terminal_parse
 );
 criterion_main!(benches);

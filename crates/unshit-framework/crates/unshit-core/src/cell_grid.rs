@@ -913,6 +913,24 @@ impl CellGrid {
         }
     }
 
+    /// Copy cells into a logical row, clipping at its right edge. Marks only
+    /// the written columns dirty and retains the row's line identity. Empty
+    /// input or an out-of-bounds starting position leaves the grid unchanged.
+    /// The row mutation version advances once for the whole write.
+    pub fn set_row_cells(&mut self, row: usize, col: usize, cells: &[Cell]) {
+        if row >= self.rows || col >= self.cols || cells.is_empty() {
+            return;
+        }
+        let cells = &cells[..cells.len().min(self.cols - col)];
+        self.cells.write_row(row, col, cells);
+        let start = row * self.cols + col;
+        self.dirty[start..start + cells.len()].fill(true);
+        self.line_damage[row].mark_range(
+            col.min(u16::MAX as usize) as u16,
+            (col + cells.len() - 1).min(u16::MAX as usize) as u16,
+        );
+    }
+
     /// Fill a logical row with `cell` and mark all its columns dirty.
     /// The row retains its line identity; callers replacing a logical line
     /// can separately call [`Self::reset_line_identity`]. Out-of-bounds rows
@@ -1378,6 +1396,64 @@ mod tests {
                 g.line_damage_for(row).map(|ld| ld.is_clean()).unwrap_or(false),
                 "row {row} must remain clean after a write to row 3",
             );
+        }
+    }
+
+    #[test]
+    fn set_row_cells_matches_scalar_writes_through_ring_rotations() {
+        for target in 0..4 {
+            for col in 0..7 {
+                for len in [0, 1, 3, 8] {
+                    let mut grid = CellGrid::new(4, 5);
+                    for step in 0..9 {
+                        grid.shift_rows(0, 1, 3);
+                        grid.clear_dirty();
+                        let _ = grid.cells(); // Warm the wrapped logical snapshot.
+                        let mut expected = grid.clone();
+                        let cells: Vec<_> = (0..len)
+                            .map(|i| Cell {
+                                ch: char::from_u32(65 + i as u32 + step).unwrap(),
+                                attrs: CellAttrs::BOLD,
+                                ..Cell::default()
+                            })
+                            .collect();
+                        let before = grid.clone();
+                        grid.set_row_cells(target, col, &cells);
+                        for (offset, cell) in cells.iter().enumerate() {
+                            expected.set_cell(target, col + offset, *cell);
+                        }
+                        assert_eq!(grid.cells(), expected.cells());
+                        assert_eq!(grid.dirty_flags(), expected.dirty_flags());
+                        assert_eq!(grid.line_ids(), expected.line_ids());
+                        for row in 0..4 {
+                            let actual = grid.line_damage[row];
+                            let scalar = expected.line_damage[row];
+                            assert_eq!(
+                                (actual.first_dirty_col, actual.last_dirty_col),
+                                (scalar.first_dirty_col, scalar.last_dirty_col)
+                            );
+                            if row == target && col < 5 && len > 0 {
+                                assert!(actual.seqno > before.line_damage[row].seqno);
+                            } else {
+                                assert_eq!(actual, before.line_damage[row]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_row_cells_empty_and_out_of_bounds_are_noops() {
+        for (rows, cols) in [(0, 0), (0, 5), (4, 0), (4, 5)] {
+            let mut grid = CellGrid::new(rows, cols);
+            let before = grid.clone();
+            grid.set_row_cells(rows, 0, &[Cell::with_char('x')]);
+            grid.set_row_cells(0, cols, &[Cell::with_char('x')]);
+            grid.set_row_cells(usize::MAX, usize::MAX, &[Cell::with_char('x')]);
+            grid.set_row_cells(0, 0, &[]);
+            assert_eq!(grid, before);
         }
     }
 

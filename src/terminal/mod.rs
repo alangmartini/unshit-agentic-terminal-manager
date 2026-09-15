@@ -50,6 +50,9 @@ fn preview_bytes(bytes: &[u8], limit: usize) -> String {
 /// visible grid. The user can browse history with `scroll_view_up` /
 /// `scroll_view_down`; `display_grid` returns the composed view.
 pub struct Terminal {
+    // Test oracle for the pre-batching path, with identical input boundaries.
+    #[cfg(test)]
+    scalar_prints: bool,
     grid: CellGrid,
     cursor_row: usize,
     cursor_col: usize,
@@ -394,6 +397,8 @@ impl Terminal {
     /// background is transparent.
     pub fn new(rows: usize, cols: usize) -> Self {
         Self {
+            #[cfg(test)]
+            scalar_prints: false,
             grid: CellGrid::new(rows, cols),
             cursor_row: 0,
             cursor_col: 0,
@@ -461,8 +466,16 @@ impl Terminal {
         }
 
         let mut parser = std::mem::take(&mut self.parser);
-        let mut performer = Performer { terminal: self };
+        #[cfg(test)]
+        let scalar_prints = self.scalar_prints;
+        let mut performer = Performer {
+            #[cfg(test)]
+            scalar_prints,
+            terminal: self,
+            pending: smallvec::SmallVec::new(),
+        };
         parser.advance(&mut performer, bytes);
+        performer.flush();
         self.parser = parser;
         // Sync cursor position to the grid so the renderer can draw it.
         self.grid.set_cursor(self.cursor_row, self.cursor_col);
@@ -1967,6 +1980,8 @@ impl Default for Terminal {
 // VTE Performer
 // ---------------------------------------------------------------------------
 
+const PRINT_BATCH_CAPACITY: usize = 128;
+
 /// Borrows `&mut Terminal` to implement `vte::Perform`.
 ///
 /// `vte::Parser::advance` requires `&mut self` on both the parser and the
@@ -1974,11 +1989,48 @@ impl Default for Terminal {
 /// parser out (see `process_bytes`) and hand a performer that borrows the
 /// rest of `Terminal` to the parser.
 struct Performer<'a> {
+    #[cfg(test)]
+    scalar_prints: bool,
     terminal: &'a mut Terminal,
+    pending: smallvec::SmallVec<[Cell; PRINT_BATCH_CAPACITY]>,
+}
+
+impl Performer<'_> {
+    // Flush before any callback reads or mutates terminal state, and before
+    // returning from process_bytes. Pending cells never span PTY chunks.
+    fn flush(&mut self) {
+        let t = &mut *self.terminal;
+        if t.rows == 0 || t.cols == 0 {
+            self.pending.clear();
+            return;
+        }
+        if self.pending.len() == 1 {
+            t.put_char(self.pending[0].ch);
+            self.pending.clear();
+            return;
+        }
+        let mut start = 0;
+        while start < self.pending.len() {
+            t.prepare_for_printable();
+            let count = (self.pending.len() - start).min(t.cols - t.cursor_col);
+            t.grid.set_row_cells(
+                t.cursor_row,
+                t.cursor_col,
+                &self.pending[start..start + count],
+            );
+            t.cursor_col += count;
+            t.wrap_pending = t.cursor_col == t.cols;
+            if t.wrap_pending {
+                t.cursor_col = t.cols - 1;
+            }
+            start += count;
+        }
+        self.pending.clear();
+    }
 }
 
 impl<'a> Perform for Performer<'a> {
-    /// Printable character: write at cursor and advance.
+    /// Buffer a printable cell until the next control or input boundary.
     fn print(&mut self, c: char) {
         // VTE 0.15 routes a split UTF-8 C1 codepoint through print, while
         // ground_dispatch routes an unsplit one through execute. Normalize
@@ -1986,12 +2038,28 @@ impl<'a> Perform for Performer<'a> {
         if matches!(c, '\u{80}'..='\u{9f}') {
             self.execute(c as u8);
         } else {
-            self.terminal.put_char(c);
+            #[cfg(test)]
+            if self.scalar_prints {
+                self.terminal.put_char(c);
+                return;
+            }
+            let t = &self.terminal;
+            self.pending.push(Cell {
+                ch: c,
+                fg: t.fg,
+                bg: t.bg,
+                attrs: t.attrs,
+                wide_continuation: false,
+            });
+            if self.pending.len() == PRINT_BATCH_CAPACITY {
+                self.flush();
+            }
         }
     }
 
     /// C0/C1 control bytes.
     fn execute(&mut self, byte: u8) {
+        self.flush();
         let t = &mut *self.terminal;
         match byte {
             // Line Feed
@@ -2036,6 +2104,7 @@ impl<'a> Perform for Performer<'a> {
 
     /// CSI (Control Sequence Introducer) dispatch.
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        self.flush();
         let t = &mut *self.terminal;
 
         // Collect the first subparam of each param into a flat Vec<u16> for
@@ -2435,6 +2504,7 @@ impl<'a> Perform for Performer<'a> {
 
     /// Operating System Command dispatch.
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.flush();
         // OSC 0 and OSC 2 both set the window title.
         if params.len() >= 2 {
             let cmd = params[0];
@@ -2448,6 +2518,7 @@ impl<'a> Perform for Performer<'a> {
 
     /// ESC dispatch for standalone escape sequences.
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.flush();
         let t = &mut *self.terminal;
         match byte {
             // DECSC: Save Cursor Position
@@ -2474,9 +2545,13 @@ impl<'a> Perform for Performer<'a> {
     }
 
     // DCS hooks are not needed for basic terminal emulation.
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {
+        self.flush();
+    }
     fn put(&mut self, _byte: u8) {}
-    fn unhook(&mut self) {}
+    fn unhook(&mut self) {
+        self.flush();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2644,6 +2719,136 @@ fn core_cell_to_ui(core: unshit_terminal_core::Cell) -> Cell {
 mod tests {
     use super::*;
 
+    fn assert_same_grid_state(actual: &CellGrid, expected: &CellGrid) {
+        assert_eq!(
+            (actual.rows(), actual.cols()),
+            (expected.rows(), expected.cols())
+        );
+        assert_eq!(actual.cells(), expected.cells());
+        assert_eq!(actual.dirty_flags(), expected.dirty_flags());
+        assert_eq!(actual.line_ids(), expected.line_ids());
+        assert_eq!(actual.cursor_visible(), expected.cursor_visible());
+        assert_eq!(
+            (actual.cursor_row(), actual.cursor_col()),
+            (expected.cursor_row(), expected.cursor_col())
+        );
+        for (a, b) in actual.line_damage().iter().zip(expected.line_damage()) {
+            // Bulk writes intentionally advance the mutation version once per batch.
+            assert_eq!(
+                (a.first_dirty_col, a.last_dirty_col),
+                (b.first_dirty_col, b.last_dirty_col)
+            );
+        }
+    }
+
+    fn assert_same_terminal_state(actual: &Terminal, expected: &Terminal) {
+        assert_same_grid_state(&actual.grid, &expected.grid);
+        assert_eq!(
+            (actual.cursor_row, actual.cursor_col, actual.wrap_pending),
+            (
+                expected.cursor_row,
+                expected.cursor_col,
+                expected.wrap_pending
+            )
+        );
+        assert_eq!(
+            (actual.grid.cursor_row(), actual.grid.cursor_col()),
+            (expected.grid.cursor_row(), expected.grid.cursor_col())
+        );
+        assert_eq!(actual.saved_cursor, expected.saved_cursor);
+        assert_eq!(
+            (actual.fg, actual.bg, actual.attrs),
+            (expected.fg, expected.bg, expected.attrs)
+        );
+        assert_eq!(actual.scrollback, expected.scrollback);
+        assert_eq!(actual.evicted_lines, expected.evicted_lines);
+        assert_eq!(
+            (actual.scroll_top, actual.scroll_bot),
+            (expected.scroll_top, expected.scroll_bot)
+        );
+        match (&actual.alt_grid, &expected.alt_grid) {
+            (Some(a), Some(b)) => assert_same_grid_state(a, b),
+            (None, None) => {}
+            _ => panic!("alternate screen presence differs"),
+        }
+        assert_eq!(actual.alt_saved_cursor, expected.alt_saved_cursor);
+        assert_eq!(
+            (
+                actual.alt_saved_fg,
+                actual.alt_saved_bg,
+                actual.alt_saved_attrs
+            ),
+            (
+                expected.alt_saved_fg,
+                expected.alt_saved_bg,
+                expected.alt_saved_attrs
+            )
+        );
+        assert_eq!(actual.title, expected.title);
+        assert_eq!(actual.pending_response, expected.pending_response);
+        assert_eq!(
+            actual.synchronized_output_active,
+            expected.synchronized_output_active
+        );
+        assert_eq!(actual.bracketed_paste, expected.bracketed_paste);
+        assert_eq!(actual.scroll_offset, expected.scroll_offset);
+        assert_eq!(actual.scroll_accum_lines, expected.scroll_accum_lines);
+        assert_eq!(actual.scroll_anim, expected.scroll_anim);
+        assert_eq!(actual.scroll_anim_cell_h, expected.scroll_anim_cell_h);
+        assert_eq!(actual.scroll_view_fraction, expected.scroll_view_fraction);
+        assert_eq!(actual.mouse_report_1000, expected.mouse_report_1000);
+        assert_eq!(actual.mouse_report_1002, expected.mouse_report_1002);
+        assert_eq!(actual.mouse_report_1003, expected.mouse_report_1003);
+        assert_eq!(actual.mouse_sgr, expected.mouse_sgr);
+        assert_eq!(actual.mouse_wheel_accum, expected.mouse_wheel_accum);
+    }
+
+    #[test]
+    fn printable_batches_preserve_scrolled_back_viewport_anchoring() {
+        let mut actual = Terminal::new(4, 17);
+        let mut expected = Terminal::new(4, 17);
+        expected.scalar_prints = true;
+        for terminal in [&mut actual, &mut expected] {
+            terminal.process_bytes(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n");
+            terminal.scroll_view_by_lines(2.25);
+        }
+        let input = vec![b'x'; 513];
+        actual.process_bytes(&input);
+        expected.process_bytes(&input);
+        assert_same_terminal_state(&actual, &expected);
+        assert_same_grid_state(&actual.display_grid(), &expected.display_grid());
+    }
+
+    #[test]
+    fn printable_batches_match_scalar_writes_at_every_input_boundary() {
+        let mut input = b"exactly-17-chars!!".to_vec();
+        input.extend(std::iter::repeat_n(b'x', 257)); // Cross two buffer-capacity boundaries.
+        input.extend_from_slice(b"\r\nabc\x08Z\tT\rR\n\x1b[31;44;1mRED\x1b[0mnormal");
+        input.extend_from_slice(b"\x1b[2;4Hmove\x1b[2@insert\x1b[3Pdelete\x1b[2Xerase");
+        input
+            .extend_from_slice(b"\x1b7saved\x1b8restored\x1bMreverse\x1b[2;4rregion\n\n\n\n\x1b[r");
+        input.extend_from_slice(b"main\x1b[?1049halt\x1b[?1049lback\x1b]2;title\x07osc");
+        input.extend_from_slice(b"before-dcs\x1bPqignored\x1b\\after-dcs\x1b[6n\x1b[>c");
+        input.extend_from_slice("\u{e9}\u{754c}\u{1f600}\u{97}".as_bytes());
+        input.extend_from_slice(
+            b"\x1b[?2026hsync\x1b[?2026l\x1b[?1000;1002;1003;1006hmouse\x1b[?2004hpaste\x1b[?25lhidden\x1b[?25h",
+        );
+        for (rows, cols) in [(0, 0), (0, 5), (4, 0), (1, 1), (5, 17), (37, 125)] {
+            for chunk_size in [1, 2, 7, 17, 127, 128, 129, 4096] {
+                let mut actual = Terminal::new(rows, cols);
+                let mut expected = Terminal::new(rows, cols);
+                expected.scalar_prints = true;
+                for chunk in input.chunks(chunk_size) {
+                    actual.grid.clear_dirty();
+                    expected.grid.clear_dirty();
+                    actual.process_bytes(chunk);
+                    expected.process_bytes(chunk);
+                    assert_same_terminal_state(&actual, &expected);
+                }
+            }
+        }
+    }
+
     #[test]
     fn utf8_controls_and_escape_sequences_are_independent_of_chunk_boundaries() {
         let mut input = String::from("\u{e9}\u{754c}\u{1f600}\x1b[31m");
@@ -2658,11 +2863,11 @@ mod tests {
             for chunk in input.as_bytes().chunks(chunk_size) {
                 terminal.process_bytes(chunk);
             }
-            (terminal.grid().clone(), terminal.take_pending_response())
+            terminal
         };
         let expected = parse(input.len());
         for chunk_size in 1..input.len() {
-            assert_eq!(parse(chunk_size), expected, "chunk size {chunk_size}");
+            assert_same_terminal_state(&parse(chunk_size), &expected);
         }
     }
 
