@@ -30,6 +30,11 @@ const DEFAULT_SCROLLBACK: usize = 10_000;
 /// The 64-message output channel can retain at most 4 MiB of these chunks.
 const READ_BUF_LEN: usize = 64 * 1024;
 
+/// Bound queued read-ahead to 512 KiB per session. The native scratch buffer,
+/// pending send, and parsed chunk each add at most 64 KiB. The existing
+/// output queue is separate.
+const READ_AHEAD_CHUNKS: usize = 8;
+
 pub const ENV_NOTIFY_SOCKET: &str = "TM_NOTIFY_SOCKET";
 pub const ENV_WORKSPACE_ID: &str = "TM_WORKSPACE_ID";
 pub const ENV_PANE_ID: &str = "TM_PANE_ID";
@@ -701,45 +706,84 @@ fn close_output(output: &Arc<Mutex<OutputState>>) {
 }
 
 fn run_reader_inner(
-    mut reader: Box<dyn Read + Send>,
+    reader: Box<dyn Read + Send>,
     output: Arc<Mutex<OutputState>>,
     terminal: Arc<Mutex<Terminal>>,
 ) {
+    let (read_tx, read_rx) = std::sync::mpsc::sync_channel(READ_AHEAD_CHUNKS);
+    let native_reader = match std::thread::Builder::new()
+        .name("pty-read-ahead".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_pty_chunks(reader, read_tx);
+            }));
+            if let Err(payload) = result {
+                log::error!(
+                    "native PTY reader panicked: {}",
+                    panic_payload_str(&payload)
+                );
+            }
+        }) {
+        Ok(thread) => thread,
+        Err(error) => {
+            log::error!("could not start native PTY reader: {error}");
+            return;
+        }
+    };
+
+    // Only parsing publishes data. Native read-ahead does not change snapshot
+    // boundaries: the terminal and attachment locks still select the sink for
+    // each parsed chunk. Dropping this receiver also releases a queued sender.
+    for bytes in read_rx {
+        let tx_opt = {
+            let Ok(mut term) = terminal.lock() else {
+                continue;
+            };
+            term.process_bytes(&bytes);
+            output.lock().ok().and_then(|guard| {
+                guard
+                    .current
+                    .as_ref()
+                    .map(|sink| (sink.tx.clone(), sink.cancellation.subscribe()))
+            })
+        };
+        if let Some((tx, mut cancelled)) = tx_opt {
+            if let Err(mpsc::error::TrySendError::Full(bytes)) = tx.try_send(bytes) {
+                // Wait outside both locks. Attachment already includes this
+                // chunk, so cancellation must not resend it to a new sink.
+                tokio::runtime::Handle::current().block_on(async {
+                    tokio::select! {
+                        _ = tx.send(bytes) => {},
+                        _ = cancelled.changed() => {},
+                    }
+                });
+            }
+        }
+    }
+    // Channel EOF means every queued chunk was processed and the native
+    // reader has dropped its sender. Joining cannot wait on another read.
+    // On a parser panic, unwinding instead drops the receiver and detaches
+    // the thread: generic Read cannot be interrupted here. Session teardown
+    // closes the PTY handles; run_reader must close output without waiting.
+    if let Err(payload) = native_reader.join() {
+        log::error!(
+            "native PTY reader thread failed: {}",
+            panic_payload_str(&payload)
+        );
+    }
+}
+
+fn read_pty_chunks(mut reader: Box<dyn Read + Send>, tx: std::sync::mpsc::SyncSender<Vec<u8>>) {
     let mut buf = vec![0u8; READ_BUF_LEN];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => {
-                let tx_opt = {
-                    let Ok(mut term) = terminal.lock() else {
-                        continue;
-                    };
-                    term.process_bytes(&buf[..n]);
-                    output.lock().ok().and_then(|guard| {
-                        guard
-                            .current
-                            .as_ref()
-                            .map(|sink| (sink.tx.clone(), sink.cancellation.subscribe()))
-                    })
-                };
-                if let Some((tx, mut cancelled)) = tx_opt {
-                    if let Err(mpsc::error::TrySendError::Full(bytes)) =
-                        tx.try_send(buf[..n].to_vec())
-                    {
-                        // Only the dedicated blocking PTY reader waits, with
-                        // neither terminal nor output mutex held. Snapshot
-                        // attachment already includes this parsed chunk, so
-                        // cancellation must not resend it to the new sink.
-                        tokio::runtime::Handle::current().block_on(async {
-                            tokio::select! {
-                                _ = tx.send(bytes) => {},
-                                _ = cancelled.changed() => {},
-                            }
-                        });
-                    }
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    return;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return,
         }
     }
@@ -769,6 +813,123 @@ mod tests {
         {
             "/bin/sh"
         }
+    }
+
+    #[test]
+    fn dropping_read_ahead_receiver_releases_a_full_native_queue() {
+        struct RepeatingReader(std::sync::mpsc::Sender<()>);
+        impl Read for RepeatingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf[0] = b'x';
+                let _ = self.0.send(());
+                Ok(1)
+            }
+        }
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            read_pty_chunks(Box::new(RepeatingReader(progress_tx)), tx);
+            let _ = done_tx.send(());
+        });
+        for _ in 0..2 {
+            progress_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("native read");
+        }
+        // One chunk is queued and another is waiting to send. Consumer
+        // unwinding must release the producer without draining either chunk.
+        drop(rx);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("native reader exits");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn native_reader_panic_preserves_already_queued_output() {
+        struct PanicAfterTail(bool);
+        impl Read for PanicAfterTail {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(!self.0, "synthetic native reader failure after tail");
+                self.0 = true;
+                let tail = b"tail-before-panic";
+                buf[..tail.len()].copy_from_slice(tail);
+                Ok(tail.len())
+            }
+        }
+        let terminal = Arc::new(Mutex::new(Terminal::new(24, 80, 0)));
+        let (tx, mut rx) = mpsc::channel(4);
+        let output = Arc::new(Mutex::new(OutputState {
+            current: Some(OutputSink::new(1, tx)),
+            next_token: 2,
+            reader_open: true,
+        }));
+        run_reader(
+            Box::new(PanicAfterTail(false)),
+            Arc::clone(&output),
+            Arc::clone(&terminal),
+        );
+        assert_eq!(rx.try_recv().unwrap(), b"tail-before-panic");
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
+        assert!(grid_text(&terminal.lock().unwrap().snapshot(0)).contains("tail-before-panic"));
+        assert!(!output.lock().unwrap().reader_open);
+    }
+
+    #[test]
+    fn blocked_parser_allows_bounded_native_read_ahead() {
+        struct CountingReader {
+            remaining: usize,
+            progress: std::sync::mpsc::Sender<usize>,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Ok(0);
+                }
+                self.remaining -= 1;
+                buf.fill(b'x');
+                let _ = self.progress.send(buf.len());
+                Ok(buf.len())
+            }
+        }
+        let terminal = Arc::new(Mutex::new(Terminal::new(24, 80, 0)));
+        let output = Arc::new(Mutex::new(OutputState {
+            current: None,
+            next_token: 1,
+            reader_open: true,
+        }));
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let terminal_guard = terminal.lock().unwrap();
+        let reader_terminal = Arc::clone(&terminal);
+        let worker = std::thread::spawn(move || {
+            run_reader(
+                Box::new(CountingReader {
+                    remaining: 70,
+                    progress: progress_tx,
+                }),
+                output,
+                reader_terminal,
+            )
+        });
+        let first = progress_rx.recv_timeout(Duration::from_secs(2));
+        let mut reads = usize::from(first.is_ok());
+        let mut read_bytes = first.unwrap_or(0);
+        while let Ok(bytes) = progress_rx.recv_timeout(Duration::from_millis(200)) {
+            reads += 1;
+            read_bytes += bytes;
+        }
+        drop(terminal_guard);
+        worker
+            .join()
+            .expect("reader finishes after the parser is released");
+        assert!(reads > 1, "native reads must overlap a blocked parser");
+        // At most 512 KiB queued, one chunk held by the parser, and one
+        // native read waiting to enqueue. This also rejects unbounded prefetch.
+        assert!(
+            read_bytes <= 512 * 1024 + 2 * READ_BUF_LEN,
+            "read-ahead exceeded its memory bound: {read_bytes} bytes"
+        );
     }
 
     #[tokio::test]
