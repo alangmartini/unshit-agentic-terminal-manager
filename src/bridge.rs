@@ -60,6 +60,29 @@ fn take_all_readers() -> HashMap<u32, PendingReader> {
     guard.take().unwrap_or_default()
 }
 
+// Keep a continuously refilled channel from monopolizing the terminal lock.
+// With the 4 KiB reader buffer, a batch contains at most 128 KiB.
+const PTY_BATCH_MAX_CHUNKS: u32 = 32;
+
+fn process_pty_batch(
+    terminal: &mut crate::terminal::Terminal,
+    first: &[u8],
+    queued: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> (u32, usize) {
+    terminal.process_bytes(first);
+    let mut chunks = 1;
+    let mut bytes = first.len();
+    while chunks < PTY_BATCH_MAX_CHUNKS {
+        let Ok(more) = queued.try_recv() else {
+            break;
+        };
+        terminal.process_bytes(&more);
+        chunks += 1;
+        bytes += more.len();
+    }
+    (chunks, bytes)
+}
+
 /// Create a subscription that reads from a PTY stdout and feeds bytes
 /// to the terminal emulator, triggering UI rebuilds.
 ///
@@ -111,14 +134,11 @@ fn pty_subscription(
                 });
 
                 // Drain channel and feed bytes to the terminal emulator.
-                // Batch all buffered chunks into a single rebuild so we
-                // pay one VTE parse pass per drain rather than one per
-                // PTY read. The framework also collapses any number of
-                // RequestRebuild events that arrive in the same drain
-                // window into a single rebuild
-                // (see `RebuildCoalescer` in `unshit-app/src/app.rs`),
-                // but draining here keeps the per pane terminal mutex
-                // hold time bounded.
+                // Batch ready chunks into one rebuild request, but cap each
+                // batch so a continuously refilled channel releases the
+                // terminal mutex and permits intermediate UI updates. The
+                // framework coalesces these requests to one rebuild per frame
+                // (see `RebuildCoalescer` in `unshit-app/src/app.rs`).
                 //
                 // Acquire the state mutex only to look up the per-pane
                 // Terminal handle, then release it before running the VTE
@@ -139,16 +159,9 @@ fn pty_subscription(
                         continue;
                     };
 
-                    let mut batched = 1u32;
-                    let mut total_bytes = data.len();
-                    let (pending_response, synchronized_output_active, osc_title) = {
+                    let (pending_response, synchronized_output_active, osc_title, batched, total_bytes) = {
                         let mut terminal = terminal_handle.lock_recover();
-                        terminal.process_bytes(&data);
-                        while let Ok(more) = rx.try_recv() {
-                            total_bytes += more.len();
-                            terminal.process_bytes(&more);
-                            batched += 1;
-                        }
+                        let (batched, total_bytes) = process_pty_batch(&mut terminal, &data, &mut rx);
                         if terminal_trace_enabled() {
                             let rows = terminal.grid().debug_rows(4, 96);
                             append_terminal_trace_line(&format!(
@@ -176,6 +189,8 @@ fn pty_subscription(
                             terminal.take_pending_response(),
                             terminal.synchronized_output_active(),
                             osc_title,
+                            batched,
+                            total_bytes,
                         )
                     };
                     {
@@ -680,6 +695,79 @@ pub fn build_subscriptions(shared: &SharedState) -> Vec<Subscription> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn short_pty_batch_answers_queries_without_waiting_for_more_output() {
+        let (_tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut terminal = crate::terminal::Terminal::new(4, 12);
+        let input = b"x\x1b[6n";
+        assert_eq!(
+            process_pty_batch(&mut terminal, input, &mut rx),
+            (1, input.len())
+        );
+        assert_eq!(terminal.take_pending_response(), b"\x1b[1;2R");
+    }
+    #[test]
+    fn pty_batches_release_queued_tail_and_preserve_terminal_state() {
+        let input =
+            "hello\u{4e2d}\u{1f642}\x1b[31mred\x1b[0m\r\n\x1b]2;batch-title\x07\x1b[>c".repeat(50);
+        let chunks: Vec<Vec<u8>> = input.as_bytes().chunks(7).map(<[u8]>::to_vec).collect();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(chunks.len());
+        for chunk in &chunks[1..] {
+            tx.try_send(chunk.clone()).unwrap();
+        }
+        drop(tx);
+        let mut actual = crate::terminal::Terminal::new(4, 12);
+        let mut expected = crate::terminal::Terminal::new(4, 12);
+        let mut first = chunks[0].clone();
+        let mut consumed = 0usize;
+        let mut batches = 0;
+        loop {
+            let (count, bytes) = process_pty_batch(&mut actual, &first, &mut rx);
+            assert!(
+                count <= PTY_BATCH_MAX_CHUNKS,
+                "one batch consumed the queued tail"
+            );
+            let end = consumed + count as usize;
+            assert_eq!(
+                bytes,
+                chunks[consumed..end].iter().map(Vec::len).sum::<usize>()
+            );
+            for chunk in &chunks[consumed..end] {
+                expected.process_bytes(chunk);
+            }
+            assert_eq!(actual.cursor_position(), expected.cursor_position());
+            assert_eq!(actual.title(), expected.title());
+            assert_eq!(actual.scrollback_len(), expected.scrollback_len());
+            assert_eq!(
+                actual.take_pending_response(),
+                expected.take_pending_response()
+            );
+            for row in 0..4 {
+                for col in 0..12 {
+                    assert_eq!(
+                        actual.grid().get_cell(row, col),
+                        expected.grid().get_cell(row, col)
+                    );
+                }
+            }
+            let last = actual.abs_line_at_display(3);
+            assert_eq!(
+                actual.selection_text((0, 0), (last, 11)),
+                expected.selection_text((0, 0), (last, 11))
+            );
+            consumed = end;
+            batches += 1;
+            match rx.try_recv() {
+                Ok(next) => first = next,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            batches > 1,
+            "sustained output must allow intermediate updates"
+        );
+        assert_eq!(consumed, chunks.len(), "every input byte must be processed");
+    }
     #[test]
     fn terminal_updates_rebuild_when_not_in_synchronized_output() {
         assert!(should_emit_terminal_rebuild(false));
