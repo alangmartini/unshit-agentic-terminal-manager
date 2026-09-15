@@ -14,6 +14,9 @@ use unshit::core::style::types::Color;
 use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 use vte::{Params, Perform};
 
+mod history_row;
+use history_row::HistoryRow;
+
 pub mod keys;
 pub mod paste_image;
 pub mod telemetry;
@@ -70,7 +73,7 @@ pub struct Terminal {
     cols: usize,
     title: String,
     /// Lines that scrolled off the top. Index 0 = oldest line.
-    scrollback: VecDeque<Vec<Cell>>,
+    scrollback: VecDeque<HistoryRow>,
     /// How many lines the user has scrolled back (0 = at bottom / live).
     scroll_offset: usize,
     /// Fractional wheel-scroll carry in lines. `scroll_view_by_lines`
@@ -645,7 +648,7 @@ impl Terminal {
         let cols = self.cols;
         let old_rows = self.rows;
         let split_at = self.scrollback.len().saturating_sub(k);
-        let lifted: Vec<Vec<Cell>> = self.scrollback.split_off(split_at).into();
+        let lifted: Vec<HistoryRow> = self.scrollback.split_off(split_at).into();
 
         self.grid.resize(old_rows + k, cols);
         self.grid.shift_rows(k, 0, old_rows);
@@ -658,7 +661,7 @@ impl Terminal {
         for (i, row) in lifted.iter().enumerate() {
             let copy = row.len().min(cols);
             for (c, cell) in row.iter().take(copy).enumerate() {
-                self.grid.set_cell(blank_top + i, c, *cell);
+                self.grid.set_cell(blank_top + i, c, cell);
             }
         }
     }
@@ -674,7 +677,7 @@ impl Terminal {
             let row: Vec<Cell> = (0..cols)
                 .map(|c| self.grid.get_cell(r, c).copied().unwrap_or_default())
                 .collect();
-            self.scrollback.push_back(row);
+            self.scrollback.push_back(row.into());
             if self.scrollback.len() > MAX_SCROLLBACK {
                 self.scrollback.pop_front();
             }
@@ -731,7 +734,7 @@ impl Terminal {
         self.scrollback.reserve(snapshot.scrollback.len());
         for line in &snapshot.scrollback {
             let converted: Vec<Cell> = line.iter().map(|c| core_cell_to_ui(*c)).collect();
-            self.scrollback.push_back(converted);
+            self.scrollback.push_back(converted.into());
         }
         self.reset_scroll();
     }
@@ -1139,13 +1142,13 @@ impl Terminal {
             let mut view = self.grid.clone();
             let (overscan_cells, overscan_id) = match self.scrollback.back() {
                 Some(row) => (
-                    Some(row.as_slice()),
+                    Some(row.cells()),
                     OVERSCAN_LINE_ID_NAMESPACE
                         | (self.evicted_lines + self.scrollback.len() as u64 - 1),
                 ),
                 None => (None, OVERSCAN_LINE_ID_NAMESPACE),
             };
-            view.insert_overscan_row_top(overscan_cells, overscan_id);
+            view.insert_overscan_row_top(overscan_cells.as_deref(), overscan_id);
             view.set_overscan_rows(1);
             view.set_render_offset_y(render_offset_y);
             if terminal_trace_enabled() {
@@ -1178,22 +1181,15 @@ impl Terminal {
 
             if virtual_line < sb_len {
                 // This row comes from scrollback.
-                let sb_row = &self.scrollback[virtual_line];
-                for col in 0..self.cols {
-                    if let Some(cell) = sb_row.get(col) {
-                        view.set_cell(display_row, col, *cell);
-                    }
-                    // If scrollback row is shorter (resize), Cell::default fills.
-                }
+                let cells = self.scrollback[virtual_line].cells();
+                // Bulk copying clips wider history and leaves the default
+                // cells in place when a row predates a column increase.
+                view.set_row_cells(display_row, 0, &cells);
             } else {
                 // This row comes from the live screen.
                 let screen_row = virtual_line - sb_len;
-                if screen_row < self.rows {
-                    for col in 0..self.cols {
-                        if let Some(cell) = self.grid.get_cell(screen_row, col) {
-                            view.set_cell(display_row, col, *cell);
-                        }
-                    }
+                if let Some(cells) = self.grid.row_cells(screen_row) {
+                    view.set_row_cells(display_row, 0, cells);
                 }
             }
         }
@@ -1402,7 +1398,7 @@ impl Terminal {
         let virtual_line = (abs - self.evicted_lines) as usize;
         let sb_len = self.scrollback.len();
         if virtual_line < sb_len {
-            self.scrollback[virtual_line].get(col).copied()
+            self.scrollback[virtual_line].get(col)
         } else {
             let screen_row = virtual_line - sb_len;
             if screen_row < self.rows {
@@ -1675,20 +1671,21 @@ impl Terminal {
 
         // Only the full-screen region feeds scrollback.
         if self.region_is_full_screen() {
-            let row = self
-                .grid
-                .row_cells(top)
-                .expect("full-screen scroll row must be inside the grid")
-                .to_vec();
-            self.scrollback.push_back(row);
-            if self.scrollback.len() > MAX_SCROLLBACK {
-                self.scrollback.pop_front();
-                // A line left the buffer for good; bump the absolute-line
-                // base so existing selection anchors stay pinned to the
-                // right text (their absolute index is unaffected; indices
-                // into the live buffer all shift down by one).
+            let reuse = if self.scrollback.len() >= MAX_SCROLLBACK {
+                // Reuse the evicted row's storage. Advancing the absolute
+                // base keeps existing selection anchors on the same text.
                 self.evicted_lines += 1;
-            }
+                self.scrollback.pop_front()
+            } else {
+                None
+            };
+            let row = HistoryRow::from_cells(
+                self.grid
+                    .row_cells(top)
+                    .expect("full-screen scroll row must be inside the grid"),
+                reuse,
+            );
+            self.scrollback.push_back(row);
             // Gate S3: a reader parked in scrollback keeps their view
             // anchored while output streams. Each pushed line moves the
             // viewport one line further from the live bottom, so bump
@@ -3217,8 +3214,8 @@ mod tests {
         assert_eq!(row_text(&t, 1), "dd");
         assert_eq!(t.cursor_position().0, 1);
         assert_eq!(t.scrollback_len(), 2);
-        assert_eq!(t.scrollback[0][0].ch, 'a');
-        assert_eq!(t.scrollback[1][0].ch, 'b');
+        assert_eq!(t.scrollback[0].get(0).unwrap().ch, 'a');
+        assert_eq!(t.scrollback[1].get(0).unwrap().ch, 'b');
     }
 
     #[test]
@@ -3233,7 +3230,7 @@ mod tests {
         assert_eq!(row_text(&t, 0), "XX");
         assert_eq!(t.cursor_position().0, 0);
         assert_eq!(t.scrollback_len(), 1);
-        assert_eq!(t.scrollback[0][0].ch, 'a');
+        assert_eq!(t.scrollback[0].get(0).unwrap().ch, 'a');
     }
 
     #[test]
@@ -3275,7 +3272,7 @@ mod tests {
         let mut t = Terminal::new(2, 4);
         // Pre-load scrollback to MAX_SCROLLBACK by directly pushing.
         for _ in 0..MAX_SCROLLBACK {
-            t.scrollback.push_back(vec![Cell::default(); 4]);
+            t.scrollback.push_back(vec![Cell::default(); 4].into());
         }
         // Now write a real row so the grid has identifiable content.
         t.process_bytes(b"AB\r\nCD");
@@ -3288,8 +3285,8 @@ mod tests {
         assert_eq!(t.scrollback_len(), MAX_SCROLLBACK);
         // The newest scrollback entry is the row we just evicted ("AB").
         let newest = t.scrollback.back().unwrap();
-        assert_eq!(newest[0].ch, 'A');
-        assert_eq!(newest[1].ch, 'B');
+        assert_eq!(newest.get(0).unwrap().ch, 'A');
+        assert_eq!(newest.get(1).unwrap().ch, 'B');
     }
 
     #[test]
@@ -4345,11 +4342,16 @@ mod tests {
         let term = term_with_scrollback();
         // The first line that scrolled off was "AAAA".
         let first_line = &term.scrollback[0];
-        assert_eq!(first_line[0].ch, 'A', "first scrollback line should be 'A'");
+        assert_eq!(
+            first_line.get(0).unwrap().ch,
+            'A',
+            "first scrollback line should be 'A'"
+        );
         // The second line was "BBBB".
         let second_line = &term.scrollback[1];
         assert_eq!(
-            second_line[0].ch, 'B',
+            second_line.get(0).unwrap().ch,
+            'B',
             "second scrollback line should be 'B'"
         );
     }
@@ -5029,7 +5031,7 @@ mod tests {
     fn anchoring_survives_eviction_at_scrollback_capacity() {
         let mut term = Terminal::new(2, 3);
         for _ in 0..MAX_SCROLLBACK {
-            term.scrollback.push_back(vec![Cell::default(); 3]);
+            term.scrollback.push_back(vec![Cell::default(); 3].into());
         }
         term.process_bytes(b"A\r\nB");
         // Pushes above capacity evict from the front.
@@ -5052,7 +5054,7 @@ mod tests {
     fn anchoring_pinned_at_top_lets_eviction_consume_the_view() {
         let mut term = Terminal::new(2, 3);
         for _ in 0..MAX_SCROLLBACK {
-            term.scrollback.push_back(vec![Cell::default(); 3]);
+            term.scrollback.push_back(vec![Cell::default(); 3].into());
         }
         term.process_bytes(b"A\r\nB");
         term.scroll_view_up(MAX_SCROLLBACK * 2);
@@ -5915,7 +5917,63 @@ mod tests {
         assert_eq!(ui.scrollback_len(), snap.scrollback.len());
         let first_line = &snap.scrollback[0];
         let first_ch = first_line[0].ch;
-        assert_eq!(ui.scrollback[0][0].ch, first_ch);
+        assert_eq!(ui.scrollback[0].get(0).unwrap().ch, first_ch);
+        assert!(ui
+            .scrollback
+            .iter()
+            .all(|row| matches!(row, HistoryRow::Uniform { .. })));
+    }
+
+    #[test]
+    fn compact_history_matches_full_cells_through_eviction_resize_and_selection() {
+        let mut compact = Terminal::new(3, 12);
+        let mut plain = Terminal::new(3, 12);
+        // Reach the real retention boundary without weakening the production cap.
+        for terminal in [&mut compact, &mut plain] {
+            for _ in 0..MAX_SCROLLBACK {
+                terminal
+                    .scrollback
+                    .push_back(vec![Cell::default(); 12].into());
+            }
+        }
+        let output = "plain\r\n\u{1b}[31mred\u{1b}[0m tail\r\n中🙂\r\nlast\r\n";
+        for chunk in output.as_bytes().chunks(7) {
+            compact.process_bytes(chunk);
+            plain.process_bytes(chunk);
+        }
+        // A full-cell history is an independent oracle for all read paths.
+        for row in &mut plain.scrollback {
+            *row = HistoryRow::Cells(row.iter().collect());
+        }
+        for (rows, cols) in [(3, 12), (2, 12), (5, 12), (5, 7), (3, 16)] {
+            compact.resize(rows, cols);
+            plain.resize(rows, cols);
+            for row in &mut plain.scrollback {
+                *row = HistoryRow::Cells(row.iter().collect());
+            }
+            assert_same_terminal_state(&compact, &plain);
+            for delta in [0.0, 2.5, 4.0, -1.25] {
+                compact.scroll_view_by_lines(delta);
+                plain.scroll_view_by_lines(delta);
+                assert_same_grid_state(&compact.display_grid(), &plain.display_grid());
+                assert_eq!(compact.scroll_offset, plain.scroll_offset);
+                assert_eq!(compact.scroll_accum_lines, plain.scroll_accum_lines);
+                let first = compact.evicted_lines + compact.scrollback_len() as u64 - 4;
+                let last = first + 5;
+                assert_eq!(
+                    compact.selection_text((first, 0), (last, cols - 1)),
+                    plain.selection_text((first, 0), (last, cols - 1))
+                );
+            }
+        }
+        assert!(compact
+            .scrollback
+            .iter()
+            .any(|row| matches!(row, HistoryRow::Uniform { .. })));
+        assert!(compact
+            .scrollback
+            .iter()
+            .any(|row| matches!(row, HistoryRow::Cells(_))));
     }
 
     #[test]
