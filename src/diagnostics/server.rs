@@ -1,9 +1,9 @@
 use std::io;
 
 use terminal_manager_diagnostics::{
-    is_supported_protocol_version, AppIdentity, DiagnosticCapabilities, DiagnosticCommand,
-    DiagnosticEventFamily, DiagnosticProtocolError, DiagnosticRequest, DiagnosticResponse,
-    InvariantOutcome, SnapshotOptions, DIAGNOSTIC_PROTOCOL_VERSION,
+    diagnostic_transport_name, is_supported_protocol_version, AppIdentity, DiagnosticCapabilities,
+    DiagnosticCommand, DiagnosticEventFamily, DiagnosticProtocolError, DiagnosticRequest,
+    DiagnosticResponse, InvariantOutcome, SnapshotOptions, DIAGNOSTIC_PROTOCOL_VERSION,
 };
 
 use super::config::DiagnosticConfig;
@@ -185,7 +185,7 @@ fn enabled_features() -> Vec<String> {
 fn handshake_capabilities() -> DiagnosticCapabilities {
     DiagnosticCapabilities {
         supported_protocol_versions: vec![DIAGNOSTIC_PROTOCOL_VERSION.to_owned()],
-        transports: vec!["named_pipe".to_owned()],
+        transports: vec![diagnostic_transport_name().to_owned()],
         commands: vec![
             "hello".to_owned(),
             "mark_step".to_owned(),
@@ -277,7 +277,10 @@ mod tests {
         assert!(capabilities.invariants);
         assert!(capabilities.step_markers);
         assert!(capabilities.flush);
-        assert_eq!(capabilities.transports, vec!["named_pipe"]);
+        assert_eq!(
+            capabilities.transports,
+            vec![diagnostic_transport_name().to_owned()]
+        );
     }
 
     #[test]

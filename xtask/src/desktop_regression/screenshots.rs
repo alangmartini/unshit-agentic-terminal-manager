@@ -129,6 +129,7 @@ pub fn capture_screen(_path: &Path) -> Result<(), String> {
     Err("desktop screenshot capture is only supported on Windows".to_owned())
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub fn stripe_lit_ratio_rgba(
     rgba: &[u8],
     bitmap_width: u32,
@@ -176,6 +177,7 @@ pub fn stripe_lit_ratio_rgba(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub fn max_stripe_lit_ratio_rgba(
     rgba: &[u8],
     bitmap_width: u32,

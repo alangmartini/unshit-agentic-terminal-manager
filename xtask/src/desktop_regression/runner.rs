@@ -20,9 +20,9 @@ use crate::desktop_regression::results::{
 use crate::desktop_regression::suites::{execute_suite, execute_suite_replay, SuiteContext};
 use serde_json::json;
 use terminal_manager_diagnostics::{
-    FailureClassification, ObserveMode, ReplayMode, ResultAppInfo, ResultDiagnosticInfo,
-    ResultReplayInfo, ResultStatus, RunnerActionKind, RunnerActionTarget, SuiteFailure,
-    DIAGNOSTIC_PROTOCOL_VERSION,
+    diagnostic_transport_name, FailureClassification, ObserveMode, ReplayMode, ResultAppInfo,
+    ResultDiagnosticInfo, ResultReplayInfo, ResultStatus, RunnerActionKind, RunnerActionTarget,
+    SuiteFailure, DIAGNOSTIC_PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,7 +418,7 @@ fn result_diagnostics(observe: ObserveMode) -> Option<ResultDiagnosticInfo> {
         Some(ResultDiagnosticInfo {
             enabled: true,
             protocol_version: Some(DIAGNOSTIC_PROTOCOL_VERSION.to_owned()),
-            transport: Some("named_pipe".to_owned()),
+            transport: Some(diagnostic_transport_name().to_owned()),
         })
     }
 }

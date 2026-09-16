@@ -1,5 +1,13 @@
 use std::{env, ffi::OsString, fmt, path::PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
+#[cfg(unix)]
+use terminal_manager_diagnostics::{
+    diagnostic_unix_socket_path, DIAGNOSTIC_UNIX_SOCKET_PATH_BUDGET,
+};
+
 pub const ENV_DIAGNOSTICS_ENABLE: &str = "TM_DIAGNOSTICS_ENABLE";
 pub const ENV_DIAGNOSTICS_PIPE_NAME: &str = "TM_DIAGNOSTICS_PIPE_NAME";
 pub const ENV_DIAGNOSTICS_TOKEN: &str = "TM_DIAGNOSTICS_TOKEN";
@@ -35,7 +43,7 @@ impl fmt::Display for DiagnosticConfigError {
             DiagnosticConfigError::InvalidPipeName => {
                 write!(
                     f,
-                    "{ENV_DIAGNOSTICS_PIPE_NAME} must be a per-run Windows named pipe path or name"
+                    "{ENV_DIAGNOSTICS_PIPE_NAME} must be a safe per-run local IPC endpoint name"
                 )
             }
         }
@@ -64,20 +72,40 @@ impl DiagnosticConfig {
 
         let pipe_name =
             os_string_to_trimmed(pipe_name).ok_or(DiagnosticConfigError::MissingPipeName)?;
-        if !is_valid_pipe_name(&pipe_name) {
+        let token = os_string_to_trimmed(token).ok_or(DiagnosticConfigError::MissingToken)?;
+        let config = Self { pipe_name, token };
+        config.validate()?;
+        Ok(Some(config))
+    }
+
+    pub fn validate(&self) -> Result<(), DiagnosticConfigError> {
+        if !is_valid_pipe_name(&self.pipe_name) {
             return Err(DiagnosticConfigError::InvalidPipeName);
         }
-
-        let token = os_string_to_trimmed(token).ok_or(DiagnosticConfigError::MissingToken)?;
-
-        Ok(Some(Self { pipe_name, token }))
+        Ok(())
     }
 
     pub fn pipe_path(&self) -> PathBuf {
-        if self.pipe_name.starts_with(r"\\.\pipe\") {
+        #[cfg(windows)]
+        {
+            if self.pipe_name.starts_with(r"\\.\pipe\") {
+                PathBuf::from(&self.pipe_name)
+            } else {
+                PathBuf::from(format!(r"\\.\pipe\{}", self.pipe_name))
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            // Unix diagnostics use a private socket in the system temporary
+            // directory. The name is validated as a single safe component,
+            // so this cannot redirect cleanup or binding outside that dir.
+            diagnostic_unix_socket_path(&self.pipe_name)
+        }
+
+        #[cfg(not(any(windows, unix)))]
+        {
             PathBuf::from(&self.pipe_name)
-        } else {
-            PathBuf::from(format!(r"\\.\pipe\{}", self.pipe_name))
         }
     }
 }
@@ -102,10 +130,36 @@ fn os_string_to_trimmed(value: Option<OsString>) -> Option<String> {
 }
 
 fn is_valid_pipe_name(pipe_name: &str) -> bool {
-    if pipe_name.starts_with(r"\\.\pipe\") {
-        pipe_name.len() > r"\\.\pipe\".len()
-    } else {
-        !pipe_name.contains('\\') && !pipe_name.contains('/')
+    #[cfg(windows)]
+    {
+        if pipe_name.starts_with(r"\\.\pipe\") {
+            pipe_name.len() > r"\\.\pipe\".len()
+        } else {
+            !pipe_name.is_empty() && !pipe_name.contains('\\') && !pipe_name.contains('/')
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if pipe_name.is_empty() || pipe_name == "." || pipe_name == ".." {
+            return false;
+        }
+        if !pipe_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return false;
+        }
+
+        // Darwin's sockaddr_un has a small path field. Keep enough headroom
+        // for the trailing NUL while avoiding an error only after bind().
+        let path = diagnostic_unix_socket_path(pipe_name);
+        path.as_os_str().as_bytes().len() <= DIAGNOSTIC_UNIX_SOCKET_PATH_BUDGET
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        !pipe_name.is_empty()
     }
 }
 
@@ -150,13 +204,20 @@ mod tests {
         )
         .expect("parse")
         .expect("enabled config");
+        #[cfg(windows)]
         assert_eq!(
             config.pipe_path(),
             PathBuf::from(r"\\.\pipe\tm-diagnostics-test")
         );
+        #[cfg(unix)]
+        assert_eq!(
+            config.pipe_path(),
+            diagnostic_unix_socket_path("tm-diagnostics-test")
+        );
         assert_eq!(config.token, "secret");
     }
 
+    #[cfg(windows)]
     #[test]
     fn diagnostics_accept_full_windows_pipe_paths() {
         let config = DiagnosticConfig::from_values(
@@ -170,6 +231,36 @@ mod tests {
         assert_eq!(
             config.pipe_path(),
             PathBuf::from(r"\\.\pipe\tm-diagnostics-full-path")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_reject_unix_paths_and_traversal_components() {
+        for pipe_name in ["/tmp/diagnostics", "nested/socket", ".", ".."] {
+            let error = DiagnosticConfig::from_values(
+                Some(OsString::from("1")),
+                Some(OsString::from(pipe_name)),
+                Some(OsString::from("secret")),
+            )
+            .expect_err("unsafe Unix endpoint names must be rejected");
+            assert_eq!(error, DiagnosticConfigError::InvalidPipeName);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_accept_short_xtask_style_endpoint_names() {
+        let config = DiagnosticConfig {
+            pipe_name: "tm-diagnostics-0123456789abcdef-0123456789ab".to_owned(),
+            token: "secret".to_owned(),
+        };
+
+        config
+            .validate()
+            .expect("short Unix endpoint must be accepted");
+        assert!(
+            config.pipe_path().as_os_str().as_bytes().len() <= DIAGNOSTIC_UNIX_SOCKET_PATH_BUDGET
         );
     }
 }

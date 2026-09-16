@@ -297,7 +297,7 @@ pub fn start(shared: SharedState, sink: Arc<OnceLock<EventSink>>) {
             let mut started = ResourceEventRecord::new("resource.monitor_started", "info");
             started.interval_ms = Some(SAMPLE_INTERVAL.as_millis() as u64);
             started.logical_cpus = Some(platform::logical_cpus());
-            started.platform_supported = Some(cfg!(windows));
+            started.platform_supported = Some(cfg!(any(windows, target_os = "macos")));
             telemetry::record(&started);
 
             let mut monitor = Monitor::new();

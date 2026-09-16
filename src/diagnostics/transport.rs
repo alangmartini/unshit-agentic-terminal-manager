@@ -1,9 +1,109 @@
+use std::io;
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+
+const MAX_DIAGNOSTIC_REQUEST_BYTES: usize = 64 * 1024;
+const DIAGNOSTIC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn read_request_line_with_timeout<R>(
+    reader: &mut BufReader<R>,
+    timeout: Duration,
+) -> io::Result<Option<String>>
+where
+    R: AsyncRead + Unpin,
+{
+    tokio::time::timeout(timeout, read_request_line(reader))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "diagnostic request read timed out"))?
+}
+
+async fn read_request_line<R>(reader: &mut BufReader<R>) -> io::Result<Option<String>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut encoded = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            break;
+        }
+
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let bytes_to_consume = newline.map_or(chunk.len(), |index| index + 1);
+        let new_len = encoded.len().checked_add(bytes_to_consume).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "diagnostic request exceeds the maximum size",
+            )
+        })?;
+        if new_len > MAX_DIAGNOSTIC_REQUEST_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "diagnostic request exceeds the maximum size",
+            ));
+        }
+
+        encoded.extend_from_slice(&chunk[..bytes_to_consume]);
+        reader.consume(bytes_to_consume);
+        if newline.is_some() {
+            break;
+        }
+    }
+
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+
+    String::from_utf8(encoded).map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "diagnostic request is not UTF-8",
+        )
+    })
+}
+
+#[cfg(test)]
+mod request_reader_tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected_before_json_parsing() {
+        let (mut writer, reader) = duplex(MAX_DIAGNOSTIC_REQUEST_BYTES + 1);
+        writer
+            .write_all(&vec![b'x'; MAX_DIAGNOSTIC_REQUEST_BYTES + 1])
+            .await
+            .expect("write oversized request");
+        let mut reader = BufReader::new(reader);
+
+        let error = read_request_line_with_timeout(&mut reader, Duration::from_secs(1))
+            .await
+            .expect_err("oversized request must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn unterminated_request_is_bounded_by_read_timeout() {
+        let (_writer, reader) = duplex(128);
+        let mut reader = BufReader::new(reader);
+
+        let error = read_request_line_with_timeout(&mut reader, Duration::from_millis(10))
+            .await
+            .expect_err("idle request must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::{io, path::Path, path::PathBuf};
 
+    use super::{read_request_line_with_timeout, DIAGNOSTIC_REQUEST_READ_TIMEOUT};
     use terminal_manager_diagnostics::{DiagnosticRequest, DiagnosticResponse};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    #[cfg(test)]
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncWriteExt, BufReader};
     #[cfg(test)]
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -16,6 +116,9 @@ mod imp {
     use crate::state::SharedState;
 
     pub async fn run(config: DiagnosticConfig, shared: SharedState) -> io::Result<()> {
+        config
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let endpoint = config.pipe_path().display().to_string();
         let events = DiagnosticEventStore::default();
         let mut server = Server::bind(config.pipe_path())?;
@@ -84,11 +187,9 @@ mod imp {
         events: DiagnosticEventStore,
     ) -> io::Result<()> {
         let mut reader = BufReader::new(connection);
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line).await?;
-        let response = if bytes == 0 {
-            invalid_request_response("empty diagnostic request")
-        } else {
+        let line =
+            read_request_line_with_timeout(&mut reader, DIAGNOSTIC_REQUEST_READ_TIMEOUT).await?;
+        let response = if let Some(line) = line {
             match serde_json::from_str::<DiagnosticRequest>(&line) {
                 Ok(request) => {
                     handle_request(request, expected_token, &events, || DiagnosticAppContext {
@@ -98,6 +199,8 @@ mod imp {
                 }
                 Err(err) => invalid_request_response(&format!("invalid diagnostic request: {err}")),
             }
+        } else {
+            invalid_request_response("empty diagnostic request")
         };
 
         let writer = reader.get_mut();
@@ -377,7 +480,191 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+mod imp {
+    use std::io;
+
+    use super::{read_request_line_with_timeout, DIAGNOSTIC_REQUEST_READ_TIMEOUT};
+    use terminal_manager_diagnostics::{DiagnosticRequest, DiagnosticResponse};
+    #[cfg(test)]
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+    #[cfg(test)]
+    use unshit_ptyd::transport::connect as connect_socket;
+    use unshit_ptyd::transport::Server as SocketServer;
+
+    use crate::diagnostics::config::DiagnosticConfig;
+    use crate::diagnostics::events::DiagnosticEventStore;
+    use crate::diagnostics::server::{
+        handle_request, invalid_request_response, DiagnosticAppContext,
+    };
+    use crate::state::SharedState;
+
+    pub async fn run(config: DiagnosticConfig, shared: SharedState) -> io::Result<()> {
+        config
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let endpoint = config.pipe_path().display().to_string();
+        let events = DiagnosticEventStore::default();
+        let mut server = SocketServer::bind(config.pipe_path()).await?;
+        loop {
+            let connection = server.accept().await?;
+            if let Err(err) = serve_connection(
+                connection,
+                &config.token,
+                shared.clone(),
+                endpoint.clone(),
+                events.clone(),
+            )
+            .await
+            {
+                log::warn!("diagnostic connection failed: {err}");
+            }
+        }
+    }
+
+    async fn serve_connection(
+        connection: UnixStream,
+        expected_token: &str,
+        shared: SharedState,
+        endpoint: String,
+        events: DiagnosticEventStore,
+    ) -> io::Result<()> {
+        let mut reader = BufReader::new(connection);
+        let line =
+            read_request_line_with_timeout(&mut reader, DIAGNOSTIC_REQUEST_READ_TIMEOUT).await?;
+        let response = if let Some(line) = line {
+            match serde_json::from_str::<DiagnosticRequest>(&line) {
+                Ok(request) => {
+                    handle_request(request, expected_token, &events, || DiagnosticAppContext {
+                        shared,
+                        diagnostic_endpoint: Some(endpoint),
+                    })
+                }
+                Err(err) => invalid_request_response(&format!("invalid diagnostic request: {err}")),
+            }
+        } else {
+            invalid_request_response("empty diagnostic request")
+        };
+
+        let writer = reader.get_mut();
+        write_response(writer, &response).await
+    }
+
+    async fn write_response(
+        writer: &mut UnixStream,
+        response: &DiagnosticResponse,
+    ) -> io::Result<()> {
+        let mut encoded = serde_json::to_vec(response).map_err(io::Error::other)?;
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await?;
+        writer.flush().await
+    }
+
+    #[cfg(test)]
+    async fn send_request(
+        path: impl AsRef<std::path::Path>,
+        request: serde_json::Value,
+    ) -> io::Result<DiagnosticResponse> {
+        let path = path.as_ref().to_path_buf();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut client = loop {
+            match connect_socket(&path).await {
+                Ok(client) => break client,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        let mut encoded = serde_json::to_vec(&request).map_err(io::Error::other)?;
+        encoded.push(b'\n');
+        client.write_all(&encoded).await?;
+        client.flush().await?;
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        serde_json::from_str::<DiagnosticResponse>(&line).map_err(io::Error::other)
+    }
+
+    #[cfg(test)]
+    fn unique_socket_name() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("tm-diagnostics-test-{}-{n}", std::process::id())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use terminal_manager_diagnostics::{
+            DiagnosticCommand, DiagnosticResponse, DIAGNOSTIC_PROTOCOL_VERSION,
+        };
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn unix_socket_hello_round_trip_requires_token() {
+            let config = DiagnosticConfig {
+                pipe_name: unique_socket_name(),
+                token: "secret-token".to_owned(),
+            };
+            let path = config.pipe_path();
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(crate::state::seed_state()));
+            let server_task = tokio::spawn(async move {
+                let _ = run(config, shared).await;
+            });
+
+            let hello = DiagnosticRequest {
+                token: "secret-token".to_owned(),
+                command: DiagnosticCommand::Hello {
+                    required_protocol_version: Some(DIAGNOSTIC_PROTOCOL_VERSION.to_owned()),
+                },
+                ..Default::default()
+            };
+            let response = send_request(&path, serde_json::to_value(hello).unwrap())
+                .await
+                .expect("hello response");
+
+            let DiagnosticResponse::Hello {
+                protocol_version,
+                app,
+                capabilities,
+                ..
+            } = response
+            else {
+                panic!("expected hello response");
+            };
+            assert_eq!(protocol_version, DIAGNOSTIC_PROTOCOL_VERSION);
+            assert_eq!(app.process_id, Some(std::process::id()));
+            assert!(capabilities.transports.contains(&"unix_socket".to_owned()));
+            assert!(capabilities.commands.contains(&"snapshot".to_owned()));
+
+            let unauthorized = DiagnosticRequest {
+                token: "wrong".to_owned(),
+                command: DiagnosticCommand::Hello {
+                    required_protocol_version: Some(DIAGNOSTIC_PROTOCOL_VERSION.to_owned()),
+                },
+                ..Default::default()
+            };
+            let response = send_request(&path, serde_json::to_value(unauthorized).unwrap())
+                .await
+                .expect("unauthorized response");
+            let DiagnosticResponse::Error { error } = response else {
+                panic!("expected unauthorized response");
+            };
+            assert_eq!(error.code, "unauthorized");
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod imp {
     use std::io;
 
@@ -389,7 +676,7 @@ mod imp {
     ) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "diagnostic named-pipe transport is only supported on Windows",
+            "diagnostic transport is not supported on this platform",
         ))
     }
 }

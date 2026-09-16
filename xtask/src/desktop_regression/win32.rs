@@ -1,6 +1,8 @@
 use std::time::Duration;
 
+#[cfg(any(target_os = "windows", test))]
 const MIN_OCCLUDER_WIDTH_PX: i32 = 2;
+#[cfg(any(target_os = "windows", test))]
 const MIN_OCCLUDER_HEIGHT_PX: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +39,7 @@ pub struct FocusWindowOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "windows", test))]
 pub struct WindowOcclusionCandidate {
     pub handle: WindowHandle,
     pub rect: DesktopRect,
@@ -44,6 +47,7 @@ pub struct WindowOcclusionCandidate {
     pub owned: bool,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl WindowOcclusionCandidate {
     fn occludes(self, target_rect: DesktopRect) -> bool {
         self.visible
@@ -56,15 +60,12 @@ impl WindowOcclusionCandidate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapCaptureReadinessError {
-    ForegroundStolen {
-        foreground: Option<WindowHandle>,
-    },
-    StuckModifier {
-        modifier: &'static str,
-    },
-    WindowOccluded {
-        occluder: WindowOcclusionCandidate,
-    },
+    #[cfg(any(target_os = "windows", test))]
+    ForegroundStolen { foreground: Option<WindowHandle> },
+    #[cfg(any(target_os = "windows", test))]
+    StuckModifier { modifier: &'static str },
+    #[cfg(any(target_os = "windows", test))]
+    WindowOccluded { occluder: WindowOcclusionCandidate },
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     Unsupported,
 }
@@ -72,8 +73,11 @@ pub enum SnapCaptureReadinessError {
 impl SnapCaptureReadinessError {
     pub fn first_bad_signal(self) -> &'static str {
         match self {
+            #[cfg(any(target_os = "windows", test))]
             Self::ForegroundStolen { .. } => "snap-foreground-stolen",
+            #[cfg(any(target_os = "windows", test))]
             Self::StuckModifier { .. } => "snap-stuck-modifier",
+            #[cfg(any(target_os = "windows", test))]
             Self::WindowOccluded { .. } => "snap-window-occluded",
             Self::Unsupported => "snap-composition-unsupported",
         }
@@ -81,12 +85,15 @@ impl SnapCaptureReadinessError {
 
     pub fn message(self) -> String {
         match self {
+            #[cfg(any(target_os = "windows", test))]
             Self::ForegroundStolen { foreground } => {
                 format!("foreground window changed before post-snap capture: {foreground:?}")
             }
+            #[cfg(any(target_os = "windows", test))]
             Self::StuckModifier { modifier } => {
                 format!("modifier key remained pressed after Win+Left: {modifier}")
             }
+            #[cfg(any(target_os = "windows", test))]
             Self::WindowOccluded { occluder } => {
                 format!("post-snap window is obscured by {occluder:?}")
             }
@@ -95,6 +102,7 @@ impl SnapCaptureReadinessError {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub fn rects_overlap(a: DesktopRect, b: DesktopRect) -> bool {
     a.width() > 0
         && a.height() > 0
@@ -1061,6 +1069,7 @@ mod imp {
 
     use super::{
         DesktopRect, DesktopSize, FocusWindowOutcome, SnapCaptureReadinessError, WindowHandle,
+        WindowManagerChord,
     };
 
     pub fn find_window_for_process(

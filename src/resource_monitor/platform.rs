@@ -2,8 +2,8 @@
 //! a process that exited or cannot be opened yields `None` and the caller
 //! counts it as unsampled rather than failing the tick.
 //!
-//! Only Windows is implemented (the app is Windows-only today). Other
-//! platforms report `None` from every probe, which the UI renders as `--`.
+//! Windows and macOS use their native process APIs. Other platforms report
+//! `None` from every probe, which the UI renders as `--`.
 
 use std::collections::HashMap;
 
@@ -164,7 +164,210 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::{HashMap, ProcSample, ProcessRecord};
+    use std::mem::{size_of, MaybeUninit};
+
+    // These constants come from Apple's public libproc headers (`libproc.h`
+    // and `sys/proc_info.h`). The libc crate supplies the matching C structs;
+    // keep the bindings local so non-macOS targets do not need to know about
+    // them.
+    const PROC_ALL_PIDS: u32 = 1;
+    const PROC_PIDTBSDINFO: i32 = libc::PROC_PIDTBSDINFO;
+    const PROC_PIDTASKINFO: i32 = libc::PROC_PIDTASKINFO;
+    const UNIX_EPOCH_FILETIME_100NS: u64 = 11_644_473_600 * 10_000_000;
+
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_listpids(
+            kind: u32,
+            typeinfo: u32,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    fn pid_arg(pid: u32) -> Option<libc::c_int> {
+        libc::c_int::try_from(pid).ok()
+    }
+
+    fn read_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+        let pid = pid_arg(pid)?;
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        // SAFETY: `info` is a properly sized writable buffer and libproc only
+        // writes the documented `proc_bsdinfo` structure into it. The pid is
+        // checked to fit the C API's signed `int` parameter above.
+        let bytes = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size_of::<libc::proc_bsdinfo>() as libc::c_int,
+            )
+        };
+        if bytes < size_of::<libc::proc_bsdinfo>() as libc::c_int {
+            return None;
+        }
+        // SAFETY: libproc reported a complete structure in the buffer.
+        Some(unsafe { info.assume_init() })
+    }
+
+    fn read_task_info(pid: u32) -> Option<libc::proc_taskinfo> {
+        let pid = pid_arg(pid)?;
+        let mut info = MaybeUninit::<libc::proc_taskinfo>::zeroed();
+        // SAFETY: `info` is a properly sized writable buffer and libproc only
+        // writes the documented `proc_taskinfo` structure into it.
+        let bytes = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDTASKINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size_of::<libc::proc_taskinfo>() as libc::c_int,
+            )
+        };
+        if bytes < size_of::<libc::proc_taskinfo>() as libc::c_int {
+            return None;
+        }
+        // SAFETY: libproc reported a complete structure in the buffer.
+        Some(unsafe { info.assume_init() })
+    }
+
+    fn process_name(bytes: &[libc::c_char]) -> Option<String> {
+        let len = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(bytes.len());
+        if len == 0 {
+            return None;
+        }
+        let bytes: Vec<u8> = bytes[..len].iter().map(|&byte| byte as u8).collect();
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn process_start_100ns(info: &libc::proc_bsdinfo) -> Option<u64> {
+        let seconds = info.pbi_start_tvsec.checked_mul(10_000_000)?;
+        let micros = info.pbi_start_tvusec.checked_mul(10)?;
+        UNIX_EPOCH_FILETIME_100NS
+            .checked_add(seconds)?
+            .checked_add(micros)
+    }
+
+    pub fn enumerate_processes_named() -> Option<(Vec<ProcessRecord>, HashMap<u32, String>)> {
+        // A first zero-sized call asks libproc for the current buffer size.
+        // The process table can grow between calls, so retry with a larger
+        // buffer when the second call fills it completely.
+        let required = unsafe { proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+        if required <= 0 {
+            return None;
+        }
+
+        let mut pids = vec![0 as libc::pid_t; (required as usize / size_of::<libc::pid_t>()) + 64];
+        let bytes = loop {
+            let capacity_bytes = pids.len().saturating_mul(size_of::<libc::pid_t>());
+            let bytes = unsafe {
+                proc_listpids(
+                    PROC_ALL_PIDS,
+                    0,
+                    pids.as_mut_ptr().cast(),
+                    capacity_bytes.min(libc::c_int::MAX as usize) as libc::c_int,
+                )
+            };
+            if bytes <= 0 {
+                return None;
+            }
+            if (bytes as usize) < capacity_bytes {
+                break bytes as usize;
+            }
+            // A continuously changing process table should not make this
+            // loop unbounded. Grow by a fixed slack amount and try once more;
+            // if it still fills, the returned prefix is still useful.
+            let next_len = pids.len().saturating_mul(2);
+            if next_len <= pids.len() {
+                break bytes as usize;
+            }
+            pids.resize(next_len, 0);
+        };
+
+        let count = bytes / size_of::<libc::pid_t>();
+        let mut records = Vec::with_capacity(count);
+        let mut names = HashMap::with_capacity(count);
+        for &raw_pid in pids.iter().take(count) {
+            if raw_pid <= 0 {
+                continue;
+            }
+            let pid = raw_pid as u32;
+            let Some(info) = read_bsd_info(pid) else {
+                continue;
+            };
+            records.push(ProcessRecord {
+                pid,
+                parent_pid: info.pbi_ppid,
+            });
+            if let Some(name) =
+                process_name(&info.pbi_name).or_else(|| process_name(&info.pbi_comm))
+            {
+                names.insert(pid, name);
+            }
+        }
+        Some((records, names))
+    }
+
+    pub fn sample_process(pid: u32) -> Option<ProcSample> {
+        let bsd = read_bsd_info(pid)?;
+        let task = read_task_info(pid)?;
+        let creation_100ns = process_start_100ns(&bsd)?;
+        // `pti_total_user` and `pti_total_system` are nanoseconds in Apple's
+        // proc_taskinfo API; convert to the monitor's 100ns time unit.
+        let cpu_ns = task.pti_total_user.saturating_add(task.pti_total_system);
+        Some(ProcSample {
+            pid,
+            creation_100ns,
+            cpu_100ns: cpu_ns / 100,
+            working_set_bytes: task.pti_resident_size,
+        })
+    }
+
+    pub fn now_100ns() -> u64 {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        UNIX_EPOCH_FILETIME_100NS
+            .saturating_add(elapsed.as_secs().saturating_mul(10_000_000))
+            .saturating_add(u64::from(elapsed.subsec_nanos()) / 100)
+    }
+
+    pub fn local_time_hhmm() -> Option<String> {
+        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        if now < 0 {
+            return None;
+        }
+        let mut local = MaybeUninit::<libc::tm>::zeroed();
+        // SAFETY: `local` is writable storage for `localtime_r`; on success
+        // the returned pointer aliases the initialized value in that storage.
+        let result = unsafe { libc::localtime_r(&now, local.as_mut_ptr()) };
+        if result.is_null() {
+            return None;
+        }
+        // SAFETY: `localtime_r` returned the pointer to our initialized value.
+        let local = unsafe { local.assume_init() };
+        if !(0..=23).contains(&local.tm_hour) || !(0..=59).contains(&local.tm_min) {
+            return None;
+        }
+        Some(format!("{:02}:{:02}", local.tm_hour, local.tm_min))
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 mod imp {
     use super::{HashMap, ProcSample, ProcessRecord};
 
@@ -264,6 +467,46 @@ mod tests {
             attributed_grandchildren >= 1,
             "expected ping under cmd: {owner:?}"
         );
+    }
+
+    #[test]
+    fn local_time_is_hh_mm() {
+        let text = local_time_hhmm().expect("local time");
+        assert_eq!(text.len(), 5);
+        assert_eq!(&text[2..3], ":");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn samples_the_current_process() {
+        let sample = sample_process(std::process::id()).expect("own process is sampleable");
+        assert!(
+            sample.working_set_bytes > 0,
+            "resident memory should be readable: {sample:?}"
+        );
+        assert!(sample.creation_100ns > 0);
+        assert!(sample.creation_100ns <= now_100ns());
+    }
+
+    #[test]
+    fn impossible_pid_is_unsampled() {
+        assert!(sample_process(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn enumeration_includes_ourselves_and_a_name() {
+        let (table, names) = enumerate_processes_named().expect("libproc process snapshot");
+        let pid = std::process::id();
+        let me = table
+            .iter()
+            .find(|record| record.pid == pid)
+            .expect("own pid in process snapshot");
+        assert_ne!(me.parent_pid, 0);
+        assert!(names.get(&pid).is_some_and(|name| !name.is_empty()));
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -9,11 +8,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use terminal_manager_diagnostics::{
-    AppIdentity, DeterministicModeOptions, DiagnosticCapabilities, DiagnosticCommand,
-    DiagnosticEnvelope, DiagnosticEvent, DiagnosticEventFamily, DiagnosticRequest,
-    DiagnosticResponse, InvariantEvaluation, InvariantScope, ObserveMode, SnapshotOptions,
-    TerminalManagerSnapshot, DIAGNOSTIC_PROTOCOL_VERSION,
+    diagnostic_transport_name, AppIdentity, DeterministicModeOptions, DiagnosticCapabilities,
+    DiagnosticCommand, DiagnosticEnvelope, DiagnosticEvent, DiagnosticEventFamily,
+    DiagnosticRequest, DiagnosticResponse, InvariantEvaluation, InvariantScope, ObserveMode,
+    SnapshotOptions, TerminalManagerSnapshot, DIAGNOSTIC_PROTOCOL_VERSION,
 };
+
+#[cfg(unix)]
+use terminal_manager_diagnostics::diagnostic_unix_socket_path;
 
 use crate::desktop_regression::artifacts::suite_artifact_name;
 
@@ -30,10 +32,23 @@ pub struct DiagnosticLaunchConfig {
 
 impl DiagnosticLaunchConfig {
     pub fn pipe_path(&self) -> PathBuf {
-        if self.pipe_name.starts_with(r"\\.\pipe\") {
+        #[cfg(windows)]
+        {
+            if self.pipe_name.starts_with(r"\\.\pipe\") {
+                PathBuf::from(&self.pipe_name)
+            } else {
+                PathBuf::from(format!(r"\\.\pipe\{}", self.pipe_name))
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            diagnostic_unix_socket_path(&self.pipe_name)
+        }
+
+        #[cfg(not(any(windows, unix)))]
+        {
             PathBuf::from(&self.pipe_name)
-        } else {
-            PathBuf::from(format!(r"\\.\pipe\{}", self.pipe_name))
         }
     }
 
@@ -57,14 +72,27 @@ pub fn diagnostic_launch_for_mode(
 
     let token = generate_token(run_id, suite_id);
     let token_prefix = &token[..12.min(token.len())];
-    Some(DiagnosticLaunchConfig {
-        pipe_name: format!(
-            "tm-diagnostics-{}-{}-{token_prefix}",
-            sanitize_pipe_component(run_id),
-            sanitize_pipe_component(suite_id)
-        ),
-        token,
-    })
+
+    #[cfg(unix)]
+    let pipe_name = unix_diagnostic_pipe_name(run_id, suite_id, token_prefix);
+    #[cfg(not(unix))]
+    let pipe_name = format!(
+        "tm-diagnostics-{}-{}-{token_prefix}",
+        sanitize_pipe_component(run_id),
+        sanitize_pipe_component(suite_id)
+    );
+
+    Some(DiagnosticLaunchConfig { pipe_name, token })
+}
+
+#[cfg(unix)]
+fn unix_diagnostic_pipe_name(run_id: &str, suite_id: &str, token_prefix: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(run_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(suite_id.as_bytes());
+    let digest = hasher.finalize();
+    format!("tm-diagnostics-{}-{token_prefix}", hex_encode(&digest[..8]))
 }
 
 fn generate_token(run_id: &str, suite_id: &str) -> String {
@@ -95,6 +123,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(not(unix))]
 fn sanitize_pipe_component(raw: &str) -> String {
     raw.chars()
         .map(|ch| {
@@ -292,11 +321,20 @@ fn send_request_blocking(
     path: &Path,
     request: &DiagnosticRequest,
 ) -> Result<DiagnosticResponse, String> {
-    let mut pipe = OpenOptions::new()
+    #[cfg(windows)]
+    let mut pipe = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .map_err(|e| format!("failed to open diagnostic pipe {}: {e}", path.display()))?;
+
+    #[cfg(unix)]
+    let mut pipe = std::os::unix::net::UnixStream::connect(path)
+        .map_err(|e| format!("failed to open diagnostic socket {}: {e}", path.display()))?;
+
+    #[cfg(not(any(windows, unix)))]
+    return Err("diagnostic transport is not supported on this platform".to_owned());
+
     let mut encoded =
         serde_json::to_vec(request).map_err(|e| format!("failed to encode request: {e}"))?;
     encoded.push(b'\n');
@@ -368,12 +406,13 @@ pub fn validate_capabilities(
     {
         missing.push(format!("protocol {DIAGNOSTIC_PROTOCOL_VERSION}"));
     }
+    let expected_transport = diagnostic_transport_name();
     if !capabilities
         .transports
         .iter()
-        .any(|transport| transport == "named_pipe")
+        .any(|transport| transport == expected_transport)
     {
-        missing.push("named_pipe transport".to_owned());
+        missing.push(format!("{expected_transport} transport"));
     }
     require_command(capabilities, "hello", &mut missing);
     require_command(capabilities, "snapshot", &mut missing);
@@ -513,6 +552,11 @@ mod tests {
         DIAGNOSTIC_PROTOCOL_VERSION,
     };
 
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    use terminal_manager_diagnostics::DIAGNOSTIC_UNIX_SOCKET_PATH_BUDGET;
+
     #[test]
     fn off_mode_has_no_diagnostic_launch_environment() {
         assert!(diagnostic_launch_for_mode(ObserveMode::Off, "run-1", "edge").is_none());
@@ -536,9 +580,35 @@ mod tests {
             env.get(ENV_DIAGNOSTICS_TOKEN).map(String::as_str),
             Some(launch.token.as_str())
         );
-        assert!(launch.pipe_name.contains("run-1"));
-        assert!(launch.pipe_name.contains("edge"));
+        #[cfg(windows)]
+        {
+            assert!(launch.pipe_name.contains("run-1"));
+            assert!(launch.pipe_name.contains("edge"));
+        }
+        #[cfg(unix)]
+        {
+            assert!(launch.pipe_name.starts_with("tm-diagnostics-"));
+            assert!(launch.pipe_name.len() <= 64);
+            assert!(
+                launch.pipe_path().as_os_str().as_bytes().len()
+                    <= DIAGNOSTIC_UNIX_SOCKET_PATH_BUDGET
+            );
+        }
         assert!(launch.token.len() >= 32);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_launch_endpoint_stays_short_for_long_run_and_suite_ids() {
+        let run_id = format!("run-{}", "x".repeat(96));
+        let suite_id = format!("suite-{}", "y".repeat(96));
+        let launch = diagnostic_launch_for_mode(ObserveMode::Full, &run_id, &suite_id)
+            .expect("full observe enables diagnostics");
+
+        assert!(launch.pipe_name.len() <= 64);
+        assert!(
+            launch.pipe_path().as_os_str().as_bytes().len() <= DIAGNOSTIC_UNIX_SOCKET_PATH_BUDGET
+        );
     }
 
     #[test]

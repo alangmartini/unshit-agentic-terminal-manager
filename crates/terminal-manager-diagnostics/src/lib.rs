@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fmt;
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+
 pub const DIAGNOSTIC_PROTOCOL_VERSION: &str = "terminal-manager.diagnostics/v1";
 pub const COMMAND_SCHEMA_VERSION: &str = "terminal-manager.diagnostics.command/v1";
 pub const RESPONSE_SCHEMA_VERSION: &str = "terminal-manager.diagnostics.response/v1";
@@ -18,6 +23,53 @@ pub const SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS: &[&str] = &[SNAPSHOT_SCHEMA_VERSIO
 pub const SUPPORTED_RESULTS_SCHEMA_VERSIONS: &[&str] = &[RESULTS_SCHEMA_VERSION];
 pub const SUPPORTED_FAILURE_MANIFEST_SCHEMA_VERSIONS: &[&str] = &[FAILURE_MANIFEST_SCHEMA_VERSION];
 pub const SUPPORTED_RUNNER_ACTION_SCHEMA_VERSIONS: &[&str] = &[RUNNER_ACTION_SCHEMA_VERSION];
+
+/// Name advertised in the diagnostics handshake for the local IPC transport
+/// used by the current target platform.
+pub const fn diagnostic_transport_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "named_pipe"
+    }
+    #[cfg(unix)]
+    {
+        "unix_socket"
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        "unsupported"
+    }
+}
+
+/// Maximum Unix-domain-socket path length used by diagnostics.
+///
+/// Darwin's `sockaddr_un` leaves only a small path field. Keeping a little
+/// headroom below the platform limit avoids bind failures from a trailing NUL
+/// or libc-specific accounting.
+#[cfg(unix)]
+pub const DIAGNOSTIC_UNIX_SOCKET_PATH_BUDGET: usize = 100;
+
+/// Return the diagnostics socket path for the current user's temporary area.
+///
+/// macOS normally provides a private, short `$TMPDIR`. A test harness or
+/// launcher can nevertheless provide a deeply nested temporary directory;
+/// in that case use `/tmp` so a valid short endpoint remains bindable. The
+/// socket itself is still owner-only and the endpoint name is validated by
+/// the application before binding.
+#[cfg(unix)]
+pub fn diagnostic_unix_socket_path(name: &str) -> PathBuf {
+    diagnostic_unix_socket_path_for_dir(std::env::temp_dir(), name)
+}
+
+#[cfg(unix)]
+pub fn diagnostic_unix_socket_path_for_dir(base_dir: impl AsRef<Path>, name: &str) -> PathBuf {
+    let candidate = base_dir.as_ref().join(name);
+    if candidate.as_os_str().as_bytes().len() <= DIAGNOSTIC_UNIX_SOCKET_PATH_BUDGET {
+        candidate
+    } else {
+        PathBuf::from("/tmp").join(name)
+    }
+}
 
 pub type JsonObject = Map<String, Value>;
 
@@ -289,7 +341,7 @@ impl Default for DiagnosticCapabilities {
                 .iter()
                 .map(|version| (*version).to_owned())
                 .collect(),
-            transports: vec!["named_pipe".to_owned()],
+            transports: vec![diagnostic_transport_name().to_owned()],
             commands: vec![
                 "hello".to_owned(),
                 "mark_step".to_owned(),
@@ -988,5 +1040,35 @@ impl Default for Size {
             width: 0,
             height: 0,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_socket_path_tests {
+    use super::*;
+
+    #[test]
+    fn long_tmpdir_falls_back_to_short_socket_root() {
+        let long_tmpdir = PathBuf::from(format!(
+            "/private/var/folders/{}/T",
+            "diagnostics-long-temp-path-".repeat(4)
+        ));
+        let name = "tm-diagnostics-0123456789abcdef-0123456789ab";
+
+        let path = diagnostic_unix_socket_path_for_dir(&long_tmpdir, name);
+
+        assert_eq!(path, PathBuf::from("/tmp").join(name));
+        assert!(path.as_os_str().as_bytes().len() <= DIAGNOSTIC_UNIX_SOCKET_PATH_BUDGET);
+    }
+
+    #[test]
+    fn short_tmpdir_keeps_private_socket_root() {
+        let tmpdir = PathBuf::from("/private/tmp");
+        let name = "tm-diagnostics-short";
+
+        assert_eq!(
+            diagnostic_unix_socket_path_for_dir(&tmpdir, name),
+            tmpdir.join(name)
+        );
     }
 }
