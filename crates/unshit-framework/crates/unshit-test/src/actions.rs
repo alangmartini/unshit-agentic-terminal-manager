@@ -119,9 +119,12 @@ impl TestHarness {
     /// Press a key (or key combo) on the element matching `selector`.
     ///
     /// Supports single keys (`"Enter"`, `"Backspace"`, `"a"`) and combos
-    /// with modifiers like `"Ctrl+A"` (select all), `"Shift+ArrowLeft"`
-    /// (extend selection), or `"Ctrl+Backspace"` (delete word), matching
-    /// the production app's text-input hotkeys.
+    /// with modifiers like `"Ctrl+A"`/`"Cmd+A"` (select all),
+    /// `"Shift+ArrowLeft"` (extend selection), or
+    /// `"Ctrl+Backspace"`/`"Command+Backspace"` (delete word), matching
+    /// the production app's text-input hotkeys. `Ctrl`, `Meta`, `Cmd`, and
+    /// `Command` all enable word-editing semantics; this lets tests exercise
+    /// the platform primary modifier without coupling to a physical keyboard.
     ///
     /// The element is focused (clicked) before the key is pressed.
     pub fn press_on(&mut self, selector: &str, key_str: &str) {
@@ -138,17 +141,23 @@ impl TestHarness {
     pub fn press_key_str(&mut self, key_str: &str) {
         let parts: Vec<&str> = key_str.split('+').collect();
         let has_ctrl = parts.iter().any(|p| p.eq_ignore_ascii_case("ctrl"));
+        let has_primary = parts.iter().any(|p| {
+            p.eq_ignore_ascii_case("meta")
+                || p.eq_ignore_ascii_case("cmd")
+                || p.eq_ignore_ascii_case("command")
+        });
         let has_shift = parts.iter().any(|p| p.eq_ignore_ascii_case("shift"));
+        let has_word_modifier = has_ctrl || has_primary;
 
         let key_part = parts.last().unwrap_or(&"");
 
-        if has_ctrl && key_part.eq_ignore_ascii_case("a") {
+        if has_word_modifier && key_part.eq_ignore_ascii_case("a") {
             self.select_all();
             return;
         }
 
         let key = parse_key(key_part);
-        self.press_key_with_mods(key, has_shift, has_ctrl);
+        self.press_key_with_mods(key, has_shift, has_word_modifier);
     }
 
     /// Select an option by value on the first `<select>` matching `selector`.

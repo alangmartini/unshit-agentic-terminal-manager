@@ -22,7 +22,9 @@
 //! On every other platform this is a stub that reports "no surface", and
 //! callers fall back to the previous behaviour of waiting for the GPU.
 
-use crate::splash::{SplashCommand, SplashRect};
+use crate::splash::SplashCommand;
+#[cfg(windows)]
+use crate::splash::SplashRect;
 use unshit_core::style::types::Color;
 
 /// What actually made it onto the screen.

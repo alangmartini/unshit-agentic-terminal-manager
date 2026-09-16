@@ -55,6 +55,9 @@ impl TextPipeline {
         sample_count: u32,
         subpixel: bool,
     ) -> Self {
+        #[cfg(not(target_os = "windows"))]
+        let _ = subpixel;
+
         #[cfg(target_os = "windows")]
         let shader_src = if use_debug_solid_text_shader() {
             include_str!("../shaders/text_debug_solid.wgsl")

@@ -335,3 +335,42 @@ fn tab_focus_change_clears_selection() {
     let anchor = h.arena().get(input.node_id).unwrap().input_state.selection_anchor;
     assert_eq!(anchor, None);
 }
+
+#[cfg(target_os = "macos")]
+mod macos_primary_modifier {
+    use super::*;
+
+    #[test]
+    fn command_a_selects_all() {
+        let mut h = focused_harness();
+        h.type_text("hello world");
+        h.press_key_str("Command+A");
+
+        assert_eq!(h.input_selection(), Some((0, 11)));
+        assert_eq!(h.input_cursor_pos(), Some(11));
+    }
+
+    #[test]
+    fn cmd_backspace_deletes_the_previous_word() {
+        let mut h = focused_harness();
+        h.type_text("hello world");
+        h.press_key_str("Cmd+Backspace");
+
+        assert_eq!(h.input_value(), Some("hello ".to_string()));
+        assert_eq!(h.input_cursor_pos(), Some(6));
+    }
+
+    #[test]
+    fn meta_arrows_jump_by_word() {
+        let mut h = focused_harness();
+        h.type_text("foo bar");
+        h.press_key_str("Meta+ArrowLeft");
+        assert_eq!(h.input_cursor_pos(), Some(4));
+
+        h.press_key_str("Meta+ArrowLeft");
+        assert_eq!(h.input_cursor_pos(), Some(0));
+
+        h.press_key_str("Meta+ArrowRight");
+        assert_eq!(h.input_cursor_pos(), Some(4));
+    }
+}

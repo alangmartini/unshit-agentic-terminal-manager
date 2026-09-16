@@ -5,7 +5,9 @@ use unshit_core::event::*;
 use unshit_core::id::NodeId;
 use unshit_core::layout::{self, TextMeasureCache, TextMeasureCtx};
 use unshit_core::scroll::ScrollbarVisualState;
-use unshit_core::style::parse::{CompiledStylesheet, FontFaceSrc};
+use unshit_core::style::parse::CompiledStylesheet;
+#[cfg(target_os = "windows")]
+use unshit_core::style::parse::FontFaceSrc;
 use unshit_core::style::pseudo::PseudoSideTable;
 use unshit_core::tree::NodeArena;
 use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache};

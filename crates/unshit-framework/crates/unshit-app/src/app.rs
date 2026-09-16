@@ -50,6 +50,33 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{ResizeDirection, Window, WindowId};
 
+/// Whether the platform's primary application modifier is held.
+///
+/// Cocoa applications use Command where Windows and Linux applications use
+/// Control. Keeping this decision in the framework prevents every consumer
+/// from having to duplicate target-specific keyboard handling.
+#[inline]
+fn primary_modifier_held(modifiers: &ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.meta_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.control_key()
+    }
+}
+
+/// Whether an input-editing modifier is held.
+///
+/// Control remains accepted on macOS for compatibility with existing
+/// keybindings and terminal-oriented workflows, while Command is the native
+/// primary modifier there.
+#[inline]
+fn text_edit_modifier_held(modifiers: &ModifiersState) -> bool {
+    modifiers.control_key() || primary_modifier_held(modifiers)
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) struct MultimediaRenderThread {
     handle: winapi::um::winnt::HANDLE,
@@ -593,7 +620,6 @@ struct AppState {
     scale_factor: f32,
     window_maximized: bool,
     zoom_factor: f32,
-    ctrl_held: bool,
     shift_held: bool,
     modifiers_state: ModifiersState,
     shortcut_resolver: ShortcutResolver,
@@ -2986,7 +3012,10 @@ impl AppHandler {
         // GDI content and the swapchain both own the client area, and the
         // window looks better going straight from one to the other than
         // flickering between them.
+        #[cfg(target_os = "windows")]
         drop(splash_surface);
+        #[cfg(not(target_os = "windows"))]
+        let _ = splash_surface;
 
         // A window that was never mapped -- no placeholder painter on this
         // platform -- is mapped here instead, at the last point before the
@@ -3066,7 +3095,6 @@ impl AppHandler {
             scale_factor,
             window_maximized: initial_window_maximized,
             zoom_factor,
-            ctrl_held: false,
             shift_held: false,
             modifiers_state: ModifiersState::default(),
             shortcut_resolver,
@@ -4290,7 +4318,6 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::ModifiersChanged(modifiers) => {
-                state.ctrl_held = modifiers.state().control_key();
                 state.shift_held = modifiers.state().shift_key();
                 state.modifiers_state = modifiers.state();
             }
@@ -4528,13 +4555,15 @@ impl ApplicationHandler for AppHandler {
                             .map(|e| e.tag == Tag::Select)
                             .unwrap_or(false);
 
-                        // Handle clipboard shortcuts (Ctrl+A/C/V/X) when a text input is focused
-                        let handled_by_clipboard =
-                            if focused_is_input && state.modifiers_state.control_key() {
-                                handle_clipboard_shortcut(state, &event, &self.app.clipboard)
-                            } else {
-                                false
-                            };
+                        // Handle clipboard shortcuts with the platform primary modifier
+                        // (Cmd on macOS, Ctrl elsewhere) when a text input is focused.
+                        let handled_by_clipboard = if focused_is_input
+                            && text_edit_modifier_held(&state.modifiers_state)
+                        {
+                            handle_clipboard_shortcut(state, &event, &self.app.clipboard)
+                        } else {
+                            false
+                        };
 
                         let handled_by_input = if handled_by_clipboard {
                             true
@@ -4593,8 +4622,8 @@ impl ApplicationHandler for AppHandler {
                         dx, dy, ms
                     ));
                 }
-                if state.ctrl_held {
-                    // Zoom handling (Ctrl + scroll)
+                if text_edit_modifier_held(&state.modifiers_state) {
+                    // Zoom handling (Cmd + scroll on macOS, Ctrl + scroll elsewhere).
                     let scroll_y = match delta {
                         winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                         winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 50.0,
@@ -6145,12 +6174,17 @@ fn handle_text_input(state: &mut AppState, event: &winit::event::KeyEvent) -> bo
 
         if let Some(k) = key {
             let shift = state.modifiers_state.shift_key();
-            let ctrl = state.modifiers_state.control_key();
+            let word_modifier = text_edit_modifier_held(&state.modifiers_state);
             let (changed, sel_changed, new_value, on_change) = {
                 let element = state.arena.get_mut(focused).unwrap();
                 let old = element.input_state.value.clone();
                 let old_anchor = element.input_state.selection_anchor;
-                unshit_core::input::apply_key_with_mods(&mut element.input_state, &k, shift, ctrl);
+                unshit_core::input::apply_key_with_mods(
+                    &mut element.input_state,
+                    &k,
+                    shift,
+                    word_modifier,
+                );
                 element.cursor_state.reset_blink(Instant::now());
                 let diff = element.input_state.value != old;
                 let sel_diff = element.input_state.selection_anchor != old_anchor;
@@ -6212,8 +6246,9 @@ fn check_radio(state: &mut AppState, target: NodeId, name: Option<&str>) {
     state.window.request_redraw();
 }
 
-/// Handle Ctrl+A, Ctrl+C, Ctrl+V, Ctrl+X shortcuts when a text input is
-/// focused. Selection state lives on the input itself
+/// Handle primary-modifier A/C/V/X shortcuts when a text input is focused.
+/// The primary modifier is Command on macOS and Control elsewhere; Control
+/// remains accepted on macOS for compatibility. Selection state lives on the input itself
 /// (`input_state.selection_anchor`), not in `interaction.text_selection`:
 /// the interaction selection is anchored on text NODES by the mouse path
 /// and can never reference an Input, whose value is not a text node.
@@ -6920,6 +6955,28 @@ mod tests {
     fn app_config_decorations_defaults_to_native_chrome() {
         let config = AppConfig::default();
         assert!(config.decorations);
+    }
+
+    #[test]
+    fn primary_modifier_matches_the_host_platform() {
+        let control = ModifiersState::CONTROL;
+        let command = ModifiersState::META;
+
+        assert!(text_edit_modifier_held(&control));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!primary_modifier_held(&control));
+            assert!(primary_modifier_held(&command));
+            assert!(text_edit_modifier_held(&command));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(primary_modifier_held(&control));
+            assert!(!primary_modifier_held(&command));
+            assert!(!text_edit_modifier_held(&command));
+        }
     }
 
     #[test]

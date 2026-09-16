@@ -6391,6 +6391,11 @@ fn rasterize_swash_for_atlas(
     font_family: &str,
     font_weight: FontWeight,
 ) -> Option<crate::atlas::GlyphEntry> {
+    // These arguments are only consumed by the Windows DirectWrite fast path;
+    // keep them in the shared signature so callers stay platform-neutral.
+    #[cfg(not(target_os = "windows"))]
+    let _ = (font_family, font_weight);
+
     #[cfg(target_os = "windows")]
     if atlas.bytes_per_pixel == 4 && use_directwrite_ui_rasterization() {
         let (dwrite_family, dwrite_weight) =
@@ -6511,6 +6516,7 @@ fn glyph_image_data_for_atlas(
     }
 }
 
+#[cfg(target_os = "windows")]
 fn rgba_glyph_data_for_atlas(data: Vec<u8>, bytes_per_pixel: u32) -> Vec<u8> {
     if bytes_per_pixel == 4 {
         return data;
@@ -7720,6 +7726,7 @@ mod tests {
         assert_eq!(data, vec![89, 40], "R8 text atlas should keep the grayscale fallback path");
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn directwrite_rgba_data_collapses_to_alpha_for_mono_atlas() {
         let data = rgba_glyph_data_for_atlas(vec![10, 30, 90, 90, 0, 20, 40, 40], 1);
@@ -9608,6 +9615,7 @@ mod tests {
     /// GPU-gated device helper (same pattern as `atlas.rs` tests): the
     /// fallback adapter keeps this runnable on headless CI, and the test
     /// self-skips when no adapter exists at all.
+    #[cfg(target_os = "windows")]
     fn glyph_drop_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         pollster::block_on(async {
             let instance = wgpu::Instance::default();
