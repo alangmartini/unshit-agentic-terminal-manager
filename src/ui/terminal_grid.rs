@@ -2205,6 +2205,73 @@ mod tests {
         );
     }
 
+    /// A surface resize causes a relayout followed by a tree rebuild. The
+    /// rebuilt active pane must keep its keyboard-capture handler; otherwise
+    /// the resize appears to succeed but the next command never reaches the
+    /// PTY. Exercise that exact ordering without needing a native window.
+    #[test]
+    fn active_terminal_keeps_keyboard_capture_after_resize_and_rebuild() {
+        let pane_id = PaneId(1);
+        let shared = test_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = pane_id;
+            guard.terminals.insert(
+                pane_id.0,
+                Arc::new(Mutex::new(crate::terminal::Terminal::new(24, 80))),
+            );
+        }
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane_id.0, CellGrid::new(24, 80));
+        let initial = build_pane_body(pane_id, true, 13, &shared, &grids);
+        let resize = find_terminal_content(&initial)
+            .and_then(|content| content.on_resize.as_ref())
+            .cloned()
+            .expect("active terminal must have a resize handler");
+
+        // Match a window growth followed by the framework's requested tree
+        // rebuild. The local terminal becomes 120x40 before the new handler
+        // is mounted.
+        resize(1200.0, 800.0);
+
+        let rebuilt = build_pane_body(pane_id, true, 13, &shared, &grids);
+        let keyboard = find_terminal_content(&rebuilt)
+            .and_then(|content| {
+                content
+                    .handlers
+                    .iter()
+                    .find(|(event_type, _)| *event_type == EventType::KeyboardCapture)
+                    .map(|(_, handler)| handler.clone())
+            })
+            .expect("active terminal must retain keyboard capture after resize rebuild");
+
+        let event = Event::Keyboard(unshit::core::event::KeyboardEvent {
+            kind: KeyEventKind::Pressed,
+            key: Key::Char('x'),
+            modifiers: Modifiers::empty(),
+            text: Some("x".to_owned()),
+        });
+        let _ = keyboard(&event);
+
+        let guard = shared.lock().unwrap();
+        let terminal = guard
+            .terminals
+            .get(&pane_id.0)
+            .expect("terminal must survive resize")
+            .lock()
+            .unwrap();
+        assert_eq!((terminal.grid().cols(), terminal.grid().rows()), (120, 40));
+        assert!(
+            guard.diagnostic_pty_recent_events.iter().any(|entry| {
+                entry.starts_with("write pane=1 bytes=1 source=keyboard")
+                    || entry.starts_with("write_failed pane=1 source=keyboard")
+            }),
+            "the rebuilt keyboard handler must attempt to forward input to the PTY"
+        );
+    }
+
     /// Regression: a BACKGROUND pane must track its own geometry too.
     ///
     /// `on_resize` used to be registered only for the focused pane, so the
