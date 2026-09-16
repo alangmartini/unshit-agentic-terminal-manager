@@ -1,10 +1,10 @@
 # Unshit Terminal Manager
 
-A GPU-accelerated terminal manager for Windows with **tmux-style session persistence**. Your shells run in a background daemon, so long-running work keeps going after you close the window — reopen it and your tabs, splits, and panes reattach to the *same* live processes. All of it — tabbed, split-pane terminals and a keyboard-first command palette — is rendered on the GPU by a custom UI framework.
+A GPU-accelerated terminal manager for macOS and Windows with **tmux-style session persistence**. Your shells run in a background daemon, so long-running work keeps going after you close the window — reopen it and your tabs, splits, and panes reattach to the *same* live processes. All of it — tabbed, split-pane terminals and a keyboard-first command palette — is rendered on the GPU by a custom UI framework.
 
 ![Unshit Terminal Manager](preview.png)
 
-Unshit Terminal Manager is a native Windows terminal multiplexer built on **unshit**, a local GPU-first UI framework (CSS styling, flexbox/grid layout via [Taffy](https://github.com/DioxusLabs/taffy), a [wgpu](https://github.com/gfx-rs/wgpu) renderer, and [cosmic-text](https://github.com/pop-os/cosmic-text) for text shaping). Your shells run inside a background daemon that owns the PTYs, parsers, and scrollback — the same detach/reattach model as **tmux**, but backing a native GPU window instead of a text-mode multiplexer. The windows, tabs, and splits you left open survive a UI restart or crash, and commands you kicked off keep running while the UI is closed.
+Unshit Terminal Manager is a native macOS and Windows terminal multiplexer built on **unshit**, a local GPU-first UI framework (CSS styling, flexbox/grid layout via [Taffy](https://github.com/DioxusLabs/taffy), a [wgpu](https://github.com/gfx-rs/wgpu) renderer, and [cosmic-text](https://github.com/pop-os/cosmic-text) for text shaping). Your shells run inside a background daemon that owns the PTYs, parsers, and scrollback — the same detach/reattach model as **tmux**, but backing a native GPU window instead of a text-mode multiplexer. The windows, tabs, and splits you left open survive a UI restart or crash, and commands you kicked off keep running while the UI is closed.
 
 ## Features
 
@@ -12,7 +12,7 @@ Unshit Terminal Manager is a native Windows terminal multiplexer built on **unsh
 - **Workspaces** — group terminals by project, each with an optional working directory and a per-workspace shell override.
 - **tmux-style persistent sessions** — tabs, splits, split ratios, and workspaces are saved to disk and restored on the next launch. Because the daemon owns the shells, a session survives closing the UI (or a UI crash) and reattaches to the *same* running process on reopen — a build or agent you kicked off keeps running in the background. Sessions only end on an explicit close or a daemon shutdown, never when the UI disconnects.
 - **Command palette** (`Ctrl+Shift+P`) — a VS Code-style launcher with fuzzy search and typed modes: `>` for actions, `@` for agents, `:` for navigation, and `/` for scrollback. Drive splits, tabs, renames, the sidebar, and settings without leaving the keyboard.
-- **Quick Prompt** (`Ctrl+Shift+Q`) — type a prompt, attach images, and launch an agent CLI (`claude` or `codex`) in a fresh git worktree. When the active workspace is a git repo it runs `git worktree add` so the agent works on an anonymous branch without disturbing your checkout; otherwise it falls back to a plain scratch directory.
+- **Quick Prompt** (`Cmd+Shift+I` on macOS, `Ctrl+Shift+Q` elsewhere) — type a prompt, attach images, and launch an agent CLI (`claude` or `codex`) in a fresh git worktree. When the active workspace is a git repo it runs `git worktree add` so the agent works on an anonymous branch without disturbing your checkout; otherwise it falls back to a plain scratch directory.
 - **Flow Explorer** — review a change as the *flows* it touches instead of a raw diff. **Explain flow…** / **Review change as flows…** in the palette ask your default agent (running in the workspace directory with the shipped `flow-explorer` skill) to write a small JSON model of one user-facing flow: the events, handlers, IPC hops and state it crosses, each with a one-sentence description, a source location and, in review mode, a diff status. The result opens as a native pane with three views: a collapsible call stack with inline source excerpts, Miller columns, and a swim-lane graph with numbered events you can zoom into. **Open flow…** opens a JSON an agent wrote elsewhere.
 - **Agents subtab** — every workspace lists its panes under `terminals` and `agents`. A pane moves to `agents` when the app launched the agent, when a SessionStart hook reported it, or simply when the guest title looks like a known agent CLI (Claude Code, Codex, Gemini CLI, OpenCode, Aider, Copilot CLI, OpenRouter), and it moves back when the agent exits. `Ctrl+Shift+A`, the palette, a **New agent ›** flyout on the workspace and subtab context menus, and `terminal-manager agent` from any shell all start a new agent tab in the workspace directory; **Kill all agents** on the subtab menu stops only the agent panes.
 - **Agent conversation recovery** — if the PTY daemon is lost in a reboot or crash, a saved pane with an exact or unambiguous provider conversation id offers a provider-specific **Resume Claude/Codex** button the next time Terminal Manager is opened. Automatic recovery and **Start at Windows sign-in** are separate, default-off controls under **Settings → Sessions**; enable both for unattended recovery after a PC restart. A normal UI-only restart still reattaches to the already-running agent instead of launching a duplicate.
@@ -30,18 +30,24 @@ Unshit Terminal Manager ships as **two executables**:
 
 | Process | Binary | Responsibility |
 |---------|--------|----------------|
-| UI | `terminal-manager.exe` | Windowing, GPU rendering, layout, input, the command palette, and Quick Prompt. |
-| Daemon | `unshit-ptyd.exe` | Owns every PTY, terminal parser, and scrollback buffer. Sessions live here, keyed by `(workspace_id, pane_id)`. |
+| UI | `terminal-manager` (`.exe` on Windows) | Windowing, GPU rendering, layout, input, the command palette, and Quick Prompt. |
+| Daemon | `unshit-ptyd` (`.exe` on Windows) | Owns every PTY, terminal parser, and scrollback buffer. Sessions live here, keyed by `(workspace_id, pane_id)`. |
 
-The UI and the daemon talk over a user-scoped **named pipe**. On startup the UI tries to connect to a running daemon; if none is reachable it spawns one (detached, with no console window) and retries with backoff.
+The UI and the daemon talk over a user-scoped **named pipe on Windows** or **Unix socket on macOS**. On startup the UI tries to connect to a running daemon; if none is reachable it spawns one (detached, with no console window) and retries with backoff.
 
 **Why sessions persist:** the shells, their output, and their scrollback are owned by `unshit-ptyd`, not by the UI. When the UI is closed and relaunched, it reattaches to the daemon's existing sessions. The PTY write path is fire-and-forget, kept off the render path so input stays responsive.
 
-**The sibling-executable requirement:** the UI locates the daemon as a sibling — the `unshit-ptyd` executable in the *same directory* as `terminal-manager.exe`. This matters when you distribute the app: **both binaries must sit in the same folder.** When you run from source, Cargo already places them together in `target/release/` (or `target/debug/`), so it just works. For development or CI you can override the lookup by pointing the `UNSHIT_PTYD_BINARY` environment variable at a specific daemon binary.
+**The sibling-executable requirement:** the UI locates the daemon as a sibling — the `unshit-ptyd` executable in the *same directory* as `terminal-manager`. This matters when you distribute the app: **both binaries must sit in the same folder.** In the macOS bundle they live under `Terminal Manager.app/Contents/MacOS/`; when you run from source, Cargo places them together in `target/release/` (or `target/debug/`). For development or CI you can override the lookup by pointing the `UNSHIT_PTYD_BINARY` environment variable at a specific daemon binary.
 
 ## Install
 
 ### For end users
+
+#### macOS
+
+When a macOS release is available, download its `.app` bundle from the [Releases](https://github.com/alangmartini/unshit-agentic-terminal-manager/releases) page and drag **Terminal Manager.app** to Applications. For local builds, run `scripts/package-macos.sh` and open the resulting bundle from `dist/`. The bundle contains both `terminal-manager` and its sibling `unshit-ptyd` daemon. macOS 11 (Big Sur) or newer is required; Apple silicon is the currently verified target. The renderer uses wgpu with Metal by default (override with `UNSHIT_RENDER_BACKEND=metal` when troubleshooting).
+
+#### Windows
 
 Download the latest installer from the [Releases](https://github.com/alangmartini/unshit-agentic-terminal-manager/releases) page and run it. It installs per-user (no administrator prompt), adds a Start Menu shortcut, and registers an uninstaller in Add/Remove Programs. Both executables (`terminal-manager.exe` and `unshit-ptyd.exe`) are packaged together — keep them in the same folder if you move the install.
 
@@ -52,7 +58,26 @@ Download the latest installer from the [Releases](https://github.com/alangmartin
 Prerequisites:
 
 - A stable **Rust** toolchain (via [rustup](https://rustup.rs/)).
-- The **MSVC** build tools (Visual Studio C++ Build Tools) — the default `x86_64-pc-windows-msvc` target.
+- On Windows, the **MSVC** build tools (Visual Studio C++ Build Tools) — the default `x86_64-pc-windows-msvc` target.
+- On macOS, Xcode Command Line Tools and a Metal-capable Mac (macOS 11 or newer).
+
+On macOS, build and run from a shell:
+
+```sh
+cargo build --release -p terminal-manager --bin terminal-manager
+cargo build --release -p unshit-ptyd --bin unshit-ptyd
+cargo run --release
+```
+
+To create a distributable application bundle containing both executables:
+
+```sh
+scripts/package-macos.sh
+open "dist/Terminal Manager.app"
+```
+
+The packager creates an ad-hoc signed bundle for local use. Distribution builds still need your own Developer ID signing and notarization workflow.
+When `SDKROOT` is unset, it probes the installed macOS SDKs with a small linker check and selects a compatible one; an explicit `SDKROOT` is always preserved.
 
 Clone and build:
 
@@ -86,7 +111,7 @@ scripts likewise run in throwaway profiles. See
 [docs/DOGFOODING.md](docs/DOGFOODING.md) for the full model (`TM_PROFILE`,
 `TM_CONFIG_DIR`, repo-scoped `scripts\kill-all.ps1`).
 
-### Building the installer
+### Building the Windows installer
 
 The Windows installer is built with [Inno Setup 6](https://jrsoftware.org/isinfo.php). After a release build:
 
@@ -100,12 +125,14 @@ The result is `dist\terminal-manager-0.5.0-setup.exe`.
 
 ## Usage
 
+On macOS, app-level shortcuts generally use **Command (⌘)** where this guide shows Ctrl; Quick Prompt is the explicit exception shown below (`Cmd+Shift+I` instead of `Ctrl+Shift+Q`). Terminal control sequences continue to use Ctrl so they reach the shell normally.
+
 - **Git diff review:** click **Review diff** in the titlebar, or find **Review Git diff** in the command palette. Choose **Last N commits** (first-parent history), **Unpushed** (the locally known push target), or **Compare base** (a branch, tag, or SHA; changes since its common ancestor with HEAD). Select a file to inspect the numbered unified patch. Enter a count/base and press Enter or **Refresh** to reload; Escape closes the view. Uses the focused session's recorded launch directory when available, otherwise the workspace directory. Staged and working-tree edits are excluded. It does not fetch or modify the repository. Large patches paginate; individual Git queries have a 4 MiB preview limit and 15-second timeout.
 
 - **Tabs:** `Ctrl+T` opens a new terminal; `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle tabs; `Ctrl+Shift+W` closes a tab.
 - **Splits:** `Ctrl+D` splits right, `Ctrl+Shift+D` splits down, `Ctrl+W` unsplits. Move focus between panes with `Ctrl+Alt+Arrow`; `Ctrl+Arrow` remains available to terminal applications for word navigation.
 - **Command palette:** `Ctrl+Shift+P`. Type to fuzzy-search, or prefix your query with `>`, `@`, `:`, or `/` to scope the search. `Enter` runs the highlighted item, `Esc` clears the query then closes.
-- **Quick Prompt:** `Ctrl+Shift+Q`. Type a prompt, optionally paste images, pick Claude or Codex, and submit to launch the agent in a fresh worktree.
+- **Quick Prompt:** `Cmd+Shift+I` on macOS, `Ctrl+Shift+Q` elsewhere. Type a prompt, optionally paste images, pick Claude or Codex, and submit to launch the agent in a fresh worktree.
 - **Flow Explorer:** open the palette and pick **Explain flow…** (name the flow, e.g. *Send a prompt*) or **Review change as flows…** (a `base..head`, blank for the default branch up to `HEAD`). An agent tab opens; approve its single write if your agent asks, and the flow appears as a new tab when it finishes. Inside the pane: `Ctrl+1/2/3` switch call stack / panes / graph, arrows and `Enter` walk the tree or columns, `s` opens the source excerpt, `e`/`c` expand or collapse everything. The skill the app sends lives at `assets/flow-explorer/SKILL.md` and can be copied into `~/.claude/skills/` to run it by hand; **Open flow…** opens the resulting JSON.
 - **Agents:** `Ctrl+Shift+A` starts the first installed agent CLI (checked in the order Claude Code, Codex, Gemini CLI, OpenCode, Aider, Copilot CLI; Claude Code when none is found) in the active workspace; right-click a workspace or its `agents` subtab for **New agent ›** with one row per installed CLI, or run `terminal-manager agent codex` from a terminal to open one in that terminal's workspace (`--workspace-id N` targets another). Panes whose title identifies an agent are filed under `agents` automatically and return to `terminals` when the agent exits. Right-click the `agents` subtab and choose **Kill all agents** to stop them; plain terminals are left alone.
 - **Agent recovery:** after a cold restart, open Terminal Manager and use the **Resume Claude/Codex** chip in an affected pane with an exact or unambiguous conversation id. For unattended recovery after Windows restarts, enable both **Start at Windows sign-in** and **Automatic agent resume** in **Settings → Sessions**. Enabling automatic resume immediately installs the minimal SessionStart capture hooks used to remember exact ids. Turning it off leaves those hooks installed for manual recovery; use **Remove recovery hooks** in the same section to remove only Terminal Manager's managed entries.
@@ -123,7 +150,9 @@ Use **Filter files** to narrow the changed-file list by path, including a rename
 
 User data is stored under your platform config and data directories:
 
-| What | Location |
+On macOS, the application data root is `~/Library/Application Support/com.godly.terminal/`; on Windows it is `%APPDATA%\com.godly.terminal\`.
+
+| What | Windows location (macOS uses the same relative path under the root above) |
 |------|----------|
 | Workspaces, tabs, and pane layout | `%APPDATA%\com.godly.terminal\workspaces.json` |
 | Quick Prompt agent worktrees | `%APPDATA%\com.godly.terminal\worktrees\` |
@@ -138,7 +167,7 @@ User data is stored under your platform config and data directories:
 | Startup phase timings | `%APPDATA%\com.godly.terminal\startup-events.jsonl` |
 | Opt-in Windows login startup | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`Unshit Terminal Manager` value) |
 
-- **Keybindings** are editable in **Settings → Keybinds**. Each action keeps a stable id and is persisted as JSON; defaults follow Windows conventions (see the table above).
+- **Keybindings** are editable in **Settings → Keybinds**. Each action keeps a stable id and is persisted as JSON; defaults follow the host platform's conventions (see the table above).
 - **Themes** are chosen in Settings. Bundled palettes ship in `assets/themes.json`, and the *Custom* theme lets you set accent, surface, and foreground colors directly.
 - **Shells** can be set app-wide or overridden per workspace from Settings.
 - **Agent recovery** stores only minimal routing and launch metadata in the workspace file: provider, stable workspace and pane identity, cwd, launch mode and phase, managed-pane flag, opaque session id, and observation time. Workspace numeric ids are stable and are not renumbered when another workspace is removed. Prompt text, transcript content, terminal output, and hook payloads are never stored in this record or in recovery telemetry.
