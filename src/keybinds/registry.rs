@@ -8,14 +8,23 @@
 //!    alias for split right) so muscle memory from other terminals
 //!    works.
 //! 3. Non-editable system shortcuts: `Escape` to close modals,
-//!    `Ctrl+1` through `Ctrl+9` to jump to a tab, and the clipboard
-//!    paste keybind (`Ctrl+V` / `Ctrl+Shift+V` -> `terminal.paste`).
+//!    the platform's primary-modifier tab switches, and clipboard
+//!    copy/paste bindings.
 
 use super::loader::UserKeybinds;
 use super::KeybindAction;
 
-/// Number of `Ctrl+N` tab-switch bindings (one per numeric key 1..=9).
+/// Number of primary-modifier tab-switch bindings (one per numeric key 1..=9).
 const TAB_SWITCH_COUNT: usize = 9;
+
+#[cfg(target_os = "macos")]
+const PRIMARY_MODIFIER: &str = "Meta";
+#[cfg(not(target_os = "macos"))]
+const PRIMARY_MODIFIER: &str = "Ctrl";
+
+fn primary_combo(key: &str) -> String {
+    format!("{PRIMARY_MODIFIER}+{key}")
+}
 
 /// Build the full list of `(combo, dispatch_command)` pairs to register
 /// with the framework on startup, with user overrides applied.
@@ -51,15 +60,15 @@ pub fn default_shortcut_bindings() -> Vec<(String, String)> {
 fn alias_bindings() -> Vec<(String, String)> {
     vec![
         (
-            "Ctrl+Shift+H".to_string(),
+            primary_combo("Shift+H"),
             KeybindAction::SplitRight.dispatch_command().to_string(),
         ),
         (
-            "Ctrl+K".to_string(),
+            primary_combo("K"),
             KeybindAction::CommandPalette.dispatch_command().to_string(),
         ),
         (
-            "Ctrl+Shift+=".to_string(),
+            primary_combo("Shift+="),
             KeybindAction::ZoomIn.dispatch_command().to_string(),
         ),
     ]
@@ -68,27 +77,31 @@ fn alias_bindings() -> Vec<(String, String)> {
 /// Non-editable system shortcuts. These don't appear in Settings >
 /// Keybinds; they're hard-wired.
 ///
-/// `Ctrl+V`, `Ctrl+Shift+V`, and `Shift+Insert` all dispatch
-/// `terminal.paste` so the user can paste clipboard text into the focused
-/// PTY using the conventional Windows binding, the Linux-terminal
-/// convention where `Ctrl+Shift+V` sidesteps the shell's `Ctrl+V`
-/// literal-input handling, or the classic `Shift+Insert`. `Ctrl+Shift+C`
-/// dispatches `terminal.copy` (the unconditional copy; a bare `Ctrl+C`
-/// only copies when a selection exists and is handled in the terminal's
-/// keyboard handler so it still sends an interrupt otherwise). These are
-/// system bindings rather than editable actions because rebinding them
-/// would risk leaving the user with no way to copy or paste at all.
+/// The primary modifier's copy/paste bindings dispatch the app-level
+/// clipboard commands. On macOS the terminal's bare `Ctrl+V` remains
+/// unbound so it reaches the PTY's literal-input handling; the
+/// `Ctrl+Shift+V` and `Ctrl+Shift+C` variants remain available for users
+/// who rely on terminal conventions. A bare `Ctrl+C` is never registered:
+/// the terminal keyboard handler conditionally copies a live selection and
+/// otherwise lets the interrupt byte reach the shell.
 fn system_bindings() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = vec![
-        ("Escape".to_string(), "modal.close".to_string()),
-        ("Ctrl+Shift+F".to_string(), "fps_overlay.toggle".to_string()),
-        ("Ctrl+V".to_string(), "terminal.paste".to_string()),
-        ("Ctrl+Shift+V".to_string(), "terminal.paste".to_string()),
-        ("Shift+Insert".to_string(), "terminal.paste".to_string()),
-        ("Ctrl+Shift+C".to_string(), "terminal.copy".to_string()),
-    ];
+    let mut out: Vec<(String, String)> = vec![("Escape".to_string(), "modal.close".to_string())];
+
+    out.push((primary_combo("Shift+F"), "fps_overlay.toggle".to_string()));
+    out.push((primary_combo("V"), "terminal.paste".to_string()));
+    out.push(("Ctrl+Shift+V".to_string(), "terminal.paste".to_string()));
+    out.push(("Shift+Insert".to_string(), "terminal.paste".to_string()));
+    out.push((primary_combo("C"), "terminal.copy".to_string()));
+    out.push(("Ctrl+Shift+C".to_string(), "terminal.copy".to_string()));
+
+    #[cfg(not(target_os = "macos"))]
+    out.push(("Ctrl+V".to_string(), "terminal.paste".to_string()));
+
     for i in 0..TAB_SWITCH_COUNT {
-        out.push((format!("Ctrl+{}", i + 1), format!("tab.switch:{}", i)));
+        out.push((
+            primary_combo(&(i + 1).to_string()),
+            format!("tab.switch:{}", i),
+        ));
     }
     out
 }
@@ -132,25 +145,43 @@ mod tests {
     }
 
     #[test]
-    fn pane_focus_defaults_use_ctrl_alt_arrows() {
-        for (combo, command) in [
+    fn pane_focus_defaults_use_primary_alt_arrows() {
+        #[cfg(target_os = "macos")]
+        let expected = [
+            ("Alt+Meta+Left", "pane.focus_left"),
+            ("Alt+Meta+Right", "pane.focus_right"),
+            ("Alt+Meta+Up", "pane.focus_up"),
+            ("Alt+Meta+Down", "pane.focus_down"),
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let expected = [
             ("Ctrl+Alt+Left", "pane.focus_left"),
             ("Ctrl+Alt+Right", "pane.focus_right"),
             ("Ctrl+Alt+Up", "pane.focus_up"),
             ("Ctrl+Alt+Down", "pane.focus_down"),
-        ] {
+        ];
+
+        for (combo, command) in expected {
             assert_eq!(find(combo).as_deref(), Some(command));
         }
 
+        // Bare Ctrl+arrows remain available for terminal word navigation on
+        // every platform; Cmd+arrows are only consumed by editable actions
+        // when an action explicitly requests them.
         for combo in ["Ctrl+Left", "Ctrl+Right", "Ctrl+Up", "Ctrl+Down"] {
             assert!(find(combo).is_none(), "{combo} must reach the terminal");
         }
     }
 
     #[test]
-    fn ctrl_v_dispatches_terminal_paste() {
-        // Conventional Windows paste binding routed through the
-        // app-level paste action so the focused PTY receives the text.
+    fn primary_v_dispatches_terminal_paste() {
+        assert_eq!(find(&primary_combo("V")).as_deref(), Some("terminal.paste"));
+        #[cfg(target_os = "macos")]
+        assert!(
+            find("Ctrl+V").is_none(),
+            "Ctrl+V must reach the PTY on macOS"
+        );
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(find("Ctrl+V").as_deref(), Some("terminal.paste"));
     }
 
@@ -162,17 +193,20 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_h_aliases_split_right() {
+    fn primary_shift_h_aliases_split_right() {
         // tmux convention: H stacks panes horizontally -> new pane beside.
-        assert_eq!(find("Ctrl+Shift+H").as_deref(), Some("pane.split_right"));
+        assert_eq!(
+            find(&primary_combo("Shift+H")).as_deref(),
+            Some("pane.split_right")
+        );
     }
 
     #[test]
-    fn ctrl_w_closes_focused_pane() {
-        // In a split tab, Ctrl+W should close just the focused pane and
-        // only fall through to closing the tab when that pane was the
-        // last one (pane.close has the cascade built in).
-        assert_eq!(find("Ctrl+W").as_deref(), Some("pane.close"));
+    fn unsplit_default_is_registered() {
+        assert_eq!(
+            find(KeybindAction::Unsplit.default_combo_str()).as_deref(),
+            Some("pane.close")
+        );
     }
 
     #[test]
@@ -181,10 +215,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_w_closes_active_tab() {
-        // Ctrl+Shift+W forcibly closes the whole tab regardless of how
+    fn primary_shift_w_closes_active_tab() {
+        // Primary+Shift+W forcibly closes the whole tab regardless of how
         // many panes it holds.
-        assert_eq!(find("Ctrl+Shift+W").as_deref(), Some("tab.close.active"));
+        assert_eq!(
+            find(KeybindAction::CloseTab.default_combo_str()).as_deref(),
+            Some("tab.close.active")
+        );
     }
 
     #[test]
@@ -193,9 +230,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_digits_switch_tabs() {
+    fn primary_digits_switch_tabs() {
         for i in 0..TAB_SWITCH_COUNT {
-            let combo = format!("Ctrl+{}", i + 1);
+            let combo = primary_combo(&(i + 1).to_string());
             assert_eq!(
                 find(&combo).as_deref(),
                 Some(format!("tab.switch:{}", i).as_str())
@@ -205,14 +242,17 @@ mod tests {
 
     #[test]
     fn palette_alias_registered() {
-        assert_eq!(find("Ctrl+K").as_deref(), Some("palette.toggle"));
+        assert_eq!(find(&primary_combo("K")).as_deref(), Some("palette.toggle"));
     }
 
     #[test]
     fn ctrl_shift_p_registered_once_as_palette_default() {
         let matches = pairs()
             .into_iter()
-            .filter(|(combo, cmd)| combo == "Ctrl+Shift+P" && cmd == "palette.toggle")
+            .filter(|(combo, cmd)| {
+                combo == KeybindAction::CommandPalette.default_combo_str()
+                    && cmd == "palette.toggle"
+            })
             .count();
 
         assert_eq!(matches, 1);
@@ -220,7 +260,7 @@ mod tests {
 
     #[test]
     fn zoom_in_alias_registered() {
-        assert_eq!(find("Ctrl+Shift+=").as_deref(), Some("zoom.in"));
+        assert_eq!(find(&primary_combo("Shift+=")).as_deref(), Some("zoom.in"));
     }
 
     #[test]
@@ -264,19 +304,25 @@ mod tests_copy_paste_bindings {
     }
 
     #[test]
-    fn ctrl_shift_c_copies() {
+    fn copy_variants_are_registered() {
         // Unconditional copy command. Bare Ctrl+C is handled in the
         // terminal keyboard handler and is conditional (only copies if
         // a selection exists, otherwise sends SIGINT).
+        assert_eq!(find(&primary_combo("C")).as_deref(), Some("terminal.copy"));
         assert_eq!(find("Ctrl+Shift+C").as_deref(), Some("terminal.copy"));
     }
 
     #[test]
-    fn ctrl_v_and_ctrl_shift_v_both_paste() {
-        // Both conventional Windows (Ctrl+V) and Linux-terminal (Ctrl+Shift+V)
-        // paste bindings are present and map to the same action.
-        assert_eq!(find("Ctrl+V").as_deref(), Some("terminal.paste"));
+    fn primary_v_and_ctrl_shift_v_both_paste() {
+        // The primary paste binding and Linux-terminal Ctrl+Shift+V map to
+        // the same action. On macOS bare Ctrl+V intentionally remains free
+        // for the PTY.
+        assert_eq!(find(&primary_combo("V")).as_deref(), Some("terminal.paste"));
         assert_eq!(find("Ctrl+Shift+V").as_deref(), Some("terminal.paste"));
+        #[cfg(target_os = "macos")]
+        assert!(find("Ctrl+V").is_none());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(find("Ctrl+V").as_deref(), Some("terminal.paste"));
     }
 
     #[test]
@@ -301,9 +347,15 @@ mod tests_copy_paste_bindings {
         // system_bindings() is responsible for these, not the
         // configurable action list.
         let bindings = pairs();
-        let copy_paste_combos = vec!["Ctrl+V", "Ctrl+Shift+V", "Shift+Insert", "Ctrl+Shift+C"];
+        let copy_paste_combos = vec![
+            primary_combo("V"),
+            "Ctrl+Shift+V".to_string(),
+            "Shift+Insert".to_string(),
+            primary_combo("C"),
+            "Ctrl+Shift+C".to_string(),
+        ];
         for combo in copy_paste_combos {
-            let found = bindings.iter().any(|(c, _)| c == combo);
+            let found = bindings.iter().any(|(c, _)| c == &combo);
             assert!(found, "copy/paste binding {} must be present", combo);
         }
     }

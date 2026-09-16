@@ -169,12 +169,18 @@ fn reject_direct_link(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    let mut is_link = metadata.file_type().is_symlink();
+    let is_link = metadata.file_type().is_symlink();
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        is_link |= metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        let is_link = is_link || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        if is_link {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed hook files and lock files must not be symlinks or reparse points",
+            ));
+        }
     }
     if is_link {
         Err(io::Error::new(
@@ -191,6 +197,7 @@ fn reject_direct_link(path: &Path) -> io::Result<()> {
 /// The lock file intentionally survives release. The kernel owns the actual
 /// lock and drops it when a process exits, including after a crash, so stale
 /// PID metadata can never strand hook configuration permanently.
+#[derive(Debug)]
 struct HookEditLock {
     file: File,
 }
@@ -682,8 +689,7 @@ mod tests {
         assert!(ready_seen, "child process never acquired the lock");
         assert_eq!(
             live_result
-                .err()
-                .expect("live owner must exclude another editor")
+                .expect_err("live owner must exclude another editor")
                 .kind(),
             io::ErrorKind::WouldBlock
         );

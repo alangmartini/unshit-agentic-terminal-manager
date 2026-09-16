@@ -2491,9 +2491,14 @@ fn dispatch_agent_new(state: &mut AppState, raw: Option<&str>, source: &'static 
 /// without the app namespace prefix (`godly-wt-1a2b3c4d` ->
 /// `wt-1a2b3c4d`), falling back to the full name for unexpected paths.
 fn worktree_tab_title(worktree_path: &std::path::Path) -> String {
-    let dir_name = worktree_path
-        .file_name()
-        .and_then(|n| n.to_str())
+    // Worktree paths normally use the host separator, but persisted/test
+    // paths can come from another platform. Treat both slash styles as
+    // separators so a Windows path remains readable when inspected on macOS
+    // (and vice versa).
+    let raw = worktree_path.to_string_lossy();
+    let dir_name = raw
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
         .unwrap_or("worktree");
     dir_name
         .strip_prefix("godly-")
@@ -5216,11 +5221,9 @@ fn prettify_osc_title(title: &str) -> &str {
         && !trimmed.contains(' ')
         && (trimmed.contains('\\') || trimmed.contains('/'));
     if looks_like_exe_path {
-        if let Some(stem) = std::path::Path::new(trimmed)
-            .file_stem()
-            .and_then(|s| s.to_str())
-        {
-            return stem;
+        let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+        if basename.len() >= 4 && basename[basename.len() - 4..].eq_ignore_ascii_case(".exe") {
+            return &basename[..basename.len() - 4];
         }
     }
     title
@@ -12123,6 +12126,23 @@ pub(crate) mod tests {
         path
     }
 
+    /// Return a path whose parent is intentionally absent. This gives save
+    /// failure tests a deterministic I/O error on Unix and Windows; changing
+    /// a file's readonly bit is not sufficient on Unix when the test process
+    /// owns the writable parent directory.
+    fn editor_save_failure_path(pane_id: u32) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!(
+                "tm-state-editor-save-failure-{}-{pane_id}-{nonce}",
+                std::process::id()
+            ))
+            .join("target.txt")
+    }
+
     #[test]
     fn dispatch_editor_open_creates_editor_tab() {
         let mut state = test_state();
@@ -12752,17 +12772,13 @@ pub(crate) mod tests {
             .get_mut(&pane_id)
             .unwrap()
             .apply(|b| b.insert_typed("x"));
-        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
-        let mut read_only_permissions = original_permissions.clone();
-        read_only_permissions.set_readonly(true);
-        std::fs::set_permissions(&path, read_only_permissions).unwrap();
+        state.editors.get_mut(&pane_id).unwrap().path = editor_save_failure_path(pane_id);
 
         assert!(dispatch(&mut state, "editor.save"));
         assert!(state.editors[&pane_id].dirty, "failed save keeps dirty");
         assert_eq!(state.toasts.len(), 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha");
 
-        std::fs::set_permissions(&path, original_permissions).unwrap();
         let _ = std::fs::remove_file(path);
     }
 
@@ -12909,10 +12925,7 @@ pub(crate) mod tests {
     fn dialog_editor_save_close_failure_keeps_pane_open() {
         let mut state = test_state();
         let (pane_id, path) = dirty_editor(&mut state, "savefail");
-        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
-        let mut read_only_permissions = original_permissions.clone();
-        read_only_permissions.set_readonly(true);
-        std::fs::set_permissions(&path, read_only_permissions).unwrap();
+        state.editors.get_mut(&pane_id).unwrap().path = editor_save_failure_path(pane_id);
 
         dispatch(&mut state, "pane.close");
         assert!(dispatch(&mut state, "dialog.editor_save_close"));
@@ -12921,8 +12934,8 @@ pub(crate) mod tests {
             "failed save must keep the pane (and its buffer) alive"
         );
         assert_eq!(state.toasts.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta");
 
-        std::fs::set_permissions(&path, original_permissions).unwrap();
         let _ = std::fs::remove_file(path);
     }
 
@@ -17560,10 +17573,14 @@ pub(crate) mod tests {
 
     #[test]
     fn dispatch_keybind_set_conflict_leaves_override_unchanged() {
-        // Ctrl+W is Unsplit's default. Setting NewTerminal to Ctrl+W
-        // must conflict and leave NewTerminal at its default.
+        // Unsplit's platform default must conflict and leave NewTerminal at
+        // its default.
         let mut state = test_state();
-        assert!(dispatch(&mut state, "keybind.set:new_terminal:Ctrl+W"));
+        let command = format!(
+            "keybind.set:new_terminal:{}",
+            crate::keybinds::KeybindAction::Unsplit.default_combo()
+        );
+        assert!(dispatch(&mut state, &command));
         assert!(
             state.keybinds.error.is_some(),
             "conflict should populate error"
@@ -18931,7 +18948,7 @@ pub(crate) mod tests {
     /// Regression test for the clipboard paste keybind feature.
     ///
     /// The action id `terminal.paste` is the contract between
-    /// `keybinds::registry::system_bindings` (Ctrl+V / Ctrl+Shift+V)
+    /// `keybinds::registry::system_bindings` (primary V / Ctrl+Shift+V)
     /// and `state::dispatch`. If any future change renames the action
     /// or drops the dispatch arm without updating the registry, this
     /// test catches it before the user sees a silently broken paste.
@@ -18943,11 +18960,15 @@ pub(crate) mod tests {
             .filter(|(_, cmd)| cmd == "terminal.paste")
             .map(|(combo, _)| combo.as_str())
             .collect();
-        // Both bindings must be registered so users coming from
-        // either Windows or Linux conventions reach the same action.
+        // The platform's primary binding and Ctrl+Shift+V must be registered
+        // so users coming from either platform convention reach the action.
+        #[cfg(target_os = "macos")]
+        let primary_paste = "Meta+V";
+        #[cfg(not(target_os = "macos"))]
+        let primary_paste = "Ctrl+V";
         assert!(
-            paste_targets.contains(&"Ctrl+V"),
-            "Ctrl+V must dispatch terminal.paste; got {paste_targets:?}"
+            paste_targets.contains(&primary_paste),
+            "{primary_paste} must dispatch terminal.paste; got {paste_targets:?}"
         );
         assert!(
             paste_targets.contains(&"Ctrl+Shift+V"),

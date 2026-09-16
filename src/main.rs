@@ -390,14 +390,15 @@ fn user_shortcut_bindings() -> Vec<(String, String)> {
     crate::keybinds::registry::shortcut_bindings_with_overrides(&overrides)
 }
 
-/// Whether `combo` is the Quick Prompt image-paste chord (Ctrl+V). Kept
+/// Whether `combo` is the Quick Prompt image-paste chord (the platform's
+/// primary-modifier V). Kept
 /// as a named predicate so the key match is unit-testable and a future
 /// edit cannot silently break it (matching uppercase `'V'`, the wrong
 /// modifier set, etc.). The `on_raw_key` hook uses this to attach a
 /// clipboard image when the overlay is open.
 fn is_quick_prompt_paste_combo(combo: &unshit::core::shortcut::KeyCombo) -> bool {
-    use unshit::core::event::{Key, Modifiers};
-    combo.key == Key::Char('v') && combo.modifiers == Modifiers::CTRL
+    use unshit::core::{event::Key, shortcut::KeyCombo};
+    *combo == KeyCombo::command(Key::Char('v'))
 }
 
 fn terminal_font_sources_from_value(value: Option<std::ffi::OsString>) -> Vec<FontSource> {
@@ -1124,7 +1125,8 @@ fn main() {
                     } else if is_quick_prompt_paste_combo(combo)
                         && crate::state::try_attach_clipboard_image(&mut guard)
                     {
-                        // Quick Prompt is open: Ctrl+V attaches a clipboard
+                        // Quick Prompt is open: the platform's primary V
+                        // attaches a clipboard
                         // image as a chip (spec U4/A4.1). Consume the event
                         // ONLY when an image was actually attached; otherwise
                         // return false so the framework falls through to its
@@ -1493,14 +1495,18 @@ mod tests {
     #[test]
     fn user_shortcut_bindings_includes_fps_overlay_toggle() {
         // Phase 0 of the 120fps perf work (refs #135) ships an in-app
-        // FPS overlay toggled by Ctrl+Shift+F. Without this binding the
+        // FPS overlay toggled by the platform's primary+Shift+F. Without this binding the
         // overlay is unreachable from the keyboard.
+        #[cfg(target_os = "macos")]
+        let expected = "Meta+Shift+F";
+        #[cfg(not(target_os = "macos"))]
+        let expected = "Ctrl+Shift+F";
         let bindings = user_shortcut_bindings();
         assert!(
             bindings
                 .iter()
-                .any(|(s, c)| s == "Ctrl+Shift+F" && c == "fps_overlay.toggle"),
-            "Ctrl+Shift+F must dispatch fps_overlay.toggle"
+                .any(|(s, c)| s == expected && c == "fps_overlay.toggle"),
+            "{expected} must dispatch fps_overlay.toggle"
         );
     }
 
@@ -2735,23 +2741,27 @@ mod tests {
 
     /// Regression test for the clipboard paste keybind feature.
     ///
-    /// Both Ctrl+V (Windows convention) and Ctrl+Shift+V (Linux
-    /// terminal convention, where Ctrl+V is reserved by the shell for
+    /// The primary V and Ctrl+Shift+V (Linux terminal convention, where
+    /// Ctrl+V is reserved by the shell for
     /// literal-input mode) MUST be registered against
     /// `terminal.paste`. If a future agent removes one binding the
     /// user loses paste from at least one platform's muscle memory;
     /// this test catches that before it ships.
     #[test]
-    fn user_shortcut_bindings_wires_terminal_paste_to_both_combos() {
+    fn user_shortcut_bindings_wires_terminal_paste_to_primary_and_ctrl_shift() {
         let bindings = user_shortcut_bindings();
         let pasters: Vec<&str> = bindings
             .iter()
             .filter(|(_, c)| c == "terminal.paste")
             .map(|(s, _)| s.as_str())
             .collect();
+        #[cfg(target_os = "macos")]
+        let primary = "Meta+V";
+        #[cfg(not(target_os = "macos"))]
+        let primary = "Ctrl+V";
         assert!(
-            pasters.contains(&"Ctrl+V"),
-            "Ctrl+V must dispatch terminal.paste; got {pasters:?}"
+            pasters.contains(&primary),
+            "{primary} must dispatch terminal.paste; got {pasters:?}"
         );
         assert!(
             pasters.contains(&"Ctrl+Shift+V"),
@@ -2759,20 +2769,19 @@ mod tests {
         );
     }
 
-    /// The Quick Prompt image-paste hook fires only on a bare Ctrl+V.
+    /// The Quick Prompt image-paste hook fires only on a bare primary V.
     /// Uppercase `'V'` (the key combo is always lowercased), a missing
-    /// Ctrl, or extra modifiers must NOT match, so plain typing and
-    /// Ctrl+Shift+V (terminal literal paste) are never mistaken for an
+    /// primary modifier, or extra modifiers must NOT match, so plain typing
+    /// and Ctrl+Shift+V (terminal literal paste) are never mistaken for an
     /// image paste.
     #[test]
-    fn quick_prompt_paste_combo_matches_only_ctrl_v() {
+    fn quick_prompt_paste_combo_matches_only_primary_v() {
         use unshit::core::event::{Key, Modifiers};
         use unshit::core::shortcut::KeyCombo;
 
-        assert!(is_quick_prompt_paste_combo(&KeyCombo::new(
-            Key::Char('v'),
-            Modifiers::CTRL
-        )));
+        assert!(is_quick_prompt_paste_combo(&KeyCombo::command(Key::Char(
+            'v'
+        ))));
         // Wrong / extra modifiers.
         assert!(!is_quick_prompt_paste_combo(&KeyCombo::plain(Key::Char(
             'v'
@@ -2782,9 +2791,17 @@ mod tests {
             Modifiers::CTRL | Modifiers::SHIFT
         )));
         // Different key.
+        #[cfg(target_os = "macos")]
+        let wrong_primary = Modifiers::CTRL;
+        #[cfg(not(target_os = "macos"))]
+        let wrong_primary = Modifiers::META;
+        assert!(!is_quick_prompt_paste_combo(&KeyCombo::new(
+            Key::Char('v'),
+            wrong_primary
+        )));
         assert!(!is_quick_prompt_paste_combo(&KeyCombo::new(
             Key::Char('c'),
-            Modifiers::CTRL
+            KeyCombo::command(Key::Char('v')).modifiers,
         )));
     }
 

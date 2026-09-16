@@ -4,28 +4,28 @@ A user invokes a global hotkey, gets a centered overlay where they can type a pr
 
 ## Objective
 
-Reduce the friction of "I have a quick task for an agent" from "open a terminal, navigate, decide a worktree path, paste prompt, copy image references" to "press Ctrl+Shift+Q, type, paste, submit." The agent must run in an isolated git worktree so the user's current checkout never moves.
+Reduce the friction of "I have a quick task for an agent" from "open a terminal, navigate, decide a worktree path, paste prompt, copy image references" to "press Cmd+Shift+I on macOS (Ctrl+Shift+Q elsewhere), type, paste, submit." The agent must run in an isolated git worktree so the user's current checkout never moves.
 
 ## User stories
 
-* **U1** As a user editing in any tab, I press Ctrl+Shift+Q and a centered overlay appears in the foreground without disturbing the active tab.
+* **U1** As a user editing in any tab, I press Cmd+Shift+I on macOS (Ctrl+Shift+Q elsewhere) and a centered overlay appears in the foreground without disturbing the active tab.
 * **U2** I type a prompt; if I trigger autocomplete I get a list of skills and slash commands relevant to the agent I picked.
 * **U3** I press Tab to switch between Claude and Codex; the autocomplete sources change to match.
-* **U4** I press Ctrl+V or Win+Shift+S then Ctrl+V; a thumbnail chip appears for each pasted image.
+* **U4** I press Cmd+V on macOS or Ctrl+V elsewhere (including after Win+Shift+S on Windows); a thumbnail chip appears for each pasted image.
 * **U5** I press Ctrl+Enter; the overlay closes, a new tab opens running the chosen agent inside a fresh worktree, and the agent receives my prompt with image references baked in.
 * **U6** I press Esc or click the backdrop; nothing happens to my current work, no worktree is created, pasted images are cleaned from temp storage.
 
 ## Acceptance criteria
 
 ### F1. Hotkey and overlay lifecycle
-* **A1.1** Pressing Ctrl+Shift+Q from anywhere in the app opens the Quick Prompt overlay.
-* **A1.2** Pressing Esc, clicking the modal backdrop, or pressing Ctrl+Shift+Q again closes it.
+* **A1.1** Pressing Cmd+Shift+I on macOS (Ctrl+Shift+Q elsewhere) from anywhere in the app opens the Quick Prompt overlay.
+* **A1.2** Pressing Esc, clicking the modal backdrop, or pressing the Quick Prompt shortcut again closes it.
 * **A1.3** Closing without submit discards the in flight prompt and removes any temp files holding pasted images.
 * **A1.4** Opening from inside any workspace or tab keeps the active tab alive; the overlay does not change focus to a different tab.
 
 ### F2. Prompt input
 * **A2.1** A multi line text input with a placeholder of "What should the agent do?" receives focus on open.
-* **A2.2** Plain text editing supports the same kbd shortcuts the rest of the app uses for inputs (arrow keys, Home/End, Ctrl+A, Ctrl+Backspace word delete).
+* **A2.2** Plain text editing supports the same input shortcuts as the rest of the app (arrow keys, Home/End, and platform-primary editing chords: Cmd+A/Cmd+Backspace on macOS, Ctrl+A/Ctrl+Backspace elsewhere; Ctrl variants remain accepted on macOS).
 * **A2.3** Submitting an empty prompt is a no op; the input gains an inline error chip "Type a prompt to continue."
 
 ### F3. Agent picker
@@ -34,7 +34,7 @@ Reduce the friction of "I have a quick task for an agent" from "open a terminal,
 * **A3.3** The selection persists across overlay opens via `quick_prompt.json`.
 
 ### F4. Image paste
-* **A4.1** With image data on the system clipboard (PrintScreen, Snipping Tool, image copied from a browser), pressing Ctrl+V inserts the image as a chip below the input, not as a base64 blob in the text.
+* **A4.1** With image data on the system clipboard (PrintScreen, Snipping Tool, image copied from a browser), pressing Cmd+V on macOS or Ctrl+V elsewhere inserts the image as a chip below the input, not as a base64 blob in the text.
 * **A4.2** A thumbnail (max 64x64 logical px) renders inside the chip; the chip shows a remove "x" on hover.
 * **A4.3** Multiple images stack horizontally; clicking the remove "x" deletes the image and its temp file.
 * **A4.4** Each chip has a stable filename of `<sha256-prefix>.png`; pasting the same image twice deduplicates to one chip.
@@ -122,10 +122,10 @@ Touched in framework subtree:
 
 * Streaming the agent output back into a result panel; we just spawn a tab and walk away.
 * Editing or saving recent prompts as templates.
-* Drag and drop image input (Ctrl+V only for now).
+* Drag and drop image input (plus platform-primary V: Cmd+V on macOS, Ctrl+V elsewhere).
 * Changing the agent of an already running tab.
 * Worktree pruning / cleanup of stale `godly-qp-*` dirs (separate maintenance feature).
-* Touching the existing context palette (`Ctrl+K`) or settings shells.
+* Touching the existing context palette (`Cmd+K` on macOS, `Ctrl+K` elsewhere) or settings shells.
 
 ## Open questions
 
@@ -136,7 +136,7 @@ Touched in framework subtree:
 
 ## Decisions resolved during planning
 
-* Hotkey is Ctrl+Shift+Q (no remap UI in this scope; keybind override system already covers it).
+* Hotkey is Cmd+Shift+I on macOS and Ctrl+Shift+Q elsewhere (no remap UI in this scope; keybind override system already covers it).
 * Submit is Ctrl+Enter.
 * Agent toggle is Tab.
 * Worktree path lives under `%APPDATA%\com.godly.terminal\worktrees\godly-qp-<8-hex>` so it never lands inside the user's repo.

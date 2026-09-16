@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::{Command, Stdio};
 
 use futures_core::Stream;
@@ -1065,7 +1065,38 @@ $notify.Dispose()
         .map(|_| ())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn spawn_desktop_notification(notification: &DesktopNotification) -> io::Result<()> {
+    // Notification Center does not provide a click callback through this
+    // short-lived `osascript` bridge. The target routing fields remain part of
+    // the shared notification request for the in-app toast and Windows path.
+    let _ = (
+        notification.workspace_id,
+        notification.pane_id,
+        &notification.socket,
+    );
+
+    // Keep notification content out of the AppleScript source. Passing the
+    // values as osascript arguments preserves quotes, newlines, and other
+    // user-provided characters without allowing them to alter the script.
+    const SCRIPT: &str = r#"
+on run argv
+    display notification (item 2 of argv) with title (item 1 of argv)
+end run
+"#;
+
+    Command::new("osascript")
+        .args(["-e", SCRIPT, "--"])
+        .arg(&notification.title)
+        .arg(&notification.text)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn spawn_desktop_notification(notification: &DesktopNotification) -> io::Result<()> {
     log::info!(
         "desktop notification requested: title={:?} text={:?} workspace_id={} pane_id={} socket={}",

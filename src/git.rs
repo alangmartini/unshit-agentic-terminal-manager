@@ -92,6 +92,23 @@ pub fn detect_git_branch(path: &Path) -> Option<String> {
 pub fn resolve_in_repo(root: &Path, relative: &str) -> Option<std::path::PathBuf> {
     use std::path::Component;
 
+    // Git emits forward slashes, but persisted paths can also come from a
+    // Windows session that is being reattached on Unix.  On Unix `Path`
+    // treats `\\` as an ordinary filename character, which would otherwise
+    // let a Windows-style `..\\..\\outside` path bypass the traversal check.
+    // Such names are not valid repository-relative paths for the cross-
+    // platform editor, so reject them before host-specific parsing.
+    if relative.contains('\\') {
+        return None;
+    }
+    // Likewise, Unix treats a Windows drive prefix as a normal component
+    // (`C:`), rather than as an absolute/rooted path.  Reject it explicitly
+    // so `C:/Users/...` cannot be joined under `root` on macOS or Linux.
+    let bytes = relative.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+
     let mut resolved = root.to_path_buf();
     for component in Path::new(relative).components() {
         match component {

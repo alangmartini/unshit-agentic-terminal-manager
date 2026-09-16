@@ -3959,7 +3959,7 @@ body.dragging-pane {
 }
 
 /* Identity caption row above the agent toggle. The hotkey echo on the
- * right reinforces the Ctrl+Shift+Q affordance without taking real
+ * right reinforces the platform Quick Prompt affordance without taking real
  * estate from the input. */
 .quick-prompt-header {
   flex-direction: row;

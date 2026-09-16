@@ -492,9 +492,10 @@ mod tests {
 
     #[test]
     fn numstat_preserves_tabs_newlines_and_rename_paths() {
-        let files =
-            parse_numstat(b"2\t1\todd\tname\n.rs\0-\t-\timage.png\00\t0\t\0old name\0new name\0")
-                .unwrap();
+        let files = parse_numstat(
+            b"2\t1\todd\tname\n.rs\0-\t-\timage.png\0\x30\t0\t\0old name\0new name\0",
+        )
+        .unwrap();
         assert_eq!(files.len(), 3);
         assert_eq!(files[0].path, "odd\tname\n.rs");
         assert_eq!(files[0].added, Some(2));

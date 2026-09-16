@@ -316,12 +316,12 @@ fn exe_stem(title: &str) -> &str {
         && !title.contains(' ')
         && (title.contains('\\') || title.contains('/'));
     if looks_like_exe_path {
-        if let Some(stem) = std::path::Path::new(title)
-            .file_stem()
-            .and_then(|s| s.to_str())
-        {
-            return stem;
-        }
+        // Window titles can contain Windows paths even when the manager is
+        // running on Unix (for example, a reattached ConPTY session).  Do
+        // not use `Path::file_stem` here: on Unix a backslash is an ordinary
+        // character, so `C:\\...\\claude.exe` would never be reduced.
+        let filename = title.rsplit(['\\', '/']).next().unwrap_or(title);
+        return &filename[..filename.len() - ".exe".len()];
     }
     title
 }

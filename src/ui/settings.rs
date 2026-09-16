@@ -1718,7 +1718,7 @@ fn reset_row_button(action: KeybindAction, shared: &SharedState) -> ElementDef {
 
 /// Split a combo into the parts shown as individual key pills. Modifiers
 /// are pushed in the canonical Ctrl, Shift, Alt, Meta order; then the key
-/// name comes last.
+/// name comes last. Meta is displayed as Cmd on macOS.
 fn combo_parts(combo: KeyCombo) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     if combo.modifiers.contains(Modifiers::CTRL) {
@@ -1731,6 +1731,9 @@ fn combo_parts(combo: KeyCombo) -> Vec<String> {
         parts.push("Alt".to_string());
     }
     if combo.modifiers.contains(Modifiers::META) {
+        #[cfg(target_os = "macos")]
+        parts.push("Cmd".to_string());
+        #[cfg(not(target_os = "macos"))]
         parts.push("Meta".to_string());
     }
     parts.push(combo.key.to_string());
@@ -4278,10 +4281,15 @@ mod tests {
         // binding: [keys, edit-pencil]
         let keys = &binding.children[0];
         assert!(keys.classes.contains(&"keys".to_string()));
-        // Default NewTerminal is Ctrl+T: two keycaps joined by a "+".
+        // Default NewTerminal uses the platform's primary modifier: two
+        // keycaps joined by a "+".
         assert_eq!(keys.children.len(), 3);
         assert!(keys.children[0].classes.contains(&"keycap".to_string()));
-        assert_eq!(text_of(&keys.children[0]), Some("Ctrl"));
+        #[cfg(target_os = "macos")]
+        let primary_label = "Cmd";
+        #[cfg(not(target_os = "macos"))]
+        let primary_label = "Ctrl";
+        assert_eq!(text_of(&keys.children[0]), Some(primary_label));
         assert!(keys.children[1].classes.contains(&"plus".to_string()));
         assert_eq!(text_of(&keys.children[1]), Some("+"));
         assert!(keys.children[2].classes.contains(&"keycap".to_string()));
@@ -4442,7 +4450,7 @@ mod tests {
         // Provoke a conflict: set NewTerminal to Unsplit's default.
         let _ = state.keybinds.set(
             crate::keybinds::KeybindAction::NewTerminal,
-            unshit::core::shortcut::KeyCombo::parse("Ctrl+W").unwrap(),
+            crate::keybinds::KeybindAction::Unsplit.default_combo(),
         );
         let snap = state.ui_snapshot();
         let shared = Arc::new(Mutex::new(state));

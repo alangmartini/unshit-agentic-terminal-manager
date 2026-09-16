@@ -136,15 +136,18 @@ mod tests {
     #[test]
     fn effective_uses_default_when_no_override() {
         let state = KeybindsState::default();
-        assert_eq!(state.effective(KeybindAction::NewTerminal), combo("Ctrl+T"));
+        assert_eq!(
+            state.effective(KeybindAction::NewTerminal),
+            KeybindAction::NewTerminal.default_combo()
+        );
     }
 
     #[test]
-    fn command_palette_effective_uses_ctrl_shift_p_default() {
+    fn command_palette_effective_uses_platform_default() {
         let state = KeybindsState::default();
         assert_eq!(
             state.effective(KeybindAction::CommandPalette),
-            combo("Ctrl+Shift+P")
+            KeybindAction::CommandPalette.default_combo()
         );
     }
 
@@ -176,10 +179,13 @@ mod tests {
 
     #[test]
     fn set_rejects_conflict_with_other_default() {
-        // Ctrl+W is Unsplit's default. Trying to bind NewTerminal to
-        // Ctrl+W must be rejected.
+        // Unsplit's platform default must remain exclusive. Trying to bind
+        // NewTerminal to it must be rejected.
         let mut state = KeybindsState::default();
-        let result = state.set(KeybindAction::NewTerminal, combo("Ctrl+W"));
+        let result = state.set(
+            KeybindAction::NewTerminal,
+            KeybindAction::Unsplit.default_combo(),
+        );
         assert!(result.is_err());
         assert!(state.error.is_some());
         assert!(!state.overrides.contains_key(&KeybindAction::NewTerminal));
@@ -221,7 +227,10 @@ mod tests {
             .unwrap();
         assert!(state.overrides.contains_key(&KeybindAction::NewTerminal));
         state
-            .set(KeybindAction::NewTerminal, combo("Ctrl+T"))
+            .set(
+                KeybindAction::NewTerminal,
+                KeybindAction::NewTerminal.default_combo(),
+            )
             .unwrap();
         assert!(
             !state.overrides.contains_key(&KeybindAction::NewTerminal),
@@ -255,7 +264,10 @@ mod tests {
             .unwrap();
         state.reset(KeybindAction::NewTerminal);
         assert!(!state.overrides.contains_key(&KeybindAction::NewTerminal));
-        assert_eq!(state.effective(KeybindAction::NewTerminal), combo("Ctrl+T"));
+        assert_eq!(
+            state.effective(KeybindAction::NewTerminal),
+            KeybindAction::NewTerminal.default_combo()
+        );
     }
 
     #[test]
@@ -295,10 +307,12 @@ mod tests {
     #[test]
     fn conflict_ignores_except_self() {
         let state = KeybindsState::default();
-        // Ctrl+T is NewTerminal's default; asking "does anyone other
-        // than NewTerminal have Ctrl+T?" must return None.
+        // NewTerminal's platform default belongs only to that action.
         assert!(state
-            .conflict(combo("Ctrl+T"), KeybindAction::NewTerminal)
+            .conflict(
+                KeybindAction::NewTerminal.default_combo(),
+                KeybindAction::NewTerminal
+            )
             .is_none());
     }
 }

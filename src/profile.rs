@@ -15,7 +15,7 @@
 //!   redirects the config dir to an arbitrary (e.g. temp) path so test
 //!   runs leave nothing behind in `%APPDATA%`.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub const ENV_PROFILE: &str = "TM_PROFILE";
@@ -65,12 +65,13 @@ fn resolve_profile(
 /// `target-codex`, ...). Installed copies live under Program Files /
 /// LocalAppData Programs, never inside a `target*` component.
 fn exe_is_repo_build(exe: &Path) -> bool {
-    exe.components().any(|c| match c {
-        Component::Normal(name) => name.to_str().is_some_and(|s| {
-            let s = s.to_ascii_lowercase();
-            s == "target" || s.starts_with("target-")
-        }),
-        _ => false,
+    // A running Unix build can still be inspecting an executable path
+    // persisted by a Windows session (and vice versa).  `Path::components`
+    // only recognises the host separator, so split both forms explicitly
+    // before checking for Cargo's target directory.
+    exe.to_string_lossy().split(['/', '\\']).any(|component| {
+        let component = component.to_ascii_lowercase();
+        component == "target" || component.starts_with("target-")
     })
 }
 

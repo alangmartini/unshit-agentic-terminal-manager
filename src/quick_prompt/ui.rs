@@ -10,6 +10,17 @@ use unshit::core::element::*;
 use crate::quick_prompt::state::{Agent, QuickPromptState};
 use crate::state::{dispatch, mutate_with, SharedState, UiSnapshot};
 
+fn quick_prompt_shortcut_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Cmd+Shift+I"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Ctrl+Shift+Q"
+    }
+}
+
 /// Build the overlay tree. Always returns an element so the root render
 /// in `main.rs` does not need a conditional branch. Positioning,
 /// alignment, and backdrop are all driven by the
@@ -83,7 +94,7 @@ fn build_header() -> ElementDef {
         .with_child(
             ElementDef::new(Tag::Span)
                 .with_class("quick-prompt-label-hint")
-                .with_text("Ctrl+Shift+Q".to_string()),
+                .with_text(quick_prompt_shortcut_label().to_string()),
         )
 }
 

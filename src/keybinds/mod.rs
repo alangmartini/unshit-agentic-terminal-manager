@@ -191,7 +191,7 @@ impl KeybindAction {
             Self::OpenFile => "Open a file in the built-in editor",
             Self::QuickOpen => "Find a file in the workspace by name and open it",
             Self::DiffOpen => "Review a git range as a read-only diff pane",
-            Self::EditorSave => "Save the focused editor pane (Ctrl+S also works in the editor)",
+            Self::EditorSave => "Save the focused editor pane",
             Self::ToggleSidebar => "Show or hide the workspace sidebar",
             Self::OpenSettings => "Open the settings window",
             Self::ZoomIn => "Scale the whole interface up, terminal and chrome together",
@@ -270,9 +270,44 @@ impl KeybindAction {
         }
     }
 
-    /// Default key combo as a parsable string (Windows/Linux conventions).
+    /// Default key combo as a parsable string for the current platform.
     pub fn default_combo_str(self) -> &'static str {
-        match self {
+        #[cfg(target_os = "macos")]
+        let combo = match self {
+            Self::NewTerminal => "Meta+T",
+            Self::NewAgent => "Shift+Meta+A",
+            Self::CloseTab => "Shift+Meta+W",
+            Self::SplitRight => "Meta+D",
+            Self::SplitDown => "Shift+Meta+D",
+            Self::Unsplit => "Meta+W",
+            // Command is reserved for app shortcuts on macOS, so terminal
+            // Control/Option word-navigation chords still reach the PTY.
+            Self::FocusLeft => "Alt+Meta+Left",
+            Self::FocusRight => "Alt+Meta+Right",
+            Self::FocusUp => "Alt+Meta+Up",
+            Self::FocusDown => "Alt+Meta+Down",
+            // Cmd+Tab belongs to macOS app switching. These match common
+            // browser/editor tab navigation without shadowing the OS.
+            Self::NextTab => "Shift+Meta+]",
+            Self::PrevTab => "Shift+Meta+[",
+            Self::CommandPalette => "Shift+Meta+P",
+            // Cmd+Shift+Q is macOS Log Out; use the non-reserved I chord.
+            Self::QuickPromptOpen => "Shift+Meta+I",
+            Self::RenameSession => "F2",
+            Self::OpenFile => "Meta+O",
+            Self::QuickOpen => "Meta+P",
+            Self::DiffOpen => "Shift+Meta+G",
+            Self::EditorSave => "Meta+S",
+            Self::ToggleSidebar => "Meta+B",
+            Self::OpenSettings => "Meta+,",
+            Self::ZoomIn => "Meta+=",
+            Self::ZoomOut => "Meta+-",
+            Self::ZoomReset => "Meta+0",
+            Self::Fullscreen => "Ctrl+Meta+F",
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let combo = match self {
             Self::NewTerminal => "Ctrl+T",
             // Ctrl+Shift chord: plain Ctrl+A must keep reaching the
             // terminal (readline line-start, select-all in TUIs).
@@ -312,7 +347,9 @@ impl KeybindAction {
             // browser-conventional zoom reset.
             Self::ZoomReset => "Ctrl+0",
             Self::Fullscreen => "F11",
-        }
+        };
+
+        combo
     }
 
     /// Parsed default key combo.
@@ -332,8 +369,12 @@ mod tests {
     }
 
     #[test]
-    fn new_agent_is_a_ctrl_shift_chord_in_the_tabs_group() {
-        assert_eq!(KeybindAction::NewAgent.default_combo_str(), "Ctrl+Shift+A");
+    fn new_agent_is_a_primary_shift_chord_in_the_tabs_group() {
+        #[cfg(target_os = "macos")]
+        let expected = "Shift+Meta+A";
+        #[cfg(not(target_os = "macos"))]
+        let expected = "Ctrl+Shift+A";
+        assert_eq!(KeybindAction::NewAgent.default_combo_str(), expected);
         assert_eq!(KeybindAction::NewAgent.dispatch_command(), "agent.new");
         assert_eq!(KeybindAction::NewAgent.group(), KeybindGroup::Tabs);
         assert_eq!(
@@ -390,28 +431,48 @@ mod tests {
     }
 
     #[test]
-    fn command_palette_default_combo_is_ctrl_shift_p() {
+    fn command_palette_default_combo_uses_primary_modifier() {
+        #[cfg(target_os = "macos")]
+        let expected = "Shift+Meta+P";
+        #[cfg(not(target_os = "macos"))]
+        let expected = "Ctrl+Shift+P";
+        assert_eq!(KeybindAction::CommandPalette.default_combo_str(), expected);
+    }
+
+    #[test]
+    fn quick_prompt_default_avoids_macos_log_out_chord() {
+        #[cfg(target_os = "macos")]
         assert_eq!(
-            KeybindAction::CommandPalette.default_combo_str(),
-            "Ctrl+Shift+P"
+            KeybindAction::QuickPromptOpen.default_combo_str(),
+            "Shift+Meta+I"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            KeybindAction::QuickPromptOpen.default_combo_str(),
+            "Ctrl+Shift+Q"
         );
     }
 
     #[test]
     fn pane_focus_defaults_preserve_ctrl_arrow_for_terminal_navigation() {
-        assert_eq!(
-            KeybindAction::FocusLeft.default_combo_str(),
-            "Ctrl+Alt+Left"
-        );
-        assert_eq!(
-            KeybindAction::FocusRight.default_combo_str(),
-            "Ctrl+Alt+Right"
-        );
-        assert_eq!(KeybindAction::FocusUp.default_combo_str(), "Ctrl+Alt+Up");
-        assert_eq!(
-            KeybindAction::FocusDown.default_combo_str(),
-            "Ctrl+Alt+Down"
-        );
+        #[cfg(target_os = "macos")]
+        let expected = [
+            "Alt+Meta+Left",
+            "Alt+Meta+Right",
+            "Alt+Meta+Up",
+            "Alt+Meta+Down",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let expected = [
+            "Ctrl+Alt+Left",
+            "Ctrl+Alt+Right",
+            "Ctrl+Alt+Up",
+            "Ctrl+Alt+Down",
+        ];
+        assert_eq!(KeybindAction::FocusLeft.default_combo_str(), expected[0]);
+        assert_eq!(KeybindAction::FocusRight.default_combo_str(), expected[1]);
+        assert_eq!(KeybindAction::FocusUp.default_combo_str(), expected[2]);
+        assert_eq!(KeybindAction::FocusDown.default_combo_str(), expected[3]);
     }
 
     #[test]

@@ -79,11 +79,21 @@ fn open_validated(url: &str) -> std::io::Result<()> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn open_validated(url: &str) -> std::io::Result<()> {
-    // Non-Windows is not a shipped target; best-effort via `xdg-open` so the
-    // feature is still exercisable on a Linux dev box. `xdg-open` receives the
-    // URL as a single argv entry, so there is no shell to interpret it.
+    // `open` asks Launch Services to resolve the default browser. The URL is
+    // passed as one argv entry, so no shell ever interprets terminal output.
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_validated(url: &str) -> std::io::Result<()> {
+    // `xdg-open` asks the desktop environment to resolve the default browser.
+    // The URL is passed as one argv entry, so no shell ever interprets terminal
+    // output.
     std::process::Command::new("xdg-open")
         .arg(url)
         .spawn()

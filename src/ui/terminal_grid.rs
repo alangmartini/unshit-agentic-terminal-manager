@@ -25,6 +25,38 @@ const WINDOWS_TERMINAL_PARITY_CONTENT_X_OFFSET: f32 = 3.0;
 /// scale to land on the column the renderer actually drew.
 const WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE: f32 = 0.996;
 
+/// The platform's primary modifier owns selection copy. A bare Ctrl+C must
+/// continue reaching the PTY as SIGINT on macOS, where Command+C is the
+/// conventional copy chord.
+fn is_primary_copy_modifier(modifiers: Modifiers) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.contains(Modifiers::META)
+            && !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.contains(Modifiers::CTRL)
+            && !modifiers.intersects(Modifiers::META | Modifiers::ALT | Modifiers::SHIFT)
+    }
+}
+
+/// Link activation accepts the traditional Ctrl+click everywhere and also
+/// the macOS Cmd+click gesture. Only a real URL consumes the press, so
+/// modifier-dragging over normal terminal text still creates a selection.
+fn is_link_open_modifier(modifiers: Modifiers) -> bool {
+    modifiers.contains(Modifiers::CTRL) || {
+        #[cfg(target_os = "macos")]
+        {
+            modifiers.contains(Modifiers::META)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+}
+
 /// Returns `true` when the pane grid contains exactly one pane (one row with
 /// one column). In that case the tab bar already displays the pane title and
 /// subtitle, so the pane header can omit them to avoid visual duplication.
@@ -771,16 +803,13 @@ fn build_pane_body(
                         let no_ctrl = !kb.modifiers.contains(Modifiers::CTRL);
                         let no_alt = !kb.modifiers.contains(Modifiers::ALT);
 
-                        // Ctrl+C with a live selection copies instead of
-                        // interrupting; with no selection it falls through to
-                        // `encode_key` -> 0x03 so the shell still receives
-                        // SIGINT. Ctrl+Shift+C is a global shortcut
-                        // (`terminal.copy`) and never reaches this handler.
-                        if kb.modifiers.contains(Modifiers::CTRL)
-                            && !has_shift
-                            && no_alt
-                            && kb.key == Key::Char('c')
-                        {
+                        // The platform's primary+C with a live selection
+                        // copies instead of reaching the PTY. Bare Ctrl+C
+                        // remains an interrupt on macOS; with no selection
+                        // the primary chord falls through to `encode_key`.
+                        // Ctrl+Shift+C is a global shortcut (`terminal.copy`)
+                        // and never reaches this handler.
+                        if is_primary_copy_modifier(kb.modifiers) && kb.key == Key::Char('c') {
                             let copied = mutate_with(&kbd_shared, |st| {
                                 if crate::state::active_pane_has_selection(st) {
                                     crate::state::dispatch(st, "terminal.copy");
@@ -1083,7 +1112,7 @@ fn build_pane_body(
                 if let Event::Mouse(me) = event {
                     if me.kind == MouseEventKind::Down && me.button == MouseButton::Left {
                         let shift = me.modifiers.contains(Modifiers::SHIFT);
-                        let ctrl = me.modifiers.contains(Modifiers::CTRL);
+                        let link_modifier = is_link_open_modifier(me.modifiers);
                         let (lx, ly) = (me.local_x, me.local_y);
                         mutate_with(&sel_down_shared, |st| {
                             // Focus the pane on press. A click-DRAG has its
@@ -1108,11 +1137,11 @@ fn build_pane_body(
                             ) else {
                                 return;
                             };
-                            // Ctrl+click opens a link under the pointer in the
+                            // Ctrl+click (or Cmd+click on macOS) opens a link under the pointer in the
                             // browser instead of starting a selection. Only
                             // consumes the press when a URL is actually there so
-                            // Ctrl+drag still selects over non-link text.
-                            if ctrl {
+                            // modifier-drag still selects over non-link text.
+                            if link_modifier {
                                 if let Some(url) =
                                     crate::state::terminal_url_at(st, sel_down_pane.0, cell)
                                 {
@@ -3417,12 +3446,12 @@ mod tests_mouse_selection_copy_paste {
     }
 
     // -----------------------------------------------------------------------
-    // Handler behavior: KeyboardCapture with Ctrl+C and selection
+    // Handler behavior: KeyboardCapture with the platform primary+C and selection
     // -----------------------------------------------------------------------
 
     #[test]
-    fn keyboard_capture_ctrl_c_with_selection_clears_selection() {
-        // The Ctrl+C handler dispatches terminal.copy, which writes the
+    fn keyboard_capture_primary_c_with_selection_clears_selection() {
+        // The primary+C handler dispatches terminal.copy, which writes the
         // real OS clipboard — serialize with every other clipboard test.
         let _lock = crate::state::tests::clipboard_access_guard();
         let shared = make_shared();
@@ -3456,17 +3485,21 @@ mod tests_mouse_selection_copy_paste {
             .map(|(_, h)| h.clone())
             .expect("KeyboardCapture handler must be present");
 
+        #[cfg(target_os = "macos")]
+        let copy_modifier = Modifiers::META;
+        #[cfg(not(target_os = "macos"))]
+        let copy_modifier = Modifiers::CTRL;
         let event = Event::Keyboard(unshit::core::event::KeyboardEvent {
             kind: unshit::core::event::KeyEventKind::Pressed,
             key: unshit::core::event::Key::Char('c'),
-            modifiers: Modifiers::CTRL,
+            modifiers: copy_modifier,
             text: None,
         });
 
         let result = (handler)(&event);
         assert!(
             result.is_none(),
-            "Ctrl+C with selection should return None (consumed by copy handler)"
+            "primary+C with selection should return None (consumed by copy handler)"
         );
 
         let guard = shared.lock().unwrap();
@@ -3477,7 +3510,7 @@ mod tests_mouse_selection_copy_paste {
     }
 
     #[test]
-    fn keyboard_capture_ctrl_c_no_selection_falls_through() {
+    fn keyboard_capture_primary_c_no_selection_falls_through() {
         let shared = make_shared();
         {
             let mut guard = shared.lock().unwrap();
@@ -3501,14 +3534,18 @@ mod tests_mouse_selection_copy_paste {
             .map(|(_, h)| h.clone())
             .expect("KeyboardCapture handler must be present");
 
+        #[cfg(target_os = "macos")]
+        let copy_modifier = Modifiers::META;
+        #[cfg(not(target_os = "macos"))]
+        let copy_modifier = Modifiers::CTRL;
         let event = Event::Keyboard(unshit::core::event::KeyboardEvent {
             kind: unshit::core::event::KeyEventKind::Pressed,
             key: unshit::core::event::Key::Char('c'),
-            modifiers: Modifiers::CTRL,
+            modifiers: copy_modifier,
             text: None,
         });
 
-        // Without a selection, Ctrl+C falls through to key encoding (the
+        // Without a selection, primary+C falls through to key encoding (the
         // handler returns None either way); the contract we verify is that no
         // copy happened, i.e. state did not gain/keep a selection.
         let _ = (handler)(&event);
@@ -3519,7 +3556,7 @@ mod tests_mouse_selection_copy_paste {
         );
     }
 
-    // Note: Ctrl+Shift+C is handled by the global shortcut resolver
+    // Note: Ctrl+Shift+C (and Meta+C on macOS) is handled by the global shortcut resolver
     // (-> terminal.copy) and never reaches this KeyboardCapture handler, so
     // there is no in-handler "ignore Ctrl+Shift+C" behavior to assert — the
     // bare-Ctrl+C-with/without-selection cases above are the real contract.
