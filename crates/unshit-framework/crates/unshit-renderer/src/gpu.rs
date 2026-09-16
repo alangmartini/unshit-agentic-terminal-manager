@@ -1739,6 +1739,14 @@ impl GpuContext {
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        // A resize replaces size-dependent render targets (the surface
+        // configuration, MSAA target, capture target, and possibly backdrop
+        // textures). Give already-completed submissions a nonblocking chance
+        // to run their completion callbacks before replacing those resources.
+        // This is deliberately `Poll`, never a UI-thread wait: the frame gate
+        // remains the hard bound when the compositor is not making progress.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+
         let w = new_size.width;
         let h = new_size.height;
         if w == 0 || h == 0 {

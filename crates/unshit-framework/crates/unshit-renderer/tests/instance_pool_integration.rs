@@ -140,6 +140,41 @@ fn regression_81_item2_no_cpu_gpu_race_at_200_fps() {
 }
 
 #[test]
+fn repeated_resize_keeps_submissions_and_pool_allocations_bounded() {
+    // Exercise the same target replacement path that a live window takes,
+    // but headlessly so the test never depends on WindowServer. In particular,
+    // resize while recent submissions can still be in flight: completed work
+    // must be reaped opportunistically and unchecked render attempts must
+    // still be capped by the frame-submission gate.
+    require_gpu!(repeated_resize_keeps_submissions_and_pool_allocations_bounded, mut ctx, {
+        let device = ctx.device.clone();
+        ctx.layered_batch.layers[0].quad_instances.push(QuadInstance::zeroed());
+
+        let sizes = [(96, 64), (192, 128), (128, 192), (256, 96)];
+        for index in 0..160 {
+            let (width, height) = sizes[index % sizes.len()];
+            ctx.resize(winit::dpi::PhysicalSize::new(width, height));
+            assert_eq!(ctx.window_size(), (width as f32, height as f32));
+            let _ = ctx.render();
+        }
+
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll failed");
+        let quad_stats = ctx.quad_pipeline.instance_pool.stats();
+        assert_eq!(quad_stats.outstanding, 0, "resize left a quad buffer in flight");
+        assert!(
+            quad_stats.total_allocated <= 2,
+            "resizes bypassed the submission cap and allocated {} quad buffers",
+            quad_stats.total_allocated
+        );
+
+        // The latest target must remain usable after the queue drains.
+        let (width, height) = sizes[(160 - 1) % sizes.len()];
+        let _ = ctx.render();
+        assert_eq!(ctx.read_pixels().len(), (width * height * 4) as usize);
+    });
+}
+
+#[test]
 fn regression_81_item2_pool_drop_is_mutex_poison_safe() {
     // Regression for pitfall 3 of the implementation plan: `PooledBuffer::drop`
     // must not panic when the pool mutex is poisoned. Panicking in a
