@@ -189,8 +189,9 @@ fn format_command_output(label: &str, bytes: &[u8]) -> String {
 ///
 /// On Windows, applies `CREATE_NO_WINDOW | DETACHED_PROCESS` creation
 /// flags so the child is not tied to the parent console and no hidden
-/// console pops up. On Unix, null stdio is enough; the child inherits
-/// the session and survives parent death.
+/// console pops up. On Unix, the daemon gets its own process group as well as
+/// null stdio. That lets it survive the UI process exiting and prevents an
+/// interactive terminal's Ctrl+C from reaching the daemon with the UI.
 ///
 /// `socket_path` is forwarded as `--socket <path>` so tests and the
 /// production UI can agree on a specific endpoint.
@@ -227,7 +228,14 @@ fn apply_detached_flags(cmd: &mut Command) {
 }
 
 #[cfg(unix)]
-fn apply_detached_flags(_cmd: &mut Command) {}
+fn apply_detached_flags(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // Put the daemon in a fresh process group before exec. The UI deliberately
+    // drops the Child handle after the connect probe; the daemon owns sessions
+    // independently and must not share the launcher's terminal signal group.
+    cmd.process_group(0);
+}
 
 /// Outcome of [`connect_or_spawn`], so startup telemetry can separate a launch
 /// that attached to a live daemon from one that had to pay process-spawn cost.

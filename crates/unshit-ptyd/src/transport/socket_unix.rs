@@ -2,8 +2,10 @@
 //!
 //! Single-instance guard: probe-then-bind. If `connect` succeeds, a
 //! daemon is already alive and we error out. If `connect` fails with
-//! `ENOENT` or `ECONNREFUSED` we treat the socket file as stale, remove
-//! it, and bind. Any other error propagates.
+//! `ENOENT` or `ECONNREFUSED` we treat an owner-owned socket file as stale,
+//! remove it, and bind. Empty owner-owned regular files are accepted as stale
+//! test/leftover endpoints; non-empty files, symlinks, and other file types
+//! are never unlinked.
 
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -28,22 +30,28 @@ impl Server {
     /// Binds to `path` after a liveness probe.
     pub async fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if path.exists() {
-            match UnixStream::connect(&path).await {
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "another daemon owns this socket",
-                    ));
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                match UnixStream::connect(&path).await {
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "another daemon owns this socket",
+                        ));
+                    }
+                    Err(e) if is_stale_connect_error(&e) => {
+                        remove_stale_endpoint(&path, EndpointKind::Socket)?;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e)
-                    if e.kind() == io::ErrorKind::NotFound
-                        || e.kind() == io::ErrorKind::ConnectionRefused =>
-                {
-                    std::fs::remove_file(&path).ok();
-                }
-                Err(e) => return Err(e),
             }
+            Ok(_) => {
+                // A regular empty file is a harmless stale endpoint fixture,
+                // but never unlink user data, symlinks, or special files.
+                remove_stale_endpoint(&path, EndpointKind::Regular)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -78,6 +86,67 @@ impl Server {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EndpointKind {
+    Socket,
+    Regular,
+}
+
+fn is_stale_connect_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+
+fn remove_stale_endpoint(path: &Path, expected_kind: EndpointKind) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    remove_stale_endpoint_with_metadata(path, expected_kind, &metadata)
+}
+
+fn remove_stale_endpoint_with_metadata(
+    path: &Path,
+    expected_kind: EndpointKind,
+    metadata: &std::fs::Metadata,
+) -> io::Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing to replace a symlink at the Unix socket path",
+        ));
+    }
+    if metadata.uid() != super::current_euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing to replace a Unix socket path owned by another user",
+        ));
+    }
+
+    match expected_kind {
+        EndpointKind::Socket if !metadata.file_type().is_socket() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Unix socket path changed while probing",
+            ));
+        }
+        EndpointKind::Regular if !metadata.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to replace a non-regular Unix socket endpoint",
+            ));
+        }
+        EndpointKind::Regular if metadata.len() != 0 => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to replace a non-empty Unix socket endpoint",
+            ));
+        }
+        _ => {}
+    }
+
+    std::fs::remove_file(path)
 }
 
 impl Drop for Server {

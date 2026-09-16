@@ -111,7 +111,6 @@ fn current_euid() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
     use super::*;
 
     #[cfg(windows)]
