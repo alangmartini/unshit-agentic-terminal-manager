@@ -15,6 +15,7 @@ use crate::pipeline::text::{GlyphInstance, TextPipeline};
 use crate::svg_cache::SvgTessCache;
 use crate::text_rendering::use_subpixel_text_shader;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -413,17 +414,26 @@ fn desired_present_mode(
     selected
 }
 
-/// True when `mode` paces the producer from the display clock: under these
-/// modes `get_current_texture` (or present) blocks on vblank, so a saturated
-/// paint loop runs at exactly the refresh rate. The app reads this once
-/// after GPU init (via [`GpuContext::is_vsync_paced`]) to choose between
-/// vblank-blocking and timer pacing; the mode cannot change at runtime
-/// because every reconfigure reuses the stored config.
+/// True when `mode` is nominally synchronized to vblank. A backend still has
+/// to prove that acquiring/presenting a surface provides producer-side
+/// back-pressure before the app can use it as a scheduler.
 fn present_mode_is_vsync_paced(mode: wgpu::PresentMode) -> bool {
     matches!(
         mode,
         wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed | wgpu::PresentMode::AutoVsync
     )
+}
+
+/// Metal's Fifo surface is synchronized for presentation, but its texture
+/// acquisition is not a portable blocking vblank semaphore. Treat it as
+/// timer-paced so an occluded or stalled WindowServer cannot let the CPU
+/// submit unbounded frames while waiting for Metal to catch up.
+fn backend_supports_blocking_acquire(backend: wgpu::Backend) -> bool {
+    backend != wgpu::Backend::Metal
+}
+
+fn surface_is_vsync_paced(backend: wgpu::Backend, mode: wgpu::PresentMode) -> bool {
+    backend_supports_blocking_acquire(backend) && present_mode_is_vsync_paced(mode)
 }
 
 /// Default swapchain frame latency. Two lets the CPU and GPU overlap by one
@@ -432,6 +442,14 @@ fn present_mode_is_vsync_paced(mode: wgpu::PresentMode) -> bool {
 /// that result, so the request and acquire-wait distribution are both logged
 /// for diagnosis.
 const DEFAULT_MAXIMUM_FRAME_LATENCY: u32 = 2;
+
+/// Absolute producer-side limit for submissions that have not completed on
+/// the GPU yet. This is deliberately independent of the surface's requested
+/// latency: a driver/compositor can stop releasing swapchain images while a
+/// window is occluded or wedged, and allocating a fresh set of instance
+/// buffers for every retry must never turn that stall into unbounded memory
+/// growth.
+const MAX_IN_FLIGHT_SUBMISSIONS: usize = 2;
 
 /// Env var overriding `desired_maximum_frame_latency` for latency A/B
 /// measurement without a rebuild.
@@ -633,10 +651,71 @@ impl WindowGpuPreferences {
     }
 }
 
+/// Result of one renderer admission attempt.
+///
+/// A deferred frame is distinct from an acquire failure: the bounded
+/// submission queue is full, so callers should retry on their normal pacing
+/// deadline rather than immediately requesting another redraw.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderOutcome {
+    Presented,
+    Deferred,
+    Dropped,
+}
+
+/// A small, lock-free submission budget shared with completion callbacks.
+///
+/// Each submitted frame owns one permit until `Queue::on_submitted_work_done`
+/// runs. Unlike a per-buffer cap, this also works for frames with many image
+/// batches: all of their buffers share one frame permit.
+#[derive(Debug)]
+struct FrameSubmissionGate {
+    in_flight: AtomicUsize,
+    limit: usize,
+}
+
+impl FrameSubmissionGate {
+    fn new(limit: usize) -> Self {
+        Self { in_flight: AtomicUsize::new(0), limit }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<FrameSubmissionPermit> {
+        let mut current = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if current >= self.limit {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(FrameSubmissionPermit { gate: Arc::clone(self) });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+struct FrameSubmissionPermit {
+    gate: Arc<FrameSubmissionGate>,
+}
+
+impl Drop for FrameSubmissionPermit {
+    fn drop(&mut self) {
+        let previous = self.gate.in_flight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "frame submission permit underflow");
+    }
+}
+
 pub struct GpuContext {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub target: RenderTarget,
+    backend: wgpu::Backend,
     /// Hardware vs software/CPU adapter the context was built on. Gates the
     /// per-frame cost (notably MSAA) on the software path; the hardware tier
     /// retains the full-quality rendering path.
@@ -733,6 +812,9 @@ pub struct GpuContext {
     current_quad_instance_buffer: Option<PooledBuffer<QuadInstance>>,
     current_glyph_instance_buffer: Option<PooledBuffer<GlyphInstance>>,
     current_image_instance_buffers: Vec<PooledBuffer<ImageInstance>>,
+    /// Bounds queued frame resources even if the compositor stops making GPU
+    /// progress. The permit is released from the submission-complete callback.
+    frame_submission_gate: Arc<FrameSubmissionGate>,
 
     /// Consumer for [`GridDrawRecord`](crate::batch::GridDrawRecord)s
     /// produced by the batch walk when the experimental fragment shader
@@ -1300,6 +1382,7 @@ impl GpuContext {
             device,
             queue,
             target: RenderTarget::Window { surface, config: surface_config, window },
+            backend,
             adapter_tier: tier,
             sample_count,
             quad_pipeline,
@@ -1333,6 +1416,7 @@ impl GpuContext {
             current_quad_instance_buffer: None,
             current_glyph_instance_buffer: None,
             current_image_instance_buffers: Vec::new(),
+            frame_submission_gate: Arc::new(FrameSubmissionGate::new(MAX_IN_FLIGHT_SUBMISSIONS)),
             #[cfg(feature = "grid-fragment-shader")]
             grid_fragment_pass: GridFragmentPass::new(),
         }
@@ -1514,6 +1598,7 @@ impl GpuContext {
         height: u32,
     ) -> Self {
         let format = wgpu::TextureFormat::Rgba8Unorm;
+        let backend = adapter.get_info().backend;
 
         // `COPY_DST` is required when the backdrop filter path copies the
         // `backdrop_source` texture onto the offscreen target at the end of
@@ -1576,6 +1661,7 @@ impl GpuContext {
             device,
             queue,
             target: RenderTarget::Headless { texture, width, height },
+            backend,
             // Headless contexts intentionally keep the hardware profile (4x
             // MSAA) regardless of the underlying adapter so pixel tests stay
             // byte-stable; the tier is still classified for honesty.
@@ -1612,6 +1698,7 @@ impl GpuContext {
             current_quad_instance_buffer: None,
             current_glyph_instance_buffer: None,
             current_image_instance_buffers: Vec::new(),
+            frame_submission_gate: Arc::new(FrameSubmissionGate::new(MAX_IN_FLIGHT_SUBMISSIONS)),
             #[cfg(feature = "grid-fragment-shader")]
             grid_fragment_pass: GridFragmentPass::new(),
         }
@@ -1726,14 +1813,11 @@ impl GpuContext {
         }
     }
 
-    /// Whether presentation paces the frame loop from the display clock:
-    /// on a vsync-paced surface `render()` blocks in the swapchain
-    /// acquire such that a saturated paint loop runs at the refresh rate.
-    /// The app reads this once after GPU init to select its pacing mode;
-    /// a one-shot read is sound because reconfigures reuse the stored
-    /// config, so the mode never changes at runtime.
+    /// Whether this surface provides a proven blocking producer clock. Metal
+    /// is intentionally excluded even for Fifo: its presentation is synced,
+    /// but acquisition cannot safely serve as renderer back-pressure.
     pub fn is_vsync_paced(&self) -> bool {
-        present_mode_is_vsync_paced(self.present_mode())
+        surface_is_vsync_paced(self.backend, self.present_mode())
     }
 
     /// Whether the configured surface uses the tear-free single-frame
@@ -1944,10 +2028,11 @@ impl GpuContext {
         (quads, glyphs, images, svg)
     }
 
-    /// Encode and submit one frame. Returns `true` after submission and, for a
-    /// window target, after the platform present call. Returns `false` only
-    /// when surface acquisition failed and the frame was dropped or deferred.
-    pub fn render(&mut self) -> bool {
+    /// Encode and submit one frame. A full bounded submission queue returns
+    /// [`RenderOutcome::Deferred`] before allocating this frame's pooled
+    /// buffers; callers should retry from their normal frame pacer. Surface
+    /// acquisition failures return [`RenderOutcome::Dropped`].
+    pub fn render(&mut self) -> RenderOutcome {
         // Reset before any early return so diagnostics queried after a
         // dropped acquisition never observe stale waits from the previous
         // presented frame.
@@ -1955,6 +2040,16 @@ impl GpuContext {
         self.last_present_hold = std::time::Duration::ZERO;
         self.last_present_call_wait = std::time::Duration::ZERO;
         let present_not_before = self.present_not_before.take();
+
+        // Native wgpu completion callbacks are driven by polling. A
+        // nonblocking maintenance poll at every renderer admission returns
+        // completed frame buffers to their pools before we decide whether a
+        // new submission may be built.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        let Some(submission_permit) = self.frame_submission_gate.try_acquire() else {
+            return RenderOutcome::Deferred;
+        };
+
         let (vw, vh) = self.window_size();
 
         if trace_text_draw_ranges() {
@@ -2095,7 +2190,11 @@ impl GpuContext {
                                 }
                             }
                         }
-                        return false;
+                        // Content buffers were prepared before surface
+                        // acquisition. Do not leave them held across a
+                        // failed acquire; no submission can safely own them.
+                        drop(self.take_pooled_frame_buffers());
+                        return RenderOutcome::Dropped;
                     }
                 };
                 let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2466,6 +2565,7 @@ impl GpuContext {
             drop(glyphs);
             drop(images);
             drop(svg);
+            drop(submission_permit);
         });
 
         if let Some(output) = surface_output {
@@ -2483,7 +2583,11 @@ impl GpuContext {
                 }
             }
         }
-        true
+        // A second nonblocking poll makes the common one-frame-behind case
+        // release immediately on fast backends, while the submission gate
+        // remains the hard safety cap if the compositor stops progressing.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        RenderOutcome::Presented
     }
 
     /// Ensure the ping pong textures used by the backdrop blur path are
@@ -3287,22 +3391,45 @@ mod tests {
         );
     }
 
-    /// The classifier the app uses to pick its pacing mode: exactly the
-    /// modes whose acquire/present blocks on vblank count as vsync paced.
+    /// A synchronized present mode alone is not enough to promise a blocking
+    /// producer clock: Metal surfaces use the timer scheduler so an occluded
+    /// compositor cannot admit an unbounded render queue.
     #[test]
-    fn vsync_paced_classification_matches_blocking_modes() {
+    fn vsync_paced_classification_requires_a_blocking_backend() {
         for mode in
             [wgpu::PresentMode::Fifo, wgpu::PresentMode::FifoRelaxed, wgpu::PresentMode::AutoVsync]
         {
-            assert!(present_mode_is_vsync_paced(mode), "{mode:?} blocks on vblank");
+            assert!(
+                surface_is_vsync_paced(wgpu::Backend::Vulkan, mode),
+                "{mode:?} is paced on a blocking backend"
+            );
+            assert!(
+                !surface_is_vsync_paced(wgpu::Backend::Metal, mode),
+                "Metal must use timer pacing even with {mode:?}"
+            );
         }
         for mode in [
             wgpu::PresentMode::Mailbox,
             wgpu::PresentMode::Immediate,
             wgpu::PresentMode::AutoNoVsync,
         ] {
-            assert!(!present_mode_is_vsync_paced(mode), "{mode:?} never blocks on vblank");
+            assert!(
+                !surface_is_vsync_paced(wgpu::Backend::Vulkan, mode),
+                "{mode:?} never blocks on vblank"
+            );
         }
+    }
+
+    #[test]
+    fn frame_submission_gate_caps_and_releases_permits() {
+        let gate = Arc::new(FrameSubmissionGate::new(2));
+        let first = gate.try_acquire().expect("first submission permit");
+        let second = gate.try_acquire().expect("second submission permit");
+        assert!(gate.try_acquire().is_none(), "third frame must be deferred");
+
+        drop(first);
+        assert!(gate.try_acquire().is_some(), "completed frame frees one slot");
+        drop(second);
     }
 
     #[test]

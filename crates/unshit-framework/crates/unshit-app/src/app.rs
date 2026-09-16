@@ -40,7 +40,7 @@ use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
-use unshit_renderer::gpu::{GpuContext, PrewarmStatus, WindowGpuPreferences};
+use unshit_renderer::gpu::{GpuContext, PrewarmStatus, RenderOutcome, WindowGpuPreferences};
 use unshit_renderer::pipeline::quad::QuadInstance;
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
@@ -1896,7 +1896,7 @@ fn fast_paint_animation_frame(
             .then(|| state.frame_pacer.presentation_target())
             .flatten(),
     );
-    let presented = state.gpu.render();
+    let presented = state.gpu.render() == RenderOutcome::Presented;
     // Split display waits out of the work numbers at the source so
     // every downstream consumer of gpu_render_us / total_us keeps
     // measuring CPU work (see FrameMetrics::{present_wait_us,present_hold_us}).
@@ -5447,7 +5447,8 @@ impl ApplicationHandler for AppHandler {
                         .then(|| state.frame_pacer.presentation_target())
                         .flatten(),
                 );
-                let presented = state.gpu.render();
+                let render_outcome = state.gpu.render();
+                let presented = render_outcome == RenderOutcome::Presented;
                 // Split display waits out of the work numbers at the
                 // source so every downstream consumer of gpu_render_us /
                 // total_us keeps measuring CPU work (see
@@ -5535,6 +5536,14 @@ impl ApplicationHandler for AppHandler {
                         frame_start,
                         self.app.config.on_frame_metrics.as_deref(),
                     );
+                } else if render_outcome == RenderOutcome::Deferred {
+                    // The renderer has the maximum safe number of GPU
+                    // submissions outstanding. Do not turn this into an
+                    // immediate redraw loop while the compositor is stalled;
+                    // wake through the ordinary frame pacer instead.
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                        Instant::now() + state.frame_pacer.min_interval(),
+                    ));
                 } else {
                     // Surface recovery consumed the attempted frame. Retry on
                     // the next scheduler admission without counting it or

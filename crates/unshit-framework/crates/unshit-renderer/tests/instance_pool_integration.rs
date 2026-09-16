@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytemuck::Zeroable;
 use unshit_renderer::gpu::GpuContext;
 use unshit_renderer::instance_buffer_pool::InstanceBufferPool;
 use unshit_renderer::pipeline::quad::QuadInstance;
@@ -115,8 +116,13 @@ fn regression_81_item2_no_cpu_gpu_race_at_200_fps() {
     // appear as outstanding > 0 after the final device.poll).
     require_gpu!(regression_81_item2_no_cpu_gpu_race_at_200_fps, mut ctx, {
         let device = ctx.device.clone();
-        // 600 frames at max rate is enough to clear the `desired_maximum_frame_latency = 4`
-        // CPU GPU buffer many times over.
+        // Exercise the real pooled-buffer path. An empty headless frame does
+        // not acquire an instance buffer and therefore cannot catch an
+        // unbounded in-flight allocation regression.
+        ctx.layered_batch.layers[0].quad_instances.push(QuadInstance::zeroed());
+        // 600 render attempts exercise the overload path many times. The
+        // renderer must defer after its bounded submission budget fills
+        // instead of allocating one pool buffer per unchecked frame.
         for _ in 0..600 {
             ctx.render();
         }
@@ -125,6 +131,11 @@ fn regression_81_item2_no_cpu_gpu_race_at_200_fps() {
         let glyph_stats = ctx.text_pipeline.instance_pool.stats();
         assert_eq!(quad_stats.outstanding, 0, "quad pool leaked");
         assert_eq!(glyph_stats.outstanding, 0, "glyph pool leaked");
+        assert!(
+            quad_stats.total_allocated <= 2,
+            "unbounded frame queue allocated {} quad buffers",
+            quad_stats.total_allocated
+        );
     });
 }
 
