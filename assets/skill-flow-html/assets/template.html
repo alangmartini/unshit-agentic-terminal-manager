@@ -879,7 +879,7 @@ body { font-size: 13px; }
       else if (key === 'ArrowRight') changed = selectInto(); else if (key === 'ArrowLeft') changed = selectOut();
       else if (key === 'Enter' || key === ' ') { if (state.selectedRow != null) changed = graphZoom(rows[state.selectedRow].nodeId); }
       else if (key === 'Escape') { changed = state.selectedRow != null; state.selectedRow = null; }
-      
+
       else if (key === 'e' || key === 'E') { expandAll(); changed = true; }
       else if (key === 'c' || key === 'C') { collapseAll(); changed = true; }
       else return;
