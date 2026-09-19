@@ -1579,6 +1579,54 @@ mod tests {
     }
 
     #[test]
+    fn conceptual_flow_rows_have_visible_layout() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/flow-explorer/cache-concept.json");
+        let mut state = seed_state();
+        crate::state::mutate_add_flow_tab(
+            &mut state,
+            crate::flow_explorer::FlowPane::open(&path).unwrap(),
+        );
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let grids = std::collections::HashMap::new();
+        let rebuild_snap = snap.clone();
+        let rebuild_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&snap, &shared, &grids, None),
+            1400.0,
+            950.0,
+        );
+        harness.set_scale_factor(1.25);
+        harness.step();
+        harness.rebuild(move || {
+            build_tree(
+                &rebuild_snap,
+                &rebuild_shared,
+                &std::collections::HashMap::new(),
+                None,
+            )
+        });
+        harness.step();
+        let tree = harness.query(".flow-tree").unwrap().layout_rect;
+        let rows = harness.query_all(".flow-row");
+        assert_eq!(rows.len(), 8);
+        for row in rows {
+            assert!(
+                row.layout_rect.width >= 100.0 && row.layout_rect.height >= 12.0,
+                "row collapsed: {:?}; tree: {tree:?}",
+                row.layout_rect
+            );
+            assert!(
+                row.layout_rect.y >= tree.y && row.layout_rect.y < tree.y + tree.height,
+                "row outside viewport: {:?}; tree: {tree:?}",
+                row.layout_rect
+            );
+        }
+    }
+
+    #[test]
     fn snapped_main_route_statusbar_stays_below_terminal_grid_with_actual_styles() {
         let state = seed_state();
         let active_pane = state.active_pane.0;

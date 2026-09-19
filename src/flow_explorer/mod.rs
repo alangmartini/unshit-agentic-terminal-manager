@@ -17,6 +17,7 @@ pub mod model;
 pub mod pane;
 pub mod poller;
 pub mod producer;
+pub mod skills;
 pub mod snippet;
 pub mod telemetry;
 pub mod tree;

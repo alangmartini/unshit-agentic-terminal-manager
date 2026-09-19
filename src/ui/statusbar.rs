@@ -295,6 +295,7 @@ mod tests {
             active_pane: PaneId(1),
             settings_open: false,
             settings_section: SettingsSection::Appearance,
+            flow_skill_installations: Vec::new(),
             theme: crate::theme::default_theme_id().into(),
             custom_theme: crate::theme::default_custom_theme(),
             config_font_size_pt: crate::state::DEFAULT_CONFIG_FONT_SIZE_PT,

@@ -5172,6 +5172,7 @@ body.dragging-pane {
 
 .app.settings .settings-statusbar .sb-cell {
   height: 14px;
+  white-space: nowrap;
 }
 
 .app.settings .settings-statusbar .sb-cell.sage {
@@ -5632,6 +5633,20 @@ body.dragging-pane {
   align-items: center;
   justify-content: flex-end;
   min-width: 0;
+}
+
+.flow-skill-help {
+  padding: 14px 18px;
+  color: var(--fg-secondary);
+  font-size: var(--t-sm);
+  white-space: normal;
+}
+
+.flow-skill-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .theme-field .set-control,
@@ -7392,11 +7407,17 @@ body.dragging-pane {
 
 /* Call stack tree. */
 .flow-tree {
+  display: flex;
+  flex-direction: column;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 6px 0;
+}
+
+.flow-tree > * {
+  flex-shrink: 0;
 }
 
 .flow-row {
