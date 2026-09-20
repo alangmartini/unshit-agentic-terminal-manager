@@ -239,7 +239,10 @@ mod tests {
         );
     }
 
+    /// The fixture is an Inno Setup InstallLocation, so the paths are
+    /// Windows-shaped; `Path::parent` on another OS would not split them.
     #[test]
+    #[cfg(windows)]
     fn scope_matches_exe_directory_against_install_location() {
         let exe = Path::new(
             r"C:\Users\Someone\AppData\Local\Programs\Terminal Manager\terminal-manager.exe",
