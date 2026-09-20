@@ -980,6 +980,7 @@ pub struct AppState {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub process_details_open: bool,
     pub diff_review: Option<crate::diff_review::Review>,
     pub palette_query: String,
     pub palette_active: usize,
@@ -1294,6 +1295,7 @@ impl AppState {
             tab_width_px: self.tab_width_px,
             toggles: self.toggles.clone(),
             palette_open: self.palette_open,
+            process_details_open: self.process_details_open,
             palette_query: self.palette_query.clone(),
             palette_active: self.palette_active,
             sidebar_collapsed: self.sidebar_collapsed,
@@ -1436,6 +1438,7 @@ pub struct UiSnapshot {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub process_details_open: bool,
     pub palette_query: String,
     pub palette_active: usize,
     pub sidebar_collapsed: bool,
@@ -1652,6 +1655,7 @@ pub fn seed_state() -> AppState {
         tab_width_px: DEFAULT_TAB_WIDTH_PX,
         toggles,
         palette_open: false,
+        process_details_open: false,
         diff_review: None,
         palette_query: String::new(),
         palette_active: 0,
@@ -1762,13 +1766,80 @@ fn load_tab_state(state: &mut AppState) {
     state.col_ratios = tab.col_ratios.clone();
 }
 
+/// Workspace tab indices belonging to the focused pane's group. Mixed
+/// splits belong to both groups; the active tab uses its live pane layout.
+pub fn grouped_tab_indices(
+    tabs: &[TerminalTab],
+    active_tab: usize,
+    live_panes: &[Vec<Pane>],
+    active_pane: PaneId,
+    is_agent: impl Fn(u32) -> bool,
+) -> Vec<usize> {
+    let active_is_agent = is_agent(active_pane.0);
+    tabs.iter()
+        .enumerate()
+        .filter_map(|(index, tab)| {
+            let panes = if index == active_tab {
+                live_panes
+            } else {
+                &tab.panes
+            };
+            (index == active_tab
+                || panes
+                    .iter()
+                    .flatten()
+                    .any(|pane| is_agent(pane.id.0) == active_is_agent))
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn visible_tab_indices(state: &AppState) -> Vec<usize> {
+    grouped_tab_indices(
+        &state.tabs,
+        state.active_tab,
+        &state.panes,
+        state.active_pane,
+        |id| is_agent_pane(state, id),
+    )
+}
+
+/// Translate a visible insertion slot back into the workspace's tab order.
+fn grouped_tab_drop_index(
+    cursor_x: f32,
+    cursor_y: f32,
+    rect: crate::drag::Rect,
+    visible: &[usize],
+) -> Option<usize> {
+    let slot = crate::drag::resolve_tabbar_drop(cursor_x, cursor_y, rect, visible.len())?;
+    Some(
+        visible
+            .get(slot)
+            .copied()
+            .unwrap_or_else(|| visible.last().map_or(0, |index| index + 1)),
+    )
+}
+
 pub fn mutate_switch_tab(state: &mut AppState, new_index: usize) {
     if new_index >= state.tabs.len() || new_index == state.active_tab {
         return;
     }
+    let agents = is_agent_pane(state, state.active_pane.0);
     save_tab_state(state);
     state.active_tab = new_index;
     load_tab_state(state);
+    // A mixed split may have last focused the other group.
+    if is_agent_pane(state, state.active_pane.0) != agents {
+        if let Some(pane) = state
+            .panes
+            .iter()
+            .flatten()
+            .find(|pane| is_agent_pane(state, pane.id.0) == agents)
+        {
+            state.active_pane = pane.id;
+            state.tabs[new_index].active_pane = pane.id;
+        }
+    }
 }
 
 fn save_workspace_state(state: &mut AppState) {
@@ -7680,7 +7751,22 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         return crate::diff_review::dispatch(state, command);
     }
     match command {
+        "processes.open" => {
+            let changed = !state.process_details_open;
+            state.process_details_open = true;
+            changed
+        }
+        "processes.close" => std::mem::take(&mut state.process_details_open),
         "modal.close" => {
+            // These surfaces render above the process dialog; Escape belongs
+            // to the visible top layer (for example the window-close prompt).
+            if state.confirm_dialog.is_none()
+                && !state.palette_open
+                && state.quick_prompt.is_none()
+                && std::mem::take(&mut state.process_details_open)
+            {
+                return true;
+            }
             // The find bar is the innermost surface Escape can close, and
             // it lives inside a pane rather than over the app. Close it
             // first, but only when nothing is stacked on top: with a
@@ -8208,24 +8294,21 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             request_close_tab(state, idx);
             true
         }
-        "tab.next" => {
-            if state.tabs.len() <= 1 {
+        "tab.next" | "tab.prev" => {
+            let visible = visible_tab_indices(state);
+            if visible.len() <= 1 {
                 return false;
             }
-            let new_idx = (state.active_tab + 1) % state.tabs.len();
-            mutate_switch_tab(state, new_idx);
-            true
-        }
-        "tab.prev" => {
-            if state.tabs.len() <= 1 {
-                return false;
-            }
-            let new_idx = if state.active_tab == 0 {
-                state.tabs.len() - 1
+            let current = visible
+                .iter()
+                .position(|index| *index == state.active_tab)
+                .unwrap_or(0);
+            let next = if command == "tab.next" {
+                (current + 1) % visible.len()
             } else {
-                state.active_tab - 1
+                (current + visible.len() - 1) % visible.len()
             };
-            mutate_switch_tab(state, new_idx);
+            mutate_switch_tab(state, visible[next]);
             true
         }
         "pane.split_right" => {
@@ -10468,11 +10551,11 @@ fn dispatch_drag_end(state: &mut AppState) -> bool {
                 state.tabs.len(),
                 state.active_tab
             );
-            if let Some(index) = crate::drag::resolve_tabbar_drop(
+            if let Some(index) = grouped_tab_drop_index(
                 cursor_x,
                 cursor_y,
                 state.tabbar_rect,
-                state.tabs.len(),
+                &visible_tab_indices(state),
             ) {
                 log::info!(
                     "drag.end: extracting pane {:?} to tab index {}",
@@ -10539,11 +10622,11 @@ fn dispatch_drag_end(state: &mut AppState) -> bool {
                 state.tabs.len(),
                 state.active_tab
             );
-            if let Some(index) = crate::drag::resolve_tabbar_drop(
+            if let Some(index) = grouped_tab_drop_index(
                 cursor_x,
                 cursor_y,
                 state.tabbar_rect,
-                state.tabs.len(),
+                &visible_tab_indices(state),
             ) {
                 log::info!("drag.end: reordering tab {} to {}", source_tab, index);
                 mutate_tab_reorder(state, &source_tab, index);
@@ -10939,6 +11022,7 @@ pub(crate) mod tests {
             tab_width_px: DEFAULT_TAB_WIDTH_PX,
             toggles: BTreeMap::new(),
             palette_open: false,
+            process_details_open: false,
             diff_review: None,
             palette_query: String::new(),
             palette_active: 0,
@@ -11523,6 +11607,26 @@ pub(crate) mod tests {
     fn dispatch_shell_clear_workspace_with_malformed_index_returns_false() {
         let mut state = test_state();
         assert!(!dispatch(&mut state, "shell.clear_workspace:abc"));
+    }
+
+    #[test]
+    fn escape_closes_confirmation_above_process_details_first() {
+        let mut state = seed_state();
+        dispatch(&mut state, "processes.open");
+        state.confirm_dialog = Some(ConfirmDialog::KillAll { count: 1 });
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.confirm_dialog.is_none());
+        assert!(state.process_details_open);
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!state.process_details_open);
+    }
+
+    #[test]
+    fn process_details_open_and_escape_close() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "processes.open"));
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!dispatch(&mut state, "processes.close"));
     }
 
     #[test]
@@ -13187,6 +13291,96 @@ pub(crate) mod tests {
         state.active_tab = 1;
         assert!(dispatch(&mut state, "tab.close.active"));
         assert_eq!(state.tabs.len(), 1);
+    }
+
+    #[test]
+    fn tab_groups_drop_maps_visible_slots_to_workspace_order() {
+        let bar = crate::drag::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 40.0,
+        };
+        let visible = [1, 3];
+        assert_eq!(grouped_tab_drop_index(0.0, 20.0, bar, &visible), Some(1));
+        assert_eq!(grouped_tab_drop_index(200.0, 20.0, bar, &visible), Some(3));
+        assert_eq!(grouped_tab_drop_index(900.0, 20.0, bar, &visible), Some(4));
+        assert_eq!(grouped_tab_drop_index(200.0, 80.0, bar, &visible), None);
+    }
+
+    #[test]
+    fn tab_groups_update_when_agent_returns_to_shell() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        let id = state.active_pane.0;
+        classify_pane_title(&mut state, id, "Claude Code");
+        assert_eq!(visible_tab_indices(&state), vec![1]);
+        classify_pane_title(&mut state, id, "PowerShell");
+        assert_eq!(visible_tab_indices(&state), vec![0, 1]);
+    }
+
+    #[test]
+    fn tab_groups_single_agent_does_not_cycle_to_shell() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        let id = state.active_pane.0;
+        state.pane_agents.insert(
+            id,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        assert!(!dispatch(&mut state, "tab.next"));
+        assert!(!dispatch(&mut state, "tab.prev"));
+        assert_eq!(state.active_tab, 1);
+    }
+
+    #[test]
+    fn tab_groups_keep_agent_focus_when_entering_mixed_split() {
+        let mut state = test_state();
+        mutate_split_right(&mut state, PaneId(1));
+        let agent = state.panes[0][1].id;
+        state.pane_agents.insert(
+            agent.0,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        state.active_pane = PaneId(1);
+        mutate_add_tab(&mut state);
+        let other = state.active_pane;
+        state.pane_agents.insert(
+            other.0,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        assert!(dispatch(&mut state, "tab.next"));
+        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.active_pane, agent);
+        assert!(dispatch(&mut state, "tab.next"));
+        assert_eq!(state.active_pane, other);
+    }
+
+    #[test]
+    fn tab_groups_cycle_only_matching_panes() {
+        let mut state = test_state();
+        for _ in 0..3 {
+            mutate_add_tab(&mut state);
+        }
+        for index in [1, 3] {
+            let id = state.tabs[index].active_pane.0;
+            state.pane_agents.insert(
+                id,
+                crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+            );
+        }
+        mutate_switch_tab(&mut state, 0);
+        for (command, expected) in [
+            ("tab.next", 2),
+            ("tab.next", 0),
+            ("tab.prev", 2),
+            ("tab.switch:1", 1),
+            ("tab.prev", 3),
+            ("tab.next", 1),
+        ] {
+            assert!(dispatch(&mut state, command));
+            assert_eq!(state.active_tab, expected);
+        }
     }
 
     #[test]
